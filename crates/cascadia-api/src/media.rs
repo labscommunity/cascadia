@@ -237,6 +237,13 @@ const STAGED_NATIVE_VIDEO: &[(&str, &str, usize, u32)] = &[
     ("gemma4", "<|video|>", 1, 0),
 ];
 
+/// The export `model_type`s whose chat template writes every image of a
+/// message before its text, so ov-genai gets the image tags first too
+/// (GenAI places each image where its tag sits). LLaVA-NeXT's template
+/// renders `<image>\n` per image, then the text; given the question first,
+/// llava-v1.6 described the last frame instead of answering it.
+const GENAI_IMAGES_FIRST: &[&str] = &["llava_next"];
+
 /// The video tag HF's Qwen chat templates render.
 const QWEN_VIDEO_TAG: &str = "<|vision_start|><|video_pad|><|vision_end|>";
 
@@ -274,7 +281,7 @@ impl MediaConfig {
             image_placeholder: "<ov_genai_image_{i}>".into(),
             reserved_text: genai_reserved_text(model_type),
             trim_text_parts: false,
-            images_first: false,
+            images_first: model_type.is_some_and(|t| GENAI_IMAGES_FIRST.contains(&t)),
             max_images: 8,
             // 1024x1024: about 1000 image tokens on Qwen3.5.
             max_image_pixels: 1 << 20,
@@ -1757,6 +1764,31 @@ mod tests {
     /// text parts back to back, whatever the parts' order; HF renders
     /// `[INST] <image>\n<image>\nA:B:Compare. [/INST]` for this message
     /// (tests/fixtures/llava_next_vision in the OpenVINO engine crate).
+    #[test]
+    fn ov_genai_writes_llava_next_images_first() {
+        let l = MediaConfig::ov_genai(Some("llava_next"));
+        let parts = vec![
+            (false, "Q".to_string()),
+            (true, l.placeholder(0)),
+            (true, l.placeholder(1)),
+        ];
+        assert_eq!(
+            l.join_parts(parts.clone()),
+            "<ov_genai_image_0><ov_genai_image_1>Q"
+        );
+        for t in [
+            None,
+            Some("qwen3_vl"),
+            Some("phi3_v"),
+            Some("internvl_chat"),
+        ] {
+            assert_eq!(
+                MediaConfig::ov_genai(t).join_parts(parts.clone()),
+                "Q<ov_genai_image_0><ov_genai_image_1>"
+            );
+        }
+    }
+
     #[test]
     fn llava_next_writes_images_first() {
         let l = MediaConfig::llava_next_native();
