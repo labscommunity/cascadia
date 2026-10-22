@@ -397,6 +397,7 @@ dependencies = [
  "cascadia-kv-wire",
  "cascadia-types",
  "futures",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
 ]
