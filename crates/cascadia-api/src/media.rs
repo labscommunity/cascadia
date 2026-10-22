@@ -239,10 +239,11 @@ const STAGED_NATIVE_VIDEO: &[(&str, &str, usize, u32)] = &[
 
 /// The export `model_type`s whose chat template writes every image of a
 /// message before its text, so ov-genai gets the image tags first too
-/// (GenAI places each image where its tag sits). LLaVA-NeXT's template
-/// renders `<image>\n` per image, then the text; given the question first,
-/// llava-v1.6 described the last frame instead of answering it.
-const GENAI_IMAGES_FIRST: &[&str] = &["llava_next"];
+/// (GenAI places each image where its tag sits). The LLaVA templates render
+/// `<image>\n` per image (LLaVA-NeXT-Video: then its videos), then the text;
+/// given the question first, llava-v1.6, llava-1.5 and LLaVA-NeXT-Video
+/// described the picture instead of answering it.
+const GENAI_IMAGES_FIRST: &[&str] = &["llava", "llava_next", "llava_next_video"];
 
 /// The video tag HF's Qwen chat templates render.
 const QWEN_VIDEO_TAG: &str = "<|vision_start|><|video_pad|><|vision_end|>";
@@ -1760,20 +1761,22 @@ mod tests {
         assert_eq!(x.reserved_in("plain text"), None);
     }
 
-    /// ov-genai on a LLaVA-NeXT export writes the image tags first too;
-    /// other export types keep the parts' order.
+    /// ov-genai on a LLaVA export (1.5, NeXT, NeXT-Video) writes the image
+    /// tags first too; other export types keep the parts' order.
     #[test]
-    fn ov_genai_writes_llava_next_images_first() {
-        let l = MediaConfig::ov_genai(Some("llava_next"));
+    fn ov_genai_writes_llava_images_first() {
         let parts = vec![
             (false, "Q".to_string()),
-            (true, l.placeholder(0)),
-            (true, l.placeholder(1)),
+            (true, "<ov_genai_image_0>".to_string()),
+            (true, "<ov_genai_image_1>".to_string()),
         ];
-        assert_eq!(
-            l.join_parts(parts.clone()),
-            "<ov_genai_image_0><ov_genai_image_1>Q"
-        );
+        for t in ["llava", "llava_next", "llava_next_video"] {
+            assert_eq!(
+                MediaConfig::ov_genai(Some(t)).join_parts(parts.clone()),
+                "<ov_genai_image_0><ov_genai_image_1>Q",
+                "{t}"
+            );
+        }
         for t in [
             None,
             Some("qwen3_vl"),
