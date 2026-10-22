@@ -2363,15 +2363,21 @@ fn render_or_fallback(
 }
 
 /// A chat request's images, decoded, and its messages with each image part
-/// replaced by that image's placeholder.
-struct PreparedMedia {
-    messages: Vec<ChatMessage>,
-    inputs: Vec<cascadia_types::MediaInput>,
-    cfg: Arc<MediaConfig>,
+/// replaced by that image's placeholder ([`prepare_media_with`]). Render
+/// `messages` with the model's chat template, check the rendered prompt with
+/// [`PreparedMedia::check_placeholders`], and send `inputs` as the task's
+/// media with `prompt_rendered` set.
+pub struct PreparedMedia {
+    /// The request's messages, each media part replaced by its placeholder.
+    pub messages: Vec<ChatMessage>,
+    /// Decoded media, in placeholder order: the task's `media`.
+    pub inputs: Vec<cascadia_types::MediaInput>,
+    /// The config the request was prepared with.
+    pub cfg: Arc<MediaConfig>,
     /// How many of `inputs` are video frames (served as images).
-    frames: usize,
+    pub frames: usize,
     /// How many of `inputs` are native videos ([`MediaConfig::native_video`]).
-    videos: usize,
+    pub videos: usize,
 }
 
 impl PreparedMedia {
@@ -2386,7 +2392,7 @@ impl PreparedMedia {
     /// two parts would only appear here (as would one in tool-call arguments
     /// or tool definitions). Each reserved string may occur only as often as
     /// the placeholders themselves carry it.
-    fn check_placeholders(&self, prompt: &str) -> Result<(), String> {
+    pub fn check_placeholders(&self, prompt: &str) -> Result<(), String> {
         let n = self.inputs.len() - self.videos;
         if let Err(found) = self.cfg.placeholders_complete(prompt, n) {
             let sent = if self.frames > 0 {
@@ -2516,22 +2522,52 @@ fn chat_caller_text(req: &ChatCompletionRequest) -> Vec<std::borrow::Cow<'_, str
     out
 }
 
-/// Validate and decode a chat request's `image_url` and `video_url` parts.
-/// `Ok(None)` for a text-only request. Image decoding runs on the blocking
-/// pool: a large JPEG takes tens of milliseconds and would stall every
-/// connection on this worker. A video is decoded by an ffmpeg subprocess
-/// (see [`video`]) into frames that are served as images, each behind a
-/// `Frame k (t s): ` label, as if the caller had sent them that way; on an
-/// engine that takes video natively ([`MediaConfig::native_video`]) the
-/// frames are one video item behind the video tag instead.
+/// Why [`prepare_media_with`] refused a request's media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaError {
+    /// The request's fault (bad, oversized, too many or misplaced media): a
+    /// 400; retrying it unchanged cannot succeed.
+    Invalid(String),
+    /// No decode slot came free within the config's `decode_wait`: a 503 with
+    /// `Retry-After`; retry later.
+    Busy(String),
+    /// A decoder or ffmpeg failure on this server: a 500.
+    Internal(String),
+}
+
+impl MediaError {
+    /// The HTTP status for this refusal: 400, 503 or 500.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            MediaError::Invalid(_) => 400,
+            MediaError::Busy(_) => 503,
+            MediaError::Internal(_) => 500,
+        }
+    }
+
+    /// The refusal's message, for the error body.
+    pub fn message(&self) -> &str {
+        match self {
+            MediaError::Invalid(m) | MediaError::Busy(m) | MediaError::Internal(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for MediaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for MediaError {}
+
+/// The server's media path: [`prepare_media_with`] on this server's config,
+/// its refusals as HTTP responses (and rejection metrics), and the 400 that
+/// names why a model without image input refuses one.
 async fn prepare_media(
     state: &AppState,
     messages: &[ChatMessage],
 ) -> Result<Option<PreparedMedia>, Response> {
-    let reject = |msg: String| {
-        count_rejected("invalid_media");
-        api_error(StatusCode::BAD_REQUEST, msg, None)
-    };
     let count: usize = messages.iter().map(|m| m.images().count()).sum();
     let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
     if count == 0 && videos == 0 {
@@ -2543,19 +2579,80 @@ async fn prepare_media(
             .as_deref()
             .map(|r| format!(": {r}"))
             .unwrap_or_default();
-        return Err(reject(if count > 0 {
-            format!(
-                "model `{}` does not accept image input (`image_url` content parts){why}",
-                state.model_id
-            )
-        } else {
-            format!(
-                "model `{}` does not accept image input, which video input is served as \
-                 (`video_url` content parts){why}",
-                state.model_id
-            )
-        }));
+        count_rejected("invalid_media");
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            if count > 0 {
+                format!(
+                    "model `{}` does not accept image input (`image_url` content parts){why}",
+                    state.model_id
+                )
+            } else {
+                format!(
+                    "model `{}` does not accept image input, which video input is served as \
+                     (`video_url` content parts){why}",
+                    state.model_id
+                )
+            },
+            None,
+        ));
     };
+    prepare_media_with(cfg, &state.decode_permits, messages)
+        .await
+        .map_err(media_error_response)
+}
+
+/// A [`MediaError`] as the server answers it: the 400 and the capacity 503
+/// (with `Retry-After`) counted as rejections, and the pre-engine refusals
+/// kept out of readiness (see `PreEngineFailure`).
+fn media_error_response(err: MediaError) -> Response {
+    match err {
+        MediaError::Invalid(msg) => {
+            count_rejected("invalid_media");
+            api_error(StatusCode::BAD_REQUEST, msg, None)
+        }
+        MediaError::Busy(msg) => {
+            count_rejected("capacity");
+            let mut resp = api_error(StatusCode::SERVICE_UNAVAILABLE, msg, None);
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+            resp.extensions_mut().insert(PreEngineFailure);
+            resp
+        }
+        MediaError::Internal(msg) => {
+            let mut resp = api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, None);
+            resp.extensions_mut().insert(PreEngineFailure);
+            resp
+        }
+    }
+}
+
+/// Validate and decode a chat request's `image_url` and `video_url` parts
+/// against `cfg`, for a caller that serves a model itself (cascadia-api's
+/// server calls it through its own wrapper). `Ok(None)` for a text-only
+/// request. Media is accepted in `user` messages only. Remote URLs are fetched
+/// only when `cfg.allow_remote_urls`. One permit of `decode_slots` is held
+/// while the request's images and videos decode, waited for at most
+/// `cfg.decode_wait` ([`MediaError::Busy`] past it). Image decoding runs on
+/// the blocking pool: a large JPEG takes tens of milliseconds and would stall
+/// every connection on this worker. A video is decoded by an ffmpeg subprocess
+/// (see [`video`]) into frames that are served as images, each behind a
+/// `Frame k (t s): ` label, as if the caller had sent them that way; on an
+/// engine that takes video natively ([`MediaConfig::native_video`]) the
+/// frames are one video item behind the video tag instead. Each
+/// [`MediaInput`](cascadia_types::MediaInput) carries the SHA-256 of its
+/// decoded pixels, which the engines' image caches and warm-resume key on.
+pub async fn prepare_media_with(
+    cfg: Arc<MediaConfig>,
+    decode_slots: &Arc<Semaphore>,
+    messages: &[ChatMessage],
+) -> Result<Option<PreparedMedia>, MediaError> {
+    let reject = MediaError::Invalid;
+    let count: usize = messages.iter().map(|m| m.images().count()).sum();
+    let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
+    if count == 0 && videos == 0 {
+        return Ok(None);
+    }
     if let Some(m) = messages.iter().find(|m| m.role != "user" && m.has_media()) {
         let kind = if m.images().next().is_some() {
             "image_url"
@@ -2687,14 +2784,13 @@ async fn prepare_media(
     let (image_bytes, video_inputs) = match sized {
         Ok(Ok(b)) => b,
         Ok(Err(msg)) => return Err(reject(msg)),
-        Err(join_err) => return Err(decode_task_failed(join_err)),
+        Err(join_err) => return Err(decode_task_error(join_err)),
     };
     let messages = messages.to_vec();
     let decode_cfg = Arc::clone(&cfg);
     // One slot for the whole request, its videos included: ffmpeg runs
     // under it, before the images decode.
-    let decode_permit =
-        acquire_decode_slot(Arc::clone(&state.decode_permits), cfg.decode_wait).await?;
+    let decode_permit = acquire_decode_slot(Arc::clone(decode_slots), cfg.decode_wait).await?;
     // One deadline over all of the request's videos, as the fetches have.
     let deadline = tokio::time::Instant::now() + cfg.video_decode_timeout;
     let mut video_frames = Vec::with_capacity(video_inputs.len());
@@ -2704,11 +2800,7 @@ async fn prepare_media(
             Err(video::VideoError::Invalid(msg)) => {
                 return Err(reject(format!("video {j}: {msg}")))
             }
-            Err(video::VideoError::Internal(msg)) => {
-                let mut resp = api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, None);
-                resp.extensions_mut().insert(PreEngineFailure);
-                return Err(resp);
-            }
+            Err(video::VideoError::Internal(msg)) => return Err(MediaError::Internal(msg)),
         }
     }
     let frames: usize = video_frames.iter().map(Vec::len).sum();
@@ -2818,21 +2910,15 @@ async fn prepare_media(
             videos: native_videos,
         })),
         Ok(Err(msg)) => Err(reject(msg)),
-        Err(join_err) => Err(decode_task_failed(join_err)),
+        Err(join_err) => Err(decode_task_error(join_err)),
     }
 }
 
-fn decode_task_failed(join_err: tokio::task::JoinError) -> Response {
+fn decode_task_error(join_err: tokio::task::JoinError) -> MediaError {
     tracing::error!(error = %join_err, "image decode task failed");
-    // A decoder fault on one upload says nothing about the pipeline: keep it
-    // out of readiness (see `PreEngineFailure`).
-    let mut resp = api_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "image decoding failed",
-        None,
-    );
-    resp.extensions_mut().insert(PreEngineFailure);
-    resp
+    // A decoder fault on one upload says nothing about the pipeline: the
+    // server keeps it out of readiness (see `PreEngineFailure`).
+    MediaError::Internal("image decoding failed".into())
 }
 
 /// A decode slot, waited for at most `wait`. The caller holds an in-flight
@@ -2842,21 +2928,12 @@ fn decode_task_failed(join_err: tokio::task::JoinError) -> Response {
 async fn acquire_decode_slot(
     permits: Arc<Semaphore>,
     wait: std::time::Duration,
-) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+) -> Result<tokio::sync::OwnedSemaphorePermit, MediaError> {
     match tokio::time::timeout(wait, permits.acquire_owned()).await {
         Ok(p) => Ok(p.expect("decode semaphore is never closed")),
-        Err(_) => {
-            count_rejected("capacity");
-            let mut resp = api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "image decoding at capacity; retry after current requests complete",
-                None,
-            );
-            resp.headers_mut()
-                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-            resp.extensions_mut().insert(PreEngineFailure);
-            Err(resp)
-        }
+        Err(_) => Err(MediaError::Busy(
+            "image decoding at capacity; retry after current requests complete".into(),
+        )),
     }
 }
 
@@ -10088,9 +10165,12 @@ level={{ effort_map[eff] }}";
     #[tokio::test]
     async fn decode_slot_wait_is_bounded() {
         let busy = Arc::new(Semaphore::new(0));
-        let resp = acquire_decode_slot(busy, std::time::Duration::from_millis(20))
+        let err = acquire_decode_slot(busy, std::time::Duration::from_millis(20))
             .await
             .unwrap_err();
+        assert!(matches!(err, MediaError::Busy(_)), "{err:?}");
+        assert_eq!(err.http_status(), 503);
+        let resp = media_error_response(err);
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
         assert!(resp.extensions().get::<PreEngineFailure>().is_some());
