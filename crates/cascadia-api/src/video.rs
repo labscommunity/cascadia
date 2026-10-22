@@ -1874,6 +1874,34 @@ mod tests {
             }
         }
 
+        /// A model that writes its images first (LLaVA-NeXT) gets the frames
+        /// first and one line naming them after the caller's text, not a
+        /// `Frame k` label per frame stranded after all the images.
+        #[tokio::test]
+        async fn images_first_frames_get_one_note() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 3);
+            let (app, seen) = video_app(ff, |m| m.images_first = true).await;
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [video_msg("what happens?", &url)]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let seen = seen.lock().unwrap();
+            let (prompt, sizes) = &seen[0];
+            assert_eq!(sizes.len(), 3);
+            assert!(
+                prompt.contains(
+                    "user: <ov_genai_image_0><ov_genai_image_1><ov_genai_image_2>what happens?\
+                     The video is shown as 3 frames, in order, at 0.0s, 1.0s, 2.0s. \n"
+                ),
+                "{prompt:?}"
+            );
+            assert!(!prompt.contains("Frame 1"), "{prompt:?}");
+        }
+
         /// Frames take the image indices after the images before them, and
         /// the request's images and frames are counted apart: eight images
         /// and a video's frames fit together.
