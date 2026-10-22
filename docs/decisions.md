@@ -1151,6 +1151,25 @@ The case file and the run files hold request content (states, questions and answ
 `--decision-dump`: `run` and `cases` write them with mode 0600 and never overwrite one. Keep them
 private.
 
+## Embedding the decision core
+
+A server that embeds the crates with its own router and engine backend serves both formats through
+the same code as the OSS routes, from `cascadia_api::decisions`:
+
+- `PassRunner`: one method, `run_pass(task)`, which submits a decision pass and returns that task's
+  chunk stream (a boxed stream of `Chunk`s). The OSS server implements it on its `Runner`.
+- `evaluate_with(&DecisionContext, &DecisionRequest)`: validation, admission, encode, the prefill
+  budget, prefix reuse, the second round, every pass and the error mapping, returning the answers
+  and prompt tokens. The context carries the `DecisionService`, the decision permits, an optional
+  dump (`DecisionDump::open`), the pass runner and optional `ApiStats`. Dropping its future
+  cancels the request as a client disconnect does on the OSS server.
+- Rendering: `systemone_body` and `systemone_error` for `/v1/systemone`; `openai::parse_request`,
+  `openai::to_internal`, `openai::to_openai` and `openai_error` (on `openai_envelope`) for
+  `/v1/decisions`. Each returns a status and a JSON value, no framework response.
+
+Pipelines need no change: the pass runner submits rank-0 tasks, and how the frames travel down the
+chain is the engine's business. The codecs and their prompts are internals, not a stable interface.
+
 ## Limitations
 
 - **Text only.** Images in either format are a 400 (`images`, `videos`, OpenAI `input_image`

@@ -38,6 +38,8 @@ minijinja-contrib = { version = "2", default-features = false, features = ["pyco
 indexmap = { version = "2", features = ["serde"] }
 ryu = "1"
 tokenizers = { workspace = true }
+# `decisions::PassRunner`, the seam embedders run decision passes through.
+async-trait = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -45,4 +47,3 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
-async-trait = { workspace = true }
