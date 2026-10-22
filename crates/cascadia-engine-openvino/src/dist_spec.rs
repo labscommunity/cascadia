@@ -1915,7 +1915,13 @@ impl Engine for OvDistSpecEngine {
                 let vocab = crate::resume_vocab_bound(&self.tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let task_id = task.task_id.clone();
-                    let c = Chunk::error(task.task_id, format!("invalid resume prefix: {e}"));
+                    let c = Chunk::error(
+                        task.task_id,
+                        format!(
+                            "{}invalid resume prefix: {e}",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    );
                     return Ok(vec![(task_id, c)]);
                 }
                 // Exhausted budget (prefix >= max_tokens): finish Length with ZERO

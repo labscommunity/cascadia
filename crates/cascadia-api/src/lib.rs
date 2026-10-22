@@ -4844,52 +4844,14 @@ fn engine_error_response(
     // edge case, and the fix is a sizing change (fewer slots, wider context).
     // Its own reason rather than `prompt_too_large` — that is the API's byte
     // limit on the request body, a different knob with a different owner.
-    // Exhaustive on purpose — no `_` arm. Every variant reaching here is a
-    // request rejected before generation started, which is exactly what this
-    // metric promises to count, and a catch-all is how PromptTooLong stayed
-    // invisible until someone went looking. A new EngineError variant should
-    // fail to compile until it is classified, not silently vanish.
-    //
-    // Reasons name the knob, not the status: `engine_unavailable` means bring
-    // the stage or its peer up, `engine_error` means read that node's logs,
-    // `invalid_request` means the caller sent something this worker can't
-    // serve. Without these a node failing 100% of requests looked identical
-    // to a healthy idle one on every metric here.
-    count_rejected(match &err {
-        EngineError::QueueFull { .. } => "capacity",
-        EngineError::PromptTooLong(_) => "prompt_over_window",
-        EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
-        EngineError::Backend(_)
-        | EngineError::Io(_)
-        | EngineError::Task { .. }
-        | EngineError::BatchAborted(_) => "engine_error",
-        EngineError::InvalidConfig(_)
-        | EngineError::PeerRejected(_)
-        | EngineError::ShardRejected(_)
-        | EngineError::UnsupportedInput(_)
-        | EngineError::ModelNotFound(_) => "invalid_request",
-    });
-    let status = match &err {
-        EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
-        // Permanent for this request: retrying sends the identical prompt into
-        // the identical window. OpenAI answers an over-context prompt with a
-        // 400, and its SDKs retry neither a 400 nor a 413 (only 408, 409, 429
-        // and 5xx). 413 stays for the byte limits on the request itself.
-        EngineError::PromptTooLong(_)
-        | EngineError::InvalidConfig(_)
-        | EngineError::PeerRejected(_)
-        | EngineError::ShardRejected(_)
-        | EngineError::UnsupportedInput(_) => StatusCode::BAD_REQUEST,
-        EngineError::ModelNotFound(_) => StatusCode::NOT_FOUND,
-        EngineError::Backend(_) | EngineError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        // A task-attributed step failure: the engine abandoned a task; the
-        // underlying cause is a backend/transport failure.
-        EngineError::Task { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-        // A pipeline stage abandoned the in-flight batch. Server-side and
-        // this node's to explain, like any other engine failure.
-        EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
+    // Every variant reaching here is a request rejected before generation
+    // started, which is what this metric counts. The reasons and statuses are
+    // one exhaustive table in cascadia-engine (`EngineError::rejection_reason`
+    // / `http_status`), shared with every other caller that fronts an engine,
+    // so a new variant fails to compile until it is classified.
+    count_rejected(err.rejection_reason());
+    let status =
+        StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     // OpenAI's shape for a prompt over the model's window: 400,
     // `invalid_request_error`, `context_length_exceeded`, and `param` naming
     // the prompt field. SDKs and agents key truncate-and-retry off the code.
