@@ -1883,7 +1883,13 @@ impl Qwen36Engine {
                 let vocab = crate::resume_vocab_bound(tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let id = task.task_id.clone();
-                    let c = Chunk::error(id.clone(), format!("invalid resume prefix: {e}"));
+                    let c = Chunk::error(
+                        id.clone(),
+                        format!(
+                            "{}invalid resume prefix: {e}",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    );
                     return vec![(id, c)];
                 }
             }
@@ -1898,7 +1904,10 @@ impl Qwen36Engine {
                 warn!(task = %task.task_id, "qwen36: empty prompt after tokenize; rejecting");
                 let e = Chunk::error(
                     task.task_id.clone(),
-                    "empty prompt after tokenize".to_string(),
+                    format!(
+                        "{}empty prompt after tokenize",
+                        cascadia_engine::CLIENT_ERROR_PREFIX
+                    ),
                 );
                 return vec![(task.task_id, e)];
             }
@@ -2633,7 +2642,13 @@ impl Qwen36Engine {
                 let vocab = crate::resume_vocab_bound(tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let id = task.task_id.clone();
-                    let c = Chunk::error(id.clone(), format!("invalid resume prefix: {e}"));
+                    let c = Chunk::error(
+                        id.clone(),
+                        format!(
+                            "{}invalid resume prefix: {e}",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    );
                     return vec![(id, c)];
                 }
             }
@@ -2648,7 +2663,10 @@ impl Qwen36Engine {
                 warn!(task = %task.task_id, "qwen36: empty prompt after tokenize; rejecting");
                 let e = Chunk::error(
                     task.task_id.clone(),
-                    "empty prompt after tokenize".to_string(),
+                    format!(
+                        "{}empty prompt after tokenize",
+                        cascadia_engine::CLIENT_ERROR_PREFIX
+                    ),
                 );
                 return vec![(task.task_id, e)];
             }

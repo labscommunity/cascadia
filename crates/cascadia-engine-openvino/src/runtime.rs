@@ -4247,7 +4247,13 @@ impl OvRuntimeEngine {
                     let id = task.task_id.clone();
                     return Ok(vec![(
                         id.clone(),
-                        Chunk::error(id, format!("invalid resume prefix: {e}")),
+                        Chunk::error(
+                            id,
+                            format!(
+                                "{}invalid resume prefix: {e}",
+                                cascadia_engine::CLIENT_ERROR_PREFIX
+                            ),
+                        ),
                     )]);
                 }
                 // Budget already exhausted by the prefix (total = prefix + new
@@ -4631,7 +4637,13 @@ impl OvRuntimeEngine {
                 let id = task.task_id.clone();
                 out.push((
                     id.clone(),
-                    Chunk::error(id, "empty prompt: no tokens to prefill"),
+                    Chunk::error(
+                        id,
+                        format!(
+                            "{}empty prompt: no tokens to prefill",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    ),
                 ));
                 continue;
             }
@@ -5271,9 +5283,10 @@ impl OvRuntimeEngine {
         // prompt would otherwise emit a fabricated token with no inference (and
         // on the static path skip the position-0 ring reset).
         if prefill && tokens.is_empty() {
-            return Err(EngineError::Backend(
-                "empty prompt: no tokens to prefill".into(),
-            ));
+            return Err(EngineError::Backend(format!(
+                "{}empty prompt: no tokens to prefill",
+                cascadia_engine::CLIENT_ERROR_PREFIX
+            )));
         }
 
         let next_token = if self.static_kv.is_some() {

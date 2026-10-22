@@ -1113,7 +1113,13 @@ impl Gemma4Engine {
                     let id = task.task_id.clone();
                     return Ok(vec![(
                         id.clone(),
-                        Chunk::error(id, format!("invalid resume prefix: {e}")),
+                        Chunk::error(
+                            id,
+                            format!(
+                                "{}invalid resume prefix: {e}",
+                                cascadia_engine::CLIENT_ERROR_PREFIX
+                            ),
+                        ),
                     )]);
                 }
                 // Exhausted budget: finish Length with ZERO new tokens — the old
@@ -1408,9 +1414,10 @@ impl Gemma4Engine {
         // A generation request must carry at least one prompt token; an empty
         // prompt would otherwise emit a fabricated token with no inference.
         if prefill && tokens.is_empty() {
-            return Err(EngineError::Backend(
-                "empty prompt: no tokens to prefill".into(),
-            ));
+            return Err(EngineError::Backend(format!(
+                "{}empty prompt: no tokens to prefill",
+                cascadia_engine::CLIENT_ERROR_PREFIX
+            )));
         }
 
         // The whole prompt (prefill) or one decode token in a single
