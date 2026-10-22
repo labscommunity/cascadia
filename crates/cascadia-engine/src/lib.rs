@@ -305,6 +305,44 @@ pub fn is_client_error_reason(reason: &str) -> bool {
     PREFIXES.iter().any(|p| r.starts_with(p))
 }
 
+/// Why GenAI cannot serve this VLM export's images correctly, if it cannot.
+///
+/// GenAI 2026.4.1 has no Pixtral path: `model_type: "llava"` maps a Pixtral
+/// checkpoint onto its LLaVA-1.5 preprocessing (`visual_language/llava/
+/// classes.cpp`), which resizes the shortest edge and center-crops a fixed
+/// square and expands each image without Pixtral's `[IMG_BREAK]` row tokens
+/// and `[IMG_END]`, behind a hard-coded `<image>` tag that the Pixtral
+/// tokenizer splits into ordinary text tokens, so no image row is merged at
+/// all. The model then answers about a different picture (903 prompt tokens
+/// where HF counts 832 on a 448x448 image). Such exports serve text only here; the message names the
+/// ov-runtime commands that serve their images, and the API returns it with
+/// the 400 that refuses them.
+pub fn genai_unsupported_vision(model_dir: &std::path::Path) -> Option<String> {
+    let cfg: serde_json::Value = std::fs::read(model_dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let vision = cfg
+        .get("vision_config")
+        .and_then(|v| v.get("model_type"))
+        .and_then(serde_json::Value::as_str)?;
+    // Mistral 3 exports carry a Pixtral vision tower too; their cut needs
+    // `--family mistral3`.
+    let family = match cfg.get("model_type").and_then(serde_json::Value::as_str) {
+        Some("mistral3") => "mistral3",
+        _ => "pixtral",
+    };
+    (vision == "pixtral").then(|| {
+        format!(
+            "ov-genai serves this Pixtral export as text only: GenAI preprocesses Pixtral as \
+             LLaVA-1.5 (center crop, no [IMG_BREAK]/[IMG_END]) and answers about a different \
+             image. Serve its images with ov-runtime on a one-stage tree: \
+             `python tools/vlm_surgery/cut_vlm_lm.py --model <export dir> --output-dir <tree> \
+             --num-stages 1 --family {family}`, then `cascadia worker --total 1 --rank 0 \
+             --engine ov-runtime --model <tree> --api <host:port>`"
+        )
+    })
+}
+
 pub type EngineResult<T> = Result<T, EngineError>;
 
 /// Stream of load-progress events yielded by [`Builder::load`].

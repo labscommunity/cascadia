@@ -54,7 +54,9 @@ pub use cascadia_types::ApiStats;
 
 mod media;
 pub use media::MediaConfig;
+pub mod media_setup;
 mod video;
+pub use media_setup::{attach_ffmpeg, media_setup, MediaEngine, MediaSetup};
 pub use video::Ffmpeg;
 mod responses;
 pub use responses::{ReasoningParam, ResponsesRequest};
