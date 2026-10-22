@@ -1870,7 +1870,8 @@ pub struct Qwen36Engine {
     /// Set when the engine cannot keep serving after a failed infer (Task 46, narrowed by Task
     /// 54): a request that could not be made idle could not be recovered either (the stage's
     /// recompile failed or timed out, or [`Rebuild::cap`] recompiles were already used), or a
-    /// recompiled stage failed its first infer. Every later task fails at once with this reason (a
+    /// recompiled stage failed its first infer; or the downstream link desynced (Task 59,
+    /// [`Self::desync`]). Every later task fails at once with this reason (a
     /// `backend error`, a 5xx at the API), and nothing touches the stage requests again. Only a
     /// restart clears it.
     engine_failed: Option<String>,
@@ -2046,7 +2047,8 @@ enum DownLink {
     /// HELLO_ACK/NAK carries no task tag, so the retried handshake reads that reply instead of
     /// sending a second HELLO, whose reply would be left behind for the first task.
     HelloOwed,
-    /// Alignment lost: every later exchange fails fast with this message until restart.
+    /// Alignment lost: every later exchange fails fast with this message until restart, and the
+    /// engine is failed with it so the rank exits for that restart (Task 59).
     Desynced(String),
 }
 
@@ -3011,14 +3013,18 @@ impl Qwen36Engine {
         }
     }
 
-    /// Mark the downstream link desynced (logged once) so no later exchange reads it.
+    /// Mark the downstream link desynced (logged once) so no later exchange reads it, and fail
+    /// the engine with the same reason (Task 59): nothing in-process can realign the stream, so
+    /// rank 0 exits for its supervisor (Task 56) and a relay rank exits through
+    /// [`Self::relay_engine_failed`]. With the other ranks restarting too, the pipeline reconnects.
     fn desync(&mut self, cause: String) {
         if matches!(self.down_link, DownLink::Desynced(_)) {
             return;
         }
         let msg = format!("qwen36 pipeline link desynced after {cause}; restart the pipeline");
         error!(rank = self.rank, "{msg}");
-        self.down_link = DownLink::Desynced(msg);
+        self.down_link = DownLink::Desynced(msg.clone());
+        self.fail_engine(msg);
     }
 
     /// Run one downstream request → reply exchange and settle the link's framing state from how
@@ -4824,12 +4830,13 @@ impl Engine for Qwen36Engine {
         if let Some(e) = self.relay_engine_failed() {
             return Err(e);
         }
-        let result = self.step_pipe_relay().map(|_| Vec::new()).and_then(|out| {
-            match self.relay_engine_failed() {
-                Some(e) => Err(e),
-                None => Ok(out),
-            }
-        });
+        // Task 59: a frame that failed the engine (a desynced downstream link) may also fail the
+        // step with its own, non-fatal error; the connection-fatal one wins so the stage exits now.
+        let result = self.step_pipe_relay().map(|_| Vec::new());
+        let result = match self.relay_engine_failed() {
+            Some(e) => Err(e),
+            None => result,
+        };
         if let Err(e) = &result {
             warn!(error = %e, "qwen36 pipeline step failed");
         }
@@ -6786,6 +6793,10 @@ mod tests {
             e.send_forward_recv_token(one_row(&e), 1, 0).is_err(),
             "TOKEN past the bound"
         );
+        // Task 59: a reply late before its first byte leaves the link owed, not desynced, and
+        // the engine keeps serving.
+        assert_eq!(e.down_link, DownLink::Owed);
+        assert!(e.engine_failed.is_none() && e.failure().reason().is_none());
 
         e.epoch = 2;
         e.reset_exchange()
@@ -6809,6 +6820,7 @@ mod tests {
             .send_forward_recv_token(one_row(&e), 1, 0)
             .expect("task 4 reads its own TOKEN");
         assert_eq!(tok, 42, "task 4 got a stale token");
+        assert!(e.engine_failed.is_none() && e.failure().reason().is_none());
         cascadia_transport::set_activation_timeout_secs(0);
         rt.block_on(fake).unwrap();
     }
@@ -6840,6 +6852,14 @@ mod tests {
 
         e.epoch = 1;
         assert!(e.send_forward_recv_token(one_row(&e), 1, 0).is_err());
+        // Task 59: the desync fails the engine, and rank 0 marks the Task 56 handle with the
+        // desync reason so the server exits for its supervisor.
+        let reason = e.engine_failed.clone().expect("a desync fails the engine");
+        assert!(
+            reason.contains("desynced") && reason.contains("restart"),
+            "{reason}"
+        );
+        assert_eq!(e.failure().reason(), Some(reason));
         e.epoch = 2;
         let err = e
             .reset_exchange()
@@ -6847,11 +6867,12 @@ mod tests {
             .to_string();
         assert!(err.contains("desynced") && err.contains("restart"), "{err}");
 
-        // The next admission is refused before any frame goes out.
+        // The next admission is refused before any frame goes out, as an engine failure.
         e.pending.push(GenerationTask::new("t9", "hello"));
         let out = e.step_pipe_first();
         let msg = out[0].1.error.clone().expect("an error chunk");
         assert!(msg.contains("desynced") && msg.contains("restart"), "{msg}");
+        assert!(msg.contains("engine failed"), "{msg}");
         cascadia_transport::set_activation_timeout_secs(0);
         rt.block_on(fake).unwrap();
     }
@@ -6883,6 +6904,9 @@ mod tests {
             fake_ack(s, FRAME_RESET_ACK, 1).await;
         });
         assert!(e.handshake_a().is_err(), "HELLO past the bound");
+        // Task 59: an owed HELLO reply is retried, never an engine failure.
+        assert_eq!(e.down_link, DownLink::HelloOwed);
+        assert!(e.engine_failed.is_none() && e.failure().reason().is_none());
         e.handshake_a().expect("the retry reads the late HELLO_ACK");
         assert!(e.handshake_done);
         e.epoch = 1;
@@ -9037,6 +9061,64 @@ mod tests {
         assert_eq!(ev[i - 1], "abandon", "{ev:?}");
         assert_eq!(ev.get(i + 1), Some(&"infer"), "{ev:?}");
         assert_eq!(dropped(&old_drops), 0, "the relay's old stage is leaked");
+        cascadia_transport::set_activation_timeout_secs(0);
+    }
+
+    #[test]
+    fn a_middle_rank_whose_downstream_link_desyncs_exits_connection_fatal() {
+        // Task 59 (pawan-03): the next rank died while this one waited for its RESET_ACK. The
+        // desynced link fails the engine, so the relay step returns the connection-fatal error
+        // and `run_relay_loop` exits for a supervisor restart, instead of refusing every frame.
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(30);
+        let rt = pipe_rt();
+        let pair = || async {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            let mut client = ActivationClient::new("127.0.0.1", server.port());
+            let (c, a) = tokio::join!(client.connect(), server.accept());
+            c.unwrap();
+            a.unwrap();
+            (server, client)
+        };
+        let (up_server, mut head) = rt.block_on(pair());
+        let (mut last, down_client) = rt.block_on(pair());
+
+        // Rank 1 of 3: upstream from the head, downstream to the last rank.
+        let mut e = bare_engine(3, "{}");
+        e.rank = 1;
+        e.hidden = MOCK_HIDDEN;
+        e.upstream = Some(Arc::new(tokio::sync::Mutex::new(up_server)));
+        e.downstream = Some(Arc::new(tokio::sync::Mutex::new(down_client)));
+        e.runtime_handle = Some(rt.handle().clone());
+        let s1 = MockStage::new(&LAST_STAGE_INPUTS, MOCK_VOCAB, Some(1));
+        e.stages = vec![OvStage::Mock(s1)];
+
+        let fake_last = rt.spawn(async move {
+            fake_expect(&mut last, FRAME_RESET, 1).await;
+            drop(last); // the last rank dies before its RESET_ACK
+        });
+        rt.block_on(async {
+            head.send_raw(&frame_header(FRAME_RESET, 1, 0))
+                .await
+                .unwrap();
+        });
+
+        let err = e.step().expect_err("the desync ends the relay step");
+        assert!(err.is_connection_fatal(), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("desynced") && msg.contains("RESET_ACK"),
+            "{msg}"
+        );
+        let reason = e.engine_failed.clone().expect("a desync fails the engine");
+        assert!(reason.contains("desynced"), "{reason}");
+        // A relay exits through this error, never through the Task 56 handle.
+        assert_eq!(e.failure().reason(), None);
+        // And keeps exiting: no later step reads the link again.
+        assert!(e.step().expect_err("still failed").is_connection_fatal());
+        rt.block_on(fake_last).unwrap();
+        drop(head);
         cascadia_transport::set_activation_timeout_secs(0);
     }
 
