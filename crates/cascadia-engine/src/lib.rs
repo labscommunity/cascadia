@@ -406,6 +406,13 @@ pub trait Engine: Send {
         EngineFailure::default()
     }
 
+    /// Task 61: the last `step()` returned no chunks but did real work, so the runner counts it
+    /// as progress, not toward a stream's empty-step limit. qwen36 reports the step that fails a
+    /// task and admits its retry. Default: `false` (an empty step is an empty step).
+    fn progressed_without_chunks(&self) -> bool {
+        false
+    }
+
     /// Tear down the engine. Idempotent.
     fn close(&mut self) {}
 }
