@@ -1175,11 +1175,16 @@ the same code as the OSS routes, from `cascadia_api::decisions`:
 - Rendering: `systemone_body` and `systemone_error` for `/v1/systemone`; `openai::to_openai`,
   `openai_error` and `openai_rejection` (all on `openai_envelope`) for `/v1/decisions`. Each
   returns a status and a JSON value (a string for SystemOne's parse errors), no framework response.
-- Before the body is read, the gateway owns two refusals. A content type other than JSON is 415
-  ``Expected request with `Content-Type: application/json` ``. A body over `--api-max-body-mb` is
-  413 `Failed to buffer the request body: length limit exceeded`. `/v1/systemone` sends both as
-  `text/plain`; `/v1/decisions` wraps them in `openai_envelope(status, "invalid_request_error",
-  text)`.
+- Before the body is read, the gateway owns two refusals, checked in this order. First the content
+  type: `application/json`, any `+json` suffix and parameters such as `; charset=utf-8` pass; a
+  missing or unparsable header, or any other type, is 415
+  ``Expected request with `Content-Type: application/json` ``, even when the body is also too big.
+  Then the size: a body over `--api-max-body-mb` is 413
+  `Failed to buffer the request body: length limit exceeded` (the same text for any limit).
+  `/v1/systemone` sends both as `text/plain`; `/v1/decisions` wraps them in
+  `openai_envelope(status, "invalid_request_error", text)`.
+- The 400 and 422 texts come from serde_json and serde_path_to_error, through axum 0.7. They match
+  the OSS server byte for byte only while the embedder resolves the same versions of those crates.
 
 Pipelines need no change: the pass runner submits rank-0 tasks, and how the frames travel down the
 chain is the engine's business. The codecs and their prompts are internals, not a stable interface.
