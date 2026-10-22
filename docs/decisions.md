@@ -803,8 +803,8 @@ tokens later, both times into a coherent alternative wording.
   failing step therefore waits for the 30 s idle wait (`STAGE_IDLE_TIMEOUT`), then the recompile
   (up to 180 s, `RECOMPILE_TIMEOUT`), then the recompiled stage's first infer (up to 30 s), so up
   to 240 s for each stuck stage (at most the engine's recompile cap: 2, or 1 when its largest stage
-is over 4 GiB, as on a 1-stage tree). After that comes the
-  re-prefill of the prompt plus the tokens already generated. No timer bounds the re-prefill; it
+  is over 4 GiB, as on a 1-stage tree). After that comes the re-prefill of the prompt plus the
+  tokens already generated. No timer bounds the re-prefill; it
   takes as long as a prefill of that length. (The recompiled stage's first infer is the first
   infer of that re-prefill.) Doing it in the failing step keeps the stream alive: the runner
   closes a stream after 3 engine steps in a row that produce nothing
