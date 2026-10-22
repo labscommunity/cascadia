@@ -419,8 +419,9 @@ tokenizing, and splices the image rows in. Every stage takes `token_type_ids`: G
 opens each image both ways in its full and sliding masks, so the types ride the wire as
 a third frame, as for Gemma 4. For the static path pass `--prefill-seq` of at least 256
 and keep `--context` + `--prefill-seq` within 1025 (sliding window 1024), for example
-`--context 768 --prefill-seq 256` (two images). Pan-and-scan (off in the published
-processor config) is refused at load.
+`--context 768 --prefill-seq 256` (two images). A tree served only on packed slots may go
+past that cap with `--packed-only` (packed slots, below). Pan-and-scan (off in the
+published processor config) is refused at load.
 
 ### Mistral 3 (ov-runtime)
 
@@ -563,7 +564,8 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
   `--context 736 --prefill-seq 288`, which holds about two images. The static IR masks
   the window by KV ring index, which a longer ring would get wrong. A tree served only on
-  packed slots may go past it with `--packed-only` (Gemma 4 on packed slots, below).
+  packed slots may go past it with `--packed-only` (Gemma 4 on packed slots, below; Gemma 3
+  too).
 - **Qwen2.5-VL / Qwen3-VL** carry M-RoPE `position_ids [3, T]` on every stage, which both
   the static IRs (`[3, 1, seq]`) and the packed IR (`[3, 1, S]`) now take; `static_variant.py`
   and `packed_variant.py` pin them from the stateful tree, and rank 0 computes each span's
@@ -635,7 +637,11 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   --prefill-seq 256` (sliding window 1024) and `--packed-seq 256` (one image wide). Each
   slot's region is `(context - 1) / slots`, so two images do not fit one slot of a
   two-slot 768-context tree (they are refused per request with a 400 `context_length_exceeded`); one 448x448 image
-  (286 tokens) fits.
+  (286 tokens) fits. For longer slots build it `--packed-only`, as Gemma 4 below: on CPU,
+  `static_variant.py --context 4096 --prefill-seq 256 --shared-prefill --packed-only` and
+  `packed_variant.py <stage> --slots 2 --packed-seq 256 --dynamic-seq` give two slots of
+  2047 tokens, which hold two images (550) and a native video (1117). Gemma 3 4B passed the
+  SDK image and video suites on such a tree, answering as its stateful tree does.
 - On CPU/GPU the packed variant is built from the same `--shared-prefill` static tree as
   the static path, so one tree serves both.
 

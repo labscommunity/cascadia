@@ -302,20 +302,21 @@ def test_window_error_cap_and_packed_only():
     err = sv.window_error(1280, 288, 1024, True, False)
     assert "exceeds the sliding window (1024)" in err and "--packed-only" in err
     assert "--packed-slots" in err
-    # --packed-only lifts the cap on Gemma 4 only.
+    # --packed-only lifts the cap on Gemma 4 and Gemma 3 only.
     assert sv.window_error(1280, 288, 1024, True, True) is None
     other = sv.window_error(1280, 288, 1024, False, False)
     assert "exceeds" in other and "--packed-only" not in other
-    assert "Gemma 4 trees only" in sv.window_error(1280, 288, 1024, False, True)
-    assert "Gemma 4 trees only" in sv.window_error(16, 0, None, False, True)
+    assert "Gemma 4 and Gemma 3 trees only" in sv.window_error(1280, 288, 1024, False, True)
+    assert "Gemma 4 and Gemma 3 trees only" in sv.window_error(16, 0, None, False, True)
     # No window: nothing to cap.
     assert sv.window_error(4096, 256, None, False, False) is None
 
 
-def test_is_gemma4():
-    assert sv.is_gemma4({"vision": {"family": "gemma4"}}, {})
-    assert sv.is_gemma4({}, {"model_type": "gemma4_text"})
-    assert not sv.is_gemma4({"vision": {"family": "gemma3"}}, {"model_type": "gemma3"})
+def test_is_gemma():
+    assert sv.is_gemma({"vision": {"family": "gemma4"}}, {})
+    assert sv.is_gemma({}, {"model_type": "gemma4_text"})
+    assert sv.is_gemma({"vision": {"family": "gemma3"}}, {"model_type": "gemma3"})
+    assert not sv.is_gemma({"vision": {"family": "llava_next"}}, {"model_type": "llava_next"})
 
 
 def _toy_tree(root, window=8):
