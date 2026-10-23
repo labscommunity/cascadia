@@ -50,5 +50,6 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
 cascadia-engine-mock = { workspace = true }
 async-trait = { workspace = true }
