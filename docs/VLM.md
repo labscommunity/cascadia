@@ -822,7 +822,33 @@ there. For checks on a request without remote URLs, `image_url_bytes` / `video_u
   window and described the second picture wrongly.
 - Phi-3.5-vision and InternVL2: these exports carry Phi-3's RoPE frequencies as a traced
   constant, with no switch to the long factors past 4096 positions, so longer sequences
-  differ from Hugging Face; ov-genai runs the same IRs. The load log says so.
+  differ from Hugging Face; InternVL2-4B then loses a fact from the start of a 6k-token
+  turn. `cut_vlm_lm.py` puts the switch back in every stage it cuts
+  (`tools/vlm_surgery/longrope.py`): an inference whose positions reach 4096 rotates with
+  the long factors (the 1.19 attention factor is in the export already). The tree records it
+  as `vision.long_rope_switch`, and the load log warns on a tree cut before it. ov-genai runs
+  the export's own IR; give it a switched copy with
+  `python tools/vlm_surgery/longrope.py --model <export> --output-dir <copy>`.
+  The switch decides once per inference, as Hugging Face does once per forward pass, so it
+  matches Hugging Face only where a prompt is prefilled in one inference:
+
+  | Path | Past 4096 positions |
+  |---|---|
+  | ov-genai with a switched copy | as Hugging Face |
+  | ov-runtime stateful tree, one or more stages | as Hugging Face |
+  | ov-dist-spec | not covered: it prefills in chunks, and the chunks before 4096 keep the short factors (the load log warns) |
+  | ov-runtime static tree with a context past 4096 | not covered, for the same reason (the load log warns) |
+  | packed slots | `packed_variant.py` refuses a slot region past 4096 |
+
+  Covering the chunked paths needs the decision made once per request (the host knows the
+  prompt length before the first chunk) and passed to every stage; deciding per token
+  instead does not recall the fact either. Measured on pawan-02 (CPU): below 4096
+  positions the switched IR's logits equal the export's exactly, and past it they equal an
+  all-long-factor IR exactly, on both exports. InternVL2-4B asked for a fact at the start of
+  a 5,976-token user turn: original export on ov-genai `'\n\n\n'`, switched copy on ov-genai
+  and switched 1- and 2-stage stateful trees on ov-runtime the fact; a switched 2-stage tree
+  on ov-dist-spec `'.'` (the unswitched one `'\n…'`). Phi-3.5-vision recalls it either way.
+  The image suite passes 11/11 on every switched tree and copy.
 - Packed slots: a prompt must fit one slot's region, `(context - 1 - packed_prefix) /
   slots`; two Pixtral images do not fit two slots of a 2048 context, and one 448x448
   LLaVA-NeXT image (2945 tokens with its text) needs a region of at least that.
