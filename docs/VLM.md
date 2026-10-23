@@ -753,7 +753,7 @@ A caller that renders the chat template and builds the `GenerationTask` itself (
 2. `cascadia_api::prepare_media_with(config, decode_slots, messages)`: validates, fetches and
    decodes the request's `image_url` / `video_url` parts. It returns the messages with
    placeholders and the decoded `MediaInput`s, or a `MediaError` (`Invalid` 400, `Busy` 503,
-   `Internal` 500).
+   `Internal` 500, `RemoteDisabled` 400: a remote URL with `allow_remote_urls` off).
 3. Render the messages with the model's template (thinking on or off as asked), check the
    rendered prompt with `PreparedMedia::check_placeholders`, and send the task with
    `media = inputs` and `prompt_rendered = true` (ov-genai then skips its own template; the
@@ -766,6 +766,20 @@ A caller that renders the chat template and builds the `GenerationTask` itself (
 Each `MediaInput` carries the SHA-256 of its decoded pixels; the engines' image caches and
 warm resume key on it together with the task's `tenant`, so set `tenant` per caller who must
 not share them.
+
+A gateway whose entry node forwards requests to the node that serves the model can fetch
+remote media at the entry node with `cascadia_api::fetch_request_media(config, messages)`: it
+runs every check that needs no decoding as `prepare_media_with` does (media in `user`
+messages only, the image and video counts, the fetch guard: public `https` addresses only,
+DNS pinned, redirects re-checked, content type, size capped while reading; one byte budget
+per request for images and one for videos, one deadline over all of a request's fetches,
+each image's header size, the request's source pixels, a fetched video's container) and
+returns the messages with each fetched URL replaced by a base64 `data:` URL, `detail` kept.
+The serving node then needs no outbound access, and its `prepare_media_with` checks the
+bytes again. Errors name the part (`image 2: ...`), never the URL. ffmpeg is not needed
+there. For checks on a request without remote URLs, `image_url_bytes` / `video_url_bytes`
+(a `data:` URL's bytes), `source_size` (an image's size from its header) and
+`check_request_pixels` are public too.
 
 ## Limits worth knowing
 

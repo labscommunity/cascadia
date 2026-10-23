@@ -771,15 +771,17 @@ fn check_dimensions(w: u32, h: u32, cfg: &MediaConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// The 400 for an image URL that is not `data:` while remote URLs are off.
+pub(crate) const DATA_ONLY_IMAGES: &str = "only `data:` image URLs are supported on this server; \
+     send the image base64-encoded (`data:image/png;base64,...`)";
+
 /// The payload of a base64 `data:image/...` URL.
 fn data_url_bytes(url: &str, remote_allowed: bool) -> Result<Vec<u8>, String> {
     let Some(rest) = url.strip_prefix("data:") else {
         return Err(if remote_allowed {
             "image URLs must be `https://` or `data:` (base64-encoded)".into()
         } else {
-            "only `data:` image URLs are supported on this server; send the image \
-             base64-encoded (`data:image/png;base64,...`)"
-                .into()
+            DATA_ONLY_IMAGES.into()
         });
     };
     data_url_payload(rest, |mime| {

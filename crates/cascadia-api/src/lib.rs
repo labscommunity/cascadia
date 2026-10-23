@@ -53,11 +53,13 @@ pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 pub use cascadia_types::ApiStats;
 
 mod media;
-pub use media::MediaConfig;
+pub use media::{
+    check_request_pixels, image_url_bytes, is_remote, source_size, FetchPolicy, MediaConfig, Remote,
+};
 pub mod media_setup;
 mod video;
 pub use media_setup::{attach_ffmpeg, media_setup, MediaEngine, MediaSetup};
-pub use video::Ffmpeg;
+pub use video::{video_url_bytes, Ffmpeg};
 mod responses;
 pub use responses::{ReasoningParam, ResponsesRequest};
 
@@ -2463,13 +2465,17 @@ pub enum MediaError {
     Busy(String),
     /// A decoder or ffmpeg failure on this server: a 500.
     Internal(String),
+    /// A remote (`http(s)://`) image or video URL on a config with
+    /// [`MediaConfig::allow_remote_urls`] off: a 400, kept apart from
+    /// [`MediaError::Invalid`] so a gateway can name its own setting.
+    RemoteDisabled(String),
 }
 
 impl MediaError {
     /// The HTTP status for this refusal: 400, 503 or 500.
     pub fn http_status(&self) -> u16 {
         match self {
-            MediaError::Invalid(_) => 400,
+            MediaError::Invalid(_) | MediaError::RemoteDisabled(_) => 400,
             MediaError::Busy(_) => 503,
             MediaError::Internal(_) => 500,
         }
@@ -2478,7 +2484,10 @@ impl MediaError {
     /// The refusal's message, for the error body.
     pub fn message(&self) -> &str {
         match self {
-            MediaError::Invalid(m) | MediaError::Busy(m) | MediaError::Internal(m) => m,
+            MediaError::Invalid(m)
+            | MediaError::Busy(m)
+            | MediaError::Internal(m)
+            | MediaError::RemoteDisabled(m) => m,
         }
     }
 }
@@ -2537,7 +2546,7 @@ async fn prepare_media(
 /// kept out of readiness (see `PreEngineFailure`).
 fn media_error_response(err: MediaError) -> Response {
     match err {
-        MediaError::Invalid(msg) => {
+        MediaError::Invalid(msg) | MediaError::RemoteDisabled(msg) => {
             count_rejected("invalid_media");
             api_error(StatusCode::BAD_REQUEST, msg, None)
         }
@@ -2583,139 +2592,12 @@ pub async fn prepare_media_with(
     if count == 0 && videos == 0 {
         return Ok(None);
     }
-    if let Some(m) = messages.iter().find(|m| m.role != "user" && m.has_media()) {
-        let kind = if m.images().next().is_some() {
-            "image_url"
-        } else {
-            "video_url"
-        };
-        return Err(reject(format!(
-            "`{kind}` parts are only accepted in `user` messages, not `{}`",
-            m.role
-        )));
-    }
-    if count > cfg.max_images {
-        return Err(reject(format!(
-            "{count} images in one request; the limit is {}",
-            cfg.max_images
-        )));
-    }
-    if videos > 0 && cfg.ffmpeg.is_none() {
-        return Err(reject(video::NEEDS_FFMPEG.into()));
-    }
-    if videos > 0 && cfg.max_videos == 0 {
-        return Err(reject(
-            "video input is turned off on this server; send the video's frames as \
-             `image_url` parts instead"
-                .into(),
-        ));
-    }
-    if videos > cfg.max_videos {
-        return Err(reject(format!(
-            "{videos} videos in one request; the limit is {}",
-            cfg.max_videos
-        )));
-    }
-    // Remote images are fetched first, outside the decode slot (a fetch
-    // waits on the network, not the CPU), sharing one byte budget per request.
-    // One deadline over all of them: each fetch has its own, but eight
-    // images back to back would still hold the permit for eight of those.
-    // Remote videos the same way, on a budget of their own.
-    let fetch_all = async {
-        let mut fetched: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
-        let mut budget = cfg.max_request_image_bytes;
-        for (i, (url, _)) in messages.iter().flat_map(|m| m.images()).enumerate() {
-            if !(cfg.allow_remote_urls && media::is_remote(url)) {
-                fetched.push(None);
-                continue;
-            }
-            let bytes = media::fetch_image(url, budget, cfg.fetch_policy)
-                .await
-                .map_err(|e| format!("image {i}: {e}"))?;
-            budget -= bytes.len();
-            fetched.push(Some(bytes));
-        }
-        let mut fetched_videos: Vec<Option<Vec<u8>>> = Vec::with_capacity(videos);
-        let mut budget = cfg.max_request_video_bytes;
-        for (j, (url, _)) in messages.iter().flat_map(|m| m.videos()).enumerate() {
-            if !(cfg.allow_remote_urls && media::is_remote(url)) {
-                fetched_videos.push(None);
-                continue;
-            }
-            let bytes = media::fetch_remote(url, budget, cfg.fetch_policy, media::Remote::Video)
-                .await
-                .map_err(|e| format!("video {j}: {e}"))?;
-            budget -= bytes.len();
-            fetched_videos.push(Some(bytes));
-        }
-        Ok::<_, String>((fetched, fetched_videos))
-    };
-    let (fetched, fetched_videos) =
-        match tokio::time::timeout(cfg.fetch_policy.per_request, fetch_all).await {
-            Ok(Ok(f)) => f,
-            Ok(Err(msg)) => return Err(reject(msg)),
-            Err(_) => {
-                return Err(reject(format!(
-                    "fetching this request's {} took longer than {} s",
-                    if videos == 0 { "images" } else { "media" },
-                    cfg.fetch_policy.per_request.as_secs_f32()
-                )))
-            }
-        };
-    // Every image's bytes and declared size, outside the decode slot: base64
-    // and a header read are cheap next to a decode, and the request's total
-    // source pixels are refused here before any image is decoded. Videos'
-    // bytes too, held to their own byte budget.
-    let header_cfg = Arc::clone(&cfg);
-    let urls: Vec<(String, Option<String>)> = messages
-        .iter()
-        .flat_map(|m| m.images())
-        .map(|(u, d)| (u.to_owned(), d.map(str::to_owned)))
-        .collect();
-    let video_urls: Vec<(String, Option<String>)> = messages
-        .iter()
-        .flat_map(|m| m.videos())
-        .map(|(u, d)| (u.to_owned(), d.map(str::to_owned)))
-        .collect();
-    let sized = tokio::task::spawn_blocking(move || {
-        let mut bytes = Vec::with_capacity(urls.len());
-        let mut sizes = Vec::with_capacity(urls.len());
-        for (i, ((url, detail), fetched)) in urls.iter().zip(fetched).enumerate() {
-            let b = match fetched {
-                Some(b) => b,
-                None => media::image_url_bytes(url, detail.as_deref(), &header_cfg)
-                    .map_err(|e| format!("image {i}: {e}"))?,
-            };
-            sizes.push(media::source_size(&b, &header_cfg).map_err(|e| format!("image {i}: {e}"))?);
-            bytes.push(b);
-        }
-        media::check_request_pixels(&sizes, &header_cfg)?;
-        let mut videos = Vec::with_capacity(video_urls.len());
-        let mut video_bytes = 0;
-        for (j, ((url, detail), fetched)) in video_urls.into_iter().zip(fetched_videos).enumerate()
-        {
-            let b = match fetched {
-                Some(b) => b,
-                None => video::video_url_bytes(&url, detail.as_deref(), &header_cfg)
-                    .map_err(|e| format!("video {j}: {e}"))?,
-            };
-            video_bytes += b.len();
-            if video_bytes > header_cfg.max_request_video_bytes {
-                return Err(format!(
-                    "this request's videos are over the {}-byte limit",
-                    header_cfg.max_request_video_bytes
-                ));
-            }
-            videos.push((b, detail));
-        }
-        Ok::<_, String>((bytes, videos))
-    })
-    .await;
-    let (image_bytes, video_inputs) = match sized {
-        Ok(Ok(b)) => b,
-        Ok(Err(msg)) => return Err(reject(msg)),
-        Err(join_err) => return Err(decode_task_error(join_err)),
-    };
+    check_media_parts(&cfg, messages, count, videos, true)?;
+    let GatheredMedia {
+        images: image_bytes,
+        videos: video_inputs,
+        ..
+    } = gather_media_bytes(&cfg, messages).await?;
     let messages = messages.to_vec();
     let decode_cfg = Arc::clone(&cfg);
     // One slot for the whole request, its videos included: ffmpeg runs
@@ -2843,6 +2725,291 @@ pub async fn prepare_media_with(
         Ok(Err(msg)) => Err(reject(msg)),
         Err(join_err) => Err(decode_task_error(join_err)),
     }
+}
+
+/// The count and placement checks [`prepare_media_with`] and
+/// [`fetch_request_media`] share. `need_ffmpeg`: whether this node decodes
+/// video (an entry node that only fetches does not).
+fn check_media_parts(
+    cfg: &MediaConfig,
+    messages: &[ChatMessage],
+    count: usize,
+    videos: usize,
+    need_ffmpeg: bool,
+) -> Result<(), MediaError> {
+    let reject = MediaError::Invalid;
+    if let Some(m) = messages.iter().find(|m| m.role != "user" && m.has_media()) {
+        let kind = if m.images().next().is_some() {
+            "image_url"
+        } else {
+            "video_url"
+        };
+        return Err(reject(format!(
+            "`{kind}` parts are only accepted in `user` messages, not `{}`",
+            m.role
+        )));
+    }
+    if count > cfg.max_images {
+        return Err(reject(format!(
+            "{count} images in one request; the limit is {}",
+            cfg.max_images
+        )));
+    }
+    if videos > 0 && need_ffmpeg && cfg.ffmpeg.is_none() {
+        return Err(reject(video::NEEDS_FFMPEG.into()));
+    }
+    if videos > 0 && cfg.max_videos == 0 {
+        return Err(reject(
+            "video input is turned off on this server; send the video's frames as \
+             `image_url` parts instead"
+                .into(),
+        ));
+    }
+    if videos > cfg.max_videos {
+        return Err(reject(format!(
+            "{videos} videos in one request; the limit is {}",
+            cfg.max_videos
+        )));
+    }
+    Ok(())
+}
+
+/// A request's media as bytes, in request order: each image's encoded bytes
+/// and each video's bytes with its `detail`, and which of them were fetched.
+struct GatheredMedia {
+    images: Vec<Vec<u8>>,
+    videos: Vec<(Vec<u8>, Option<String>)>,
+    remote_images: Vec<bool>,
+    remote_videos: Vec<bool>,
+}
+
+/// Fetch a request's remote media under `cfg.fetch_policy` (its byte budgets
+/// and one deadline over every fetch), read the `data:` ones, and check what
+/// can be checked without decoding: each image's header size, the request's
+/// source pixels, the videos' byte total.
+async fn gather_media_bytes(
+    cfg: &Arc<MediaConfig>,
+    messages: &[ChatMessage],
+) -> Result<GatheredMedia, MediaError> {
+    let reject = MediaError::Invalid;
+    let count: usize = messages.iter().map(|m| m.images().count()).sum();
+    let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
+    // A remote URL on a config that fetches none is its own refusal, so a
+    // caller can name the setting; any other non-`data:` URL is `Invalid`
+    // below, from the `data:` decoders.
+    if !cfg.allow_remote_urls {
+        if let Some(i) = messages
+            .iter()
+            .flat_map(|m| m.images())
+            .position(|(url, _)| media::is_remote(url))
+        {
+            return Err(MediaError::RemoteDisabled(format!(
+                "image {i}: {}",
+                media::DATA_ONLY_IMAGES
+            )));
+        }
+        if let Some(j) = messages
+            .iter()
+            .flat_map(|m| m.videos())
+            .position(|(url, _)| media::is_remote(url))
+        {
+            return Err(MediaError::RemoteDisabled(format!(
+                "video {j}: {}",
+                video::DATA_ONLY_VIDEOS
+            )));
+        }
+    }
+    let remote = |url: &str| cfg.allow_remote_urls && media::is_remote(url);
+    let remote_images: Vec<bool> = messages
+        .iter()
+        .flat_map(|m| m.images())
+        .map(|(url, _)| remote(url))
+        .collect();
+    let remote_videos: Vec<bool> = messages
+        .iter()
+        .flat_map(|m| m.videos())
+        .map(|(url, _)| remote(url))
+        .collect();
+    // Remote images are fetched first, outside the decode slot (a fetch
+    // waits on the network, not the CPU), sharing one byte budget per request.
+    // One deadline over all of them: each fetch has its own, but eight
+    // images back to back would still hold the permit for eight of those.
+    // Remote videos the same way, on a budget of their own.
+    let fetch_all = async {
+        let mut fetched: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+        let mut budget = cfg.max_request_image_bytes;
+        for (i, (url, _)) in messages.iter().flat_map(|m| m.images()).enumerate() {
+            if !(cfg.allow_remote_urls && media::is_remote(url)) {
+                fetched.push(None);
+                continue;
+            }
+            let bytes = media::fetch_image(url, budget, cfg.fetch_policy)
+                .await
+                .map_err(|e| format!("image {i}: {e}"))?;
+            budget -= bytes.len();
+            fetched.push(Some(bytes));
+        }
+        let mut fetched_videos: Vec<Option<Vec<u8>>> = Vec::with_capacity(videos);
+        let mut budget = cfg.max_request_video_bytes;
+        for (j, (url, _)) in messages.iter().flat_map(|m| m.videos()).enumerate() {
+            if !(cfg.allow_remote_urls && media::is_remote(url)) {
+                fetched_videos.push(None);
+                continue;
+            }
+            let bytes = media::fetch_remote(url, budget, cfg.fetch_policy, media::Remote::Video)
+                .await
+                .map_err(|e| format!("video {j}: {e}"))?;
+            budget -= bytes.len();
+            fetched_videos.push(Some(bytes));
+        }
+        Ok::<_, String>((fetched, fetched_videos))
+    };
+    let (fetched, fetched_videos) =
+        match tokio::time::timeout(cfg.fetch_policy.per_request, fetch_all).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(msg)) => return Err(reject(msg)),
+            Err(_) => {
+                return Err(reject(format!(
+                    "fetching this request's {} took longer than {} s",
+                    if videos == 0 { "images" } else { "media" },
+                    cfg.fetch_policy.per_request.as_secs_f32()
+                )))
+            }
+        };
+    // Every image's bytes and declared size, outside the decode slot: base64
+    // and a header read are cheap next to a decode, and the request's total
+    // source pixels are refused here before any image is decoded. Videos'
+    // bytes too, held to their own byte budget.
+    let header_cfg = Arc::clone(cfg);
+    let urls: Vec<(String, Option<String>)> = messages
+        .iter()
+        .flat_map(|m| m.images())
+        .map(|(u, d)| (u.to_owned(), d.map(str::to_owned)))
+        .collect();
+    let video_urls: Vec<(String, Option<String>)> = messages
+        .iter()
+        .flat_map(|m| m.videos())
+        .map(|(u, d)| (u.to_owned(), d.map(str::to_owned)))
+        .collect();
+    let sized = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::with_capacity(urls.len());
+        let mut sizes = Vec::with_capacity(urls.len());
+        for (i, ((url, detail), fetched)) in urls.iter().zip(fetched).enumerate() {
+            let b = match fetched {
+                Some(b) => b,
+                None => media::image_url_bytes(url, detail.as_deref(), &header_cfg)
+                    .map_err(|e| format!("image {i}: {e}"))?,
+            };
+            sizes.push(media::source_size(&b, &header_cfg).map_err(|e| format!("image {i}: {e}"))?);
+            bytes.push(b);
+        }
+        media::check_request_pixels(&sizes, &header_cfg)?;
+        let mut videos = Vec::with_capacity(video_urls.len());
+        let mut video_bytes = 0;
+        for (j, ((url, detail), fetched)) in video_urls.into_iter().zip(fetched_videos).enumerate()
+        {
+            let b = match fetched {
+                Some(b) => b,
+                None => video::video_url_bytes(&url, detail.as_deref(), &header_cfg)
+                    .map_err(|e| format!("video {j}: {e}"))?,
+            };
+            video_bytes += b.len();
+            if video_bytes > header_cfg.max_request_video_bytes {
+                return Err(format!(
+                    "this request's videos are over the {}-byte limit",
+                    header_cfg.max_request_video_bytes
+                ));
+            }
+            videos.push((b, detail));
+        }
+        Ok::<_, String>((bytes, videos))
+    })
+    .await;
+    let (images, videos) = match sized {
+        Ok(Ok(b)) => b,
+        Ok(Err(msg)) => return Err(reject(msg)),
+        Err(join_err) => return Err(decode_task_error(join_err)),
+    };
+    Ok(GatheredMedia {
+        images,
+        videos,
+        remote_images,
+        remote_videos,
+    })
+}
+
+/// Fetch a chat request's remote `image_url` / `video_url` parts the way this
+/// server would, for a gateway's entry node that forwards the request to the
+/// node that serves the model. Every check that needs no decoding runs here,
+/// as [`prepare_media_with`] runs it: media only in `user` messages, the image
+/// and video counts, the SSRF guard on each fetch (public `https` addresses
+/// only, redirects re-checked, content type, size read-capped), one byte
+/// budget per request for images and one for videos, one deadline
+/// ([`FetchPolicy::per_request`](media::FetchPolicy::per_request)) over all
+/// of a request's fetches, each image's header size and the request's source
+/// pixels; a fetched video must start like a container this server decodes.
+///
+/// Returns the messages with every fetched URL replaced by a base64 `data:`
+/// URL (`detail` kept), so the serving node needs no outbound access;
+/// `data:` parts are left as sent. Errors never contain a URL: they name the
+/// part (`image 2: ...`) and the reason. A remote URL with
+/// [`MediaConfig::allow_remote_urls`] off is [`MediaError::RemoteDisabled`];
+/// every other refusal is [`MediaError::Invalid`]. ffmpeg is not needed
+/// here; the serving node decodes.
+pub async fn fetch_request_media(
+    cfg: Arc<MediaConfig>,
+    messages: &[ChatMessage],
+) -> Result<Vec<ChatMessage>, MediaError> {
+    let count: usize = messages.iter().map(|m| m.images().count()).sum();
+    let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
+    if count == 0 && videos == 0 {
+        return Ok(messages.to_vec());
+    }
+    check_media_parts(&cfg, messages, count, videos, false)?;
+    let gathered = gather_media_bytes(&cfg, messages).await?;
+    let mut images = gathered.images.into_iter().zip(gathered.remote_images);
+    let mut fetched_videos = gathered.videos.into_iter().zip(gathered.remote_videos);
+    let mut video_index = 0;
+    let mut out = messages.to_vec();
+    for part in out.iter_mut().flat_map(|m| m.parts.iter_mut()) {
+        match part {
+            ContentPart::ImageUrl { url, .. } => {
+                let (bytes, remote) = images.next().expect("one entry per image part");
+                if remote {
+                    // `source_size` accepted the bytes, so their format is known.
+                    let mime = image::guess_format(&bytes)
+                        .map(|f| f.to_mime_type())
+                        .unwrap_or("image/png");
+                    *url = data_url(mime, &bytes);
+                }
+            }
+            ContentPart::VideoUrl { url, .. } => {
+                let ((bytes, _), remote) = fetched_videos.next().expect("one entry per video part");
+                let j = video_index;
+                video_index += 1;
+                if remote {
+                    let container = video::Container::sniff(&bytes).ok_or_else(|| {
+                        MediaError::Invalid(format!(
+                            "video {j}: the data is not a video this server decodes; {}",
+                            video::SUPPORTED
+                        ))
+                    })?;
+                    *url = data_url(container.mime(), &bytes);
+                }
+            }
+            ContentPart::Text(_) => {}
+        }
+    }
+    Ok(out)
+}
+
+/// A base64 `data:` URL for `bytes`.
+fn data_url(mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
 }
 
 fn decode_task_error(join_err: tokio::task::JoinError) -> MediaError {
@@ -5973,6 +6140,201 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("only `data:`"));
+    }
+
+    fn user_msg(parts: serde_json::Value) -> ChatMessage {
+        serde_json::from_value(serde_json::json!({"role": "user", "content": parts})).unwrap()
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([9, 9, 9]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    /// A config that fetches from a loopback test server over plain HTTP,
+    /// which stands in for a public host (the production policy refuses both).
+    fn loopback_fetch_cfg() -> Arc<MediaConfig> {
+        let mut media = MediaConfig::ov_genai(None);
+        media.allow_remote_urls = true;
+        media.fetch_policy = media::FetchPolicy {
+            allow_http: true,
+            allow_non_public: true,
+            ..media::FetchPolicy::PUBLIC_HTTPS
+        };
+        Arc::new(media)
+    }
+
+    /// The entry-node fetch: remote images and videos come back as `data:`
+    /// URLs holding the fetched bytes, `data:` parts and text as sent, and
+    /// `detail` kept.
+    #[tokio::test]
+    async fn fetch_request_media_inlines_remote_media() {
+        use base64::Engine as _;
+        let png = png_bytes();
+        let mp4 = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2mp41".to_vec();
+        let (png_srv, mp4_srv) = (png.clone(), mp4.clone());
+        let srv = Router::new()
+            .route(
+                "/a.png",
+                get(
+                    move || async move { ([(header::CONTENT_TYPE, "image/png")], png_srv.clone()) },
+                ),
+            )
+            .route(
+                "/v.mp4",
+                get(move || async move {
+                    (
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        mp4_srv.clone(),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, srv).await.unwrap() });
+
+        let inline = png_url(2, 2);
+        let messages = vec![
+            user_msg(serde_json::json!([
+                {"type": "text", "text": "compare"},
+                {"type": "image_url", "image_url": {"url": format!("{base}/a.png"), "detail": "low"}},
+                {"type": "image_url", "image_url": {"url": inline}},
+                {"type": "video_url", "video_url": {"url": format!("{base}/v.mp4")}},
+            ])),
+            serde_json::from_value(serde_json::json!({"role": "assistant", "content": "ok"}))
+                .unwrap(),
+        ];
+        let out = fetch_request_media(loopback_fetch_cfg(), &messages)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        assert_eq!(
+            out[0].parts,
+            vec![
+                ContentPart::Text("compare".into()),
+                ContentPart::ImageUrl {
+                    url: format!("data:image/png;base64,{}", b64(&png)),
+                    detail: Some("low".into()),
+                },
+                ContentPart::ImageUrl {
+                    url: inline,
+                    detail: None,
+                },
+                ContentPart::VideoUrl {
+                    url: format!("data:video/mp4;base64,{}", b64(&mp4)),
+                    detail: None,
+                },
+            ]
+        );
+        assert_eq!(out[1].content, "ok");
+        // Text only: returned as sent.
+        let text = vec![user_msg(
+            serde_json::json!([{"type": "text", "text": "hi"}]),
+        )];
+        let out = fetch_request_media(loopback_fetch_cfg(), &text)
+            .await
+            .unwrap();
+        assert_eq!(out[0].parts, text[0].parts);
+    }
+
+    /// A fetched "video" that is no container this server decodes is refused
+    /// at the entry node, as the serving node would refuse it.
+    #[tokio::test]
+    async fn fetch_request_media_refuses_a_fetched_non_video() {
+        let srv = Router::new().route(
+            "/v.mp4",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "video/mp4")],
+                    b"not a video".to_vec(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v.mp4", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, srv).await.unwrap() });
+        let messages = vec![user_msg(serde_json::json!([
+            {"type": "video_url", "video_url": {"url": url}}]))];
+        let err = fetch_request_media(loopback_fetch_cfg(), &messages)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MediaError::Invalid(_)), "{err:?}");
+        assert!(
+            err.message()
+                .starts_with("video 0: the data is not a video"),
+            "{err}"
+        );
+    }
+
+    /// With remote URLs off, a remote image or video is `RemoteDisabled` (a
+    /// 400) on both paths, with the message the server has always sent; a
+    /// `data:` request passes.
+    #[tokio::test]
+    async fn remote_urls_off_is_its_own_refusal() {
+        let cfg = Arc::new(MediaConfig::ov_genai(None));
+        assert!(!cfg.allow_remote_urls);
+        let cases = [
+            (
+                serde_json::json!([{"type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png"}}]),
+                "image 0: only `data:` image URLs",
+            ),
+            (
+                serde_json::json!([{"type": "video_url",
+                    "video_url": {"url": "https://example.com/v.mp4"}}]),
+                "video 0: only `data:` video URLs",
+            ),
+        ];
+        for (parts, want) in cases {
+            let messages = vec![user_msg(parts)];
+            let err = fetch_request_media(Arc::clone(&cfg), &messages)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MediaError::RemoteDisabled(_)), "{err:?}");
+            assert_eq!(err.http_status(), 400);
+            assert!(err.message().starts_with(want), "{err}");
+        }
+        let slots = Arc::new(Semaphore::new(1));
+        let messages = vec![user_msg(serde_json::json!([{"type": "image_url",
+            "image_url": {"url": "https://example.com/a.png"}}]))];
+        let err = prepare_media_with(Arc::clone(&cfg), &slots, &messages).await;
+        assert!(matches!(err, Err(MediaError::RemoteDisabled(_))));
+        let ok = vec![user_msg(serde_json::json!([{"type": "image_url",
+            "image_url": {"url": png_url(2, 2)}}]))];
+        assert!(fetch_request_media(cfg, &ok).await.is_ok());
+    }
+
+    /// A refused fetch never echoes its URL: presigned URLs carry
+    /// credentials in the query (and sometimes the path or userinfo).
+    #[tokio::test]
+    async fn fetch_errors_never_contain_the_url() {
+        let mut media = MediaConfig::ov_genai(None);
+        media.allow_remote_urls = true;
+        let cfg = Arc::new(media);
+        for url in [
+            "https://127.0.0.1/SECRETPATH/a.png?X-Amz-Signature=SECRETSIG",
+            "https://10.1.2.3/SECRETPATH/a.png?sig=SECRETSIG",
+            "http://example.com/SECRETPATH/a.png?sig=SECRETSIG",
+            "https://example.com:8443/SECRETPATH/a.png?sig=SECRETSIG",
+            "https://user:SECRETPW@example.com/SECRETPATH/a.png",
+            "https://exa mple.com/SECRETPATH/a.png?sig=SECRETSIG",
+        ] {
+            for parts in [
+                serde_json::json!([{"type": "image_url", "image_url": {"url": url}}]),
+                serde_json::json!([{"type": "video_url", "video_url": {"url": url}}]),
+            ] {
+                let err = fetch_request_media(Arc::clone(&cfg), &[user_msg(parts)])
+                    .await
+                    .unwrap_err();
+                let msg = err.message();
+                assert!(!msg.contains("SECRET"), "{url} -> {msg}");
+                assert!(!msg.contains("a.png"), "{url} -> {msg}");
+            }
+        }
     }
 
     /// An image request is admitted (or refused) before any decoding: with
