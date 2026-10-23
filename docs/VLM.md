@@ -823,10 +823,10 @@ kind; the host and the address it resolved to only at `debug`, off unless enable
   LLaVA-NeXT or LLaVA-NeXT-Video come to about 5,900 tokens, past their 4096 window, so
   they are refused; before LLaVA-NeXT-Video was sized, GenAI ran such a prompt past the
   window and described the second picture wrongly.
-- Phi-3.5-vision and InternVL2: these exports carry Phi-3's RoPE frequencies as a traced
-  constant, with no switch to the long factors past 4096 positions, so longer sequences
-  differ from Hugging Face; InternVL2-4B then loses a fact from the start of a 6k-token
-  turn. `cut_vlm_lm.py` puts the switch back in every stage it cuts
+- Phi-3.5-vision, InternVL2 and Phi-4-multimodal: these exports carry Phi-3's RoPE
+  frequencies as a traced constant, with no switch to the long factors past 4096 positions,
+  so longer sequences differ from Hugging Face; InternVL2-4B then loses a fact from the start
+  of a 6k-token turn, and Phi-4-multimodal (ov-genai only) answers with degenerate text. `cut_vlm_lm.py` puts the switch back in every stage it cuts
   (`tools/vlm_surgery/longrope.py`): an inference whose positions reach 4096 rotates with
   the long factors (the 1.19 attention factor is in the export already). The tree records it
   as `vision.long_rope_switch`, and the load log warns on a tree cut before it. ov-genai runs
@@ -851,7 +851,11 @@ kind; the host and the address it resolved to only at `debug`, off unless enable
   a 5,976-token user turn: original export on ov-genai `'\n\n\n'`, switched copy on ov-genai
   and switched 1- and 2-stage stateful trees on ov-runtime the fact; a switched 2-stage tree
   on ov-dist-spec `'.'` (the unswitched one `'\n…'`). Phi-3.5-vision recalls it either way.
-  The image suite passes 11/11 on every switched tree and copy.
+  The image suite passes 11/11 on every switched tree and copy. Phi-4-multimodal
+  (`phi4mm`, served on ov-genai only, three quarters of each head rotated): the same tool
+  finds its constant; below 4096 the switched IR's logits equal the export's exactly, past
+  it an all-long IR's; a 5,575-token turn on ov-genai answered `'. 47. and. and. The. P. …'`
+  on the original export and the fact on the switched copy, whose image suite passes 11/11.
 - Packed slots: a prompt must fit one slot's region, `(context - 1 - packed_prefix) /
   slots`; two Pixtral images do not fit two slots of a 2048 context, and one 448x448
   LLaVA-NeXT image (2945 tokens with its text) needs a region of at least that.
