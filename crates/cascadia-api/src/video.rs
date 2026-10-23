@@ -99,8 +99,12 @@ const VIDEO_MIME_TYPES: [&str; 4] = [
     "video/x-matroska",
 ];
 
+/// The 400 for a video URL that is not `data:` while remote URLs are off.
+pub(crate) const DATA_ONLY_VIDEOS: &str = "only `data:` video URLs are supported on this server; \
+     send the video base64-encoded (`data:video/mp4;base64,...`)";
+
 /// What a refused video's 400 says it may be.
-const SUPPORTED: &str = "send MP4, MOV, WebM or MKV";
+pub(crate) const SUPPORTED: &str = "send MP4, MOV, WebM or MKV";
 
 /// The `detail` values a video takes. `auto` (the default) is
 /// [`MediaConfig::max_video_frame_pixels`] per frame.
@@ -124,9 +128,7 @@ pub fn video_url_bytes(
         return Err(if cfg.allow_remote_urls {
             "video URLs must be `https://` or `data:` (base64-encoded)".into()
         } else {
-            "only `data:` video URLs are supported on this server; send the video \
-             base64-encoded (`data:video/mp4;base64,...`)"
-                .into()
+            DATA_ONLY_VIDEOS.into()
         });
     };
     media::data_url_payload(rest, |mime| {
@@ -166,6 +168,15 @@ impl Container {
         .iter()
         .any(|k| kind == *k)
         .then_some(Self::Mov)
+    }
+
+    /// The `data:` media type a fetched video of this container is passed
+    /// on as (one of the types [`video_url_bytes`] takes).
+    pub fn mime(self) -> &'static str {
+        match self {
+            Self::Mov => "video/mp4",
+            Self::Matroska => "video/x-matroska",
+        }
     }
 
     fn demuxer(self) -> &'static str {
