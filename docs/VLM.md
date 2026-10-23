@@ -542,9 +542,19 @@ refuses a split that puts them elsewhere, and the features never cross the wire.
 Only the target sees images; the draft is a text model fed the prompt without its
 image ids, so it changes the acceptance rate, never the answer. Any causal target with
 1-D positions works the same way: Pixtral / Mistral 3, Phi-3.5-vision, InternVL2 and
-LLaVA-NeXT (`--family phi3_v|internvl_chat|llava_next --all-logits`). A Phi-3.5-vision
-target (two stages on one box) with a draft made from the same export by
-`make_text_draft.py` passed the SDK image suite 11/11.
+LLaVA-NeXT (`--family phi3_v|internvl_chat|llava_next --all-logits`). Each passed the SDK
+image suite and video suite 11/11 as a two-stage target (both ranks and the draft on one
+box, CPU, `--spec-k 4`) with a draft made from the same export by `make_text_draft.py`:
+
+| Target | Image (one image) | Video (4 frames, as labelled frames) |
+|---|---|---|
+| Phi-3.5-vision | 785 prompt tokens | 3,120 tokens, about 225 s a request |
+| InternVL2-4B | 280 prompt tokens | 1,112 tokens, about 33 s a request |
+| LLaVA-NeXT 7B (llava-v1.6-mistral) | 2,956 prompt tokens | 11,799 tokens, about 2,000 s a request on this CPU |
+
+A Phi-3.5-vision or InternVL2 target prefills a prompt past 4096 tokens in chunks, which
+the long-RoPE switch does not cover (see [Limits](#limits-worth-knowing)); serve long
+prompts for those two on a stateful `ov-runtime` tree or `ov-genai`.
 The target's last stage must return logits for every position (`--all-logits`), and the
 draft must be one IR that takes `input_ids`:
 
