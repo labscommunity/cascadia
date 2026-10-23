@@ -776,8 +776,11 @@ per request for images and one for videos, one deadline over all of a request's 
 each image's header size, the request's source pixels, a fetched video's container) and
 returns the messages with each fetched URL replaced by a base64 `data:` URL, `detail` kept.
 The serving node then needs no outbound access, and its `prepare_media_with` checks the
-bytes again. Errors name the part (`image 2: ...`), never the URL. ffmpeg is not needed
-there. For checks on a request without remote URLs, `image_url_bytes` / `video_url_bytes`
+bytes again. Errors name the part (`image 2: ...`), never the URL. A failed or refused fetch
+is logged on the target `cascadia_api::media_fetch`: at `warn` only its reason
+(`connect_failed`, `body_failed`, `dns_failed`, `no_addresses`, `not_public`) and the media
+kind; the host and the address it resolved to only at `debug`, off unless enabled
+(`RUST_LOG=cascadia_api::media_fetch=debug`). ffmpeg is not needed there. For checks on a request without remote URLs, `image_url_bytes` / `video_url_bytes`
 (a `data:` URL's bytes), `source_size` (an image's size from its header) and
 `check_request_pixels` are public too.
 
