@@ -73,7 +73,11 @@ cascadia worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
 `ov-dist-spec` takes `image_url` parts when the target is a causal tree with 1-D positions
 (Pixtral or Mistral 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT) cut by
 `tools/vlm_surgery/cut_vlm_lm.py --all-logits`; Gemma 3 / 4 (token types) and Qwen VL
-(M-RoPE) targets are refused at load. Only the target sees images:
+(M-RoPE) targets are refused at load. Phi-3.5-vision and InternVL2 targets carry Phi-3's
+long-RoPE switch, which decides once per inference; this engine prefills in chunks, so a
+prompt past 4096 tokens keeps the short factors in its earlier chunks and differs from
+Hugging Face (the load log warns; see [../VLM.md](../VLM.md#limits-worth-knowing)).
+Only the target sees images:
 
 - **Rank 0** expands each `[IMG]` placeholder into the image's rows of `[IMG]` closed by
   `[IMG_BREAK]` / `[IMG_END]`, runs the vision encoder (CPU, cached per tenant by image
