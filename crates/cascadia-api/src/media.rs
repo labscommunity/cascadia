@@ -931,6 +931,20 @@ pub async fn fetch_remote(
     }
 }
 
+/// The log target of every remote-fetch event. At `warn` an event names
+/// only why the fetch failed (`reason`) and the media kind; the host, the
+/// address it resolved to and the transport error (which can name either)
+/// are user data and the internal network's layout, so they go to `debug`
+/// on the same target, for an operator who turns it on.
+pub(crate) const FETCH_LOG: &str = "cascadia_api::media_fetch";
+
+/// Log a failed remote fetch: the reason at `warn`, the host (and the
+/// address or error, if any) at `debug`.
+fn log_fetch_failure(what: &str, reason: &'static str, host: &str, detail: Option<&str>) {
+    tracing::warn!(target: FETCH_LOG, reason, kind = what, "remote media fetch refused or failed");
+    tracing::debug!(target: FETCH_LOG, reason, kind = what, host, detail, "remote media fetch detail");
+}
+
 /// Fetch failures whose cause stays in the server log.
 fn unreachable(what: &str) -> String {
     format!("could not fetch the {what} from this server")
@@ -957,7 +971,7 @@ async fn fetch_inner(
             .build()
             .map_err(|e| format!("could not set up the {what} fetch: {e}"))?;
         let mut resp = client.get(current.clone()).send().await.map_err(|e| {
-            tracing::warn!(host = %host, error = %without_url(e), "{what} fetch failed");
+            log_fetch_failure(what, "connect_failed", &host, Some(&without_url(e)));
             unreachable(what)
         })?;
         if resp.status().is_redirection() {
@@ -997,7 +1011,7 @@ async fn fetch_inner(
         }
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(|e| {
-            tracing::warn!(host = %host, error = %without_url(e), "{what} fetch failed mid-body");
+            log_fetch_failure(what, "body_failed", &host, Some(&without_url(e)));
             unreachable(what)
         })? {
             if body.len() + chunk.len() > max_bytes {
@@ -1056,12 +1070,12 @@ async fn check_target(
     let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
         Ok(a) => a.collect(),
         Err(e) => {
-            tracing::warn!(host = %host, error = %e, "{what} host did not resolve");
+            log_fetch_failure(what, "dns_failed", &host, Some(&e.to_string()));
             return Err(unreachable(what));
         }
     };
     let Some(first) = addrs.first().copied() else {
-        tracing::warn!(host = %host, "{what} host resolved to no addresses");
+        log_fetch_failure(what, "no_addresses", &host, None);
         return Err(unreachable(what));
     };
     // Every answer must be public: a host that resolves to one public and one
@@ -1070,7 +1084,7 @@ async fn check_target(
     // resolved to: that would turn the endpoint into an internal DNS oracle.
     if !policy.allow_non_public {
         if let Some(bad) = addrs.iter().find(|a| !is_public(a.ip())) {
-            tracing::warn!(host = %host, ip = %bad.ip(), "{what} host refused: not a public address");
+            log_fetch_failure(what, "not_public", &host, Some(&bad.ip().to_string()));
             return Err(format!("{what} host is not a public address"));
         }
     }
