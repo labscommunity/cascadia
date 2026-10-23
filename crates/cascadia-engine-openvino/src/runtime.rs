@@ -204,6 +204,12 @@ pub(crate) struct PipelineVision {
     /// the tokenizer.
     #[serde(default)]
     image_token_id: Option<i64>,
+    /// Phi-3 `su` / `longrope` trees cut with the long-RoPE switch
+    /// (`tools/vlm_surgery/longrope.py`): the original window past which
+    /// every stage takes the long factors, as Hugging Face does. Absent on
+    /// older cuts, which keep the short factors at every length.
+    #[serde(default)]
+    pub(crate) long_rope_switch: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -232,6 +238,10 @@ struct StageConfig {
     static_seq: Option<u32>,
     #[serde(default)]
     static_context: Option<u32>,
+    /// `cut_vlm_lm.py`'s long-RoPE switch position (Phi-3.5-vision,
+    /// InternVL2), carried into static stages by `static_variant.py`.
+    #[serde(default)]
+    long_rope_switch: Option<u64>,
     /// Packed multi-slot IR variant (openvino_packed_model.xml): how many
     /// independent requests share one inference via the sequence dimension.
     #[serde(default)]
@@ -2929,19 +2939,25 @@ impl VisionFirst {
             VisionFamily::Phi3V | VisionFamily::InternVL => {
                 // Phi-3's su/longrope switches to its long factors past
                 // `original_max_position_embeddings`; optimum traced the
-                // rotary inv_freq as a constant (no position-dependent
-                // switch in the IR), so past that length the export
-                // (ov-genai's too) differs from HF.
+                // rotary inv_freq as a constant, so an export (ov-genai's
+                // too) and a tree cut before the switch existed keep the
+                // short factors and differ from HF past that length.
                 let text = v.get("llm_config").unwrap_or(&v);
-                if let Some(orig) = text
+                let orig = text
                     .get("original_max_position_embeddings")
-                    .and_then(serde_json::Value::as_u64)
-                {
-                    warn!(
+                    .and_then(serde_json::Value::as_u64);
+                match (cfg.long_rope_switch, orig) {
+                    (Some(at), _) => info!(
+                        positions = at,
+                        "{family:?} tree: long-RoPE switch past {at} positions, as HF"
+                    ),
+                    (None, Some(orig)) => warn!(
                         positions = orig,
                         "{family:?} tree: the IR's RoPE is fixed (no long-factor switch); \
-                         sequences past {orig} tokens differ from HF"
-                    );
+                         sequences past {orig} tokens differ from HF; re-cut it with \
+                         tools/vlm_surgery/cut_vlm_lm.py"
+                    ),
+                    (None, None) => {}
                 }
                 let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
                 let tok = Tokenizer::from_file(&tok_path)
@@ -7496,6 +7512,24 @@ impl Builder for OvRuntimeBuilder {
         let stage_dir = self.pipeline_dir.join(format!("stage_{}", self.rank));
         let stage_cfg = read_stage_config(&stage_dir)?;
 
+        if let (false, Some(at), Some(ctx)) = (
+            stage_cfg.stateful,
+            stage_cfg.long_rope_switch,
+            stage_cfg.static_context,
+        ) {
+            if u64::from(ctx) > at {
+                // The switch decides once per inference; a static tree
+                // prefills a long prompt in chunks, so the chunks before
+                // position `at` keep the short factors (Hugging Face takes
+                // the long ones for the whole prompt).
+                warn!(
+                    positions = at,
+                    context = ctx,
+                    "static stage: prompts past {at} tokens are prefilled in chunks, which the \
+                     long-RoPE switch does not cover; they differ from HF (stateful trees do not)"
+                );
+            }
+        }
         self.static_params = if !stage_cfg.stateful {
             let ctx = stage_cfg.static_context.unwrap_or(0);
             let s = stage_cfg.static_seq.unwrap_or(1);
@@ -10814,6 +10848,25 @@ mod tests {
         assert_eq!(decode_wire_positions(&pos_t, 3, 2).unwrap(), pos);
     }
 
+    /// A tree cut with the long-RoPE switch says where it switches; an
+    /// older cut's vision block has no such field and reads as `None`.
+    #[test]
+    fn vision_block_reads_the_long_rope_switch() {
+        let v: PipelineVision = serde_json::from_str(
+            r#"{"family":"phi3_v","text_embeddings":"t.xml",
+                "vision_embeddings":"openvino_vision_embeddings_model.xml",
+                "long_rope_switch":4096}"#,
+        )
+        .unwrap();
+        assert_eq!(v.long_rope_switch, Some(4096));
+        let v: PipelineVision = serde_json::from_str(
+            r#"{"family":"phi3_v","text_embeddings":"t.xml",
+                "vision_embeddings":"openvino_vision_embeddings_model.xml"}"#,
+        )
+        .unwrap();
+        assert_eq!(v.long_rope_switch, None);
+    }
+
     #[test]
     fn vision_block_family_is_checked() {
         let v = |f: Option<&str>| PipelineVision {
@@ -10823,6 +10876,7 @@ mod tests {
             vision_embeddings: "openvino_vision_embeddings_model.xml".into(),
             mrope_rows: None,
             image_token_id: None,
+            long_rope_switch: None,
         };
         assert_eq!(
             vision_family(&v(Some("gemma4")), None).unwrap(),
