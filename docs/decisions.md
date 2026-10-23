@@ -1027,15 +1027,20 @@ link.
 During the recovery the engine is held, so other requests wait for it. Every wait is bounded;
 before Task 46 none was.
 
-### BUG-1 (open)
+### BUG-1 (OpenVINO 2026.4.0 GPU fault)
 
-The `unknown C++ exception in infer` itself is not fixed; the engine only recovers afterwards.
-On hardware it showed up in long generations on the GPU (System 2's thinking, above, and once
-after a prefix-cache restore); chat generations of that length can hit it too. Its cause is
-unknown. One lead: OpenVINO's `InferRequest` wrapper turns any C++ exception into an
-`ov::Exception`, so an error the shim reports as "unknown" did not pass through it as a C++
-exception. On Windows that suggests a structured (SEH) exception from the driver or plugin. That
-would also explain why the request stayed busy: OpenVINO's own cleanup never ran. On pawan-01
+BUG-1 is a fault in OpenVINO 2026.4.0's GPU plugin, not in Cascadia. Run on 2026.4.1, the
+supported runtime: on pawan-03, 100 rounds of 1600-token chat each on an 8-stage jev9b tree and
+an 8-stage kev9b tree ran 0 faults, where 2026.4.0 faults in about 3% of rounds. The recovery
+above stays as hardening against a fault like it.
+
+On 2026.4.0 the shim reports it as `unknown C++ exception in infer`. It showed up in long
+generations on the GPU (System 2's thinking, above, and once after a prefix-cache restore);
+chat generations of that length hit it too. A diagnostic build's exception logger caught it as a
+structured exception: an access violation (`0xc0000005`, a read at `0x108`) at
+`openvino.dll+0x82d20`, called from `openvino_intel_gpu_plugin.dll`. OpenVINO's `InferRequest`
+wrapper turns C++ exceptions into `ov::Exception`, so a structured exception passes it as
+"unknown". That also explains why the request stayed busy: OpenVINO's own cleanup never ran. On pawan-01
 such a request never came back to idle: it stayed `Cancelled` for the full 30 s, and a fresh
 request on the same compiled model then failed its first infer. The engine now recompiles the
 stage (above). On pawan-01 (build 0c61635a, chat soak) the fault hit stage3 and later stage6 in
