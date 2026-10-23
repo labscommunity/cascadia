@@ -70,8 +70,10 @@ Families (the `vision.family` rank 0 serves):
 
 Phi-3's su/longrope RoPE is traced into these exports with a constant
 inv_freq (no switch to the long factors past
-original_max_position_embeddings), so a cut serves them exactly as the
-export does: HF-exact up to 4096 positions.
+original_max_position_embeddings). Every phi3_v / internvl_chat stage gets the
+switch back (longrope.py): the long factors once a pass's positions reach the
+original window, as Hugging Face picks them. The tree records it as
+`vision.long_rope_switch`.
 
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
@@ -93,6 +95,7 @@ import openvino as ov
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, os.pardir, "gemma4_surgery"))
 import export_gemma4_text as g  # noqa: E402  (extract_stage, stage_ranges)
+import longrope  # noqa: E402  (add_long_rope_switch)
 
 EXPORT_VERSION = "vlm_lm_surgery_v1"
 
@@ -411,6 +414,25 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
     num_kv_heads, head_dim = lm_kv_geometry(lm_xml) or (
         text.get("num_key_value_heads"),
         text.get("head_dim") or hidden // int(text["num_attention_heads"]))
+    # Phi-3 su/longrope (Phi-3.5-vision, InternVL2's Phi-3 tower): every stage
+    # gets the long-factor switch the export lost.
+    long_rope = None
+    if family in ("phi3_v", "internvl_chat"):
+        try:
+            long_rope = longrope.long_rope(text)
+        except (KeyError, ValueError) as e:
+            raise SystemExit(f"rope_scaling: {e}")
+    if long_rope and only_stage is not None:
+        # A stage kept from a cut before the switch would rotate with the
+        # short factors while this one switches.
+        for j in range(num_stages):
+            sc = os.path.join(out_dir, f"stage_{j}", "stage_config.json")
+            if j != only_stage and os.path.exists(sc):
+                with open(sc) as f:
+                    if "long_rope_switch" not in json.load(f):
+                        raise SystemExit(
+                            f"stage_{j} in {out_dir} was cut without the long-RoPE switch; "
+                            "re-cut every stage (drop --stage)")
     stages_meta = []
     for i, (a, b) in enumerate(ranges):
         first, last = i == 0, i == len(ranges) - 1
@@ -424,6 +446,8 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
             meta["logits"] = "all" if all_logits else "last"
         if mrope_rows:
             meta["position_rows"] = mrope_rows
+        if long_rope:
+            meta["long_rope_switch"] = long_rope[2]
         stages_meta.append(meta)
         if only_stage is not None and i != only_stage:
             continue
@@ -434,6 +458,12 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
             check_mrope_positions(stage, mrope_rows, i)
         if family == "qwen3_vl":
             stage = fix_deepstack_inputs(stage, first, i)
+        if long_rope:
+            try:
+                n = longrope.add_long_rope_switch(stage, text)
+            except ValueError as e:
+                raise SystemExit(f"stage_{i}: {e}")
+            log(f"stage_{i}: long-RoPE switch past {long_rope[2]} positions ({n} constant(s))")
         sdir = os.path.join(out_dir, f"stage_{i}")
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"), compress_to_fp16=False)
@@ -501,6 +531,8 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         pipeline["vision"]["mrope_rows"] = mrope_rows
     if n_deepstack:
         pipeline["vision"]["deepstack_layers"] = n_deepstack
+    if long_rope:
+        pipeline["vision"]["long_rope_switch"] = long_rope[2]
     g.check_contiguous(stages_meta, num_layers, num_stages)
     with open(marker, "w") as f:
         json.dump(pipeline, f, indent=2)

@@ -2571,6 +2571,17 @@ impl Builder for OvDistSpecBuilder {
         }
         if let Some(v) = pipeline_cfg.vision.as_ref() {
             let family = crate::runtime::vision_family(v, pipeline_cfg.export_version.as_deref())?;
+            if let Some(at) = v.long_rope_switch {
+                // The switch decides once per inference and this engine
+                // prefills in PREFILL_CHUNK chunks, so a prompt past `at`
+                // keeps the short factors in its earlier chunks.
+                warn!(
+                    positions = at,
+                    "ov-dist-spec: prompts past {at} tokens are prefilled in chunks, which the \
+                     long-RoPE switch does not cover; they differ from HF (serve them on a \
+                     stateful ov-runtime tree or ov-genai)"
+                );
+            }
             // The FORWARD wire carries hidden states and the mask only, every
             // rank counts 1-D positions, and the draft reads the prompt as plain
             // ids: only causal families with 1-D positions ride it. Families that

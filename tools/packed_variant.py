@@ -423,6 +423,17 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None,
             "stateless static-path feature — re-export with --target npu"
         )
     packed_seq = packed_seq or slots
+    switch = cfg.get("long_rope_switch")
+    region = (int(cfg["static_context"]) - int(cfg["static_seq"])) // slots
+    if switch and region > int(switch):
+        # longrope.py decides short or long factors once per pass over every
+        # row, so one slot past the window would switch its neighbours too.
+        raise RuntimeError(
+            f"{stage_dir}: a slot region of {region} positions passes this tree's long-RoPE "
+            f"switch at {switch}, which is per pass, not per slot; use at least "
+            f"{-(-(int(cfg['static_context']) - int(cfg['static_seq'])) // int(switch))} slots "
+            "or a smaller static context"
+        )
     if decode_seq is not None:
         if dynamic:
             raise RuntimeError("--decode-seq and --dynamic-seq do not mix: a dynamic "
