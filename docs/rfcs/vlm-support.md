@@ -9,6 +9,27 @@ GPTQ builder it mentions is PR #174's, not part of this tree. Claims marked
 **[verified]** were read in this tree or in the cited upstream source; claims
 marked **[inferred]** still need checking (see [Open questions](#open-questions)).
 
+**Since this draft (2026-10-23, branch `pawan/vlm-support`).** Later sections are dated
+logs and keep their wording; these lines in them are now out of date:
+
+- "Not yet verified on the cluster / on hardware" (Phi-3.5-vision and InternVL2, Qwen2.5-VL
+  and Qwen3-VL, LLaVA-NeXT on `ov-runtime`): all three families' cuts were served on the
+  pawan PCs and passed the SDK image and video suites on stateful, static and packed trees;
+  Qwen2.5-VL and Qwen3-VL also across two machines. Counts and limits are in
+  [../VLM.md](../VLM.md).
+- "Not yet run on the 26B tree" (Gemma 4 packed slots): the 26B-A4B tree across two
+  machines passed images and video on stateful, static, packed and packed-only trees
+  (packed images 10/11 with one skip).
+- "`ov-dist-spec` still refuses non-Pixtral targets" / LLaVA-NeXT "not covered": it takes
+  Phi-3.5-vision, InternVL2 and LLaVA-NeXT targets; each passed the image and video suites
+  11/11.
+- Phi-3.5-vision / InternVL2 "no switch to the su/longrope long factors ... HF-exact up to
+  4096 positions": `tools/vlm_surgery/longrope.py` adds the switch to every stage
+  `cut_vlm_lm.py` cuts and to an export copy for `ov-genai` (Phi-4-multimodal too). It
+  matches Hugging Face where a prompt is prefilled in one inference (`ov-genai`, stateful
+  `ov-runtime`); `ov-dist-spec` and static trees prefill long prompts in chunks and are not
+  covered yet (their loads warn).
+
 ## Summary
 
 Every Qwen3.5-family IR we build already contains a vision tower, and the ov-genai
