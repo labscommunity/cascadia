@@ -537,6 +537,7 @@ impl OvMoeRunner {
             qk_head_dim: self.manifest.qk_head_dim,
             v_head_dim: self.manifest.v_head_dim,
             vocab_size: self.manifest.vocab_size,
+            config_digest: self.manifest.config_digest,
             layer_start,
             layer_end,
             is_first: self.is_first,

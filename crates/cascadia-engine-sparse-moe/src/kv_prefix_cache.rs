@@ -128,6 +128,10 @@ pub struct ModelFingerprint {
     pub qk_head_dim: u32,
     pub v_head_dim: u32,
     pub vocab_size: u32,
+    /// [`crate::manifest::config_digest`] of the export's `manifest.json`: every config field,
+    /// including those not listed here (rotary dim, rope theta, ...).
+    #[serde(default)]
+    pub config_digest: u64,
     /// Rank's `(layer_start, layer_end, is_first, is_last)` baked in.
     /// A snapshot from rank 0 of a 2-stage split can't restore on rank 1.
     pub layer_start: u32,
@@ -166,6 +170,7 @@ impl ModelFingerprint {
         self.qk_head_dim.hash(&mut h);
         self.v_head_dim.hash(&mut h);
         self.vocab_size.hash(&mut h);
+        self.config_digest.hash(&mut h);
         h.finish()
     }
 }
@@ -492,6 +497,7 @@ mod tests {
             qk_head_dim: 192,
             v_head_dim: 128,
             vocab_size: 163840,
+            config_digest: 0,
             layer_start: 0,
             layer_end: u32::MAX,
             is_first: true,
@@ -531,6 +537,14 @@ mod tests {
             head.plane_digest(),
             fp_b().plane_digest(),
             "different arch/num_layers must change the plane fp"
+        );
+        // So must another export of the same dims (e.g. a different rotary dim).
+        let mut reexport = fp_a();
+        reexport.config_digest = 1;
+        assert_ne!(
+            head.plane_digest(),
+            reexport.plane_digest(),
+            "a different manifest.json must change the plane fp"
         );
     }
 
