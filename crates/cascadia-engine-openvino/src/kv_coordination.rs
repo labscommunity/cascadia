@@ -56,6 +56,21 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Digest of a tree's shared config file (`pipeline_config.json`, `manifest.json`), folded into the
+/// cross-chain KV fingerprint. Two exports under one `model_id` that differ in config (a re-export
+/// with another rotary dim, a re-cut) then refuse each other's KV at NEGOTIATE and go cold, instead
+/// of restoring KV the other graph never wrote; `set_state`'s size check only catches a shape change.
+/// Hashed over the parsed JSON re-serialized (sorted keys, no whitespace), so line endings or
+/// indentation cannot split one export. Every rank of a tree reads the same file, which keeps the
+/// fingerprint rank-invariant. 0 when the file is missing or not JSON.
+pub(crate) fn config_digest(path: &std::path::Path) -> u64 {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| serde_json::to_vec(&v).ok())
+        .map_or(0, |c| fnv1a64(&c))
+}
+
 /// Content-derived epoch over the negotiated prefix tokens. Sound for the serve-time `rank_honors`
 /// check (same content ⇒ same epoch ⇒ honor; foreign content ⇒ different epoch ⇒ reject).
 pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
@@ -906,7 +921,8 @@ pub(crate) fn wire_to_blob(
 }
 
 impl OvRuntimeEngine {
-    /// MODEL-level fingerprint (`model_id` + `total_layers`), NOT per-stage. A cross-chain pull
+    /// MODEL-level fingerprint (`model_id` + `total_layers` + the tree's
+    /// [`config_digest`] of `pipeline_config.json`), NOT per-stage. A cross-chain pull
     /// asserts ONE fingerprint — the entry head's — for EVERY rank's GET, so all ranks of a model
     /// must share it; a per-stage layer span (`layer_start`/`layer_end`) would wrongly reject the
     /// worker ranks of a legitimate move (the tail's stage span differs from the head's). Per-rank
@@ -917,6 +933,7 @@ impl OvRuntimeEngine {
         let s = self.shard_spec();
         let mut buf = s.model_id.clone().into_bytes();
         buf.extend_from_slice(&s.total_layers.to_le_bytes());
+        buf.extend_from_slice(&self.kv_config_digest().to_le_bytes());
         fnv1a64(&buf)
     }
 }
@@ -1287,6 +1304,31 @@ mod tests {
         );
         // empty bundle (no stages)
         assert_eq!(unframe_blobs(&frame_blobs(&[])), Some(vec![]));
+    }
+    #[test]
+    fn config_digest_sees_values_not_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = |name: &str, text: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            config_digest(&p)
+        };
+        let a = digest("a.json", "{\"num_layers\": 32, \"rope_theta\": 500000.0}");
+        let b = digest(
+            "b.json",
+            "{\r\n  \"rope_theta\": 500000.0,\r\n  \"num_layers\": 32\r\n}\r\n",
+        );
+        assert_eq!(
+            a, b,
+            "key order, indentation and line endings are not config"
+        );
+        assert_ne!(
+            a,
+            digest("c.json", "{\"num_layers\": 32, \"rope_theta\": 10000.0}"),
+            "a changed value is another export"
+        );
+        assert_eq!(config_digest(&dir.path().join("missing.json")), 0);
+        assert_eq!(digest("d.json", "not json"), 0);
     }
     #[test]
     fn kv_seq_from_blob_reads_depth() {

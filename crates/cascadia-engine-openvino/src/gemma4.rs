@@ -662,6 +662,10 @@ pub struct Gemma4Engine {
     /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::kv_coordination::SharedKvCache,
+    /// [`crate::kv_coordination::config_digest`] of the tree's `pipeline_config.json`, read once
+    /// at load and folded into the KV fingerprint.
+    #[cfg(feature = "kv_coord")]
+    kv_config_digest: u64,
 }
 
 impl Gemma4Engine {
@@ -2091,13 +2095,15 @@ impl Gemma4Engine {
 
 #[cfg(feature = "kv_coord")]
 impl Gemma4Engine {
-    /// Stable model+stage fingerprint — a stage only matches the identical stage on a peer chain.
+    /// Stable model+stage fingerprint — a stage only matches the identical stage on a peer chain
+    /// of the same export (`pipeline_config.json` digest).
     fn kv_model_fingerprint(&self) -> u64 {
         let s = &self.spec;
         let mut buf = s.model_id.clone().into_bytes();
         buf.extend_from_slice(&s.layer_start.to_le_bytes());
         buf.extend_from_slice(&s.layer_end.to_le_bytes());
         buf.extend_from_slice(&s.total_layers.to_le_bytes());
+        buf.extend_from_slice(&self.kv_config_digest.to_le_bytes());
         crate::kv_coordination::fnv1a64(&buf)
     }
     /// Whether this stage bears any OWN KV: true iff its layer range starts before the own-KV
@@ -2685,6 +2691,10 @@ impl Builder for Gemma4Builder {
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::kv_coordination::OvKvCache::default(),
             )),
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: crate::kv_coordination::config_digest(
+                &self.pipeline_dir.join("pipeline_config.json"),
+            ),
         }))
     }
 }

@@ -1787,6 +1787,10 @@ pub struct OvDistSpecEngine {
     kv_share: crate::kv_coordination::SharedKvCache,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
+    /// [`crate::kv_coordination::config_digest`] of the tree's `pipeline_config.json`, read once
+    /// at load and folded into the KV fingerprint.
+    #[cfg(feature = "kv_coord")]
+    kv_config_digest: u64,
 }
 
 impl Engine for OvDistSpecEngine {
@@ -2698,6 +2702,10 @@ impl Builder for OvDistSpecBuilder {
         Ok(Box::new(OvDistSpecEngine {
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: crate::kv_coordination::config_digest(
+                &self.pipeline_dir.join("pipeline_config.json"),
+            ),
             target,
             draft: masked_draft,
             tokenizer,
@@ -2740,6 +2748,10 @@ pub struct OvDistSpecWorkerEngine {
     kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
+    /// [`crate::kv_coordination::config_digest`] of the tree's `pipeline_config.json`, read once
+    /// at load and folded into the KV fingerprint.
+    #[cfg(feature = "kv_coord")]
+    kv_config_digest: u64,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -3450,6 +3462,10 @@ impl Builder for OvDistSpecWorkerBuilder {
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: crate::kv_coordination::config_digest(
+                &self.pipeline_dir.join("pipeline_config.json"),
+            ),
         }))
     }
 }
@@ -3464,7 +3480,9 @@ impl OvDistSpecEngine {
     /// fp would reject rank>0. Mirrors qwen36 (fcd3e4e). Identical sharding across chains guards the
     /// stage span, replacing the dropped per-rank component.
     fn kv_fingerprint(&self) -> u64 {
-        crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
+        let mut buf = self.kv_model_id.clone().into_bytes();
+        buf.extend_from_slice(&self.kv_config_digest.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
     }
     /// Snapshot draft + target stage0 into one bundle keyed by `tokens`, and broadcast CAPTURE down
     /// the target chain so every worker rank stashes its slice. Best-effort.
@@ -3661,7 +3679,9 @@ impl OvDistSpecWorkerEngine {
     /// MODEL-level fp — identical on every rank so a cross-chain pull's single asserted fingerprint
     /// matches rank>0 GETs. See the driver's `kv_fingerprint` for the full rationale (fcd3e4e).
     fn kv_fingerprint(&self) -> u64 {
-        crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
+        let mut buf = self.kv_model_id.clone().into_bytes();
+        buf.extend_from_slice(&self.kv_config_digest.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
     }
     /// Drain the plane hand-off mailbox and apply the parked slice, if any. See
     /// [`crate::kv_coordination::drain_handoff`]; called from `FrameKind::Restore` for the same two
