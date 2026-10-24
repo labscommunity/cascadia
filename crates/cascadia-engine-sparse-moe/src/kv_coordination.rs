@@ -1061,6 +1061,7 @@ mod tests {
             qk_head_dim: 1,
             v_head_dim: 1,
             vocab_size: 256,
+            config_digest: 0,
             layer_start: 0,
             layer_end: 1,
             is_first: true,

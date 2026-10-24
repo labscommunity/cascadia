@@ -3197,6 +3197,10 @@ pub struct OvRuntimeEngine {
     /// in both modes, so this only labels the mode in the warm-resume logs the cert greps.
     #[cfg(feature = "kv_coord")]
     plane_restore: bool,
+    /// [`crate::kv_coordination::config_digest`] of the tree's `pipeline_config.json`, read once
+    /// at load and folded into the KV fingerprint.
+    #[cfg(feature = "kv_coord")]
+    kv_config_digest: u64,
 }
 
 impl OvRuntimeEngine {
@@ -6694,6 +6698,9 @@ impl OvRuntimeEngine {
     pub(crate) fn tokenizer_ref(&self) -> Option<&Tokenizer> {
         self.tokenizer.as_deref()
     }
+    pub(crate) fn kv_config_digest(&self) -> u64 {
+        self.kv_config_digest
+    }
     pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
         &mut self.kv
     }
@@ -8709,6 +8716,10 @@ impl Builder for OvRuntimeBuilder {
             plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: crate::kv_coordination::config_digest(
+                &self.pipeline_dir.join("pipeline_config.json"),
+            ),
         }))
     }
 }
@@ -11170,6 +11181,8 @@ mod tests {
             kv_warm_pending: false,
             #[cfg(feature = "kv_coord")]
             plane_restore: false,
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: 0,
         }
     }
 
