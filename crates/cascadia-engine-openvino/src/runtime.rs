@@ -1353,15 +1353,20 @@ fn single_task_final_chunk(
     prompt_len: usize,
     is_eos: bool,
 ) -> Chunk {
-    Chunk::final_marker(task_id, delta)
-        .with_n_tokens(1)
-        .with_prompt_tokens(prompt_len as u32)
-        .with_token_ids(vec![token as i64])
-        .with_finish_reason(if is_eos {
-            cascadia_types::FinishReason::Stop
-        } else {
-            cascadia_types::FinishReason::Length
-        })
+    // `token_id` too, not only `token_ids`: a consumer that reads
+    // `token_id` would otherwise see 0 for the final token.
+    Chunk {
+        token_id: token as i64,
+        ..Chunk::final_marker(task_id, delta)
+    }
+    .with_n_tokens(1)
+    .with_prompt_tokens(prompt_len as u32)
+    .with_token_ids(vec![token as i64])
+    .with_finish_reason(if is_eos {
+        cascadia_types::FinishReason::Stop
+    } else {
+        cascadia_types::FinishReason::Length
+    })
 }
 
 /// Encode a vision tree's per-step `token_type_ids` (1 on image soft tokens)
@@ -5258,14 +5263,18 @@ impl OvRuntimeEngine {
         // completion_tokens = 2N-1. This chunk carries exactly one token, and
         // it is set explicitly so an empty final delta (EOS decoding to "")
         // still counts.
-        let chunk = Chunk::final_marker(task_id.clone(), delta)
-            .with_n_tokens(1)
-            .with_prompt_tokens(prompt_tokens)
-            .with_finish_reason(if is_eos {
-                cascadia_types::FinishReason::Stop
-            } else {
-                cascadia_types::FinishReason::Length
-            });
+        let chunk = Chunk {
+            token_id: token as i64,
+            ..Chunk::final_marker(task_id.clone(), delta)
+        }
+        .with_n_tokens(1)
+        .with_prompt_tokens(prompt_tokens)
+        .with_token_ids(vec![token as i64])
+        .with_finish_reason(if is_eos {
+            cascadia_types::FinishReason::Stop
+        } else {
+            cascadia_types::FinishReason::Length
+        });
         packed.retire(slot);
         info!(
             task = %task_id,
@@ -10976,6 +10985,7 @@ mod tests {
         let c = single_task_final_chunk("t".into(), 7, "x".into(), 3, false);
         assert_eq!(c.finish_reason, Some(cascadia_types::FinishReason::Length));
         assert_eq!(c.token_ids, vec![7]);
+        assert_eq!(c.token_id, 7, "token_id carries the final token too");
     }
 
     #[test]
