@@ -1493,6 +1493,11 @@ mod tests {
         let mut c = OvKvCache::default();
         c.capture_under_epoch_ns("tenant-a", 0xE1, vec![11, 22, 33], vec![0xAA]);
         assert_eq!(c.serve("tenant-b", 0xE1, 3), None);
+        assert_eq!(
+            c.serve(LOCAL_NS, 0xE1, 3),
+            None,
+            "a tenant's slice served to \"\""
+        );
         assert!(c.serve("tenant-a", 0xE1, 3).is_some());
         // An UNTAGGED capture — every v1 frame, i.e. everything on the wire today — is unchanged:
         // readable by any partner, so the certified cross-chain pull stays warm.
@@ -2105,6 +2110,46 @@ mod tests {
         // and probes `export`/`serve` directly, never touching `lookup`.
         assert_eq!(c.serve("tenant-b", epoch, len), None);
         assert!(c.serve("tenant-a", epoch, len).is_some());
+    }
+
+    /// The untenanted namespace (`LOCAL_NS`, "") on the head's token-keyed path (lookup, serve of
+    /// an offer, take_warm): confined in both directions, and still reachable by its own turns.
+    /// Worker-rank untagged captures are the documented exception, see
+    /// `worker_capture_tagged_with_a_tenant_is_confined_to_it`.
+    #[test]
+    fn local_ns_is_confined_in_both_directions() {
+        let mut c = OvKvCache::default();
+        c.capture(LOCAL_NS, vec![11, 22, 33], vec![9u8; 16]);
+        c.capture("tenant-a", vec![44, 55, 66], vec![8u8; 16]);
+        assert_eq!(
+            c.lookup("tenant-a", &[11, 22, 33]),
+            None,
+            "\"\" leaked to a tenant"
+        );
+        assert_eq!(
+            c.lookup(LOCAL_NS, &[44, 55, 66]),
+            None,
+            "a tenant leaked to \"\""
+        );
+        let (epoch, len) = c
+            .lookup(LOCAL_NS, &[11, 22, 33])
+            .expect("\"\" reaches its own");
+        assert_eq!(len, 3);
+        assert_eq!(
+            c.serve("tenant-a", epoch, len),
+            None,
+            "\"\" offer served to a tenant"
+        );
+        assert!(c.serve(LOCAL_NS, epoch, len).is_some());
+        let (epoch, len) = c.lookup("tenant-a", &[44, 55, 66]).unwrap();
+        assert_eq!(
+            c.serve(LOCAL_NS, epoch, len),
+            None,
+            "a tenant offer served to \"\""
+        );
+        assert!(c.take_warm("tenant-a", &[11, 22, 33, 1]).is_none());
+        assert!(c.take_warm(LOCAL_NS, &[44, 55, 66, 1]).is_none());
+        assert!(c.take_warm(LOCAL_NS, &[11, 22, 33, 1]).is_some());
     }
 
     /// H.1b (ii): the partner-bearing CAPTURE body round-trips, and — the property that forces it to
