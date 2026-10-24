@@ -262,6 +262,10 @@ struct cascadia_runtime_t {
     // restore are exactly that. Deliberately survives recreate_request: the CompiledModel
     // (and thus the plugin's KV precision) is retained, so the types cannot change.
     std::unordered_map<std::string, ov::element::Type> state_dtypes;
+    // The request's states hold KV: set by an inference or a restore, cleared by reset_state and
+    // recreate_request. A new request starts without. set_state_blob reads it to prime an empty
+    // GPU request (see prime_empty_gpu_request).
+    bool state_live = false;
 };
 
 extern "C" {
@@ -1074,6 +1078,7 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
         for (auto& state : handle->request->query_state()) {
             state.reset();
         }
+        handle->state_live = false;
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
@@ -1121,6 +1126,7 @@ int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle) {
     }
     try {
         handle->request = std::make_shared<ov::InferRequest>(handle->compiled->create_infer_request());
+        handle->state_live = false;
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
@@ -1325,10 +1331,71 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
     catch (...) { set_last_error("unknown C++ exception in get_state_blob"); return 1; }
 }
 
+// True when the compiled model executes on a GPU (`GPU`, `GPU.0`, or under AUTO/HETERO).
+static bool runs_on_gpu(const ov::CompiledModel& compiled) {
+    try {
+        for (const auto& d : compiled.get_property(ov::execution_devices))
+            if (d.find("GPU") != std::string::npos) return true;
+    } catch (...) {
+    }
+    return false;
+}
+
+// The GPU plugin (seen on 2026.2 and 2026.4.1) mishandles set_state into a request whose states
+// are empty: the restore succeeds and a 1-token step after it runs, but the first step of two or
+// more tokens fails with "opset1::Add ... Argument shapes are inconsistent". set_state over live
+// state of any length works and gives exactly the logits of an unrestored run. So before a restore
+// into an empty GPU request, run one throwaway 1-token inference: every input zero-filled, every
+// dynamic dim 1. It leaves one token of junk in each state, which the restore below overwrites (it
+// fails unless every state is applied). The caller's input tensors are put back afterwards.
+// Best-effort: a model the zero inputs cannot run keeps the old behaviour, with a note on stderr.
+static void prime_empty_gpu_request(cascadia_runtime_t* handle) {
+    if (handle->state_live || handle->request->query_state().empty() ||
+        !runs_on_gpu(*handle->compiled))
+        return;
+    std::vector<std::pair<ov::Output<const ov::Node>, ov::Tensor>> saved;
+    try {
+        for (const auto& port : handle->compiled->inputs()) {
+            try {
+                saved.emplace_back(port, handle->request->get_tensor(port));
+            } catch (const std::exception&) {
+            }
+            ov::Shape shape;
+            for (const auto& d : port.get_partial_shape())
+                shape.push_back(d.is_static() ? static_cast<size_t>(d.get_length()) : 1);
+            ov::Tensor t(port.get_element_type(), shape);
+            std::memset(t.data(), 0, t.get_byte_size());
+            // One attended token: an all-zero mask would leave the softmax nothing to attend.
+            if (port.get_names().count("attention_mask")) {
+                if (t.get_element_type() == ov::element::i64) {
+                    std::fill_n(t.data<int64_t>(), t.get_size(), int64_t{1});
+                } else if (t.get_element_type() == ov::element::i32) {
+                    std::fill_n(t.data<int32_t>(), t.get_size(), int32_t{1});
+                }
+            }
+            handle->request->set_tensor(port, t);
+        }
+        handle->request->infer();
+        handle->state_live = true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "[cascadia-shim] set_state_blob: GPU prime of an empty request failed (%s); "
+                     "restoring without it\n",
+                     e.what());
+    }
+    for (auto& [port, t] : saved) {
+        try {
+            handle->request->set_tensor(port, t);
+        } catch (const std::exception&) {
+        }
+    }
+}
+
 int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_t* buf, size_t len) {
     if (!handle || !handle->request) { set_last_error("null runtime handle"); return 1; }
     if (!buf || len < 4) { set_last_error("set_state_blob: short buffer"); return 1; }
     try {
+        prime_empty_gpu_request(handle);
         // Canonical restore keyed by KV IDENTITY (layer, key/value) parsed from each VariableState
         // name. get_state_blob emits states in this same canonical order, so blob slot i maps to the
         // model state that shares its identity — independent of OV's per-INSTANCE query_state() ORDER
@@ -1463,6 +1530,8 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         // A skipped state (byte-size mismatch) leaves that variable at its CURRENT value while its
         // siblings carry the donor's — a silent half-restore the caller then treats as a good warm
         // resume. Fail instead so the engine falls back to a cold reprefill.
+        // A partial apply is scrubbed by the caller (recreate_request clears the flag again).
+        if (applied > 0) handle->state_live = true;
         if (applied != count) {
             std::ostringstream oss;
             oss << "set_state_blob: applied " << applied << " of " << count << " states"
@@ -1574,7 +1643,11 @@ int32_t cascadia_runtime_set_input(
 
 int32_t cascadia_runtime_infer(cascadia_runtime_t* handle) {
     if (!handle || !handle->request) { set_last_error("null runtime"); return 1; }
-    try { handle->request->infer(); return 0; }
+    try {
+        handle->request->infer();
+        handle->state_live = true;
+        return 0;
+    }
     catch (const std::exception& e) { set_last_error(e); return 1; }
     catch (...) {
         set_last_error("unknown C++ exception in infer"); return 1;
