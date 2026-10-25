@@ -499,11 +499,11 @@ pub(crate) struct OvKvCache {
     /// its own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
     /// stashes here. Served by `export` for repeat/later per-rank GETs (clone, not remove). Bounded.
     ///
-    /// Keyed by epoch ALONE, with the tenant carried as a value: a v1 CAPTURE frame carries no
-    /// tenant, so partner-KEYING would file every legacy capture under `LOCAL_NS` and turn the
-    /// certified multi-stage cross-chain warm pull cold. `serve` instead confines a capture that
-    /// DOES carry a tenant (H.1b R2 `CAPTURE_V2`) to that tenant, and leaves an untagged one
-    /// readable by anyone — exactly today's behaviour for today's frames.
+    /// Keyed by epoch ALONE, with the tenant carried as a value (a v1 CAPTURE frame carries none,
+    /// and the head's RESTORE names only the epoch). `serve` confines every capture to exactly the
+    /// tenant it was stashed under: a `CAPTURE_V2` tenant to that tenant, an untagged (v1,
+    /// `LOCAL_NS`) one to `LOCAL_NS`. A current head sends v1 only for a tenant-less turn, so its
+    /// pullers assert `LOCAL_NS` too; an older head that sent v1 for tenant turns now pulls cold.
     captures: HashMap<u64, (String, Vec<i32>, Vec<u8>)>,
     /// Issue-34 multi-stage cross-chain warm-resume: `(epoch, rank) → that rank's pulled blob`. The head
     /// pulls every rank's KV but can't use a downstream rank's slice locally, so it stashes it here and
@@ -545,7 +545,7 @@ impl OvKvCache {
     }
 
     /// §8 worker: stash this rank's blob under the head-broadcast `(epoch, tokens)`, untagged. The
-    /// v1 CAPTURE frame carries no tenant, so the entry stays readable by any `serve`.
+    /// v1 CAPTURE frame carries no tenant, so the entry lives in `LOCAL_NS`.
     pub(crate) fn capture_under_epoch(&mut self, epoch: u64, tokens: Vec<i32>, blob: Vec<u8>) {
         self.capture_under_epoch_ns(LOCAL_NS, epoch, tokens, blob);
     }
@@ -582,10 +582,10 @@ impl OvKvCache {
             return;
         }
         // Tag the capture with the SAME tenant as the entry beside it. This used to call the
-        // untagged `capture_under_epoch` (LOCAL_NS) while `insert_entry` tagged its copy, which left
-        // a pulled cross-tenant blob readable by anyone: `serve` deliberately lets an UNTAGGED
-        // capture be read by any partner (the v1-frame compatibility rule), so a partner who can
-        // synthesize the content epoch could fetch KV pulled on another tenant's behalf. The
+        // untagged `capture_under_epoch` (LOCAL_NS) while `insert_entry` tagged its copy, which
+        // filed a tenant's pulled blob in the wrong namespace (and, while `serve` still let an
+        // untagged capture be read by any partner, left it readable by anyone who could
+        // synthesize the content epoch). The
         // rank's own restore is unaffected — `take_capture` is keyed by epoch and is not
         // namespace-filtered, because it serves the rank's OWN RESTORE, not a wire read.
         self.capture_under_epoch_ns(partner, synth_epoch(&tokens), tokens.clone(), blob.clone());
@@ -673,10 +673,11 @@ impl OvKvCache {
         let (tokens, blob) = if let Some(off) = self.take_offer(partner, epoch) {
             off
         } else if let Some((cap_ns, tokens, blob)) = self.captures.get(&epoch) {
-            // A capture that carries a tenant (CAPTURE_V2) is confined to it. An UNTAGGED capture
-            // (`LOCAL_NS`, i.e. every v1 frame — all of them today) stays readable by any partner,
-            // so the certified multi-stage cross-chain pull is unchanged.
-            if !cap_ns.is_empty() && cap_ns != partner {
+            // Exact namespace match, untagged (`LOCAL_NS`) included. Letting an untagged capture
+            // be read by any partner gained no warm resume (the head's `lookup` already refuses
+            // the mismatch, and the pull is all-or-nothing) but handed a worker slice, tokens
+            // included, to any GET that named its epoch.
+            if cap_ns != partner {
                 tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch", epoch);
                 return None;
             }
@@ -1509,10 +1510,15 @@ mod tests {
             "a tenant's slice served to \"\""
         );
         assert!(c.serve("tenant-a", 0xE1, 3).is_some());
-        // An UNTAGGED capture — every v1 frame, i.e. everything on the wire today — is unchanged:
-        // readable by any partner, so the certified cross-chain pull stays warm.
+        // An UNTAGGED capture (a v1 frame: a tenant-less turn) is confined to `LOCAL_NS` the same
+        // way, and is still repeat-served to it (rank>0 answers every per-rank GET).
         c.capture_under_epoch(0xE2, vec![44, 55, 66], vec![0xBB]);
-        assert!(c.serve("tenant-b", 0xE2, 3).is_some());
+        assert_eq!(
+            c.serve("tenant-b", 0xE2, 3),
+            None,
+            "an untagged slice served to a tenant"
+        );
+        assert!(c.serve(LOCAL_NS, 0xE2, 3).is_some());
         assert!(c.serve(LOCAL_NS, 0xE2, 3).is_some());
     }
 
@@ -2124,7 +2130,7 @@ mod tests {
 
     /// The untenanted namespace (`LOCAL_NS`, "") on the head's token-keyed path (lookup, serve of
     /// an offer, take_warm): confined in both directions, and still reachable by its own turns.
-    /// Worker-rank untagged captures are the documented exception, see
+    /// The worker-rank captures follow the same rule, see
     /// `worker_capture_tagged_with_a_tenant_is_confined_to_it`.
     #[test]
     fn local_ns_is_confined_in_both_directions() {

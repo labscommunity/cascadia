@@ -277,12 +277,19 @@ async fn a_tagged_capture_is_confined_to_its_tenant<F: ContractFixture>() {
     );
 }
 
-/// (f2) The migration residual, pinned explicitly: an UNTAGGED capture ("" — every legacy v1
-/// CAPTURE frame, and a tenant-less turn via the `kv_tenant_hint_missing` expiry path) is still
-/// served to ANY partner. Refusing it is bfae9ffe one frame later — an old-build head's chain
-/// would have every rank>0 donor answer `get_none`. Retire only with the legacy Capture frame.
-async fn an_untagged_capture_still_serves_any_partner<F: ContractFixture>() {
+/// (f2) An UNTAGGED capture ("" — a v1 CAPTURE frame, i.e. a tenant-less turn, including the
+/// `kv_tenant_hint_missing` expiry path) is served to "" — repeatedly, since rank>0 answers every
+/// per-rank GET — and to no tenant. Serving it to any partner gained no warm resume (the head's
+/// lookup already refuses the mismatch) but handed the slice to any GET naming its epoch.
+async fn an_untagged_capture_serves_only_the_untagged_namespace<F: ContractFixture>() {
     let (holder, epoch) = F::with_capture("");
+    for _ in 0..2 {
+        let (_c, reply) = ask(&holder, get_v2(F::model_fp(), "", epoch, PREFIX_LEN, RANK)).await;
+        assert!(
+            matches!(reply, KvMessage::Found(_)),
+            "an untagged capture must still serve \"\" — rank>0 is its only donor"
+        );
+    }
     for partner in [OWNER, FOREIGN] {
         let (_c, reply) = ask(
             &holder,
@@ -290,9 +297,8 @@ async fn an_untagged_capture_still_serves_any_partner<F: ContractFixture>() {
         )
         .await;
         assert!(
-            matches!(reply, KvMessage::Found(_)),
-            "an untagged (legacy) capture must serve `{partner}` — refusing it starves rank>0 \
-             donors on mixed-version chains (the bfae9ffe failure class)"
+            matches!(reply, KvMessage::NotFound),
+            "an untagged capture served to tenant `{partner}`"
         );
     }
 }
@@ -538,8 +544,8 @@ macro_rules! instantiate_contract {
             super::a_tagged_capture_is_confined_to_its_tenant::<$fixture>().await
         }
         #[tokio::test]
-        async fn an_untagged_capture_still_serves_any_partner() {
-            super::an_untagged_capture_still_serves_any_partner::<$fixture>().await
+        async fn an_untagged_capture_serves_only_the_untagged_namespace() {
+            super::an_untagged_capture_serves_only_the_untagged_namespace::<$fixture>().await
         }
     };
 }

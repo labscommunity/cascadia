@@ -704,8 +704,8 @@ pub async fn send_capture(
     tenant: &str,
 ) -> TransportResult<()> {
     // An oversized tenant must FAIL the capture, never silently fall back to the untagged v1
-    // frame: untagged ("") stashes are deliberately servable to ANY partner, so the fallback
-    // would convert a length overrun into a cross-tenant read with every guard passing. The
+    // frame: that would file the tenant's slice under "" (and, before "" was confined to itself,
+    // made it servable to ANY partner with every guard passing). The
     // caller treats the error as "capture skipped" (best-effort; the turn is still delivered).
     if tenant.len() > MAX_CAPTURE_TENANT_BYTES as usize {
         return Err(TransportError::Io(std::io::Error::other(format!(

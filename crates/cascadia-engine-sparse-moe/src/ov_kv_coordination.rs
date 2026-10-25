@@ -274,7 +274,7 @@ pub(crate) type OvSharedHolderCache = Arc<Mutex<OvHolderState>>;
 pub(crate) struct OvHolderState {
     pub(crate) prefix: OvMoeKvPrefixCache,
     offers: KvOfferStash<OvMoeKvSnapshot>,
-    // Tenant as VALUE, epoch-only key ("" = untagged/legacy, served to any partner); see
+    // Tenant as VALUE, epoch-only key ("" = untagged, served only to ""); see
     // `SparseMoEEngine::kv_capture`.
     pub(crate) captures: HashMap<u64, (String, Vec<i32>, OvMoeKvSnapshot)>,
     fp: ModelFingerprint,
@@ -335,12 +335,12 @@ impl KvSnapshotHolder for OvMoeKvHolder {
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         // Load-bearing for rank>0 — see the long note on `SparseMoeKvHolder::export`. Removing it
         // here is what failed the sparse-moe cells; this is the holder the rig matrix exercises.
-        // H.1a close: tagged captures (CaptureV2 tenant) are confined; untagged ("") serve any
-        // partner — refusing those is bfae9ffe one frame later.
+        // H.1a close: every capture is served only to the tenant it was stashed under, untagged
+        // ("") only to "" (see `SparseMoeKvHolder::export`).
         let (prefix, snap) = if let Some(off) = g.offers.take(partner, expected_epoch) {
             off
         } else if let Some((cap_ns, tokens, snap)) = g.captures.get(&expected_epoch) {
-            if !cap_ns.is_empty() && cap_ns != partner {
+            if cap_ns != partner {
                 tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
                     epoch = expected_epoch);
                 return None;
@@ -529,8 +529,8 @@ mod tests {
         assert!(holder.export("tenant-a", epoch, len).is_some());
     }
 
-    // The H.1a capture-stash pins (tagged capture confined to its tenant; untagged capture serves
-    // any partner) moved to `crate::kv_coordination::holder_conformance`, which states them once
+    // The H.1a capture-stash pins (every capture served only to the tenant it was stashed under,
+    // untagged only to "") moved to `crate::kv_coordination::holder_conformance`, which states them once
     // and drives BOTH MoE holders — this one included — over the framed wire harness.
 
     fn ov_slot(model_fp: u64, past: usize) -> cascadia_engine::kv_handoff::KvHandoffSlot {

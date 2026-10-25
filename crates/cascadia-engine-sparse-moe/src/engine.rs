@@ -1555,10 +1555,9 @@ pub struct SparseMoEEngine {
     /// the per-rank `GET(E)` serves from it. Unlike `kv_offers` (short-lived NEGOTIATE→GET correlation
     /// on the head), these must survive across turns — a forced move can pull a prefix captured many
     /// turns earlier. Bounded by `kv_prefix_cache.capacity()`; eviction is oldest-arbitrary.
-    // Tenant carried as a VALUE, key stays epoch-only: partner-KEYING would file every legacy
-    // (v1-frame) capture under a local namespace and turn the certified multi-stage cross-chain
-    // warm pull cold. `""` = untagged (legacy frame or tenant-less turn) — served to any partner;
-    // a non-empty tenant confines the entry (H.1a).
+    // Tenant carried as a VALUE, key stays epoch-only (the head's RESTORE names only the epoch).
+    // Every entry is served only to the tenant it was stashed under: `""` (a v1 frame, i.e. a
+    // tenant-less turn) only to `""` (H.1a).
     #[cfg(feature = "kv_coord")]
     pub(crate) kv_capture:
         std::collections::HashMap<u64, (String, Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
@@ -5167,10 +5166,9 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         let (prefix, snap) = if let Some(off) = self.kv_offers.take(partner, expected_epoch) {
             off
         } else if let Some((cap_ns, tokens, snap)) = self.kv_capture.get(&expected_epoch) {
-            // Tagged captures are confined to their tenant; untagged ("" — legacy v1 frames and
-            // tenant-less turns) serve any partner, keeping the certified cross-chain pull
-            // unchanged. See `SparseMoEEngine::export`.
-            if !cap_ns.is_empty() && cap_ns != partner {
+            // Served only to the tenant it was stashed under, untagged ("") only to "". See
+            // `SparseMoeKvHolder::export`.
+            if cap_ns != partner {
                 tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
                     epoch = expected_epoch);
                 return None;
