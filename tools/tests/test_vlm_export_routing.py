@@ -237,6 +237,44 @@ def test_raw_checkpoint_is_exported_then_cut(tmp_path, monkeypatch, cuts, quant,
     assert routed["source_dir"] is None
 
 
+def _optimum_argv(monkeypatch, model, revision):
+    """Run optimum_export with subprocess.call and download stubbed; return
+    (argv, download calls)."""
+    calls, downloads = [], []
+    monkeypatch.setattr(ce.subprocess, "call", lambda cmd: calls.append(cmd) or 0)
+
+    def _download(repo, rev):
+        downloads.append((repo, rev))
+        return "/cache/" + repo.replace("/", "--")
+
+    monkeypatch.setattr(ce, "download", _download)
+    ce.optimum_export(model, "/out", ce.VLM_TASK, "int4", revision=revision, sym=True)
+    return calls[0], downloads
+
+
+def test_optimum_export_downloads_a_hub_id_at_its_revision(monkeypatch):
+    argv, downloads = _optimum_argv(monkeypatch, "llava-hf/llava-1.5-7b-hf", "b234b804")
+    assert downloads == [("llava-hf/llava-1.5-7b-hf", "b234b804")]
+    assert "--revision" not in argv
+    assert argv[argv.index("--model") + 1] == "/cache/llava-hf--llava-1.5-7b-hf"
+    assert argv[-1] == "/out"
+
+
+@pytest.mark.parametrize("revision", [None, "b234b804"])
+def test_optimum_export_passes_a_local_dir_as_is(tmp_path, monkeypatch, revision):
+    argv, downloads = _optimum_argv(monkeypatch, str(tmp_path), revision)
+    assert downloads == []
+    assert "--revision" not in argv
+    assert argv[argv.index("--model") + 1] == str(tmp_path)
+
+
+def test_optimum_export_without_a_revision_passes_the_hub_id(monkeypatch):
+    argv, downloads = _optimum_argv(monkeypatch, "org/model", None)
+    assert downloads == []
+    assert "--revision" not in argv
+    assert argv[argv.index("--model") + 1] == "org/model"
+
+
 # --- export -------------------------------------------------------------------
 
 def test_export_leaves_an_openvino_export_alone(tmp_path, capsys):

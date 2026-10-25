@@ -199,13 +199,14 @@ def download(repo: str, revision: str) -> str:
 
 def optimum_export(model: str, out_dir: str, task: str, weight_format: str,
                    revision: str | None = None, sym: bool = False) -> None:
-    """optimum-cli export openvino, run with this interpreter."""
+    """optimum-cli export openvino, run with this interpreter. A hub id with a known
+    revision is downloaded at that revision first: optimum-cli has no --revision."""
+    if revision and not os.path.isdir(model):
+        model = download(model, revision)
     cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "openvino",
            "--model", model, "--task", task, "--weight-format", weight_format]
     if sym:
         cmd.append("--sym")
-    if revision and not os.path.isdir(model):
-        cmd += ["--revision", revision]
     cmd.append(out_dir)
     log("Running: " + " ".join(cmd))
     rc = subprocess.call(cmd)
