@@ -3385,9 +3385,10 @@ impl Qwen36Engine {
     /// ranks must share it; folding in `rank`/`total` made rank>0 GETs reject a legitimate move.
     /// Per-rank slice selection is by the dial INDEX (rank N → that rank's holder), and a sharding
     /// mismatch degrades safely (the opaque blob's `set_state` size-rejects ⇒ cold), so the stage span
-    /// is not needed as a guard. Mirrors `kv_coordination::kv_model_fingerprint`.
+    /// is not needed as a guard. Mirrors `kv_coordination::kv_model_fingerprint`. Hashed as parsed
+    /// JSON, so the same tree cut on Windows (CRLF) and on Linux/macOS (LF) shares one fingerprint.
     fn kv_fingerprint(&self) -> u64 {
-        crate::kv_coordination::fnv1a64(self.manifest_json.as_bytes())
+        crate::kv_coordination::json_digest(self.manifest_json.as_bytes())
     }
 
     /// Capture this rank's local KV under `tokens` (head/single-box token-keyed path). Called at the

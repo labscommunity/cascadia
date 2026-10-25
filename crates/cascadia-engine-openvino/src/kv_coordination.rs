@@ -64,9 +64,14 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
 /// indentation cannot split one export. Every rank of a tree reads the same file, which keeps the
 /// fingerprint rank-invariant. 0 when the file is missing or not JSON.
 pub(crate) fn config_digest(path: &std::path::Path) -> u64 {
-    std::fs::read(path)
+    std::fs::read(path).map_or(0, |b| json_digest(&b))
+}
+
+/// [`config_digest`] over JSON already in memory: a tree cut on Windows (CRLF) and one cut on
+/// Linux or macOS (LF) hash alike. 0 when `bytes` is not JSON.
+pub(crate) fn json_digest(bytes: &[u8]) -> u64 {
+    serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| serde_json::to_vec(&v).ok())
         .map_or(0, |c| fnv1a64(&c))
 }
@@ -1329,6 +1334,11 @@ mod tests {
         );
         assert_eq!(config_digest(&dir.path().join("missing.json")), 0);
         assert_eq!(digest("d.json", "not json"), 0);
+        // The in-memory form (qwen35's manifest) agrees with the file form.
+        assert_eq!(
+            json_digest(b"{\r\n  \"rope_theta\": 500000.0,\r\n  \"num_layers\": 32\r\n}"),
+            a
+        );
     }
     #[test]
     fn kv_seq_from_blob_reads_depth() {
