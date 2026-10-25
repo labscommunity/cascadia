@@ -387,10 +387,46 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 - Images on `ov-dist-spec` for Gemma 3, Gemma 4, Qwen2.5-VL and Qwen3-VL targets: such a
   tree is refused at load (the FORWARD wire carries no token types or M-RoPE positions).
   Serve these on `ov-runtime`.
-- Trees made with `export_shards.py` carry no vision tower (it notes when it drops one);
-  cut vision trees with `tools/vlm_surgery/cut_vlm_lm.py`.
+- `cascadia shard --text-only` (export_shards.py's generic flow) builds the text tower
+  alone; such a tree serves text only.
 
 ## Exporting
+
+### `cascadia shard` and `cascadia export`
+
+`cascadia shard` makes vision trees itself. For a vision-language model it:
+
+- cuts an OpenVINO VLM export (a local dir or an HF repo such as
+  `OpenVINO/Qwen3-VL-4B-Instruct-int4-ov`) with `cut_vlm_lm.py`, the family read from
+  `config.json`;
+- exports a raw checkpoint with optimum-intel first, then cuts it. With the exporter pins
+  (`tools/requirements.txt`, transformers 5.2 to 5.4) optimum-intel 2.2 exports LLaVA,
+  LLaVA-NeXT, Mistral 3 and Gemma 3 this way. Its Qwen VL, Phi-3.5-vision and InternVL
+  exporters need an older transformers and its Gemma 4 exporter a newer one, so for those
+  `shard` asks for the OpenVINO export instead;
+- routes a Gemma 4 OpenVINO export to `export_gemma4_text.py --vision` and Qwen3.5/3.6 to
+  `export_qwen36_moe.py`, as before;
+- refuses any other VLM (Qwen2-VL, LLaVA-1.5, mllama, PaliGemma, ...), naming it.
+  `--text-only` shards its text tower instead.
+
+```bash
+cascadia shard --model OpenVINO/Qwen3-VL-4B-Instruct-int4-ov --output-dir <tree> --num-stages 2
+```
+
+The tree's `model_id` is the repo's base name (`Qwen3-VL-4B-Instruct-int4-ov`) or a local
+dir's name, so every machine that cuts one repo writes the same `pipeline_config.json`.
+Compare those files with line endings normalised: Python writes CRLF on Windows. The KV
+fingerprint reads the parsed JSON, so a Windows cut and a Linux or macOS cut of one source
+share it.
+
+`cascadia export --model <HF id | dir> --output-dir <dir> [--weight-format int4]` makes
+one whole-model OpenVINO export for ov-genai or OVMS (optimum-intel `image-text-to-text`
+for a VLM, `text-generation-with-past` for text). A source that already is an OpenVINO
+export is left as it is.
+
+Both write `cascadia-export.json` beside the output: `model_id`, the source repo and
+revision, `stages` (shard only), `numLayers`, `quant`, `sizeBytes` and `inputModalities`
+(`["text","image","video"]` for a VLM, `["text"]` for text). Nodes do not read it.
 
 ### Gemma 4 26B / 31B (ov-runtime)
 
