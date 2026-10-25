@@ -78,7 +78,7 @@ original window, as Hugging Face picks them. The tree records it as
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
       --family pixtral|mistral3|gemma3|llava_next|phi3_v|internvl_chat|qwen2_5_vl|qwen3_vl \
-      [--stage I] [--all-logits]
+      [--stage I] [--all-logits] [--model-id ID]
 """
 
 from __future__ import annotations
@@ -93,6 +93,10 @@ import time
 import openvino as ov
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+# In the repo the surgery module sits in ../gemma4_surgery; `cascadia shard`
+# writes every embedded script into one flat temp dir, so look beside this
+# file too.
+sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, os.pardir, "gemma4_surgery"))
 import export_gemma4_text as g  # noqa: E402  (extract_stage, stage_ranges)
 import longrope  # noqa: E402  (add_long_rope_switch)
@@ -220,13 +224,28 @@ def flat_text_config(cfg: dict, family: str = "pixtral") -> dict:
     return tc
 
 
+def vision_type(cfg: dict, family: str | None = None) -> str:
+    """The vision tower's type: Phi-3.5-vision names it in img_processor,
+    every other family in vision_config."""
+    if family == "phi3_v" or (family is None and cfg.get("model_type") == "phi3_v"):
+        return (cfg.get("img_processor") or {}).get("name", "")
+    return (cfg.get("vision_config") or {}).get("model_type", "")
+
+
+def family_for_config(cfg: dict) -> str | None:
+    """The --family that cuts this config.json, or None when no family does."""
+    mt = cfg.get("model_type", "")
+    vt = vision_type(cfg)
+    for family, spec in FAMILIES.items():
+        if mt in spec["model_types"] and vt in spec["vision_types"]:
+            return family
+    return None
+
+
 def check_family(cfg: dict, family: str) -> None:
     spec = FAMILIES[family]
     mt = cfg.get("model_type", "")
-    if family == "phi3_v":
-        vt = (cfg.get("img_processor") or {}).get("name", "")
-    else:
-        vt = (cfg.get("vision_config") or {}).get("model_type", "")
+    vt = vision_type(cfg, family)
     if mt not in spec["model_types"] or vt not in spec["vision_types"]:
         raise SystemExit(
             f"--family {family} expects model_type in {spec['model_types']} with a "
@@ -355,7 +374,8 @@ def check_llava_next(cfg: dict, hidden: int) -> None:
 
 
 def run(model_dir: str, out_dir: str, num_stages: int, family: str,
-        suffix: str, only_stage: int | None, all_logits: bool = False) -> None:
+        suffix: str, only_stage: int | None, all_logits: bool = False,
+        model_id: str | None = None) -> None:
     with open(os.path.join(model_dir, "config.json")) as f:
         cfg = json.load(f)
     check_family(cfg, family)
@@ -513,7 +533,9 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
                 add_stop_token(gen, end)
 
     pipeline = {
-        "model_id": os.path.basename(os.path.abspath(model_dir)),
+        # The tree's identity (it feeds the KV fingerprint): the caller's
+        # name for the source, so two copies of one export cut the same tree.
+        "model_id": model_id or os.path.basename(os.path.abspath(model_dir)),
         "num_stages": num_stages,
         "num_layers": num_layers,
         "hidden_size": hidden,
@@ -549,13 +571,15 @@ def main() -> None:
     ap.add_argument("--boundary-suffix", default=g.DEFAULT_LAYERNORM_SUFFIX)
     ap.add_argument("--all-logits", action="store_true",
                     help="keep logits for every fed position (an ov-dist-spec target)")
+    ap.add_argument("--model-id", default=None,
+                    help="the tree's model_id (default: the --model directory's name)")
     args = ap.parse_args()
     # One stage serves a single box through ov-runtime: GenAI's own Pixtral
     # preprocessing differs from HF's (see docs/rfcs/vlm-support.md).
     if args.num_stages < 1:
         raise SystemExit("--num-stages must be >= 1")
     run(args.model, args.output_dir, args.num_stages, args.family,
-        args.boundary_suffix, args.stage, args.all_logits)
+        args.boundary_suffix, args.stage, args.all_logits, args.model_id)
 
 
 if __name__ == "__main__":

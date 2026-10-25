@@ -183,6 +183,11 @@ pub enum Command {
     /// to the text-surgery path (`tools/gemma4_surgery/export_gemma4_text.py`),
     /// while safetensors gemma-4 still uses the torch `export_gemma4.py`.
     Shard(ShardArgs),
+    /// Export a HuggingFace model as one whole-model OpenVINO IR directory
+    /// (optimum-intel: `image-text-to-text` for a vision-language model,
+    /// `text-generation-with-past` for text), for ov-genai or OVMS on one
+    /// box. See `cascadia export --help`.
+    Export(ExportArgs),
     /// Profile available OV devices on this host against a single
     /// model. Writes `device_profile.json`. See `cascadia
     /// profile-devices --help`. Step 1 of issue #41 (three-tier
@@ -1256,6 +1261,48 @@ pub struct ShardArgs {
     /// faster start.
     #[arg(long)]
     pub skip_check: bool,
+
+    /// HuggingFace revision of `--model` (branch, tag or commit). Defaults to
+    /// the hub's current commit; either way the commit is recorded in
+    /// `cascadia-export.json`.
+    #[arg(long)]
+    pub revision: Option<String>,
+
+    /// For a vision-language model, shard the text tower alone: the tree then
+    /// serves text only. Without it such a model gets a vision tree (an
+    /// OpenVINO VLM export is cut with `tools/vlm_surgery/cut_vlm_lm.py`, a raw
+    /// checkpoint is exported with optimum-intel first), or is refused when no
+    /// vision tree can be made.
+    #[arg(long)]
+    pub text_only: bool,
+}
+
+/// `cascadia export`: one whole-model OpenVINO IR directory from a HuggingFace
+/// model. Flattenable like [`ShardArgs`].
+#[derive(Parser, Debug, Clone)]
+pub struct ExportArgs {
+    /// HuggingFace repo id or a local checkpoint directory. A source that is
+    /// already an OpenVINO export is left as it is (nothing is written).
+    #[arg(long)]
+    pub model: String,
+
+    /// Output directory for the OpenVINO IR (will be created). Also gets
+    /// `cascadia-export.json`.
+    #[arg(long, short = 'o')]
+    pub output_dir: String,
+
+    /// optimum-cli `--weight-format` (default int4).
+    #[arg(long)]
+    pub weight_format: Option<String>,
+
+    /// HuggingFace revision of `--model`. Defaults to the hub's current commit.
+    #[arg(long)]
+    pub revision: Option<String>,
+
+    /// Override the python interpreter used to run the bundled exporter.
+    /// Defaults to `python3` then `python` on PATH.
+    #[arg(long)]
+    pub python: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -1411,6 +1458,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Worker(args) => cmd_worker(args).await,
         Command::Discover(args) => cmd_discover(args).await,
         Command::Shard(args) => cmd_shard(args).await,
+        Command::Export(args) => cmd_export(args),
         Command::ProfileDevices(args) => cmd_profile_devices(args),
         Command::ProfileStages(args) => cmd_profile_per_stage(args),
         Command::Place(args) => cmd_place(args),
@@ -3063,6 +3111,44 @@ const GEMMA4_TEXT_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/gemma4_surgery/export_gemma4_text.py"
 ));
+/// The VLM tree cutter and its Phi-3 long-RoPE helper, dispatched by
+/// export_shards.py (through cascadia_export.py) for a vision-language model
+/// whose language model it can cut.
+const CUT_VLM_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/vlm_surgery/cut_vlm_lm.py"
+));
+const LONGROPE_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/vlm_surgery/longrope.py"
+));
+/// `cascadia export` itself, plus the VLM routing and the
+/// cascadia-export.json sidecar `cascadia shard` shares with it.
+const CASCADIA_EXPORT_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/cascadia_export.py"
+));
+
+/// Write the embedded exporter and every module it imports into one flat
+/// dir (the scripts import their siblings from beside themselves), plus
+/// requirements.txt so a refusal can print the install line.
+fn write_embedded_exporter(dir: &std::path::Path) -> Result<()> {
+    for (name, body) in [
+        ("export_shards.py", EXPORT_SCRIPT),
+        ("export_gemma4.py", GEMMA4_SCRIPT),
+        ("model_aliases.py", ALIASES_SCRIPT),
+        ("export_qwen36_moe.py", QWEN36_SCRIPT),
+        ("export_gemma4_text.py", GEMMA4_TEXT_SCRIPT),
+        ("cut_vlm_lm.py", CUT_VLM_SCRIPT),
+        ("longrope.py", LONGROPE_SCRIPT),
+        ("cascadia_export.py", CASCADIA_EXPORT_SCRIPT),
+        ("requirements.txt", EXPORT_REQUIREMENTS),
+    ] {
+        std::fs::write(dir.join(name), body)
+            .with_context(|| format!("writing embedded {name} to temp dir"))?;
+    }
+    Ok(())
+}
 
 /// Assemble the flag list passed to the embedded Python exporter (the args
 /// after `python -u <script>`). Pure + side-effect-free so it's unit-testable
@@ -3130,7 +3216,34 @@ fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
         flags.push("--stage".into());
         flags.push(s.to_string());
     }
+    if let Some(r) = &args.revision {
+        flags.push("--revision".into());
+        flags.push(r.clone());
+    }
+    if args.text_only {
+        flags.push("--text-only".into());
+    }
     Ok(flags)
+}
+
+/// The flags passed to the embedded `cascadia_export.py` (after `python -u
+/// <script>`). Pure, so it is unit-testable without spawning Python.
+fn export_flags(args: &ExportArgs) -> Vec<String> {
+    let mut flags = vec![
+        "--model".into(),
+        args.model.clone(),
+        "--output-dir".into(),
+        args.output_dir.clone(),
+    ];
+    if let Some(w) = &args.weight_format {
+        flags.push("--weight-format".into());
+        flags.push(w.clone());
+    }
+    if let Some(r) = &args.revision {
+        flags.push("--revision".into());
+        flags.push(r.clone());
+    }
+    flags
 }
 
 /// The imports the bundled exporter needs. Shared with `cascadia doctor` so the
@@ -3230,6 +3343,79 @@ fn shard_tree_engine(dir: &std::path::Path) -> &'static str {
     "ov-runtime"
 }
 
+/// The interpreter runs but can't import `imports`: re-run the import so the
+/// user sees the real ModuleNotFoundError, with the install line.
+fn export_deps_error(python: &str, imports: &str) -> anyhow::Error {
+    use std::process::{Command, Stdio};
+    let stderr = Command::new(python)
+        .args(["-c", imports])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_default();
+    anyhow!(
+        "python environment check failed for interpreter {python:?}:\n{}\n\
+         Install: {}\n\
+         (or point at another interpreter with --python <path>)",
+        stderr.trim(),
+        export_pip_install_line(python)
+    )
+}
+
+/// What `cascadia export` imports on top of the shard exporter's deps.
+const OPTIMUM_IMPORTS: &str = "import optimum.intel, nncf";
+
+fn cmd_export(args: ExportArgs) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    // The whole environment is checked before any download or export.
+    let env = resolve_python(args.python.as_deref(), true)?;
+    let python = env.path.clone();
+    eprintln!("Checking Python environment for required packages...");
+    let Some(versions) = env.deps else {
+        return Err(export_deps_error(&python, EXPORT_IMPORTS));
+    };
+    for line in versions.lines() {
+        eprintln!("  {line}");
+    }
+    let optimum_ok = Command::new(&python)
+        .args(["-c", OPTIMUM_IMPORTS])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !optimum_ok {
+        return Err(export_deps_error(&python, OPTIMUM_IMPORTS));
+    }
+
+    let tmpdir = tempfile::Builder::new()
+        .prefix("cascadia-export-")
+        .tempdir()
+        .context("creating temp dir for embedded exporter")?;
+    write_embedded_exporter(tmpdir.path())?;
+    let flags = export_flags(&args);
+    eprintln!(
+        "Running exporter: {} -u <embedded cascadia_export.py> {}",
+        python,
+        flags.join(" ")
+    );
+    let status = Command::new(&python)
+        .arg("-u")
+        .arg(tmpdir.path().join("cascadia_export.py"))
+        .args(&flags)
+        .stdin(Stdio::null())
+        .status()
+        .context("spawning python exporter")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "exporter exited with {} — see output above",
+            status
+        ));
+    }
+    Ok(())
+}
+
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
     use std::process::{Command, Stdio};
 
@@ -3275,25 +3461,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
                     }
                 }
             }
-            // The chosen interpreter runs but can't import the deps: re-run the
-            // import so the user sees the real ModuleNotFoundError.
-            None => {
-                let out = Command::new(&python)
-                    .args(["-c", EXPORT_IMPORTS])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output();
-                let stderr = out
-                    .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
-                    .unwrap_or_default();
-                return Err(anyhow!(
-                    "python environment check failed for interpreter {python:?}:\n{}\n\
-                     Install: {}\n\
-                     (or point at another interpreter with --python <path>)",
-                    stderr.trim(),
-                    export_pip_install_line(&python)
-                ));
-            }
+            None => return Err(export_deps_error(&python, EXPORT_IMPORTS)),
         }
     }
 
@@ -3306,16 +3474,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         .tempdir()
         .context("creating temp dir for embedded exporter")?;
     let script_path = _tmpdir.path().join("export_shards.py");
-    for (name, body) in [
-        ("export_shards.py", EXPORT_SCRIPT),
-        ("export_gemma4.py", GEMMA4_SCRIPT),
-        ("model_aliases.py", ALIASES_SCRIPT),
-        ("export_qwen36_moe.py", QWEN36_SCRIPT),
-        ("export_gemma4_text.py", GEMMA4_TEXT_SCRIPT),
-    ] {
-        std::fs::write(_tmpdir.path().join(name), body)
-            .with_context(|| format!("writing embedded {name} to temp dir"))?;
-    }
+    write_embedded_exporter(_tmpdir.path())?;
 
     // Build python argv: `python -u <script> <flags…>` (flags already
     // validated + assembled by `shard_exporter_flags`).
@@ -4301,6 +4460,97 @@ mod tests {
         let flags = shard_exporter_flags(&args).expect("layer-split/stage flags");
         assert!(has_pair(&flags, "--layer-split", "8"));
         assert!(has_pair(&flags, "--stage", "1"));
+    }
+
+    /// `--revision` and `--text-only` reach the exporter only when set, so a
+    /// shard without them passes exactly today's flags.
+    #[test]
+    fn shard_flags_forward_revision_and_text_only() {
+        let base = [
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "-o",
+            "o",
+            "--num-stages",
+            "2",
+        ];
+        let plain = shard_exporter_flags(&parse_shard(&base)).expect("plain flags");
+        assert!(!plain
+            .iter()
+            .any(|f| f == "--revision" || f == "--text-only"));
+        let mut argv = base.to_vec();
+        argv.extend(["--revision", "abc123", "--text-only"]);
+        let flags = shard_exporter_flags(&parse_shard(&argv)).expect("flags");
+        assert!(has_pair(&flags, "--revision", "abc123"));
+        assert_eq!(flags.last().map(String::as_str), Some("--text-only"));
+    }
+
+    /// `cascadia export` parses into `ExportArgs` and forwards only what was set.
+    #[test]
+    fn export_args_parse_and_forward() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "export",
+            "--model",
+            "Qwen/Qwen2-VL-2B-Instruct",
+            "--output-dir",
+            "out",
+        ])
+        .expect("parse export");
+        let Command::Export(args) = cli.cmd else {
+            panic!("expected export subcommand");
+        };
+        assert_eq!(
+            export_flags(&args),
+            [
+                "--model",
+                "Qwen/Qwen2-VL-2B-Instruct",
+                "--output-dir",
+                "out"
+            ]
+        );
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "export",
+            "--model",
+            "m",
+            "-o",
+            "out",
+            "--weight-format",
+            "int8",
+            "--revision",
+            "r1",
+            "--python",
+            "/usr/bin/python3",
+        ])
+        .expect("parse export");
+        let Command::Export(args) = cli.cmd else {
+            panic!("expected export subcommand");
+        };
+        assert_eq!(args.python.as_deref(), Some("/usr/bin/python3"));
+        let flags = export_flags(&args);
+        assert!(has_pair(&flags, "--weight-format", "int8"));
+        assert!(has_pair(&flags, "--revision", "r1"));
+        assert!(!flags.iter().any(|f| f == "--python"));
+    }
+
+    /// Every module the exporter imports lands beside it in the flat temp dir.
+    #[test]
+    fn embedded_exporter_is_written_flat() {
+        let dir = tempfile::tempdir().unwrap();
+        write_embedded_exporter(dir.path()).unwrap();
+        for name in [
+            "export_shards.py",
+            "export_gemma4_text.py",
+            "cut_vlm_lm.py",
+            "longrope.py",
+            "cascadia_export.py",
+            "requirements.txt",
+        ] {
+            assert!(dir.path().join(name).is_file(), "{name} missing");
+        }
     }
 
     /// `--target npu` parses into the NPU variant.
