@@ -19,8 +19,8 @@
 //! unconfined — cross-tenant KV *reuse* on that path never crosses the wire and is an H.1 §5
 //! non-goal. `kv_capture`/`captures` (the multi-stage worker stash) carries the tenant as a VALUE
 //! (H.1a close): the CaptureV2 frame relays the head's turn tenant, consumer-inserted blobs are
-//! tagged with the asserted partner, and `export` confines tagged entries while an untagged one
-//! ("" — legacy v1 frame or tenant-less turn) stays readable by any partner.
+//! tagged with the asserted partner, and `export` serves an entry only to the exact tenant it was
+//! stashed under — an untagged one ("" — v1 frame, tenant-less turn) only to "".
 //! **Sharded serve:** under `kv_coord` a `total>1` engine gets the configured cache size and the
 //! head seeds it after a chain-wide `CAPTURE` (engine.rs), so a sharded holder does serve. WITHOUT
 //! the feature the cache is capacity-0 and lookup/insert degrade to None/no-op — the "sharded gap"
@@ -577,9 +577,9 @@ impl KvCoordination for SparseMoEEngine {
             off
         } else if let Some((cap_ns, tokens, snap)) = self.kv_capture.get(&expected_epoch) {
             // A capture that carries a tenant (CaptureV2 / tagged consumer-insert) is confined to
-            // it. An UNTAGGED capture ("" — every legacy v1 frame, and a tenant-less turn) stays
-            // readable by any partner, so the certified multi-stage cross-chain pull is unchanged.
-            if !cap_ns.is_empty() && cap_ns != partner {
+            // it, and an UNTAGGED capture ("" — a v1 frame, i.e. a tenant-less turn) to "". See
+            // `SparseMoeKvHolder::export` for why "" no longer serves any partner.
+            if cap_ns != partner {
                 tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
                     epoch = expected_epoch);
                 return None;
@@ -749,7 +749,7 @@ pub(crate) struct SparseHolderState {
     /// Holder-internal NEGOTIATE→GET correlation (mirror of the engine's `kv_offers`).
     offers: KvOfferStash<KvSnapshot>,
     /// Mirror of the engine's `kv_capture` (multi-stage per-rank captures). `pub(crate)` for
-    /// mirroring. Tenant as VALUE, epoch-only key ("" = untagged/legacy, served to any partner);
+    /// mirroring. Tenant as VALUE, epoch-only key ("" = untagged, served only to "");
     /// see `SparseMoEEngine::kv_capture`.
     pub(crate) captures: std::collections::HashMap<u64, (String, Vec<i32>, KvSnapshot)>,
     /// Fingerprint snapshotted at holder creation (the prefix cache's lookup key).
@@ -814,14 +814,20 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
         // plane0 7/7 -> 5/7 and plane1 10/10 -> 6/10, "B tail never restored from a carried blob".
         //
         // H.1a close: the CaptureV2 frame carries the head's turn tenant, the stash entry is
-        // tagged with it, and a tagged entry is confined to that tenant here. An UNTAGGED entry
-        // ("" — a legacy v1 frame, or a tenant-less turn including the `kv_tenant_hint_missing`
-        // expiry path) stays readable by any partner: refusing those is exactly what bfae9ffe
-        // did, one frame later. Do not "fix" the fallback by deleting it or refusing "".
+        // tagged with it, and every entry is served only to the tenant it was stashed under — an
+        // UNTAGGED one ("" — a v1 frame, or a tenant-less turn including the
+        // `kv_tenant_hint_missing` expiry path) only to "". A current head sends v1 only for a
+        // tenant-less turn and its pullers then assert "" as well, so nothing that warmed before
+        // goes cold: the head's `lookup` already refused a mismatched tenant, and the pull is
+        // all-or-nothing. What changes is that a GET naming another tenant no longer gets this
+        // rank's slice (tokens included). The cost is a chain whose head is an OLDER build that
+        // sent v1 for tenant turns: its rank>0 donors now answer `get_none` and the pull goes
+        // cold (bfae9ffe's symptom), which the lockstep pin rules out. Keep the fallback itself:
+        // deleting it is bfae9ffe.
         let (prefix, snap) = if let Some(off) = g.offers.take(partner, expected_epoch) {
             off
         } else if let Some((cap_ns, tokens, snap)) = g.captures.get(&expected_epoch) {
-            if !cap_ns.is_empty() && cap_ns != partner {
+            if cap_ns != partner {
                 tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
                     epoch = expected_epoch);
                 return None;
