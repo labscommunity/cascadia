@@ -1808,6 +1808,12 @@ def _write_sidecar(args, routed):
                         source_dir=(routed or {}).get("source_dir"))
 
 
+def _gemma4_per_layer(cfg: dict) -> bool:
+    """True for a Gemma 4 with per-layer embeddings (E2B / E4B)."""
+    text = cfg.get("text_config") or cfg
+    return bool(text.get("hidden_size_per_layer_input"))
+
+
 def _source_identity(args):
     """The source's model_id, repo and resolved revision. Offline (or with
     the hub unreachable) the revision stays unknown rather than failing the
@@ -2093,6 +2099,22 @@ def _shard():
                     "the generic exporter."
                 )
 
+            # The IR surgery cuts vision trees only without per-layer
+            # embeddings (26B / 31B). An E2B / E4B vision tree comes from the
+            # torch exporter, which needs the safetensors snapshot as well as
+            # this export's vision encoder.
+            if _gemma4_per_layer(_raw_cfg) and not args.text_only:
+                raise SystemExit(
+                    f"{args.model} is a Gemma 4 E2B / E4B export (per-layer "
+                    f"embeddings), whose vision tree the IR surgery cannot cut. "
+                    f"Make it with the gemma4 engine's exporter:\n"
+                    f"  python tools/export_gemma4.py --model <google/gemma-4-E2B-it "
+                    f"or -E4B-it snapshot> --output-dir <tree> --num-stages "
+                    f"{args.num_stages} --vision {args.model}\n"
+                    f"or pass --text-only to shard its text tower alone (it then "
+                    f"serves text only)."
+                )
+
             _here = os.path.dirname(os.path.abspath(__file__))
             # in-repo layout (tools/gemma4_surgery/) and the flat temp dir the
             # CLI extracts the embedded scripts into
@@ -2114,12 +2136,24 @@ def _shard():
         # builds the text tower only; its vision tree comes from the
         # OpenVINO export (the branch above).
         if _raw_cfg.get("vision_config") is not None and not args.text_only:
+            if _gemma4_per_layer(_raw_cfg):
+                how = (
+                    f"for E2B / E4B (per-layer embeddings) run `cascadia export "
+                    f"--model {args.model} --output-dir <ov dir>`, then `python "
+                    f"tools/export_gemma4.py --model <snapshot of {args.model}> "
+                    f"--output-dir <tree> --num-stages {args.num_stages} --vision "
+                    f"<ov dir>`"
+                )
+            else:
+                how = (
+                    f"run `cascadia export --model {args.model} --output-dir <dir>` "
+                    f"and shard <dir>"
+                )
             raise SystemExit(
-                f"{args.model} is a raw Gemma 4 vision-language checkpoint; `cascadia "
-                f"shard` makes Gemma 4 vision trees from its OpenVINO export. Run "
-                f"`cascadia export --model {args.model} --output-dir <dir>` and shard "
-                f"<dir>, or pass --text-only to shard the text tower alone (it then "
-                f"serves text only)."
+                f"{args.model} is a raw Gemma 4 vision-language checkpoint, and "
+                f"`cascadia shard` builds Gemma 4 vision trees from its OpenVINO "
+                f"export: {how}. Or pass --text-only to shard the text tower alone "
+                f"(it then serves text only)."
             )
         print(
             "Detected Gemma 4 - dispatching to the dedicated exporter "
