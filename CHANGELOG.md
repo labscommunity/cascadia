@@ -1,5 +1,88 @@
 # Changelog
 
+## [0.2.6](https://github.com/labscommunity/cascadia/compare/v0.2.5...v0.2.6) (2026-10-26)
+
+
+### Features
+
+* **cli:** --elastic memory posture + --ov-config passthrough (Linux interposer, Windows Detours hook, conformance suites) ([f09c84a](https://github.com/labscommunity/cascadia/commit/f09c84a646254a8bdf91c6140170ba8466b42051))
+* **doctor:** report the OpenVINO GenAI version built against and loaded ([2f9f0fb](https://github.com/labscommunity/cascadia/commit/2f9f0fb05035e4ee01819a11251ebb234c8ae7c3))
+* **inkling:** multi-stream decode (single stage + pipeline micro-batches), cache-aware batched MoE ([98a0feb](https://github.com/labscommunity/cascadia/commit/98a0feb6eb97750915fac93237bb8759770c3d72))
+
+
+### Bug Fixes
+
+* **conformance:** fail C3 closed when the stock leg also survives; bind test servers to loopback ([9db0f46](https://github.com/labscommunity/cascadia/commit/9db0f46bdf990ec4f6c2659f42c9c6694f79b24d))
+* **deploy:** ranks listen on RELAY_PORT+rank; apply-update keeps the operator's fleet.env ([f5eba35](https://github.com/labscommunity/cascadia/commit/f5eba351c3541d50e83909627124e8e60a8308fb))
+* **deps:** bump quinn-proto to 0.11.19 for October advisories ([932548e](https://github.com/labscommunity/cascadia/commit/932548ed331e1ea7e0a0800a8bcffa59b90f15a2))
+* **deps:** bump rustls-webpki to 0.103.16 for RUSTSEC-2026-0382 ([7bfe20d](https://github.com/labscommunity/cascadia/commit/7bfe20d8df18ec63b669f5a2c0ab1b00d288ccd0))
+* **deps:** bump tokio to 1.53.3 for RUSTSEC-2026-0386 ([7c4741f](https://github.com/labscommunity/cascadia/commit/7c4741fd2c69321c73ea8fd9a41a65f24a205b7e))
+* **deps:** bump webpki-roots to 1.0.11 for RUSTSEC-2026-0381 ([8f97722](https://github.com/labscommunity/cascadia/commit/8f97722cb77cb8e3a2abe92630b2dfc0ac7f8e11))
+* **deps:** clear October 2026 rustls-webpki, webpki-roots, quinn-proto and tokio advisories ([75a2ca2](https://github.com/labscommunity/cascadia/commit/75a2ca2cd933fd4d2be581b476e3c220afb0333d))
+* **elastic:** build the interposer on Linux only ([aa5a932](https://github.com/labscommunity/cascadia/commit/aa5a932af80bd257cb988c4daec1d5f90362cdf0))
+* **engine:** a local failure on rank 0 no longer re-dials a healthy downstream ([2d65b98](https://github.com/labscommunity/cascadia/commit/2d65b98b55271413900544424e1460adcd57f24c))
+* **engine:** close the link when a worker stream frame fails ([6c3f10e](https://github.com/labscommunity/cascadia/commit/6c3f10e1b2ba026788200f3f67ff8ca278d224ed))
+* **engine:** drain owed stream replies on a local failure ([5ced734](https://github.com/labscommunity/cascadia/commit/5ced7345df727bb5213e7c31f26361f4c3d92a4d))
+* **engine:** feed a lone long prompt until it ends or a chunk comes out ([804f686](https://github.com/labscommunity/cascadia/commit/804f686b4a4310774f49481813e974311bcde2ad))
+* **engine:** hold back stream text on a token decode error ([3f4cc34](https://github.com/labscommunity/cascadia/commit/3f4cc348a0d277053c08a26a6f837eef164fb362))
+* **engine:** log failed idle re-dials of the downstream link ([56a001a](https://github.com/labscommunity/cascadia/commit/56a001a33fbcb6175092331d56bdcee467c91758))
+* **engine:** long prompts travel as StreamFeed windows instead of taking the chain down ([ef07a27](https://github.com/labscommunity/cascadia/commit/ef07a274912246fb78dd448469f3fdc40809a669))
+* **engine:** reject stream frames for a free or repeated slot ([3683e57](https://github.com/labscommunity/cascadia/commit/3683e57ec928d5a730d03ce2fa45b70d49d7de29))
+* **engine:** warn when a stream or API env var is rejected ([4122ce0](https://github.com/labscommunity/cascadia/commit/4122ce0d08bc581e762728cb58e1657d610515e7))
+* **inkling:** the batched MoE path grows the expert cache on decode rows only ([91f8056](https://github.com/labscommunity/cascadia/commit/91f80564ac40506bb1f4d6cddc2f063cc48d0fdd))
+* **inkling:** warn when CASCADIA_INKLING_EXPERT_CACHE_MIB is rejected ([c80cd6d](https://github.com/labscommunity/cascadia/commit/c80cd6d9b8f4accc36f84d6ecb8a8ff32cd9142e))
+* **setup:** keep setup-openvino.ps1 ASCII so Windows PowerShell 5.1 parses it ([60acb67](https://github.com/labscommunity/cascadia/commit/60acb67a9d7e1e49bb5d1b50511e250f39d08003))
+* **setup:** quote the printed ov_sdk.py path for spaced checkouts ([c0b9134](https://github.com/labscommunity/cascadia/commit/c0b9134af9c463f8f1a7b1578908e244b66fc924))
+* **setup:** read the OpenVINO GenAI pin from release.yml in setup scripts ([eeafd05](https://github.com/labscommunity/cascadia/commit/eeafd0501362483aee48dbfe6acf950584295663))
+* **sparse-moe:** spell the StreamFeed frame code without a suffix-like digit group ([88e2eea](https://github.com/labscommunity/cascadia/commit/88e2eeafdfc0a2e90afeb492a417b3d11317e7cb))
+* **transport:** wait_readable lives on ActivationStream after the UDS merge ([fd32730](https://github.com/labscommunity/cascadia/commit/fd327303e362351418fc44074d765d8965d63ef1))
+
+
+### Documentation
+
+* choosing the OpenVINO version (INSTALL.md, setup scripts) ([796cc98](https://github.com/labscommunity/cascadia/commit/796cc988d3bef7897fef3df8d6e74202bd47f6ff))
+* **engine:** put each doc comment on its own item ([60969df](https://github.com/labscommunity/cascadia/commit/60969dfa8da09ba38624b7036453077e2c628931))
+* **engine:** update stale multi-stream comments ([eb0c789](https://github.com/labscommunity/cascadia/commit/eb0c7899e018bbed26f1f1cebf5317b0f470c056))
+* **inkling:** correct the expert cache cap and restore open follow-ups ([2ddc715](https://github.com/labscommunity/cascadia/commit/2ddc715540df8fb21a30d7660d5af20bfb745f2d))
+* **inkling:** make the multi-stream perf note match the code and tests ([030f83f](https://github.com/labscommunity/cascadia/commit/030f83fb2996e7802e2c745635d0caef5973ca1f))
+* **inkling:** note that the f32 fused MoE does not compile on the Arc 140V ([6996ac1](https://github.com/labscommunity/cascadia/commit/6996ac1439dff30088a84bc472803e63ad409756))
+* **inkling:** remove deploy kit and fleet tool references from the perf note ([7972943](https://github.com/labscommunity/cascadia/commit/7972943d12269e467ebb9220d360472d1837a997))
+* **qwen3.8:** tell 2026.4.1.0 bundle users when to run convert_tokenizer ([caed2bf](https://github.com/labscommunity/cascadia/commit/caed2bf6088e07dd5f27b932f51ae9ab6e3fab19))
+* refresh OpenVINO GenAI examples to the 2026.4.1.0 pin ([2fab62e](https://github.com/labscommunity/cascadia/commit/2fab62e5e23e6b54abf0b2c30dcaee929937c027))
+
+
+### Testing
+
+* **conformance:** runtime checks for the --elastic posture (Linux cgroup suite + Windows psapi/Job Object port), with the review fixes: C3/W4 fail closed when the cap is above stock's knee, loopback-bound test servers, documented C1/C3 criteria. ([2c909c4](https://github.com/labscommunity/cascadia/commit/2c909c4e219523062e5b6c16ecae8b8a4516df5c))
+* **inkling:** a link loss while streams are in flight ([c7e19b3](https://github.com/labscommunity/cascadia/commit/c7e19b3b5ea6d41943b376c0d908854bb05aa0a4))
+* **inkling:** a rank-0 decode panic keeps the multi-stream link ([6feec8d](https://github.com/labscommunity/cascadia/commit/6feec8dc103a582158eebe9fd7463e6784913172))
+* **inkling:** assert that four groups keep all four ranks busy at once ([c9e10c5](https://github.com/labscommunity/cascadia/commit/c9e10c5f1ae21af9d900b5f3bd0d4d75c9f45fed))
+* **inkling:** cancel a stream during decode, pipeline and single stage ([21a58b1](https://github.com/labscommunity/cascadia/commit/21a58b17613b1cced78008dced128aeec3e7afbb))
+* **inkling:** check cache hits per pass and that prefill does not grow the cache ([fdd64f5](https://github.com/labscommunity/cascadia/commit/fdd64f5d9f7f7f5b5b94ea46d7c12127d2c3e404))
+* **inkling:** check that a cancelled feed leaves no stream on rank 0 ([a144a57](https://github.com/labscommunity/cascadia/commit/a144a57597340ad4fc0010f577da70482f2a549a))
+* **inkling:** cover the slot-count mismatch and the context cap ([0bec261](https://github.com/labscommunity/cascadia/commit/0bec261e5db58507d9dff7f8994804ffbb8bb5e1))
+* **inkling:** cover the stream-mode last rank's idle wait ([0a55a69](https://github.com/labscommunity/cascadia/commit/0a55a691ecb0426d62af46f91a40e614e214243f))
+* **inkling:** drive a lone multi-window prompt through the runner ([bb4d9e8](https://github.com/labscommunity/cascadia/commit/bb4d9e8f223151aee00abcec4d121e51442d79da))
+* **inkling:** the single-stage multi-stream scheduler against the one-task path ([5c2fa9d](https://github.com/labscommunity/cascadia/commit/5c2fa9d93162f16491fef95e88aff0a241d65905))
+* **transport:** cover wait_readable on TCP and Unix sockets ([b0428ab](https://github.com/labscommunity/cascadia/commit/b0428abc0322ddfdd518946580dd53953c8d4348))
+
+
+### CI
+
+* pin OpenVINO GenAI 2026.4.1 stable and make the bundled version selectable (ov_version, dry_run, scripts/ov_sdk.py) ([9e0cedc](https://github.com/labscommunity/cascadia/commit/9e0cedca6b9460325c510aafae326c2ca216c395))
+* pin validated OpenVINO GenAI 2026.4.1 stable ([404c5cd](https://github.com/labscommunity/cascadia/commit/404c5cdc9077fc500b4a7a541ec391fd69b7b036))
+* **release:** don't let OV_EXTRA_VERSIONS variant legs block promotion ([edf10e9](https://github.com/labscommunity/cascadia/commit/edf10e9b6afdca4a4b865949dd8c2ff5d980f046))
+* **release:** fail the bundle smoke test on doctor's GenAI skew warning ([b0adb38](https://github.com/labscommunity/cascadia/commit/b0adb3849d02b0c83cf5af9e74e7a5405cac74d7))
+* **release:** make the bundled OpenVINO GenAI version selectable ([d06ae35](https://github.com/labscommunity/cascadia/commit/d06ae351841c40bcb04713fef5e79cbd8f3e976e))
+* **release:** only trust a published .sha256 that names the fetched archive ([82361c5](https://github.com/labscommunity/cascadia/commit/82361c5fcda4ea6d08168fed124ea7b1562fba11))
+* **release:** warn on missing variant bundles in promote ([91e54ed](https://github.com/labscommunity/cascadia/commit/91e54edcb2ceaffa5451e9d504105373b467d3e6))
+
+
+### Miscellaneous
+
+* **deps:** bump rustls to 0.23.46 ([833e743](https://github.com/labscommunity/cascadia/commit/833e74328138f5be3279260e52ec3e21fbdfdbfe))
+* **inkling:** drop the fleet deployment kit and the streams showcase from this PR ([6c03aeb](https://github.com/labscommunity/cascadia/commit/6c03aeb75f19f01660bdbbfe73c71d9c4503ce6f))
+
 ## [0.2.5](https://github.com/labscommunity/cascadia/compare/v0.2.4...v0.2.5) (2026-10-01)
 
 
