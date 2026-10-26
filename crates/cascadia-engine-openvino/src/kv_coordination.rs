@@ -620,6 +620,13 @@ impl OvKvCache {
         if tokens.is_empty() || blob.is_empty() {
             return;
         }
+        // The plane never moves a media turn's KV, so a pulled blob keyed by image stand-ins is
+        // forged; filed here, a later local image turn would warm-resume from it.
+        if is_media_key(&tokens) {
+            tracing::info!(target: "cascadia::kv", event = "kv_insert_refused_media",
+                tokens = tokens.len());
+            return;
+        }
         // Tag the capture with the SAME tenant as the entry beside it. This used to call the
         // untagged `capture_under_epoch` (LOCAL_NS) while `insert_entry` tagged its copy, which
         // filed a tenant's pulled blob in the wrong namespace (and, while `serve` still let an
@@ -724,6 +731,12 @@ impl OvKvCache {
         } else {
             return None;
         };
+        // A media turn's entry (an engine-local capture: this box's image warm resume and RESTORE
+        // read it) is never handed out over the wire.
+        if is_media_key(&tokens) {
+            tracing::info!(target: "cascadia::kv", event = "kv_serve_refused_media", epoch);
+            return None;
+        }
         // Probe A (serve side): identity of exactly what this holder is about to hand out, plus which
         // store it came from. NOTE the check below is LENGTH-only — it never compares tokens — so a
         // capture stored under a colliding synthesized epoch with the same length but different tokens
@@ -745,6 +758,14 @@ impl OvKvCache {
     /// NEGOTIATE: longest cached full-sequence that is a prefix of `token_ids`; stash it as an offer
     /// under its content epoch for the paired GET. Returns `(epoch, prefix_len)`. Engine-agnostic.
     pub(crate) fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        // A NEGOTIATE carries tokenized text. Image stand-ins are computable from the tenant and
+        // the image hash, so a request carrying them could only be forged to reach a media turn's
+        // entry, which this box keeps for its own warm resume and never serves.
+        if is_media_key(token_ids) {
+            tracing::info!(target: "cascadia::kv", event = "kv_lookup_refused_media",
+                tokens = token_ids.len());
+            return None;
+        }
         let (prefix, blob) = {
             let Some(e) = self.longest_prefix(partner, token_ids) else {
                 self.log_prefix_miss(partner, token_ids);
@@ -2181,6 +2202,45 @@ mod tests {
     /// A media turn leaves the plane-served mirror untouched, on the head (token-keyed) and on a
     /// worker (epoch-keyed); a text turn still lands in both. The engine-local cache, which the
     /// image warm resume reads, is a separate `OvKvCache` the guard never sees.
+    /// The engine-local cache keeps media turns for this box (warm resume, RESTORE), but the
+    /// wire-facing calls never reach them, even with forged image stand-ins.
+    #[test]
+    fn media_entries_are_local_only() {
+        let ids: Vec<i64> = vec![1, 2, 9, 9, 3];
+        let media = crate::vision_kv::cache_key(&ids, 9, &[[5u8; 32]], &[2], "tenant-a");
+        let len = media.len() as u32;
+        let epoch = synth_epoch(&media);
+        let mut c = OvKvCache::default();
+        c.capture("tenant-a", media.clone(), vec![0xAA; 8]);
+        c.capture_under_epoch_ns("tenant-a", epoch, media.clone(), vec![0xBB]);
+
+        let mut forged = media.clone();
+        forged.push(4);
+        assert_eq!(
+            c.lookup("tenant-a", &forged),
+            None,
+            "forged NEGOTIATE reached a media turn"
+        );
+        assert_eq!(
+            c.serve("tenant-a", epoch, len),
+            None,
+            "media capture served"
+        );
+        let mut planted = OvKvCache::default();
+        planted.insert_both("tenant-a", media.clone(), vec![0xCC]);
+        assert!(
+            planted.entries.is_empty() && planted.captures.is_empty(),
+            "forged insert filed"
+        );
+
+        // This box's own uses are untouched.
+        assert!(
+            c.take_warm("tenant-a", &forged).is_some(),
+            "local image warm resume"
+        );
+        assert!(c.take_capture(epoch).is_some(), "rank's own RESTORE");
+    }
+
     #[test]
     fn media_turns_stay_out_of_the_plane_cache() {
         let ids: Vec<i64> = vec![1, 2, 9, 9, 3];
