@@ -3788,7 +3788,7 @@ mod python_tests {
         let line = export_pip_install_line("python3");
         assert!(line.starts_with("python3 -m pip install "), "{line}");
         // Double quotes: the only form valid in sh, zsh, PowerShell and cmd.exe.
-        assert!(line.contains("\"transformers>=5.2,<5.5\""), "{line}");
+        assert!(line.contains("\"transformers>=5.5,<5.6\""), "{line}");
         assert!(line.contains("\"safetensors>=0.4\""), "{line}");
         // Comments and blank lines from requirements.txt never leak through.
         assert!(!line.contains('#'), "{line}");
