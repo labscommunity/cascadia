@@ -86,6 +86,14 @@ pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
     fnv1a64(&buf)
 }
 
+/// True when a capture key belongs to a media turn: image soft tokens are keyed by stand-ins
+/// for each image's hash (`vision_kv::cache_key`, `pad_cache_id`), which set bit 31 and so read
+/// as negative here, where every real token id is non-negative. The CAPTURE frame carries this
+/// key, so a worker rank can tell a media turn from the frame alone.
+pub(crate) fn is_media_key(tokens: &[i32]) -> bool {
+    tokens.iter().any(|&t| t < 0)
+}
+
 /// FNV-1a digest of raw bytes — identity only, for cross-rank / cross-mode comparison in the logs.
 ///
 /// Deliberately over RAW BYTES, never over lengths or manifest fields: an earlier probe compared the
@@ -542,6 +550,37 @@ impl OvKvCache {
             },
         );
         self.entries.truncate(KV_MAX_ENTRIES);
+    }
+
+    /// Holder mirror of [`Self::capture`]: the plane-served copy (`kv_share`). A media turn is
+    /// left out: the plane never pulls, takes or replicates media-turn KV (enterprise D9), and
+    /// with `KV_MAX_ENTRIES` slots shared, a media capture here only evicts a text session's
+    /// servable entry. The engine-local copy still holds it for this box's own image warm resume.
+    pub(crate) fn capture_for_plane(&mut self, partner: &str, tokens: Vec<i32>, blob: Vec<u8>) {
+        if is_media_key(&tokens) {
+            tracing::debug!(target: "cascadia::kv", event = "kv_share_skip_media",
+                tokens = tokens.len());
+            return;
+        }
+        self.capture(partner, tokens, blob);
+    }
+
+    /// Holder mirror of [`Self::capture_under_epoch_ns`] (a worker rank's CAPTURE): a media turn
+    /// is left out, as in [`Self::capture_for_plane`]. The rank's own RESTORE reads the
+    /// engine-local copy, so same-chain image warm resume is unaffected.
+    pub(crate) fn capture_under_epoch_for_plane(
+        &mut self,
+        partner: &str,
+        epoch: u64,
+        tokens: Vec<i32>,
+        blob: Vec<u8>,
+    ) {
+        if is_media_key(&tokens) {
+            tracing::debug!(target: "cascadia::kv", event = "kv_share_skip_media",
+                epoch, tokens = tokens.len());
+            return;
+        }
+        self.capture_under_epoch_ns(partner, epoch, tokens, blob);
     }
 
     /// §8 worker: stash this rank's blob under the head-broadcast `(epoch, tokens)`, untagged. The
@@ -2126,6 +2165,58 @@ mod tests {
         // and probes `export`/`serve` directly, never touching `lookup`.
         assert_eq!(c.serve("tenant-b", epoch, len), None);
         assert!(c.serve("tenant-a", epoch, len).is_some());
+    }
+
+    /// A media turn's capture key (image soft tokens as hash stand-ins) reads as media, a text
+    /// key does not, and the real `vision_kv` key is what both ranks see.
+    #[test]
+    fn media_keys_are_told_apart_from_text() {
+        let ids: Vec<i64> = vec![1, 2, 9, 9, 9, 3];
+        let key = crate::vision_kv::cache_key(&ids, 9, &[[7u8; 32]], &[3], "tenant-a");
+        assert!(is_media_key(&key), "{key:?}");
+        assert!(!is_media_key(&[1, 2, 9, 9, 9, 3]));
+        assert!(!is_media_key(&[]));
+    }
+
+    /// A media turn leaves the plane-served mirror untouched, on the head (token-keyed) and on a
+    /// worker (epoch-keyed); a text turn still lands in both. The engine-local cache, which the
+    /// image warm resume reads, is a separate `OvKvCache` the guard never sees.
+    #[test]
+    fn media_turns_stay_out_of_the_plane_cache() {
+        let ids: Vec<i64> = vec![1, 2, 9, 9, 3];
+        let media = crate::vision_kv::cache_key(&ids, 9, &[[5u8; 32]], &[2], "tenant-a");
+        let text = vec![1, 2, 4, 4, 3];
+        let mut c = OvKvCache::default();
+        c.capture_for_plane("tenant-a", media.clone(), vec![0xAA; 8]);
+        c.capture_under_epoch_for_plane("tenant-a", synth_epoch(&media), media.clone(), vec![0xBB]);
+        assert!(
+            c.entries.is_empty() && c.captures.is_empty(),
+            "a media turn took a slot"
+        );
+        assert_eq!(c.lookup("tenant-a", &media), None);
+        assert_eq!(
+            c.serve("tenant-a", synth_epoch(&media), media.len() as u32),
+            None
+        );
+
+        c.capture_for_plane("tenant-a", text.clone(), vec![0xCC; 8]);
+        assert!(
+            c.lookup("tenant-a", &text).is_some(),
+            "a text turn must still capture"
+        );
+        let epoch = synth_epoch(&text);
+        c.capture_under_epoch_for_plane("tenant-a", epoch, text.clone(), vec![0xDD]);
+        assert!(c.serve("tenant-a", epoch, text.len() as u32).is_some());
+
+        // A full cache of text sessions is not disturbed by media turns.
+        let mut c = OvKvCache::default();
+        for i in 0..KV_MAX_ENTRIES as i32 {
+            c.capture_for_plane(LOCAL_NS, vec![100 + i, 1], vec![1]);
+        }
+        for _ in 0..KV_MAX_ENTRIES {
+            c.capture_for_plane(LOCAL_NS, media.clone(), vec![2]);
+        }
+        assert!((0..KV_MAX_ENTRIES as i32).all(|i| c.lookup(LOCAL_NS, &[100 + i, 1, 7]).is_some()));
     }
 
     /// The untenanted namespace (`LOCAL_NS`, "") on the head's token-keyed path (lookup, serve of

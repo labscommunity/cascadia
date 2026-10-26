@@ -1660,10 +1660,11 @@ impl Gemma4Engine {
                         }
                         // Mirror into the lock-free holder cache so a busy node can serve this turn's
                         // KV to a moved peer without the engine lock.
+                        // A media turn stays out of it and keeps only the local copy below.
                         self.kv_share
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .capture(&tenant, full.clone(), blob.clone());
+                            .capture_for_plane(&tenant, full.clone(), blob.clone());
                         self.kv.capture(&tenant, full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "gemma4 get_state_blob skipped"),
@@ -2034,11 +2035,17 @@ impl Gemma4Engine {
                     (e, tk, crate::kv_coordination::LOCAL_NS.to_string())
                 };
                 if let Ok(blob) = self.runtime.get_state_blob() {
-                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here),
+                    // except a media turn's slice: RESTORE reads `self.kv` below, not the mirror.
                     self.kv_share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob.clone());
+                        .capture_under_epoch_for_plane(
+                            &tenant,
+                            epoch,
+                            tokens.clone(),
+                            blob.clone(),
+                        );
                     self.kv
                         .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
                 }
