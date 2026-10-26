@@ -92,3 +92,67 @@ def test_gemma4_ir_unreadable_config_fails_loudly(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", _argv(model, tmp_path / "out"))
     with pytest.raises(SystemExit, match="config.json"):
         export_shards.main()
+
+
+E2B_TEXT = {"model_type": "gemma4_text", "hidden_size_per_layer_input": 256}
+BIG_TEXT = {"model_type": "gemma4_text", "hidden_size_per_layer_input": 0}
+
+
+def _stub_ir_with(dirpath, text_config):
+    dirpath.mkdir(parents=True, exist_ok=True)
+    (dirpath / "config.json").write_text(json.dumps(
+        {"model_type": "gemma4", "text_config": text_config, "vision_config": {}}))
+    (dirpath / "openvino_language_model.xml").write_text("")
+    return dirpath
+
+
+def _surgery_calls(monkeypatch):
+    import types
+
+    calls = []
+    stub = types.ModuleType("export_gemma4_text")
+    stub.run_export = lambda **kw: calls.append(kw)
+    monkeypatch.setitem(sys.modules, "export_gemma4_text", stub)
+    return calls
+
+
+def test_e2b_e4b_export_is_pointed_at_the_torch_exporter(tmp_path, monkeypatch):
+    """The IR surgery cannot cut an E2B / E4B vision tree (per-layer
+    embeddings); `shard` names the exporter that can instead of failing in
+    the surgery."""
+    calls = _surgery_calls(monkeypatch)
+    model = _stub_ir_with(tmp_path / "ir", E2B_TEXT)
+    monkeypatch.setattr(sys, "argv", _argv(model, tmp_path / "out"))
+    with pytest.raises(SystemExit) as e:
+        export_shards.main()
+    assert "tools/export_gemma4.py" in str(e.value) and "--text-only" in str(e.value)
+    assert calls == []
+
+
+def test_e2b_e4b_text_only_gets_the_text_tree(tmp_path, monkeypatch):
+    calls = _surgery_calls(monkeypatch)
+    model = _stub_ir_with(tmp_path / "ir", E2B_TEXT)
+    monkeypatch.setattr(sys, "argv", _argv(model, tmp_path / "out", "--text-only"))
+    export_shards.main()
+    assert [c["vision"] for c in calls] == [False]
+
+
+def test_26b_31b_export_gets_the_vision_tree(tmp_path, monkeypatch):
+    calls = _surgery_calls(monkeypatch)
+    model = _stub_ir_with(tmp_path / "ir", BIG_TEXT)
+    monkeypatch.setattr(sys, "argv", _argv(model, tmp_path / "out"))
+    export_shards.main()
+    assert [c["vision"] for c in calls] == [True]
+
+
+@pytest.mark.parametrize("text,needle", [(E2B_TEXT, "tools/export_gemma4.py"),
+                                         (BIG_TEXT, "and shard <dir>")])
+def test_raw_gemma4_refusal_names_the_working_path(tmp_path, monkeypatch, text, needle):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "config.json").write_text(json.dumps(
+        {"model_type": "gemma4", "text_config": text, "vision_config": {}}))
+    monkeypatch.setattr(sys, "argv", _argv(raw, tmp_path / "out"))
+    with pytest.raises(SystemExit, match="raw Gemma 4") as e:
+        export_shards.main()
+    assert needle in str(e.value)
