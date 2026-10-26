@@ -400,10 +400,10 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
   `OpenVINO/Qwen3-VL-4B-Instruct-int4-ov`) with `cut_vlm_lm.py`, the family read from
   `config.json`;
 - exports a raw checkpoint with optimum-intel first, then cuts it. With the exporter pins
-  (`tools/requirements.txt`, transformers 5.2 to 5.4) optimum-intel 2.2 exports LLaVA,
-  LLaVA-NeXT, Mistral 3 and Gemma 3 this way. Its Qwen VL, Phi-3.5-vision and InternVL
-  exporters need an older transformers and its Gemma 4 exporter a newer one, so for those
-  `shard` asks for the OpenVINO export instead;
+  (`tools/requirements.txt`, transformers 5.5.x) optimum-intel 2.2 exports LLaVA,
+  LLaVA-NeXT, Mistral 3, Gemma 3 and Gemma 4 this way. Its Qwen VL, Phi-3.5-vision and
+  InternVL exporters need an older transformers, so for those `shard` asks for the
+  OpenVINO export instead;
 - routes a Gemma 4 OpenVINO export to `export_gemma4_text.py --vision` and Qwen3.5/3.6 to
   `export_qwen36_moe.py`, as before;
 - refuses any other VLM (Qwen2-VL, LLaVA-1.5, mllama, PaliGemma, ...), naming it.

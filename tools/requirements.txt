@@ -1,15 +1,19 @@
 # Exporter toolchain pins (#77 Part A).
 #
 # Floor rationale:
-# - transformers >= 5.2 — first release carrying `qwen3_5_moe` modeling code
-#   (Qwen3.5/Qwen3.6); < 5.5 per export_gemma4.py's documented quirks.
+# - transformers >= 5.5 — the floor optimum-intel 2.2's Gemma 4 exporter sets
+#   (`cascadia export` / `cascadia shard` of a raw Gemma 4 checkpoint); it also
+#   carries `qwen3_5_moe` (>= 5.2) and `minimax_m2`. < 5.6 is optimum-intel
+#   2.2's own ceiling. export_gemma4.py loads Gemma 4 natively from 5.5 (below
+#   it needs the repo's remote code) and must stay < 5.14 (per-layer
+#   attributes).
 # - openvino >= 2026.2 — first release with the fused GatedDeltaNet op +
 #   qwen3_5_moe support; matches the SDK floor in INSTALL.md.
 # - optimum-intel: qwen3_5_moe export path requires a 2026.2-era release.
 #
 # TODO(#77): exact == pins recorded after the first verified Qwen3.6 export
 # on the 2026.2 toolchain (Part B Path 1 task).
-transformers>=5.2,<5.5
+transformers>=5.5,<5.6
 openvino>=2026.2
 optimum-intel>=1.27
 nncf>=2.18
