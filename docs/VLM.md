@@ -402,8 +402,9 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 - exports a raw checkpoint with optimum-intel first, then cuts it. With the exporter pins
   (`tools/requirements.txt`, transformers 5.5.x) optimum-intel 2.2 exports LLaVA,
   LLaVA-NeXT, Mistral 3, Gemma 3 and Gemma 4 this way. Its Qwen VL, Phi-3.5-vision and
-  InternVL exporters need an older transformers, so for those `shard` asks for the
-  OpenVINO export instead;
+  InternVL exporters need an older transformers: for Qwen VL `shard` prints a
+  side-environment recipe (below), and Phi-3.5-vision / InternVL2, which ship remote
+  modelling code, need their OpenVINO export;
 - routes a Gemma 4 OpenVINO export to `export_gemma4_text.py --vision` and Qwen3.5/3.6 to
   `export_qwen36_moe.py`, as before;
 - refuses any other VLM (Qwen2-VL, LLaVA-1.5, mllama, PaliGemma, ...), naming it.
@@ -427,6 +428,35 @@ export is left as it is.
 Both write `cascadia-export.json` beside the output: `model_id`, the source repo and
 revision, `stages` (shard only), `numLayers`, `quant`, `sizeBytes` and `inputModalities`
 (`["text","image","video"]` for a VLM, `["text"]` for text). Nodes do not read it.
+
+#### Qwen VL from a raw checkpoint (side environment)
+
+optimum-intel 2.2's Qwen2-VL / Qwen2.5-VL / Qwen3-VL exporters stop at transformers 5.0,
+below the exporter pins, so `cascadia shard` and `cascadia export` refuse a raw Qwen VL
+checkpoint and print this recipe with the versions filled in from the installed
+optimum-intel. Export in a separate environment, then shard the export directory:
+
+```bash
+python -m venv cascadia-vlm-export
+cascadia-vlm-export/bin/python -m pip install "transformers==5.0.*" "optimum-intel==2.2.0" \
+    "openvino==2026.4.1" nncf torch torchvision
+cascadia-vlm-export/bin/optimum-cli export openvino --model Qwen/Qwen2.5-VL-3B-Instruct \
+    --task image-text-to-text --weight-format int4 Qwen2.5-VL-3B-Instruct-int4-ov
+cascadia shard --model Qwen2.5-VL-3B-Instruct-int4-ov \
+    --output-dir Qwen2.5-VL-3B-Instruct-int4-ov-2st --num-stages 2
+```
+
+On Windows the environment's tools are under `cascadia-vlm-export\Scripts\`. Name the
+export directory after the model, as above: its name becomes the tree's `model_id`.
+Phi-3.5-vision and InternVL2 ship remote modelling code and stay refused; use their
+OpenVINO exports.
+
+Qwen2.5-VL computes in f16 on an Arm CPU (OpenVINO's default there), and its activations
+overflow it: every token after the first comes out as `!`. This holds for the OpenVINO
+organisation's exports too (checked with `OpenVINO/Qwen2.5-VL-7B-Instruct-int4-ov` on an
+Apple M-series CPU). Serve it on such a host with
+`--ov-config INFERENCE_PRECISION_HINT=f32` on every rank. Intel x86 CPUs default to f32 or
+bf16; if a GPU gives the same output, the same hint applies.
 
 ### Gemma 4 26B / 31B (ov-runtime)
 
