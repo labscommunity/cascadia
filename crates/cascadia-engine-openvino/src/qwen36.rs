@@ -2394,11 +2394,12 @@ impl Qwen36Engine {
                 // Best-effort: a blob/chain miss degrades to no warm-pull, never breaks generation.
                 let ns = partner.unwrap_or_else(|| crate::kv_coordination::LOCAL_NS.to_string());
                 if let Some(blob) = self.blob_local_stages() {
-                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here),
+                    // except a media turn's slice: RESTORE reads `self.kv` below, not the mirror.
                     self.kv_share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .capture_under_epoch_ns(&ns, kv_epoch, tokens.clone(), blob.clone());
+                        .capture_under_epoch_for_plane(&ns, kv_epoch, tokens.clone(), blob.clone());
                     self.kv
                         .capture_under_epoch_ns(&ns, kv_epoch, tokens.clone(), blob);
                 }
@@ -3398,11 +3399,12 @@ impl Qwen36Engine {
             return;
         }
         if let Some(blob) = self.blob_local_stages() {
-            // Mirror into the lock-free holder cache so a busy node serves this turn's KV unblocked.
+            // Mirror into the lock-free holder cache so a busy node serves this turn's KV unblocked,
+            // except a media turn's: it keeps only the local copy below.
             self.kv_share
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .capture(tenant, tokens.clone(), blob.clone());
+                .capture_for_plane(tenant, tokens.clone(), blob.clone());
             self.kv.capture(tenant, tokens, blob);
         }
     }
