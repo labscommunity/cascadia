@@ -146,8 +146,63 @@ def optimum_exports_vlm(model_type: str) -> bool | str | None:
             continue
         if VLM_TASK not in tasks:
             return False
-        return transformers_bounds_refusal(tasks[VLM_TASK]) or True
+        reason = transformers_bounds_refusal(tasks[VLM_TASK])
+        if reason is None:
+            return True
+        refusal = BoundsRefusal(reason)
+        refusal.pin = transformers_pin(tasks[VLM_TASK])
+        return refusal
     return False
+
+
+class BoundsRefusal(str):
+    """A transformers-bounds refusal (the reason text) carrying `pin`, the
+    transformers requirement under which the installed optimum-intel does
+    export the type."""
+
+    pin: str
+
+
+def transformers_pin(constructor) -> str:
+    """The transformers requirement the export config's own bounds ask for:
+    `MAX_TRANSFORMERS_VERSION` 5.0 gives `transformers==5.0.*`, 4.57.6 gives
+    `transformers==4.57.6`, a `MIN_TRANSFORMERS_VERSION` alone gives `>=`."""
+    cls = getattr(constructor, "func", constructor)
+    lo = getattr(cls, "MIN_TRANSFORMERS_VERSION", None)
+    hi = getattr(cls, "MAX_TRANSFORMERS_VERSION", None)
+    if hi:
+        hi = str(hi)
+        return f"transformers=={hi}.*" if hi.count(".") == 1 else f"transformers=={hi}"
+    return f"transformers>={lo}"
+
+
+def side_venv_recipe(model: str, pin: str, num_stages: int | None) -> str:
+    """Commands that export `model` in a separate Python environment holding
+    `pin` and this environment's optimum-intel and OpenVINO, then shard the
+    result (`shard` takes a local OpenVINO export directly)."""
+    import importlib.metadata as md
+
+    pins = [pin, f"optimum-intel=={md.version('optimum-intel')}",
+            f"openvino=={md.version('openvino')}", "nncf", "torch", "torchvision"]
+    name = (os.path.basename(os.path.abspath(model)) if os.path.isdir(model)
+            else model.rstrip("/").rsplit("/", 1)[-1])
+    # The export dir's name becomes the tree's model_id; name it after the
+    # model, as the OpenVINO organisation's exports are.
+    out = f"{name}-int4-ov"
+    venv = "cascadia-vlm-export"
+    lines = [
+        f"  python -m venv {venv}",
+        f"  {venv}/bin/python -m pip install " + " ".join(f'"{p}"' for p in pins),
+        f"  {venv}/bin/optimum-cli export openvino --model {model} "
+        f"--task {VLM_TASK} --weight-format int4 {out}",
+    ]
+    if num_stages:
+        lines.append(f"  cascadia shard --model {out} --output-dir {out}-{num_stages}st "
+                     f"--num-stages {num_stages}")
+    else:
+        lines.append(f"  (serve {out} as it is, or cut it with `cascadia shard --model {out}`)")
+    return ("export it in a separate Python environment (on Windows the venv's tools are "
+            f"under {venv}\\Scripts\\):\n" + "\n".join(lines))
 
 
 def transformers_bounds_refusal(constructor) -> str | None:
@@ -167,23 +222,31 @@ def transformers_bounds_refusal(constructor) -> str | None:
     return None
 
 
-def raw_export_refusal(cfg: dict, supported: bool | str | None) -> str | None:
+def raw_export_refusal(cfg: dict, supported: bool | str | None, model: str | None = None,
+                       num_stages: int | None = None) -> str | None:
     """Why optimum-intel cannot export this raw VLM checkpoint, or None.
-    `supported` is optimum_exports_vlm(model_type)."""
+    `supported` is optimum_exports_vlm(model_type). A transformers-bounds
+    refusal comes with the side-environment recipe that does export it
+    (`model`, `num_stages` fill the commands in)."""
     mt = (cfg.get("model_type") or "").lower()
     if supported is None:
         return ("exporting a raw checkpoint needs optimum-intel, which this Python lacks. "
                 f"Install the exporter pins: {install_line()}")
     if supported is False:
         return f"optimum-intel cannot export model_type {mt!r} as {VLM_TASK}"
-    if isinstance(supported, str):
-        return f"optimum-intel cannot export model_type {mt!r} here: {supported}"
     if cfg.get("auto_map"):
         # Remote modelling code would run on this machine; the OpenVINO
-        # organisation's ready exports avoid it.
+        # organisation's ready exports avoid it. Checked before the bounds,
+        # so no side-environment recipe ever suggests running it.
         return (f"model_type {mt!r} ships its own modelling code (auto_map), which cascadia "
                 "does not run. Use a ready OpenVINO export of it (e.g. from the OpenVINO "
                 "organisation on Hugging Face) as --model")
+    if isinstance(supported, str):
+        why = f"optimum-intel cannot export model_type {mt!r} here: {supported}"
+        pin = getattr(supported, "pin", None)
+        if pin and model:
+            why += "; " + side_venv_recipe(model, pin, num_stages)
+        return why
     return None
 
 
@@ -351,7 +414,7 @@ def shard_vlm(args, raw_cfg: dict) -> dict | None:
         _cut(src, args, family, identity["model_id"])
         return {"identity": identity, "source_dir": src}
 
-    why = raw_export_refusal(raw_cfg, optimum_exports_vlm(mt))
+    why = raw_export_refusal(raw_cfg, optimum_exports_vlm(mt), args.model, args.num_stages)
     if why:
         refuse_vlm(mt, why)
     with tempfile.TemporaryDirectory(prefix="cascadia-vlm-export-") as tmp:
@@ -397,7 +460,7 @@ def export(model: str, out_dir: str, weight_format: str = "int4",
         raise SystemExit("`cascadia export` needs optimum-intel, which this Python lacks. "
                          f"Install the exporter pins: {install_line()}")
     if vlm:
-        why = raw_export_refusal(cfg, supported)
+        why = raw_export_refusal(cfg, supported, model)
         if why:
             raise SystemExit(f"{mt!r} is a vision-language model: {why}.")
     identity = source_identity(model, revision)

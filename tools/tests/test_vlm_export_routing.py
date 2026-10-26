@@ -214,6 +214,60 @@ def test_transformers_bounds_are_read_from_the_export_config():
     assert transformers.__version__ in ce.transformers_bounds_refusal(New)
 
 
+def test_transformers_pin_follows_the_export_configs_bounds():
+    class Two:
+        MAX_TRANSFORMERS_VERSION = "5.0"
+
+    class Three:
+        MAX_TRANSFORMERS_VERSION = "4.57.6"
+
+    class Floor:
+        MIN_TRANSFORMERS_VERSION = "5.5"
+
+    assert ce.transformers_pin(Two) == "transformers==5.0.*"
+    assert ce.transformers_pin(Three) == "transformers==4.57.6"
+    assert ce.transformers_pin(Floor) == "transformers>=5.5"
+
+
+def _bounds(pin):
+    r = ce.BoundsRefusal("its optimum-intel exporter needs transformers <= 5.0 (installed: 5.5.4)")
+    r.pin = pin
+    return r
+
+
+def test_bounds_refusal_gives_a_side_environment_recipe(tmp_path, monkeypatch, cuts):
+    """A Qwen VL raw checkpoint is refused with commands that do export it:
+    a separate environment with the exporter's own transformers bound and
+    this environment's optimum-intel / OpenVINO, then `cascadia shard` of the
+    export directory."""
+    _raw(monkeypatch, FAMILY_CONFIGS["qwen2_5_vl"])
+    monkeypatch.setattr(ce, "optimum_exports_vlm", lambda mt: _bounds("transformers==5.0.*"))
+    with pytest.raises(SystemExit) as e:
+        ce.shard_vlm(_args("Qwen/Qwen2.5-VL-3B-Instruct", tmp_path),
+                     FAMILY_CONFIGS["qwen2_5_vl"])
+    msg = str(e.value)
+    import importlib.metadata as md
+
+    assert '"transformers==5.0.*"' in msg
+    assert f'"optimum-intel=={md.version("optimum-intel")}"' in msg
+    assert f'"openvino=={md.version("openvino")}"' in msg
+    assert ("optimum-cli export openvino --model Qwen/Qwen2.5-VL-3B-Instruct "
+            "--task image-text-to-text --weight-format int4 "
+            "Qwen2.5-VL-3B-Instruct-int4-ov") in msg
+    assert "cascadia shard --model Qwen2.5-VL-3B-Instruct-int4-ov" in msg
+    assert "--num-stages 2" in msg
+    assert "--revision" not in msg
+    assert cuts == []
+
+
+def test_remote_code_refusal_wins_over_the_bounds_recipe():
+    """Phi-3.5-vision and InternVL2 are outside the bounds too, but they ship
+    remote code: no recipe may suggest running it."""
+    cfg = {**FAMILY_CONFIGS["phi3_v"], "auto_map": {"AutoModel": "x.Y"}}
+    msg = ce.raw_export_refusal(cfg, _bounds("transformers==4.53.3"), "m/phi", 2)
+    assert "auto_map" in msg and "pip install" not in msg
+
+
 def test_raw_remote_code_checkpoint_is_refused(tmp_path, monkeypatch, cuts):
     cfg = {**FAMILY_CONFIGS["internvl_chat"], "auto_map": {"AutoModel": "x.Y"}}
     _raw(monkeypatch, cfg)
