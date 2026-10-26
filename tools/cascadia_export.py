@@ -164,45 +164,77 @@ class BoundsRefusal(str):
 
 
 def transformers_pin(constructor) -> str:
-    """The transformers requirement the export config's own bounds ask for:
-    `MAX_TRANSFORMERS_VERSION` 5.0 gives `transformers==5.0.*`, 4.57.6 gives
-    `transformers==4.57.6`, a `MIN_TRANSFORMERS_VERSION` alone gives `>=`."""
+    """The transformers requirement the export config's own bounds ask for,
+    spelled exactly as `transformers_bounds_refusal` compares them: MAX 5.0
+    gives `transformers<=5.0` (pip then picks 5.0.0, never 5.0.1, which the
+    bound refuses), MIN and MAX give `>=MIN,<=MAX`, MIN alone `>=MIN`."""
     cls = getattr(constructor, "func", constructor)
     lo = getattr(cls, "MIN_TRANSFORMERS_VERSION", None)
     hi = getattr(cls, "MAX_TRANSFORMERS_VERSION", None)
-    if hi:
-        hi = str(hi)
-        return f"transformers=={hi}.*" if hi.count(".") == 1 else f"transformers=={hi}"
-    return f"transformers>={lo}"
+    parts = ([f">={lo}"] if lo else []) + ([f"<={hi}"] if hi else [])
+    return "transformers" + ",".join(parts)
 
 
-def side_venv_recipe(model: str, pin: str, num_stages: int | None) -> str:
-    """Commands that export `model` in a separate Python environment holding
-    `pin` and this environment's optimum-intel and OpenVINO, then shard the
-    result (`shard` takes a local OpenVINO export directly)."""
+def _installed_version(dist: str, module: str) -> str | None:
+    """`dist`'s installed version: pip metadata first, else the module's own
+    `__version__` (an SDK install such as INSTALL.md's has no metadata), cut
+    to its release part (`2026.4.1-22982-...` -> `2026.4.1`). None if
+    neither is there."""
     import importlib.metadata as md
 
-    pins = [pin, f"optimum-intel=={md.version('optimum-intel')}",
-            f"openvino=={md.version('openvino')}", "nncf", "torch", "torchvision"]
+    try:
+        return md.version(dist)
+    except md.PackageNotFoundError:
+        pass
+    try:
+        import importlib
+
+        v = getattr(importlib.import_module(module), "__version__", None)
+    except Exception:
+        return None
+    return v.split("-")[0] if v else None
+
+
+def side_venv_recipe(model: str, pin: str, num_stages: int | None,
+                     weight_format: str = "int4", sym: bool = False) -> str:
+    """Commands that export `model` in a separate Python environment holding
+    `pin` and this environment's optimum-intel and OpenVINO, then shard the
+    result (`shard` takes a local OpenVINO export directly). The caller's
+    weight format is kept; optimum-cli has no --revision, so a pinned
+    revision is the caller's to download first."""
+    import shlex
+
+    pins, notes = [pin], []
+    for dist, module in (("optimum-intel", "optimum.intel"), ("openvino", "openvino")):
+        v = _installed_version(dist, module)
+        if v:
+            pins.append(f"{dist}=={v}")
+        else:
+            pins.append(dist)
+            notes.append(f"({dist}'s version could not be read here: match the one this "
+                         "cascadia uses)")
+    pins += ["nncf", "torch", "torchvision"]
     name = (os.path.basename(os.path.abspath(model)) if os.path.isdir(model)
             else model.rstrip("/").rsplit("/", 1)[-1])
     # The export dir's name becomes the tree's model_id; name it after the
     # model, as the OpenVINO organisation's exports are.
-    out = f"{name}-int4-ov"
+    out = f"{name}-{weight_format}-ov"
     venv = "cascadia-vlm-export"
+    q = shlex.quote
     lines = [
         f"  python -m venv {venv}",
-        f"  {venv}/bin/python -m pip install " + " ".join(f'"{p}"' for p in pins),
-        f"  {venv}/bin/optimum-cli export openvino --model {model} "
-        f"--task {VLM_TASK} --weight-format int4 {out}",
+        f"  {venv}/bin/python -m pip install " + " ".join(q(p) for p in pins),
+        f"  {venv}/bin/optimum-cli export openvino --model {q(model)} --task {VLM_TASK} "
+        f"--weight-format {weight_format}" + (" --sym" if sym else "") + f" {q(out)}",
     ]
     if num_stages:
-        lines.append(f"  cascadia shard --model {out} --output-dir {out}-{num_stages}st "
+        lines.append(f"  cascadia shard --model {q(out)} --output-dir {q(f'{out}-{num_stages}st')} "
                      f"--num-stages {num_stages}")
     else:
-        lines.append(f"  (serve {out} as it is, or cut it with `cascadia shard --model {out}`)")
-    return ("export it in a separate Python environment (on Windows the venv's tools are "
-            f"under {venv}\\Scripts\\):\n" + "\n".join(lines))
+        lines.append(f"  then serve {q(out)} as it is, or cut it with "
+                     f"`cascadia shard --model {q(out)}`")
+    return ("Export it in a separate Python environment (on Windows the environment's tools "
+            f"are under {venv}\\Scripts\\):\n" + "\n".join(lines + notes))
 
 
 def transformers_bounds_refusal(constructor) -> str | None:
@@ -222,12 +254,10 @@ def transformers_bounds_refusal(constructor) -> str | None:
     return None
 
 
-def raw_export_refusal(cfg: dict, supported: bool | str | None, model: str | None = None,
-                       num_stages: int | None = None) -> str | None:
+def raw_export_refusal(cfg: dict, supported: bool | str | None) -> str | None:
     """Why optimum-intel cannot export this raw VLM checkpoint, or None.
-    `supported` is optimum_exports_vlm(model_type). A transformers-bounds
-    refusal comes with the side-environment recipe that does export it
-    (`model`, `num_stages` fill the commands in)."""
+    `supported` is optimum_exports_vlm(model_type). The side-environment
+    recipe for a transformers-bounds refusal is `raw_export_recipe`'s."""
     mt = (cfg.get("model_type") or "").lower()
     if supported is None:
         return ("exporting a raw checkpoint needs optimum-intel, which this Python lacks. "
@@ -242,12 +272,20 @@ def raw_export_refusal(cfg: dict, supported: bool | str | None, model: str | Non
                 "does not run. Use a ready OpenVINO export of it (e.g. from the OpenVINO "
                 "organisation on Hugging Face) as --model")
     if isinstance(supported, str):
-        why = f"optimum-intel cannot export model_type {mt!r} here: {supported}"
-        pin = getattr(supported, "pin", None)
-        if pin and model:
-            why += "; " + side_venv_recipe(model, pin, num_stages)
-        return why
+        return f"optimum-intel cannot export model_type {mt!r} here: {supported}"
     return None
+
+
+def raw_export_recipe(cfg: dict, supported: bool | str | None, model: str,
+                      num_stages: int | None = None, weight_format: str = "int4",
+                      sym: bool = False) -> str | None:
+    """The commands that do export a checkpoint refused for optimum-intel's
+    transformers bounds; None for every other refusal, remote code included
+    (no recipe may suggest running it)."""
+    if cfg.get("auto_map") or not isinstance(supported, str):
+        return None
+    pin = getattr(supported, "pin", None)
+    return side_venv_recipe(model, pin, num_stages, weight_format, sym) if pin else None
 
 
 def download(repo: str, revision: str) -> str:
@@ -373,14 +411,18 @@ def write_shard_sidecar(model: str, out_dir: str, identity: dict,
 
 # --- shard ------------------------------------------------------------------
 
-def refuse_vlm(mt: str, why: str) -> None:
+def refuse_vlm(mt: str, why: str, recipe: str | None = None) -> None:
+    head = (f"{mt!r} is a vision-language model and `cascadia shard` cannot make a vision "
+            f"tree for it: {why}.\n")
+    if recipe:
+        raise SystemExit(head + recipe + "\nOr pass --text-only to shard the text tower "
+                         "alone (it then serves text only).")
     raise SystemExit(
-        f"{mt!r} is a vision-language model and `cascadia shard` cannot make a vision tree "
-        f"for it: {why}.\n"
-        f"  - `cascadia export` makes a whole-model OpenVINO export (ov-genai, OVMS) if "
-        f"optimum-intel supports it;\n"
-        f"  - `cascadia shard --text-only` shards the text tower alone (it then serves text "
-        f"only).")
+        head
+        + "  - `cascadia export` makes a whole-model OpenVINO export (ov-genai, OVMS) if "
+        "optimum-intel supports it;\n"
+        "  - `cascadia shard --text-only` shards the text tower alone (it then serves text "
+        "only).")
 
 
 def shard_vlm(args, raw_cfg: dict) -> dict | None:
@@ -414,14 +456,18 @@ def shard_vlm(args, raw_cfg: dict) -> dict | None:
         _cut(src, args, family, identity["model_id"])
         return {"identity": identity, "source_dir": src}
 
-    why = raw_export_refusal(raw_cfg, optimum_exports_vlm(mt), args.model, args.num_stages)
+    supported = optimum_exports_vlm(mt)
+    wf, sym = {"fp16": ("fp16", False), "int8": ("int8", False),
+               "int4": ("int4", True), "int4_asym": ("int4", False)}[args.quantization]
+    why = raw_export_refusal(raw_cfg, supported)
     if why:
-        refuse_vlm(mt, why)
+        # The recipe keeps the weight format but not our int4's --sym: its
+        # default is the command checked end to end (asymmetric int4).
+        refuse_vlm(mt, why, raw_export_recipe(raw_cfg, supported, args.model,
+                                              args.num_stages, wf))
     with tempfile.TemporaryDirectory(prefix="cascadia-vlm-export-") as tmp:
         log(f"Detected a raw {family} checkpoint - exporting it with optimum-intel, "
             f"then cutting it")
-        wf, sym = {"fp16": ("fp16", False), "int8": ("int8", False),
-                   "int4": ("int4", True), "int4_asym": ("int4", False)}[args.quantization]
         optimum_export(args.model, tmp, VLM_TASK, wf, revision=identity["revision"], sym=sym)
         _cut(tmp, args, family, identity["model_id"])
         quant = source_quant(tmp)
@@ -460,9 +506,11 @@ def export(model: str, out_dir: str, weight_format: str = "int4",
         raise SystemExit("`cascadia export` needs optimum-intel, which this Python lacks. "
                          f"Install the exporter pins: {install_line()}")
     if vlm:
-        why = raw_export_refusal(cfg, supported, model)
+        why = raw_export_refusal(cfg, supported)
         if why:
-            raise SystemExit(f"{mt!r} is a vision-language model: {why}.")
+            recipe = raw_export_recipe(cfg, supported, model, None, weight_format)
+            raise SystemExit(f"{mt!r} is a vision-language model: {why}."
+                             + (f"\n{recipe}" if recipe else ""))
     identity = source_identity(model, revision)
     task = VLM_TASK if vlm else TEXT_TASK
     log(f"Exporting {model} ({mt}, {'vision-language' if vlm else 'text'}) with "
