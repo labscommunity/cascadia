@@ -500,6 +500,7 @@ fn final_chunk(
         logprobs: None,
         n_tokens: Some(1),
         prompt_tokens: Some(prompt_len as u32),
+        completion_tokens: None,
         error: None,
         token_ids: Vec::new(),
         finish_reason: Some(if is_eos {

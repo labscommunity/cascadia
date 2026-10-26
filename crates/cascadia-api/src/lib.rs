@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use cascadia_runner::Runner;
-use cascadia_types::GenerationTask;
+use cascadia_types::{ChatTurn, GenerationTask};
 use chrono::Utc;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
@@ -52,13 +52,26 @@ pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 /// this whole HTTP-server crate.
 pub use cascadia_types::ApiStats;
 
-/// Tokens a chunk contributes to the cumulative counter. The convention
-/// (engine `n_tokens` authoritative, else one per non-empty chunk — #55)
-/// lives on [`cascadia_types::Chunk::token_count`] so the API's `usage`,
-/// the dashboard counters, and the runner's Prometheus metrics can never
-/// drift apart; this alias keeps the historical call sites and tests.
-fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
-    chunk.token_count()
+/// Reconcile per-request and global streaming counters together. A final
+/// authoritative count replaces estimates, including when it is lower.
+fn record_stream_tokens(
+    chunk: &cascadia_types::Chunk,
+    stats: &ApiStats,
+    completion: &std::sync::atomic::AtomicU32,
+) {
+    let before = completion.load(Ordering::Relaxed);
+    let mut after = before;
+    chunk.accumulate_tokens(&mut after);
+    completion.store(after, Ordering::Relaxed);
+    if after >= before {
+        stats
+            .tokens_total
+            .fetch_add(u64::from(after - before), Ordering::Relaxed);
+    } else {
+        stats
+            .tokens_total
+            .fetch_sub(u64::from(before - after), Ordering::Relaxed);
+    }
 }
 
 /// RAII guard: bumps `requests_in_flight` on construction and decrements it
@@ -112,6 +125,12 @@ pub struct AppState {
     /// OFF (to inject the empty `<think></think>`). Keeps the working
     /// thinking-on path byte-identical to the engine's native render.
     pub defer_template_on_thinking: bool,
+    /// The engine applies the model's chat template itself (sycl-llama: the
+    /// llama-server child renders the GGUF template on the structured turns
+    /// the task carries). Render here is a placeholder so the empty-prompt
+    /// guard stays honest; tools flow through GenerationTask, so the
+    /// no-template refusal does not apply.
+    pub engine_applies_template: bool,
     /// The chat template distinguishes OpenAI's `reasoning_effort` words
     /// (probed at load: "low" and "medium" render differently). When true the
     /// caller's own word reaches the template; when false the GLM high/max
@@ -142,6 +161,8 @@ pub struct Config {
     pub chat_template: ChatTemplateConfig,
     /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
     pub defer_template_on_thinking: bool,
+    /// See [`AppState::engine_applies_template`]. Set by the CLI for sycl-llama.
+    pub engine_applies_template: bool,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
 }
@@ -154,6 +175,7 @@ impl Default for Config {
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
             defer_template_on_thinking: false,
+            engine_applies_template: false,
             marker_dialect: None,
         }
     }
@@ -485,6 +507,7 @@ pub fn make_router_with_stats(
         bos_token: Arc::from(cfg.chat_template.bos_token.clone().unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.clone().unwrap_or_default()),
         defer_template_on_thinking: cfg.defer_template_on_thinking,
+        engine_applies_template: cfg.engine_applies_template,
         effort_words: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -801,6 +824,45 @@ impl ChatCompletionRequest {
             self.top_logprobs.unwrap_or(1).clamp(1, 20)
         } else {
             0
+        }
+    }
+
+    /// `tool_choice` must be one of the OpenAI shapes: `"auto"`, `"none"`,
+    /// `"required"`, or `{"type":"function","function":{"name":N}}` naming a
+    /// function present in `tools`. Anything else is the caller's mistake
+    /// (a 400), not something an engine should guess at.
+    fn validate_tool_choice(&self) -> Result<(), String> {
+        let Some(choice) = &self.tool_choice else {
+            return Ok(());
+        };
+        if let Some(s) = choice.as_str() {
+            return match s {
+                "auto" | "none" | "required" => Ok(()),
+                other => Err(format!(
+                    "tool_choice '{other}' is not one of \"auto\", \"none\", \"required\""
+                )),
+            };
+        }
+        let name = choice
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .filter(|n| choice.get("type").and_then(|t| t.as_str()) == Some("function") && !n.is_empty())
+            .ok_or_else(|| {
+                "tool_choice must be a string or {\"type\":\"function\",\"function\":{\"name\":...}}"
+                    .to_string()
+            })?;
+        let declared = self
+            .tools
+            .iter()
+            .flatten()
+            .any(|t| t.function.get("name").and_then(|n| n.as_str()) == Some(name));
+        if declared {
+            Ok(())
+        } else {
+            Err(format!(
+                "tool_choice names function '{name}', which is not in tools"
+            ))
         }
     }
 
@@ -1310,6 +1372,7 @@ fn chat_template_smoke_failures(
     let multi_turn = [m("user", "hi"), m("assistant", "hello"), m("user", "more")];
     let round_trip = [m("user", "weather in Paris?"), call, tool_reply];
 
+    #[allow(clippy::type_complexity)]
     let cases: [(&'static str, &[ChatMessage], Option<&[Tool]>, bool); 7] = [
         ("plain", &plain, None, true),
         ("system", &with_system, None, true),
@@ -1741,6 +1804,11 @@ fn render_prompt(
     // `reasoning_effort` (the caller's parameter above) is also dropped on
     // this branch, intentionally: ov-genai applies its own template with the
     // effort undefined, so there is nowhere for the mapped value to go.
+    if state.engine_applies_template {
+        // the child renders the GGUF chat template on the forwarded turns;
+        // the prompt is a fallback and must simply be non-empty
+        return Ok(render_prompt_legacy(messages));
+    }
     if state.defer_template_on_thinking && enable_thinking {
         if tools.is_some_and(|t| !t.is_empty()) {
             return Err(PromptRenderError::Failed(
@@ -2211,11 +2279,45 @@ pub fn render_chat_prompt(
     ChatPromptRenderer::new(cfg).render(messages)
 }
 
+/// The engine-side structured turns from a chat request: tool fields travel
+/// as the OpenAI wire JSON a downstream chat server (llama-server's jinja)
+/// expects verbatim.
+fn chat_turns(req: &ChatCompletionRequest) -> Vec<ChatTurn> {
+    req.messages
+        .iter()
+        .map(|m| ChatTurn {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            tool_calls: m
+                .tool_calls
+                .as_ref()
+                .and_then(|cs| serde_json::to_value(cs).ok()),
+            tool_call_id: m.tool_call_id.clone(),
+            name: m.name.clone(),
+        })
+        .collect()
+}
+
+/// The request's tool definitions as wire JSON for the engine.
+fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
+    req.tools
+        .as_ref()
+        .and_then(|ts| serde_json::to_value(ts).ok())
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    if let Err(e) = req.validate_tool_choice() {
+        count_rejected("invalid_request");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response();
+    }
     let enable_thinking = req.effective_enable_thinking();
     // effective_reasoning_effort() hardcodes GLM's high/max vocabulary and is
     // applied to every model this server serves, not just GLM-5. A template
@@ -2290,9 +2392,45 @@ async fn chat_completions(
         )
             .into_response();
     }
+    // Same bound on the structured turns: tool-call results ride as
+    // messages and never count toward prompt.len(), so a request could
+    // pass the prompt check while shipping a megabyte of tool output.
+    let messages_bytes: usize = req
+        .messages
+        .iter()
+        .map(|m| {
+            m.content.len()
+                + m.tool_calls
+                    .as_ref()
+                    .map_or(0, |cs| serde_json::to_string(cs).map_or(0, |s| s.len()))
+                + m.tool_call_id.as_ref().map_or(0, String::len)
+                + m.name.as_ref().map_or(0, String::len)
+        })
+        .sum();
+    if messages_bytes > state.max_prompt_bytes {
+        count_rejected("prompt_too_large");
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "messages are {messages_bytes} bytes (content + tool fields); \
+                     max allowed is {} (max_prompt_bytes)",
+                    state.max_prompt_bytes,
+                )
+            })),
+        )
+            .into_response();
+    }
     let task = GenerationTask {
         task_id: task_id.clone(),
         prompt,
+        // Structured turns for engines that forward the conversation to a
+        // downstream chat server applying its own template (sycl-llama:
+        // llama-server renders the GGUF chat template). Other engines ignore
+        // the field and keep consuming `prompt`.
+        messages: chat_turns(&req),
+        tools: chat_tools(&req),
+        tool_choice: req.tool_choice.clone(),
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
@@ -2389,12 +2527,8 @@ async fn chat_completions(
             )
                 .into_response();
         }
-        // Count tokens for EVERY chunk including the final one — engines
-        // like ov-genai deliver their whole output on a single final
-        // chunk, and spec-decode carries its last round there too; gating
-        // on `!is_final` dropped them (tokens_total stuck at 0 for
-        // ov-genai). chunk_token_count contributes 0 for the empty final
-        // markers other engines emit, so there's no phantom over-count.
+        // Count every chunk, but replace the running sum when the final
+        // carries authoritative usage (including hidden thinking/tools).
         match marker.as_mut() {
             Some(f) => {
                 buf.push_str(&f.feed(&chunk));
@@ -2404,7 +2538,7 @@ async fn chat_completions(
             }
             None => buf.push_str(&chunk.text),
         }
-        completion_tokens += chunk_token_count(&chunk);
+        chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
         }
@@ -2525,6 +2659,10 @@ async fn completions(
         task_id: task_id.clone(),
         // Raw prompt — the legacy endpoint does NOT apply a chat template.
         prompt: prompt.clone(),
+        // Prompt-only: no structured turns on the /v1/completions path.
+        messages: Vec::new(),
+        tools: None,
+        tool_choice: None,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
@@ -2603,7 +2741,7 @@ async fn completions(
             }
             None => buf.push_str(&chunk.text),
         }
-        completion_tokens += chunk_token_count(&chunk);
+        chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
         }
@@ -2689,6 +2827,8 @@ async fn stream_text_completion(
     let stats = state.stats.clone();
     let usage_completion = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let usage_prompt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let usage_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let final_finished = usage_finished.clone();
     let final_completion = usage_completion.clone();
     let final_prompt = usage_prompt.clone();
     let usage_model = model.clone();
@@ -2707,14 +2847,20 @@ async fn stream_text_completion(
             let stats = stats.clone();
             let usage_completion = usage_completion.clone();
             let usage_prompt = usage_prompt.clone();
+            let usage_finished = usage_finished.clone();
             let echo_pending = echo_pending.clone();
             async move {
+                // A progress marker (a long prompt still going down the
+                // pipeline, one window per engine step): nothing to send,
+                // nothing to count; the connection stays open.
+                if chunk.is_progress() {
+                    return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
+                }
                 if chunk.error.is_none() {
-                    let n = chunk_token_count(&chunk);
-                    stats.tokens_total.fetch_add(n as u64, Ordering::Relaxed);
-                    usage_completion.fetch_add(n, Ordering::Relaxed);
+                    record_stream_tokens(&chunk, &stats, &usage_completion);
                     if chunk.is_final {
                         usage_prompt.store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+                        usage_finished.store(chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled), Ordering::Relaxed);
                     }
                 }
                 if let Some(reason) = &chunk.error {
@@ -2737,7 +2883,8 @@ async fn stream_text_completion(
                     "object": "text_completion",
                     "created": now_unix(),
                     "model": model,
-                    "n_tokens": chunk.n_tokens.unwrap_or(1),
+                    "n_tokens": chunk.token_count(),
+                    "completion_tokens": chunk.completion_tokens,
                     "choices": [{
                         "index": 0,
                         "text": text,
@@ -2755,7 +2902,7 @@ async fn stream_text_completion(
         })
         .chain(stream::once(async move {
             let mut out = String::new();
-            if include_usage {
+            if include_usage && final_finished.load(Ordering::Relaxed) {
                 let prompt = final_prompt.load(Ordering::Relaxed);
                 let completion = final_completion.load(Ordering::Relaxed);
                 let usage = serde_json::json!({
@@ -2820,12 +2967,25 @@ async fn stream_completion(
         let _inflight = inflight; // hold the in-flight gauge until generation completes
         let mut buf = String::new();
         let mut err: Option<String> = None;
+        let mut completion_tokens = 0;
+        let mut prompt_tokens = 0;
+        let mut finished = false;
+        let mut finish_reason = "stop";
         let mut stream = chunk_stream;
         let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
         while let Some(chunk) = stream.next().await {
             if let Some(reason) = &chunk.error {
                 err = Some(reason.clone());
                 break;
+            }
+            chunk.accumulate_tokens(&mut completion_tokens);
+            if chunk.is_final {
+                prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
+                finished = chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
+                finish_reason = chunk
+                    .finish_reason
+                    .map(|f| f.as_openai_str())
+                    .unwrap_or("stop");
             }
             match marker.as_mut() {
                 Some(f) => {
@@ -2837,7 +2997,11 @@ async fn stream_completion(
                 None => buf.push_str(&chunk.text),
             }
         }
-        let frames: Vec<Bytes> = if let Some(reason) = err {
+        state
+            .stats
+            .tokens_total
+            .fetch_add(u64::from(completion_tokens), Ordering::Relaxed);
+        let mut frames: Vec<Bytes> = if let Some(reason) = &err {
             warn!(task = %task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
             vec![Bytes::from(format!(
                 "data: {}\n\n",
@@ -2864,9 +3028,21 @@ async fn stream_completion(
         } else {
             let delta = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
                 "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
-                "delta": { "role": "assistant", "content": buf }, "finish_reason": "stop" }] });
+                "delta": { "role": "assistant", "content": buf }, "finish_reason": finish_reason }] });
             vec![Bytes::from(format!("data: {delta}\n\n"))]
         };
+        if include_usage && finished && err.is_none() {
+            let usage = serde_json::json!({
+                "id": task_id, "object": "chat.completion.chunk",
+                "created": now_unix(), "model": model, "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+            });
+            frames.push(Bytes::from(format!("data: {usage}\n\n")));
+        }
         let body = stream::iter(
             frames
                 .into_iter()
@@ -2893,6 +3069,8 @@ async fn stream_completion(
     // stream drains; the per-chunk closure gets the originals.
     let usage_completion = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let usage_prompt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let usage_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let final_finished = usage_finished.clone();
     let final_completion = usage_completion.clone();
     let final_prompt = usage_prompt.clone();
     let usage_model = model.clone();
@@ -2928,20 +3106,20 @@ async fn stream_completion(
             let stats = stats.clone();
             let usage_completion = usage_completion.clone();
             let usage_prompt = usage_prompt.clone();
+            let usage_finished = usage_finished.clone();
             let marker = marker.clone();
             async move {
-                // Count model tokens as they stream so the dashboard's
-                // tokens_total advances live (not just at request end).
-                // Counts the final chunk too (ov-genai emits its whole
-                // output there); chunk_token_count yields 0 for empty
-                // markers, so no phantom token.
+                // Publish real per-chunk counts live; authoritative-only
+                // engines reconcile their full model count at completion.
+                if chunk.is_progress() {
+                    return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
+                }
                 if chunk.error.is_none() {
-                    let n = chunk_token_count(&chunk);
-                    stats.tokens_total.fetch_add(n as u64, Ordering::Relaxed);
-                    usage_completion.fetch_add(n, Ordering::Relaxed);
+                    record_stream_tokens(&chunk, &stats, &usage_completion);
                     if chunk.is_final {
                         usage_prompt
                             .store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+                        usage_finished.store(chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled), Ordering::Relaxed);
                     }
                 }
                 // A failed task carries `error` on its final chunk. The 200
@@ -2985,7 +3163,8 @@ async fn stream_completion(
                     "object": "chat.completion.chunk",
                     "created": now_unix(),
                     "model": model,
-                    "n_tokens": chunk.n_tokens.unwrap_or(1),
+                    "n_tokens": chunk.token_count(),
+                    "completion_tokens": chunk.completion_tokens,
                     "choices": [{
                         "index": 0,
                         "delta": {
@@ -3021,7 +3200,7 @@ async fn stream_completion(
             // Combined into a single HTTP frame with [DONE] (SSE events are
             // delimited by \n\n regardless of HTTP chunk boundaries).
             let mut out = String::new();
-            if include_usage {
+            if include_usage && final_finished.load(Ordering::Relaxed) {
                 let prompt = final_prompt.load(Ordering::Relaxed);
                 let completion = final_completion.load(Ordering::Relaxed);
                 let usage = serde_json::json!({
@@ -3264,20 +3443,20 @@ mod tests {
     fn chunk_token_count_honors_engine_count() {
         // ov-genai's shape: whole response on one final chunk, n_tokens set.
         let c = Chunk::final_marker("t", "The capital of France is Paris.").with_n_tokens(8);
-        assert_eq!(chunk_token_count(&c), 8);
+        assert_eq!(c.token_count(), 8);
 
         // Same shape WITHOUT n_tokens falls back to 1 (the pre-#55 behavior
         // that under-counted ov-genai) — documents why the engine must set it.
         let c = Chunk::final_marker("t", "The capital of France is Paris.");
-        assert_eq!(chunk_token_count(&c), 1);
+        assert_eq!(c.token_count(), 1);
 
         // Empty final marker (mock/runtime) contributes 0 — no phantom token.
         let c = Chunk::final_marker("t", "");
-        assert_eq!(chunk_token_count(&c), 0);
+        assert_eq!(c.token_count(), 0);
 
         // A normal per-token chunk counts as 1.
         let c = Chunk::token("t", 123, "Paris");
-        assert_eq!(chunk_token_count(&c), 1);
+        assert_eq!(c.token_count(), 1);
     }
 
     // The R1-family chat template the exporter (tools/export_deepseek_v4.py,
@@ -3411,6 +3590,239 @@ mod tests {
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// A subprocess-style stream: final usage includes hidden thinking/tools;
+    /// transport fragments deliberately contribute zero model-token counts.
+    struct UsageTailEngine {
+        text: String,
+        fail: bool,
+        pending: Option<cascadia_types::TaskId>,
+    }
+
+    impl cascadia_engine::Engine for UsageTailEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some(task.task_id);
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some(id) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            let final_chunk = if self.fail {
+                Chunk::error(&id, "child failed before usage")
+            } else {
+                Chunk::final_marker(&id, "")
+                    .with_n_tokens(0)
+                    .with_prompt_tokens(42)
+                    .with_completion_tokens(38)
+            };
+            Ok(vec![
+                (id.clone(), Chunk::progress(id.clone())),
+                (
+                    id.clone(),
+                    Chunk::token(&id, 0, &self.text).with_n_tokens(0),
+                ),
+                (id, final_chunk),
+            ])
+        }
+    }
+
+    struct UsageTailBuilder {
+        text: String,
+        fail: bool,
+    }
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for UsageTailBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(UsageTailEngine {
+                text: self.text,
+                fail: self.fail,
+                pending: None,
+            }))
+        }
+    }
+
+    async fn usage_tail_app(tool: bool, fail: bool) -> (Router, Arc<ApiStats>) {
+        let text = if tool {
+            r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#
+        } else {
+            "visible answer"
+        };
+        let runner = Runner::new(Box::new(UsageTailBuilder {
+            text: text.into(),
+            fail,
+        }));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let stats = Arc::new(ApiStats::default());
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        (
+            make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats.clone()),
+            stats,
+        )
+    }
+
+    #[tokio::test]
+    async fn authoritative_usage_reaches_chat_legacy_tools_and_stats() {
+        for (legacy, tool, streaming) in [
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (true, false, true),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            let (app, stats) = usage_tail_app(tool, false).await;
+            let mut request = serde_json::json!({
+                "model": "mock-model", "stream": streaming,
+                "stream_options": {"include_usage": true},
+            });
+            if legacy {
+                request["prompt"] = serde_json::json!("hi");
+            } else {
+                request["messages"] = serde_json::json!([{"role":"user","content":"hi"}]);
+            }
+            if tool {
+                request["tools"] =
+                    serde_json::json!([{"type":"function","function":{"name":"get_weather"}}]);
+            }
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(if legacy {
+                            "/v1/completions"
+                        } else {
+                            "/v1/chat/completions"
+                        })
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            let usage = if streaming {
+                let body = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(body.trim_end().ends_with("data: [DONE]"));
+                let events: Vec<Value> = body
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|line| *line != "[DONE]")
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let tails: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.get("usage").is_some())
+                    .collect();
+                assert_eq!(tails.len(), 1, "{body}");
+                assert!(tails[0]["choices"].as_array().unwrap().is_empty());
+                assert_eq!(events.last().unwrap()["usage"], tails[0]["usage"]);
+                if tool {
+                    assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+                }
+                tails[0]["usage"].clone()
+            } else {
+                let response: Value = serde_json::from_slice(&bytes).unwrap();
+                if tool {
+                    assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+                }
+                response["usage"].clone()
+            };
+            assert_eq!(
+                usage,
+                serde_json::json!({"prompt_tokens":42,"completion_tokens":38,"total_tokens":80})
+            );
+            assert_eq!(stats.tokens_total.load(Ordering::Relaxed), 38);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_streams_never_emit_successful_usage_tail() {
+        for (legacy, tool) in [(false, false), (true, false), (false, true)] {
+            let (app, stats) = usage_tail_app(tool, true).await;
+            let mut request = serde_json::json!({"model":"mock-model","stream":true,
+                "stream_options":{"include_usage":true}});
+            if legacy {
+                request["prompt"] = serde_json::json!("hi");
+            } else {
+                request["messages"] = serde_json::json!([{"role":"user","content":"hi"}]);
+            }
+            if tool {
+                request["tools"] =
+                    serde_json::json!([{"type":"function","function":{"name":"get_weather"}}]);
+            }
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(if legacy {
+                            "/v1/completions"
+                        } else {
+                            "/v1/chat/completions"
+                        })
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("\"object\":\"error\""), "{body}");
+            assert!(!body.contains("\"usage\""), "{body}");
+            assert_eq!(stats.tokens_total.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn streaming_stats_replace_not_add_lower_authoritative_total() {
+        let stats = ApiStats::default();
+        let completion = std::sync::atomic::AtomicU32::new(0);
+        record_stream_tokens(
+            &Chunk::token("t", 0, "partial").with_n_tokens(5),
+            &stats,
+            &completion,
+        );
+        record_stream_tokens(
+            &Chunk::final_marker("t", "").with_completion_tokens(3),
+            &stats,
+            &completion,
+        );
+        assert_eq!(completion.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.tokens_total.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -4908,6 +5320,82 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    #[test]
+    fn chat_turns_forward_tool_fields_as_wire_json() {
+        let req = chat_request(serde_json::json!({
+            "tools": [{"type":"function","function":{"name":"get_weather",
+                "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],
+            "messages": [
+                {"role":"assistant","content":null,
+                 "tool_calls":[{"id":"call_1","type":"function",
+                    "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+                {"role":"tool","tool_call_id":"call_1","name":"get_weather",
+                 "content":"{\"temp_c\":18}"},
+                {"role":"user","content":"thanks"}
+            ]
+        }));
+        let turns = chat_turns(&req);
+        assert_eq!(turns.len(), 3);
+        let calls = turns[0].tool_calls.as_ref().expect("tool_calls forwarded");
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            calls[0]["function"]["arguments"], "{\"city\":\"Paris\"}",
+            "arguments stay the OpenAI string form"
+        );
+        assert_eq!(turns[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(turns[1].name.as_deref(), Some("get_weather"));
+        let tools = chat_tools(&req).expect("tools forwarded");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_turns_get_413() {
+        // max_prompt_bytes small enough that the rendered prompt passes but
+        // the tool-result turn does not — content + tool fields must count.
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_prompt_bytes: 128,
+            // roles-only template: the rendered prompt stays tiny while the
+            // tool-result turn is huge, so the messages check is what fires
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% if tools %}{{ tools | tojson }}{% endif %}\
+                     {% for m in messages %}{{ m.role }}\n{% endfor %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let big = "x".repeat(4096);
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "tools": [{"type":"function","function":{"name":"f"}}],
+            "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"tool","tool_call_id":"c1","content": big},
+            ],
+        });
+        let (status, body) = post_chat(app, payload).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("messages"),
+            "error must name the messages payload: {body}"
+        );
+    }
+
     /// Qwen3.8's template accepts only xhigh/medium/low and raises for anything
     /// else; the API's GLM-mapped default ("high") must not turn into a 400.
     #[test]
@@ -5492,6 +5980,49 @@ level={{ effort_map[eff] }}";
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tool_choice_shape_is_validated_before_the_engine() {
+        // a templated app, so the only thing that can 400 here is tool_choice
+        let app = make_tool_app().await;
+        for (choice, want) in [
+            (serde_json::json!("sometimes"), StatusCode::BAD_REQUEST),
+            (
+                serde_json::json!({"type": "function", "function": {"name": "get_time"}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"type": "function"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+                StatusCode::OK,
+            ),
+            (serde_json::json!("required"), StatusCode::OK),
+        ] {
+            let payload = serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "weather in Paris?"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "tool_choice": choice,
+                "stream": false
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), want, "{choice}");
+        }
     }
 
     #[test]

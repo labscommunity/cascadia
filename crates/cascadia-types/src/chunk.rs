@@ -56,17 +56,24 @@ pub struct Chunk {
     /// Filled when the engine supports it AND the task asked for it.
     #[serde(default)]
     pub logprobs: Option<TokenLogprobs>,
-    /// Number of model tokens condensed into this chunk's `text`. Most
-    /// engines emit one token per chunk so this is None (consumers
-    /// treat None as 1). Spec-decode emits 1..=K+1 tokens per chunk
-    /// (one full spec round) and sets this so downstream tok/s metrics
-    /// don't undercount.
+    /// Number of known model tokens condensed into this chunk. Most engines
+    /// emit one token per chunk and leave this None (non-empty text counts
+    /// as one). Spec-decode sets its exact batch count. A transport fragment
+    /// with unknown token boundaries sets Some(0) and reports authoritative
+    /// `completion_tokens` on the final chunk instead of guessing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_tokens: Option<u32>,
     /// Prompt token count, set on the FINAL chunk by engines that know
     /// it (the API's usage block reads it; None = engine can't tell).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u32>,
+    /// Authoritative total model tokens generated for this task, including
+    /// hidden reasoning and tool calls. Only valid on a successful FINAL
+    /// chunk; replaces the accumulated per-chunk count, never adds to it.
+    /// None means no authoritative total is available (including failures
+    /// and early cancellation). SSE events are not model-token boundaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
     /// Set when a task terminates by FAILURE rather than completion. The
     /// `step()` API returns `Vec<(TaskId, Chunk)>` — not a `Result` — so a
     /// final chunk is the only "task is done" signal an engine can emit.
@@ -104,10 +111,37 @@ impl Chunk {
             logprobs: None,
             n_tokens: None,
             prompt_tokens: None,
+            completion_tokens: None,
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
         }
+    }
+
+    /// A progress marker: no text, no token (`n_tokens` = 0), not final. An
+    /// engine emits one from a step that did real work for the task but has
+    /// nothing to say yet (a long prompt going down a pipeline one window at
+    /// a time), so the runner's no-progress watchdog sees the work and the
+    /// API sends nothing for it. Consumers: [`Self::is_progress`].
+    pub fn progress(task_id: TaskId) -> Self {
+        Self {
+            task_id,
+            token_id: 0,
+            text: String::new(),
+            token_ids: Vec::new(),
+            is_final: false,
+            logprobs: None,
+            n_tokens: Some(0),
+            prompt_tokens: None,
+            completion_tokens: None,
+            error: None,
+            finish_reason: None,
+        }
+    }
+
+    /// See [`Self::progress`].
+    pub fn is_progress(&self) -> bool {
+        !self.is_final && self.error.is_none() && self.text.is_empty() && self.n_tokens == Some(0)
     }
 
     pub fn final_marker(task_id: impl Into<TaskId>, text: impl Into<String>) -> Self {
@@ -119,6 +153,7 @@ impl Chunk {
             logprobs: None,
             n_tokens: None,
             prompt_tokens: None,
+            completion_tokens: None,
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
@@ -137,6 +172,7 @@ impl Chunk {
             logprobs: None,
             n_tokens: None,
             prompt_tokens: None,
+            completion_tokens: None,
             error: Some(reason.into()),
             finish_reason: None,
             token_ids: Vec::new(),
@@ -145,6 +181,12 @@ impl Chunk {
 
     pub fn with_prompt_tokens(mut self, n: u32) -> Self {
         self.prompt_tokens = Some(n);
+        self
+    }
+
+    /// Set the whole-generation total on a successful final chunk.
+    pub fn with_completion_tokens(mut self, n: u32) -> Self {
+        self.completion_tokens = Some(n);
         self
     }
 
@@ -171,22 +213,48 @@ impl Chunk {
         self
     }
 
-    /// Tokens this chunk contributes to a cumulative count — the ONE
-    /// convention every consumer (API `usage`, dashboard counters,
-    /// Prometheus metrics) must share. The engine's `n_tokens` is
-    /// authoritative when set (spec-decode reports 1..=K+1; ov-genai sets
-    /// it on its single final chunk — issue #55); otherwise one token per
-    /// non-empty chunk, so the empty final markers mock/runtime engines
-    /// emit contribute 0 rather than a phantom token.
+    /// Known tokens contributed by this chunk (not a whole-generation total).
+    /// `n_tokens` wins when set; otherwise non-empty text contributes one and
+    /// empty final markers contribute zero. Cumulative usage consumers must
+    /// use [`Self::accumulate_tokens`] to reconcile authoritative final totals.
     pub fn token_count(&self) -> u32 {
         self.n_tokens
             .unwrap_or(if self.text.is_empty() { 0 } else { 1 })
+    }
+
+    /// Update a task's cumulative count without double-counting a final
+    /// authoritative total. Failures and cancelled tasks have no final total.
+    pub fn accumulate_tokens(&self, total: &mut u32) {
+        if self.error.is_some() {
+            return;
+        }
+        if self.is_final && self.finish_reason != Some(FinishReason::Cancelled) {
+            if let Some(n) = self.completion_tokens {
+                *total = n;
+                return;
+            }
+        }
+        *total += self.token_count();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_marker_is_not_a_token_nor_final() {
+        let p = Chunk::progress("t".into());
+        assert!(p.is_progress());
+        assert!(!p.is_final);
+        assert!(p.text.is_empty());
+        assert_eq!(p.n_tokens, Some(0));
+        assert!(!Chunk::token("t".to_string(), 1, "a").is_progress());
+        assert!(!Chunk::final_marker("t".to_string(), "").is_progress());
+        let mut e = Chunk::progress("t".into());
+        e.error = Some("x".into());
+        assert!(!e.is_progress());
+    }
 
     #[test]
     fn chunk_token_ids_defaults_empty_and_is_additive() {
@@ -198,6 +266,7 @@ mod tests {
             logprobs: None,
             n_tokens: None,
             prompt_tokens: None,
+            completion_tokens: None,
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
@@ -215,5 +284,36 @@ mod tests {
         });
         let back: Chunk = serde_json::from_value(without_field).unwrap();
         assert_eq!(back.token_ids, Vec::<i64>::new());
+        assert_eq!(back.completion_tokens, None);
+    }
+
+    #[test]
+    fn authoritative_completion_replaces_partial_counts_only_on_success() {
+        let mut total = 0;
+        Chunk::progress("t".into()).accumulate_tokens(&mut total);
+        assert_eq!(total, 0);
+        Chunk::token("t", 1, "partial").accumulate_tokens(&mut total);
+        Chunk::final_marker("t", "last")
+            .with_n_tokens(2)
+            .with_completion_tokens(38)
+            .accumulate_tokens(&mut total);
+        assert_eq!(total, 38);
+        Chunk::error("t", "failed")
+            .with_completion_tokens(99)
+            .accumulate_tokens(&mut total);
+        assert_eq!(total, 38);
+        Chunk::final_marker("t", "")
+            .with_finish_reason(FinishReason::Cancelled)
+            .with_completion_tokens(99)
+            .accumulate_tokens(&mut total);
+        assert_eq!(total, 38);
+        Chunk::final_marker("t", "")
+            .with_completion_tokens(0)
+            .accumulate_tokens(&mut total);
+        assert_eq!(total, 0);
+        let final_chunk = Chunk::final_marker("t", "").with_completion_tokens(38);
+        let round_trip: Chunk =
+            serde_json::from_str(&serde_json::to_string(&final_chunk).unwrap()).unwrap();
+        assert_eq!(round_trip.completion_tokens, Some(38));
     }
 }

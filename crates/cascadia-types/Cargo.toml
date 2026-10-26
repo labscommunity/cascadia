@@ -10,7 +10,7 @@ description = "Engine-agnostic core types: generation tasks, chunks, shards, pee
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }

@@ -3,8 +3,8 @@
 // We hand-roll the parser rather than use EventSource because EventSource
 // is GET-only — and OpenAI-shaped completions are POST. The wire format
 // is "data: <json>\n\n", terminated by "data: [DONE]\n\n". Cascadia adds a
-// non-standard `n_tokens` field per chunk so spec-decode chunks count
-// correctly (see cascadia-api lib.rs line ~470).
+// non-standard per-chunk `n_tokens` and authoritative final
+// `completion_tokens` fields; SSE event boundaries are not token boundaries.
 
 export type ChatRole = "user" | "assistant" | "system";
 
@@ -18,6 +18,8 @@ export type ChatCompletionChunk = {
   object: "chat.completion.chunk";
   /** Cascadia extension: tokens condensed into this chunk (spec-decode emits 1..K+1). */
   n_tokens?: number;
+  /** Whole-generation model-token total, only on successful final chunks. */
+  completion_tokens?: number | null;
   choices: {
     index: number;
     delta: { role?: string; content?: string };

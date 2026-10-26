@@ -197,11 +197,11 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~130 KB per context token as serialised (1.2 GB at 8 K, 4.45 GB at 32 K). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
-| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. `qwen35` additionally rejects prompts at or past `max_position_embeddings` (413). |
+| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. `qwen35` additionally rejects prompts at or past `max_position_embeddings` (413). A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
 | `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers (each entry may also be a [unix socket](#unix-domain-sockets) `unix:/path.sock`); this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
 | `--ep-worker-index <N>` / `--ep-worker-count <W>` | — | `sparse-moe` (Inkling) expert-parallel **worker**: serve expert shard N of W (experts with `id % W == N`, shared experts included) for every MoE layer on `--listen`; no API, no attention, no sequence state. |
 | `--ov-config <KEY=VALUE>` | — | Raw OV plugin property passthrough, repeatable. See below. |
-| `--elastic` | off | Elastic memory posture (Linux; file-backed big allocations). See below. |
+| `--elastic` | off | Elastic memory posture (Linux; file-backed big allocations). On `--engine sycl-llama` it instead enables `GGML_STREAM_WEIGHTS=1` on the spawned `llama-server` (device-side weight streaming; with the default `--elastic-vram auto` a model that fits runs at stock speed) — see below and [engines/sycl-llama.md](engines/sycl-llama.md). |
 | `--elastic-min-mb <MB>` | 1 | Elastic threshold; 16 = weights-only, zero speed cost. |
 | `--elastic-pool-mb <MB>` | 8192 | Elastic retained-mapping pool cap (0 = off). |
 
@@ -294,6 +294,24 @@ they share a wire protocol. See [engines/ov-dist-spec.md](engines/ov-dist-spec.m
 
 Raising sparsity trades quality for speed. Validate against dense before you
 deploy.
+
+### sycl-llama
+
+`sycl-llama` engine only. Deep-dive: [engines/sycl-llama.md](engines/sycl-llama.md).
+All flags exist on both `cascadia run` and `cascadia worker`.
+
+| Flag | Default | Env var | Meaning |
+|---|---|---|---|
+| `--llama-bin <PATH>` | auto | `CASCADIA_LLAMA_BIN` | Path to `llama-server`. Resolution: flag > env > `llama-server` on `PATH`. |
+| `--llama-ctx <N>` | `4096` | — | Context size (`-c`). |
+| `--llama-ngl <N>` | `99` | — | GPU layers (`-ngl`). Forced to 0 when `--device CPU`. |
+| `--llama-args <ARGS>` | — | — | Extra raw args, one value per occurrence split on spaces, repeatable: `--llama-args "-ctk q8_0 -fa on"`. |
+| `--llama-load-timeout <SECS>` | auto | — | Per-attempt health deadline: `60 + 8 per GiB` of model file. |
+| `--llama-load-retries <N>` | `1` | — | Extra load attempts after a child exit or health timeout. |
+| `--elastic-vram <auto\|GiB>` | `auto` | `GGML_STREAM_VRAM_MB` | Resident-weight budget for `--elastic`: `auto` = free VRAM − non-streamed weights − 2× largest layer − reserve; `0` = stream every layer. |
+| `--elastic-share <N>` | — | `GGML_STREAM_VRAM_SHARE` | Expected co-tenant count for `--elastic-vram auto` (sycl-llama): caps automatic resident weights at 1/N of the card so N instances load equal shares. Ignored with an explicit `--elastic-vram` or `GGML_STREAM_RESIDENT_LAYERS`. |
+| `--llama-mtp` | off | — | Speculative decoding with the model's own MTP head (`--spec-type draft-mtp`; GGUF needs nextn layers, e.g. Qwen3.8-27B). Qwen3.8-27B on the B70: 19.0 → 26.5 t/s resident, 0.80 → 2.39 t/s at `--elastic-vram 8`, 0.67 → 2.02 t/s fully streamed. |
+| — | `0` | `CASCADIA_EXPERT_CACHE_MB` → `GGML_STREAM_EXPERT_CACHE_MB` | MiB of hot-expert residency on MoE models under `--elastic`. Default 0: only the experts the router selects are read per token (automatic, any MoE); a budget pins the hottest expert slices on device. |
 
 ### Other
 
