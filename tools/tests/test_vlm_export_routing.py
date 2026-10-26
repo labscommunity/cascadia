@@ -224,13 +224,21 @@ def test_transformers_pin_follows_the_export_configs_bounds():
     class Floor:
         MIN_TRANSFORMERS_VERSION = "5.5"
 
-    assert ce.transformers_pin(Two) == "transformers==5.0.*"
-    assert ce.transformers_pin(Three) == "transformers==4.57.6"
+    class Both:
+        MIN_TRANSFORMERS_VERSION = "4.51.0"
+        MAX_TRANSFORMERS_VERSION = "4.53.3"
+
+    # Exactly the bounds `transformers_bounds_refusal` compares: `==5.0.*` would
+    # admit 5.0.1, which the `<= 5.0` bound refuses.
+    assert ce.transformers_pin(Two) == "transformers<=5.0"
+    assert ce.transformers_pin(Three) == "transformers<=4.57.6"
     assert ce.transformers_pin(Floor) == "transformers>=5.5"
+    assert ce.transformers_pin(Both) == "transformers>=4.51.0,<=4.53.3"
 
 
 def _bounds(pin):
-    r = ce.BoundsRefusal("its optimum-intel exporter needs transformers <= 5.0 (installed: 5.5.4)")
+    r = ce.BoundsRefusal("its optimum-intel exporter needs transformers <= 5.0 "
+                         "(installed: 5.5.4)")
     r.pin = pin
     return r
 
@@ -240,32 +248,67 @@ def test_bounds_refusal_gives_a_side_environment_recipe(tmp_path, monkeypatch, c
     a separate environment with the exporter's own transformers bound and
     this environment's optimum-intel / OpenVINO, then `cascadia shard` of the
     export directory."""
+    pytest.importorskip("optimum.intel", exc_type=ImportError)
     _raw(monkeypatch, FAMILY_CONFIGS["qwen2_5_vl"])
-    monkeypatch.setattr(ce, "optimum_exports_vlm", lambda mt: _bounds("transformers==5.0.*"))
+    monkeypatch.setattr(ce, "optimum_exports_vlm", lambda mt: _bounds("transformers<=5.0"))
     with pytest.raises(SystemExit) as e:
         ce.shard_vlm(_args("Qwen/Qwen2.5-VL-3B-Instruct", tmp_path),
                      FAMILY_CONFIGS["qwen2_5_vl"])
     msg = str(e.value)
     import importlib.metadata as md
 
-    assert '"transformers==5.0.*"' in msg
-    assert f'"optimum-intel=={md.version("optimum-intel")}"' in msg
-    assert f'"openvino=={md.version("openvino")}"' in msg
+    assert "'transformers<=5.0'" in msg
+    assert f"optimum-intel=={md.version('optimum-intel')}" in msg
+    assert f"openvino=={md.version('openvino')}" in msg
+    # The command checked end to end: asymmetric int4, no --sym.
     assert ("optimum-cli export openvino --model Qwen/Qwen2.5-VL-3B-Instruct "
             "--task image-text-to-text --weight-format int4 "
             "Qwen2.5-VL-3B-Instruct-int4-ov") in msg
     assert "cascadia shard --model Qwen2.5-VL-3B-Instruct-int4-ov" in msg
     assert "--num-stages 2" in msg
     assert "--revision" not in msg
+    assert ".\n" not in msg.split("Export it in", 1)[1], "a stray period after the recipe"
     assert cuts == []
+
+
+def test_recipe_keeps_the_weight_format_and_quotes_paths(tmp_path, monkeypatch):
+    pytest.importorskip("optimum.intel", exc_type=ImportError)
+    src = tmp_path / "my model"
+    src.mkdir()
+    recipe = ce.side_venv_recipe(str(src), "transformers<=5.0", None, "int8")
+    assert f"--model '{src}'" in recipe
+    assert "--weight-format int8 'my model-int8-ov'" in recipe
+    assert "cascadia shard --model 'my model-int8-ov'" in recipe
+
+
+def test_recipe_survives_an_sdk_openvino(monkeypatch):
+    """An OpenVINO without pip metadata (the INSTALL.md SDK layout) still gives a
+    recipe: the module's version, cut to its release, or no pin and a note."""
+    import importlib.metadata as md
+
+    real = md.version
+
+    def no_meta(dist):
+        if dist == "openvino":
+            raise md.PackageNotFoundError(dist)
+        return real(dist)
+
+    monkeypatch.setattr(md, "version", no_meta)
+    import openvino
+
+    assert ce._installed_version("openvino", "openvino") == openvino.__version__.split("-")[0]
+    monkeypatch.setattr(ce, "_installed_version",
+                        lambda dist, module: None if dist == "openvino" else "2.2.0")
+    recipe = ce.side_venv_recipe("org/m", "transformers<=5.0", 2)
+    assert " openvino " in recipe + " " and "openvino's version could not be read" in recipe
 
 
 def test_remote_code_refusal_wins_over_the_bounds_recipe():
     """Phi-3.5-vision and InternVL2 are outside the bounds too, but they ship
     remote code: no recipe may suggest running it."""
     cfg = {**FAMILY_CONFIGS["phi3_v"], "auto_map": {"AutoModel": "x.Y"}}
-    msg = ce.raw_export_refusal(cfg, _bounds("transformers==4.53.3"), "m/phi", 2)
-    assert "auto_map" in msg and "pip install" not in msg
+    assert "auto_map" in ce.raw_export_refusal(cfg, _bounds("transformers<=4.53.3"))
+    assert ce.raw_export_recipe(cfg, _bounds("transformers<=4.53.3"), "m/phi", 2) is None
 
 
 def test_raw_remote_code_checkpoint_is_refused(tmp_path, monkeypatch, cuts):

@@ -438,8 +438,8 @@ optimum-intel. Export in a separate environment, then shard the export directory
 
 ```bash
 python -m venv cascadia-vlm-export
-cascadia-vlm-export/bin/python -m pip install "transformers==5.0.*" "optimum-intel==2.2.0" \
-    "openvino==2026.4.1" nncf torch torchvision
+cascadia-vlm-export/bin/python -m pip install 'transformers>=4.57,<=5.0' optimum-intel==2.2.0 \
+    openvino==2026.4.1 nncf torch torchvision
 cascadia-vlm-export/bin/optimum-cli export openvino --model Qwen/Qwen2.5-VL-3B-Instruct \
     --task image-text-to-text --weight-format int4 Qwen2.5-VL-3B-Instruct-int4-ov
 cascadia shard --model Qwen2.5-VL-3B-Instruct-int4-ov \
@@ -447,7 +447,9 @@ cascadia shard --model Qwen2.5-VL-3B-Instruct-int4-ov \
 ```
 
 On Windows the environment's tools are under `cascadia-vlm-export\Scripts\`. Name the
-export directory after the model, as above: its name becomes the tree's `model_id`.
+export directory after the model, as above: its name becomes the tree's `model_id`. The
+printed recipe keeps the `--quantization` / `--weight-format` you passed. optimum-cli takes
+no `--revision`, so to pin one, download that revision first and pass its directory.
 Phi-3.5-vision and InternVL2 ship remote modelling code and stay refused; use their
 OpenVINO exports.
 
