@@ -402,15 +402,21 @@ pub fn to_internal(r: &OaRequest) -> Result<(DecisionRequest, Vec<OaMeta>), Deci
 }
 
 /// Internal answers (request order) → the OpenAI response, with a fresh id and the prompt tokens
-/// the core prefilled.
+/// the core prefilled. A question the core left unanswered is a server error, not a panic.
 pub fn to_openai(
     answers: &IndexMap<String, Answer>,
     meta: &[OaMeta],
     input_tokens: u64,
-) -> OaResponse {
-    let out = meta
-        .iter()
-        .map(|m| match &answers[&m.name] {
+) -> Result<OaResponse, DecisionError> {
+    let mut out = Vec::with_capacity(meta.len());
+    for m in meta {
+        let answer = answers.get(&m.name).ok_or_else(|| {
+            DecisionError::Engine(format!(
+                "internal error: no answer for question {:?}",
+                m.name
+            ))
+        })?;
+        out.push(match answer {
             Answer::Noul { noul } => OaAnswer::Predicate {
                 name: m.name.clone(),
                 probability: *noul,
@@ -454,9 +460,9 @@ pub fn to_openai(
                     .collect(),
                 confidence: *confidence,
             },
-        })
-        .collect();
-    OaResponse {
+        });
+    }
+    Ok(OaResponse {
         id: format!("dec-{}", uuid::Uuid::new_v4().simple()),
         answers: out,
         usage: OaUsage {
@@ -464,7 +470,7 @@ pub fn to_openai(
             output_tokens: 0,
             total_tokens: input_tokens,
         },
-    }
+    })
 }
 
 /// OpenAI's error envelope, which its SDKs parse into typed errors: `status` and
@@ -570,23 +576,48 @@ pub fn parse_request(text: &str) -> Result<OaRequest, DecisionError> {
         let v = serde_json::from_str::<serde_json::Value>(text).unwrap_or_default();
         bad(bad_content_part(&v).unwrap_or_else(|| format!("invalid request body: {e}")))
     })?;
-    let body = parse_ordered(text).map_err(|e| bad(format!("invalid request body: {e}")))?;
+    // Only the choice values are read exactly: other fields (unknown ones included) are skipped
+    // unread, as the typed parse skips them, so an out-of-range float there is not refused.
     // The typed parse refused repeated keys at every level read here, so each path is unique.
-    let qs = match body.get("questions") {
-        Some(OrderedValue::Array(qs)) => qs.as_slice(),
-        _ => &[],
-    };
-    for (q, node) in r.questions.iter_mut().zip(qs) {
-        let (OaQuestion::Choice { choices, .. }, Some(OrderedValue::Array(cs))) =
-            (q, node.get("choices"))
-        else {
+    let raw = serde_json::from_str::<RawBody>(text)
+        .map_err(|e| bad(format!("invalid request body: {e}")))?;
+    for (q, node) in r.questions.iter_mut().zip(raw.questions) {
+        // Read only under a choice question (the typed parse checked its `choices`); any other
+        // question's unknown `choices` field stays unread.
+        let (OaQuestion::Choice { choices, .. }, Some(cs)) = (q, node.choices) else {
             continue;
         };
+        let cs = serde_json::from_str::<Vec<RawChoice>>(cs.get())
+            .map_err(|e| bad(format!("invalid request body: {e}")))?;
         for (c, cn) in choices.iter_mut().zip(cs) {
-            c.value = cn.get("value").cloned().unwrap_or(OrderedValue::Null);
+            c.value = match cn.value {
+                Some(v) => {
+                    parse_ordered(v.get()).map_err(|e| bad(format!("invalid request body: {e}")))?
+                }
+                None => OrderedValue::Null,
+            };
         }
     }
     Ok(r)
+}
+
+/// The body read only down to each choice's raw `value` text ([`parse_request`]).
+#[derive(Deserialize)]
+struct RawBody<'a> {
+    #[serde(borrow, default)]
+    questions: Vec<RawQuestion<'a>>,
+}
+
+#[derive(Deserialize)]
+struct RawQuestion<'a> {
+    #[serde(borrow, default)]
+    choices: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(Deserialize)]
+struct RawChoice<'a> {
+    #[serde(borrow, default)]
+    value: Option<&'a serde_json::value::RawValue>,
 }
 
 /// POST /v1/decisions: the OpenAI Decisions API wire format. The body is taken as raw JSON text
@@ -610,9 +641,10 @@ pub async fn decide(
         Err(e) => return oa_err(e),
     };
     match super::handler::evaluate(&state, &req).await {
-        Ok((answers, input_tokens)) => {
-            Json(to_openai(&answers, &meta, input_tokens)).into_response()
-        }
+        Ok((answers, input_tokens)) => match to_openai(&answers, &meta, input_tokens) {
+            Ok(r) => Json(r).into_response(),
+            Err(e) => oa_err(e),
+        },
         Err(e) => oa_err(e),
     }
 }
@@ -672,6 +704,29 @@ mod tests {
             serde_json::to_string(&meta[0].choice_values[0]).unwrap(),
             "123456789012345678901234567890"
         );
+    }
+
+    #[test]
+    fn only_choice_values_are_range_checked() {
+        // Final review N1: an out-of-range float in an unknown field is skipped unread (as the
+        // typed parse skips it and as at e109a582); in a choice value it is still a 400.
+        let ok = r#"{"input": "x", "metadata": {"x": 1e400}, "questions": [
+            {"type": "predicate", "name": "p", "instructions": "q", "choices": "not read"},
+            {"type": "choice", "name": "c", "instructions": "q", "extra": 1e400,
+             "choices": [{"value": 1.5, "note": -1e400}, {"value": "b"}]}]}"#;
+        let r = parse_request(ok).unwrap();
+        let OaQuestion::Choice { choices, .. } = &r.questions[1] else {
+            panic!("choice")
+        };
+        assert_eq!(serde_json::to_string(&choices[0].value).unwrap(), "1.5");
+        let bad_value = r#"{"input": "x", "questions": [{"type": "choice", "name": "c",
+            "instructions": "q", "choices": [{"value": 1e400}, {"value": "b"}]}]}"#;
+        match parse_request(bad_value) {
+            Err(DecisionError::BadRequest(m)) => {
+                assert!(m.starts_with("invalid request body: "), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -903,7 +958,7 @@ mod tests {
             "urgent".to_string(),
             crate::decisions::schema::answer_from_probs(&r.questions["urgent"], &[0.2, 0.8]),
         );
-        let v = serde_json::to_value(to_openai(&answers, &meta, 7)).unwrap();
+        let v = serde_json::to_value(to_openai(&answers, &meta, 7).unwrap()).unwrap();
         // OpenAI's documented examples, reproduced exactly (confidence 0.93 and 0.55 included)
         assert_eq!(
             v["answers"][0],
@@ -932,6 +987,20 @@ mod tests {
             v.as_object().unwrap().len(),
             3,
             "only `id`, `answers` and `usage`"
+        );
+    }
+
+    #[test]
+    fn a_question_the_core_left_unanswered_is_a_server_error_not_a_panic() {
+        let (_, meta) = to_internal(&oa(
+            r#"{"input": "x", "questions": [{"type": "predicate", "name": "urgent", "instructions": "q"}]}"#,
+        ))
+        .unwrap();
+        let e = to_openai(&indexmap::IndexMap::new(), &meta, 1).unwrap_err();
+        assert!(matches!(e, DecisionError::Engine(_)), "{e:?}");
+        assert_eq!(
+            e.to_string(),
+            r#"internal error: no answer for question "urgent""#
         );
     }
 }
