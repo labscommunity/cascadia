@@ -312,6 +312,7 @@ dependencies = [
  "cascadia-discovery",
  "cascadia-elastic",
  "cascadia-engine",
+ "cascadia-engine-llamacpp",
  "cascadia-engine-mock",
  "cascadia-engine-openvino",
  "cascadia-engine-sparse-moe",
@@ -401,6 +402,23 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "cascadia-engine-llamacpp"
+version = "0.2.6"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-types",
+ "futures",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
