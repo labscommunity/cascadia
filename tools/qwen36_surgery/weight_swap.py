@@ -67,7 +67,8 @@ class Weights:
         from safetensors import safe_open  # noqa: F401  (import check)
         self.d = Path(d)
         self.idx = json.loads((self.d / "model.safetensors.index.json").read_text())["weight_map"]
-        self.prefix = "model.language_model." if any(k.startswith("model.language_model.") for k in self.idx) else "model."
+        # "" for a bare text model (Qwen3_5TextModel, e.g. Kev-27B: "layers.0...", "embed_tokens.weight")
+        self.prefix = next((p for p in ("model.language_model.", "model.") if any(k.startswith(p) for k in self.idx)), "")
         self._f = {}
 
     def _file(self, name):

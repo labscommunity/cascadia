@@ -5,6 +5,7 @@ codec_golden.py's job). Peak memory ~ one fp32 layer + the passes' activations.
 
   python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.parity.jsonl --out ref.json
   python tools/decision/reference_stream.py kev  --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors --tree TREE --dump d.parity.jsonl --out ref.json
+  python tools/decision/reference_stream.py kev  --weights KEV27B_DIR --full-weights --tree TREE --dump d.parity.jsonl --out ref.json
   python tools/decision/reference_stream.py clef --weights CLEF_DIR --clef-dir CLEF_DIR --tree TREE --dump d.parity.jsonl --out ref.json
   python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.wide.parity.jsonl --out wide_ref.json --wide
 
@@ -48,7 +49,8 @@ class Ckpt:
     def __init__(self, d):
         self.d = Path(d)
         self.idx = json.loads((self.d / "model.safetensors.index.json").read_text())["weight_map"]
-        self.prefix = "model.language_model." if any(k.startswith("model.language_model.") for k in self.idx) else "model."
+        # "" for a bare text model (Qwen3_5TextModel, e.g. Kev-27B: "layers.0...", "embed_tokens.weight")
+        self.prefix = next((p for p in ("model.language_model.", "model.") if any(k.startswith(p) for k in self.idx)), "")
         self._f = {}
 
     def _file(self, name):
@@ -423,6 +425,8 @@ def main():
     ap.add_argument("--lora", default=None)
     ap.add_argument("--lora-scale", type=float, default=None, help="override adapter_config.json")
     ap.add_argument("--clef-dir", default=None, help="clef: dir with joint_head.safetensors + joint_head_config.json")
+    ap.add_argument("--full-weights", action="store_true",
+                    help="kev: --weights is Kev's full-weight fine-tune (head.pt weights 'full'), no adapter")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--wide", action="store_true",
                     help="jev: the dump is parity_check.py --wide's slice of WIDE_RECORDS (needs the tree's tokenizer.json)")
@@ -431,10 +435,13 @@ def main():
         ap.error("--wide is for jev only")
     if a.family == "clef" and not a.clef_dir:
         ap.error("clef needs --clef-dir")
-    if a.family == "kev" and not a.lora:
+    if a.family == "kev" and not a.lora and not a.full_weights:
         # Kev's head was trained on Base + LoRA hidden states: a reference without the adapter is
         # the stock backbone, and parity against a tree exported the same way would still pass.
-        ap.error("kev needs --lora (Kev's adapter_model.safetensors) with --weights (its Base checkpoint)")
+        ap.error("kev needs --lora (Kev's adapter_model.safetensors) with --weights (its Base checkpoint), "
+                 "or --full-weights when --weights is a full-weight fine-tune (Kev-27B v2)")
+    if a.full_weights and (a.family != "kev" or a.lora):
+        ap.error("--full-weights is for kev without --lora")
     scale = resolve_lora_scale(a.lora, a.lora_scale)
     recs, tok = (WIDE_RECORDS, tree_tokenizer(a.tree)) if a.wide else (records(), None)
     ref = build_ref(a.family, a.weights, a.dump, recs, a.tree, a.lora, scale, a.clef_dir, threads=a.threads, tok=tok)

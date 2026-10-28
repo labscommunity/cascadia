@@ -216,8 +216,9 @@ def kev_head_unsupported(meta):
     if meta.get("special_embeddings", False):
         bad.append(f"special_embeddings={meta['special_embeddings']!r} (trained special-token embedding "
                    "rows the export does not carry)")
-    if meta.get("weights") not in (None, "lora"):
-        bad.append(f"weights {meta['weights']!r} (a kev export grafts a LoRA onto --weights)")
+    if meta.get("weights") not in (None, "lora", "full"):
+        bad.append(f"weights {meta['weights']!r} (a kev export grafts a LoRA onto --weights, or swaps in "
+                   "a full-weight checkpoint)")
     head = meta.get("head")
     if not isinstance(head, dict):
         # Meta's default head is None: a run that never saved its pointer head
@@ -451,22 +452,32 @@ def main():
         ap.error("clef takes no --lora/--lora-scale: --clef-dir is the full checkpoint its joint head reads")
     tokenizer = a.tokenizer
     if a.family == "kev":
-        # Kev's pointer head was trained on its fine-tuned backbone's hidden states (Base + LoRA):
-        # without either, the tree is the stock backbone under Kev's head and serves wrong answers
-        # that a reference built the same way would not catch.
+        # Kev's pointer head was trained on its fine-tuned backbone's hidden states (Base + LoRA, or
+        # a full-weight fine-tune): without them, the tree is the stock backbone under Kev's head and
+        # serves wrong answers that a reference built the same way would not catch.
         try:
             meta = kev_head_meta(a.head_pt)
         except Exception as e:  # missing file, or torch's varied unpickling errors: a bad head.pt
             ap.error(f"--head-pt {a.head_pt} is not a readable head.pt: {type(e).__name__}: {e}")
-        missing = [f for f, v in (("--weights", a.weights), ("--lora", a.lora)) if not v]
-        if missing:
-            rec = f" ({a.head_pt} records base {meta['base']!r}, weights {meta['weights']!r})" \
-                if meta["base"] or meta["weights"] else ""
-            ap.error(f"kev needs {' and '.join(missing)}: the pointer head reads its fine-tuned "
-                     f"backbone's hidden states, not the stock IR's{rec}")
-        if meta["weights"] not in (None, "lora"):
+        if meta["weights"] == "full":
+            # A full-weight fine-tune (Kev-27B v2): --weights is the whole checkpoint the head was
+            # trained on, swapped in as for clef, with nothing grafted on top.
+            if not a.weights:
+                ap.error(f"{a.head_pt} records weights 'full': kev needs --weights (the fine-tuned "
+                         f"checkpoint beside it), not the stock IR's backbone")
+            if a.lora or a.lora_scale is not None:
+                ap.error(f"{a.head_pt} records weights 'full': --weights is the whole fine-tune, so kev "
+                         f"takes no --lora/--lora-scale")
+        else:
+            missing = [f for f, v in (("--weights", a.weights), ("--lora", a.lora)) if not v]
+            if missing:
+                rec = f" ({a.head_pt} records base {meta['base']!r}, weights {meta['weights']!r})" \
+                    if meta["base"] or meta["weights"] else ""
+                ap.error(f"kev needs {' and '.join(missing)}: the pointer head reads its fine-tuned "
+                         f"backbone's hidden states, not the stock IR's{rec}")
+        if meta["weights"] not in (None, "lora", "full"):
             ap.error(f"{a.head_pt} records weights {meta['weights']!r}; a kev export grafts a LoRA "
-                     f"(weights 'lora') onto --weights")
+                     f"(weights 'lora') onto --weights, or swaps in a full-weight checkpoint ('full')")
         if meta.get("unsupported"):
             ap.error(f"{a.head_pt}: the server's Kev pointer head cannot serve " + "; ".join(meta["unsupported"]))
         # The spike (and so the golden reference) tokenizes with Kev's own tokenizer.json, which
