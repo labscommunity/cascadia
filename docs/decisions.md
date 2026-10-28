@@ -1400,3 +1400,33 @@ projection row, but a 4-tap linear-attention `conv1d` channel is single-signed i
 rows, and those rows saturated. That garbled the convolution in all 48 linear-attention layers of every
 `--weights` tree. With the fix, the swapped `conv1d` matches Intel's constants in at least 99.9% of
 entries.
+
+### Kev-27B
+
+**Model:** [jaredpalmer/kev-27b](https://huggingface.co/jaredpalmer/kev-27b) v2 (Kev 1.0), served across
+two machines like JEV-27B. Unlike Kev-9B (a LoRA), v2 is a full-weight fine-tune of Qwen3.8-27B saved as a
+bare `Qwen3_5TextModel`: its `head.pt` records `weights: 'full'`, its tensors carry no `model.` prefix,
+and it has no `lm_head`. The export swaps the whole checkpoint into Intel's int8 IR (`--weights`, no
+`--lora`) and keeps the IR's own `lm_head`, which the pointer head never reads; chat from this tree is not
+meaningful (Kev is decisions-only). The previous version, a LoRA at tag `v1-lora`, exports like Kev-9B.
+
+```bash
+hf download jaredpalmer/kev-27b --revision af0e6d551bdc2cc724f3e9d7a8bee1cd4fb8f7bf --local-dir ~/models/kev27b   # 51 GB (BF16)
+python tools/decision_export.py kev --base-ir ~/models/qwen38-27b-int8 --weights ~/models/kev27b \
+    --head-pt ~/models/kev27b/head.pt --stages 2 --out ~/trees/kev27b-int8
+# the fp32 reference reads the same checkpoint, with no adapter
+python tools/decision/reference_stream.py kev --weights ~/models/kev27b --full-weights --tree ~/trees/kev27b-int8 \
+    --dump d.parity.jsonl --out ref.json
+```
+
+Serve it with the two `cascadia worker` commands shown for JEV-27B. Two hosts that each downloaded and
+exported produced byte-identical trees (17/17 files by SHA-256); each export took about 4.5 minutes.
+
+**Measured parity** (same two hosts and set as JEV-27B, OpenVINO GenAI 2026.4.1, CPU; the fp32 reference
+took 21 minutes on one host with the ranks stopped):
+
+| Check | Result |
+|---|---|
+| int8 (2 machines) vs streamed fp32 reference | **82/82** (choice 33/33, predicate 24/24, score 25/25), max \|Δp\| 0.0180, no flips |
+| `/v1/decisions` vs `/v1/systemone` (string states) | 62/62 identical |
+| Temperature-0 chat before vs after the decision run | byte-identical |
