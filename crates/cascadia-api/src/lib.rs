@@ -4557,7 +4557,8 @@ mod tests {
                 .await
                 .unwrap();
         let mine =
-            serde_json::to_string(&decisions::openai::to_openai(&answers, &meta, n)).unwrap();
+            serde_json::to_string(&decisions::openai::to_openai(&answers, &meta, n).unwrap())
+                .unwrap();
         let (status, route) = post_raw(
             make_decision_app().await,
             "/v1/decisions",
