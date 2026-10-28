@@ -675,14 +675,14 @@ def test_cli_kev_needs_weights_and_lora(cli, monkeypatch, capsys, drop):
     assert calls == [] and not (tmp / "t").exists()
 
 
-def test_cli_kev_head_pt_recording_full_weights_refused(cli, monkeypatch, capsys):
+def test_cli_kev_head_pt_recording_unknown_weights_refused(cli, monkeypatch, capsys):
     run, calls, base, tmp = cli
-    _stub_kev(monkeypatch, meta={"base": "B", "weights": "full"})
+    _stub_kev(monkeypatch, meta={"base": "B", "weights": "qlora"})
     kd = _kev_dir(tmp)
     with pytest.raises(SystemExit):
         run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
             "--head-pt", str(kd / "head.pt"), "--out", str(tmp / "t"))
-    assert "'full'" in capsys.readouterr().err and calls == []
+    assert "'qlora'" in capsys.readouterr().err and calls == []
 
 
 def test_kev_head_meta_reads_base_and_weights_mode(tmp_path):
@@ -775,7 +775,7 @@ def test_kev_shipped_head_shape_exports(tmp_path):
     ({"option_isolation": True}, "option_isolation"),
     ({"special_embeddings": True}, "special_embeddings"),
     ({"head_dim": 256}, "head_dim 256"),
-    ({"weights": "full"}, "weights 'full'"),
+    ({"weights": "qlora"}, "weights 'qlora'"),
     ({"head": None}, "head tensors None"),  # Meta's default: no head saved (was a TypeError)
     ({"head_dim": None}, "head_dim None"),  # was int(None): a misleading "not a readable head.pt"
 ])
@@ -1326,3 +1326,35 @@ def test_cli_stages_must_be_positive(cli, capsys, value):
     with pytest.raises(SystemExit) as e:
         run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), "--stages", value)
     assert e.value.code == 2 and "--stages" in capsys.readouterr().err and calls == []
+
+
+def test_cli_kev_full_weights_swaps_the_checkpoint_without_lora(cli, monkeypatch):
+    # Kev-27B v2: head.pt records weights 'full', so --weights is the whole fine-tune and nothing is grafted.
+    run, calls, base, tmp = cli
+    _stub_kev(monkeypatch, meta={"base": "Qwen/Qwen3.8-27B", "weights": "full"})
+    kd = _kev_dir(tmp)
+    run("kev", "--base-ir", str(base), "--weights", "W", "--head-pt", str(kd / "head.pt"),
+        "--stages", "2", "--out", str(tmp / "t"))
+    (_, a, kw, _), = calls
+    assert a == (str(base), str(tmp / "t"), 2, False, None)
+    assert kw == {"weights": "W", "lora": None, "lora_scale": None, "final_hidden": True,
+                  "tokenizer": str(kd / "tokenizer.json")}
+
+
+@pytest.mark.parametrize("argv,flag", [([], "--weights"), (["--weights", "W", "--lora", "L.safetensors"], "--lora"),
+                                       (["--weights", "W", "--lora-scale", "2"], "--lora-scale")])
+def test_cli_kev_full_weights_needs_weights_and_no_lora(cli, monkeypatch, capsys, argv, flag):
+    run, calls, base, tmp = cli
+    _stub_kev(monkeypatch, meta={"base": "Qwen/Qwen3.8-27B", "weights": "full"})
+    kd = _kev_dir(tmp)
+    with pytest.raises(SystemExit):
+        run("kev", "--base-ir", str(base), *argv, "--head-pt", str(kd / "head.pt"), "--out", str(tmp / "t"))
+    err = capsys.readouterr().err
+    assert flag in err and "'full'" in err
+    assert calls == [] and not (tmp / "t").exists()
+
+
+def test_kev_head_full_weights_is_supported_other_modes_are_not():
+    head = {k: None for k in de.KEV_HEAD_TENSORS}
+    assert de.kev_head_unsupported({"head": head, "weights": "full"}) == []
+    assert any("'qlora'" in m for m in de.kev_head_unsupported({"head": head, "weights": "qlora"}))

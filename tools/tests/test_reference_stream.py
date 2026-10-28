@@ -416,3 +416,36 @@ def test_kev_reference_needs_weights(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         rs.main()
     assert "--weights" in capsys.readouterr().err
+
+
+def test_kev_reference_full_weights_needs_no_lora(tmp_path, monkeypatch):
+    # Kev-27B v2 is a full-weight fine-tune: --full-weights states that --weights already is it.
+    ran = []
+    monkeypatch.setattr(rs, "build_ref", lambda *a, **kw: ran.append(a) or {})
+    monkeypatch.setattr(sys, "argv", ["reference_stream.py", "kev", "--weights", str(tmp_path), "--full-weights",
+                                      "--dump", "d", "--tree", "t", "--out", str(tmp_path / "ref.json")])
+    rs.main()
+    assert ran and ran[0][0] == "kev" and ran[0][5] is None  # lora
+
+
+@pytest.mark.parametrize("argv", [["clef", "--clef-dir", "C"], ["kev", "--lora", "L"]])
+def test_full_weights_is_for_kev_without_lora(tmp_path, monkeypatch, capsys, argv):
+    monkeypatch.setattr(rs, "build_ref", lambda *a, **kw: {})
+    monkeypatch.setattr(rs, "resolve_lora_scale", lambda lora, override=None: None)
+    monkeypatch.setattr(sys, "argv", ["reference_stream.py", argv[0], "--weights", str(tmp_path), *argv[1:],
+                                      "--full-weights", "--dump", "d", "--tree", "t", "--out", str(tmp_path / "ref.json")])
+    with pytest.raises(SystemExit):
+        rs.main()
+    assert "--full-weights" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("keys,prefix", [
+    (["model.language_model.layers.0.mlp.up_proj.weight"], "model.language_model."),
+    (["model.layers.0.mlp.up_proj.weight"], "model."),
+    (["layers.0.mlp.up_proj.weight", "embed_tokens.weight"], ""),  # bare Qwen3_5TextModel (Kev-27B)
+])
+def test_checkpoint_prefix(tmp_path, keys, prefix):
+    from weight_swap import Weights
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: "m.safetensors" for k in keys}}))
+    assert rs.Ckpt(tmp_path).prefix == prefix
+    assert Weights(tmp_path).prefix == prefix
