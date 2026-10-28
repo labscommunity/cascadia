@@ -967,9 +967,12 @@ degraded: 2 stage copies leaked by fault recovery (N bytes); decode is slower un
 restarts (measured +16% with two on an Arc 140V); restart recommended`, with `leaked_copies`,
 `leaked_bytes` and `cap` fields. The rule keys on successful recompiles: a recovery that fails
 also leaks a copy, but it fails the engine, so no later recompile can warn. With the cap of 1 (a
-1-stage tree, or a big pipeline stage) only one recompile can succeed, so this warning never fires
-there: the one leaked copy (about 9 GB for a 1-stage 9B tree) stays until the restart, and the
-next fault fails the engine instead of leaking a second. Its decode cost was not measured. The
+1-stage tree, or a big pipeline stage) only one recompile can succeed, so there the warning keys
+on leaked bytes: the first successful recompile whose leaked copies hold at least 4 GiB logs, once,
+`qwen36: engine degraded: 1 stage copy leaked by fault recovery (N bytes); the memory stays held
+until the server restarts and the next fault fails the engine; restart recommended`. The one
+leaked copy (about 9 GB for a 1-stage 9B tree) stays until the restart, and the next fault fails
+the engine instead of leaking a second. Its decode cost was not measured. The
 code would name a helper thread leaked by a timed-out recompile in the text, but that cannot
 happen today: a timed-out recompile fails the engine. The API process's `/metrics` exposes
 `cascadia_engine_stage_recompiles_total` (counter: successful recompiles) and

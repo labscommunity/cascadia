@@ -81,7 +81,8 @@ const LARGE_LEAK_BYTES: u64 = 4 << 30;
 /// Successful recompiles at which the engine is flagged degraded (Task 54 fix round 3): each one
 /// leaves one leaked stage copy, and two leaked copies cost decode about 16%. A recompile that
 /// fails also leaks a copy, but it fails the engine, so no later recompile can warn. Under
-/// [`LARGE_LEAK_MAX_RECOMPILES`] only one recompile can succeed, so this never warns there.
+/// [`LARGE_LEAK_MAX_RECOMPILES`] only one recompile can succeed, so there the warning keys on
+/// leaked bytes instead (at least [`LARGE_LEAK_BYTES`] after a successful recompile).
 const DEGRADED_AT_RECOMPILES: usize = 2;
 /// Bound on one stage recompile, run on a helper thread (Task 54 fix round 2). A cold compile
 /// without the model cache can take tens of seconds; a cache-warm one measured 1.2-1.7 s on p01.
@@ -1304,7 +1305,7 @@ struct Rebuild {
     /// Recompiles this engine has started.
     recompiled: usize,
     /// Recompiles that succeeded (the fresh copy is installed). The degraded warning keys on
-    /// this ([`DEGRADED_AT_RECOMPILES`]).
+    /// this ([`DEGRADED_AT_RECOMPILES`]) or on `leaked_bytes` ([`LARGE_LEAK_BYTES`]).
     recompiles_ok: usize,
     /// Stage copies this engine's fault recovery leaked ([`leak_stage`] or a bounded call's
     /// `Forget`), whatever happened next: the faulted copy every recompile replaces, whether or
@@ -1349,13 +1350,17 @@ impl Rebuild {
     }
 
     /// A recompile succeeded (its old copy was already counted by [`Self::note_leaked`]): count
-    /// it, and warn once at the [`DEGRADED_AT_RECOMPILES`]th. Measured on an Arc 140V: one leaked
-    /// copy is harmless, two cost decode about 16%. Any failed step of a recovery fails the engine,
-    /// so when this warns every leaked copy came from a recompile that succeeded.
+    /// it, and warn once at the [`DEGRADED_AT_RECOMPILES`]th, or as soon as the leaked copies
+    /// hold [`LARGE_LEAK_BYTES`] (a 1-stage tree or a big pipeline stage, whose cap of 1 never
+    /// reaches a second recompile). Measured on an Arc 140V: one small leaked copy is harmless,
+    /// two cost decode about 16%. Any failed step of a recovery fails the engine, so when this
+    /// warns every leaked copy came from a recompile that succeeded.
     fn note_recompiled(&mut self) {
         self.recompiles_ok += 1;
         cascadia_metrics::ENGINE_STAGE_RECOMPILES_TOTAL.inc();
-        if self.recompiles_ok >= DEGRADED_AT_RECOMPILES && !self.degraded_warned {
+        let degraded =
+            self.recompiles_ok >= DEGRADED_AT_RECOMPILES || self.leaked_bytes >= LARGE_LEAK_BYTES;
+        if degraded && !self.degraded_warned {
             self.degraded_warned = true;
             let (n, m, cap) = (self.leaked_copies, self.leaked_bytes, self.cap);
             let msg = degraded_message(n, m, self.leaked_threads);
@@ -1377,16 +1382,25 @@ impl Rebuild {
     }
 }
 
-/// The degraded-engine warning text. `threads` is the number of recompile helper threads a
-/// timed-out recompile leaked (not stage copies), mentioned only when non-zero. Today it is always
-/// zero when this is logged: a timed-out recompile fails the engine, so no later recompile
-/// succeeds to warn.
+/// The degraded-engine warning text. One copy (the large-leak case) has no measured decode
+/// cost, so its text names the memory held instead. `threads` is the number of recompile helper
+/// threads a timed-out recompile leaked (not stage copies), mentioned only when non-zero. Today it
+/// is always zero when this is logged: a timed-out recompile fails the engine, so no later
+/// recompile succeeds to warn.
 fn degraded_message(copies: usize, bytes: u64, threads: usize) -> String {
-    let mut m = format!(
-        "qwen36: engine degraded: {copies} stage copies leaked by fault recovery ({bytes} bytes); \
-         decode is slower until the server restarts (measured +16% with two on an Arc 140V); \
-         restart recommended"
-    );
+    let mut m = if copies >= DEGRADED_AT_RECOMPILES {
+        format!(
+            "qwen36: engine degraded: {copies} stage copies leaked by fault recovery ({bytes} \
+             bytes); decode is slower until the server restarts (measured +16% with two on an \
+             Arc 140V); restart recommended"
+        )
+    } else {
+        format!(
+            "qwen36: engine degraded: {copies} stage copy leaked by fault recovery ({bytes} \
+             bytes); the memory stays held until the server restarts and the next fault fails \
+             the engine; restart recommended"
+        )
+    };
     if threads > 0 {
         m.push_str(&format!(
             "; {threads} recompile helper thread(s) also leaked after a timeout"
@@ -7966,6 +7980,12 @@ mod tests {
             degraded_message(2, 2000, 1),
             format!("{base}; 1 recompile helper thread(s) also leaked after a timeout")
         );
+        assert_eq!(
+            degraded_message(1, 9000, 0),
+            "qwen36: engine degraded: 1 stage copy leaked by fault recovery (9000 bytes); the \
+             memory stays held until the server restarts and the next fault fails the engine; \
+             restart recommended"
+        );
     }
 
     #[test]
@@ -8154,8 +8174,8 @@ mod tests {
         assert_eq!(e.rebuild.recompiled, 1);
         assert_eq!(e.rebuild.recompiles_ok, 1);
         assert!(
-            !e.rebuild.degraded_warned,
-            "one recompile is below DEGRADED_AT_RECOMPILES"
+            e.rebuild.degraded_warned,
+            "one whole-model leak reaches LARGE_LEAK_BYTES"
         );
         assert_eq!(watched.reason(), None, "recovered");
 
