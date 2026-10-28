@@ -91,6 +91,15 @@ const RECOMPILE_TIMEOUT: Duration = Duration::from_secs(180);
 /// could wait forever on the stuck request). A copy left with a timed-out or dead helper thread is
 /// leaked by `Forget` and not counted here. Logged as `process_leaked`.
 static LEAKED_RUNTIMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The error a timed-out pipeline exchange returns: a timeout, not `SocketClosed` (the socket is
+/// still open and the link state says whether it can be reused).
+fn reply_timed_out(what: &str) -> TransportError {
+    let after = cascadia_transport::recv_timeout();
+    TransportError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("{what} reply timed out after {after:?}"),
+    ))
+}
 /// One `wait_for` slice inside [`STAGE_IDLE_TIMEOUT`]: the state is re-read after each.
 const STAGE_IDLE_POLL: Duration = Duration::from_millis(100);
 
@@ -3106,7 +3115,7 @@ impl Qwen36Engine {
                         self.desync(format!("a {what} reply timeout {at}"));
                     }
                 }
-                Err(TransportError::SocketClosed)
+                Err(reply_timed_out(what))
             }
         }
     }
@@ -6820,9 +6829,13 @@ mod tests {
         let body = crate::decision::encode_result(&Ok(vec![1.0]));
 
         e.epoch = 1;
+        let err = e
+            .send_forward_recv_token(one_row(&e), 1, 0)
+            .expect_err("TOKEN past the bound");
+        let err = err.to_string();
         assert!(
-            e.send_forward_recv_token(one_row(&e), 1, 0).is_err(),
-            "TOKEN past the bound"
+            err.contains("reply timed out after") && !err.contains("socket closed"),
+            "a timeout is named a timeout, not a closed socket: {err}"
         );
         // Task 59: a reply late before its first byte leaves the link owed, not desynced, and
         // the engine keeps serving.

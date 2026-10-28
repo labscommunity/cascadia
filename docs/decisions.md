@@ -720,7 +720,8 @@ wait stopped:
   late frames of earlier tasks until it reads its own reply, then carries on normally. The skip is
   bounded: at most 16 stale frames and 32 MiB, within that task's own timeout. The log shows
   `pipeline reply timed out; its late reply will be skipped`, then one
-  `skipped a late reply of an earlier task` per frame skipped.
+  `skipped a late reply of an earlier task` per frame skipped. The failed task's error names the
+  timeout (`… TOKEN reply timed out after 60s`), not a closed socket.
 - **Mid-frame, mid-request, or on a reply with no task tag** (CAPTURE_ACK, used only with KV
   coordination), or after any other wire error on the link. Rank 0 can no longer find frame
   boundaries, so it marks the link desynced and logs one error,
