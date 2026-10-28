@@ -1256,7 +1256,7 @@ ships Kev's own tokenizer and swaps the text embeddings. The repo's `adapter_con
 
 ```bash
 hf download Qwen/Qwen3.5-9B-Base --revision 68c46c4b3498877f3ef123c856ecfde50c39f404 --local-dir ~/models/qwen35-9b-base
-hf download jaredpalmer/kev-9b adapter_model.safetensors adapter_config.json head.pt tokenizer.json --local-dir ~/models/kev9b
+hf download jaredpalmer/kev-9b --revision db029f08b290afd9fee4aa4bbcd9ae48602d1eb0 adapter_model.safetensors adapter_config.json head.pt tokenizer.json --local-dir ~/models/kev9b
 python tools/decision_export.py kev --base-ir ~/models/qwen35-9b-int8 --weights ~/models/qwen35-9b-base \
     --lora ~/models/kev9b/adapter_model.safetensors --head-pt ~/models/kev9b/head.pt \
     --out ~/trees/kev9b-int8           # 1 stage; 248 LoRA branches grafted (--stages 8: 31 per stage)
