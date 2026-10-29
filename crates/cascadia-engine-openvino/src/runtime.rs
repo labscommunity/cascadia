@@ -1684,8 +1684,20 @@ const RESTORE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 /// rig's 120s, 120s / 1200s — the same prefill budget `recv_reply_prefill` gave
 /// before, and strictly tighter than it at pathological settings.
 ///
+/// A caller-set prefill budget (`cascadia_transport::set_prefill_reply_timeout_secs`,
+/// e.g. the node entry's first-token budget) replaces the widened prefill
+/// default outright, so the head fails and frees its slot when the caller gives
+/// up instead of 600-1200 s later. Decode is unaffected.
+///
 /// Pure, for testing.
-fn token_recv_deadline(recv_timeout: std::time::Duration, prefill: bool) -> std::time::Duration {
+fn token_recv_deadline(
+    recv_timeout: std::time::Duration,
+    prefill: bool,
+    prefill_override: Option<std::time::Duration>,
+) -> std::time::Duration {
+    if let (true, Some(caller)) = (prefill, prefill_override) {
+        return caller;
+    }
     let factor = if prefill {
         cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR
     } else {
@@ -1805,7 +1817,11 @@ async fn recv_token_seq_checked(
     awaiting_seq: u32,
     prefill: bool,
 ) -> Result<i32, TokenWaitFailure> {
-    let budget = token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
+    let budget = token_recv_deadline(
+        cascadia_transport::recv_timeout(),
+        prefill,
+        cascadia_transport::prefill_reply_timeout_override(),
+    );
     let deadline_at = std::time::Instant::now() + budget;
     // Discards are summarised into the terminal error rather than logged per
     // frame. A peer echoing the wrong seq every time — a version skew, or a
@@ -10489,37 +10505,48 @@ mod tests {
         let f = cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR;
         // Below the ceiling: the configured value governs, x factor for prefill.
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(60), false),
+            token_recv_deadline(Duration::from_secs(60), false, None),
             Duration::from_secs(60)
         );
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(60), true),
+            token_recv_deadline(Duration::from_secs(60), true, None),
             Duration::from_secs(60) * f
         );
         // At the rig's config: decode sits exactly on the ceiling, and prefill
         // gets the same 1200s `recv_reply_prefill` used to give it.
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(120), false),
+            token_recv_deadline(Duration::from_secs(120), false, None),
             TOKEN_RECV_DEADLINE_CEILING
         );
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(120), true),
+            token_recv_deadline(Duration::from_secs(120), true, None),
             TOKEN_RECV_DEADLINE_CEILING * f
         );
         // Above it, the cap binds on both paths — this is the assertion a
         // `max()` typo fails.
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(600), false),
+            token_recv_deadline(Duration::from_secs(600), false, None),
             TOKEN_RECV_DEADLINE_CEILING
         );
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(600), true),
+            token_recv_deadline(Duration::from_secs(600), true, None),
             TOKEN_RECV_DEADLINE_CEILING * f
         );
         // An absurd configured base clamps rather than panicking on overflow.
         assert_eq!(
-            token_recv_deadline(Duration::MAX, true),
+            token_recv_deadline(Duration::MAX, true, None),
             TOKEN_RECV_DEADLINE_CEILING * f
+        );
+        // A caller-set prefill budget replaces the widened default; decode
+        // keeps its own bound.
+        let caller = Some(Duration::from_secs(300));
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(120), true, caller),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(120), false, caller),
+            TOKEN_RECV_DEADLINE_CEILING
         );
     }
 
