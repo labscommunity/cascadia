@@ -388,7 +388,10 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
   tree is refused at load (the FORWARD wire carries no token types or M-RoPE positions).
   Serve these on `ov-runtime`.
 - `cascadia shard --text-only` (export_shards.py's generic flow) builds the text tower
-  alone; such a tree serves text only.
+  alone; such a tree serves text only. It reads Hugging Face weights laid out as
+  `model.layers.*` (Qwen2-VL, Qwen2.5-VL, Phi-3.5-vision) and refuses, before writing
+  anything, an OpenVINO export or a checkpoint whose text tower is elsewhere (Qwen3-VL,
+  Mistral 3, LLaVA).
 
 ## Exporting
 
