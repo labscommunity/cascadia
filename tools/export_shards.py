@@ -59,6 +59,7 @@ CASCADIA_ALLOW_LOSSY_EXPORT=1 (check_export_quirks).
 """
 
 import argparse
+import fnmatch
 import gc
 import glob
 import json
@@ -321,6 +322,71 @@ def vision_dropped_note(config):
         "text and the API refuses image input with a 400. Staged image input "
         "needs a family-specific export (see docs/rfcs/vlm-support.md)."
     )
+
+
+# Weight files load_stage_weights reads; the text exporter reads nothing else.
+_WEIGHT_GLOBS = ("*.safetensors", "pytorch_model*.bin", "model*.bin", "consolidated*.bin")
+
+
+def _weight_keys(model, revision, names):
+    """A safetensors checkpoint's tensor names, from its index or the file
+    headers (never the weights). None when only .bin weights could say."""
+    if os.path.isdir(model):
+        index = os.path.join(model, "model.safetensors.index.json")
+        if os.path.exists(index):
+            with open(index) as f:
+                return list(json.load(f)["weight_map"])
+        files = sorted(glob.glob(os.path.join(model, "*.safetensors")))
+        if not files:
+            return None
+        from safetensors import safe_open
+
+        keys = []
+        for sf in files:
+            with safe_open(sf, framework="np") as f:
+                keys += list(f.keys())
+        return keys
+    if not any(n.endswith(".safetensors") for n in names):
+        return None
+    from huggingface_hub import HfApi
+
+    return list(HfApi().get_safetensors_metadata(model, revision=revision).weight_map)
+
+
+def text_exporter_refusal(args, raw_cfg) -> str | None:
+    """Why the generic text exporter cannot cut this source, decided before
+    anything is downloaded or written; None when it can. A VLM reaches the
+    generic flow only with --text-only (cascadia_export.shard_vlm cuts or
+    refuses it otherwise)."""
+    from cascadia_export import is_openvino_export, is_vlm_config, source_files
+
+    vlm = is_vlm_config(raw_cfg)
+    # A local dir costs a listdir; an HF id a file listing, so only for a VLM.
+    if not (vlm or os.path.isdir(args.model)):
+        return None
+    names = [os.path.basename(f) for f in source_files(args.model, args.revision)]
+    cmd = "cascadia shard --text-only" if args.text_only else "cascadia shard"
+    if not any(fnmatch.fnmatch(n, g) for n in names for g in _WEIGHT_GLOBS):
+        if not is_openvino_export(names):
+            return None
+        return (
+            f"`{cmd}` cannot cut {args.model}: it is an OpenVINO export (IR files, no "
+            f"checkpoint weights) and the text exporter reads Hugging Face weights; pass "
+            f"the original checkpoint"
+            + (", or drop --text-only to cut a vision tree from this export" if vlm else "")
+        )
+    if not vlm:
+        return None
+    keys = _weight_keys(args.model, args.revision, names)
+    if keys and not any(k.startswith("model.layers.") for k in keys):
+        mt = raw_cfg.get("model_type") or "this model"
+        return (
+            f"`{cmd}` cannot cut {args.model} ({mt}): its text-tower weights are not "
+            f"under model.layers.*, the only layout the text exporter reads; drop "
+            f"--text-only to cut a vision tree, or use `cascadia export` for a "
+            f"whole-model export"
+        )
+    return None
 
 
 def is_moe_config(config) -> bool:
@@ -2248,6 +2314,9 @@ def _shard():
     routed = shard_vlm(args, _raw_cfg)
     if routed:
         return args, routed
+    why = text_exporter_refusal(args, _raw_cfg)
+    if why:
+        raise SystemExit(why)
 
     # Past the dispatches: the generic dense builder needs the full stack.
     if torch is None:
@@ -2455,9 +2524,6 @@ def _shard():
         "quantization": args.quantization,
         "export_version": "v5_canonical_inputs",
     }
-    with open(os.path.join(output_dir, "pipeline_config.json"), "w") as f:
-        json.dump(pipeline_meta, f, indent=2)
-
     total_mb = 0.0
     for s in plan:
         if args.stage is not None and s["stage"] != args.stage:
@@ -2487,6 +2553,14 @@ def _shard():
             )
         total_mb += size
         gc.collect()
+
+    # The tree's marker goes in last, by atomic rename: a run that fails
+    # part-way leaves no pipeline_config.json, so no tree looks complete
+    # without its stages.
+    marker = os.path.join(output_dir, "pipeline_config.json")
+    with open(marker + ".tmp", "w") as f:
+        json.dump(pipeline_meta, f, indent=2)
+    os.replace(marker + ".tmp", marker)
 
     print("\n" + "=" * 60, flush=True)
     print("EXPORT COMPLETE", flush=True)
