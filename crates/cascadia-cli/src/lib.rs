@@ -3067,10 +3067,7 @@ const EXPORT_REQUIREMENTS: &str = include_str!(concat!(
 /// Every entry is double-quoted: `>=`/`<`/`[extras]` need quoting, and double
 /// quotes are the only form that survives sh, zsh, PowerShell and cmd.exe alike.
 pub(crate) fn export_pip_install_line(python: &str) -> String {
-    let pkgs: Vec<String> = EXPORT_REQUIREMENTS
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim()) // drop comments
-        .filter(|l| !l.is_empty())
+    let pkgs: Vec<String> = export_requirement_lines()
         .map(|p| format!("\"{p}\""))
         .collect();
     // Quote the interpreter only when it needs it. No PowerShell `&` call
@@ -3083,6 +3080,36 @@ pub(crate) fn export_pip_install_line(python: &str) -> String {
         python.to_string()
     };
     format!("{py} -m pip install {}", pkgs.join(" "))
+}
+
+/// The requirement lines of EXPORT_REQUIREMENTS, comments and blanks dropped.
+/// The pip line and [`export_requirements`] both read through here, so they
+/// cannot drift from each other or from this binary's exporter.
+fn export_requirement_lines() -> impl Iterator<Item = &'static str> {
+    EXPORT_REQUIREMENTS
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+}
+
+/// The exporter's pinned deps as `(name, PEP 440 specifier)` pairs, e.g.
+/// `("transformers", ">=5.5,<5.6")`, parsed from the requirements.txt compiled
+/// into this binary. For callers that check installed versions before running
+/// the exporter, so they never keep a copy of the pins.
+pub fn export_requirements() -> &'static [(&'static str, &'static str)] {
+    static REQS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> =
+        std::sync::OnceLock::new();
+    REQS.get_or_init(|| {
+        export_requirement_lines()
+            .map(|l| {
+                let at = l.find(['<', '>', '=', '!', '~']).unwrap_or(l.len());
+                let (name, spec) = l.split_at(at);
+                // `pkg[extra]>=1` names the package `pkg`.
+                let name = name.split('[').next().unwrap_or(name).trim();
+                (name, spec.trim())
+            })
+            .collect()
+    })
 }
 
 /// Sibling modules the exporter imports at runtime: the dedicated Gemma-4
@@ -3781,6 +3808,24 @@ mod python_tests {
             .to_string();
         assert!(err.contains("cascadia-no-such-python"), "{err}");
         assert!(!err.contains("on PATH"), "{err}");
+    }
+
+    #[test]
+    fn export_requirements_are_the_pip_line_pins_split_into_name_and_spec() {
+        let reqs = export_requirements();
+        assert!(reqs.contains(&("transformers", ">=5.5,<5.6")), "{reqs:?}");
+        assert!(reqs.contains(&("huggingface_hub", ">=0.30")), "{reqs:?}");
+        // Same entries as the pip line, in the same order: one source.
+        let line = export_pip_install_line("python");
+        let quoted: Vec<String> = reqs.iter().map(|(n, s)| format!("\"{n}{s}\"")).collect();
+        assert_eq!(line, format!("python -m pip install {}", quoted.join(" ")));
+        for (name, spec) in reqs {
+            assert!(
+                !name.is_empty() && !name.contains(['<', '>', '=', ' ']),
+                "{name}"
+            );
+            assert!(!spec.is_empty(), "{name} has no specifier");
+        }
     }
 
     #[test]
