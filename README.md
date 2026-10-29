@@ -78,7 +78,7 @@ There are follow-up steps for performing real inference in **[QUICKSTART.md](QUI
 # Engines that need OpenVINO return a clean runtime error.
 cargo build --release -p cascadia
 
-# Real OpenVINO mode. Links against openvino-genai 2026.2.0+. Required
+# Real OpenVINO mode. Links against openvino-genai 2026.4.1.0 (the release pin). Required
 # for inference on real Intel hardware.
 INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.4.1.0 \
   cargo build --release -p cascadia --features openvino
