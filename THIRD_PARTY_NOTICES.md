@@ -137,7 +137,7 @@ read the formulas and the wire format through Kev's Apache-2.0
 - the confidence formulas: choice `(p_max - 1/K) / (1 - 1/K)` and score
   `max(0, 1 - E|level - mode| / D)`, in
   `crates/cascadia-api/src/decisions/schema.rs` and documented in
-  `docs/decisions.md`.
+  `docs/DECISIONS.md`.
 
 **Implementation:** Rust re-implementation. No TypeSafe source files have
 been copied into the cascadia tree.

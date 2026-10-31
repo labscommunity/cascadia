@@ -368,7 +368,7 @@ pub fn to_internal(r: &OaRequest) -> Result<(DecisionRequest, Vec<OaMeta>), Deci
                     .iter()
                     .map(|l| {
                         m.level_labels.push(l.label.clone());
-                        // One text per level, as the models were trained; see docs/decisions.md.
+                        // One text per level, as the models were trained; see docs/DECISIONS.md.
                         OrderedValue::String(
                             match l.description.as_deref().filter(|d| !d.is_empty()) {
                                 Some(d) => format!("{}: {d}", l.label),
@@ -507,7 +507,7 @@ pub fn openai_rejection(r: &JsonRejection) -> (StatusCode, serde_json::Value) {
 /// The `/v1/decisions` request from the raw body, exactly as the OSS route reads it once the
 /// content type and body size have passed (the extractor's JSON read, then [`parse_request`]);
 /// on failure, the status and envelope the route returns. The 415 and 413 the route sends before
-/// reading the body are the embedder's own (see docs/decisions.md, "Embedding the decision core").
+/// reading the body are the embedder's own (see docs/DECISIONS.md, "Embedding the decision core").
 pub fn openai_parse(body: &[u8]) -> Result<OaRequest, (StatusCode, serde_json::Value)> {
     let raw = match Json::<Box<serde_json::value::RawValue>>::from_bytes(body) {
         Ok(Json(raw)) => raw,
