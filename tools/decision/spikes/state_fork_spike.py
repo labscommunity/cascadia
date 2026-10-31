@@ -8,7 +8,7 @@ heads in numpy. Nothing in crates/ uses it. Results fed a local design note that
 
 Verdict: the fork modes are NO-GO on OpenVINO 2026.4 GPU (RemoteTensor states refused, NaN rows once
 the prefix exceeds 256 tokens with beam_idx expansion, a fault on shrink, unfaithful copies). H-lite
-(mode H) is GO: shipped as Task 55, Kev p50 3.56 s to 2.41 s (docs/decisions.md).
+(mode H) is GO: shipped as Task 55, Kev p50 3.56 s to 2.41 s (docs/DECISIONS.md).
 
   python state_fork_spike.py analyze --family kev --dump fork-kev-9b.jsonl --cases td40.jsonl --tree DIR
   python state_fork_spike.py run     --family kev --dump ... --cases ... --tree DIR --out res-kev.jsonl \

@@ -1,4 +1,4 @@
-"""Build a Cascadia decision-model tree (docs/decisions.md).
+"""Build a Cascadia decision-model tree (docs/DECISIONS.md).
 
   jev:  python tools/decision_export.py jev  --base-ir STOCK_INT8_IR --adapter-dir JEV/adapter_vllm --out TREE [--stages N]
         (--weights FT_DIR only for a fine-tuned, NOT LoRA-merged backbone, with --weights-not-merged)

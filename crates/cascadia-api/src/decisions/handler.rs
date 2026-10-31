@@ -98,7 +98,7 @@ fn err(e: &DecisionError) -> Response {
 /// reads it once the content type and body size have passed: on failure, the status (400 for a
 /// syntax error, 422 for a body that does not fit the schema) and the `text/plain` body the
 /// route returns. The 415 and 413 the route sends before reading the body are the embedder's own
-/// (see docs/decisions.md, "Embedding the decision core").
+/// (see docs/DECISIONS.md, "Embedding the decision core").
 pub fn systemone_parse(body: &[u8]) -> Result<DecisionRequest, (StatusCode, String)> {
     match Json::<DecisionRequest>::from_bytes(body) {
         Ok(Json(req)) => Ok(req),

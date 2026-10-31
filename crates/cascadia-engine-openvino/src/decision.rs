@@ -1,5 +1,5 @@
 //! Decision heads run where the final hidden states live (single box or the last pipeline rank).
-//! See docs/decisions.md. Pure logic here; qwen36.rs drives it.
+//! See docs/DECISIONS.md. Pure logic here; qwen36.rs drives it.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};

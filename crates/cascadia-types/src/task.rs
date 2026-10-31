@@ -144,7 +144,7 @@ pub struct GenerationTask {
     /// also covers tasks constructed in-process).
     #[serde(default, deserialize_with = "de_resume_ids")]
     pub resume_token_ids: Option<Vec<i32>>,
-    /// Decision readout (docs/decisions.md). `Some` ⇒ the engine prefills
+    /// Decision readout (docs/DECISIONS.md). `Some` ⇒ the engine prefills
     /// `decision.prompt_ids` verbatim and emits ONE final chunk carrying
     /// `Chunk::decision_logits`; `prompt`, sampling and `max_tokens` are ignored.
     /// Engines without decision support fail the task with a
