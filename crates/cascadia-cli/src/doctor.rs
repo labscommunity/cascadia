@@ -323,7 +323,7 @@ fn check_python(r: &mut Report) {
             );
             // Print the pins anyway: a bundle user has no tools/requirements.txt
             // to read, and this is the only place they can learn them.
-            r.note("Install Python 3.10+, then:");
+            r.note("Install Python 3.10-3.13 (the OpenVINO export does not run on 3.14), then:");
             r.note(&crate::export_pip_install_line("python"));
         }
     }

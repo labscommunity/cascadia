@@ -298,10 +298,24 @@ def download(repo: str, revision: str) -> str:
     return local
 
 
+def python_refusal(version_info=sys.version_info) -> str | None:
+    """Why this interpreter cannot run the pinned optimum export, or None. optimum 2.3 /
+    optimum-intel 2.2 fail on Python 3.14 inside the export (`NormalizedConfig ...
+    'allow_new'`); 3.10-3.13 work."""
+    if tuple(version_info[:2]) >= (3, 14):
+        return (f"the OpenVINO export (optimum-intel 2.2, optimum 2.3) does not run on Python "
+                f"{version_info[0]}.{version_info[1]}; use Python 3.10-3.13 "
+                f"(`cascadia export|shard --python <path>`)")
+    return None
+
+
 def optimum_export(model: str, out_dir: str, task: str, weight_format: str,
                    revision: str | None = None, sym: bool = False) -> None:
     """optimum-cli export openvino, run with this interpreter. A hub id with a known
     revision is downloaded at that revision first: optimum-cli has no --revision."""
+    why = python_refusal()
+    if why:
+        raise SystemExit(why)
     if revision and not os.path.isdir(model):
         model = download(model, revision)
     cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "openvino",
