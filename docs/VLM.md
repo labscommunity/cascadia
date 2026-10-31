@@ -1,10 +1,10 @@
-# Image input (VLM)
+# Image and video input (VLM)
 
 Cascadia takes images the way the OpenAI API does: `image_url` content parts in
 `/v1/chat/completions` messages. This page says which models and engines take them, how
-to export each one, and what the limits are. The design and its verification history are
-in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video is served as sampled frames, or
+to export each one, and what the limits are. Video is served as sampled frames, or
 whole where the engine takes it natively (see [Video](#video)); audio is not supported.
+Measurements here come from two Lunar Lake AI PCs (Core Ultra 7 258V: CPU, Arc 140V GPU, NPU; 32 GB), called PC A and PC B, joined over Tailscale for two-machine runs.
 
 ## The request
 
@@ -208,7 +208,7 @@ equal its `get_rope_index` on Qwen3-VL and Qwen3.5 and the original code's on Qw
 (stateful, static, packed; one box or several; CPU or NPU): rank 0 encodes it and the stages see the
 same rows and position frames as for an image.
 
-Measured on pawan-04 (CPU) with the SDK video suite's 4 s clip (4 frames): a Qwen3-VL-4B
+Measured on PC A (CPU) with the SDK video suite's 4 s clip (4 frames): a Qwen3-VL-4B
 tree takes 450 prompt tokens natively (one encode, cached for the follow-up turns) where
 the same clip as labelled frames took 871, and ov-genai's native path 447 (GenAI 2026.4.1
 replaces the whole `<|vision_start|><|video_pad|><|vision_end|>`, dropping the outer pair
@@ -219,14 +219,14 @@ takes 565, as ov-genai does, in every mode: one-stage stateful, static
 (`static_variant.py --context 2048 --prefill-seq 256 --shared-prefill`) and packed
 (`packed_variant.py --slots 2 --packed-seq 64 --dynamic-seq`; two slots, since 565
 tokens do not fit a four-slot region of 511), and a two-stage static and packed tree
-across pawan-04 (rank 0) and pawan-02, each answering "The first shape is a red
+across PC A (rank 0) and PC B, each answering "The first shape is a red
 circle, and the last shape is a blue square." (about 30-40 s a request on CPU) and
 passing the image suite (294 prompt tokens). A two-stage Qwen3-VL tree
-across pawan-04 (rank 0) and pawan-02 also counts 450 and answers the same.
+across PC A (rank 0) and PC B also counts 450 and answers the same.
 
 The `qwen35` engine was verified live on 2026-10-19 with a two-stage Qwen3.6-35B-A3B tree
-(`export_qwen36_moe.py --total 2`), stage 0 and the vision IRs on pawan-04 (rank 0) and
-stage 1 on pawan-02, both CPU: the same clip as a `video_url` (MP4 and WebM), a Responses
+(`export_qwen36_moe.py --total 2`), stage 0 and the vision IRs on PC A (rank 0) and
+stage 1 on PC B, both CPU: the same clip as a `video_url` (MP4 and WebM), a Responses
 `input_video` and a streamed request all count 454 prompt tokens and answer "The first
 shape is a red circle, and the last shape is a blue square." (about 20 s each). ov-genai's
 native path counts 451 for the same clip, 3 fewer for the same reason as Qwen3-VL's 447
@@ -283,13 +283,13 @@ packed rows' block ids and the packed sliding and full host masks equal HF's
 `tools/vlm_fixtures/gen_gemma4_video_fixtures.py`). Pixel parity is measured on
 synthetic gradient frames only, not on decoded camera footage.
 
-Measured on pawan-04 (CPU) with the SDK video suite's 4 s clip on a one-stage E4B tree
+Measured on PC A (CPU) with the SDK video suite's 4 s clip on a one-stage E4B tree
 (`trees\e4bv-1stage`): 332 prompt tokens natively where the same clip as labelled frames
 took 1109, every check passing ("The first shape is a red circle, and the last shape is
 a blue square."), the frames encoded once (about 4 s) and served from the encode cache
 on the follow-up requests.
 
-Measured on pawan-02 (CPU) with a two-stage 26B-A4B vision tree (`export_gemma4_text.py
+Measured on PC B (CPU) with a two-stage 26B-A4B vision tree (`export_gemma4_text.py
 --num-stages 2 --vision`, each stage cut with `--stage I`), stateful, rank 0 and rank 1
 as two processes on the one box over the stage wire: the SDK video suite's 4 s clip costs
 336 prompt tokens natively, as ov-genai's native path counts on the same export, where the
@@ -299,13 +299,13 @@ streamed, the four refusals), and the image suite passes 11/11 (288 prompt token
 one image). The export's stage IRs build their masks as HF does: every sliding-window
 attention reads `token_type_ids`, no full-attention layer does.
 
-On two machines (pawan-04 and pawan-02, CPU, each cutting only its own stage with
+On two machines (PC A and PC B, CPU, each cutting only its own stage with
 `--stage I`, about 25 s a stage) the same suites pass 11/11 each, stateful (rank 0 on
-pawan-04) and static (`static_variant.py --context 736 --prefill-seq 288
---shared-prefill`, rank 0 on pawan-02): 336 prompt tokens for the clip, 288 for one image,
+PC A) and static (`static_variant.py --context 736 --prefill-seq 288
+--shared-prefill`, rank 0 on PC B): 336 prompt tokens for the clip, 288 for one image,
 561 for the clip as frames, and the same answer in every video case as on one box. A
 video request takes 17 to 23 s stateful and 30 to 36 s static. Packed slots
-(`packed_variant.py --slots 2 --packed-seq 288 --dynamic-seq`, rank 0 on pawan-04) pass
+(`packed_variant.py --slots 2 --packed-seq 288 --dynamic-seq`, rank 0 on PC A) pass
 both suites 11/11 with the same counts and answers, 35 to 42 s a video request; every stage
 logs `masks=attn_mask_sliding_4d (sliding window 1024), attn_mask_4d (full, causal)`. That
 run used `--context 1280` (a 639-token slot, room for the 561-token frames case and two
@@ -644,7 +644,7 @@ python tools/vlm_surgery/make_text_draft.py --model <ministral3-3b-int4-ov expor
 
 Video reaches this engine as labelled frames (the startup log says `native_video=false`):
 each sampled frame is one Pixtral image behind its `Frame k (t s): ` label, and the target
-sees them all; the draft, as for any image, sees only the text. Measured on pawan-04 (CPU,
+sees them all; the draft, as for any image, sees only the text. Measured on PC A (CPU,
 both ranks on one box, `--spec-k 4`) with the SDK video suite's 4 s clip: 4 frames, 3322
 prompt tokens, about 335 s a request, answered correctly through `video_url` (MP4 and
 WebM), `input_video` and streaming, with acceptance 0.22 (16 of 72 drafted). On this
@@ -807,7 +807,7 @@ matching the stateful tree (223), and the packed concurrent test too. Gemma 3 12
 (286 tokens per image, no slot leak); it is slow on CPU, about 200-300 s a request.
 
 Video on the NPU: a Qwen3-VL-4B static tree (`static_variant.py --context 2048
---prefill-seq 256`, decode and prefill IRs apart) on pawan-04's NPU (`--device NPU
+--prefill-seq 256`, decode and prefill IRs apart) on PC A's NPU (`--device NPU
 --ov-cache-dir`) passed the SDK video suite with native video: 450 prompt tokens for the
 4 s clip (436 for its two frames as images), the same answer as on CPU ("The first
 shape is a red circle, and the last shape is a blue square."). The first start compiled
@@ -926,7 +926,7 @@ kind; the host and the address it resolved to only at `debug`, off unless enable
 
   Covering the chunked paths needs the decision made once per request (the host knows the
   prompt length before the first chunk) and passed to every stage; deciding per token
-  instead does not recall the fact either. Measured on pawan-02 (CPU): below 4096
+  instead does not recall the fact either. Measured on PC B (CPU): below 4096
   positions the switched IR's logits equal the export's exactly, and past it they equal an
   all-long-factor IR exactly, on both exports. InternVL2-4B asked for a fact at the start of
   a 5,976-token user turn: original export on ov-genai `'\n\n\n'`, switched copy on ov-genai

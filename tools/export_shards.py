@@ -320,7 +320,7 @@ def vision_dropped_note(config):
         f"'{outer or 'this model'}' is a vision-language checkpoint: only its text "
         "tower is exported; the vision encoder is dropped, so these shards serve "
         "text and the API refuses image input with a 400. Staged image input "
-        "needs a family-specific export (see docs/rfcs/vlm-support.md)."
+        "needs a family-specific export (see docs/VLM.md)."
     )
 
 

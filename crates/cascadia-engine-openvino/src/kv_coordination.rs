@@ -553,7 +553,7 @@ impl OvKvCache {
     }
 
     /// Holder mirror of [`Self::capture`]: the plane-served copy (`kv_share`). A media turn is
-    /// left out: the plane never pulls, takes or replicates media-turn KV (enterprise D9), and
+    /// left out: the plane never pulls, takes or replicates media-turn KV, and
     /// with `KV_MAX_ENTRIES` slots shared, a media capture here only evicts a text session's
     /// servable entry. The engine-local copy still holds it for this box's own image warm resume.
     pub(crate) fn capture_for_plane(&mut self, partner: &str, tokens: Vec<i32>, blob: Vec<u8>) {

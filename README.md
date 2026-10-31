@@ -19,6 +19,7 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 ## Features
 
 - **OpenAI-compatible API**: `/v1/chat/completions` and `/v1/responses` with SSE streaming; point existing clients at it unchanged
+- **Image and video input**: `image_url` / `video_url` parts (and `input_image` / `input_video` on `/v1/responses`) for vision-language models, on one box or staged across machines; see [docs/VLM.md](docs/VLM.md)
 - **Pipeline parallelism**: shard a model into stages and run each stage on a different machine, activations relayed over TCP
 - **Built-in sharder**: `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling
 - **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models (Kimi K2.6, MiniMax-M2, GLM-5, DeepSeek-V4, Inkling), and `qwen35` for the Qwen3.5 hybrid family (Qwen3.6 MoE, dense Qwen3.8)
@@ -199,6 +200,8 @@ $ cascadia engines
 
 Qwen3.5/3.6 hybrid MoE (`model_type: qwen3_5_moe`) is special-cased: `cascadia shard` dispatches it to a dedicated IR-surgery exporter and it serves through the `qwen35` engine (alias `qwen36-moe`) ([docs/architectures/qwen36-moe-support.md](docs/architectures/qwen36-moe-support.md)). Other mixture-of-experts and architecturally-incompatible families like Llama 4, Qwen3-MoE, Mixtral, gpt-oss, full DeepSeek-V2/V3, Gemma 3, the Gemma 4 26B-A4B MoE variant, and Mamba hybrids are detected and rejected up front with a clear error. See [docs/SHARDING.md](docs/SHARDING.md) and [docs/architectures/](docs/architectures/) for the full per-family status table and deep-dives.
 
+Vision-language models (Qwen3-VL, Qwen2.5-VL, Qwen2-VL, Gemma 3, Gemma 4, Pixtral, Mistral 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT and more on `ov-genai`) take images and video. `cascadia shard` cuts a vision tree from an OpenVINO export or a raw checkpoint; which engine serves which family, and how to export each, is in [docs/VLM.md](docs/VLM.md).
+
 ## Architecture
 
 Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` traits in `cascadia-engine` are the plugin seam. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for design rationale and per-crate responsibilities. Key crates:
@@ -248,6 +251,7 @@ Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM /
 | [INSTALL.md](INSTALL.md) | Full setup: OpenVINO SDK, GPU runtime, Docker |
 | [docs/CLI.md](docs/CLI.md) | Every command and flag |
 | [docs/SHARDING.md](docs/SHARDING.md) | Sharding flow + per-model-family support table |
+| [docs/VLM.md](docs/VLM.md) | Image and video input: models, export commands, flags, limits |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions + crate responsibilities |
 | [docs/METRICS.md](docs/METRICS.md) | Prometheus `/metrics` inventory + example queries |
 | [docs/engines/](docs/engines/) | Per-engine deep dives |

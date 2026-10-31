@@ -274,7 +274,7 @@ older upstream (`packed plan frame has 3 rows and no version tag: the upstream
 stage runs an older build ...`), and an older relay refuses the 5-row frame
 (`expected an I64 [1,3,S] packed plan frame, got ... shape=[1, 5, 64]`); either
 way the relay NACKs the batch and the request fails with an error instead of a
-wrong answer. Checked live both ways between pawan-04 and pawan-02.
+wrong answer. Checked live both ways between two Lunar Lake PCs.
 
 Validated on TinyLlama 2-stage static (CPU, both ranks on one box over
 loopback): `"The capital of France is Paris."`, usage `35 + 15`; and 4
@@ -284,11 +284,11 @@ retiring at 5.9 s while the rest ran to 7.5 s.
 Across two machines (CPU, Qwen3-VL-4B two-stage tree cut with `cut_vlm_lm.py
 --num-stages 2`, `static_variant.py --context 2048 --prefill-seq 64
 --shared-prefill`, `packed_variant.py --slots 4 --packed-seq 64 --decode-seq 4` on
-each stage; rank 0 on pawan-04, rank 1 on pawan-02), 128 greedy tokens: 0.62 s a
+each stage; rank 0 and rank 1 on two Lunar Lake PCs), 128 greedy tokens: 0.62 s a
 step for one request, 4.53 tok/s total for three (one box, one stage: 0.79 s and
 3.65 tok/s); the SDK image suite (223 prompt tokens) and the concurrent image test
 (two images and a text request at once) pass. The text is token-identical to the
-same two-stage tree with both ranks on pawan-04 over loopback (all 3 requests), so
+same two-stage tree with both ranks on one PC over loopback (all 3 requests), so
 the wire adds nothing, but not to the one-stage tree: the hidden state crosses the
 stage boundary in f16 (the wire contract), which the one-stage graph never rounds,
 and the stories part after 76-458 characters.

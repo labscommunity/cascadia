@@ -1388,7 +1388,7 @@ mod tests {
             "172.16.0.1",
             "192.168.1.1",
             "169.254.169.254",
-            "100.72.95.18",
+            "100.100.100.100",
             "100.64.0.1",
             "0.0.0.0",
             "0.1.2.3",
@@ -1433,7 +1433,7 @@ mod tests {
             ("https://127.0.0.1/a.png", "not a public address"),
             ("https://localhost/a.png", "not a public address"),
             ("https://10.0.0.5/a.png", "not a public address"),
-            ("https://100.72.95.18/a.png", "not a public address"),
+            ("https://100.100.100.100/a.png", "not a public address"),
             (
                 "https://[::ffff:169.254.169.254]/a.png",
                 "not a public address",

@@ -88,7 +88,7 @@ Only the target sees images:
   prefill, never a speculative span, and the mask-based rewind only touches text rows.
 - **The draft** is text-only and is fed the prompt with the image ids (`[IMG]`,
   `[IMG_BREAK]`, `[IMG_END]`) dropped: hundreds of placeholders read as text are likely noise
-  to it (0 of 40 drafts accepted on pawan-02). Its cache is its own, so its positions
+  to it (0 of 40 drafts accepted on a Lunar Lake CPU). Its cache is its own, so its positions
   need not match the target's. Verification keeps the output the target's greedy output;
   the draft only moves the acceptance rate. It must share the target's token ids
   (Ministral-3-3B for Pixtral 12B: the same tekken vocabulary).
@@ -129,7 +129,7 @@ carry images.
 Video arrives as labelled frames (`Frame k (t s): ` and one image per frame; the engine
 takes no native video), so a video is a multi-image prompt here: the SDK video suite's
 4 s clip is 4 frames, 3322 prompt tokens on Pixtral 12B, accepted at 0.22 with
-Ministral-3-3B at K=4 (pawan-04, CPU). The answer can repeat the frame labels.
+Ministral-3-3B at K=4 (Lunar Lake CPU). The answer can repeat the frame labels.
 
 Check a draft against its export (greedy draft vs embeddings + language model, and a
 masked-rewind run that must match):

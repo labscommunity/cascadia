@@ -144,5 +144,5 @@ cargo build -p cascadia
 ```
 
 Image answers need a real VLM and are not in CI; the same SDK drives them by
-hand against `cascadia run <vlm-export>` (see `docs/rfcs/vlm-support.md`,
-"Phase 1b").
+hand against `cascadia run <vlm-export>` with `scripts/vlm_check.py` (see
+`docs/VLM.md`).
