@@ -337,6 +337,7 @@ def test_raw_checkpoint_is_exported_then_cut(tmp_path, monkeypatch, cuts, quant,
 def _optimum_argv(monkeypatch, model, revision):
     """Run optimum_export with subprocess.call and download stubbed; return
     (argv, download calls)."""
+    monkeypatch.setattr(ce, "python_refusal", lambda: None)
     calls, downloads = [], []
     monkeypatch.setattr(ce.subprocess, "call", lambda cmd: calls.append(cmd) or 0)
 
@@ -363,6 +364,21 @@ def test_optimum_export_passes_a_local_dir_as_is(tmp_path, monkeypatch, revision
     assert downloads == []
     assert "--revision" not in argv
     assert argv[argv.index("--model") + 1] == str(tmp_path)
+
+
+def test_python_refusal_names_the_working_versions():
+    assert ce.python_refusal((3, 13, 12)) is None
+    assert ce.python_refusal((3, 10, 0)) is None
+    why = ce.python_refusal((3, 14, 9))
+    assert "Python 3.14" in why and "3.10-3.13" in why and "--python" in why
+
+
+def test_optimum_export_refuses_a_too_new_python_before_any_work(monkeypatch):
+    monkeypatch.setattr(ce, "python_refusal", lambda: "too new")
+    monkeypatch.setattr(ce.subprocess, "call", lambda cmd: pytest.fail("ran optimum-cli"))
+    monkeypatch.setattr(ce, "download", lambda *a: pytest.fail("downloaded"))
+    with pytest.raises(SystemExit, match="too new"):
+        ce.optimum_export("org/model", "/out", ce.VLM_TASK, "int4", revision="b234b804")
 
 
 def test_optimum_export_without_a_revision_passes_the_hub_id(monkeypatch):
@@ -522,6 +538,8 @@ def test_tiny_vlm_export_then_cut_round_trip(tmp_path):
     """optimum-intel exports a tiny random LLaVA-NeXT, and the cut makes a
     2-stage vision tree from it. (LLaVA-NeXT because the exporter pins allow
     it: optimum-intel's Qwen VL exporters stop at transformers 5.0.)"""
+    if ce.python_refusal():
+        pytest.skip(ce.python_refusal())
     pytest.importorskip("optimum.intel", exc_type=ImportError)
     pytest.importorskip("transformers")
     from transformers import LlavaNextConfig, LlavaNextForConditionalGeneration

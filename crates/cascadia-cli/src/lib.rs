@@ -3345,7 +3345,7 @@ pub(crate) fn resolve_python(explicit: Option<&str>, check_deps: bool) -> Result
             "cannot run the interpreter passed to --python: {p:?}"
         )),
         (None, None) => Err(anyhow!(
-            "no Python interpreter found on PATH. Install Python 3.10+ or pass --python <path>."
+            "no Python interpreter found on PATH. Install Python 3.10-3.13 or pass --python <path>."
         )),
     }
 }

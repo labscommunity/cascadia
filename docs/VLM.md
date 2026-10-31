@@ -407,7 +407,9 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
   LLaVA-NeXT, Mistral 3, Gemma 3 and Gemma 4 this way. Its Qwen VL, Phi-3.5-vision and
   InternVL exporters need an older transformers: for Qwen VL `shard` prints a
   side-environment recipe (below), and Phi-3.5-vision / InternVL2, which ship remote
-  modelling code, need their OpenVINO export;
+  modelling code, need their OpenVINO export. The export needs Python 3.10-3.13:
+  optimum 2.3 fails inside it on 3.14, so `shard` and `export` refuse 3.14 up front (point
+  them at another interpreter with `--python <path>`);
 - routes a Gemma 4 OpenVINO export to `export_gemma4_text.py --vision` and Qwen3.5/3.6 to
   `export_qwen36_moe.py`, as before;
 - refuses any other VLM (Qwen2-VL, LLaVA-1.5, mllama, PaliGemma, ...), naming it.
