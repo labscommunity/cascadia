@@ -5,6 +5,8 @@
 //! (non-streaming + SSE streaming). Tools, logprobs, /events, /state,
 //! Ollama dialect deferred — see Phase 5 follow-up.
 
+pub mod decisions;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -39,6 +41,14 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 /// healthier than unbounded admission. Adjustable via
 /// [`Config::max_concurrent_requests`].
 pub const DEFAULT_MAX_CONCURRENT: usize = 16;
+
+/// Default cap on concurrent decision requests (`/v1/decisions`, `/v1/systemone`), a pool of
+/// its own so decisions and chat never take each other's permits: up to
+/// [`DEFAULT_MAX_CONCURRENT`] chat plus this many decision requests are admitted at once. Like
+/// chat's, it bounds admission and queue depth, not parallelism: the engine still runs one pass
+/// at a time. Adjustable via
+/// [`Config::max_concurrent_decisions`] (the CLI's `--max-decision-requests`).
+pub const DEFAULT_MAX_CONCURRENT_DECISIONS: usize = 16;
 
 /// Default cap on tokenized prompt length passed to the engine.
 /// Bounded so a 64 KiB JSON body of "a"*N characters that compresses
@@ -109,6 +119,9 @@ pub struct AppState {
     pub runner: Arc<Runner>,
     pub model_id: String,
     pub permits: Arc<Semaphore>,
+    /// Admission for decision requests, separate from chat's [`AppState::permits`]. A decision
+    /// holds one from before its encode until its last pass (a tournament's finals included).
+    pub decision_permits: Arc<Semaphore>,
     /// Live counters, shared with the dashboard. See [`ApiStats`].
     pub stats: Arc<ApiStats>,
     pub max_prompt_bytes: usize,
@@ -144,6 +157,128 @@ pub struct AppState {
     /// `false`, a success flips it back `true` — so `/health` reflects the real
     /// state of the chain instead of always returning 200 while requests 503.
     pub ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Decision models (`decision.json` next to the weights): serves `/v1/systemone`. `None` for a
+    /// plain chat model, which answers decision routes with 501.
+    pub decisions: Option<Arc<decisions::DecisionService>>,
+    /// `--decision-dump FILE`, opened once at startup (0600, no symlinks): one JSON line per
+    /// decision pass. Records request-derived token ids.
+    pub decision_dump: Option<Arc<DecisionDump>>,
+}
+
+/// Where the dump's bytes go: the opened file, or a test double.
+pub(crate) trait DumpSink: std::io::Write + Send {
+    /// Cut the file back to `len` bytes (drops a torn tail after a failed write).
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+impl DumpSink for std::fs::File {
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+/// The open `--decision-dump` file and its optional size cap (`--decision-dump-max-bytes`).
+/// Closes for good (a latch) once a request would pass the cap or a write fails, so the file is
+/// always a prefix of the run's requests, whole lines only (P3-DRIFT-2, P3-SEC-2).
+pub struct DecisionDump {
+    /// Set once: checked before a request's lines are cloned or serialized (P3-SEC-1).
+    closed: std::sync::atomic::AtomicBool,
+    pub(crate) file: std::sync::Mutex<DumpFile>,
+}
+
+pub(crate) struct DumpFile {
+    sink: Box<dyn DumpSink>,
+    /// File size so far (the length found at open plus every byte appended since).
+    len: u64,
+    max_bytes: Option<u64>,
+}
+
+impl DecisionDump {
+    pub(crate) fn new(sink: Box<dyn DumpSink>, len: u64, max_bytes: Option<u64>) -> Self {
+        Self {
+            closed: std::sync::atomic::AtomicBool::new(false),
+            file: std::sync::Mutex::new(DumpFile {
+                sink,
+                len,
+                max_bytes,
+            }),
+        }
+    }
+
+    /// Open `path` as the OSS server opens `--decision-dump` (append, mode 0600; a symlink, a
+    /// non-regular file, a file with other hard links or another user's file is refused),
+    /// appending after what the file already holds, closing once it reaches `max_bytes` when set.
+    /// For embedders passing a dump to [`decisions::evaluate_with`]; the line format is the
+    /// tools' (docs/DECISIONS.md), not a stable interface.
+    pub fn open(path: &std::path::Path, max_bytes: Option<u64>) -> std::io::Result<Self> {
+        let file = open_decision_dump(path)?;
+        let len = file.metadata().map_or(0, |m| m.len());
+        Ok(Self::new(Box::new(file), len, max_bytes))
+    }
+
+    /// No later request is written: skip the clone and the serialization.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The file's size as counted (tests).
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.file.lock().unwrap_or_else(|e| e.into_inner()).len
+    }
+
+    fn close(&self, why: &str) {
+        if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            tracing::warn!("--decision-dump {why}; later requests are not recorded");
+        }
+    }
+
+    /// Append one request's lines whole. Once they would pass the cap, nothing more is written,
+    /// this request's lines nor any later request's. A failed write drops the bytes it left
+    /// (or, if the file cannot be cut back, counts them) and closes the dump.
+    pub(crate) fn append(&self, lines: &[u8]) -> std::io::Result<()> {
+        // A poisoned lock (a panic mid-write) must not take the endpoint down: keep the state.
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_closed() {
+            return Ok(());
+        }
+        let after = f.len.saturating_add(lines.len() as u64);
+        if f.max_bytes.is_some_and(|m| after > m) {
+            self.close("reached --decision-dump-max-bytes");
+            return Ok(());
+        }
+        let mut written = 0;
+        while written < lines.len() {
+            match f.sink.write(&lines[written..]) {
+                Ok(0) => {
+                    return Err(self.write_failed(
+                        &mut f,
+                        written,
+                        std::io::ErrorKind::WriteZero.into(),
+                    ))
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.write_failed(&mut f, written, e)),
+            }
+        }
+        f.len = after;
+        if f.max_bytes.is_some_and(|m| f.len >= m) {
+            self.close("reached --decision-dump-max-bytes");
+        }
+        Ok(())
+    }
+
+    fn write_failed(&self, f: &mut DumpFile, written: usize, e: std::io::Error) -> std::io::Error {
+        if written > 0 {
+            let base = f.len;
+            if f.sink.truncate_to(base).is_err() {
+                f.len = base.saturating_add(written as u64);
+            }
+        }
+        self.close("write failed");
+        e
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -157,6 +292,8 @@ pub struct ChatTemplateConfig {
 pub struct Config {
     pub max_body_bytes: usize,
     pub max_concurrent_requests: usize,
+    /// See [`DEFAULT_MAX_CONCURRENT_DECISIONS`].
+    pub max_concurrent_decisions: usize,
     pub max_prompt_bytes: usize,
     pub chat_template: ChatTemplateConfig,
     /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
@@ -165,6 +302,13 @@ pub struct Config {
     pub engine_applies_template: bool,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
+    /// See [`AppState::decisions`]; the CLI loads it with [`decisions::DecisionService::load`].
+    pub decisions: Option<Arc<decisions::DecisionService>>,
+    /// See [`AppState::decision_dump`]. Startup only (the CLI's `--decision-dump`), never an env var.
+    pub decision_dump: Option<std::path::PathBuf>,
+    /// Stop writing the dump once a request's lines would take it past this many bytes; no later
+    /// request is written either (`None`: unlimited).
+    pub decision_dump_max_bytes: Option<u64>,
 }
 
 impl Default for Config {
@@ -172,11 +316,15 @@ impl Default for Config {
         Self {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT,
+            max_concurrent_decisions: DEFAULT_MAX_CONCURRENT_DECISIONS,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
             defer_template_on_thinking: false,
             engine_applies_template: false,
             marker_dialect: None,
+            decisions: None,
+            decision_dump: None,
+            decision_dump_max_bytes: None,
         }
     }
 }
@@ -460,6 +608,42 @@ pub fn load_chat_template_config_at(tok_dir: &std::path::Path) -> ChatTemplateCo
     }
 }
 
+/// Open the `--decision-dump` file for appending, mode 0600. Refuses a symlink at the path
+/// (`O_NOFOLLOW`), and, checked on the opened descriptor, anything but a regular file this user
+/// owns with one link: a FIFO (with `O_NONBLOCK` the open cannot block startup), a device, or a
+/// hardlink to another file the server account owns (SEC-4).
+fn open_decision_dump(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let f = o.open(p)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let m = f.metadata()?;
+        let refuse = |why: &str| Err(std::io::Error::other(why.to_string()));
+        if !m.file_type().is_file() {
+            return refuse("not a regular file");
+        }
+        if m.nlink() != 1 {
+            return refuse("the file has other hard links");
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if m.uid() != unsafe { libc::geteuid() } {
+            return refuse("the file is owned by another user");
+        }
+        // `mode` only applies on create: tighten a pre-existing file too.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| std::io::Error::other(format!("chmod 0600: {e}")))?;
+    }
+    Ok(f)
+}
+
 /// Build the router with default request-size + concurrency limits.
 /// For custom limits use [`make_router_with_config`].
 pub fn make_router(runner: Arc<Runner>, model_id: impl Into<String>) -> Router {
@@ -482,10 +666,28 @@ pub fn make_router_with_stats(
     cfg: Config,
     stats: Arc<ApiStats>,
 ) -> Router {
+    let decision_dump = cfg.decision_dump.as_ref().map(|p| {
+        Arc::new(
+            DecisionDump::open(p, cfg.decision_dump_max_bytes)
+                .unwrap_or_else(|e| panic!("--decision-dump {}: {e}", p.display())),
+        )
+    });
+    make_router_inner(runner, model_id, cfg, stats, decision_dump)
+}
+
+/// [`make_router_with_stats`] with the decision dump already opened.
+fn make_router_inner(
+    runner: Arc<Runner>,
+    model_id: impl Into<String>,
+    cfg: Config,
+    stats: Arc<ApiStats>,
+    decision_dump: Option<Arc<DecisionDump>>,
+) -> Router {
     let state = AppState {
         runner,
         model_id: model_id.into(),
         permits: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
+        decision_permits: Arc::new(Semaphore::new(cfg.max_concurrent_decisions)),
         stats,
         max_prompt_bytes: cfg.max_prompt_bytes,
         // Parse the chat template once here (not per request). A parse error
@@ -511,6 +713,8 @@ pub fn make_router_with_stats(
         effort_words: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        decisions: cfg.decisions.clone(),
+        decision_dump,
     };
     let state = AppState {
         effort_words: state
@@ -535,6 +739,8 @@ pub fn make_router_with_stats(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/decisions", post(decisions::openai::decide))
+        .route("/v1/systemone", post(decisions::handler::decide))
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
         // Flip `ready` from each completion's final status so /health tracks the
@@ -2585,6 +2791,7 @@ async fn chat_completions(
         // model's context PAST the rendered prompt. Only the scheduler's
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
+        decision: None,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -2812,6 +3019,7 @@ async fn completions(
         tenant: String::new(),
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
+        decision: None,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
@@ -3848,6 +4056,2582 @@ mod tests {
             .await
             .unwrap();
         make_router(Arc::new(runner), "mock-model")
+    }
+
+    async fn make_decision_app() -> Router {
+        make_decision_app_full(1000, 4000, None).await
+    }
+
+    async fn make_decision_app_with(max_tokens: usize, max_total_tokens: usize) -> Router {
+        make_decision_app_full(max_tokens, max_total_tokens, None).await
+    }
+
+    /// The word-level Kev test tokenizer with the mock engine's sentinel words.
+    fn kev_test_tokenizer() -> tokenizers::Tokenizer {
+        let words = [
+            "[unk]",
+            "<|fim_prefix|>",
+            "<|fim_middle|>",
+            "<|box_start|>",
+            "<|box_end|>",
+            "<|fim_suffix|>",
+        ];
+        let mut vocab: std::collections::HashMap<String, u32> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.to_string(), i as u32))
+            .collect();
+        // The mock engine's decision sentinels: a failed task, non-finite logits (NaN, +inf,
+        // -inf), an evicted snapshot (`require_warm`) and a prefix the cache cannot hold
+        // (`needs_snapshot`).
+        use cascadia_engine_mock as mock;
+        vocab.insert("__engine_error__".into(), mock::DECISION_FAIL_ID);
+        vocab.insert("__non_finite__".into(), mock::DECISION_NON_FINITE_ID);
+        vocab.insert("__evicted__".into(), mock::DECISION_EVICTED_ID);
+        vocab.insert("__uncacheable__".into(), mock::DECISION_UNCACHEABLE_ID);
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::whitespace::WhitespaceSplit,
+        ));
+        tok.add_special_tokens(
+            &words[1..]
+                .iter()
+                .map(|w| tokenizers::AddedToken::from(w.to_string(), true))
+                .collect::<Vec<_>>(),
+        );
+        tok
+    }
+
+    async fn make_decision_app_full(
+        max_tokens: usize,
+        max_total_tokens: usize,
+        dump: Option<(std::path::PathBuf, Option<u64>)>,
+    ) -> Router {
+        let tok = kev_test_tokenizer();
+        let codec = decisions::kev::KevCodec::new(
+            tok,
+            decisions::profile::KevProfile { temperature: 1.0 },
+            max_tokens,
+            max_total_tokens,
+        )
+        .unwrap();
+        decision_app_with_codec(
+            Box::new(codec),
+            max_tokens,
+            max_total_tokens,
+            dump,
+            Arc::new(ApiStats::default()),
+        )
+        .await
+    }
+
+    /// A mock-engine router serving decisions through `codec` (any family).
+    async fn decision_app_with_codec(
+        codec: Box<dyn decisions::Codec>,
+        max_tokens: usize,
+        max_total_tokens: usize,
+        dump: Option<(std::path::PathBuf, Option<u64>)>,
+        stats: Arc<ApiStats>,
+    ) -> Router {
+        decision_app_on(
+            Box::new(MockBuilder::new()),
+            decisions::profile::Family::Kev,
+            codec,
+            max_tokens,
+            max_total_tokens,
+            dump,
+            stats,
+        )
+        .await
+    }
+
+    /// [`decision_app_with_codec`] on any engine, with the service's `family`.
+    async fn decision_app_on(
+        builder: Box<dyn cascadia_engine::Builder>,
+        family: decisions::profile::Family,
+        codec: Box<dyn decisions::Codec>,
+        max_tokens: usize,
+        max_total_tokens: usize,
+        dump: Option<(std::path::PathBuf, Option<u64>)>,
+        stats: Arc<ApiStats>,
+    ) -> Router {
+        let runner = Runner::new(builder);
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family,
+                codec,
+                max_tokens,
+                max_total_tokens,
+                max_questions: 32,
+                prefix_reuse: true,
+                encode_slots: decisions::default_encode_slots(),
+            })),
+            decision_dump: dump.as_ref().map(|d| d.0.clone()),
+            decision_dump_max_bytes: dump.and_then(|d| d.1),
+            max_body_bytes: 1 << 20,
+            ..Config::default()
+        };
+        make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats)
+    }
+
+    /// Raw JSON text: `serde_json::json!` sorts object keys, which would hide question-order bugs.
+    async fn post_decisions(app: Router, payload: &str) -> (StatusCode, Value, String) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(Value::Null),
+            text,
+        )
+    }
+
+    /// POST to the OpenAI-format route `/v1/decisions` (raw JSON text, like `post_decisions`).
+    async fn post_openai(app: Router, payload: &str) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/decisions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// The Kev service `make_decision_app_with` serves, for driving the core without a router.
+    fn kev_service(max_tokens: usize, max_total_tokens: usize) -> Arc<decisions::DecisionService> {
+        let codec = decisions::kev::KevCodec::new(
+            kev_test_tokenizer(),
+            decisions::profile::KevProfile { temperature: 1.0 },
+            max_tokens,
+            max_total_tokens,
+        )
+        .unwrap();
+        Arc::new(decisions::DecisionService {
+            family: decisions::profile::Family::Kev,
+            codec: Box::new(codec),
+            max_tokens,
+            max_total_tokens,
+            max_questions: 32,
+            prefix_reuse: true,
+            encode_slots: decisions::default_encode_slots(),
+        })
+    }
+
+    /// An embedder's pass runner, not the OSS `Runner`: answers every pass with the mock engine's
+    /// logits (`[0, -1, ...]`) and prompt count, or fails it, and records each pass's length.
+    struct FakePasses {
+        fail: bool,
+        prompts: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl FakePasses {
+        fn new(fail: bool) -> Self {
+            Self {
+                fail,
+                prompts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl decisions::PassRunner for FakePasses {
+        async fn run_pass(
+            &self,
+            task: GenerationTask,
+        ) -> Result<futures::stream::BoxStream<'static, Chunk>, cascadia_engine::EngineError>
+        {
+            let d = task.decision.expect("a decision pass");
+            self.prompts.lock().unwrap().push(d.prompt_ids.len());
+            let last = if self.fail {
+                Chunk::error(task.task_id.clone(), "fake engine failure")
+            } else {
+                Chunk::final_marker(task.task_id.clone(), "")
+                    .with_prompt_tokens(d.prompt_ids.len() as u32)
+                    .with_decision_logits((0..d.head.output_len()).map(|i| -(i as f32)).collect())
+            };
+            // A non-final chunk first: the core reads the stream to its end.
+            let first = Chunk::token(task.task_id, 0, "");
+            Ok(futures::stream::iter([first, last]).boxed())
+        }
+    }
+
+    async fn evaluate_fake(
+        svc: &Arc<decisions::DecisionService>,
+        permits: usize,
+        runner: &FakePasses,
+        req: &decisions::schema::DecisionRequest,
+    ) -> Result<
+        (indexmap::IndexMap<String, decisions::schema::Answer>, u64),
+        decisions::DecisionError,
+    > {
+        let permits = Arc::new(Semaphore::new(permits));
+        let ctx = decisions::DecisionContext {
+            service: svc,
+            permits: &permits,
+            dump: None,
+            runner,
+            stats: None,
+        };
+        decisions::evaluate_with(&ctx, req).await
+    }
+
+    /// The embedder seam: `evaluate_with` on a fake pass runner (no OSS `Runner`, no stats, no
+    /// dump) answers exactly as `/v1/systemone` does on the mock engine, and `systemone_body`
+    /// renders the same bytes.
+    #[tokio::test]
+    async fn evaluate_with_on_an_embedders_pass_runner_matches_the_route() {
+        let so = r#"{"model": "m", "state": "a b", "questions": {
+            "team": {"type": "choice", "instructions": "who", "criteria": {"billing": "x", "tech": "y"}},
+            "urgent": {"type": "noul"},
+            "sev": {"type": "score", "criteria": ["lo", "mid", "hi"]}}}"#;
+        let req: decisions::schema::DecisionRequest = serde_json::from_str(so).unwrap();
+        let runner = FakePasses::new(false);
+        let (answers, input_tokens) = evaluate_fake(&kev_service(1000, 4000), 1, &runner, &req)
+            .await
+            .unwrap();
+        let prompts = runner.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 3, "one Kev pass per question");
+        assert_eq!(input_tokens, prompts.iter().sum::<usize>() as u64);
+        assert_eq!(
+            answers.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["team", "urgent", "sev"]
+        );
+        // mock logits [0, -1, ...] => the first option wins
+        assert_eq!(
+            serde_json::to_value(&answers["team"]).unwrap()["choice"],
+            "billing"
+        );
+        let (status, _, text) = post_decisions(make_decision_app().await, so).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = decisions::systemone_body("mock-model", answers, input_tokens);
+        assert_eq!(serde_json::to_string(&body).unwrap(), text);
+    }
+
+    /// The rendering helpers are what the routes return, for each error class: not served (501),
+    /// capacity (503), validation (400) and an engine failure (503), in both formats.
+    #[tokio::test]
+    async fn decision_error_helpers_match_the_routes() {
+        let svc = kev_service(1000, 4000);
+        let ok = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul"}}}"#;
+        let ok_oa = r#"{"input": "a b", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#;
+        let failing =
+            r#"{"model": "m", "state": "__engine_error__", "questions": {"u": {"type": "noul"}}}"#;
+        let failing_oa = r#"{"input": "__engine_error__", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#;
+        let empty = r#"{"model": "m", "state": "a b", "questions": {}}"#;
+        let empty_oa = r#"{"input": "a b", "questions": []}"#;
+        let so = |s: &str| serde_json::from_str::<decisions::schema::DecisionRequest>(s).unwrap();
+        let oa = |s: &str| {
+            decisions::openai::to_internal(&decisions::openai::parse_request(s).unwrap())
+                .unwrap()
+                .0
+        };
+
+        // Each error as the core returns it to an embedder, on the fake runner.
+        let capacity = evaluate_fake(&svc, 0, &FakePasses::new(false), &so(ok))
+            .await
+            .unwrap_err();
+        let capacity_oa = evaluate_fake(&svc, 0, &FakePasses::new(false), &oa(ok_oa))
+            .await
+            .unwrap_err();
+        let invalid = evaluate_fake(&svc, 1, &FakePasses::new(false), &so(empty))
+            .await
+            .unwrap_err();
+        let invalid_oa = evaluate_fake(&svc, 1, &FakePasses::new(false), &oa(empty_oa))
+            .await
+            .unwrap_err();
+        let engine = evaluate_fake(&svc, 1, &FakePasses::new(true), &so(ok))
+            .await
+            .unwrap_err();
+        let engine_oa = evaluate_fake(&svc, 1, &FakePasses::new(true), &oa(ok_oa))
+            .await
+            .unwrap_err();
+        assert_eq!(capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            matches!(engine, decisions::DecisionError::Engine(_)),
+            "{engine:?}"
+        );
+
+        // ... and what the routes answer for the same request.
+        let capacity_app = || async {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                decisions: Some(kev_service(1000, 4000)),
+                max_concurrent_decisions: 0,
+                ..Config::default()
+            };
+            make_router_with_config(Arc::new(runner), "mock-model", cfg)
+        };
+        let not_served = decisions::DecisionError::NotServed;
+        let cases = [
+            (
+                make_app().await,
+                make_app().await,
+                ok,
+                ok_oa,
+                &not_served,
+                &not_served,
+            ),
+            (
+                capacity_app().await,
+                capacity_app().await,
+                ok,
+                ok_oa,
+                &capacity,
+                &capacity_oa,
+            ),
+            (
+                make_decision_app().await,
+                make_decision_app().await,
+                empty,
+                empty_oa,
+                &invalid,
+                &invalid_oa,
+            ),
+            (
+                make_decision_app().await,
+                make_decision_app().await,
+                failing,
+                failing_oa,
+                &engine,
+                &engine_oa,
+            ),
+        ];
+        for (app, app_oa, body, body_oa, e, e_oa) in cases {
+            let (status, text) =
+                post_raw(app, "/v1/systemone", Some("application/json"), body).await;
+            assert_eq!(
+                json_bytes(decisions::systemone_error(e)),
+                (status, text),
+                "{body}"
+            );
+            let (status, text) =
+                post_raw(app_oa, "/v1/decisions", Some("application/json"), body_oa).await;
+            assert_eq!(
+                json_bytes(decisions::openai_error(e_oa)),
+                (status, text),
+                "{body_oa}"
+            );
+        }
+    }
+
+    /// POST `body` to `uri` with `content_type`: the status and the body bytes as text, plus a
+    /// check that the body is JSON exactly when the route says so.
+    async fn post_raw(
+        app: Router,
+        uri: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder().method("POST").uri(uri);
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        let response = app
+            .oneshot(req.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let ct = response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let json = serde_json::from_str::<Value>(&text).is_ok();
+        assert_eq!(ct == "application/json", json, "{ct}: {text}");
+        (status, text)
+    }
+
+    /// The bytes `Json(value)` sends.
+    fn json_bytes((status, v): (StatusCode, Value)) -> (StatusCode, String) {
+        (status, serde_json::to_string(&v).unwrap())
+    }
+
+    /// Raw-body parsing for embedders: for a malformed body, one that does not fit the schema and
+    /// a valid one, `systemone_parse` / `openai_parse` give the route's status and bytes.
+    #[tokio::test]
+    async fn raw_body_parsers_match_the_routes() {
+        // SystemOne: the extractor's syntax (400) and data (422) rejections, as text/plain.
+        for body in [
+            r#"{"model": "m", "#,
+            r#"{"model": "m", "state": "s", "strategy": "vote", "questions": {"u": {"type": "noul"}}}"#,
+            r#"{"model": "m", "state": "s", "questions": {"u": {"type": "maybe"}}}"#,
+        ] {
+            let route = post_raw(
+                make_decision_app().await,
+                "/v1/systemone",
+                Some("application/json"),
+                body,
+            )
+            .await;
+            assert_ne!(route.0, StatusCode::OK, "{body}");
+            assert_eq!(
+                decisions::systemone_parse(body.as_bytes()).unwrap_err(),
+                route,
+                "{body}"
+            );
+        }
+        // OpenAI: the extractor's syntax rejection in the envelope, then `parse_request`'s 400s.
+        for body in [
+            r#"{"input": "x", "#,
+            r#"{"input": "x", "questions": [{"type": "rank", "name": "u", "instructions": "x"}]}"#,
+            r#"{"input": "x", "input": "y", "questions": []}"#,
+        ] {
+            let route = post_raw(
+                make_decision_app().await,
+                "/v1/decisions",
+                Some("application/json"),
+                body,
+            )
+            .await;
+            assert_ne!(route.0, StatusCode::OK, "{body}");
+            assert_eq!(
+                json_bytes(decisions::openai_parse(body.as_bytes()).unwrap_err()),
+                route,
+                "{body}"
+            );
+        }
+        // Valid bodies: parsed, evaluated and rendered through the seam, the route's 200 bytes.
+        let so = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul"}, "c": {"type": "choice", "criteria": {"x": "1", "y": "2"}}}}"#;
+        let req = decisions::systemone_parse(so.as_bytes()).unwrap();
+        let (answers, n) =
+            evaluate_fake(&kev_service(1000, 4000), 1, &FakePasses::new(false), &req)
+                .await
+                .unwrap();
+        let body = decisions::systemone_body("mock-model", answers, n);
+        let route = post_raw(
+            make_decision_app().await,
+            "/v1/systemone",
+            Some("application/json"),
+            so,
+        )
+        .await;
+        assert_eq!(
+            (StatusCode::OK, serde_json::to_string(&body).unwrap()),
+            route
+        );
+        let oa = r#"{"input": "a b", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}, {"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": 10000000000000000000000001}, {"value": "y"}]}]}"#;
+        let (req, meta) =
+            decisions::openai::to_internal(&decisions::openai_parse(oa.as_bytes()).unwrap())
+                .unwrap();
+        let (answers, n) =
+            evaluate_fake(&kev_service(1000, 4000), 1, &FakePasses::new(false), &req)
+                .await
+                .unwrap();
+        let mine =
+            serde_json::to_string(&decisions::openai::to_openai(&answers, &meta, n).unwrap())
+                .unwrap();
+        let (status, route) = post_raw(
+            make_decision_app().await,
+            "/v1/decisions",
+            Some("application/json"),
+            oa,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The response id is fresh per response (`dec-` + 32 hex digits); the rest is the same bytes.
+        let strip = |t: &str| t[t.find(r#""answers""#).unwrap()..].to_string();
+        assert_eq!(strip(&mine), strip(&route));
+        assert!(route.contains("10000000000000000000000001"), "{route}");
+    }
+
+    /// The rejections that come before the body is read, which an embedder's gateway owns: the
+    /// texts docs/DECISIONS.md ("Embedding the decision core") quotes.
+    #[tokio::test]
+    async fn pre_parse_rejections_are_the_documented_ones() {
+        let ok = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul"}}}"#;
+        const CT: &str = "Expected request with `Content-Type: application/json`";
+        const BIG: &str = "Failed to buffer the request body: length limit exceeded";
+        let route = post_raw(make_decision_app().await, "/v1/systemone", None, ok).await;
+        assert_eq!(route, (StatusCode::UNSUPPORTED_MEDIA_TYPE, CT.to_string()));
+        let route = post_raw(
+            make_decision_app().await,
+            "/v1/decisions",
+            Some("text/plain"),
+            ok,
+        )
+        .await;
+        assert_eq!(
+            route,
+            json_bytes(decisions::openai_envelope(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "invalid_request_error",
+                CT.into()
+            ))
+        );
+        // The decision test app's body limit is 1 MiB (`max_body_bytes`).
+        let big = format!(
+            r#"{{"model": "m", "state": "{}", "questions": {{}}}}"#,
+            "x".repeat(1 << 20)
+        );
+        let route = post_raw(
+            make_decision_app().await,
+            "/v1/systemone",
+            Some("application/json"),
+            &big,
+        )
+        .await;
+        assert_eq!(route, (StatusCode::PAYLOAD_TOO_LARGE, BIG.to_string()));
+        let route = post_raw(
+            make_decision_app().await,
+            "/v1/decisions",
+            Some("application/json"),
+            &big,
+        )
+        .await;
+        assert_eq!(
+            route,
+            json_bytes(decisions::openai_envelope(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                BIG.into()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_decisions_route_answers_in_openai_shape() {
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"model": "gpt-6-luna", "input": "I was charged twice for my order.",
+            "questions": [{"type": "choice", "name": "department", "instructions": "Which department?",
+              "choices": [{"value": "billing", "description": "Payments."}, {"value": "technical", "description": "Bugs."}]},
+              {"type": "predicate", "name": "urgent", "instructions": "Urgent?"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"][0]["type"], "choice");
+        assert_eq!(v["answers"][0]["name"], "department");
+        assert_eq!(v["answers"][0]["choice"], "billing");
+        assert_eq!(v["answers"][0]["probabilities"][1]["value"], "technical");
+        assert_eq!(v["answers"][1]["type"], "predicate");
+        assert!(
+            v["answers"][1]["probability"].as_f64().unwrap() < 0.5,
+            "mock: first option (false) wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_errors_use_openai_error_shape() {
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"input": "x", "questions": []}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].is_string());
+    }
+
+    /// L5: every response carries a unique `id` and the `usage` the core computed.
+    #[tokio::test]
+    async fn openai_response_has_id_and_usage() {
+        let oa = r#"{"input": "a b", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#;
+        let so = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul", "instructions": "x"}}}"#;
+        let (status, a) = post_openai(make_decision_app().await, oa).await;
+        assert_eq!(status, StatusCode::OK, "{a}");
+        let (_, b) = post_openai(make_decision_app().await, oa).await;
+        let id = a["id"].as_str().unwrap();
+        assert!(id.starts_with("dec-"), "{id}");
+        assert_ne!(a["id"], b["id"], "ids must be unique per response");
+        let (_, s, _) = post_decisions(make_decision_app().await, so).await;
+        let input = a["usage"]["input_tokens"].as_u64().unwrap();
+        assert!(input > 0);
+        assert_eq!(input, s["usage"]["input_tokens"].as_u64().unwrap());
+        assert_eq!(a["usage"]["output_tokens"], 0);
+        assert_eq!(a["usage"]["total_tokens"].as_u64(), Some(input));
+    }
+
+    /// L8: a body the request schema rejects gets OpenAI's envelope, not the framework's 422 text.
+    #[tokio::test]
+    async fn openai_bad_content_parts_use_openai_error_shape() {
+        let q = r#""questions": [{"type": "predicate", "name": "u", "instructions": "x"}]"#;
+        let cases = [
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": "input_file", "file_id": "f"}}]}}], {q}}}"#
+                ),
+                "unsupported content part type 'input_file'",
+            ),
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": "input_text"}}]}}], {q}}}"#
+                ),
+                r#"input_text parts need a string "text""#,
+            ),
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"text": "x"}}]}}], {q}}}"#
+                ),
+                r#"every content part needs a "type""#,
+            ),
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": 5, "text": "x"}}]}}], {q}}}"#
+                ),
+                r#"content part "type" must be a string"#,
+            ),
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": "input_image"}}]}}], {q}}}"#
+                ),
+                r#"input_image parts need a string "image_url""#,
+            ),
+            // OpenAI's newer object form of `image_url` is not accepted (a string URL only).
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": "input_image", "image_url": {{"url": "https://x/y.png"}}}}]}}], {q}}}"#
+                ),
+                r#"input_image parts need a string "image_url""#,
+            ),
+            // an unknown question type and plain malformed JSON get the envelope too
+            (
+                r#"{"input": "x", "questions": [{"type": "rank", "name": "u", "instructions": "x"}]}"#
+                    .to_string(),
+                "rank",
+            ),
+            (r#"{"input": "x", "#.to_string(), "JSON"),
+        ];
+        for (body, needle) in cases {
+            let (status, v) = post_openai(make_decision_app().await, &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error", "{body}: {v}");
+            assert!(v["error"]["code"].is_null(), "{v}");
+            let m = v["error"]["message"].as_str().unwrap();
+            assert!(m.contains(needle), "{body}: {m}");
+        }
+        // the framework's other rejections keep their status, inside the envelope
+        let big = format!(r#"{{"input": "{}", {q}}}"#, "x".repeat(2 << 20));
+        let (status, v) = post_openai(make_decision_app().await, &big).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let response = make_decision_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/decisions")
+                    .body(Body::from(format!(r#"{{"input": "x", {q}}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// H16/L9: a 30-digit integer and a 17-digit float survive both routes digit for digit
+    /// (checked on the RAW body: `serde_json::Value` would round both through f64).
+    #[tokio::test]
+    async fn exact_numbers_on_both_routes() {
+        let (big, f17) = ("123456789012345678901234567890", "0.18466034385487662");
+        let oa = format!(
+            r#"{{"input": "a b", "questions": [{{"type": "choice", "name": "c", "instructions": "x", "choices": [{{"value": {big}}}, {{"value": {f17}}}]}}]}}"#
+        );
+        let response = make_decision_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/decisions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(oa))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // mock logits [0, -1, ...] ⇒ the first option wins
+        assert!(text.contains(&format!(r#""choice":{big},"#)), "{text}");
+        assert!(text.contains(&format!(r#""value":{big},"#)), "{text}");
+        assert!(text.contains(&format!(r#""value":{f17},"#)), "{text}");
+        let so = format!(
+            r#"{{"model": "m", "state": {{"id": {big}, "f": {f17}}}, "questions": {{"s": {{"type": "score", "criteria": [{big}, {f17}]}}}}}}"#
+        );
+        let (status, v, text) = post_decisions(make_decision_app().await, &so).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // Kev's legend is its rendered level text (Python `str()`), so every digit is there.
+        assert!(
+            text.contains(&format!(r#""legend":{{"0":"{big}","1":"{f17}"}}"#)),
+            "{text}"
+        );
+    }
+
+    /// Task 25 review (a): a repeated top-level key is a 400 in OpenAI's envelope.
+    #[tokio::test]
+    async fn openai_duplicate_keys_are_400() {
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"input": "x", "input": "y", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let m = v["error"]["message"].as_str().unwrap();
+        assert!(m.contains("duplicate field `input`"), "{m}");
+    }
+
+    #[tokio::test]
+    async fn openai_and_systemone_routes_agree() {
+        let oa = r#"{"input": "a b", "questions": [{"type": "choice", "name": "team", "instructions": "who", "choices": [{"value": "billing", "description": "x"}, {"value": "tech", "description": "y"}]},
+                    {"type": "score", "name": "sev", "instructions": "how", "levels": [{"label": "lo"}, {"label": "mid"}, {"label": "hi"}]}]}"#;
+        let so = r#"{"model": "m", "state": "a b", "questions": {"team": {"type": "choice", "instructions": "who", "criteria": {"billing": "x", "tech": "y"}},
+                    "sev": {"type": "score", "instructions": "how", "criteria": ["lo", "mid", "hi"]}}}"#;
+        let (_, a) = post_openai(make_decision_app().await, oa).await;
+        let (_, b, _) = post_decisions(make_decision_app().await, so).await;
+        assert_eq!(
+            a["answers"][0]["probabilities"][0]["probability"],
+            b["answers"]["team"]["probabilities"]["billing"]
+        );
+        assert_eq!(a["answers"][1]["score"], b["answers"]["sev"]["score"]);
+        assert_eq!(
+            a["answers"][1]["confidence"],
+            b["answers"]["sev"]["confidence"]
+        );
+    }
+
+    #[tokio::test]
+    async fn decisions_answer_every_question_in_order() {
+        let (status, v, body) = post_decisions(
+            make_decision_app().await,
+            r#"{
+            "model": "mock-model", "state": "a b",
+            "questions": {
+                "team": {"type": "choice", "instructions": "who", "criteria": {"billing": "x", "tech": "y"}},
+                "urgent": {"type": "noul"},
+                "sev": {"type": "score", "criteria": ["lo", "mid", "hi"]}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // Order is checked on the RAW body: parsing into serde_json::Value sorts keys.
+        let (t, u, s) = (
+            body.find("\"team\"").unwrap(),
+            body.find("\"urgent\"").unwrap(),
+            body.find("\"sev\"").unwrap(),
+        );
+        assert!(t < u && u < s, "answers out of request order: {body}");
+        // mock logits [0, -1, ...] ⇒ first option wins
+        assert_eq!(v["answers"]["team"]["choice"], "billing");
+        assert!(v["answers"]["urgent"]["noul"].as_f64().unwrap() < 0.5);
+        assert_eq!(v["usage"]["output_tokens"], 0);
+        assert!(v["usage"]["input_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(v["model"], "mock-model");
+    }
+
+    #[tokio::test]
+    async fn decisions_on_a_chat_model_is_501() {
+        let (status, _, _) = post_decisions(
+            make_app().await,
+            r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn decisions_validation_is_400() {
+        let (status, v, _) = post_decisions(
+            make_decision_app().await,
+            r#"{"model": "m", "state": "s", "questions": {}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    }
+
+    #[tokio::test]
+    async fn decisions_over_the_total_token_budget_is_413() {
+        // 32 passes of ~11 tokens > max_total_tokens = 40
+        let qs: Vec<String> = (0..32)
+            .map(|i| format!(r#""q{i}": {{"type": "noul"}}"#))
+            .collect();
+        let body = format!(
+            r#"{{"model": "m", "state": "a b", "questions": {{{}}}}}"#,
+            qs.join(",")
+        );
+        let app = make_decision_app_with(1000, 40).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        // 32 passes of 11 tokens (<fim_prefix> a b + an 8-token branch) = 352: the prefill budget,
+        // not the per-pass cap, is what rejects it. A 3-token prefix is under MIN_PREFIX_TOKENS,
+        // which the engine never caches, so it is counted in every pass (P2-CE-2).
+        assert_eq!(
+            v["error"],
+            "this request needs 352 prefill tokens; the per-request limit is 40"
+        );
+    }
+
+    #[tokio::test]
+    async fn kev_deeply_nested_state_is_413_before_the_indented_expansion() {
+        // 120 nested arrays around 15,000 ones: ~30 KB of compact JSON, far under the byte
+        // pre-check (400,000 x 8 = 3.2 MB), but Kev's `render` indents every leaf by up to 238 spaces,
+        // ~3.6 MB of text. The render budget must refuse it before building that string.
+        let depth = 120;
+        let leaves = vec!["1"; 15_000].join(",");
+        let state = format!("{}{leaves}{}", "[".repeat(depth), "]".repeat(depth));
+        let body = format!(
+            r#"{{"model": "m", "state": {state}, "questions": {{"u": {{"type": "noul"}}}}}}"#
+        );
+        assert!(body.len() < 1 << 20);
+        let app = make_decision_app_with(100_000, 400_000).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(
+            v["error"],
+            "the rendered request text exceeds 3200000 bytes; the limit is 8 bytes per token of the 400000-token request budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn kev_state_at_the_pass_cap_is_413() {
+        // 10 state tokens + <fim_prefix> = 11 >= max_tokens 11: rejected right after the state is
+        // tokenized, before it is cloned into any question's row.
+        let state = ["a"; 10].join(" ");
+        let body = format!(
+            r#"{{"model": "m", "state": "{state}", "questions": {{"u": {{"type": "noul"}}}}}}"#
+        );
+        let app = make_decision_app_with(11, 1000).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(
+            v["error"],
+            "the state is 11 tokens; a decision pass is limited to 11"
+        );
+    }
+
+    #[tokio::test]
+    async fn decisions_dump_writes_one_line_per_pass() {
+        let path = std::env::temp_dir().join(format!("decision-dump-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // a pre-existing world-readable file must be tightened to 0600 at startup
+        std::fs::write(&path, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let app = make_decision_app_full(1000, 4000, Some((path.clone(), None))).await;
+        let (status, v, _) = post_decisions(
+            app,
+            r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}, "w": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "pre-existing empty file plus 2 appended lines"
+        );
+        assert_eq!(lines[0]["parts"][0][0], "u");
+        assert!(lines[0]["readout"]["prompt_ids"].as_array().unwrap().len() > 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn decisions_dump_stops_appending_at_its_byte_cap() {
+        // P2-SEC-5: --decision-dump-max-bytes. A request's lines are written whole or not at
+        // all, and the request itself is unaffected.
+        let dir = std::env::temp_dir().join(format!("decision-dump-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}, "w": {"type": "noul"}}}"#;
+        let free = dir.join("free.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((free.clone(), None))).await;
+        assert_eq!(post_decisions(app, body).await.0, StatusCode::OK);
+        let one = std::fs::metadata(&free).unwrap().len();
+        assert!(one > 0);
+        // Room for exactly one request's lines: the first is written, the second skipped.
+        let capped = dir.join("capped.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((capped.clone(), Some(one)))).await;
+        assert_eq!(post_decisions(app.clone(), body).await.0, StatusCode::OK);
+        assert_eq!(std::fs::metadata(&capped).unwrap().len(), one);
+        assert_eq!(post_decisions(app, body).await.0, StatusCode::OK);
+        assert_eq!(
+            std::fs::metadata(&capped).unwrap().len(),
+            one,
+            "over the cap"
+        );
+        // Too small for even one request: nothing, not half a request.
+        let tiny = dir.join("tiny.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((tiny.clone(), Some(one - 1)))).await;
+        assert_eq!(post_decisions(app, body).await.0, StatusCode::OK);
+        assert_eq!(std::fs::metadata(&tiny).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn decisions_dump_cap_latches_so_no_later_request_is_written() {
+        // P3-DRIFT-2 / P3-SEC-2: once one request would pass the cap, no later request is
+        // written, even one that would still fit: the file stays a prefix of the run.
+        let dir = std::env::temp_dir().join(format!("decision-dump-latch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}}}"#;
+        let big = r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}, "w": {"type": "noul"}, "x": {"type": "noul"}}}"#;
+        let probe = dir.join("probe.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((probe.clone(), None))).await;
+        assert_eq!(post_decisions(app, small).await.0, StatusCode::OK);
+        let s = std::fs::metadata(&probe).unwrap().len();
+        // Room for two small requests: small fits, big is skipped, and the next small (which
+        // would fit) is not written either.
+        let capped = dir.join("capped.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((capped.clone(), Some(2 * s)))).await;
+        assert_eq!(post_decisions(app.clone(), small).await.0, StatusCode::OK);
+        assert_eq!(post_decisions(app.clone(), big).await.0, StatusCode::OK);
+        assert_eq!(post_decisions(app, small).await.0, StatusCode::OK);
+        assert_eq!(std::fs::metadata(&capped).unwrap().len(), s, "latched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Accepts `room` bytes, then fails like a full disk; records truncations.
+    struct FullDisk {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+        room: usize,
+    }
+
+    impl std::io::Write for FullDisk {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut d = self.data.lock().unwrap();
+            let n = buf.len().min(self.room.saturating_sub(d.len()));
+            if n == 0 {
+                return Err(std::io::Error::other("no space left on device"));
+            }
+            d.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DumpSink for FullDisk {
+        fn truncate_to(&mut self, len: u64) -> std::io::Result<()> {
+            self.data.lock().unwrap().truncate(len as usize);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_dump_write_drops_its_torn_line_and_closes_the_dump() {
+        // P3-SEC-2: ENOSPC mid-request must not leave a torn line (parity_check parses every
+        // line) nor a byte count short of the file. The dump stops at the first failure.
+        let data = Arc::new(std::sync::Mutex::new(b"0123".to_vec()));
+        let dump = DecisionDump::new(
+            Box::new(FullDisk {
+                data: data.clone(),
+                room: 10,
+            }),
+            4,
+            None,
+        );
+        assert!(dump.append(b"abc\n").is_ok());
+        assert_eq!(&*data.lock().unwrap(), b"0123abc\n");
+        assert!(!dump.is_closed());
+        assert!(dump.append(b"defgh\n").is_err(), "only 2 of 6 bytes fit");
+        assert_eq!(
+            &*data.lock().unwrap(),
+            b"0123abc\n",
+            "the torn tail is dropped"
+        );
+        assert!(dump.is_closed());
+        assert!(
+            dump.append(b"x\n").is_ok(),
+            "closed: nothing written, no error"
+        );
+        assert_eq!(&*data.lock().unwrap(), b"0123abc\n");
+    }
+
+    #[test]
+    fn a_dump_that_cannot_drop_its_torn_tail_counts_it() {
+        struct NoTruncate(FullDisk);
+        impl std::io::Write for NoTruncate {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl DumpSink for NoTruncate {
+            fn truncate_to(&mut self, _: u64) -> std::io::Result<()> {
+                Err(std::io::Error::other("read-only"))
+            }
+        }
+        let data = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dump = DecisionDump::new(
+            Box::new(NoTruncate(FullDisk {
+                data: data.clone(),
+                room: 3,
+            })),
+            0,
+            Some(100),
+        );
+        assert!(dump.append(b"abcdef\n").is_err());
+        assert_eq!(dump.bytes(), 3, "the bytes that reached the file");
+        assert!(dump.is_closed());
+    }
+
+    #[tokio::test]
+    // Holding the dump's lock across the awaits is the stalled disk this test simulates.
+    #[allow(clippy::await_holding_lock)]
+    async fn decisions_disconnect_keeps_the_permit_until_the_dump_write_ends() {
+        // P3-SEC-1: a client that leaves while its request waits on the dump must not free its
+        // permit while the detached write still holds a request-sized clone.
+        use std::sync::atomic::Ordering::SeqCst;
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let data = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dump = Arc::new(DecisionDump::new(
+            Box::new(FullDisk {
+                data: data.clone(),
+                room: usize::MAX,
+            }),
+            0,
+            None,
+        ));
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
+                codec: Box::new(
+                    decisions::kev::KevCodec::new(
+                        kev_test_tokenizer(),
+                        decisions::profile::KevProfile { temperature: 1.0 },
+                        1000,
+                        4000,
+                    )
+                    .unwrap(),
+                ),
+                max_tokens: 1000,
+                max_total_tokens: 4000,
+                max_questions: 32,
+                prefix_reuse: false,
+                encode_slots: decisions::default_encode_slots(),
+            })),
+            max_concurrent_decisions: 1,
+            ..Config::default()
+        };
+        let stats = Arc::new(ApiStats::default());
+        let app = make_router_inner(
+            Arc::new(runner),
+            "mock-model",
+            cfg,
+            stats.clone(),
+            Some(dump.clone()),
+        );
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        // The disk stalls: the write waits on the dump's lock.
+        let stall = dump.file.lock().unwrap();
+        let first = tokio::spawn(app.clone().oneshot(systemone_request(body)));
+        for _ in 0..200 {
+            if Arc::strong_count(&dump) > 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        first.abort();
+        let _ = first.await;
+        // The orphaned write still holds the only permit: a new request is refused at once.
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.clone().oneshot(systemone_request(body)),
+        )
+        .await
+        .expect("refused, not queued behind the stalled dump")
+        .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 1);
+        drop(stall);
+        for _ in 0..200 {
+            if stats.requests_in_flight.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 0);
+        assert!(
+            !data.lock().unwrap().is_empty(),
+            "the orphan's lines were written"
+        );
+        let r = app.oneshot(systemone_request(body)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decisions_dump_refuses_fifos_and_hardlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("decision-dump-kinds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A FIFO: without O_NONBLOCK the open would block startup forever.
+        let fifo = dir.join("fifo.jsonl");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(open_decision_dump(&fifo).is_err());
+        // A hardlink to a file this account owns.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("dump.jsonl");
+        std::fs::hard_link(&victim, &link).unwrap();
+        let e = open_decision_dump(&link).unwrap_err();
+        assert!(e.to_string().contains("hard links"), "{e}");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "not chmodded"
+        );
+        // A fresh path is created 0600; reopening appends.
+        let ok = dir.join("ok.jsonl");
+        open_decision_dump(&ok).unwrap();
+        assert_eq!(
+            std::fs::metadata(&ok).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(open_decision_dump(&ok).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decisions_dump_refuses_a_symlink_at_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("decision-dump-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("victim");
+        std::fs::write(&target, "keep").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("dump.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let runner = Arc::new(runner);
+        let cfg = Config {
+            decision_dump: Some(link.clone()),
+            ..Config::default()
+        };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            make_router_with_config(runner, "mock-model", cfg)
+        }));
+        let msg = match res {
+            Ok(_) => panic!("a symlinked --decision-dump path was opened"),
+            Err(e) => e.downcast_ref::<String>().cloned().unwrap_or_default(),
+        };
+        assert!(msg.starts_with("--decision-dump"), "{msg}");
+        // The symlink target is untouched: not appended to, not chmodded.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn decisions_oversized_state_is_rejected_before_tokenizing() {
+        let big = "a ".repeat(4000 * 8);
+        let body = format!(
+            r#"{{"model": "m", "state": "{big}", "questions": {{"u": {{"type": "noul"}}}}}}"#
+        );
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 4000).await, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        // The byte pre-check fired (64000 > 4000 x 8), not a token-count check after encoding.
+        assert_eq!(v["error"], "state is 64000 bytes; the limit is 32000");
+    }
+
+    #[tokio::test]
+    async fn decisions_engine_error_text_is_not_returned() {
+        // the mock fails a task whose prompt_ids contain DECISION_FAIL_ID (Task 2)
+        let (status, v, body) = post_decisions(
+            make_decision_app().await,
+            r#"{"model": "m", "state": "__engine_error__", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["error"], "decision engine error");
+        assert!(!body.contains("mock"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn decisions_non_finite_logits_are_an_engine_error_not_a_200() {
+        // the mock returns NaN/+inf/-inf logits for DECISION_NON_FINITE_ID; softmax of those is
+        // NaN, which would serialise as `null` with a fabricated first-option answer
+        for q in [
+            r#"{"u": {"type": "noul"}}"#,
+            r#"{"c": {"type": "choice", "criteria": {"a": "x", "b": "y", "c": "z"}}}"#,
+        ] {
+            let (status, v, body) = post_decisions(
+                make_decision_app().await,
+                &format!(r#"{{"model": "m", "state": "__non_finite__", "questions": {q}}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+            assert_eq!(v["error"], "decision engine error");
+            assert!(!body.contains("null"), "{body}");
+        }
+        // the OpenAI route maps the same core error into its own envelope
+        let response = make_decision_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/decisions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"input": "__non_finite__", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["message"], "decision engine error");
+        assert_eq!(v["error"]["type"], "server_error");
+    }
+
+    /// The Kev test codec with one probability replaced by `bad` (H17: finite logits whose
+    /// calibration overflowed, so the codec's softmax returned NaN or inf).
+    struct NonFiniteProbCodec {
+        inner: decisions::kev::KevCodec,
+        bad: f64,
+    }
+
+    impl decisions::Codec for NonFiniteProbCodec {
+        fn limits(&self) -> decisions::schema::Limits {
+            self.inner.limits()
+        }
+        fn encode_until(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<Vec<decisions::Pass>, decisions::DecisionError> {
+            self.inner.encode_until(req, cancel)
+        }
+        fn probabilities(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            part: &decisions::PassPart,
+            logits: &[f32],
+        ) -> Vec<f64> {
+            let mut p = self.inner.probabilities(req, part, logits);
+            p[0] = self.bad;
+            p
+        }
+    }
+
+    async fn non_finite_prob_app(bad: f64) -> Router {
+        let codec = decisions::kev::KevCodec::new(
+            kev_test_tokenizer(),
+            decisions::profile::KevProfile { temperature: 1.0 },
+            1000,
+            4000,
+        )
+        .unwrap();
+        decision_app_with_codec(
+            Box::new(NonFiniteProbCodec { inner: codec, bad }),
+            1000,
+            4000,
+            None,
+            Arc::new(ApiStats::default()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn decisions_non_finite_probabilities_are_an_engine_error_not_a_200() {
+        // H17: the logits are finite, but the codec's probabilities are not (a calibration that
+        // overflowed `(l + b) / t`). Without a check they serialise as `null` in a 200.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let (status, v, body) = post_decisions(
+                non_finite_prob_app(bad).await,
+                r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{bad}: {v}");
+            assert_eq!(v["error"], "decision engine error");
+            assert!(!body.contains("null"), "{body}");
+            let (status, v) = post_openai(
+                non_finite_prob_app(bad).await,
+                r#"{"input": "s", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{bad}: {v}");
+            assert_eq!(v["error"]["message"], "decision engine error");
+            assert_eq!(v["error"]["type"], "server_error");
+        }
+        // the same app with finite probabilities still answers
+        let (status, v, _) = post_decisions(
+            non_finite_prob_app(0.25).await,
+            r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// A codec whose first encode blocks until released (a slow tokenization), then records
+    /// whether it saw the cancel flag. Every encode answers one noul question with a tiny
+    /// pointer pass.
+    struct GateCodec {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        saw_cancel: Arc<std::sync::atomic::AtomicBool>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl decisions::Codec for GateCodec {
+        fn limits(&self) -> decisions::schema::Limits {
+            decisions::schema::Limits {
+                max_questions: 32,
+                max_options: 16,
+                min_levels: 2,
+                max_levels: 16,
+                image_parts: false,
+            }
+        }
+        fn encode_until(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<Vec<decisions::Pass>, decisions::DecisionError> {
+            if let Some(tx) = self.started.lock().unwrap().take() {
+                let _ = tx.send(());
+                let rx = self.release.lock().unwrap().take().unwrap();
+                let _ = rx.recv();
+                self.saw_cancel.store(
+                    cancel.load(std::sync::atomic::Ordering::SeqCst),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                self.finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let qid = req.questions.keys().next().unwrap().clone();
+            Ok(vec![decisions::Pass {
+                readout: cascadia_types::DecisionReadout {
+                    prompt_ids: vec![1, 2, 3, 4],
+                    head: cascadia_types::ReadoutHead::Pointer {
+                        decide_pos: 3,
+                        option_pos: vec![1, 2],
+                    },
+                    cache_prefix: None,
+                    require_warm: false,
+                    needs_snapshot: false,
+                },
+                parts: vec![decisions::PassPart {
+                    question_id: qid,
+                    logits: 0..2,
+                }],
+            }])
+        }
+        fn probabilities(
+            &self,
+            _req: &decisions::schema::DecisionRequest,
+            _part: &decisions::PassPart,
+            logits: &[f32],
+        ) -> Vec<f64> {
+            decisions::softmax(&logits.iter().map(|&x| x as f64).collect::<Vec<_>>())
+        }
+    }
+
+    /// Records how many encodes run at once (each holds the tokenizer for 50 ms).
+    struct CountingCodec {
+        inner: GateCodec,
+        now: std::sync::atomic::AtomicUsize,
+        max: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl decisions::Codec for CountingCodec {
+        fn limits(&self) -> decisions::schema::Limits {
+            self.inner.limits()
+        }
+        fn encode_until(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<Vec<decisions::Pass>, decisions::DecisionError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.max.fetch_max(n, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.now.fetch_sub(1, SeqCst);
+            self.inner.encode_until(req, cancel)
+        }
+        fn probabilities(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            part: &decisions::PassPart,
+            logits: &[f32],
+        ) -> Vec<f64> {
+            self.inner.probabilities(req, part, logits)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn decision_encodes_are_bounded_by_their_own_slots_not_the_request_permits() {
+        // P2-SEC-3: 16 decision permits must not mean 16 concurrent tokenizer transients. Six
+        // requests within the permits all answer, but at most `encode_slots` (2) encode at once.
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let max = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let codec = CountingCodec {
+            inner: GateCodec {
+                started: std::sync::Mutex::new(None),
+                release: std::sync::Mutex::new(None),
+                saw_cancel: Default::default(),
+                finished: Default::default(),
+            },
+            now: Default::default(),
+            max: max.clone(),
+        };
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
+                codec: Box::new(codec),
+                max_tokens: 1000,
+                max_total_tokens: 4000,
+                max_questions: 32,
+                prefix_reuse: false,
+                encode_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            })),
+            max_concurrent_decisions: 16,
+            ..Config::default()
+        };
+        let app = make_router_with_stats(
+            Arc::new(runner),
+            "mock-model",
+            cfg,
+            Arc::new(ApiStats::default()),
+        );
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        let reqs: Vec<_> = (0..6)
+            .map(|_| tokio::spawn(app.clone().oneshot(systemone_request(body))))
+            .collect();
+        for r in reqs {
+            assert_eq!(r.await.unwrap().unwrap().status(), StatusCode::OK);
+        }
+        let seen = max.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((1..=2).contains(&seen), "{seen} encodes ran at once");
+    }
+
+    #[test]
+    fn default_encode_slots_are_few() {
+        let n = decisions::default_encode_slots().available_permits();
+        assert!((1..=4).contains(&n), "{n}");
+    }
+
+    fn systemone_request(body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/systemone")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    /// A router whose decision codec holds its first encode until `release` sends, so a test can
+    /// keep one decision permit taken while it sends other requests.
+    async fn gated_decision_app(
+        max_concurrent_requests: usize,
+        max_concurrent_decisions: usize,
+    ) -> (
+        Router,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let codec = GateCodec {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            saw_cancel: Default::default(),
+            finished: Default::default(),
+        };
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
+                codec: Box::new(codec),
+                max_tokens: 1000,
+                max_total_tokens: 4000,
+                max_questions: 32,
+                prefix_reuse: false,
+                encode_slots: decisions::default_encode_slots(),
+            })),
+            max_concurrent_requests,
+            max_concurrent_decisions,
+            ..Config::default()
+        };
+        let app = make_router_with_stats(
+            Arc::new(runner),
+            "mock-model",
+            cfg,
+            Arc::new(ApiStats::default()),
+        );
+        (app, started_rx, release_tx)
+    }
+
+    fn chat_hello() -> serde_json::Value {
+        serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+        })
+    }
+
+    #[test]
+    fn decision_pool_defaults_to_the_chat_pool_size() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.max_concurrent_decisions,
+            DEFAULT_MAX_CONCURRENT_DECISIONS
+        );
+        assert_eq!(DEFAULT_MAX_CONCURRENT_DECISIONS, 16);
+        assert_eq!(cfg.max_concurrent_requests, DEFAULT_MAX_CONCURRENT);
+    }
+
+    #[tokio::test]
+    async fn a_full_decision_pool_refuses_decisions_but_not_chat() {
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        let (app, started, release) = gated_decision_app(1, 1).await;
+        let first = tokio::spawn(app.clone().oneshot(systemone_request(body)));
+        started.await.unwrap();
+        // The one decision permit is held mid-encode: a second decision is refused at once, with
+        // the same text as before.
+        let (status, v, _) = post_decisions(app.clone(), body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(
+            v["error"],
+            "engine at capacity; retry after current requests complete"
+        );
+        // The chat pool's only permit is still free.
+        let (status, v) = post_chat(app.clone(), chat_hello()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        release.send(()).unwrap();
+        let r = first.await.unwrap().unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let (status, v, _) = post_decisions(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_chat_pool_does_not_refuse_decisions() {
+        // A chat pool of zero is one that is always full.
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        let (app, _started, release) = gated_decision_app(0, 1).await;
+        let (status, _) = post_chat(app.clone(), chat_hello()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The gate holds only the first encode; release it up front so the decision runs.
+        release.send(()).unwrap();
+        let (status, v, _) = post_decisions(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn decisions_disconnect_keeps_the_permit_until_the_encode_ends() {
+        // SEC-2: a client disconnect drops the request future but not its spawn_blocking encode.
+        // The permit must stay held by the encode, or orphaned encodes pile up unbounded.
+        use std::sync::atomic::Ordering::SeqCst;
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let saw_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let codec = GateCodec {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            saw_cancel: saw_cancel.clone(),
+            finished: finished.clone(),
+        };
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
+                codec: Box::new(codec),
+                max_tokens: 1000,
+                max_total_tokens: 4000,
+                max_questions: 32,
+                prefix_reuse: false,
+                encode_slots: decisions::default_encode_slots(),
+            })),
+            max_concurrent_decisions: 1,
+            ..Config::default()
+        };
+        let stats = Arc::new(ApiStats::default());
+        let app = make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats.clone());
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        let first = tokio::spawn(app.clone().oneshot(systemone_request(body)));
+        started_rx.await.unwrap();
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 1);
+        assert_eq!(stats.requests_total.load(SeqCst), 1);
+        // The client goes away mid-encode.
+        first.abort();
+        let _ = first.await;
+        // The orphaned encode still holds the only permit: a new request is refused.
+        let r = app.clone().oneshot(systemone_request(body)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 1);
+        release_tx.send(()).unwrap();
+        for _ in 0..200 {
+            if finished.load(SeqCst) && stats.requests_in_flight.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_cancel.load(SeqCst),
+            "the encode was told the client left"
+        );
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 0);
+        let r = app.oneshot(systemone_request(body)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            stats.requests_total.load(SeqCst),
+            2,
+            "the refusal is not a request"
+        );
+    }
+
+    /// One noul pass with a probability vector one short: a codec bug must be a 503, not a panic
+    /// or a silently truncated answer (QUA-6).
+    struct ShortCodec(GateCodec);
+
+    impl decisions::Codec for ShortCodec {
+        fn limits(&self) -> decisions::schema::Limits {
+            self.0.limits()
+        }
+        fn encode_until(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<Vec<decisions::Pass>, decisions::DecisionError> {
+            self.0.encode_until(req, cancel)
+        }
+        fn probabilities(
+            &self,
+            _req: &decisions::schema::DecisionRequest,
+            _part: &decisions::PassPart,
+            _logits: &[f32],
+        ) -> Vec<f64> {
+            vec![1.0]
+        }
+    }
+
+    #[tokio::test]
+    async fn decisions_probability_count_mismatch_is_a_503() {
+        let codec = ShortCodec(GateCodec {
+            started: std::sync::Mutex::new(None),
+            release: std::sync::Mutex::new(None),
+            saw_cancel: Default::default(),
+            finished: Default::default(),
+        });
+        let app =
+            decision_app_with_codec(Box::new(codec), 1000, 4000, None, Default::default()).await;
+        let (status, v, _) = post_decisions(
+            app,
+            r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["error"], "decision engine error");
+    }
+
+    #[tokio::test]
+    async fn kev_pass_whose_snapshot_was_evicted_is_a_503_not_a_cold_reprefill() {
+        // SEC-3: state of 21 tokens (<state> + 20), 3 noul passes of 29 (tail 8). Reuse work 45,
+        // full work 87. Under a 60-token budget passes 2 and 3 must resume warm; the mock
+        // reports their snapshot evicted, so the request is refused rather than re-prefilled.
+        let state = format!("__evicted__{}", " a".repeat(19));
+        let body = format!(
+            r#"{{"model": "m", "state": "{state}", "questions": {{"a": {{"type": "noul"}}, "b": {{"type": "noul"}}, "c": {{"type": "noul"}}}}}}"#
+        );
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 60).await, &body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(
+            v["error"],
+            "engine at capacity; retry after current requests complete"
+        );
+        // On the discount at all, every later pass resumes (P2-SEC-2): 66 used to let pass 2 run
+        // cold; now the request fails at the first pass that misses its snapshot.
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 66).await, &body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        // A budget that covers every pass cold never asks for a warm resume.
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 100).await, &body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["input_tokens"], 87);
+    }
+
+    #[tokio::test]
+    async fn kev_prefix_the_cache_can_never_hold_is_a_413_not_a_retry() {
+        // P2-SEC-1/2: the engine refuses the FIRST pass (no prefill) when its cache can never hold
+        // the shared prefix; the client is told the full need, not to retry.
+        let state = format!("__uncacheable__{}", " a".repeat(19));
+        let body = format!(
+            r#"{{"model": "m", "state": "{state}", "questions": {{"a": {{"type": "noul"}}, "b": {{"type": "noul"}}, "c": {{"type": "noul"}}}}}}"#
+        );
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 60).await, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(
+            v["error"],
+            "this request needs 87 prefill tokens without prefix reuse (the shared prefix cannot \
+             fit the prefix cache); the per-request limit is 60"
+        );
+        // Within the budget in full: nothing is flagged, the cache is not needed.
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 87).await, &body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn kev_state_too_short_to_cache_is_budgeted_in_full() {
+        // P2-CE-2: a 6-token prefix (<state> + 5) is under MIN_PREFIX_TOKENS, which the engine
+        // never snapshots, so it earns no discount: 3 passes of 14 need 42, not 6 + 3 x 8 = 30.
+        let body = r#"{"model": "m", "state": "x a a a a", "questions": {"a": {"type": "noul"}, "b": {"type": "noul"}, "c": {"type": "noul"}}}"#;
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 30).await, body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(
+            v["error"],
+            "this request needs 42 prefill tokens; the per-request limit is 30"
+        );
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 42).await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["input_tokens"], 42);
+    }
+
+    #[tokio::test]
+    async fn kev_score_legend_is_the_rendered_level_text() {
+        let (status, v, _) = post_decisions(
+            make_decision_app().await,
+            r#"{"model": "m", "state": "a", "questions": {"s": {"type": "score", "criteria": [{"name": "x"}, "lo"]}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["answers"]["s"]["legend"],
+            serde_json::json!({"0": "name: x", "1": "lo"})
+        );
+    }
+
+    /// One token per character (Clef span arithmetic stays checkable).
+    fn char_tokenizer() -> tokenizers::Tokenizer {
+        let mut vocab: std::collections::HashMap<String, u32> = (32u8..127)
+            .map(|b| ((b as char).to_string(), b as u32))
+            .collect();
+        vocab.insert("\n".into(), 10);
+        vocab.insert("[unk]".into(), 0);
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut t = tokenizers::Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::split::Split::new(
+                tokenizers::pre_tokenizers::split::SplitPattern::Regex("".into()),
+                tokenizers::SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .unwrap(),
+        ));
+        t
+    }
+
+    async fn clef_app() -> Router {
+        let codec = decisions::clef::ClefCodec::new(char_tokenizer(), 16384, None).unwrap();
+        decision_app_with_codec(Box::new(codec), 16384, 65536, None, Default::default()).await
+    }
+
+    async fn jev_app() -> Router {
+        let verbalizers: Vec<String> = [
+            "false", "true", "0", "1", "2", "3", "4", "5", "A", "B", "C", "D",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let kinds = |v: [(&str, f64); 3]| v.into_iter().map(|(k, x)| (k.to_string(), x)).collect();
+        let profile = decisions::profile::JevProfile {
+            verbalizer_ids: (100..112).collect(),
+            bias: vec![0.0; 12],
+            verbalizers,
+            slots: [("noul", [0, 2]), ("score", [2, 8]), ("choice", [8, 12])]
+                .into_iter()
+                .map(|(k, r)| (k.to_string(), r))
+                .collect(),
+            temperature: kinds([("noul", 1.0), ("score", 1.0), ("choice", 1.0)]),
+            choice_labels: vec![],
+            choice_label_ids: vec![],
+            strategy: Default::default(),
+        };
+        let codec = decisions::jev::JevCodec::new(char_tokenizer(), profile)
+            .unwrap()
+            .with_pass_cap(4000);
+        decision_app_with_codec(Box::new(codec), 4000, 16000, None, Default::default()).await
+    }
+
+    fn close(v: &Value, want: f64) -> bool {
+        (v.as_f64().unwrap() - want).abs() < 1e-4
+    }
+
+    #[tokio::test]
+    async fn clef_one_joint_pass_is_sliced_per_question_on_both_routes() {
+        // CMP-2 / P2-CE-3: one joint pass carries every option; the mock returns joint logits
+        // -(i^2)/4 over all of them, so the choice gets [0, -0.25, -1] (sorted keys a, m, z) and
+        // the noul [-2.25, -4] (Clef order true, false). The logits are not evenly spaced, so a
+        // wrong per-question offset (every part read from 0, or the parts swapped) changes the
+        // probabilities: the noul read at 0..2 would give 0.5622, not 0.852.
+        let (status, v, body) = post_decisions(
+            clef_app().await,
+            r#"{"model": "m", "state": "S", "questions": {
+              "c": {"type": "choice", "instructions": "Q", "criteria": {"z": "zz", "a": "aa", "m": "mm"}},
+              "u": {"type": "noul", "instructions": "U"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let c = &v["answers"]["c"];
+        assert_eq!(c["choice"], "a");
+        assert!(close(&c["probabilities"]["a"], 0.4658), "{c}");
+        assert!(close(&c["probabilities"]["m"], 0.3628), "{c}");
+        assert!(close(&c["probabilities"]["z"], 0.1714), "{c}");
+        // reported in request order
+        let (z, a) = (body.find("\"z\":").unwrap(), body.find("\"a\":").unwrap());
+        assert!(z < a, "{body}");
+        assert!(close(&v["answers"]["u"]["noul"], 0.852), "{v}");
+        let (status, v) = post_openai(
+            clef_app().await,
+            r#"{"input": "S", "questions": [
+              {"type": "choice", "name": "c", "instructions": "Q", "choices": [{"value": "z"}, {"value": "a"}, {"value": "m"}]},
+              {"type": "predicate", "name": "u", "instructions": "U"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"][0]["choice"], "a");
+        assert_eq!(v["answers"][0]["probabilities"][0]["value"], "z");
+        assert!(close(
+            &v["answers"][0]["probabilities"][1]["probability"],
+            0.4658
+        ));
+        assert!(close(&v["answers"][1]["probability"], 0.852), "{v}");
+    }
+
+    #[tokio::test]
+    async fn jev_passes_answer_every_kind_on_both_routes() {
+        // CMP-2: one verbalizer pass per question; mock logits -(i) over each pass's slots.
+        let (status, v, _) = post_decisions(
+            jev_app().await,
+            r#"{"model": "m", "state": "S", "questions": {
+              "u": {"type": "noul", "instructions": "U"},
+              "c": {"type": "choice", "instructions": "Q", "criteria": {"x": "1", "y": "2", "w": "3"}},
+              "s": {"type": "score", "instructions": "R", "criteria": ["a", "b", "c", "d"]}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // noul slots [false, true] get [0, -1]
+        assert!(close(&v["answers"]["u"]["noul"], 0.2689), "{v}");
+        let c = &v["answers"]["c"];
+        assert_eq!(c["choice"], "x");
+        assert!(close(&c["probabilities"]["x"], 0.6652), "{c}");
+        let s = &v["answers"]["s"];
+        let probs = s["probabilities"].as_object().unwrap();
+        assert_eq!(
+            probs.len(),
+            4,
+            "6 JEV score slots rescaled onto 4 levels: {s}"
+        );
+        let total: f64 = probs.values().map(|p| p.as_f64().unwrap()).sum();
+        assert!((total - 1.0).abs() < 1e-3, "{s}");
+        assert_eq!(
+            s["legend"],
+            serde_json::json!({"0": "a", "1": "b", "2": "c", "3": "d"})
+        );
+        let (status, v) = post_openai(
+            jev_app().await,
+            r#"{"input": "S", "questions": [
+              {"type": "predicate", "name": "u", "instructions": "U"},
+              {"type": "choice", "name": "c", "instructions": "Q", "choices": [{"value": "x"}, {"value": "y"}, {"value": "w"}]},
+              {"type": "score", "name": "s", "instructions": "R", "levels": [{"label": "a"}, {"label": "b"}, {"label": "c"}, {"label": "d"}]}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(close(&v["answers"][0]["probability"], 0.2689), "{v}");
+        assert_eq!(v["answers"][1]["choice"], "x");
+        assert_eq!(
+            v["answers"][2]["probabilities"].as_array().unwrap().len(),
+            4,
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_system2_fields_are_ignored_like_any_unknown_field_on_both_routes() {
+        // Task 53: System 2 is gone. Its request fields are handled as the server before Task 43
+        // handled every unknown field (neither request schema denies unknown fields): ignored,
+        // whatever their value. The answer is System 1's, with no `thinking` object.
+        let questions = r#""questions": {
+              "u": {"type": "noul", "instructions": "U"},
+              "c": {"type": "choice", "instructions": "Q", "criteria": {"x": "1", "y": "2", "w": "3"}}}"#;
+        let plain = format!(r#"{{"model": "m", "state": "S", {questions}}}"#);
+        let (status, want, _) = post_decisions(jev_app().await, &plain).await;
+        assert_eq!(status, StatusCode::OK, "{want}");
+        for extra in [
+            r#""thinking": "on", "threshold": 0.8, "think_budget": 64, "return_reasoning": true"#,
+            r#""thinking": "auto""#,
+            // values the System 2 validation refused (400) are ignored too
+            r#""thinking": "bogus", "threshold": 7, "think_budget": 0, "return_reasoning": "x""#,
+        ] {
+            let body = format!(r#"{{"model": "m", "state": "S", {extra}, {questions}}}"#);
+            let (status, v, text) = post_decisions(jev_app().await, &body).await;
+            assert_eq!(status, StatusCode::OK, "{extra}: {v}");
+            assert_eq!(v, want, "{extra}");
+            assert!(!text.contains("thinking"), "{text}");
+        }
+
+        let oa_questions = r#""questions": [
+              {"type": "predicate", "name": "u", "instructions": "U"},
+              {"type": "choice", "name": "c", "instructions": "Q", "choices": [{"value": "x"}, {"value": "y"}, {"value": "w"}]}]"#;
+        let (status, want) = post_openai(
+            jev_app().await,
+            &format!(r#"{{"input": "S", {oa_questions}}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{want}");
+        let body = format!(
+            r#"{{"input": "S", "thinking": "on", "threshold": 0.5, "think_budget": 9, "return_reasoning": true, {oa_questions}}}"#
+        );
+        let (status, v) = post_openai(jev_app().await, &body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"], want["answers"]);
+        assert_eq!(v["usage"], want["usage"]);
+        assert_eq!(v["usage"]["output_tokens"], 0);
+        assert!(v["answers"][0].get("thinking").is_none(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn jev_list_state_image_part_is_400_but_kev_reads_it_as_data() {
+        // EDGE-1: only JEV reads list elements as message parts.
+        let body = r#"{"model": "m", "state": [{"sku": 1, "image": "https://x/1.jpg"}], "questions": {"u": {"type": "noul"}}}"#;
+        let (status, v, _) = post_decisions(jev_app().await, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["error"],
+            "image parts in state are not supported (text-only server)"
+        );
+        let (status, v, _) = post_decisions(make_decision_app().await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v, _) = post_decisions(clef_app().await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// What a [`ScriptedEngine`] ran, and the logits it answers the next passes with.
+    #[derive(Clone, Default)]
+    struct Scripted {
+        seen: Arc<std::sync::Mutex<Vec<cascadia_types::DecisionReadout>>>,
+        logits: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<f32>>>>,
+    }
+
+    impl Scripted {
+        fn seen(&self) -> Vec<cascadia_types::DecisionReadout> {
+            self.seen.lock().unwrap().clone()
+        }
+        fn head_ids(&self) -> Vec<Vec<u32>> {
+            self.seen()
+                .iter()
+                .map(|r| match &r.head {
+                    cascadia_types::ReadoutHead::Verbalizer { token_ids } => token_ids.clone(),
+                    h => panic!("{h:?}"),
+                })
+                .collect()
+        }
+    }
+
+    /// A decision engine that records every readout, in the order run, and answers each with the
+    /// next queued logits (the mock's `-(i)` once the queue is empty).
+    struct ScriptedEngine {
+        s: Scripted,
+        pending: std::collections::VecDeque<cascadia_types::GenerationTask>,
+    }
+
+    impl cascadia_engine::Engine for ScriptedEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            self.pending.push_back(task);
+            Ok(())
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            let Some(task) = self.pending.pop_front() else {
+                return Ok(Vec::new());
+            };
+            let d = task.decision.clone().expect("decision tasks only");
+            self.s.seen.lock().unwrap().push(d.clone());
+            let n = d.head.output_len();
+            let logits = self
+                .s
+                .logits
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| (0..n).map(|i| -(i as f32)).collect());
+            let chunk = Chunk::final_marker(task.task_id.clone(), "")
+                .with_prompt_tokens(d.prompt_ids.len() as u32)
+                .with_finish_reason(cascadia_types::FinishReason::Stop)
+                .with_decision_logits(logits);
+            Ok(vec![(task.task_id, chunk)])
+        }
+    }
+
+    struct ScriptedBuilder(Scripted);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ScriptedBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(ScriptedEngine {
+                s: self.0,
+                pending: Default::default(),
+            }))
+        }
+    }
+
+    /// A JEV with 16 trained choice slots (A..P, ids 108..124) and the first `labels` choice
+    /// labels of A..Z, AA..ZZ (ids 1000 + i past the trained ones), unit temperature, no bias.
+    fn wide_jev_codec(
+        labels: usize,
+        strategy: decisions::profile::JevStrategy,
+        max_total: usize,
+    ) -> decisions::jev::JevCodec {
+        let az: Vec<String> = ('A'..='Z').map(String::from).collect();
+        let all: Vec<String> = az
+            .iter()
+            .cloned()
+            .chain(
+                az.iter()
+                    .flat_map(|a| az.iter().map(move |b| format!("{a}{b}"))),
+            )
+            .take(256)
+            .collect();
+        let verbalizers: Vec<String> = ["false", "true", "0", "1", "2", "3", "4", "5"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(all[..16].iter().cloned())
+            .collect();
+        let kinds = |v: [(&str, f64); 3]| v.into_iter().map(|(k, x)| (k.to_string(), x)).collect();
+        let profile = decisions::profile::JevProfile {
+            verbalizer_ids: (100..124).collect(),
+            bias: vec![0.0; 24],
+            verbalizers,
+            slots: [("noul", [0, 2]), ("score", [2, 8]), ("choice", [8, 24])]
+                .into_iter()
+                .map(|(k, r)| (k.to_string(), r))
+                .collect(),
+            temperature: kinds([("noul", 1.0), ("score", 1.0), ("choice", 1.0)]),
+            choice_labels: all[..labels].to_vec(),
+            choice_label_ids: (0..labels as u32)
+                .map(|i| if i < 16 { 108 + i } else { 1000 + i })
+                .collect(),
+            strategy,
+        };
+        decisions::jev::JevCodec::new(char_tokenizer(), profile)
+            .unwrap()
+            .with_pass_cap(4000)
+            .with_total_cap(max_total)
+    }
+
+    async fn wide_jev_app(
+        s: &Scripted,
+        labels: usize,
+        strategy: decisions::profile::JevStrategy,
+        max_total: usize,
+        dump: Option<std::path::PathBuf>,
+    ) -> Router {
+        decision_app_on(
+            Box::new(ScriptedBuilder(s.clone())),
+            decisions::profile::Family::Jev,
+            Box::new(wide_jev_codec(labels, strategy, max_total)),
+            4000,
+            max_total,
+            dump.map(|d| (d, None)),
+            Default::default(),
+        )
+        .await
+    }
+
+    /// A `/v1/systemone` body: choice `q` over o0..o{n-1} (descriptions `d0`..), then a noul,
+    /// with a top-level `strategy` unless it is empty.
+    fn wide_body(n: usize, strategy: &str) -> String {
+        let criteria: Vec<String> = (0..n).map(|i| format!(r#""o{i}": "d{i}""#)).collect();
+        let strategy = match strategy {
+            "" => String::new(),
+            s => format!(r#""strategy": "{s}", "#),
+        };
+        format!(
+            r#"{{"model": "m", "state": "S", {strategy}"questions": {{
+              "q": {{"type": "choice", "instructions": "Which team should handle this ticket?", "criteria": {{{}}}}},
+              "u": {{"type": "noul", "instructions": "U"}}}}}}"#,
+            criteria.join(", ")
+        )
+    }
+
+    /// The same question on `/v1/decisions`.
+    fn wide_openai_body(n: usize, strategy: &str) -> String {
+        let choices: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"value": "o{i}", "description": "d{i}"}}"#))
+            .collect();
+        let strategy = match strategy {
+            "" => String::new(),
+            s => format!(r#""strategy": "{s}", "#),
+        };
+        format!(
+            r#"{{"input": "S", {strategy}"questions": [
+              {{"type": "choice", "name": "q", "instructions": "Which team should handle this ticket?", "choices": [{}]}},
+              {{"type": "predicate", "name": "u", "instructions": "U"}}]}}"#,
+            choices.join(", ")
+        )
+    }
+
+    #[tokio::test]
+    async fn jev_sixteen_options_are_unchanged_by_labels_and_strategy() {
+        // Up to the trained slots nothing changes: the same passes and the same answers as a
+        // profile without labels (today's behaviour), whatever the strategy asked for.
+        use decisions::profile::JevStrategy;
+        let old = Scripted::default();
+        let (status, _, want) = post_decisions(
+            wide_jev_app(&old, 0, JevStrategy::Single, 16000, None).await,
+            &wide_body(16, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{want}");
+        let (_, want_oa) = post_openai(
+            wide_jev_app(&Scripted::default(), 0, JevStrategy::Single, 16000, None).await,
+            &wide_openai_body(16, ""),
+        )
+        .await;
+        for s in ["", "auto", "single", "tournament", "permute"] {
+            let wide = Scripted::default();
+            let app = wide_jev_app(&wide, 256, JevStrategy::Tournament, 16000, None).await;
+            let (status, _, got) = post_decisions(app, &wide_body(16, s)).await;
+            assert_eq!(status, StatusCode::OK, "{got}");
+            assert_eq!(got, want, "{s}: byte for byte");
+            assert_eq!(wide.seen().len(), 2, "{s}: one pass per question");
+            for (a, b) in wide.seen().iter().zip(old.seen()) {
+                assert_eq!(a.prompt_ids, b.prompt_ids, "{s}");
+                assert_eq!(a.head, b.head, "{s}");
+            }
+            let app = wide_jev_app(
+                &Scripted::default(),
+                256,
+                JevStrategy::Tournament,
+                16000,
+                None,
+            )
+            .await;
+            let (status, got_oa) = post_openai(app, &wide_openai_body(16, s)).await;
+            assert_eq!(status, StatusCode::OK, "{got_oa}");
+            assert_eq!(got_oa["answers"], want_oa["answers"], "{s}");
+            assert_eq!(got_oa["usage"], want_oa["usage"], "{s}");
+        }
+    }
+
+    /// ln(p), with -1e30 for p = 0 (finite: the handler refuses non-finite logits).
+    fn ln_logits(p: &[f64]) -> Vec<f32> {
+        p.iter()
+            .map(|&x| if x == 0.0 { -1e30 } else { x.ln() as f32 })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn jev_twenty_option_tournament_runs_two_groups_then_a_final() {
+        // Task 36's hand-computed tournament: group 0 ties options 2 and 5, group 1's winner is
+        // 13, the final over 0..16 gives 2 → 0.5, 13 → 0.25, 5 and 0 → 0.125. With unit
+        // temperature and no bias, logits ln(p) give exactly those passes.
+        use decisions::profile::JevStrategy;
+        let mut g0 = vec![0.05; 10];
+        g0[2] = 0.3;
+        g0[5] = 0.3;
+        let mut g1 = vec![0.05; 10];
+        g1[3] = 0.55;
+        let mut fin = vec![0.0; 16];
+        fin[2] = 0.5;
+        fin[13] = 0.25;
+        fin[5] = 0.125;
+        fin[0] = 0.125;
+        let mut want = vec![0.0; 20];
+        want[2] = 0.475;
+        want[13] = 0.2375;
+        want[5] = 0.11875;
+        want[0] = 0.11875;
+        for w in &mut want[16..] {
+            *w = 0.0125;
+        }
+        for route in ["systemone", "openai"] {
+            let s = Scripted::default();
+            s.logits.lock().unwrap().extend([
+                ln_logits(&g0),
+                ln_logits(&g1),
+                vec![0.0, -1.0], // the noul, run between the groups and the final
+                ln_logits(&fin),
+            ]);
+            // The profile's default (single) is overridden by the request.
+            let app = wide_jev_app(&s, 256, JevStrategy::Single, 16000, None).await;
+            let probs: Vec<f64> = if route == "systemone" {
+                let (status, v, _) = post_decisions(app, &wide_body(20, "tournament")).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let q = &v["answers"]["q"];
+                assert_eq!(q["choice"], "o2");
+                assert!(close(&q["confidence"], (0.475 - 0.05) / 0.95), "{q}");
+                assert!(close(&v["answers"]["u"]["noul"], 0.2689), "{v}");
+                let p = q["probabilities"].as_object().unwrap();
+                let keys: Vec<&String> = p.keys().collect();
+                assert_eq!(keys[0], "o0", "request order");
+                (0..20)
+                    .map(|i| p[&format!("o{i}")].as_f64().unwrap())
+                    .collect()
+            } else {
+                let (status, v) = post_openai(app, &wide_openai_body(20, "tournament")).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                assert_eq!(v["answers"][0]["choice"], "o2");
+                v["answers"][0]["probabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x["probability"].as_f64().unwrap())
+                    .collect()
+            };
+            for (o, (got, w)) in probs.iter().zip(&want).enumerate() {
+                assert!((got - w).abs() < 1e-4, "{route} option {o}: {got} vs {w}");
+            }
+            // Two group passes and the noul in round 1, then the final: 2 + 1 choice passes,
+            // each on the trained slots.
+            let ids = s.head_ids();
+            assert_eq!(ids.len(), 4, "{route}");
+            assert_eq!(ids[0], (108..118).collect::<Vec<u32>>());
+            assert_eq!(ids[1], (108..118).collect::<Vec<u32>>());
+            assert_eq!(ids[2], vec![100, 101]);
+            assert_eq!(ids[3], (108..124).collect::<Vec<u32>>());
+            let fin_text: String = s.seen()[3]
+                .prompt_ids
+                .iter()
+                .map(|&i| i as u8 as char)
+                .collect();
+            assert!(
+                fin_text.contains("\nA) o0: d0\n") && fin_text.contains("\nP) o15: d15\n"),
+                "{fin_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jev_twenty_option_permute_and_single_pass_counts() {
+        use decisions::profile::JevStrategy;
+        let label_ids: Vec<u32> = (108..124).chain(1016..1020).collect();
+        // permute: four passes over all 20 labels, and a distribution over all 20 options.
+        let s = Scripted::default();
+        let app = wide_jev_app(&s, 256, JevStrategy::Single, 16000, None).await;
+        let (status, v, _) = post_decisions(app, &wide_body(20, "permute")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let ids = s.head_ids();
+        assert_eq!(ids.len(), 5, "4 permute passes and the noul");
+        for (i, pass) in ids[..4].iter().enumerate() {
+            assert_eq!(pass, &label_ids, "pass {i}");
+        }
+        // Each pass reads -(i) by position, so option o gets the mean of its four positions'
+        // probabilities: serve_decide's permute combination of those passes.
+        let codec = wide_jev_codec(256, JevStrategy::Single, 16000);
+        let decisions::jev::ChoicePlan::Permute { orders } = codec.plan_choice(
+            20,
+            JevStrategy::Permute,
+            "Which team should handle this ticket?",
+        ) else {
+            panic!()
+        };
+        let pass =
+            codec.choice_pass_probabilities(&(0..20).map(|i| -(i as f32)).collect::<Vec<_>>());
+        let want = decisions::jev::combine_permute(&orders, &vec![pass; 4]);
+        let p = v["answers"]["q"]["probabilities"].as_object().unwrap();
+        assert_eq!(p.len(), 20);
+        for (o, w) in want.iter().enumerate() {
+            assert!(close(&p[&format!("o{o}")], *w), "option {o}: {v}");
+        }
+        // single (the profile's default here): one pass with 20 label ids.
+        let s = Scripted::default();
+        let app = wide_jev_app(&s, 256, JevStrategy::Single, 16000, None).await;
+        let (status, v, _) = post_decisions(app, &wide_body(20, "")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let ids = s.head_ids();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], label_ids);
+        // mock logits -(i): the first option wins
+        assert_eq!(v["answers"]["q"]["choice"], "o0");
+    }
+
+    #[tokio::test]
+    async fn strategy_is_for_jev_only() {
+        for app in [make_decision_app().await, clef_app().await] {
+            let (status, v, _) = post_decisions(
+                app,
+                r#"{"model": "m", "state": "s", "strategy": "single", "questions": {"u": {"type": "noul"}}}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert_eq!(v["error"], "strategy applies to JEV only");
+        }
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"input": "s", "strategy": "tournament", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["message"], "strategy applies to JEV only");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        // "auto" (and null) mean "the profile's default", which every family has.
+        for strategy in [r#""auto""#, "null"] {
+            for app in [make_decision_app().await, clef_app().await] {
+                let (status, v, _) = post_decisions(
+                    app,
+                    &format!(
+                        r#"{{"model": "m", "state": "s", "strategy": {strategy}, "questions": {{"u": {{"type": "noul"}}}}}}"#
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+            }
+        }
+        // Not a strategy at all: a schema error, like an unknown question type.
+        let (status, v) = post_openai(
+            jev_app().await,
+            r#"{"input": "s", "strategy": "vote", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown variant"),
+            "{v}"
+        );
+        let (status, _, _) = post_decisions(
+            jev_app().await,
+            r#"{"model": "m", "state": "s", "strategy": "vote", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_tournament_is_413_before_any_engine_call() {
+        // The final is counted as its worst case up front: a budget that covers round 1 but
+        // not that final refuses the request with nothing run.
+        use decisions::profile::JevStrategy;
+        let body = wide_body(20, "tournament");
+        let req: decisions::schema::DecisionRequest = serde_json::from_str(&body).unwrap();
+        let (passes, reserve) = decisions::Codec::encode_rounds(
+            &wide_jev_codec(256, JevStrategy::Single, usize::MAX),
+            &req,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(passes.len(), 3, "two groups and the noul");
+        let round1: usize = passes.iter().map(|p| p.readout.prompt_ids.len()).sum();
+        let s = Scripted::default();
+        let app = wide_jev_app(&s, 256, JevStrategy::Single, round1 + reserve - 1, None).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{}", round1 + reserve)),
+            "{v}"
+        );
+        assert!(s.seen().is_empty(), "no engine call");
+        let s = Scripted::default();
+        let app = wide_jev_app(&s, 256, JevStrategy::Single, round1 + reserve, None).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(s.seen().len(), 4);
+        // The real final fits its reserve.
+        assert!(s.seen()[3].prompt_ids.len() <= reserve);
+        let (status, v) = post_openai(
+            wide_jev_app(
+                &Scripted::default(),
+                256,
+                JevStrategy::Single,
+                round1 + reserve - 1,
+                None,
+            )
+            .await,
+            &wide_openai_body(20, "tournament"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    }
+
+    #[tokio::test]
+    async fn dump_lines_of_jev_choice_passes_name_their_strategy_and_round() {
+        use decisions::profile::JevStrategy;
+        let path = std::env::temp_dir().join(format!(
+            "decision-dump-wide-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let app = wide_jev_app(
+            &Scripted::default(),
+            256,
+            JevStrategy::Tournament,
+            16000,
+            Some(path.clone()),
+        )
+        .await;
+        let (status, v, _) = post_decisions(app.clone(), &wide_body(20, "")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v, _) = post_decisions(app, &wide_body(3, "")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let tags: Vec<(Value, Value, Value)> = lines
+            .iter()
+            .map(|l| {
+                (
+                    l["parts"][0][0].clone(),
+                    l["strategy"].clone(),
+                    l["round"].clone(),
+                )
+            })
+            .collect();
+        let t = |q: &str, s: Option<&str>, r: Option<u64>| {
+            (
+                Value::from(q),
+                s.map_or(Value::Null, Value::from),
+                r.map_or(Value::Null, Value::from),
+            )
+        };
+        assert_eq!(
+            tags,
+            [
+                t("q", Some("tournament"), Some(1)),
+                t("q", Some("tournament"), Some(1)),
+                t("u", None, None),
+                t("q", Some("tournament"), Some(2)),
+                t("q", Some("native"), Some(1)),
+                t("u", None, None),
+            ]
+        );
+        // Every line keeps the shape the parity tools read.
+        for l in &lines {
+            assert!(
+                l["readout"]["prompt_ids"].is_array() && l["parts"][0][2].is_u64(),
+                "{l}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A router whose model carries a (minimal) tools-capable chat template.

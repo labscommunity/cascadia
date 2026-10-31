@@ -9,6 +9,15 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::stream;
 
+/// Decision sentinel: a prompt id that fails the decision task with "mock engine failure".
+pub const DECISION_FAIL_ID: u32 = 999_999;
+/// Decision sentinel: a prompt id that returns non-finite logits (NaN, +inf, -inf, …).
+pub const DECISION_NON_FINITE_ID: u32 = 999_998;
+/// Decision sentinel: in a `require_warm` pass, fails as an evicted prefix snapshot.
+pub const DECISION_EVICTED_ID: u32 = 999_997;
+/// Decision sentinel: in a `needs_snapshot` pass, fails as a prefix the cache can never hold.
+pub const DECISION_UNCACHEABLE_ID: u32 = 999_996;
+
 #[derive(Default)]
 pub struct MockEngine {
     pending: Vec<(GenerationTask, usize)>,
@@ -73,6 +82,49 @@ impl Engine for MockEngine {
                 task.task_id.clone(),
                 Chunk::error(task.task_id, "mock injected engine failure"),
             )]);
+        }
+        // Decision tasks answer in one final chunk with deterministic logits (`-(i)`, joint
+        // heads `-(i^2)/4`, so the first option always wins). The `DECISION_*_ID` sentinel
+        // prompt ids exercise the API's error paths.
+        if let Some(d) = &task.decision {
+            // In a `require_warm` pass: its prefix snapshot was evicted (SEC-3).
+            if d.require_warm && d.prompt_ids.contains(&DECISION_EVICTED_ID) {
+                return Ok(vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, "decision_cold: mock snapshot evicted"),
+                )]);
+            }
+            // In a `needs_snapshot` pass: the cache can never hold the prefix.
+            if d.needs_snapshot && d.prompt_ids.contains(&DECISION_UNCACHEABLE_ID) {
+                return Ok(vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, "decision_uncacheable: mock cache too small"),
+                )]);
+            }
+            if d.prompt_ids.contains(&DECISION_FAIL_ID) {
+                return Ok(vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, "mock engine failure"),
+                )]);
+            }
+            let non_finite = d.prompt_ids.contains(&DECISION_NON_FINITE_ID);
+            // A joint head (Clef) slices one logits vector per question: there the logits are
+            // -(i^2)/4, not evenly spaced, so a wrong slice offset changes the softmax (P2-CE-3).
+            let joint = matches!(d.head, cascadia_types::ReadoutHead::Joint { .. });
+            let logits: Vec<f32> = (0..d.head.output_len())
+                .map(|i| match (non_finite, i % 3) {
+                    (false, _) if joint => -((i * i) as f32) / 4.0,
+                    (false, _) => -(i as f32),
+                    (true, 0) => f32::NAN,
+                    (true, 1) => f32::INFINITY,
+                    (true, _) => f32::NEG_INFINITY,
+                })
+                .collect();
+            let chunk = Chunk::final_marker(task.task_id.clone(), "")
+                .with_prompt_tokens(d.prompt_ids.len() as u32)
+                .with_finish_reason(cascadia_types::FinishReason::Stop)
+                .with_decision_logits(logits);
+            return Ok(vec![(task.task_id, chunk)]);
         }
         let max = task.max_tokens.max(1) as usize;
         let words: Vec<&str> = task.prompt.split_whitespace().collect();
@@ -298,5 +350,114 @@ mod tests {
         assert!(matches!(res, Err(EngineError::Backend(ref m)) if m == "boom"));
         // Error is one-shot; the engine resumes on the next step.
         assert!(!e.step().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decision_task_returns_one_final_chunk_with_logits() {
+        let mut e = MockEngine::new();
+        let mut t = GenerationTask {
+            task_id: "d1".into(),
+            prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            logprobs: 0,
+            sampling: Default::default(),
+            enable_thinking: false,
+            trust_remote_code: false,
+            tenant: String::new(),
+            resume_token_ids: None,
+            decision: None,
+        };
+        t.decision = Some(cascadia_types::DecisionReadout {
+            prompt_ids: vec![5, 6, 7, 8],
+            head: cascadia_types::ReadoutHead::Verbalizer {
+                token_ids: vec![1, 2, 3],
+            },
+            cache_prefix: None,
+            require_warm: false,
+            needs_snapshot: false,
+        });
+        e.submit(t).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let c = &out[0].1;
+        assert!(c.is_final);
+        assert_eq!(c.decision_logits, Some(vec![0.0, -1.0, -2.0]));
+        assert_eq!(c.prompt_tokens, Some(4));
+        assert!(e.step().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decision_task_with_sentinel_id_fails() {
+        let mut e = MockEngine::new();
+        let t = GenerationTask {
+            task_id: "d2".into(),
+            prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            logprobs: 0,
+            sampling: Default::default(),
+            enable_thinking: false,
+            trust_remote_code: false,
+            tenant: String::new(),
+            resume_token_ids: None,
+            decision: Some(cascadia_types::DecisionReadout {
+                prompt_ids: vec![5, DECISION_FAIL_ID],
+                head: cascadia_types::ReadoutHead::Verbalizer { token_ids: vec![1] },
+                cache_prefix: None,
+                require_warm: false,
+                needs_snapshot: false,
+            }),
+        };
+        e.submit(t).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1, "one error chunk, nothing else");
+        let c = &out[0].1;
+        assert_eq!(c.error.as_deref(), Some("mock engine failure"));
+        assert_eq!(
+            c.decision_logits, None,
+            "a failed decision carries no logits"
+        );
+        assert!(e.step().unwrap().is_empty(), "the task is finished");
+    }
+
+    #[test]
+    fn decision_task_with_non_finite_sentinel_returns_nan_and_inf() {
+        let mut e = MockEngine::new();
+        let t = GenerationTask {
+            task_id: "d3".into(),
+            prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            logprobs: 0,
+            sampling: Default::default(),
+            enable_thinking: false,
+            trust_remote_code: false,
+            tenant: String::new(),
+            resume_token_ids: None,
+            decision: Some(cascadia_types::DecisionReadout {
+                prompt_ids: vec![5, DECISION_NON_FINITE_ID],
+                head: cascadia_types::ReadoutHead::Verbalizer {
+                    token_ids: vec![1, 2, 3],
+                },
+                cache_prefix: None,
+                require_warm: false,
+                needs_snapshot: false,
+            }),
+        };
+        e.submit(t).unwrap();
+        let out = e.step().unwrap();
+        let l = out[0].1.decision_logits.clone().unwrap();
+        assert!(l[0].is_nan());
+        assert_eq!(l[1..], [f32::INFINITY, f32::NEG_INFINITY]);
     }
 }

@@ -18,7 +18,7 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 futures = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -35,8 +35,15 @@ bytes = { workspace = true }
 # formatter, silently stripping tools from the prompt.
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "json"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+indexmap = { version = "2", features = ["serde"] }
+ryu = "1"
+tokenizers = { workspace = true }
+# `decisions::PassRunner`, the seam embedders run decision passes through.
+async-trait = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
-async-trait = { workspace = true }

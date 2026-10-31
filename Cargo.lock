@@ -251,6 +251,7 @@ version = "0.2.6"
 dependencies = [
  "anyhow",
  "cascadia-cli",
+ "cascadia-ov-genai-shim",
  "clap",
  "tokio",
 ]
@@ -269,12 +270,16 @@ dependencies = [
  "cascadia-types",
  "chrono",
  "futures",
+ "indexmap",
+ "libc",
  "minijinja",
  "minijinja-contrib",
  "parking_lot",
+ "ryu",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokenizers",
  "tokio",
  "tower",
  "tower-http 0.5.2",
@@ -287,6 +292,7 @@ name = "cascadia-cli"
 version = "0.2.6"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "cascadia-api",
  "cascadia-dashboard",
@@ -401,6 +407,7 @@ dependencies = [
  "async-trait",
  "cascadia-engine",
  "cascadia-kv-wire",
+ "cascadia-metrics",
  "cascadia-ov-genai-shim",
  "cascadia-runner",
  "cascadia-transport",
@@ -482,6 +489,7 @@ version = "0.2.6"
 dependencies = [
  "cc",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

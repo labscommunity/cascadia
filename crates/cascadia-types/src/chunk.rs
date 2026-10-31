@@ -99,6 +99,16 @@ pub struct Chunk {
     /// not resume sources. `#[serde(default)]` keeps the wire additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub token_ids: Vec<i64>,
+    /// Raw per-option logits of a decision readout, on the FINAL chunk only
+    /// (length = `ReadoutHead::output_len`). `None` on every generation chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_logits: Option<Vec<f32>>,
+    /// On an ERROR chunk from an engine that knows it: how many of the task's prompt tokens were
+    /// resumed from a cached state instead of prefilled (0 = a cold prefill, a cache miss). Lets
+    /// the API's failure line say whether a failed task started from a cache hit. `None` =
+    /// unknown (the task was never admitted, or the engine cannot tell). Additive on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_prefix: Option<u32>,
 }
 
 impl Chunk {
@@ -115,6 +125,8 @@ impl Chunk {
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
+            decision_logits: None,
+            warm_prefix: None,
         }
     }
 
@@ -136,6 +148,8 @@ impl Chunk {
             completion_tokens: None,
             error: None,
             finish_reason: None,
+            decision_logits: None,
+            warm_prefix: None,
         }
     }
 
@@ -157,6 +171,8 @@ impl Chunk {
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
+            decision_logits: None,
+            warm_prefix: None,
         }
     }
 
@@ -176,6 +192,8 @@ impl Chunk {
             error: Some(reason.into()),
             finish_reason: None,
             token_ids: Vec::new(),
+            decision_logits: None,
+            warm_prefix: None,
         }
     }
 
@@ -210,6 +228,18 @@ impl Chunk {
     /// the "one token per chunk" fallback. See `Chunk::n_tokens` docs.
     pub fn with_n_tokens(mut self, n: u32) -> Self {
         self.n_tokens = Some(n);
+        self
+    }
+
+    /// Record how much of a failed task's prompt was resumed from a cached state (ERROR chunk).
+    pub fn with_warm_prefix(mut self, n: usize) -> Self {
+        self.warm_prefix = Some(u32::try_from(n).unwrap_or(u32::MAX));
+        self
+    }
+
+    /// Attach a decision readout's raw per-option logits (FINAL chunk only).
+    pub fn with_decision_logits(mut self, logits: Vec<f32>) -> Self {
+        self.decision_logits = Some(logits);
         self
     }
 
@@ -270,6 +300,8 @@ mod tests {
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
+            decision_logits: None,
+            warm_prefix: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let back: Chunk = serde_json::from_str(&json).unwrap();

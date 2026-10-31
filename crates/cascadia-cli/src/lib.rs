@@ -26,7 +26,7 @@ use cascadia_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 pub mod discover;
@@ -403,13 +403,45 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub prefix_cache_gb: Option<f64>,
 
-    /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
-    /// is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
-    /// window of the largest served models. Only `qwen35` also bounds the
-    /// prompt in TOKENS (against `max_position_embeddings`); on other engines
-    /// this byte cap is the whole guard, so lower it on an exposed endpoint.
+    /// Largest request body on every API route (MiB): chat/completions,
+    /// completions, /v1/decisions and /v1/systemone; a long decision state
+    /// needs it raised. The rendered chat prompt is capped at the same size.
+    /// 1 MiB ≈ 250 K tokens of English, the window of the largest served
+    /// models. Only `qwen35` also bounds the prompt in TOKENS (against
+    /// `max_position_embeddings`); on other engines this byte cap is the
+    /// whole guard, so lower it on an exposed endpoint.
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
+
+    /// Append every decision pass (/v1/decisions and /v1/systemone; codec token ids + head
+    /// layout) as JSONL to FILE, mode 0600. FILE must be a regular file (or absent).
+    /// For parity checks only: the file holds request-derived data.
+    #[arg(long)]
+    pub decision_dump: Option<PathBuf>,
+
+    /// Close --decision-dump for good once a request's lines would take the file past BYTES:
+    /// neither that request nor any later one is written (whole lines only; a failed write closes
+    /// it too). Default: unlimited.
+    #[arg(long, value_name = "BYTES")]
+    pub decision_dump_max_bytes: Option<u64>,
+
+    /// Decision requests (/v1/decisions and /v1/systemone) admitted at once; one more is a 503
+    /// `engine at capacity`. A pool of its own: decisions and chat never take each other's
+    /// permits, so up to C chat + N decision requests are admitted at once, where C is chat's
+    /// pool (16, unless CASCADIA_API_MAX_CONCURRENT sets it). The engine still runs one pass at a
+    /// time, so N sets queue depth, not parallelism. With Kev and the prefix cache, more admitted
+    /// requests (chat included) evict more shared-prefix snapshots, and an evicted one is also a
+    /// 503. 1 to 240: C plus N must fit the engine's 256-task pending queue, and a server that
+    /// serves decisions refuses to start when it does not.
+    #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
+    pub max_decision_requests: usize,
+
+    /// Keep serving after the engine fails for good (qwen35 only: a stage that cannot be
+    /// recovered), refusing every request with a 5xx and `/health` degraded. Default off: the
+    /// process exits non-zero after a short grace so the supervisor restarts it. For debugging a
+    /// failed engine in place.
+    #[arg(long)]
+    pub keep_serving_on_engine_failure: bool,
 
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
@@ -805,10 +837,33 @@ pub struct RunArgs {
     #[arg(long, value_delimiter = ',')]
     pub ep_workers: Vec<String>,
 
-    /// Largest chat-completions request body in MiB (rendered prompt capped
-    /// alike). See `cascadia worker --help`.
+    /// Largest request body on every API route in MiB, /v1/decisions and
+    /// /v1/systemone included (rendered chat prompt capped alike). See
+    /// `cascadia worker --help`.
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
+
+    /// Append every decision pass (/v1/decisions and /v1/systemone; codec token ids + head
+    /// layout) as JSONL to FILE, mode 0600. FILE must be a regular file (or absent).
+    /// For parity checks only: the file holds request-derived data.
+    #[arg(long)]
+    pub decision_dump: Option<PathBuf>,
+
+    /// Close --decision-dump for good once a request's lines would take the file past BYTES:
+    /// neither that request nor any later one is written (whole lines only; a failed write closes
+    /// it too). Default: unlimited.
+    #[arg(long, value_name = "BYTES")]
+    pub decision_dump_max_bytes: Option<u64>,
+
+    /// Decision requests admitted at once, a pool separate from chat's; chat's pool plus N must
+    /// fit the engine's 256-task pending queue. See `cascadia worker --help`. 1 to 240.
+    #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
+    pub max_decision_requests: usize,
+
+    /// Stay up after the engine fails, refusing with a 5xx, instead of exiting for a restart.
+    /// See `cascadia worker --help`.
+    #[arg(long)]
+    pub keep_serving_on_engine_failure: bool,
 
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
@@ -911,6 +966,7 @@ impl WorkerArgs {
         api_max_body_mb: f64,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
+        decision_dump: Option<PathBuf>,
     ) -> Self {
         WorkerArgs {
             rank: 0,
@@ -926,6 +982,10 @@ impl WorkerArgs {
             engine,
             prefix_cache_gb,
             api_max_body_mb,
+            decision_dump,
+            decision_dump_max_bytes: None,
+            max_decision_requests: cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS,
+            keep_serving_on_engine_failure: false,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1239,7 +1299,11 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.api_max_body_mb,
         args.ep_workers,
         args.ep_placement,
+        args.decision_dump,
     );
+    worker.decision_dump_max_bytes = args.decision_dump_max_bytes;
+    worker.max_decision_requests = args.max_decision_requests;
+    worker.keep_serving_on_engine_failure = args.keep_serving_on_engine_failure;
     // Carry the elastic posture onto the worker so the OV memory-knob seeding
     // (ov_perf_properties) fires; the interposer itself was already activated
     // in main before the async runtime started.
@@ -1500,6 +1564,49 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     }
 
     props
+}
+
+/// Largest `--max-decision-requests`: every admitted request can have a pass queued in the
+/// engine, so the decision pool plus chat's must fit its pending queue, or decisions would fill
+/// it and chat would get `QueueFull` 503s. This bound assumes chat's default pool
+/// ([`cascadia_api::DEFAULT_MAX_CONCURRENT`]); [`check_admission_fits`] checks the real one.
+const MAX_DECISION_REQUESTS: usize =
+    cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS - cascadia_api::DEFAULT_MAX_CONCURRENT;
+
+/// `--max-decision-requests`: a whole number from 1 to [`MAX_DECISION_REQUESTS`]. Zero would
+/// refuse every decision with a 503 that reads like load, so it is a startup error instead.
+fn parse_max_decision_requests(s: &str) -> Result<usize, String> {
+    let range = format!("a whole number from 1 to {MAX_DECISION_REQUESTS}");
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be at least 1 (0 would refuse every decision request)".into()),
+        Ok(n) if n > MAX_DECISION_REQUESTS => Err(format!(
+            "must be at most {MAX_DECISION_REQUESTS}: chat's {} permits (by default) plus N must \
+             fit the engine's {}-task pending queue",
+            cascadia_api::DEFAULT_MAX_CONCURRENT,
+            cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS,
+        )),
+        Ok(n) => Ok(n),
+        // Past usize too: the same bound, never a panic later in `Semaphore::new`.
+        Err(_) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            Err(format!("must be at most {MAX_DECISION_REQUESTS} ({range})"))
+        }
+        Err(_) => Err(format!("{s:?} is not {range}")),
+    }
+}
+
+/// Chat's pool (`CASCADIA_API_MAX_CONCURRENT`) plus the decision pool must fit the engine's
+/// pending queue, for the same reason as [`MAX_DECISION_REQUESTS`]. Only a server that serves
+/// /v1/decisions has a decision pool to fit; without one any chat pool is accepted.
+fn check_admission_fits(chat: usize, decisions: usize, decisions_served: bool) -> Result<()> {
+    let queue = cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS;
+    if decisions_served && chat.saturating_add(decisions) > queue {
+        return Err(anyhow!(
+            "CASCADIA_API_MAX_CONCURRENT ({chat}) plus --max-decision-requests ({decisions}) must \
+             be at most {queue}, the engine's pending-task queue, or decisions could fill it and \
+             chat would get QueueFull 503s; lower one of them"
+        ));
+    }
+    Ok(())
 }
 
 /// clap value-parser for `--ov-config`: require a `KEY=VALUE` shape with a
@@ -1979,7 +2086,16 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
 /// cadence instead of being Nagle-aggregated into ~3500 B bursts
 /// every ~1 s — the original demo's bursty token feel was driven
 /// almost entirely by this default.
-async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {
+///
+/// Task 61: once `stop` reads `true`, every open connection shuts down
+/// gracefully (hyper's `graceful_shutdown`): an idle keep-alive connection
+/// closes at once, and one with a response in flight closes after that
+/// response, so no new request is admitted while in-flight ones finish.
+async fn serve_with_nodelay(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
@@ -2013,12 +2129,22 @@ async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: axum::Router
                 Ok::<_, Infallible>(res.unwrap_or_else(|e: Infallible| match e {}))
             }
         });
+        let mut stop = stop.clone();
         tokio::spawn(async move {
-            if let Err(e) = http1::Builder::new()
+            let conn = http1::Builder::new()
                 .keep_alive(true)
-                .serve_connection(io, svc)
-                .await
-            {
+                .serve_connection(io, svc);
+            let mut conn = std::pin::pin!(conn);
+            // A dropped sender never stops a connection (`false`: the arm is disabled).
+            let stopped = async { stop.wait_for(|&s| s).await.is_ok() };
+            let res = tokio::select! {
+                res = conn.as_mut() => res,
+                true = stopped => {
+                    conn.as_mut().graceful_shutdown();
+                    conn.await
+                }
+            };
+            if let Err(e) = res {
                 tracing::debug!(error = %e, "connection serve ended");
             }
         });
@@ -2085,6 +2211,140 @@ fn install_shutdown_signal_handler(
         let _ = tokio::signal::ctrl_c().await;
         ShutdownSignal::Sigint
     })
+}
+
+/// Task 56: how long in-flight responses get to reach their clients once the engine has failed
+/// (the failing request's 5xx, and any requests it already refused) before the process exits.
+const ENGINE_FAILED_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Task 56: how often the API serve loop reads the engine's failure handle.
+const ENGINE_FAILURE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Resolve with the reason once the engine reports a permanent failure. `None` (the
+/// `--keep-serving-on-engine-failure` opt-out) never resolves.
+async fn engine_failed(failure: Option<cascadia_engine::EngineFailure>) -> String {
+    let Some(failure) = failure else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(reason) = failure.reason() {
+            return reason;
+        }
+        tokio::time::sleep(ENGINE_FAILURE_POLL).await;
+    }
+}
+
+/// Bound on `runner.close()` at shutdown, signal or engine failure alike.
+const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The `--keep-serving-on-engine-failure` wiring: the failure handle the serve loop watches, or
+/// `None` when the operator asked to keep a failed engine up. The handle was grabbed once at load,
+/// so watching it never takes the engine lock.
+fn watched_failure(args: &WorkerArgs, runner: &Runner) -> Option<cascadia_engine::EngineFailure> {
+    (!args.keep_serving_on_engine_failure).then(|| runner.engine_failure())
+}
+
+/// Task 56 fix round 1: end the process at once with a non-zero code. Used only when the close
+/// overruns its bound, after an engine failure or a signal alike (Task 61): returning would let
+/// `main` drop the tokio runtime, and that drop waits on the still-blocked close task (after a
+/// native fault a request's destructor can block forever), so the process would never exit and,
+/// after an engine failure, never be restarted.
+fn force_exit_after_close_overrun() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(1);
+}
+
+/// Serve the API until a SIGTERM/SIGINT (`Ok`, exit 0) or, with `failure` watched, until the
+/// engine fails for good (`Err`, a non-zero exit, so systemd `Restart=on-failure` and NSSM restart
+/// the server). Either way the open connections are told to stop admitting requests
+/// (`stop_connections`, see [`serve_with_nodelay`]) and the same bounded `runner.close()` runs
+/// last. A close that overruns `close_timeout` calls `force_exit`
+/// ([`force_exit_after_close_overrun`] in production) instead of returning.
+#[allow(clippy::too_many_arguments)]
+async fn serve_until_shutdown(
+    serve: impl std::future::Future<Output = Result<()>>,
+    stop_connections: tokio::sync::watch::Sender<bool>,
+    shutdown_signal: impl std::future::Future<Output = ShutdownSignal>,
+    failure: Option<cascadia_engine::EngineFailure>,
+    grace: std::time::Duration,
+    close_timeout: std::time::Duration,
+    force_exit: impl FnOnce(),
+    runner: Arc<Runner>,
+) -> Result<()> {
+    // Race the axum serve against SIGTERM/SIGINT. Without this,
+    // `kill <pid>` exits the tokio runtime before `Runner::close()`
+    // runs, which silently drops any teardown work close() does
+    // (flushing caches, draining transports, etc.). On signal we
+    // fall through to runner.close() below.
+    let mut engine_failure = None;
+    tokio::select! {
+        res = serve => {
+            res.context("serve_with_nodelay")?;
+        }
+        sig = shutdown_signal => {
+            info!(
+                signal = %sig,
+                pid = std::process::id(),
+                "shutdown signal received; running graceful close"
+            );
+        }
+        reason = engine_failed(failure) => {
+            error!(
+                reason = %reason,
+                pid = std::process::id(),
+                "engine failed; exiting so the supervisor restarts the server"
+            );
+            engine_failure = Some(reason);
+        }
+    }
+    // The serve future (and its listener) is dropped: no new connection is accepted. The
+    // connections already open run on their own tasks: each stops admitting requests and closes
+    // once its response in flight, if any, is done. Give those responses a moment to land.
+    let _ = stop_connections.send(true);
+    if engine_failure.is_some() {
+        tokio::time::sleep(grace).await;
+    }
+    // Bounded close so a stuck peer / transport doesn't force the
+    // operator to escalate `kill` → `kill -9`. `Runner::close()` is
+    // sync (parking_lot::Mutex) and may block_on async transport
+    // teardown internally; dispatch via spawn_blocking so the timer
+    // can actually fire, then await with a deadline. On timeout the
+    // close task keeps its thread, and when `main` drops the tokio
+    // runtime that drop waits for it, so a close that never returns
+    // would hold the process up. The overrun therefore forces the exit
+    // (`force_exit`), after a signal and after an engine failure alike.
+    let close_task = tokio::task::spawn_blocking(move || runner.close());
+    match tokio::time::timeout(close_timeout, close_task).await {
+        Ok(Ok(())) => info!("runner.close() complete"),
+        Ok(Err(join_err)) => tracing::warn!(
+            error = %join_err,
+            "runner.close() task panicked"
+        ),
+        Err(_) => {
+            tracing::warn!(
+                timeout_s = close_timeout.as_secs_f64(),
+                "runner.close() exceeded timeout; abandoning teardown"
+            );
+            match &engine_failure {
+                Some(reason) => error!(
+                    reason = %reason,
+                    "engine failed and runner.close() overran; forcing a non-zero exit"
+                ),
+                None => error!(
+                    "runner.close() overran after a shutdown signal; forcing a non-zero exit"
+                ),
+            }
+            force_exit();
+        }
+    }
+    match engine_failure {
+        Some(reason) => Err(anyhow!(
+            "engine failed: {reason}; exiting so the supervisor restarts the server"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Reject phase-split flag combinations before a worker binds any socket. Pure
@@ -2201,6 +2461,64 @@ fn check_api_addr_is_tcp(api: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Where `--decision-dump` writes, if anywhere: only when a decision model is loaded, since
+/// the file would otherwise stay empty. Logs either way (the file holds request-derived data).
+fn decision_dump_target(dump: Option<&std::path::Path>, decisions_loaded: bool) -> Option<PathBuf> {
+    let p = dump?;
+    if decisions_loaded {
+        warn!(path = %p.display(), "--decision-dump records request-derived token ids to disk; use for parity checks only");
+        Some(p.to_path_buf())
+    } else {
+        warn!(path = %p.display(), "--decision-dump ignored: no decision model is loaded");
+        None
+    }
+}
+
+/// Decision models: a `decision.json` beside the shard tree turns on /v1/decisions and
+/// /v1/systemone, on the rank that serves the API (`serves_api`). Only qwen35 implements decision
+/// passes; other engines would run them as empty chats. Reads only the tree's json files, so it
+/// runs before the model load.
+fn load_decisions(
+    args: &WorkerArgs,
+    serves_api: bool,
+    prefix_cache_bytes: usize,
+) -> Option<Arc<cascadia_api::decisions::DecisionService>> {
+    if !serves_api {
+        None
+    } else if matches!(args.engine, EngineKind::Qwen36Moe) {
+        match cascadia_api::decisions::DecisionService::load(std::path::Path::new(&args.model)) {
+            Ok(Some(mut svc)) => {
+                svc.prefix_reuse = cascadia_api::decisions::DecisionService::prefix_reuse_for(
+                    args.total,
+                    prefix_cache_bytes,
+                );
+                // The values every 413 and the docs' limits table depend on. For Clef,
+                // max_tokens is the effective joint prompt cap after the head-input clamp.
+                info!(
+                    model = %args.model,
+                    family = ?svc.family,
+                    max_tokens = svc.max_tokens,
+                    max_total_tokens = svc.max_total_tokens,
+                    max_questions = svc.max_questions,
+                    prefix_reuse = svc.prefix_reuse,
+                    "decision.json loaded; /v1/decisions (OpenAI format) and /v1/systemone will be served"
+                );
+                Some(Arc::new(svc))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(model = %args.model, error = %e, "decision.json present but unusable; /v1/decisions disabled");
+                None
+            }
+        }
+    } else {
+        if cascadia_api::decisions::decision_json_present(std::path::Path::new(&args.model)) {
+            warn!(engine = ?args.engine, "decision.json ignored: only --engine qwen35 serves /v1/decisions");
+        }
+        None
+    }
+}
+
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if args.rank >= args.total {
         return Err(anyhow!(
@@ -2313,6 +2631,28 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
 
     preflight_model_path(&args)?;
+    // Loaded before the model, like the sizing flags above: it reads only the tree's json files,
+    // and whether decisions are served decides the admission check below.
+    let serves_api = is_first && args.api.is_some();
+    let decisions = load_decisions(&args, serves_api, prefix_cache_bytes);
+    // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
+    // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
+    // once, so a client that sends that many requests at once needs the
+    // cap above it. Read only on the rank that serves the API, so no other
+    // rank warns about a value it never uses.
+    let max_concurrent_requests = if serves_api {
+        api_max_concurrent(
+            std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
+            cascadia_api::DEFAULT_MAX_CONCURRENT,
+        )
+    } else {
+        cascadia_api::DEFAULT_MAX_CONCURRENT
+    };
+    check_admission_fits(
+        max_concurrent_requests,
+        args.max_decision_requests,
+        decisions.is_some(),
+    )?;
     let builder = build_builder(&args, prefix_cache_bytes)?;
     let runner = Arc::new(Runner::new(builder));
     let listen = if !is_first {
@@ -2562,6 +2902,13 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             chat_template.template.as_deref(),
         );
         cfg.chat_template = chat_template;
+        cfg.decisions = decisions;
+        if let Some(p) =
+            decision_dump_target(args.decision_dump.as_deref(), cfg.decisions.is_some())
+        {
+            cfg.decision_dump = Some(p);
+            cfg.decision_dump_max_bytes = args.decision_dump_max_bytes;
+        }
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
         // windows admit. Both caps follow one operator-facing knob.
@@ -2575,14 +2922,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
-        // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
-        // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
-        // once, so a client that sends that many requests at once needs the
-        // cap above it.
-        cfg.max_concurrent_requests = api_max_concurrent(
-            std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
-            cfg.max_concurrent_requests,
-        );
+        // Chat's pool and decision admission, sized and checked before the model load.
+        cfg.max_concurrent_requests = max_concurrent_requests;
+        cfg.max_concurrent_decisions = args.max_decision_requests;
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster
@@ -2650,45 +2992,21 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // orphaned processes under systemd / k8s.
         let shutdown_signal =
             install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
-        // Race the axum serve against SIGTERM/SIGINT. Without this,
-        // `kill <pid>` exits the tokio runtime before `Runner::close()`
-        // runs, which silently drops any teardown work close() does
-        // (flushing caches, draining transports, etc.). On signal we
-        // fall through to runner.close() below.
-        tokio::select! {
-            res = serve_with_nodelay(listener, app) => {
-                res.context("serve_with_nodelay")?;
-            }
-            sig = shutdown_signal => {
-                info!(
-                    signal = %sig,
-                    pid = std::process::id(),
-                    "shutdown signal received; running graceful close"
-                );
-            }
-        }
-        // Bounded close so a stuck peer / transport doesn't force the
-        // operator to escalate `kill` → `kill -9`. `Runner::close()` is
-        // sync (parking_lot::Mutex) and may block_on async transport
-        // teardown internally; dispatch via spawn_blocking so the timer
-        // can actually fire, then await with a deadline. On timeout we
-        // log loudly and return — the process exit will SIGKILL any
-        // straggler threads, which is the right outcome at that point.
-        const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let r = runner.clone();
-        let close_task = tokio::task::spawn_blocking(move || r.close());
-        match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
-            Ok(Ok(())) => info!("runner.close() complete"),
-            Ok(Err(join_err)) => tracing::warn!(
-                error = %join_err,
-                "runner.close() task panicked"
-            ),
-            Err(_) => tracing::warn!(
-                timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
-                "runner.close() exceeded timeout; abandoning teardown"
-            ),
-        }
-        return Ok(());
+        // Task 56: watch the engine's failure handle unless the operator asked to keep a failed
+        // engine up.
+        let failure = watched_failure(&args, &runner);
+        let (stop_connections, stop) = tokio::sync::watch::channel(false);
+        return serve_until_shutdown(
+            serve_with_nodelay(listener, app, stop),
+            stop_connections,
+            shutdown_signal,
+            failure,
+            ENGINE_FAILED_GRACE,
+            SHUTDOWN_CLOSE_TIMEOUT,
+            force_exit_after_close_overrun,
+            runner,
+        )
+        .await;
     }
 
     // No API — read prompts from stdin.
@@ -2717,6 +3035,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             trust_remote_code: false,
             tenant: String::new(), // H.1b: single-tenant CLI path — LOCAL_NS
             resume_token_ids: None,
+            decision: None,
         };
         // `generate_async`, not `generate`: this loop runs on the tokio
         // runtime, and the sync path would block a worker on the engine
@@ -3139,6 +3458,7 @@ mod python_tests {
             None,
             1.0,
             Vec::new(),
+            None,
             None,
         );
         a.engine = engine;
@@ -3585,6 +3905,7 @@ mod ov_property_tests {
             1.0,
             Vec::new(),
             None,
+            None,
         )
     }
 
@@ -3786,6 +4107,421 @@ mod cli_version_tests {
 }
 
 #[cfg(test)]
+mod engine_failure_tests {
+    use super::*;
+    use cascadia_engine::{Engine, EngineError, EngineFailure};
+    use cascadia_types::{Chunk, TaskId};
+    use std::time::{Duration, Instant};
+
+    /// A fake engine whose failure handle the test sets, as qwen36 sets its own. Its `close`
+    /// takes the given time, standing in for a teardown stuck on a faulted request.
+    struct FailingLater(EngineFailure, Duration);
+
+    impl Engine for FailingLater {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(Vec::new())
+        }
+        fn failure(&self) -> EngineFailure {
+            self.0.clone()
+        }
+        fn close(&mut self) {
+            std::thread::sleep(self.1);
+        }
+    }
+
+    struct FailingLaterBuilder(EngineFailure, Duration);
+
+    #[async_trait::async_trait]
+    impl Builder for FailingLaterBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(FailingLater(self.0, self.1)))
+        }
+    }
+
+    async fn started(handle: &EngineFailure) -> Arc<Runner> {
+        started_with_close(handle, Duration::ZERO).await
+    }
+
+    async fn started_with_close(handle: &EngineFailure, close: Duration) -> Arc<Runner> {
+        let runner = Arc::new(Runner::new(Box::new(FailingLaterBuilder(
+            handle.clone(),
+            close,
+        ))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        runner
+    }
+
+    /// A connection-stop sender no connection watches (the serve here is a pending future).
+    fn unwatched() -> tokio::sync::watch::Sender<bool> {
+        tokio::sync::watch::channel(false).0
+    }
+
+    /// A shutdown future the test fires by hand, standing in for SIGTERM.
+    fn signal() -> (
+        tokio::sync::oneshot::Sender<()>,
+        impl std::future::Future<Output = ShutdownSignal>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        (tx, async move {
+            let _ = rx.await;
+            ShutdownSignal::Sigterm
+        })
+    }
+
+    /// The default: the engine fails mid-serve, the serve loop stops, waits out the grace, closes
+    /// the runner and returns `Err` (a non-zero exit) carrying the reason.
+    #[tokio::test]
+    async fn an_engine_failure_returns_err_after_the_grace_and_closes_the_runner() {
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        let (_tx, shutdown) = signal();
+        let grace = Duration::from_millis(300);
+        let setter = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            setter.set("stage1 could not be recovered");
+        });
+        let t0 = Instant::now();
+        let r = serve_until_shutdown(
+            std::future::pending(),
+            unwatched(),
+            shutdown,
+            Some(runner.engine_failure()),
+            grace,
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
+            runner.clone(),
+        )
+        .await;
+        let took = t0.elapsed();
+        let err = r.expect_err("an engine failure exits non-zero").to_string();
+        assert!(
+            err.contains("engine failed: stage1 could not be recovered")
+                && err.contains("supervisor restarts the server"),
+            "{err}"
+        );
+        assert!(
+            took >= Duration::from_millis(50) + grace && took < Duration::from_secs(5),
+            "noticed, then the grace: {took:?}"
+        );
+        assert!(
+            runner
+                .submit(GenerationTask::new("after", "hello"))
+                .is_err(),
+            "the runner is closed"
+        );
+    }
+
+    /// `--keep-serving-on-engine-failure`: a failed engine keeps the server up (it refuses with a
+    /// 5xx), and a SIGTERM still exits 0.
+    #[tokio::test]
+    async fn with_the_opt_out_a_failed_engine_keeps_serving_and_a_signal_exits_ok() {
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        handle.set("stage1 could not be recovered");
+        let (tx, shutdown) = signal();
+        let serving = tokio::spawn(serve_until_shutdown(
+            std::future::pending(),
+            unwatched(),
+            shutdown,
+            None,
+            Duration::from_millis(50),
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
+            runner,
+        ));
+        tokio::time::sleep(ENGINE_FAILURE_POLL * 3).await;
+        assert!(!serving.is_finished(), "still serving");
+        tx.send(()).unwrap();
+        serving.await.unwrap().expect("a signal shutdown exits 0");
+    }
+
+    /// A healthy engine, watched: a SIGTERM exits 0 at once, with no grace.
+    #[tokio::test]
+    async fn a_signal_with_a_healthy_engine_exits_ok_without_the_grace() {
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        let (tx, shutdown) = signal();
+        tx.send(()).unwrap();
+        let t0 = Instant::now();
+        serve_until_shutdown(
+            std::future::pending(),
+            unwatched(),
+            shutdown,
+            Some(runner.engine_failure()),
+            Duration::from_secs(30),
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
+            runner,
+        )
+        .await
+        .expect("a signal shutdown exits 0");
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Fix round 1: after an engine failure, a close that overruns its bound forces the exit
+    /// (`force_exit`; `process::exit(1)` in production) rather than return into a runtime drop
+    /// that would wait on the stuck close forever.
+    #[tokio::test]
+    async fn an_overrunning_close_after_an_engine_failure_forces_the_exit() {
+        let handle = EngineFailure::default();
+        let runner = started_with_close(&handle, Duration::from_secs(1)).await;
+        handle.set("stage1 could not be recovered");
+        let (_tx, shutdown) = signal();
+        let forced = std::sync::atomic::AtomicBool::new(false);
+        let t0 = Instant::now();
+        let r = serve_until_shutdown(
+            std::future::pending(),
+            unwatched(),
+            shutdown,
+            Some(runner.engine_failure()),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            || forced.store(true, std::sync::atomic::Ordering::SeqCst),
+            runner,
+        )
+        .await;
+        assert!(forced.load(std::sync::atomic::Ordering::SeqCst), "forced");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "did not wait out the close"
+        );
+        assert!(r.is_err());
+    }
+
+    /// Task 61: the signal path forces the exit on an overrun too, instead of returning into a
+    /// runtime drop that would wait on the stuck close. A close in time is never forced (the
+    /// tests above).
+    #[tokio::test]
+    async fn an_overrunning_close_after_a_signal_forces_the_exit() {
+        let handle = EngineFailure::default();
+        let runner = started_with_close(&handle, Duration::from_secs(1)).await;
+        let (tx, shutdown) = signal();
+        tx.send(()).unwrap();
+        let forced = std::sync::atomic::AtomicBool::new(false);
+        let t0 = Instant::now();
+        serve_until_shutdown(
+            std::future::pending(),
+            unwatched(),
+            shutdown,
+            Some(runner.engine_failure()),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            || forced.store(true, std::sync::atomic::Ordering::SeqCst),
+            runner,
+        )
+        .await
+        .expect("no engine failure: the signal path returns Ok when force_exit returns");
+        assert!(forced.load(std::sync::atomic::Ordering::SeqCst), "forced");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "did not wait out the close"
+        );
+    }
+
+    /// Read from `conn` until `needle` has arrived (`true`) or the peer closed (`false`).
+    async fn read_until(
+        conn: &mut tokio::net::TcpStream,
+        seen: &mut Vec<u8>,
+        needle: &str,
+    ) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1024];
+        loop {
+            if String::from_utf8_lossy(seen).contains(needle) {
+                return true;
+            }
+            let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect("read");
+            if n == 0 {
+                return false;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Task 61: once the connections are told to stop, an idle keep-alive connection is closed
+    /// at once, so it cannot send a new request into the grace, while a response in flight on
+    /// another connection still streams to its end.
+    #[tokio::test]
+    async fn stopped_connections_admit_no_new_request_and_finish_the_one_in_flight() {
+        use tokio::io::AsyncWriteExt;
+        let slow = || async {
+            let parts = futures::stream::unfold(0, |i| async move {
+                match i {
+                    0 => Some((Ok::<_, std::io::Error>("first;".to_string()), 1)),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Some((Ok("last.".to_string()), 2))
+                    }
+                    _ => None,
+                }
+            });
+            axum::body::Body::from_stream(parts)
+        };
+        let app = axum::Router::new()
+            .route("/quick", axum::routing::get(|| async { "quick." }))
+            .route("/slow", axum::routing::get(slow));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_connections, stop) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_with_nodelay(listener, app, stop));
+
+        // A keep-alive connection that has finished its request, and one streaming a response.
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        idle.write_all(b"GET /quick HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut idle_seen = Vec::new();
+        assert!(read_until(&mut idle, &mut idle_seen, "quick.").await);
+        let mut busy = tokio::net::TcpStream::connect(addr).await.unwrap();
+        busy.write_all(b"GET /slow HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut busy_seen = Vec::new();
+        assert!(read_until(&mut busy, &mut busy_seen, "first;").await);
+
+        stop_connections.send(true).unwrap();
+        assert!(
+            !read_until(&mut idle, &mut idle_seen, "never").await,
+            "the idle keep-alive connection is closed"
+        );
+        assert!(
+            read_until(&mut busy, &mut busy_seen, "last.").await,
+            "the response in flight finished"
+        );
+        assert!(
+            !read_until(&mut busy, &mut busy_seen, "never").await,
+            "then its connection closed"
+        );
+    }
+
+    /// Fix round 1: the opt-out wiring `cmd_worker` uses. With
+    /// `--keep-serving-on-engine-failure` nothing is watched, and a reported failure does not end
+    /// the serve; without it the same failure does.
+    #[tokio::test]
+    async fn the_opt_out_flag_stops_a_reported_failure_from_ending_the_serve() {
+        let single = || {
+            WorkerArgs::single_node(
+                "m".into(),
+                "GPU".into(),
+                EngineKind::Mock,
+                ":8000".into(),
+                None,
+                1.0,
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        let mut keep = single();
+        keep.keep_serving_on_engine_failure = true;
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        handle.set("stage1 could not be recovered");
+
+        let watched = watched_failure(&keep, &runner);
+        assert!(watched.is_none(), "the opt-out watches nothing");
+        let (tx, shutdown) = signal();
+        let serving = tokio::spawn(serve_until_shutdown(
+            std::future::pending(),
+            unwatched(),
+            shutdown,
+            watched,
+            Duration::ZERO,
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
+            runner.clone(),
+        ));
+        tokio::time::sleep(ENGINE_FAILURE_POLL * 3).await;
+        assert!(!serving.is_finished(), "still serving after the failure");
+        tx.send(()).unwrap();
+        serving.await.unwrap().expect("a signal shutdown exits 0");
+
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        handle.set("stage1 could not be recovered");
+        let watched = watched_failure(&single(), &runner);
+        assert_eq!(
+            watched.as_ref().and_then(|f| f.reason()).as_deref(),
+            Some("stage1 could not be recovered")
+        );
+        let (_tx, shutdown) = signal();
+        let r = serve_until_shutdown(
+            std::future::pending(),
+            unwatched(),
+            shutdown,
+            watched,
+            Duration::ZERO,
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
+            runner,
+        )
+        .await;
+        assert!(r.is_err(), "the default exits on the failure");
+    }
+
+    #[test]
+    fn the_opt_out_flag_parses_on_worker_and_run_and_defaults_off() {
+        let run = |extra: &[&str]| {
+            let mut argv = vec!["cascadia", "run", "some-model-dir"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).expect("parse run argv").cmd {
+                Command::Run(args) => args.keep_serving_on_engine_failure,
+                _ => panic!("expected run subcommand"),
+            }
+        };
+        assert!(!run(&[]));
+        assert!(run(&["--keep-serving-on-engine-failure"]));
+        let worker = |extra: &[&str]| {
+            let mut argv = vec![
+                "cascadia", "worker", "--rank", "0", "--total", "1", "--model", "m",
+            ];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).expect("parse worker argv").cmd {
+                Command::Worker(args) => args.keep_serving_on_engine_failure,
+                _ => panic!("expected worker subcommand"),
+            }
+        };
+        assert!(!worker(&[]));
+        assert!(worker(&["--keep-serving-on-engine-failure"]));
+        let single = WorkerArgs::single_node(
+            "m".into(),
+            "GPU".into(),
+            EngineKind::Mock,
+            ":8000".into(),
+            None,
+            1.0,
+            Vec::new(),
+            None,
+            None,
+        );
+        assert!(!single.keep_serving_on_engine_failure);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3797,6 +4533,90 @@ mod tests {
         assert_eq!(api_max_concurrent(Some("0"), 64), 64);
         assert_eq!(api_max_concurrent(Some("-1"), 64), 64);
         assert_eq!(api_max_concurrent(Some("8"), 64), 8);
+    }
+
+    #[test]
+    fn check_admission_fits_keeps_chat_plus_decisions_within_the_queue() {
+        assert!(check_admission_fits(16, 16, true).is_ok());
+        assert!(check_admission_fits(16, 240, true).is_ok());
+        assert!(check_admission_fits(64, 192, true).is_ok(), "exactly 256");
+        for (chat, decisions) in [(64, 193), (300, 1), (usize::MAX, 240)] {
+            let err = check_admission_fits(chat, decisions, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("CASCADIA_API_MAX_CONCURRENT ({chat})"))
+                    && err.contains(&format!("--max-decision-requests ({decisions})"))
+                    && err.contains(&format!(
+                        "at most {}",
+                        cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS
+                    )),
+                "{err}"
+            );
+        }
+        // Without /v1/decisions there is no decision pool: any chat pool starts.
+        for (chat, decisions) in [(64, 193), (300, 240), (usize::MAX, 240)] {
+            assert!(check_admission_fits(chat, decisions, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn load_decisions_serves_only_a_usable_tree_on_the_api_rank() {
+        // A usable tree: a Clef decision.json (no family section needed) and a word-level
+        // tokenizer.json, so only the gates can turn it off.
+        let usable = tempfile::tempdir().unwrap();
+        std::fs::write(
+            usable.path().join("decision.json"),
+            r#"{"family": "clef", "max_tokens": 64}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            usable.path().join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null, "decoder": null,
+                "model": {"type": "WordLevel", "vocab": {"[unk]": 0, "a": 1},
+                          "unk_token": "[unk]"}}"#,
+        )
+        .unwrap();
+        let unusable = tempfile::tempdir().unwrap();
+        std::fs::write(unusable.path().join("decision.json"), "{").unwrap();
+        let worker = |engine: &str, model: &std::path::Path| {
+            let cli = Cli::try_parse_from([
+                "cascadia",
+                "worker",
+                "--rank",
+                "0",
+                "--total",
+                "1",
+                "--engine",
+                engine,
+                "--model",
+                model.to_str().unwrap(),
+            ])
+            .expect("parse worker argv");
+            let Command::Worker(args) = cli.cmd else {
+                panic!("expected worker subcommand");
+            };
+            args
+        };
+        assert!(
+            load_decisions(&worker("qwen35", usable.path()), true, 0).is_some(),
+            "a usable tree on the API rank"
+        );
+        assert!(
+            load_decisions(&worker("qwen35", usable.path()), false, 0).is_none(),
+            "not the API rank"
+        );
+        assert!(
+            load_decisions(&worker("mock", usable.path()), true, 0).is_none(),
+            "not qwen35"
+        );
+        // The admission check then sees no decision pool.
+        assert!(
+            load_decisions(&worker("qwen35", unusable.path()), true, 0).is_none(),
+            "unusable"
+        );
     }
 
     /// Parse a `cascadia shard …` argv into its `ShardArgs` (panics on a
@@ -4106,11 +4926,190 @@ mod tests {
             args.api_max_body_mb,
             Vec::new(),
             args.ep_placement,
+            None,
         );
         assert_eq!(worker.prefix_cache_gb, Some(0.0));
         assert_eq!(worker.api_max_body_mb, 2.0);
         assert_eq!(worker.rank, 0);
         assert_eq!(worker.total, 1);
+    }
+
+    #[test]
+    fn decision_dump_is_kept_only_with_a_decision_model() {
+        let p = std::path::Path::new("/tmp/dump.jsonl");
+        assert_eq!(decision_dump_target(Some(p), true).as_deref(), Some(p));
+        assert_eq!(decision_dump_target(Some(p), false), None);
+        assert_eq!(decision_dump_target(None, true), None);
+    }
+
+    #[test]
+    fn run_forwards_decision_dump() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "some-model-dir",
+            "--engine",
+            "qwen35",
+            "--decision-dump",
+            "/tmp/d.jsonl",
+        ])
+        .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(
+            args.decision_dump.as_deref(),
+            Some(std::path::Path::new("/tmp/d.jsonl"))
+        );
+        let worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+            Vec::new(),
+            args.ep_placement,
+            args.decision_dump,
+        );
+        assert_eq!(
+            worker.decision_dump.as_deref(),
+            Some(std::path::Path::new("/tmp/d.jsonl"))
+        );
+        assert_eq!(worker.decision_dump_max_bytes, None);
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "some-model-dir",
+            "--decision-dump",
+            "/tmp/d.jsonl",
+            "--decision-dump-max-bytes",
+            "1000000",
+        ])
+        .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(args.decision_dump_max_bytes, Some(1_000_000));
+    }
+
+    #[test]
+    fn max_decision_requests_parses_defaults_and_forwards() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["cascadia", "run", "some-model-dir"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let Command::Run(args) = parse(&[]).expect("parse run argv").cmd else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(
+            args.max_decision_requests,
+            cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS
+        );
+        let Command::Run(args) = parse(&["--max-decision-requests", "4"])
+            .expect("parse run argv")
+            .cmd
+        else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(args.max_decision_requests, 4);
+        let mut worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+            Vec::new(),
+            args.ep_placement,
+            args.decision_dump,
+        );
+        assert_eq!(
+            worker.max_decision_requests,
+            cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS
+        );
+        worker.max_decision_requests = args.max_decision_requests;
+        assert_eq!(worker.max_decision_requests, 4);
+        for bad in ["0", "many"] {
+            let err = parse(&["--max-decision-requests", bad])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--max-decision-requests"), "{bad}: {err}");
+        }
+        let err = parse(&["--max-decision-requests", "0"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least 1"), "{err}");
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--max-decision-requests",
+            "2",
+        ])
+        .expect("parse worker argv");
+        let Command::Worker(args) = cli.cmd else {
+            panic!("expected worker subcommand");
+        };
+        assert_eq!(args.max_decision_requests, 2);
+        // The cap keeps decisions plus chat's pool within the engine's pending queue.
+        let cap = cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS
+            - cascadia_api::DEFAULT_MAX_CONCURRENT;
+        assert_eq!(MAX_DECISION_REQUESTS, cap);
+        assert_eq!(
+            parse_max_decision_requests(&cap.to_string()),
+            Ok(cap),
+            "a value at the cap is accepted"
+        );
+        let Command::Run(args) = parse(&["--max-decision-requests", &cap.to_string()])
+            .expect("parse run argv at the cap")
+            .cmd
+        else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(args.max_decision_requests, cap);
+        // The help text spells the cap out; it must follow the constants.
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand_mut("worker")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains(&format!("1 to {cap}")), "{help}");
+        assert!(
+            help.contains(&format!(
+                "{}-task pending queue",
+                cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS
+            )),
+            "{help}"
+        );
+        for over in [(cap + 1).to_string(), usize::MAX.to_string()] {
+            let err = parse_max_decision_requests(&over).unwrap_err();
+            assert!(err.contains(&format!("at most {cap}")), "{over}: {err}");
+            let err = parse(&["--max-decision-requests", &over])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--max-decision-requests"), "{over}: {err}");
+            assert!(err.contains(&format!("at most {cap}")), "{over}: {err}");
+        }
+        assert!(Cli::try_parse_from([
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--max-decision-requests",
+            "0",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -4139,6 +5138,7 @@ mod tests {
             args.api_max_body_mb,
             args.ep_workers,
             args.ep_placement,
+            None,
         );
         assert_eq!(worker.ep_placement, Some(PathBuf::from("placement.json")));
         assert_eq!(worker.ep_workers, ["127.0.0.1:9201", "127.0.0.1:9202"]);
