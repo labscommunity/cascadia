@@ -209,7 +209,7 @@ impl DecisionDump {
     /// non-regular file, a file with other hard links or another user's file is refused),
     /// appending after what the file already holds, closing once it reaches `max_bytes` when set.
     /// For embedders passing a dump to [`decisions::evaluate_with`]; the line format is the
-    /// tools' (docs/decisions.md), not a stable interface.
+    /// tools' (docs/DECISIONS.md), not a stable interface.
     pub fn open(path: &std::path::Path, max_bytes: Option<u64>) -> std::io::Result<Self> {
         let file = open_decision_dump(path)?;
         let len = file.metadata().map_or(0, |m| m.len());
@@ -4574,7 +4574,7 @@ mod tests {
     }
 
     /// The rejections that come before the body is read, which an embedder's gateway owns: the
-    /// texts docs/decisions.md ("Embedding the decision core") quotes.
+    /// texts docs/DECISIONS.md ("Embedding the decision core") quotes.
     #[tokio::test]
     async fn pre_parse_rejections_are_the_documented_ones() {
         let ok = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul"}}}"#;

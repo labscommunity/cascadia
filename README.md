@@ -250,7 +250,7 @@ Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM /
 | [docs/SHARDING.md](docs/SHARDING.md) | Sharding flow + per-model-family support table |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions + crate responsibilities |
 | [docs/METRICS.md](docs/METRICS.md) | Prometheus `/metrics` inventory + example queries |
-| [docs/decisions.md](docs/decisions.md) | Decision API (`/v1/decisions`, `/v1/systemone`): models, limits, errors |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Decision API (`/v1/decisions`, `/v1/systemone`): models, limits, errors |
 | [docs/engines/](docs/engines/) | Per-engine deep dives |
 | [docs/architectures/](docs/architectures/) | Per-model-family export/support notes |
 | [docs/perf/](docs/perf/) | Performance investigations and tuning |

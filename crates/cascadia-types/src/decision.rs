@@ -1,5 +1,5 @@
 //! Decision readout: a prefill-only pass whose result is per-option logits
-//! computed by the model's decision head (see docs/decisions.md). The API's
+//! computed by the model's decision head (see docs/DECISIONS.md). The API's
 //! codec tokenizes and lays out the prompt; the engine prefills `prompt_ids`
 //! exactly (no chat template, no think block, no special tokens added) and
 //! never decodes.

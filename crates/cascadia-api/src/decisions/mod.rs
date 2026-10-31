@@ -1,4 +1,4 @@
-//! Typed decisions over decision models (docs/decisions.md): POST /v1/decisions (OpenAI format,
+//! Typed decisions over decision models (docs/DECISIONS.md): POST /v1/decisions (OpenAI format,
 //! openai.rs) and POST /v1/systemone (Jev/SystemOne format, handler.rs), sharing one core.
 //!
 //! Embedding: a server with its own router and engine backend serves both formats through
