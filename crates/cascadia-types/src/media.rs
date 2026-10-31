@@ -3,8 +3,8 @@
 //! The API decodes every image and video once and hands engines raw pixels,
 //! never URLs or encoded bytes. The shape is a frame stack, so a video is one
 //! [`MediaInput`] of kind [`MediaKind::Video`] with the same task, caches
-//! keyed on [`MediaInput::sha256`], and engine entry points as an image (RFC
-//! `docs/rfcs/vlm-support.md`, "Video: out of scope, kept cheap").
+//! keyed on [`MediaInput::sha256`], and engine entry points as an image
+//! (`docs/VLM.md`, "Video").
 
 use std::sync::Arc;
 

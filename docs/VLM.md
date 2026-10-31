@@ -1,10 +1,10 @@
-# Image input (VLM)
+# Image and video input (VLM)
 
 Cascadia takes images the way the OpenAI API does: `image_url` content parts in
 `/v1/chat/completions` messages. This page says which models and engines take them, how
-to export each one, and what the limits are. The design and its verification history are
-in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video is served as sampled frames, or
+to export each one, and what the limits are. Video is served as sampled frames, or
 whole where the engine takes it natively (see [Video](#video)); audio is not supported.
+Measurements here come from two Lunar Lake AI PCs (Core Ultra 7 258V: CPU, Arc 140V GPU, NPU; 32 GB), called PC A and PC B, joined over Tailscale for two-machine runs.
 
 ## The request
 

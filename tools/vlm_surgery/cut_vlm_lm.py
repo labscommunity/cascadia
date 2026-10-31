@@ -575,7 +575,7 @@ def main() -> None:
                     help="the tree's model_id (default: the --model directory's name)")
     args = ap.parse_args()
     # One stage serves a single box through ov-runtime: GenAI's own Pixtral
-    # preprocessing differs from HF's (see docs/rfcs/vlm-support.md).
+    # preprocessing differs from HF's (see docs/VLM.md, Pixtral).
     if args.num_stages < 1:
         raise SystemExit("--num-stages must be >= 1")
     run(args.model, args.output_dir, args.num_stages, args.family,
