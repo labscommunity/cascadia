@@ -2931,6 +2931,19 @@ fn check_media_parts(
             continue;
         };
         let n = urls.len();
+        // The parser checks these too; a caller that builds its parts
+        // itself (a gateway's own parser) is checked here.
+        if n == 0 {
+            return Err(reject(format!(
+                "video {j}: a frame list needs at least one frame"
+            )));
+        }
+        if fps.is_some_and(|f| !(f > 0.0 && f <= video::MAX_FPS)) {
+            return Err(reject(format!(
+                "video {j}: `fps` must be above 0 and at most {}",
+                video::MAX_FPS
+            )));
+        }
         // Refused, not thinned, as OVMS refuses past its cap.
         if n > cfg.max_video_frames {
             return Err(reject(format!(
@@ -8096,6 +8109,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.videos().collect::<Vec<_>>(), vec![("data:v", None)]);
+    }
+
+    /// A caller that builds its `VideoFrames` parts itself, past the parser
+    /// (a gateway with its own), still gets the parser's bounds: an empty
+    /// list, or an `fps` that is 0, negative, NaN or past 120, is a 400
+    /// before anything is decoded.
+    #[tokio::test]
+    async fn prepare_media_checks_frame_lists_built_without_the_parser() {
+        let slots = Arc::new(Semaphore::new(1));
+        let with = |urls: Vec<String>, fps: Option<f64>| {
+            let mut m = user_msg(serde_json::json!([{"type": "text", "text": "x"}]));
+            m.parts.push(ContentPart::VideoFrames {
+                urls,
+                detail: None,
+                fps,
+            });
+            vec![m]
+        };
+        let cfg = Arc::new(MediaConfig::ov_genai(None));
+        let frame = png_url(8, 8);
+        for fps in [0.0, -1.0, f64::NAN, 121.0] {
+            let err = prepare_media_with(
+                Arc::clone(&cfg),
+                &slots,
+                &with(vec![frame.clone()], Some(fps)),
+            )
+            .await
+            .err()
+            .expect("refused");
+            assert_eq!(
+                err,
+                MediaError::Invalid("video 0: `fps` must be above 0 and at most 120".into()),
+                "{fps}"
+            );
+        }
+        let err = prepare_media_with(Arc::clone(&cfg), &slots, &with(Vec::new(), None))
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(
+            err,
+            MediaError::Invalid("video 0: a frame list needs at least one frame".into())
+        );
+        let ok = prepare_media_with(cfg, &slots, &with(vec![frame], Some(2.0)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.inputs.len(), 1);
     }
 
     #[test]
