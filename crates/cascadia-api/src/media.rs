@@ -85,15 +85,18 @@ pub struct MediaConfig {
     /// tests; not exposed as a flag.
     #[doc(hidden)]
     pub fetch_policy: FetchPolicy,
-    /// The ffmpeg and ffprobe that decode `video_url` parts. `None` (no
-    /// ffmpeg found) refuses every video with a 400 naming `--api-ffmpeg`.
+    /// The ffmpeg and ffprobe that decode `video_url` files. `None` (no
+    /// ffmpeg found) refuses every video file with a 400 naming
+    /// `--api-ffmpeg`; frame lists need no ffmpeg.
     pub ffmpeg: Option<crate::video::Ffmpeg>,
-    /// Videos allowed in one request.
+    /// Videos (files and frame lists) allowed in one request.
     pub max_videos: usize,
-    /// Frames sampled from one video at most, whatever its length.
+    /// Frames sampled from one video at most, whatever its length, and the
+    /// most a frame list may carry.
     pub max_video_frames: usize,
     /// Frames sampled per second of video, before the
-    /// [`MediaConfig::max_video_frames`] cap spreads them out.
+    /// [`MediaConfig::max_video_frames`] cap spreads them out; a frame list's
+    /// rate when it sends no `fps`.
     pub video_fps: f64,
     /// Longest video accepted, in seconds, read from its container before
     /// any frame is decoded.
@@ -663,7 +666,21 @@ pub fn decode_image_bytes(
         Some("low") => cfg.low_detail_pixels,
         _ => cfg.max_image_pixels,
     };
+    let mut rgb = decode_rgb(bytes, cfg)?;
+    let (w, h) = rgb.dimensions();
+    let pixels = u64::from(w) * u64::from(h);
+    if pixels > budget {
+        let (nw, nh) = downscaled_size(w, h, budget);
+        rgb = image::imageops::resize(&rgb, nw, nh, FilterType::CatmullRom);
+    }
 
+    let (width, height) = rgb.dimensions();
+    Ok(rgb_image(width, height, rgb.into_raw()))
+}
+
+/// Encoded image bytes decoded to RGB8 at their source size, upright (EXIF
+/// orientation applied), refused past the config's source bounds.
+pub(crate) fn decode_rgb(bytes: &[u8], cfg: &MediaConfig) -> Result<image::RgbImage, String> {
     // Check the declared size before decoding a single pixel.
     source_size(bytes, cfg)?;
     let format = ImageReader::new(Cursor::new(bytes))
@@ -694,17 +711,7 @@ pub fn decode_image_bytes(
         .into_rgb8();
     let mut image = DynamicImage::ImageRgb8(rgb);
     image.apply_orientation(orientation);
-    let mut rgb = image.into_rgb8();
-
-    let (w, h) = rgb.dimensions();
-    let pixels = u64::from(w) * u64::from(h);
-    if pixels > budget {
-        let (nw, nh) = downscaled_size(w, h, budget);
-        rgb = image::imageops::resize(&rgb, nw, nh, FilterType::CatmullRom);
-    }
-
-    let (width, height) = rgb.dimensions();
-    Ok(rgb_image(width, height, rgb.into_raw()))
+    Ok(image.into_rgb8())
 }
 
 /// The most a decoder may allocate: a source at the pixel limit in 16-bit

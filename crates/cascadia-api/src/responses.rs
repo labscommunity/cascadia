@@ -402,14 +402,26 @@ fn chat_part(part: &Value, at: &str) -> Result<Value, Refusal> {
             )),
         },
         "input_video" => {
-            let url = match part.get("video_url") {
-                Some(Value::String(u)) => Some(u.as_str()),
-                Some(obj) => obj.get("url").and_then(Value::as_str),
+            // A string is a video file; an array is a frame list (OVMS's
+            // form), with `fps` and `detail` beside it or in `{url, ...}`. A
+            // file's `fps` is not forwarded: the server samples it at its own
+            // rate.
+            let video_url = part.get("video_url");
+            let inner = |key: &str| {
+                video_url
+                    .and_then(|v| v.get(key))
+                    .filter(|f| !f.is_null())
+                    .or(part.get(key))
+            };
+            let url = match video_url {
+                Some(u @ (Value::String(_) | Value::Array(_))) => Some(u),
+                Some(obj) => obj.get("url").filter(|u| u.is_string() || u.is_array()),
                 None => None,
             };
+            let fps = url.filter(|u| u.is_array()).and(inner("fps"));
             match (url, part.get("file_id")) {
                 (Some(url), _) => Ok(json!({"type": "video_url", "video_url": {
-                    "url": url, "detail": field("detail")}})),
+                    "url": url, "detail": inner("detail"), "fps": fps}})),
                 (None, Some(f)) if !f.is_null() => Err(Refusal::new(
                     format!("{at}.file_id"),
                     "`file_id` videos are not supported: this server keeps no files; \

@@ -121,7 +121,9 @@ pub fn attach_ffmpeg(
             Ok(None)
         }
         (Err(why), Some(_)) => Err(why),
-        (Err(why), None) => Ok(Some(format!("video input off: no ffmpeg found ({why})"))),
+        (Err(why), None) => Ok(Some(format!(
+            "video files off (frame lists still served): no ffmpeg found ({why})"
+        ))),
     }
 }
 

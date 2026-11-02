@@ -87,9 +87,9 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// The 400 a video gets on a server without ffmpeg.
-pub const NEEDS_FFMPEG: &str = "video input needs ffmpeg on the server, which was not found \
-     (the operator can point `--api-ffmpeg` at it); send the video's frames as `image_url` \
-     parts instead";
+pub const NEEDS_FFMPEG: &str = "a video file needs ffmpeg on the server, which was not found \
+     (the operator can point `--api-ffmpeg` at it); send the video's frames instead, as a \
+     frame list (`video_url.url` an array of images) or as `image_url` parts";
 
 /// The `data:` media types taken for a video.
 const VIDEO_MIME_TYPES: [&str; 4] = [
@@ -108,7 +108,7 @@ pub(crate) const SUPPORTED: &str = "send MP4, MOV, WebM or MKV";
 
 /// The `detail` values a video takes. `auto` (the default) is
 /// [`MediaConfig::max_video_frame_pixels`] per frame.
-fn check_detail(detail: Option<&str>) -> Result<(), String> {
+pub(crate) fn check_detail(detail: Option<&str>) -> Result<(), String> {
     match detail {
         None | Some("auto" | "low" | "high") => Ok(()),
         Some(other) => Err(format!(
@@ -260,7 +260,7 @@ struct ProbeFormat {
 const ASSUMED_FPS: f64 = 60.0;
 /// The highest frame rate believed: a variable-rate stream's `r_frame_rate`
 /// can be its timebase (`1000/1`).
-const MAX_FPS: f64 = 120.0;
+pub(crate) const MAX_FPS: f64 = 120.0;
 
 /// ffprobe's `num/den` rate (`30000/1001`), at most [`MAX_FPS`]; `0/0` is
 /// unknown.
@@ -496,28 +496,7 @@ impl Plan {
             up if cfg.native_video && up <= max => up,
             _ => frames,
         };
-        let auto = cfg.max_video_frame_pixels;
-        let budget = match detail {
-            Some("low") => cfg.low_detail_pixels.min(auto / 4).max(4),
-            Some("high") => cfg.max_image_pixels.max(auto),
-            _ => auto,
-        };
-        let (w, h) = (video.width, video.height);
-        let (w, h) = if u64::from(w) * u64::from(h) > budget {
-            media::downscaled_size(w, h, budget)
-        } else {
-            (w, h)
-        };
-        let even = |x: u32| (x & !1).max(2);
-        let (mut w, mut h) = (even(w), even(h));
-        // Evening can stretch the ratio (600x3, accepted at 200:1, would be
-        // 600x2): trim the long side back to it, or the engine's resize
-        // refuses the frames after the request was accepted.
-        if w > MAX_ASPECT * h {
-            w = MAX_ASPECT * h;
-        } else if h > MAX_ASPECT * w {
-            h = MAX_ASPECT * w;
-        }
+        let (w, h) = frame_size(video.width, video.height, detail, cfg);
         Self {
             frames,
             width: w,
@@ -544,6 +523,85 @@ impl Plan {
     fn frame_bytes(&self) -> usize {
         self.width as usize * self.height as usize * 3
     }
+}
+
+/// The size a `w x h` video frame is served at: fit to the `detail` budget
+/// keeping the aspect ratio, with even sides. `low` is the smallest budget (a
+/// quarter of the frame budget, at most the image low-detail one), `high` the
+/// largest.
+fn frame_size(w: u32, h: u32, detail: Option<&str>, cfg: &MediaConfig) -> (u32, u32) {
+    let auto = cfg.max_video_frame_pixels;
+    let budget = match detail {
+        Some("low") => cfg.low_detail_pixels.min(auto / 4).max(4),
+        Some("high") => cfg.max_image_pixels.max(auto),
+        _ => auto,
+    };
+    let (w, h) = if u64::from(w) * u64::from(h) > budget {
+        media::downscaled_size(w, h, budget)
+    } else {
+        (w, h)
+    };
+    let even = |x: u32| (x & !1).max(2);
+    let (mut w, mut h) = (even(w), even(h));
+    // Evening can stretch the ratio (600x3, accepted at 200:1, would be
+    // 600x2): trim the long side back to it, or the engine's resize
+    // refuses the frames after the request was accepted.
+    if w > MAX_ASPECT * h {
+        w = MAX_ASPECT * h;
+    } else if h > MAX_ASPECT * w {
+        h = MAX_ASPECT * w;
+    }
+    (w, h)
+}
+
+/// A frame list's frames (`video_url.url` an array of images, their
+/// `detail` checked by the API) as a decoded video's: each image decoded
+/// (EXIF orientation applied, as for an image) and resized to the size a
+/// video of that frame size is served at for `detail`, frame `k` at
+/// `k / fps` s. The frames must decode to one size; the API checked their
+/// headers already, so only an EXIF turn on some of them gets here. Past
+/// `deadline` (the request's video decode deadline, as ffmpeg has) the
+/// request is refused. Blocking: run it on the blocking pool.
+pub fn frames_from_images(
+    images: &[Vec<u8>],
+    detail: Option<&str>,
+    fps: f64,
+    cfg: &MediaConfig,
+    deadline: std::time::Instant,
+) -> Result<Vec<Frame>, String> {
+    let mut first = None;
+    images
+        .iter()
+        .enumerate()
+        .map(|(k, bytes)| {
+            if std::time::Instant::now() > deadline {
+                return Err(format!(
+                    "decoding this request's videos took longer than {} s; send fewer or \
+                     smaller frames",
+                    cfg.video_decode_timeout.as_secs_f32()
+                ));
+            }
+            let rgb = media::decode_rgb(bytes, cfg).map_err(|e| format!("frame {k}: {e}"))?;
+            let (w, h) = rgb.dimensions();
+            let (w0, h0) = *first.get_or_insert((w, h));
+            if (w, h) != (w0, h0) {
+                return Err(format!(
+                    "frame {k}: the frame is {w}x{h} but frame 0 is {w0}x{h0} after EXIF \
+                     orientation; every frame of a video must be the same size"
+                ));
+            }
+            let (tw, th) = frame_size(w, h, detail, cfg);
+            let rgb = if (tw, th) == (w, h) {
+                rgb
+            } else {
+                image::imageops::resize(&rgb, tw, th, image::imageops::FilterType::CatmullRom)
+            };
+            Ok(Frame {
+                input: media::rgb_image(tw, th, rgb.into_raw()),
+                secs: k as f64 / fps,
+            })
+        })
+        .collect()
 }
 
 /// A video's sampled frames as one native [`MediaInput`]: the frames
@@ -1694,7 +1752,7 @@ mod tests {
     /// test skips (and says so) where ffmpeg is not on PATH.
     mod api {
         use super::super::*;
-        use crate::tests::{make_app, png_url, post_chat};
+        use crate::tests::{make_app, png_data_url, png_url, post_chat};
         use crate::{make_router_with_config, ChatTemplateConfig, Config};
         use axum::body::{to_bytes, Body};
         use axum::http::{Request, StatusCode};
@@ -1785,13 +1843,16 @@ mod tests {
         }
 
         /// An image server that decodes videos with `ffmpeg`, `tweak`ed.
-        async fn video_app(ffmpeg: Ffmpeg, tweak: impl FnOnce(&mut MediaConfig)) -> (Router, Seen) {
+        async fn video_app(
+            ffmpeg: impl Into<Option<Ffmpeg>>,
+            tweak: impl FnOnce(&mut MediaConfig),
+        ) -> (Router, Seen) {
             video_app_with_window(ffmpeg, usize::MAX, tweak).await
         }
 
         /// [`video_app`] on an engine whose context fits `max_media` images.
         async fn video_app_with_window(
-            ffmpeg: Ffmpeg,
+            ffmpeg: impl Into<Option<Ffmpeg>>,
             max_media: usize,
             tweak: impl FnOnce(&mut MediaConfig),
         ) -> (Router, Seen) {
@@ -1805,7 +1866,7 @@ mod tests {
                 .await
                 .unwrap();
             let mut media = MediaConfig::ov_genai(None);
-            media.ffmpeg = Some(ffmpeg);
+            media.ffmpeg = ffmpeg.into();
             tweak(&mut media);
             let cfg = Config {
                 chat_template: ChatTemplateConfig {
@@ -2658,8 +2719,9 @@ mod tests {
             );
         }
 
-        /// The video allowance raises the chat body limit only on a server
-        /// that decodes videos, and the videos' bytes are held to it.
+        /// The video allowance raises the chat body limit on a server that
+        /// takes videos (a frame list needs no ffmpeg, so a server without
+        /// it has the allowance too), and the videos' bytes are held to it.
         #[tokio::test]
         async fn the_video_allowance_is_for_video_servers_only() {
             let Some(ff) = ffmpeg() else { return };
@@ -2679,6 +2741,10 @@ mod tests {
             );
             let (without, _) = video_app(ff.clone(), |m| m.ffmpeg = None).await;
             let (status, v) = post_chat(without, body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert!(error_message(&v).contains("`--api-ffmpeg`"), "{v}");
+            let (off, _) = video_app(ff.clone(), |m| m.max_videos = 0).await;
+            let (status, v) = post_chat(off, body.clone()).await;
             assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
             assert!(!error_message(&v).contains("--api-max-video-mb"), "{v}");
             // Over every allowance on a video server, the 413 names the flag.
@@ -2717,7 +2783,8 @@ mod tests {
         }
 
         /// `/v1/responses` takes `input_video` with the URL as a string (as
-        /// OpenRouter documents it) or as `{url}`; `file_id` is refused.
+        /// OpenRouter documents it) or as `{url}`; a file's `fps` is ignored
+        /// (the server samples it); `file_id` is refused.
         #[tokio::test]
         async fn responses_take_input_video() {
             let Some(ff) = ffmpeg() else { return };
@@ -2729,7 +2796,7 @@ mod tests {
                     json!({"model": "mock-model", "max_output_tokens": 1, "input": [
                         {"role": "user", "content": [
                             {"type": "input_text", "text": "describe"},
-                            {"type": "input_video", "video_url": video_url}]}]}),
+                            {"type": "input_video", "video_url": video_url, "fps": 2}]}]}),
                 )
                 .await;
                 assert_eq!(status, StatusCode::OK, "{v}");
@@ -2747,6 +2814,404 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(v["error"]["param"], "input[0].content[0].file_id");
             assert_eq!(v["error"]["code"], "video_file_id_not_supported");
+        }
+
+        fn frames_msg(text: &str, video_url: Value) -> Value {
+            json!({"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "video_url", "video_url": video_url}]})
+        }
+
+        /// OVMS's form, `video_url.url` an array of frames, is served with no
+        /// ffmpeg on the server: as labelled frames at `--api-video-fps`
+        /// (or the list's `fps`), and natively as one item. `/v1/models`
+        /// still lists `video` only with ffmpeg, as files need it. A list's
+        /// pixels are a video's, outside the images' pixel total.
+        #[tokio::test]
+        async fn a_frame_list_is_served_without_ffmpeg() {
+            let frames = vec![png_url(64, 48); 3];
+            let (app, seen) =
+                video_app(None::<Ffmpeg>, |m| m.max_request_source_pixels = 1000).await;
+            let r = app
+                .clone()
+                .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let v: Value =
+                serde_json::from_slice(&to_bytes(r.into_body(), 4096).await.unwrap()).unwrap();
+            assert_eq!(v["data"][0]["input_modalities"], json!(["text", "image"]));
+            for (text, video_url) in [
+                ("what happens?", json!({"url": frames})),
+                ("and now?", json!({"url": frames, "fps": 2})),
+            ] {
+                let (status, v) = post_chat(
+                    app.clone(),
+                    json!({"model": "mock-model", "max_tokens": 1,
+                        "messages": [frames_msg(text, video_url)]}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+            }
+            {
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen[0].1, vec![(64, 48, 1); 3]);
+                assert!(
+                    seen[0].0.contains(
+                        "user: what happens?Frame 1 (0.0s): <ov_genai_image_0>\
+                         Frame 2 (1.0s): <ov_genai_image_1>Frame 3 (2.0s): <ov_genai_image_2>\n"
+                    ),
+                    "{:?}",
+                    seen[0].0
+                );
+                assert!(
+                    seen[1].0.contains("Frame 2 (0.5s): <ov_genai_image_1>"),
+                    "{:?}",
+                    seen[1].0
+                );
+            }
+            let (app, seen) = video_app(None::<Ffmpeg>, native("qwen3_vl")).await;
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [frames_msg("what happens?", json!({"url": frames}))]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].1, vec![(64, 48, 3)]);
+            assert!(
+                seen[0]
+                    .0
+                    .contains("user: what happens?<ov_genai_video_0>\n"),
+                "{:?}",
+                seen[0].0
+            );
+        }
+
+        /// A frame list is held to the video limits: the frame cap (refused,
+        /// as OVMS refuses past its own, not thinned), its span, one frame
+        /// size, the video frame-size bound, `data:` frames only with remote
+        /// URLs off, the video count, video turned off (checked before the
+        /// cap), the byte budget and the decode deadline.
+        #[tokio::test]
+        async fn frame_lists_are_held_to_the_video_limits() {
+            let refused = |tweak: fn(&mut MediaConfig), videos: Vec<Value>| async move {
+                let (app, _) = video_app(None::<Ffmpeg>, tweak).await;
+                let parts: Vec<Value> = videos
+                    .into_iter()
+                    .map(|v| json!({"type": "video_url", "video_url": v}))
+                    .collect();
+                let (status, v) = post_chat(
+                    app,
+                    json!({"model": "mock-model",
+                        "messages": [{"role": "user", "content": parts}]}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+                error_message(&v).to_owned()
+            };
+            let f = png_url(32, 32);
+            let list = |urls: Vec<String>| vec![json!({ "url": urls })];
+            type Case = (fn(&mut MediaConfig), Vec<Value>, &'static str);
+            let cases: Vec<Case> = vec![
+                (
+                    |_| {},
+                    list(vec![f.clone(); 17]),
+                    "video 0: 17 frames; the limit is 16 (`--api-max-video-frames`)",
+                ),
+                (
+                    |_| {},
+                    vec![json!({"url": vec![f.clone(); 16], "fps": 0.01})],
+                    "span 1600.0 s; the limit is 600 s",
+                ),
+                (
+                    |_| {},
+                    list(vec![f.clone(), png_url(32, 30)]),
+                    "video 0 frame 1: the frame is 32x30 but frame 0 is 32x32",
+                ),
+                (
+                    |m| m.max_video_source_pixels = 1000,
+                    list(vec![f.clone()]),
+                    "a video frame may be at most 1000 pixels",
+                ),
+                (
+                    |_| {},
+                    list(vec![f.clone(), "https://example.com/f.png".into()]),
+                    "video 0 frame 1: only `data:` image URLs",
+                ),
+                (
+                    |_| {},
+                    list(vec![f.clone(), "data:video/mp4;base64,AAAA".into()]),
+                    "video 0 frame 1: ",
+                ),
+                (
+                    |_| {},
+                    vec![json!({"url": [f.clone()], "detail": "tiny"})],
+                    "video detail `tiny` is not supported",
+                ),
+                (
+                    |_| {},
+                    [list(vec![f.clone()]), list(vec![f.clone()])].concat(),
+                    "2 videos in one request; the limit is 1",
+                ),
+                (
+                    |m| m.max_videos = 0,
+                    list(vec![f.clone(); 17]),
+                    "video input is turned off",
+                ),
+                (
+                    |m| m.max_request_video_bytes = 100,
+                    list(vec![f.clone()]),
+                    "videos are over the 100-byte limit",
+                ),
+                (
+                    |m| m.video_decode_timeout = Duration::ZERO,
+                    list(vec![f.clone()]),
+                    "video 0: decoding this request's videos took longer than 0 s",
+                ),
+            ];
+            for (tweak, videos, want) in cases {
+                let msg = refused(tweak, videos).await;
+                assert!(msg.contains(want), "want {want:?} in {msg:?}");
+            }
+        }
+
+        /// One request with an image, a frame list and a video file: on the
+        /// labelled-frames path the images and both videos' frames share one
+        /// placeholder sequence, each video named; natively the image keeps
+        /// its tag and each video is one item behind its own, in request
+        /// order. Errors number videos among both kinds.
+        #[tokio::test]
+        async fn a_frame_list_mixes_with_images_and_video_files() {
+            let Some(ff) = ffmpeg() else { return };
+            let file = clip(&ff, "mp4", "video/mp4", 3);
+            let content = |file: &str| {
+                json!([
+                    {"type": "text", "text": "a"},
+                    {"type": "image_url", "image_url": {"url": png_url(16, 16)}},
+                    {"type": "video_url", "video_url": {"url": vec![png_url(64, 48); 2]}},
+                    {"type": "video_url", "video_url": {"url": file}}])
+            };
+            let body = |file: &str| {
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [{"role": "user", "content": content(file)}]})
+            };
+            let (app, seen) = video_app(ff.clone(), |m| m.max_videos = 2).await;
+            let (status, v) = post_chat(app, body(&file)).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            {
+                let seen = seen.lock().unwrap();
+                let (prompt, sizes) = &seen[0];
+                assert_eq!(
+                    sizes,
+                    &[
+                        vec![(16, 16, 1)],
+                        vec![(64, 48, 1); 2],
+                        vec![(320, 240, 1); 3]
+                    ]
+                    .concat()
+                );
+                assert!(
+                    prompt.contains(
+                        "user: a<ov_genai_image_0>Video 1 frame 1 (0.0s): <ov_genai_image_1>\
+                         Video 1 frame 2 (1.0s): <ov_genai_image_2>\
+                         Video 2 frame 1 (0.0s): <ov_genai_image_3>"
+                    ),
+                    "{prompt:?}"
+                );
+            }
+            let (app, seen) = video_app(ff.clone(), |m| {
+                native("qwen3_vl")(m);
+                m.max_videos = 2;
+            })
+            .await;
+            let (status, v) = post_chat(app, body(&file)).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            {
+                let seen = seen.lock().unwrap();
+                let (prompt, sizes) = &seen[0];
+                assert_eq!(sizes, &vec![(16, 16, 1), (64, 48, 2), (320, 240, 4)]);
+                assert!(
+                    prompt.contains(
+                        "user: a<ov_genai_image_0><ov_genai_video_0><ov_genai_video_1>\n"
+                    ),
+                    "{prompt:?}"
+                );
+            }
+            let (app, _) = video_app(ff, |m| m.max_videos = 2).await;
+            let (status, v) = post_chat(app, body("https://example.com/v.mp4")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert!(
+                error_message(&v).starts_with("video 1: only `data:` video URLs"),
+                "{v}"
+            );
+        }
+
+        /// The video allowance on the body limit covers a frame list on a
+        /// server without ffmpeg: about 1 MB of noise frames, past the 64 KiB
+        /// text limit and the 1 KiB image allowance set here, is served; past
+        /// the video allowance too, the 413 names `--api-max-video-mb`.
+        #[tokio::test]
+        async fn a_frame_list_has_the_video_allowance_without_ffmpeg() {
+            let mut state = 1u32;
+            let mut noise = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            };
+            let frames: Vec<String> = (0..4)
+                .map(|_| {
+                    png_data_url(&image::RgbImage::from_fn(256, 256, |_, _| {
+                        image::Rgb([noise(), noise(), noise()])
+                    }))
+                })
+                .collect();
+            assert!(frames.iter().map(String::len).sum::<usize>() > 512 << 10);
+            let body = json!({"model": "mock-model", "max_tokens": 1,
+                "messages": [frames_msg("x", json!({"url": frames}))]});
+            let (app, _) = video_app(None::<Ffmpeg>, |m| m.max_request_image_bytes = 1 << 10).await;
+            let (status, v) = post_chat(app, body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let (tight, _) = video_app(None::<Ffmpeg>, |m| {
+                m.max_request_image_bytes = 1 << 10;
+                m.max_request_video_bytes = 1 << 10;
+            })
+            .await;
+            let (status, v) = post_chat(tight, body).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(error_message(&v).contains("`--api-max-video-mb`"), "{v}");
+        }
+
+        /// `/v1/responses` takes a frame list in `input_video`, as the array
+        /// itself or as `{url: [...]}`, with `fps` and `detail` beside it or
+        /// inside the object; a bad list is the chat endpoint's 400.
+        #[tokio::test]
+        async fn responses_take_a_frame_list() {
+            let frames = vec![png_url(448, 448); 2];
+            let low = (224, 224, 1);
+            for (part, size) in [
+                (
+                    json!({"type": "input_video", "video_url": frames, "fps": 4}),
+                    (448, 448, 1),
+                ),
+                (
+                    json!({"type": "input_video", "video_url": {"url": frames, "fps": 4,
+                        "detail": "low"}}),
+                    low,
+                ),
+                (
+                    json!({"type": "input_video", "video_url": {"url": frames, "fps": null},
+                        "fps": 4, "detail": "low"}),
+                    low,
+                ),
+            ] {
+                let (app, seen) = video_app(None::<Ffmpeg>, |_| {}).await;
+                let (status, v) = post_responses(
+                    app,
+                    json!({"model": "mock-model", "max_output_tokens": 1, "input": [
+                        {"role": "user", "content": [
+                            {"type": "input_text", "text": "describe"}, part.clone()]}]}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{part}: {v}");
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen[0].1, vec![size; 2], "{part}");
+                assert!(
+                    seen[0].0.contains("Frame 2 (0.2s): <ov_genai_image_1>"),
+                    "{part}: {:?}",
+                    seen[0].0
+                );
+            }
+            let (app, _) = video_app(None::<Ffmpeg>, |_| {}).await;
+            let (status, v) = post_responses(
+                app,
+                json!({"model": "mock-model", "input": [{"role": "user", "content": [
+                    {"type": "input_video", "video_url": []}]}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(error_message(&v).contains("non-empty array"), "{v}");
+        }
+
+        /// Every route a video takes (labelled frames, images-first, GenAI
+        /// native on each family, the staged Qwen and Gemma 4 trees) gets
+        /// a frame list exactly as it gets the video file those frames came
+        /// from: the same prompt and the same media, pixels, times and hash
+        /// included. So each engine that serves a video file serves the
+        /// frame list the same way.
+        #[tokio::test]
+        async fn a_frame_list_is_served_as_its_video_file_is() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 3);
+            let routes: Vec<(&str, MediaConfig)> = vec![
+                ("frames", MediaConfig::ov_genai(None)),
+                ("images first", MediaConfig::ov_genai(Some("llava_next"))),
+                ("genai qwen3_vl", MediaConfig::ov_genai(Some("qwen3_vl"))),
+                (
+                    "genai qwen2_5_vl",
+                    MediaConfig::ov_genai(Some("qwen2_5_vl")),
+                ),
+                ("genai gemma4", MediaConfig::ov_genai(Some("gemma4"))),
+                (
+                    "staged qwen3_vl",
+                    MediaConfig::qwen35_native().staged_native_video("qwen3_vl"),
+                ),
+                (
+                    "staged qwen2_5_vl",
+                    MediaConfig::qwen35_native().staged_native_video("qwen2_5_vl"),
+                ),
+                (
+                    "staged gemma4",
+                    MediaConfig::gemma4_native().staged_native_video("gemma4"),
+                ),
+            ];
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            for (route, mut cfg) in routes {
+                cfg.ffmpeg = Some(ff.clone());
+                let cfg = Arc::new(cfg);
+                let prepare = |video_url: Value| {
+                    let (cfg, slots) = (Arc::clone(&cfg), Arc::clone(&slots));
+                    async move {
+                        let m: crate::ChatMessage =
+                            serde_json::from_value(frames_msg("what happens?", video_url)).unwrap();
+                        crate::prepare_media_with(cfg, &slots, &[m])
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    }
+                };
+                let file = prepare(json!({"url": url})).await;
+                // The file's frames, back as lossless PNGs, at the rate that
+                // spread them over the clip's 3 s.
+                let frames: Vec<(u32, u32, &[u8])> = file
+                    .inputs
+                    .iter()
+                    .flat_map(|m| {
+                        let fb = (m.width * m.height * 3) as usize;
+                        m.pixels
+                            .chunks_exact(fb)
+                            .map(move |p| (m.width, m.height, p))
+                    })
+                    .collect();
+                let fps = frames.len() as f64 / 3.0;
+                let urls: Vec<String> = frames
+                    .iter()
+                    .map(|&(w, h, p)| {
+                        png_data_url(&image::RgbImage::from_raw(w, h, p.to_vec()).unwrap())
+                    })
+                    .collect();
+                let list = prepare(json!({"url": urls, "fps": fps})).await;
+                assert!(!file.inputs.is_empty(), "{route}");
+                assert_eq!(
+                    list.messages[0].content, file.messages[0].content,
+                    "{route}"
+                );
+                assert_eq!(list.inputs, file.inputs, "{route}");
+                assert_eq!(
+                    (list.frames, list.videos),
+                    (file.frames, file.videos),
+                    "{route}"
+                );
+            }
         }
     }
 }

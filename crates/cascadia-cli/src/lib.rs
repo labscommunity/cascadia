@@ -247,8 +247,9 @@ pub enum EngineKind {
 pub struct ApiMediaArgs {
     /// ffmpeg binary that decodes `video_url` parts into frames (`ffprobe`
     /// is taken from the same directory, else from PATH). Default: `ffmpeg`
-    /// on PATH. Without one, video parts get a 400 and `/v1/models` does not
-    /// list `video`. A decode-only LGPL build is enough.
+    /// on PATH. Without one, video files get a 400 and `/v1/models` does not
+    /// list `video`; frame lists (`video_url.url` an array of images) need
+    /// no ffmpeg. A decode-only LGPL build is enough.
     #[arg(long, value_name = "PATH")]
     pub api_ffmpeg: Option<PathBuf>,
 
@@ -257,17 +258,18 @@ pub struct ApiMediaArgs {
     #[arg(long, value_name = "N")]
     pub api_max_images: Option<usize>,
 
-    /// Videos one request may carry (default 1).
+    /// Videos (files and frame lists) one request may carry (default 1); 0
+    /// turns video off and keeps the video allowance out of the body limit.
     #[arg(long, value_name = "N")]
     pub api_max_videos: Option<usize>,
 
-    /// Frames sampled from one video at most (default 16). Each costs one
-    /// image's tokens.
+    /// Frames sampled from one video at most (default 16), and the most a
+    /// frame list may carry (past it a 400). Each costs one image's tokens.
     #[arg(long, value_name = "N")]
     pub api_max_video_frames: Option<usize>,
 
     /// Frames sampled per second of video before the frame cap spreads them
-    /// out (default 1.0).
+    /// out (default 1.0); also the rate of a frame list sent without `fps`.
     #[arg(long, value_name = "FPS")]
     pub api_video_fps: Option<f64>,
 
@@ -2866,7 +2868,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
                 max_images = media.max_images,
                 max_image_pixels = media.max_image_pixels,
                 remote_urls = media.allow_remote_urls,
-                video = media.accepts_video(),
+                video_files = media.accepts_video(),
                 max_videos = media.max_videos,
                 max_video_frames = media.max_video_frames,
                 native_video = media.native_video,

@@ -13,8 +13,12 @@ or `VLM CHECK FAILED <n>`, and the exit code follows it.
   3. the same, streamed, ends with a finish_reason
   4. /v1/responses takes it as an `input_image`
   5. a `video_url` clip is described red, then blue      (skipped with --no-video)
-  6. an `https://` image is refused with 400 (remote URLs are off by default)
-  7. bytes that are not an image are refused with 400
+  6. a frame list (`video_url.url` an array of images, OVMS's form) of red then blue
+     frames is described red, then blue; the same through /v1/responses `input_video`;
+     a list past the server's frame cap is refused with 400   (skipped with --no-frames,
+     which a server with --api-max-videos 0 needs; no ffmpeg on either side)
+  7. an `https://` image is refused with 400 (remote URLs are off by default)
+  8. bytes that are not an image are refused with 400
 
 Run:   python3 scripts/vlm_check.py --base-url http://127.0.0.1:8099/v1
 Needs: pip install -r tests/conformance/requirements-openai-sdk.txt; ffmpeg on PATH
@@ -32,13 +36,22 @@ import zlib
 
 
 def red_circle_png(size=448) -> bytes:
-    rows = []
     c, r2 = size / 2, (size * 0.35) ** 2
+    return png(size, lambda x, y: b"\xdc\x14\x14" if (x - c) ** 2 + (y - c) ** 2 <= r2
+               else b"\xff\xff\xff")
+
+
+def solid_png(rgb: bytes, size=448) -> bytes:
+    return png(size, lambda x, y: rgb)
+
+
+def png(size, pixel) -> bytes:
+    """A size x size RGB PNG, `pixel(x, y)` the 3 bytes of each pixel."""
+    rows = []
     for y in range(size):
         row = bytearray(b"\x00")  # filter: none
         for x in range(size):
-            inside = (x - c) ** 2 + (y - c) ** 2 <= r2
-            row += b"\xdc\x14\x14" if inside else b"\xff\xff\xff"
+            row += pixel(x, y)
         rows.append(bytes(row))
 
     def chunk(tag, data):
@@ -75,7 +88,8 @@ def main() -> int:
     ap.add_argument("--base-url", default="http://127.0.0.1:8099/v1")
     ap.add_argument("--model", help="served model id (default: the first in /v1/models)")
     ap.add_argument("--video", help="an MP4 to send instead of the generated clip")
-    ap.add_argument("--no-video", action="store_true", help="skip the video checks")
+    ap.add_argument("--no-video", action="store_true", help="skip the video file checks")
+    ap.add_argument("--no-frames", action="store_true", help="skip the frame-list checks")
     ap.add_argument("--timeout", type=float, default=1800.0, help="per-request seconds")
     ap.add_argument("--dry-run", action="store_true", help="build the media and stop")
     args = ap.parse_args()
@@ -91,7 +105,11 @@ def main() -> int:
                 print("ffmpeg not on PATH: pass --video <clip.mp4> or --no-video")
                 return 2
             clip = red_then_blue_mp4(ffmpeg)
-    print(f"media: png {len(png)} B, clip {len(clip) if clip else 0} B")
+    # Two red frames then two blue ones, 1 s apart: the clip above, extracted.
+    red, blue = solid_png(b"\xff\x00\x00"), solid_png(b"\x00\x00\xff")
+    frames = [data_url("image/png", f) for f in (red, red, blue, blue)]
+    print(f"media: png {len(png)} B, clip {len(clip) if clip else 0} B, "
+          f"frames {len(frames)} x {len(red)} B")
     if args.dry_run:
         print("VLM CHECK DRY RUN")
         return 0
@@ -157,23 +175,43 @@ def main() -> int:
                 {"type": "input_image", "image_url": data_url("image/png", png)}]}])
         return None if says(r.output_text, "red") else f"output {r.output_text!r}"
 
+    order_q = "The video shows one solid color, then another. Which two colors, in order?"
+
+    def red_then_blue(answer):
+        answer = answer or ""
+        red, blue = re.search(r"\bred\b", answer, re.I), re.search(r"\bblue\b", answer, re.I)
+        return None if red and blue and red.start() < blue.start() else (
+            f"answer {answer!r} is not red then blue")
+
     def video_check():
         r = chat([{"type": "video_url", "video_url": {"url": data_url("video/mp4", clip)}},
-                  {"type": "text", "text": "The video shows one solid color, then another. "
-                                           "Which two colors, in order?"}])
-        answer = r.choices[0].message.content or ""
-        red, blue = re.search(r"\bred\b", answer, re.I), re.search(r"\bblue\b", answer, re.I)
-        if not (red and blue and red.start() < blue.start()):
-            return f"answer {answer!r} is not red then blue"
+                  {"type": "text", "text": order_q}])
+        answer = r.choices[0].message.content
         print(f"  video answer {answer!r}, prompt_tokens {r.usage.prompt_tokens}")
+        return red_then_blue(answer)
 
-    def refused(content):
+    def frames_check():
+        r = chat([{"type": "video_url", "video_url": {"url": frames, "fps": 1}},
+                  {"type": "text", "text": order_q}])
+        answer = r.choices[0].message.content
+        print(f"  frames answer {answer!r}, prompt_tokens {r.usage.prompt_tokens}")
+        return red_then_blue(answer)
+
+    def responses_frames_check():
+        r = client.responses.create(model=model, temperature=0, max_output_tokens=64, input=[
+            {"role": "user", "content": [
+                {"type": "input_video", "video_url": frames, "fps": 1},
+                {"type": "input_text", "text": order_q}]}])
+        print(f"  responses frames answer {r.output_text!r}")
+        return red_then_blue(r.output_text)
+
+    def refused(content, want=None):
         try:
             chat(content)
         except openai.BadRequestError as e:
             msg = str(e.body.get("message") if isinstance(e.body, dict) else e)
             # A server that takes no images refuses every image; that proves nothing here.
-            if "does not accept image input" in msg:
+            if "does not accept image input" in msg or (want and want not in msg):
                 return f"refused for the wrong reason: {msg}"
             print(f"  400: {msg}")
             return None
@@ -185,6 +223,14 @@ def main() -> int:
     check("responses-image", responses_check)
     if clip:
         check("chat-video", video_check)
+    if not args.no_frames:
+        check("chat-frames", frames_check)
+        check("responses-frames", responses_frames_check)
+        # Past any frame cap a server would set for its context (the default is
+        # 16), and refused for the cap, which is checked before the span.
+        check("frames-over-cap-refused", lambda: refused(
+            [{"type": "video_url", "video_url": {"url": frames * 257}},
+             {"type": "text", "text": order_q}], want="frames; the limit is"))
     check("remote-url-refused", lambda: refused(
         [{"type": "text", "text": question},
          {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]))

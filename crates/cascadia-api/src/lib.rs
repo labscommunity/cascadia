@@ -188,7 +188,7 @@ where
                     let video = <AppState as axum::extract::FromRef<S>>::from_ref(state)
                         .media
                         .as_deref()
-                        .is_some_and(MediaConfig::accepts_video);
+                        .is_some_and(|m| m.max_videos > 0);
                     let msg = if video {
                         "request body is larger than this server accepts; if it carries \
                          images or videos, send fewer or smaller images or a shorter video \
@@ -724,7 +724,9 @@ pub fn make_router_with_stats(
     let image_body_bytes = cfg
         .max_body_bytes
         .saturating_add(cfg.media.as_ref().map_or(0, |m| {
-            media::base64_len(m.max_request_image_bytes).saturating_add(if m.accepts_video() {
+            // Frame lists need no ffmpeg, so the room is there whenever a
+            // request may carry a video.
+            media::base64_len(m.max_request_image_bytes).saturating_add(if m.max_videos > 0 {
                 media::base64_len(m.max_request_video_bytes)
             } else {
                 0
@@ -1025,6 +1027,21 @@ pub enum ContentPart {
         url: String,
         detail: Option<String>,
     },
+    /// A `video_url` whose `url` is an array (OVMS's form): the video's
+    /// frames, already extracted, each an image URL as `image_url` takes.
+    /// Served as a decoded video is, without ffmpeg; `fps` (else the
+    /// server's `video_fps`) spaces their times.
+    VideoFrames {
+        urls: Vec<String>,
+        detail: Option<String>,
+        fps: Option<f64>,
+    },
+}
+
+impl ContentPart {
+    fn is_video(&self) -> bool {
+        matches!(self, Self::VideoUrl { .. } | Self::VideoFrames { .. })
+    }
 }
 
 #[derive(Deserialize)]
@@ -1080,12 +1097,18 @@ impl ChatMessage {
         })
     }
 
-    /// The video parts, in order.
+    /// The video file parts, in order (frame lists are not files).
     pub fn videos(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
         self.parts.iter().filter_map(|p| match p {
             ContentPart::VideoUrl { url, detail } => Some((url.as_str(), detail.as_deref())),
             _ => None,
         })
+    }
+
+    /// Video parts of either kind, files and frame lists: what
+    /// `--api-max-videos` counts.
+    pub fn video_count(&self) -> usize {
+        self.parts.iter().filter(|p| p.is_video()).count()
     }
 
     /// Whether any part is an image or a video.
@@ -1143,8 +1166,10 @@ fn parse_content(value: Option<serde_json::Value>) -> Result<(String, Vec<Conten
                 Some(text) => out.push(ContentPart::Text(text.to_owned())),
                 None => return Err("content part of type `text` needs a string `text`".into()),
             },
+            "video_url" if part[kind]["url"].is_array() => out.push(parse_frame_list(&part[kind])?),
             // `image_url` (and `video_url`) is an object `{url, detail}`;
-            // some clients send the bare URL string.
+            // some clients send the bare URL string. A file's `fps` is
+            // ignored: the server samples it at its own rate.
             "image_url" | "video_url" => {
                 let (url, detail) = match part.get(kind) {
                     Some(serde_json::Value::String(u)) => (Some(u.as_str()), None),
@@ -1181,6 +1206,45 @@ fn parse_content(value: Option<serde_json::Value>) -> Result<(String, Vec<Conten
         })
         .collect::<String>();
     Ok((text, out))
+}
+
+/// A `video_url` object whose `url` is an array: OVMS's frame list, a
+/// non-empty array of image URL strings, with an optional `detail` and our
+/// `fps` (a number in (0, [`video::MAX_FPS`]]).
+fn parse_frame_list(obj: &serde_json::Value) -> Result<ContentPart, String> {
+    let list = obj["url"].as_array().expect("checked by the caller");
+    if list.is_empty() {
+        return Err("`video_url.url` must be a non-empty array of frame image URLs".into());
+    }
+    let urls = list
+        .iter()
+        .enumerate()
+        .map(|(k, u)| {
+            u.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("`video_url.url[{k}]` must be a string (an image URL)"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fps = match obj.get("fps") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(f) => match f.as_f64() {
+            Some(f) if f > 0.0 && f <= video::MAX_FPS => Some(f),
+            _ => {
+                return Err(format!(
+                    "`video_url.fps` must be a number above 0 and at most {}",
+                    video::MAX_FPS
+                ))
+            }
+        },
+    };
+    Ok(ContentPart::VideoFrames {
+        urls,
+        detail: obj
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .map(str::to_owned),
+        fps,
+    })
 }
 
 /// OpenAI `stop` is either a single string or an array of strings.
@@ -2580,7 +2644,7 @@ async fn prepare_media(
     messages: &[ChatMessage],
 ) -> Result<Option<PreparedMedia>, Response> {
     let count: usize = messages.iter().map(|m| m.images().count()).sum();
-    let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
+    let videos: usize = messages.iter().map(ChatMessage::video_count).sum();
     if count == 0 && videos == 0 {
         return Ok(None);
     }
@@ -2660,7 +2724,7 @@ pub async fn prepare_media_with(
 ) -> Result<Option<PreparedMedia>, MediaError> {
     let reject = MediaError::Invalid;
     let count: usize = messages.iter().map(|m| m.images().count()).sum();
-    let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
+    let videos: usize = messages.iter().map(ChatMessage::video_count).sum();
     if count == 0 && videos == 0 {
         return Ok(None);
     }
@@ -2668,6 +2732,7 @@ pub async fn prepare_media_with(
     let GatheredMedia {
         images: image_bytes,
         videos: video_inputs,
+        frame_lists,
         ..
     } = gather_media_bytes(&cfg, messages).await?;
     let messages = messages.to_vec();
@@ -2678,7 +2743,7 @@ pub async fn prepare_media_with(
     // One deadline over all of the request's videos, as the fetches have.
     let deadline = tokio::time::Instant::now() + cfg.video_decode_timeout;
     let mut video_frames = Vec::with_capacity(video_inputs.len());
-    for (j, (bytes, detail)) in video_inputs.into_iter().enumerate() {
+    for (j, (bytes, detail)) in file_video_indices(&messages).into_iter().zip(video_inputs) {
         match video::decode_video(bytes, detail.as_deref(), &cfg, deadline).await {
             Ok(frames) => video_frames.push(frames),
             Err(video::VideoError::Invalid(msg)) => {
@@ -2687,7 +2752,8 @@ pub async fn prepare_media_with(
             Err(video::VideoError::Internal(msg)) => return Err(MediaError::Internal(msg)),
         }
     }
-    let frames: usize = video_frames.iter().map(Vec::len).sum();
+    let frames: usize = video_frames.iter().map(Vec::len).sum::<usize>()
+        + frame_lists.iter().map(Vec::len).sum::<usize>();
     // Each video's plan caps its frames, and the counts were checked above.
     debug_assert!(count + frames <= cfg.max_images + cfg.max_videos * cfg.max_video_frames);
     let several_videos = videos > 1;
@@ -2702,6 +2768,19 @@ pub async fn prepare_media_with(
         let _decode_permit = decode_permit;
         let mut image_bytes = image_bytes.into_iter();
         let mut video_frames = video_frames.into_iter();
+        let mut frame_lists = frame_lists.into_iter();
+        // A video's frames: a file's from ffmpeg above, a frame list's
+        // decoded here as images, then served alike.
+        let deadline = deadline.into_std();
+        let mut next_frames = |part: &ContentPart, j: usize| match part {
+            ContentPart::VideoFrames { detail, fps, .. } => {
+                let images = frame_lists.next().expect("bytes for every frame list");
+                let fps = fps.unwrap_or(decode_cfg.video_fps);
+                video::frames_from_images(&images, detail.as_deref(), fps, &decode_cfg, deadline)
+                    .map_err(|e| format!("video {j}: {e}"))
+            }
+            _ => Ok(video_frames.next().expect("frames for every video file")),
+        };
         let mut video_index = 0;
         // Images (video frames included) and native videos number their
         // tags apart, as GenAI matches them.
@@ -2729,9 +2808,11 @@ pub async fn prepare_media_with(
                     }
                     // The whole video behind its own tag: the engine (GenAI)
                     // encodes its frames together, with their times.
-                    ContentPart::VideoUrl { .. } if decode_cfg.native_video => {
-                        let frames = video_frames.next().expect("frames for every video");
+                    v @ (ContentPart::VideoUrl { .. } | ContentPart::VideoFrames { .. })
+                        if decode_cfg.native_video =>
+                    {
                         let j = video_index;
+                        let frames = next_frames(&v, j)?;
                         video_index += 1;
                         let input = video::video_input(frames)
                             .ok_or_else(|| format!("video {j}: its frames differ in size"))?;
@@ -2752,8 +2833,8 @@ pub async fn prepare_media_with(
                     // part naming it, then the image. A model that writes
                     // its images first gets one line naming every frame
                     // instead (the labels would all land after the images).
-                    ContentPart::VideoUrl { .. } => {
-                        let frames = video_frames.next().expect("frames for every video");
+                    v @ (ContentPart::VideoUrl { .. } | ContentPart::VideoFrames { .. }) => {
+                        let frames = next_frames(&v, video_index)?;
                         let video_no = several_videos.then_some(video_index + 1);
                         video_index += 1;
                         if decode_cfg.images_first {
@@ -2827,7 +2908,9 @@ fn check_media_parts(
             cfg.max_images
         )));
     }
-    if videos > 0 && need_ffmpeg && cfg.ffmpeg.is_none() {
+    // Frame lists are decoded as images; only video files need ffmpeg.
+    let files = messages.iter().map(|m| m.videos().count()).sum::<usize>();
+    if files > 0 && need_ffmpeg && cfg.ffmpeg.is_none() {
         return Err(reject(video::NEEDS_FFMPEG.into()));
     }
     if videos > 0 && cfg.max_videos == 0 {
@@ -2843,7 +2926,47 @@ fn check_media_parts(
             cfg.max_videos
         )));
     }
+    for (j, part) in video_parts(messages) {
+        let ContentPart::VideoFrames { urls, fps, .. } = part else {
+            continue;
+        };
+        let n = urls.len();
+        // Refused, not thinned, as OVMS refuses past its cap.
+        if n > cfg.max_video_frames {
+            return Err(reject(format!(
+                "video {j}: {n} frames; the limit is {} (`--api-max-video-frames`)",
+                cfg.max_video_frames
+            )));
+        }
+        // The span bounds the frame times, which Qwen turns into positions.
+        let fps = fps.unwrap_or(cfg.video_fps);
+        let secs = n as f64 / fps;
+        if secs > cfg.max_video_seconds {
+            return Err(reject(format!(
+                "video {j}: {n} frames at {fps} fps span {secs:.1} s; the limit is {} s",
+                cfg.max_video_seconds
+            )));
+        }
+    }
     Ok(())
+}
+
+/// The request's video parts, files and frame lists, each with its index
+/// among them: the `video {j}` every video error names.
+fn video_parts(messages: &[ChatMessage]) -> impl Iterator<Item = (usize, &ContentPart)> {
+    messages
+        .iter()
+        .flat_map(|m| &m.parts)
+        .filter(|p| p.is_video())
+        .enumerate()
+}
+
+/// The index among all videos ([`video_parts`]) of each video file, in order.
+fn file_video_indices(messages: &[ChatMessage]) -> Vec<usize> {
+    video_parts(messages)
+        .filter(|(_, p)| matches!(p, ContentPart::VideoUrl { .. }))
+        .map(|(j, _)| j)
+        .collect()
 }
 
 /// A request's media as bytes, in request order: each image's encoded bytes
@@ -2851,8 +2974,11 @@ fn check_media_parts(
 struct GatheredMedia {
     images: Vec<Vec<u8>>,
     videos: Vec<(Vec<u8>, Option<String>)>,
+    /// Each frame list's encoded frames, in request order.
+    frame_lists: Vec<Vec<Vec<u8>>>,
     remote_images: Vec<bool>,
     remote_videos: Vec<bool>,
+    remote_frames: Vec<Vec<bool>>,
 }
 
 /// Fetch a request's remote media under `cfg.fetch_policy` (its byte budgets
@@ -2865,11 +2991,30 @@ async fn gather_media_bytes(
 ) -> Result<GatheredMedia, MediaError> {
     let reject = MediaError::Invalid;
     let count: usize = messages.iter().map(|m| m.images().count()).sum();
-    let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
+    let videos: usize = messages.iter().map(ChatMessage::video_count).sum();
+    // Each video file's and frame list's index among the request's videos,
+    // as errors name it; each list with its frame URLs and `detail`.
+    let files = file_video_indices(messages);
+    let lists: Vec<(usize, Vec<String>, Option<String>)> = video_parts(messages)
+        .filter_map(|(j, p)| match p {
+            ContentPart::VideoFrames { urls, detail, .. } => {
+                Some((j, urls.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .collect();
     // A remote URL on a config that fetches none is its own refusal, so a
     // caller can name the setting; any other non-`data:` URL is `Invalid`
     // below, from the `data:` decoders.
     if !cfg.allow_remote_urls {
+        for (j, urls, _) in &lists {
+            if let Some(k) = urls.iter().position(|u| media::is_remote(u)) {
+                return Err(MediaError::RemoteDisabled(format!(
+                    "video {j} frame {k}: {}",
+                    media::DATA_ONLY_IMAGES
+                )));
+            }
+        }
         if let Some(i) = messages
             .iter()
             .flat_map(|m| m.images())
@@ -2886,7 +3031,8 @@ async fn gather_media_bytes(
             .position(|(url, _)| media::is_remote(url))
         {
             return Err(MediaError::RemoteDisabled(format!(
-                "video {j}: {}",
+                "video {}: {}",
+                files[j],
                 video::DATA_ONLY_VIDEOS
             )));
         }
@@ -2901,6 +3047,10 @@ async fn gather_media_bytes(
         .iter()
         .flat_map(|m| m.videos())
         .map(|(url, _)| remote(url))
+        .collect();
+    let remote_frames: Vec<Vec<bool>> = lists
+        .iter()
+        .map(|(_, urls, _)| urls.iter().map(|u| remote(u)).collect())
         .collect();
     // Remote images are fetched first, outside the decode slot (a fetch
     // waits on the network, not the CPU), sharing one byte budget per request.
@@ -2923,7 +3073,7 @@ async fn gather_media_bytes(
         }
         let mut fetched_videos: Vec<Option<Vec<u8>>> = Vec::with_capacity(videos);
         let mut budget = cfg.max_request_video_bytes;
-        for (j, (url, _)) in messages.iter().flat_map(|m| m.videos()).enumerate() {
+        for (&j, (url, _)) in files.iter().zip(messages.iter().flat_map(|m| m.videos())) {
             if !(cfg.allow_remote_urls && media::is_remote(url)) {
                 fetched_videos.push(None);
                 continue;
@@ -2934,9 +3084,26 @@ async fn gather_media_bytes(
             budget -= bytes.len();
             fetched_videos.push(Some(bytes));
         }
-        Ok::<_, String>((fetched, fetched_videos))
+        // A frame list's frames are images on the video budget.
+        let mut fetched_frames: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(lists.len());
+        for (j, urls, _) in &lists {
+            let mut frames = Vec::with_capacity(urls.len());
+            for (k, url) in urls.iter().enumerate() {
+                if !(cfg.allow_remote_urls && media::is_remote(url)) {
+                    frames.push(None);
+                    continue;
+                }
+                let bytes = media::fetch_image(url, budget, cfg.fetch_policy)
+                    .await
+                    .map_err(|e| format!("video {j} frame {k}: {e}"))?;
+                budget -= bytes.len();
+                frames.push(Some(bytes));
+            }
+            fetched_frames.push(frames);
+        }
+        Ok::<_, String>((fetched, fetched_videos, fetched_frames))
     };
-    let (fetched, fetched_videos) =
+    let (fetched, fetched_videos, fetched_frames) =
         match tokio::time::timeout(cfg.fetch_policy.per_request, fetch_all).await {
             Ok(Ok(f)) => f,
             Ok(Err(msg)) => return Err(reject(msg)),
@@ -2976,9 +3143,57 @@ async fn gather_media_bytes(
             bytes.push(b);
         }
         media::check_request_pixels(&sizes, &header_cfg)?;
-        let mut videos = Vec::with_capacity(video_urls.len());
+        // A frame list's frames as images, each under a video's frame-size
+        // bound, all one size (as OVMS requires, and a native video needs),
+        // their bytes in the videos'. Their pixels are a video's, not in the
+        // images' total: a list is served wherever the file it came from is.
+        let over_video_bytes = || {
+            format!(
+                "this request's videos are over the {}-byte limit",
+                header_cfg.max_request_video_bytes
+            )
+        };
         let mut video_bytes = 0;
-        for (j, ((url, detail), fetched)) in video_urls.into_iter().zip(fetched_videos).enumerate()
+        let mut frame_lists = Vec::with_capacity(lists.len());
+        for ((j, urls, detail), fetched) in lists.into_iter().zip(fetched_frames) {
+            video::check_detail(detail.as_deref()).map_err(|e| format!("video {j}: {e}"))?;
+            let mut frames = Vec::with_capacity(urls.len());
+            let mut first = None;
+            for (k, (url, fetched)) in urls.iter().zip(fetched).enumerate() {
+                let at = |e: String| format!("video {j} frame {k}: {e}");
+                let b = match fetched {
+                    Some(b) => b,
+                    None => media::image_url_bytes(url, None, &header_cfg).map_err(at)?,
+                };
+                let (w, h) = media::source_size(&b, &header_cfg).map_err(at)?;
+                if u64::from(w) * u64::from(h) > header_cfg.max_video_source_pixels {
+                    return Err(at(format!(
+                        "the frame is {w}x{h}; a video frame may be at most {} pixels",
+                        header_cfg.max_video_source_pixels
+                    )));
+                }
+                match first {
+                    None => first = Some((w, h)),
+                    Some((w0, h0)) if (w0, h0) != (w, h) => {
+                        return Err(at(format!(
+                            "the frame is {w}x{h} but frame 0 is {w0}x{h0}; every frame of a \
+                             video must be the same size"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+                video_bytes += b.len();
+                if video_bytes > header_cfg.max_request_video_bytes {
+                    return Err(over_video_bytes());
+                }
+                frames.push(b);
+            }
+            frame_lists.push(frames);
+        }
+        let mut videos = Vec::with_capacity(video_urls.len());
+        for (j, ((url, detail), fetched)) in files
+            .into_iter()
+            .zip(video_urls.into_iter().zip(fetched_videos))
         {
             let b = match fetched {
                 Some(b) => b,
@@ -2987,17 +3202,14 @@ async fn gather_media_bytes(
             };
             video_bytes += b.len();
             if video_bytes > header_cfg.max_request_video_bytes {
-                return Err(format!(
-                    "this request's videos are over the {}-byte limit",
-                    header_cfg.max_request_video_bytes
-                ));
+                return Err(over_video_bytes());
             }
             videos.push((b, detail));
         }
-        Ok::<_, String>((bytes, videos))
+        Ok::<_, String>((bytes, videos, frame_lists))
     })
     .await;
-    let (images, videos) = match sized {
+    let (images, videos, frame_lists) = match sized {
         Ok(Ok(b)) => b,
         Ok(Err(msg)) => return Err(reject(msg)),
         Err(join_err) => return Err(decode_task_error(join_err)),
@@ -3005,8 +3217,10 @@ async fn gather_media_bytes(
     Ok(GatheredMedia {
         images,
         videos,
+        frame_lists,
         remote_images,
         remote_videos,
+        remote_frames,
     })
 }
 
@@ -3033,7 +3247,7 @@ pub async fn fetch_request_media(
     messages: &[ChatMessage],
 ) -> Result<Vec<ChatMessage>, MediaError> {
     let count: usize = messages.iter().map(|m| m.images().count()).sum();
-    let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
+    let videos: usize = messages.iter().map(ChatMessage::video_count).sum();
     if count == 0 && videos == 0 {
         return Ok(messages.to_vec());
     }
@@ -3041,18 +3255,21 @@ pub async fn fetch_request_media(
     let gathered = gather_media_bytes(&cfg, messages).await?;
     let mut images = gathered.images.into_iter().zip(gathered.remote_images);
     let mut fetched_videos = gathered.videos.into_iter().zip(gathered.remote_videos);
+    let mut frame_lists = gathered.frame_lists.into_iter().zip(gathered.remote_frames);
     let mut video_index = 0;
+    // `source_size` accepted the bytes, so their format is known.
+    let image_mime = |bytes: &[u8]| {
+        image::guess_format(bytes)
+            .map(|f| f.to_mime_type())
+            .unwrap_or("image/png")
+    };
     let mut out = messages.to_vec();
     for part in out.iter_mut().flat_map(|m| m.parts.iter_mut()) {
         match part {
             ContentPart::ImageUrl { url, .. } => {
                 let (bytes, remote) = images.next().expect("one entry per image part");
                 if remote {
-                    // `source_size` accepted the bytes, so their format is known.
-                    let mime = image::guess_format(&bytes)
-                        .map(|f| f.to_mime_type())
-                        .unwrap_or("image/png");
-                    *url = data_url(mime, &bytes);
+                    *url = data_url(image_mime(&bytes), &bytes);
                 }
             }
             ContentPart::VideoUrl { url, .. } => {
@@ -3067,6 +3284,15 @@ pub async fn fetch_request_media(
                         ))
                     })?;
                     *url = data_url(container.mime(), &bytes);
+                }
+            }
+            ContentPart::VideoFrames { urls, .. } => {
+                video_index += 1;
+                let (frames, remote) = frame_lists.next().expect("one entry per frame list");
+                for ((url, bytes), remote) in urls.iter_mut().zip(frames).zip(remote) {
+                    if remote {
+                        *url = data_url(image_mime(&bytes), &bytes);
+                    }
                 }
             }
             ContentPart::Text(_) => {}
@@ -6271,8 +6497,16 @@ mod tests {
     }
 
     pub(crate) fn png_url(w: u32, h: u32) -> String {
+        png_data_url(&image::RgbImage::from_pixel(
+            w,
+            h,
+            image::Rgb([200, 10, 10]),
+        ))
+    }
+
+    /// `img` as a PNG `data:` URL.
+    pub(crate) fn png_data_url(img: &image::RgbImage) -> String {
         use base64::Engine as _;
-        let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 10, 10]));
         let mut buf = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
             .unwrap();
@@ -6965,17 +7199,24 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, srv).await.unwrap() });
 
         let inline = png_url(2, 2);
+        // A frame list's remote frames are inlined too (the same size as
+        // `a.png`, as a video's frames must be).
+        let frame = png_url(4, 4);
         let messages = vec![
             user_msg(serde_json::json!([
                 {"type": "text", "text": "compare"},
                 {"type": "image_url", "image_url": {"url": format!("{base}/a.png"), "detail": "low"}},
                 {"type": "image_url", "image_url": {"url": inline}},
                 {"type": "video_url", "video_url": {"url": format!("{base}/v.mp4")}},
+                {"type": "video_url", "video_url": {"url": [format!("{base}/a.png"), frame.clone()],
+                    "fps": 2}},
             ])),
             serde_json::from_value(serde_json::json!({"role": "assistant", "content": "ok"}))
                 .unwrap(),
         ];
-        let out = fetch_request_media(loopback_fetch_cfg(), &messages)
+        let mut two_videos = (*loopback_fetch_cfg()).clone();
+        two_videos.max_videos = 2;
+        let out = fetch_request_media(Arc::new(two_videos), &messages)
             .await
             .unwrap();
         assert_eq!(out.len(), 2);
@@ -6995,6 +7236,11 @@ mod tests {
                 ContentPart::VideoUrl {
                     url: format!("data:video/mp4;base64,{}", b64(&mp4)),
                     detail: None,
+                },
+                ContentPart::VideoFrames {
+                    urls: vec![format!("data:image/png;base64,{}", b64(&png)), frame],
+                    detail: None,
+                    fps: Some(2.0),
                 },
             ]
         );
@@ -7799,6 +8045,57 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("needs `video_url.url`"), "{err}");
+    }
+
+    /// OVMS's frame list: `video_url.url` an array of image URL strings
+    /// (with our optional `fps`) is a `VideoFrames` part, counted as a video
+    /// but not among the files; an empty array, a non-string entry or a bad
+    /// `fps` is a 400 at parse time. A video file's `fps` is ignored, as it
+    /// always was.
+    #[test]
+    fn message_takes_a_frame_list_video() {
+        let raw = r#"{"role":"user","content":[
+            {"type":"video_url","video_url":{"url":["data:a","data:b"],"detail":"low","fps":2}},
+            {"type":"video_url","video_url":{"url":["data:c"],"fps":null}}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            m.parts,
+            vec![
+                ContentPart::VideoFrames {
+                    urls: vec!["data:a".into(), "data:b".into()],
+                    detail: Some("low".into()),
+                    fps: Some(2.0),
+                },
+                ContentPart::VideoFrames {
+                    urls: vec!["data:c".into()],
+                    detail: None,
+                    fps: None,
+                },
+            ]
+        );
+        assert_eq!((m.videos().count(), m.video_count()), (0, 2));
+        assert!(m.has_media());
+        let refused = |video_url: &str| {
+            serde_json::from_str::<ChatMessage>(&format!(
+                r#"{{"role":"user","content":[{{"type":"video_url","video_url":{video_url}}}]}}"#
+            ))
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(refused(r#"{"url":[]}"#).contains("non-empty array"));
+        assert!(refused(r#"{"url":["data:a",3]}"#).contains("`video_url.url[1]` must be a string"));
+        for fps in ["0", "-1", "121", "\"2\""] {
+            let err = refused(&format!(r#"{{"url":["data:a"],"fps":{fps}}}"#));
+            assert!(
+                err.contains("`video_url.fps` must be a number"),
+                "{fps}: {err}"
+            );
+        }
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"video_url","video_url":{"url":"data:v","fps":2}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.videos().collect::<Vec<_>>(), vec![("data:v", None)]);
     }
 
     #[test]

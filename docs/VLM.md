@@ -122,7 +122,7 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
   only as good as the container's packets: it is advisory against a crafted file, which
   the source-frame cap, the decode deadline and the two decode slots still bound.
   `--api-max-video-mb` (32 MiB per request, at most 1024; on top of the image allowance,
-  and the chat and Responses body limits grow by it only when video is on).
+  and the chat and Responses body limits grow by it whenever `--api-max-videos` is above 0).
   `--api-video-decode-timeout` (30 s for all of a request's videos, at most 3600; past it ffmpeg is
   killed and the request gets a `400` asking for a shorter or lower-resolution clip).
   Videos decode under the request's one decode slot.
@@ -136,9 +136,56 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
 - Decoding needs ffmpeg and ffprobe on the server: `--api-ffmpeg PATH`, else `ffmpeg` on
   `PATH` (ffprobe beside it or on `PATH`). A decode-only LGPL build is enough. ffmpeg runs
   as a subprocess on a private temp file (removed afterwards), restricted to local files,
-  with the container forced. Without ffmpeg a video part is a `400` naming `--api-ffmpeg`,
-  and `/v1/models` does not list `video`.
+  with the container forced. Without ffmpeg a video file is a `400` naming `--api-ffmpeg`,
+  and `/v1/models` does not list `video`; frame lists (next section) are still served.
 - Everything above holds on every engine; what differs is how the frames reach the model.
+
+### Frame lists
+
+A caller that extracts the frames itself can send them as one video, in the form OpenVINO
+Model Server takes: `video_url.url` is an array of frames, each an image URL as `image_url`
+takes it. No ffmpeg is needed for this form.
+
+```json
+{"type": "video_url", "video_url": {"url": ["data:image/jpeg;base64,...", "data:image/jpeg;base64,..."],
+  "detail": "auto", "fps": 2}}
+```
+
+In `/v1/responses`, `input_video` takes the array as `video_url` itself or as
+`{"url": [...]}`, with `fps` and `detail` beside it or inside the object.
+
+- Each frame is a `data:` image URL (PNG, JPEG, WEBP or GIF), or `https://` with
+  `--api-allow-image-urls`, under the image fetch checks. Fetched frames share the
+  request's video byte budget.
+- The array holds 1 to `--api-max-video-frames` (16) frames, in order. Past that the
+  request is a `400`, as OpenVINO Model Server refuses past its own cap; no frame is
+  dropped. A frame list counts against `--api-max-videos` like a file.
+- Every frame must be the same size (a `400` names the first that differs). Each is at most
+  `--api-max-video-source-pixels`; their bytes count toward `--api-max-video-mb`. Their
+  pixels are a video's, not counted with the request's images, so a list is served wherever
+  the clip it came from would be. They decode under the request's decode slot and
+  `--api-video-decode-timeout`, as a file's frames do.
+- `detail` sizes the frames as for a video file of that frame size (448x448 by default).
+- Frame `k` is at `k / fps` seconds. `fps` is optional, above 0 and at most 120, and
+  defaults to `--api-video-fps` (1); the frames may span at most `--api-max-video-seconds`.
+  Send the rate the frames were taken at: Qwen3-VL writes the times into the prompt, the
+  staged Qwen2.5-VL trees space positions by them, the labelled-frames path writes them in
+  each `Frame k (t s): ` label, and GenAI gets the rate, without which it resamples
+  Qwen3-VL's frames as a 24 fps source (next section). A video file's `fps` is ignored: a
+  file is sampled at the server's rate.
+- From there a frame list is the video its frames came from: the same prompt and the same
+  `MediaInput`s (pixels, times and hash), natively or as labelled frames, on every engine
+  and family. Two things a file gets that a list does not: an odd frame count is passed as
+  sent, not rounded up to Qwen's pairs, and a one-frame list carries no rate (as a one-frame
+  file on a family without pairs does).
+- Gemma 4 keeps at most its processor's `num_frames` (32 unless the export sets fewer) and
+  resamples past it, a list's frames as a file's.
+- Where it differs from OpenVINO Model Server: frames are `data:` or `https://` URLs (no
+  local paths, no plain `http://`) in PNG, JPEG, WEBP or GIF; video parts go in `user`
+  messages only; one video per request unless `--api-max-videos` is raised; frames are
+  scaled to the `detail` budget; and the frame times are sent.
+- A server with no ffmpeg still serves frame lists, so its chat and Responses body limits
+  carry the `--api-max-video-mb` allowance; `--api-max-videos 0` keeps it out.
 
 ### Native video (ov-genai)
 
@@ -834,7 +881,8 @@ A caller that renders the chat template and builds the `GenerationTask` itself (
 1. `cascadia_api::media_setup(MediaEngine, model_dir)`: the model's `MediaConfig` (or why it
    serves text only), then its own limits on that config and `attach_ffmpeg` for video.
 2. `cascadia_api::prepare_media_with(config, decode_slots, messages)`: validates, fetches and
-   decodes the request's `image_url` / `video_url` parts. It returns the messages with
+   decodes the request's `image_url` / `video_url` parts (a frame list is
+   `ContentPart::VideoFrames`, a video file `ContentPart::VideoUrl`). It returns the messages with
    placeholders and the decoded `MediaInput`s, or a `MediaError` (`Invalid` 400, `Busy` 503,
    `Internal` 500, `RemoteDisabled` 400: a remote URL with `allow_remote_urls` off).
 3. Render the messages with the model's template (thinking on or off as asked), check the
@@ -857,7 +905,8 @@ messages only, the image and video counts, the fetch guard: public `https` addre
 DNS pinned, redirects re-checked, content type, size capped while reading; one byte budget
 per request for images and one for videos, one deadline over all of a request's fetches,
 each image's header size, the request's source pixels, a fetched video's container) and
-returns the messages with each fetched URL replaced by a base64 `data:` URL, `detail` kept.
+returns the messages with each fetched URL replaced by a base64 `data:` URL, `detail` kept
+(a frame list's fetched frames too, each as a `data:` image URL).
 The serving node then needs no outbound access, and its `prepare_media_with` checks the
 bytes again. Errors name the part (`image 2: ...`), never the URL. A failed or refused fetch
 is logged on the target `cascadia_api::media_fetch`: at `warn` only its reason
