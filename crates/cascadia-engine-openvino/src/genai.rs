@@ -48,6 +48,9 @@ pub struct OvGenaiBuilder {
     /// Continuous batching (#20): serve concurrent requests through one
     /// `ContinuousBatchingPipeline` instead of one-generation-per-`step()`.
     pub continuous_batching: Option<CbSchedulerConfig>,
+    /// Largest prompt, in tokens, `submit` accepts; 0 means the served window
+    /// (see `with_prompt_token_limit`).
+    pub prompt_token_limit: u32,
     pipe: Option<LlmPipeline>,
     cb_pipe: Option<CbPipeline>,
 }
@@ -67,6 +70,7 @@ impl OvGenaiBuilder {
             prompt_lookup_ngram: 0,
             prompt_pretemplated: false,
             continuous_batching: None,
+            prompt_token_limit: 0,
             pipe: None,
             cb_pipe: None,
         }
@@ -75,6 +79,17 @@ impl OvGenaiBuilder {
     /// Enable continuous batching (#20) with the given scheduler knobs.
     pub fn with_continuous_batching(mut self, sched: CbSchedulerConfig) -> Self {
         self.continuous_batching = Some(sched);
+        self
+    }
+
+    /// Refuse prompts over `limit` tokens at `submit` with `PromptTooLong`, before any
+    /// generation starts. Past the model's window ov-genai does not fail on its own: on CPU
+    /// it generates junk with a normal finish. Unset, the limit is the served window: the NPU
+    /// `MAX_PROMPT_LEN` (GenAI's default 1024), else the model config's
+    /// `max_position_embeddings`. The count is of the prompt as submitted, so when ov-genai
+    /// applies the chat template itself the template's own tokens are not counted.
+    pub fn with_prompt_token_limit(mut self, limit: u32) -> Self {
+        self.prompt_token_limit = limit;
         self
     }
 
@@ -321,11 +336,16 @@ impl Builder for OvGenaiBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        let prompt_token_limit = match self.prompt_token_limit {
+            0 => default_prompt_token_limit(&self.device, &self.model_path, &self.ov_properties),
+            n => n,
+        };
         if let Some(pipe) = self.cb_pipe {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
                 pipe: Box::new(pipe),
                 prompt_pretemplated: self.prompt_pretemplated,
+                prompt_token_limit,
                 next_request_id: 0,
                 max_tokens_default: 256,
                 idle_steps: 0,
@@ -338,10 +358,56 @@ impl Builder for OvGenaiBuilder {
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
+            prompt_token_limit,
             pending: Vec::new(),
             max_tokens_default: 256,
         }))
     }
+}
+
+/// The prompt limit when the embedder sets none: on NPU the `MAX_PROMPT_LEN` GenAI is
+/// given (else its default 1024), elsewhere the model's window from its config
+/// (top level or `text_config`); 0 (off) when the model records none.
+fn default_prompt_token_limit(device: &str, model_path: &str, props: &[(String, String)]) -> u32 {
+    // Same NPU test the CLI uses to decide MAX_PROMPT_LEN applies ("NPU", "NPU.0").
+    if device.trim().to_ascii_uppercase().starts_with("NPU") {
+        return props
+            .iter()
+            .find(|(k, _)| k == "MAX_PROMPT_LEN")
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(1024);
+    }
+    let cfg = std::fs::read_to_string(std::path::Path::new(model_path).join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let window = |v: &serde_json::Value| -> Option<u64> {
+        let positions = v.get("max_position_embeddings")?.as_u64()?;
+        // YaRN / linear / dynamic scaling extend the window past the stated positions;
+        // llama3 and longrope configs already state the scaled window.
+        let scaled = v.get("rope_scaling").and_then(|r| {
+            let kind = r.get("rope_type").or_else(|| r.get("type"))?.as_str()?;
+            if !matches!(kind, "yarn" | "linear" | "dynamic") {
+                return None;
+            }
+            let base = r
+                .get("original_max_position_embeddings")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(positions);
+            Some((base as f64 * r.get("factor")?.as_f64()?) as u64)
+        });
+        Some(positions.max(scaled.unwrap_or(0)))
+    };
+    cfg.as_ref()
+        .and_then(|c| window(c).or_else(|| window(c.get("text_config")?)))
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+/// The `PromptTooLong` message for a prompt over `limit` tokens; None when it fits or
+/// `limit` is 0.
+fn prompt_over_limit(prompt_tokens: u32, limit: u32) -> Option<String> {
+    (limit > 0 && prompt_tokens > limit)
+        .then(|| format!("prompt is {prompt_tokens} tokens but this model accepts at most {limit}"))
 }
 
 fn map_ov_err(err: OvError) -> EngineError {
@@ -359,6 +425,7 @@ pub struct OvGenaiEngine {
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
+    prompt_token_limit: u32,
     pending: Vec<GenerationTask>,
     max_tokens_default: u32,
 }
@@ -405,6 +472,15 @@ impl Engine for OvGenaiEngine {
                 queued: self.pending.len(),
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
+        }
+        if self.prompt_token_limit > 0 {
+            if let Some(n) = self.pipe.count_tokens(&task.prompt) {
+                if let Some(msg) = prompt_over_limit(n, self.prompt_token_limit) {
+                    warn!(task = %task.task_id, prompt_tokens = n,
+                          limit = self.prompt_token_limit, "ov-genai: refusing over-limit prompt");
+                    return Err(EngineError::PromptTooLong(msg));
+                }
+            }
         }
         self.pending.push(task);
         Ok(())
@@ -610,6 +686,7 @@ pub struct OvGenaiCbEngine {
     active: Vec<ActiveCbTask>,
     pipe: Box<dyn CbPipe>,
     prompt_pretemplated: bool,
+    prompt_token_limit: u32,
     next_request_id: u64,
     max_tokens_default: u32,
     /// Consecutive iterations in which the whole batch produced nothing.
@@ -705,6 +782,14 @@ impl Engine for OvGenaiCbEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        let prompt_tokens = self.pipe.count_tokens(&task.prompt);
+        if let Some(n) = prompt_tokens {
+            if let Some(msg) = prompt_over_limit(n, self.prompt_token_limit) {
+                warn!(task = %task.task_id, prompt_tokens = n,
+                      limit = self.prompt_token_limit, "ov-genai cb: refusing over-limit prompt");
+                return Err(EngineError::PromptTooLong(msg));
+            }
+        }
         let max_tokens = if task.max_tokens > 0 {
             task.max_tokens
         } else {
@@ -726,7 +811,7 @@ impl Engine for OvGenaiCbEngine {
             .add_request(request_id, &task.prompt, &cfg)
             .map_err(map_ov_err)?;
         self.active.push(ActiveCbTask {
-            prompt_tokens: self.pipe.count_tokens(&task.prompt),
+            prompt_tokens,
             task_id: task.task_id,
             handle,
             total_tokens: 0,
@@ -1040,6 +1125,8 @@ mod tests {
         /// Returned once a request's script runs out.
         default_read: Option<CbRead>,
         step_fails: bool,
+        /// What `count_tokens` reports; 7 when unset.
+        prompt_tokens: Option<u32>,
         steps: usize,
         added: Vec<u64>,
         cancelled: Vec<u64>,
@@ -1083,7 +1170,7 @@ mod tests {
             }
         }
         fn count_tokens(&self, _text: &str) -> Option<u32> {
-            Some(7)
+            Some(self.st.lock().unwrap().prompt_tokens.unwrap_or(7))
         }
     }
 
@@ -1125,6 +1212,7 @@ mod tests {
             active: Vec::new(),
             pipe: Box::new(MockPipe { st: st.clone() }),
             prompt_pretemplated: false,
+            prompt_token_limit: 0,
             next_request_id: 0,
             max_tokens_default: 256,
             idle_steps: 0,
@@ -1154,6 +1242,105 @@ mod tests {
         );
         // Nothing was admitted.
         assert!(e.active.is_empty());
+    }
+
+    #[test]
+    fn prompt_over_limit_rejects_only_past_the_limit() {
+        assert_eq!(prompt_over_limit(5000, 0), None, "0 means no limit");
+        assert_eq!(
+            prompt_over_limit(2048, 2048),
+            None,
+            "a prompt at the limit fits"
+        );
+        let msg = prompt_over_limit(2049, 2048).expect("one over is refused");
+        assert!(msg.contains("2049") && msg.contains("2048"), "{msg}");
+    }
+
+    /// Without an explicit limit the engine refuses past the window it serves: the NPU
+    /// prompt cap GenAI is given (else GenAI's default 1024), or the model's own window.
+    #[test]
+    fn default_prompt_limit_is_the_served_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().to_str().unwrap();
+        assert_eq!(
+            default_prompt_token_limit("CPU", model, &[]),
+            0,
+            "no config: off"
+        );
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"max_position_embeddings":2048}"#,
+        )
+        .unwrap();
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 2048);
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"text_config":{"max_position_embeddings":4096}}"#,
+        )
+        .unwrap();
+        assert_eq!(default_prompt_token_limit("GPU", model, &[]), 4096);
+        assert_eq!(default_prompt_token_limit("NPU", model, &[]), 1024);
+        let cap = [("MAX_PROMPT_LEN".to_string(), "2048".to_string())];
+        assert_eq!(default_prompt_token_limit("NPU", model, &cap), 2048);
+        // Any NPU spelling the CLI treats as NPU gets the NPU cap.
+        assert_eq!(default_prompt_token_limit("NPU.0", model, &[]), 1024);
+        assert_eq!(default_prompt_token_limit(" npu ", model, &cap), 2048);
+    }
+
+    /// YaRN / linear / dynamic rope scaling extends the window past the config's
+    /// `max_position_embeddings`; llama3 and longrope configs already state the scaled one.
+    #[test]
+    fn default_prompt_limit_follows_rope_scaling() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().to_str().unwrap();
+        let write = |json: &str| std::fs::write(dir.path().join("config.json"), json).unwrap();
+        write(
+            r#"{"max_position_embeddings":32768,"rope_scaling":{"type":"yarn","factor":4.0,
+                "original_max_position_embeddings":32768}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 131072);
+        write(
+            r#"{"max_position_embeddings":40960,"rope_scaling":{"rope_type":"yarn","factor":4.0}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 163840);
+        write(
+            r#"{"max_position_embeddings":131072,"rope_scaling":{"rope_type":"llama3","factor":8.0,
+                "original_max_position_embeddings":8192}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 131072);
+    }
+
+    /// Past the window ov-genai generates junk instead of failing, so the limit must be
+    /// enforced before the request reaches the pipeline.
+    #[test]
+    fn cb_submit_refuses_an_over_limit_prompt_before_admitting_it() {
+        let st = Arc::new(Mutex::new(MockState {
+            prompt_tokens: Some(3071),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.prompt_token_limit = 2048;
+        let err = e.submit(task("t1", 8)).expect_err("over-limit prompt");
+        assert!(matches!(err, EngineError::PromptTooLong(_)), "{err}");
+        assert!(e.active.is_empty());
+        assert!(
+            st.lock().unwrap().added.is_empty(),
+            "never handed to the pipeline"
+        );
+    }
+
+    #[test]
+    fn cb_submit_admits_a_prompt_at_the_limit() {
+        let st = Arc::new(Mutex::new(MockState {
+            prompt_tokens: Some(2048),
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.prompt_token_limit = 2048;
+        e.submit(task("t1", 8)).expect("fits");
+        assert_eq!(e.active.len(), 1);
+        assert_eq!(e.active[0].prompt_tokens, Some(2048));
     }
 
     /// The B1 fix: a step that progressed the batch without producing a token
