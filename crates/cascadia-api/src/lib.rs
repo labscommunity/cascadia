@@ -3773,6 +3773,67 @@ mod tests {
         }
     }
 
+    // Qwen3.x templates group consecutive tool results into one user turn with
+    // `loop.previtem` / `loop.nextitem`. Without minijinja's
+    // `adjacent_loop_items` feature both are undefined: a tool result followed
+    // by anything failed to render (HTTP 500), and the first tool result lost
+    // its `<|im_start|>user` header.
+    #[test]
+    fn tool_results_group_with_adjacent_loop_items() {
+        let env = build_chat_env(concat!(
+            "{%- for message in messages %}",
+            "{%- if message.role == 'tool' %}",
+            "{%- if loop.previtem and loop.previtem.role != 'tool' %}{{- '<|im_start|>user' }}{%- endif %}",
+            "{{- '\\n<tool_response>' + message.content + '</tool_response>' }}",
+            "{%- if not loop.last and loop.nextitem.role != 'tool' %}{{- '<|im_end|>\\n' }}",
+            "{%- elif loop.last %}{{- '<|im_end|>\\n' }}{%- endif %}",
+            "{%- else %}{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}",
+            "{%- endif %}{%- endfor %}",
+        ))
+        .unwrap();
+        let render = |msgs: &[ChatMessage]| {
+            render_with_chat_env(&env, msgs, "", "", false, None, None).unwrap()
+        };
+
+        // A tool result followed by a user turn.
+        let out = render(&[
+            msg("user", "q"),
+            msg("assistant", ""),
+            msg("tool", "r1"),
+            msg("user", "next"),
+        ]);
+        assert!(
+            out.contains("<|im_start|>user\n<tool_response>r1</tool_response><|im_end|>\n<|im_start|>user\nnext"),
+            "{out}"
+        );
+
+        // Two tool results in a row share one user turn.
+        let out = render(&[
+            msg("user", "q"),
+            msg("assistant", ""),
+            msg("tool", "r1"),
+            msg("tool", "r2"),
+        ]);
+        assert!(
+            out.ends_with("<|im_start|>user\n<tool_response>r1</tool_response>\n<tool_response>r2</tool_response><|im_end|>\n"),
+            "{out}"
+        );
+
+        // Two tool rounds.
+        let out = render(&[
+            msg("user", "q"),
+            msg("assistant", ""),
+            msg("tool", "r1"),
+            msg("assistant", ""),
+            msg("tool", "r2"),
+        ]);
+        assert_eq!(
+            out.matches("<|im_start|>user\n<tool_response>").count(),
+            2,
+            "{out}"
+        );
+    }
+
     // Proves the dsv4 chat fix at the render boundary: WITHOUT a template the
     // API degenerates an instruct model into a "role: content" join; WITH the
     // R1 template it emits the <｜User｜>/<｜Assistant｜> markers the model was
