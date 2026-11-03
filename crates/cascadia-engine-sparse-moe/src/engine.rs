@@ -69,7 +69,8 @@ pub struct SparseMoEBuilderConfig {
     // Deliberately absent: `profile`. `CASCADIA_GLM5_PROFILE` is read from a
     // `OnceLock` process global in the decode loop, which no config can reach;
     // it stays env-only rather than becoming a field that silently does nothing.
-    /// Context budget. `None` → `CASCADIA_GLM5_MAX_SEQ`, else [`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`].
+    /// Context budget for the staged arches (glm5, dsv4, inkling). `None` → that arch's
+    /// `CASCADIA_<ARCH>_MAX_SEQ`, else its default ([`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`] for glm5).
     pub max_seq: Option<usize>,
     /// KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE` (0 = off).
     pub prefix_cache_depth: Option<u32>,
@@ -8270,6 +8271,24 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 cap: OV_MAX_PENDING,
             });
         }
+        // Refuse here, synchronously with the request, rather than let prefill
+        // drop the prompt's tail and answer from its head with a normal finish.
+        // Counted the way admission encodes it (special tokens included).
+        if let Some(tok) = self.tokenizer.as_ref() {
+            let n = tok
+                .encode(task.prompt.as_str(), true)
+                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
+                .get_ids()
+                .len();
+            let max_seq = self.runner.max_seq();
+            if n > max_seq {
+                warn!(task = %task.task_id, prompt_tokens = n, context_budget = max_seq,
+                      "refusing over-budget prompt");
+                return Err(EngineError::PromptTooLong(format!(
+                    "prompt is {n} tokens but this model's context budget is {max_seq}"
+                )));
+            }
+        }
         self.pending.push_back(task);
         self.note_link_busy();
         Ok(())
@@ -8533,6 +8552,45 @@ mod tests {
             reason.starts_with("resume_unsupported:"),
             "sentinel must PREFIX the reason (callers match with starts_with): {reason}"
         );
+    }
+
+    /// A prompt over the runner's context budget is refused at submit, where the
+    /// caller can still be told (PromptTooLong is a 4xx before any stream), instead
+    /// of being truncated during prefill and answered from its head. A prompt that
+    /// exactly fills the budget (StubRunner: 32) is accepted.
+    #[test]
+    fn pipeline_engine_refuses_over_budget_prompt_at_submit() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let tok = Tokenizer::from_bytes(
+            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
+                "decoder":null,"model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+        )
+        .expect("build tiny tokenizer");
+        let mut eng = PipelineEngine::new(
+            StubRunner,
+            Some(tok),
+            StageTransport {
+                upstream: None,
+                downstream: None,
+            },
+            rt.handle().clone(),
+            0,
+            1,
+            None,
+        );
+        let words = |n: usize| vec!["hi"; n].join(" ");
+        eng.submit(GenerationTask::new("fits", words(32)))
+            .expect("a prompt that exactly fills max_seq is accepted");
+        match eng.submit(GenerationTask::new("over", words(33))) {
+            Err(EngineError::PromptTooLong(msg)) => {
+                assert!(msg.contains("33") && msg.contains("32"), "{msg}")
+            }
+            other => panic!("expected PromptTooLong, got {other:?}"),
+        }
+        assert_eq!(eng.pending.len(), 1, "a refused prompt is never queued");
     }
 
     #[test]
