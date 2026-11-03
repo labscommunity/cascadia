@@ -560,17 +560,20 @@ impl Builder for SparseMoEBuilder {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
             // Context budget sizes the rope table + KV/compressed/indexer
-            // caches (memory scales with it). Overridable for long-context
-            // deployments via CASCADIA_DSV4_MAX_SEQ; fall back to the default on
-            // a missing, unparseable, or zero value.
-            let max_seq = env_max_seq(
-                "CASCADIA_DSV4_MAX_SEQ",
-                crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
-            );
+            // caches (memory scales with it). A non-zero config `max_seq` wins,
+            // as for glm5 and inkling, so the embedder's value is the one served;
+            // else CASCADIA_DSV4_MAX_SEQ, else the default on a missing,
+            // unparseable, or zero value.
+            let max_seq = self.config.max_seq.filter(|&n| n > 0).unwrap_or_else(|| {
+                env_max_seq(
+                    "CASCADIA_DSV4_MAX_SEQ",
+                    crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
+                )
+            });
             if max_seq > 131072 {
                 warn!(
                     max_seq,
-                    "CASCADIA_DSV4_MAX_SEQ is large; per-layer caches scale with it"
+                    "dsv4 context budget is large; per-layer caches scale with it"
                 );
             }
             let runner = crate::dsv4::stage::Dsv4Runner::load_staged(
