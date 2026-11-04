@@ -7165,8 +7165,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // is the first generated token). take() keeps the HEAD, so truncation
         // drops the tail — i.e. the newest turn. Never do this silently: a
         // caller whose prompt overflowed the budget is served an answer to a
-        // prompt it did not send, so log loudly with the numbers. (A future
-        // improvement is a budget-aware trim or an explicit 4xx over budget.)
+        // prompt it did not send, so log loudly with the numbers. `PipelineEngine`
+        // refuses an over-budget prompt at submit, so this guards other callers.
         let n_prefill = n_prompt.min(max_seq);
         if n_prompt > max_seq {
             warn!(
