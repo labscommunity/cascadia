@@ -10,6 +10,7 @@
 //! `openvino` crate (Core/CompiledModel/InferRequest) and the
 //! distributed spec-decode protocol; tracked separately.
 
+mod decision;
 pub mod dist_spec;
 pub mod gemma4;
 pub mod genai;
@@ -17,6 +18,7 @@ pub mod genai;
 pub mod kv_coordination;
 pub mod packed;
 mod packed_exec;
+mod pass_timing;
 pub mod prefix_cache;
 pub mod qwen36;
 pub mod rotary;

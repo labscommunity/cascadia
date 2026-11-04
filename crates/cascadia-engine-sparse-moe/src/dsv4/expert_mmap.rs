@@ -379,8 +379,8 @@ impl MmapExpert {
         let row_bytes = in_dim / 2;
         // Each output row is an independent fused dequant+dot: the int4 nibbles
         // are unpacked straight into the FMA against x (no f32 scratch row, no
-        // scalar unpack), rayon across rows. Same value as dequant-then-dot,
-        // modulo f32 summation order (see `dequant_row_dot`).
+        // scalar unpack), rayon across rows. Bit-identical to dequant-then-
+        // `math::dot` (the eager experts' path; see `dequant_row_dot`).
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("fma")
@@ -575,9 +575,8 @@ fn dequant_row_dot(packed_row: &[u8], scales_row: &[u8], x: &[f32], in_dim: usiz
 
 /// AVX-512 fused dequant+dot — the AVX2 strategy at 512-bit: per 32-col group,
 /// decode 16 packed bytes to 32 int8, interleave to column order, sign-extend to
-/// 2×16-wide f32, scale, and FMA against x into one 16-wide accumulator. Same
-/// value as the scalar/AVX2 paths within f32 lane-order ULP (the caller rounds
-/// to bf16).
+/// 2×16-wide f32, scale, and FMA against x into two 16-wide accumulators that
+/// reduce in `math::dot_avx2`'s order (the caller rounds to bf16).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn dequant_row_dot_avx512(
@@ -590,7 +589,10 @@ unsafe fn dequant_row_dot_avx512(
     let ng = in_dim / G;
     let lo_mask = _mm_set1_epi8(0x0F);
     let bias = _mm_set1_epi8(8);
-    let mut acc = _mm512_setzero_ps();
+    // Two 16-wide sums: `lo` holds `math::dot_avx2`'s acc0|acc1 (cols 0..15 of
+    // each group), `hi` its acc2|acc3 (cols 16..31), so the reduction below is
+    // that dot's, and the mmap path is bit-identical to the eager one.
+    let (mut lo, mut hi) = (_mm512_setzero_ps(), _mm512_setzero_ps());
     let xp = x.as_ptr();
     for g in 0..ng {
         let s = half::bf16::from_le_bytes([scales_row[g * 2], scales_row[g * 2 + 1]]).to_f32();
@@ -608,10 +610,14 @@ unsafe fn dequant_row_dot_avx512(
         let base = g * G;
         let x0 = _mm512_loadu_ps(xp.add(base));
         let x1 = _mm512_loadu_ps(xp.add(base + 16));
-        acc = _mm512_fmadd_ps(_mm512_mul_ps(c0, sv), x0, acc);
-        acc = _mm512_fmadd_ps(_mm512_mul_ps(c1, sv), x1, acc);
+        lo = _mm512_fmadd_ps(_mm512_mul_ps(c0, sv), x0, lo);
+        hi = _mm512_fmadd_ps(_mm512_mul_ps(c1, sv), x1, hi);
     }
-    _mm512_reduce_add_ps(acc)
+    let half = |v: __m512| {
+        let top = _mm256_castpd_ps(_mm512_extractf64x4_pd::<1>(_mm512_castps_pd(v)));
+        _mm256_add_ps(_mm512_castps512_ps256(v), top)
+    };
+    hsum_avx2(_mm256_add_ps(half(lo), half(hi)))
 }
 
 /// Scalar reference for `dequant_row_dot` (non-x86 / no-AVX2). Same nibble decode
@@ -648,7 +654,9 @@ unsafe fn dequant_row_dot_avx2(
     let ng = in_dim / G;
     let lo_mask = _mm_set1_epi8(0x0F);
     let bias = _mm_set1_epi8(8);
-    let mut acc = _mm256_setzero_ps();
+    // One sum per 8-col slice, combined as (a0+a1)+(a2+a3): `math::dot_avx2`'s
+    // order, so the mmap path is bit-identical to the eager one.
+    let mut acc = [_mm256_setzero_ps(); 4];
     let xp = x.as_ptr();
     for g in 0..ng {
         // NB: `use core::arch::x86_64::*` brings an intrinsic `bf16` into scope,
@@ -672,20 +680,32 @@ unsafe fn dequant_row_dot_avx2(
         let x1 = _mm256_loadu_ps(xp.add(base + 8));
         let x2 = _mm256_loadu_ps(xp.add(base + 16));
         let x3 = _mm256_loadu_ps(xp.add(base + 24));
-        acc = _mm256_fmadd_ps(_mm256_mul_ps(c0, sv), x0, acc);
-        acc = _mm256_fmadd_ps(_mm256_mul_ps(c1, sv), x1, acc);
-        acc = _mm256_fmadd_ps(_mm256_mul_ps(c2, sv), x2, acc);
-        acc = _mm256_fmadd_ps(_mm256_mul_ps(c3, sv), x3, acc);
+        acc[0] = _mm256_fmadd_ps(_mm256_mul_ps(c0, sv), x0, acc[0]);
+        acc[1] = _mm256_fmadd_ps(_mm256_mul_ps(c1, sv), x1, acc[1]);
+        acc[2] = _mm256_fmadd_ps(_mm256_mul_ps(c2, sv), x2, acc[2]);
+        acc[3] = _mm256_fmadd_ps(_mm256_mul_ps(c3, sv), x3, acc[3]);
     }
-    // horizontal sum of the 8 lanes
-    let lo128 = _mm256_castps256_ps128(acc);
-    let hi128 = _mm256_extractf128_ps::<1>(acc);
-    let s128 = _mm_add_ps(lo128, hi128);
+    hsum_avx2(fold4(acc))
+}
+
+/// `(a0+a1)+(a2+a3)`, the accumulator fold of `math::dot_avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fold4(a: [core::arch::x86_64::__m256; 4]) -> core::arch::x86_64::__m256 {
+    use core::arch::x86_64::*;
+    _mm256_add_ps(_mm256_add_ps(a[0], a[1]), _mm256_add_ps(a[2], a[3]))
+}
+
+/// Horizontal sum of 8 lanes in `math::dot_avx2`'s order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hsum_avx2(acc: core::arch::x86_64::__m256) -> f32 {
+    use core::arch::x86_64::*;
+    let s128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps::<1>(acc));
     let shuf = _mm_movehdup_ps(s128);
     let sums = _mm_add_ps(s128, shuf);
     let shuf2 = _mm_movehl_ps(shuf, sums);
-    let sums2 = _mm_add_ss(sums, shuf2);
-    _mm_cvtss_f32(sums2)
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
 }
 
 #[cfg(test)]
@@ -729,6 +749,55 @@ mod tests {
         let got = dequant_row_dot(&packed, &scales, &x, in_dim) as f64;
         let rel = (got - refv).abs() / refv.abs().max(1e-6);
         assert!(rel < 1e-4, "fused={got} ref={refv} rel={rel}");
+    }
+
+    /// The fused kernel must equal dequant-then-`math::dot` BIT for bit: that
+    /// is what eager Inkling/GLM experts compute, and `--experts eager` vs
+    /// `mmap` are documented as value-identical. A different f32 summation
+    /// order (an AVX2 one-accumulator chain did this) flips bf16 roundings on
+    /// AVX2-only CPUs. Covers every kernel this CPU can run.
+    #[test]
+    fn fused_dequant_dot_is_bit_identical_to_dequant_then_dot() {
+        let in_dim = 1024usize;
+        let ng = in_dim / G;
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..64 {
+            let packed: Vec<u8> = (0..in_dim / 2).map(|_| next() as u8).collect();
+            let scales: Vec<u8> = (0..ng)
+                .flat_map(|_| {
+                    half::bf16::from_f32(((next() % 1000) as f32 + 1.0) * 1e-4).to_le_bytes()
+                })
+                .collect();
+            let x: Vec<f32> = (0..in_dim)
+                .map(|_| ((next() % 20001) as f32 - 10000.0) * 1e-4)
+                .collect();
+            let mut w = vec![0f32; in_dim];
+            for g in 0..ng {
+                let s = half::bf16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]).to_f32();
+                for i in 0..G / 2 {
+                    let byte = packed[g * (G / 2) + i];
+                    w[g * G + 2 * i] = ((byte & 0x0F) as i32 - 8) as f32 * s;
+                    w[g * G + 2 * i + 1] = ((byte >> 4) as i32 - 8) as f32 * s;
+                }
+            }
+            let want = crate::dsv4::math::dot(&w, &x).to_bits();
+            assert_eq!(
+                dequant_row_dot(&packed, &scales, &x, in_dim).to_bits(),
+                want
+            );
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: avx2+fma detected; slices are in_dim/2, in_dim/G*2, in_dim long.
+                let avx2 = unsafe { super::dequant_row_dot_avx2(&packed, &scales, &x, in_dim) };
+                assert_eq!(avx2.to_bits(), want, "AVX2 kernel");
+            }
+        }
     }
 
     use super::MmapExpert;
@@ -849,7 +918,7 @@ unsafe fn dequant_rows_avx2<const ROWS: usize>(
     let ng = n / G;
     let mask = _mm_set1_epi8(15);
     let bias = _mm_set1_epi8(8);
-    let mut acc = [_mm256_setzero_ps(); ROWS];
+    let mut acc = [[_mm256_setzero_ps(); 4]; ROWS];
     for g in 0..ng {
         let xp = x.as_ptr().add(g * G);
         let x0 = _mm256_loadu_ps(xp);
@@ -869,18 +938,14 @@ unsafe fn dequant_rows_avx2<const ROWS: usize>(
             let c1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(il)));
             let c2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ih));
             let c3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(ih)));
-            *a = _mm256_fmadd_ps(_mm256_mul_ps(c0, sv), x0, *a);
-            *a = _mm256_fmadd_ps(_mm256_mul_ps(c1, sv), x1, *a);
-            *a = _mm256_fmadd_ps(_mm256_mul_ps(c2, sv), x2, *a);
-            *a = _mm256_fmadd_ps(_mm256_mul_ps(c3, sv), x3, *a);
+            a[0] = _mm256_fmadd_ps(_mm256_mul_ps(c0, sv), x0, a[0]);
+            a[1] = _mm256_fmadd_ps(_mm256_mul_ps(c1, sv), x1, a[1]);
+            a[2] = _mm256_fmadd_ps(_mm256_mul_ps(c2, sv), x2, a[2]);
+            a[3] = _mm256_fmadd_ps(_mm256_mul_ps(c3, sv), x3, a[3]);
         }
     }
     for (a, value) in acc.into_iter().zip(y) {
-        let s = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps::<1>(a));
-        let shuf = _mm_movehdup_ps(s);
-        let sums = _mm_add_ps(s, shuf);
-        let shuf2 = _mm_movehl_ps(shuf, sums);
-        *value = to_bf16(_mm_cvtss_f32(_mm_add_ss(sums, shuf2)));
+        *value = to_bf16(hsum_avx2(fold4(a)));
     }
 }
 

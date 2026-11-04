@@ -22,9 +22,9 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    register_gauge_vec, register_histogram, register_histogram_vec, register_int_counter_vec,
-    register_int_gauge, Encoder, GaugeVec, Histogram, HistogramVec, IntCounterVec, IntGauge,
-    TextEncoder,
+    register_gauge_vec, register_histogram, register_histogram_vec, register_int_counter,
+    register_int_counter_vec, register_int_gauge, Encoder, GaugeVec, Histogram, HistogramVec,
+    IntCounter, IntCounterVec, IntGauge, TextEncoder,
 };
 
 /// TTFT buckets: sub-100 ms warm-path decode up to cold multi-stage
@@ -246,6 +246,26 @@ pub static ENGINE_WARMUP_DURATION_SECONDS: LazyLock<GaugeVec> = LazyLock::new(||
     .expect("register cascadia_engine_warmup_duration_seconds")
 });
 
+/// Stage recompiles that succeeded (qwen36 fault recovery). Each one leaks the
+/// faulted copy, so this counts leaked stage copies too.
+pub static ENGINE_STAGE_RECOMPILES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "cascadia_engine_stage_recompiles_total",
+        "Stage recompiles that succeeded after a faulted infer request."
+    )
+    .expect("register cascadia_engine_stage_recompiles_total")
+});
+
+/// Weight bytes held by stage copies that fault recovery leaked on purpose
+/// (never dropped: their destructor can hang). Drops back only on a restart.
+pub static ENGINE_LEAKED_STAGE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "cascadia_engine_leaked_stage_bytes",
+        "Weight bytes of stage copies leaked by fault recovery."
+    )
+    .expect("register cascadia_engine_leaked_stage_bytes")
+});
+
 // --- Transport-level (bumped by cascadia-transport) ----------------------
 
 /// Bytes sent on the inter-stage activation links (tensor frames + raw
@@ -326,6 +346,8 @@ pub fn init() {
     LazyLock::force(&TASKS_FAILED_TOTAL);
     LazyLock::force(&ENGINE_LOAD_DURATION_SECONDS);
     LazyLock::force(&ENGINE_WARMUP_DURATION_SECONDS);
+    LazyLock::force(&ENGINE_STAGE_RECOMPILES_TOTAL);
+    LazyLock::force(&ENGINE_LEAKED_STAGE_BYTES);
     LazyLock::force(&TRANSPORT_SENT_BYTES_TOTAL);
     LazyLock::force(&TRANSPORT_RECV_BYTES_TOTAL);
 }
@@ -357,6 +379,23 @@ mod tests {
         assert!(text.contains("cascadia_inflight_tasks"), "got:\n{text}");
         assert!(
             text.contains("cascadia_transport_send_seconds"),
+            "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn engine_recovery_metrics_are_registered_and_exposed() {
+        init();
+        ENGINE_STAGE_RECOMPILES_TOTAL.inc();
+        ENGINE_LEAKED_STAGE_BYTES.add(1);
+        let (_, body) = encode_text();
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            text.contains("# TYPE cascadia_engine_stage_recompiles_total counter"),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("# TYPE cascadia_engine_leaked_stage_bytes gauge"),
             "got:\n{text}"
         );
     }

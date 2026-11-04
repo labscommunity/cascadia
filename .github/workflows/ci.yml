@@ -189,6 +189,34 @@ jobs:
           cargo check --workspace --all-targets
           --features cascadia-engine-openvino/kv_coord,cascadia-engine-sparse-moe/kv_coord
 
+  python-tools:
+    # tools/tests (exporters, decision parity tools) ran by hand only, so a
+    # break in an exporter or a parity gate reached main unseen. Only the
+    # light deps are installed: every test that needs torch, openvino,
+    # transformers or real model weights skips itself (pytest.importorskip /
+    # env checks), and the rest run in seconds. Pins are exact for a
+    # reproducible run; bump them by hand.
+    name: python tools tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: python -m pip install "pytest==9.0.2" "numpy==2.4.3" "safetensors==0.8.0"
+
+      - name: Test (tools/tests)
+        # -rs lists every skip with its reason, so a test that silently
+        # stopped running shows up in the log.
+        run: python -m pytest tools/tests -q -rs
+
   # Pre-flight the Linux release compile: the openvino C++ shim (gemv_offload.cpp)
   # is only built with --features openvino on ubuntu-22.04 + g++-12 + OV SDK.
   # ci's stub build never touches it, so GCC errors like v0.1.3/v0.1.4

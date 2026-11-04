@@ -7,10 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "cascadia binary — distributed LLM inference for Intel hardware."
+build = "build.rs"
 
 [features]
 default = []
-openvino = ["cascadia-cli/openvino"]
+# The direct shim dependency is only for its `links` metadata: build.rs
+# embeds the OpenVINO lib dirs as LC_RPATH on macOS.
+openvino = ["cascadia-cli/openvino", "dep:cascadia-ov-genai-shim"]
 # Issue-34 Option C: KV-coordination surface (holder + multi-stage capture/RESTORE + total>1 cache).
 kv_coord = ["cascadia-cli/kv_coord"]
 dashboard-embed = ["cascadia-cli/dashboard-embed"]
@@ -21,6 +24,11 @@ path = "src/main.rs"
 
 [dependencies]
 cascadia-cli = { workspace = true }
+cascadia-ov-genai-shim = { workspace = true, optional = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+
+# The shim dependency is read for its `links` metadata only (see build.rs), never from code.
+[package.metadata.cargo-machete]
+ignored = ["cascadia-ov-genai-shim"]

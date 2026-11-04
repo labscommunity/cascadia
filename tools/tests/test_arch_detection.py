@@ -381,7 +381,7 @@ def test_traced_rotary_partial_inv_freq_width_and_denominator():
     with the ROTARY dim as the denominator — matching transformers Phi/Phi3.
     Guards against the head_dim-denominator bug (which matched cos/sin VALUES
     but, applied with full-head rotate_half, corrupted ~every dim)."""
-    import torch
+    torch = pytest.importorskip("torch")
 
     head_dim, prf, theta = 96, 0.75, 10_000.0
     rotary = export_shards.TracedRotaryEmbedding(
@@ -414,7 +414,7 @@ def test_partial_rotary_APPLIED_matches_hf_phi3(head_dim, prf):
     compare the RESULT (not just cos/sin) to HF's apply_rotary_pos_emb. The
     earlier cos/sin-only comparison passed while the applied rotation was wrong
     on ~88% of dims."""
-    import torch
+    torch = pytest.importorskip("torch")
 
     try:
         from transformers import Phi3Config
@@ -455,7 +455,7 @@ def test_partial_rotary_passes_through_contiguous_tail():
     """Without transformers: apply_rotary rotates the leading rotary_dim slice
     and leaves the CONTIGUOUS tail [rotary_dim:] untouched (HF layout) — not
     the split-across-both-halves layout the buggy zero-pad version produced."""
-    import torch
+    torch = pytest.importorskip("torch")
 
     head_dim, prf = 64, 0.5
     rotary_dim = int(prf * head_dim)  # 32
@@ -478,7 +478,7 @@ def test_partial_rotary_passes_through_contiguous_tail():
 
 
 def test_traced_rotary_full_rotary_unchanged_default():
-    import torch
+    torch = pytest.importorskip("torch")
 
     head_dim = 128
     rope_theta = 500_000.0
