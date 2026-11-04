@@ -8560,10 +8560,6 @@ mod tests {
         );
     }
 
-    /// A prompt over the runner's context budget is refused at submit, where the
-    /// caller can still be told (PromptTooLong is a 4xx before any stream), instead
-    /// of being truncated during prefill and answered from its head. A prompt that
-    /// exactly fills the budget (StubRunner: 32) is accepted.
     #[test]
     fn staged_max_seq_prefers_a_nonzero_config_value() {
         // An env var no test sets, so the fallback is the default.
@@ -8577,6 +8573,10 @@ mod tests {
         assert_eq!(super::staged_max_seq(None, var, 4096), 4096);
     }
 
+    /// A prompt over the runner's context budget is refused at submit, where the
+    /// caller can still be told (PromptTooLong is a 4xx before any stream), instead
+    /// of being truncated during prefill and answered from its head. A prompt that
+    /// exactly fills the budget (StubRunner: 32) is accepted.
     #[test]
     fn pipeline_engine_refuses_over_budget_prompt_at_submit() {
         let rt = tokio::runtime::Builder::new_current_thread()
