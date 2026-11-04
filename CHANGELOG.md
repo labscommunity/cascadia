@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.7](https://github.com/labscommunity/cascadia/compare/v0.2.6...v0.2.7) (2026-11-04)
+
+
+### Features
+
+* **api:** stream content while tools are present ([e01f12d](https://github.com/labscommunity/cascadia/commit/e01f12d31395abac92055997a5e016cc7c3d91e6))
+* **engine:** sycl-llama engine — run GGUF on Intel GPUs, --elastic streams weights (27B in 3.2 GiB VRAM) ([fcffb92](https://github.com/labscommunity/cascadia/commit/fcffb926e95a910616972f4228136770b6e13185))
+* **qwen35:** build OpenVINO VLM IRs from GPTQ-Int4 checkpoints (Qwen3.5-397B-A17B) ([0f6aa21](https://github.com/labscommunity/cascadia/commit/0f6aa21c3767a6417b91ec56820431edbc34b19a))
+
+
+### Bug Fixes
+
+* **api:** enable minijinja adjacent_loop_items for chat templates ([5c6a681](https://github.com/labscommunity/cascadia/commit/5c6a68150251725edfde8617974ec8ddbd967ade))
+* **api:** enable minijinja adjacent_loop_items for chat templates ([e544494](https://github.com/labscommunity/cascadia/commit/e544494748c4fb4f8eab5752de975c057230414c))
+
+
+### Documentation
+
+* **perf:** B70 placement study — streaming vs host-in-place (0003) vs driver oversubscription ([75c5008](https://github.com/labscommunity/cascadia/commit/75c5008889e494a08837575ee5a951b6f131dabb))
+* **readme:** drop alpha status badge and note ([36b03a7](https://github.com/labscommunity/cascadia/commit/36b03a7e417fcd7e44596d22b271ba258ee4c484))
+* **readme:** drop alpha status badge and note ([cd3b022](https://github.com/labscommunity/cascadia/commit/cd3b02239343f299d200cc1c5e0daa41ae661493))
+
 ## [0.2.6](https://github.com/labscommunity/cascadia/compare/v0.2.5...v0.2.6) (2026-10-26)
 
 
