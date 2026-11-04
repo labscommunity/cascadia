@@ -410,6 +410,22 @@ fn prompt_over_limit(prompt_tokens: u32, limit: u32) -> Option<String> {
         .then(|| format!("prompt is {prompt_tokens} tokens but this model accepts at most {limit}"))
 }
 
+/// The submit-time refusal both ov-genai engines share. No count (no tokenizer)
+/// passes, as before the limit existed.
+fn refuse_over_limit(
+    task_id: &impl std::fmt::Display,
+    prompt_tokens: Option<u32>,
+    limit: u32,
+) -> EngineResult<()> {
+    match prompt_tokens.and_then(|n| prompt_over_limit(n, limit).map(|msg| (n, msg))) {
+        Some((n, msg)) => {
+            warn!(task = %task_id, prompt_tokens = n, limit, "ov-genai: refusing over-limit prompt");
+            Err(EngineError::PromptTooLong(msg))
+        }
+        None => Ok(()),
+    }
+}
+
 fn map_ov_err(err: OvError) -> EngineError {
     match err {
         OvError::Stub => {
@@ -474,13 +490,8 @@ impl Engine for OvGenaiEngine {
             });
         }
         if self.prompt_token_limit > 0 {
-            if let Some(n) = self.pipe.count_tokens(&task.prompt) {
-                if let Some(msg) = prompt_over_limit(n, self.prompt_token_limit) {
-                    warn!(task = %task.task_id, prompt_tokens = n,
-                          limit = self.prompt_token_limit, "ov-genai: refusing over-limit prompt");
-                    return Err(EngineError::PromptTooLong(msg));
-                }
-            }
+            let n = self.pipe.count_tokens(&task.prompt);
+            refuse_over_limit(&task.task_id, n, self.prompt_token_limit)?;
         }
         self.pending.push(task);
         Ok(())
@@ -783,13 +794,7 @@ impl Engine for OvGenaiCbEngine {
             });
         }
         let prompt_tokens = self.pipe.count_tokens(&task.prompt);
-        if let Some(n) = prompt_tokens {
-            if let Some(msg) = prompt_over_limit(n, self.prompt_token_limit) {
-                warn!(task = %task.task_id, prompt_tokens = n,
-                      limit = self.prompt_token_limit, "ov-genai cb: refusing over-limit prompt");
-                return Err(EngineError::PromptTooLong(msg));
-            }
-        }
+        refuse_over_limit(&task.task_id, prompt_tokens, self.prompt_token_limit)?;
         let max_tokens = if task.max_tokens > 0 {
             task.max_tokens
         } else {
@@ -1242,6 +1247,27 @@ mod tests {
         );
         // Nothing was admitted.
         assert!(e.active.is_empty());
+    }
+
+    #[test]
+    fn refuse_over_limit_refuses_only_a_counted_prompt_past_the_limit() {
+        let id = "t1";
+        assert!(matches!(
+            refuse_over_limit(&id, Some(2049), 2048),
+            Err(EngineError::PromptTooLong(_))
+        ));
+        assert!(
+            refuse_over_limit(&id, Some(2048), 2048).is_ok(),
+            "at the limit fits"
+        );
+        assert!(
+            refuse_over_limit(&id, None, 2048).is_ok(),
+            "no count passes"
+        );
+        assert!(
+            refuse_over_limit(&id, Some(9999), 0).is_ok(),
+            "0 means no limit"
+        );
     }
 
     #[test]
