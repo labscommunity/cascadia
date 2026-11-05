@@ -2127,7 +2127,13 @@ impl Builder for OvDistSpecBuilder {
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
             target,
             draft: masked_draft,
-            prompt_window: crate::pipeline_model_window(&self.pipeline_dir),
+            // The tail returns f16 logits per prompt token, far wider than the hidden frame out.
+            prompt_window: crate::forwarded_prompt_window(
+                crate::pipeline_model_window(&self.pipeline_dir),
+                crate::pipeline_config_value(&self.pipeline_dir, "vocab_size").unwrap_or(0)
+                    as usize
+                    * 2,
+            ),
             tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             k: self.k as usize,
