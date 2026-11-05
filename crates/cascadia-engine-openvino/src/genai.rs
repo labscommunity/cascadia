@@ -405,7 +405,7 @@ fn default_prompt_token_limit(device: &str, model_path: &str, props: &[(String, 
 
 /// The `PromptTooLong` message for a prompt over `limit` tokens; None when it fits or
 /// `limit` is 0.
-fn prompt_over_limit(prompt_tokens: u32, limit: u32) -> Option<String> {
+pub(crate) fn prompt_over_limit(prompt_tokens: u32, limit: u32) -> Option<String> {
     (limit > 0 && prompt_tokens > limit)
         .then(|| format!("prompt is {prompt_tokens} tokens but this model accepts at most {limit}"))
 }

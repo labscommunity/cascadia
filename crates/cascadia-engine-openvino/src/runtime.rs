@@ -1450,6 +1450,8 @@ pub struct OvRuntimeEngine {
     rotary: Rotary,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// The model's window, which `submit` refuses a longer prompt against on a stateful export.
+    prompt_window: Option<u32>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -3859,6 +3861,13 @@ impl Engine for OvRuntimeEngine {
                 return Err(EngineError::PromptTooLong(msg));
             }
         }
+        if window.is_none() {
+            crate::refuse_over_model_window(
+                self.tokenizer.as_deref(),
+                &task.prompt,
+                self.prompt_window,
+            )?;
+        }
         self.pending.push(task);
         Ok(())
     }
@@ -5401,6 +5410,7 @@ impl Builder for OvRuntimeBuilder {
         };
 
         Ok(Box::new(OvRuntimeEngine {
+            prompt_window: crate::pipeline_model_window(&self.pipeline_dir),
             packed,
             spec,
             runtime,

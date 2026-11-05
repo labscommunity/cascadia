@@ -521,6 +521,8 @@ pub struct Gemma4Engine {
     num_stages: u32,
     runtime: OvRuntime,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// The model's window, which `submit` refuses a longer prompt against.
+    prompt_window: Option<u32>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -1514,6 +1516,11 @@ impl Engine for Gemma4Engine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        crate::refuse_over_model_window(
+            self.tokenizer.as_deref(),
+            &task.prompt,
+            self.prompt_window,
+        )?;
         self.pending.push(task);
         Ok(())
     }
@@ -2313,6 +2320,7 @@ impl Builder for Gemma4Builder {
             num_kv_shared_layers: self.num_kv_shared_layers,
             num_stages: self.total,
             runtime,
+            prompt_window: crate::pipeline_model_window(&self.pipeline_dir),
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             upstream: self.upstream,
