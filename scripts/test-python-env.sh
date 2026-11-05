@@ -15,7 +15,7 @@ set -uo pipefail
 BIN="${1:?usage: $0 <path to the cascadia binary>}"
 case "$BIN" in /*|[A-Za-z]:*) ;; *) BIN="$PWD/$BIN" ;; esac
 MODEL="hf-internal-testing/tiny-random-LlamaForCausalLM"
-CHECKS="no-prompt-outside-terminal doctor-only-looks terminal-prompt setup-from-nothing second-run-installs-nothing int4-means-int4 export-through-private skip-check caller-python-vars-ignored activated-venv-wins broken-venv-falls-through python-flag-wins path-python-used-unasked off-pin-path-python killed-setup-recovers damaged-env-rebuilds reuses-system-uv-python-packages system-python-unchanged changed-package-restored moe-exporters-reachable old-env-removed remove-deletes-everything"
+CHECKS="no-prompt-outside-terminal doctor-only-looks terminal-prompt setup-from-nothing second-run-installs-nothing int4-means-int4 export-through-private skip-check caller-python-vars-ignored activated-venv-wins broken-venv-falls-through python-flag-wins path-python-used-unasked off-pin-path-python killed-setup-recovers orphaned-install-recovers damaged-env-rebuilds reuses-system-uv-python-packages system-python-unchanged changed-package-restored moe-exporters-reachable old-env-removed old-downloads-removed home-folder-untouched remove-deletes-everything"
 
 if [ "${DRY_RUN:-0}" = 1 ]; then
     for c in $CHECKS; do echo "would run: $c"; done
@@ -23,7 +23,9 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
 fi
 
 WORK="${WORK:-$(mktemp -d)}"
-mkdir -p "$WORK/empty"
+mkdir -p "$WORK/empty" "$WORK/user-home"
+# Anything written to the home folder lands here, for home-folder-untouched to find.
+export HOME="$WORK/user-home" USERPROFILE="$WORK/user-home"
 ROOT="$WORK/home"
 FAILED=0
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WINDOWS=1 ;; *) WINDOWS=0 ;; esac
@@ -176,10 +178,19 @@ if [ "$WINDOWS" = 0 ]; then
       done
       kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid"
       wait "$pid" 2>/dev/null )
-    MARKER_AFTER_KILL=$([ -f "$ENV_DIR/cascadia-complete" ] && echo yes || echo no)
 else
-    MARKER_AFTER_KILL=no
+    # Only the parent, as when Task Manager ends it: uv keeps running and holding
+    # files, and Windows refuses to move a directory with a file open inside it.
+    env PATH="$RUN_PATH" CASCADIA_PYTHON_HOME="$ROOT" "$BIN" python setup </dev/null >/dev/null 2>&1 &
+    pid=$!
+    for _ in $(seq 1 600); do
+        [ -d "$ENV_DIR/Lib" ] && [ "$(find "$ENV_DIR/Lib" -name '*.py' 2>/dev/null | head -50 | wc -l)" -ge 50 ] && break
+        sleep 0.1
+    done
+    taskkill //F //IM cascadia.exe >/dev/null 2>&1
+    wait "$pid" 2>/dev/null
 fi
+MARKER_AFTER_KILL=$([ -f "$ENV_DIR/cascadia-complete" ] && echo yes || echo no)
 cas python setup
 RC_SETUP=$RC
 cp "$WORK/out.log" "$WORK/after-kill.log"
@@ -187,6 +198,26 @@ cp "$WORK/out.log" "$WORK/after-kill.log"
 RC_IMPORT=$?
 check killed-setup-recovers '[ "$MARKER_AFTER_KILL" = no ] && [ "$RC_SETUP" = 0 ] && [ "$RC_IMPORT" = 0 ] && [ -f "$ENV_DIR/cascadia-complete" ]' \
     "marker after kill: $MARKER_AFTER_KILL, setup exit $RC_SETUP, import exit $RC_IMPORT"
+
+# Only Cascadia dies, as with the out-of-memory killer: uv keeps writing, so the
+# next setup has to wait for it. Windows did this above.
+if [ "$WINDOWS" = 0 ]; then
+    rm -rf "$ENV_DIR"
+    env PATH="$RUN_PATH" CASCADIA_PYTHON_HOME="$ROOT" "$BIN" python setup </dev/null >/dev/null 2>&1 &
+    pid=$!
+    for _ in $(seq 1 600); do
+        [ -d "$ENV_DIR/lib" ] && [ "$(find "$ENV_DIR/lib" -name '*.py' 2>/dev/null | head -50 | wc -l)" -ge 50 ] && break
+        sleep 0.1
+    done
+    kill -9 "$pid"
+    wait "$pid" 2>/dev/null
+    cas python setup
+    RC_SETUP=$RC
+    "$PY" -c "import torch, openvino, nncf, optimum.intel" >/dev/null 2>&1
+    RC_IMPORT=$?
+    check orphaned-install-recovers '[ "$RC_SETUP" = 0 ] && [ "$RC_IMPORT" = 0 ] && [ -f "$ENV_DIR/cascadia-complete" ]' \
+        "setup exit $RC_SETUP, import exit $RC_IMPORT"
+fi
 
 FUNCTIONAL="$("$PY" -c 'import importlib.util as u; print(u.find_spec("torch").submodule_search_locations[0])')/nn/functional.py"
 rm -f "$FUNCTIONAL"
@@ -254,11 +285,28 @@ for t in glm_moe_dsa:export_glm5 deepseek_v4:export_deepseek_v4 minimax_m2:expor
 done
 check moe-exporters-reachable '[ "$MOE_OK" = yes ]' "$MOE_OK"
 
-# --- Cleaning up -----------------------------------------------------------------
-mkdir -p "$ROOT/aaaaaaaaaaaa"
+# --- A release with new pins --------------------------------------------------
+# What the last release leaves: its environment, a package the new lock doesn't
+# have in the download cache, and an older uv and Python.
+OLD_ENV="$ROOT/aaaaaaaaaaaa"
+SYS_UV="$WORK/uv-on-path/$(basename "$UV")"
+env UV_CACHE_DIR="$ROOT/uv-cache" PATH="$RUN_PATH" "$SYS_UV" venv --no-config --quiet --python "$SYS_PY" "$OLD_ENV"
+env UV_CACHE_DIR="$ROOT/uv-cache" PATH="$RUN_PATH" "$SYS_UV" pip install --no-config --quiet \
+    --python "$(pybin "$OLD_ENV")" --only-binary :all: iniconfig==2.0.0
+mkdir -p "$ROOT/uv/0.0.1" "$ROOT/cpython/cpython-3.0.0-old"
+# uv keeps an empty lock file per package name, on Windows at least.
+cached() { find "$ROOT/uv-cache" -ipath "*$1*" -not -name '*.lock' 2>/dev/null | head -1; }
+CACHED_BEFORE="$(cached iniconfig)"
 rm -f "$ENV_DIR/cascadia-complete"
 cas python setup
-check old-env-removed '[ "$RC" = 0 ] && [ ! -d "$ROOT/aaaaaaaaaaaa" ] && [ -d "$ENV_DIR" ]' "exit $RC"
+check old-env-removed '[ "$RC" = 0 ] && [ ! -d "$OLD_ENV" ] && [ -d "$ENV_DIR" ]' "exit $RC"
+check old-downloads-removed '[ -n "$CACHED_BEFORE" ] && [ -z "$(cached iniconfig)" ] && [ -n "$(cached nncf)" ] && [ ! -e "$ROOT/uv/0.0.1" ] && [ ! -e "$ROOT/cpython/cpython-3.0.0-old" ]' \
+    "cached before: $CACHED_BEFORE, now: $(cached iniconfig), nncf: $(cached nncf)"
+
+# Everything above converted a model; nothing should have written outside Cascadia's folder.
+check home-folder-untouched '[ ! -e "$HOME/intel" ]' "something created ~/intel"
+
+# --- Cleaning up -----------------------------------------------------------------
 
 cas python remove
 check remove-deletes-everything '[ "$RC" = 0 ] && [ ! -e "$ROOT" ] && [ -x "$SYS_PY" ]' "exit $RC"

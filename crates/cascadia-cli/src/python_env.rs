@@ -815,6 +815,46 @@ fn extract_uv(archive: &[u8], dest: &Path) -> Result<()> {
 }
 
 /// Download the pinned `uv`, verify it and put it in place atomically.
+/// How long to wait before each new try at a download.
+const DOWNLOAD_RETRY_PAUSES: [Duration; 4] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+];
+
+/// GitHub can answer 504 for minutes on one route while working everywhere else.
+/// A missing file stays missing, so that one fails at once.
+fn worth_retrying(e: &reqwest::Error) -> bool {
+    e.status()
+        .is_none_or(|s| s.is_server_error() || s == reqwest::StatusCode::TOO_MANY_REQUESTS)
+}
+
+/// Run `attempt`, trying again after each pause while `retry` says it's worth it.
+async fn with_retries<T, E, Fut>(
+    pauses: &[Duration],
+    retry: impl Fn(&E) -> bool,
+    attempt: impl Fn() -> Fut,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut pauses = pauses.iter();
+    loop {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(e) => match pauses.next() {
+                Some(pause) if retry(&e) => {
+                    eprintln!("Download failed, trying again in {}s: {e}", pause.as_secs());
+                    tokio::time::sleep(*pause).await;
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+}
+
 async fn download_uv(platform: &Platform, dest: &Path) -> Result<()> {
     let url = format!(
         "https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{}",
@@ -825,15 +865,17 @@ async fn download_uv(platform: &Platform, dest: &Path) -> Result<()> {
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(60))
         .build()?;
-    let bytes = client
-        .get(&url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .with_context(|| format!("downloading {url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("downloading {url}"))?;
+    let bytes = with_retries(&DOWNLOAD_RETRY_PAUSES, worth_retrying, || async {
+        client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await
+    })
+    .await
+    .with_context(|| format!("downloading {url}"))?;
     verify_sha256(&bytes, platform.uv_sha256).with_context(|| format!("verifying {url}"))?;
     let dir = dest.parent().context("uv path has no parent")?;
     std::fs::create_dir_all(dir)?;
@@ -903,7 +945,27 @@ fn run_uv(cmd: &mut Command, what: &str) -> Result<()> {
 }
 
 /// Install `entries` into the environment, checked against the lock's hashes.
-fn install_packages(uv: &Path, root: &Path, python: &Path, entries: &[&LockEntry]) -> Result<()> {
+/// Keep the environment locked for as long as this `uv` runs, even if Cascadia is
+/// killed: `uv` carries on writing, and a new setup has to wait for it. A lock lasts
+/// until every handle to it is closed, and `uv` doesn't read stdin. Windows releases
+/// the lock with Cascadia, but won't move the folder while `uv` has files open
+/// there, so [`discard_dir`] waits instead.
+fn hold_lock_for(cmd: &mut Command, env_lock: &std::fs::File) {
+    #[cfg(unix)]
+    if let Ok(held) = env_lock.try_clone() {
+        cmd.stdin(held);
+    }
+    #[cfg(not(unix))]
+    let _ = (cmd, env_lock);
+}
+
+fn install_packages(
+    uv: &Path,
+    root: &Path,
+    python: &Path,
+    entries: &[&LockEntry],
+    env_lock: &std::fs::File,
+) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -912,22 +974,22 @@ fn install_packages(uv: &Path, root: &Path, python: &Path, entries: &[&LockEntry
         file.write_all(e.block.as_bytes())?;
     }
     file.flush()?;
-    run_uv(
-        uv_command(uv, root)
-            .args(["pip", "install", "--no-config", "-r"])
-            .arg(file.path())
-            .arg("--python")
-            .arg(python)
-            .args([
-                "--torch-backend",
-                "cpu",
-                "--require-hashes",
-                "--no-deps",
-                "--only-binary",
-                ":all:",
-            ]),
-        "install the exporter's packages",
-    )
+    let mut install = uv_command(uv, root);
+    install
+        .args(["pip", "install", "--no-config", "-r"])
+        .arg(file.path())
+        .arg("--python")
+        .arg(python)
+        .args([
+            "--torch-backend",
+            "cpu",
+            "--require-hashes",
+            "--no-deps",
+            "--only-binary",
+            ":all:",
+        ]);
+    hold_lock_for(&mut install, env_lock);
+    run_uv(&mut install, "install the exporter's packages")
 }
 
 /// Refuse a setup that can't fit, rather than failing partway through.
@@ -1028,6 +1090,7 @@ fn build_env(
     lock: &[LockEntry],
     base: Option<&(String, PyInfo)>,
     layer: bool,
+    env_lock: &std::fs::File,
 ) -> Result<()> {
     discard_dir(&managed.dir)?;
     let mut venv = uv_command(uv, &managed.root);
@@ -1044,6 +1107,7 @@ fn build_env(
             venv.args(["--python", "3.12", "--managed-python"]);
         }
     }
+    hold_lock_for(&mut venv, env_lock);
     run_uv(&mut venv, "create the environment")?;
 
     let none = HashMap::new();
@@ -1052,7 +1116,7 @@ fn build_env(
         _ => &none,
     };
     let install = packages_to_install(lock, seen);
-    install_packages(uv, &managed.root, &managed.python(), &install)?;
+    install_packages(uv, &managed.root, &managed.python(), &install, env_lock)?;
     verify_managed(&managed.python(), lock)?;
     std::fs::write(managed.dir.join(COMPLETE_MARKER), &managed.id)
         .context("marking the environment complete")?;
@@ -1098,9 +1162,10 @@ pub(crate) async fn setup_managed(yes: bool) -> Result<PythonEnv> {
         }
         check_free_space(&managed.root)?;
         let uv = find_or_get_uv(platform, &managed.root).await?;
+        forget_old_packages(&uv, &managed, &lock);
         // Layer only when it saves something: otherwise the system's other
         // packages have no reason to be visible to the exporter.
-        let layered = build_env(&uv, &managed, &lock, base.as_ref(), reused > 0);
+        let layered = build_env(&uv, &managed, &lock, base.as_ref(), reused > 0, &lock_file);
         if let Err(e) = layered {
             if reused == 0 {
                 return Err(e);
@@ -1109,7 +1174,7 @@ pub(crate) async fn setup_managed(yes: bool) -> Result<PythonEnv> {
                 "warning: the environment layered on the system Python failed ({e:#}); \
                  rebuilding without it."
             );
-            build_env(&uv, &managed, &lock, base.as_ref(), false)?;
+            build_env(&uv, &managed, &lock, base.as_ref(), false, &lock_file)?;
         }
         remove_old_envs(&managed);
     }
@@ -1152,7 +1217,7 @@ async fn repair_managed(env: &PythonEnv) -> Result<()> {
             names.join(", ")
         );
         let uv = find_or_get_uv(platform, &managed.root).await?;
-        install_packages(&uv, &managed.root, &managed.python(), &wrong)?;
+        install_packages(&uv, &managed.root, &managed.python(), &wrong, &lock_file)?;
     }
     lock_file.unlock().context("releasing the environment lock")
 }
@@ -1206,6 +1271,45 @@ fn remove_dir_with_retries(path: &Path) -> std::io::Result<()> {
     last
 }
 
+/// How long to wait for whatever is holding a file in a directory to let go.
+const RENAME_WAIT: Duration = Duration::from_secs(60);
+
+/// Run `rename` until it works or `wait` is up, saying once that it's waiting.
+fn rename_when_free(
+    dir: &Path,
+    wait: Duration,
+    mut rename: impl FnMut() -> std::io::Result<()>,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        let e = match rename() {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if start.elapsed() >= wait {
+            if wait.is_zero() {
+                return Err(e).with_context(|| format!("moving aside {}", dir.display()));
+            }
+            return Err(e).with_context(|| {
+                format!(
+                    "Something is still using {}, most likely an install that was cut off \
+                     (uv.exe) or a virus scan. Wait for it to finish or end it, then try again.",
+                    dir.display()
+                )
+            });
+        }
+        if !said {
+            eprintln!(
+                "Waiting for another program to let go of {}...",
+                dir.display()
+            );
+            said = true;
+        }
+        std::thread::sleep(Duration::from_millis(500).min(wait));
+    }
+}
+
 /// Get `dir` out of the way now, and delete it if that can be done. The rename
 /// can't race anything writing into it, so a rebuild always starts clean;
 /// anything the delete leaves behind goes with the next [`sweep_trash`].
@@ -1221,7 +1325,14 @@ fn discard_dir(dir: &Path) -> Result<()> {
         .map(|n| dir.with_file_name(format!("{name}{TRASH_MARK}{pid}-{n}")))
         .find(|p| !p.exists())
         .context("no free name to move the old environment to")?;
-    std::fs::rename(dir, &trash).with_context(|| format!("moving aside {}", dir.display()))?;
+    // Only Windows refuses this: a cut-off install or a virus scan still holding
+    // a file inside blocks the rename until it lets go.
+    let wait = if cfg!(windows) {
+        RENAME_WAIT
+    } else {
+        Duration::ZERO
+    };
+    rename_when_free(dir, wait, || std::fs::rename(dir, &trash))?;
     if let Err(e) = remove_dir_with_retries(&trash) {
         tracing::debug!(path = %trash.display(), error = %e, "left for the next setup");
     }
@@ -1237,20 +1348,23 @@ fn sweep_trash(root: &Path) {
     }
 }
 
-/// Delete the environment `name` under `root`, unless an export is using it.
-fn remove_env(root: &Path, name: &str) -> Result<bool> {
-    let lock_path = root.join(format!("{name}.lock"));
-    let guard = std::fs::OpenOptions::new()
+fn open_env_lock(root: &Path, name: &str) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&lock_path)?;
+        .open(root.join(format!("{name}.lock")))
+}
+
+/// Delete the environment `name` under `root`, unless an export is using it.
+fn remove_env(root: &Path, name: &str) -> Result<bool> {
+    let guard = open_env_lock(root, name)?;
     if guard.try_lock().is_err() {
         return Ok(false);
     }
     discard_dir(&root.join(name))?;
     drop(guard);
-    std::fs::remove_file(&lock_path).ok();
+    std::fs::remove_file(root.join(format!("{name}.lock"))).ok();
     Ok(true)
 }
 
@@ -1264,14 +1378,132 @@ fn env_names(root: &Path) -> Vec<String> {
 }
 
 /// A new lock leaves the previous environment behind: clear it once the new one
-/// works. One in use is left for next time, and its packages stay in the
-/// download cache, so going back to that version costs little.
+/// works. One in use is left for next time, along with the uv and Python it may
+/// still need.
 fn remove_old_envs(managed: &Managed) {
     sweep_trash(&managed.root);
-    for name in env_names(&managed.root) {
-        if name != managed.id {
-            let _ = remove_env(&managed.root, &name);
+    let old: Vec<String> = env_names(&managed.root)
+        .into_iter()
+        .filter(|name| *name != managed.id)
+        .collect();
+    let removed = old
+        .iter()
+        .filter(|name| matches!(remove_env(&managed.root, name), Ok(true)))
+        .count();
+    if !old.is_empty() && removed == old.len() {
+        remove_old_tools(managed);
+    }
+}
+
+/// Delete the uv and Python versions nothing here runs on any more.
+fn remove_old_tools(managed: &Managed) {
+    for entry in std::fs::read_dir(managed.root.join("uv"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry.file_name() != UV_VERSION {
+            let _ = remove_dir_with_retries(&entry.path());
         }
+    }
+    let Some(home) = python_home(&managed.dir) else {
+        return;
+    };
+    for entry in std::fs::read_dir(managed.root.join("cpython"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        // uv's short names are links to the full one, so compare where they lead.
+        let in_use = entry
+            .path()
+            .canonicalize()
+            .is_ok_and(|p| home.starts_with(p));
+        if !in_use && entry.file_name().to_string_lossy().starts_with("cpython-") {
+            let _ = remove_dir_with_retries(&entry.path());
+        }
+    }
+}
+
+/// The Python installation a virtual environment runs on.
+fn python_home(env_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(env_dir.join("pyvenv.cfg"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "home").then(|| PathBuf::from(value.trim()))
+        })?
+        .canonicalize()
+        .ok()
+}
+
+/// What an environment has installed, from its `*.dist-info` folder names.
+fn installed_in(env_dir: &Path) -> Vec<(String, String)> {
+    let unix = std::fs::read_dir(env_dir.join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|version| version.path().join("site-packages"));
+    let windows = std::iter::once(env_dir.join("Lib").join("site-packages"));
+    unix.chain(windows)
+        .flat_map(|site| std::fs::read_dir(site).into_iter().flatten().flatten())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let (dist, version) = name.strip_suffix(".dist-info")?.rsplit_once('-')?;
+            Some((normalize_name(dist), version.to_string()))
+        })
+        .collect()
+}
+
+/// The packages in `installed` that the lock doesn't want at that version.
+fn stale_packages(installed: &[(String, String)], lock: &[LockEntry]) -> Vec<String> {
+    let mut stale: Vec<String> = installed
+        .iter()
+        .filter(|(name, version)| {
+            !lock
+                .iter()
+                .any(|e| e.name == *name && same_release(&e.version, version))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    stale.sort();
+    stale.dedup();
+    stale
+}
+
+/// A new lock would otherwise leave every old package version in the download
+/// cache for good. This runs before installing because uv clears all versions of
+/// a package: what the new lock needs is then the only version cached. Installed
+/// environments keep their files. If an older environment is still in use it
+/// waits for next time, and if this fails the cost is only disk space.
+fn forget_old_packages(uv: &Path, managed: &Managed, lock: &[LockEntry]) {
+    let mut stale = Vec::new();
+    for name in env_names(&managed.root) {
+        if name == managed.id {
+            continue;
+        }
+        let Ok(guard) = open_env_lock(&managed.root, &name) else {
+            return;
+        };
+        if guard.try_lock().is_err() {
+            return;
+        }
+        stale.extend(stale_packages(
+            &installed_in(&managed.root.join(&name)),
+            lock,
+        ));
+    }
+    stale.sort();
+    stale.dedup();
+    if stale.is_empty() {
+        return;
+    }
+    let mut cmd = uv_command(uv, &managed.root);
+    cmd.args(["cache", "clean", "--no-config", "--quiet"])
+        .args(&stale);
+    if let Err(e) = run_with_timeout(&mut cmd, PROBE_TIMEOUT) {
+        tracing::debug!(error = %e, "left old packages in the download cache");
     }
 }
 
@@ -1546,6 +1778,196 @@ torch==2.15.0+cpu \\
         discard_dir(&dir).expect("should pick another name");
         assert!(!dir.exists());
         assert!(held.join("locked").exists(), "the leftover is untouched");
+    }
+
+    #[test]
+    fn a_held_directory_is_waited_for_then_named() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let dir = Path::new("env");
+
+        // Lets go on the third try: no error.
+        let mut tries = 0;
+        rename_when_free(dir, Duration::from_secs(30), || {
+            tries += 1;
+            if tries < 3 {
+                Err(denied())
+            } else {
+                Ok(())
+            }
+        })
+        .expect("should wait for it");
+        assert_eq!(tries, 3);
+
+        // Never lets go: stops, and says what to do.
+        let msg = format!(
+            "{:#}",
+            rename_when_free(dir, Duration::from_millis(1), || Err(denied())).unwrap_err()
+        );
+        assert!(msg.contains("still using env"), "{msg}");
+        assert!(msg.contains("then try again"), "{msg}");
+
+        // Not waiting at all: one try and the plain error.
+        let mut tries = 0;
+        let msg = format!(
+            "{:#}",
+            rename_when_free(dir, Duration::ZERO, || {
+                tries += 1;
+                Err(denied())
+            })
+            .unwrap_err()
+        );
+        assert_eq!(tries, 1);
+        assert!(msg.contains("moving aside env"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn downloads_are_tried_again_only_when_that_can_help() {
+        use std::cell::Cell;
+        let pauses = [Duration::ZERO; 3];
+        let tries = Cell::new(0);
+
+        // A passing failure: works on the third try.
+        let got = with_retries(
+            &pauses,
+            |_: &String| true,
+            || async {
+                tries.set(tries.get() + 1);
+                if tries.get() < 3 {
+                    Err("504".to_string())
+                } else {
+                    Ok(7)
+                }
+            },
+        )
+        .await;
+        assert_eq!(got, Ok(7));
+        assert_eq!(tries.get(), 3);
+
+        // It never recovers: stops when the pauses run out, with the last error.
+        tries.set(0);
+        let got: Result<u8, String> = with_retries(
+            &pauses,
+            |_| true,
+            || async {
+                tries.set(tries.get() + 1);
+                Err("504".to_string())
+            },
+        )
+        .await;
+        assert_eq!(got, Err("504".to_string()));
+        assert_eq!(tries.get(), 4);
+
+        // Trying again can't help: one try.
+        tries.set(0);
+        let got: Result<u8, String> = with_retries(
+            &pauses,
+            |_| false,
+            || async {
+                tries.set(tries.get() + 1);
+                Err("404".to_string())
+            },
+        )
+        .await;
+        assert_eq!(got, Err("404".to_string()));
+        assert_eq!(tries.get(), 1);
+    }
+
+    /// What keeps a new setup from racing a `uv` that outlived a killed Cascadia.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_keeps_the_environment_locked_after_cascadia_lets_go() {
+        let root = tempfile::tempdir().unwrap();
+        let open = || open_env_lock(root.path(), "abc").unwrap();
+        let cascadia = open();
+        cascadia.try_lock().unwrap();
+
+        let mut sleep = Command::new("sleep");
+        sleep.arg("30");
+        hold_lock_for(&mut sleep, &cascadia);
+        let mut uv = sleep.spawn().unwrap();
+        // Cascadia is gone: only the child's copy of the handle is left.
+        drop(sleep);
+        drop(cascadia);
+
+        assert!(open().try_lock().is_err(), "still locked while it runs");
+        uv.kill().unwrap();
+        uv.wait().unwrap();
+        // Not instantly: a child another test is starting holds a copy of every
+        // open file until it execs.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while open().try_lock().is_err() {
+            assert!(Instant::now() < deadline, "free once it has exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn only_what_the_lock_no_longer_wants_is_stale() {
+        let lock = parse_lock(LOCK);
+        let wanted = &lock[0];
+        let installed = vec![
+            (wanted.name.clone(), wanted.version.clone()),
+            (wanted.name.clone(), format!("{}+cpu", wanted.version)),
+            ("left-the-lock".to_string(), "1.0".to_string()),
+            ("left-the-lock".to_string(), "1.0".to_string()),
+        ];
+        assert_eq!(stale_packages(&installed, &lock), ["left-the-lock"]);
+
+        let moved = vec![(wanted.name.clone(), "0.0.0-older".to_string())];
+        assert_eq!(
+            stale_packages(&moved, &lock),
+            std::slice::from_ref(&wanted.name)
+        );
+    }
+
+    #[test]
+    fn installed_packages_are_read_on_both_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        let unix = root.path().join("unix/lib/python3.12/site-packages");
+        std::fs::create_dir_all(unix.join("typing_extensions-4.1.dist-info")).unwrap();
+        std::fs::create_dir_all(unix.join("typing_extensions")).unwrap();
+        let windows = root.path().join("win/Lib/site-packages");
+        std::fs::create_dir_all(windows.join("torch-2.15.0+cpu.dist-info")).unwrap();
+        assert_eq!(
+            installed_in(&root.path().join("unix")),
+            [("typing-extensions".to_string(), "4.1".to_string())]
+        );
+        assert_eq!(
+            installed_in(&root.path().join("win")),
+            [("torch".to_string(), "2.15.0+cpu".to_string())]
+        );
+    }
+
+    #[test]
+    fn old_uv_and_python_go_and_the_ones_in_use_stay() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = Managed {
+            root: root.path().to_path_buf(),
+            dir: root.path().join("abc"),
+            id: "abc".to_string(),
+        };
+        let current = root.path().join("cpython/cpython-3.12.2-x");
+        let old = root.path().join("cpython/cpython-3.12.1-x");
+        let hidden = root.path().join("cpython/.temp");
+        let uv_now = root.path().join("uv").join(UV_VERSION);
+        let uv_old = root.path().join("uv/0.0.1");
+        for dir in [&managed.dir, &current, &old, &hidden, &uv_now, &uv_old] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            managed.dir.join("pyvenv.cfg"),
+            format!("home = {}\nversion = 3.12\n", current.join("bin").display()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(current.join("bin")).unwrap();
+
+        remove_old_tools(&managed);
+
+        assert!(current.exists(), "the Python in use stays");
+        assert!(hidden.exists(), "uv's own files stay");
+        assert!(!old.exists());
+        assert!(uv_now.exists());
+        assert!(!uv_old.exists());
     }
 
     #[test]

@@ -4,7 +4,7 @@ Choose an installation path for your engine:
 
 | Goal | How | Needs |
 | --- | --- | --- |
-| Run it on Intel hardware | **Prebuilt bundle** (below) | an Intel driver; (Linux GPU) the runtime stack |
+| Run it on Intel hardware | **Prebuilt bundle** (below) | an Intel driver; (Linux GPU) the runtime stack; (Windows) the Visual C++ Redistributable |
 | Try it / develop / CI | **Stub mode** build | Rust only |
 | Build real inference yourself | **OpenVINO mode** build | Rust + C++ toolchain + OpenVINO GenAI SDK + (Linux) GPU runtime |
 | Run GGUF models on Intel GPUs | **SYCL llama.cpp build** (below) | Rust + Intel oneAPI + patched `llama-server` + Intel GPU driver |
@@ -17,7 +17,7 @@ After any install, run **`cascadia doctor`**. Its OpenVINO and sycl-llama sectio
 
 Each [GitHub Release](https://github.com/labscommunity/cascadia/releases) ships self-contained bundles with the OpenVINO runtime included — no SDK install, no `INTEL_OPENVINO_DIR`:
 
-- **Windows** — `cascadia-<ver>-windows-x86_64.zip`: unzip, run `cascadia.exe doctor`. Needs only a current Intel graphics driver (the OpenCL/GPU runtime ships inside it).
+- **Windows** — `cascadia-<ver>-windows-x86_64.zip`: unzip, run `cascadia.exe doctor`. Needs a current Intel graphics driver (the OpenCL/GPU runtime ships inside it) and the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe), which many PCs already have. Without the redistributable, `cascadia.exe` can't start: Windows reports `VCRUNTIME140.dll was not found`, or over SSH and in scripts it exits with no message (code `-1073741515`). Installing the redistributable fixes both.
 - **Linux** — `cascadia-<ver>-linux-x86_64.tar.gz`: untar, run `./cascadia doctor`. Bundled libraries load from `lib/` beside the binary. Needs glibc 2.35+ (Ubuntu 22.04 or newer), the OpenCL ICD loader even for CPU-only use (`sudo apt install ocl-icd-libopencl1` — `libopenvino_genai.so` imports `libOpenCL.so.1`, so without it the binary does not start) and, for GPU inference, the Intel GPU runtime stack below (the bundle has no scripts — use the `apt-get` block, or `scripts/setup-openvino.sh` from a source checkout).
 
 The binary is not installed on your PATH — run it as `./cascadia` from the unpacked directory, or add that directory to PATH.
@@ -188,7 +188,8 @@ Without a terminal to ask in (CI, scripts), pass `--yes`. Linux x86_64, Windows 
 - **Only what's missing is installed.** `uv`, a Python 3.12 or 3.13 and packages at exactly the tested version are reused if you have them. Your system Python is never changed.
 - **Your own Python still works.** An activated venv or conda environment, or a Python on `PATH` with the exporter's packages, is used as it is, with no question asked. `--python <path>` picks one explicitly. Each run prints which it chose.
 - **Repair and clean-up.** `cascadia python setup` installs ahead of time and repairs a damaged install. `cascadia python remove` deletes everything it installed.
-- **Windows.** torch and OpenVINO need the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). It needs admin rights, so Cascadia points you to it rather than installing it.
+- **New Cascadia versions.** The install is kept until a release changes the tested package versions. You're then asked once, only the packages that changed are downloaded, and the old versions are deleted.
+- **Windows.** `cascadia.exe`, torch and OpenVINO all need the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). Installing it needs admin rights, so Cascadia doesn't do it for you.
 - **Company networks.** `HTTPS_PROXY` and uv's `UV_DEFAULT_INDEX`, `UV_INDEX`, `UV_NATIVE_TLS` and `UV_PYTHON_INSTALL_MIRROR` are honoured; every package is checked against the hash Cascadia ships with. If the download of `uv` itself fails, install `uv` yourself or use `--python`.
 
 To install into your own environment instead, `cascadia doctor` prints the pinned `pip install` line (`pip install -r tools/requirements.txt` from a source checkout). `nncf` is needed to compress weights to INT4 (the default) or INT8: without it, an export that compresses stops and tells you to install it or pass `--quantization fp16`.
