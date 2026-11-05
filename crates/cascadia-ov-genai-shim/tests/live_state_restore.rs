@@ -15,13 +15,14 @@
 //! recreated) used to make the next multi-token step fail with "opset1::Add
 //! ... Argument shapes are inconsistent"; the shim now primes such a request
 //! before restoring. Each case must give the logits of a run that never
-//! restored.
+//! restored, on the first step and on the single-token steps after it.
 #![cfg(feature = "openvino")]
 
 use cascadia_ov_genai_shim::{DType, PluginConfig, Runtime};
 
 const PREFIX: usize = 97;
 const SUFFIX: usize = 22;
+const FOLLOW_ON_STEPS: usize = 3;
 
 fn ids(start: usize, n: usize) -> Vec<i64> {
     (start..start + n)
@@ -117,8 +118,33 @@ fn f32_to_half(x: f32) -> u16 {
     sign | ((exp as u16) << 10) | ((b >> 13) & 0x3ff) as u16
 }
 
-fn check(case: &str, got: &[f32], want: &[f32]) {
+/// The suffix step, then single-token steps: what a resumed turn runs after a restore.
+fn resume(rt: &mut Runtime) -> Vec<Vec<f32>> {
+    let mut out = vec![step(rt, PREFIX, SUFFIX)];
+    for i in 0..FOLLOW_ON_STEPS {
+        out.push(step(rt, PREFIX + SUFFIX + i, 1));
+    }
+    out
+}
+
+fn check(case: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    assert_eq!(got.len(), want.len(), "{case}: step count");
+    for (i, (got, want)) in got.iter().zip(want).enumerate() {
+        check_step(&format!("{case} step {i}"), got, want);
+    }
+}
+
+fn check_step(case: &str, got: &[f32], want: &[f32]) {
     assert_eq!(got.len(), want.len(), "{case}: output size");
+    // The fold below skips NaN, so NaN output would otherwise pass as a perfect match.
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "{case}: non-finite output"
+    );
+    assert!(
+        want.iter().all(|x| x.is_finite()),
+        "{case}: non-finite reference"
+    );
     let peak = want.iter().fold(0f32, |m, x| m.max(x.abs()));
     let diff = got
         .iter()
@@ -148,32 +174,32 @@ fn restore_into_an_empty_request_then_a_multi_token_step() {
     let mut donor = Runtime::compile(&xml, &device, &plugin).expect("compile donor");
     step(&mut donor, 0, PREFIX);
     let blob = donor.get_state_blob().expect("get_state_blob");
-    let want = step(&mut donor, PREFIX, SUFFIX);
+    let want = resume(&mut donor);
 
     // A separately compiled request that has never run: the cross-chain recipient.
     let mut fresh = Runtime::compile(&xml, &device, &plugin).expect("compile recipient");
     fresh
         .set_state_blob(&blob)
         .expect("restore into a fresh request");
-    check("fresh", &step(&mut fresh, PREFIX, SUFFIX), &want);
+    check("fresh", &resume(&mut fresh), &want);
 
     // The same request after reset_state, as after the engine's load-time warm-up.
     fresh.reset_state().expect("reset_state");
     fresh
         .set_state_blob(&blob)
         .expect("restore after reset_state");
-    check("reset", &step(&mut fresh, PREFIX, SUFFIX), &want);
+    check("reset", &resume(&mut fresh), &want);
 
     // After recreate_request, as after the engine scrubs a failed restore.
     fresh.recreate_request().expect("recreate_request");
     fresh
         .set_state_blob(&blob)
         .expect("restore after recreate_request");
-    check("recreated", &step(&mut fresh, PREFIX, SUFFIX), &want);
+    check("recreated", &resume(&mut fresh), &want);
 
     // Over live state, which never needed the prime.
     fresh
         .set_state_blob(&blob)
         .expect("restore over live state");
-    check("live", &step(&mut fresh, PREFIX, SUFFIX), &want);
+    check("live", &resume(&mut fresh), &want);
 }

@@ -967,10 +967,12 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
     try {
         // OV C++ API: query each variable_state and reset it. Equivalent
         // to InferRequest::reset_state() (which is sugar over this loop).
+        // Cleared first: a throw partway leaves the request neither empty nor whole, and a
+        // needless prime is harmless where a skipped one is not.
+        handle->state_live = false;
         for (auto& state : handle->request->query_state()) {
             state.reset();
         }
-        handle->state_live = false;
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
@@ -1240,11 +1242,13 @@ static bool runs_on_gpu(const ov::CompiledModel& compiled) {
 // into an empty GPU request, run one throwaway 1-token inference: every input zero-filled, every
 // dynamic dim 1. It leaves one token of junk in each state, which the restore below overwrites (it
 // fails unless every state is applied). The caller's input tensors are put back afterwards.
-// Best-effort: a model the zero inputs cannot run keeps the old behaviour, with a note on stderr.
-static void prime_empty_gpu_request(cascadia_runtime_t* handle) {
+// Returns false when the prime fails, which must fail the restore: without the prime a restore can
+// be silently discarded, so it would report success and the next step would serve wrong tokens.
+static bool prime_empty_gpu_request(cascadia_runtime_t* handle) {
     if (handle->state_live || handle->request->query_state().empty() ||
         !runs_on_gpu(*handle->compiled))
-        return;
+        return true;
+    bool primed = false;
     std::vector<std::pair<ov::Output<const ov::Node>, ov::Tensor>> saved;
     try {
         for (const auto& port : handle->compiled->inputs()) {
@@ -1269,11 +1273,16 @@ static void prime_empty_gpu_request(cascadia_runtime_t* handle) {
         }
         handle->request->infer();
         handle->state_live = true;
+        primed = true;
     } catch (const std::exception& e) {
+        // stderr too: some callers keep only the restore's pass or fail, not its last error.
         std::fprintf(stderr,
                      "[cascadia-shim] set_state_blob: GPU prime of an empty request failed (%s); "
-                     "restoring without it\n",
+                     "failing the restore\n",
                      e.what());
+        std::ostringstream oss;
+        oss << "set_state_blob: GPU prime of an empty request failed: " << e.what();
+        set_last_error(oss.str().c_str());
     }
     for (auto& [port, t] : saved) {
         try {
@@ -1281,13 +1290,14 @@ static void prime_empty_gpu_request(cascadia_runtime_t* handle) {
         } catch (const std::exception&) {
         }
     }
+    return primed;
 }
 
 int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_t* buf, size_t len) {
     if (!handle || !handle->request) { set_last_error("null runtime handle"); return 1; }
     if (!buf || len < 4) { set_last_error("set_state_blob: short buffer"); return 1; }
     try {
-        prime_empty_gpu_request(handle);
+        if (!prime_empty_gpu_request(handle)) return 1;
         // Canonical restore keyed by KV IDENTITY (layer, key/value) parsed from each VariableState
         // name. get_state_blob emits states in this same canonical order, so blob slot i maps to the
         // model state that shares its identity — independent of OV's per-INSTANCE query_state() ORDER
