@@ -56,6 +56,8 @@ import sys
 import time
 from typing import Any
 
+from export_quant import compress_weights, require_compressor
+
 
 # Files `--vision` copies from the vision directory into the tree root.
 VISION_FILES = (
@@ -1268,35 +1270,8 @@ def export_single_stage(
         f"{len(ov_model.outputs)} outputs"
     )
 
-    # Optional INT4/INT8 compression.
-    if quantization in ("int4", "int4_asym"):
-        try:
-            import nncf
-
-            mode = (
-                nncf.CompressWeightsMode.INT4_SYM
-                if quantization == "int4"
-                else nncf.CompressWeightsMode.INT4_ASYM
-            )
-            log(f"  nncf {quantization} compression...")
-            ov_model = nncf.compress_weights(
-                ov_model, mode=mode, group_size=128, ratio=1.0, all_layers=True
-            )
-        except Exception as e:
-            log(
-                f"  WARNING: INT4 compression failed ({e}); leaving FP32. "
-                "Re-run with --quantization fp32 to skip the attempt."
-            )
-    elif quantization == "int8":
-        try:
-            import nncf
-
-            log("  nncf int8 compression...")
-            ov_model = nncf.compress_weights(
-                ov_model, mode=nncf.CompressWeightsMode.INT8_ASYM
-            )
-        except Exception as e:
-            log(f"  WARNING: INT8 compression failed ({e}); leaving FP32.")
+    # INT4/INT8 compression.
+    ov_model = compress_weights(ov_model, quantization, log)
 
     # Save.
     stage_dir = os.path.join(output_dir, f"stage_{idx}")
@@ -1525,6 +1500,7 @@ def run_export(
     sets `allow_global_per_layer_attribute_access` or the bundled remote
     code is used.
     """
+    require_compressor(quantization)
     import torch
     from transformers import (
         AutoConfig,

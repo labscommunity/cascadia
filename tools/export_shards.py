@@ -70,6 +70,8 @@ import sys
 
 import numpy as np
 
+from export_quant import compress_weights, require_compressor
+
 # torch is only needed by the dense/gemma4 export paths; the qwen3_5_moe
 # IR-surgery path runs on openvino + numpy alone (and its target env — an
 # AI PC inference node — typically has no torch). Defer the hard failure
@@ -1556,38 +1558,7 @@ def export_single_stage(
         )
 
     # 8. Compress weights.
-    if quantization in ("int4", "int4_asym"):
-        try:
-            import nncf
-
-            mode = (
-                nncf.CompressWeightsMode.INT4_SYM
-                if quantization == "int4"
-                else nncf.CompressWeightsMode.INT4_ASYM
-            )
-            print(f"  nncf {quantization} compression...", flush=True)
-            ov_model = nncf.compress_weights(
-                ov_model, mode=mode, group_size=128, ratio=1.0, all_layers=True
-            )
-            print("  Quantization OK", flush=True)
-        except Exception as e:
-            print(
-                f"  WARNING: INT4 compression failed ({e}); falling back to FP16",
-                flush=True,
-            )
-    elif quantization == "int8":
-        try:
-            import nncf
-
-            print("  nncf int8 compression...", flush=True)
-            ov_model = nncf.compress_weights(
-                ov_model, mode=nncf.CompressWeightsMode.INT8_ASYM
-            )
-        except Exception as e:
-            print(
-                f"  WARNING: INT8 compression failed ({e}); falling back to FP16",
-                flush=True,
-            )
+    ov_model = compress_weights(ov_model, quantization, lambda m: print(m, flush=True))
 
     # NPU: EVERY dim (inputs AND outputs) must be static or the compiler
     # rejects the IR (#37). Run this on the FINAL graph — after make_stateful is
@@ -2324,6 +2295,7 @@ def _shard():
             "torch is required for this model's export path. "
             "Install: pip install -r tools/requirements.txt  (or run `cascadia doctor`, which prints the pins)"
         )
+    require_compressor(args.quantization)
     from transformers import AutoConfig
 
     moe_msg = (

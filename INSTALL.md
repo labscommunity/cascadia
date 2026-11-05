@@ -184,7 +184,7 @@ pip install -r tools/requirements.txt   # from a source checkout
 
 From a release bundle there is no `tools/` directory: run `cascadia doctor` (or `cascadia shard`) and it prints the exact pinned `pip install` line for the exporter compiled into that binary.
 
-`nncf` is optional (INT4 quantization); without it, sharding falls back to FP16 — `cascadia shard` warns when it is missing. `cascadia doctor` reports whether the core export packages (torch / openvino / transformers) are present.
+`nncf` is needed to compress weights to INT4 (the default) or INT8: without it, an export that compresses stops and tells you to install it or pass `--quantization fp16`. `cascadia doctor` reports whether the core export packages (torch / openvino / transformers) are present.
 
 Exporting a **whole-model** IR for `--engine ov-genai` is a different job and uses Intel's exporter, not this one — `pip install "optimum-intel[openvino]"`, see [docs/engines/ov-genai.md](docs/engines/ov-genai.md).
 

@@ -1207,8 +1207,9 @@ pub struct ShardArgs {
     #[arg(long)]
     pub num_stages: u32,
 
-    /// Weight quantization. INT4 is the typical choice for Intel
-    /// hardware; FP16 if NNCF is unavailable or you want max quality.
+    /// Weight quantization. INT4 is the typical choice for Intel hardware; FP16
+    /// if NNCF is unavailable or you want max quality. A compressed format
+    /// that cannot be applied stops the export rather than falling back.
     #[arg(long, value_enum, default_value_t = ShardQuant::Int4)]
     pub quantization: ShardQuant,
 
@@ -1234,6 +1235,12 @@ pub struct ShardArgs {
     /// on CPU) and ~N× fewer prefill forwards even single-device. 0 = off.
     #[arg(long, default_value_t = 0)]
     pub static_prefill_seq: u32,
+
+    /// NPU only: also emit a packed multi-slot IR variant
+    /// (openvino_packed_model.xml) that serves N concurrent requests in one
+    /// inference; serve it with `cascadia worker --packed-slots N`. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    pub packed_slots: u32,
 
     /// torch default dtype during export. FP16 reduces memory and is
     /// required for `--target npu` (the runtime feeds KV as f16).
@@ -3158,6 +3165,17 @@ const CASCADIA_EXPORT_SCRIPT: &str = include_str!(concat!(
     "/../../tools/cascadia_export.py"
 ));
 
+/// The weight compression both shard exporters share.
+const EXPORT_QUANT_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/export_quant.py"
+));
+/// Builds the packed multi-slot IR for `--packed-slots`.
+const PACKED_VARIANT_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/packed_variant.py"
+));
+
 /// Write the embedded exporter and every module it imports into one flat
 /// dir (the scripts import their siblings from beside themselves), plus
 /// requirements.txt so a refusal can print the install line.
@@ -3171,6 +3189,8 @@ fn write_embedded_exporter(dir: &std::path::Path) -> Result<()> {
         ("cut_vlm_lm.py", CUT_VLM_SCRIPT),
         ("longrope.py", LONGROPE_SCRIPT),
         ("cascadia_export.py", CASCADIA_EXPORT_SCRIPT),
+        ("export_quant.py", EXPORT_QUANT_SCRIPT),
+        ("packed_variant.py", PACKED_VARIANT_SCRIPT),
         ("requirements.txt", EXPORT_REQUIREMENTS),
     ] {
         std::fs::write(dir.join(name), body)
@@ -3236,6 +3256,11 @@ fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
             flags.push("--static-prefill-seq".into());
             flags.push(args.static_prefill_seq.to_string());
         }
+    }
+    // Forwarded on every target: the exporter refuses it without `--target npu`.
+    if args.packed_slots != 0 {
+        flags.push("--packed-slots".into());
+        flags.push(args.packed_slots.to_string());
     }
     if let Some(s) = &args.layer_split {
         flags.push("--layer-split".into());
@@ -3472,7 +3497,8 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
                 for line in versions.lines() {
                     eprintln!("  {line}");
                 }
-                // NNCF is optional but warn if missing for INT4 quant.
+                // Only the paths that compress need NNCF (IR surgery keeps the
+                // input's weights), and they refuse to go on without it.
                 let nncf = Command::new(&python)
                     .args(["-c", "import nncf; print('nncf', nncf.__version__)"])
                     .output();
@@ -3485,7 +3511,10 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
                             args.quantization,
                             ShardQuant::Int4 | ShardQuant::Int4Asym | ShardQuant::Int8
                         ) {
-                            eprintln!("  WARNING: nncf not installed; falls back to FP16 weights");
+                            eprintln!(
+                                "  WARNING: nncf not installed; exporting a model that needs \
+                                 compression will stop"
+                            );
                         }
                     }
                 }
@@ -4583,6 +4612,40 @@ mod tests {
         assert!(!flags.iter().any(|f| f == "--python"));
     }
 
+    /// `--packed-slots` reaches the exporter, which owns its "requires
+    /// `--target npu`" refusal, and is absent unless asked for.
+    #[test]
+    fn shard_forwards_packed_slots() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "cascadia",
+                "shard",
+                "--model",
+                "m",
+                "-o",
+                "o",
+                "--num-stages",
+                "2",
+            ];
+            argv.extend_from_slice(extra);
+            let Command::Shard(args) = Cli::try_parse_from(argv).expect("parse shard").cmd else {
+                panic!("expected shard subcommand");
+            };
+            shard_exporter_flags(&args).expect("flags")
+        };
+        assert!(!parse(&[]).iter().any(|f| f == "--packed-slots"));
+        assert!(has_pair(
+            &parse(&["--target", "npu", "--packed-slots", "4"]),
+            "--packed-slots",
+            "4"
+        ));
+        assert!(has_pair(
+            &parse(&["--packed-slots", "4"]),
+            "--packed-slots",
+            "4"
+        ));
+    }
+
     /// Every module the exporter imports lands beside it in the flat temp dir.
     #[test]
     fn embedded_exporter_is_written_flat() {
@@ -4594,6 +4657,8 @@ mod tests {
             "cut_vlm_lm.py",
             "longrope.py",
             "cascadia_export.py",
+            "export_quant.py",
+            "packed_variant.py",
             "requirements.txt",
         ] {
             assert!(dir.path().join(name).is_file(), "{name} missing");
