@@ -34,6 +34,7 @@ pub mod doctor;
 pub mod placement;
 pub mod profile;
 pub mod profile_stage;
+mod python_env;
 pub mod run_placement;
 use discover::{cmd_discover, DiscoverArgs};
 use doctor::{cmd_doctor, DoctorArgs};
@@ -188,6 +189,9 @@ pub enum Command {
     /// `text-generation-with-past` for text), for ov-genai or OVMS on one
     /// box. See `cascadia export --help`.
     Export(ExportArgs),
+
+    /// Manage the private Python environment `shard` and `export` can run in.
+    Python(PythonArgs),
     /// Profile available OV devices on this host against a single
     /// model. Writes `device_profile.json`. See `cascadia
     /// profile-devices --help`. Step 1 of issue #41 (three-tier
@@ -1259,10 +1263,15 @@ pub struct ShardArgs {
     #[arg(long)]
     pub stage: Option<u32>,
 
-    /// Override the python interpreter used to run the bundled exporter.
-    /// Defaults to `python3` then `python` on PATH.
+    /// The Python to run the exporter with. Usually not needed: an activated
+    /// environment, Cascadia's own packages or a Python on PATH is found for you.
     #[arg(long)]
     pub python: Option<String>,
+
+    /// Install the Python packages the exporter needs without asking, if they
+    /// are missing. Without a terminal to ask in, they are only installed with this.
+    #[arg(long)]
+    pub yes: bool,
 
     /// Skip the Python interpreter detection check (assumes the chosen
     /// interpreter has nncf, openvino, transformers, torch, safetensors
@@ -1308,10 +1317,31 @@ pub struct ExportArgs {
     #[arg(long)]
     pub revision: Option<String>,
 
-    /// Override the python interpreter used to run the bundled exporter.
-    /// Defaults to `python3` then `python` on PATH.
+    /// The Python to run the exporter with. Usually not needed: an activated
+    /// environment, Cascadia's own packages or a Python on PATH is found for you.
     #[arg(long)]
     pub python: Option<String>,
+
+    /// Install the Python packages the exporter needs without asking, if they
+    /// are missing. Without a terminal to ask in, they are only installed with this.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// `cascadia python`: the private environment `shard` and `export` run in.
+#[derive(Args, Debug, Clone)]
+pub struct PythonArgs {
+    #[command(subcommand)]
+    pub cmd: PythonCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PythonCommand {
+    /// Install what `shard` and `export` need, or repair it if it is damaged.
+    /// `shard` and `export` offer this themselves; run it to do it ahead of time.
+    Setup,
+    /// Delete everything `setup` installed.
+    Remove,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -1467,7 +1497,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Worker(args) => cmd_worker(args).await,
         Command::Discover(args) => cmd_discover(args).await,
         Command::Shard(args) => cmd_shard(args).await,
-        Command::Export(args) => cmd_export(args),
+        Command::Export(args) => cmd_export(args).await,
+        Command::Python(args) => cmd_python(args).await,
         Command::ProfileDevices(args) => cmd_profile_devices(args),
         Command::ProfileStages(args) => cmd_profile_per_stage(args),
         Command::Place(args) => cmd_place(args),
@@ -3176,6 +3207,36 @@ const PACKED_VARIANT_SCRIPT: &str = include_str!(concat!(
     "/../../tools/packed_variant.py"
 ));
 
+/// The sparse-MoE exporters `export_moe.py` routes to, and what they import.
+macro_rules! tool {
+    ($path:literal) => {
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/", $path))
+    };
+}
+const MOE_SCRIPTS: &[(&str, &str)] = &[
+    ("export_moe.py", tool!("export_moe.py")),
+    ("export_glm5.py", tool!("export_glm5.py")),
+    ("export_deepseek_v4.py", tool!("export_deepseek_v4.py")),
+    ("export_minimax_m2.py", tool!("export_minimax_m2.py")),
+    ("export_inkling.py", tool!("export_inkling.py")),
+    (
+        "deepseek_v4_ref/__init__.py",
+        tool!("deepseek_v4_ref/__init__.py"),
+    ),
+    (
+        "deepseek_v4_ref/kernels_ref.py",
+        tool!("deepseek_v4_ref/kernels_ref.py"),
+    ),
+    (
+        "deepseek_v4_ref/model.py",
+        tool!("deepseek_v4_ref/model.py"),
+    ),
+    ("glm5_ref/__init__.py", tool!("glm5_ref/__init__.py")),
+    ("glm5_ref/kernels_ref.py", tool!("glm5_ref/kernels_ref.py")),
+    ("glm5_ref/load_export.py", tool!("glm5_ref/load_export.py")),
+    ("inkling_ref/__init__.py", tool!("inkling_ref/__init__.py")),
+];
+
 /// Write the embedded exporter and every module it imports into one flat
 /// dir (the scripts import their siblings from beside themselves), plus
 /// requirements.txt so a refusal can print the install line.
@@ -3194,6 +3255,15 @@ fn write_embedded_exporter(dir: &std::path::Path) -> Result<()> {
         ("requirements.txt", EXPORT_REQUIREMENTS),
     ] {
         std::fs::write(dir.join(name), body)
+            .with_context(|| format!("writing embedded {name} to temp dir"))?;
+    }
+    for (name, body) in MOE_SCRIPTS {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&path, body)
             .with_context(|| format!("writing embedded {name} to temp dir"))?;
     }
     Ok(())
@@ -3305,77 +3375,7 @@ fn export_flags(args: &ExportArgs) -> Vec<String> {
 pub(crate) const EXPORT_IMPORTS: &str =
     "import torch, openvino, transformers, safetensors, huggingface_hub";
 
-/// A Python interpreter and what it can do.
-#[derive(Debug)]
-pub(crate) struct PythonEnv {
-    pub path: String,
-    /// Version summary from the dependency probe; `None` if the imports failed
-    /// (or `check_deps` was false), so callers can skip probing a second time.
-    pub deps: Option<String>,
-}
-
-/// True only if the interpreter runs AND exits 0. Spawning is not enough: the
-/// Windows Store `python3.exe` alias spawns, prints "Python was not found" and
-/// exits 9009 — treating that as an interpreter is the very bug we're fixing.
-fn python_runs(p: &str) -> bool {
-    std::process::Command::new(p)
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Import the exporter's deps and report their versions. `None` if the imports
-/// fail — that interpreter can't run the exporter.
-fn probe_export_deps(p: &str) -> Option<String> {
-    let code = format!(
-        "{EXPORT_IMPORTS}; import sys; \
-         print('python', sys.version.split()[0]); \
-         print('torch', torch.__version__); \
-         print('openvino', openvino.__version__); \
-         print('transformers', transformers.__version__)"
-    );
-    let out = std::process::Command::new(p)
-        .args(["-c", &code])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Resolve the interpreter to run the embedded exporter with: prefer one that
-/// can import the deps, since on Windows `python3` is often a stub with no
-/// packages while `python` is the real install. Falls back to any interpreter
-/// that runs, so the caller can still surface the real `ModuleNotFoundError`.
-pub(crate) fn resolve_python(explicit: Option<&str>, check_deps: bool) -> Result<PythonEnv> {
-    let candidates: Vec<String> = match explicit {
-        Some(p) => vec![p.to_string()],
-        None => vec!["python3".to_string(), "python".to_string()],
-    };
-    let mut runnable: Option<String> = None;
-    for p in &candidates {
-        if check_deps {
-            if let Some(deps) = probe_export_deps(p) {
-                return Ok(PythonEnv {
-                    path: p.clone(),
-                    deps: Some(deps),
-                });
-            }
-        }
-        if runnable.is_none() && python_runs(p) {
-            runnable = Some(p.clone());
-        }
-    }
-    match (runnable, explicit) {
-        (Some(path), _) => Ok(PythonEnv { path, deps: None }),
-        (None, Some(p)) => Err(anyhow!(
-            "cannot run the interpreter passed to --python: {p:?}"
-        )),
-        (None, None) => Err(anyhow!(
-            "no Python interpreter found on PATH. Install Python 3.10-3.13 or pass --python <path>."
-        )),
-    }
-}
+pub(crate) use python_env::{resolve_python, Need};
 
 /// `--engine` that serves the shard tree at `dir`, mirroring the mapping in
 /// cascadia-engine-openvino's staged-tree diagnostic: export_shards.py and the
@@ -3391,10 +3391,11 @@ fn shard_tree_engine(dir: &std::path::Path) -> &'static str {
     if read_key("pipeline_config.json", "export_version").is_some_and(|v| v.starts_with("gemma4")) {
         return "gemma4";
     }
-    if read_key("manifest.json", "arch").is_some_and(|a| a.starts_with("qwen3_5")) {
-        return "qwen35";
+    match read_key("manifest.json", "arch").as_deref() {
+        Some(a) if a.starts_with("qwen3_5") => "qwen35",
+        Some("glm5" | "deepseek_v4" | "minimax_m2" | "inkling") => "sparse-moe",
+        _ => "ov-runtime",
     }
-    "ov-runtime"
 }
 
 /// The interpreter runs but can't import `imports`: re-run the import so the
@@ -3411,29 +3412,41 @@ fn export_deps_error(python: &str, imports: &str) -> anyhow::Error {
     anyhow!(
         "python environment check failed for interpreter {python:?}:\n{}\n\
          Install: {}\n\
-         (or point at another interpreter with --python <path>)",
+         (or let Cascadia install them: `cascadia python setup`)",
         stderr.trim(),
         export_pip_install_line(python)
     )
 }
 
 /// What `cascadia export` imports on top of the shard exporter's deps.
-const OPTIMUM_IMPORTS: &str = "import optimum.intel, nncf";
+pub(crate) const OPTIMUM_IMPORTS: &str = "import optimum.intel, nncf";
 
-fn cmd_export(args: ExportArgs) -> Result<()> {
-    use std::process::{Command, Stdio};
+async fn cmd_python(args: PythonArgs) -> Result<()> {
+    match args.cmd {
+        // Asking for it is the consent.
+        PythonCommand::Setup => python_env::setup_managed(true).await.map(|env| {
+            eprintln!("Ready: {}", env.path);
+        }),
+        PythonCommand::Remove => python_env::remove_managed(),
+    }
+}
+
+async fn cmd_export(args: ExportArgs) -> Result<()> {
+    use std::process::Stdio;
 
     // The whole environment is checked before any download or export.
-    let env = resolve_python(args.python.as_deref(), true)?;
+    let env =
+        python_env::python_for_export(args.python.as_deref(), true, Need::Pins, args.yes).await?;
     let python = env.path.clone();
     eprintln!("Checking Python environment for required packages...");
-    let Some(versions) = env.deps else {
+    let Some(versions) = env.deps.as_deref() else {
         return Err(export_deps_error(&python, EXPORT_IMPORTS));
     };
     for line in versions.lines() {
         eprintln!("  {line}");
     }
-    let optimum_ok = Command::new(&python)
+    let optimum_ok = env
+        .command()
         .args(["-c", OPTIMUM_IMPORTS])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -3454,7 +3467,8 @@ fn cmd_export(args: ExportArgs) -> Result<()> {
         python,
         flags.join(" ")
     );
-    let status = Command::new(&python)
+    let status = env
+        .command()
         .arg("-u")
         .arg(tmpdir.path().join("cascadia_export.py"))
         .args(&flags)
@@ -3471,7 +3485,7 @@ fn cmd_export(args: ExportArgs) -> Result<()> {
 }
 
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     // Build (and validate) the exporter flag list up front so the NPU
     // fail-fast guard fires before we probe Python or spawn anything.
@@ -3487,19 +3501,26 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
 
     // `--skip-check` means exactly that: don't import the deps just to pick an
     // interpreter (importing torch costs seconds).
-    let env = resolve_python(args.python.as_deref(), !args.skip_check)?;
+    let env = python_env::python_for_export(
+        args.python.as_deref(),
+        !args.skip_check,
+        Need::Imports,
+        args.yes,
+    )
+    .await?;
     let python = env.path.clone();
 
     if !args.skip_check {
         eprintln!("Checking Python environment for required packages...");
-        match env.deps {
+        match env.deps.as_deref() {
             Some(versions) => {
                 for line in versions.lines() {
                     eprintln!("  {line}");
                 }
                 // Only the paths that compress need NNCF (IR surgery keeps the
                 // input's weights), and they refuse to go on without it.
-                let nncf = Command::new(&python)
+                let nncf = env
+                    .command()
                     .args(["-c", "import nncf; print('nncf', nncf.__version__)"])
                     .output();
                 match nncf {
@@ -3536,7 +3557,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
 
     // Build python argv: `python -u <script> <flags…>` (flags already
     // validated + assembled by `shard_exporter_flags`).
-    let mut cmd = Command::new(&python);
+    let mut cmd = env.command();
     cmd.arg("-u").arg(&script_path).args(&flags);
     eprintln!(
         "Running exporter: {} -u <embedded> {}",
@@ -3834,7 +3855,7 @@ mod python_tests {
     #[test]
     fn explicit_interpreter_that_cannot_run_names_the_path() {
         // Must not tell the user to "pass --python" — they just did.
-        let err = resolve_python(Some("cascadia-no-such-python"), false)
+        let err = resolve_python(Some("cascadia-no-such-python"), false, Need::Imports)
             .unwrap_err()
             .to_string();
         assert!(err.contains("cascadia-no-such-python"), "{err}");
@@ -4659,6 +4680,9 @@ mod tests {
             "cascadia_export.py",
             "export_quant.py",
             "packed_variant.py",
+            "export_moe.py",
+            "export_glm5.py",
+            "deepseek_v4_ref/model.py",
             "requirements.txt",
         ] {
             assert!(dir.path().join(name).is_file(), "{name} missing");

@@ -1,0 +1,11 @@
+# Packages the private environment `cascadia python setup` builds holds on top
+# of requirements.txt. Nobody can pip install into that environment later, so
+# it carries what some models need that the exporter never imports itself.
+#
+# - sentencepiece, tiktoken, protobuf: loading a repo that ships tokenizer.model
+#   without a tokenizer.json.
+# - torchvision: the VLM exports optimum-intel runs.
+sentencepiece
+tiktoken
+protobuf
+torchvision

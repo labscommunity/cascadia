@@ -95,6 +95,8 @@ def install_line() -> str:
                 line = line.split("#", 1)[0].strip()
                 if line:
                     pins.append(f'"{line}"')
+    if os.environ.get("CASCADIA_MANAGED_PYTHON"):
+        return "cascadia python setup"
     return f"{sys.executable} -m pip install {' '.join(pins) or 'optimum-intel'}"
 
 
@@ -221,8 +223,10 @@ def side_venv_recipe(model: str, pin: str, num_stages: int | None,
     out = f"{name}-{weight_format}-ov"
     venv = "cascadia-vlm-export"
     q = shlex.quote
+    # Someone on Cascadia's private environment may have no other Python.
+    python = q(sys.executable) if os.environ.get("CASCADIA_MANAGED_PYTHON") else "python"
     lines = [
-        f"  python -m venv {venv}",
+        f"  {python} -m venv {venv}",
         f"  {venv}/bin/python -m pip install " + " ".join(q(p) for p in pins),
         f"  {venv}/bin/optimum-cli export openvino --model {q(model)} --task {VLM_TASK} "
         f"--weight-format {weight_format}" + (" --sym" if sym else "") + f" {q(out)}",

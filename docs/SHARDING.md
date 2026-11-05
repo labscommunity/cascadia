@@ -11,7 +11,8 @@ the embedding + (on the last stage) the final norm + lm_head.
 ## Quick start
 
 ```bash
-# One-time pip install (export-time only, not needed at runtime). From a source
+# Optional: the first export offers to install what it needs. To use your own
+# environment instead (export-time only, not needed at runtime), from a source
 # checkout; from a release bundle run `cascadia doctor`, which prints the pins:
 pip install -r tools/requirements.txt
 
@@ -55,7 +56,8 @@ network).
 | `--target cpu-gpu\|npu` | Deployment target. `npu` emits a stateless static-shape shard — see [NPU_SHARDING.md](NPU_SHARDING.md). |
 | `--static-seq N` / `--static-context N` | NPU only: fixed query window (must be 1) and total context (default 1024). |
 | `--default-dtype fp16\|fp32` | torch dtype during export. `fp16` (default) is required for `--target npu`. |
-| `--python /path/to/python` | Override Python interpreter. By default cascadia tries `python3` then `python` and picks the first that can import the export deps — so a bare `python3` stub (common on Windows) doesn't shadow the real install. |
+| `--python /path/to/python` | Use this Python. By default: an activated environment, then Cascadia's own packages, then `python3` and `python` on `PATH`. |
+| `--yes` | Install the Python packages without asking if they're missing. Required without a terminal. |
 | `--skip-check` | Skip the dependency probe — pass if you know your env is already set up. |
 
 ## Supported architectures

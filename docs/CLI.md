@@ -327,8 +327,8 @@ All flags exist on both `cascadia run` and `cascadia worker`.
 ## `cascadia shard`
 
 Export a HuggingFace causal-LM into per-stage OpenVINO IRs. **The only command
-that downloads from HuggingFace.** Needs export-time Python deps (~3 GB); run
-`cascadia doctor` to see the exact pinned `pip install` line for your host.
+that downloads from HuggingFace.** The first run offers to install the Python
+packages it needs (see [INSTALL.md](../INSTALL.md#export-time-python-only-for-cascadia-shard-and-cascadia-export)).
 
 ```
 cascadia shard --model <MODEL> -o <DIR> --num-stages <N> [OPTIONS]
@@ -346,7 +346,9 @@ cascadia shard --model <MODEL> -o <DIR> --num-stages <N> [OPTIONS]
 | `--static-seq <N>` | `1` | NPU only: fixed query-window length. Must be 1. |
 | `--static-context <N>` | `1024` | NPU only: fixed total context length. |
 | `--stage <N>` | all | Export only this stage (debug) — re-export one stage without redoing the rest. |
-| `--python <PATH>` | auto | Override the interpreter running the bundled exporter. |
+| `--python <PATH>` | auto | Use this Python. By default: an activated environment, then Cascadia's own packages, then a Python on `PATH`. |
+| `--yes` | off | Install the Python packages without asking if they're missing. Required without a terminal. |
+| `--packed-slots <N>` | `0` | NPU only: also emit a packed multi-slot IR for `cascadia worker --packed-slots N`. |
 | `--skip-check` | off | Skip interpreter/dependency detection. Faster start if you know the env is good. |
 
 ```bash

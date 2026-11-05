@@ -70,6 +70,7 @@ import sys
 
 import numpy as np
 
+from export_moe import exporter_for, run_export as run_moe_export
 from export_quant import compress_weights, require_compressor
 
 # torch is only needed by the dense/gemma4 export paths; the qwen3_5_moe
@@ -2281,6 +2282,12 @@ def _shard():
     # export (exporting a raw checkpoint first), or refuse; --text-only
     # falls through to the text tower below.
     from cascadia_export import shard_vlm
+
+    # Sparse-MoE families have their own exporters and on-disk layout.
+    _moe_exporter = exporter_for(_outer_mt, _inner_mt)
+    if _moe_exporter:
+        run_moe_export(args, _moe_exporter)
+        return args, None
 
     routed = shard_vlm(args, _raw_cfg)
     if routed:

@@ -34,7 +34,7 @@ Because OpenVINO's C++ ABI is not stable across releases, the runtime cannot be 
 
 Version strings are Intel's archive versions exactly as they appear in the file names on <https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/>: `2026.4.1.0`, `2026.5.0.0beta1`, `2026.5.0.0.dev20260925`.
 
-Python is not needed for inference. It is needed only for `cascadia shard` — which works from the prebuilt binary too: the Python exporters are compiled into it and extracted at run time (see "Export-time Python" below).
+Python is not needed for inference. To export a model, `cascadia shard` works from the prebuilt binary alone: it installs what it needs the first time (see "Export-time Python" below).
 
 ---
 
@@ -174,17 +174,24 @@ If cargo stops with "`embed-spa` is enabled, but the dashboard SPA has not been 
 
 ---
 
-## Export-time Python (only for `cascadia shard`)
+## Export-time Python (only for `cascadia shard` and `cascadia export`)
 
-Sharding a HuggingFace model into per-stage IRs runs a bundled Python exporter. This is needed **only** when you run `cascadia shard` — not at inference time, and not on workers. Install once, anywhere with the RAM:
+Python is needed only to export a model: not at inference time, and not on workers. You don't have to set it up. The first time you export, Cascadia asks once and installs what's missing:
 
-```bash
-pip install -r tools/requirements.txt   # from a source checkout
+```text
+$ cascadia shard --model Qwen/Qwen3-1.7B -o qwen3 --num-stages 2
+Exporting needs 59 Python packages. Install them in Cascadia's own folder (up to about 1.5 GB; nothing else on your system changes)? [Y/n]
 ```
 
-From a release bundle there is no `tools/` directory: run `cascadia doctor` (or `cascadia shard`) and it prints the exact pinned `pip install` line for the exporter compiled into that binary.
+Without a terminal to ask in (CI, scripts), pass `--yes`. Linux x86_64, Windows x86_64 and macOS arm64 are supported; setup needs PyPI, pytorch.org and GitHub.
 
-`nncf` is needed to compress weights to INT4 (the default) or INT8: without it, an export that compresses stops and tells you to install it or pass `--quantization fp16`. `cascadia doctor` reports whether the core export packages (torch / openvino / transformers) are present.
+- **Only what's missing is installed.** `uv`, a Python 3.12 or 3.13 and packages at exactly the tested version are reused if you have them. Your system Python is never changed.
+- **Your own Python still works.** An activated venv or conda environment, or a Python on `PATH` with the exporter's packages, is used as it is, with no question asked. `--python <path>` picks one explicitly. Each run prints which it chose.
+- **Repair and clean-up.** `cascadia python setup` installs ahead of time and repairs a damaged install. `cascadia python remove` deletes everything it installed.
+- **Windows.** torch and OpenVINO need the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). It needs admin rights, so Cascadia points you to it rather than installing it.
+- **Company networks.** `HTTPS_PROXY` and uv's `UV_DEFAULT_INDEX`, `UV_INDEX`, `UV_NATIVE_TLS` and `UV_PYTHON_INSTALL_MIRROR` are honoured; every package is checked against the hash Cascadia ships with. If the download of `uv` itself fails, install `uv` yourself or use `--python`.
+
+To install into your own environment instead, `cascadia doctor` prints the pinned `pip install` line (`pip install -r tools/requirements.txt` from a source checkout). `nncf` is needed to compress weights to INT4 (the default) or INT8: without it, an export that compresses stops and tells you to install it or pass `--quantization fp16`.
 
 Exporting a **whole-model** IR for `--engine ov-genai` is a different job and uses Intel's exporter, not this one — `pip install "optimum-intel[openvino]"`, see [docs/engines/ov-genai.md](docs/engines/ov-genai.md).
 
