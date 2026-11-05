@@ -60,6 +60,18 @@ struct PipelineConfig {
     num_layers: u32,
     #[serde(default)]
     num_kv_shared_layers: u32,
+    #[serde(default)]
+    hidden_size: u32,
+    /// Per-layer-input width (E2B/E4B); 0 on exports without the side channel.
+    #[serde(default)]
+    pli_dim: u32,
+}
+
+/// Bytes per prompt token of the f32 hidden frame a stage sends: `hidden_size` plus one `pli_dim`
+/// for each layer after this stage. The largest frame of a prefill; cross-KV frames are narrower.
+fn hidden_frame_bytes_per_token(cfg: &PipelineConfig, layer_end: u32) -> usize {
+    let tail = cfg.pli_dim as usize * cfg.num_layers.saturating_sub(layer_end) as usize;
+    (cfg.hidden_size as usize + tail) * std::mem::size_of::<f32>()
 }
 
 fn default_true() -> bool {
@@ -1974,6 +1986,8 @@ pub struct Gemma4Builder {
     /// KV-sharing layer count from pipeline_config.json, stashed in load() for build(). See
     /// [`Gemma4Engine::num_kv_shared_layers`].
     num_kv_shared_layers: u32,
+    /// Hidden-frame size from load(), for build()'s prompt bound.
+    frame_bytes_per_token: usize,
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -2190,6 +2204,8 @@ impl Builder for Gemma4Builder {
         };
         self.spec = Some(spec);
         self.num_kv_shared_layers = pipeline_cfg.num_kv_shared_layers;
+        self.frame_bytes_per_token =
+            hidden_frame_bytes_per_token(&pipeline_cfg, stage_cfg.layer_end);
 
         events.push(LoadProgress::message(format!(
             "compiling stage {} on {}",
@@ -2320,7 +2336,14 @@ impl Builder for Gemma4Builder {
             num_kv_shared_layers: self.num_kv_shared_layers,
             num_stages: self.total,
             runtime,
-            prompt_window: crate::pipeline_model_window(&self.pipeline_dir),
+            prompt_window: {
+                let window = crate::pipeline_model_window(&self.pipeline_dir);
+                if self.downstream.is_some() {
+                    crate::forwarded_prompt_window(window, self.frame_bytes_per_token)
+                } else {
+                    window
+                }
+            },
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             upstream: self.upstream,
@@ -2349,6 +2372,21 @@ impl Builder for Gemma4Builder {
 mod tests {
     use super::*;
     use cascadia_types::PeerLayout;
+
+    /// Gemma 4 E2B on two stages refused 11,428 tokens at 269,152,256 bytes on the rig: 23,552 per
+    /// token, the width the export gives stage 0 (hidden + PLI for the 17 layers after it).
+    #[test]
+    fn hidden_frame_size_counts_the_layers_after_this_stage() {
+        let cfg = |hidden_size, pli_dim| PipelineConfig {
+            num_layers: 35,
+            hidden_size,
+            pli_dim,
+            ..serde_json::from_str(r#"{"model_id":"m","num_stages":2}"#).unwrap()
+        };
+        assert_eq!(hidden_frame_bytes_per_token(&cfg(1536, 256), 18), 23_552);
+        assert_eq!(hidden_frame_bytes_per_token(&cfg(1536, 256), 35), 6_144);
+        assert_eq!(hidden_frame_bytes_per_token(&cfg(1536, 0), 18), 6_144);
+    }
 
     /// Rig incident (2026-08-17): RESTORE/ABORT ack recvs were UNBOUNDED while
     /// CAPTURE's was bounded, so a peer that died without acking wedged the

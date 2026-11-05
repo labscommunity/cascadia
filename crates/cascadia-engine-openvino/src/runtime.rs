@@ -5410,7 +5410,15 @@ impl Builder for OvRuntimeBuilder {
         };
 
         Ok(Box::new(OvRuntimeEngine {
-            prompt_window: crate::pipeline_model_window(&self.pipeline_dir),
+            prompt_window: {
+                let window = crate::pipeline_model_window(&self.pipeline_dir);
+                if self.downstream.is_some() {
+                    // The hidden frame is f16 per token.
+                    crate::forwarded_prompt_window(window, self.hidden_size * 2)
+                } else {
+                    window
+                }
+            },
             packed,
             spec,
             runtime,
