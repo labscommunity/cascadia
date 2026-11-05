@@ -333,20 +333,31 @@ def optimum_export(model: str, out_dir: str, task: str, weight_format: str,
         raise SystemExit(f"optimum-cli export exited with {rc}; see the output above")
 
 
+# manifest.json arch of the sparse-MoE layouts: one tree serves any stage count,
+# because the engine picks the split when it loads it.
+SPARSE_MOE_ARCHS = ("glm5", "deepseek_v4", "minimax_m2", "inkling")
+
+
 def tree_facts(out_dir: str) -> dict | None:
     """stages, numLayers and whether the tree carries vision, read from what
     the exporter wrote: pipeline_config.json (ov-runtime, gemma4 trees) or
-    manifest.json (qwen35 trees). None when neither is there."""
+    manifest.json (qwen35 and sparse-MoE trees). None when neither is there."""
     for name in ("pipeline_config.json", "manifest.json"):
         path = os.path.join(out_dir, name)
         if os.path.exists(path):
             with open(path) as f:
                 cfg = json.load(f)
-            stages = cfg.get("num_stages")
-            if stages is None:
-                stages = len(cfg.get("stages") or [])
+            quant = cfg.get("quantization")
+            if cfg.get("arch") in SPARSE_MOE_ARCHS:
+                stages = None
+                if cfg.get("experts_format") == "int4_bin":
+                    quant = "int4"
+            else:
+                stages = cfg.get("num_stages")
+                if stages is None:
+                    stages = len(cfg.get("stages") or [])
             return {"stages": stages, "numLayers": cfg.get("num_layers"),
-                    "vision": "vision" in cfg, "quant": cfg.get("quantization")}
+                    "vision": "vision" in cfg, "quant": quant}
     return None
 
 

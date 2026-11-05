@@ -15,7 +15,7 @@ set -uo pipefail
 BIN="${1:?usage: $0 <path to the cascadia binary>}"
 case "$BIN" in /*|[A-Za-z]:*) ;; *) BIN="$PWD/$BIN" ;; esac
 MODEL="hf-internal-testing/tiny-random-LlamaForCausalLM"
-CHECKS="no-prompt-outside-terminal doctor-only-looks terminal-prompt setup-from-nothing second-run-installs-nothing int4-means-int4 export-through-private skip-check caller-python-vars-ignored activated-venv-wins broken-venv-falls-through python-flag-wins killed-setup-recovers damaged-env-rebuilds reuses-system-uv-python-packages system-python-unchanged changed-package-restored moe-exporters-reachable old-env-removed remove-deletes-everything"
+CHECKS="no-prompt-outside-terminal doctor-only-looks terminal-prompt setup-from-nothing second-run-installs-nothing int4-means-int4 export-through-private skip-check caller-python-vars-ignored activated-venv-wins broken-venv-falls-through python-flag-wins path-python-used-unasked off-pin-path-python killed-setup-recovers damaged-env-rebuilds reuses-system-uv-python-packages system-python-unchanged changed-package-restored moe-exporters-reachable old-env-removed remove-deletes-everything"
 
 if [ "${DRY_RUN:-0}" = 1 ]; then
     for c in $CHECKS; do echo "would run: $c"; done
@@ -143,6 +143,25 @@ check broken-venv-falls-through 'tree_ok && said "private"' "exit $RC"
 shard --python "$(pybin "$VENV")"
 check python-flag-wins 'tree_ok && said "(--python)"' "exit $RC"
 
+# A Python on PATH that can do the job needs no setup, and no question. One
+# outside the pins still serves `shard`, with a warning; `export` fails on those.
+SAVED_ROOT="$ROOT"; SAVED_PATH="$RUN_PATH"
+ROOT="$WORK/home-unused"
+if [ "$WINDOWS" = 1 ]; then RUN_PATH="$VENV/Scripts"; else RUN_PATH="$VENV/bin"; fi
+shard
+check path-python-used-unasked 'tree_ok && said "meets the exporter" && ! said "Exporting needs" && [ -z "$(envdir)" ]' "exit $RC"
+
+env UV_CACHE_DIR="$SAVED_ROOT/uv-cache" PATH="$SAVED_PATH" "$UV" pip install --no-config --quiet \
+    --python "$(pybin "$VENV")" --no-deps --only-binary :all: transformers==5.4.0
+shard
+RC_SHARD=$RC
+SHARD_WARNED=$(said "isn't tested with" && echo yes || echo no)
+rm -rf "$WORK/exp"
+cas export --model "$MODEL" -o "$WORK/exp" --weight-format fp16
+check off-pin-path-python '[ "$RC_SHARD" = 0 ] && [ "$SHARD_WARNED" = yes ] && [ "$RC" != 0 ] && said "--yes" && [ -z "$(envdir)" ]' \
+    "shard exit $RC_SHARD, warned $SHARD_WARNED; export exit $RC should refuse and install nothing"
+ROOT="$SAVED_ROOT"; RUN_PATH="$SAVED_PATH"
+
 # --- Interrupted and damaged -------------------------------------------------
 rm -f "$ENV_DIR/cascadia-complete"
 rm -rf "$ENV_DIR"
@@ -206,9 +225,20 @@ check system-python-unchanged 'tree_ok && [ "$(find "$SYS" -type f -not -name "*
 LOCKED_NUMPY="$(version numpy)"
 env UV_CACHE_DIR="$ROOT/uv-cache" PATH="$RUN_PATH" "$WORK/uv-on-path/$(basename "$UV")" pip install --no-config --quiet --python "$SYS_PY" \
     --break-system-packages --only-binary :all: --no-deps "numpy<$LOCKED_NUMPY"
-shard
-check changed-package-restored 'tree_ok && said "restoring" && [ "$(version numpy)" = "$LOCKED_NUMPY" ]' \
-    "exit $RC, numpy now $(version numpy), locked $LOCKED_NUMPY"
+# Two exports at once: one restores it, the other waits for that and needs nothing.
+one() {
+    rm -rf "$WORK/tree-$1"
+    env -u VIRTUAL_ENV -u CONDA_PREFIX -u CONDA_DEFAULT_ENV PATH="$RUN_PATH" CASCADIA_PYTHON_HOME="$ROOT" \
+        "$BIN" shard --model "$MODEL" -o "$WORK/tree-$1" --num-stages 2 --quantization fp16 </dev/null >"$WORK/out-$1.log" 2>&1
+}
+one a & PID_A=$!
+one b & PID_B=$!
+wait "$PID_A"; RC_A=$?
+wait "$PID_B"; RC_B=$?
+cat "$WORK/out-a.log" "$WORK/out-b.log" >"$WORK/out.log"
+RESTORES="$(grep -c "restoring [0-9]* package" "$WORK/out.log")"
+check changed-package-restored '[ "$RC_A" = 0 ] && [ "$RC_B" = 0 ] && [ "$RESTORES" = 1 ] && [ "$(version numpy)" = "$LOCKED_NUMPY" ]' \
+    "exits $RC_A and $RC_B, restored $RESTORES time(s), numpy now $(version numpy), locked $LOCKED_NUMPY"
 
 # Real checkpoints are hundreds of GB. A config alone proves the binary carries
 # each exporter and its imports: it runs, and stops on the missing weights.

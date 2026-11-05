@@ -1,5 +1,6 @@
 """`cascadia shard` reaches the sparse-MoE exporters, from the binary alone."""
 import ast
+import json
 import os
 import re
 import subprocess
@@ -66,6 +67,29 @@ def test_a_failed_exporter_fails_the_shard(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "call", lambda cmd: 3)
     with pytest.raises(SystemExit, match="exited with 3"):
         export_moe.run_export(args(model=str(tmp_path)), "export_glm5")
+
+
+def test_the_sidecar_describes_a_sparse_moe_tree(tmp_path):
+    cascadia_export = pytest.importorskip("cascadia_export")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"arch": "glm5", "num_layers": 3, "experts_format": "int4_bin"})
+    )
+    facts = cascadia_export.tree_facts(str(tmp_path))
+    assert facts["stages"] is None, "one tree serves any stage count"
+    assert facts["quant"] == "int4"
+    assert facts["numLayers"] == 3
+
+    # The format isn't known from the layout alone for an OpenVINO-IR expert tree.
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"arch": "minimax_m2", "num_layers": 3, "experts_format": "ov_ir"})
+    )
+    assert cascadia_export.tree_facts(str(tmp_path))["quant"] is None
+
+    # Other manifests keep counting their stages.
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"arch": "qwen3_5_moe", "stages": [{}, {}], "num_layers": 8})
+    )
+    assert cascadia_export.tree_facts(str(tmp_path))["stages"] == 2
 
 
 def _local_imports(path):

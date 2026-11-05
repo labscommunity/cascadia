@@ -202,8 +202,13 @@ fn import_module(dist: &str) -> String {
     }
 }
 
-/// One subprocess: import every requirement, then print one
-/// `cascadia-probe <dist> <version>` line per requirement.
+/// Prefix of the line naming a requirement that didn't import.
+const MISSING_MARK: &str = "cascadia-missing";
+
+/// One subprocess: try every requirement and report each as a
+/// `cascadia-probe <dist> <version>` or `cascadia-missing <dist>` line. A single
+/// pass answers both "inside the pins?" and "can it run a shard export?", since
+/// importing torch takes tens of seconds on a cold Windows box.
 fn probe_pins(mut cmd: Command) -> Result<String, String> {
     let reqs: Vec<String> = export_requirements()
         .iter()
@@ -214,17 +219,20 @@ fn probe_pins(mut cmd: Command) -> Result<String, String> {
     // the pip wheel that `importlib.metadata` would report.
     let code = format!(
         "import importlib, importlib.metadata as md, sys\n\
-         reqs = [{}]\n\
-         mods = {{d: importlib.import_module(m) for d, m in reqs}}\n\
-         for d, _ in reqs:\n\
-         \x20   v = getattr(mods[d], '__version__', None)\n\
+         print('{PROBE_MARK}', 'python', sys.version.split()[0])\n\
+         for d, m in [{}]:\n\
+         \x20   try:\n\
+         \x20       mod = importlib.import_module(m)\n\
+         \x20   except Exception:\n\
+         \x20       print('{MISSING_MARK}', d)\n\
+         \x20       continue\n\
+         \x20   v = getattr(mod, '__version__', None)\n\
          \x20   if not isinstance(v, str):\n\
          \x20       try:\n\
          \x20           v = md.version(d)\n\
          \x20       except md.PackageNotFoundError:\n\
          \x20           v = '?'\n\
-         \x20   print('{PROBE_MARK}', d, v)\n\
-         print('{PROBE_MARK}', 'python', sys.version.split()[0])\n",
+         \x20   print('{PROBE_MARK}', d, v)\n",
         reqs.join(", ")
     );
     run_with_timeout(cmd.args(["-c", &code]), PROBE_TIMEOUT).map_err(|e| {
@@ -233,12 +241,31 @@ fn probe_pins(mut cmd: Command) -> Result<String, String> {
     })
 }
 
+/// Did a [`probe_pins`] run import everything a shard export needs?
+fn core_imports_ok(probe_out: &str) -> bool {
+    let core: Vec<&str> = EXPORT_IMPORTS
+        .trim_start_matches("import ")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    !probe_out
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(MISSING_MARK))
+        .any(|d| core.contains(&d.trim()))
+}
+
 /// The version lines of a [`probe_pins`] run, as `probe_export_deps` prints them.
 fn pin_summary(probe_out: &str) -> String {
     probe_out
         .lines()
         .filter_map(|l| l.trim().strip_prefix(PROBE_MARK))
-        .map(|l| format!("{}\n", l.trim()))
+        .map(str::trim)
+        .filter(|l| {
+            ["python ", "torch ", "openvino ", "transformers "]
+                .iter()
+                .any(|name| l.starts_with(name))
+        })
+        .map(|l| format!("{l}\n"))
         .collect()
 }
 
@@ -397,15 +424,27 @@ pub(crate) fn resolve_python(
         managed: false,
         guard: None,
     };
-    let probe = |p: &str| {
-        check_deps
-            .then(|| probe_export_deps(Command::new(p)))
-            .flatten()
+    // An interpreter the user chose is used regardless. `export` also says when
+    // it is outside the pins, the first thing to check if the export misbehaves.
+    let probe = |p: &str| -> Option<String> {
+        match (check_deps, need) {
+            (false, _) => None,
+            (true, Need::Imports) => probe_export_deps(Command::new(p)),
+            (true, Need::Pins) => {
+                let out = probe_pins(Command::new(p)).ok()?;
+                if !core_imports_ok(&out) {
+                    return None;
+                }
+                if let Err(why) = check_versions(&out, export_requirements()) {
+                    eprintln!("warning: {p} is outside the exporter's pins: {why}");
+                }
+                Some(pin_summary(&out))
+            }
+        }
     };
 
     if let Some(p) = explicit {
         if let Some(deps) = probe(p) {
-            warn_outside_pins(p, need);
             return Ok(env(p, Some(deps), "--python"));
         }
         return if python_runs(p) {
@@ -422,7 +461,6 @@ pub(crate) fn resolve_python(
             return Ok(env(&p, None, label));
         }
         if let Some(deps) = probe(&p) {
-            warn_outside_pins(&p, need);
             return Ok(env(&p, Some(deps), label));
         }
     }
@@ -444,21 +482,23 @@ pub(crate) fn resolve_python(
     let mut rejected = Vec::new();
     let mut runnable = None;
     for p in &candidates {
-        let pins = probe_pins(Command::new(p));
-        match pins.and_then(|out| check_versions(&out, export_requirements()).map(|()| out)) {
-            Ok(out) => {
-                return Ok(env(
-                    p,
-                    Some(pin_summary(&out)),
-                    "on PATH, meets the exporter's pins",
-                ))
-            }
+        match probe_pins(Command::new(p)) {
+            Ok(out) => match check_versions(&out, export_requirements()) {
+                Ok(()) => {
+                    return Ok(env(
+                        p,
+                        Some(pin_summary(&out)),
+                        "on PATH, meets the exporter's pins",
+                    ))
+                }
+                Err(why) => {
+                    rejected.push(format!("{p}: {why}"));
+                    if importer.is_none() && core_imports_ok(&out) {
+                        importer = Some((p.clone(), pin_summary(&out)));
+                    }
+                }
+            },
             Err(why) => rejected.push(format!("{p}: {why}")),
-        }
-        if importer.is_none() {
-            if let Some(deps) = probe_export_deps(Command::new(p)) {
-                importer = Some((p.clone(), deps));
-            }
         }
         if runnable.is_none() && python_runs(p) {
             runnable = Some(p.clone());
@@ -483,19 +523,6 @@ fn no_python_error() -> anyhow::Error {
     anyhow!(
         "no Python interpreter found on PATH. Install Python 3.10-3.13 or pass --python <path>."
     )
-}
-
-/// An explicitly chosen interpreter is used regardless, but say when it is
-/// outside the pins: that is the first thing to check if the export misbehaves.
-fn warn_outside_pins(p: &str, need: Need) {
-    if need != Need::Pins {
-        return;
-    }
-    let verdict =
-        probe_pins(Command::new(p)).and_then(|out| check_versions(&out, export_requirements()));
-    if let Err(why) = verdict {
-        eprintln!("warning: {p} is outside the exporter's pins: {why}");
-    }
 }
 
 /// The interpreter inside a venv at `prefix`.
@@ -1096,25 +1123,38 @@ pub(crate) async fn setup_managed(yes: bool) -> Result<PythonEnv> {
 
 /// Put back any package that no longer matches the lock, such as a reused system
 /// package the user upgraded. Imports can pass on such an environment, so the
-/// versions are what's compared; reading them takes milliseconds.
+/// versions are what's compared; reading them takes milliseconds. Changing the
+/// environment takes its lock, like a setup: not under a running export, and only
+/// one repair, so the versions are read again once it's held.
 async fn repair_managed(env: &PythonEnv) -> Result<()> {
     let (Some(platform), Some(managed)) = (&PLATFORM, Managed::current()?) else {
         return Ok(());
     };
     let lock = parse_lock(platform.lock);
     let info = py_info(env.command()).map_err(|e| anyhow!(e))?;
-    let wrong = packages_to_install(&lock, &info.dists);
-    if wrong.is_empty() {
+    if packages_to_install(&lock, &info.dists).is_empty() {
         return Ok(());
     }
-    let names: Vec<&str> = wrong.iter().map(|e| e.name.as_str()).collect();
-    eprintln!(
-        "Private Python environment: restoring {} package(s) that changed: {}",
-        wrong.len(),
-        names.join(", ")
-    );
-    let uv = find_or_get_uv(platform, &managed.root).await?;
-    install_packages(&uv, &managed.root, &managed.python(), &wrong)
+    let lock_file = managed.open_lock()?;
+    if lock_file.try_lock().is_err() {
+        eprintln!("Waiting for another export to finish before restoring Python packages...");
+        lock_file
+            .lock()
+            .context("waiting for the environment lock")?;
+    }
+    let info = py_info(env.command()).map_err(|e| anyhow!(e))?;
+    let wrong = packages_to_install(&lock, &info.dists);
+    if !wrong.is_empty() {
+        let names: Vec<&str> = wrong.iter().map(|e| e.name.as_str()).collect();
+        eprintln!(
+            "Private Python environment: restoring {} package(s) that changed: {}",
+            wrong.len(),
+            names.join(", ")
+        );
+        let uv = find_or_get_uv(platform, &managed.root).await?;
+        install_packages(&uv, &managed.root, &managed.python(), &wrong)?;
+    }
+    lock_file.unlock().context("releasing the environment lock")
 }
 
 /// The interpreter for `shard` or `export`: an existing one if it can do the job,
@@ -1174,7 +1214,13 @@ fn discard_dir(dir: &Path) -> Result<()> {
         return Ok(());
     }
     let name = dir.file_name().unwrap_or_default().to_string_lossy();
-    let trash = dir.with_file_name(format!("{name}{TRASH_MARK}{}", std::process::id()));
+    // Unique: an earlier discard's leftovers can still hold a name, even this
+    // process's own when a layered build fails and is rebuilt.
+    let pid = std::process::id();
+    let trash = (0u32..)
+        .map(|n| dir.with_file_name(format!("{name}{TRASH_MARK}{pid}-{n}")))
+        .find(|p| !p.exists())
+        .context("no free name to move the old environment to")?;
     std::fs::rename(dir, &trash).with_context(|| format!("moving aside {}", dir.display()))?;
     if let Err(e) = remove_dir_with_retries(&trash) {
         tracing::debug!(path = %trash.display(), error = %e, "left for the next setup");
@@ -1390,7 +1436,6 @@ torch==2.15.0+cpu \\
         let reqs = [("torch", ">=2.6"), ("nncf", ">=2.18")];
         let ok = "chatter\ncascadia-probe torch 2.15.0\ncascadia-probe nncf 3.4.0\n";
         assert!(check_versions(ok, &reqs).is_ok());
-        assert_eq!(pin_summary(ok), "torch 2.15.0\nnncf 3.4.0\n");
         let old = "cascadia-probe torch 2.1.0\ncascadia-probe nncf 3.4.0\n";
         assert!(check_versions(old, &reqs)
             .unwrap_err()
@@ -1399,6 +1444,31 @@ torch==2.15.0+cpu \\
         assert!(check_versions(gone, &reqs)
             .unwrap_err()
             .contains("nncf missing"));
+    }
+
+    #[test]
+    fn one_probe_answers_both_questions() {
+        // A shard-only environment: no nncf or optimum-intel.
+        let shard_only = "cascadia-probe python 3.12.1\n\
+                          cascadia-probe torch 2.15.0\n\
+                          cascadia-missing nncf\n\
+                          cascadia-missing optimum-intel\n\
+                          cascadia-probe nncf-lookalike 1\n";
+        assert!(
+            core_imports_ok(shard_only),
+            "the optional ones can be missing"
+        );
+        let reqs = [("nncf", ">=2.18")];
+        assert!(check_versions(shard_only, &reqs)
+            .unwrap_err()
+            .contains("nncf missing"));
+        assert!(!core_imports_ok("cascadia-missing torch\n"));
+        assert!(!core_imports_ok("cascadia-missing huggingface_hub\n"));
+        assert_eq!(
+            pin_summary("cascadia-probe python 3.12.1\ncascadia-probe torch 2.15.0\ncascadia-probe nncf 3.4.0\n"),
+            "python 3.12.1\ntorch 2.15.0\n",
+            "the same lines as the import-only probe"
+        );
     }
 
     #[test]
@@ -1461,6 +1531,21 @@ torch==2.15.0+cpu \\
         sweep_trash(root.path());
         assert!(!left.exists());
         assert!(root.path().join("keep").exists());
+    }
+
+    #[test]
+    fn discarding_never_collides_with_earlier_leftovers() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("abc");
+        std::fs::create_dir_all(&dir).unwrap();
+        // What a delete that failed leaves: this process's first trash name, full.
+        let held = root
+            .path()
+            .join(format!("abc{TRASH_MARK}{}-0", std::process::id()));
+        std::fs::create_dir_all(held.join("locked")).unwrap();
+        discard_dir(&dir).expect("should pick another name");
+        assert!(!dir.exists());
+        assert!(held.join("locked").exists(), "the leftover is untouched");
     }
 
     #[test]
