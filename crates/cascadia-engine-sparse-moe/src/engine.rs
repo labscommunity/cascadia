@@ -69,7 +69,8 @@ pub struct SparseMoEBuilderConfig {
     // Deliberately absent: `profile`. `CASCADIA_GLM5_PROFILE` is read from a
     // `OnceLock` process global in the decode loop, which no config can reach;
     // it stays env-only rather than becoming a field that silently does nothing.
-    /// Context budget. `None` → `CASCADIA_GLM5_MAX_SEQ`, else [`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`].
+    /// Context budget for the staged arches (glm5, dsv4, inkling). `None` or 0 → that arch's
+    /// `CASCADIA_<ARCH>_MAX_SEQ`, else its default ([`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`] for glm5).
     pub max_seq: Option<usize>,
     /// KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE` (0 = off).
     pub prefix_cache_depth: Option<u32>,
@@ -378,6 +379,15 @@ fn env_max_seq(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// A staged arch's context budget: a non-zero configured `max_seq` wins, else
+/// [`env_max_seq`]. Zero means unset, so a 0 never becomes a window that refuses
+/// every prompt.
+fn staged_max_seq(configured: Option<usize>, var: &str, default: usize) -> usize {
+    configured
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| env_max_seq(var, default))
+}
+
 impl SparseMoEBuilder {
     /// Rank 0 (the API rank) needs the tokenizer; workers drive themselves from
     /// the hidden states on the wire. Shared by every Rust-shell family.
@@ -559,17 +569,16 @@ impl Builder for SparseMoEBuilder {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
             // Context budget sizes the rope table + KV/compressed/indexer
-            // caches (memory scales with it). Overridable for long-context
-            // deployments via CASCADIA_DSV4_MAX_SEQ; fall back to the default on
-            // a missing, unparseable, or zero value.
-            let max_seq = env_max_seq(
+            // caches (memory scales with it).
+            let max_seq = staged_max_seq(
+                self.config.max_seq,
                 "CASCADIA_DSV4_MAX_SEQ",
                 crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
             );
             if max_seq > 131072 {
                 warn!(
                     max_seq,
-                    "CASCADIA_DSV4_MAX_SEQ is large; per-layer caches scale with it"
+                    "dsv4 context budget is large; per-layer caches scale with it"
                 );
             }
             let runner = crate::dsv4::stage::Dsv4Runner::load_staged(
@@ -639,12 +648,11 @@ impl Builder for SparseMoEBuilder {
             }
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
-            let max_seq = self.config.max_seq.unwrap_or_else(|| {
-                env_max_seq(
-                    "CASCADIA_INKLING_MAX_SEQ",
-                    crate::inkling::stage::INKLING_DEFAULT_MAX_SEQ,
-                )
-            });
+            let max_seq = staged_max_seq(
+                self.config.max_seq,
+                "CASCADIA_INKLING_MAX_SEQ",
+                crate::inkling::stage::INKLING_DEFAULT_MAX_SEQ,
+            );
             // Expert-parallel driver: every layer local, experts remote.
             let remote = if self.ep_clients.is_empty() {
                 None
@@ -697,12 +705,11 @@ impl Builder for SparseMoEBuilder {
         if arch.as_deref() == Some("glm5") {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
-            let max_seq = self.config.max_seq.unwrap_or_else(|| {
-                env_max_seq(
-                    "CASCADIA_GLM5_MAX_SEQ",
-                    crate::glm::stage::GLM5_DEFAULT_MAX_SEQ,
-                )
-            });
+            let max_seq = staged_max_seq(
+                self.config.max_seq,
+                "CASCADIA_GLM5_MAX_SEQ",
+                crate::glm::stage::GLM5_DEFAULT_MAX_SEQ,
+            );
             let runner = crate::glm::stage::GlmRunner::load_staged(
                 &self.config.model_dir,
                 max_seq,
@@ -7158,8 +7165,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // is the first generated token). take() keeps the HEAD, so truncation
         // drops the tail — i.e. the newest turn. Never do this silently: a
         // caller whose prompt overflowed the budget is served an answer to a
-        // prompt it did not send, so log loudly with the numbers. (A future
-        // improvement is a budget-aware trim or an explicit 4xx over budget.)
+        // prompt it did not send, so log loudly with the numbers. `PipelineEngine`
+        // refuses an over-budget prompt at submit, so this guards other callers.
         let n_prefill = n_prompt.min(max_seq);
         if n_prompt > max_seq {
             warn!(
@@ -8270,6 +8277,24 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 cap: OV_MAX_PENDING,
             });
         }
+        // Refuse here, synchronously with the request, rather than let prefill
+        // drop the prompt's tail and answer from its head with a normal finish.
+        // Counted the way admission encodes it (special tokens included).
+        if let Some(tok) = self.tokenizer.as_ref() {
+            let n = tok
+                .encode(task.prompt.as_str(), true)
+                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
+                .get_ids()
+                .len();
+            let max_seq = self.runner.max_seq();
+            if n > max_seq {
+                warn!(task = %task.task_id, prompt_tokens = n, context_budget = max_seq,
+                      "refusing over-budget prompt");
+                return Err(EngineError::PromptTooLong(format!(
+                    "prompt is {n} tokens but this model's context budget is {max_seq}"
+                )));
+            }
+        }
         self.pending.push_back(task);
         self.note_link_busy();
         Ok(())
@@ -8533,6 +8558,58 @@ mod tests {
             reason.starts_with("resume_unsupported:"),
             "sentinel must PREFIX the reason (callers match with starts_with): {reason}"
         );
+    }
+
+    #[test]
+    fn staged_max_seq_prefers_a_nonzero_config_value() {
+        // An env var no test sets, so the fallback is the default.
+        let var = "CASCADIA_TEST_UNSET_MAX_SEQ";
+        assert_eq!(super::staged_max_seq(Some(2048), var, 4096), 2048);
+        assert_eq!(
+            super::staged_max_seq(Some(0), var, 4096),
+            4096,
+            "0 means unset"
+        );
+        assert_eq!(super::staged_max_seq(None, var, 4096), 4096);
+    }
+
+    /// A prompt over the runner's context budget is refused at submit, where the
+    /// caller can still be told (PromptTooLong is a 4xx before any stream), instead
+    /// of being truncated during prefill and answered from its head. A prompt that
+    /// exactly fills the budget (StubRunner: 32) is accepted.
+    #[test]
+    fn pipeline_engine_refuses_over_budget_prompt_at_submit() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let tok = Tokenizer::from_bytes(
+            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
+                "decoder":null,"model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+        )
+        .expect("build tiny tokenizer");
+        let mut eng = PipelineEngine::new(
+            StubRunner,
+            Some(tok),
+            StageTransport {
+                upstream: None,
+                downstream: None,
+            },
+            rt.handle().clone(),
+            0,
+            1,
+            None,
+        );
+        let words = |n: usize| vec!["hi"; n].join(" ");
+        eng.submit(GenerationTask::new("fits", words(32)))
+            .expect("a prompt that exactly fills max_seq is accepted");
+        match eng.submit(GenerationTask::new("over", words(33))) {
+            Err(EngineError::PromptTooLong(msg)) => {
+                assert!(msg.contains("33") && msg.contains("32"), "{msg}")
+            }
+            other => panic!("expected PromptTooLong, got {other:?}"),
+        }
+        assert_eq!(eng.pending.len(), 1, "a refused prompt is never queued");
     }
 
     #[test]

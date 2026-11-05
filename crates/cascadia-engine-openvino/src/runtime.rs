@@ -349,6 +349,18 @@ fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String>
     })
 }
 
+/// `Some(reason)` when a prompt is longer than the unpacked static (NPU) KV ring
+/// (`past_len = static_context - 1`); prefill would otherwise evict the prompt's
+/// head and answer through a sliding window.
+fn static_prompt_too_long(prompt_tokens: usize, past_len: usize) -> Option<String> {
+    (prompt_tokens > past_len).then(|| {
+        format!(
+            "prompt is {prompt_tokens} tokens but this pipeline's static KV window holds \
+             {past_len}; re-export with a larger --static-context"
+        )
+    })
+}
+
 /// Encode a packed step's per-row assignment as one framed I64 `[1, 3, S]`
 /// tensor: row 0 slot ids (`-1` = idle row), row 1 absolute positions, row 2
 /// the shared-prefix reuse length. The packed analogue of
@@ -1438,6 +1450,8 @@ pub struct OvRuntimeEngine {
     rotary: Rotary,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// The model's window, which `submit` refuses a longer prompt against on a stateful export.
+    prompt_window: Option<u32>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -3821,19 +3835,38 @@ impl Engine for OvRuntimeEngine {
         // caller gets a 413 before any stream is opened — a streaming client
         // rejected mid-stream would already have had its 200 committed and
         // would receive a non-standard error frame instead.
-        if let Some(packed) = self.packed.as_ref() {
-            if let Some(tok) = self.tokenizer.as_ref() {
-                let n = tok
-                    .encode(task.prompt.clone(), false)
-                    .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
-                    .get_ids()
-                    .len();
-                if let Some(msg) = packed_prompt_too_long(n, packed.kv.region) {
-                    warn!(task = %task.task_id, prompt_tokens = n,
-                          region = packed.kv.region, "refusing over-region prompt");
-                    return Err(EngineError::PromptTooLong(msg));
-                }
+        //
+        // The unpacked static (NPU) ring is refused the same way. Only the prompt
+        // counts: a resume carries tokens the original node already generated
+        // past the ring through its sliding window, and continues the same way.
+        let window = match (self.packed.as_ref(), self.static_kv.as_ref()) {
+            (Some(packed), _) => Some((packed.kv.region, true)),
+            (None, Some(sk)) => Some((sk.past_len, false)),
+            (None, None) => None,
+        };
+        if let (Some((window, packed)), Some(tok)) = (window, self.tokenizer.as_ref()) {
+            let n = tok
+                .encode(task.prompt.clone(), false)
+                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
+                .get_ids()
+                .len();
+            let refusal = if packed {
+                packed_prompt_too_long(n, window)
+            } else {
+                static_prompt_too_long(n, window)
+            };
+            if let Some(msg) = refusal {
+                warn!(task = %task.task_id, prompt_tokens = n, window, packed,
+                      "refusing over-window prompt");
+                return Err(EngineError::PromptTooLong(msg));
             }
+        }
+        if window.is_none() {
+            crate::refuse_over_model_window(
+                self.tokenizer.as_deref(),
+                &task.prompt,
+                self.prompt_window,
+            )?;
         }
         self.pending.push(task);
         Ok(())
@@ -5377,6 +5410,15 @@ impl Builder for OvRuntimeBuilder {
         };
 
         Ok(Box::new(OvRuntimeEngine {
+            prompt_window: {
+                let window = crate::pipeline_model_window(&self.pipeline_dir);
+                if self.downstream.is_some() {
+                    // The hidden frame is f16 per token.
+                    crate::forwarded_prompt_window(window, self.hidden_size * 2)
+                } else {
+                    window
+                }
+            },
             packed,
             spec,
             runtime,
@@ -5508,6 +5550,24 @@ mod tests {
         assert!(
             msg.contains("--static-context") && msg.contains("--packed-slots"),
             "the message must name both remedies: {msg}"
+        );
+    }
+
+    /// The unpacked static (NPU) ring holds `static_context - 1` tokens. A longer
+    /// prompt would evict its own head and be answered through a sliding window,
+    /// so submit refuses it. A prompt that exactly fills the ring still fits.
+    #[test]
+    fn over_window_prompt_is_refused_on_the_static_ring() {
+        assert!(
+            static_prompt_too_long(1023, 1023).is_none(),
+            "an exact fill is servable"
+        );
+        assert!(static_prompt_too_long(1, 1023).is_none());
+        let msg = static_prompt_too_long(1024, 1023).expect("over-window must be refused");
+        assert!(msg.contains("1024") && msg.contains("1023"), "{msg}");
+        assert!(
+            msg.contains("--static-context"),
+            "the message must name the remedy: {msg}"
         );
     }
 

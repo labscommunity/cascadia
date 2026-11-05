@@ -44,6 +44,67 @@ pub(crate) fn timeout_knob_lock() -> std::sync::MutexGuard<'static, ()> {
     L.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `max_position_embeddings` (top level or `text_config`) from a pipeline's HF config where its
+/// stages load it, `tokenizer/` then the pipeline root. `None` when neither records one.
+pub(crate) fn pipeline_model_window(pipeline_dir: &std::path::Path) -> Option<u32> {
+    pipeline_config_value(pipeline_dir, "max_position_embeddings")
+}
+
+/// A positive `u32` field of a pipeline's HF config, top level or `text_config`, from the first
+/// directory that holds a usable one: `tokenizer/`, then the pipeline root.
+pub(crate) fn pipeline_config_value(pipeline_dir: &std::path::Path, key: &str) -> Option<u32> {
+    [pipeline_dir.join("tokenizer"), pipeline_dir.to_path_buf()]
+        .iter()
+        .find_map(|dir| {
+            let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            let field = |c: &serde_json::Value| c.get(key)?.as_u64();
+            field(&v)
+                .or_else(|| field(v.get("text_config")?))
+                .filter(|n| *n > 0)
+                .and_then(|n| u32::try_from(n).ok())
+        })
+}
+
+/// The prompt bound for a stage whose prefill crosses the wire as one frame: the model window, or
+/// the most tokens that fit `MAX_TENSOR_BYTES` at `frame_bytes_per_token`, whichever is lower. A
+/// receiver rejects a larger frame without reading its body, which strands the chain, so these
+/// prompts are refused before anything is sent. 0 bytes means unknown and leaves the window as is.
+pub(crate) fn forwarded_prompt_window(
+    model_window: Option<u32>,
+    frame_bytes_per_token: usize,
+) -> Option<u32> {
+    let frame_cap = (frame_bytes_per_token > 0).then(|| {
+        u32::try_from(cascadia_transport::MAX_TENSOR_BYTES / frame_bytes_per_token)
+            .unwrap_or(u32::MAX)
+    });
+    match (model_window, frame_cap) {
+        (Some(window), Some(cap)) => Some(window.min(cap)),
+        (window, cap) => window.or(cap),
+    }
+}
+
+/// Refuse a prompt over a pipeline stage's model window at submit, counted as admission encodes
+/// it. Nothing else bounds these stages' prompts, so an unrefused one prefills past what the
+/// model was built for. No window or no count admits it.
+pub(crate) fn refuse_over_model_window(
+    tokenizer: Option<&tokenizers::Tokenizer>,
+    prompt: &str,
+    window: Option<u32>,
+) -> cascadia_engine::EngineResult<()> {
+    let (Some(tokenizer), Some(window)) = (tokenizer, window) else {
+        return Ok(());
+    };
+    let Ok(encoding) = tokenizer.encode(prompt, false) else {
+        return Ok(());
+    };
+    let tokens = u32::try_from(encoding.get_ids().len()).unwrap_or(u32::MAX);
+    match genai::prompt_over_limit(tokens, window) {
+        Some(msg) => Err(cascadia_engine::EngineError::PromptTooLong(msg)),
+        None => Ok(()),
+    }
+}
+
 /// Exclusive id bound for `validate_resume_ids`: max assigned id + 1 — NOT
 /// `get_vocab_size(true)`, which returns the ENTRY COUNT and under-counts the
 /// bound on a sparse vocab (added tokens with gapped ids), wrongly rejecting
@@ -55,4 +116,85 @@ pub(crate) fn resume_vocab_bound(tok: &tokenizers::Tokenizer) -> u32 {
         .map(|&m| m.saturating_add(1))
         .unwrap_or(0)
         .max(tok.get_vocab_size(true) as u32)
+}
+
+#[cfg(test)]
+mod model_window_tests {
+    use super::{forwarded_prompt_window, pipeline_model_window, refuse_over_model_window};
+    use cascadia_engine::EngineError;
+
+    fn word_tokenizer() -> tokenizers::Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#;
+        tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("tokenizer")
+    }
+
+    #[test]
+    fn refuses_only_a_counted_prompt_past_the_window() {
+        let tok = word_tokenizer();
+        assert!(refuse_over_model_window(Some(&tok), "hi hi hi", Some(3)).is_ok());
+        let err = refuse_over_model_window(Some(&tok), "hi hi hi hi", Some(3)).unwrap_err();
+        match err {
+            EngineError::PromptTooLong(msg) => {
+                assert!(
+                    msg.contains("prompt is 4 tokens") && msg.contains("at most 3"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected PromptTooLong, got {other:?}"),
+        }
+        assert!(refuse_over_model_window(Some(&tok), "hi hi hi hi", None).is_ok());
+        assert!(refuse_over_model_window(None, "hi hi hi hi", Some(3)).is_ok());
+    }
+
+    #[test]
+    fn a_forwarded_prompt_is_bounded_by_the_frame_it_becomes() {
+        // Measured frames: gemma4 refused 11,428 tokens at 269,152,256 bytes (23,552 per token) and
+        // ov-dist-spec 4,034 at 1,034,769,408 (256,512). ov-runtime sends f16 at hidden 4096.
+        assert_eq!(forwarded_prompt_window(Some(131_072), 23_552), Some(11_397));
+        assert_eq!(forwarded_prompt_window(Some(131_072), 256_512), Some(1_046));
+        assert_eq!(forwarded_prompt_window(Some(131_072), 8_192), Some(32_768));
+        // The lower bound wins either way.
+        assert_eq!(forwarded_prompt_window(Some(4_096), 8_192), Some(4_096));
+        // Either side unknown leaves the other in force.
+        assert_eq!(forwarded_prompt_window(None, 8_192), Some(32_768));
+        assert_eq!(forwarded_prompt_window(Some(4_096), 0), Some(4_096));
+        assert_eq!(forwarded_prompt_window(None, 0), None);
+    }
+
+    #[test]
+    fn pipeline_window_follows_where_the_stage_loads_its_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(pipeline_model_window(dir.path()), None);
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"text_config":{"max_position_embeddings":32768}}"#,
+        )
+        .unwrap();
+        assert_eq!(pipeline_model_window(dir.path()), Some(32768));
+        std::fs::create_dir(dir.path().join("tokenizer")).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer/config.json"),
+            r#"{"max_position_embeddings":4096}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline_model_window(dir.path()),
+            Some(4096),
+            "tokenizer/ wins"
+        );
+        std::fs::write(
+            dir.path().join("tokenizer/config.json"),
+            r#"{"max_position_embeddings":0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline_model_window(dir.path()),
+            Some(32768),
+            "0 is not a window"
+        );
+    }
 }
