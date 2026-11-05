@@ -30,7 +30,11 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WINDOWS=1 ;; *) WINDOWS=0 ;; esac
 HOST_PATH="$PATH"
 
 pass() { echo "PASS $1"; }
-fail() { echo "FAIL $1: $2"; FAILED=$((FAILED + 1)); }
+fail() {
+    echo "FAIL $1: $2"
+    FAILED=$((FAILED + 1))
+    tail -5 "$WORK/out.log" 2>/dev/null | sed 's/^/    | /'
+}
 check() { # <name> <condition as a string> <why it failed>
     if eval "$2"; then pass "$1"; else fail "$1" "$3"; fi
 }
@@ -159,6 +163,7 @@ else
 fi
 cas python setup
 RC_SETUP=$RC
+cp "$WORK/out.log" "$WORK/after-kill.log"
 "$PY" -c "import torch, openvino, nncf, optimum.intel" >/dev/null 2>&1
 RC_IMPORT=$?
 check killed-setup-recovers '[ "$MARKER_AFTER_KILL" = no ] && [ "$RC_SETUP" = 0 ] && [ "$RC_IMPORT" = 0 ] && [ -f "$ENV_DIR/cascadia-complete" ]' \

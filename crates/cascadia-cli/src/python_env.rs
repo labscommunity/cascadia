@@ -1002,10 +1002,7 @@ fn build_env(
     base: Option<&(String, PyInfo)>,
     layer: bool,
 ) -> Result<()> {
-    if managed.dir.exists() {
-        std::fs::remove_dir_all(&managed.dir)
-            .with_context(|| format!("removing the old {}", managed.dir.display()))?;
-    }
+    discard_dir(&managed.dir)?;
     let mut venv = uv_command(uv, &managed.root);
     venv.args(["venv", "--no-config", "--no-project"])
         .arg(&managed.dir);
@@ -1032,13 +1029,14 @@ fn build_env(
     verify_managed(&managed.python(), lock)?;
     std::fs::write(managed.dir.join(COMPLETE_MARKER), &managed.id)
         .context("marking the environment complete")?;
-    eprintln!(
-        "Python packages ready: {} installed, {} reused from {}.",
-        install.len(),
-        lock.len() - install.len(),
-        base.filter(|_| layer)
-            .map_or("nothing", |(p, _)| p.as_str()),
-    );
+    let reused = lock.len() - install.len();
+    match base.filter(|_| layer) {
+        Some((p, _)) if reused > 0 => eprintln!(
+            "Python packages ready: {} installed, {reused} reused from {p}.",
+            install.len()
+        ),
+        _ => eprintln!("Python packages ready: {} installed.", install.len()),
+    }
     Ok(())
 }
 
@@ -1148,6 +1146,51 @@ pub(crate) async fn python_for_export(
     Ok(env)
 }
 
+/// What a directory is renamed to while it waits to be deleted.
+const TRASH_MARK: &str = ".trash-";
+
+/// Delete `path`, retrying: just after a killed install, files can still be
+/// appearing while the walk runs, and it fails with "Directory not empty".
+fn remove_dir_with_retries(path: &Path) -> std::io::Result<()> {
+    let mut last = Ok(());
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        match std::fs::remove_dir_all(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(()) => return Ok(()),
+            Err(e) => last = Err(e),
+        }
+    }
+    last
+}
+
+/// Get `dir` out of the way now, and delete it if that can be done. The rename
+/// can't race anything writing into it, so a rebuild always starts clean;
+/// anything the delete leaves behind goes with the next [`sweep_trash`].
+fn discard_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    let trash = dir.with_file_name(format!("{name}{TRASH_MARK}{}", std::process::id()));
+    std::fs::rename(dir, &trash).with_context(|| format!("moving aside {}", dir.display()))?;
+    if let Err(e) = remove_dir_with_retries(&trash) {
+        tracing::debug!(path = %trash.display(), error = %e, "left for the next setup");
+    }
+    Ok(())
+}
+
+/// Delete what an earlier [`discard_dir`] couldn't.
+fn sweep_trash(root: &Path) {
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().contains(TRASH_MARK) {
+            let _ = remove_dir_with_retries(&entry.path());
+        }
+    }
+}
+
 /// Delete the environment `name` under `root`, unless an export is using it.
 fn remove_env(root: &Path, name: &str) -> Result<bool> {
     let lock_path = root.join(format!("{name}.lock"));
@@ -1159,8 +1202,7 @@ fn remove_env(root: &Path, name: &str) -> Result<bool> {
     if guard.try_lock().is_err() {
         return Ok(false);
     }
-    let dir = root.join(name);
-    std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    discard_dir(&root.join(name))?;
     drop(guard);
     std::fs::remove_file(&lock_path).ok();
     Ok(true)
@@ -1179,6 +1221,7 @@ fn env_names(root: &Path) -> Vec<String> {
 /// works. One in use is left for next time, and its packages stay in the
 /// download cache, so going back to that version costs little.
 fn remove_old_envs(managed: &Managed) {
+    sweep_trash(&managed.root);
     for name in env_names(&managed.root) {
         if name != managed.id {
             let _ = remove_env(&managed.root, &name);
@@ -1202,7 +1245,7 @@ pub(crate) fn remove_managed() -> Result<()> {
             );
         }
     }
-    std::fs::remove_dir_all(&root).with_context(|| format!("removing {}", root.display()))?;
+    remove_dir_with_retries(&root).with_context(|| format!("removing {}", root.display()))?;
     eprintln!("Removed {}", root.display());
     Ok(())
 }
@@ -1402,11 +1445,31 @@ torch==2.15.0+cpu \\
     }
 
     #[test]
+    fn discarding_clears_the_path_at_once_and_sweeping_clears_leftovers() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("abc");
+        std::fs::create_dir_all(dir.join("lib/deep")).unwrap();
+        std::fs::write(dir.join("lib/deep/f"), "x").unwrap();
+        discard_dir(&dir).unwrap();
+        assert!(!dir.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        discard_dir(&dir).expect("nothing to discard is fine");
+
+        let left = root.path().join(format!("abc{TRASH_MARK}1"));
+        std::fs::create_dir_all(left.join("x")).unwrap();
+        std::fs::create_dir_all(root.path().join("keep")).unwrap();
+        sweep_trash(root.path());
+        assert!(!left.exists());
+        assert!(root.path().join("keep").exists());
+    }
+
+    #[test]
     fn only_lock_ids_count_as_environments() {
         assert!(is_env_dir_name(&lock_id(LOCK)));
         assert!(!is_env_dir_name("uv"));
         assert!(!is_env_dir_name("uv-cache"));
         assert!(!is_env_dir_name("cpython"));
+        assert!(!is_env_dir_name(&format!("{}{TRASH_MARK}7", lock_id(LOCK))));
     }
 
     #[test]
