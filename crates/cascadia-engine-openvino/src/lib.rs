@@ -33,6 +33,27 @@ pub use qwen36::{Qwen36Builder, Qwen36Engine};
 pub use rotary::{ModelTextConfig, RopeScalingConfig, Rotary};
 pub use runtime::{OvRuntimeBuilder, OvRuntimeEngine};
 
+#[cfg(test)]
+pub(crate) async fn assert_closed(
+    client: &mut cascadia_transport::ActivationClient,
+    peer: &mut tokio::net::TcpStream,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), peer.read(&mut byte)).await;
+    assert!(
+        matches!(read, Ok(Ok(0))),
+        "the peer must see the connection close, got {read:?}"
+    );
+    assert!(
+        matches!(
+            client.recv_raw(1).await,
+            Err(cascadia_transport::TransportError::NotConnected)
+        ),
+        "later exchanges must fail instead of reading a late reply"
+    );
+}
+
 /// Tests that touch the process-global activation-timeout knob (or read a
 /// value derived from it under a precondition) must hold this lock: three
 /// runtime.rs tests set it to 1 s and back while gemma4's ceiling test asserts

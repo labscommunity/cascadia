@@ -902,8 +902,29 @@ fn run_async<F: std::future::Future>(h: &tokio::runtime::Handle, fut: F) -> F::O
 /// byte from the recv timeout so an idle relay can park on the next request
 /// without killing its socket; a driver that just sent FORWARD/RESET/HELLO is
 /// owed a reply now, so a black-holed downstream must not pin this thread
-/// forever. Times out at the same configured activation timeout.
-async fn reply_bounded<T, F>(fut: F) -> Result<T, TransportError>
+/// forever. Times out at the same configured activation timeout, and closes the connection then,
+/// so a late reply can't be read as the next exchange's.
+async fn reply_bounded<T, F>(
+    downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
+    fut: F,
+) -> Result<T, TransportError>
+where
+    F: std::future::Future<Output = Result<T, TransportError>>,
+{
+    match tokio::time::timeout(cascadia_transport::recv_timeout(), fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            // `fut` and any guard it held mid-read are gone, so this lock can't deadlock.
+            downstream.lock().await.close().await;
+            Err(TransportError::SocketClosed)
+        }
+    }
+}
+
+/// [`reply_bounded`] for a control ack, which keeps the connection on elapse: capture and restore
+/// degrade to a cold turn, and a late ack can only fail the next exchange's kind check.
+#[cfg(feature = "kv_coord")]
+async fn ack_bounded<T, F>(fut: F) -> Result<T, TransportError>
 where
     F: std::future::Future<Output = Result<T, TransportError>>,
 {
@@ -1250,7 +1271,7 @@ impl Qwen36Engine {
         let h = self.handle()?;
         run_async(
             &h,
-            reply_bounded(async move {
+            reply_bounded(downstream.clone(), async move {
                 let mut g = downstream.lock().await;
                 g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
                 let hb = g.recv_raw(12).await?;
@@ -1286,7 +1307,7 @@ impl Qwen36Engine {
         );
         run_async(
             &h,
-            reply_bounded(async move {
+            reply_bounded(downstream.clone(), async move {
                 let mut g = downstream.lock().await;
                 g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
                     .await?;
@@ -1335,7 +1356,7 @@ impl Qwen36Engine {
         let payload = payload.to_vec();
         run_async(
             &h,
-            reply_bounded(async move {
+            reply_bounded(downstream.clone(), async move {
                 let mut g = downstream.lock().await;
                 g.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await?;
                 g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
@@ -1366,7 +1387,7 @@ impl Qwen36Engine {
         let h = self.handle()?;
         run_async(
             &h,
-            reply_bounded(async move {
+            reply_bounded(downstream.clone(), async move {
                 let mut g = downstream.lock().await;
                 g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
                 let hb = g.recv_raw(12).await?;
@@ -1413,7 +1434,7 @@ impl Qwen36Engine {
         };
         run_async(
             &h,
-            reply_bounded(async move {
+            ack_bounded(async move {
                 let mut g = downstream.lock().await;
                 g.send_raw(&frame_header(kind, task_epoch, 0)).await?;
                 g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
@@ -1461,7 +1482,7 @@ impl Qwen36Engine {
         let h = self.handle()?;
         run_async(
             &h,
-            reply_bounded(async move {
+            ack_bounded(async move {
                 let mut g = downstream.lock().await;
                 g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, 0))
                     .await?;
@@ -3090,6 +3111,31 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #244: replies are bounded from outside the read, so an elapse leaves the socket open and a
+    /// late reply answers the next exchange unless the bound also closes it.
+    #[tokio::test]
+    async fn a_reply_that_never_comes_closes_the_connection() {
+        let _knob = crate::timeout_knob_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let mut peer = accept.await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+
+        tokio::time::pause();
+        let conn = downstream.clone();
+        let res = reply_bounded(downstream.clone(), async move {
+            conn.lock().await.recv_raw(12).await
+        })
+        .await;
+        tokio::time::resume();
+
+        assert!(res.is_err());
+        crate::assert_closed(&mut *downstream.lock().await, &mut peer).await;
+    }
 
     #[test]
     fn ov_properties_reach_plugin_config() {
