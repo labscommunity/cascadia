@@ -3403,7 +3403,7 @@ fn shard_tree_engine(dir: &std::path::Path) -> &'static str {
 fn export_deps_error(python: &str, imports: &str) -> anyhow::Error {
     use std::process::{Command, Stdio};
     let stderr = Command::new(python)
-        .args(["-c", imports])
+        .args(python_env::run_code(imports))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -3447,7 +3447,7 @@ async fn cmd_export(args: ExportArgs) -> Result<()> {
     }
     let optimum_ok = env
         .command()
-        .args(["-c", OPTIMUM_IMPORTS])
+        .args(python_env::run_code(OPTIMUM_IMPORTS))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -3521,7 +3521,9 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
                 // input's weights), and they refuse to go on without it.
                 let nncf = env
                     .command()
-                    .args(["-c", "import nncf; print('nncf', nncf.__version__)"])
+                    .args(python_env::run_code(
+                        "import nncf; print('nncf', nncf.__version__)",
+                    ))
                     .output();
                 match nncf {
                     Ok(o) if o.status.success() => {

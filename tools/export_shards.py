@@ -65,6 +65,7 @@ import glob
 import json
 import math
 import os
+import pickle
 import shutil
 import sys
 
@@ -1169,19 +1170,22 @@ def load_stage_weights(model_dir, layer_start, layer_end, has_embed, has_head, t
             f"in {model_dir}"
         )
     for bf in bin_files:
+        # Always weights_only: a full unpickle runs whatever the file's author put in it.
         try:
             # mmap=True lazy-maps the shard, so we materialize only the few
             # layers this stage keeps (via .clone()) instead of loading the
             # whole multi-GB shard into RAM.
             shard = torch.load(bf, map_location="cpu", weights_only=True, mmap=True)
-        except Exception as e:
-            # Older torch (no mmap kwarg) or a checkpoint weights_only can't
-            # unpickle — fall back loudly for trusted local/HF weights.
-            print(
-                f"  torch.load(weights_only,mmap) failed ({e}); retrying full unpickle",
-                flush=True,
-            )
-            shard = torch.load(bf, map_location="cpu", weights_only=False)
+        except Exception:
+            # Older torch (no mmap kwarg) or the legacy format, which can't be mapped.
+            try:
+                shard = torch.load(bf, map_location="cpu", weights_only=True)
+            except pickle.UnpicklingError as e:
+                raise SystemExit(
+                    f"{bf} holds more than plain weights, and loading it could run code "
+                    "its author put there, so Cascadia won't. Use a copy of this model "
+                    "with .safetensors weights."
+                ) from e
         for key, tensor in shard.items():
             if wanted(key):
                 state_dict[key] = tensor.clone() if hasattr(tensor, "clone") else tensor

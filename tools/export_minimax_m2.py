@@ -382,21 +382,14 @@ def tiny_config():
     )
 
 
-def load_reference(args):
-    """Return (model, cfg_dict). model is an HF MiniMaxM2ForCausalLM in fp32."""
-    from transformers import AutoModelForCausalLM
-    if args.tiny:
-        from transformers import MiniMaxM2ForCausalLM
-        torch.manual_seed(0)
-        cfg = tiny_config()
-        model = MiniMaxM2ForCausalLM(cfg).to(torch.float32).eval()
-        hf = model.config
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model, trust_remote_code=True, torch_dtype=torch.float32,
-            low_cpu_mem_usage=True)
-        model.eval()
-        hf = model.config
+def load_reference():
+    """Return (model, cfg_dict) for --tiny: an HF MiniMaxM2ForCausalLM in fp32. A real
+    checkpoint streams through export_full_streaming instead."""
+    from transformers import MiniMaxM2ForCausalLM
+    torch.manual_seed(0)
+    cfg = tiny_config()
+    model = MiniMaxM2ForCausalLM(cfg).to(torch.float32).eval()
+    hf = model.config
 
     # Rope lives under `rope_parameters` in transformers 5.x. The model
     # derives the rotary dim as head_dim * partial_rotary_factor (default
@@ -537,16 +530,18 @@ def export_full_streaming(args, out: Path):
     safetensors shards on demand, builds the same validated wrappers via
     lightweight namespaces, traces+quantizes, and frees before the next."""
     md = Path(args.model)
-    # Load via the canonical config so rotary is derived exactly as the
-    # model does it: MiniMax-M2's config.json carries a top-level
-    # `rotary_dim` (64) which transformers converts to
-    # partial_rotary_factor = rotary_dim/head_dim = 0.5. Reading the raw
-    # JSON would miss this (no rope_parameters/partial_rotary_factor) and
-    # wrongly default to full rotary.
+    # MiniMax-M2's config.json carries a top-level `rotary_dim` (64 of head_dim
+    # 128). The repo's own code turns that into partial_rotary_factor 0.5, but we
+    # don't run a repo's code and transformers' class ignores the field, leaving
+    # full rotary: read it here, or the export succeeds and the model is wrong.
     from transformers import AutoConfig
-    hf = AutoConfig.from_pretrained(md, trust_remote_code=True)
+    hf = AutoConfig.from_pretrained(md, trust_remote_code=False)
     head_dim = getattr(hf, "head_dim", hf.hidden_size // hf.num_attention_heads)
-    prf = getattr(hf, "partial_rotary_factor", None)
+    rotary_dim = getattr(hf, "rotary_dim", None)
+    if rotary_dim is not None:
+        prf = rotary_dim / head_dim
+    else:
+        prf = getattr(hf, "partial_rotary_factor", None)
     if prf is None:
         prf = (getattr(hf, "rope_parameters", None) or {}).get("partial_rotary_factor", 1.0)
     rope_theta = getattr(hf, "rope_theta", None)
@@ -801,7 +796,7 @@ def main():
     expert_q = "int8" if args.experts_int8 else qmode
 
     print("[load] reference model ...", flush=True)
-    model, cfg = load_reference(args)
+    model, cfg = load_reference()
     H = cfg["hidden_size"]
     base = model.model  # MiniMaxM2Model
     layer_ids = parse_layers(args.layers, cfg["num_layers"])

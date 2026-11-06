@@ -115,6 +115,14 @@ impl PythonEnv {
     }
 }
 
+/// The arguments that run `code` with `python -c`, with the working folder off
+/// `sys.path`: `-c` searches it first, so a `torch.py` in the folder someone runs
+/// Cascadia from would be imported. `-P` does the same, but only from Python 3.11.
+pub(crate) fn run_code(code: &str) -> [String; 2] {
+    let no_cwd = "import sys; sys.path[:] = [p for p in sys.path if p]";
+    ["-c".into(), format!("{no_cwd}\n{code}")]
+}
+
 /// `PYTHONPATH` would let a stray package replace the locked one, and
 /// `PYTHONHOME` stops the interpreter from starting at all.
 fn scrub_python_env(cmd: &mut Command) {
@@ -189,7 +197,7 @@ fn probe_export_deps(mut cmd: Command) -> Option<String> {
          print('openvino', openvino.__version__); \
          print('transformers', transformers.__version__)"
     );
-    run_with_timeout(cmd.args(["-c", &code]), PROBE_TIMEOUT).ok()
+    run_with_timeout(cmd.args(run_code(&code)), PROBE_TIMEOUT).ok()
 }
 
 /// The module a pinned pip dist imports as: the dist name with `-` as `_`, as
@@ -235,7 +243,7 @@ fn probe_pins(mut cmd: Command) -> Result<String, String> {
          \x20   print('{PROBE_MARK}', d, v)\n",
         reqs.join(", ")
     );
-    run_with_timeout(cmd.args(["-c", &code]), PROBE_TIMEOUT).map_err(|e| {
+    run_with_timeout(cmd.args(run_code(&code)), PROBE_TIMEOUT).map_err(|e| {
         let last = e.lines().last().unwrap_or("").to_string();
         format!("imports failed: {last}")
     })
@@ -731,7 +739,7 @@ impl PyInfo {
 }
 
 fn py_info(mut cmd: Command) -> Result<PyInfo, String> {
-    let out = run_with_timeout(cmd.args(["-c", PY_INFO]), PROBE_TIMEOUT)?;
+    let out = run_with_timeout(cmd.args(run_code(PY_INFO)), PROBE_TIMEOUT)?;
     let line = out
         .lines()
         .find_map(|l| l.trim().strip_prefix(PROBE_MARK))
@@ -1064,7 +1072,7 @@ fn verify_managed(python: &Path, lock: &[LockEntry]) -> Result<()> {
         guard: None,
     };
     let imports = format!("{EXPORT_IMPORTS}; {}", crate::OPTIMUM_IMPORTS);
-    if let Err(e) = run_with_timeout(env.command().args(["-c", &imports]), PROBE_TIMEOUT) {
+    if let Err(e) = run_with_timeout(env.command().args(run_code(&imports)), PROBE_TIMEOUT) {
         let last = e.lines().last().unwrap_or("");
         let hint = missing_runtime_hint(&e).unwrap_or("");
         bail!("the new environment can't import the exporter's packages: {last}\n{hint}");
@@ -1629,6 +1637,37 @@ torch==2.15.0+cpu \\
             executable: String::new(),
             dists: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn a_file_in_the_working_folder_is_not_imported() {
+        let Some(python) = python_candidates().into_iter().find(|p| python_runs(p)) else {
+            eprintln!("no Python here, skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("json.py.ran");
+        std::fs::write(
+            dir.path().join("json.py"),
+            "open(__file__ + '.ran', 'w').close()\n",
+        )
+        .unwrap();
+        let in_folder = || {
+            let mut cmd = Command::new(&python);
+            scrub_python_env(&mut cmd);
+            cmd.current_dir(dir.path());
+            cmd
+        };
+        let out = run_with_timeout(
+            in_folder().args(run_code("import json; print('imported')")),
+            PROBE_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "imported");
+        assert!(!ran.exists(), "the check imported the planted json.py");
+        // The plant works: without run_code, Python does import it.
+        in_folder().args(["-c", "import json"]).output().unwrap();
+        assert!(ran.exists());
     }
 
     #[test]

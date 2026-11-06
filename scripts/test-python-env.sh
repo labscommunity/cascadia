@@ -15,7 +15,7 @@ set -uo pipefail
 BIN="${1:?usage: $0 <path to the cascadia binary>}"
 case "$BIN" in /*|[A-Za-z]:*) ;; *) BIN="$PWD/$BIN" ;; esac
 MODEL="hf-internal-testing/tiny-random-LlamaForCausalLM"
-CHECKS="no-prompt-outside-terminal doctor-only-looks terminal-prompt setup-from-nothing second-run-installs-nothing int4-means-int4 export-through-private skip-check caller-python-vars-ignored activated-venv-wins broken-venv-falls-through python-flag-wins path-python-used-unasked off-pin-path-python killed-setup-recovers orphaned-install-recovers damaged-env-rebuilds reuses-system-uv-python-packages system-python-unchanged changed-package-restored moe-exporters-reachable old-env-removed old-downloads-removed home-folder-untouched remove-deletes-everything"
+CHECKS="no-prompt-outside-terminal doctor-only-looks terminal-prompt setup-from-nothing second-run-installs-nothing int4-means-int4 export-through-private skip-check caller-python-vars-ignored activated-venv-wins broken-venv-falls-through python-flag-wins path-python-used-unasked off-pin-path-python killed-setup-recovers orphaned-install-recovers damaged-env-rebuilds reuses-system-uv-python-packages system-python-unchanged working-folder-ignored changed-package-restored moe-exporters-reachable old-env-removed old-downloads-removed home-folder-untouched remove-deletes-everything"
 
 if [ "${DRY_RUN:-0}" = 1 ]; then
     for c in $CHECKS; do echo "would run: $c"; done
@@ -24,6 +24,7 @@ fi
 
 WORK="${WORK:-$(mktemp -d)}"
 mkdir -p "$WORK/empty" "$WORK/user-home"
+WORK="$(cd "$WORK" && pwd)"
 # Anything written to the home folder lands here, for home-folder-untouched to find.
 export HOME="$WORK/user-home" USERPROFILE="$WORK/user-home"
 ROOT="$WORK/home"
@@ -251,6 +252,28 @@ check reuses-system-uv-python-packages '[ "$RC" = 0 ] && ! said "Downloading uv"
 shard
 check system-python-unchanged 'tree_ok && [ "$(find "$SYS" -type f -not -name "*.pyc" | wc -l)" = "$SYS_FILES_BEFORE" ] && [ "$("$SYS_PY" -c "import importlib.metadata as m; print(m.version(\"transformers\"))")" = 5.4.0 ]' \
     "exit $RC; the system Python should be as it was"
+
+# Python searches the working folder first for `-c` and `-m`, so any of these would run.
+# Setup's own checks run too, by making it rebuild; a system Python is on PATH for doctor.
+PLANT="$WORK/planted"
+mkdir -p "$PLANT"
+for m in json torch openvino transformers nncf optimum runpy; do
+    echo 'open(__file__ + ".ran", "w").close()' >"$PLANT/$m.py"
+done
+cd "$PLANT" || exit 1
+rm -f "$ENV_DIR/cascadia-complete"
+cas python setup
+RC_SETUP=$RC
+cas doctor
+shard
+RC_SHARD=$RC
+rm -rf "$WORK/exp"
+cas export --model "$MODEL" -o "$WORK/exp" --weight-format fp16
+RC_EXPORT=$RC
+cd - >/dev/null || exit 1
+RAN="$(find "$PLANT" -name '*.ran' | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+check working-folder-ignored '[ -z "$RAN" ] && [ "$RC_SETUP" = 0 ] && [ "$RC_SHARD" = 0 ] && [ "$RC_EXPORT" = 0 ]' \
+    "ran: [$RAN]; setup $RC_SETUP, shard $RC_SHARD, export $RC_EXPORT"
 
 # The user upgrades a package the environment was reusing. Imports still pass.
 LOCKED_NUMPY="$(version numpy)"

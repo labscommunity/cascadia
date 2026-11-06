@@ -257,8 +257,7 @@ def resolve_sliding_window(text_config, layer_types=None):
     under a v1.1 stamp. A negative window is a configuration error rather
     than something to pass through: `build_attention_mask` would mask every
     key and softmax would return NaN, and the export would still succeed.
-    Bool / non-integral values (only reachable through `trust_remote_code`
-    configs) are rejected rather than coerced.
+    Bool / non-integral values are rejected rather than coerced.
     """
     try:
         from transformers.integrations.heterogeneity.configuration_utils import (
@@ -1488,17 +1487,14 @@ def run_export(
     carries the encoder for rank 0.
 
     Caller is responsible for ensuring `model_id` resolves to a local
-    snapshot with `config.json` and `*.safetensors`. We use HF's
-    `AutoModelForCausalLM` with `trust_remote_code=True` so older
-    `transformers` (< 5.5) still load Gemma 4 via the model repo's
-    bundled Python code.
+    snapshot with `config.json` and `*.safetensors`. Code in a model repo never
+    runs: `transformers` carries Gemma 4 from the 5.5 we require.
 
-    In the other direction, from `transformers` 5.14 a heterogeneous config
-    (31B's `head_dim=256` / `global_head_dim=512`) registers those as
-    per-layer attributes, so the exporter's global `text_config.head_dim`
-    reads raise `AmbiguousGlobalPerLayerAttributeError` unless the config
-    sets `allow_global_per_layer_attribute_access` or the bundled remote
-    code is used.
+    From `transformers` 5.14 a heterogeneous config (31B's `head_dim=256` /
+    `global_head_dim=512`) registers those as per-layer attributes, so the
+    exporter's global `text_config.head_dim` reads raise
+    `AmbiguousGlobalPerLayerAttributeError` unless the config sets
+    `allow_global_per_layer_attribute_access`.
     """
     require_compressor(quantization)
     import torch
@@ -1519,12 +1515,12 @@ def run_export(
     apply_patches()
 
     log("Loading config...")
-    full_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    full_config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
     text_config = getattr(full_config, "text_config", None) or full_config
     if not hasattr(text_config, "layer_types"):
         raise RuntimeError(
             f"Gemma 4 text_config missing 'layer_types' "
-            f"(model_id={model_id!r}). Check trust_remote_code support."
+            f"(model_id={model_id!r}). Check the transformers version (>= 5.5)."
         )
     if getattr(text_config, "enable_moe_block", False):
         raise RuntimeError(
@@ -1618,7 +1614,7 @@ def run_export(
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float32,
-        trust_remote_code=True,
+        trust_remote_code=False,
         low_cpu_mem_usage=True,
         attn_implementation="eager",
     )
@@ -1632,7 +1628,7 @@ def run_export(
     tok_dir = os.path.join(output_dir, "tokenizer")
     if not os.path.exists(tok_dir):
         os.makedirs(tok_dir, exist_ok=True)
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False)
         tok.save_pretrained(tok_dir)
         tc_path = os.path.join(tok_dir, "tokenizer_config.json")
         if os.path.exists(tc_path):

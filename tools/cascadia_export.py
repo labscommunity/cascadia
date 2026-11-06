@@ -313,6 +313,14 @@ def python_refusal(version_info=sys.version_info) -> str | None:
     return None
 
 
+# Runs optimum-cli with the working folder off sys.path: `python -m` searches it first, so a
+# torch.py in the folder someone runs from would be imported. -P needs Python 3.11.
+OPTIMUM_CLI = (
+    "import sys; sys.path[:] = [p for p in sys.path if p]; import runpy; "
+    "runpy.run_module('optimum.commands.optimum_cli', run_name='__main__', alter_sys=True)"
+)
+
+
 def optimum_export(model: str, out_dir: str, task: str, weight_format: str,
                    revision: str | None = None, sym: bool = False) -> None:
     """optimum-cli export openvino, run with this interpreter. A hub id with a known
@@ -322,12 +330,12 @@ def optimum_export(model: str, out_dir: str, task: str, weight_format: str,
         raise SystemExit(why)
     if revision and not os.path.isdir(model):
         model = download(model, revision)
-    cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "openvino",
+    cmd = [sys.executable, "-c", OPTIMUM_CLI, "export", "openvino",
            "--model", model, "--task", task, "--weight-format", weight_format]
     if sym:
         cmd.append("--sym")
     cmd.append(out_dir)
-    log("Running: " + " ".join(cmd))
+    log("Running: optimum-cli " + " ".join(cmd[3:]))
     rc = subprocess.call(cmd)
     if rc != 0:
         raise SystemExit(f"optimum-cli export exited with {rc}; see the output above")
