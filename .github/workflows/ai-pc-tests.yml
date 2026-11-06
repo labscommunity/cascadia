@@ -118,7 +118,7 @@ jobs:
           $dest = Join-Path $env:RUNNER_TOOL_CACHE "openvino_genai\$env:OV_VERSION"
           $root = (python scripts/ov_sdk.py fetch $env:OV_VERSION --os windows --dest $dest | Select-Object -Last 1)
           if (-not (Test-Path "$root\runtime\include")) {
-            Write-Host "::error::ov_sdk did not produce an SDK root: '$root' (is Python on this runner's PATH?)"
+            Write-Host "::error::ov_sdk did not produce an SDK root: '$root' (see its output above; it needs Python on PATH)"
             exit 1
           }
           "INTEL_OPENVINO_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append

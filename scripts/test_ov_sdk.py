@@ -3,8 +3,11 @@
     python3 -m unittest scripts/test_ov_sdk.py
 """
 
+import io
 import os
 import sys
+import tarfile
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -84,6 +87,21 @@ class Candidates(unittest.TestCase):
             ov_sdk.candidate_urls("2026.4.1.0", "linux", None)  # linux needs a dist
         with self.assertRaises(ValueError):
             ov_sdk.candidate_urls("2026.4.1.0", "plan9", None)
+
+
+class ExtractStripped(unittest.TestCase):
+    def test_creates_missing_parents_of_dest(self):
+        # A fresh runner or machine has no parent yet (INSTALL.md's
+        # $HOME/openvino/<version>, the AI-PC job's tool cache).
+        with tempfile.TemporaryDirectory() as td:
+            archive = os.path.join(td, "sdk.tar.gz")
+            with tarfile.open(archive, "w:gz") as t:
+                info = tarfile.TarInfo("openvino_genai_x/runtime/include/a.h")
+                info.size = 1
+                t.addfile(info, io.BytesIO(b"x"))
+            dest = os.path.join(td, "not", "yet", "2026.4.1.0")
+            ov_sdk._extract_stripped(archive, dest)
+            self.assertTrue(os.path.isfile(os.path.join(dest, "runtime", "include", "a.h")))
 
 
 class Sha256Sidecar(unittest.TestCase):
