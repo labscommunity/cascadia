@@ -68,6 +68,18 @@ mod sys {
     pub struct cascadia_cb_handle_t {
         _private: [u8; 0],
     }
+    /// Mirrors `cascadia_media_t` in shim.h.
+    #[repr(C)]
+    pub struct cascadia_media_t {
+        pub kind: i32,
+        pub pixels: *const u8,
+        pub num_frames: u32,
+        pub height: u32,
+        pub width: u32,
+        pub fps: f32,
+    }
+    pub const CASCADIA_MEDIA_IMAGE: i32 = 0;
+    pub const CASCADIA_MEDIA_VIDEO: i32 = 1;
 
     extern "C" {
         pub fn cascadia_last_error_message() -> *const c_char;
@@ -139,9 +151,12 @@ mod sys {
         pub fn cascadia_pipeline_generate(
             handle: *mut cascadia_pipeline_t,
             prompt: *const c_char,
+            media: *const cascadia_media_t,
+            media_count: usize,
             cfg: *const cascadia_genconfig_t,
             out_text: *mut *mut c_char,
             out_token_count: *mut u32,
+            out_input_tokens: *mut u32,
         ) -> c_int;
 
         pub fn cascadia_free_string(s: *mut c_char);
@@ -163,8 +178,14 @@ mod sys {
             handle: *mut cascadia_cb_pipeline_t,
             request_id: u64,
             prompt: *const c_char,
+            media: *const cascadia_media_t,
+            media_count: usize,
             cfg: *const cascadia_genconfig_t,
             out_handle: *mut *mut cascadia_cb_handle_t,
+        ) -> c_int;
+        pub fn cascadia_cb_handle_input_tokens(
+            handle: *mut cascadia_cb_handle_t,
+            out_count: *mut u32,
         ) -> c_int;
         pub fn cascadia_cb_step(handle: *mut cascadia_cb_pipeline_t) -> c_int;
         pub fn cascadia_cb_handle_read(
@@ -462,11 +483,93 @@ impl PluginConfig {
     }
 }
 
+/// What a [`Media`] holds: an image (GenAI's images argument) or a video
+/// (its videos argument, one `[T, H, W, 3]` tensor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+/// One decoded media item, borrowed for a call; the shim copies the pixels.
+/// `pixels` is RGB8, frame-major `[num_frames, height, width, 3]`. Images
+/// match the prompt's image tags in order, videos its video tags.
+#[derive(Clone, Copy, Debug)]
+pub struct Media<'a> {
+    pub kind: MediaKind,
+    pub pixels: &'a [u8],
+    pub num_frames: u32,
+    pub height: u32,
+    pub width: u32,
+    /// A video's sampled frame rate (frames per second of the stack), 0.0
+    /// when unknown; unused for an image.
+    pub fps: f32,
+}
+
+/// Check one item's shape before it crosses the FFI: the pixel buffer must
+/// hold the declared stack, an image exactly one frame, a video at least one.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+fn check_media(i: usize, m: &Media<'_>) -> Result<()> {
+    let want = m.num_frames as usize * m.height as usize * m.width as usize * 3;
+    if m.pixels.len() != want {
+        return Err(Error::Native(format!(
+            "media {i}: {} pixel bytes for a {}x{}x{} RGB stack (want {want})",
+            m.pixels.len(),
+            m.num_frames,
+            m.height,
+            m.width
+        )));
+    }
+    let frames_ok = match m.kind {
+        MediaKind::Image => m.num_frames == 1,
+        MediaKind::Video => m.num_frames >= 1,
+    };
+    if !frames_ok || m.height == 0 || m.width == 0 {
+        return Err(Error::Native(format!(
+            "media {i}: an image needs one frame and a video at least one, both \
+             non-empty (got {:?} of {}x{}x{})",
+            m.kind, m.num_frames, m.height, m.width
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "openvino")]
+fn native_media(media: &[Media<'_>]) -> Result<Vec<sys::cascadia_media_t>> {
+    media
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            check_media(i, m)?;
+            let kind = match m.kind {
+                MediaKind::Image => sys::CASCADIA_MEDIA_IMAGE,
+                MediaKind::Video => sys::CASCADIA_MEDIA_VIDEO,
+            };
+            Ok(sys::cascadia_media_t {
+                kind,
+                pixels: m.pixels.as_ptr(),
+                num_frames: m.num_frames,
+                height: m.height,
+                width: m.width,
+                fps: if m.fps.is_finite() && m.fps > 0.0 {
+                    m.fps
+                } else {
+                    0.0
+                },
+            })
+        })
+        .collect()
+}
+
 /// One generate result.
 #[derive(Clone, Debug)]
 pub struct GenResult {
     pub text: String,
     pub generated_tokens: u32,
+    /// Prompt length as the model saw it, image tokens included. `None` when
+    /// the pipeline did not report one (plain LLM exports).
+    pub input_tokens: Option<u32>,
 }
 
 /// Owned LLMPipeline handle.
@@ -508,7 +611,8 @@ impl LlmPipeline {
     }
 
     /// VLM-layout export (e.g. Qwen3.5/3.6: `openvino_language_model.xml`
-    /// + separate embeddings IRs), served text-only via `VLMPipeline`.
+    /// and separate embeddings IRs), served via `VLMPipeline`; images go in
+    /// through [`LlmPipeline::generate`]'s `media`.
     /// `prompt_lookup` enables prompt-lookup decoding (OV GenAI >= 2026.2
     /// supports it on VLM pipelines).
     pub fn vlm(
@@ -600,23 +704,41 @@ impl LlmPipeline {
     }
 
     #[cfg(not(feature = "openvino"))]
-    pub fn generate(&self, _prompt: &str, _cfg: &GenConfig) -> Result<GenResult> {
+    pub fn generate(
+        &self,
+        _prompt: &str,
+        _media: &[Media<'_>],
+        _cfg: &GenConfig,
+    ) -> Result<GenResult> {
         Err(Error::Stub)
     }
 
+    /// Generate from `prompt`, with `media` matched to its tags in order
+    /// (images to image tags, videos to video tags). Media on a plain LLM
+    /// export is an error.
     #[cfg(feature = "openvino")]
-    pub fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult> {
+    pub fn generate(
+        &self,
+        prompt: &str,
+        media: &[Media<'_>],
+        cfg: &GenConfig,
+    ) -> Result<GenResult> {
         let prompt_c = cstr(prompt)?;
+        let native = native_media(media)?;
         unsafe {
             let raw_cfg = native_genconfig(cfg)?;
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
+            let mut input_tokens: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(
                 self.handle,
                 prompt_c.as_ptr(),
+                native.as_ptr(),
+                native.len(),
                 raw_cfg,
                 &mut text_p,
                 &mut tok_count,
+                &mut input_tokens,
             );
             sys::cascadia_genconfig_destroy(raw_cfg);
             if rc != 0 || text_p.is_null() {
@@ -627,6 +749,7 @@ impl LlmPipeline {
             Ok(GenResult {
                 text,
                 generated_tokens: tok_count,
+                input_tokens: (input_tokens > 0).then_some(input_tokens),
             })
         }
     }
@@ -916,16 +1039,25 @@ impl CbPipeline {
         &self,
         _request_id: u64,
         _prompt: &str,
+        _media: &[Media<'_>],
         _cfg: &GenConfig,
     ) -> Result<CbHandle> {
         Err(Error::Stub)
     }
 
-    /// Enroll a prompt into the running batch. `request_id` must be unique
-    /// among live requests on this pipeline.
+    /// Enroll a prompt into the running batch, with `media` matched to its
+    /// tags in order (images to image tags, videos to video tags). `request_id` must be unique among live requests
+    /// on this pipeline.
     #[cfg(feature = "openvino")]
-    pub fn add_request(&self, request_id: u64, prompt: &str, cfg: &GenConfig) -> Result<CbHandle> {
+    pub fn add_request(
+        &self,
+        request_id: u64,
+        prompt: &str,
+        media: &[Media<'_>],
+        cfg: &GenConfig,
+    ) -> Result<CbHandle> {
         let prompt_c = cstr(prompt)?;
+        let native = native_media(media)?;
         unsafe {
             let raw_cfg = native_genconfig(cfg)?;
             let mut handle: *mut sys::cascadia_cb_handle_t = ptr::null_mut();
@@ -933,6 +1065,8 @@ impl CbPipeline {
                 self.inner.ptr,
                 request_id,
                 prompt_c.as_ptr(),
+                native.as_ptr(),
+                native.len(),
                 raw_cfg,
                 &mut handle,
             );
@@ -1076,6 +1210,20 @@ impl CbHandle {
     }
 
     #[cfg(not(feature = "openvino"))]
+    pub fn input_tokens(&self) -> Option<u32> {
+        None
+    }
+
+    /// Prompt length as the model saw it, image tokens included, from the
+    /// request's perf metrics. `None` until the pipeline reports one.
+    #[cfg(feature = "openvino")]
+    pub fn input_tokens(&self) -> Option<u32> {
+        let mut out: u32 = 0;
+        let rc = unsafe { sys::cascadia_cb_handle_input_tokens(self.handle, &mut out) };
+        (rc == 0 && out > 0).then_some(out)
+    }
+
+    #[cfg(not(feature = "openvino"))]
     pub fn cancel(&self) -> Result<()> {
         Err(Error::Stub)
     }
@@ -1146,6 +1294,13 @@ pub struct Runtime {
 unsafe impl Send for Runtime {}
 
 impl Runtime {
+    /// A runtime with no model, for unit tests of code that holds one but
+    /// never runs it. Only the stub build (no `openvino` feature) has it.
+    #[cfg(not(feature = "openvino"))]
+    pub fn stub() -> Self {
+        Self {}
+    }
+
     /// Compile a model from disk and create an InferRequest.
     pub fn compile(model_xml_path: &str, device: &str, plugin: &PluginConfig) -> Result<Self> {
         Self::do_compile(model_xml_path, device, plugin)
@@ -1771,6 +1926,47 @@ where
     }
     buf.truncate(len);
     String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::{check_media, Media, MediaKind};
+
+    fn item(kind: MediaKind, num_frames: u32, pixels: &[u8]) -> Media<'_> {
+        Media {
+            kind,
+            pixels,
+            num_frames,
+            height: 2,
+            width: 2,
+            fps: 1.0,
+        }
+    }
+
+    #[test]
+    fn images_take_one_frame_and_videos_a_stack() {
+        let one = [0u8; 12];
+        let four = [0u8; 48];
+        assert!(check_media(0, &item(MediaKind::Image, 1, &one)).is_ok());
+        assert!(check_media(0, &item(MediaKind::Video, 1, &one)).is_ok());
+        assert!(check_media(0, &item(MediaKind::Video, 4, &four)).is_ok());
+        let e = check_media(3, &item(MediaKind::Image, 4, &four)).unwrap_err();
+        assert!(
+            e.to_string().contains("media 3: an image needs one frame"),
+            "{e}"
+        );
+        assert!(check_media(0, &item(MediaKind::Video, 0, &[])).is_err());
+    }
+
+    #[test]
+    fn a_buffer_short_of_the_declared_stack_is_refused() {
+        let e = check_media(1, &item(MediaKind::Video, 4, &[0u8; 47])).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("47 pixel bytes for a 4x2x2 RGB stack"),
+            "{e}"
+        );
+    }
 }
 
 #[cfg(test)]

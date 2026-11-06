@@ -12,21 +12,23 @@
 //! `perf_metrics` defaults to `max_new_tokens` when EOS fires early on
 //! short greedy decodes, which inflates reported tok/s).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
-    GenConfig, LlmPipeline, PluginConfig,
+    GenConfig, LlmPipeline, Media, MediaKind as ShimMediaKind, PluginConfig,
 };
 use cascadia_types::{
-    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
-    TaskId,
+    Chunk, FinishReason, GenerationTask, LoadProgress, MediaKind, PeerLayout, SamplingParams,
+    ShardSpec, TaskId,
 };
 use futures::stream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::genai_media::{strip_media_tags, MediaSizer};
 
 #[derive(Default)]
 pub struct OvGenaiBuilder {
@@ -247,11 +249,15 @@ impl Builder for OvGenaiBuilder {
             && !model_dir.join("openvino_model.xml").exists();
         if let Some(sched) = &self.continuous_batching {
             if is_vlm_layout {
-                return Err(EngineError::InvalidConfig(
-                    "--cb is not supported on VLM-layout exports; \
-                     ContinuousBatchingPipeline needs a plain LM export"
-                        .into(),
-                ));
+                // ContinuousBatchingPipeline grew a VLM path (images overload,
+                // VLMDecodedResults) in GenAI 2026.2 — VLM-layout dirs now
+                // construct, and image tasks go through the images overload
+                // (verified on 2026.4.1). The constructor error surfaces
+                // cleanly if the installed runtime predates the support.
+                info!(
+                    "--cb on a VLM-layout export: serving text and images through \
+                     the CB pipeline's VLM path (needs OpenVINO GenAI >= 2026.2)"
+                );
             }
             progress.push(LoadProgress::message(format!(
                 "compiling ContinuousBatchingPipeline on {} (cache {} GB, max_num_seqs {}, \
@@ -321,9 +327,16 @@ impl Builder for OvGenaiBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        let dir = Path::new(&self.model_path);
+        let accepts_images = takes_images(dir);
+        let max_ctx = crate::read_max_ctx(dir, "ov-genai");
+        let media_sizer = load_media_sizer(dir, accepts_images, max_ctx);
         if let Some(pipe) = self.cb_pipe {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
+                accepts_images,
+                max_ctx,
+                media_sizer,
                 pipe: Box::new(pipe),
                 prompt_pretemplated: self.prompt_pretemplated,
                 next_request_id: 0,
@@ -335,6 +348,9 @@ impl Builder for OvGenaiBuilder {
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
             pipe,
+            accepts_images,
+            max_ctx,
+            media_sizer,
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
@@ -343,6 +359,20 @@ impl Builder for OvGenaiBuilder {
         }))
     }
 }
+
+/// Whether an export serves images: a VLM layout (language model IR, no
+/// `openvino_model.xml`) with its vision encoder IR, the same test the CLI
+/// uses to offer image input. Anything else answers images with a 400.
+pub fn takes_images(model_dir: &Path) -> bool {
+    model_dir.join("openvino_language_model.xml").exists()
+        && !model_dir.join("openvino_model.xml").exists()
+        && model_dir
+            .join("openvino_vision_embeddings_model.xml")
+            .exists()
+        && unsupported_vision(model_dir).is_none()
+}
+
+pub use cascadia_engine::genai_unsupported_vision as unsupported_vision;
 
 fn map_ov_err(err: OvError) -> EngineError {
     match err {
@@ -354,8 +384,158 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+/// Borrow a task's decoded media in the shim's form. A kind this engine
+/// cannot feed GenAI fails the task: answering from the text alone would
+/// describe media the model never saw.
+fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
+    task.media
+        .iter()
+        .map(|m| {
+            let kind = match m.kind {
+                MediaKind::Image => ShimMediaKind::Image,
+                // The API sends one only for the families GenAI preprocesses
+                // video for (`MediaConfig::native_video`).
+                MediaKind::Video => ShimMediaKind::Video,
+                #[allow(unreachable_patterns)]
+                other => {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "ov-genai: unsupported media kind {other:?}"
+                    )))
+                }
+            };
+            Ok(Media {
+                kind,
+                pixels: &m.pixels,
+                num_frames: m.num_frames,
+                height: m.height,
+                width: m.width,
+                fps: sampled_fps(m.timestamps_ms.as_deref()),
+            })
+        })
+        .collect()
+}
+
+/// Refuse a prompt at or past the model's window with
+/// [`EngineError::PromptTooLong`] (a 400 `context_length_exceeded`), before
+/// GenAI runs it.
+///
+/// GenAI's CPU/GPU pipelines check no window themselves: an over-window prompt
+/// runs past `max_position_embeddings` or fails as a generic error (a 5xx).
+/// A text-only prompt is the tokenizer's count of its text: exact for a
+/// pre-rendered prompt and a floor when GenAI applies its own template.
+///
+/// GenAI expands a turn's images and videos inside `generate` and reports that
+/// count only after the run, so a media turn is sized here from the export's
+/// processor configs ([`MediaSizer`]): each item's soft tokens plus the text
+/// with its `<ov_genai_*>` tags removed, less one token per tag for a merge
+/// across it. Each item's count is meant as a floor of what GenAI 2026.4.1
+/// builds: where GenAI preprocesses differently from Hugging Face (LLaVA-NeXT,
+/// InternVL2, Qwen VL), the smaller of the HF count and a mirror of GenAI's
+/// own code; image framing and timestamp text are not counted. The mirrors
+/// follow GenAI's sources and are swept against transcriptions of them in the
+/// tests; they have not been run against a live GenAI. An export without a
+/// sizer (a family it has no math for, or configs it cannot read), or an item
+/// the sizer cannot size, is left to GenAI as before.
+fn window_check(
+    task: &GenerationTask,
+    max_ctx: Option<usize>,
+    media: Option<&MediaSizer>,
+    count_tokens: impl FnOnce(&str) -> Option<u32>,
+) -> EngineResult<()> {
+    let Some(max) = max_ctx else {
+        return Ok(());
+    };
+    if task.media.is_empty() {
+        return match count_tokens(&task.prompt) {
+            Some(n) if n as usize >= max => Err(EngineError::PromptTooLong(format!(
+                "prompt is {n} tokens but the model's context is {max}; send a shorter prompt"
+            ))),
+            _ => Ok(()),
+        };
+    }
+    let Some(sizer) = media else {
+        return Ok(());
+    };
+    let soft = match sizer.soft_tokens(&task.media) {
+        Ok(n) => n,
+        Err(why) => {
+            debug!(task = %task.task_id, %why, "ov-genai: media not sized; left to GenAI");
+            return Ok(());
+        }
+    };
+    let (text, tags) = strip_media_tags(&task.prompt);
+    let Some(n) = count_tokens(&text) else {
+        return Ok(());
+    };
+    let planned = (n as usize + soft).saturating_sub(tags);
+    if planned >= max {
+        warn!(task = %task.task_id, prompt_tokens = planned, max, "ov-genai: refusing over-window media prompt");
+        return Err(EngineError::PromptTooLong(format!(
+            "prompt is at least {planned} tokens with its images and videos expanded but the \
+             model's context is {max}; send a shorter prompt (or fewer or smaller images)"
+        )));
+    }
+    Ok(())
+}
+
+/// The media sizer for an image-taking export, if its family has one; says
+/// once at load which way the media window check goes.
+fn load_media_sizer(
+    dir: &Path,
+    accepts_images: bool,
+    max_ctx: Option<usize>,
+) -> Option<MediaSizer> {
+    if !accepts_images || max_ctx.is_none() {
+        return None;
+    }
+    match MediaSizer::from_export(dir) {
+        Ok(Some(s)) => {
+            info!(
+                family = s.name(),
+                "ov-genai: image and video prompts are sized before the run; one past the \
+                 window is refused with context_length_exceeded"
+            );
+            Some(s)
+        }
+        Ok(None) => {
+            warn!(
+                "ov-genai: no image/video token math for this export's model_type; a media \
+                 prompt past the window is not refused up front (GenAI runs or fails it)"
+            );
+            None
+        }
+        Err(why) => {
+            warn!(
+                %why,
+                "ov-genai: cannot read this export's processor configs; a media prompt past \
+                 the window is not refused up front (GenAI runs or fails it)"
+            );
+            None
+        }
+    }
+}
+
+/// The rate a video's frames were sampled at, from their timestamps (the API
+/// spaces them evenly from 0): GenAI stamps Qwen3-VL's frames with their
+/// times from it. 0.0 (unknown) with fewer than two frames.
+fn sampled_fps(timestamps_ms: Option<&[u32]>) -> f32 {
+    match timestamps_ms {
+        Some([first, .., last]) if last > first => {
+            let n = timestamps_ms.map_or(0, <[u32]>::len) - 1;
+            (n as f64 * 1000.0 / f64::from(last - first)) as f32
+        }
+        _ => 0.0,
+    }
+}
+
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
+    /// The export is a VLM layout with its vision encoder: see [`takes_images`].
+    accepts_images: bool,
+    /// The model's window from its config.json; see [`window_check`].
+    max_ctx: Option<usize>,
+    /// Sizes media prompts for [`window_check`]; `None` leaves them to GenAI.
+    media_sizer: Option<MediaSizer>,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -369,9 +549,10 @@ impl Engine for OvGenaiEngine {
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
             /*enable_thinking*/ false,
+            /*prompt_rendered*/ false,
             &SamplingParams::default(),
         );
-        match self.pipe.generate("Hi", &cfg) {
+        match self.pipe.generate("Hi", &[], &cfg) {
             Ok(_) => info!(
                 spec_k = self.speculative_k,
                 prompt_lookup = self.prompt_lookup_ngram,
@@ -392,6 +573,12 @@ impl Engine for OvGenaiEngine {
                 "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
             ));
         }
+        if !self.accepts_images {
+            cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
+        }
+        window_check(&task, self.max_ctx, self.media_sizer.as_ref(), |p| {
+            self.pipe.count_tokens(p)
+        })?;
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -433,11 +620,17 @@ impl Engine for OvGenaiEngine {
             max_new,
             task.temperature,
             task.enable_thinking,
+            task.prompt_rendered,
             &task.sampling,
         );
 
         let started = Instant::now();
-        let result = match self.pipe.generate(&task.prompt, &cfg) {
+        let generated = shim_media(&task).and_then(|media| {
+            self.pipe
+                .generate(&task.prompt, &media, &cfg)
+                .map_err(map_ov_err)
+        });
+        let result = match generated {
             Ok(r) => r,
             Err(err) => {
                 warn!(task = %task.task_id, error = %err, "generate failed");
@@ -496,7 +689,13 @@ impl Engine for OvGenaiEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
             .with_n_tokens(tokens)
             .with_finish_reason(finish);
-        if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt) {
+        // The pipeline's own count is exact and includes image tokens; the
+        // tokenizer count of the prompt text is the fallback for plain LLM
+        // exports, which do not report one.
+        if let Some(prompt_tokens) = result
+            .input_tokens
+            .or_else(|| self.pipe.count_tokens(&task.prompt))
+        {
             chunk = chunk.with_prompt_tokens(prompt_tokens);
         }
         Ok(vec![(task.task_id, chunk)])
@@ -541,6 +740,7 @@ trait CbPipe: Send {
         &self,
         request_id: u64,
         prompt: &str,
+        media: &[Media<'_>],
         cfg: &GenConfig,
     ) -> Result<Box<dyn CbReq>, OvError>;
     fn step(&self) -> Result<(), OvError>;
@@ -551,6 +751,8 @@ trait CbPipe: Send {
 trait CbReq: Send {
     fn read(&mut self) -> Result<CbRead, OvError>;
     fn cancel(&self) -> Result<(), OvError>;
+    /// Prompt length as the model saw it, image tokens included.
+    fn input_tokens(&self) -> Option<u32>;
 }
 
 impl CbPipe for CbPipeline {
@@ -558,10 +760,11 @@ impl CbPipe for CbPipeline {
         &self,
         request_id: u64,
         prompt: &str,
+        media: &[Media<'_>],
         cfg: &GenConfig,
     ) -> Result<Box<dyn CbReq>, OvError> {
         Ok(Box::new(CbPipeline::add_request(
-            self, request_id, prompt, cfg,
+            self, request_id, prompt, media, cfg,
         )?))
     }
     fn step(&self) -> Result<(), OvError> {
@@ -578,6 +781,9 @@ impl CbReq for CbHandle {
     }
     fn cancel(&self) -> Result<(), OvError> {
         CbHandle::cancel(self)
+    }
+    fn input_tokens(&self) -> Option<u32> {
+        CbHandle::input_tokens(self)
     }
 }
 
@@ -608,6 +814,12 @@ struct ActiveCbTask {
 /// no-progress guard relies on that distinction.
 pub struct OvGenaiCbEngine {
     active: Vec<ActiveCbTask>,
+    /// See [`takes_images`].
+    accepts_images: bool,
+    /// The model's window from its config.json; see [`window_check`].
+    max_ctx: Option<usize>,
+    /// Sizes media prompts for [`window_check`]; `None` leaves them to GenAI.
+    media_sizer: Option<MediaSizer>,
     pipe: Box<dyn CbPipe>,
     prompt_pretemplated: bool,
     next_request_id: u64,
@@ -628,10 +840,11 @@ impl Engine for OvGenaiCbEngine {
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
             /*enable_thinking*/ false,
+            /*prompt_rendered*/ false,
             &SamplingParams::default(),
         );
         // u64::MAX cannot collide with the sequential request-id counter.
-        match self.pipe.add_request(u64::MAX, "Hi", &cfg) {
+        match self.pipe.add_request(u64::MAX, "Hi", &[], &cfg) {
             Ok(mut handle) => {
                 // Only a terminal status means the pipeline actually served a
                 // request. Reporting "ok" after a failed step told operators
@@ -679,6 +892,12 @@ impl Engine for OvGenaiCbEngine {
                 "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
             ));
         }
+        if !self.accepts_images {
+            cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
+        }
+        window_check(&task, self.max_ctx, self.media_sizer.as_ref(), |p| {
+            self.pipe.count_tokens(p)
+        })?;
         if self.active.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -717,13 +936,15 @@ impl Engine for OvGenaiCbEngine {
             max_tokens,
             task.temperature,
             task.enable_thinking,
+            task.prompt_rendered,
             &task.sampling,
         );
+        let media = shim_media(&task)?;
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let handle = self
             .pipe
-            .add_request(request_id, &task.prompt, &cfg)
+            .add_request(request_id, &task.prompt, &media, &cfg)
             .map_err(map_ov_err)?;
         self.active.push(ActiveCbTask {
             prompt_tokens: self.pipe.count_tokens(&task.prompt),
@@ -873,7 +1094,9 @@ impl Engine for OvGenaiCbEngine {
                     let mut chunk = Chunk::final_marker(t.task_id.clone(), read.text_delta)
                         .with_n_tokens(read.new_tokens)
                         .with_finish_reason(finish);
-                    if let Some(prompt_tokens) = t.prompt_tokens {
+                    // The request's perf metrics are exact and count image
+                    // tokens; the submit-time tokenizer count is the fallback.
+                    if let Some(prompt_tokens) = t.handle.input_tokens().or(t.prompt_tokens) {
                         chunk = chunk.with_prompt_tokens(prompt_tokens);
                     }
                     out.push((t.task_id, chunk));
@@ -935,6 +1158,7 @@ impl Engine for OvGenaiCbEngine {
 
 /// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
 /// passes 0 for the speculative knobs — the CB scheduler owns batching).
+#[allow(clippy::too_many_arguments)] // one flat knob list, mirrored by both engines
 fn build_gen_config(
     speculative_k: u32,
     prompt_lookup_ngram: u32,
@@ -942,6 +1166,7 @@ fn build_gen_config(
     max_tokens: u32,
     temperature: f32,
     enable_thinking: bool,
+    prompt_rendered: bool,
     sampling: &SamplingParams,
 ) -> GenConfig {
     let do_sample = temperature > 0.0;
@@ -955,7 +1180,9 @@ fn build_gen_config(
         // template loaded AND this request is thinking-OFF — do we tell
         // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
         // native templating (the legacy join the API emitted), untouched.
-        skip_chat_template: prompt_pretemplated && !enable_thinking,
+        // A task the API rendered itself (every media request) skips it
+        // regardless of thinking.
+        skip_chat_template: (prompt_pretemplated && !enable_thinking) || prompt_rendered,
         // OpenAI sampling knobs (#14). top_p/top_k take effect in the
         // sampling regime (do_sample, i.e. temperature > 0); penalties and
         // seed are forwarded regardless.
@@ -1005,6 +1232,7 @@ impl OvGenaiEngine {
         max_tokens: u32,
         temperature: f32,
         enable_thinking: bool,
+        prompt_rendered: bool,
         sampling: &SamplingParams,
     ) -> GenConfig {
         build_gen_config(
@@ -1014,6 +1242,7 @@ impl OvGenaiEngine {
             max_tokens,
             temperature,
             enable_thinking,
+            prompt_rendered,
             sampling,
         )
     }
@@ -1021,6 +1250,35 @@ impl OvGenaiEngine {
 
 #[cfg(test)]
 mod tests {
+    /// Pixtral exports are text-only on ov-genai (GenAI preprocesses them as
+    /// LLaVA-1.5); other VLM families and configs without a vision tower pass.
+    #[test]
+    fn pixtral_images_are_not_served_by_genai() {
+        let dir = std::env::temp_dir().join(format!("cascadia-genai-pix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |v: &str| std::fs::write(dir.join("config.json"), v).unwrap();
+        write(r#"{"model_type":"llava","vision_config":{"model_type":"pixtral"}}"#);
+        let hint = unsupported_vision(&dir).unwrap();
+        assert!(
+            hint.contains("Pixtral")
+                && hint.contains("--num-stages 1 --family pixtral")
+                && hint.contains("--engine ov-runtime --model <tree>"),
+            "{hint}"
+        );
+        // Mistral 3 carries a Pixtral tower too, and is cut as `mistral3`.
+        write(r#"{"model_type":"mistral3","vision_config":{"model_type":"pixtral"}}"#);
+        assert!(unsupported_vision(&dir)
+            .unwrap()
+            .contains("--family mistral3"));
+        write(
+            r#"{"model_type":"qwen3_5_moe","vision_config":{"model_type":"qwen3_5_moe_vision"}}"#,
+        );
+        assert!(unsupported_vision(&dir).is_none());
+        write(r#"{"model_type":"qwen3"}"#);
+        assert!(unsupported_vision(&dir).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     use std::collections::VecDeque;
@@ -1043,6 +1301,12 @@ mod tests {
         steps: usize,
         added: Vec<u64>,
         cancelled: Vec<u64>,
+        /// Per enrolled request: (media items, skip_chat_template).
+        enrolled: Vec<(usize, bool)>,
+        /// Per enrolled request: each item's (kind, frames, fps).
+        media_seen: Vec<Vec<(ShimMediaKind, u32, f32)>>,
+        /// What every handle reports from its perf metrics.
+        input_tokens: Option<u32>,
     }
 
     struct MockPipe {
@@ -1059,10 +1323,18 @@ mod tests {
             &self,
             request_id: u64,
             _prompt: &str,
-            _cfg: &GenConfig,
+            media: &[Media<'_>],
+            cfg: &GenConfig,
         ) -> Result<Box<dyn CbReq>, OvError> {
             let mut st = self.st.lock().unwrap();
             st.added.push(request_id);
+            st.enrolled.push((media.len(), cfg.skip_chat_template));
+            st.media_seen.push(
+                media
+                    .iter()
+                    .map(|m| (m.kind, m.num_frames, m.fps))
+                    .collect(),
+            );
             let idx = st.added.len() - 1;
             while st.reads.len() <= idx {
                 st.reads.push(VecDeque::new());
@@ -1102,6 +1374,9 @@ mod tests {
             self.st.lock().unwrap().cancelled.push(self.id);
             Ok(())
         }
+        fn input_tokens(&self) -> Option<u32> {
+            self.st.lock().unwrap().input_tokens
+        }
     }
 
     fn read_of(status: CbStatus, tokens: u32, text: &str, finish: CbFinish) -> CbRead {
@@ -1123,6 +1398,9 @@ mod tests {
     fn mock_engine(st: &Arc<Mutex<MockState>>) -> OvGenaiCbEngine {
         OvGenaiCbEngine {
             active: Vec::new(),
+            accepts_images: true,
+            max_ctx: None,
+            media_sizer: None,
             pipe: Box::new(MockPipe { st: st.clone() }),
             prompt_pretemplated: false,
             next_request_id: 0,
@@ -1134,6 +1412,95 @@ mod tests {
 
     fn task(id: &str, max_tokens: u32) -> GenerationTask {
         GenerationTask::new(id, "hello").with_max_tokens(max_tokens)
+    }
+
+    /// A text prompt at or past the window is a 400 before anything is enrolled; one under it,
+    /// or an unknown window, passes. The mock tokenizer counts every prompt as 7 tokens.
+    #[test]
+    fn cb_submit_refuses_text_prompts_at_or_past_the_window() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.max_ctx = Some(7);
+        let err = e.submit(task("at", 4)).unwrap_err();
+        assert!(matches!(err, EngineError::PromptTooLong(_)), "{err:?}");
+        assert!(
+            st.lock().unwrap().added.is_empty(),
+            "refused before add_request"
+        );
+        e.max_ctx = Some(8);
+        assert!(e.submit(task("under", 4)).is_ok());
+        e.max_ctx = None;
+        assert!(e.submit(task("unknown", 4)).is_ok());
+        assert_eq!(st.lock().unwrap().added.len(), 2);
+    }
+
+    /// A media turn is sized before `add_request` (text 7 + a Gemma 3 image's 256 soft
+    /// tokens, less one for its tag) and refused at or past the window; without a sizer
+    /// for the export it is left to GenAI.
+    #[test]
+    fn cb_submit_refuses_media_prompts_at_or_past_the_window() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.media_sizer = Some(MediaSizer::Gemma3 { per_image: 256 });
+        let tagged = || {
+            let mut t = image_task("img");
+            t.prompt = "user: <ov_genai_image_0>what is this?".into();
+            t
+        };
+        e.max_ctx = Some(262);
+        let err = e.submit(tagged()).unwrap_err();
+        let EngineError::PromptTooLong(msg) = err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            msg.contains("at least 262 tokens") && msg.contains("context is 262"),
+            "{msg}"
+        );
+        assert!(
+            st.lock().unwrap().added.is_empty(),
+            "refused before add_request"
+        );
+        e.max_ctx = Some(263);
+        assert!(e.submit(tagged()).is_ok());
+        e.media_sizer = None;
+        e.max_ctx = Some(8);
+        let mut t = tagged();
+        t.task_id = "unsized".into();
+        assert!(e.submit(t).is_ok(), "no sizer: left to GenAI");
+        assert_eq!(st.lock().unwrap().added.len(), 2);
+    }
+
+    /// The window check on both engines' submit path: media sized from the sizer and the
+    /// tag-stripped text, a floor that never refuses a prompt that fits.
+    #[test]
+    fn window_check_sizes_media_turns() {
+        let gemma3 = MediaSizer::Gemma3 { per_image: 256 };
+        let mut t = image_task("two");
+        t.media.push(t.media[0].clone());
+        t.prompt = "<ov_genai_image_0>A<ov_genai_image_1>B".into();
+        let seen = std::cell::RefCell::new(String::new());
+        let count = |p: &str| {
+            *seen.borrow_mut() = p.to_string();
+            Some(10)
+        };
+        // 10 text + 2 x 256 - 2 tags = 520.
+        let err = window_check(&t, Some(520), Some(&gemma3), count).unwrap_err();
+        assert!(matches!(err, EngineError::PromptTooLong(_)), "{err:?}");
+        assert_eq!(*seen.borrow(), "AB", "the tags are not counted as text");
+        assert!(window_check(&t, Some(521), Some(&gemma3), |_| Some(10)).is_ok());
+        // No window, no sizer, or no token count: nothing is refused.
+        assert!(window_check(&t, None, Some(&gemma3), |_| Some(10_000)).is_ok());
+        assert!(window_check(&t, Some(8), None, |_| Some(10_000)).is_ok());
+        assert!(window_check(&t, Some(8), Some(&gemma3), |_| None).is_ok());
+        // An item the family cannot size (Gemma 3 takes no native video) is left to GenAI.
+        let mut v = image_task("vid");
+        v.media[0].kind = MediaKind::Video;
+        v.media[0].timestamps_ms = Some(vec![0]);
+        assert!(window_check(&v, Some(8), Some(&gemma3), |_| Some(10_000)).is_ok());
+        // Text-only turns are counted whole, at or past the window refused.
+        let text = task("txt", 4);
+        assert!(window_check(&text, Some(10), Some(&gemma3), |_| Some(10)).is_err());
+        assert!(window_check(&text, Some(11), None, |_| Some(10)).is_ok());
     }
 
     /// Option B: the CB engine has no forced-prefix path — a resumed submit
@@ -1282,6 +1649,119 @@ mod tests {
         e.submit(task("t1", 4096)).unwrap();
         let out = e.step().unwrap();
         assert_eq!(out[0].1.finish_reason, Some(FinishReason::Length));
+    }
+
+    fn image_task(id: &str) -> GenerationTask {
+        let mut t = task(id, 4096);
+        t.media.push(cascadia_types::MediaInput {
+            kind: MediaKind::Image,
+            pixels: vec![0u8; 2 * 2 * 3].into(),
+            num_frames: 1,
+            width: 2,
+            height: 2,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        });
+        t.prompt_rendered = true;
+        t
+    }
+
+    /// A text-only export refuses an image task at submit with the 400-class
+    /// error, before it reaches the pipeline.
+    #[test]
+    fn text_only_export_refuses_image_tasks() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.accepts_images = false;
+        let err = e.submit(image_task("img")).unwrap_err();
+        assert!(matches!(err, EngineError::UnsupportedInput(_)), "{err}");
+        assert!(e.submit(task("txt", 4)).is_ok(), "text still served");
+    }
+
+    /// A media task reaches the pipeline with its media and with GenAI's own
+    /// templating off, even with thinking on: the API rendered it so each
+    /// image tag sits inside its message, and a second template pass would
+    /// wrap the whole prompt again.
+    #[test]
+    fn cb_media_task_carries_media_and_skips_native_template() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        let mut t = image_task("img");
+        t.enable_thinking = true;
+        e.submit(t).unwrap();
+        e.submit(task("txt", 8)).unwrap();
+        assert_eq!(st.lock().unwrap().enrolled, vec![(1, true), (0, false)]);
+    }
+
+    /// A native video reaches the pipeline as one video item with its whole
+    /// frame stack and the rate it was sampled at, after the images.
+    #[test]
+    fn cb_video_task_carries_one_video_item_with_its_frames() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        let mut t = image_task("vid");
+        t.media.push(cascadia_types::MediaInput {
+            kind: MediaKind::Video,
+            pixels: vec![0u8; 4 * 2 * 2 * 3].into(),
+            num_frames: 4,
+            width: 2,
+            height: 2,
+            timestamps_ms: Some(vec![0, 500, 1000, 1500]),
+            sha256: [1; 32],
+        });
+        e.submit(t).unwrap();
+        assert_eq!(
+            st.lock().unwrap().media_seen,
+            vec![vec![
+                (ShimMediaKind::Image, 1, 0.0),
+                (ShimMediaKind::Video, 4, 2.0)
+            ]]
+        );
+    }
+
+    #[test]
+    fn sampled_fps_comes_from_the_timestamps() {
+        assert_eq!(sampled_fps(None), 0.0);
+        assert_eq!(sampled_fps(Some(&[0])), 0.0);
+        assert_eq!(sampled_fps(Some(&[0, 1000, 2000])), 1.0);
+        assert_eq!(sampled_fps(Some(&[0, 250])), 4.0);
+        assert_eq!(sampled_fps(Some(&[5, 5])), 0.0);
+    }
+
+    /// usage.prompt_tokens must count image tokens, which only the pipeline
+    /// knows. The tokenizer count of the prompt text (the mock's 7) sees the
+    /// placeholder tag, not the ~200 tokens an image expands to.
+    #[test]
+    fn cb_final_chunk_reports_the_pipelines_input_tokens() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut g = st.lock().unwrap();
+            g.input_tokens = Some(218);
+            g.reads.push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Finished,
+                1,
+                "ok",
+                CbFinish::Stop,
+            ))]));
+        }
+        let mut e = mock_engine(&st);
+        e.submit(image_task("img")).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out[0].1.prompt_tokens, Some(218));
+    }
+
+    /// The flag only adds skips: a text task keeps today's rule.
+    #[test]
+    fn gen_config_skips_template_for_rendered_prompts() {
+        let s = SamplingParams::default();
+        let skip = |pre, think, rendered| {
+            build_gen_config(0, 0, pre, 8, 0.0, think, rendered, &s).skip_chat_template
+        };
+        assert!(skip(true, false, false));
+        assert!(!skip(true, true, false));
+        assert!(!skip(false, false, false));
+        assert!(skip(false, true, true));
+        assert!(skip(true, true, true));
     }
 
     /// ...and fall back to the token-count inference when it reports nothing,
@@ -1506,7 +1986,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cb_rejects_vlm_layout() {
+    async fn cb_no_longer_gates_vlm_layout() {
+        // GenAI 2026.2's ContinuousBatchingPipeline handles VLM-layout dirs
+        // (text-only); the old hard reject is gone. On stub/invalid IRs the
+        // load still fails — but in the pipeline constructor, not the gate.
         let dir = tempfile::tempdir().unwrap();
         for f in [
             "openvino_language_model.xml",
@@ -1518,8 +2001,8 @@ mod tests {
         let mut b = OvGenaiBuilder::new(dir.path().to_str().unwrap(), "CPU")
             .with_continuous_batching(CbSchedulerConfig::default());
         let shard = ShardSpec::single_stage("model", "CPU");
-        let err = b.load(shard).await.err().expect("must reject");
-        assert!(err.to_string().contains("VLM-layout"), "{err}");
+        let err = b.load(shard).await.err().expect("stub IRs still fail");
+        assert!(!err.to_string().contains("VLM-layout"), "{err}");
     }
 
     /// Stub builds surface a Backend error from CbPipeline::new — proves the

@@ -37,8 +37,23 @@ impl Engine for MockEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // Images are accepted and ignored on purpose: the API's image tests
+        // use the mock as an image-capable stand-in (the echo shows where each
+        // placeholder landed). Real text-only engines refuse it in `submit`
+        // via `cascadia_engine::refuse_media`. A native video item is refused,
+        // as on every engine but ov-genai.
+        cascadia_engine::refuse_video(&task, "mock")?;
         if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
             return Ok(());
+        }
+        // Test sentinel: a prompt containing `__prompt_too_long__` is refused
+        // at submit as over the window, the way a real engine refuses a
+        // prompt past its context, so the API's over-window shape can be
+        // tested on every route without a tokenizer.
+        if task.prompt.contains("__prompt_too_long__") {
+            return Err(EngineError::PromptTooLong(
+                "prompt is 9000 tokens; the model's window is 8192".into(),
+            ));
         }
         // Option B resume: the seed ids are already-emitted, so start the
         // echo cursor past them. They are never re-emitted by step().

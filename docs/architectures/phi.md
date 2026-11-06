@@ -70,7 +70,13 @@ beyond.
 
 **Fix path:** bake the LongRoPE short/long `inv_freq` into
 `TracedRotaryEmbedding` (select by sequence length), or model it in the
-runtime for a v3-style external-rotary path.
+runtime for a v3-style external-rotary path. The VLM path already does the
+first for Phi-3.5-vision, InternVL2 and Phi-4-multimodal exports
+(`tools/vlm_surgery/longrope.py`: a `Select` on `max(position_ids)` in front
+of the traced `inv_freq`); it matches Hugging Face where a prompt is
+prefilled in one inference, and a chunked prefill needs the decision made
+once per request instead (see [../VLM.md](../VLM.md#limits-worth-knowing)).
+Text shards from `export_shards.py` do not use it yet.
 
 ### 2. Sliding window
 
@@ -82,5 +88,6 @@ usually fine because the window is large.
 
 `microsoft/Phi-4-multimodal-instruct` has `model_type:
 "phi4mm_for_causal_lm"` and a different decoder layout (vision + audio
-encoders + LoRA adapters per modality). Not supported. Use the text
-backbone separately if extractable.
+encoders + LoRA adapters per modality). Not supported by the text sharding
+path. It is served as a vision-language model on `ov-genai` from its OpenVINO
+export (images, and video as frames; see [../VLM.md](../VLM.md)).

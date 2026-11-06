@@ -4,8 +4,8 @@
 #
 # Prereqs:
 #   - self-hosted runners online with labels [self-hosted, ai-pc, windows]
-#   - repository variable INTEL_OPENVINO_DIR pointing at the OpenVINO GenAI SDK
-#     root on the runners.
+#   - Python 3.8+ on the runners' PATH: the job fetches the OpenVINO GenAI SDK
+#     with scripts/ov_sdk.py, once per version, into the runner's tool cache.
 #   - Git for Windows on the runners (dtolnay/rust-toolchain needs bash; the
 #     runner service PATH gets only Git\cmd, not Git\bin).
 #
@@ -56,6 +56,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Must match ci.yml and release.yml; ci.yml's drift check fails otherwise.
+  OV_VERSION: "2026.4.1.0"
 
 jobs:
   ai-pc-openvino:
@@ -108,20 +110,28 @@ jobs:
           shared-key: ai-pc-openvino
           cache-on-failure: true
 
+      - name: Fetch OpenVINO GenAI SDK
+        shell: powershell
+        run: |
+          # ov_sdk logs progress to stderr; PowerShell 5.1 can treat that as an error.
+          $ErrorActionPreference = 'Continue'
+          $dest = Join-Path $env:RUNNER_TOOL_CACHE "openvino_genai\$env:OV_VERSION"
+          $root = (python scripts/ov_sdk.py fetch $env:OV_VERSION --os windows --dest $dest | Select-Object -Last 1)
+          if (-not (Test-Path "$root\runtime\include")) {
+            Write-Host "::error::ov_sdk did not produce an SDK root: '$root' (see its output above; it needs Python on PATH)"
+            exit 1
+          }
+          "INTEL_OPENVINO_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "INTEL_OPENVINO_DIR=$root"
+
       # Test binaries load openvino*.dll and tbb12.dll at process start, and
       # the runner service PATH does not include them — a miss surfaces only
       # as an opaque STATUS_DLL_NOT_FOUND (0xC0000135) at the test step, after
       # the full release build. Verify and fail here instead.
       - name: Add OpenVINO DLLs to PATH (Windows)
         shell: powershell
-        env:
-          INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
         run: |
           $ov = $env:INTEL_OPENVINO_DIR
-          if ([string]::IsNullOrWhiteSpace($ov)) {
-            Write-Host "::error::repository variable INTEL_OPENVINO_DIR is not set for this runner"
-            exit 1
-          }
           foreach ($d in "$ov\runtime\bin\intel64\Release", "$ov\runtime\3rdparty\tbb\bin") {
             if (-not (Test-Path $d)) {
               Write-Host "::error::OpenVINO DLL dir not found: $d - tests would die with STATUS_DLL_NOT_FOUND (0xC0000135)"
@@ -133,8 +143,6 @@ jobs:
 
       # Real OpenVINO build (mirrors `just build-ov`).
       - name: Build cascadia with the openvino feature
-        env:
-          INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
         run: cargo build --release -p cascadia --features openvino
 
       # OV-gated tests (skipped on the ubuntu stub CI because they need the real
@@ -145,8 +153,6 @@ jobs:
       # build and run with the `openvino` feature here — the stub ci.yml only
       # compiles them (they otherwise execute on no hardware lane).
       - name: Run OpenVINO-feature tests
-        env:
-          INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
         run: cargo test -p cascadia-engine-openvino -p cascadia-ov-genai-shim -p cascadia-engine-sparse-moe --features openvino --no-fail-fast
 
       # Optional end-to-end smoke once a small model is staged on the runners:
@@ -155,6 +161,4 @@ jobs:
       # decided (avoids a guessed CLI invocation).
       #
       # - name: e2e smoke against the real engine
-      #   env:
-      #     INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
       #   run: cargo test -p cascadia-tests-e2e --release -- --test-threads=1

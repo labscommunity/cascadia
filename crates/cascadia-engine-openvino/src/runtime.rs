@@ -69,6 +69,147 @@ struct PipelineConfig {
     hidden_size: u32,
     #[serde(default)]
     export_version: Option<String>,
+    /// Gemma 4 vision trees (`tools/gemma4_surgery --vision`): see
+    /// [`VisionTree`]. Every rank must load the same block.
+    #[serde(default)]
+    vision: Option<PipelineVision>,
+    /// Tree-wide copy of `stage_config.packed_only` (see StageConfig); every
+    /// stage must agree with it.
+    #[serde(default)]
+    packed_only: bool,
+    /// Every stage's layer range, as the surgery cutters list it
+    /// (`tools/vlm_surgery`, `tools/gemma4_surgery`); empty on trees that
+    /// do not (`tools/export_shards.py`). See [`check_stage_layers`].
+    #[serde(default)]
+    stages: Vec<ListedStage>,
+}
+
+/// One `stages` entry of pipeline_config.json: the stage and its half-open
+/// layer range.
+#[derive(Debug, Deserialize)]
+struct ListedStage {
+    stage: u32,
+    #[serde(default)]
+    layer_start: u32,
+    #[serde(default)]
+    layer_end: u32,
+}
+
+/// Refuse a tree whose stages' layer ranges leave a gap or overlap: it loads
+/// and serves garbage (a re-cut stage dropped into a tree cut another way).
+/// Each rank checks what it can see without a wire change: its own range
+/// against pipeline_config.json's `stages` list, that list (when it names a
+/// stage more than once, or neighbours), and the sibling stage configs on its
+/// disk (a single-host tree). Two machines each holding a self-consistent
+/// tree from different cuts are not caught here. A range of `0..0` is an
+/// export that never stated one and is not checked.
+fn check_stage_layers(
+    rank: u32,
+    pipeline: &PipelineConfig,
+    own: (u32, u32),
+    siblings: &[(u32, u32, u32)],
+) -> EngineResult<()> {
+    if own.1 == 0 {
+        return Ok(());
+    }
+    let reject = |msg: String| {
+        Err(EngineError::ShardRejected(format!(
+            "{msg}; the stages come from different cuts (re-cut the whole tree, or every \
+             stage with one split)"
+        )))
+    };
+    if own.0 >= own.1 {
+        return reject(format!(
+            "stage_{rank} holds layers {}..{}, an empty range",
+            own.0, own.1
+        ));
+    }
+    if let Some(l) = pipeline.stages.iter().find(|l| l.stage == rank) {
+        if (l.layer_start, l.layer_end) != own {
+            return reject(format!(
+                "stage_{rank}/stage_config.json holds layers {}..{} but pipeline_config.json \
+                 lists {}..{} for it",
+                own.0, own.1, l.layer_start, l.layer_end
+            ));
+        }
+    }
+    let listed: Vec<(u32, u32, u32)> = pipeline
+        .stages
+        .iter()
+        .map(|l| (l.stage, l.layer_start, l.layer_end))
+        .collect();
+    let mut on_disk = siblings.to_vec();
+    on_disk.push((rank, own.0, own.1));
+    for (ranges, source) in [
+        (listed, "pipeline_config.json lists"),
+        (on_disk, "the stage configs on disk hold"),
+    ] {
+        let mut by_stage = std::collections::BTreeMap::new();
+        for (s, a, b) in ranges {
+            if b == 0 {
+                continue;
+            }
+            if by_stage.insert(s, (a, b)).is_some() {
+                return reject(format!("{source} stage {s} twice"));
+            }
+        }
+        for (&s, &(a, b)) in &by_stage {
+            if s == 0 && a != 0 {
+                return reject(format!("{source} stage 0 starting at layer {a}, not 0"));
+            }
+            if s + 1 == pipeline.num_stages && pipeline.num_layers > 0 && b != pipeline.num_layers {
+                return reject(format!(
+                    "{source} the last stage ending at layer {b}, but the model has {} layers",
+                    pipeline.num_layers
+                ));
+            }
+            if let Some(&(next, _)) = by_stage.get(&(s + 1)) {
+                if next != b {
+                    return reject(format!(
+                        "{source} stage {s} ending at layer {b} and stage {} starting at layer \
+                         {next} ({})",
+                        s + 1,
+                        if next > b { "a gap" } else { "an overlap" }
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PipelineVision {
+    /// Which model family's image path the tree carries (`gemma4`, `gemma3`,
+    /// `pixtral`, `mistral3`); trees from before the field are Gemma 4
+    /// surgery trees.
+    #[serde(default)]
+    family: Option<String>,
+    /// Whether every stage takes `token_type_ids` (the third wire frame).
+    /// Absent means the family's default: on for gemma4 and gemma3
+    /// (bidirectional image attention), off otherwise.
+    #[serde(default)]
+    pub(crate) token_type_ids: Option<bool>,
+    /// Text embedding table IR in the pipeline dir (rank 0 embeds the prompt).
+    text_embeddings: String,
+    /// Vision encoder IR in the pipeline dir.
+    vision_embeddings: String,
+    /// Rows of every stage's `position_ids` when the language model takes
+    /// M-RoPE positions (Qwen2.5-VL / Qwen3-VL: 3). Every rank is then fed
+    /// `[rows, T]` positions, which ride the wire as a frame after the hidden.
+    #[serde(default)]
+    pub(crate) mrope_rows: Option<u32>,
+    /// The soft-token id rank 0 expands, where the tool names it (Phi-3.5:
+    /// `<|image|>`); otherwise the family reads it from `config.vlm.json` or
+    /// the tokenizer.
+    #[serde(default)]
+    image_token_id: Option<i64>,
+    /// Phi-3 `su` / `longrope` trees cut with the long-RoPE switch
+    /// (`tools/vlm_surgery/longrope.py`): the original window past which
+    /// every stage takes the long factors, as Hugging Face does. Absent on
+    /// older cuts, which keep the short factors at every length.
+    #[serde(default)]
+    pub(crate) long_rope_switch: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -97,6 +238,10 @@ struct StageConfig {
     static_seq: Option<u32>,
     #[serde(default)]
     static_context: Option<u32>,
+    /// `cut_vlm_lm.py`'s long-RoPE switch position (Phi-3.5-vision,
+    /// InternVL2), carried into static stages by `static_variant.py`.
+    #[serde(default)]
+    long_rope_switch: Option<u64>,
     /// Packed multi-slot IR variant (openvino_packed_model.xml): how many
     /// independent requests share one inference via the sequence dimension.
     #[serde(default)]
@@ -105,6 +250,24 @@ struct StageConfig {
     packed_seq: Option<u32>,
     #[serde(default)]
     packed_context: Option<u32>,
+    /// Mask ports of a packed IR built from several mask producers
+    /// (`tools/packed_variant.py`, Gemma 4 and Gemma 3): port name -> `full_attention` or
+    /// `sliding_attention`. Absent = the one full-attention `attn_mask_4d`.
+    #[serde(default)]
+    packed_masks: Option<std::collections::BTreeMap<String, String>>,
+    /// Sliding window (tokens) of the `sliding_attention` mask port.
+    #[serde(default)]
+    packed_sliding_window: Option<u32>,
+    /// The packed IR takes any query width up to `packed_seq`
+    /// (`packed_variant.py --dynamic-seq`, CPU/GPU): a decode step runs at
+    /// its live rows instead of `packed_seq`.
+    #[serde(default)]
+    packed_dynamic: Option<bool>,
+    /// Query rows of the narrow static decode IR
+    /// (`openvino_packed_decode_model.xml`, `packed_variant.py --decode-seq`,
+    /// NPU) beside the wide one; decode steps run on it.
+    #[serde(default)]
+    packed_decode_seq: Option<u32>,
     /// Chunked-prefill IR variant (openvino_prefill_model.xml) query-window
     /// width, exported via `--static-prefill-seq`. Absent/None on decode-only
     /// static exports and on all stateful exports.
@@ -119,6 +282,26 @@ struct StageConfig {
     num_kv_heads: Option<u32>,
     #[serde(default)]
     head_dim: Option<u32>,
+    /// Static shards whose layers differ in KV geometry (Gemma 4's sliding
+    /// and global layers): `[kv_heads, head_dim]` per layer in port order.
+    /// Absent = every layer is `num_kv_heads` x `head_dim`.
+    #[serde(default)]
+    kv_layers: Option<Vec<[u32; 2]>>,
+    /// The decode IR has a dynamic query width and serves prefill chunks too
+    /// (CPU/GPU): one compiled model instead of two copies of the weights.
+    #[serde(default)]
+    prefill_shares_decode: bool,
+    /// Rows of this stage's `position_ids` input when it is not the plain
+    /// `[B, T]` (Qwen2.5-VL / Qwen3-VL cuts: 3). Must match the pipeline's
+    /// `vision.mrope_rows`.
+    #[serde(default)]
+    position_rows: Option<u32>,
+    /// `tools/vlm_surgery/static_variant.py --packed-only` (Gemma 4, Gemma 3): the KV
+    /// ring runs past the sliding window, which the static IR masks by ring
+    /// index, so only the packed IR (host-built sliding mask) serves it
+    /// correctly. Loading it without `--packed-slots` is refused.
+    #[serde(default)]
+    packed_only: bool,
 }
 
 fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
@@ -175,6 +358,15 @@ fn lookup_eos(model_dir: &Path) -> Vec<u32> {
 
 fn i64_to_bytes(v: &[i64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 8);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// f32 slice as little-endian bytes (an `inputs_embeds`-style f32 IR input).
+fn f32_vec_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
     for x in v {
         out.extend_from_slice(&x.to_le_bytes());
     }
@@ -333,6 +525,255 @@ fn packed_geometry_error(slots: u32, packed_seq: u32) -> Option<String> {
     })
 }
 
+/// The narrow static decode IR `packed_variant.py --decode-seq` writes beside
+/// the wide packed IR.
+const PACKED_DECODE_XML: &str = "openvino_packed_decode_model.xml";
+
+/// Refuse a packed width setup the stage cannot run: a dynamic-width packed IR
+/// on the NPU (static shapes only), a narrow decode IR together with a dynamic
+/// one, a decode width that cannot hold every slot or is no narrower than the
+/// wide IR, or a decode width without its IR file.
+fn packed_width_error(
+    dynamic: bool,
+    decode_seq: Option<u32>,
+    slots: u32,
+    packed_seq: u32,
+    device: &str,
+    decode_xml_exists: bool,
+) -> Option<String> {
+    let npu = device.to_ascii_uppercase().contains("NPU");
+    if dynamic && npu {
+        return Some(
+            "the packed variant has a dynamic query width (packed_variant.py --dynamic-seq), \
+             which the NPU cannot compile; rebuild it static, with --decode-seq for a narrow \
+             decode IR"
+                .into(),
+        );
+    }
+    let d = decode_seq?;
+    if dynamic {
+        return Some(
+            "stage_config has both packed_dynamic and packed_decode_seq; a dynamic packed IR \
+             already decodes at the live rows, rebuild with one of the two"
+                .into(),
+        );
+    }
+    if d < slots || d >= packed_seq {
+        return Some(format!(
+            "packed_decode_seq={d} must hold every slot ({slots}) and be narrower than \
+             packed_seq={packed_seq}; rebuild with packed_variant.py --decode-seq"
+        ));
+    }
+    (!decode_xml_exists).then(|| {
+        format!(
+            "stage_config sets packed_decode_seq={d} but {PACKED_DECODE_XML} is missing; \
+             rebuild with packed_variant.py --decode-seq"
+        )
+    })
+}
+
+/// Refuse a prompt holding an image wider than one packed inference: its rows
+/// attend to each other both ways (Gemma 4, Gemma 3), so the image must sit whole in
+/// one inference of `packed_seq` rows, the packed analogue of the static
+/// path's `image_safe_take` refusal.
+fn packed_image_too_wide(
+    prompt_ids: &[i64],
+    image_token: i64,
+    packed_seq: usize,
+) -> Option<String> {
+    let mut widest = 0;
+    let mut run = 0;
+    for &t in prompt_ids {
+        run = if t == image_token { run + 1 } else { 0 };
+        widest = widest.max(run);
+    }
+    (widest > packed_seq).then(|| {
+        format!(
+            "an image of {widest} tokens does not fit one packed inference of {packed_seq} rows \
+             (this model attends inside an image both ways, so an image is never split); send \
+             a smaller image (lower detail), or serve with a packed variant built with \
+             --packed-seq {widest} or more"
+        )
+    })
+}
+
+/// Packed admission at submit, in the order that keeps a refused request
+/// cheap: refuse stray image tokens, expand the prompt from image sizes alone
+/// (`expand`), check every image fits one packed inference and the prompt fits
+/// a slot's region, and only then encode the images (`encode`, on the same
+/// `front` end). Returns the served ids and the encoded rows (None without
+/// media).
+///
+/// On a tree whose masks open image blocks (`image_blocks`, Gemma 4 and Gemma 3) a prompt
+/// without media must not hold the image soft token: typed as text (e.g. a
+/// `/v1/completions` prompt of literal `<|image|>`), its run would be masked
+/// as an image and could be wider than any packed inference.
+#[allow(clippy::too_many_arguments)]
+fn packed_check_then_encode<F, E>(
+    front: &mut F,
+    ids: &[i64],
+    has_media: bool,
+    image_token: Option<i64>,
+    image_blocks: bool,
+    packed_seq: usize,
+    region: usize,
+    expand: impl FnOnce(&F, &[i64]) -> Result<Vec<i64>, String>,
+    encode: impl FnOnce(&mut F, &[i64]) -> Result<(Vec<i64>, E), String>,
+) -> EngineResult<(Vec<i64>, Option<E>)> {
+    if let (true, false, Some(image)) = (image_blocks, has_media, image_token) {
+        if ids.contains(&image) {
+            return Err(EngineError::UnsupportedInput(
+                "the prompt contains the image placeholder token but the request carries no \
+                 image; send images as image_url content parts"
+                    .into(),
+            ));
+        }
+    }
+    let planned = if has_media {
+        expand(front, ids).map_err(EngineError::UnsupportedInput)?
+    } else {
+        ids.to_vec()
+    };
+    if let (true, Some(image)) = (image_blocks, image_token) {
+        if let Some(msg) = packed_image_too_wide(&planned, image, packed_seq) {
+            return Err(EngineError::UnsupportedInput(msg));
+        }
+    }
+    if let Some(msg) = packed_prompt_too_long(planned.len(), region) {
+        return Err(EngineError::PromptTooLong(msg));
+    }
+    if !has_media {
+        return Ok((planned, None));
+    }
+    let (expanded, rows) = encode(front, ids).map_err(EngineError::UnsupportedInput)?;
+    if expanded != planned {
+        return Err(EngineError::Backend(format!(
+            "image token counts from sizes ({} prompt tokens) disagree with the encoder's ({})",
+            planned.len(),
+            expanded.len()
+        )));
+    }
+    Ok((expanded, Some(rows)))
+}
+
+/// Why a stage cannot load given its `packed_only` marker, or None.
+///
+/// `stage` and `pipeline` are the stage's and the tree's markers, `packed`
+/// whether the load runs the packed variant (`--packed-slots`), `masks` the
+/// stage's `packed_masks`. A marked tree must load packed, from a packed IR
+/// with the host-built sliding mask, and its markers must agree.
+fn packed_only_error(
+    rank: u32,
+    stage: bool,
+    pipeline: bool,
+    packed: bool,
+    masks: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    if stage != pipeline {
+        return Some(format!(
+            "stage_{rank} packed_only={stage} but pipeline_config.json packed_only={pipeline}: \
+             the stage and the tree come from different static_variant.py runs (one with \
+             --packed-only); rebuild the whole static tree with one setting"
+        ));
+    }
+    if !stage {
+        return None;
+    }
+    if !packed {
+        return Some(format!(
+            "stage_{rank} is a packed-only tree (tools/vlm_surgery/static_variant.py \
+             --packed-only): its KV ring runs past the sliding window, which the static IR \
+             masks by ring index, so static mode would give wrong output. Serve it with \
+             --packed-slots N (after tools/packed_variant.py <stage_dir> --slots N), or \
+             rebuild the static tree without --packed-only"
+        ));
+    }
+    let sliding = masks.is_some_and(|m| m.values().any(|k| k == PACKED_SLIDING));
+    if !sliding {
+        return Some(format!(
+            "stage_{rank} is a packed-only tree but its packed variant has no \
+             sliding_attention mask port (stage_config.packed_masks), so the IR still masks \
+             the sliding window by ring index; rebuild it with tools/packed_variant.py, or \
+             rebuild the static tree without --packed-only"
+        ));
+    }
+    None
+}
+
+/// Mask kinds a packed IR can declare (`stage_config.packed_masks` values).
+const PACKED_FULL: &str = "full_attention";
+const PACKED_SLIDING: &str = "sliding_attention";
+
+/// Turn the packed IR's mask ports (`(kind, port, dtype)`, kind found from
+/// the port's name) into the masks to feed, checked against what
+/// `stage_config.packed_masks` says the tool built. A sliding port needs the
+/// window. No metadata means the one full-attention port of every packed IR
+/// built before Gemma 4.
+fn packed_mask_ports(
+    ports: Vec<(String, String, ShimDType)>,
+    declared: Option<&std::collections::BTreeMap<String, String>>,
+    window: Option<usize>,
+) -> Result<Vec<crate::packed_exec::PackedMask>, String> {
+    if ports.is_empty() {
+        return Err(
+            "packed variant missing the attn_mask_4d input — rebuild it with \
+                    tools/packed_variant.py"
+                .into(),
+        );
+    }
+    let mut kinds: Vec<&str> = ports.iter().map(|(k, _, _)| k.as_str()).collect();
+    kinds.sort_unstable();
+    let mut want: Vec<&str> = match declared {
+        Some(d) => d.values().map(String::as_str).collect(),
+        None => vec![PACKED_FULL],
+    };
+    want.sort_unstable();
+    if kinds != want {
+        return Err(format!(
+            "packed IR mask ports {:?} do not match stage_config.packed_masks {:?}; rebuild \
+             the packed variant with tools/packed_variant.py",
+            ports.iter().map(|(_, p, _)| p).collect::<Vec<_>>(),
+            declared
+        ));
+    }
+    ports
+        .into_iter()
+        .map(|(kind, port, dtype)| {
+            let w = if kind == PACKED_SLIDING {
+                match window {
+                    Some(w) if w > 0 => Some(w),
+                    _ => {
+                        return Err(format!(
+                            "packed IR has a sliding-window mask port ({port}) but \
+                             stage_config.json gives no packed_sliding_window; rebuild the \
+                             packed variant with tools/packed_variant.py"
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            Ok(crate::packed_exec::PackedMask::new(port, dtype, w))
+        })
+        .collect()
+}
+
+/// `8x256 x7, 2x512 x1`: each distinct `(kv_heads, head_dim)` and how many
+/// layers have it, in first-seen order, for the load log.
+fn describe_kv_geometry(geom: &[(usize, usize)]) -> String {
+    let mut seen: Vec<((usize, usize), usize)> = Vec::new();
+    for &g in geom {
+        match seen.iter_mut().find(|(k, _)| *k == g) {
+            Some((_, n)) => *n += 1,
+            None => seen.push((g, 1)),
+        }
+    }
+    seen.iter()
+        .map(|((k, d), n)| format!("{k}x{d} x{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Refuse a prompt that cannot fit one packed slot's KV region.
 ///
 /// A slot's region is a bounded window: once it fills, the oldest entries slide
@@ -349,18 +790,101 @@ fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String>
     })
 }
 
-/// Encode a packed step's per-row assignment as one framed I64 `[1, 3, S]`
+/// The bound a non-packed tree holds a prompt to at submit.
+#[derive(Clone, Copy, Debug)]
+enum PromptWindow {
+    /// A static tree's KV ring of `past_len` (static_context - 1) entries. A
+    /// longer prompt would slide its earliest tokens (the system prompt first)
+    /// out of the ring while it prefills, one token per inference past the
+    /// window: the answer comes back 200 from a silently truncated prompt,
+    /// slowly, holding the tree's only slot; image rows cannot slide at all.
+    /// Generation past the window still slides.
+    StaticRing(usize),
+    /// A stateful tree's model context (`max_position_embeddings`, widened by
+    /// a stated RoPE scaling). A prompt at or past it would run positions the
+    /// model was never trained on while the KV cache grows; at-or-past leaves
+    /// the first generated token a position, as the other engines do.
+    ModelContext(usize),
+}
+
+/// Refuse a prompt past `window` with `PromptTooLong` (400
+/// `context_length_exceeded`), as OpenAI does. `None` (a packed tree, a relay,
+/// a tree without a readable context) checks nothing. `expand` gives the
+/// prompt as it will be prefilled (images expanded from their sizes alone); if
+/// it fails, the turn is left for the step path to refuse as before.
+fn prompt_past_window(
+    ids: &[i64],
+    has_media: bool,
+    window: Option<PromptWindow>,
+    expand: impl FnOnce(&[i64]) -> Result<Vec<i64>, String>,
+) -> EngineResult<()> {
+    let Some(window) = window else {
+        return Ok(());
+    };
+    let planned = if has_media {
+        match expand(ids) {
+            Ok(p) => p.len(),
+            Err(_) => return Ok(()),
+        }
+    } else {
+        ids.len()
+    };
+    let with = if has_media {
+        " with its images expanded"
+    } else {
+        ""
+    };
+    let msg = match window {
+        PromptWindow::StaticRing(past_len) if planned > past_len => format!(
+            "prompt is {planned} tokens{with} but this static tree's KV window holds \
+             {past_len} (static_context - 1); send a shorter prompt (or fewer or smaller \
+             images), or convert the tree with a larger context"
+        ),
+        PromptWindow::ModelContext(max) if planned >= max => format!(
+            "prompt is {planned} tokens{with} but the model's context is {max}; send a \
+             shorter prompt (or fewer or smaller images)"
+        ),
+        _ => return Ok(()),
+    };
+    Err(EngineError::PromptTooLong(msg))
+}
+
+/// Row tag of a packed plan frame, one per column: the frame layout's version
+/// plus whether the sender's tree masks image blocks. A peer that does not
+/// write it is an older build.
+const PLAN_TAG_TEXT: i64 = 0x504B_0002;
+const PLAN_TAG_IMAGES: i64 = 0x504B_0102;
+/// Rows of a plan frame: slot, position, reuse, image id, tag.
+const PLAN_ROWS: usize = 5;
+
+/// Encode a packed step's per-row assignment as one framed I64 `[1, 5, S]`
 /// tensor: row 0 slot ids (`-1` = idle row), row 1 absolute positions, row 2
-/// the shared-prefix reuse length. The packed analogue of
+/// the shared-prefix reuse length, row 3 the row's image id (`-1` for text and
+/// idle rows, and on every tree without image blocks), row 4 the frame tag
+/// ([`PLAN_TAG_TEXT`] / [`PLAN_TAG_IMAGES`]). The packed analogue of
 /// `encode_wire_position` — downstream stages need per-ROW routing, not one
 /// scalar, to rebuild the mask and scatter each row into the right slot's ring.
 ///
 /// The reuse length must travel: only the driver stage holds the prompt ids to
 /// match against the prefix cache, but EVERY stage has to open the same shared
 /// columns or its attention would disagree with stage 0's.
-fn encode_wire_plan(rows: &[Option<(usize, i64, usize)>]) -> WireTensor {
+///
+/// A tree whose masks open image blocks (Gemma 4) sends `images`, because only
+/// rank 0 knows where the images are; the tag says it did, so a stage of the
+/// other kind refuses the frame instead of masking differently.
+///
+/// `S` is the plan's own width: `packed_seq` for a prefill chunk, the live
+/// rows only for a decode step. Builds from before that sent every frame
+/// `packed_seq` rows wide in a 3- or 4-row frame without the tag, which an
+/// older relay would mis-read once narrower; the 5-row tagged layout makes
+/// each side refuse the other's frames instead (an older peer finds a frame of
+/// the wrong shape, this build names the older upstream).
+fn encode_wire_plan(
+    rows: &[crate::packed_exec::WireRowOpt],
+    images: Option<&[Option<u32>]>,
+) -> WireTensor {
     let s = rows.len();
-    let mut data = Vec::with_capacity(s * 3 * 8);
+    let mut data = Vec::with_capacity(s * PLAN_ROWS * 8);
     for r in rows {
         let slot: i64 = r.map(|(sl, _, _)| sl as i64).unwrap_or(-1);
         data.extend_from_slice(&slot.to_le_bytes());
@@ -373,25 +897,62 @@ fn encode_wire_plan(rows: &[Option<(usize, i64, usize)>]) -> WireTensor {
         let sh: i64 = r.map(|(_, _, sh)| sh as i64).unwrap_or(0);
         data.extend_from_slice(&sh.to_le_bytes());
     }
-    WireTensor::new(WireDType::I64, [1, 3, s as u32], data)
+    for (i, r) in rows.iter().enumerate() {
+        let img: i64 = match (r, images.and_then(|im| im.get(i).copied().flatten())) {
+            (Some(_), Some(id)) => id as i64,
+            _ => -1,
+        };
+        data.extend_from_slice(&img.to_le_bytes());
+    }
+    let tag = if images.is_some() {
+        PLAN_TAG_IMAGES
+    } else {
+        PLAN_TAG_TEXT
+    };
+    for _ in rows {
+        data.extend_from_slice(&tag.to_le_bytes());
+    }
+    WireTensor::new(WireDType::I64, [1, PLAN_ROWS as u32, s as u32], data)
 }
 
 /// Decode + validate a packed plan frame. Rejects a wrong dtype/rank, a
 /// length/shape disagreement, out-of-range slot ids, and negative positions —
 /// each of which would otherwise index or wrap somewhere downstream.
+#[cfg(test)]
 fn decode_wire_plan(
     t: &WireTensor,
     slots: usize,
-) -> EngineResult<Vec<Option<(usize, i64, usize)>>> {
+) -> EngineResult<Vec<crate::packed_exec::WireRowOpt>> {
+    decode_wire_plan_images(t, slots, false).map(|(rows, _)| rows)
+}
+
+/// [`decode_wire_plan`] for either tree kind: `want_images` (this stage masks
+/// image blocks) requires an image-tagged frame and returns its per-row image
+/// ids; otherwise a text-tagged frame and an empty id list. An untagged 3- or
+/// 4-row frame comes from an older build and is refused by name.
+fn decode_wire_plan_images(
+    t: &WireTensor,
+    slots: usize,
+    want_images: bool,
+) -> EngineResult<(Vec<crate::packed_exec::WireRowOpt>, Vec<Option<u32>>)> {
     let s = t.shape[2] as usize;
-    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] != 3 || s == 0 {
+    if t.dtype == WireDType::I64 && t.shape[0] == 1 && s > 0 && matches!(t.shape[1], 3 | 4) {
         return Err(EngineError::Backend(format!(
-            "expected an I64 [1,3,S] packed plan frame, got dtype={:?} shape={:?} — likely a \
-             packed/non-packed pipeline mismatch or a desynced activation stream",
+            "packed plan frame has {} rows and no version tag: the upstream stage runs an \
+             older build (before narrow decode frames); stages run different builds, run the \
+             same build on every stage",
+            t.shape[1]
+        )));
+    }
+    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] as usize != PLAN_ROWS || s == 0 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 [1,{PLAN_ROWS},S] packed plan frame, got dtype={:?} shape={:?} — \
+             likely a packed/non-packed pipeline mismatch, stages running different builds, or \
+             a desynced activation stream",
             t.dtype, t.shape
         )));
     }
-    if t.data.len() != s * 3 * 8 {
+    if t.data.len() != s * PLAN_ROWS * 8 {
         return Err(EngineError::Backend(format!(
             "packed plan frame payload {} bytes does not match shape {:?}",
             t.data.len(),
@@ -403,13 +964,44 @@ fn decode_wire_plan(
         b.copy_from_slice(&t.data[i * 8..i * 8 + 8]);
         i64::from_le_bytes(b)
     };
+    let tag = rd(4 * s);
+    if (0..s).any(|r| rd(4 * s + r) != tag) || !matches!(tag, PLAN_TAG_TEXT | PLAN_TAG_IMAGES) {
+        return Err(EngineError::Backend(format!(
+            "packed plan frame has an unknown version tag {tag:#x}: stages run different \
+             builds, run the same build on every stage"
+        )));
+    }
+    let sent_images = tag == PLAN_TAG_IMAGES;
+    if sent_images != want_images {
+        let (this, peer) = if want_images {
+            (
+                "masks image blocks (a token_type_ids vision tree)",
+                "an upstream serving a tree without image blocks",
+            )
+        } else {
+            (
+                "does not mask image blocks",
+                "an upstream serving a token_type_ids vision tree",
+            )
+        };
+        return Err(EngineError::Backend(format!(
+            "packed plan frame {} image ids but this stage {this}: likely {peer}; run the same \
+             build and tree on every stage",
+            if sent_images { "carries" } else { "carries no" }
+        )));
+    }
     let mut out = Vec::with_capacity(s);
+    let mut images = Vec::with_capacity(if want_images { s } else { 0 });
     for r in 0..s {
         let slot = rd(r);
         let pos = rd(s + r);
         let shared = rd(2 * s + r);
+        let image = if want_images { rd(3 * s + r) } else { -1 };
         if slot < 0 {
             out.push(None);
+            if want_images {
+                images.push(None);
+            }
             continue;
         }
         if shared < 0 || shared > pos {
@@ -427,9 +1019,59 @@ fn decode_wire_plan(
                 "packed plan row {r} has negative position {pos}"
             )));
         }
+        if image < -1 || image > u32::MAX as i64 {
+            return Err(EngineError::Backend(format!(
+                "packed plan row {r} has image id {image} out of range"
+            )));
+        }
         out.push(Some((slot as usize, pos, shared as usize)));
+        if want_images {
+            images.push((image >= 0).then_some(image as u32));
+        }
     }
-    Ok(out)
+    Ok((out, images))
+}
+
+/// The plan a relay or head stage runs for a plan frame off the wire. Same-slot
+/// rows in one frame are a prefill chunk: their causal order is restored from
+/// arrival order, and their image ids (empty unless the tree masks image
+/// blocks) come from the frame, so this stage masks exactly as the sender did.
+fn relay_plan(
+    rows: &[crate::packed_exec::WireRowOpt],
+    images: &[Option<u32>],
+) -> crate::packed::PackedPlan {
+    let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    crate::packed::PackedPlan {
+        rows: rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                row.map(|(slot, _, _)| {
+                    let n = seen.entry(slot).or_insert(0);
+                    let order = *n;
+                    *n += 1;
+                    crate::packed::PackedRow {
+                        slot,
+                        order,
+                        image: images.get(r).copied().flatten(),
+                    }
+                })
+            })
+            .collect(),
+    }
+}
+
+/// The rows rank 0 samples from a packed plan: each slot's last row (a
+/// decode row is its slot's only one; a prefill chunk yields its token on its
+/// last row), in row order.
+fn last_row_per_slot(plan: &crate::packed::PackedPlan) -> Vec<usize> {
+    let mut last: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (r, pr) in plan.active_rows() {
+        last.insert(pr.slot, r);
+    }
+    let mut rows: Vec<usize> = last.into_values().collect();
+    rows.sort_unstable();
+    rows
 }
 
 /// True when a packed plan carries a prefill chunk: some slot owns more than
@@ -438,7 +1080,7 @@ fn decode_wire_plan(
 /// across every remaining stage. A single-row prefill chunk is
 /// indistinguishable from a decode row here and gets the strict decode
 /// deadline, which a one-row tail inference fits comfortably.
-fn plan_has_prefill_rows(rows: &[Option<(usize, i64, usize)>]) -> bool {
+fn plan_has_prefill_rows(rows: &[crate::packed_exec::WireRowOpt]) -> bool {
     let mut seen = std::collections::HashSet::new();
     rows.iter()
         .flatten()
@@ -699,6 +1341,163 @@ fn decode_wire_lead(t: &WireTensor, want_pos: bool) -> EngineResult<(u32, Option
     Ok((seq, position))
 }
 
+/// The single-task path's last chunk: usage and finish reason, as the packed
+/// path's. `prompt_len` is every prompt token the model consumed (images'
+/// soft tokens included), which is what OpenAI's `usage.prompt_tokens`
+/// counts; without it the API reported 0. `n_tokens` is this chunk's one
+/// token, so an EOS that decodes to "" still counts.
+fn single_task_final_chunk(
+    task_id: TaskId,
+    token: i32,
+    delta: String,
+    prompt_len: usize,
+    is_eos: bool,
+) -> Chunk {
+    // `token_id` too, not only `token_ids`: a consumer that reads
+    // `token_id` would otherwise see 0 for the final token.
+    Chunk {
+        token_id: token as i64,
+        ..Chunk::final_marker(task_id, delta)
+    }
+    .with_n_tokens(1)
+    .with_prompt_tokens(prompt_len as u32)
+    .with_token_ids(vec![token as i64])
+    .with_finish_reason(if is_eos {
+        cascadia_types::FinishReason::Stop
+    } else {
+        cascadia_types::FinishReason::Length
+    })
+}
+
+/// Encode a vision tree's per-step `token_type_ids` (1 on image soft tokens)
+/// as I64 `[1,1,n]`, the frame that follows the hidden. Every stage's
+/// sliding-window layers need it: they attend bidirectionally inside each
+/// image, and only rank 0 knows where the images are.
+fn encode_wire_types(types: &[i64]) -> WireTensor {
+    let bytes = types.iter().flat_map(|t| t.to_le_bytes()).collect();
+    WireTensor::new(WireDType::I64, [1, 1, types.len() as u32], bytes)
+}
+
+/// Decode + strictly validate the types frame against the hidden's token
+/// count `seq`. Values must be 0 or 1 (text or image; video is not served).
+fn decode_wire_types(t: &WireTensor, seq: usize) -> EngineResult<Vec<i64>> {
+    if t.dtype != WireDType::I64 || t.shape != [1, 1, seq as u32] || t.data.len() != seq * 8 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 [1,1,{seq}] token_type_ids frame after the hidden, got dtype={:?} \
+             shape={:?} len={} — a vision tree's ranks must all load the same \
+             pipeline_config.json (with its `vision` block)",
+            t.dtype,
+            t.shape,
+            t.data.len()
+        )));
+    }
+    let types: Vec<i64> = t
+        .data
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    if let Some(bad) = types.iter().find(|&&v| v != 0 && v != 1) {
+        return Err(EngineError::Backend(format!(
+            "token_type_ids frame carries {bad}; only 0 (text) and 1 (image) are served"
+        )));
+    }
+    Ok(types)
+}
+
+/// Encode an M-RoPE tree's per-step positions, row-major `[rows, n]`, as I64
+/// `[1, rows, n]`: the frame after the hidden (and the types frame, if any).
+/// Only rank 0 knows where images sit, so every later stage takes its
+/// `position_ids` from here. The shape's middle dim carries the row count, so
+/// a peer built for another layout (or a 1-D tree) fails on the first frame.
+fn encode_wire_positions(rows: usize, positions: &[i64]) -> WireTensor {
+    let n = positions.len() / rows.max(1);
+    let bytes = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
+    WireTensor::new(WireDType::I64, [1, rows as u32, n as u32], bytes)
+}
+
+/// Decode + strictly validate a positions frame against the hidden's token
+/// count `seq`. Positions are never negative (they start at 0 and the decode
+/// delta only pulls them back to the image span's end).
+fn decode_wire_positions(t: &WireTensor, rows: usize, seq: usize) -> EngineResult<Vec<i64>> {
+    if t.dtype != WireDType::I64
+        || t.shape != [1, rows as u32, seq as u32]
+        || t.data.len() != rows * seq * 8
+    {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 [1,{rows},{seq}] M-RoPE positions frame after the hidden, got \
+             dtype={:?} shape={:?} len={} — every rank of a Qwen VL tree must run a build with \
+             M-RoPE frames and load the same pipeline_config.json",
+            t.dtype,
+            t.shape,
+            t.data.len()
+        )));
+    }
+    let v: Vec<i64> = t
+        .data
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    if let Some(bad) = v.iter().find(|&&p| p < 0) {
+        return Err(EngineError::Backend(format!(
+            "negative M-RoPE position {bad} — corrupted or desynced activation stream"
+        )));
+    }
+    Ok(v)
+}
+
+/// A consumed activation group's decode result: `(hidden, shape, position)`,
+/// or the error the upstream must be NACKed with (see
+/// `recv_hidden_from_upstream`).
+type OwedGroup = EngineResult<(Vec<f32>, [usize; 3], Option<i64>)>;
+
+/// The decoded body of an activation group (everything after the lead).
+#[derive(Debug)]
+struct DecodedGroup {
+    hidden: Vec<f32>,
+    shape: [usize; 3],
+    types: Option<Vec<i64>>,
+    positions: Option<Vec<i64>>,
+}
+
+/// Decode + validate the frames that follow a group's lead: the hidden, and
+/// the optional `token_type_ids` and M-RoPE positions frames, both checked
+/// against the hidden's token count. Pure, so the "decode failure after the
+/// group was consumed" path is testable without a socket.
+fn decode_hidden_group(
+    hidden: &WireTensor,
+    types: Option<&WireTensor>,
+    positions: Option<&WireTensor>,
+) -> EngineResult<DecodedGroup> {
+    let shape = [
+        hidden.shape[0] as usize,
+        hidden.shape[1] as usize,
+        hidden.shape[2] as usize,
+    ];
+    let types = types.map(|t| decode_wire_types(t, shape[1])).transpose()?;
+    let positions = positions
+        .map(|p| decode_wire_positions(p, crate::qwen_vl_vision::MROPE_ROWS, shape[1]))
+        .transpose()?;
+    let hidden = match hidden.dtype {
+        WireDType::F32 => hidden
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        WireDType::F16 => f16_bytes_to_f32(&hidden.data),
+        other => {
+            return Err(EngineError::Backend(format!(
+                "unexpected upstream dtype {other:?}"
+            )))
+        }
+    };
+    Ok(DecodedGroup {
+        hidden,
+        shape,
+        types,
+        positions,
+    })
+}
+
 /// Encode a token + the echoed per-hop seq as I32 `[1,1,2]` = `[token, seq]`
 /// (8 bytes): the token is element 0, the seq element 1 — i.e. the seq occupies
 /// bytes 4..8, the HIGH half if the payload is read as one little-endian i64.
@@ -764,7 +1563,9 @@ fn decode_token_with_seq(t: &WireTensor) -> EngineResult<(i32, u32)> {
 const NACK_TOKEN: i32 = -1;
 
 /// Send the downstream activation frames in wire order: `[lead] [hidden]`,
-/// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`).
+/// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`),
+/// then `[types]` on a vision tree (see `encode_wire_types`), then
+/// `[positions]` on an M-RoPE tree (see `encode_wire_positions`).
 ///
 /// Takes the VALUES, not pre-encoded frames, and encodes here: the lead and the
 /// hidden are both `WireTensor`, so a pre-encoded signature let the two be
@@ -776,11 +1577,19 @@ async fn send_hidden_frames(
     seq: u32,
     position: Option<i64>,
     hid: WireTensor,
+    types: Option<WireTensor>,
+    positions: Option<WireTensor>,
 ) -> Result<(), cascadia_transport::TransportError> {
     let lead = encode_wire_lead(seq, position);
     let mut guard = downstream.lock().await;
     guard.send(&lead).await?;
     guard.send(&hid).await?;
+    if let Some(t) = types {
+        guard.send(&t).await?;
+    }
+    if let Some(p) = positions {
+        guard.send(&p).await?;
+    }
     Ok(())
 }
 
@@ -803,22 +1612,46 @@ async fn send_hidden_frames(
 /// waits again. Peeking here rather than in the caller is what keeps this the
 /// literal body of `recv_hidden_from_upstream`, and so keeps the loopback tests
 /// below covering it: a peek inlined at the call site would be untested.
+///
+/// On a vision tree (`want_types`) a third frame, the step's
+/// `token_type_ids`, follows the hidden and is deadlined like it; on an
+/// M-RoPE tree (`want_positions`) the step's positions follow last.
 async fn recv_hidden_frames(
     upstream: &Arc<tokio::sync::Mutex<ActivationServer>>,
     want_pos: bool,
-) -> Result<(WireTensor, Option<WireTensor>), cascadia_transport::TransportError> {
+    want_types: bool,
+    want_positions: bool,
+) -> Result<HiddenFrames, cascadia_transport::TransportError> {
     let mut guard = upstream.lock().await;
     let lead = guard.recv().await?.0;
     // A static shard never receives control frames, and its lead is I64 either
     // way — so the check costs nothing there and cannot shadow an activation.
     #[cfg(feature = "kv_coord")]
     if !want_pos && lead.dtype == WireDType::I8 {
-        return Ok((lead, None));
+        return Ok((lead, None, None, None));
     }
     let _ = want_pos;
     let hid = guard.recv_reply().await?.0;
-    Ok((lead, Some(hid)))
+    let types = if want_types {
+        Some(guard.recv_reply().await?.0)
+    } else {
+        None
+    };
+    let positions = if want_positions {
+        Some(guard.recv_reply().await?.0)
+    } else {
+        None
+    };
+    Ok((lead, Some(hid), types, positions))
 }
+
+/// `[lead] [hidden]?` and the optional types and positions frames.
+type HiddenFrames = (
+    WireTensor,
+    Option<WireTensor>,
+    Option<WireTensor>,
+    Option<WireTensor>,
+);
 
 /// Hard ceiling on the active token-response wait, independent of the body
 /// `recv_timeout()`. `recv_timeout` is operator-tunable for slow stages, and
@@ -851,8 +1684,20 @@ const RESTORE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 /// rig's 120s, 120s / 1200s — the same prefill budget `recv_reply_prefill` gave
 /// before, and strictly tighter than it at pathological settings.
 ///
+/// A caller-set prefill budget (`cascadia_transport::set_prefill_reply_timeout_secs`,
+/// e.g. the node entry's first-token budget) replaces the widened prefill
+/// default outright, so the head fails and frees its slot when the caller gives
+/// up instead of 600-1200 s later. Decode is unaffected.
+///
 /// Pure, for testing.
-fn token_recv_deadline(recv_timeout: std::time::Duration, prefill: bool) -> std::time::Duration {
+fn token_recv_deadline(
+    recv_timeout: std::time::Duration,
+    prefill: bool,
+    prefill_override: Option<std::time::Duration>,
+) -> std::time::Duration {
+    if let (true, Some(caller)) = (prefill, prefill_override) {
+        return caller;
+    }
     let factor = if prefill {
         cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR
     } else {
@@ -972,7 +1817,11 @@ async fn recv_token_seq_checked(
     awaiting_seq: u32,
     prefill: bool,
 ) -> Result<i32, TokenWaitFailure> {
-    let budget = token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
+    let budget = token_recv_deadline(
+        cascadia_transport::recv_timeout(),
+        prefill,
+        cascadia_transport::prefill_reply_timeout_override(),
+    );
     let deadline_at = std::time::Instant::now() + budget;
     // Discards are summarised into the terminal error rather than logged per
     // frame. A peer echoing the wrong seq every time — a version skew, or a
@@ -1072,6 +1921,10 @@ struct StaticKvLayer {
     val_in: String,
     key_out: usize,
     val_out: usize,
+    /// This layer's KV geometry. Uniform on most exports; Gemma 4 mixes
+    /// sliding (8x256) and global (2x512) layers within a stage.
+    kv_heads: usize,
+    head_dim: usize,
 }
 
 /// Host-side bounded KV ring for the stateless static-shape (NPU) path.
@@ -1091,15 +1944,26 @@ struct StaticKv {
     /// never crowd out the sliding portion.
     sink: usize,
     context: usize,
-    kv_heads: usize,
-    head_dim: usize,
     elem_bytes: usize,
     kv_dtype: ShimDType,
     /// Resolved primary input port names (cached at build so the per-token
     /// decode loop does no HashMap lookups / string allocs). `ids_in` is set
-    /// for the embed stage, `hidden_in` for relay/head stages.
+    /// for the embed stage, `hidden_in` for relay/head stages, `embeds_in`
+    /// for a vision tree's stage 0 (rank 0 embeds the prompt itself).
     ids_in: Option<String>,
     hidden_in: Option<String>,
+    embeds_in: Option<String>,
+    /// Gemma 4 vision trees: `token_type_ids` (1 on image soft tokens).
+    types_in: Option<String>,
+    /// Qwen3-VL stage 0: `visual_pos_masks` / `deepstack_visual_embeds`.
+    visual_mask_in: Option<String>,
+    deepstack_in: Option<String>,
+    /// Token types of the rows the next inference feeds, set by the caller
+    /// and taken by `static_infer`/`static_infer_chunk` (zeros when unset).
+    next_types: Vec<i64>,
+    /// Ids of the rows the next static inference feeds (Qwen3-VL stage 0 only,
+    /// to build its DeepStack mask); set by the caller alongside `next_types`.
+    next_ids: Vec<i64>,
     attn_in: String,
     pos_in: String,
     layers: Vec<StaticKvLayer>,
@@ -1122,8 +1986,9 @@ impl StaticKv {
     /// Expected byte length of one layer's `present.*` output:
     /// `kv_heads * context * head_dim * elem_bytes`. Used to validate the IR's
     /// output shape/dtype before `absorb_layer` slices it.
-    fn present_layer_bytes(&self) -> usize {
-        self.kv_heads * self.context * self.head_dim * self.elem_bytes
+    fn present_layer_bytes(&self, li: usize) -> usize {
+        let l = &self.layers[li];
+        l.kv_heads * self.context * l.head_dim * self.elem_bytes
     }
 
     /// Set how many real past tokens are visible for a token at absolute
@@ -1172,11 +2037,11 @@ impl StaticKv {
     ) {
         // Read scalar fields into locals before borrowing the buffer field,
         // so the mutable buffer borrow stays disjoint from these reads.
-        let slot = self.head_dim * self.elem_bytes;
+        let slot = self.layers[li].head_dim * self.elem_bytes;
         let present_row = present_ctx * slot; // per-head stride in present
         let buf_row = self.past_len * slot; // per-head stride in the ring
         let full = valid_now >= self.past_len;
-        let kv_heads = self.kv_heads;
+        let kv_heads = self.layers[li].kv_heads;
         let past_len = self.past_len;
         let sink = self.sink;
         let buf: &mut [u8] = if is_value {
@@ -1266,6 +2131,35 @@ fn fill_static_mask(buf: &mut Vec<u8>, ctx: usize, past_len: usize, valid: usize
     }
 }
 
+/// Rows of the next prefill chunk at `idx`, at most `take`, never ending
+/// inside a run of image tokens (`types` 1). Gemma 4 attends bidirectionally
+/// within an image, and one inference only sees that whole: the IR pads the
+/// past's token types as text. Err when an image starting at `idx` is longer
+/// than `take` (the chunk window, or a one-row step). Empty `types` (no
+/// token types on this tree) leaves `take` as is.
+fn image_safe_take(types: &[i64], idx: usize, take: usize) -> Result<usize, String> {
+    let end = idx + take;
+    if types.is_empty() || take == 0 || end >= types.len() {
+        return Ok(take);
+    }
+    if types[end - 1] != 1 || types[end] != 1 {
+        return Ok(take);
+    }
+    let mut start = end - 1;
+    while start > idx && types[start - 1] == 1 {
+        start -= 1;
+    }
+    if start > idx {
+        return Ok(start - idx);
+    }
+    let run = types[idx..].iter().take_while(|&&t| t == 1).count();
+    Err(format!(
+        "an image of {run} tokens does not fit one prefill inference of {take} rows; \
+         export the static tree with a --prefill-seq at least that wide and a context \
+         that holds the whole prompt"
+    ))
+}
+
 /// Width of the next prefill chunk starting at absolute `position`: bounded
 /// by the model's chunk window `c`, the `remaining` prompt tokens, and — the
 /// parity cap — the number of rows that keep every query's absolute position
@@ -1279,12 +2173,25 @@ fn chunk_take(c: usize, remaining: usize, position: usize, past_len: usize) -> u
 }
 
 /// Primary input of one prefill chunk: prompt ids on the embed stage, hidden
-/// rows (`hid` floats per token, row-major) on relay/head stages. Conversion
+/// rows (`hid` floats per token, row-major) on relay/head stages, embedding
+/// rows on a vision tree's stage 0. Conversion
 /// into the IR's dtype happens directly inside the reusable `primary_buf`.
 #[derive(Clone, Copy)]
 enum ChunkInput<'a> {
     Ids(&'a [i64]),
     Hidden(&'a [f32], usize),
+    /// A vision tree's stage 0: rank 0's embedding rows (`inputs_embeds`,
+    /// fed as f32 like the stateful path).
+    Embeds(&'a [f32], usize),
+}
+
+/// Name of a static IR's primary input kind, for error messages.
+fn primary_kind(ids: bool, embeds: bool) -> &'static str {
+    match (ids, embeds) {
+        (true, _) => "input_ids",
+        (false, true) => "inputs_embeds",
+        (false, false) => "hidden_states",
+    }
 }
 
 /// Byte width of a float output element, for prefix-slicing converted rows.
@@ -1314,12 +2221,21 @@ struct StaticPrefill {
     /// `ensure_prefill_loaded` re-creates it from `PrefillReload` on demand.
     /// Wiring, window dims, and buffers persist across park/reload.
     runtime: Option<OvRuntime>,
+    /// The decode IR itself serves prefill (CPU/GPU trees whose one IR has a
+    /// dynamic query width, `stage_config.prefill_shares_decode`): chunks run
+    /// on the engine's main runtime and there is nothing to park or reload.
+    shared: bool,
     /// Fixed query-window width C of the prefill IR.
     seq: usize,
     /// Fixed total context of the prefill IR (= ring past_len + seq).
     context: usize,
     ids_in: Option<String>,
     hidden_in: Option<String>,
+    embeds_in: Option<String>,
+    types_in: Option<String>,
+    /// Qwen3-VL stage 0: `visual_pos_masks` / `deepstack_visual_embeds`.
+    visual_mask_in: Option<String>,
+    deepstack_in: Option<String>,
     attn_in: String,
     pos_in: String,
     layers: Vec<StaticKvLayer>,
@@ -1398,9 +2314,761 @@ fn import_plugin(plugin: &PluginConfig) -> PluginConfig {
 
 // -------- Engine --------
 
+/// Image families ov-runtime serves on a vision tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisionFamily {
+    /// Gemma 4 surgery trees (26B-A4B/31B): `token_type_ids` on every stage.
+    Gemma4,
+    /// Gemma 3 trees from tools/vlm_surgery (`--family gemma3`):
+    /// `token_type_ids` on every stage, like Gemma 4.
+    Gemma3,
+    /// LLaVA-layout Pixtral trees from tools/vlm_surgery: causal attention.
+    Pixtral,
+    /// Phi-3.5-vision (`phi3_v`) trees from tools/vlm_surgery: causal.
+    Phi3V,
+    /// InternVL2 (`internvl_chat`) trees from tools/vlm_surgery: causal.
+    InternVL,
+    /// LLaVA-NeXT (llava-v1.6) trees from tools/vlm_surgery: anyres tiles,
+    /// causal attention.
+    LlavaNext,
+    /// Qwen2.5-VL / Qwen3-VL trees from tools/vlm_surgery: causal attention,
+    /// M-RoPE positions on every stage (`[3, T]`, a wire frame after the
+    /// hidden) and, on Qwen3-VL, DeepStack rows into stage 0.
+    QwenVl(crate::qwen_vl_vision::Kind),
+}
+
+impl VisionFamily {
+    /// Whether the family attends bidirectionally inside an image, so its
+    /// stages take `token_type_ids` unless the tree says otherwise.
+    pub(crate) fn token_types_by_default(self) -> bool {
+        matches!(self, VisionFamily::Gemma4 | VisionFamily::Gemma3)
+    }
+}
+
+/// Qwen VL trees carry M-RoPE `position_ids [3, T]` on every stage, and every
+/// path now wires them: the stateful IR takes the `[3, 1, T]` block directly,
+/// the static IRs (`static_variant.py`) pin `position_ids [3, 1, seq]`, and the
+/// packed IR (`packed_variant.py`) pins `[3, 1, S]` and carries the rows per
+/// slot on the plan frame. All this function enforces is that the pipeline's
+/// `vision.mrope_rows` and this stage's `position_rows` agree and are 3 (a
+/// peer built for another layout, or a 1-D tree, fails here before any frame),
+/// and that no other family smuggles the fields in. `stateful`/`packed` are
+/// accepted for every mode now; they are kept for the call site's clarity.
+fn check_mrope_tree(
+    family: VisionFamily,
+    mrope_rows: Option<u32>,
+    position_rows: Option<u32>,
+    _stateful: bool,
+    _packed: bool,
+) -> EngineResult<()> {
+    let want = crate::qwen_vl_vision::MROPE_ROWS as u32;
+    let is_qwen = matches!(family, VisionFamily::QwenVl(_));
+    if !is_qwen {
+        if mrope_rows.is_some() || position_rows.is_some() {
+            return Err(EngineError::InvalidConfig(format!(
+                "a {family:?} vision tree declares M-RoPE positions (mrope_rows {mrope_rows:?}, \
+                 position_rows {position_rows:?}); only qwen2_5_vl / qwen3_vl trees take them"
+            )));
+        }
+        return Ok(());
+    }
+    if mrope_rows != Some(want) || position_rows != Some(want) {
+        return Err(EngineError::InvalidConfig(format!(
+            "{family:?} tree: pipeline vision.mrope_rows is {mrope_rows:?} and this stage's \
+             position_rows is {position_rows:?}, both must be {want}; re-cut the tree with \
+             tools/vlm_surgery/cut_vlm_lm.py from this build"
+        )));
+    }
+    Ok(())
+}
+
+/// A stage whose `position_ids` take M-RoPE rows (a Qwen VL cut) in a
+/// pipeline without a `vision` block would be fed plain `[B, T]` positions
+/// and fail at its first inference (or, on a relay, as a generic downstream
+/// NACK); refuse it at load, as [`check_mrope_tree`] does for a vision tree.
+fn check_positions_without_vision(rank: u32, position_rows: Option<u32>) -> EngineResult<()> {
+    match position_rows {
+        Some(rows) => Err(EngineError::InvalidConfig(format!(
+            "stage_{rank} takes {rows}-row M-RoPE position_ids but pipeline_config.json has no \
+             `vision` block to say so; use the pipeline_config.json the tree was cut with \
+             (tools/vlm_surgery/cut_vlm_lm.py)"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The family of a pipeline's `vision` block. A tree without the field is
+/// accepted only when it is a Gemma 4 vision surgery tree (written before the
+/// field existed); any other family is refused rather than fed another
+/// family's preprocessing.
+pub(crate) fn vision_family(
+    v: &PipelineVision,
+    export_version: Option<&str>,
+) -> EngineResult<VisionFamily> {
+    match (v.family.as_deref(), export_version) {
+        (Some("gemma4"), _) | (None, Some("gemma4_vision_surgery_v1")) => Ok(VisionFamily::Gemma4),
+        (Some("gemma3"), _) => Ok(VisionFamily::Gemma3),
+        // Mistral 3 is Pixtral's processor and tower plus a 2x2 patch merger,
+        // which the Pixtral front end runs when the export carries it.
+        (Some("pixtral" | "mistral3"), _) => Ok(VisionFamily::Pixtral),
+        (Some("phi3_v"), _) => Ok(VisionFamily::Phi3V),
+        (Some("internvl_chat"), _) => Ok(VisionFamily::InternVL),
+        (Some("llava_next"), _) => Ok(VisionFamily::LlavaNext),
+        (Some("qwen2_5_vl"), _) => Ok(VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen25Vl)),
+        (Some("qwen3_vl"), _) => Ok(VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen3Vl)),
+        (Some(f), _) => Err(EngineError::InvalidConfig(format!(
+            "pipeline_config.json `vision.family` is {f:?}; ov-runtime serves image input \
+             for \"gemma4\", \"gemma3\", \"pixtral\", \"mistral3\", \"llava_next\", \"phi3_v\", \
+             \"internvl_chat\", \"qwen2_5_vl\" and \"qwen3_vl\""
+        ))),
+        (None, other) => Err(EngineError::InvalidConfig(format!(
+            "pipeline_config.json has a `vision` block without `family` on a {other:?} \
+             export; re-export the tree so it names its family"
+        ))),
+    }
+}
+
+/// The soft tokens of the widest image (or native-video frame) a
+/// `token_type_ids` vision tree can send, from the tree root's processor
+/// configs without loading the vision encoder: a relay stage's copy of what
+/// rank 0's front end reports (`max_image_tokens`). On Gemma 4 a frame counts
+/// whether or not native video is on, which is rank 0's figure as long as a
+/// frame is no wider than an image (70 and 280 in every export). `None` for
+/// families without bidirectional image blocks.
+fn widest_image_tokens(dir: &Path, family: VisionFamily) -> Result<Option<usize>, String> {
+    Ok(match family {
+        VisionFamily::Gemma4 => {
+            let image = crate::gemma4_vision::PreprocessConfig::from_model_dir(dir)?;
+            let video = crate::gemma4_vision::video::VideoConfig::from_model_dir(dir)?;
+            Some(image.max_soft_tokens.max(video.frame.max_soft_tokens) as usize)
+        }
+        VisionFamily::Gemma3 => Some(
+            crate::gemma3_vision::PreprocessConfig::from_model_dir(dir)?.image_seq_length as usize,
+        ),
+        VisionFamily::Pixtral
+        | VisionFamily::Phi3V
+        | VisionFamily::InternVL
+        | VisionFamily::LlavaNext
+        | VisionFamily::QwenVl(_) => None,
+    })
+}
+
+/// A static `token_type_ids` stage's chunked-prefill IR must hold the widest
+/// image whole: an image is attended both ways, so no chunk may end inside
+/// one, on rank 0 or on any relay.
+fn static_image_window_fits(pseq: usize, max: usize, rank: u32) -> EngineResult<()> {
+    if pseq < max {
+        return Err(EngineError::InvalidConfig(format!(
+            "stage_{rank}: static prefill IR takes {pseq} rows but an image can be {max} \
+             tokens; re-convert with --prefill-seq {max} or more"
+        )));
+    }
+    Ok(())
+}
+
+/// A vision tree: stage 0 takes `inputs_embeds` instead of ids (rank 0
+/// embeds the prompt and splices image rows). On a Gemma 4 tree every stage
+/// also takes `token_type_ids` (1 on image soft tokens: sliding-window layers
+/// attend bidirectionally inside each image), so that row rides the wire as a
+/// third frame `[lead] [hidden] [types]`. The static path (trees from
+/// `tools/vlm_surgery/static_variant.py`, stage 0 fed embedding rows) serves
+/// both: a `token_type_ids` tree needs a chunked-prefill IR at least one
+/// image wide, and no chunk ends inside an image (`image_safe_take`). The
+/// packed path serves both too: on a `token_type_ids` tree its host masks open
+/// each image both ways, a packed prefill chunk never splits an image
+/// (`crate::packed::image_safe_take`), and the plan frame carries each row's
+/// image id to the other stages.
+struct VisionTree {
+    /// Rank 0 only.
+    first: Option<VisionFirst>,
+    /// Stages take `token_type_ids` and the wire carries the third frame.
+    token_types: bool,
+    /// Full-attention layers also see each image both ways (Gemma 3); Gemma
+    /// 4 opens images on its sliding layers only and keeps full attention
+    /// causal, as HF does. Read by the packed host masks.
+    full_blocks: bool,
+    /// Stages take `[3, T]` M-RoPE `position_ids` (Qwen2.5-VL / Qwen3-VL),
+    /// computed on rank 0 and carried as a frame after the hidden (and the
+    /// types frame, if any).
+    mrope: bool,
+}
+
+/// Rank 0's image front end, per family.
+pub(crate) enum Frontend {
+    Gemma4(crate::gemma4_vision::ImageFrontend),
+    Gemma3(crate::gemma3_vision::Frontend),
+    Pixtral(crate::pixtral_vision::Frontend),
+    Phi3V(crate::phi3v_vision::Frontend),
+    InternVL(crate::internvl_vision::Frontend),
+    LlavaNext(crate::llava_next_vision::Frontend),
+    QwenVl(crate::qwen_vl_vision::Frontend),
+}
+
+/// One turn's images as rank 0 prefills them.
+/// A packed vision turn encoded at `submit` and taken at admission: the
+/// expanded prompt, its image rows, and (Qwen VL) its M-RoPE positions +
+/// (Qwen3-VL) its DeepStack rows.
+struct PackedTurn {
+    ids: Vec<i64>,
+    rows: Vec<Vec<f32>>,
+    mrope: Option<crate::qwen35_vision::rope::MropePositions>,
+    deepstack: Vec<Vec<f32>>,
+}
+
+/// What a packed vision turn's encode yields beyond the expanded ids: the
+/// image rows, and Qwen VL's M-RoPE positions + Qwen3-VL's DeepStack rows (both
+/// absent for every other family, which `prepare_turn` fills as None / empty).
+type PackedEncoded = (
+    Vec<Vec<f32>>,
+    Option<crate::qwen35_vision::rope::MropePositions>,
+    Vec<Vec<f32>>,
+);
+
+pub(crate) struct PreparedTurn {
+    /// The prompt with each image placeholder expanded.
+    pub(crate) ids: Vec<i64>,
+    /// Each image's embedding rows, in prompt order.
+    pub(crate) rows: Vec<Vec<f32>>,
+    /// Qwen VL: the prompt's M-RoPE positions.
+    pub(crate) mrope: Option<crate::qwen35_vision::rope::MropePositions>,
+    /// Qwen3-VL: each image's DeepStack rows (layer-major).
+    pub(crate) deepstack: Vec<Vec<f32>>,
+}
+
+impl Frontend {
+    /// The rendered prompt of a turn with images as the tokenizer must see
+    /// it. Gemma 3 expands each `<start_of_image>` on the text, as HF's
+    /// processor does (its "\n\n" framing merges with the neighbouring
+    /// text's tokens), and Qwen3-VL and Gemma 4 write each video's timestamp
+    /// markup; the other families expand on ids in `prepare`.
+    pub(crate) fn prompt_text<'a>(
+        &self,
+        prompt: &'a str,
+        media: &[cascadia_types::MediaInput],
+    ) -> std::borrow::Cow<'a, str> {
+        match self {
+            Frontend::Gemma3(f) => std::borrow::Cow::Owned(f.expand_text(prompt)),
+            Frontend::QwenVl(f) => f.prompt_text(prompt, media),
+            Frontend::Gemma4(f) => f.prompt_text(prompt, media),
+            Frontend::Pixtral(_)
+            | Frontend::LlavaNext(_)
+            | Frontend::Phi3V(_)
+            | Frontend::InternVL(_) => std::borrow::Cow::Borrowed(prompt),
+        }
+    }
+
+    /// Whether the family takes a `MediaKind::Video` item natively (the API
+    /// sends every other family a video's frames as images): Qwen VL, and
+    /// Gemma 4 when its tokenizer has `<|video|>`.
+    pub(crate) fn takes_video(&self) -> bool {
+        match self {
+            Frontend::QwenVl(_) => true,
+            Frontend::Gemma4(f) => f.takes_video(),
+            Frontend::Gemma3(_)
+            | Frontend::Pixtral(_)
+            | Frontend::LlavaNext(_)
+            | Frontend::Phi3V(_)
+            | Frontend::InternVL(_) => false,
+        }
+    }
+
+    /// A `prompt_len`-token prompt's length once `media` expand, from the
+    /// images' dimensions alone (no encode). Not Gemma 4 / Gemma 3.
+    pub(crate) fn expanded_len(
+        &self,
+        prompt_len: usize,
+        media: &[cascadia_types::MediaInput],
+    ) -> Result<usize, String> {
+        match self {
+            Frontend::Pixtral(f) => f.expanded_len(prompt_len, media),
+            Frontend::Phi3V(f) => f.expanded_len(prompt_len, media),
+            Frontend::InternVL(f) => f.expanded_len(prompt_len, media),
+            Frontend::LlavaNext(f) => f.expanded_len(prompt_len, media),
+            Frontend::Gemma4(_) | Frontend::Gemma3(_) | Frontend::QwenVl(_) => {
+                Err("expanded length is sized for Pixtral images only".into())
+            }
+        }
+    }
+
+    /// Every id an image expands to (soft tokens and their framing).
+    pub(crate) fn image_framing(&self) -> Vec<i64> {
+        match self {
+            Frontend::Gemma4(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
+            Frontend::Gemma3(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
+            Frontend::Pixtral(f) => vec![f.tokens.image, f.tokens.image_break, f.tokens.image_end],
+            Frontend::QwenVl(f) => vec![
+                f.layout.tokens.image_pad,
+                f.layout.tokens.vision_start,
+                f.layout.tokens.vision_end,
+            ],
+            Frontend::Phi3V(f) => vec![f.image_token],
+            Frontend::InternVL(f) => vec![f.tokens.context, f.tokens.start, f.tokens.end],
+            // Newline rows are image tokens too; nothing frames an image.
+            Frontend::LlavaNext(f) => vec![f.image_token],
+        }
+    }
+
+    /// The soft-token id whose rows the encoder supplies.
+    pub(crate) fn image_token(&self) -> i64 {
+        match self {
+            Frontend::Gemma4(f) => f.tokens.image,
+            Frontend::Gemma3(f) => f.tokens.image,
+            Frontend::Pixtral(f) => f.tokens.image,
+            Frontend::QwenVl(f) => f.layout.tokens.image_pad,
+            Frontend::LlavaNext(f) => f.image_token,
+            Frontend::Phi3V(f) => f.image_token,
+            Frontend::InternVL(f) => f.tokens.context,
+        }
+    }
+
+    /// The rendered prompt's ids as the family's processor lays them out
+    /// before images expand. Phi-3.5-vision tokenizes each chunk between
+    /// `<|image_N|>` tags on its own (each with its BOS) and stands one
+    /// `<|image|>` in for each tag; every other family encodes the prompt
+    /// whole, without special tokens (the template writes them).
+    pub(crate) fn encode_prompt(&self, tok: &Tokenizer, prompt: &str) -> Result<Vec<i64>, String> {
+        match self {
+            Frontend::Phi3V(f) => f.encode_prompt(tok, prompt),
+            _ => tok
+                .encode(prompt, false)
+                .map(|e| e.get_ids().iter().map(|&u| i64::from(u)).collect())
+                .map_err(|e| format!("tokenizer encode: {e}")),
+        }
+    }
+
+    /// Ids for the text embedding table (Gemma embeds image tokens as pad;
+    /// their rows are overwritten either way).
+    fn embedding_ids(&self, ids: &[i64]) -> Vec<i64> {
+        match self {
+            Frontend::Gemma4(f) => crate::gemma4_vision::text_embedding_ids(ids, &f.tokens),
+            // Gemma 3's soft-token id is inside the vocabulary, so it embeds
+            // as itself, as in HF.
+            Frontend::Gemma3(_)
+            | Frontend::Pixtral(_)
+            | Frontend::LlavaNext(_)
+            | Frontend::Phi3V(_)
+            | Frontend::InternVL(_)
+            | Frontend::QwenVl(_) => ids.to_vec(),
+        }
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+        tenant: &str,
+    ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
+        match self {
+            Frontend::Gemma4(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::Gemma3(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::Pixtral(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::Phi3V(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::InternVL(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::LlavaNext(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::QwenVl(f) => f
+                .prepare(media, prompt_ids, tenant)
+                .map(|p| (p.ids, p.rows)),
+        }
+    }
+
+    /// [`Self::prepare`] keeping what a family needs beyond the rows: Qwen
+    /// VL's positions and DeepStack rows.
+    pub(crate) fn prepare_turn(
+        &mut self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+        tenant: &str,
+    ) -> Result<PreparedTurn, String> {
+        match self {
+            Frontend::QwenVl(f) => {
+                // Sized first: a prompt that cannot fit costs no encode.
+                let planned = f.expand_ids(media, prompt_ids)?;
+                let p = f.prepare(media, prompt_ids, tenant)?;
+                if p.ids != planned {
+                    return Err(format!(
+                        "image token counts from sizes ({} prompt tokens) disagree with the \
+                         encoder's ({})",
+                        planned.len(),
+                        p.ids.len()
+                    ));
+                }
+                Ok(PreparedTurn {
+                    ids: p.ids,
+                    rows: p.rows,
+                    mrope: Some(p.mrope),
+                    deepstack: p.deepstack,
+                })
+            }
+            _ => self
+                .prepare(media, prompt_ids, tenant)
+                .map(|(ids, rows)| PreparedTurn {
+                    ids,
+                    rows,
+                    mrope: None,
+                    deepstack: Vec::new(),
+                }),
+        }
+    }
+
+    /// Qwen3-VL: the DeepStack layers stage 0 takes (0 otherwise).
+    fn deepstack_layers(&self) -> usize {
+        match self {
+            Frontend::QwenVl(f) => f.deepstack_layers,
+            _ => 0,
+        }
+    }
+
+    /// The expanded prompt `prepare` would return, from image sizes alone.
+    pub(crate) fn expand_ids(
+        &self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+    ) -> Result<Vec<i64>, String> {
+        match self {
+            Frontend::Gemma4(f) => f.expand_ids(media, prompt_ids),
+            Frontend::Gemma3(f) => f.expand_ids(media, prompt_ids),
+            Frontend::Pixtral(f) => f.expand_ids(media, prompt_ids),
+            Frontend::QwenVl(f) => f.expand_ids(media, prompt_ids),
+            Frontend::Phi3V(f) => f.expand_ids(media, prompt_ids),
+            Frontend::InternVL(f) => f.expand_ids(media, prompt_ids),
+            Frontend::LlavaNext(f) => f.expand_ids(media, prompt_ids),
+        }
+    }
+
+    /// Most tokens one image's bidirectional run can take, for families that
+    /// attend bidirectionally inside images (on Gemma 4 a video frame is a
+    /// run of its own, at the video processor's budget).
+    fn max_image_tokens(&self) -> Option<usize> {
+        match self {
+            Frontend::Gemma4(f) => Some(f.max_run_tokens()),
+            Frontend::Gemma3(f) => Some(f.preprocess.image_seq_length as usize),
+            Frontend::Pixtral(_)
+            | Frontend::LlavaNext(_)
+            | Frontend::Phi3V(_)
+            | Frontend::InternVL(_)
+            | Frontend::QwenVl(_) => None,
+        }
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Frontend::Gemma4(f) if f.takes_video() => format!(
+                "Gemma 4 images, {} soft tokens each at most; videos whole, {} soft tokens a \
+                 frame at most, up to {} frames",
+                f.preprocess.max_soft_tokens, f.video.frame.max_soft_tokens, f.video.num_frames
+            ),
+            Frontend::Gemma4(f) => format!(
+                "Gemma 4 images, {} soft tokens each at most (no <|video|> in the tokenizer: \
+                 videos arrive as frames)",
+                f.preprocess.max_soft_tokens
+            ),
+            Frontend::Gemma3(f) => format!(
+                "Gemma 3 images, resized to {}x{}, {} soft tokens each",
+                f.preprocess.width, f.preprocess.height, f.preprocess.image_seq_length
+            ),
+            Frontend::Pixtral(f) if f.preprocess.spatial_merge > 1 => format!(
+                "Mistral 3 images, longest edge {} px, one token per {}px cell \
+                 ({}px patches merged {}x{})",
+                f.preprocess.longest_edge,
+                f.preprocess.patch_size * f.preprocess.spatial_merge,
+                f.preprocess.patch_size,
+                f.preprocess.spatial_merge,
+                f.preprocess.spatial_merge
+            ),
+            Frontend::Pixtral(f) => format!(
+                "Pixtral images, longest edge {} px, one token per {}px patch",
+                f.preprocess.longest_edge, f.preprocess.patch_size
+            ),
+            Frontend::QwenVl(f) => f.describe(),
+            Frontend::Phi3V(f) => format!(
+                "Phi-3.5-vision images, HD transform into at most {} 336-px crops plus a \
+                 global view ({} soft tokens for a 448x448 image)",
+                f.preprocess.num_crops,
+                crate::phi3v_vision::num_image_tokens(448, 448, &f.preprocess).unwrap_or(0)
+            ),
+            Frontend::InternVL(f) => format!(
+                "InternVL images, {}..{} tiles of {} px (plus a thumbnail), {} soft tokens each",
+                f.preprocess.min_tiles,
+                f.preprocess.max_tiles,
+                f.preprocess.image_size,
+                f.preprocess.tokens_per_tile
+            ),
+            Frontend::LlavaNext(f) => format!(
+                "LLaVA-NeXT images, a {} px base view plus tiles over pinpoints {:?}",
+                f.preprocess.tile, f.preprocess.pinpoints
+            ),
+        }
+    }
+}
+
+/// The text rank 0 tokenizes a task's prompt from: the rendered prompt, with
+/// a Gemma 3 tree's images expanded on the text ([`Frontend::prompt_text`]).
+fn tokenizer_text(vision: Option<&VisionTree>, task: &GenerationTask) -> String {
+    match vision.and_then(|v| v.first.as_ref()) {
+        Some(first) if !task.media.is_empty() => first
+            .frontend
+            .prompt_text(&task.prompt, &task.media)
+            .into_owned(),
+        _ => task.prompt.clone(),
+    }
+}
+
+/// A rank-0 prompt's ids: the vision front end's layout on a vision tree
+/// ([`Frontend::encode_prompt`]) of the text [`tokenizer_text`] gives, else
+/// that text encoded whole without special tokens.
+fn encode_prompt_ids(
+    tok: &Tokenizer,
+    vision: Option<&VisionTree>,
+    task: &GenerationTask,
+) -> Result<Vec<i64>, String> {
+    let text = tokenizer_text(vision, task);
+    match vision.and_then(|v| v.first.as_ref()) {
+        Some(first) => first.frontend.encode_prompt(tok, &text),
+        None => tok
+            .encode(text, false)
+            .map(|e| e.get_ids().iter().map(|&u| i64::from(u)).collect())
+            .map_err(|e| format!("tokenizer encode: {e}")),
+    }
+}
+
+/// Rank 0's half of a vision tree: the text embedding table it embeds every
+/// step through, and the vision encoder whose rows it splices into a prompt.
+pub(crate) struct VisionFirst {
+    embed: OvRuntime,
+    embed_input: String,
+    pub(crate) frontend: Frontend,
+}
+
+impl VisionFirst {
+    pub(crate) fn load(
+        pipeline_dir: &Path,
+        cfg: &PipelineVision,
+        family: VisionFamily,
+    ) -> EngineResult<Self> {
+        let invalid = |m: String| EngineError::InvalidConfig(format!("vision tree: {m}"));
+        // Small next to a stage; the CPU keeps them off the stage's device.
+        let plugin = PluginConfig::new();
+        let embed_xml = pipeline_dir.join(&cfg.text_embeddings);
+        let embed = OvRuntime::compile(embed_xml.to_string_lossy().as_ref(), "CPU", &plugin)
+            .map_err(|e| invalid(format!("compiling {}: {e}", embed_xml.display())))?;
+        let embed_input = embed.input_name(0).map_err(map_ov_err)?;
+        if cfg.vision_embeddings != "openvino_vision_embeddings_model.xml" {
+            return Err(invalid(format!(
+                "vision_embeddings {:?} is not the encoder IR name",
+                cfg.vision_embeddings
+            )));
+        }
+        // The flattened config.json is text-only; the VLM original keeps the
+        // image token ids.
+        let vlm = pipeline_dir.join("config.vlm.json");
+        let v: serde_json::Value = std::fs::read(&vlm)
+            .map_err(|e| invalid(format!("reading {}: {e}", vlm.display())))
+            .and_then(|b| {
+                serde_json::from_slice(&b)
+                    .map_err(|e| invalid(format!("parsing {}: {e}", vlm.display())))
+            })?;
+        let id = |k: &str| {
+            v.get(k)
+                .or_else(|| v.get("text_config").and_then(|t| t.get(k)))
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| invalid(format!("{} lacks {k}", vlm.display())))
+        };
+        let frontend = match family {
+            VisionFamily::Gemma4 => {
+                let tokens = crate::gemma4_vision::ImageTokens {
+                    image: id("image_token_id")?,
+                    boi: id("boi_token_id")?,
+                    eoi: id("eoi_token_id")?,
+                    pad: id("pad_token_id")?,
+                };
+                let mut f = crate::gemma4_vision::ImageFrontend::load(pipeline_dir, tokens)
+                    .map_err(invalid)?;
+                // Native video, as the gemma4 engine: only with `<|video|>`
+                // in the tree's tokenizer (the CLI's `tree_has_video_token`
+                // routes videos here on the same condition).
+                let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
+                if let Ok(tok) = Tokenizer::from_file(&tok_path) {
+                    f.enable_video_from_tokenizer(&tok);
+                }
+                Frontend::Gemma4(f)
+            }
+            VisionFamily::Gemma3 => {
+                // The ids are in config.json; the processor expands the
+                // prompt text, so rank 0 needs each token's spelling too.
+                let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
+                let tok = Tokenizer::from_file(&tok_path)
+                    .map_err(|e| invalid(format!("reading {}: {e}", tok_path.display())))?;
+                let text = |k: &str| -> EngineResult<(i64, String)> {
+                    let id = id(k)?;
+                    let t = u32::try_from(id)
+                        .ok()
+                        .and_then(|u| tok.id_to_token(u))
+                        .ok_or_else(|| invalid(format!("tokenizer has no token {id} ({k})")))?;
+                    Ok((id, t))
+                };
+                let (image, image_text) = text("image_token_index")?;
+                let (boi, boi_text) = text("boi_token_index")?;
+                let (eoi, eoi_text) = text("eoi_token_index")?;
+                let tokens = crate::gemma3_vision::ImageTokens {
+                    image,
+                    boi,
+                    eoi,
+                    image_text,
+                    boi_text,
+                    eoi_text,
+                };
+                let f =
+                    crate::gemma3_vision::Frontend::load(pipeline_dir, tokens).map_err(invalid)?;
+                if let Some(n) = v
+                    .get("mm_tokens_per_image")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    if n != u64::from(f.preprocess.image_seq_length) {
+                        return Err(invalid(format!(
+                            "config mm_tokens_per_image {n} != processor image_seq_length {}",
+                            f.preprocess.image_seq_length
+                        )));
+                    }
+                }
+                Frontend::Gemma3(f)
+            }
+            VisionFamily::Pixtral => {
+                // LLaVA configs name the image id `image_token_index`; the
+                // row break and end are special tokens of the tokenizer.
+                let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
+                let tok = Tokenizer::from_file(&tok_path)
+                    .map_err(|e| invalid(format!("reading {}: {e}", tok_path.display())))?;
+                let special = |t: &str| {
+                    tok.token_to_id(t)
+                        .map(i64::from)
+                        .ok_or_else(|| invalid(format!("tokenizer has no {t}")))
+                };
+                let tokens = crate::pixtral_vision::ImageTokens {
+                    image: id("image_token_index").or_else(|_| special("[IMG]"))?,
+                    image_break: special("[IMG_BREAK]")?,
+                    image_end: special("[IMG_END]")?,
+                };
+                Frontend::Pixtral(
+                    crate::pixtral_vision::Frontend::load(
+                        pipeline_dir,
+                        tokens,
+                        cfg.family.as_deref() == Some("mistral3"),
+                    )
+                    .map_err(invalid)?,
+                )
+            }
+            VisionFamily::Phi3V | VisionFamily::InternVL => {
+                // Phi-3's su/longrope switches to its long factors past
+                // `original_max_position_embeddings`; optimum traced the
+                // rotary inv_freq as a constant, so an export (ov-genai's
+                // too) and a tree cut before the switch existed keep the
+                // short factors and differ from HF past that length.
+                let text = v.get("llm_config").unwrap_or(&v);
+                let orig = text
+                    .get("original_max_position_embeddings")
+                    .and_then(serde_json::Value::as_u64);
+                match (cfg.long_rope_switch, orig) {
+                    (Some(at), _) => info!(
+                        positions = at,
+                        "{family:?} tree: long-RoPE switch past {at} positions, as HF"
+                    ),
+                    (None, Some(orig)) => warn!(
+                        positions = orig,
+                        "{family:?} tree: the IR's RoPE is fixed (no long-factor switch); \
+                         sequences past {orig} tokens differ from HF; re-cut it with \
+                         tools/vlm_surgery/cut_vlm_lm.py"
+                    ),
+                    (None, None) => {}
+                }
+                let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
+                let tok = Tokenizer::from_file(&tok_path)
+                    .map_err(|e| invalid(format!("reading {}: {e}", tok_path.display())))?;
+                let special = |t: &str| {
+                    tok.token_to_id(t)
+                        .map(i64::from)
+                        .ok_or_else(|| invalid(format!("tokenizer has no {t}")))
+                };
+                if family == VisionFamily::Phi3V {
+                    // The processor marks soft tokens with negative ids and
+                    // embeds them as id 0; rank 0 uses `<|image|>` instead
+                    // (its rows are overwritten either way).
+                    let image = cfg
+                        .image_token_id
+                        .map_or_else(|| special("<|image|>"), Ok)?;
+                    Frontend::Phi3V(
+                        crate::phi3v_vision::Frontend::load(pipeline_dir, &v, image)
+                            .map_err(invalid)?,
+                    )
+                } else {
+                    let tokens = crate::internvl_vision::ImageTokens {
+                        context: id("img_context_token_id")
+                            .or_else(|_| special("<IMG_CONTEXT>"))?,
+                        start: special("<img>")?,
+                        end: special("</img>")?,
+                    };
+                    Frontend::InternVL(
+                        crate::internvl_vision::Frontend::load(pipeline_dir, &v, tokens)
+                            .map_err(invalid)?,
+                    )
+                }
+            }
+            VisionFamily::LlavaNext => Frontend::LlavaNext(
+                crate::llava_next_vision::Frontend::load(pipeline_dir, id("image_token_index")?)
+                    .map_err(invalid)?,
+            ),
+            VisionFamily::QwenVl(kind) => Frontend::QwenVl(
+                crate::qwen_vl_vision::Frontend::load(pipeline_dir, kind, &v).map_err(invalid)?,
+            ),
+        };
+        Ok(Self {
+            embed,
+            embed_input,
+            frontend,
+        })
+    }
+
+    /// Row-major `[ids.len(), hidden]` text embeddings for `ids` (image soft
+    /// tokens embed as pad), and `hidden`.
+    pub(crate) fn embed(&mut self, ids: &[i64]) -> EngineResult<(Vec<f32>, usize)> {
+        let ids = self.frontend.embedding_ids(ids);
+        self.embed
+            .set_input(
+                &self.embed_input,
+                ShimDType::I64,
+                &[1, ids.len()],
+                &i64_to_bytes(&ids),
+            )
+            .map_err(map_ov_err)?;
+        self.embed.infer().map_err(map_ov_err)?;
+        let (dtype, shape, bytes) = self.embed.output(0).map_err(map_ov_err)?;
+        let v = bytes_to_f32(dtype, &bytes)?;
+        let hidden = shape.last().copied().unwrap_or(0);
+        if hidden == 0 || v.len() != ids.len() * hidden {
+            return Err(EngineError::Backend(format!(
+                "text embeddings returned shape {shape:?} for {} ids",
+                ids.len()
+            )));
+        }
+        Ok((v, hidden))
+    }
+}
+
 struct ActiveTask {
     task: GenerationTask,
     prompt_ids: Vec<i64>,
+    /// Vision trees: each image's embedding rows, spliced into the prefill's
+    /// embeddings and then dropped (taken by the first feed).
+    image_rows: Vec<Vec<f32>>,
+    /// Qwen VL trees: the prompt's M-RoPE positions (`None` on a text turn:
+    /// the plain index on every row).
+    mrope: Option<crate::qwen35_vision::rope::MropePositions>,
+    /// Qwen3-VL: each image's DeepStack rows, taken by the prefill like
+    /// `image_rows`.
+    deepstack: Vec<Vec<f32>>,
+    /// The prompt's KV cache key (`vision_kv`); `None` keeps the turn out of
+    /// the cache.
+    #[cfg(feature = "kv_coord")]
+    kv_key: Option<Vec<i32>>,
     generated: Vec<i32>,
     /// Bytes already handed to the client. Not the decoded text: the delta is
     /// computed by `advance_emitted`, which holds back an unresolved
@@ -1434,10 +3102,28 @@ struct ActiveTask {
 
 pub struct OvRuntimeEngine {
     spec: ShardSpec,
+    /// Gemma 4 vision tree: see [`VisionTree`].
+    vision: Option<VisionTree>,
+    /// Vision trees: the `token_type_ids` of the step being fed — computed on
+    /// rank 0, received as the third frame elsewhere, forwarded downstream.
+    step_types: Vec<i64>,
+    /// M-RoPE trees: the `[3, T]` positions of the step being fed — computed
+    /// on rank 0, received as the last frame elsewhere, forwarded downstream.
+    step_positions: Vec<i64>,
+    /// Qwen3-VL static tree, rank 0 stage 0: the active turn's DeepStack rows
+    /// flattened to `[layers, total, hidden]` (built once per prefill from
+    /// `active.deepstack`), and how many image tokens stage 0 has already fed,
+    /// so a chunked prefill slices one image's rows across inferences.
+    static_ds_global: Vec<f32>,
+    static_ds_total: usize,
+    static_ds_cursor: usize,
     runtime: OvRuntime,
     rotary: Rotary,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Rank 0's model context (`config.json`'s `max_position_embeddings`, widened by a
+    /// stated RoPE scaling); a stateful tree refuses a prompt at or past it at submit.
+    max_ctx: Option<usize>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -1452,6 +3138,10 @@ pub struct OvRuntimeEngine {
     /// node id, not the canonical name). Empty for v3 IRs.
     canonical_inputs: std::collections::HashMap<String, String>,
     pending: Vec<GenerationTask>,
+    /// Packed vision tree: each pending image task's expanded prompt ids and
+    /// image rows, encoded at `submit` so an over-region prompt is refused
+    /// there (400 `context_length_exceeded`) like a long text prompt; taken at admission.
+    packed_images: std::collections::HashMap<TaskId, PackedTurn>,
     active: Option<ActiveTask>,
     /// `--packed-slots`: multi-slot packed decode state (own compiled variant,
     /// per-slot KV regions, slot table). Mutually exclusive with `static_kv`
@@ -1523,6 +3213,10 @@ pub struct OvRuntimeEngine {
     /// in both modes, so this only labels the mode in the warm-resume logs the cert greps.
     #[cfg(feature = "kv_coord")]
     plane_restore: bool,
+    /// [`crate::kv_coordination::config_digest`] of the tree's `pipeline_config.json`, read once
+    /// at load and folded into the KV fingerprint.
+    #[cfg(feature = "kv_coord")]
+    kv_config_digest: u64,
 }
 
 impl OvRuntimeEngine {
@@ -1588,12 +3282,23 @@ impl OvRuntimeEngine {
         let seq_len = input_ids.len();
         let total = position as usize + seq_len;
         let attn = vec![1i64; total];
-        let pos: Vec<i64> = (position..position + seq_len as i64).collect();
 
-        let in_ids = self
-            .input_named("input_ids")
-            .ok_or_else(|| EngineError::Backend("v5 IR missing input_ids".into()))?
-            .to_string();
+        if self.vision.is_some() {
+            self.feed_vision_embeds(input_ids)?;
+        } else {
+            let in_ids = self
+                .input_named("input_ids")
+                .ok_or_else(|| EngineError::Backend("v5 IR missing input_ids".into()))?
+                .to_string();
+            self.runtime
+                .set_input(
+                    &in_ids,
+                    ShimDType::I64,
+                    &[1, seq_len],
+                    &i64_to_bytes(input_ids),
+                )
+                .map_err(map_ov_err)?;
+        }
         let in_attn = self
             .input_named("attention_mask")
             .ok_or_else(|| EngineError::Backend("v5 IR missing attention_mask".into()))?
@@ -1605,25 +3310,392 @@ impl OvRuntimeEngine {
         let in_beam = self.input_named("beam_idx").map(|s| s.to_string());
 
         self.runtime
-            .set_input(
-                &in_ids,
-                ShimDType::I64,
-                &[1, seq_len],
-                &i64_to_bytes(input_ids),
-            )
-            .map_err(map_ov_err)?;
-        self.runtime
             .set_input(&in_attn, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
             .map_err(map_ov_err)?;
-        self.runtime
-            .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
-            .map_err(map_ov_err)?;
+        self.set_position_ids(&in_pos, position, seq_len)?;
         if let Some(beam) = in_beam {
             self.runtime
                 .set_input(&beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
                 .map_err(map_ov_err)?;
         }
         Ok(())
+    }
+
+    /// Vision tree, rank 0: row-major `[input_ids.len(), hidden]` embeddings
+    /// of `input_ids` with the active task's image rows spliced in (taken:
+    /// the first call of a task's prefill consumes them), and `hidden`.
+    fn vision_rows(&mut self, input_ids: &[i64]) -> EngineResult<(Vec<f32>, usize)> {
+        let rows = self
+            .active
+            .as_mut()
+            .map(|a| std::mem::take(&mut a.image_rows))
+            .unwrap_or_default();
+        let first = self
+            .vision
+            .as_mut()
+            .and_then(|v| v.first.as_mut())
+            .ok_or_else(|| EngineError::Backend("vision tree: rank 0 lacks its encoder".into()))?;
+        let image = first.frontend.image_token();
+        let (mut embeds, hidden) = first.embed(input_ids)?;
+        if !rows.is_empty() {
+            let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+            crate::gemma4_vision::splice_images(&mut embeds, hidden, input_ids, image, &refs)
+                .map_err(EngineError::Backend)?;
+        }
+        Ok((embeds, hidden))
+    }
+
+    fn vision_image_token(&self) -> EngineResult<i64> {
+        self.vision
+            .as_ref()
+            .and_then(|v| v.first.as_ref())
+            .map(|f| f.frontend.image_token())
+            .ok_or_else(|| EngineError::Backend("vision tree: rank 0 lacks its encoder".into()))
+    }
+
+    /// A static vision tree's stage 0: the IR takes `inputs_embeds`, so rank
+    /// 0 embeds every prompt and generated token itself.
+    fn static_takes_embeds(&self) -> bool {
+        self.static_kv
+            .as_ref()
+            .is_some_and(|sk| sk.embeds_in.is_some())
+    }
+
+    /// Token types of the rows the next static inference feeds: into that
+    /// inference (`next_types`) and onto the wire with its hidden rows
+    /// (`step_types`).
+    fn set_static_types(&mut self, types: &[i64]) {
+        self.step_types = types.to_vec();
+        if let Some(sk) = self.static_kv.as_mut() {
+            sk.next_types = types.to_vec();
+        }
+    }
+
+    /// Record the ids of the rows the next static inference feeds, so stage 0
+    /// of a Qwen3-VL tree can build their DeepStack mask. A no-op for every
+    /// other tree (and relay stages, which hold no DeepStack layers).
+    fn set_static_ids(&mut self, ids: &[i64]) {
+        if self.static_deepstack_layers() == 0 {
+            return;
+        }
+        if let Some(sk) = self.static_kv.as_mut() {
+            sk.next_ids = ids.to_vec();
+        }
+    }
+
+    /// One static seq=1 step on an embedding row (`hidden` floats).
+    fn run_first_row(
+        &mut self,
+        row: &[f32],
+        hidden: usize,
+        position: i64,
+    ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
+        let bytes: Vec<u8> = row.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let (dtype, shape, out) =
+            self.static_infer(false, ShimDType::F32, &[1, 1, hidden], &bytes, position, 0)?;
+        Ok((bytes_to_f32(dtype, &out)?, shape))
+    }
+
+    /// A vision tree whose stages take `token_type_ids` (the third frame).
+    fn vision_token_types(&self) -> bool {
+        self.vision.as_ref().is_some_and(|v| v.token_types)
+    }
+
+    /// A Qwen VL tree: every stage takes `[3, T]` M-RoPE positions, which
+    /// rank 0 computes and the wire carries after the hidden.
+    fn vision_mrope(&self) -> bool {
+        self.vision.as_ref().is_some_and(|v| v.mrope)
+    }
+
+    /// Set `position_ids` for `seq_len` tokens from `position`: the plain
+    /// `[1, T]` index, or on an M-RoPE tree the `[3, 1, T]` block — computed
+    /// from the active turn's positions on rank 0 (kept in `step_positions`
+    /// for the wire), taken from the upstream frame elsewhere.
+    fn set_position_ids(
+        &mut self,
+        in_pos: &str,
+        position: i64,
+        seq_len: usize,
+    ) -> EngineResult<()> {
+        if !self.vision_mrope() {
+            let pos: Vec<i64> = (position..position + seq_len as i64).collect();
+            return self
+                .runtime
+                .set_input(in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
+                .map_err(map_ov_err);
+        }
+        let rows = crate::qwen_vl_vision::MROPE_ROWS;
+        if self.spec.is_first_stage {
+            let mrope = self.active.as_ref().and_then(|a| a.mrope.as_ref());
+            let t0 = position as usize;
+            self.step_positions = crate::qwen_vl_vision::positions(mrope, t0, t0 + seq_len);
+        } else if self.step_positions.len() != rows * seq_len {
+            return Err(EngineError::Backend(format!(
+                "M-RoPE tree: {} positions for a {seq_len}-token hidden",
+                self.step_positions.len()
+            )));
+        }
+        self.runtime
+            .set_input(
+                in_pos,
+                ShimDType::I64,
+                &[rows, 1, seq_len],
+                &i64_to_bytes(&self.step_positions),
+            )
+            .map_err(map_ov_err)
+    }
+
+    /// The `[3, count]` row-major M-RoPE positions of a static inference's
+    /// `count` query rows. On the first stage they are computed from the
+    /// active turn's positions at absolute `position` and recorded in
+    /// `step_positions` for the wire; on a relay stage they are the columns
+    /// `[offset, offset + count)` of `step_positions` (the whole frame,
+    /// received after the hidden) — `run_relay_chunk` feeds a frame in
+    /// sub-chunks, so a sub-chunk reads its own slice rather than the frame's
+    /// start. Only the first stage knows where images sit, so it computes;
+    /// every later stage takes what the wire carried, unchanged.
+    fn mrope_static_positions(
+        &mut self,
+        position: i64,
+        offset: usize,
+        count: usize,
+    ) -> EngineResult<Vec<i64>> {
+        let rows = crate::qwen_vl_vision::MROPE_ROWS;
+        if self.spec.is_first_stage {
+            let mrope = self.active.as_ref().and_then(|a| a.mrope.as_ref());
+            let t0 = position as usize;
+            let p = crate::qwen_vl_vision::positions(mrope, t0, t0 + count);
+            self.step_positions = p.clone();
+            return Ok(p);
+        }
+        let width = self.step_positions.len() / rows.max(1);
+        if offset + count > width {
+            return Err(EngineError::Backend(format!(
+                "M-RoPE tree: rows [{offset}, {}) requested of a {width}-wide positions frame",
+                offset + count
+            )));
+        }
+        let mut out = vec![0i64; rows * count];
+        for r in 0..rows {
+            out[r * count..(r + 1) * count].copy_from_slice(
+                &self.step_positions[r * width + offset..r * width + offset + count],
+            );
+        }
+        Ok(out)
+    }
+
+    /// `[3, 1, width]` M-RoPE `position_ids` bytes for a static inference whose
+    /// first `real` rows are real at absolute `position` (`offset` into a relay
+    /// frame). Pad columns continue the plain index — masked out and never
+    /// absorbed, so their value is irrelevant, only non-negative.
+    fn mrope_static_position_bytes(
+        &mut self,
+        position: i64,
+        offset: usize,
+        real: usize,
+        width: usize,
+    ) -> EngineResult<Vec<u8>> {
+        let rows = crate::qwen_vl_vision::MROPE_ROWS;
+        let p = self.mrope_static_positions(position, offset, real)?;
+        let mut buf = Vec::with_capacity(rows * width * 8);
+        for r in 0..rows {
+            for c in 0..width {
+                let v = if c < real {
+                    p[r * real + c]
+                } else {
+                    position + c as i64
+                };
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Ok(buf)
+    }
+
+    /// DeepStack layers stage 0 of a Qwen3-VL static tree feeds (0 on any other
+    /// stage, family, or a non-DeepStack tree).
+    fn static_deepstack_layers(&self) -> usize {
+        if !self.spec.is_first_stage {
+            return 0;
+        }
+        self.vision
+            .as_ref()
+            .and_then(|v| v.first.as_ref())
+            .map_or(0, |f| f.frontend.deepstack_layers())
+    }
+
+    /// Flatten the active turn's per-image DeepStack rows into the global
+    /// `[layers, total, hidden]` buffer a chunked prefill slices, and reset the
+    /// image-token cursor. Called once when a prefill begins; a no-op (empty
+    /// buffer) on a text turn or a non-DeepStack tree.
+    fn build_static_deepstack(&mut self) -> EngineResult<()> {
+        let layers = self.static_deepstack_layers();
+        self.static_ds_cursor = 0;
+        if layers == 0 {
+            self.static_ds_global = Vec::new();
+            self.static_ds_total = 0;
+            return Ok(());
+        }
+        let hidden = self.hidden_size;
+        let imgs = self
+            .active
+            .as_mut()
+            .map(|a| std::mem::take(&mut a.deepstack))
+            .unwrap_or_default();
+        let (g, total) = crate::qwen_vl_vision::flatten_deepstack(&imgs, layers, hidden)
+            .map_err(EngineError::Backend)?;
+        self.static_ds_global = g;
+        self.static_ds_total = total;
+        Ok(())
+    }
+
+    /// Drop the turn's DeepStack rows (layers x image tokens x hidden f32,
+    /// often hundreds of MB) when the active task ends, finished or not.
+    fn clear_static_deepstack(&mut self) {
+        self.static_ds_global = Vec::new();
+        self.static_ds_total = 0;
+        self.static_ds_cursor = 0;
+    }
+
+    /// This static inference's DeepStack feed for stage 0 of a Qwen3-VL tree:
+    /// `visual_pos_masks` (length `width`) and `deepstack_visual_embeds`
+    /// (`[layers, width, hidden]`) from the fed `ids`, advancing the cursor by
+    /// the image tokens fed. Once the prompt's image tokens are all fed
+    /// (`cursor >= total`) every row is text — a decode step that sampled the
+    /// pad id included — so the feed is all zero, matching `deepstack_inputs`
+    /// on an empty image list. `None` when the tree has no DeepStack here.
+    /// The tuple is `(visual_pos_masks, deepstack_visual_embeds, layers, hidden)`.
+    #[allow(clippy::type_complexity)]
+    fn take_static_deepstack(
+        &mut self,
+        ids: &[i64],
+        width: usize,
+    ) -> EngineResult<Option<(Vec<i64>, Vec<f32>, usize, usize)>> {
+        let layers = self.static_deepstack_layers();
+        if layers == 0 {
+            return Ok(None);
+        }
+        let hidden = self.hidden_size;
+        if self.static_ds_cursor >= self.static_ds_total {
+            return Ok(Some((
+                vec![0i64; width],
+                vec![0f32; layers * width * hidden],
+                layers,
+                hidden,
+            )));
+        }
+        let image = self.vision_image_token()?;
+        let (mask, embeds, k) = crate::qwen_vl_vision::deepstack_window(
+            ids,
+            image,
+            &self.static_ds_global,
+            self.static_ds_total,
+            self.static_ds_cursor,
+            layers,
+            hidden,
+            width,
+        )
+        .map_err(EngineError::Backend)?;
+        self.static_ds_cursor += k;
+        // Every image token is fed: no later inference reads the rows (the
+        // cursor check above zero-feeds), so release them now.
+        if self.static_ds_cursor >= self.static_ds_total {
+            self.static_ds_global = Vec::new();
+        }
+        Ok(Some((mask, embeds, layers, hidden)))
+    }
+
+    /// Packed slots on a `token_type_ids` tree: the masks open image blocks
+    /// and the plan frame carries each row's image id (row 3 of `[1, 5, S]`).
+    fn packed_image_blocks(&self) -> bool {
+        self.packed.is_some() && self.vision_token_types()
+    }
+
+    /// Vision tree, rank 0: embed `input_ids` through the text embedding
+    /// table, splice the active task's image rows into a prefill, and set
+    /// stage 0's `inputs_embeds` and `token_type_ids` (kept in `step_types`
+    /// for the wire).
+    fn feed_vision_embeds(&mut self, input_ids: &[i64]) -> EngineResult<()> {
+        let (embeds, hidden) = self.vision_rows(input_ids)?;
+        let image = self.vision_image_token()?;
+        let token_types = self.vision_token_types();
+        let in_embeds = self
+            .input_named("inputs_embeds")
+            .ok_or_else(|| EngineError::Backend("vision tree: stage 0 lacks inputs_embeds".into()))?
+            .to_string();
+        let bytes: Vec<u8> = embeds.iter().flat_map(|x| x.to_le_bytes()).collect();
+        self.runtime
+            .set_input(
+                &in_embeds,
+                ShimDType::F32,
+                &[1, input_ids.len(), hidden],
+                &bytes,
+            )
+            .map_err(map_ov_err)?;
+        let layers = self
+            .vision
+            .as_ref()
+            .and_then(|v| v.first.as_ref())
+            .map_or(0, |f| f.frontend.deepstack_layers());
+        if layers > 0 {
+            self.feed_deepstack(input_ids, image, layers, hidden)?;
+        }
+        if token_types {
+            self.step_types = crate::gemma4_vision::token_type_ids(input_ids, image);
+            let in_types = self
+                .input_named("token_type_ids")
+                .ok_or_else(|| {
+                    EngineError::Backend("vision tree: stage 0 lacks token_type_ids".into())
+                })?
+                .to_string();
+            self.runtime
+                .set_input(
+                    &in_types,
+                    ShimDType::I64,
+                    &[1, input_ids.len()],
+                    &i64_to_bytes(&self.step_types),
+                )
+                .map_err(map_ov_err)?;
+        }
+        Ok(())
+    }
+
+    /// Qwen3-VL stage 0: `visual_pos_masks` (1 on the fed image tokens) and
+    /// `deepstack_visual_embeds [layers, N, hidden]`, the active turn's
+    /// DeepStack rows (taken by the prefill that feeds them; a decode step
+    /// feeds no image token and gets one zero row per layer).
+    fn feed_deepstack(
+        &mut self,
+        input_ids: &[i64],
+        image: i64,
+        layers: usize,
+        hidden: usize,
+    ) -> EngineResult<()> {
+        let images = self
+            .active
+            .as_mut()
+            .map(|a| std::mem::take(&mut a.deepstack))
+            .unwrap_or_default();
+        let (mask, embeds, n) =
+            crate::qwen_vl_vision::deepstack_inputs(input_ids, image, &images, layers, hidden)
+                .map_err(EngineError::Backend)?;
+        let name = |k: &str| {
+            self.input_named(k)
+                .map(str::to_string)
+                .ok_or_else(|| EngineError::Backend(format!("Qwen3-VL stage 0 lacks {k}")))
+        };
+        let (in_mask, in_embeds) = (name("visual_pos_masks")?, name("deepstack_visual_embeds")?);
+        self.runtime
+            .set_input(
+                &in_mask,
+                ShimDType::I64,
+                &[1, input_ids.len()],
+                &i64_to_bytes(&mask),
+            )
+            .map_err(map_ov_err)?;
+        let bytes: Vec<u8> = embeds.iter().flat_map(|x| x.to_le_bytes()).collect();
+        self.runtime
+            .set_input(&in_embeds, ShimDType::F32, &[layers, n, hidden], &bytes)
+            .map_err(map_ov_err)
     }
 
     fn build_feed_relay(
@@ -1680,7 +3752,6 @@ impl OvRuntimeEngine {
         let seq_len = shape[1];
         let total = position as usize + seq_len;
         let attn = vec![1i64; total];
-        let pos: Vec<i64> = (position..position + seq_len as i64).collect();
 
         let in_hs = self
             .input_named("hidden_states")
@@ -1700,12 +3771,32 @@ impl OvRuntimeEngine {
         self.runtime
             .set_input(&in_hs, ShimDType::F16, &shape, &hs_bytes)
             .map_err(map_ov_err)?;
+        if self.vision_token_types() {
+            let in_types = self
+                .input_named("token_type_ids")
+                .ok_or_else(|| {
+                    EngineError::Backend("vision tree: stage lacks token_type_ids".into())
+                })?
+                .to_string();
+            if self.step_types.len() != seq_len {
+                return Err(EngineError::Backend(format!(
+                    "vision tree: {} token types for a {seq_len}-token hidden",
+                    self.step_types.len()
+                )));
+            }
+            self.runtime
+                .set_input(
+                    &in_types,
+                    ShimDType::I64,
+                    &[1, seq_len],
+                    &i64_to_bytes(&self.step_types),
+                )
+                .map_err(map_ov_err)?;
+        }
         self.runtime
             .set_input(&in_attn, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
             .map_err(map_ov_err)?;
-        self.runtime
-            .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
-            .map_err(map_ov_err)?;
+        self.set_position_ids(&in_pos, position, seq_len)?;
         if let Some(beam) = in_beam {
             self.runtime
                 .set_input(&beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
@@ -1728,12 +3819,17 @@ impl OvRuntimeEngine {
                     input_ids.len()
                 )));
             }
+            if self.static_takes_embeds() {
+                let (row, hidden) = self.vision_rows(input_ids)?;
+                return self.run_first_row(&row, hidden, position);
+            }
             let (dtype, shape, bytes) = self.static_infer(
                 false,
                 ShimDType::I64,
                 &[1, 1],
                 &i64_to_bytes(input_ids),
                 position,
+                0,
             )?;
             return Ok((bytes_to_f32(dtype, &bytes)?, shape));
         }
@@ -1757,8 +3853,14 @@ impl OvRuntimeEngine {
                 return self.run_relay_chunk(hidden, shape, position);
             }
             let hs_bytes = f32_to_f16_bytes(hidden);
+            if self.vision_token_types() {
+                let types = self.step_types.clone();
+                if let Some(sk) = self.static_kv.as_mut() {
+                    sk.next_types = types;
+                }
+            }
             let (dtype, out_shape, bytes) =
-                self.static_infer(true, ShimDType::F16, &shape, &hs_bytes, position)?;
+                self.static_infer(true, ShimDType::F16, &shape, &hs_bytes, position, 0)?;
             return Ok((bytes_to_f32(dtype, &bytes)?, out_shape));
         }
         self.build_feed_relay(hidden, shape, position)?;
@@ -1799,6 +3901,18 @@ impl OvRuntimeEngine {
         let past_len = self.static_kv.as_ref().map(|sk| sk.past_len).unwrap_or(0);
         let in_window = (position as usize).saturating_add(r) <= past_len + 1;
         let pf_seq = self.prefill.as_ref().map(|p| p.seq);
+        // This frame's token types (Gemma 4 vision trees), one per row.
+        let types: Vec<i64> = if self.vision_token_types() {
+            self.step_types.clone()
+        } else {
+            Vec::new()
+        };
+        if !types.is_empty() && types.len() != r {
+            return Err(EngineError::Backend(format!(
+                "{} token types for a {r}-row frame",
+                types.len()
+            )));
+        }
 
         if let (Some(pf_seq), true) = (pf_seq, in_window) {
             self.ensure_prefill_loaded()?;
@@ -1806,7 +3920,13 @@ impl OvRuntimeEngine {
             let mut x_out = 0usize;
             let mut off = 0usize;
             while off < r {
-                let take = pf_seq.min(r - off);
+                let take = image_safe_take(&types, off, pf_seq.min(r - off))
+                    .map_err(EngineError::UnsupportedInput)?;
+                if !types.is_empty() {
+                    if let Some(sk) = self.static_kv.as_mut() {
+                        sk.next_types = types[off..off + take].to_vec();
+                    }
+                }
                 let final_sub = off + take == r;
                 // Head stage: only the final sub-chunk's last row is ever
                 // read — skip the whole-[1,C,vocab] output copy otherwise.
@@ -1816,6 +3936,7 @@ impl OvRuntimeEngine {
                     take,
                     position + off as i64,
                     want,
+                    off,
                 )?;
                 if want {
                     let x = *oshape.last().unwrap_or(&0);
@@ -1850,9 +3971,22 @@ impl OvRuntimeEngine {
         let mut rows: Vec<f32> = Vec::new();
         let mut x = 0usize;
         for t in 0..r {
+            if !types.is_empty() {
+                image_safe_take(&types, t, 1).map_err(EngineError::UnsupportedInput)?;
+                if let Some(sk) = self.static_kv.as_mut() {
+                    sk.next_types = vec![types[t]];
+                }
+            }
             let row = f32_to_f16_bytes(&hidden[t * h..(t + 1) * h]);
-            let (dt, os, by) =
-                self.static_infer(true, ShimDType::F16, &[1, 1, h], &row, position + t as i64)?;
+            // Relay sub-token t reads column t of the frame's M-RoPE positions.
+            let (dt, os, by) = self.static_infer(
+                true,
+                ShimDType::F16,
+                &[1, 1, h],
+                &row,
+                position + t as i64,
+                t,
+            )?;
             x = *os.last().unwrap_or(&0);
             if x == 0 || by.len() < x * float_elem_bytes(dt)? {
                 return Err(EngineError::Backend(format!(
@@ -1888,14 +4022,18 @@ impl OvRuntimeEngine {
     /// whose logits nothing reads.
     fn run_first_chunk(
         &mut self,
-        chunk: &[i64],
+        chunk: ChunkInput<'_>,
         position: i64,
         want_output: bool,
     ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
-        let take = chunk.len();
+        let take = match chunk {
+            ChunkInput::Ids(ids) => ids.len(),
+            ChunkInput::Hidden(rows, h) | ChunkInput::Embeds(rows, h) => rows.len() / h.max(1),
+        };
         debug!(take, position, "first-stage chunk: infer start");
+        // First stage feeds the whole chunk in one inference (offset 0).
         let (dtype, shape, bytes) =
-            self.static_infer_chunk(ChunkInput::Ids(chunk), take, position, want_output)?;
+            self.static_infer_chunk(chunk, take, position, want_output, 0)?;
         debug!(take, position, "first-stage chunk: infer+absorb done");
         if !want_output {
             return Ok((Vec::new(), Vec::new()));
@@ -1953,8 +4091,39 @@ impl OvRuntimeEngine {
         // [seq] (stateful) or [seq, position] (static);
         // recv_hidden_from_upstream mirrors it.
         let pos = self.static_kv.is_some().then_some(position);
-        self.block_on(send_hidden_frames(&downstream, seq, pos, hid))
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let types = match self.vision.as_ref().filter(|v| v.token_types) {
+            Some(_) if self.step_types.len() != shape[1] => {
+                return Err(EngineError::Backend(format!(
+                    "vision tree: {} token types for a {}-token hidden",
+                    self.step_types.len(),
+                    shape[1]
+                )))
+            }
+            Some(_) => Some(encode_wire_types(&self.step_types)),
+            None => None,
+        };
+        let positions = if self.vision_mrope() {
+            let rows = crate::qwen_vl_vision::MROPE_ROWS;
+            if self.step_positions.len() != rows * shape[1] {
+                return Err(EngineError::Backend(format!(
+                    "M-RoPE tree: {} positions for a {}-token hidden",
+                    self.step_positions.len(),
+                    shape[1]
+                )));
+            }
+            Some(encode_wire_positions(rows, &self.step_positions))
+        } else {
+            None
+        };
+        self.block_on(send_hidden_frames(
+            &downstream,
+            seq,
+            pos,
+            hid,
+            types,
+            positions,
+        ))
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!(position, "downstream send: done");
         Ok(())
     }
@@ -1999,7 +4168,13 @@ impl OvRuntimeEngine {
         outcome.map_err(TokenWaitFailure::into_error)
     }
 
-    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
+    /// Receive one activation group. The OUTER error means nothing is owed:
+    /// no group arrived, its frames lost alignment, or the lead could not be
+    /// decoded (no seq to echo). Once the lead decodes, `inbound_seq` is set
+    /// and the upstream is owed a reply, so any later decode failure comes
+    /// back as the INNER error for the caller to NACK (`answer_upstream`),
+    /// the same rule `step_relay_packed` follows.
+    fn recv_hidden_from_upstream(&mut self) -> EngineResult<OwedGroup> {
         // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
         // [seq] or [seq, position]. The LEAD frame's wait is lenient
         // (idle-between-requests); the hidden that must follow it is deadlined,
@@ -2017,8 +4192,15 @@ impl OvRuntimeEngine {
                 .clone()
                 .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
             debug!(want_pos, "upstream recv: waiting");
-            let (lead, hidden) = self
-                .block_on(recv_hidden_frames(&upstream, want_pos))
+            let want_types = self.vision_token_types();
+            let want_positions = self.vision_mrope();
+            let (lead, hidden, types, positions) = self
+                .block_on(recv_hidden_frames(
+                    &upstream,
+                    want_pos,
+                    want_types,
+                    want_positions,
+                ))
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
             info!(dtype = ?lead.dtype, len = lead.data.len(), want_pos, "ov_tail_upstream_frame_recv");
             let tensor = match hidden {
@@ -2042,25 +4224,16 @@ impl OvRuntimeEngine {
             // frame yields a clear EngineError, not a desync.
             let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
             self.inbound_seq = Some(inbound_seq);
-            let shape = [
-                tensor.shape[0] as usize,
-                tensor.shape[1] as usize,
-                tensor.shape[2] as usize,
-            ];
-            let floats = match tensor.dtype {
-                WireDType::F32 => tensor
-                    .data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                WireDType::F16 => f16_bytes_to_f32(&tensor.data),
-                other => {
-                    return Err(EngineError::Backend(format!(
-                        "unexpected upstream dtype {other:?}"
-                    )))
+            let group = decode_hidden_group(&tensor, types.as_ref(), positions.as_ref()).map(|g| {
+                if let Some(t) = g.types {
+                    self.step_types = t;
                 }
-            };
-            return Ok((floats, shape, position));
+                if let Some(p) = g.positions {
+                    self.step_positions = p;
+                }
+                (g.hidden, g.shape, position)
+            });
+            return Ok(group);
         }
     }
 
@@ -2099,10 +4272,8 @@ impl OvRuntimeEngine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-            let enc = tok
-                .encode(task.prompt.clone(), false)
-                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
-            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids = encode_prompt_ids(&tok, self.vision.as_ref(), &task)
+                .map_err(EngineError::Backend)?;
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
@@ -2117,7 +4288,13 @@ impl OvRuntimeEngine {
                     let id = task.task_id.clone();
                     return Ok(vec![(
                         id.clone(),
-                        Chunk::error(id, format!("invalid resume prefix: {e}")),
+                        Chunk::error(
+                            id,
+                            format!(
+                                "{}invalid resume prefix: {e}",
+                                cascadia_engine::CLIENT_ERROR_PREFIX
+                            ),
+                        ),
                     )]);
                 }
                 // Budget already exhausted by the prefix (total = prefix + new
@@ -2132,17 +4309,103 @@ impl OvRuntimeEngine {
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
+            // Vision trees: encode the images and expand each one's placeholder
+            // into its soft-token run. Images reach no other tree.
+            let mut image_rows = Vec::new();
+            let mut mrope = None;
+            let mut deepstack = Vec::new();
+            // The warm-resume key: the prompt ids, image soft tokens replaced
+            // by stand-ins for each image's hash. `None` keeps the turn out of
+            // the KV cache.
+            #[cfg(feature = "kv_coord")]
+            let mut kv_key: Option<(Vec<i32>, Option<crate::vision_kv::ImageSpans>)> = None;
+            if !task.media.is_empty() {
+                let refuse = |reason: String| {
+                    warn!(task = %task.task_id, reason = %reason, "ov-runtime: image turn refused");
+                    let id = task.task_id.clone();
+                    vec![(id.clone(), Chunk::error(id, reason))]
+                };
+                if resume.is_some() {
+                    return Ok(refuse(
+                        "resume_unsupported: a resumed turn cannot carry images".into(),
+                    ));
+                }
+                let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) else {
+                    return Ok(refuse(
+                        "this model tree takes no images (no `vision` block in \
+                         pipeline_config.json); re-export it with tools/gemma4_surgery --vision"
+                            .into(),
+                    ));
+                };
+                let started = std::time::Instant::now();
+                match first
+                    .frontend
+                    .prepare_turn(&task.media, &prompt_ids, &task.tenant)
+                {
+                    Ok(PreparedTurn {
+                        ids,
+                        rows,
+                        mrope: positions,
+                        deepstack: ds,
+                    }) => {
+                        info!(
+                            task = %task.task_id,
+                            images = rows.len(),
+                            prompt = ids.len(),
+                            encode_ms = started.elapsed().as_millis() as u64,
+                            "ov-runtime: images encoded"
+                        );
+                        #[cfg(feature = "kv_coord")]
+                        match crate::vision_kv::for_turn(
+                            &ids,
+                            first.frontend.image_token(),
+                            &rows,
+                            &task.media,
+                            &task.tenant,
+                        ) {
+                            Ok((key, spans)) => kv_key = Some((key, Some(spans))),
+                            Err(e) => warn!(task = %task.task_id, reason = %e,
+                                "ov-runtime: no KV warm-resume key for this image turn"),
+                        }
+                        prompt_ids = ids;
+                        image_rows = rows;
+                        mrope = positions;
+                        deepstack = ds;
+                    }
+                    Err(e) => return Ok(refuse(e)),
+                }
+            }
             // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
             // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
             // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
+            // A turn with images keys on its images' hashes (`vision_kv`), never
+            // on their placeholder ids, which every image of one size shares.
             #[cfg(feature = "kv_coord")]
-            if self.static_kv.is_none() {
-                let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                if let Some((blob, len, plane_pulled)) =
-                    self.kv.take_warm(&task.tenant, &prompt_i32)
-                {
+            if task.media.is_empty() {
+                kv_key = Some((prompt_ids.iter().map(|&t| t as i32).collect(), None));
+            }
+            #[cfg(feature = "kv_coord")]
+            if let (None, Some((prompt_i32, spans))) = (&self.static_kv, &kv_key) {
+                // A prefix that ends inside an image cannot resume: the
+                // prefill would splice only part of its rows.
+                let taken = self
+                    .kv
+                    .take_warm_where(&task.tenant, prompt_i32, |blob, len| {
+                        let depth = crate::kv_coordination::kv_seq_from_blob(blob)
+                            .map(|s| s.min(len))
+                            .unwrap_or(len);
+                        let splits = spans.as_ref().is_some_and(|sp| sp.splits(depth));
+                        if splits {
+                            info!(
+                                depth,
+                                "ov-runtime: a cached prefix ends inside an image; skipped"
+                            );
+                        }
+                        !splits
+                    });
+                if let Some((blob, len, plane_pulled)) = taken {
                     match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
                             // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
@@ -2207,6 +4470,22 @@ impl OvRuntimeEngine {
                     }
                 }
             }
+            #[cfg(feature = "kv_coord")]
+            if warm_prefix > 0 {
+                // Images inside the resumed prefix are already in the KV.
+                if let Some((_, Some(spans))) = &kv_key {
+                    let before = image_rows.len();
+                    image_rows = spans.rows_from(warm_prefix, image_rows);
+                    if !deepstack.is_empty() {
+                        deepstack = spans.rows_from(warm_prefix, deepstack);
+                    }
+                    info!(
+                        images_resumed = before - image_rows.len(),
+                        images_prefilled = image_rows.len(),
+                        "ov-runtime: image turn warm-resumed"
+                    );
+                }
+            }
             if warm_prefix == 0 && self.static_kv.is_none() {
                 self.runtime.reset_state().map_err(map_ov_err)?;
             }
@@ -2254,6 +4533,11 @@ impl OvRuntimeEngine {
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
+                image_rows,
+                mrope,
+                deepstack,
+                #[cfg(feature = "kv_coord")]
+                kv_key: kv_key.map(|(k, _)| k),
                 generated: resume_seed,
                 emitted: resume_last_text.into_bytes(),
                 prefilled: false,
@@ -2290,6 +4574,7 @@ impl OvRuntimeEngine {
             // stream instead of ending whichever stream observes the Err.
             let failed = self.active.as_ref().map(|a| a.task.task_id.clone());
             self.active = None;
+            self.clear_static_deepstack();
             let _ = self.runtime.reset_state();
             if let Some(sk) = self.static_kv.as_mut() {
                 sk.reset();
@@ -2331,6 +4616,7 @@ impl OvRuntimeEngine {
                 return Ok(Vec::new());
             }
             let msg = packed_abort_message(&fatal);
+            self.packed_images.clear();
             let out = self
                 .pending
                 .drain(..)
@@ -2346,6 +4632,11 @@ impl OvRuntimeEngine {
                 break;
             };
             let task = self.pending.remove(0);
+            // The turn's images, encoded at submit. Taken off the map before
+            // any refusal below, so every `continue` (and `?`) drops them with
+            // the task instead of leaving them resident: a Qwen3-VL turn's
+            // DeepStack rows run to hundreds of MB.
+            let mut encoded = self.packed_images.remove(&task.task_id);
             // Option B: the packed path has no forced-prefix support — it neither
             // appends `resume_token_ids` to the prompt nor seeds `generated`/`emitted`.
             // Admitting a resume task here would regenerate the turn FROM SCRATCH and
@@ -2371,27 +4662,128 @@ impl OvRuntimeEngine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-            // Admission failures are attributed to the failed task so the
-            // runner routes them to its stream — a bare Err here would kill
-            // whichever concurrent stream happened to be polling.
-            let enc = tok.encode(task.prompt.clone(), false).map_err(|e| {
-                EngineError::Backend(format!("tokenizer encode: {e}"))
-                    .for_task(task.task_id.clone())
-            })?;
-            let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            // Admission failures become the failed task's own error chunk:
+            // a bare Err here would kill whichever concurrent stream happened
+            // to be polling, and returning one would drop the chunks already
+            // queued in `out` for tasks this loop has taken off `pending`.
+            let mut prompt_ids = match encode_prompt_ids(&tok, self.vision.as_ref(), &task) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let id = task.task_id.clone();
+                    out.push((id.clone(), Chunk::error(id, e)));
+                    continue;
+                }
+            };
             if prompt_ids.is_empty() {
-                return Err(
-                    EngineError::Backend("empty prompt: no tokens to prefill".into())
-                        .for_task(task.task_id),
-                );
+                let id = task.task_id.clone();
+                out.push((
+                    id.clone(),
+                    Chunk::error(
+                        id,
+                        format!(
+                            "{}empty prompt: no tokens to prefill",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    ),
+                ));
+                continue;
             }
-            info!(
-                task = %task.task_id,
+            // Vision tree: expand and encode the images, then embed the whole
+            // prompt with their rows spliced in. Prefix sharing stops at the
+            // first image token (`admit`).
+            let mut prompt_rows = Vec::new();
+            let mut shareable = prompt_ids.len();
+            // Qwen VL: the turn's M-RoPE positions + Qwen3-VL DeepStack rows,
+            // carried into the slot so its prefill chunks and decode steps feed
+            // the right [3, 1, S] positions and DeepStack windows.
+            let mut mrope = None;
+            let mut deepstack_imgs: Vec<Vec<f32>> = Vec::new();
+            let mut deepstack_layers = 0usize;
+            if let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) {
+                deepstack_layers = first.frontend.deepstack_layers();
+                let mut image_rows = Vec::new();
+                if !task.media.is_empty() {
+                    // Encoded and length-checked at submit.
+                    let Some(PackedTurn {
+                        ids,
+                        rows,
+                        mrope: positions,
+                        deepstack,
+                    }) = encoded.take()
+                    else {
+                        let id = task.task_id.clone();
+                        out.push((
+                            id.clone(),
+                            Chunk::error(id, "image rows missing at admission"),
+                        ));
+                        continue;
+                    };
+                    prompt_ids = ids;
+                    image_rows = rows;
+                    mrope = positions;
+                    deepstack_imgs = deepstack;
+                }
+                let image = first.frontend.image_token();
+                shareable = prompt_ids
+                    .iter()
+                    .position(|&t| t == image)
+                    .unwrap_or(prompt_ids.len());
+                let embedded = first.embed(&prompt_ids).and_then(|(mut rows, hidden)| {
+                    if !image_rows.is_empty() {
+                        let refs: Vec<&[f32]> = image_rows.iter().map(Vec::as_slice).collect();
+                        crate::gemma4_vision::splice_images(
+                            &mut rows,
+                            hidden,
+                            &prompt_ids,
+                            image,
+                            &refs,
+                        )
+                        .map_err(EngineError::Backend)?;
+                    }
+                    Ok(rows)
+                });
+                match embedded {
+                    Ok(rows) => prompt_rows = rows,
+                    Err(e) => {
+                        let id = task.task_id.clone();
+                        out.push((id.clone(), Chunk::error(id, e.to_string())));
+                        continue;
+                    }
+                }
+            }
+            let (id, prompt_tokens, images) =
+                (task.task_id.clone(), prompt_ids.len(), task.media.len());
+            // Flatten the per-image DeepStack rows to the slot's global
+            // [layers, total, hidden] buffer (Qwen3-VL; empty otherwise).
+            let (ds_global, ds_total) = match crate::qwen_vl_vision::flatten_deepstack(
+                &deepstack_imgs,
+                deepstack_layers,
+                self.hidden_size,
+            ) {
+                Ok(g) => g,
+                Err(e) => {
+                    out.push((id.clone(), Chunk::error(id, e)));
+                    continue;
+                }
+            };
+            let shared = self.packed.as_mut().unwrap().admit(
                 slot,
-                prompt_tokens = prompt_ids.len(),
+                task,
+                prompt_ids,
+                prompt_rows,
+                shareable,
+                mrope,
+                ds_global,
+                ds_total,
+            );
+            info!(
+                task = %id,
+                slot,
+                prompt_tokens,
+                images,
+                shared_prefix = shared,
                 "task admitted to packed slot"
             );
-            self.packed.as_mut().unwrap().admit(slot, task, prompt_ids);
         }
 
         // Keep inferring until this call produces at least one chunk. A prompt
@@ -2407,7 +4799,23 @@ impl OvRuntimeEngine {
             // gets its own attributed error and every slot is retired. A
             // bare `?` would kill whichever stream happened to be polling
             // and leave the other slots wedged-active forever.
-            let stepped = match self.packed.as_mut().unwrap().step() {
+            // A vision tree's rank 0 embeds the sampled tokens itself.
+            let packed = self.packed.as_mut().unwrap();
+            let first = self.vision.as_mut().and_then(|v| v.first.as_mut());
+            let stepped = match first {
+                Some(first) => {
+                    let mut embed = |ids: &[i64]| first.embed(ids).map(|(rows, _)| rows);
+                    packed.step(Some(&mut embed))
+                }
+                None => packed.step(None),
+            };
+            // A slot whose own chunk could not be planned was retired by the
+            // step; answer just that task and carry on with the rest.
+            for (task, e) in self.packed.as_mut().unwrap().take_failed() {
+                warn!(task = %task.task_id, error = %e, "packed slot failed; retired alone");
+                out.push((task.task_id.clone(), Chunk::error(task.task_id, e)));
+            }
+            let stepped = match stepped {
                 Ok(s) => s,
                 Err(e) => return self.abort_packed_batch(e, out),
             };
@@ -2422,8 +4830,21 @@ impl OvRuntimeEngine {
                 // rows to the same slots) plus the hidden block, then take back
                 // one sampled token per row from the tail.
                 bytes_to_f32(odt, &obytes).and_then(|hidden| {
-                    let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
-                    let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
+                    let packed = self.packed.as_ref().unwrap();
+                    let plan_rows = packed.last_plan_rows();
+                    let images = self
+                        .packed_image_blocks()
+                        .then(|| packed.last_plan_images());
+                    // Qwen VL: the per-row M-RoPE positions this stage fed ride
+                    // the wire to every downstream stage (only rank 0 knows them).
+                    let mrope = self.vision_mrope().then(|| packed.last_plan_mrope());
+                    let tokens = self.exchange_packed_downstream(
+                        &hidden,
+                        &oshape,
+                        &plan_rows,
+                        images.as_deref(),
+                        mrope.as_deref(),
+                    )?;
                     self.emit_packed_tokens(&tokens, kind, &mut out)
                 })
             };
@@ -2484,13 +4905,15 @@ impl OvRuntimeEngine {
         &mut self,
         hidden: &[f32],
         shape: &[usize],
-        plan_rows: &[Option<(usize, i64, usize)>],
+        plan_rows: &[crate::packed_exec::WireRowOpt],
+        plan_images: Option<&[Option<u32>]>,
+        mrope: Option<&[i64]>,
     ) -> EngineResult<Vec<i32>> {
         let down = self.downstream.clone().ok_or_else(|| {
             EngineError::Backend("packed pipeline stage has no downstream".into())
         })?;
         let s3 = to_shape3(shape);
-        let plan_frame = encode_wire_plan(plan_rows);
+        let plan_frame = encode_wire_plan(plan_rows, plan_images);
         // f16 on the wire, matching the non-packed path: the receiving stage
         // converts to f16 before feeding the IR regardless, so f32 doubled the
         // bytes per stage hop and bought nothing.
@@ -2499,6 +4922,11 @@ impl OvRuntimeEngine {
             [s3[0] as u32, s3[1] as u32, s3[2] as u32],
             f32_to_f16_bytes(hidden),
         );
+        // Qwen VL: the per-row M-RoPE positions as `[1, 3, S]`, sent after the
+        // hidden so the downstream stage feeds the same rows (see the
+        // non-packed `send_hidden_frames`).
+        let mrope_frame =
+            mrope.map(|m| encode_wire_positions(crate::qwen_vl_vision::MROPE_ROWS, m));
         // A prefill reply waits on multi-token compute across every remaining
         // stage — widen its deadline like the non-packed path does.
         let prefill = plan_has_prefill_rows(plan_rows);
@@ -2512,6 +4940,12 @@ impl OvRuntimeEngine {
                 .send(&hidden_frame)
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden send: {e}")))?;
+            if let Some(f) = &mrope_frame {
+                guard
+                    .send(f)
+                    .await
+                    .map_err(|e| EngineError::Backend(format!("packed M-RoPE send: {e}")))?;
+            }
             // Having just sent both frames this stage is OWED a token frame.
             // `recv_reply*`, NOT plain `recv` under an external
             // `tokio::time::timeout` (#122): the deadline lives inside the
@@ -2597,7 +5031,9 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
         let slots = self.packed.as_ref().unwrap().kv.slots;
-        let (plan_res, hidden, hshape) = self.block_on(async {
+        let want_images = self.packed_image_blocks();
+        let want_mrope = self.vision_mrope();
+        let (plan_res, hidden, hshape, mrope_frame) = self.block_on(async {
             let mut guard = up.lock().await;
             // The plan frame is this stage's idle wait for the next unit of
             // work — idle-tolerant `recv`. Once it arrives the upstream owes
@@ -2617,7 +5053,20 @@ impl OvRuntimeEngine {
                 .recv_reply()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
-            let plan_res = decode_wire_plan(&pf, slots);
+            // Qwen VL: the per-row M-RoPE positions follow the hidden, deadlined
+            // like it (same owed-frame rule).
+            let mrope_frame = if want_mrope {
+                Some(
+                    guard
+                        .recv_reply()
+                        .await
+                        .map_err(|e| EngineError::Backend(format!("packed M-RoPE recv: {e}")))?
+                        .0,
+                )
+            } else {
+                None
+            };
+            let plan_res = decode_wire_plan_images(&pf, slots, want_images);
             let hidden: Vec<f32> = match hf.dtype {
                 WireDType::F16 => f16_bytes_to_f32(&hf.data),
                 _ => hf
@@ -2626,8 +5075,25 @@ impl OvRuntimeEngine {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             };
-            Ok::<_, EngineError>((plan_res, hidden, hf.shape))
+            Ok::<_, EngineError>((plan_res, hidden, hf.shape, mrope_frame))
         })?;
+        // Decoded like the plan: a malformed frame is a body failure that is
+        // NACKed below, never an early return that leaves the upstream
+        // waiting out its reply deadline. The positions cover the plan's own
+        // rows (a decode frame carries only its live rows).
+        let rows = plan_res.as_ref().map_or(0, |(r, _)| r.len());
+        let mrope_res = match mrope_frame {
+            Some(f) => {
+                decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, rows).inspect(|_| {
+                    debug!(
+                        rows = crate::qwen_vl_vision::MROPE_ROWS,
+                        seq = rows,
+                        "packed relay: M-RoPE positions frame received"
+                    )
+                })
+            }
+            None => Ok(Vec::new()),
+        };
 
         // The pair is consumed. From here on, any failure MUST still answer
         // the upstream — otherwise it blocks awaiting a token frame that
@@ -2636,7 +5102,7 @@ impl OvRuntimeEngine {
         // frame ([1,1,0]): wire-aligned, unambiguous (a real reply always
         // has one token per row), and it tells the upstream "batch lost,
         // link healthy".
-        let step = self.relay_packed_body(plan_res, hidden, hshape);
+        let step = self.relay_packed_body(plan_res, hidden, hshape, mrope_res);
         let frame = match &step {
             Ok(tokens) => encode_wire_tokens(tokens),
             Err(e) => {
@@ -2667,27 +5133,15 @@ impl OvRuntimeEngine {
     /// turn any failure into an on-wire NACK instead of a swallowed error.
     fn relay_packed_body(
         &mut self,
-        plan_res: EngineResult<Vec<Option<(usize, i64, usize)>>>,
+        plan_res: EngineResult<(Vec<crate::packed_exec::WireRowOpt>, Vec<Option<u32>>)>,
         hidden: Vec<f32>,
         hshape: [u32; MAX_RANK],
+        mrope_res: EngineResult<Vec<i64>>,
     ) -> EngineResult<Vec<i32>> {
-        let plan_rows = plan_res?;
+        let (plan_rows, plan_images) = plan_res?;
+        let mrope = mrope_res?;
         let hidden_size = hshape[2] as usize;
-        let plan = crate::packed::PackedPlan {
-            rows: plan_rows
-                .iter()
-                .map(|r| r.map(|(slot, _, _)| crate::packed::PackedRow { slot, order: 0 }))
-                .collect(),
-        };
-        // Same-slot rows in one frame are a prefill chunk: restore their causal
-        // order so this stage masks them exactly as the sender did.
-        let mut plan = plan;
-        let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-        for row in plan.rows.iter_mut().flatten() {
-            let n = seen.entry(row.slot).or_insert(0);
-            row.order = *n;
-            *n += 1;
-        }
+        let plan = relay_plan(&plan_rows, &plan_images);
         let positions: Vec<i64> = plan_rows
             .iter()
             .map(|r| r.map(|(_, p, _)| p).unwrap_or(0))
@@ -2696,22 +5150,31 @@ impl OvRuntimeEngine {
             .iter()
             .map(|r| r.map(|(_, _, sh)| sh).unwrap_or(0))
             .collect();
+        // The relay feeds only the M-RoPE positions the wire carried; the
+        // DeepStack rows live on rank 0 (stage 0) alone, so its extras here
+        // carry no mask / embeds.
+        let extras = crate::packed_exec::PackedExtras {
+            mrope,
+            ds_mask: Vec::new(),
+            ds_embeds: Vec::new(),
+        };
         let (odt, oshape, obytes) = self.packed.as_mut().unwrap().run_plan(
             &plan,
             crate::packed_exec::PackedPrimary::Hidden(&hidden, hidden_size),
             &positions,
             &reuse,
+            &extras,
         )?;
 
         if self.spec.is_last_stage {
+            // Rank 0 reads one token per slot: a decode row (its slot's only
+            // row) or a prefill chunk's last row. Every other row answers 0,
+            // so the head samples no logits nobody reads.
             let logits = bytes_to_f32(odt, &obytes)?;
-            let mut tokens = Vec::with_capacity(plan.rows.len());
-            for (r, row) in plan.rows.iter().enumerate() {
-                tokens.push(if row.is_some() {
-                    argmax_logits_row(&logits, &oshape, r)?
-                } else {
-                    0
-                });
+            let sampled = last_row_per_slot(&plan);
+            let mut tokens = vec![0; plan.rows.len()];
+            for r in sampled {
+                tokens[r] = argmax_logits_row(&logits, &oshape, r)?;
             }
             Ok(tokens)
         } else {
@@ -2719,7 +5182,9 @@ impl OvRuntimeEngine {
             // A downstream failure (including its NACK) propagates as Err —
             // the caller NACKs our own upstream in turn, so the abort
             // reaches rank 0 no matter how deep the pipeline is.
-            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)
+            let images = self.packed_image_blocks().then_some(plan_images.as_slice());
+            let mrope_fwd = self.vision_mrope().then_some(extras.mrope.as_slice());
+            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows, images, mrope_fwd)
         }
     }
 
@@ -2818,14 +5283,18 @@ impl OvRuntimeEngine {
         // completion_tokens = 2N-1. This chunk carries exactly one token, and
         // it is set explicitly so an empty final delta (EOS decoding to "")
         // still counts.
-        let chunk = Chunk::final_marker(task_id.clone(), delta)
-            .with_n_tokens(1)
-            .with_prompt_tokens(prompt_tokens)
-            .with_finish_reason(if is_eos {
-                cascadia_types::FinishReason::Stop
-            } else {
-                cascadia_types::FinishReason::Length
-            });
+        let chunk = Chunk {
+            token_id: token as i64,
+            ..Chunk::final_marker(task_id.clone(), delta)
+        }
+        .with_n_tokens(1)
+        .with_prompt_tokens(prompt_tokens)
+        .with_token_ids(vec![token as i64])
+        .with_finish_reason(if is_eos {
+            cascadia_types::FinishReason::Stop
+        } else {
+            cascadia_types::FinishReason::Length
+        });
         packed.retire(slot);
         info!(
             task = %task_id,
@@ -2859,9 +5328,10 @@ impl OvRuntimeEngine {
         // prompt would otherwise emit a fabricated token with no inference (and
         // on the static path skip the position-0 ring reset).
         if prefill && tokens.is_empty() {
-            return Err(EngineError::Backend(
-                "empty prompt: no tokens to prefill".into(),
-            ));
+            return Err(EngineError::Backend(format!(
+                "{}empty prompt: no tokens to prefill",
+                cascadia_engine::CLIENT_ERROR_PREFIX
+            )));
         }
 
         let next_token = if self.static_kv.is_some() {
@@ -2882,6 +5352,28 @@ impl OvRuntimeEngine {
                     }
                 }
             }
+            // A vision tree's stage 0 takes embeddings: embed the whole
+            // prompt once (image rows spliced in) and feed it row by row.
+            let vrows = if self.static_takes_embeds() {
+                Some(self.vision_rows(&tokens)?)
+            } else {
+                None
+            };
+            // Qwen3-VL stage 0: flatten this turn's DeepStack rows once; each
+            // inference below slices its own image tokens from them.
+            if prefill {
+                self.build_static_deepstack()?;
+            }
+            // Gemma 4: each inference also takes its rows' token types, and
+            // an image must sit whole inside one inference.
+            let vtypes = if vrows.is_some() && self.vision_token_types() {
+                Some(crate::gemma4_vision::token_type_ids(
+                    &tokens,
+                    self.vision_image_token()?,
+                ))
+            } else {
+                None
+            };
             let nt = if prefill && self.prefill.is_some() {
                 // Chunked prefill: up to C prompt tokens per inference
                 // instead of one — stage weights stream from DRAM once per
@@ -2903,7 +5395,17 @@ impl OvRuntimeEngine {
                 let mut idx = 0usize;
                 while idx < tokens.len() {
                     let chunk_start = self.position;
-                    let take = chunk_take(c, tokens.len() - idx, chunk_start as usize, past_len);
+                    let mut take =
+                        chunk_take(c, tokens.len() - idx, chunk_start as usize, past_len);
+                    if let Some(vt) = &vtypes {
+                        let safe = image_safe_take(vt, idx, take.max(1))
+                            .map_err(EngineError::UnsupportedInput)?;
+                        if take > 0 {
+                            take = safe;
+                        }
+                        let n = take.max(1);
+                        self.set_static_types(&vt[idx..idx + n]);
+                    }
                     let ts = std::time::Instant::now();
                     let (token, wire) = if take >= 2 {
                         // Lazy so a prompt that never chunks (1-token, or
@@ -2913,11 +5415,14 @@ impl OvRuntimeEngine {
                         // Single-stage: nothing reads a non-final chunk's
                         // logits — skip the [1,C,vocab] copy + convert.
                         let want_output = !single_stage || is_final_chunk;
-                        let (out, shape) = self.run_first_chunk(
-                            &tokens[idx..idx + take],
-                            chunk_start,
-                            want_output,
-                        )?;
+                        self.set_static_ids(&tokens[idx..idx + take]);
+                        let input = match &vrows {
+                            Some((rows, h)) => {
+                                ChunkInput::Embeds(&rows[idx * h..(idx + take) * h], *h)
+                            }
+                            None => ChunkInput::Ids(&tokens[idx..idx + take]),
+                        };
+                        let (out, shape) = self.run_first_chunk(input, chunk_start, want_output)?;
                         let alpha = ts.elapsed();
                         self.position += take as i64;
                         idx += take;
@@ -2939,7 +5444,13 @@ impl OvRuntimeEngine {
                         // Window cap (or a 1-token remainder): one seq=1 step
                         // through the decode model — the exact sliding-window
                         // semantics for over-window rows.
-                        let (out, shape) = self.run_first(&[tokens[idx]], chunk_start)?;
+                        self.set_static_ids(&tokens[idx..idx + 1]);
+                        let (out, shape) = match &vrows {
+                            Some((rows, h)) => {
+                                self.run_first_row(&rows[idx * h..(idx + 1) * h], *h, chunk_start)?
+                            }
+                            None => self.run_first(&[tokens[idx]], chunk_start)?,
+                        };
                         let alpha = ts.elapsed();
                         self.position += 1;
                         idx += 1;
@@ -2956,10 +5467,20 @@ impl OvRuntimeEngine {
                 nt
             } else {
                 let mut nt = 0i32;
-                for &t in &tokens {
+                for (i, &t) in tokens.iter().enumerate() {
+                    if let Some(vt) = &vtypes {
+                        image_safe_take(vt, i, 1).map_err(EngineError::UnsupportedInput)?;
+                        self.set_static_types(&vt[i..i + 1]);
+                    }
+                    self.set_static_ids(&tokens[i..i + 1]);
                     let position = self.position;
                     let ts = std::time::Instant::now();
-                    let (out, shape) = self.run_first(&[t], position)?;
+                    let (out, shape) = match &vrows {
+                        Some((rows, h)) => {
+                            self.run_first_row(&rows[i * h..(i + 1) * h], *h, position)?
+                        }
+                        None => self.run_first(&[t], position)?,
+                    };
                     let alpha = ts.elapsed();
                     self.position += 1;
                     // Static prefill round-trips per prompt token — each reply
@@ -3107,23 +5628,18 @@ impl OvRuntimeEngine {
             warn!(task = %task_id, "detokenizer decode diverged; re-anchored");
         }
         let chunk = if is_final {
-            Chunk {
-                task_id: task_id.clone(),
-                token_id: next_token as i64,
-                text: delta,
-                is_final: true,
-                logprobs: None,
-                n_tokens: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-                error: None,
-                token_ids: Vec::new(),
-                // ov-runtime doesn't yet distinguish length vs stop here; the
-                // API falls back to "stop" (unchanged behavior). #14 follow-up.
-                finish_reason: None,
-            }
+            single_task_final_chunk(
+                task_id.clone(),
+                next_token,
+                delta,
+                active.prompt_ids.len(),
+                is_eos,
+            )
         } else {
+            // Counted explicitly, as the packed path does: a token whose text
+            // lands in a later chunk would otherwise count 0.
             Chunk::token(task_id.clone(), next_token as i64, delta)
+                .with_n_tokens(1)
                 .with_token_ids(vec![next_token as i64])
         };
 
@@ -3161,9 +5677,9 @@ impl OvRuntimeEngine {
             }
             // Issue-34: capture the full post-turn KV under (prompt + generated) for warm-pull.
             // Best-effort + gated — off-rig get_state_blob returns Stub, so nothing is cached.
+            // Keyed on `kv_key`, which names each image by its hash.
             #[cfg(feature = "kv_coord")]
-            {
-                let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
+            if let Some(mut full) = active.kv_key.take() {
                 // Skip the resume seed: `prompt_ids` already carries those ids.
                 full.extend_from_slice(
                     &active.generated[active.resume_seed_len.min(active.generated.len())..],
@@ -3187,16 +5703,19 @@ impl OvRuntimeEngine {
                         }
                         // Mirror into the lock-free holder cache so a busy node can serve this turn's
                         // KV to a moved peer without the engine lock.
+                        // A media turn stays out of it (`capture_for_plane`) and keeps only the
+                        // local copy below, which this box's image warm resume reads.
                         self.kv_share
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .capture(&tenant, full.clone(), blob.clone());
+                            .capture_for_plane(&tenant, full.clone(), blob.clone());
                         self.kv.capture(&tenant, full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "get_state_blob skipped (no KV capture)"),
                 }
             }
             self.active = None;
+            self.clear_static_deepstack();
         }
 
         Ok(vec![(task_id, chunk)])
@@ -3215,6 +5734,7 @@ impl OvRuntimeEngine {
         in_shape: &[usize],
         in_bytes: &[u8],
         position: i64,
+        offset: usize,
     ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
         // Align the ring to this absolute position (resets at position 0) and
         // refresh the reusable mask buffer.
@@ -3224,6 +5744,16 @@ impl OvRuntimeEngine {
             sk.write_mask_bytes();
         }
         let pos_bytes = position.to_le_bytes();
+        // M-RoPE trees feed `[3, 1, 1]` positions; DeepStack stage 0 feeds the
+        // one row's (empty for a decode token) DeepStack mask + embeds. Both
+        // need `&mut self`, so compute them before the shared-borrow feed.
+        let mrope_pos = if self.vision_mrope() {
+            Some(self.mrope_static_position_bytes(position, offset, 1, 1)?)
+        } else {
+            None
+        };
+        let next_ids = self.static_kv.as_ref().unwrap().next_ids.clone();
+        let deepstack = self.take_static_deepstack(&next_ids, 1)?;
 
         // Feed primary input + mask + position + the per-layer past-KV ring.
         // self.runtime (mut) and self.static_kv (shared) are disjoint fields,
@@ -3234,7 +5764,7 @@ impl OvRuntimeEngine {
             let in_main = if use_hidden {
                 sk.hidden_in.as_deref()
             } else {
-                sk.ids_in.as_deref()
+                sk.ids_in.as_deref().or(sk.embeds_in.as_deref())
             }
             .ok_or_else(|| EngineError::Backend("static IR missing primary input".into()))?;
             self.runtime
@@ -3248,11 +5778,43 @@ impl OvRuntimeEngine {
                     &sk.mask_bytes,
                 )
                 .map_err(map_ov_err)?;
-            self.runtime
-                .set_input(&sk.pos_in, ShimDType::I64, &[1, 1], &pos_bytes)
-                .map_err(map_ov_err)?;
-            let shape = [1, sk.kv_heads, sk.past_len, sk.head_dim];
+            match &mrope_pos {
+                Some(b) => self.runtime.set_input(
+                    &sk.pos_in,
+                    ShimDType::I64,
+                    &[crate::qwen_vl_vision::MROPE_ROWS, 1, 1],
+                    b,
+                ),
+                None => self
+                    .runtime
+                    .set_input(&sk.pos_in, ShimDType::I64, &[1, 1], &pos_bytes),
+            }
+            .map_err(map_ov_err)?;
+            if let Some(types_in) = sk.types_in.as_deref() {
+                let t = sk.next_types.first().copied().unwrap_or(0);
+                self.runtime
+                    .set_input(types_in, ShimDType::I64, &[1, 1], &t.to_le_bytes())
+                    .map_err(map_ov_err)?;
+            }
+            if let (Some((mask, embeds, layers, hidden)), Some(mask_in), Some(ds_in)) = (
+                &deepstack,
+                sk.visual_mask_in.as_deref(),
+                sk.deepstack_in.as_deref(),
+            ) {
+                self.runtime
+                    .set_input(mask_in, ShimDType::I64, &[1, 1], &i64_to_bytes(mask))
+                    .map_err(map_ov_err)?;
+                self.runtime
+                    .set_input(
+                        ds_in,
+                        ShimDType::F32,
+                        &[*layers, 1, *hidden],
+                        &f32_vec_bytes(embeds),
+                    )
+                    .map_err(map_ov_err)?;
+            }
             for (li, layer) in sk.layers.iter().enumerate() {
+                let shape = [1, layer.kv_heads, sk.past_len, layer.head_dim];
                 self.runtime
                     .set_input(&layer.key_in, sk.kv_dtype, &shape, &sk.key_buf[li])
                     .map_err(map_ov_err)?;
@@ -3262,6 +5824,11 @@ impl OvRuntimeEngine {
             }
         }
         self.runtime.infer().map_err(map_ov_err)?;
+        {
+            let sk = self.static_kv.as_mut().unwrap();
+            sk.next_types.clear();
+            sk.next_ids.clear();
+        }
 
         // Primary output (index 0): logits on the head stage, hidden_states
         // otherwise — the static export emits it before the present.* outputs.
@@ -3270,21 +5837,17 @@ impl OvRuntimeEngine {
         // Absorb the new token's K/V. Validate each present.* output's byte
         // length AND shape against [1, kv_heads, context, head_dim] so a
         // dtype/factorization mismatch is a clear error, not silent corruption.
-        let (n, expect, kvh, ctx, hd) = {
-            let sk = self.static_kv.as_ref().unwrap();
-            (
-                sk.layers.len(),
-                sk.present_layer_bytes(),
-                sk.kv_heads,
-                sk.context,
-                sk.head_dim,
-            )
-        };
-        let want_shape = [1usize, kvh, ctx, hd];
+        let n = self.static_kv.as_ref().unwrap().layers.len();
         for li in 0..n {
-            let (ko, vo) = {
-                let l = &self.static_kv.as_ref().unwrap().layers[li];
-                (l.key_out, l.val_out)
+            let (ko, vo, expect, want_shape) = {
+                let sk = self.static_kv.as_ref().unwrap();
+                let l = &sk.layers[li];
+                (
+                    l.key_out,
+                    l.val_out,
+                    sk.present_layer_bytes(li),
+                    [1usize, l.kv_heads, sk.context, l.head_dim],
+                )
             };
             let (_, kshape, kpres) = self.runtime.output(ko).map_err(map_ov_err)?;
             let (_, vshape, vpres) = self.runtime.output(vo).map_err(map_ov_err)?;
@@ -3312,7 +5875,10 @@ impl OvRuntimeEngine {
     /// a variant). Reload cost is logged; with a CACHE_DIR-backed compile the
     /// reload comes from the OV blob/UMD cache rather than a cold compile.
     fn ensure_prefill_loaded(&mut self) -> EngineResult<()> {
-        let parked = self.prefill.as_ref().is_some_and(|p| p.runtime.is_none());
+        let parked = self
+            .prefill
+            .as_ref()
+            .is_some_and(|p| !p.shared && p.runtime.is_none());
         if !parked {
             return Ok(());
         }
@@ -3372,37 +5938,70 @@ impl OvRuntimeEngine {
         real: usize,
         position: i64,
         want_output: bool,
+        offset: usize,
     ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
+        // Validate the chunk and that the prefill model is loaded WITHOUT
+        // mutating any state: begin_token/write_prefill_mask below move the ring
+        // cursor for tokens whose K/V this inference absorbs, so a bad chunk or
+        // a parked model must bail before them. The M-RoPE positions and the
+        // DeepStack feed need `&mut self`, which the ring/prefill split borrow
+        // would forbid, so they are computed here first (neither touches the
+        // ring; on an abort the whole task resets).
+        let width = {
+            let pf = self.prefill.as_ref().ok_or_else(|| {
+                EngineError::Backend(
+                    "static_infer_chunk requires the static ring + a prefill variant".into(),
+                )
+            })?;
+            if self.static_kv.is_none() {
+                return Err(EngineError::Backend(
+                    "static_infer_chunk requires the static ring + a prefill variant".into(),
+                ));
+            }
+            if real == 0 || real > pf.seq {
+                return Err(EngineError::Backend(format!(
+                    "chunk of {real} real tokens does not fit the prefill window (seq={})",
+                    pf.seq
+                )));
+            }
+            if position < 0 {
+                return Err(EngineError::Backend(format!(
+                    "negative chunk position {position}"
+                )));
+            }
+            if !pf.shared && pf.runtime.is_none() {
+                return Err(EngineError::Backend(
+                    "prefill model is parked — callers must ensure_prefill_loaded first".into(),
+                ));
+            }
+            pf.seq
+        };
+        let mrope_pos = if self.vision_mrope() {
+            Some(self.mrope_static_position_bytes(position, offset, real, width)?)
+        } else {
+            None
+        };
+        // Consumed here, as `static_infer` clears it: a stale set must never
+        // feed a later inference's DeepStack mask.
+        let next_ids = self
+            .static_kv
+            .as_mut()
+            .map(|sk| std::mem::take(&mut sk.next_ids))
+            .unwrap_or_default();
+        let deepstack = self.take_static_deepstack(&next_ids, width)?;
+
         // Split-borrow the ring and the prefill model: disjoint fields of
         // self, so ring buffers feed the prefill runtime with no staging copy
         // (beyond the shim's own per-input memcpy, common to every path).
-        let (sk, pf) = match (self.static_kv.as_mut(), self.prefill.as_mut()) {
-            (Some(sk), Some(pf)) => (sk, pf),
-            _ => {
-                return Err(EngineError::Backend(
-                    "static_infer_chunk requires the static ring + a prefill variant".into(),
-                ))
-            }
+        let (sk, pf) = (
+            self.static_kv.as_mut().unwrap(),
+            self.prefill.as_mut().unwrap(),
+        );
+        let prt = if pf.shared {
+            &mut self.runtime
+        } else {
+            pf.runtime.as_mut().unwrap()
         };
-        if real == 0 || real > pf.seq {
-            return Err(EngineError::Backend(format!(
-                "chunk of {real} real tokens does not fit the prefill window (seq={})",
-                pf.seq
-            )));
-        }
-        if position < 0 {
-            return Err(EngineError::Backend(format!(
-                "negative chunk position {position}"
-            )));
-        }
-        // Parked check FIRST: begin_token/write_prefill_mask mutate ring
-        // state — advancing the cursor for a token whose K/V is never
-        // absorbed would desync the ring if this error ever fires.
-        let prt = pf.runtime.as_mut().ok_or_else(|| {
-            EngineError::Backend(
-                "prefill model is parked — callers must ensure_prefill_loaded first".into(),
-            )
-        })?;
         sk.begin_token(position as usize);
         sk.write_prefill_mask(&mut pf.mask_bytes, pf.context, real);
 
@@ -3438,14 +6037,30 @@ impl OvRuntimeEngine {
                 pf.primary_buf.resize(pf.seq * hid * 2, 0);
                 pf.hidden_in.as_deref()
             }
+            ChunkInput::Embeds(rows, hid) => {
+                if hid == 0 || rows.len() != real * hid {
+                    return Err(EngineError::Backend(format!(
+                        "chunk embeddings len {} != {real} rows of {hid}",
+                        rows.len()
+                    )));
+                }
+                for v in rows {
+                    pf.primary_buf.extend_from_slice(&v.to_le_bytes());
+                }
+                pf.primary_buf.resize(pf.seq * hid * 4, 0);
+                pf.embeds_in.as_deref()
+            }
         }
         .ok_or_else(|| EngineError::Backend("prefill IR missing primary input".into()))?;
 
         // position_ids [1, C] = position..position+C; the pad tail continues
-        // past the real tokens (masked + never absorbed, value irrelevant).
-        pf.pos_buf.clear();
-        for p in position..position + pf.seq as i64 {
-            pf.pos_buf.extend_from_slice(&p.to_le_bytes());
+        // past the real tokens (masked + never absorbed, value irrelevant). An
+        // M-RoPE tree feeds `[3, 1, C]` from `mrope_pos` instead (same padding).
+        if mrope_pos.is_none() {
+            pf.pos_buf.clear();
+            for p in position..position + pf.seq as i64 {
+                pf.pos_buf.extend_from_slice(&p.to_le_bytes());
+            }
         }
 
         match input {
@@ -3455,6 +6070,9 @@ impl OvRuntimeEngine {
             ChunkInput::Hidden(_, hid) => prt
                 .set_input(in_main, ShimDType::F16, &[1, pf.seq, hid], &pf.primary_buf)
                 .map_err(map_ov_err)?,
+            ChunkInput::Embeds(_, hid) => prt
+                .set_input(in_main, ShimDType::F32, &[1, pf.seq, hid], &pf.primary_buf)
+                .map_err(map_ov_err)?,
         }
         prt.set_input(
             &pf.attn_in,
@@ -3463,10 +6081,50 @@ impl OvRuntimeEngine {
             &pf.mask_bytes,
         )
         .map_err(map_ov_err)?;
-        prt.set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf)
+        match &mrope_pos {
+            Some(b) => prt.set_input(
+                &pf.pos_in,
+                ShimDType::I64,
+                &[crate::qwen_vl_vision::MROPE_ROWS, 1, pf.seq],
+                b,
+            ),
+            None => prt.set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf),
+        }
+        .map_err(map_ov_err)?;
+        if let Some(types_in) = pf.types_in.as_deref() {
+            // Pad rows are text: masked out anyway, and never an image.
+            let types = std::mem::take(&mut sk.next_types);
+            let mut buf = Vec::with_capacity(pf.seq * 8);
+            for i in 0..pf.seq {
+                let t = if i < real {
+                    types.get(i).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                buf.extend_from_slice(&t.to_le_bytes());
+            }
+            prt.set_input(types_in, ShimDType::I64, &[1, pf.seq], &buf)
+                .map_err(map_ov_err)?;
+        }
+        // Qwen3-VL stage 0: the chunk's DeepStack mask + embeds, padded to the
+        // prefill window (pad rows are text, pad embeds zero and never gathered).
+        if let (Some((mask, embeds, layers, hidden)), Some(mask_in), Some(ds_in)) = (
+            &deepstack,
+            pf.visual_mask_in.as_deref(),
+            pf.deepstack_in.as_deref(),
+        ) {
+            prt.set_input(mask_in, ShimDType::I64, &[1, pf.seq], &i64_to_bytes(mask))
+                .map_err(map_ov_err)?;
+            prt.set_input(
+                ds_in,
+                ShimDType::F32,
+                &[*layers, pf.seq, *hidden],
+                &f32_vec_bytes(embeds),
+            )
             .map_err(map_ov_err)?;
-        let kv_shape = [1, sk.kv_heads, sk.past_len, sk.head_dim];
+        }
         for (li, layer) in pf.layers.iter().enumerate() {
+            let kv_shape = [1, layer.kv_heads, sk.past_len, layer.head_dim];
             prt.set_input(&layer.key_in, sk.kv_dtype, &kv_shape, &sk.key_buf[li])
                 .map_err(map_ov_err)?;
             prt.set_input(&layer.val_in, sk.kv_dtype, &kv_shape, &sk.val_buf[li])
@@ -3483,10 +6141,11 @@ impl OvRuntimeEngine {
         // Absorb the `real` new tokens' K/V from each present.* (rows of
         // pf.context slots; chunk token t at slot past_len + t). Validate
         // length AND shape first, as the seq=1 path does.
-        let expect = sk.kv_heads * pf.context * sk.head_dim * sk.elem_bytes;
-        let want_shape = [1usize, sk.kv_heads, pf.context, sk.head_dim];
         for li in 0..pf.layers.len() {
-            let (ko, vo) = (pf.layers[li].key_out, pf.layers[li].val_out);
+            let l = &pf.layers[li];
+            let (ko, vo) = (l.key_out, l.val_out);
+            let expect = l.kv_heads * pf.context * l.head_dim * sk.elem_bytes;
+            let want_shape = [1usize, l.kv_heads, pf.context, l.head_dim];
             let (_, kshape, kpres) = prt.output(ko).map_err(map_ov_err)?;
             let (_, vshape, vpres) = prt.output(vo).map_err(map_ov_err)?;
             if kpres.len() != expect
@@ -3557,9 +6216,11 @@ impl OvRuntimeEngine {
         // Before this point nothing is owed: a failed recv either got no group
         // at all, or lost frame alignment, in which case the socket is gone and
         // there is nothing to answer on. After it, `inbound_seq` is set and
-        // every failure must answer.
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
-        let step = self.relay_last_body(hidden, shape, pos_opt);
+        // every failure must answer — a bad types / positions / hidden frame
+        // included, which is why it arrives as the inner `group` error.
+        let group = self.recv_hidden_from_upstream()?;
+        let step =
+            group.and_then(|(hidden, shape, pos_opt)| self.relay_last_body(hidden, shape, pos_opt));
         self.answer_upstream(step)
     }
 
@@ -3602,8 +6263,9 @@ impl OvRuntimeEngine {
             return self.step_relay_packed();
         }
         // See `step_last`: nothing is owed until the group is consumed.
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
-        let step = self.relay_middle_body(hidden, shape, pos_opt);
+        let group = self.recv_hidden_from_upstream()?;
+        let step = group
+            .and_then(|(hidden, shape, pos_opt)| self.relay_middle_body(hidden, shape, pos_opt));
         let answered = self.answer_upstream(step);
         self.escalate_if_downstream_is_gone(answered)
     }
@@ -3708,6 +6370,11 @@ impl Engine for OvRuntimeEngine {
             if self.static_kv.is_some() && self.hidden_size > 0 {
                 let zero = vec![0f32; self.hidden_size];
                 let hs = self.hidden_size;
+                // An M-RoPE relay reads its positions from the wire frame;
+                // warm it with one zero column in place of that frame.
+                if self.vision_mrope() {
+                    self.step_positions = vec![0; crate::qwen_vl_vision::MROPE_ROWS];
+                }
                 if let Err(e) = self.run_relay(&zero, [1, 1, hs], 0) {
                     warn!(error = %e, "ov-runtime relay warmup (decode model) failed");
                 }
@@ -3719,6 +6386,7 @@ impl Engine for OvRuntimeEngine {
                 if let Some(sk) = self.static_kv.as_mut() {
                     sk.reset();
                 }
+                self.step_positions.clear();
                 self.position = 0;
                 info!("ov-runtime warmup ok (static relay)");
             } else {
@@ -3754,10 +6422,17 @@ impl Engine for OvRuntimeEngine {
                     // Ensure covers a future re-warm with --park-prefill:
                     // today warmup precedes any park, but that ordering is
                     // an invariant nothing else enforces.
-                    if let Err(e) = self
-                        .ensure_prefill_loaded()
-                        .and_then(|_| self.run_first_chunk(warm, 0, true).map(|_| ()))
-                    {
+                    let warm_chunk = |s: &mut Self| -> EngineResult<()> {
+                        s.ensure_prefill_loaded()?;
+                        if s.static_takes_embeds() {
+                            let (rows, h) = s.vision_rows(warm)?;
+                            s.run_first_chunk(ChunkInput::Embeds(&rows, h), 0, true)?;
+                        } else {
+                            s.run_first_chunk(ChunkInput::Ids(warm), 0, true)?;
+                        }
+                        Ok(())
+                    };
+                    if let Err(e) = warm_chunk(self) {
                         warn!(error = %e, "ov-runtime warmup (prefill model) failed");
                     }
                 }
@@ -3779,6 +6454,19 @@ impl Engine for OvRuntimeEngine {
             return Err(EngineError::Backend(
                 "non-first stage does not accept tasks directly".into(),
             ));
+        }
+        // Qwen VL trees and Gemma 4 trees with `<|video|>` take a video
+        // whole; every other tree gets frames.
+        if !self
+            .vision
+            .as_ref()
+            .and_then(|v| v.first.as_ref())
+            .is_some_and(|f| f.frontend.takes_video())
+        {
+            cascadia_engine::refuse_video(&task, "ov-runtime")?;
+        }
+        if self.vision.as_ref().is_none_or(|v| v.first.is_none()) {
+            cascadia_engine::refuse_media(&task, "ov-runtime (tree without a `vision` block)")?;
         }
         // Dead-wire latch: refuse before the request costs anything. This is
         // synchronous with the HTTP request, so the non-streaming path answers
@@ -3815,23 +6503,105 @@ impl Engine for OvRuntimeEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        // Hold the prompt to the tree's window here, for the same
+        // 400-before-any-stream reason as the packed check below: a static
+        // tree's KV ring (an over-window prompt would slide its start out, and
+        // an image cannot slide at all), a stateful tree's model context.
+        // Counted on the prompt as step_first serves it (resume ids appended,
+        // images expanded from their sizes), unencoded. Packed trees check
+        // their slot region below.
+        let window = match (&self.packed, &self.static_kv) {
+            (Some(_), _) => None,
+            (None, Some(sk)) => Some(PromptWindow::StaticRing(sk.past_len)),
+            (None, None) => self.max_ctx.map(PromptWindow::ModelContext),
+        };
+        if let (Some(window), Some(tok)) = (window, self.tokenizer.as_ref()) {
+            let has_media = !task.media.is_empty();
+            let first = self.vision.as_ref().and_then(|v| v.first.as_ref());
+            let ids = match encode_prompt_ids(tok, self.vision.as_ref(), &task) {
+                Ok(ids) => Some(ids),
+                // As before: a media turn that cannot be tokenized is refused
+                // here; a text one is left for the step path to report.
+                Err(e) if has_media => return Err(EngineError::Backend(e)),
+                Err(_) => None,
+            };
+            if let Some(mut ids) = ids {
+                cascadia_types::append_resume_ids(&mut ids, task.resume_ids());
+                prompt_past_window(&ids, has_media, Some(window), |ids| match first {
+                    Some(first) => first.frontend.expand_ids(&task.media, ids),
+                    None => Err("no vision front end".into()),
+                })
+                .inspect_err(
+                    |e| warn!(task = %task.task_id, error = %e, "refusing prompt at submit"),
+                )?;
+            }
+        }
         // Packed slots divide the KV window, so a prompt can be too long for a
         // slot while the model itself could hold it. Reject here rather than at
         // admission: submit() is synchronous with the HTTP request, so the
-        // caller gets a 413 before any stream is opened — a streaming client
+        // caller gets a 400 before any stream is opened — a streaming client
         // rejected mid-stream would already have had its 200 committed and
         // would receive a non-standard error frame instead.
-        if let Some(packed) = self.packed.as_ref() {
+        // A resumed task skips it: admission refuses it (packed slots have no
+        // forced-prefix path), so encoding its images here would only spend
+        // encoder time under the engine lock on rows nobody reads.
+        if let Some(packed) = self.packed.as_ref().filter(|_| task.resume_ids().is_none()) {
             if let Some(tok) = self.tokenizer.as_ref() {
-                let n = tok
-                    .encode(task.prompt.clone(), false)
-                    .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
-                    .get_ids()
-                    .len();
-                if let Some(msg) = packed_prompt_too_long(n, packed.kv.region) {
-                    warn!(task = %task.task_id, prompt_tokens = n,
-                          region = packed.kv.region, "refusing over-region prompt");
-                    return Err(EngineError::PromptTooLong(msg));
+                let ids = encode_prompt_ids(tok, self.vision.as_ref(), &task)
+                    .map_err(EngineError::Backend)?;
+                // Every check runs on the prompt as it will be served, with
+                // each image's token count taken from its size, before any
+                // image is encoded: a refused request costs no encoder time
+                // (under the engine lock) and leaves the encode cache alone.
+                let (packed_seq, region) = (packed.kv.packed_seq, packed.kv.region);
+                let image_blocks = self.vision.as_ref().is_some_and(|v| v.token_types);
+                let (ids, images) = match self.vision.as_mut().and_then(|v| v.first.as_mut()) {
+                    Some(first) => {
+                        let image = first.frontend.image_token();
+                        let (media, tenant) = (&task.media, &task.tenant);
+                        packed_check_then_encode(
+                            &mut first.frontend,
+                            &ids,
+                            !media.is_empty(),
+                            Some(image),
+                            image_blocks,
+                            packed_seq,
+                            region,
+                            |f: &Frontend, ids: &[i64]| f.expand_ids(media, ids),
+                            // `prepare_turn` keeps Qwen VL's M-RoPE positions
+                            // and Qwen3-VL's DeepStack rows (None / empty for
+                            // every other family), taken at admission.
+                            |f: &mut Frontend, ids: &[i64]| {
+                                f.prepare_turn(media, ids, tenant)
+                                    .map(|p| (p.ids, (p.rows, p.mrope, p.deepstack)))
+                            },
+                        )
+                    }
+                    None => packed_check_then_encode(
+                        &mut (),
+                        &ids,
+                        false,
+                        None,
+                        false,
+                        packed_seq,
+                        region,
+                        |_: &(), ids: &[i64]| Ok(ids.to_vec()),
+                        |_: &mut (), _: &[i64]| Err::<(Vec<i64>, PackedEncoded), _>(String::new()),
+                    ),
+                }
+                .inspect_err(
+                    |e| warn!(task = %task.task_id, error = %e, "refusing packed prompt at submit"),
+                )?;
+                if let Some((rows, mrope, deepstack)) = images {
+                    self.packed_images.insert(
+                        task.task_id.clone(),
+                        PackedTurn {
+                            ids,
+                            rows,
+                            mrope,
+                            deepstack,
+                        },
+                    );
                 }
             }
         }
@@ -3876,6 +6646,7 @@ impl Engine for OvRuntimeEngine {
 
     fn cancel(&mut self, task_id: &TaskId) {
         self.pending.retain(|t| t.task_id != *task_id);
+        self.packed_images.remove(task_id);
         // Packed path: drop just this request's slot. Its KV region is cleared
         // and returned to the free pool immediately, so a disconnecting client
         // frees capacity for the next admission without disturbing the other
@@ -3903,6 +6674,7 @@ impl Engine for OvRuntimeEngine {
         {
             info!(task = %task_id, "ov-runtime cancel: abandoning active task");
             self.active = None;
+            self.clear_static_deepstack();
             let _ = self.runtime.reset_state();
             if let Some(sk) = self.static_kv.as_mut() {
                 sk.reset();
@@ -3943,6 +6715,9 @@ impl OvRuntimeEngine {
     }
     pub(crate) fn tokenizer_ref(&self) -> Option<&Tokenizer> {
         self.tokenizer.as_deref()
+    }
+    pub(crate) fn kv_config_digest(&self) -> u64 {
+        self.kv_config_digest
     }
     pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
         &mut self.kv
@@ -4138,6 +6913,13 @@ pub(crate) fn resolve_canonical_inputs(
         "attention_mask",
         "position_ids",
         "beam_idx",
+        // Gemma 4 vision trees: stage 0's (tagged `grafted_inputs_embeds`)
+        // and every stage's image-attention row.
+        "inputs_embeds",
+        "token_type_ids",
+        // Qwen3-VL stage 0: DeepStack rows and where they go.
+        "visual_pos_masks",
+        "deepstack_visual_embeds",
     ] {
         for idx in 0..n_inputs {
             let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
@@ -4200,6 +6982,9 @@ fn resolve_static_layers(runtime: &OvRuntime, what: &str) -> EngineResult<Vec<St
             val_in,
             key_out,
             val_out,
+            // Filled in from stage_config by the caller.
+            kv_heads: 0,
+            head_dim: 0,
         });
     }
     if layers.is_empty() {
@@ -4426,11 +7211,17 @@ impl OvRuntimeEngine {
                     (e, tk, crate::kv_coordination::LOCAL_NS.to_string())
                 };
                 if let Ok(blob) = self.runtime.get_state_blob() {
-                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here),
+                    // except a media turn's slice: RESTORE reads `self.kv` below, not the mirror.
                     self.kv_share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob.clone());
+                        .capture_under_epoch_for_plane(
+                            &tenant,
+                            epoch,
+                            tokens.clone(),
+                            blob.clone(),
+                        );
                     self.kv
                         .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
                 }
@@ -4598,6 +7389,7 @@ pub struct OvRuntimeBuilder {
     rotary: Option<Rotary>,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
+    max_ctx: Option<usize>,
     eos_token_ids: Vec<u32>,
     input_names: Vec<String>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -4608,11 +7400,25 @@ pub struct OvRuntimeBuilder {
     /// None for the stateful path. static_seq is validated == 1 at load and not
     /// stored (the ring math assumes one token per step).
     static_params: Option<(u32, u32, u32)>,
+    /// Per-layer `(kv_heads, head_dim)` of a static shard with mixed KV
+    /// geometry (`stage_config.kv_layers`); None = uniform `static_params`.
+    static_kv_layers: Option<Vec<(usize, usize)>>,
+    /// `stage_config.prefill_shares_decode`: no separate prefill compile.
+    prefill_shared: bool,
     /// (seq, context) of the chunked-prefill IR variant, when the stage
     /// exports one (stage_config.static_prefill_*) and it isn't disabled.
     static_prefill_params: Option<(u32, u32)>,
     /// Resolved packed geometry: (slots, packed_seq, packed_context).
     packed_params: Option<(u32, u32, u32)>,
+    /// `stage_config.packed_masks` / `packed_sliding_window` (see StageConfig).
+    packed_masks: Option<std::collections::BTreeMap<String, String>>,
+    packed_window: Option<u32>,
+    /// `stage_config.packed_dynamic` / `packed_decode_seq` (see StageConfig),
+    /// checked at load.
+    packed_dynamic: bool,
+    packed_decode_seq: Option<u32>,
+    /// Gemma 4 vision tree, loaded with the stage.
+    vision: Option<VisionTree>,
 }
 
 impl OvRuntimeBuilder {
@@ -4746,6 +7552,24 @@ impl Builder for OvRuntimeBuilder {
         let stage_dir = self.pipeline_dir.join(format!("stage_{}", self.rank));
         let stage_cfg = read_stage_config(&stage_dir)?;
 
+        if let (false, Some(at), Some(ctx)) = (
+            stage_cfg.stateful,
+            stage_cfg.long_rope_switch,
+            stage_cfg.static_context,
+        ) {
+            if u64::from(ctx) > at {
+                // The switch decides once per inference; a static tree
+                // prefills a long prompt in chunks, so the chunks before
+                // position `at` keep the short factors (Hugging Face takes
+                // the long ones for the whole prompt).
+                warn!(
+                    positions = at,
+                    context = ctx,
+                    "static stage: prompts past {at} tokens are prefilled in chunks, which the \
+                     long-RoPE switch does not cover; they differ from HF (stateful trees do not)"
+                );
+            }
+        }
         self.static_params = if !stage_cfg.stateful {
             let ctx = stage_cfg.static_context.unwrap_or(0);
             let s = stage_cfg.static_seq.unwrap_or(1);
@@ -4775,6 +7599,11 @@ impl Builder for OvRuntimeBuilder {
         // equals the decode variant's (context - 1) — that identity is what
         // lets both compiled models share one host KV ring.
         let prefill_xml = stage_dir.join("openvino_prefill_model.xml");
+        self.prefill_shared = stage_cfg.prefill_shares_decode;
+        self.static_kv_layers = stage_cfg
+            .kv_layers
+            .as_ref()
+            .map(|v| v.iter().map(|&[k, d]| (k as usize, d as usize)).collect());
         self.static_prefill_params = match (self.static_params, stage_cfg.static_prefill_seq) {
             (Some((ctx, _, _)), Some(pseq)) if !self.disable_chunked_prefill => {
                 let pctx = stage_cfg.static_prefill_context.unwrap_or(0);
@@ -4787,7 +7616,7 @@ impl Builder for OvRuntimeBuilder {
                         ctx - 1 + pseq
                     )));
                 }
-                if !prefill_xml.exists() {
+                if !stage_cfg.prefill_shares_decode && !prefill_xml.exists() {
                     return Err(EngineError::InvalidConfig(format!(
                         "stage_config advertises a chunked-prefill variant \
                          (static_prefill_seq={pseq}) but {} is missing — re-export the stage",
@@ -4849,14 +7678,46 @@ impl Builder for OvRuntimeBuilder {
                         "packed_slots={slots} exceeds the KV window ({past_len})"
                     )));
                 }
+                let dynamic = stage_cfg.packed_dynamic.unwrap_or(false);
+                let decode_seq = stage_cfg.packed_decode_seq;
+                let decode_xml = stage_dir.join(PACKED_DECODE_XML);
+                if let Some(msg) = packed_width_error(
+                    dynamic,
+                    decode_seq,
+                    slots,
+                    pseq,
+                    &self.device,
+                    decode_xml.exists(),
+                ) {
+                    return Err(EngineError::InvalidConfig(msg));
+                }
                 events.push(LoadProgress::message(format!(
                     "packed multi-slot variant: slots={slots} seq={pseq} context={pctx} \
-                     per-request context={}",
-                    past_len / slots
+                     per-request context={} decode width={}",
+                    past_len / slots,
+                    match (dynamic, decode_seq) {
+                        (true, _) => "live rows (dynamic IR)".to_string(),
+                        (false, Some(d)) => format!("{d} (narrow decode IR)"),
+                        (false, None) => format!("{pseq} (no narrow decode IR)"),
+                    }
                 )));
+                self.packed_masks = stage_cfg.packed_masks.clone();
+                self.packed_window = stage_cfg.packed_sliding_window;
+                self.packed_dynamic = dynamic;
+                self.packed_decode_seq = decode_seq;
                 Some((slots, pseq, pctx))
             }
         };
+
+        if let Some(msg) = packed_only_error(
+            self.rank,
+            stage_cfg.packed_only,
+            pipeline_cfg.packed_only,
+            self.packed_params.is_some(),
+            stage_cfg.packed_masks.as_ref(),
+        ) {
+            return Err(EngineError::InvalidConfig(msg));
+        }
 
         // The packed variant does its own chunked prefill (a plan whose rows all
         // belong to one slot IS a causal chunk), so the separate prefill model
@@ -4920,11 +7781,13 @@ impl Builder for OvRuntimeBuilder {
         // (single-host multi-process); for distributed deploys each node has
         // only its own stage dir, so the strict wire-frame validation in
         // recv_hidden_from_upstream is the backstop at the first activation.
+        let mut sibling_layers = Vec::new();
         for r in 0..pipeline_cfg.num_stages {
             if r == self.rank {
                 continue;
             }
             if let Ok(cfg) = read_stage_config(&self.pipeline_dir.join(format!("stage_{r}"))) {
+                sibling_layers.push((r, cfg.layer_start, cfg.layer_end));
                 if cfg.stateful != stage_cfg.stateful {
                     return Err(EngineError::ShardRejected(format!(
                         "pipeline is not homogeneous: stage_{} stateful={} but stage_{r} \
@@ -4939,7 +7802,20 @@ impl Builder for OvRuntimeBuilder {
                 // pipeline stitched from different exports would silently
                 // apply different sliding windows per stage — corrupted
                 // output, no error. Fail fast instead. (Differing
-                // static_prefill_seq alone is fine — relays sub-chunk.)
+                // static_prefill_seq alone is fine for text — relays
+                // sub-chunk — but on a `token_type_ids` vision tree every
+                // stage's must hold the widest image; the vision block below
+                // checks each stage's own.)
+                // A packed-only stage beside a static-servable one (2-machine
+                // trees each check theirs against pipeline_config above).
+                if cfg.packed_only != stage_cfg.packed_only {
+                    return Err(EngineError::ShardRejected(format!(
+                        "pipeline is not homogeneous: stage_{} packed_only={} but stage_{r} \
+                         packed_only={} — rebuild the whole static tree with one \
+                         static_variant.py --packed-only setting",
+                        self.rank, stage_cfg.packed_only, cfg.packed_only
+                    )));
+                }
                 if cfg.static_context != stage_cfg.static_context {
                     return Err(EngineError::ShardRejected(format!(
                         "pipeline is not homogeneous: stage_{} static_context={:?} but \
@@ -4950,6 +7826,13 @@ impl Builder for OvRuntimeBuilder {
                 }
             }
         }
+
+        check_stage_layers(
+            self.rank,
+            &pipeline_cfg,
+            (stage_cfg.layer_start, stage_cfg.layer_end),
+            &sibling_layers,
+        )?;
 
         let is_first = stage_cfg.has_embed;
         let is_last = stage_cfg.has_head;
@@ -5027,7 +7910,32 @@ impl Builder for OvRuntimeBuilder {
         // copy of the stage weights resident (a compiled model owns its own
         // weight allocation per device) — the price of the split; KV is NOT
         // duplicated (the host ring is shared).
-        if let Some((pseq, pctx)) = self.static_prefill_params {
+        if let (Some((pseq, _)), true) = (self.static_prefill_params, self.prefill_shared) {
+            if self
+                .prefill_device
+                .as_ref()
+                .is_some_and(|d| *d != self.device)
+            {
+                return Err(EngineError::InvalidConfig(
+                    "--prefill-device needs a separate prefill IR; this stage's decode IR \
+                     serves prefill itself (prefill_shares_decode)"
+                        .into(),
+                ));
+            }
+            // There is no second model to park: the decode IR stays resident.
+            if self.park_prefill {
+                warn!(
+                    "--park-prefill does nothing on this stage: its decode IR serves prefill \
+                     itself (prefill_shares_decode), so no separate prefill model is resident"
+                );
+                events.push(LoadProgress::message(String::from(
+                    "warning: --park-prefill has no effect (prefill runs on the decode IR)",
+                )));
+            }
+            events.push(LoadProgress::message(format!(
+                "chunked prefill (seq={pseq}) runs on the decode IR (one compiled model)"
+            )));
+        } else if let Some((pseq, pctx)) = self.static_prefill_params {
             let pdev = self
                 .prefill_device
                 .clone()
@@ -5123,6 +8031,12 @@ impl Builder for OvRuntimeBuilder {
                 let tok = Tokenizer::from_file(&tok_path)
                     .map_err(|e| EngineError::Backend(format!("tokenizer load: {e}")))?;
                 self.tokenizer = Some(Arc::new(tok));
+                let ctx_dir = if tokenizer_dir.join("config.json").exists() {
+                    &tokenizer_dir
+                } else {
+                    &self.pipeline_dir
+                };
+                self.max_ctx = crate::read_max_ctx(ctx_dir, "ov-runtime");
                 let eos_in_tok = lookup_eos(&tokenizer_dir);
                 self.eos_token_ids = if eos_in_tok.is_empty() {
                     lookup_eos(&self.pipeline_dir)
@@ -5138,6 +8052,108 @@ impl Builder for OvRuntimeBuilder {
                     "warning: no tokenizer.json at {tok_path:?}; first-stage tokenization will fail"
                 )));
             }
+        }
+
+        if let Some(v) = pipeline_cfg.vision.as_ref() {
+            let family = vision_family(v, pipeline_cfg.export_version.as_deref())?;
+            let token_types = v.token_type_ids.unwrap_or(family.token_types_by_default());
+            let mrope = matches!(family, VisionFamily::QwenVl(_));
+            check_mrope_tree(
+                family,
+                v.mrope_rows,
+                stage_cfg.position_rows,
+                stage_cfg.stateful,
+                self.packed_params.is_some(),
+            )?;
+            // Bidirectional image attention (token_type_ids) needs each image
+            // whole inside one inference: on the static path that is a
+            // chunked-prefill IR at least one image wide. Packed slots build
+            // the image blocks into their host mask instead, and keep each
+            // image inside one packed inference (`image_safe_take`); the
+            // image ids ride the plan frame to the other stages.
+            let packed_seq = self.packed_params.map(|(_, pseq, _)| pseq as usize);
+            let static_window = if !stage_cfg.stateful && token_types && packed_seq.is_none() {
+                match self.static_prefill_params {
+                    Some((pseq, _)) => Some(pseq as usize),
+                    None => {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "a static {family:?} vision tree needs a chunked-prefill IR on \
+                             every stage (an image is attended bidirectionally, so it must \
+                             sit whole inside one inference); convert it with \
+                             tools/vlm_surgery/static_variant.py --prefill-seq"
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
+            let first = if is_first {
+                let f = VisionFirst::load(&self.pipeline_dir, v, family)?;
+                if let (Some(pseq), Some(max)) = (static_window, f.frontend.max_image_tokens()) {
+                    static_image_window_fits(pseq, max, self.rank)?;
+                }
+                // Packed: an image wider than one packed inference is refused
+                // per request (submit), so a narrow variant still serves text
+                // and smaller images. Say so at load.
+                if let (true, Some(pseq), Some(max)) =
+                    (token_types, packed_seq, f.frontend.max_image_tokens())
+                {
+                    if pseq < max {
+                        warn!(
+                            packed_seq = pseq,
+                            max_image_tokens = max,
+                            "packed slots: images wider than packed_seq are refused; rebuild \
+                             the packed variant with --packed-seq {max} to serve every image"
+                        );
+                        events.push(LoadProgress::message(format!(
+                            "packed slots: packed_seq {pseq} is narrower than the widest image \
+                             ({max} tokens); wider images are refused"
+                        )));
+                    }
+                }
+                events.push(LoadProgress::message(format!(
+                    "vision tree: rank 0 embeds the prompt and encodes images ({})",
+                    f.frontend.describe()
+                )));
+                Some(f)
+            } else {
+                // A relay sub-chunks the prefill too, and a chunk never ends
+                // inside an image: one narrower than the widest image loads
+                // fine and then fails every such image mid-pipeline. It has no
+                // front end, so it reads the figure from the processor configs
+                // every cut copies to the tree root.
+                if let Some(pseq) = static_window {
+                    let max = widest_image_tokens(&self.pipeline_dir, family).map_err(|e| {
+                        EngineError::InvalidConfig(format!(
+                            "static {family:?} vision tree: stage_{} cannot size the widest \
+                             image ({e}); every stage needs the tree root's processor configs",
+                            self.rank
+                        ))
+                    })?;
+                    if let Some(max) = max {
+                        static_image_window_fits(pseq, max, self.rank)?;
+                    }
+                }
+                events.push(LoadProgress::message(format!(
+                    "vision tree ({family:?}): {}",
+                    if token_types {
+                        "relaying token_type_ids"
+                    } else if mrope {
+                        "relaying hidden states and M-RoPE positions"
+                    } else {
+                        "relaying hidden states"
+                    }
+                )));
+                None
+            };
+            self.vision = Some(VisionTree {
+                first,
+                token_types,
+                full_blocks: !matches!(family, VisionFamily::Gemma4),
+                mrope,
+            });
+        } else {
+            check_positions_without_vision(self.rank, stage_cfg.position_rows)?;
         }
 
         events.push(LoadProgress::ready());
@@ -5166,8 +8182,23 @@ impl Builder for OvRuntimeBuilder {
         // host-side KV ring. The primary output (logits on the head stage,
         // hidden_states otherwise) is output index 0 — no alias guess needed.
         let static_kv = if let Some((ctx, kvh, hd)) = self.static_params {
-            let layers = resolve_static_layers(&runtime, "static shard")?;
+            let mut layers = resolve_static_layers(&runtime, "static shard")?;
             let (kvh, hd) = (kvh as usize, hd as usize);
+            let geom = self
+                .static_kv_layers
+                .clone()
+                .unwrap_or_else(|| vec![(kvh, hd); layers.len()]);
+            if geom.len() != layers.len() || geom.iter().any(|&(k, d)| k == 0 || d == 0) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "stage_config.kv_layers lists {} layers but the static IR has {}",
+                    geom.len(),
+                    layers.len()
+                )));
+            }
+            for (l, &(k, d)) in layers.iter_mut().zip(&geom) {
+                l.kv_heads = k;
+                l.head_dim = d;
+            }
             let past_len = (ctx - 1) as usize;
             // KV activations are f16 in the static export; derive elem_bytes
             // from the dtype so the two can never drift.
@@ -5178,8 +8209,9 @@ impl Builder for OvRuntimeBuilder {
                 ShimDType::I64 => 8,
                 ShimDType::I8 => 1,
             };
-            let layer_bytes = kvh * past_len * hd * elem_bytes;
-            let n = layers.len();
+            let layer_bytes = |l: &StaticKvLayer| l.kv_heads * past_len * l.head_dim * elem_bytes;
+            let key_buf: Vec<Vec<u8>> = layers.iter().map(|l| vec![0u8; layer_bytes(l)]).collect();
+            let val_buf = key_buf.clone();
             // Cache the resolved primary/aux input port names so the per-token
             // decode loop does no HashMap lookups or string allocs. A static
             // shard always has attention_mask + position_ids; embed stages have
@@ -5198,26 +8230,38 @@ impl Builder for OvRuntimeBuilder {
                 })?;
             let ids_in = canonical_inputs.get("input_ids").cloned();
             let hidden_in = canonical_inputs.get("hidden_states").cloned();
-            if ids_in.is_none() && hidden_in.is_none() {
+            let embeds_in = canonical_inputs.get("inputs_embeds").cloned();
+            if ids_in.is_none() && hidden_in.is_none() && embeds_in.is_none() {
                 return Err(EngineError::Backend(
-                    "static IR has neither input_ids nor hidden_states input".into(),
+                    "static IR has none of input_ids / hidden_states / inputs_embeds".into(),
+                ));
+            }
+            if ids_in.is_some() && embeds_in.is_some() {
+                return Err(EngineError::InvalidConfig(
+                    "static stage 0 takes both input_ids and inputs_embeds; the static \
+                     path feeds one (re-export the stage with a single primary input)"
+                        .into(),
                 ));
             }
             Some(StaticKv {
                 past_len,
                 sink: crate::packed::KV_SINK.min(past_len / 2),
                 context: ctx as usize,
-                kv_heads: kvh,
-                head_dim: hd,
                 elem_bytes,
                 kv_dtype,
                 ids_in,
                 hidden_in,
+                embeds_in,
+                types_in: canonical_inputs.get("token_type_ids").cloned(),
+                visual_mask_in: canonical_inputs.get("visual_pos_masks").cloned(),
+                deepstack_in: canonical_inputs.get("deepstack_visual_embeds").cloned(),
+                next_types: Vec::new(),
+                next_ids: Vec::new(),
                 attn_in,
                 pos_in,
                 layers,
-                key_buf: vec![vec![0u8; layer_bytes]; n],
-                val_buf: vec![vec![0u8; layer_bytes]; n],
+                key_buf,
+                val_buf,
                 valid: 0,
                 mask_bytes: vec![0u8; ctx as usize * 8],
             })
@@ -5232,9 +8276,14 @@ impl Builder for OvRuntimeBuilder {
         // including the primary-input KIND (an embed-stage prefill IR built
         // around hidden_states, or vice versa, is not a sibling of one
         // export and would otherwise only fail at the first chunk).
-        let prefill = match self.prefill_runtime {
-            None => None,
-            Some(prt) => {
+        // A shared prefill runs on the decode compilation: resolve its ports
+        // there and keep no runtime of its own.
+        let shared = self.prefill_shared && self.static_prefill_params.is_some();
+        let prefill_rt = if shared { None } else { self.prefill_runtime };
+        let prefill = match (prefill_rt, shared) {
+            (None, false) => None,
+            (prt, _) => {
+                let prt_ref = prt.as_ref().unwrap_or(&runtime);
                 let (pseq, pctx) = self.static_prefill_params.ok_or_else(|| {
                     EngineError::Backend(
                         "inconsistent builder state: prefill runtime without prefill params".into(),
@@ -5245,8 +8294,12 @@ impl Builder for OvRuntimeBuilder {
                         "inconsistent builder state: prefill runtime without static ring".into(),
                     )
                 })?;
-                let pcanon = resolve_canonical_inputs(&prt)?;
-                let players = resolve_static_layers(&prt, "chunked-prefill variant")?;
+                let pcanon = resolve_canonical_inputs(prt_ref)?;
+                let mut players = resolve_static_layers(prt_ref, "chunked-prefill variant")?;
+                for (p, d) in players.iter_mut().zip(&sk.layers) {
+                    p.kv_heads = d.kv_heads;
+                    p.head_dim = d.head_dim;
+                }
                 if players.len() != sk.layers.len() {
                     return Err(EngineError::Backend(format!(
                         "chunked-prefill variant has {} KV layers but the decode variant has \
@@ -5263,35 +8316,64 @@ impl Builder for OvRuntimeBuilder {
                 })?;
                 let ids_in = pcanon.get("input_ids").cloned();
                 let hidden_in = pcanon.get("hidden_states").cloned();
-                if ids_in.is_none() && hidden_in.is_none() {
+                let embeds_in = pcanon.get("inputs_embeds").cloned();
+                if ids_in.is_none() && hidden_in.is_none() && embeds_in.is_none() {
                     return Err(EngineError::Backend(
-                        "prefill IR has neither input_ids nor hidden_states input".into(),
+                        "prefill IR has none of input_ids / hidden_states / inputs_embeds".into(),
                     ));
                 }
                 if ids_in.is_some() != sk.ids_in.is_some()
                     || hidden_in.is_some() != sk.hidden_in.is_some()
+                    || embeds_in.is_some() != sk.embeds_in.is_some()
                 {
                     return Err(EngineError::Backend(format!(
                         "prefill/decode variants disagree on the primary input kind \
                          (decode: {}, prefill: {}) — the two IRs are not siblings of one export",
-                        if sk.ids_in.is_some() {
-                            "input_ids"
-                        } else {
-                            "hidden_states"
-                        },
-                        if ids_in.is_some() {
-                            "input_ids"
-                        } else {
-                            "hidden_states"
-                        },
+                        primary_kind(sk.ids_in.is_some(), sk.embeds_in.is_some()),
+                        primary_kind(ids_in.is_some(), embeds_in.is_some()),
                     )));
                 }
+                // Qwen3-VL stage 0: a prefill IR without the DeepStack ports
+                // would run every prefill chunk without them — silently wrong
+                // output, so refuse it here as the packed variant does.
+                let visual_mask_in = pcanon.get("visual_pos_masks").cloned();
+                let deepstack_in = pcanon.get("deepstack_visual_embeds").cloned();
+                let ds_layers = self
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.first.as_ref())
+                    .map_or(0, |f| f.frontend.deepstack_layers());
+                if ds_layers > 0 && (visual_mask_in.is_none() || deepstack_in.is_none()) {
+                    return Err(EngineError::InvalidConfig(
+                        "Qwen3-VL chunked-prefill stage 0 is missing visual_pos_masks / \
+                         deepstack_visual_embeds; rebuild it with tools/vlm_surgery/static_variant.py \
+                         from this build"
+                            .into(),
+                    ));
+                }
+                // Gemma 3 / Gemma 4: a prefill IR without the token_type_ids
+                // port would run every prefill chunk causal-only inside the
+                // images (the load check below sees only the decode IR).
+                let types_in = pcanon.get("token_type_ids").cloned();
+                if self.vision.as_ref().is_some_and(|v| v.token_types) && types_in.is_none() {
+                    return Err(EngineError::InvalidConfig(
+                        "token_type_ids tree: the chunked-prefill IR has no token_type_ids \
+                         input, so its images would attend causally; rebuild it with \
+                         tools/vlm_surgery/static_variant.py from this build"
+                            .into(),
+                    ));
+                }
                 Some(StaticPrefill {
-                    runtime: Some(prt),
+                    runtime: prt,
+                    shared,
                     seq: pseq as usize,
                     context: pctx as usize,
                     ids_in,
                     hidden_in,
+                    embeds_in,
+                    types_in,
+                    visual_mask_in,
+                    deepstack_in,
                     attn_in,
                     pos_in,
                     layers: players,
@@ -5324,65 +8406,307 @@ impl Builder for OvRuntimeBuilder {
                     })
                     .collect::<Vec<_>>();
                 let pcanon = resolve_canonical_inputs(&prt)?;
-                let ids_in = pcanon.get("input_ids").cloned().unwrap_or_default();
+                // A vision tree's stage 0 takes `inputs_embeds` where an
+                // id-fed stage takes `input_ids`; both ride `ids_in`.
+                let embeds_in = pcanon.get("inputs_embeds").cloned();
+                let embed_hidden = if embeds_in.is_some() {
+                    self.hidden_size
+                } else {
+                    0
+                };
+                // The packed IR must feed what this rank has: embedding rows on
+                // a vision tree's rank 0, ids on a text tree's. A mismatched
+                // file (stale, or built from another export) would otherwise
+                // drop the images silently or fail every step.
+                let vision_first = self.vision.as_ref().is_some_and(|v| v.first.is_some());
+                if spec.is_first_stage && embeds_in.is_some() != vision_first {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "packed variant {} inputs_embeds but this tree {} a vision block; \
+                         rebuild it with tools/packed_variant.py from this tree's static stage",
+                        if embeds_in.is_some() {
+                            "takes"
+                        } else {
+                            "lacks"
+                        },
+                        if vision_first { "has" } else { "has no" },
+                    )));
+                }
+                let ids_in = embeds_in
+                    .or_else(|| pcanon.get("input_ids").cloned())
+                    .unwrap_or_default();
                 let hidden_in = pcanon.get("hidden_states").cloned().unwrap_or_default();
                 if ids_in.is_empty() && hidden_in.is_empty() {
                     return Err(EngineError::Backend(
-                        "packed variant has neither input_ids nor hidden_states".into(),
+                        "packed variant has none of input_ids / inputs_embeds / hidden_states"
+                            .into(),
                     ));
                 }
                 let pos_in = pcanon.get("position_ids").cloned().ok_or_else(|| {
                     EngineError::Backend("packed variant missing position_ids".into())
                 })?;
-                // The packed variant replaces the 2D attention_mask with a 4D
-                // per-row mask parameter; find it by name and take its dtype
-                // from the IR so f16/f32 exports both work.
-                let mut mask_in = None;
-                let mut mask_dtype = ShimDType::F16;
+                // The packed variant replaces the 2D attention_mask with 4D
+                // per-row mask parameters: `attn_mask_4d` (full attention)
+                // and, on Gemma 4, `attn_mask_sliding_4d`. Find each by name
+                // and take its dtype from the IR so f16/f32 exports both work.
+                let mut ports: Vec<(String, String, ShimDType)> = Vec::new();
+                let mut types_in = None;
                 for idx in 0..prt.input_count() {
                     let aliases = prt.input_aliases(idx).map_err(map_ov_err)?;
-                    if aliases.iter().any(|a| a.contains("attn_mask_4d")) {
-                        mask_in = Some(prt.input_name(idx).map_err(map_ov_err)?);
-                        mask_dtype = prt.input_dtype(idx).map_err(map_ov_err)?;
+                    let kind = if aliases.iter().any(|a| a.contains("attn_mask_sliding_4d")) {
+                        Some(PACKED_SLIDING)
+                    } else if aliases.iter().any(|a| a.contains("attn_mask_4d")) {
+                        Some(PACKED_FULL)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        ports.push((
+                            kind.to_string(),
+                            prt.input_name(idx).map_err(map_ov_err)?,
+                            prt.input_dtype(idx).map_err(map_ov_err)?,
+                        ));
+                    }
+                    if aliases.iter().any(|a| a == "token_type_ids") {
+                        types_in = Some(prt.input_name(idx).map_err(map_ov_err)?);
                     }
                 }
-                let mask_in = mask_in.ok_or_else(|| {
-                    EngineError::Backend(
-                        "packed variant missing the attn_mask_4d input — rebuild it with \
-                         tools/packed_variant.py"
+                let mut masks = packed_mask_ports(
+                    ports,
+                    self.packed_masks.as_ref(),
+                    self.packed_window.map(|w| w as usize),
+                )
+                .map_err(EngineError::InvalidConfig)?;
+                // Gemma 4's full-attention layers stay causal over images and
+                // video frames (HF's `create_masks_for_vision_model`).
+                let full_blocks = self.vision.as_ref().is_none_or(|v| v.full_blocks);
+                for m in masks.iter_mut().filter(|m| m.window.is_none()) {
+                    m.blocks = full_blocks;
+                }
+                // Still unsupported on packed slots, refused by name:
+                // - a packed IR that still reads the 2D attention_mask (some
+                //   node besides the replaced mask producers consumes it), which
+                //   the host has no per-row value for;
+                // - a token_type_ids tree with mixed KV geometry (Gemma 4's
+                //   sliding + global layers) whose packed IR has no sliding
+                //   mask port: it was built without config.json layer_types and
+                //   would let sliding layers see past their window.
+                if pcanon.contains_key("attention_mask") {
+                    return Err(EngineError::InvalidConfig(
+                        "packed variant still reads the 2D attention_mask (a node other than \
+                         the SDPA mask producers consumes it); packed slots feed only 4D \
+                         per-row masks, so this stage cannot be packed"
                             .into(),
-                    )
-                })?;
-                let kv = crate::packed::PackedKv::new(
+                    ));
+                }
+                let has_sliding = masks.iter().any(|m| m.window.is_some());
+                let token_types_tree = self.vision.as_ref().is_some_and(|v| v.token_types);
+                if token_types_tree && self.static_kv_layers.is_some() && !has_sliding {
+                    return Err(EngineError::InvalidConfig(
+                        "this Gemma 4 stage mixes sliding and global layers but its packed \
+                         variant has no attn_mask_sliding_4d port; rebuild it with \
+                         tools/packed_variant.py with the tree's config.json (layer_types, \
+                         sliding_window) beside the stage"
+                            .into(),
+                    ));
+                }
+                let geom = match self.static_kv_layers.clone() {
+                    Some(g) => {
+                        if g.len() != players.len() || g.iter().any(|&(k, d)| k == 0 || d == 0) {
+                            return Err(EngineError::InvalidConfig(format!(
+                                "stage_config.kv_layers lists {} layers but the packed IR has {}",
+                                g.len(),
+                                players.len()
+                            )));
+                        }
+                        g
+                    }
+                    None => vec![(kvh as usize, hd as usize); players.len()],
+                };
+                let kv = crate::packed::PackedKv::with_layers(
                     slots as usize,
                     past_len,
                     pseq as usize,
-                    players.len(),
-                    kvh as usize,
-                    hd as usize,
+                    geom,
                     ShimDType::F16,
                     self.packed_prefix as usize,
                 );
+                let image_blocks = self.vision.as_ref().is_some_and(|v| v.token_types);
+                let image_token = match self.vision.as_ref().and_then(|v| v.first.as_ref()) {
+                    Some(first) if image_blocks => Some(first.frontend.image_token()),
+                    _ => None,
+                };
+                let mask_desc: Vec<String> = masks
+                    .iter()
+                    .map(|m| match (m.window, image_blocks && m.blocks) {
+                        (Some(w), _) => format!("{} (sliding window {w})", m.port),
+                        (None, true) => format!("{} (full, image blocks open)", m.port),
+                        (None, false) => format!("{} (full, causal)", m.port),
+                    })
+                    .collect();
                 info!(
                     slots,
                     packed_seq = pseq,
                     region = kv.region,
                     shared_prefix = kv.prefix_capacity,
+                    masks = %mask_desc.join(", "),
+                    kv_geometry = %describe_kv_geometry(kv.geometry()),
+                    image_blocks,
+                    token_type_ids_port = types_in.as_deref().unwrap_or("none"),
                     "packed multi-slot decode active"
                 );
-                Some(crate::packed_exec::PackedState::new(
-                    prt, kv, players, ids_in, hidden_in, mask_in, pos_in, mask_dtype,
-                ))
+                // Qwen VL: this stage feeds [3, 1, S] M-RoPE positions, and
+                // Qwen3-VL stage 0 (rank 0, which holds `first`) feeds the
+                // DeepStack ports. Relay stages hold no DeepStack layers.
+                let mrope = self.vision.as_ref().is_some_and(|v| v.mrope);
+                let ds_layers = self
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.first.as_ref())
+                    .map_or(0, |f| f.frontend.deepstack_layers());
+                let visual_mask_in = pcanon.get("visual_pos_masks").cloned();
+                let deepstack_in = pcanon.get("deepstack_visual_embeds").cloned();
+                if ds_layers > 0 && (visual_mask_in.is_none() || deepstack_in.is_none()) {
+                    return Err(EngineError::InvalidConfig(
+                        "Qwen3-VL packed stage 0 is missing visual_pos_masks / \
+                         deepstack_visual_embeds; rebuild it with tools/packed_variant.py \
+                         from this build"
+                            .into(),
+                    ));
+                }
+                let mut state = crate::packed_exec::PackedState::new(
+                    Box::new(prt),
+                    kv,
+                    players,
+                    ids_in,
+                    hidden_in,
+                    embed_hidden,
+                    masks,
+                    pos_in,
+                );
+                state.types_in = types_in;
+                state.image_token = image_token;
+                state.mrope = mrope;
+                state.deepstack_layers = ds_layers;
+                state.deepstack_hidden = self.hidden_size;
+                state.deepstack_image_pad = self
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.first.as_ref())
+                    .map_or(0, |f| f.frontend.image_token());
+                state.visual_mask_in = visual_mask_in;
+                state.deepstack_in = deepstack_in;
+                state.dynamic = self.packed_dynamic;
+                if let Some(d) = self.packed_decode_seq {
+                    // The narrow decode IR: the same graph at `d` query rows.
+                    // It must take the same ports under the same names, since
+                    // `run_plan` feeds either IR from one set of port names.
+                    let nxml = packed_xml.with_file_name(PACKED_DECODE_XML);
+                    let nrt = OvRuntime::compile(
+                        nxml.to_string_lossy().as_ref(),
+                        &self.device,
+                        &packed_plugin,
+                    )
+                    .map_err(map_ov_err)?;
+                    let ncanon = resolve_canonical_inputs(&nrt)?;
+                    let mut nnames = std::collections::HashSet::new();
+                    for idx in 0..nrt.input_count() {
+                        nnames.insert(nrt.input_name(idx).map_err(map_ov_err)?);
+                    }
+                    let nlayers = resolve_static_layers(&nrt, "packed decode variant")?
+                        .into_iter()
+                        .map(|l| crate::packed_exec::PackedLayer {
+                            key_in: l.key_in,
+                            val_in: l.val_in,
+                            key_out: l.key_out,
+                            val_out: l.val_out,
+                        })
+                        .collect::<Vec<_>>();
+                    let same_masks = state.masks.iter().all(|m| nnames.contains(&m.port));
+                    if ncanon != pcanon || !same_masks || nlayers.len() != state.layers.len() {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "{} does not take the same ports as the packed IR; rebuild both \
+                             with one tools/packed_variant.py run",
+                            nxml.display()
+                        )));
+                    }
+                    // A second compiled model: its own resident copy of the
+                    // stage weights. Say so, with the size, so an OOM on a
+                    // big tree has a hint.
+                    let weights_mb = std::fs::metadata(nxml.with_extension("bin"))
+                        .map_or(0, |m| m.len() / 1_000_000);
+                    info!(
+                        decode_seq = d,
+                        weights_mb,
+                        "packed narrow decode IR active: a second compiled copy of the stage \
+                         weights (about {weights_mb} MB on disk) is resident beside the wide IR"
+                    );
+                    state.narrow = Some(crate::packed_exec::PackedNarrow {
+                        runtime: Box::new(nrt),
+                        layers: nlayers,
+                        seq: d as usize,
+                    });
+                }
+                Some(state)
             }
         };
 
+        if let Some(v) = self.vision.as_ref() {
+            let main = if v.first.is_some() {
+                "inputs_embeds"
+            } else {
+                "hidden_states"
+            };
+            let deepstack = v
+                .first
+                .as_ref()
+                .is_some_and(|f| f.frontend.deepstack_layers() > 0);
+            let need: &[&str] = if v.token_types {
+                &[main, "token_type_ids"][..]
+            } else if deepstack {
+                &[main, "visual_pos_masks", "deepstack_visual_embeds"][..]
+            } else {
+                &[main][..]
+            };
+            if let Some(m) = need.iter().find(|n| !canonical_inputs.contains_key(**n)) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "vision tree: stage {} IR has no {m} input; re-export the tree \
+                     (tools/gemma4_surgery --vision or tools/vlm_surgery)",
+                    self.rank
+                )));
+            }
+            if v.first.is_none() && canonical_inputs.contains_key("deepstack_visual_embeds") {
+                return Err(EngineError::InvalidConfig(format!(
+                    "Qwen3-VL tree: stage {} takes DeepStack rows, which only stage 0 (on rank \
+                     0) can be fed; re-cut so stage 0 holds the DeepStack layers",
+                    self.rank
+                )));
+            }
+        } else if canonical_inputs.contains_key("token_type_ids")
+            || canonical_inputs.contains_key("deepstack_visual_embeds")
+            || (canonical_inputs.contains_key("inputs_embeds")
+                && !canonical_inputs.contains_key("input_ids"))
+        {
+            return Err(EngineError::InvalidConfig(
+                "this stage takes image inputs (token_type_ids / inputs_embeds) but \
+                 pipeline_config.json has no `vision` block"
+                    .into(),
+            ));
+        }
+
         Ok(Box::new(OvRuntimeEngine {
             packed,
+            vision: self.vision,
+            step_types: Vec::new(),
+            step_positions: Vec::new(),
+            static_ds_global: Vec::new(),
+            static_ds_total: 0,
+            static_ds_cursor: 0,
             spec,
             runtime,
             rotary,
             hidden_size: self.hidden_size,
             tokenizer: self.tokenizer,
+            max_ctx: self.max_ctx,
             eos_token_ids: self.eos_token_ids.clone(),
             upstream: self.upstream,
             downstream: self.downstream,
@@ -5391,6 +8715,7 @@ impl Builder for OvRuntimeBuilder {
             input_names: self.input_names,
             canonical_inputs,
             pending: Vec::new(),
+            packed_images: std::collections::HashMap::new(),
             active: None,
             static_kv,
             prefill,
@@ -5415,6 +8740,10 @@ impl Builder for OvRuntimeBuilder {
             plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: crate::kv_coordination::config_digest(
+                &self.pipeline_dir.join("pipeline_config.json"),
+            ),
         }))
     }
 }
@@ -5469,6 +8798,80 @@ mod tests {
             old.matches("caf").count() > 1,
             "old logic duplicated the prefix, which is the bug: {old:?}"
         );
+    }
+
+    /// The decode-width setups a stage refuses at load: a dynamic packed IR
+    /// on the NPU, both kinds at once, a decode width that cannot hold every
+    /// slot or is not narrower than the wide IR, and a missing decode IR.
+    #[test]
+    fn packed_width_setups_the_stage_cannot_run_are_refused() {
+        // nothing narrow: the pre-existing setup
+        assert!(packed_width_error(false, None, 4, 64, "NPU", false).is_none());
+        // dynamic on CPU/GPU is the point; on the NPU it cannot compile
+        assert!(packed_width_error(true, None, 4, 64, "CPU", false).is_none());
+        assert!(packed_width_error(true, None, 4, 64, "GPU.0", false).is_none());
+        let npu = packed_width_error(true, None, 4, 64, "NPU", false).unwrap();
+        assert!(npu.contains("--decode-seq"), "{npu}");
+        // a narrow static decode IR beside a static wide one
+        assert!(packed_width_error(false, Some(4), 4, 64, "NPU", true).is_none());
+        assert!(packed_width_error(false, Some(8), 4, 64, "NPU", true).is_none());
+        assert!(packed_width_error(false, Some(3), 4, 64, "NPU", true).is_some());
+        assert!(packed_width_error(false, Some(64), 4, 64, "NPU", true).is_some());
+        assert!(packed_width_error(true, Some(4), 4, 64, "CPU", true).is_some());
+        let missing = packed_width_error(false, Some(4), 4, 64, "NPU", false).unwrap();
+        assert!(missing.contains(PACKED_DECODE_XML), "{missing}");
+    }
+
+    /// The head samples each slot's last row only: every decode row, and the
+    /// final row of a prefill chunk — the rows rank 0 reads.
+    #[test]
+    fn head_samples_each_slots_last_row() {
+        let chunk = crate::packed::PackedPlan::chunk(6, 1, 4);
+        assert_eq!(last_row_per_slot(&chunk), vec![3]);
+        let decode = crate::packed::PackedPlan::decode(3, &[2, 0, 3]);
+        assert_eq!(last_row_per_slot(&decode), vec![0, 1, 2]);
+        assert!(last_row_per_slot(&crate::packed::PackedPlan::idle(4)).is_empty());
+    }
+
+    /// A decode frame carries only its live rows; a relay rebuilds the same
+    /// narrow plan from it, and masks those rows exactly as the sender did
+    /// whatever width it then runs them at.
+    #[test]
+    fn a_narrow_decode_frame_rebuilds_the_senders_rows() {
+        let mut kv = crate::packed::PackedKv::new(4, 16, 8, 1, 1, 2, ShimDType::F16, 0);
+        for (s, n) in [(0, 2), (2, 3)] {
+            kv.advance(s, n);
+        }
+        let sender = crate::packed::PackedPlan::decode(2, &[0, 2]);
+        let rows: Vec<crate::packed_exec::WireRowOpt> = sender
+            .rows
+            .iter()
+            .map(|r| r.map(|pr| (pr.slot, kv.position(pr.slot) as i64, 0)))
+            .collect();
+        let frame = encode_wire_plan(&rows, None);
+        assert_eq!(frame.shape[2], 2, "no idle rows on the wire");
+        let (back, images) = decode_wire_plan_images(&frame, 4, false).unwrap();
+        assert_eq!(back, rows);
+        let relay = relay_plan(&back, &images);
+        assert_eq!(relay.rows, sender.rows);
+        // The relay pads to its own width (here the wide 8): the live rows
+        // mask as the sender's narrow plan did.
+        let mut padded = relay.clone();
+        padded.rows.resize(8, None);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        kv.fill_mask(&sender, &mut a, ShimDType::F16);
+        kv.fill_mask(&padded, &mut b, ShimDType::F16);
+        let (actx, bctx) = (kv.context_at(2), kv.context_at(8));
+        for r in 0..2 {
+            assert_eq!(
+                a[r * actx * 2..(r * actx + 16) * 2],
+                b[r * bctx * 2..(r * bctx + 16) * 2]
+            );
+            assert_eq!(
+                a[(r * actx + 16) * 2..(r * actx + 18) * 2],
+                b[(r * bctx + 16) * 2..(r * bctx + 18) * 2]
+            );
+        }
     }
 
     /// A packed variant narrower than its own slot count can never decode every
@@ -5532,12 +8935,16 @@ mod tests {
             past_len,
             sink: crate::packed::KV_SINK.min(past_len / 2),
             context: past_len + 1,
-            kv_heads,
-            head_dim,
             elem_bytes: elem,
             kv_dtype: ShimDType::F16,
             ids_in: Some("input_ids".into()),
             hidden_in: None,
+            embeds_in: None,
+            types_in: None,
+            visual_mask_in: None,
+            deepstack_in: None,
+            next_types: Vec::new(),
+            next_ids: Vec::new(),
             attn_in: "attention_mask".into(),
             pos_in: "position_ids".into(),
             layers: (0..layers)
@@ -5546,12 +8953,79 @@ mod tests {
                     val_in: "v".into(),
                     key_out: 1,
                     val_out: 2,
+                    kv_heads,
+                    head_dim,
                 })
                 .collect(),
             key_buf: vec![vec![0u8; layer_bytes]; layers],
             val_buf: vec![vec![0u8; layer_bytes]; layers],
             valid: 0,
             mask_bytes: vec![0u8; (past_len + 1) * 8],
+        }
+    }
+
+    /// A chunk never ends inside an image (types 1); it shrinks to the image's
+    /// start, and an image that starts the chunk but is longer is an error.
+    #[test]
+    fn image_safe_take_keeps_images_whole() {
+        let t = [0, 0, 1, 1, 1, 0, 0];
+        assert_eq!(image_safe_take(&t, 0, 3), Ok(2)); // would split at 2..5
+        assert_eq!(image_safe_take(&t, 0, 5), Ok(5)); // ends after the image
+        assert_eq!(image_safe_take(&t, 0, 2), Ok(2)); // ends before it
+        assert_eq!(image_safe_take(&t, 2, 3), Ok(3)); // exactly the image
+        assert!(image_safe_take(&t, 2, 2).is_err()); // image wider than the chunk
+        assert!(image_safe_take(&t, 2, 1).is_err()); // a one-row step inside it
+        assert_eq!(image_safe_take(&t, 5, 1), Ok(1));
+        assert_eq!(image_safe_take(&[], 0, 4), Ok(4)); // no token types
+        assert_eq!(image_safe_take(&t, 6, 4), Ok(4)); // runs off the end
+        assert_eq!(image_safe_take(&[1], 0, 1), Ok(1)); // a 1-token image
+    }
+
+    /// A Gemma 4 video's frames are runs of their own (stage ids carry the
+    /// soft tokens as `<|image|>`, framed and labelled per frame), so a
+    /// static prefill chunk may end between two frames but never inside one.
+    #[test]
+    fn image_safe_take_cuts_a_video_between_frames() {
+        // text, frame 0 (3), eoi + label + boi, frame 1 (3), text
+        let t = [0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0];
+        assert_eq!(image_safe_take(&t, 0, 8), Ok(8)); // after frame 0's framing
+        assert_eq!(image_safe_take(&t, 0, 10), Ok(8)); // would split frame 1
+        assert_eq!(image_safe_take(&t, 2, 3), Ok(3)); // exactly frame 0
+        assert_eq!(image_safe_take(&t, 8, 4), Ok(4));
+        assert!(image_safe_take(&t, 8, 2).is_err()); // a frame wider than the chunk
+    }
+
+    /// Layers with different KV geometry (Gemma 4: 8x256 sliding, 2x512
+    /// global) each absorb into a buffer of their own size and stride.
+    #[test]
+    fn ring_absorbs_mixed_layer_geometry() {
+        let mut ring = test_ring(4, 8, 4, 2);
+        ring.layers[1].kv_heads = 2;
+        ring.layers[1].head_dim = 8;
+        ring.key_buf[1] = vec![0u8; 2 * 4 * 8 * 2];
+        ring.val_buf[1] = vec![0u8; 2 * 4 * 8 * 2];
+        assert_eq!(ring.present_layer_bytes(0), 8 * 5 * 4 * 2);
+        assert_eq!(ring.present_layer_bytes(1), 2 * 5 * 8 * 2);
+        ring.begin_token(0);
+        // Layer 1's present: [1, 2, ctx=5, 8] f16; the new token at slot 4.
+        let slot = 8 * 2;
+        let mut p = vec![0u8; ring.present_layer_bytes(1)];
+        for h in 0..2 {
+            let src = h * 5 * slot + 4 * slot;
+            for b in 0..slot {
+                p[src + b] = (h * 50 + b + 1) as u8;
+            }
+        }
+        ring.absorb_layer(1, false, &p);
+        for h in 0..2 {
+            let dst = h * 4 * slot;
+            for b in 0..slot {
+                assert_eq!(
+                    ring.key_buf[1][dst + b],
+                    (h * 50 + b + 1) as u8,
+                    "h{h} b{b}"
+                );
+            }
         }
     }
 
@@ -5577,10 +9051,10 @@ mod tests {
         real: usize,
         is_value: bool,
     ) -> Vec<u8> {
-        let slot = ring.head_dim * ring.elem_bytes;
+        let slot = ring.layers[0].head_dim * ring.elem_bytes;
         let ctx = ring.past_len + c;
-        let mut p = vec![0xEEu8; ring.kv_heads * ctx * slot];
-        for h in 0..ring.kv_heads {
+        let mut p = vec![0xEEu8; ring.layers[0].kv_heads * ctx * slot];
+        for h in 0..ring.layers[0].kv_heads {
             for t in 0..real {
                 let base = h * ctx * slot + (ring.past_len + t) * slot;
                 for b in 0..slot {
@@ -5605,8 +9079,8 @@ mod tests {
             Some((3, 12, 12)),
             Some((1, 129, 40)),
         ];
-        let frame = encode_wire_plan(&rows);
-        assert_eq!(frame.shape, [1, 3, 4]);
+        let frame = encode_wire_plan(&rows, None);
+        assert_eq!(frame.shape, [1, 5, 4]);
         let back = decode_wire_plan(&frame, 4).expect("round trip");
         assert_eq!(back, rows);
     }
@@ -5617,13 +9091,408 @@ mod tests {
         let lead = encode_wire_lead(5, None);
         assert!(decode_wire_plan(&lead, 4).is_err());
         // slot id beyond this stage's slot count
-        let frame = encode_wire_plan(&[Some((9usize, 0i64, 0usize))]);
+        let frame = encode_wire_plan(&[Some((9usize, 0i64, 0usize))], None);
         let err = decode_wire_plan(&frame, 4).unwrap_err().to_string();
         assert!(err.contains("slot 9"), "{err}");
         // negative position would wrap in the ring math
-        let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))]);
+        let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))], None);
         bad.data[8..16].copy_from_slice(&(-3i64).to_le_bytes());
         assert!(decode_wire_plan(&bad, 4).is_err());
+        // a corrupted tag is not a frame of any build
+        let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))], None);
+        bad.data[32..40].copy_from_slice(&7i64.to_le_bytes());
+        let err = decode_wire_plan(&bad, 4).unwrap_err().to_string();
+        assert!(err.contains("different builds"), "{err}");
+    }
+
+    /// Gemma 4's plan frame carries each row's image id; it round-trips, and
+    /// idle rows decode as text.
+    #[test]
+    fn packed_plan_frame_round_trips_image_ids() {
+        let rows = vec![
+            Some((1usize, 40i64, 0usize)),
+            Some((1, 41, 0)),
+            None,
+            Some((1, 43, 0)),
+        ];
+        let images = vec![None, Some(0u32), Some(7), Some(2)];
+        let frame = encode_wire_plan(&rows, Some(&images));
+        assert_eq!(frame.shape, [1, 5, 4]);
+        let (back, back_images) = decode_wire_plan_images(&frame, 4, true).expect("round trip");
+        assert_eq!(back, rows);
+        // the idle row's id is not sent
+        assert_eq!(back_images, vec![None, Some(0), None, Some(2)]);
+    }
+
+    /// Tree kinds do not mix: a stage that masks image blocks refuses a text
+    /// frame, every other stage refuses an image frame.
+    #[test]
+    fn packed_plan_frame_versions_do_not_mix() {
+        let rows = vec![Some((0usize, 3i64, 0usize))];
+        let text = encode_wire_plan(&rows, None);
+        let image = encode_wire_plan(&rows, Some(&[Some(0)]));
+        let err = decode_wire_plan_images(&text, 2, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("masks image blocks"), "{err}");
+        let err = decode_wire_plan_images(&image, 2, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not mask image blocks"), "{err}");
+        // an out-of-range image id is rejected
+        let mut bad = encode_wire_plan(&rows, Some(&[Some(0)]));
+        bad.data[24..32].copy_from_slice(&(-5i64).to_le_bytes());
+        assert!(decode_wire_plan_images(&bad, 2, true).is_err());
+    }
+
+    /// Builds do not mix. An older upstream's untagged 3- or 4-row frame
+    /// (always `packed_seq` rows) is refused by name; an older relay meets a
+    /// 5-row frame its own decoder rejects (it accepts only 3 or 4 rows, the
+    /// check reproduced here), so neither side reads the other's rows.
+    #[test]
+    fn packed_plan_frames_of_another_build_are_refused() {
+        let old_frame = |n_rows: u32, s: u32| {
+            WireTensor::new(
+                WireDType::I64,
+                [1, n_rows, s],
+                vec![0u8; (n_rows * s * 8) as usize],
+            )
+        };
+        for (n_rows, want_images) in [(3, false), (4, true), (4, false), (3, true)] {
+            let err = decode_wire_plan_images(&old_frame(n_rows, 8), 4, want_images)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("older build") && err.contains("different builds"),
+                "{n_rows} rows: {err}"
+            );
+        }
+        let new = encode_wire_plan(&[Some((0usize, 3i64, 0usize))], None);
+        let old_decoder_accepts = |t: &WireTensor| matches!(t.shape[1], 3 | 4);
+        assert!(
+            !old_decoder_accepts(&new),
+            "an older relay must not read it"
+        );
+        let img = encode_wire_plan(&[Some((0usize, 3i64, 0usize))], Some(&[None]));
+        assert!(!old_decoder_accepts(&img));
+    }
+
+    /// A relay rebuilds the sender's plan from the wire, image ids included,
+    /// and its masks (full and sliding) come out byte-identical.
+    #[test]
+    fn relay_rebuilt_image_plan_masks_like_the_sender() {
+        let mut kv =
+            crate::packed::PackedKv::with_layers(2, 16, 6, vec![(8, 4), (2, 8)], ShimDType::F16, 0);
+        kv.advance(1, 3);
+        let images = [None, Some(0), Some(0), Some(0), None];
+        let sender = crate::packed::PackedPlan::chunk_with_images(6, 1, &images);
+        let rows: Vec<crate::packed_exec::WireRowOpt> = sender
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, pr)| pr.map(|pr| (pr.slot, 3 + r as i64, 0)))
+            .collect();
+        let ids: Vec<Option<u32>> = sender
+            .rows
+            .iter()
+            .map(|r| r.and_then(|p| p.image))
+            .collect();
+        let frame = encode_wire_plan(&rows, Some(&ids));
+        let (wrows, wimages) = decode_wire_plan_images(&frame, 2, true).unwrap();
+        let rebuilt = relay_plan(&wrows, &wimages);
+        assert_eq!(rebuilt.rows, sender.rows);
+        for window in [None, Some(2)] {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            kv.fill_mask_window(&sender, &mut a, ShimDType::F32, window);
+            kv.fill_mask_window(&rebuilt, &mut b, ShimDType::F32, window);
+            assert_eq!(a, b, "window {window:?}");
+        }
+    }
+
+    type SubmitChecked = EngineResult<(Vec<i64>, Option<()>)>;
+
+    /// Submit's packed checks, with a counting stand-in for the encoder:
+    /// `expand` turns each placeholder 9 into `n` soft tokens 9 from the size
+    /// alone, `encode` is what would run the vision encoder.
+    fn submit_check(
+        ids: &[i64],
+        has_media: bool,
+        soft: usize,
+        packed_seq: usize,
+        region: usize,
+    ) -> (SubmitChecked, usize) {
+        let expand_with = move |ids: &[i64]| -> Vec<i64> {
+            ids.iter()
+                .flat_map(|&t| if t == 9 { vec![9; soft] } else { vec![t] })
+                .collect()
+        };
+        let mut encodes = 0usize;
+        let r = packed_check_then_encode(
+            &mut encodes,
+            ids,
+            has_media,
+            Some(9),
+            true,
+            packed_seq,
+            region,
+            |_: &usize, ids: &[i64]| Ok(expand_with(ids)),
+            |n: &mut usize, ids: &[i64]| {
+                *n += 1;
+                Ok((expand_with(ids), ()))
+            },
+        );
+        (r, encodes)
+    }
+
+    /// A text-only prompt holding the image soft token (a /v1/completions
+    /// prompt of literal `<|image|>`) is refused at submit with a 400: on a
+    /// Gemma packed tree its run would be masked as an image, and one wider
+    /// than packed_seq used to abort every tenant's batch at step time.
+    #[test]
+    fn packed_submit_refuses_stray_image_tokens() {
+        let ids: Vec<i64> = std::iter::once(1)
+            .chain(std::iter::repeat_n(9, 600))
+            .collect();
+        let (r, encodes) = submit_check(&ids, false, 0, 288, 4096);
+        let e = r.unwrap_err();
+        assert!(matches!(e, EngineError::UnsupportedInput(_)), "{e}");
+        assert!(e.to_string().contains("no image"), "{e}");
+        assert_eq!(encodes, 0);
+        // a short run too: any image token without media
+        assert!(submit_check(&[1, 9, 2], false, 0, 288, 4096).0.is_err());
+        // plain text passes untouched
+        let (r, _) = submit_check(&[1, 2, 3], false, 0, 288, 4096);
+        assert_eq!(r.unwrap(), (vec![1, 2, 3], None));
+    }
+
+    /// Over-wide and over-region prompts are refused from image sizes alone,
+    /// before the encoder runs; an accepted one encodes exactly once.
+    #[test]
+    fn packed_submit_refuses_before_encoding() {
+        let (r, encodes) = submit_check(&[1, 9, 2], true, 300, 288, 4096);
+        assert!(matches!(r, Err(EngineError::UnsupportedInput(_))));
+        assert_eq!(encodes, 0, "an over-wide image is never encoded");
+        let (r, encodes) = submit_check(&[1, 9, 2, 9], true, 200, 288, 300);
+        assert!(matches!(r, Err(EngineError::PromptTooLong(_))));
+        assert_eq!(encodes, 0, "an over-region prompt is never encoded");
+        let (r, encodes) = submit_check(&[1, 9, 2], true, 280, 288, 4096);
+        let (ids, rows) = r.unwrap();
+        assert_eq!((ids.len(), rows, encodes), (282, Some(()), 1));
+    }
+
+    /// The size-based count must agree with the encoder's, or submit refuses
+    /// instead of serving a prompt that was checked at another length.
+    #[test]
+    fn packed_submit_refuses_a_size_count_mismatch() {
+        let mut n = 0usize;
+        let r = packed_check_then_encode(
+            &mut n,
+            &[1, 9],
+            true,
+            Some(9),
+            true,
+            288,
+            4096,
+            |_: &usize, _: &[i64]| Ok(vec![1, 9, 9]),
+            |_: &mut usize, _: &[i64]| Ok((vec![1, 9, 9, 9], ())),
+        );
+        assert!(matches!(r, Err(EngineError::Backend(_))));
+    }
+
+    /// A non-packed static tree refuses a prompt past its KV window
+    /// (past_len) with PromptTooLong at submit: an image prompt counted after
+    /// expansion, a text-only one as it stands. A prompt that fits and a
+    /// non-static tree are let through.
+    #[test]
+    fn static_submit_refuses_a_prompt_past_the_window() {
+        let expand = |soft: usize| {
+            move |ids: &[i64]| -> Result<Vec<i64>, String> {
+                Ok(ids
+                    .iter()
+                    .flat_map(|&t| if t == 9 { vec![9; soft] } else { vec![t] })
+                    .collect())
+            }
+        };
+        let ids = [1i64, 9, 2];
+        // 3 ids before expansion, 802 after: past a 767-row window only once
+        // the image's soft tokens are counted.
+        let r = prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), expand(800));
+        assert!(
+            matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("767")),
+            "{r:?}"
+        );
+        assert!(
+            prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), expand(256))
+                .is_ok()
+        );
+        // Exactly the window fits (the eviction warn fires only past it).
+        assert!(
+            prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), expand(765))
+                .is_ok()
+        );
+        assert!(
+            prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), expand(766))
+                .is_err()
+        );
+        // Text-only: refused past the window (it would slide its start out),
+        // let through up to it; `expand` is not consulted.
+        let long: Vec<i64> = (0..2000).collect();
+        let r = prompt_past_window(&long, false, Some(PromptWindow::StaticRing(767)), expand(1));
+        assert!(
+            matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("2000 tokens but")),
+            "{r:?}"
+        );
+        let fits: Vec<i64> = (0..767).collect();
+        let no_expand =
+            |_: &[i64]| -> Result<Vec<i64>, String> { panic!("text needs no expansion") };
+        assert!(
+            prompt_past_window(&fits, false, Some(PromptWindow::StaticRing(767)), no_expand)
+                .is_ok()
+        );
+        assert!(prompt_past_window(
+            &long[..768],
+            false,
+            Some(PromptWindow::StaticRing(767)),
+            expand(1)
+        )
+        .is_err());
+        // Not a static tree: no window to check against.
+        assert!(prompt_past_window(&ids, true, None, expand(800)).is_ok());
+        // An expansion error leaves the turn to the step path's refusal.
+        let fail = |_: &[i64]| -> Result<Vec<i64>, String> { Err("bad".into()) };
+        assert!(prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), fail).is_ok());
+    }
+
+    /// A stateful tree refuses a prompt at or past the model's context
+    /// (leaving the first generated token a position), counted after image
+    /// expansion; one token under it is let through.
+    #[test]
+    fn stateful_submit_refuses_a_prompt_at_the_model_context() {
+        let ctx = Some(PromptWindow::ModelContext(4096));
+        let text = |n: usize| -> Vec<i64> { (0..n as i64).collect() };
+        let no_expand =
+            |_: &[i64]| -> Result<Vec<i64>, String> { panic!("text needs no expansion") };
+        assert!(prompt_past_window(&text(4095), false, ctx, no_expand).is_ok());
+        let r = prompt_past_window(&text(4096), false, ctx, no_expand);
+        assert!(
+            matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("context is 4096")),
+            "{r:?}"
+        );
+        // An image prompt is counted as it will be prefilled.
+        let grow = |ids: &[i64]| -> Result<Vec<i64>, String> {
+            Ok(ids
+                .iter()
+                .flat_map(|&t| if t == 9 { vec![9; 4000] } else { vec![t] })
+                .collect())
+        };
+        // 4000 soft tokens + 96 others = 4096: at the context once expanded.
+        let mut image_prompt = vec![1i64, 9];
+        image_prompt.extend(100..195);
+        let r = prompt_past_window(&image_prompt, true, ctx, grow);
+        assert!(
+            matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("images expanded")),
+            "{r:?}"
+        );
+        assert!(prompt_past_window(&[1, 9, 2], true, ctx, grow).is_ok());
+        // No readable context (or a packed tree / relay): nothing to check.
+        assert!(prompt_past_window(&text(100_000), false, None, no_expand).is_ok());
+    }
+
+    /// LLaVA-NeXT on packed slots follows Pixtral's rules (causal: no image
+    /// blocks, so an image may span packed inferences): a prompt is sized from
+    /// its images' dimensions and refused with a 400 before any encode when it
+    /// outgrows the slot's region. One 448x448 image is 2928 soft tokens.
+    #[test]
+    fn packed_llava_next_prompt_is_sized_before_encoding() {
+        use crate::llava_next_vision::{expand_image_tokens, image_tokens, PreprocessConfig};
+        let n = image_tokens(448, 448, &PreprocessConfig::llava_v16()).unwrap();
+        assert_eq!(n, 2928);
+        let ids = [1i64, 32000, 13, 5];
+        let run = |region: usize| {
+            let mut encodes = 0usize;
+            let r = packed_check_then_encode(
+                &mut encodes,
+                &ids,
+                true,
+                Some(32000),
+                false,
+                32,
+                region,
+                |_: &usize, ids: &[i64]| expand_image_tokens(ids, 32000, &[n]),
+                |c: &mut usize, ids: &[i64]| {
+                    *c += 1;
+                    Ok((expand_image_tokens(ids, 32000, &[n])?, ()))
+                },
+            );
+            (r, encodes)
+        };
+        let (r, encodes) = run(991);
+        assert!(matches!(r, Err(EngineError::PromptTooLong(_))), "{r:?}");
+        assert_eq!(encodes, 0);
+        let (r, encodes) = run(4096);
+        assert_eq!(r.unwrap().0.len(), 3 + n);
+        assert_eq!(encodes, 1, "wider than packed_seq is fine on a causal tree");
+    }
+
+    #[test]
+    fn packed_refuses_an_image_wider_than_one_inference() {
+        let ids = [1i64, 9, 9, 9, 2, 9, 9];
+        assert!(packed_image_too_wide(&ids, 9, 3).is_none());
+        let msg = packed_image_too_wide(&ids, 9, 2).expect("3-token image, 2 rows");
+        assert!(
+            msg.contains("3 tokens") && msg.contains("--packed-seq 3"),
+            "{msg}"
+        );
+        assert!(packed_image_too_wide(&[1, 2, 3], 9, 1).is_none());
+    }
+
+    #[test]
+    fn packed_mask_ports_follow_the_ir_and_its_metadata() {
+        let full = || {
+            (
+                PACKED_FULL.to_string(),
+                "attn_mask_4d".to_string(),
+                ShimDType::F32,
+            )
+        };
+        let sliding = || {
+            (
+                PACKED_SLIDING.to_string(),
+                "attn_mask_sliding_4d".to_string(),
+                ShimDType::F32,
+            )
+        };
+        // every packed IR before Gemma 4: one full port, no metadata
+        let m = packed_mask_ports(vec![full()], None, None).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].port.as_str(), m[0].window), ("attn_mask_4d", None));
+        // Gemma 4: both, the sliding one with its window
+        let declared: std::collections::BTreeMap<String, String> = [
+            ("attn_mask_4d".to_string(), PACKED_FULL.to_string()),
+            (
+                "attn_mask_sliding_4d".to_string(),
+                PACKED_SLIDING.to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let m = packed_mask_ports(vec![sliding(), full()], Some(&declared), Some(1024)).unwrap();
+        let w: Vec<_> = m.iter().map(|m| (m.port.as_str(), m.window)).collect();
+        assert_eq!(
+            w,
+            vec![("attn_mask_sliding_4d", Some(1024)), ("attn_mask_4d", None)]
+        );
+        // a sliding port without a window, a missing port, no port at all
+        assert!(packed_mask_ports(vec![sliding(), full()], Some(&declared), None).is_err());
+        assert!(packed_mask_ports(vec![full()], Some(&declared), Some(1024)).is_err());
+        assert!(packed_mask_ports(vec![sliding(), full()], None, Some(1024)).is_err());
+        assert!(packed_mask_ports(Vec::new(), None, None).is_err());
+    }
+
+    #[test]
+    fn kv_geometry_is_described_per_shape() {
+        let g = [(8, 256), (8, 256), (2, 512), (8, 256)];
+        assert_eq!(describe_kv_geometry(&g), "8x256 x3, 2x512 x1");
     }
 
     #[test]
@@ -5868,7 +9737,7 @@ mod tests {
     /// Which token sits in each ring slot, recovered by matching the
     /// deterministic per-token byte pattern back.
     fn ring_tokens(ring: &StaticKv, n: usize) -> Vec<Option<usize>> {
-        let slot = ring.head_dim * ring.elem_bytes;
+        let slot = ring.layers[0].head_dim * ring.elem_bytes;
         (0..ring.past_len)
             .map(|i| {
                 (0..n).find(|&t| {
@@ -6251,6 +10120,144 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ---- packed-only trees (static_variant.py --packed-only) ----
+
+    fn sliding_masks() -> std::collections::BTreeMap<String, String> {
+        [
+            ("attn_mask_4d", "full_attention"),
+            ("attn_mask_sliding_4d", "sliding_attention"),
+        ]
+        .into_iter()
+        .map(|(p, k)| (p.to_string(), k.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn packed_only_error_cases() {
+        let masks = sliding_masks();
+        // Unmarked trees load either way, as before.
+        assert_eq!(packed_only_error(0, false, false, false, None), None);
+        assert_eq!(packed_only_error(0, false, false, true, None), None);
+        // A marked tree loads packed with a host-built sliding mask.
+        assert_eq!(packed_only_error(1, true, true, true, Some(&masks)), None);
+        let msg = packed_only_error(1, true, true, false, Some(&masks)).unwrap();
+        assert!(
+            msg.contains("stage_1") && msg.contains("--packed-slots"),
+            "{msg}"
+        );
+        assert!(msg.contains("without --packed-only"), "{msg}");
+        let full_only: std::collections::BTreeMap<String, String> =
+            [("attn_mask_4d".to_string(), "full_attention".to_string())].into();
+        for m in [None, Some(&full_only)] {
+            let msg = packed_only_error(0, true, true, true, m).unwrap();
+            assert!(msg.contains("sliding_attention"), "{msg}");
+        }
+        // Stage and tree markers must agree, whichever way they differ.
+        for (stage, tree) in [(true, false), (false, true)] {
+            let msg = packed_only_error(0, stage, tree, true, Some(&masks)).unwrap();
+            assert!(msg.contains("pipeline_config.json packed_only"), "{msg}");
+        }
+    }
+
+    /// A static stage dir (or two) with `packed_only` markers; stage 0 also
+    /// gets a packed variant (an empty IR file: the stub never compiles it).
+    fn write_packed_only_tree(tag: &str, tree: bool, stages: &[bool]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cascadia-packed-only-test-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pipeline_config.json"),
+            format!(
+                r#"{{"model_id":"m","num_stages":{},"num_layers":2,"hidden_size":8,
+                    "packed_only":{tree}}}"#,
+                stages.len()
+            ),
+        )
+        .unwrap();
+        for (r, marked) in stages.iter().enumerate() {
+            let stage = dir.join(format!("stage_{r}"));
+            std::fs::create_dir_all(&stage).unwrap();
+            std::fs::write(
+                stage.join("stage_config.json"),
+                format!(
+                    r#"{{"layer_start":{r},"layer_end":{},"has_embed":{},"has_head":{},
+                        "stateful":false,"static_seq":1,"static_context":8,
+                        "num_kv_heads":2,"head_dim":4,"packed_only":{marked},
+                        "packed_slots":2,"packed_seq":4,"packed_context":11,
+                        "packed_dynamic":true,
+                        "packed_masks":{{"attn_mask_4d":"full_attention",
+                                         "attn_mask_sliding_4d":"sliding_attention"}},
+                        "packed_sliding_window":4}}"#,
+                    r + 1,
+                    r == 0,
+                    r + 1 == stages.len()
+                ),
+            )
+            .unwrap();
+            std::fs::write(stage.join("openvino_packed_model.xml"), "").unwrap();
+        }
+        dir
+    }
+
+    async fn load_err(dir: &Path, total: u32, packed_slots: u32) -> String {
+        let mut b = OvRuntimeBuilder::new(dir, 0, total, "CPU");
+        b.packed_slots = packed_slots;
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("the stub cannot compile, so load fails somewhere");
+        err.to_string()
+    }
+
+    #[tokio::test]
+    async fn packed_only_tree_refused_in_static_mode() {
+        let dir = write_packed_only_tree("static", true, &[true]);
+        let msg = load_err(&dir, 1, 0).await;
+        assert!(
+            msg.contains("packed-only tree") && msg.contains("--packed-slots"),
+            "got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn packed_only_tree_passes_the_gate_in_packed_mode() {
+        let dir = write_packed_only_tree("packed", true, &[true]);
+        let msg = load_err(&dir, 1, 2).await;
+        assert!(
+            !msg.contains("packed_only") && !msg.contains("packed-only"),
+            "got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn packed_only_stage_and_tree_must_agree() {
+        // A stage built with --packed-only under an unmarked pipeline_config
+        // (one machine's tree rebuilt, the other's not).
+        let dir = write_packed_only_tree("stage-vs-tree", false, &[true]);
+        let msg = load_err(&dir, 1, 2).await;
+        assert!(
+            msg.contains("pipeline_config.json packed_only=false"),
+            "got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn packed_only_sibling_stages_must_agree() {
+        let dir = write_packed_only_tree("siblings", true, &[true, false]);
+        let msg = load_err(&dir, 2, 2).await;
+        assert!(
+            msg.contains("not homogeneous") && msg.contains("stage_1 packed_only=false"),
+            "got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // -------- per-hop sequence echo (token desync guard) --------
     //
     // `OvRuntimeEngine` can't be constructed without a compiled OpenVINO IR
@@ -6498,37 +10505,48 @@ mod tests {
         let f = cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR;
         // Below the ceiling: the configured value governs, x factor for prefill.
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(60), false),
+            token_recv_deadline(Duration::from_secs(60), false, None),
             Duration::from_secs(60)
         );
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(60), true),
+            token_recv_deadline(Duration::from_secs(60), true, None),
             Duration::from_secs(60) * f
         );
         // At the rig's config: decode sits exactly on the ceiling, and prefill
         // gets the same 1200s `recv_reply_prefill` used to give it.
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(120), false),
+            token_recv_deadline(Duration::from_secs(120), false, None),
             TOKEN_RECV_DEADLINE_CEILING
         );
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(120), true),
+            token_recv_deadline(Duration::from_secs(120), true, None),
             TOKEN_RECV_DEADLINE_CEILING * f
         );
         // Above it, the cap binds on both paths — this is the assertion a
         // `max()` typo fails.
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(600), false),
+            token_recv_deadline(Duration::from_secs(600), false, None),
             TOKEN_RECV_DEADLINE_CEILING
         );
         assert_eq!(
-            token_recv_deadline(Duration::from_secs(600), true),
+            token_recv_deadline(Duration::from_secs(600), true, None),
             TOKEN_RECV_DEADLINE_CEILING * f
         );
         // An absurd configured base clamps rather than panicking on overflow.
         assert_eq!(
-            token_recv_deadline(Duration::MAX, true),
+            token_recv_deadline(Duration::MAX, true, None),
             TOKEN_RECV_DEADLINE_CEILING * f
+        );
+        // A caller-set prefill budget replaces the widened default; decode
+        // keeps its own bound.
+        let caller = Some(Duration::from_secs(300));
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(120), true, caller),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(120), false, caller),
+            TOKEN_RECV_DEADLINE_CEILING
         );
     }
 
@@ -6740,11 +10758,13 @@ mod tests {
 
         let stamped = 7u32;
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![1, 2, 3, 4]);
-        send_hidden_frames(&downstream, stamped, None, hid.clone())
+        send_hidden_frames(&downstream, stamped, None, hid.clone(), None, None)
             .await
             .unwrap();
 
-        let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (lead, hid_t, _, _) = recv_hidden_frames(&upstream, false, false, false)
+            .await
+            .unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         let (inbound, pos) = decode_wire_lead(&lead, false).unwrap();
         assert!(pos.is_none());
@@ -6779,7 +10799,9 @@ mod tests {
         let ctrl = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_CAPTURE]);
         downstream.lock().await.send(&ctrl).await.unwrap();
 
-        let (frame, hidden) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (frame, hidden, _, _) = recv_hidden_frames(&upstream, false, false, false)
+            .await
+            .unwrap();
         assert_eq!(frame.dtype, WireDType::I8, "control frame comes back as-is");
         assert!(
             hidden.is_none(),
@@ -6788,10 +10810,12 @@ mod tests {
 
         // The very next activation must be unaffected.
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![4, 3, 2, 1]);
-        send_hidden_frames(&downstream, 9, None, hid.clone())
+        send_hidden_frames(&downstream, 9, None, hid.clone(), None, None)
             .await
             .unwrap();
-        let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (lead, hid_t, _, _) = recv_hidden_frames(&upstream, false, false, false)
+            .await
+            .unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         assert_eq!(decode_wire_lead(&lead, false).unwrap(), (9, None));
         assert_eq!(
@@ -6809,11 +10833,13 @@ mod tests {
         let upstream = Arc::new(tokio::sync::Mutex::new(server));
 
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![9, 8, 7, 6]);
-        send_hidden_frames(&downstream, 3, Some(11), hid.clone())
+        send_hidden_frames(&downstream, 3, Some(11), hid.clone(), None, None)
             .await
             .unwrap();
 
-        let (lead, hid_t) = recv_hidden_frames(&upstream, true).await.unwrap();
+        let (lead, hid_t, _, _) = recv_hidden_frames(&upstream, true, false, false)
+            .await
+            .unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         assert_eq!(
             decode_wire_lead(&lead, true).unwrap(),
@@ -6821,6 +10847,238 @@ mod tests {
             "lead carries seq then position"
         );
         assert_eq!(hid_t.data, hid.data, "hidden is the second frame");
+    }
+
+    #[tokio::test]
+    async fn vision_wire_is_lead_hidden_then_types() {
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        let hid = WireTensor::new(WireDType::F16, [1, 3, 1], vec![1, 2, 3, 4, 5, 6]);
+        let types = [0i64, 1, 1];
+        send_hidden_frames(
+            &downstream,
+            4,
+            None,
+            hid.clone(),
+            Some(encode_wire_types(&types)),
+            None,
+        )
+        .await
+        .unwrap();
+        let (lead, hid_t, types_t, _) = recv_hidden_frames(&upstream, false, true, false)
+            .await
+            .unwrap();
+        assert_eq!(decode_wire_lead(&lead, false).unwrap(), (4, None));
+        assert_eq!(hid_t.unwrap().data, hid.data, "hidden is the second frame");
+        let types_t = types_t.expect("a vision tree's hidden is followed by its types");
+        assert_eq!(decode_wire_types(&types_t, 3).unwrap(), types);
+    }
+
+    #[tokio::test]
+    async fn mrope_wire_is_lead_hidden_then_positions() {
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let hid = WireTensor::new(WireDType::F16, [1, 2, 1], vec![1, 2, 3, 4]);
+        let pos = [7i64, 8, 7, 9, 7, 10];
+        send_hidden_frames(
+            &downstream,
+            5,
+            None,
+            hid.clone(),
+            None,
+            Some(encode_wire_positions(3, &pos)),
+        )
+        .await
+        .unwrap();
+        let (lead, hid_t, types_t, pos_t) = recv_hidden_frames(&upstream, false, false, true)
+            .await
+            .unwrap();
+        assert_eq!(decode_wire_lead(&lead, false).unwrap(), (5, None));
+        assert_eq!(hid_t.unwrap().data, hid.data);
+        assert!(types_t.is_none());
+        let pos_t = pos_t.expect("an M-RoPE tree's hidden is followed by its positions");
+        assert_eq!(decode_wire_positions(&pos_t, 3, 2).unwrap(), pos);
+    }
+
+    /// A tree cut with the long-RoPE switch says where it switches; an
+    /// older cut's vision block has no such field and reads as `None`.
+    #[test]
+    fn vision_block_reads_the_long_rope_switch() {
+        let v: PipelineVision = serde_json::from_str(
+            r#"{"family":"phi3_v","text_embeddings":"t.xml",
+                "vision_embeddings":"openvino_vision_embeddings_model.xml",
+                "long_rope_switch":4096}"#,
+        )
+        .unwrap();
+        assert_eq!(v.long_rope_switch, Some(4096));
+        let v: PipelineVision = serde_json::from_str(
+            r#"{"family":"phi3_v","text_embeddings":"t.xml",
+                "vision_embeddings":"openvino_vision_embeddings_model.xml"}"#,
+        )
+        .unwrap();
+        assert_eq!(v.long_rope_switch, None);
+    }
+
+    #[test]
+    fn vision_block_family_is_checked() {
+        let v = |f: Option<&str>| PipelineVision {
+            family: f.map(String::from),
+            token_type_ids: None,
+            text_embeddings: "t.xml".into(),
+            vision_embeddings: "openvino_vision_embeddings_model.xml".into(),
+            mrope_rows: None,
+            image_token_id: None,
+            long_rope_switch: None,
+        };
+        assert_eq!(
+            vision_family(&v(Some("gemma4")), None).unwrap(),
+            VisionFamily::Gemma4
+        );
+        assert_eq!(
+            vision_family(&v(None), Some("gemma4_vision_surgery_v1")).unwrap(),
+            VisionFamily::Gemma4,
+            "trees from before the field still load"
+        );
+        assert_eq!(
+            vision_family(&v(Some("pixtral")), None).unwrap(),
+            VisionFamily::Pixtral
+        );
+        assert_eq!(
+            vision_family(&v(Some("mistral3")), None).unwrap(),
+            VisionFamily::Pixtral
+        );
+        assert_eq!(
+            vision_family(&v(Some("phi3_v")), None).unwrap(),
+            VisionFamily::Phi3V
+        );
+        assert_eq!(
+            vision_family(&v(Some("internvl_chat")), None).unwrap(),
+            VisionFamily::InternVL
+        );
+        let g3 = vision_family(&v(Some("gemma3")), None).unwrap();
+        assert_eq!(g3, VisionFamily::Gemma3);
+        assert!(
+            g3.token_types_by_default(),
+            "Gemma 3 opens images both ways"
+        );
+        assert!(VisionFamily::Gemma4.token_types_by_default());
+        assert!(!VisionFamily::Pixtral.token_types_by_default());
+        assert_eq!(
+            vision_family(&v(Some("llava_next")), None).unwrap(),
+            VisionFamily::LlavaNext
+        );
+        assert_eq!(
+            vision_family(&v(Some("qwen2_5_vl")), None).unwrap(),
+            VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen25Vl)
+        );
+        assert_eq!(
+            vision_family(&v(Some("qwen3_vl")), None).unwrap(),
+            VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen3Vl)
+        );
+        assert!(vision_family(&v(Some("qwen2_vl")), None).is_err());
+        assert!(vision_family(&v(None), Some("something_else_v1")).is_err());
+    }
+
+    /// A Qwen VL tree loads only stateful, with 3 position rows declared by
+    /// the pipeline and by the stage; other families must declare none.
+    #[test]
+    fn mrope_trees_are_checked_at_load() {
+        let q = VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen25Vl);
+        assert!(check_mrope_tree(q, Some(3), Some(3), true, false).is_ok());
+        let err = |r: EngineResult<()>| r.unwrap_err().to_string();
+        assert!(err(check_mrope_tree(q, None, Some(3), true, false)).contains("re-cut"));
+        assert!(err(check_mrope_tree(q, Some(3), None, true, false)).contains("re-cut"));
+        assert!(err(check_mrope_tree(q, Some(4), Some(4), true, false)).contains("re-cut"));
+        // Static (not stateful) and packed Qwen VL trees are now served, as
+        // long as the rows agree — the M-RoPE positions are wired on both.
+        assert!(check_mrope_tree(q, Some(3), Some(3), false, false).is_ok());
+        assert!(check_mrope_tree(q, Some(3), Some(3), false, true).is_ok());
+        assert!(check_mrope_tree(VisionFamily::Pixtral, None, None, false, true).is_ok());
+        assert!(check_mrope_tree(VisionFamily::Pixtral, Some(3), None, true, false).is_err());
+        assert!(check_mrope_tree(VisionFamily::Gemma4, None, Some(3), true, false).is_err());
+    }
+
+    #[test]
+    fn positions_frame_round_trips_and_is_strict() {
+        let pos = [0i64, 1, 5, 0, 2, 5, 0, 3, 5];
+        let t = encode_wire_positions(3, &pos);
+        assert_eq!(t.shape, [1, 3, 3]);
+        assert_eq!(decode_wire_positions(&t, 3, 3).unwrap(), pos);
+        // Wrong token count, wrong row count, wrong dtype: all refused.
+        assert!(decode_wire_positions(&t, 3, 2).is_err());
+        assert!(decode_wire_positions(&t, 1, 9).is_err());
+        let types = encode_wire_types(&[0, 1, 1]);
+        assert!(decode_wire_positions(&types, 3, 3).is_err());
+        let mut neg = encode_wire_positions(3, &pos);
+        neg.data[0..8].copy_from_slice(&(-1i64).to_le_bytes());
+        assert!(decode_wire_positions(&neg, 3, 3).is_err());
+        // A positions frame read where the next lead is expected (a peer
+        // that does not expect M-RoPE) is refused, not mis-bound.
+        assert!(decode_wire_lead(&t, false).is_err());
+        assert!(decode_wire_lead(&t, true).is_err());
+    }
+
+    #[test]
+    fn single_task_final_chunk_carries_usage_and_reason() {
+        let c = single_task_final_chunk("t".into(), 1, String::new(), 289, true);
+        assert!(c.is_final);
+        assert_eq!(c.prompt_tokens, Some(289));
+        assert_eq!(c.n_tokens, Some(1), "an empty EOS delta still counts");
+        assert_eq!(c.finish_reason, Some(cascadia_types::FinishReason::Stop));
+        let c = single_task_final_chunk("t".into(), 7, "x".into(), 3, false);
+        assert_eq!(c.finish_reason, Some(cascadia_types::FinishReason::Length));
+        assert_eq!(c.token_ids, vec![7]);
+        assert_eq!(c.token_id, 7, "token_id carries the final token too");
+    }
+
+    #[test]
+    fn types_frame_is_validated_against_the_hidden() {
+        let t = encode_wire_types(&[0, 1]);
+        assert!(
+            decode_wire_types(&t, 3).is_err(),
+            "length must match the hidden"
+        );
+        assert!(
+            decode_wire_types(&encode_wire_types(&[2]), 1).is_err(),
+            "video is not served"
+        );
+        // A next step's lead read where types were expected (an upstream rank
+        // without the vision block) fails the value check, not misread.
+        assert!(decode_wire_types(&encode_wire_lead(5, None), 1).is_err());
+        assert_eq!(decode_wire_types(&t, 2).unwrap(), vec![0, 1]);
+    }
+
+    /// A consumed group whose follow-on frames do not decode is an inner
+    /// (owed, NACKed) error, never a panic or a silent default; a good group
+    /// decodes every frame against the hidden's token count.
+    #[test]
+    fn hidden_group_decode_failures_are_reported_after_the_lead() {
+        let hidden = WireTensor::new(
+            WireDType::F32,
+            [1, 2, 1],
+            [1.0f32, 2.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
+        );
+        let rows = crate::qwen_vl_vision::MROPE_ROWS;
+        let pos = encode_wire_positions(rows, &vec![0; rows * 2]);
+        let g =
+            decode_hidden_group(&hidden, Some(&encode_wire_types(&[0, 1])), Some(&pos)).unwrap();
+        assert_eq!(g.hidden, vec![1.0, 2.0]);
+        assert_eq!(g.shape, [1, 2, 1]);
+        assert_eq!(g.types, Some(vec![0, 1]));
+        assert_eq!(g.positions.unwrap().len(), rows * 2);
+        let g = decode_hidden_group(&hidden, None, None).unwrap();
+        assert!(g.types.is_none() && g.positions.is_none());
+        // Types frame for the wrong token count.
+        assert!(decode_hidden_group(&hidden, Some(&encode_wire_types(&[0])), None).is_err());
+        // Positions frame for the wrong token count.
+        let short = encode_wire_positions(rows, &vec![0; rows]);
+        assert!(decode_hidden_group(&hidden, None, Some(&short)).is_err());
+        // A hidden in a dtype no stage sends.
+        let bad = WireTensor::new(WireDType::I64, [1, 1, 1], vec![0; 8]);
+        assert!(decode_hidden_group(&bad, None, None).is_err());
     }
 
     /// The seq is carried as an i64 lane on the lead wire and an i32 lane on
@@ -6846,5 +11104,255 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tok, 8);
+    }
+
+    /// A relay of a static `token_type_ids` tree sizes the widest image from
+    /// the tree root, as rank 0's front end would, and a prefill IR narrower
+    /// than it is refused on any stage.
+    #[test]
+    fn relays_size_the_widest_image_from_the_tree_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert!(
+            widest_image_tokens(d, VisionFamily::Gemma4).is_err(),
+            "no processor config: refused, not skipped"
+        );
+        assert_eq!(widest_image_tokens(d, VisionFamily::Pixtral).unwrap(), None);
+        std::fs::write(
+            d.join("processor_config.json"),
+            r#"{"image_processor":{"max_soft_tokens":280},"image_seq_length":256}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            widest_image_tokens(d, VisionFamily::Gemma4).unwrap(),
+            Some(280)
+        );
+        std::fs::write(d.join("preprocessor_config.json"), "{}").unwrap();
+        assert_eq!(
+            widest_image_tokens(d, VisionFamily::Gemma3).unwrap(),
+            Some(256)
+        );
+
+        assert!(static_image_window_fits(280, 280, 1).is_ok());
+        let err = static_image_window_fits(256, 280, 1).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::InvalidConfig(m) if m.contains("stage_1")),
+            "{err}"
+        );
+    }
+
+    /// One-box packed engine on a stub runtime: enough to run admission
+    /// without OpenVINO.
+    #[cfg(not(feature = "openvino"))]
+    fn packed_test_engine(tokenizer: Option<Tokenizer>) -> OvRuntimeEngine {
+        let kv = crate::packed::PackedKv::new(2, 32, 4, 1, 1, 2, ShimDType::F16, 0);
+        let masks = vec![crate::packed_exec::PackedMask::new(
+            "attn_mask_4d".into(),
+            ShimDType::F16,
+            None,
+        )];
+        let packed = crate::packed_exec::PackedState::new(
+            Box::new(OvRuntime::stub()),
+            kv,
+            Vec::new(),
+            "input_ids".into(),
+            String::new(),
+            0,
+            masks,
+            "position_ids".into(),
+        );
+        OvRuntimeEngine {
+            packed: Some(packed),
+            vision: None,
+            step_types: Vec::new(),
+            step_positions: Vec::new(),
+            static_ds_global: Vec::new(),
+            static_ds_total: 0,
+            static_ds_cursor: 0,
+            spec: ShardSpec {
+                model_id: "t".into(),
+                layer_start: 0,
+                layer_end: 1,
+                total_layers: 1,
+                device: "CPU".into(),
+                is_first_stage: true,
+                is_last_stage: true,
+                tp_size: 1,
+                tp_rank: 0,
+            },
+            runtime: OvRuntime::stub(),
+            rotary: Rotary::from_config_json(r#"{"head_dim":2}"#).unwrap(),
+            hidden_size: 2,
+            tokenizer: tokenizer.map(Arc::new),
+            max_ctx: None,
+            eos_token_ids: Vec::new(),
+            upstream: None,
+            downstream: None,
+            runtime_handle: tokio::runtime::Handle::current(),
+            position: 0,
+            input_names: Vec::new(),
+            canonical_inputs: std::collections::HashMap::new(),
+            pending: Vec::new(),
+            packed_images: std::collections::HashMap::new(),
+            active: None,
+            static_kv: None,
+            prefill: None,
+            park_prefill: false,
+            prefill_reload: None,
+            step_warn: StepWarnLimiter::default(),
+            wire_dead: WireDeadLatch::default(),
+            awaiting_token_seq: 0,
+            inbound_seq: None,
+            consecutive_token_timeouts: 0,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
+            kv_warm_pending: false,
+            #[cfg(feature = "kv_coord")]
+            plane_restore: false,
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: 0,
+        }
+    }
+
+    /// A turn's encoded images (`packed_images`) leave the map with the task
+    /// on every admission refusal, not only when the task is admitted.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn packed_admission_refusals_drop_the_encoded_images() {
+        let turn = || PackedTurn {
+            ids: vec![1, 2],
+            rows: vec![vec![0.0; 1 << 16]],
+            mrope: None,
+            deepstack: vec![vec![0.0; 1 << 16]],
+        };
+        let tok = Tokenizer::from_bytes(
+            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":null,"decoder":null,
+                "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+        )
+        .unwrap();
+
+        let mut e = packed_test_engine(Some(tok));
+        let mut resumed = GenerationTask::new("resumed", "hi");
+        resumed.resume_token_ids = Some(vec![0]);
+        let empty = GenerationTask::new("empty", "");
+        for t in [resumed, empty] {
+            e.packed_images.insert(t.task_id.clone(), turn());
+            e.pending.push(t);
+        }
+        let out = e.step_first_packed().unwrap();
+        assert_eq!(out.len(), 2, "both refused with their own error chunk");
+        assert!(out.iter().all(|(_, c)| c.error.is_some()));
+        assert!(e.packed_images.is_empty(), "a refusal leaked its images");
+
+        // No tokenizer: the engine-level error drops the task's images too.
+        let mut e = packed_test_engine(None);
+        let t = GenerationTask::new("no-tok", "hi");
+        e.packed_images.insert(t.task_id.clone(), turn());
+        e.pending.push(t);
+        assert!(e.step_first_packed().is_err());
+        assert!(e.packed_images.is_empty());
+    }
+
+    /// A resumed task is refused at admission, so submit must not encode (and
+    /// park) its images first.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn packed_submit_leaves_a_resumed_task_to_admission() {
+        let tok = Tokenizer::from_bytes(
+            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":null,"decoder":null,
+                "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+        )
+        .unwrap();
+        let mut e = packed_test_engine(Some(tok));
+        // Over the 4-token-per-slot region: only checked for a fresh task.
+        let mut resumed = GenerationTask::new(
+            "resumed",
+            "hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi",
+        );
+        resumed.resume_token_ids = Some(vec![0]);
+        assert!(e.submit(resumed).is_ok(), "left for admission to refuse");
+        assert!(e.packed_images.is_empty());
+        let fresh = GenerationTask::new(
+            "fresh",
+            "hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi",
+        );
+        assert!(matches!(
+            e.submit(fresh),
+            Err(EngineError::PromptTooLong(_))
+        ));
+    }
+
+    fn layered_pipeline(stages: &str) -> PipelineConfig {
+        serde_json::from_str(&format!(
+            r#"{{"model_id":"m","num_stages":2,"num_layers":28,"stages":{stages}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// A tree whose stage ranges leave a gap or overlap is refused at load,
+    /// from the pipeline's `stages` list or the sibling configs on disk; a
+    /// contiguous tree, or one that states no ranges, loads.
+    #[test]
+    fn stage_layer_ranges_must_tile_the_model() {
+        let whole = r#"[{"stage":0,"layer_start":0,"layer_end":14},
+                        {"stage":1,"layer_start":14,"layer_end":28}]"#;
+        let p = layered_pipeline(whole);
+        assert!(check_stage_layers(1, &p, (14, 28), &[(0, 0, 14)]).is_ok());
+        assert!(check_stage_layers(0, &p, (0, 14), &[]).is_ok());
+
+        // Own stage re-cut, pipeline list from the old cut.
+        let err = check_stage_layers(1, &p, (16, 28), &[]).unwrap_err();
+        assert!(err.to_string().contains("lists 14..28"), "{err}");
+
+        // Re-cut stage 1 rewrote the list; stage 0 on disk is the old cut.
+        let p = layered_pipeline(
+            r#"[{"stage":0,"layer_start":0,"layer_end":16},
+                {"stage":1,"layer_start":16,"layer_end":28}]"#,
+        );
+        let err = check_stage_layers(1, &p, (16, 28), &[(0, 0, 14)]).unwrap_err();
+        assert!(err.to_string().contains("a gap"), "{err}");
+        let err = check_stage_layers(1, &p, (16, 28), &[(0, 0, 18)]).unwrap_err();
+        assert!(err.to_string().contains("an overlap"), "{err}");
+
+        // A list that does not tile 0..num_layers.
+        let p = layered_pipeline(
+            r#"[{"stage":0,"layer_start":0,"layer_end":14},
+                {"stage":1,"layer_start":14,"layer_end":27}]"#,
+        );
+        assert!(check_stage_layers(0, &p, (0, 14), &[]).is_err());
+        let p = layered_pipeline(r#"[{"stage":0,"layer_start":2,"layer_end":14}]"#);
+        assert!(check_stage_layers(1, &p, (14, 28), &[]).is_err());
+
+        // No list (export_shards.py), no siblings, or no stated range.
+        let p = layered_pipeline("[]");
+        assert!(check_stage_layers(1, &p, (14, 28), &[]).is_ok());
+        assert!(check_stage_layers(1, &p, (14, 28), &[(0, 0, 0)]).is_ok());
+        assert!(check_stage_layers(1, &p, (0, 0), &[(0, 0, 3)]).is_ok());
+        assert!(
+            check_stage_layers(1, &p, (20, 20), &[]).is_err(),
+            "empty range"
+        );
+    }
+
+    /// A Qwen VL stage (`position_rows: 3`) in a pipeline without a `vision`
+    /// block is refused at load; a plain stage passes.
+    #[test]
+    fn mrope_stage_without_a_vision_block_is_refused() {
+        assert!(matches!(
+            check_positions_without_vision(1, Some(3)),
+            Err(EngineError::InvalidConfig(_))
+        ));
+        assert!(check_positions_without_vision(1, None).is_ok());
     }
 }

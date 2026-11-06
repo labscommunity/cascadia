@@ -56,6 +56,26 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Digest of a tree's shared config file (`pipeline_config.json`, `manifest.json`), folded into the
+/// cross-chain KV fingerprint. Two exports under one `model_id` that differ in config (a re-export
+/// with another rotary dim, a re-cut) then refuse each other's KV at NEGOTIATE and go cold, instead
+/// of restoring KV the other graph never wrote; `set_state`'s size check only catches a shape change.
+/// Hashed over the parsed JSON re-serialized (sorted keys, no whitespace), so line endings or
+/// indentation cannot split one export. Every rank of a tree reads the same file, which keeps the
+/// fingerprint rank-invariant. 0 when the file is missing or not JSON.
+pub(crate) fn config_digest(path: &std::path::Path) -> u64 {
+    std::fs::read(path).map_or(0, |b| json_digest(&b))
+}
+
+/// [`config_digest`] over JSON already in memory: a tree cut on Windows (CRLF) and one cut on
+/// Linux or macOS (LF) hash alike. 0 when `bytes` is not JSON.
+pub(crate) fn json_digest(bytes: &[u8]) -> u64 {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| serde_json::to_vec(&v).ok())
+        .map_or(0, |c| fnv1a64(&c))
+}
+
 /// Content-derived epoch over the negotiated prefix tokens. Sound for the serve-time `rank_honors`
 /// check (same content ⇒ same epoch ⇒ honor; foreign content ⇒ different epoch ⇒ reject).
 pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
@@ -64,6 +84,14 @@ pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
         buf.extend_from_slice(&t.to_le_bytes());
     }
     fnv1a64(&buf)
+}
+
+/// True when a capture key belongs to a media turn: image soft tokens are keyed by stand-ins
+/// for each image's hash (`vision_kv::cache_key`, `pad_cache_id`), which set bit 31 and so read
+/// as negative here, where every real token id is non-negative. The CAPTURE frame carries this
+/// key, so a worker rank can tell a media turn from the frame alone.
+pub(crate) fn is_media_key(tokens: &[i32]) -> bool {
+    tokens.iter().any(|&t| t < 0)
 }
 
 /// FNV-1a digest of raw bytes — identity only, for cross-rank / cross-mode comparison in the logs.
@@ -479,11 +507,11 @@ pub(crate) struct OvKvCache {
     /// its own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
     /// stashes here. Served by `export` for repeat/later per-rank GETs (clone, not remove). Bounded.
     ///
-    /// Keyed by epoch ALONE, with the tenant carried as a value: a v1 CAPTURE frame carries no
-    /// tenant, so partner-KEYING would file every legacy capture under `LOCAL_NS` and turn the
-    /// certified multi-stage cross-chain warm pull cold. `serve` instead confines a capture that
-    /// DOES carry a tenant (H.1b R2 `CAPTURE_V2`) to that tenant, and leaves an untagged one
-    /// readable by anyone — exactly today's behaviour for today's frames.
+    /// Keyed by epoch ALONE, with the tenant carried as a value (a v1 CAPTURE frame carries none,
+    /// and the head's RESTORE names only the epoch). `serve` confines every capture to exactly the
+    /// tenant it was stashed under: a `CAPTURE_V2` tenant to that tenant, an untagged (v1,
+    /// `LOCAL_NS`) one to `LOCAL_NS`. A current head sends v1 only for a tenant-less turn, so its
+    /// pullers assert `LOCAL_NS` too; an older head that sent v1 for tenant turns now pulls cold.
     captures: HashMap<u64, (String, Vec<i32>, Vec<u8>)>,
     /// Issue-34 multi-stage cross-chain warm-resume: `(epoch, rank) → that rank's pulled blob`. The head
     /// pulls every rank's KV but can't use a downstream rank's slice locally, so it stashes it here and
@@ -524,8 +552,39 @@ impl OvKvCache {
         self.entries.truncate(KV_MAX_ENTRIES);
     }
 
+    /// Holder mirror of [`Self::capture`]: the plane-served copy (`kv_share`). A media turn is
+    /// left out: the plane never pulls, takes or replicates media-turn KV, and
+    /// with `KV_MAX_ENTRIES` slots shared, a media capture here only evicts a text session's
+    /// servable entry. The engine-local copy still holds it for this box's own image warm resume.
+    pub(crate) fn capture_for_plane(&mut self, partner: &str, tokens: Vec<i32>, blob: Vec<u8>) {
+        if is_media_key(&tokens) {
+            tracing::debug!(target: "cascadia::kv", event = "kv_share_skip_media",
+                tokens = tokens.len());
+            return;
+        }
+        self.capture(partner, tokens, blob);
+    }
+
+    /// Holder mirror of [`Self::capture_under_epoch_ns`] (a worker rank's CAPTURE): a media turn
+    /// is left out, as in [`Self::capture_for_plane`]. The rank's own RESTORE reads the
+    /// engine-local copy, so same-chain image warm resume is unaffected.
+    pub(crate) fn capture_under_epoch_for_plane(
+        &mut self,
+        partner: &str,
+        epoch: u64,
+        tokens: Vec<i32>,
+        blob: Vec<u8>,
+    ) {
+        if is_media_key(&tokens) {
+            tracing::debug!(target: "cascadia::kv", event = "kv_share_skip_media",
+                epoch, tokens = tokens.len());
+            return;
+        }
+        self.capture_under_epoch_ns(partner, epoch, tokens, blob);
+    }
+
     /// §8 worker: stash this rank's blob under the head-broadcast `(epoch, tokens)`, untagged. The
-    /// v1 CAPTURE frame carries no tenant, so the entry stays readable by any `serve`.
+    /// v1 CAPTURE frame carries no tenant, so the entry lives in `LOCAL_NS`.
     pub(crate) fn capture_under_epoch(&mut self, epoch: u64, tokens: Vec<i32>, blob: Vec<u8>) {
         self.capture_under_epoch_ns(LOCAL_NS, epoch, tokens, blob);
     }
@@ -561,11 +620,18 @@ impl OvKvCache {
         if tokens.is_empty() || blob.is_empty() {
             return;
         }
+        // The plane never moves a media turn's KV, so a pulled blob keyed by image stand-ins is
+        // forged; filed here, a later local image turn would warm-resume from it.
+        if is_media_key(&tokens) {
+            tracing::info!(target: "cascadia::kv", event = "kv_insert_refused_media",
+                tokens = tokens.len());
+            return;
+        }
         // Tag the capture with the SAME tenant as the entry beside it. This used to call the
-        // untagged `capture_under_epoch` (LOCAL_NS) while `insert_entry` tagged its copy, which left
-        // a pulled cross-tenant blob readable by anyone: `serve` deliberately lets an UNTAGGED
-        // capture be read by any partner (the v1-frame compatibility rule), so a partner who can
-        // synthesize the content epoch could fetch KV pulled on another tenant's behalf. The
+        // untagged `capture_under_epoch` (LOCAL_NS) while `insert_entry` tagged its copy, which
+        // filed a tenant's pulled blob in the wrong namespace (and, while `serve` still let an
+        // untagged capture be read by any partner, left it readable by anyone who could
+        // synthesize the content epoch). The
         // rank's own restore is unaffected — `take_capture` is keyed by epoch and is not
         // namespace-filtered, because it serves the rank's OWN RESTORE, not a wire read.
         self.capture_under_epoch_ns(partner, synth_epoch(&tokens), tokens.clone(), blob.clone());
@@ -653,10 +719,11 @@ impl OvKvCache {
         let (tokens, blob) = if let Some(off) = self.take_offer(partner, epoch) {
             off
         } else if let Some((cap_ns, tokens, blob)) = self.captures.get(&epoch) {
-            // A capture that carries a tenant (CAPTURE_V2) is confined to it. An UNTAGGED capture
-            // (`LOCAL_NS`, i.e. every v1 frame — all of them today) stays readable by any partner,
-            // so the certified multi-stage cross-chain pull is unchanged.
-            if !cap_ns.is_empty() && cap_ns != partner {
+            // Exact namespace match, untagged (`LOCAL_NS`) included. Letting an untagged capture
+            // be read by any partner gained no warm resume (the head's `lookup` already refuses
+            // the mismatch, and the pull is all-or-nothing) but handed a worker slice, tokens
+            // included, to any GET that named its epoch.
+            if cap_ns != partner {
                 tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch", epoch);
                 return None;
             }
@@ -664,6 +731,12 @@ impl OvKvCache {
         } else {
             return None;
         };
+        // A media turn's entry (an engine-local capture: this box's image warm resume and RESTORE
+        // read it) is never handed out over the wire.
+        if is_media_key(&tokens) {
+            tracing::info!(target: "cascadia::kv", event = "kv_serve_refused_media", epoch);
+            return None;
+        }
         // Probe A (serve side): identity of exactly what this holder is about to hand out, plus which
         // store it came from. NOTE the check below is LENGTH-only — it never compares tokens — so a
         // capture stored under a colliding synthesized epoch with the same length but different tokens
@@ -685,6 +758,14 @@ impl OvKvCache {
     /// NEGOTIATE: longest cached full-sequence that is a prefix of `token_ids`; stash it as an offer
     /// under its content epoch for the paired GET. Returns `(epoch, prefix_len)`. Engine-agnostic.
     pub(crate) fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        // A NEGOTIATE carries tokenized text. Image stand-ins are computable from the tenant and
+        // the image hash, so a request carrying them could only be forged to reach a media turn's
+        // entry, which this box keeps for its own warm resume and never serves.
+        if is_media_key(token_ids) {
+            tracing::info!(target: "cascadia::kv", event = "kv_lookup_refused_media",
+                tokens = token_ids.len());
+            return None;
+        }
         let (prefix, blob) = {
             let Some(e) = self.longest_prefix(partner, token_ids) else {
                 self.log_prefix_miss(partner, token_ids);
@@ -804,6 +885,19 @@ impl OvKvCache {
         partner: &str,
         prompt: &[i32],
     ) -> Option<(Vec<u8>, usize, bool)> {
+        self.take_warm_where(partner, prompt, |_, _| true)
+    }
+
+    /// [`take_warm`](Self::take_warm) over the entries `usable(blob, len)`
+    /// accepts: the longest of those is removed and returned, and a rejected
+    /// entry stays cached. Image turns use it to skip a prefix whose KV ends
+    /// inside an image without losing a shorter one that does not.
+    pub(crate) fn take_warm_where(
+        &mut self,
+        partner: &str,
+        prompt: &[i32],
+        usable: impl Fn(&[u8], usize) -> bool,
+    ) -> Option<(Vec<u8>, usize, bool)> {
         let idx = self
             .entries
             .iter()
@@ -813,6 +907,7 @@ impl OvKvCache {
                     && !e.tokens.is_empty()
                     && e.tokens.len() < prompt.len()
                     && prompt.starts_with(&e.tokens)
+                    && usable(&e.blob, e.tokens.len())
             })
             .max_by_key(|(_, e)| e.tokens.len())
             .map(|(i, _)| i);
@@ -892,7 +987,8 @@ pub(crate) fn wire_to_blob(
 }
 
 impl OvRuntimeEngine {
-    /// MODEL-level fingerprint (`model_id` + `total_layers`), NOT per-stage. A cross-chain pull
+    /// MODEL-level fingerprint (`model_id` + `total_layers` + the tree's
+    /// [`config_digest`] of `pipeline_config.json`), NOT per-stage. A cross-chain pull
     /// asserts ONE fingerprint — the entry head's — for EVERY rank's GET, so all ranks of a model
     /// must share it; a per-stage layer span (`layer_start`/`layer_end`) would wrongly reject the
     /// worker ranks of a legitimate move (the tail's stage span differs from the head's). Per-rank
@@ -903,6 +999,7 @@ impl OvRuntimeEngine {
         let s = self.shard_spec();
         let mut buf = s.model_id.clone().into_bytes();
         buf.extend_from_slice(&s.total_layers.to_le_bytes());
+        buf.extend_from_slice(&self.kv_config_digest().to_le_bytes());
         fnv1a64(&buf)
     }
 }
@@ -1210,6 +1307,23 @@ mod tests {
     }
 
     #[test]
+    fn take_warm_where_skips_rejected_entries_and_keeps_them() {
+        let mut c = OvKvCache::default();
+        c.capture(LOCAL_NS, vec![1, 2], b"short".to_vec());
+        c.capture(LOCAL_NS, vec![1, 2, 3, 4], b"long".to_vec());
+        let (blob, len, _) = c
+            .take_warm_where(LOCAL_NS, &[1, 2, 3, 4, 5], |_, l| l < 4)
+            .unwrap();
+        assert_eq!((blob.as_slice(), len), (&b"short"[..], 2));
+        let (blob, len, _) = c.take_warm(LOCAL_NS, &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(
+            (blob.as_slice(), len),
+            (&b"long"[..], 4),
+            "the rejected entry stayed cached"
+        );
+    }
+
+    #[test]
     fn take_warm_removes_and_returns_len() {
         let mut c = OvKvCache::default();
         c.capture(LOCAL_NS, vec![1, 2, 3], vec![0xC, 0xD]);
@@ -1256,6 +1370,36 @@ mod tests {
         );
         // empty bundle (no stages)
         assert_eq!(unframe_blobs(&frame_blobs(&[])), Some(vec![]));
+    }
+    #[test]
+    fn config_digest_sees_values_not_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = |name: &str, text: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            config_digest(&p)
+        };
+        let a = digest("a.json", "{\"num_layers\": 32, \"rope_theta\": 500000.0}");
+        let b = digest(
+            "b.json",
+            "{\r\n  \"rope_theta\": 500000.0,\r\n  \"num_layers\": 32\r\n}\r\n",
+        );
+        assert_eq!(
+            a, b,
+            "key order, indentation and line endings are not config"
+        );
+        assert_ne!(
+            a,
+            digest("c.json", "{\"num_layers\": 32, \"rope_theta\": 10000.0}"),
+            "a changed value is another export"
+        );
+        assert_eq!(config_digest(&dir.path().join("missing.json")), 0);
+        assert_eq!(digest("d.json", "not json"), 0);
+        // The in-memory form (qwen35's manifest) agrees with the file form.
+        assert_eq!(
+            json_digest(b"{\r\n  \"rope_theta\": 500000.0,\r\n  \"num_layers\": 32\r\n}"),
+            a
+        );
     }
     #[test]
     fn kv_seq_from_blob_reads_depth() {
@@ -1420,11 +1564,21 @@ mod tests {
         let mut c = OvKvCache::default();
         c.capture_under_epoch_ns("tenant-a", 0xE1, vec![11, 22, 33], vec![0xAA]);
         assert_eq!(c.serve("tenant-b", 0xE1, 3), None);
+        assert_eq!(
+            c.serve(LOCAL_NS, 0xE1, 3),
+            None,
+            "a tenant's slice served to \"\""
+        );
         assert!(c.serve("tenant-a", 0xE1, 3).is_some());
-        // An UNTAGGED capture — every v1 frame, i.e. everything on the wire today — is unchanged:
-        // readable by any partner, so the certified cross-chain pull stays warm.
+        // An UNTAGGED capture (a v1 frame: a tenant-less turn) is confined to `LOCAL_NS` the same
+        // way, and is still repeat-served to it (rank>0 answers every per-rank GET).
         c.capture_under_epoch(0xE2, vec![44, 55, 66], vec![0xBB]);
-        assert!(c.serve("tenant-b", 0xE2, 3).is_some());
+        assert_eq!(
+            c.serve("tenant-b", 0xE2, 3),
+            None,
+            "an untagged slice served to a tenant"
+        );
+        assert!(c.serve(LOCAL_NS, 0xE2, 3).is_some());
         assert!(c.serve(LOCAL_NS, 0xE2, 3).is_some());
     }
 
@@ -2032,6 +2186,137 @@ mod tests {
         // and probes `export`/`serve` directly, never touching `lookup`.
         assert_eq!(c.serve("tenant-b", epoch, len), None);
         assert!(c.serve("tenant-a", epoch, len).is_some());
+    }
+
+    /// A media turn's capture key (image soft tokens as hash stand-ins) reads as media, a text
+    /// key does not, and the real `vision_kv` key is what both ranks see.
+    #[test]
+    fn media_keys_are_told_apart_from_text() {
+        let ids: Vec<i64> = vec![1, 2, 9, 9, 9, 3];
+        let key = crate::vision_kv::cache_key(&ids, 9, &[[7u8; 32]], &[3], "tenant-a");
+        assert!(is_media_key(&key), "{key:?}");
+        assert!(!is_media_key(&[1, 2, 9, 9, 9, 3]));
+        assert!(!is_media_key(&[]));
+    }
+
+    /// A media turn leaves the plane-served mirror untouched, on the head (token-keyed) and on a
+    /// worker (epoch-keyed); a text turn still lands in both. The engine-local cache, which the
+    /// image warm resume reads, is a separate `OvKvCache` the guard never sees.
+    /// The engine-local cache keeps media turns for this box (warm resume, RESTORE), but the
+    /// wire-facing calls never reach them, even with forged image stand-ins.
+    #[test]
+    fn media_entries_are_local_only() {
+        let ids: Vec<i64> = vec![1, 2, 9, 9, 3];
+        let media = crate::vision_kv::cache_key(&ids, 9, &[[5u8; 32]], &[2], "tenant-a");
+        let len = media.len() as u32;
+        let epoch = synth_epoch(&media);
+        let mut c = OvKvCache::default();
+        c.capture("tenant-a", media.clone(), vec![0xAA; 8]);
+        c.capture_under_epoch_ns("tenant-a", epoch, media.clone(), vec![0xBB]);
+
+        let mut forged = media.clone();
+        forged.push(4);
+        assert_eq!(
+            c.lookup("tenant-a", &forged),
+            None,
+            "forged NEGOTIATE reached a media turn"
+        );
+        assert_eq!(
+            c.serve("tenant-a", epoch, len),
+            None,
+            "media capture served"
+        );
+        let mut planted = OvKvCache::default();
+        planted.insert_both("tenant-a", media.clone(), vec![0xCC]);
+        assert!(
+            planted.entries.is_empty() && planted.captures.is_empty(),
+            "forged insert filed"
+        );
+
+        // This box's own uses are untouched.
+        assert!(
+            c.take_warm("tenant-a", &forged).is_some(),
+            "local image warm resume"
+        );
+        assert!(c.take_capture(epoch).is_some(), "rank's own RESTORE");
+    }
+
+    #[test]
+    fn media_turns_stay_out_of_the_plane_cache() {
+        let ids: Vec<i64> = vec![1, 2, 9, 9, 3];
+        let media = crate::vision_kv::cache_key(&ids, 9, &[[5u8; 32]], &[2], "tenant-a");
+        let text = vec![1, 2, 4, 4, 3];
+        let mut c = OvKvCache::default();
+        c.capture_for_plane("tenant-a", media.clone(), vec![0xAA; 8]);
+        c.capture_under_epoch_for_plane("tenant-a", synth_epoch(&media), media.clone(), vec![0xBB]);
+        assert!(
+            c.entries.is_empty() && c.captures.is_empty(),
+            "a media turn took a slot"
+        );
+        assert_eq!(c.lookup("tenant-a", &media), None);
+        assert_eq!(
+            c.serve("tenant-a", synth_epoch(&media), media.len() as u32),
+            None
+        );
+
+        c.capture_for_plane("tenant-a", text.clone(), vec![0xCC; 8]);
+        assert!(
+            c.lookup("tenant-a", &text).is_some(),
+            "a text turn must still capture"
+        );
+        let epoch = synth_epoch(&text);
+        c.capture_under_epoch_for_plane("tenant-a", epoch, text.clone(), vec![0xDD]);
+        assert!(c.serve("tenant-a", epoch, text.len() as u32).is_some());
+
+        // A full cache of text sessions is not disturbed by media turns.
+        let mut c = OvKvCache::default();
+        for i in 0..KV_MAX_ENTRIES as i32 {
+            c.capture_for_plane(LOCAL_NS, vec![100 + i, 1], vec![1]);
+        }
+        for _ in 0..KV_MAX_ENTRIES {
+            c.capture_for_plane(LOCAL_NS, media.clone(), vec![2]);
+        }
+        assert!((0..KV_MAX_ENTRIES as i32).all(|i| c.lookup(LOCAL_NS, &[100 + i, 1, 7]).is_some()));
+    }
+
+    /// The untenanted namespace (`LOCAL_NS`, "") on the head's token-keyed path (lookup, serve of
+    /// an offer, take_warm): confined in both directions, and still reachable by its own turns.
+    /// The worker-rank captures follow the same rule, see
+    /// `worker_capture_tagged_with_a_tenant_is_confined_to_it`.
+    #[test]
+    fn local_ns_is_confined_in_both_directions() {
+        let mut c = OvKvCache::default();
+        c.capture(LOCAL_NS, vec![11, 22, 33], vec![9u8; 16]);
+        c.capture("tenant-a", vec![44, 55, 66], vec![8u8; 16]);
+        assert_eq!(
+            c.lookup("tenant-a", &[11, 22, 33]),
+            None,
+            "\"\" leaked to a tenant"
+        );
+        assert_eq!(
+            c.lookup(LOCAL_NS, &[44, 55, 66]),
+            None,
+            "a tenant leaked to \"\""
+        );
+        let (epoch, len) = c
+            .lookup(LOCAL_NS, &[11, 22, 33])
+            .expect("\"\" reaches its own");
+        assert_eq!(len, 3);
+        assert_eq!(
+            c.serve("tenant-a", epoch, len),
+            None,
+            "\"\" offer served to a tenant"
+        );
+        assert!(c.serve(LOCAL_NS, epoch, len).is_some());
+        let (epoch, len) = c.lookup("tenant-a", &[44, 55, 66]).unwrap();
+        assert_eq!(
+            c.serve(LOCAL_NS, epoch, len),
+            None,
+            "a tenant offer served to \"\""
+        );
+        assert!(c.take_warm("tenant-a", &[11, 22, 33, 1]).is_none());
+        assert!(c.take_warm(LOCAL_NS, &[44, 55, 66, 1]).is_none());
+        assert!(c.take_warm(LOCAL_NS, &[11, 22, 33, 1]).is_some());
     }
 
     /// H.1b (ii): the partner-bearing CAPTURE body round-trips, and — the property that forces it to

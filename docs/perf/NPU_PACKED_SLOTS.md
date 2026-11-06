@@ -76,6 +76,81 @@ It emits `openvino_packed_model.xml` beside the decode IR and records
 `packed_slots` / `packed_seq` / `packed_context` / `packed_region` in
 `stage_config.json`.
 
+**Decode width.** A `packed_seq`-wide IR leaves room for prefill chunks, but a
+decode step has only one live row per slot. Each stage runs a plan at the
+narrowest width it has compiled, so give it a narrow one:
+
+```bash
+# static shapes (NPU, also CPU): a second, narrow IR for decode steps (D >= slots)
+python tools/packed_variant.py <stage_dir> --slots 4 --packed-seq 64 --decode-seq 4
+# CPU, from a --shared-prefill static tree: one IR with a dynamic query width
+python tools/packed_variant.py <stage_dir> --slots 4 --packed-seq 64 --dynamic-seq
+```
+
+`--decode-seq D` writes `openvino_packed_decode_model.xml` (`packed_decode_seq`),
+a second compile with its own resident weights (the load log names its size);
+`--dynamic-seq` (`packed_dynamic`) runs each decode step at its live rows and is
+refused on the NPU. `--decode-seq` is the NPU's way to a narrow decode (measured
+below on the NPU, CPU and iGPU). Prefill chunks stay `packed_seq` rows
+wide either way, and a decode step ships only its live rows to the next stage.
+Without either, every decode step runs at `packed_seq` rows as before.
+
+Measured on Lunar Lake, Qwen3-VL-4B one-stage tree (`--context 2048 --prefill-seq 64
+--shared-prefill`, `--slots 4 --packed-seq 64`), 128 greedy tokens, 1 and 3 requests:
+
+| CPU | s/step (1 req) | tok/s (3 req, total) | greedy text vs 64 rows |
+|---|---|---|---|
+| 64 rows, build before narrow decode | 1.95 | 1.48 | — |
+| 64 rows (no flag), this build | 1.92 | 1.53 | identical, all 3 requests |
+| `--decode-seq 4` | 0.75 | 3.69 | identical, all 3 requests |
+| `--dynamic-seq` | 0.94 | 3.02 | 2 of 3 identical; one diverges at token ~80 |
+
+The `--dynamic-seq` divergence is the dynamic-shape compile, not the narrow width:
+the same dynamic IR run at the full 64 rows every step (the build before narrow
+decode, which ignores `packed_dynamic`) gives the same diverging text.
+
+`--decode-seq` is the faster of the two on the CPU too (a static shape beats the
+dynamic one), at the cost of a second resident weight copy. Most of what remains
+is the per-step copy of the whole past KV window in and out (the static path,
+one row a step, takes 0.84 s on the same tree).
+
+On the Arc 140V iGPU (OpenVINO 2026.4.1, same tree, 4 slots, greedy, 128 tokens):
+
+| decode width | s/step | 3 requests, tok/s total | text vs GPU static (0.26 s/step) |
+|---|---|---|---|
+| 64 rows (no flag) | 0.40 | 7.14 | coherent; diverges after ~36 chars |
+| `--decode-seq 4` | 0.33 | 8.90 | coherent; diverges after ~36 chars |
+| `--dynamic-seq` | 0.28 | 10.29 | identical, all 3 requests |
+
+The fixed-width IRs drift from the static path in f16 (one prefill step's
+logits differ by up to 2.4 against 0.03 for the dynamic IR at the same 64
+rows), so their greedy text differs while still reading correctly. The packed
+mask's blocked value is -65504 in both mask dtypes: the GPU plugin runs the IR
+in f16 and converts an f32 mask input to f16, so the earlier f32 value (-3e38)
+became -inf there, and the f16 SDPA turned the -inf entries into garbage tokens
+at every width (non-finite logits with `--dynamic-seq`).
+
+On the Lunar Lake NPU (Intel AI Boost, OpenVINO 2026.4.1), Qwen3-VL-4B one-stage
+tree built for it (`static_variant.py --context 2048`, no prefill IR: packed mode
+does its own chunks), `--slots 4 --packed-seq 64 --decode-seq 4`, `--device NPU
+--ov-cache-dir`, 128 greedy tokens:
+
+| decode width | s/step (1 req) | 3 requests, tok/s total | text |
+|---|---|---|---|
+| 64 rows (no flag) | 0.46 | 6.38 | coherent |
+| `--decode-seq 4` | 0.33 | 9.21 | coherent; vs 64 rows, 1 of 3 identical, the others diverge at char 182 and 533 |
+
+The NPU compiles the narrow IR (the first start compiled the decode, wide and
+narrow IRs in about 9.5, 4.5 and 4 minutes; a restart from the cache dir serves in
+under a minute), and the load log names the second copy: `packed narrow decode IR
+active: a second compiled copy of the stage weights (about 2277 MB on disk) is
+resident beside the wide IR`. Greedy text is batch-composition invariant (request 0
+alone and with two others: identical) but not equal to the CPU packed text above:
+the NPU computes in f16, so the stories part after 71-460 characters while all
+reading correctly. The SDK image suite (223 prompt tokens) and video suite (450
+prompt tokens for the 4 s clip, "The first shape is a red circle, and the last
+shape is a blue square.") pass on the same server.
+
 The host side lives in `crates/cascadia-engine-openvino/src/packed.rs`. The KV
 window is partitioned into `region = past_len / slots` per slot; slot `s` owns
 `[s*region, (s+1)*region)` in every layer and head. A `PackedPlan` maps each
@@ -180,9 +255,11 @@ saving a full NPU compile and a second resident weight copy.
 > poisoning reply recvs, an on-wire NACK from a failed relay step,
 > whole-batch abort with per-task attribution).
 
-Packing works across a pipeline. Stage 0 ships an I64 `[1, 3, S]` **plan frame**
-(per row: slot id with `-1` for idle, absolute position, and shared-prefix reuse
-length) ahead of the `[1, S, hidden]` block; relay and head stages decode it,
+Packing works across a pipeline. Stage 0 ships an I64 `[1, 5, S]` **plan frame**
+(per row: slot id with `-1` for idle, absolute position, shared-prefix reuse
+length, image id, and a tag giving the frame layout's version) ahead of the
+`[1, S, hidden]` block, `S` being the plan's own width (the live rows of a decode
+step); relay and head stages decode it,
 re-derive same-slot causal order, run their own packed inference over their own
 per-slot rings, and the tail replies with one token per row. The reuse length
 must travel because only the driver stage holds the prompt ids to match against
@@ -191,12 +268,30 @@ whose absolute position equals its reuse length starts its slot's sequence
 (position 0 when nothing is reused) — the same in-band new-sequence signal the
 single-task static path already uses, so no separate admission message is
 needed. Every stage must be started with the same `--packed-slots`, since the
-slot count is baked into each stage's IR shape.
+slot count is baked into each stage's IR shape. Every stage must also run the
+same build: a stage of this build names an untagged 3- or 4-row frame as an
+older upstream (`packed plan frame has 3 rows and no version tag: the upstream
+stage runs an older build ...`), and an older relay refuses the 5-row frame
+(`expected an I64 [1,3,S] packed plan frame, got ... shape=[1, 5, 64]`); either
+way the relay NACKs the batch and the request fails with an error instead of a
+wrong answer. Checked live both ways between two Lunar Lake PCs.
 
 Validated on TinyLlama 2-stage static (CPU, both ranks on one box over
 loopback): `"The capital of France is Paris."`, usage `35 + 15`; and 4
 concurrent requests across the pipeline with first tokens at 2.09-2.26 s, slot 2
 retiring at 5.9 s while the rest ran to 7.5 s.
+
+Across two machines (CPU, Qwen3-VL-4B two-stage tree cut with `cut_vlm_lm.py
+--num-stages 2`, `static_variant.py --context 2048 --prefill-seq 64
+--shared-prefill`, `packed_variant.py --slots 4 --packed-seq 64 --decode-seq 4` on
+each stage; rank 0 and rank 1 on two Lunar Lake PCs), 128 greedy tokens: 0.62 s a
+step for one request, 4.53 tok/s total for three (one box, one stage: 0.79 s and
+3.65 tok/s); the SDK image suite (223 prompt tokens) and the concurrent image test
+(two images and a text request at once) pass. The text is token-identical to the
+same two-stage tree with both ranks on one PC over loopback (all 3 requests), so
+the wire adds nothing, but not to the one-stage tree: the hidden state crosses the
+stage boundary in f16 (the wire contract), which the one-stage graph never rounds,
+and the stories part after 76-458 characters.
 
 ### Prefix caching (`--packed-prefix N`)
 

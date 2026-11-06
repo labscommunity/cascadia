@@ -198,6 +198,18 @@ const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
 const FRAME_CAPTURE_V2: u32 = 12;
 /// Handshake schema version (spec §3.4).
 const PROTO_VERSION: u32 = 1;
+/// FORWARD carrying an explicit `[4, n]` i64 M-RoPE position block ahead of
+/// the hidden tensor: sent only for turns with images, whose positions are
+/// not the token index. Text turns keep `FRAME_FORWARD`, so the wire is
+/// unchanged for them.
+const FRAME_FORWARD_MROPE: u32 = 13;
+/// HELLO_ACK capability bit for `FRAME_FORWARD_MROPE`. The ACK's `pos` field
+/// already carries the CAPTURE v2 floor (0 or 1) in bit 0; a peer that
+/// predates this bit sends it clear, so the head reads "unsupported".
+const MROPE_CAP: u32 = 2;
+/// Upper bound on a position block's entries (4 rows x the longest span a
+/// frame may carry), so a corrupt length cannot drive a huge allocation.
+const MAX_MROPE_ENTRIES: usize = 4 << 20;
 /// H.1b (R2) HELLO capability level for `FRAME_CAPTURE_V2`. Advertised in the payload (downstream
 /// ranks NAK a peer that names a different level) and echoed in `HELLO_ACK`'s `pos` field so the
 /// head learns the chain-wide FLOOR — an old build sends `pos = 0` there, which reads as "no v2"
@@ -372,6 +384,98 @@ pub struct Qwen36Builder {
     im_start_id: Option<u32>,
     /// `max_position_embeddings` from the tree's config.json (`None` = unknown, no guard).
     max_ctx: Option<usize>,
+    /// Rank 0's image path, when the tree carries the vision IRs.
+    vision: Option<VisionRuntime>,
+    /// Device for the vision IRs; `None` = the stage device.
+    vision_device: Option<String>,
+}
+
+/// Rank 0's image path: the vision IRs, the processor settings and the
+/// prompt's image token ids (`crate::qwen35_vision`).
+struct VisionRuntime {
+    encoder: crate::qwen35_vision::encoder::VisionEncoder,
+    /// Encoded images by content hash (metadata: `grid_thw`), so a chat's
+    /// earlier images are not re-encoded every turn.
+    cache: crate::image_cache::EncodeCache<[u32; 3]>,
+    preprocess: crate::qwen35_vision::PreprocessConfig,
+    /// The video processor's settings (`Qwen3VLVideoProcessor`: its own pixel
+    /// budget over all frames).
+    video: crate::qwen35_vision::PreprocessConfig,
+    image_pad: u32,
+    video_pad: u32,
+    merge: u32,
+}
+
+impl VisionRuntime {
+    /// Load from a tree that carries `openvino_vision_embeddings_model.xml`
+    /// (and its `_pos`/`_merger` siblings); `Ok(None)` when it does not.
+    fn load(
+        dir: &Path,
+        device: &str,
+        plugin: &PluginConfig,
+        hidden: usize,
+    ) -> Result<Option<Self>, String> {
+        if !dir.join("openvino_vision_embeddings_model.xml").exists() {
+            return Ok(None);
+        }
+        let cfg_path = dir.join("config.json");
+        let vc = crate::qwen35_vision::encoder::VisionConfig::from_config_json(&cfg_path)?;
+        if vc.out_hidden_size != hidden {
+            return Err(format!(
+                "vision out_hidden_size {} does not match the manifest's hidden_size {hidden}",
+                vc.out_hidden_size
+            ));
+        }
+        let pp_path = dir.join("preprocessor_config.json");
+        let preprocess = if pp_path.exists() {
+            crate::qwen35_vision::PreprocessConfig::from_json_file(&pp_path)?
+        } else {
+            warn!(
+                "qwen35: no preprocessor_config.json beside the vision IRs; using Qwen3.5 defaults"
+            );
+            crate::qwen35_vision::PreprocessConfig::qwen35()
+        };
+        let video = match crate::qwen35_vision::PreprocessConfig::video_from_dir(dir) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "qwen35: no video processor config; videos take the image settings");
+                preprocess.clone()
+            }
+        };
+        if (
+            video.patch_size,
+            video.merge_size,
+            video.temporal_patch_size,
+        ) != (
+            preprocess.patch_size,
+            preprocess.merge_size,
+            preprocess.temporal_patch_size,
+        ) {
+            return Err(
+                "the video processor's patch layout differs from the image processor's".into(),
+            );
+        }
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cfg_path)
+                .map_err(|e| format!("{}: {e}", cfg_path.display()))?,
+        )
+        .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+        let id = |k: &str| {
+            cfg[k]
+                .as_u64()
+                .map(|v| v as u32)
+                .ok_or_else(|| format!("config.json has no {k}"))
+        };
+        Ok(Some(Self {
+            encoder: crate::qwen35_vision::encoder::VisionEncoder::load(dir, device, plugin, vc)?,
+            cache: crate::image_cache::EncodeCache::from_env(),
+            preprocess,
+            video,
+            image_pad: id("image_token_id")?,
+            video_pad: id("video_token_id")?,
+            merge: vc.spatial_merge_size as u32,
+        }))
+    }
 }
 
 impl Qwen36Builder {
@@ -438,7 +542,17 @@ impl Qwen36Builder {
             prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
             im_start_id: None,
             max_ctx: None,
+            vision: None,
+            vision_device: None,
         }
+    }
+
+    /// Run rank 0's vision IRs on `device` (e.g. the iGPU) instead of the
+    /// stage device. They then compile with only the cache dir: the stages'
+    /// plugin properties are tuned for their own device and may not apply.
+    pub fn with_vision_device(mut self, device: impl Into<String>) -> Self {
+        self.vision_device = Some(device.into());
+        self
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
@@ -575,7 +689,7 @@ impl Builder for Qwen36Builder {
                      to snapshot at and stays empty (every turn cold)"
                 );
             }
-            self.max_ctx = read_max_ctx(&dir);
+            self.max_ctx = crate::read_max_ctx(&dir, "qwen35");
             self.eos = read_eos(&dir);
         }
 
@@ -593,6 +707,32 @@ impl Builder for Qwen36Builder {
                 Runtime::compile(xml.to_str().unwrap_or_default(), &self.device, &plugin)
                     .map_err(map_ov)?,
             );
+        }
+
+        // Images enter at the decode driver only: the encoder's rows replace
+        // pad-token embeddings before stage 0.
+        if self.rank == 0 {
+            let device = self
+                .vision_device
+                .clone()
+                .unwrap_or_else(|| self.device.clone());
+            let vision_plugin = if device == self.device {
+                plugin.clone()
+            } else {
+                match &self.cache_dir {
+                    Some(d) => PluginConfig::new().with("CACHE_DIR", d),
+                    None => PluginConfig::new(),
+                }
+            };
+            self.vision = VisionRuntime::load(&dir, &device, &vision_plugin, manifest.hidden())
+                .map_err(|e| {
+                    EngineError::InvalidConfig(format!("qwen35 vision IRs on {device}: {e}"))
+                })?;
+            if self.vision.is_some() {
+                progress.push(LoadProgress::message(format!(
+                    "compiled vision IRs on {device}: image input enabled"
+                )));
+            }
         }
 
         self.manifest_json = Some(manifest_raw);
@@ -666,6 +806,10 @@ impl Builder for Qwen36Builder {
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
+            vision: self.vision,
+            chain_mrope: false,
+            #[cfg(test)]
+            last_positions: None,
         }))
     }
 }
@@ -680,41 +824,6 @@ fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
     }
 }
 
-/// `max_position_embeddings` from the tree's config.json (`text_config` when nested). `None` when
-/// the tree does not state it — the prompt-window guard in `submit` is then off, so say which of
-/// the three ways that happened rather than letting an unreadable config disable it silently.
-fn read_max_ctx(dir: &Path) -> Option<usize> {
-    let raw = match std::fs::read_to_string(dir.join("config.json")) {
-        Ok(raw) => raw,
-        Err(e) => {
-            warn!(error = %e, "qwen35: no readable config.json; the prompt-window guard is OFF");
-            return None;
-        }
-    };
-    let v: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "qwen35: config.json is not valid JSON; the prompt-window guard is OFF");
-            return None;
-        }
-    };
-    let cfg = if v.get("text_config").is_some() {
-        &v["text_config"]
-    } else {
-        &v
-    };
-    let max = cfg["max_position_embeddings"]
-        .as_u64()
-        .filter(|&m| m > 0)
-        .map(|m| m as usize);
-    if max.is_none() {
-        warn!(
-            "qwen35: config.json states no max_position_embeddings; the prompt-window guard is OFF"
-        );
-    }
-    max
-}
-
 /// The empty think block the official chat template injects for `enable_thinking=false`.
 const THINK_BLOCK: &str = "\n<think>\n\n</think>\n\n";
 
@@ -726,9 +835,13 @@ const THINK_BLOCK: &str = "\n<think>\n\n</think>\n\n";
 /// One implementation so `submit`'s window guard and `step_local` cannot size different sequences:
 /// counting the bare prompt let a `max_ctx - 1` prompt through and then prefilled past
 /// `max_position_embeddings`.
-fn admitted_prompt_ids(tok: &Tokenizer, task: &GenerationTask) -> Result<Vec<u32>, String> {
+fn admitted_prompt_ids(
+    tok: &Tokenizer,
+    task: &GenerationTask,
+    temporal: usize,
+) -> Result<Vec<u32>, String> {
     let mut ids = tok
-        .encode(task.prompt.as_str(), true)
+        .encode(prompt_text(task, temporal).as_ref(), true)
         .map_err(|e| e.to_string())?
         .get_ids()
         .to_vec();
@@ -738,6 +851,41 @@ fn admitted_prompt_ids(tok: &Tokenizer, task: &GenerationTask) -> Result<Vec<u32
         }
     }
     Ok(ids)
+}
+
+/// One video's rows `[tokens, hidden]` and grid `[t, h, w]`: the video
+/// processor's resize, frame pairs into the temporal patch, one temporal
+/// group per encode (the tower attends within a group, so this is the
+/// whole-video encode with a group-sized attention mask).
+fn encode_video(
+    v: &mut VisionRuntime,
+    m: &cascadia_types::MediaInput,
+) -> Result<(Vec<f32>, [u32; 3]), String> {
+    use crate::qwen35_vision::video;
+    if m.timestamps_ms.as_ref().map(Vec::len) != Some(m.num_frames as usize) {
+        return Err("no time for every frame".into());
+    }
+    let p = video::preprocess_video(
+        &m.pixels,
+        m.num_frames,
+        m.width,
+        m.height,
+        &v.video,
+        video::VideoResize::Temporal,
+    )?;
+    let mut rows = Vec::new();
+    for g in 0..p.grid_thw[0] as usize {
+        rows.extend(v.encoder.encode(&video::temporal_group(&p, g))?);
+    }
+    Ok((rows, p.grid_thw))
+}
+
+/// The text rank 0 tokenizes: the rendered prompt, each video's
+/// `<|video_pad|>` replaced by its per-group timestamp markup as HF's
+/// Qwen3.5 processor writes it (frames grouped by `temporal`, the video
+/// processor's temporal patch). Unchanged for a turn without videos.
+fn prompt_text(task: &GenerationTask, temporal: usize) -> std::borrow::Cow<'_, str> {
+    crate::qwen35_vision::video::with_frame_markup(&task.prompt, &task.media, temporal)
 }
 
 fn map_wire(err: TransportError) -> EngineError {
@@ -821,7 +969,7 @@ pub struct Qwen36Engine {
     stages_dirty: bool,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
     /// are refused at submit rather than prefilled for hours on the single batch=1 slot. `None`
-    /// when the tree does not state it (guard off; `read_max_ctx` warns which case it was).
+    /// when the tree does not state it (guard off; `crate::read_max_ctx` warns which case it was).
     max_ctx: Option<usize>,
     /// Measured prefill and snapshot-copy rates for the warm-turn refresh rule
     /// (`prefix_cache::RefreshCosts::refresh_pays`).
@@ -829,6 +977,14 @@ pub struct Qwen36Engine {
     /// Bytes of the parts restored by the latest prefix-cache hit: the size estimate for the
     /// state a refresh snapshot of this conversation would copy.
     last_restore_bytes: usize,
+    /// Rank 0's image path (`None`: the tree has no vision IRs; image turns are refused).
+    vision: Option<VisionRuntime>,
+    /// Every downstream rank accepts `FRAME_FORWARD_MROPE` (negotiated at HELLO). Image turns
+    /// on a chain without it are refused: those ranks would read the plain token index.
+    chain_mrope: bool,
+    /// The position block the last FORWARD ran with (relay side), for the wire tests.
+    #[cfg(test)]
+    last_positions: Option<Vec<i64>>,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -876,6 +1032,9 @@ struct ActiveTask {
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
     /// decode frames (n=1), for the pipeline gate-4 wire histogram.
     wire_ms: Vec<f64>,
+    /// Image rows and M-RoPE positions when the turn carries images
+    /// (`prompt_ids` is then the pad-expanded sequence).
+    vision: Option<crate::qwen35_vision::prompt::VisionPrompt>,
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -922,6 +1081,8 @@ enum InFrame {
         pos: u32,
         hidden: Vec<f32>,
         n: usize,
+        /// `[4, n]` positions from `FRAME_FORWARD_MROPE`; `None` = token index.
+        positions: Option<Vec<i64>>,
     },
     /// Issue-34 §8 CAPTURE: snapshot local KV under the head's content `kv_epoch` (body-carried).
     /// `partner` is `Some` only for `FRAME_CAPTURE_V2` (H.1b R2); `None` keeps the v1 frame's
@@ -984,19 +1145,37 @@ impl Qwen36Engine {
     /// real embeddings on the global first stage, the upstream stage's
     /// output otherwise. Returns the last stage's full first output,
     /// flattened [1, T, width].
-    fn chain_pass(&mut self, embeds: &[f32], t0: usize, t1: usize) -> EngineResult<Vec<f32>> {
-        let out = self.chain_pass_inner(embeds, t0, t1)?;
+    /// `pos` is the `[4, t1 - t0]` position block (row 0 the token index,
+    /// rows 1-3 M-RoPE): `qwen35_vision::prompt::text_positions` for text,
+    /// `VisionPrompt::positions` for a turn with images.
+    fn chain_pass(
+        &mut self,
+        embeds: &[f32],
+        t0: usize,
+        t1: usize,
+        pos: &[i64],
+    ) -> EngineResult<Vec<f32>> {
+        let out = self.chain_pass_inner(embeds, t0, t1, pos)?;
         // Only a pass that ran every local stage counts as priming (see `primed`).
         self.primed = true;
         Ok(out)
     }
 
-    fn chain_pass_inner(&mut self, embeds: &[f32], t0: usize, t1: usize) -> EngineResult<Vec<f32>> {
+    fn chain_pass_inner(
+        &mut self,
+        embeds: &[f32],
+        t0: usize,
+        t1: usize,
+        pos: &[i64],
+    ) -> EngineResult<Vec<f32>> {
         let n = t1 - t0;
+        if pos.len() != MROPE_ROWS * n {
+            return Err(EngineError::Backend(format!(
+                "position block has {} entries for a span of {n} ({MROPE_ROWS} rows expected)",
+                pos.len()
+            )));
+        }
         let mask = vec![1i64; t1];
-        let pos: Vec<i64> = (0..MROPE_ROWS)
-            .flat_map(|_| (t0 as i64)..(t1 as i64))
-            .collect();
         let width = self.hidden;
         let zeros_embeds = vec![0f32; n * width];
         let first_global = self.rank == 0;
@@ -1023,7 +1202,7 @@ impl Qwen36Engine {
                         .set_input(name, DType::I64, &[1, t1], &le_bytes_i64(&mask))
                         .map_err(map_ov)?,
                     s if s.contains("position") => st
-                        .set_input(name, DType::I64, &[MROPE_ROWS, 1, n], &le_bytes_i64(&pos))
+                        .set_input(name, DType::I64, &[MROPE_ROWS, 1, n], &le_bytes_i64(pos))
                         .map_err(map_ov)?,
                     s if s.contains("beam") => st
                         .set_input(name, DType::I32, &[1], &le_bytes_i32(&[0]))
@@ -1047,12 +1226,162 @@ impl Qwen36Engine {
         Ok(hidden)
     }
 
+    /// Embeddings and positions for the span `toks` at absolute index `t0`:
+    /// the text embeddings with the active turn's image rows spliced in, and
+    /// its M-RoPE positions, or the plain token index for a text turn.
+    fn span_inputs(&mut self, toks: &[u32], t0: usize) -> EngineResult<(Vec<f32>, Vec<i64>)> {
+        let mut e = self.embed_seq(toks)?;
+        let t1 = t0 + toks.len();
+        let pos = match self.active.as_ref().and_then(|a| a.vision.as_ref()) {
+            Some(v) => {
+                v.splice(t0, &mut e);
+                v.positions(t0, t1)
+            }
+            None => crate::qwen35_vision::prompt::text_positions(t0, t1),
+        };
+        Ok((e, pos))
+    }
+
+    /// Pipeline rank 0: run `toks` at `t0` through the local stages and the
+    /// chain; returns the chain-end token and the wire share. Image turns
+    /// send their positions with the span (`FRAME_FORWARD_MROPE`).
+    fn pipe_span(&mut self, toks: &[u32], t0: usize) -> EngineResult<(u32, f64)> {
+        let n = toks.len();
+        let (e, pos) = self.span_inputs(toks, t0)?;
+        let h = self.chain_pass(&e, t0, t0 + n, &pos)?;
+        let explicit = self.active.as_ref().is_some_and(|a| a.vision.is_some());
+        self.send_forward_recv_token(h, n, t0, explicit.then_some(pos))
+    }
+
+    /// Encode a turn's images and expand its prompt. `Ok(None)` for a text
+    /// turn; `Err` refuses the turn (never a silent text-only answer).
+    fn prepare_vision(
+        &mut self,
+        task: &GenerationTask,
+        prompt_ids: &[u32],
+    ) -> Result<Option<crate::qwen35_vision::prompt::VisionPrompt>, String> {
+        if task.media.is_empty() {
+            return Ok(None);
+        }
+        if task.resume_ids().is_some() {
+            return Err("resume_unsupported: a resumed turn cannot carry images".into());
+        }
+        if self.total > 1 && !self.chain_mrope {
+            return Err(
+                "a downstream rank predates image input (no M-RoPE frames); \
+                        upgrade every rank of this pipeline"
+                    .into(),
+            );
+        }
+        let hidden = self.hidden;
+        let v = self.vision.as_mut().ok_or(
+            "this model tree has no vision encoder (openvino_vision_embeddings*_model.xml); \
+             re-export it with the vision IRs",
+        )?;
+        let mut items = Vec::with_capacity(task.media.len());
+        let mut is_video = Vec::with_capacity(task.media.len());
+        let mut from_cache = 0;
+        for (i, m) in task.media.iter().enumerate() {
+            let video = match m.kind {
+                cascadia_types::MediaKind::Image => false,
+                cascadia_types::MediaKind::Video => true,
+                #[allow(unreachable_patterns)]
+                other => return Err(format!("media {i}: {other:?} is not supported")),
+            };
+            let what = if video { "video" } else { "image" };
+            is_video.push(video);
+            if let Some((rows, grid)) = v.cache.get(&task.tenant, &m.sha256) {
+                items.push((rows, grid, m.sha256));
+                from_cache += 1;
+                continue;
+            }
+            let (rows, grid) = if video {
+                encode_video(v, m).map_err(|e| format!("{what} {i}: {e}"))?
+            } else {
+                let p = crate::qwen35_vision::preprocess(
+                    &[&m.pixels[..]],
+                    m.width,
+                    m.height,
+                    &v.preprocess,
+                )
+                .map_err(|e| format!("{what} {i}: {e}"))?;
+                let rows = v
+                    .encoder
+                    .encode(&p)
+                    .map_err(|e| format!("{what} {i}: {e}"))?;
+                (rows, p.grid_thw)
+            };
+            v.cache.put(&task.tenant, m.sha256, &rows, grid);
+            items.push((rows, grid, m.sha256));
+        }
+        v.cache.report(from_cache, task.media.len());
+        crate::qwen35_vision::prompt::VisionPrompt::with_videos(
+            prompt_ids,
+            v.image_pad,
+            v.video_pad,
+            &items,
+            &is_video,
+            hidden,
+            v.merge,
+            &task.tenant,
+        )
+        .map(Some)
+    }
+
+    /// Frames per temporal group of a video (the video processor's temporal
+    /// patch; 2 without a vision tree, where no video is admitted).
+    fn video_temporal(&self) -> usize {
+        self.vision
+            .as_ref()
+            .map_or(2, |v| v.video.temporal_patch_size as usize)
+    }
+
+    /// Admission wrapper over [`Self::prepare_vision`]: on success `prompt_ids`
+    /// becomes the pad-expanded sequence; on refusal, the task's error chunk.
+    fn admit_vision(
+        &mut self,
+        task: &GenerationTask,
+        prompt_ids: &mut Vec<u32>,
+    ) -> Result<Option<crate::qwen35_vision::prompt::VisionPrompt>, Vec<(TaskId, Chunk)>> {
+        let refuse = |reason: String| {
+            warn!(task = %task.task_id, reason = %reason, "qwen35: image turn refused");
+            vec![(
+                task.task_id.clone(),
+                Chunk::error(task.task_id.clone(), reason),
+            )]
+        };
+        let started = Instant::now();
+        let v = match self.prepare_vision(task, prompt_ids) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(refuse(e)),
+        };
+        if let Some(max) = self.max_ctx {
+            if v.ids.len() >= max {
+                return Err(refuse(format!(
+                    "prompt is {} tokens with its images; the model's window is {max}",
+                    v.ids.len()
+                )));
+            }
+        }
+        info!(
+            task = %task.task_id,
+            images = task.media.len(),
+            image_tokens = v.pad_positions.len(),
+            prompt = v.ids.len(),
+            encode_ms = started.elapsed().as_millis() as u64,
+            "qwen35: images encoded"
+        );
+        prompt_ids.clone_from(&v.ids);
+        Ok(Some(v))
+    }
+
     /// Run a token span starting at absolute position `t0`; returns the
     /// LAST position's logits row. Single-box only (needs the full chain).
     fn run_span(&mut self, toks: &[u32], t0: usize) -> EngineResult<Vec<f32>> {
         let n = toks.len();
-        let e = self.embed_seq(toks)?;
-        let out = self.chain_pass(&e, t0, t0 + n)?;
+        let (e, pos) = self.span_inputs(toks, t0)?;
+        let out = self.chain_pass(&e, t0, t0 + n, &pos)?;
         if self.last_logits_only {
             // Exporter already sliced the last stage to the final
             // position; the output IS the last row.
@@ -1104,13 +1433,17 @@ impl Qwen36Engine {
         };
         // Issue-34: capture this rank's local KV under (prompt + generated) BEFORE reset_all wipes
         // it. Keyed by the full sequence (session-resume). Gated + best-effort (stub ⇒ no-op).
+        // A turn with images keys on `cache_key`: its pad ids are the same for
+        // every same-grid image, so they would restore another image's state.
         #[cfg(feature = "kv_coord")]
         {
             // Skip the resume seed: `prompt_ids` already carries those ids, so
             // counting them again keys the blob at a depth that never matches
             // the fed sequence (same defect dist_spec fixed).
             let tokens: Vec<i32> = t
-                .prompt_ids
+                .vision
+                .as_ref()
+                .map_or(&t.prompt_ids, |v| &v.cache_key)
                 .iter()
                 .chain(t.gen_ids.iter().skip(t.resume_seed_len))
                 .map(|&u| u as i32)
@@ -1230,10 +1563,12 @@ impl Qwen36Engine {
                 "qwen36 pipeline handshake refused: {reason}"
             )));
         }
-        self.chain_capture_v2 = down_cap.min(CAPTURE_V2_CAP);
+        self.chain_capture_v2 = (down_cap & 1).min(CAPTURE_V2_CAP);
+        self.chain_mrope = down_cap & MROPE_CAP != 0;
         self.handshake_done = true;
         info!(
             capture_v2 = self.chain_capture_v2,
+            mrope = self.chain_mrope,
             "qwen36 pipeline handshake ok"
         );
         Ok(())
@@ -1273,6 +1608,7 @@ impl Qwen36Engine {
         hidden: &[f32],
         n: usize,
         t0: usize,
+        positions: Option<&[i64]>,
     ) -> EngineResult<(i32, u32)> {
         let downstream = self
             .downstream
@@ -1284,12 +1620,23 @@ impl Qwen36Engine {
             [1, n as u32, self.hidden as u32],
             le_bytes_f32(hidden),
         );
+        let positions = positions.map(le_bytes_i64);
         run_async(
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
-                    .await?;
+                match &positions {
+                    Some(p) => {
+                        g.send_raw(&frame_header(FRAME_FORWARD_MROPE, epoch, t0 as u32))
+                            .await?;
+                        g.send_raw(&((p.len() / 8) as u32).to_be_bytes()).await?;
+                        g.send_raw(p).await?;
+                    }
+                    None => {
+                        g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
+                            .await?
+                    }
+                }
                 g.send(&tensor).await?;
                 let hb = g.recv_raw(12).await?;
                 let (kind, e, _) = parse_header(&hb);
@@ -1314,10 +1661,12 @@ impl Qwen36Engine {
         hidden: Vec<f32>,
         n: usize,
         t0: usize,
+        positions: Option<Vec<i64>>,
     ) -> EngineResult<(u32, f64)> {
         let epoch = self.epoch;
         let started = Instant::now();
-        let (token, infer_us) = self.forward_downstream(epoch, &hidden, n, t0)?;
+        let (token, infer_us) =
+            self.forward_downstream(epoch, &hidden, n, t0, positions.as_deref())?;
         let wire_ms =
             (started.elapsed().as_secs_f64() * 1000.0 - infer_us as f64 / 1000.0).max(0.0);
         Ok((token as u32, wire_ms))
@@ -1507,14 +1856,15 @@ impl Qwen36Engine {
             // warm-resume (chain-wide RESTORE of the pulled KV) or cold-reset to position 0.
             self.epoch = self.epoch.wrapping_add(1);
             let tokenizer = self.tokenizer.as_ref().expect("rank 0 has tokenizer");
-            let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
-                Ok(e) => e.get_ids().to_vec(),
-                Err(e) => {
-                    warn!(task = %task.task_id, error = %e, "tokenize failed");
-                    let reason = format!("tokenize failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
-                }
-            };
+            let mut prompt_ids: Vec<u32> =
+                match tokenizer.encode(prompt_text(&task, self.video_temporal()).as_ref(), true) {
+                    Ok(e) => e.get_ids().to_vec(),
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "tokenize failed");
+                        let reason = format!("tokenize failed: {e}");
+                        return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+                    }
+                };
             if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
                 // Legacy-rendered prompts only: a chat template injects
                 // the empty think block itself (API passes
@@ -1533,7 +1883,13 @@ impl Qwen36Engine {
                 let vocab = crate::resume_vocab_bound(tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let id = task.task_id.clone();
-                    let c = Chunk::error(id.clone(), format!("invalid resume prefix: {e}"));
+                    let c = Chunk::error(
+                        id.clone(),
+                        format!(
+                            "{}invalid resume prefix: {e}",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    );
                     return vec![(id, c)];
                 }
             }
@@ -1548,7 +1904,10 @@ impl Qwen36Engine {
                 warn!(task = %task.task_id, "qwen36: empty prompt after tokenize; rejecting");
                 let e = Chunk::error(
                     task.task_id.clone(),
-                    "empty prompt after tokenize".to_string(),
+                    format!(
+                        "{}empty prompt after tokenize",
+                        cascadia_engine::CLIENT_ERROR_PREFIX
+                    ),
                 );
                 return vec![(task.task_id, e)];
             }
@@ -1572,6 +1931,10 @@ impl Qwen36Engine {
                     }
                 }
             };
+            let vision = match self.admit_vision(&task, &mut prompt_ids) {
+                Ok(v) => v,
+                Err(c) => return c,
+            };
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
             } else {
@@ -1594,9 +1957,17 @@ impl Qwen36Engine {
             // Issue-34 warm-resume: a cached strict-prefix blob ⇒ RESTORE this rank + the whole
             // downstream chain (all-or-nothing); any rank short ⇒ cold. 0 ⇒ full prefill (default).
             let warm_prefix: usize = {
+                // Image turns key on `cache_key` (each pad stands for its image's hash);
+                // positions and image rows are by absolute index, so a suffix prefill
+                // needs nothing else.
                 #[cfg(feature = "kv_coord")]
                 {
-                    let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
+                    let prompt_i32: Vec<i32> = vision
+                        .as_ref()
+                        .map_or(&prompt_ids, |v| &v.cache_key)
+                        .iter()
+                        .map(|&u| u as i32)
+                        .collect();
                     match self.kv.take_warm(&task.tenant, &prompt_i32) {
                         Some((blob, len, plane_pulled)) => {
                             let kv_epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
@@ -1666,6 +2037,7 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
+                vision,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -1686,10 +2058,7 @@ impl Qwen36Engine {
                 let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
                 let t0 = t.step;
                 let n = toks.len();
-                let res = self
-                    .embed_seq(&toks)
-                    .and_then(|e| self.chain_pass(&e, t0, t0 + n))
-                    .and_then(|h| self.send_forward_recv_token(h, n, t0));
+                let res = self.pipe_span(&toks, t0);
                 match res {
                     Ok((tok, _wire_ms)) => {
                         let t = self.active.as_mut().unwrap();
@@ -1763,10 +2132,7 @@ impl Qwen36Engine {
                 return self.finalize(FinishReason::Stop);
             }
             let step = t.step;
-            let res = self
-                .embed_seq(&[next])
-                .and_then(|e| self.chain_pass(&e, step, step + 1))
-                .and_then(|h| self.send_forward_recv_token(h, 1, step));
+            let res = self.pipe_span(&[next], step);
             match res {
                 Ok((tok, wire_ms)) => {
                     let t = self.active.as_mut().unwrap();
@@ -1908,7 +2274,22 @@ impl Qwen36Engine {
                         blob,
                     })
                 }
-                FRAME_FORWARD => {
+                FRAME_FORWARD | FRAME_FORWARD_MROPE => {
+                    let positions = if kind == FRAME_FORWARD_MROPE {
+                        let lb = g.recv_raw(4).await?;
+                        let count = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                        if count > MAX_MROPE_ENTRIES {
+                            return Err(TransportError::SocketClosed);
+                        }
+                        let raw = g.recv_raw(count * 8).await?;
+                        Some(
+                            raw.chunks_exact(8)
+                                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                                .collect::<Vec<i64>>(),
+                        )
+                    } else {
+                        None
+                    };
                     let (t, _) = g.recv().await?;
                     if !matches!(t.dtype, WireDType::F32) {
                         return Err(TransportError::SocketClosed);
@@ -1919,6 +2300,7 @@ impl Qwen36Engine {
                         pos,
                         hidden: f32_from_le(&t.data),
                         n,
+                        positions,
                     })
                 }
                 _ => Err(TransportError::SocketClosed),
@@ -1933,21 +2315,26 @@ impl Qwen36Engine {
                 // rank-0 payload downstream so every rank checks against
                 // the origin; reply upstream with the combined verdict.
                 let mut reason = self.validate_hello(&payload);
-                // Chain floor: this rank's own capability, lowered by everything below it. The last
-                // rank has nothing below, so it reports its own.
-                let mut cap = CAPTURE_V2_CAP;
+                // Chain floor: this rank's own capabilities, lowered by everything below it. The
+                // last rank has nothing below, so it reports its own. Bit 0 is the CAPTURE v2
+                // floor, `MROPE_CAP` the M-RoPE frame bit; an older peer leaves the latter clear.
+                let mut capture = CAPTURE_V2_CAP;
+                let mut mrope = MROPE_CAP;
                 if reason.is_none() && !is_last {
                     match self.forward_hello_downstream(&payload) {
                         Ok((r, down_cap)) => {
                             reason = r.map(|r| format!("downstream: {r}"));
-                            cap = cap.min(down_cap);
+                            capture = capture.min(down_cap & 1);
+                            mrope &= down_cap;
                         }
                         Err(e) => {
                             reason = Some(format!("downstream handshake forward failed: {e}"))
                         }
                     }
                 }
-                self.chain_capture_v2 = cap;
+                self.chain_capture_v2 = capture;
+                self.chain_mrope = mrope != 0;
+                let cap = capture | mrope;
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 match reason {
@@ -1957,7 +2344,11 @@ impl Qwen36Engine {
                             g.send_raw(&frame_header(FRAME_HELLO_ACK, 0, cap)).await
                         })
                         .map_err(map_wire)?;
-                        info!(capture_v2 = cap, "qwen36 pipeline handshake ok");
+                        info!(
+                            capture_v2 = capture,
+                            mrope = mrope != 0,
+                            "qwen36 pipeline handshake ok"
+                        );
                     }
                     Some(reason) => {
                         warn!(reason = %reason, "qwen36 pipeline handshake mismatch; refusing to serve");
@@ -2003,11 +2394,12 @@ impl Qwen36Engine {
                 // Best-effort: a blob/chain miss degrades to no warm-pull, never breaks generation.
                 let ns = partner.unwrap_or_else(|| crate::kv_coordination::LOCAL_NS.to_string());
                 if let Some(blob) = self.blob_local_stages() {
-                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here),
+                    // except a media turn's slice: RESTORE reads `self.kv` below, not the mirror.
                     self.kv_share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .capture_under_epoch_ns(&ns, kv_epoch, tokens.clone(), blob.clone());
+                        .capture_under_epoch_for_plane(&ns, kv_epoch, tokens.clone(), blob.clone());
                     self.kv
                         .capture_under_epoch_ns(&ns, kv_epoch, tokens.clone(), blob);
                 }
@@ -2090,6 +2482,7 @@ impl Qwen36Engine {
                 pos,
                 hidden,
                 n,
+                positions,
             } => {
                 if self.poisoned.is_some() {
                     return Err(EngineError::Backend(
@@ -2115,7 +2508,15 @@ impl Qwen36Engine {
                 }
                 let infer_started = Instant::now();
                 let t0 = pos as usize;
-                let out = self.chain_pass(&hidden, t0, t0 + n)?;
+                let pos_block = match &positions {
+                    Some(p) => p.clone(),
+                    None => crate::qwen35_vision::prompt::text_positions(t0, t0 + n),
+                };
+                let out = self.chain_pass(&hidden, t0, t0 + n, &pos_block)?;
+                #[cfg(test)]
+                {
+                    self.last_positions = Some(pos_block.clone());
+                }
                 // rank>0 counterpart of the head's `qwen36_fp_at (cold fold)`. The tail folds via this
                 // frame, not the prefill loop, so without this its COLD state at `pos` is unmeasurable
                 // and only its warm-RESTORED state (logged by restore_local_stages) is visible. Single-box
@@ -2155,7 +2556,7 @@ impl Qwen36Engine {
                 } else {
                     // Middle: pass the hidden span on; the chain end's
                     // token comes back through us.
-                    self.forward_downstream(epoch, &out, n, t0)?
+                    self.forward_downstream(epoch, &out, n, t0, positions.as_deref())?
                 };
                 let infer_us = own_us.saturating_add(downstream_us);
                 let h = self.handle()?;
@@ -2223,14 +2624,15 @@ impl Qwen36Engine {
             let task = self.pending.remove(0);
             // reset moved below — Issue-34 warm-resume may restore a cached prefix blob instead.
             let tokenizer = self.tokenizer.as_ref().expect("single-box has tokenizer");
-            let mut prompt_ids: Vec<u32> = match admitted_prompt_ids(tokenizer, &task) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!(task = %task.task_id, error = %e, "tokenize failed");
-                    let reason = format!("tokenize failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
-                }
-            };
+            let mut prompt_ids: Vec<u32> =
+                match admitted_prompt_ids(tokenizer, &task, self.video_temporal()) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "tokenize failed");
+                        let reason = format!("tokenize failed: {e}");
+                        return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+                    }
+                };
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
@@ -2241,7 +2643,13 @@ impl Qwen36Engine {
                 let vocab = crate::resume_vocab_bound(tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let id = task.task_id.clone();
-                    let c = Chunk::error(id.clone(), format!("invalid resume prefix: {e}"));
+                    let c = Chunk::error(
+                        id.clone(),
+                        format!(
+                            "{}invalid resume prefix: {e}",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    );
                     return vec![(id, c)];
                 }
             }
@@ -2256,7 +2664,10 @@ impl Qwen36Engine {
                 warn!(task = %task.task_id, "qwen36: empty prompt after tokenize; rejecting");
                 let e = Chunk::error(
                     task.task_id.clone(),
-                    "empty prompt after tokenize".to_string(),
+                    format!(
+                        "{}empty prompt after tokenize",
+                        cascadia_engine::CLIENT_ERROR_PREFIX
+                    ),
                 );
                 return vec![(task.task_id, e)];
             }
@@ -2280,6 +2691,12 @@ impl Qwen36Engine {
                     }
                 }
             };
+            // Images: encode them and expand each pad token to the image's rows. The prompt
+            // grows by the image tokens, so the window is checked again on the expanded length.
+            let vision = match self.admit_vision(&task, &mut prompt_ids) {
+                Ok(v) => v,
+                Err(c) => return c,
+            };
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
             } else {
@@ -2295,10 +2712,19 @@ impl Qwen36Engine {
             };
             // Issue-34 warm-resume: restore a cached strict-prefix blob and prefill only the suffix;
             // else cold reset. Gated + best-effort (stub ⇒ no blob ⇒ cold). 0 on the default path.
+            // Image turns key the local prefix cache on `cache_key`: real ids with every pad
+            // token replaced by a pseudo-id from its image's pixel hash. Text before the first
+            // image matches any turn; a resent image matches through itself; a different image
+            // never matches. Prefill still feeds the real ids.
+            let cache_key: Vec<u32> = vision
+                .as_ref()
+                .map_or_else(|| prompt_ids.clone(), |v| v.cache_key.clone());
             let warm_prefix: usize = {
+                // Keyed on `cache_key` too. A plane peer looks up by real ids, which
+                // never match an image's stand-ins, so image entries stay local.
                 #[cfg(feature = "kv_coord")]
                 {
-                    let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
+                    let prompt_i32: Vec<i32> = cache_key.iter().map(|&u| u as i32).collect();
                     match self.kv.take_warm(&task.tenant, &prompt_i32) {
                         Some((blob, len, plane_pulled)) if self.restore_local_stages(&blob) => {
                             // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
@@ -2319,14 +2745,14 @@ impl Qwen36Engine {
                             // A plane blob that failed to restore may have dirtied some stages:
                             // scrub before the local cache gets to try.
                             self.reset_all();
-                            self.local_warm_or_cold(&prompt_ids)
+                            self.local_warm_or_cold(&cache_key)
                         }
-                        None => self.local_warm_or_cold(&prompt_ids),
+                        None => self.local_warm_or_cold(&cache_key),
                     }
                 }
                 #[cfg(not(feature = "kv_coord"))]
                 {
-                    self.local_warm_or_cold(&prompt_ids)
+                    self.local_warm_or_cold(&cache_key)
                 }
             };
             // Every arm above resets (or restores over) the stage requests. If the reset FAILED the
@@ -2362,10 +2788,10 @@ impl Qwen36Engine {
             let boundaries = self
                 .im_start_id
                 .filter(|_| self.prefix_cache.enabled() && !self.stages_dirty)
-                .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
+                .map(|im| crate::prefix_cache::chat_boundaries(&cache_key, im))
                 .unwrap_or_default();
             let snapshot_at = crate::prefix_cache::plan_snapshots(
-                &prompt_ids,
+                &cache_key,
                 &boundaries,
                 warm_prefix,
                 &self.prefix_cache,
@@ -2398,6 +2824,7 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
+                vision,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -2427,8 +2854,11 @@ impl Qwen36Engine {
                         t.logits = l;
                         t.prefill_idx = end;
                         t.step += toks.len();
-                        let snap_key =
-                            (t.snapshot_at.contains(&end)).then(|| t.prompt_ids[..end].to_vec());
+                        // Snapshots key on the same content-hashed sequence restores look up.
+                        let snap_key = (t.snapshot_at.contains(&end)).then(|| match &t.vision {
+                            Some(v) => v.cache_key[..end].to_vec(),
+                            None => t.prompt_ids[..end].to_vec(),
+                        });
                         // Same diagnostics as the multi-stage loop, mirrored onto the SINGLE-STAGE
                         // path. On a 1-stage (single-box) topology every stage is local, so these
                         // fingerprints cover the WHOLE model state — the 2-stage head-only view left
@@ -2571,9 +3001,10 @@ impl Engine for Qwen36Engine {
             // Local stage pass only (no logits on rank 0), then the
             // startup handshake — fail-loud at boot, not first request.
             self.reset_all();
-            let r = self
-                .embed_seq(&[1000])
-                .and_then(|e| self.chain_pass(&e, 0, 1));
+            let r = self.embed_seq(&[1000]).and_then(|e| {
+                let pos = crate::qwen35_vision::prompt::text_positions(0, 1);
+                self.chain_pass(&e, 0, 1, &pos)
+            });
             match r {
                 Ok(_) => info!("qwen35 warmup ok (stage0 local)"),
                 Err(e) => warn!(error = %e, "qwen35 warmup failed"),
@@ -2593,6 +3024,13 @@ impl Engine for Qwen36Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // A tree with the vision IRs takes a video whole (rank 0 encodes it).
+        if self.vision.is_none() {
+            cascadia_engine::refuse_video(&task, "qwen35")?;
+        }
+        if self.vision.is_none() {
+            cascadia_engine::refuse_media(&task, "qwen35 (tree without vision IRs)")?;
+        }
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -2607,14 +3045,15 @@ impl Engine for Qwen36Engine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
-        // The API bounds request BYTES; this bounds tokens against the model's window so a
-        // multi-MB prompt is a 413, not an hours-long prefill holding the batch=1 slot.
+        // The API bounds request BYTES; this bounds tokens against the model's window so an
+        // over-window prompt is a 400 `context_length_exceeded`, not an hours-long prefill
+        // holding the batch=1 slot.
         if let Some(max) = self.max_ctx {
             if let Some(tok) = &self.tokenizer {
                 // The SEQUENCE admission prefills, not the bare prompt: it also carries the
                 // injected think block and the resume prefix, either of which can push a prompt
                 // that passed this guard past the window.
-                if let Ok(ids) = admitted_prompt_ids(tok, &task) {
+                if let Ok(ids) = admitted_prompt_ids(tok, &task, self.video_temporal()) {
                     let n = ids.len() + task.resume_ids().map_or(0, <[i32]>::len);
                     if n >= max {
                         return Err(EngineError::PromptTooLong(format!(
@@ -2868,7 +3307,8 @@ impl Qwen36Engine {
         // inference. The fold's garbage state is overwritten by the restore.
         if !self.primed {
             let zeros = vec![0f32; self.hidden];
-            if let Err(e) = self.chain_pass(&zeros, 0, 1) {
+            let pos = crate::qwen35_vision::prompt::text_positions(0, 1);
+            if let Err(e) = self.chain_pass(&zeros, 0, 1, &pos) {
                 warn!(error = %e, "qwen36: priming fold before restore failed; cold reprefill");
                 self.state_restored = true;
                 return false;
@@ -2946,9 +3386,10 @@ impl Qwen36Engine {
     /// ranks must share it; folding in `rank`/`total` made rank>0 GETs reject a legitimate move.
     /// Per-rank slice selection is by the dial INDEX (rank N → that rank's holder), and a sharding
     /// mismatch degrades safely (the opaque blob's `set_state` size-rejects ⇒ cold), so the stage span
-    /// is not needed as a guard. Mirrors `kv_coordination::kv_model_fingerprint`.
+    /// is not needed as a guard. Mirrors `kv_coordination::kv_model_fingerprint`. Hashed as parsed
+    /// JSON, so the same tree cut on Windows (CRLF) and on Linux/macOS (LF) shares one fingerprint.
     fn kv_fingerprint(&self) -> u64 {
-        crate::kv_coordination::fnv1a64(self.manifest_json.as_bytes())
+        crate::kv_coordination::json_digest(self.manifest_json.as_bytes())
     }
 
     /// Capture this rank's local KV under `tokens` (head/single-box token-keyed path). Called at the
@@ -2958,11 +3399,12 @@ impl Qwen36Engine {
             return;
         }
         if let Some(blob) = self.blob_local_stages() {
-            // Mirror into the lock-free holder cache so a busy node serves this turn's KV unblocked.
+            // Mirror into the lock-free holder cache so a busy node serves this turn's KV unblocked,
+            // except a media turn's: it keeps only the local copy below.
             self.kv_share
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .capture(tenant, tokens.clone(), blob.clone());
+                .capture_for_plane(tenant, tokens.clone(), blob.clone());
             self.kv.capture(tenant, tokens, blob);
         }
     }
@@ -3168,23 +3610,35 @@ mod tests {
     #[test]
     fn read_max_ctx_prefers_nested_text_config_and_is_none_when_unstated() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_max_ctx(dir.path()), None, "no config.json");
+        assert_eq!(
+            crate::read_max_ctx(dir.path(), "qwen35"),
+            None,
+            "no config.json"
+        );
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"model_type":"qwen3_5","text_config":{"max_position_embeddings":262144},"max_position_embeddings":4096}"#,
         )
         .unwrap();
-        assert_eq!(read_max_ctx(dir.path()), Some(262144));
+        assert_eq!(crate::read_max_ctx(dir.path(), "qwen35"), Some(262144));
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"model_type":"qwen3_5_moe","max_position_embeddings":40960}"#,
         )
         .unwrap();
-        assert_eq!(read_max_ctx(dir.path()), Some(40960));
+        assert_eq!(crate::read_max_ctx(dir.path(), "qwen35"), Some(40960));
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
-        assert_eq!(read_max_ctx(dir.path()), None, "key absent");
+        assert_eq!(
+            crate::read_max_ctx(dir.path(), "qwen35"),
+            None,
+            "key absent"
+        );
         std::fs::write(dir.path().join("config.json"), "{ not json").unwrap();
-        assert_eq!(read_max_ctx(dir.path()), None, "unparseable config.json");
+        assert_eq!(
+            crate::read_max_ctx(dir.path(), "qwen35"),
+            None,
+            "unparseable config.json"
+        );
     }
 
     fn bare_engine(total: u32, manifest: &str) -> Qwen36Engine {
@@ -3229,6 +3683,9 @@ mod tests {
             max_ctx: None,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
+            vision: None,
+            chain_mrope: false,
+            last_positions: None,
         }
     }
 
@@ -3340,6 +3797,121 @@ mod tests {
             "poisoned head must emit an error chunk, got a silent empty success"
         );
         assert!(chunk.error.as_deref().unwrap().contains("manifest"));
+    }
+
+    /// Two engines over a real localhost socket (no stages, so a stage pass
+    /// is the identity): the HELLO_ACK carries the M-RoPE bit, a text frame
+    /// runs at the token index, and an image frame delivers its explicit
+    /// position block to the downstream rank unchanged.
+    #[test]
+    fn pipeline_carries_mrope_positions_for_image_turns() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client) = rt.block_on(async {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            let port = server.port();
+            let accept = tokio::spawn(async move {
+                server.accept().await.unwrap();
+                server
+            });
+            let mut client = ActivationClient::new("127.0.0.1", port);
+            client.connect().await.unwrap();
+            (accept.await.unwrap(), client)
+        });
+        let mut head = bare_engine(2, "{}");
+        head.rank = 0;
+        head.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        head.runtime_handle = Some(rt.handle().clone());
+        let mut tail = bare_engine(2, "{}");
+        tail.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        tail.runtime_handle = Some(rt.handle().clone());
+        let tail_thread = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                tail.step_pipe_relay().unwrap();
+                seen.push(tail.last_positions.take());
+            }
+            seen
+        });
+
+        head.handshake_a().unwrap();
+        assert!(
+            head.chain_mrope,
+            "a current downstream advertises M-RoPE frames"
+        );
+        let hidden = vec![0.5f32; 2 * head.hidden];
+        head.forward_downstream(0, &hidden, 2, 7, None).unwrap();
+        let block = vec![7, 8, 3, 3, 3, 4, 3, 5];
+        head.forward_downstream(0, &hidden, 2, 7, Some(&block))
+            .unwrap();
+
+        let seen = tail_thread.join().unwrap();
+        assert_eq!(seen[0], None, "HELLO runs no stage pass");
+        assert_eq!(
+            seen[1],
+            Some(crate::qwen35_vision::prompt::text_positions(7, 9))
+        );
+        assert_eq!(seen[2], Some(block));
+    }
+
+    fn image_task(id: &str) -> GenerationTask {
+        let mut t = GenerationTask::new(id, "hi");
+        t.media.push(cascadia_types::MediaInput {
+            kind: cascadia_types::MediaKind::Image,
+            pixels: vec![0u8; 4 * 4 * 3].into(),
+            num_frames: 1,
+            width: 4,
+            height: 4,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        });
+        t
+    }
+
+    /// An image turn the engine cannot serve faithfully is refused with the
+    /// reason, never answered from the text alone; a text turn is untouched.
+    #[test]
+    fn image_turns_are_refused_when_they_cannot_be_served() {
+        let mut e = bare_engine(1, "{}");
+        assert!(e
+            .prepare_vision(&GenerationTask::new("t", "hi"), &[1, 2])
+            .unwrap()
+            .is_none());
+        let err = e.prepare_vision(&image_task("a"), &[1]).unwrap_err();
+        assert!(err.contains("no vision encoder"), "{err}");
+
+        let mut resumed = image_task("b");
+        resumed.resume_token_ids = Some(vec![5]);
+        let err = e.prepare_vision(&resumed, &[1]).unwrap_err();
+        assert!(err.starts_with("resume_unsupported:"), "{err}");
+
+        // A pipeline whose downstream did not advertise M-RoPE frames would
+        // run the image tokens at plain token-index positions.
+        let mut p = bare_engine(2, "{}");
+        p.rank = 0;
+        let err = p.prepare_vision(&image_task("c"), &[1]).unwrap_err();
+        assert!(err.contains("predates image input"), "{err}");
+    }
+
+    /// The refusal reaches the client as the task's error chunk.
+    #[test]
+    fn a_refused_image_turn_emits_an_error_chunk() {
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.handshake_done = true;
+        e.tokenizer = Some(tiny_tokenizer());
+        e.pending.push(image_task("t0"));
+        let out = e.step_pipe_first();
+        assert_eq!(out.len(), 1);
+        let chunk = &out[0].1;
+        assert!(chunk.is_final, "{chunk:?}");
+        let err = chunk.error.as_deref().unwrap_or("");
+        assert!(err.contains("predates image input"), "{err}");
+        assert!(e.active.is_none());
     }
 
     /// Minimal real tokenizer: whitespace pre-tokenizer over a one-word
@@ -3472,6 +4044,7 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            vision: None,
         });
 
         let out = e.finalize_error("pipeline decode failed: wire closed".into());
@@ -3504,6 +4077,7 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            vision: None,
         }
     }
 
@@ -3587,6 +4161,7 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            vision: None,
         });
 
         let id: TaskId = "t0".into();

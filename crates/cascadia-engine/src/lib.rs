@@ -51,9 +51,16 @@ pub enum EngineError {
 
     /// The prompt cannot fit this engine's per-request window. Distinct from
     /// `QueueFull`: that one clears when load drops, this one never does, so
-    /// the API must answer 413 rather than a retryable 5xx.
+    /// the API must answer OpenAI's 400 `context_length_exceeded` rather than
+    /// a retryable 5xx.
     #[error("prompt too long: {0}")]
     PromptTooLong(String),
+
+    /// The request carries input this engine cannot consume (today: images
+    /// on a text-only engine or tree). Permanent for the request, like
+    /// `PromptTooLong`, so the API answers 400 rather than a retryable 5xx.
+    #[error("unsupported input: {0}")]
+    UnsupportedInput(String),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -86,6 +93,38 @@ pub enum EngineError {
         #[source]
         source: Box<EngineError>,
     },
+}
+
+/// The [`GenerationTask::media`] contract for an engine that cannot consume
+/// media: fail the task rather than answer from its text alone. Call first in
+/// `submit`; `engine` names the engine in the message the caller sees.
+pub fn refuse_media(task: &GenerationTask, engine: &str) -> EngineResult<()> {
+    if task.media.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::UnsupportedInput(format!(
+        "the {engine} engine does not accept image input ({} image(s) in the request)",
+        task.media.len()
+    )))
+}
+
+/// The [`MediaKind::Video`](cascadia_types::MediaKind::Video) contract for an
+/// engine that takes images but not video: fail the task rather than read a
+/// frame stack as one image. The API sends such an engine a video's frames as
+/// images, so this only fires on a routing bug. Call first in `submit`.
+pub fn refuse_video(task: &GenerationTask, engine: &str) -> EngineResult<()> {
+    let videos = task
+        .media
+        .iter()
+        .filter(|m| matches!(m.kind, cascadia_types::MediaKind::Video))
+        .count();
+    if videos == 0 {
+        return Ok(());
+    }
+    Err(EngineError::UnsupportedInput(format!(
+        "the {engine} engine does not accept native video input ({videos} video(s) in the \
+         request); its videos are served as frames"
+    )))
 }
 
 impl EngineError {
@@ -176,6 +215,132 @@ impl EngineError {
             _ => false,
         }
     }
+
+    /// The HTTP status a request rejected with this error gets. One table for
+    /// every caller that fronts an engine (cascadia-api's server, and any
+    /// gateway that submits tasks itself), so they classify alike. Permanent
+    /// rejections are 4xx: retrying the identical request (on this or any peer)
+    /// cannot succeed. OpenAI answers an over-context prompt with a 400 and its
+    /// SDKs retry neither a 400 nor a 413. Exhaustive on purpose: a new variant
+    /// must be classified here before it compiles.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            EngineError::QueueFull { .. } | EngineError::NotLoaded | EngineError::NotConnected => {
+                503
+            }
+            EngineError::PromptTooLong(_)
+            | EngineError::InvalidConfig(_)
+            | EngineError::PeerRejected(_)
+            | EngineError::ShardRejected(_)
+            | EngineError::UnsupportedInput(_) => 400,
+            EngineError::ModelNotFound(_) => 404,
+            EngineError::Backend(_)
+            | EngineError::Io(_)
+            | EngineError::Task { .. }
+            | EngineError::BatchAborted(_) => 500,
+        }
+    }
+
+    /// The request is at fault (a 4xx [`http_status`](Self::http_status)): a
+    /// caller must not retry it unchanged or count it against the peer's health.
+    pub fn is_client_error(&self) -> bool {
+        (400..500).contains(&self.http_status())
+    }
+
+    /// The rejection-metric reason, named for the knob that fixes it:
+    /// `capacity`, `prompt_over_window` (a sizing change), `engine_unavailable`
+    /// (bring the stage or its peer up), `engine_error` (read that node's logs),
+    /// `invalid_request` (the caller sent something this worker can't serve).
+    pub fn rejection_reason(&self) -> &'static str {
+        match self {
+            EngineError::QueueFull { .. } => "capacity",
+            EngineError::PromptTooLong(_) => "prompt_over_window",
+            EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
+            EngineError::Backend(_)
+            | EngineError::Io(_)
+            | EngineError::Task { .. }
+            | EngineError::BatchAborted(_) => "engine_error",
+            EngineError::InvalidConfig(_)
+            | EngineError::PeerRejected(_)
+            | EngineError::ShardRejected(_)
+            | EngineError::UnsupportedInput(_)
+            | EngineError::ModelNotFound(_) => "invalid_request",
+        }
+    }
+}
+
+/// Prefix of a [`Chunk::error`](cascadia_types::Chunk::error) reason that the
+/// request caused after admission (a malformed resume prefix, an empty prompt):
+/// permanent for the request, so not a reason to retry it or demote the peer.
+pub const CLIENT_ERROR_PREFIX: &str = "invalid_request: ";
+
+/// Whether a stream's error reason (a [`Chunk`](cascadia_types::Chunk)'s
+/// `error`) is the request's fault. Engines refuse a request they cannot serve
+/// at submit with a typed [`EngineError`] (use
+/// [`is_client_error`](EngineError::is_client_error) there); a refusal that
+/// reaches a stream as text carries one of these stable prefixes: an
+/// [`EngineError`]'s own `Display` prefix for a client variant (`prompt too
+/// long:`, `unsupported input:`, ...), [`CLIENT_ERROR_PREFIX`], or
+/// `resume_unsupported:`, optionally behind a `task <id>: ` attribution and a
+/// `backend error: ` wrapper.
+pub fn is_client_error_reason(reason: &str) -> bool {
+    const PREFIXES: [&str; 8] = [
+        CLIENT_ERROR_PREFIX,
+        "resume_unsupported:",
+        "prompt too long: ",
+        "unsupported input: ",
+        "invalid configuration: ",
+        "peer layout rejected: ",
+        "shard rejected: ",
+        "model not found at ",
+    ];
+    let mut r = reason;
+    if let Some(rest) = r.strip_prefix("task ") {
+        r = rest.split_once(": ").map_or(r, |(_, after)| after);
+    }
+    // A step-path refusal reaches the stream as a `Backend` error's text.
+    if let Some(rest) = r.strip_prefix("backend error: ") {
+        r = rest;
+    }
+    PREFIXES.iter().any(|p| r.starts_with(p))
+}
+
+/// Why GenAI cannot serve this VLM export's images correctly, if it cannot.
+///
+/// GenAI 2026.4.1 has no Pixtral path: `model_type: "llava"` maps a Pixtral
+/// checkpoint onto its LLaVA-1.5 preprocessing (`visual_language/llava/
+/// classes.cpp`), which resizes the shortest edge and center-crops a fixed
+/// square and expands each image without Pixtral's `[IMG_BREAK]` row tokens
+/// and `[IMG_END]`, behind a hard-coded `<image>` tag that the Pixtral
+/// tokenizer splits into ordinary text tokens, so no image row is merged at
+/// all. The model then answers about a different picture (903 prompt tokens
+/// where HF counts 832 on a 448x448 image). Such exports serve text only here; the message names the
+/// ov-runtime commands that serve their images, and the API returns it with
+/// the 400 that refuses them.
+pub fn genai_unsupported_vision(model_dir: &std::path::Path) -> Option<String> {
+    let cfg: serde_json::Value = std::fs::read(model_dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let vision = cfg
+        .get("vision_config")
+        .and_then(|v| v.get("model_type"))
+        .and_then(serde_json::Value::as_str)?;
+    // Mistral 3 exports carry a Pixtral vision tower too; their cut needs
+    // `--family mistral3`.
+    let family = match cfg.get("model_type").and_then(serde_json::Value::as_str) {
+        Some("mistral3") => "mistral3",
+        _ => "pixtral",
+    };
+    (vision == "pixtral").then(|| {
+        format!(
+            "ov-genai serves this Pixtral export as text only: GenAI preprocesses Pixtral as \
+             LLaVA-1.5 (center crop, no [IMG_BREAK]/[IMG_END]) and answers about a different \
+             image. Serve its images with ov-runtime on a one-stage tree: \
+             `python tools/vlm_surgery/cut_vlm_lm.py --model <export dir> --output-dir <tree> \
+             --num-stages 1 --family {family}`, then `cascadia worker --total 1 --rank 0 \
+             --engine ov-runtime --model <tree> --api <host:port>`"
+        )
+    })
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
@@ -554,6 +719,136 @@ mod tests {
                 EngineError::Backend(msg.into()).is_connection_fatal(),
                 "must stay fatal: {msg}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod refuse_media_tests {
+    use super::*;
+
+    #[test]
+    fn text_tasks_pass_and_image_tasks_are_refused_with_the_engine_named() {
+        let mut t = GenerationTask::new("t", "hello");
+        assert!(refuse_media(&t, "x").is_ok());
+        t.media.push(cascadia_types::MediaInput {
+            kind: cascadia_types::MediaKind::Image,
+            pixels: std::sync::Arc::from(vec![0u8; 3]),
+            num_frames: 1,
+            width: 1,
+            height: 1,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        });
+        let e = refuse_media(&t, "gemma4").unwrap_err();
+        assert!(matches!(e, EngineError::UnsupportedInput(_)));
+        assert!(
+            e.to_string()
+                .contains("gemma4 engine does not accept image input"),
+            "{e}"
+        );
+        assert!(!e.is_connection_fatal());
+    }
+
+    #[test]
+    fn image_tasks_pass_and_video_tasks_are_refused() {
+        let mut t = GenerationTask::new("t", "hello");
+        let item = |kind, num_frames| cascadia_types::MediaInput {
+            kind,
+            pixels: std::sync::Arc::from(vec![0u8; 3 * num_frames as usize]),
+            num_frames,
+            width: 1,
+            height: 1,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        };
+        assert!(refuse_video(&t, "x").is_ok());
+        t.media.push(item(cascadia_types::MediaKind::Image, 1));
+        assert!(refuse_video(&t, "x").is_ok());
+        t.media.push(item(cascadia_types::MediaKind::Video, 4));
+        let e = refuse_video(&t, "gemma4").unwrap_err();
+        assert!(matches!(e, EngineError::UnsupportedInput(_)));
+        assert!(
+            e.to_string()
+                .contains("gemma4 engine does not accept native video input (1 video(s)"),
+            "{e}"
+        );
+        assert!(!e.is_connection_fatal());
+    }
+}
+
+#[cfg(test)]
+mod client_error_tests {
+    use super::*;
+
+    #[test]
+    fn statuses_and_client_faults_follow_one_table() {
+        let client = [
+            EngineError::PromptTooLong("x".into()),
+            EngineError::UnsupportedInput("x".into()),
+            EngineError::InvalidConfig("x".into()),
+            EngineError::PeerRejected("x".into()),
+            EngineError::ShardRejected("x".into()),
+            EngineError::ModelNotFound("x".into()),
+        ];
+        for e in &client {
+            assert!(e.is_client_error(), "{e}");
+            assert!(is_client_error_reason(&e.to_string()), "{e}");
+        }
+        assert_eq!(EngineError::PromptTooLong("x".into()).http_status(), 400);
+        assert_eq!(EngineError::ModelNotFound("x".into()).http_status(), 404);
+        let server = [
+            EngineError::QueueFull { queued: 1, cap: 1 },
+            EngineError::NotLoaded,
+            EngineError::NotConnected,
+            EngineError::Backend("boom".into()),
+            EngineError::BatchAborted("x".into()),
+            EngineError::Task {
+                task_id: "t".into(),
+                source: Box::new(EngineError::Backend("x".into())),
+            },
+        ];
+        for e in &server {
+            assert!(!e.is_client_error(), "{e}");
+            assert!(!is_client_error_reason(&e.to_string()), "{e}");
+        }
+        assert_eq!(
+            EngineError::QueueFull { queued: 1, cap: 1 }.http_status(),
+            503
+        );
+        assert_eq!(EngineError::Backend("x".into()).http_status(), 500);
+        assert_eq!(
+            EngineError::PromptTooLong("x".into()).rejection_reason(),
+            "prompt_over_window"
+        );
+    }
+
+    /// The texts engines put on a stream for a request's own fault, as they
+    /// reach a caller: bare, attributed to a task, or wrapped as a step's
+    /// backend error.
+    #[test]
+    fn stream_reasons_from_client_faults_are_recognised() {
+        let empty = EngineError::Backend(format!(
+            "{CLIENT_ERROR_PREFIX}empty prompt: no tokens to prefill"
+        ))
+        .for_task("t-1".into());
+        for r in [
+            format!("{CLIENT_ERROR_PREFIX}invalid resume prefix: id 9 out of range"),
+            format!("{CLIENT_ERROR_PREFIX}empty prompt after tokenize"),
+            empty.to_string(),
+            "unsupported input: resume_unsupported: a resumed turn cannot carry images".into(),
+            "resume_unsupported: ov-genai has no forced-prefix path".into(),
+            "task t-2: prompt too long: prompt is at least 5875 tokens".into(),
+        ] {
+            assert!(is_client_error_reason(&r), "{r}");
+        }
+        for r in [
+            "tokenize failed: bad utf8",
+            "image rows missing at admission",
+            "task t-3: backend error: stage 1 hung up",
+            "batch aborted: NACK",
+        ] {
+            assert!(!is_client_error_reason(r), "{r}");
         }
     }
 }

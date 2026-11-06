@@ -56,6 +56,12 @@ const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
     Forward = 1,
+    /// FORWARD whose LOGITS_RESPONSE carries the last position's row only
+    /// (`[1, 1, vocab]`): a prompt prefill chunk, where the driver samples
+    /// from that row alone. Same body as FORWARD. A distinct kind rather than
+    /// a flag in the body, so a worker built before it fails loudly ("bad
+    /// kind 10") instead of answering every row.
+    ForwardLastRow = 10,
     Reset = 3,
     LogitsResponse = 4,
     // Issue-34 §8 multi-stage KV coordination (append-only; `kv_coord`-gated). CAPTURE snapshots a
@@ -83,6 +89,7 @@ impl FrameKind {
     fn from_u32(v: u32) -> Option<Self> {
         match v {
             1 => Some(Self::Forward),
+            10 => Some(Self::ForwardLastRow),
             3 => Some(Self::Reset),
             4 => Some(Self::LogitsResponse),
             #[cfg(feature = "kv_coord")]
@@ -234,6 +241,14 @@ struct PipelineConfig {
     model_id: String,
     #[serde(default)]
     export_version: Option<String>,
+    /// Per-stage metadata (`tools/vlm_surgery/cut_vlm_lm.py` writes it; v5
+    /// shards from `export_shards.py` may not).
+    #[serde(default)]
+    stages: Vec<StageConfig>,
+    /// A VLM tree's image block (`cut_vlm_lm.py`): stage 0 takes
+    /// `inputs_embeds` and rank 0 embeds ids and encodes images itself.
+    #[serde(default)]
+    vision: Option<crate::runtime::PipelineVision>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -244,6 +259,104 @@ struct StageConfig {
     has_head: bool,
     #[serde(default)]
     export_version: Option<String>,
+    /// Last stage only: `"all"` when the head emits logits for every fed
+    /// position, `"last"` when it was sliced to the final one.
+    #[serde(default)]
+    logits: Option<String>,
+}
+
+/// `export_version` of `cut_vlm_lm.py` trees. Its cuts before `--all-logits`
+/// existed carry no `logits` field and always sliced the head.
+const VLM_CUT_EXPORT: &str = "vlm_lm_surgery_v1";
+
+/// Why a last stage cannot serve dist-spec verification, if it cannot: the
+/// verify step reads the target's logits at every fed position, so a head
+/// sliced to the last position would verify one draft at most.
+fn last_stage_logits_refusal(cfg: &StageConfig) -> Option<String> {
+    let sliced = match cfg.logits.as_deref() {
+        Some("all") => false,
+        Some(_) => true,
+        None => cfg.export_version.as_deref() == Some(VLM_CUT_EXPORT),
+    };
+    sliced.then(|| {
+        "the last stage's head returns last-position logits only, but dist-spec verifies \
+         every drafted position; re-cut the tree with tools/vlm_surgery/cut_vlm_lm.py \
+         --all-logits"
+            .to_string()
+    })
+}
+
+/// Refuse prompt ids the draft's embedding table cannot index (`vocab` from
+/// the draft's config.json; unknown vocab passes).
+fn check_draft_ids(ids: &[i64], vocab: Option<usize>) -> Result<(), String> {
+    let Some(vocab) = vocab else { return Ok(()) };
+    match ids.iter().find(|&&t| t < 0 || t as usize >= vocab) {
+        Some(t) => Err(format!(
+            "prompt token {t} is outside the draft's {vocab}-token vocabulary; the draft \
+             must share the target's tokenizer"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Overwrite the image soft-token rows of row-major `[ids.len(), hidden]`
+/// text embeddings with `images`' rows, in prompt order; the number of rows
+/// written. No images (every span but a prompt with images: drafted and
+/// accepted tokens, text prompts) leaves the text rows as they are, even on an
+/// id that happens to be the image token.
+fn splice_prompt_rows(
+    embeds: &mut [f32],
+    hidden: usize,
+    ids: &[i64],
+    image_token: i64,
+    images: &[&[f32]],
+) -> Result<usize, String> {
+    if images.is_empty() {
+        return Ok(0);
+    }
+    crate::gemma4_vision::splice_images(embeds, hidden, ids, image_token, images)?;
+    Ok(images.iter().map(|im| im.len()).sum::<usize>() / hidden.max(1))
+}
+
+/// The draft's view of an image turn's expanded prompt: every image id (soft
+/// tokens and their row/end framing) dropped. A text draft cannot read
+/// hundreds of `[IMG]` placeholders as anything but noise, and its cache is
+/// its own, so its positions need not line up with the target's.
+fn draft_prompt_ids(ids: &[i64], image_ids: &[i64]) -> Vec<i64> {
+    ids.iter()
+        .copied()
+        .filter(|t| !image_ids.contains(t))
+        .collect()
+}
+
+/// The target's prompt ids: on an image turn the vision family's own layout
+/// ([`crate::runtime::Frontend::encode_prompt`]: Phi-3.5-vision tokenizes each
+/// chunk between its `<|image_N|>` tags with its BOS), else the prompt encoded
+/// whole without special tokens (the template writes them).
+fn target_prompt_ids(
+    tok: &Tokenizer,
+    vision: Option<&crate::runtime::VisionFirst>,
+    task: &GenerationTask,
+) -> Result<Vec<i64>, String> {
+    match vision {
+        Some(v) if !task.media.is_empty() => v
+            .frontend
+            .encode_prompt(tok, &v.frontend.prompt_text(&task.prompt, &task.media)),
+        _ => tok
+            .encode(task.prompt.as_str(), false)
+            .map(|e| e.get_ids().iter().map(|&u| i64::from(u)).collect())
+            .map_err(|e| format!("tokenizer encode: {e}")),
+    }
+}
+
+/// The `vocab_size` in `dir/config.json` (top level or `text_config`).
+fn config_vocab(dir: &std::path::Path) -> Option<usize> {
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
+    v.get("vocab_size")
+        .or_else(|| v.get("text_config").and_then(|t| t.get("vocab_size")))
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as usize)
 }
 
 fn read_pipeline_config(p: &std::path::Path) -> Result<PipelineConfig, EngineError> {
@@ -409,6 +522,11 @@ pub struct MaskedReq {
     cache_len: usize,
     logical_pos: usize,
     inputs: std::collections::HashMap<String, String>,
+    /// The model's vocabulary when known: `feed` refuses ids past it. The
+    /// prompt is checked at admission, but the draft is also fed every token
+    /// the TARGET samples, and a target with a wider (padded) vocabulary can
+    /// sample one the draft's embedding table cannot index.
+    vocab: Option<usize>,
 }
 
 #[cfg(feature = "kv_coord")]
@@ -477,6 +595,7 @@ impl MaskedReq {
             cache_len: 0,
             logical_pos: 0,
             inputs,
+            vocab: None,
         })
     }
 
@@ -491,6 +610,15 @@ impl MaskedReq {
     }
 
     pub fn feed(&mut self, input_ids: &[i64]) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
+        if let Some(vocab) = self.vocab {
+            if let Some(t) = input_ids.iter().find(|&&t| t < 0 || t as usize >= vocab) {
+                return Err(EngineError::Backend(format!(
+                    "token {t} is outside the draft's {vocab}-token vocabulary (the target \
+                     sampled an id the draft cannot embed); the draft must share the target's \
+                     tokenizer"
+                )));
+            }
+        }
         let n = input_ids.len();
         let total = self.cache_len + n;
         if total > self.valid_mask.len() {
@@ -627,6 +755,10 @@ pub struct TargetSendHandle {
 pub struct DistributedMaskedReq {
     stage0: OvRuntime,
     stage0_inputs: std::collections::HashMap<String, String>,
+    /// A VLM tree's rank-0 half (text embedding table + image encoder):
+    /// stage 0 takes `inputs_embeds`, so every span is embedded here. `None`
+    /// on a v5 tree, whose stage 0 takes `input_ids`.
+    vision: Option<crate::runtime::VisionFirst>,
     downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
     runtime_handle: tokio::runtime::Handle,
     valid_mask: Vec<i64>,
@@ -797,8 +929,24 @@ impl DistributedMaskedReq {
         downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, EngineError> {
+        Self::with_vision(stage0, downstream, runtime_handle, None)
+    }
+
+    /// [`Self::new`] for a VLM tree: `vision` embeds every span for a stage 0
+    /// that takes `inputs_embeds`.
+    pub(crate) fn with_vision(
+        stage0: OvRuntime,
+        downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
+        runtime_handle: tokio::runtime::Handle,
+        vision: Option<crate::runtime::VisionFirst>,
+    ) -> Result<Self, EngineError> {
         let inputs = v5_inputs(&stage0)?;
-        for k in ["input_ids", "attention_mask", "position_ids", "beam_idx"] {
+        let token_in = if vision.is_some() {
+            "inputs_embeds"
+        } else {
+            "input_ids"
+        };
+        for k in [token_in, "attention_mask", "position_ids", "beam_idx"] {
             if !inputs.contains_key(k) {
                 return Err(EngineError::Backend(format!(
                     "stage 0 IR is missing v5 input: {k}"
@@ -808,6 +956,7 @@ impl DistributedMaskedReq {
         Ok(Self {
             stage0,
             stage0_inputs: inputs,
+            vision,
             downstream,
             runtime_handle,
             valid_mask: vec![1i64; 4096],
@@ -858,14 +1007,11 @@ impl DistributedMaskedReq {
         let pos: Vec<i64> = (self.logical_pos as i64..(self.logical_pos + n) as i64).collect();
 
         // Run stage 0 locally (synchronous GPU compute).
-        let in_ids = self.stage0_inputs.get("input_ids").unwrap().clone();
         let attn_name = self.stage0_inputs.get("attention_mask").unwrap().clone();
         let pos_name = self.stage0_inputs.get("position_ids").unwrap().clone();
         let beam_name = self.stage0_inputs.get("beam_idx").unwrap().clone();
         let _ts = std::time::Instant::now();
-        self.stage0
-            .set_input(&in_ids, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
-            .map_err(map_ov_err)?;
+        self.set_stage0_tokens(input_ids, &[])?;
         self.stage0
             .set_input(
                 &attn_name,
@@ -979,7 +1125,81 @@ impl DistributedMaskedReq {
         result.map_err(|e| EngineError::Backend(e.to_string()))
     }
 
+    /// Feed `input_ids` and return the target's logits for every one of them
+    /// (a verify span).
     pub fn feed(&mut self, input_ids: &[i64]) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
+        self.feed_span(input_ids, &[], FrameKind::Forward)
+    }
+
+    /// Prefill a prompt in [`PREFILL_CHUNK`]-row chunks, each answered with
+    /// its last row's logits only; returns the final chunk's `[1, 1, vocab]`.
+    /// On a VLM tree each image's encoder rows are spliced over the image soft
+    /// tokens of the chunk that holds them (`images` is empty for every other
+    /// span, so image rows never reach a speculative span).
+    pub(crate) fn feed_prompt(
+        &mut self,
+        input_ids: &[i64],
+        images: &[Vec<f32>],
+    ) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
+        if input_ids.is_empty() {
+            return self.feed_span(input_ids, &[], FrameKind::ForwardLastRow);
+        }
+        let image = match (&self.vision, images.is_empty()) {
+            (_, true) => None,
+            (Some(v), false) => Some(v.frontend.image_token()),
+            (None, false) => {
+                return Err(EngineError::Backend(
+                    "image rows for a target whose stage 0 takes input_ids".into(),
+                ))
+            }
+        };
+        // Values per image row: the images' values over the prompt's image tokens.
+        let hidden = match image {
+            Some(t) => {
+                let tokens = input_ids.iter().filter(|&&x| x == t).count();
+                let values: usize = images.iter().map(Vec::len).sum();
+                if tokens == 0 || !values.is_multiple_of(tokens) {
+                    return Err(EngineError::Backend(format!(
+                        "{tokens} image tokens in the prompt for {values} image values"
+                    )));
+                }
+                values / tokens
+            }
+            None => 0,
+        };
+        let (mut before, mut spliced, mut last) = (0usize, 0usize, None);
+        for chunk in input_ids.chunks(PREFILL_CHUNK) {
+            let in_chunk = image.map_or(0, |t| chunk.iter().filter(|&&x| x == t).count());
+            let rows = if in_chunk > 0 {
+                image_rows_span(images, hidden, before, in_chunk).map_err(EngineError::Backend)?
+            } else {
+                Vec::new()
+            };
+            before += in_chunk;
+            spliced += in_chunk;
+            last = Some(self.feed_span(chunk, &rows, FrameKind::ForwardLastRow)?);
+        }
+        if spliced > 0 {
+            info!(
+                images = images.len(),
+                rows = spliced,
+                prompt = input_ids.len(),
+                chunks = input_ids.len().div_ceil(PREFILL_CHUNK),
+                "ov-dist-spec: image rows spliced into the target's stage 0 prefill"
+            );
+        }
+        Ok(last.expect("a non-empty prompt has a chunk"))
+    }
+
+    /// One stage-0 inference + FORWARD round trip for `input_ids`, with
+    /// `images` (rows of this span's image tokens, in order) spliced in. `kind`
+    /// picks every row's logits (`Forward`) or the last row's (`ForwardLastRow`).
+    fn feed_span(
+        &mut self,
+        input_ids: &[i64],
+        images: &[&[f32]],
+        kind: FrameKind,
+    ) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
         let n = input_ids.len();
         let total = self.cache_len + n;
         if total > self.valid_mask.len() {
@@ -994,14 +1214,11 @@ impl DistributedMaskedReq {
         let pos: Vec<i64> = (self.logical_pos as i64..(self.logical_pos + n) as i64).collect();
 
         // Run stage 0 locally.
-        let in_ids = self.stage0_inputs.get("input_ids").unwrap().clone();
         let attn_name = self.stage0_inputs.get("attention_mask").unwrap().clone();
         let pos_name = self.stage0_inputs.get("position_ids").unwrap().clone();
         let beam_name = self.stage0_inputs.get("beam_idx").unwrap().clone();
         let _ts = std::time::Instant::now();
-        self.stage0
-            .set_input(&in_ids, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
-            .map_err(map_ov_err)?;
+        self.set_stage0_tokens(input_ids, images)?;
         self.stage0
             .set_input(
                 &attn_name,
@@ -1060,7 +1277,7 @@ impl DistributedMaskedReq {
             // attention_mask + hidden via send_tensor).
             let _ts_send = std::time::Instant::now();
             let mut header = [0u8; 8];
-            header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+            header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
             header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
             g.send_raw(&header).await?;
             let attn_tensor = WireTensor::new(
@@ -1168,6 +1385,143 @@ impl DistributedMaskedReq {
         }
         self.logical_pos = self.logical_pos.saturating_sub(k);
     }
+
+    /// Whether stage 0 takes embeddings (a VLM tree), so image turns can run.
+    pub(crate) fn takes_images(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Set stage 0's token input for `ids`: the ids on a v5 tree; on a VLM
+    /// tree, their text-embedding rows with `images` spliced in.
+    fn set_stage0_tokens(&mut self, ids: &[i64], images: &[&[f32]]) -> Result<(), EngineError> {
+        let Some(vision) = self.vision.as_mut() else {
+            if !images.is_empty() {
+                return Err(EngineError::Backend(
+                    "image rows for a target whose stage 0 takes input_ids".into(),
+                ));
+            }
+            let in_ids = self.stage0_inputs.get("input_ids").unwrap();
+            return self
+                .stage0
+                .set_input(in_ids, ShimDType::I64, &[1, ids.len()], &i64_to_bytes(ids))
+                .map_err(map_ov_err);
+        };
+        let (mut rows, hidden) = vision.embed(ids)?;
+        let image = vision.frontend.image_token();
+        splice_prompt_rows(&mut rows, hidden, ids, image, images).map_err(EngineError::Backend)?;
+        let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let in_embeds = self.stage0_inputs.get("inputs_embeds").unwrap();
+        self.stage0
+            .set_input(in_embeds, ShimDType::F32, &[1, ids.len(), hidden], &bytes)
+            .map_err(map_ov_err)
+    }
+}
+
+/// The target's logits must cover every fed position for verification; a
+/// head sliced to the last position (a VLM tree cut without `--all-logits`)
+/// would otherwise index out of bounds.
+fn check_verify_rows(logits_len: usize, vocab: usize, span: usize) -> Result<(), EngineError> {
+    if vocab == 0 || logits_len < span * vocab {
+        return Err(EngineError::Backend(format!(
+            "target returned {} logits rows for a {span}-token verify span; the last stage \
+             must emit logits for every position (re-cut a VLM tree with \
+             tools/vlm_surgery/cut_vlm_lm.py --all-logits)",
+            logits_len / vocab.max(1)
+        )));
+    }
+    Ok(())
+}
+
+/// Rows a prompt prefill feeds per inference. Bounds every rank's per-chunk
+/// activations and the last stage's logits (`PREFILL_CHUNK x vocab`) whatever
+/// the prompt length: an image turn expands to thousands of tokens.
+pub(crate) const PREFILL_CHUNK: usize = 512;
+
+/// The rows `[start, start + n)` of the images' rows taken end to end
+/// (`hidden` values per row), as slices of the images that hold them: the
+/// image rows of one prefill chunk.
+fn image_rows_span(
+    images: &[Vec<f32>],
+    hidden: usize,
+    start: usize,
+    n: usize,
+) -> Result<Vec<&[f32]>, String> {
+    let mut out = Vec::new();
+    let (mut skip, mut want) = (start, n);
+    for im in images {
+        let rows = im.len() / hidden.max(1);
+        if skip >= rows {
+            skip -= rows;
+            continue;
+        }
+        let take = want.min(rows - skip);
+        if take > 0 {
+            out.push(&im[skip * hidden..(skip + take) * hidden]);
+        }
+        want -= take;
+        skip = 0;
+        if want == 0 {
+            break;
+        }
+    }
+    if want > 0 {
+        return Err(format!(
+            "image rows {start}..{} requested, but the images carry fewer",
+            start + n
+        ));
+    }
+    Ok(out)
+}
+
+/// A last stage's output cut to its final position: `[1, T, V]` (or
+/// `[T, V]`) logits of `elem`-byte values become `[1, 1, V]`.
+fn last_row_only(
+    bytes: Vec<u8>,
+    shape: &[usize],
+    elem: usize,
+) -> Result<(Vec<u8>, Vec<usize>), String> {
+    let vocab = match shape {
+        [1, _, v] | [_, v] => *v,
+        _ => return Err(format!("last-row logits from a {shape:?} output")),
+    };
+    let row = vocab * elem;
+    if row == 0 || bytes.len() < row || !bytes.len().is_multiple_of(row) {
+        return Err(format!(
+            "{} logits bytes do not hold whole rows of {vocab}",
+            bytes.len()
+        ));
+    }
+    Ok((bytes[bytes.len() - row..].to_vec(), vec![1, 1, vocab]))
+}
+
+/// The refusal (the API's 400 `context_length_exceeded`) for a prompt at or
+/// past the target's window, if it is.
+fn prompt_window_refusal(n: usize, max: Option<usize>) -> Option<String> {
+    let max = max?;
+    (n >= max).then(|| {
+        format!("prompt is {n} tokens; the target's window is {max} (max_position_embeddings)")
+    })
+}
+
+/// `max_position_embeddings` from a target tree's config.json (the tree root,
+/// else `tokenizer/`; `text_config` when nested).
+fn config_max_ctx(dir: &std::path::Path) -> Option<usize> {
+    [
+        dir.join("config.json"),
+        dir.join("tokenizer").join("config.json"),
+    ]
+    .iter()
+    .find_map(|p| {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).ok()?).ok()?;
+        v.get("max_position_embeddings")
+            .or_else(|| {
+                v.get("text_config")
+                    .and_then(|t| t.get("max_position_embeddings"))
+            })
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&m| m > 0)
+            .map(|m| m as usize)
+    })
 }
 
 // -------- spec_decode loop --------
@@ -1283,6 +1637,7 @@ pub fn spec_decode_greedy(
         let (t_logits, t_shape) = target.feed_recv_async(target_handle)?;
         t_target += _ts.elapsed();
         let v = t_shape[2];
+        check_verify_rows(t_logits.len(), v, verify.len())?;
         let mut t_greedy = Vec::with_capacity(verify.len());
         for i in 0..verify.len() {
             let row = &t_logits[i * v..(i + 1) * v];
@@ -1398,6 +1753,13 @@ struct ActiveSpec {
     stats: SpecDecodeStats,
     /// Whether we already emitted the first sampled token's chunk.
     initialized: bool,
+    /// Prompt tokens the target consumed (image soft tokens included), for
+    /// `usage.prompt_tokens`.
+    prompt_len: usize,
+    /// Images this turn's prompt carries (VLM target). An image turn stays
+    /// out of the KV warm-resume cache: its key would be placeholder ids that
+    /// every image of one size shares.
+    images: usize,
 }
 
 pub struct OvDistSpecEngine {
@@ -1408,6 +1770,12 @@ pub struct OvDistSpecEngine {
     /// at the first token that matches ANY of these.
     eos_token_ids: Vec<u32>,
     k: usize,
+    /// The draft's vocabulary (its config.json), to refuse prompt ids it
+    /// cannot embed. `None` when unknown.
+    draft_vocab: Option<usize>,
+    /// The target's window (`max_position_embeddings`); prompts at or past it
+    /// are refused at submit (400 `context_length_exceeded`). `None` when the tree does not state it.
+    max_ctx: Option<usize>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveSpec>,
     /// Issue-34: opaque KV blob cache + a stable model id (the target pipeline dir) for the
@@ -1419,6 +1787,10 @@ pub struct OvDistSpecEngine {
     kv_share: crate::kv_coordination::SharedKvCache,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
+    /// [`crate::kv_coordination::config_digest`] of the tree's `pipeline_config.json`, read once
+    /// at load and folded into the KV fingerprint.
+    #[cfg(feature = "kv_coord")]
+    kv_config_digest: u64,
 }
 
 impl Engine for OvDistSpecEngine {
@@ -1453,6 +1825,36 @@ impl Engine for OvDistSpecEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // Only the target sees images: rank 0 encodes them and splices their
+        // rows into stage 0's embeddings, while the draft reads the expanded
+        // ids as text. A target whose stage 0 takes ids has no image path.
+        cascadia_engine::refuse_video(&task, "ov-dist-spec")?;
+        if !self.target.takes_images() {
+            cascadia_engine::refuse_media(
+                &task,
+                "ov-dist-spec (target tree without a `vision` block)",
+            )?;
+        }
+        // Synchronous with the HTTP request, so an over-window prompt is a 400
+        // before anything runs. An image turn is sized from its images'
+        // dimensions (their token grids), before any image is encoded.
+        if let Some(max) = self.max_ctx {
+            let n = target_prompt_ids(&self.tokenizer, self.target.vision.as_ref(), &task)
+                .map_err(EngineError::Backend)?
+                .len()
+                + task.resume_ids().map_or(0, <[i32]>::len);
+            let n = match self.target.vision.as_ref() {
+                Some(v) if !task.media.is_empty() => v
+                    .frontend
+                    .expanded_len(n, &task.media)
+                    .map_err(EngineError::UnsupportedInput)?,
+                _ => n,
+            };
+            if let Some(why) = prompt_window_refusal(n, Some(max)) {
+                warn!(task = %task.task_id, prompt_tokens = n, max, "ov-dist-spec: refusing over-window prompt");
+                return Err(EngineError::PromptTooLong(why));
+            }
+        }
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
                 .active
@@ -1497,16 +1899,16 @@ impl Engine for OvDistSpecEngine {
                 return Ok(Vec::new());
             }
             let task = self.pending.remove(0);
-            let enc = match self.tokenizer.encode(task.prompt.clone(), false) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(error = %e, "tokenize failed");
-                    let task_id = task.task_id.clone();
-                    let c = Chunk::error(task.task_id, format!("tokenize failed: {e}"));
-                    return Ok(vec![(task_id, c)]);
-                }
-            };
-            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids =
+                match target_prompt_ids(&self.tokenizer, self.target.vision.as_ref(), &task) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        warn!(error = %e, "tokenize failed");
+                        let task_id = task.task_id.clone();
+                        let c = Chunk::error(task.task_id, format!("tokenize failed: {e}"));
+                        return Ok(vec![(task_id, c)]);
+                    }
+                };
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) — flows into
             // BOTH the draft and target prefill via start_task's shared feed_ids.
@@ -1517,7 +1919,13 @@ impl Engine for OvDistSpecEngine {
                 let vocab = crate::resume_vocab_bound(&self.tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let task_id = task.task_id.clone();
-                    let c = Chunk::error(task.task_id, format!("invalid resume prefix: {e}"));
+                    let c = Chunk::error(
+                        task.task_id,
+                        format!(
+                            "{}invalid resume prefix: {e}",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    );
                     return Ok(vec![(task_id, c)]);
                 }
                 // Exhausted budget (prefix >= max_tokens): finish Length with ZERO
@@ -1531,15 +1939,71 @@ impl Engine for OvDistSpecEngine {
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
+            // VLM target: expand each image placeholder into its soft-token run
+            // and encode the images (cached per tenant by content hash). The
+            // draft is fed the prompt with every image id removed
+            // (`draft_prompt_ids`).
+            let mut image_rows = Vec::new();
+            if !task.media.is_empty() {
+                let refuse = |reason: String| {
+                    warn!(task = %task.task_id, reason = %reason, "ov-dist-spec: image turn refused");
+                    let id = task.task_id.clone();
+                    vec![(id.clone(), Chunk::error(id, reason))]
+                };
+                if resume.is_some() {
+                    return Ok(refuse(
+                        "resume_unsupported: a resumed turn cannot carry images".into(),
+                    ));
+                }
+                let Some(vision) = self.target.vision.as_mut() else {
+                    return Ok(refuse(
+                        "this target tree takes no images (no `vision` block in \
+                         pipeline_config.json)"
+                            .into(),
+                    ));
+                };
+                let started = std::time::Instant::now();
+                match vision
+                    .frontend
+                    .prepare(&task.media, &prompt_ids, &task.tenant)
+                {
+                    Ok((ids, rows)) => {
+                        info!(
+                            task = %task.task_id,
+                            images = rows.len(),
+                            prompt = ids.len(),
+                            encode_ms = started.elapsed().as_millis() as u64,
+                            "ov-dist-spec: images encoded"
+                        );
+                        prompt_ids = ids;
+                        image_rows = rows;
+                    }
+                    Err(e) => return Ok(refuse(e)),
+                }
+            }
+            // Only what the draft is fed is checked against its vocabulary: on
+            // an image turn that is the prompt without its image ids.
+            let draft_view = match self.target.vision.as_ref() {
+                Some(v) if !image_rows.is_empty() => std::borrow::Cow::Owned(draft_prompt_ids(
+                    &prompt_ids,
+                    &v.frontend.image_framing(),
+                )),
+                _ => std::borrow::Cow::Borrowed(prompt_ids.as_slice()),
+            };
+            if let Err(e) = check_draft_ids(&draft_view, self.draft_vocab) {
+                let task_id = task.task_id.clone();
+                return Ok(vec![(task_id, Chunk::error(task.task_id, e))]);
+            }
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
+                images = image_rows.len(),
                 k = self.k,
                 "ov-dist-spec task active"
             );
 
             let task_id = task.task_id.clone();
-            match self.start_task(task, &prompt_ids) {
+            match self.start_task(task, &prompt_ids, image_rows) {
                 Ok(active) => self.active = Some(active),
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec start failed");
@@ -1677,11 +2141,18 @@ impl OvDistSpecEngine {
         &mut self,
         task: GenerationTask,
         prompt_ids: &[i64],
+        image_rows: Vec<Vec<f32>>,
     ) -> Result<ActiveSpec, EngineError> {
+        let images = image_rows.len();
         // Issue-34: warm-resume a cached strict prefix (restores draft+target+chain, all-or-nothing)
         // and feed only the suffix; else cold-reset + feed the full prompt. 0 on the default build.
+        // An image turn always prefills cold: its rows splice into the whole prompt.
         #[cfg(feature = "kv_coord")]
-        let warm_len = self.kv_try_warm_resume(&task.tenant, prompt_ids);
+        let warm_len = if images > 0 {
+            0
+        } else {
+            self.kv_try_warm_resume(&task.tenant, prompt_ids)
+        };
         #[cfg(not(feature = "kv_coord"))]
         let warm_len = 0usize;
         if warm_len == 0 {
@@ -1694,8 +2165,28 @@ impl OvDistSpecEngine {
         self.target.t_wire = std::time::Duration::ZERO;
 
         let feed_ids = &prompt_ids[warm_len..];
-        let (t_logits, t_shape) = self.target.feed(feed_ids)?;
-        self.draft.feed(feed_ids)?;
+        // Target: embeddings with the image rows spliced (VLM tree) or ids.
+        // Draft: ids only; on an image turn, the prompt without its image ids.
+        let (t_logits, t_shape) = self.target.feed_prompt(feed_ids, &image_rows)?;
+        drop(image_rows);
+        // An image turn's draft reads the prompt without its image ids.
+        let draft_ids = match self.target.vision.as_ref() {
+            Some(v) if images > 0 => {
+                let ids = draft_prompt_ids(feed_ids, &v.frontend.image_framing());
+                info!(
+                    target_prompt = feed_ids.len(),
+                    draft_prompt = ids.len(),
+                    "ov-dist-spec: draft prefill without the image ids"
+                );
+                ids
+            }
+            _ => feed_ids.to_vec(),
+        };
+        // Chunked like the target: the draft's prefill logits are discarded,
+        // and a whole image prompt's would be `T x vocab` floats.
+        for chunk in draft_ids.chunks(PREFILL_CHUNK) {
+            self.draft.feed(chunk)?;
+        }
         let vocab = t_shape[2];
         let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
 
@@ -1737,6 +2228,8 @@ impl OvDistSpecEngine {
             d_last_logit,
             stats: SpecDecodeStats::default(),
             initialized: false,
+            prompt_len: prompt_ids.len(),
+            images,
         })
     }
 
@@ -1766,6 +2259,7 @@ impl OvDistSpecEngine {
         verify.extend_from_slice(&drafts);
         let (t_logits, t_shape) = self.target.feed(&verify)?;
         let v = t_shape[2];
+        check_verify_rows(t_logits.len(), v, verify.len())?;
         let mut t_greedy = Vec::with_capacity(verify.len());
         for i in 0..verify.len() {
             t_greedy.push(argmax(&t_logits[i * v..(i + 1) * v]) as i64);
@@ -1866,13 +2360,21 @@ impl OvDistSpecEngine {
                 .collect();
             // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
             // plane-asserted value, which describes a pulled entry, not this turn.
-            self.kv_capture(&active.task.tenant, tokens);
+            if active.images == 0 {
+                self.kv_capture(&active.task.tenant, tokens);
+            } else {
+                info!(task = %active.task.task_id, images = active.images,
+                    "ov-dist-spec: image turn kept out of the KV cache");
+            }
         }
         info!(
             task = %active.task.task_id,
             tokens = active.out.len(),
             steps = active.stats.n_steps,
+            drafted = active.stats.total_drafts,
+            accepted = active.stats.total_accepted,
             accept = active.stats.accept_rate(),
+            images = active.images,
             "ov-dist-spec done"
         );
         // Surface every id this round appended, in order — including a
@@ -1895,7 +2397,9 @@ impl OvDistSpecEngine {
                 is_final: true,
                 logprobs: None,
                 n_tokens: if n_tokens > 0 { Some(n_tokens) } else { None },
-                prompt_tokens: None,
+                // OpenAI's usage.prompt_tokens: every prompt token the target
+                // consumed, image soft tokens included.
+                prompt_tokens: Some(active.prompt_len as u32),
                 completion_tokens: None,
                 error: None,
                 token_ids,
@@ -1948,6 +2452,10 @@ pub struct OvDistSpecBuilder {
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+    /// VLM target tree: rank 0's text embedding table + image encoder.
+    vision: Option<crate::runtime::VisionFirst>,
+    draft_vocab: Option<usize>,
+    max_ctx: Option<usize>,
 }
 
 impl OvDistSpecBuilder {
@@ -1973,6 +2481,9 @@ impl OvDistSpecBuilder {
             tokenizer: None,
             eos_token_ids: Vec::new(),
             downstream: None,
+            vision: None,
+            draft_vocab: None,
+            max_ctx: None,
         }
     }
 
@@ -2062,6 +2573,55 @@ impl Builder for OvDistSpecBuilder {
                 "driver requires v5 shards (canonical inputs)".into(),
             ));
         }
+        if let Some(v) = pipeline_cfg.vision.as_ref() {
+            let family = crate::runtime::vision_family(v, pipeline_cfg.export_version.as_deref())?;
+            if let Some(at) = v.long_rope_switch {
+                // The switch decides once per inference and this engine
+                // prefills in PREFILL_CHUNK chunks, so a prompt past `at`
+                // keeps the short factors in its earlier chunks.
+                warn!(
+                    positions = at,
+                    "ov-dist-spec: prompts past {at} tokens are prefilled in chunks, which the \
+                     long-RoPE switch does not cover; they differ from HF (serve them on a \
+                     stateful ov-runtime tree or ov-genai)"
+                );
+            }
+            // The FORWARD wire carries hidden states and the mask only, every
+            // rank counts 1-D positions, and the draft reads the prompt as plain
+            // ids: only causal families with 1-D positions ride it. Families that
+            // attend bidirectionally inside an image (token_type_ids: Gemma 3/4)
+            // or take M-RoPE positions (Qwen VL) cannot.
+            use crate::runtime::VisionFamily as F;
+            let causal_1d = matches!(family, F::Pixtral | F::Phi3V | F::InternVL | F::LlavaNext);
+            if !causal_1d || v.token_type_ids.unwrap_or(false) {
+                return Err(EngineError::ShardRejected(format!(
+                    "ov-dist-spec takes a VLM target only for causal 1-D-position trees \
+                     (tools/vlm_surgery/cut_vlm_lm.py --family pixtral|mistral3|phi3_v|\
+                     internvl_chat|llava_next); this tree's vision family is {family:?}{}",
+                    if v.token_type_ids.unwrap_or(false) {
+                        " with token_type_ids"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            if let Some(why) = pipeline_cfg
+                .stages
+                .last()
+                .and_then(last_stage_logits_refusal)
+            {
+                return Err(EngineError::ShardRejected(why));
+            }
+            let first = crate::runtime::VisionFirst::load(&self.pipeline_dir, v, family)?;
+            let msg = format!(
+                "vision target: rank 0 embeds every span and encodes images ({}); the draft \
+                 reads the prompt as ids, with the image ids removed",
+                first.frontend.describe()
+            );
+            info!("ov-dist-spec: {msg}");
+            events.push(LoadProgress::message(msg));
+            self.vision = Some(first);
+        }
         let plugin = self.plugin();
 
         events.push(LoadProgress::message(
@@ -2098,7 +2658,25 @@ impl Builder for OvDistSpecBuilder {
             "compiling draft {}",
             self.draft_model_path
         )));
-        let draft_xml = std::path::Path::new(&self.draft_model_path).join("openvino_model.xml");
+        self.max_ctx = config_max_ctx(&self.pipeline_dir);
+        if self.max_ctx.is_none() {
+            warn!("ov-dist-spec: the target tree states no max_position_embeddings; the prompt-window guard is OFF");
+        }
+        let draft_dir = std::path::Path::new(&self.draft_model_path);
+        self.draft_vocab = config_vocab(draft_dir);
+        let target_vocab =
+            config_vocab(&self.pipeline_dir.join("tokenizer")).or(config_vocab(&self.pipeline_dir));
+        if let (Some(d), Some(t)) = (self.draft_vocab, target_vocab) {
+            if d != t {
+                warn!(
+                    draft_vocab = d,
+                    target_vocab = t,
+                    "ov-dist-spec: draft and target vocabularies differ; prompt ids past the \
+                     draft's are refused, and acceptance suffers if the tokenizers disagree"
+                );
+            }
+        }
+        let draft_xml = draft_dir.join("openvino_model.xml");
         let draft = OvRuntime::compile(
             draft_xml.to_str().unwrap_or_default(),
             &self.draft_device,
@@ -2116,17 +2694,28 @@ impl Builder for OvDistSpecBuilder {
         let draft = self.draft.ok_or(EngineError::NotLoaded)?;
         let tokenizer = self.tokenizer.ok_or(EngineError::NotLoaded)?;
         let downstream = self.downstream.ok_or(EngineError::NotConnected)?;
-        let target =
-            DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
-        let masked_draft = MaskedReq::new(draft)?;
+        let target = DistributedMaskedReq::with_vision(
+            stage0,
+            downstream,
+            tokio::runtime::Handle::current(),
+            self.vision,
+        )?;
+        let mut masked_draft = MaskedReq::new(draft)?;
+        masked_draft.vocab = self.draft_vocab;
         Ok(Box::new(OvDistSpecEngine {
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: crate::kv_coordination::config_digest(
+                &self.pipeline_dir.join("pipeline_config.json"),
+            ),
             target,
             draft: masked_draft,
             tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             k: self.k as usize,
+            draft_vocab: self.draft_vocab,
+            max_ctx: self.max_ctx,
             pending: Vec::new(),
             active: None,
             #[cfg(feature = "kv_coord")]
@@ -2162,6 +2751,10 @@ pub struct OvDistSpecWorkerEngine {
     kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
+    /// [`crate::kv_coordination::config_digest`] of the tree's `pipeline_config.json`, read once
+    /// at load and folded into the KV fingerprint.
+    #[cfg(feature = "kv_coord")]
+    kv_config_digest: u64,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -2458,7 +3051,7 @@ impl OvDistSpecWorkerEngine {
             FrameKind::CaptureAck | FrameKind::RestoreAck => Err(EngineError::Backend(
                 "ov-dist-spec worker: unexpected ack frame from upstream".into(),
             )),
-            FrameKind::Forward => {
+            kind @ (FrameKind::Forward | FrameKind::ForwardLastRow) => {
                 // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
                 //    Keep hidden as raw bytes (f16 wire format) — the IR
                 //    expects f16 for the hidden_states port and we want
@@ -2567,6 +3160,16 @@ impl OvDistSpecWorkerEngine {
                     output_us,
                     "worker.frame timing"
                 );
+                // A prefill chunk: answer with the last position's row only.
+                let (out_bytes, out_shape) = if self.is_last && kind == FrameKind::ForwardLastRow {
+                    let elem = match out_dtype {
+                        ShimDType::F16 => 2,
+                        _ => 4,
+                    };
+                    last_row_only(out_bytes, &out_shape, elem).map_err(EngineError::Backend)?
+                } else {
+                    (out_bytes, out_shape)
+                };
                 let out_f16_bytes = match out_dtype {
                     ShimDType::F16 => out_bytes,
                     ShimDType::F32 => {
@@ -2620,7 +3223,7 @@ impl OvDistSpecWorkerEngine {
                             i64_to_bytes(&attn),
                         );
                         let mut header = [0u8; 8];
-                        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+                        header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
                         header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
                         {
                             let mut dg = downstream.lock().await;
@@ -2794,6 +3397,15 @@ impl Builder for OvDistSpecWorkerBuilder {
                 self.rank
             )));
         }
+        if let Some(why) = is_last
+            .then(|| last_stage_logits_refusal(&stage_cfg))
+            .flatten()
+        {
+            return Err(EngineError::ShardRejected(format!(
+                "rank {}: {why}",
+                self.rank
+            )));
+        }
         if stage_cfg
             .export_version
             .as_deref()
@@ -2853,6 +3465,10 @@ impl Builder for OvDistSpecWorkerBuilder {
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: crate::kv_coordination::config_digest(
+                &self.pipeline_dir.join("pipeline_config.json"),
+            ),
         }))
     }
 }
@@ -2867,7 +3483,9 @@ impl OvDistSpecEngine {
     /// fp would reject rank>0. Mirrors qwen36 (fcd3e4e). Identical sharding across chains guards the
     /// stage span, replacing the dropped per-rank component.
     fn kv_fingerprint(&self) -> u64 {
-        crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
+        let mut buf = self.kv_model_id.clone().into_bytes();
+        buf.extend_from_slice(&self.kv_config_digest.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
     }
     /// Snapshot draft + target stage0 into one bundle keyed by `tokens`, and broadcast CAPTURE down
     /// the target chain so every worker rank stashes its slice. Best-effort.
@@ -3064,7 +3682,9 @@ impl OvDistSpecWorkerEngine {
     /// MODEL-level fp — identical on every rank so a cross-chain pull's single asserted fingerprint
     /// matches rank>0 GETs. See the driver's `kv_fingerprint` for the full rationale (fcd3e4e).
     fn kv_fingerprint(&self) -> u64 {
-        crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
+        let mut buf = self.kv_model_id.clone().into_bytes();
+        buf.extend_from_slice(&self.kv_config_digest.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
     }
     /// Drain the plane hand-off mailbox and apply the parked slice, if any. See
     /// [`crate::kv_coordination::drain_handoff`]; called from `FrameKind::Restore` for the same two
@@ -3314,6 +3934,221 @@ mod tests {
     use super::*;
     use cascadia_transport::{ActivationClient, ActivationServer};
 
+    const IMG: i64 = 10;
+
+    /// Text rows `[ids.len(), 2]` whose values encode the id, so a test can
+    /// tell an untouched row from a spliced one.
+    fn text_rows(ids: &[i64]) -> Vec<f32> {
+        ids.iter().flat_map(|&t| [t as f32, -(t as f32)]).collect()
+    }
+
+    #[test]
+    fn prompt_span_splices_image_rows_in_order() {
+        let ids = [1, IMG, IMG, 5, IMG, 2];
+        let mut rows = text_rows(&ids);
+        let images: [&[f32]; 2] = [&[100.0, 101.0, 102.0, 103.0], &[200.0, 201.0]];
+        assert_eq!(splice_prompt_rows(&mut rows, 2, &ids, IMG, &images), Ok(3));
+        assert_eq!(
+            rows,
+            vec![1.0, -1.0, 100.0, 101.0, 102.0, 103.0, 5.0, -5.0, 200.0, 201.0, 2.0, -2.0]
+        );
+    }
+
+    #[test]
+    fn speculative_span_keeps_text_rows_even_on_the_image_id() {
+        // A drafted/accepted span carries no images: a draft that proposes the
+        // image token id embeds it through the text table like any token.
+        let ids = [IMG, 7];
+        let mut rows = text_rows(&ids);
+        assert_eq!(splice_prompt_rows(&mut rows, 2, &ids, IMG, &[]), Ok(0));
+        assert_eq!(rows, text_rows(&ids));
+    }
+
+    #[test]
+    fn image_row_count_must_match_the_placeholders() {
+        let ids = [1, IMG, IMG];
+        let mut rows = text_rows(&ids);
+        let err = splice_prompt_rows(&mut rows, 2, &ids, IMG, &[&[9.0, 9.0]]).unwrap_err();
+        assert!(err.contains("2 image rows"), "{err}");
+    }
+
+    #[test]
+    fn prefill_chunks_take_their_own_image_rows() {
+        // Two images of 3 and 2 rows (hidden 1), split across chunks.
+        let images = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0]];
+        let flat = |v: Vec<&[f32]>| v.concat();
+        assert_eq!(
+            flat(image_rows_span(&images, 1, 0, 2).unwrap()),
+            vec![1.0, 2.0]
+        );
+        let across = image_rows_span(&images, 1, 2, 2).unwrap();
+        assert_eq!(across.len(), 2, "one slice per image it spans");
+        assert_eq!(flat(across), vec![3.0, 4.0]);
+        assert_eq!(flat(image_rows_span(&images, 1, 4, 1).unwrap()), vec![5.0]);
+        assert!(image_rows_span(&images, 1, 4, 2).is_err());
+        let wide = vec![vec![1.0, 1.5, 2.0, 2.5]];
+        assert_eq!(
+            flat(image_rows_span(&wide, 2, 1, 1).unwrap()),
+            vec![2.0, 2.5]
+        );
+    }
+
+    #[test]
+    fn chunked_prefill_splices_like_the_whole_prompt() {
+        // Splicing chunk by chunk with each chunk's span of image rows gives the
+        // rows a single whole-prompt splice gives.
+        let ids: Vec<i64> = vec![1, IMG, IMG, IMG, 5, IMG, IMG, 2, 3];
+        let images = vec![
+            vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+            vec![20.0, 21.0, 22.0, 23.0],
+        ];
+        let mut whole = text_rows(&ids);
+        let refs: Vec<&[f32]> = images.iter().map(Vec::as_slice).collect();
+        splice_prompt_rows(&mut whole, 2, &ids, IMG, &refs).unwrap();
+        for chunk_len in 1..=ids.len() {
+            let (mut before, mut got) = (0, Vec::new());
+            for chunk in ids.chunks(chunk_len) {
+                let n = chunk.iter().filter(|&&t| t == IMG).count();
+                let rows = image_rows_span(&images, 2, before, n).unwrap();
+                before += n;
+                let mut part = text_rows(chunk);
+                splice_prompt_rows(&mut part, 2, chunk, IMG, &rows).unwrap();
+                got.extend(part);
+            }
+            assert_eq!(got, whole, "chunk {chunk_len}");
+        }
+    }
+
+    #[test]
+    fn last_stage_answers_a_prefill_chunk_with_one_row() {
+        // [1, 3, 2] f32 logits -> the last row only.
+        let vals: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let (row, shape) = last_row_only(bytes, &[1, 3, 2], 4).unwrap();
+        assert_eq!(shape, vec![1, 1, 2]);
+        assert_eq!(
+            row,
+            [4.0f32, 5.0]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        let (row, shape) = last_row_only(vec![1, 2, 3, 4, 5, 6], &[3, 1], 2).unwrap();
+        assert_eq!((row, shape), (vec![5, 6], vec![1, 1, 1]));
+        assert!(last_row_only(vec![0; 6], &[1, 3, 4], 4).is_err());
+        assert!(last_row_only(vec![0; 8], &[2, 1, 1, 4], 2).is_err());
+    }
+
+    #[test]
+    fn over_window_prompt_is_refused() {
+        assert!(prompt_window_refusal(10, None).is_none());
+        assert!(prompt_window_refusal(9, Some(10)).is_none());
+        let why = prompt_window_refusal(10, Some(10)).unwrap();
+        assert!(
+            why.contains("10 tokens") && why.contains("window is 10"),
+            "{why}"
+        );
+        // Sized from image dimensions alone, before any encode: eight 1 MP
+        // images on Pixtral expand a short prompt past a 32k window.
+        let cfg = crate::pixtral_vision::PreprocessConfig::pixtral();
+        let n = crate::pixtral_vision::expanded_prompt_len(40, &[(1024, 1024); 8], &cfg).unwrap();
+        assert!(n > 32_768, "{n}");
+        assert!(prompt_window_refusal(n, Some(32_768)).is_some());
+    }
+
+    #[test]
+    fn reads_the_target_window() {
+        let dir = std::env::temp_dir().join(format!("cascadia-ds-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tokenizer")).unwrap();
+        assert_eq!(config_max_ctx(&dir), None);
+        std::fs::write(
+            dir.join("tokenizer").join("config.json"),
+            r#"{"text_config":{"max_position_embeddings":4096}}"#,
+        )
+        .unwrap();
+        assert_eq!(config_max_ctx(&dir), Some(4096));
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"max_position_embeddings":1024000}"#,
+        )
+        .unwrap();
+        assert_eq!(config_max_ctx(&dir), Some(1_024_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn draft_prompt_drops_the_image_ids() {
+        // [INST] [IMG] [IMG] [IMG_BREAK] [IMG] [IMG] [IMG_END] text [/INST]
+        let ids = [1, 3, IMG, IMG, 12, IMG, IMG, 13, 1784, 4];
+        assert_eq!(draft_prompt_ids(&ids, &[IMG, 12, 13]), vec![1, 3, 1784, 4]);
+        assert_eq!(draft_prompt_ids(&[1, 5], &[IMG, 12, 13]), vec![1, 5]);
+    }
+
+    #[test]
+    fn draft_is_fed_ids_it_can_embed() {
+        // Ids the draft's table can index pass, whatever they spell.
+        assert!(check_draft_ids(&[1, IMG, IMG, 12, 2], Some(131072)).is_ok());
+        assert!(check_draft_ids(&[1, 131072], Some(131072)).is_err());
+        assert!(check_draft_ids(&[-1], Some(8)).is_err());
+        assert!(check_draft_ids(&[1 << 40], None).is_ok());
+        // An image turn checks the draft's view: an image id past the draft's
+        // vocabulary is never fed to it, so it does not refuse the turn.
+        let ids = [1, 300, 300, 2];
+        assert!(check_draft_ids(&ids, Some(256)).is_err());
+        assert!(check_draft_ids(&draft_prompt_ids(&ids, &[300]), Some(256)).is_ok());
+    }
+
+    #[test]
+    fn last_stage_must_emit_every_position() {
+        let cfg = |logits: Option<&str>, ver: Option<&str>| StageConfig {
+            has_head: true,
+            logits: logits.map(str::to_string),
+            export_version: ver.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(last_stage_logits_refusal(&cfg(Some("all"), Some(VLM_CUT_EXPORT))).is_none());
+        assert!(last_stage_logits_refusal(&cfg(Some("last"), Some(VLM_CUT_EXPORT))).is_some());
+        // A cut from before --all-logits always sliced the head.
+        let why = last_stage_logits_refusal(&cfg(None, Some(VLM_CUT_EXPORT))).unwrap();
+        assert!(why.contains("--all-logits"), "{why}");
+        // export_shards.py v5 shards: full logits, no field.
+        assert!(last_stage_logits_refusal(&cfg(None, Some("v5_canonical_inputs"))).is_none());
+        assert!(last_stage_logits_refusal(&cfg(None, None)).is_none());
+    }
+
+    #[test]
+    fn verify_needs_a_logits_row_per_fed_position() {
+        assert!(check_verify_rows(5 * 32, 32, 5).is_ok());
+        let err = check_verify_rows(32, 32, 5).unwrap_err().to_string();
+        assert!(err.contains("1 logits rows for a 5-token"), "{err}");
+        assert!(check_verify_rows(0, 0, 1).is_err());
+    }
+
+    #[test]
+    fn reads_a_cut_vlm_pipeline_config() {
+        let cfg: PipelineConfig = serde_json::from_str(
+            r#"{"model_id":"pixtral-12b-int4-ov","num_stages":2,"export_version":"vlm_lm_surgery_v1",
+                "stages":[{"stage":0,"has_embed":true,"has_head":false},
+                          {"stage":1,"has_embed":false,"has_head":true,"logits":"all",
+                           "export_version":"vlm_lm_surgery_v1"}],
+                "vision":{"family":"pixtral","text_embeddings":"openvino_text_embeddings_model.xml",
+                          "vision_embeddings":"openvino_vision_embeddings_model.xml",
+                          "token_type_ids":false,"image_token_id":10}}"#,
+        )
+        .unwrap();
+        let v = cfg.vision.as_ref().unwrap();
+        assert_eq!(
+            crate::runtime::vision_family(v, cfg.export_version.as_deref()).unwrap(),
+            crate::runtime::VisionFamily::Pixtral
+        );
+        assert!(last_stage_logits_refusal(cfg.stages.last().unwrap()).is_none());
+        // A v5 shard's pipeline_config (no stages / vision) still parses.
+        let v5: PipelineConfig =
+            serde_json::from_str(r#"{"model_id":"m","export_version":"v5_canonical_inputs"}"#)
+                .unwrap();
+        assert!(v5.vision.is_none() && v5.stages.is_empty());
+    }
+
     /// `decode_delta` used to remember a byte LENGTH and slice `full[len..]`.
     /// Its only guard was `full.len() <= last_text_len`, which catches a decode
     /// that got shorter but not one that grew while the boundary moved: a
@@ -3344,6 +4179,7 @@ mod tests {
     fn frame_kind_roundtrip() {
         for k in [
             FrameKind::Forward,
+            FrameKind::ForwardLastRow,
             FrameKind::Reset,
             FrameKind::LogitsResponse,
         ] {
@@ -3395,6 +4231,16 @@ mod tests {
     /// mirrors `tests/test_dist_spec_protocol.py::test_forward_roundtrip`.
     #[tokio::test]
     async fn forward_roundtrip() {
+        forward_roundtrip_as(FrameKind::Forward).await;
+    }
+
+    /// The prefill kind travels with the FORWARD body unchanged.
+    #[tokio::test]
+    async fn forward_last_row_roundtrip() {
+        forward_roundtrip_as(FrameKind::ForwardLastRow).await;
+    }
+
+    async fn forward_roundtrip_as(sent: FrameKind) {
         let mut server = ActivationServer::new("127.0.0.1", 0);
         server.start().await.unwrap();
         let port = server.port();
@@ -3415,7 +4261,7 @@ mod tests {
 
         // Send FORWARD frame inline (mirroring DistributedMaskedReq.feed)
         let mut header = [0u8; 8];
-        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+        header[0..4].copy_from_slice(&(sent as u32).to_be_bytes());
         header[4..8].copy_from_slice(&42u32.to_be_bytes());
         client.send_raw(&header).await.unwrap();
         let attn = vec![1i64, 1, 1, 0, 1];
@@ -3426,7 +4272,7 @@ mod tests {
         client.send(&hidden_t).await.unwrap();
 
         let (kind, pos, attn_rx, hidden_rx) = h.await.unwrap();
-        assert_eq!(kind, FrameKind::Forward);
+        assert_eq!(kind, sent);
         assert_eq!(pos, 42);
         assert_eq!(attn_rx, i64_to_bytes(&attn));
         assert_eq!(hidden_rx, hidden_data);
@@ -3474,5 +4320,26 @@ mod tests {
         let (kind, rx) = h.await.unwrap();
         assert_eq!(kind, FrameKind::LogitsResponse);
         assert_eq!(rx, logits);
+    }
+
+    /// The draft refuses a target-sampled id past its vocabulary instead of
+    /// handing OpenVINO an out-of-range embedding index.
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn draft_feed_refuses_ids_past_its_vocabulary() {
+        let mut d = MaskedReq {
+            runtime: OvRuntime::stub(),
+            has_beam: false,
+            valid_mask: vec![1; 8],
+            cache_len: 0,
+            logical_pos: 0,
+            inputs: std::collections::HashMap::new(),
+            vocab: Some(100),
+        };
+        for bad in [100, -1] {
+            let err = d.feed(&[bad]).unwrap_err();
+            assert!(err.to_string().contains("100-token vocabulary"), "{err}");
+        }
+        assert_eq!((d.cache_len, d.logical_pos), (0, 0), "nothing was fed");
     }
 }

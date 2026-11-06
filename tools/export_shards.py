@@ -59,6 +59,7 @@ CASCADIA_ALLOW_LOSSY_EXPORT=1 (check_export_quirks).
 """
 
 import argparse
+import fnmatch
 import gc
 import glob
 import json
@@ -260,6 +261,17 @@ def detect_architecture(config) -> str:
             "qwen35` (docs/architectures/qwen3.8.md)."
         )
 
+    # Llama 3.2 Vision (model_type 'mllama'): the text tower interleaves
+    # gated cross-attention layers that read image states. "mllama" CONTAINS
+    # "llama", so without this branch it would export through the plain
+    # Llama path with those layers mis-wired — garbage even on text.
+    if _has("mllama"):
+        raise UnsupportedModelError(
+            "Llama 3.2 Vision (model_type 'mllama') interleaves cross-attention "
+            "layers into its text tower; the generic exporter models only "
+            "self-attention decoder layers. Not supported (text or images)."
+        )
+
     # ---- Accept list — families that load and run.
 
     if _has("llama"):
@@ -285,6 +297,96 @@ def detect_architecture(config) -> str:
         flush=True,
     )
     return "llama"
+
+
+# Wrapper model_types of vision-language checkpoints whose text tower the
+# generic exporter can cut (the vision tower is then left out).
+_VLM_WRAPPER_TYPES = ("mistral3", "pixtral", "llava", "qwen2_vl", "qwen2_5_vl", "idefics", "paligemma")
+
+
+def vision_dropped_note(config):
+    """The note to print when ``config`` is a vision-language checkpoint.
+
+    The generic exporter cuts only the text tower, so its shards serve text
+    and the API answers ``image_url`` parts with a 400. Saying so at export
+    time beats discovering it from a refused request. ``None`` for a
+    text-only checkpoint.
+    """
+    outer = getattr(config, "model_type", "").lower()
+    has_vision = getattr(config, "vision_config", None) is not None
+    if not has_vision and not any(t in outer for t in _VLM_WRAPPER_TYPES):
+        return None
+    return (
+        f"'{outer or 'this model'}' is a vision-language checkpoint: only its text "
+        "tower is exported; the vision encoder is dropped, so these shards serve "
+        "text and the API refuses image input with a 400. Staged image input "
+        "needs a family-specific export (see docs/VLM.md)."
+    )
+
+
+# Weight files load_stage_weights reads; the text exporter reads nothing else.
+_WEIGHT_GLOBS = ("*.safetensors", "pytorch_model*.bin", "model*.bin", "consolidated*.bin")
+
+
+def _weight_keys(model, revision, names):
+    """A safetensors checkpoint's tensor names, from its index or the file
+    headers (never the weights). None when only .bin weights could say."""
+    if os.path.isdir(model):
+        index = os.path.join(model, "model.safetensors.index.json")
+        if os.path.exists(index):
+            with open(index) as f:
+                return list(json.load(f)["weight_map"])
+        files = sorted(glob.glob(os.path.join(model, "*.safetensors")))
+        if not files:
+            return None
+        from safetensors import safe_open
+
+        keys = []
+        for sf in files:
+            with safe_open(sf, framework="np") as f:
+                keys += list(f.keys())
+        return keys
+    if not any(n.endswith(".safetensors") for n in names):
+        return None
+    from huggingface_hub import HfApi
+
+    return list(HfApi().get_safetensors_metadata(model, revision=revision).weight_map)
+
+
+def text_exporter_refusal(args, raw_cfg) -> str | None:
+    """Why the generic text exporter cannot cut this source, decided before
+    anything is downloaded or written; None when it can. A VLM reaches the
+    generic flow only with --text-only (cascadia_export.shard_vlm cuts or
+    refuses it otherwise)."""
+    from cascadia_export import is_openvino_export, is_vlm_config, source_files
+
+    vlm = is_vlm_config(raw_cfg)
+    # A local dir costs a listdir; an HF id a file listing, so only for a VLM.
+    if not (vlm or os.path.isdir(args.model)):
+        return None
+    names = [os.path.basename(f) for f in source_files(args.model, args.revision)]
+    cmd = "cascadia shard --text-only" if args.text_only else "cascadia shard"
+    if not any(fnmatch.fnmatch(n, g) for n in names for g in _WEIGHT_GLOBS):
+        if not is_openvino_export(names):
+            return None
+        return (
+            f"`{cmd}` cannot cut {args.model}: it is an OpenVINO export (IR files, no "
+            f"checkpoint weights) and the text exporter reads Hugging Face weights; pass "
+            f"the original checkpoint"
+            + (", or drop --text-only to cut a vision tree from this export" if vlm else "")
+        )
+    if not vlm:
+        return None
+    keys = _weight_keys(args.model, args.revision, names)
+    if keys and not any(k.startswith("model.layers.") for k in keys):
+        mt = raw_cfg.get("model_type") or "this model"
+        return (
+            f"`{cmd}` cannot cut {args.model} ({mt}): its text-tower weights are not "
+            f"under model.layers.*, the only layout the text exporter reads; drop "
+            f"--text-only to cut a vision tree, or use `cascadia export` for a "
+            f"whole-model export"
+        )
+    return None
 
 
 def is_moe_config(config) -> bool:
@@ -1631,7 +1733,7 @@ def export_single_stage(
 # ---------------------------------------------------------------------------
 
 
-def fetch_config_json(model_id_or_path: str) -> str:
+def fetch_config_json(model_id_or_path: str, revision: str | None = None) -> str:
     """Return a local path to config.json for ``model_id_or_path``.
 
     For a local directory, point at the file. For an HF repo id, download
@@ -1656,7 +1758,8 @@ def fetch_config_json(model_id_or_path: str) -> str:
     os.makedirs(local_dir, exist_ok=True)
     try:
         return hf_hub_download(
-            repo_id=model_id_or_path, filename="config.json", local_dir=local_dir
+            repo_id=model_id_or_path, filename="config.json", local_dir=local_dir,
+            revision=revision,
         )
     except Exception:
         # `local_dir` makes hf_hub_download skip the hub cache, so this raises
@@ -1667,6 +1770,7 @@ def fetch_config_json(model_id_or_path: str) -> str:
             return hf_hub_download(
                 repo_id=model_id_or_path,
                 filename="config.json",
+                revision=revision,
                 local_files_only=True,
             )
         except Exception:
@@ -1674,7 +1778,7 @@ def fetch_config_json(model_id_or_path: str) -> str:
         raise
 
 
-def maybe_download(model_id_or_path: str) -> str:
+def maybe_download(model_id_or_path: str, revision: str | None = None) -> str:
     """If `model_id_or_path` is an existing local directory, return it.
     Otherwise treat as an HF repo id and snapshot_download. Returns the
     local model directory containing config.json + safetensors + tokenizer.
@@ -1701,6 +1805,7 @@ def maybe_download(model_id_or_path: str) -> str:
         repo_id=model_id_or_path,
         local_dir=local_dir,
         allow_patterns=["*.safetensors", *common],
+        revision=revision,
         max_workers=8,
     )
     if not glob.glob(os.path.join(local_dir, "*.safetensors")):
@@ -1714,6 +1819,7 @@ def maybe_download(model_id_or_path: str) -> str:
                 "consolidated*.bin",
                 *common,
             ],
+            revision=revision,
             max_workers=8,
         )
     return local_dir
@@ -1743,6 +1849,57 @@ def copy_tokenizer(model_dir: str, output_dir: str) -> None:
 
 
 def main():
+    args, routed = _shard()
+    _write_sidecar(args, routed)
+
+
+def _write_sidecar(args, routed):
+    """cascadia-export.json beside the finished tree (tools/cascadia_export.py)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from cascadia_export import write_shard_sidecar
+
+    if routed and routed.get("quant"):
+        # A raw VLM exported into a temp dir: its weight format was read
+        # before the dir went away.
+        from cascadia_export import tree_facts, write_sidecar
+
+        facts = tree_facts(args.output_dir)
+        if facts is None:
+            return
+        write_sidecar(args.output_dir, routed["identity"], vlm=facts["vision"],
+                      quant=routed["quant"], num_layers=facts["numLayers"],
+                      stages=facts["stages"])
+        return
+    write_shard_sidecar(args.model, args.output_dir, args.identity,
+                        source_dir=(routed or {}).get("source_dir"))
+
+
+def _gemma4_per_layer(cfg: dict) -> bool:
+    """True for a Gemma 4 with per-layer embeddings (E2B / E4B)."""
+    text = cfg.get("text_config") or cfg
+    return bool(text.get("hidden_size_per_layer_input"))
+
+
+def _source_identity(args):
+    """The source's model_id, repo and resolved revision. Offline (or with
+    the hub unreachable) the revision stays unknown rather than failing the
+    export."""
+    from cascadia_export import source_identity
+
+    try:
+        return source_identity(args.model, args.revision)
+    except Exception as exc:
+        print(f"  warning: could not resolve {args.model}'s revision ({exc}); "
+              f"cascadia-export.json records none", flush=True)
+        local = os.path.isdir(args.model)
+        return {"model_id": os.path.basename(os.path.abspath(args.model)) if local
+                else args.model.rstrip("/").rsplit("/", 1)[-1],
+                "repo": None if local else args.model, "revision": args.revision}
+
+
+def _shard():
+    """Parse the flags and write the tree. Returns (args, routed): routed is
+    cascadia_export.shard_vlm's result when a VLM was cut, else None."""
     parser = argparse.ArgumentParser(
         description="Export an HF causal-LM model as cascadia per-stage shards"
     )
@@ -1829,6 +1986,19 @@ def main():
         help="Override partial_rotary_factor (default: read from "
         "config.partial_rotary_factor, else 1.0). Values < 1.0 rotate only "
         "the leading fraction of each head's dims (Phi-1/2, StableLM-2).",
+    )
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="HF revision of --model (default: the hub's current commit, "
+        "recorded in cascadia-export.json)",
+    )
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="For a vision-language model, shard the text tower alone (the "
+        "tree then serves text only). Without it such a model gets a vision "
+        "tree, or is refused when none can be cut.",
     )
     args = parser.parse_args()
 
@@ -1918,8 +2088,13 @@ def main():
     # stage builder. Detect it config-first from the raw config.json (older
     # transformers reject the "gemma4" model_type inside AutoConfig before we
     # could route) and dispatch before the generic flow.
+    # Resolve the source once: cascadia-export.json records it, and every
+    # download below fetches that exact commit.
+    args.identity = _source_identity(args)
+    args.revision = args.identity["revision"]
+
     try:
-        with open(fetch_config_json(args.model)) as _f:
+        with open(fetch_config_json(args.model, args.revision)) as _f:
             _raw_cfg = json.load(_f)
     except Exception as _cfg_exc:
         # Tolerated for HF-id inputs (the generic flow re-fetches and reports
@@ -1990,6 +2165,22 @@ def main():
                     "the generic exporter."
                 )
 
+            # The IR surgery cuts vision trees only without per-layer
+            # embeddings (26B / 31B). An E2B / E4B vision tree comes from the
+            # torch exporter, which needs the safetensors snapshot as well as
+            # this export's vision encoder.
+            if _gemma4_per_layer(_raw_cfg) and not args.text_only:
+                raise SystemExit(
+                    f"{args.model} is a Gemma 4 E2B / E4B export (per-layer "
+                    f"embeddings), whose vision tree the IR surgery cannot cut. "
+                    f"Make it with the gemma4 engine's exporter:\n"
+                    f"  python tools/export_gemma4.py --model <google/gemma-4-E2B-it "
+                    f"or -E4B-it snapshot> --output-dir <tree> --num-stages "
+                    f"{args.num_stages} --vision {args.model}\n"
+                    f"or pass --text-only to shard its text tower alone (it then "
+                    f"serves text only)."
+                )
+
             _here = os.path.dirname(os.path.abspath(__file__))
             # in-repo layout (tools/gemma4_surgery/) and the flat temp dir the
             # CLI extracts the embedded scripts into
@@ -2003,9 +2194,33 @@ def main():
                 num_stages=args.num_stages,
                 quantization=args.quantization,
                 stage=args.stage,
+                vision=not args.text_only,
             )
-            return
+            return args, None
 
+        # A raw Gemma 4 checkpoint goes through the torch exporter, which
+        # builds the text tower only; its vision tree comes from the
+        # OpenVINO export (the branch above).
+        if _raw_cfg.get("vision_config") is not None and not args.text_only:
+            if _gemma4_per_layer(_raw_cfg):
+                how = (
+                    f"for E2B / E4B (per-layer embeddings) run `cascadia export "
+                    f"--model {args.model} --output-dir <ov dir>`, then `python "
+                    f"tools/export_gemma4.py --model <snapshot of {args.model}> "
+                    f"--output-dir <tree> --num-stages {args.num_stages} --vision "
+                    f"<ov dir>`"
+                )
+            else:
+                how = (
+                    f"run `cascadia export --model {args.model} --output-dir <dir>` "
+                    f"and shard <dir>"
+                )
+            raise SystemExit(
+                f"{args.model} is a raw Gemma 4 vision-language checkpoint, and "
+                f"`cascadia shard` builds Gemma 4 vision trees from its OpenVINO "
+                f"export: {how}. Or pass --text-only to shard the text tower alone "
+                f"(it then serves text only)."
+            )
         print(
             "Detected Gemma 4 - dispatching to the dedicated exporter "
             "tools/export_gemma4.py (per-layer-type attention / KV-sharing / "
@@ -2023,7 +2238,7 @@ def main():
             stage=args.stage,
             device_verify="CPU",
         )
-        return
+        return args, None
 
     # Qwen3.5/3.6 hybrid MoE (model_type qwen3_5_moe) uses a dedicated
     # exporter, tools/qwen36_surgery/export_qwen36_moe.py: IR surgery on
@@ -2072,6 +2287,7 @@ def main():
                 repo_id=args.model,
                 local_dir=_model_dir,
                 allow_patterns=["*.xml", "*.bin", "*.json", "*.jinja", "tokenizer*"],
+                revision=args.revision,
                 max_workers=8,
             )
         _here = os.path.dirname(os.path.abspath(__file__))
@@ -2088,7 +2304,19 @@ def main():
             validate=True,
             layer_split=args.layer_split,
         )
-        return
+        return args, None
+
+    # Any other vision-language model: cut a vision tree from its OpenVINO
+    # export (exporting a raw checkpoint first), or refuse; --text-only
+    # falls through to the text tower below.
+    from cascadia_export import shard_vlm
+
+    routed = shard_vlm(args, _raw_cfg)
+    if routed:
+        return args, routed
+    why = text_exporter_refusal(args, _raw_cfg)
+    if why:
+        raise SystemExit(why)
 
     # Past the dispatches: the generic dense builder needs the full stack.
     if torch is None:
@@ -2122,7 +2350,7 @@ def main():
         # gemma4 on an older transformers). Read the raw config.json so we can
         # emit OUR specific rejection instead of an opaque transformers error.
         try:
-            with open(fetch_config_json(args.model)) as f:
+            with open(fetch_config_json(args.model, args.revision)) as f:
                 raw_ns = _RawConfigNS(json.load(f))
         except Exception:
             # Can't even read config.json — the original parse error is the
@@ -2197,10 +2425,13 @@ def main():
     # the text tower once: for a multimodal wrapper (e.g. Mistral 3.x) those
     # fields live under config.text_config, not the wrapper. For a plain
     # decoder-only config _text_config is the identity, so this is a no-op.
+    note = vision_dropped_note(config)
+    if note:
+        print(f"  NOTE: {note}", flush=True)
     config = _text_config(config)
 
     # Accepted — now fetch the weights.
-    model_dir = maybe_download(args.model)
+    model_dir = maybe_download(args.model, args.revision)
     # transformers 4.x exposes rope_theta directly; 5.x moved it under
     # config.rope_parameters = {"rope_theta": ..., "rope_type": ...}.
     # Handle both — wrong rope_theta gets silently baked into the traced
@@ -2260,6 +2491,20 @@ def main():
         print(f"  Stage {s['stage']}: {' + '.join(parts)}", flush=True)
 
     output_dir = args.output_dir
+    if args.stage is not None:
+        # The other stages already in output_dir stay as they are, so they
+        # must be this plan's, or the tree skips or repeats layers.
+        _here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(_here, "gemma4_surgery"))
+        sys.path.insert(0, _here)
+        from export_gemma4_text import check_reused_tree
+
+        check_reused_tree(
+            output_dir, args.num_stages, config.num_hidden_layers,
+            "v5_canonical_inputs",
+            [(s["layer_start"], s["layer_end"] - 1) for s in plan],
+            config.hidden_size,
+        )
     os.makedirs(output_dir, exist_ok=True)
     copy_tokenizer(model_dir, output_dir)
 
@@ -2279,9 +2524,6 @@ def main():
         "quantization": args.quantization,
         "export_version": "v5_canonical_inputs",
     }
-    with open(os.path.join(output_dir, "pipeline_config.json"), "w") as f:
-        json.dump(pipeline_meta, f, indent=2)
-
     total_mb = 0.0
     for s in plan:
         if args.stage is not None and s["stage"] != args.stage:
@@ -2312,11 +2554,20 @@ def main():
         total_mb += size
         gc.collect()
 
+    # The tree's marker goes in last, by atomic rename: a run that fails
+    # part-way leaves no pipeline_config.json, so no tree looks complete
+    # without its stages.
+    marker = os.path.join(output_dir, "pipeline_config.json")
+    with open(marker + ".tmp", "w") as f:
+        json.dump(pipeline_meta, f, indent=2)
+    os.replace(marker + ".tmp", marker)
+
     print("\n" + "=" * 60, flush=True)
     print("EXPORT COMPLETE", flush=True)
     print(f"  Output: {output_dir}", flush=True)
     print(f"  Total: {total_mb:.0f} MB", flush=True)
     print("=" * 60, flush=True)
+    return args, None
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with /health, /v1/models, /v1/chat/completions."
+description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with /health, /v1/models, /v1/chat/completions, /v1/responses."
 
 [dependencies]
 cascadia-types = { workspace = true }
@@ -35,8 +35,21 @@ bytes = { workspace = true }
 # formatter, silently stripping tools from the prompt.
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "json", "adjacent_loop_items"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+# Image input (`image_url` content parts): decode, downscale and hash once in
+# the API so engines only ever see RGB pixels. Formats limited to what
+# OpenAI accepts (PNG, JPEG, WEBP, non-animated GIF).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+base64 = "0.22"
+sha2 = "0.10"
+# Opt-in remote image fetch (`--api-allow-image-urls`).
+reqwest = { workspace = true }
+url = { workspace = true }
+# Video input (`video_url` parts): ffmpeg reads the caller's bytes from a
+# private temp file, removed when the decode ends.
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
 cascadia-engine-mock = { workspace = true }
 async-trait = { workspace = true }

@@ -186,10 +186,57 @@ std::string join_port_names(const Set& names) {
 
 }  // namespace
 
+// Borrowed media copied into owned u8 tensors, split by kind as GenAI takes
+// them: an image as [1, H, W, 3] RGB8, a video as [T, H, W, 3] with its
+// metadata. The copy keeps the caller's buffer lifetime out of the picture:
+// the CB pipeline may read the tensors after add_request returns.
+struct MediaTensors {
+    std::vector<ov::Tensor> images;
+    std::vector<ov::Tensor> videos;
+    std::vector<ov::genai::VideoMetadata> videos_metadata;
+};
+
+static MediaTensors media_tensors(const cascadia_media_t* media, size_t count) {
+    MediaTensors out;
+    if (count == 0) return out;
+    if (!media) throw std::runtime_error("media is null but media_count > 0");
+    for (size_t i = 0; i < count; ++i) {
+        const cascadia_media_t& m = media[i];
+        if (m.kind == CASCADIA_MEDIA_IMAGE) {
+            if (!m.pixels || m.num_frames != 1 || m.height == 0 || m.width == 0) {
+                throw std::runtime_error("image " + std::to_string(i) +
+                                         " needs pixels and exactly one non-empty frame");
+            }
+            ov::Tensor t(ov::element::u8, ov::Shape{1, m.height, m.width, 3});
+            std::memcpy(t.data(), m.pixels, t.get_byte_size());
+            out.images.push_back(std::move(t));
+        } else if (m.kind == CASCADIA_MEDIA_VIDEO) {
+            if (!m.pixels || m.num_frames == 0 || m.height == 0 || m.width == 0) {
+                throw std::runtime_error("video " + std::to_string(i) +
+                                         " needs pixels and at least one non-empty frame");
+            }
+            ov::Tensor t(ov::element::u8, ov::Shape{m.num_frames, m.height, m.width, 3});
+            std::memcpy(t.data(), m.pixels, t.get_byte_size());
+            out.videos.push_back(std::move(t));
+            // The API already sampled the frames: every one is used, at the
+            // rate it was sampled at. Left empty, GenAI resamples Qwen3-VL's
+            // video assuming a 24 fps source (2026.4.1), keeping 4 of 16
+            // frames and stamping them with the wrong times.
+            ov::genai::VideoMetadata md;
+            md.fps = m.fps > 0.0f ? m.fps : 0.0f;
+            md.frames_indices.resize(m.num_frames);
+            for (uint32_t k = 0; k < m.num_frames; ++k) md.frames_indices[k] = k;
+            out.videos_metadata.push_back(std::move(md));
+        } else {
+            throw std::runtime_error("unsupported media kind " + std::to_string(m.kind));
+        }
+    }
+    return out;
+}
+
 struct cascadia_pipeline_t {
     // Exactly one of `pipe` / `vlm` is set; generate / get_tokenizer
-    // dispatch on which. VLM handles are text-only (no image inputs
-    // through this ABI).
+    // dispatch on which. Media is only accepted on `vlm`.
     std::unique_ptr<ov::genai::LLMPipeline> pipe;
     std::unique_ptr<ov::genai::VLMPipeline> vlm;
 };
@@ -215,6 +262,10 @@ struct cascadia_runtime_t {
     // restore are exactly that. Deliberately survives recreate_request: the CompiledModel
     // (and thus the plugin's KV precision) is retained, so the types cannot change.
     std::unordered_map<std::string, ov::element::Type> state_dtypes;
+    // The request's states hold KV: set by an inference or a restore, cleared by reset_state and
+    // recreate_request. A new request starts without. set_state_blob reads it to prime an empty
+    // GPU request (see prime_empty_gpu_request).
+    bool state_live = false;
 };
 
 extern "C" {
@@ -388,29 +439,47 @@ void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v) {
 }
 
 int32_t cascadia_pipeline_generate(
-    cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
-    char** out_text, uint32_t* out_token_count) {
+    cascadia_pipeline_t* handle, const char* prompt, const cascadia_media_t* media,
+    size_t media_count, const cascadia_genconfig_t* cfg, char** out_text,
+    uint32_t* out_token_count, uint32_t* out_input_tokens) {
     if (!handle || (!handle->pipe && !handle->vlm) || !prompt || !out_text) {
         set_last_error("null arg in pipeline_generate"); return 1;
     }
+    if (out_input_tokens) *out_input_tokens = 0;
     try {
         std::string text;
         uint32_t generated = 0;
+        if (media_count > 0 && !handle->vlm) {
+            set_last_error("media given but the model is not a VLM-layout export");
+            return 1;
+        }
         if (handle->vlm) {
-            // Text-only generate on a VLM-layout export; no image tensors.
+            MediaTensors m = media_tensors(media, media_count);
             ov::genai::GenerationConfig gen_cfg =
                 cfg ? cfg->cfg : ov::genai::GenerationConfig{};
             // StreamerVariant{} default-constructs its FIRST alternative —
             // an empty std::function — which fast-fails (0xc0000409) when
             // invoked. Pass monostate explicitly: "no streamer".
-            ov::genai::VLMDecodedResults results = handle->vlm->generate(
-                std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg,
-                ov::genai::StreamerVariant{std::monostate{}});
+            // Image-only requests keep the images overload they always took.
+            ov::genai::VLMDecodedResults results = m.videos.empty()
+                ? handle->vlm->generate(
+                      std::string(prompt), m.images, gen_cfg,
+                      ov::genai::StreamerVariant{std::monostate{}})
+                : handle->vlm->generate(
+                      std::string(prompt), m.images, m.videos, std::vector<ov::Tensor>{},
+                      m.videos_metadata, gen_cfg,
+                      ov::genai::StreamerVariant{std::monostate{}});
             text = results.texts.empty() ? std::string{} : results.texts[0];
             try {
                 generated = static_cast<uint32_t>(
                     results.perf_metrics.get_num_generated_tokens());
             } catch (...) { generated = 0; }
+            if (out_input_tokens) {
+                try {
+                    *out_input_tokens = static_cast<uint32_t>(
+                        results.perf_metrics.get_num_input_tokens());
+                } catch (...) { *out_input_tokens = 0; }
+            }
         } else {
             ov::genai::DecodedResults results = cfg
                 ? handle->pipe->generate(std::string(prompt), cfg->cfg)
@@ -509,6 +578,7 @@ void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle) { delete handl
 
 int32_t cascadia_cb_add_request(
     cascadia_cb_pipeline_t* handle, uint64_t request_id, const char* prompt,
+    const cascadia_media_t* media, size_t media_count,
     const cascadia_genconfig_t* cfg, cascadia_cb_handle_t** out_handle) {
     if (!handle || !handle->pipe || !prompt || !cfg || !out_handle) {
         set_last_error("null arg in cb_add_request");
@@ -516,6 +586,29 @@ int32_t cascadia_cb_add_request(
     }
     try {
         auto h = std::make_unique<cascadia_cb_handle_t>();
+        if (media_count > 0) {
+            // The images overload honours apply_chat_template itself (verified
+            // on 2026.4.1: off keeps a pre-rendered prompt as is, on wraps it
+            // again), so none of the manual templating below applies.
+            MediaTensors m = media_tensors(media, media_count);
+            if (m.videos.empty()) {
+                h->handle = handle->pipe->add_request(
+                    request_id, std::string(prompt), m.images, cfg->cfg);
+            } else {
+                // Only the properties overload takes videos_metadata (the
+                // images+videos one would let GenAI resample the frames).
+                ov::AnyMap props{
+                    {"generation_config", cfg->cfg},
+                    ov::genai::images(m.images),
+                    ov::genai::videos(m.videos),
+                    ov::genai::videos_metadata(m.videos_metadata),
+                };
+                h->handle =
+                    handle->pipe->add_request(request_id, std::string(prompt), props);
+            }
+            *out_handle = h.release();
+            return 0;
+        }
         // ContinuousBatchingPipeline's string add_request() overload does NOT
         // honour GenerationConfig::apply_chat_template — verified on OV GenAI
         // 2026.2 by an A/B against LLMPipeline, where the same flag through the
@@ -687,6 +780,25 @@ int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle) {
 }
 
 void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle) { delete handle; }
+
+int32_t cascadia_cb_handle_input_tokens(cascadia_cb_handle_t* handle, uint32_t* out_count) {
+    if (!handle || !handle->handle || !out_count) {
+        set_last_error("null arg in cb_handle_input_tokens");
+        return 1;
+    }
+    *out_count = 0;
+    try {
+        *out_count = static_cast<uint32_t>(
+            handle->handle->get_perf_metrics().get_num_input_tokens());
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_handle_input_tokens");
+        return 1;
+    }
+}
 
 int32_t cascadia_cb_count_tokens(
     cascadia_cb_pipeline_t* handle, const char* text, uint32_t* out_count) {
@@ -966,6 +1078,7 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
         for (auto& state : handle->request->query_state()) {
             state.reset();
         }
+        handle->state_live = false;
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
@@ -1013,6 +1126,7 @@ int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle) {
     }
     try {
         handle->request = std::make_shared<ov::InferRequest>(handle->compiled->create_infer_request());
+        handle->state_live = false;
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
@@ -1217,10 +1331,71 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
     catch (...) { set_last_error("unknown C++ exception in get_state_blob"); return 1; }
 }
 
+// True when the compiled model executes on a GPU (`GPU`, `GPU.0`, or under AUTO/HETERO).
+static bool runs_on_gpu(const ov::CompiledModel& compiled) {
+    try {
+        for (const auto& d : compiled.get_property(ov::execution_devices))
+            if (d.find("GPU") != std::string::npos) return true;
+    } catch (...) {
+    }
+    return false;
+}
+
+// The GPU plugin (seen on 2026.2 and 2026.4.1) mishandles set_state into a request whose states
+// are empty: the restore succeeds and a 1-token step after it runs, but the first step of two or
+// more tokens fails with "opset1::Add ... Argument shapes are inconsistent". set_state over live
+// state of any length works and gives exactly the logits of an unrestored run. So before a restore
+// into an empty GPU request, run one throwaway 1-token inference: every input zero-filled, every
+// dynamic dim 1. It leaves one token of junk in each state, which the restore below overwrites (it
+// fails unless every state is applied). The caller's input tensors are put back afterwards.
+// Best-effort: a model the zero inputs cannot run keeps the old behaviour, with a note on stderr.
+static void prime_empty_gpu_request(cascadia_runtime_t* handle) {
+    if (handle->state_live || handle->request->query_state().empty() ||
+        !runs_on_gpu(*handle->compiled))
+        return;
+    std::vector<std::pair<ov::Output<const ov::Node>, ov::Tensor>> saved;
+    try {
+        for (const auto& port : handle->compiled->inputs()) {
+            try {
+                saved.emplace_back(port, handle->request->get_tensor(port));
+            } catch (const std::exception&) {
+            }
+            ov::Shape shape;
+            for (const auto& d : port.get_partial_shape())
+                shape.push_back(d.is_static() ? static_cast<size_t>(d.get_length()) : 1);
+            ov::Tensor t(port.get_element_type(), shape);
+            std::memset(t.data(), 0, t.get_byte_size());
+            // One attended token: an all-zero mask would leave the softmax nothing to attend.
+            if (port.get_names().count("attention_mask")) {
+                if (t.get_element_type() == ov::element::i64) {
+                    std::fill_n(t.data<int64_t>(), t.get_size(), int64_t{1});
+                } else if (t.get_element_type() == ov::element::i32) {
+                    std::fill_n(t.data<int32_t>(), t.get_size(), int32_t{1});
+                }
+            }
+            handle->request->set_tensor(port, t);
+        }
+        handle->request->infer();
+        handle->state_live = true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "[cascadia-shim] set_state_blob: GPU prime of an empty request failed (%s); "
+                     "restoring without it\n",
+                     e.what());
+    }
+    for (auto& [port, t] : saved) {
+        try {
+            handle->request->set_tensor(port, t);
+        } catch (const std::exception&) {
+        }
+    }
+}
+
 int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_t* buf, size_t len) {
     if (!handle || !handle->request) { set_last_error("null runtime handle"); return 1; }
     if (!buf || len < 4) { set_last_error("set_state_blob: short buffer"); return 1; }
     try {
+        prime_empty_gpu_request(handle);
         // Canonical restore keyed by KV IDENTITY (layer, key/value) parsed from each VariableState
         // name. get_state_blob emits states in this same canonical order, so blob slot i maps to the
         // model state that shares its identity — independent of OV's per-INSTANCE query_state() ORDER
@@ -1355,6 +1530,8 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         // A skipped state (byte-size mismatch) leaves that variable at its CURRENT value while its
         // siblings carry the donor's — a silent half-restore the caller then treats as a good warm
         // resume. Fail instead so the engine falls back to a cold reprefill.
+        // A partial apply is scrubbed by the caller (recreate_request clears the flag again).
+        if (applied > 0) handle->state_live = true;
         if (applied != count) {
             std::ostringstream oss;
             oss << "set_state_blob: applied " << applied << " of " << count << " states"
@@ -1466,7 +1643,11 @@ int32_t cascadia_runtime_set_input(
 
 int32_t cascadia_runtime_infer(cascadia_runtime_t* handle) {
     if (!handle || !handle->request) { set_last_error("null runtime"); return 1; }
-    try { handle->request->infer(); return 0; }
+    try {
+        handle->request->infer();
+        handle->state_live = true;
+        return 0;
+    }
     catch (const std::exception& e) { set_last_error(e); return 1; }
     catch (...) {
         set_last_error("unknown C++ exception in infer"); return 1;

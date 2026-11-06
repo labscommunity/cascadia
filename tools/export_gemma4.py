@@ -57,6 +57,15 @@ import time
 from typing import Any
 
 
+# Files `--vision` copies from the vision directory into the tree root.
+VISION_FILES = (
+    "openvino_vision_embeddings_model.xml",
+    "openvino_vision_embeddings_model.bin",
+    "preprocessor_config.json",
+    "processor_config.json",
+)
+
+
 def log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -658,11 +667,32 @@ def resolve_kv_sharing(text_config, stage_plan):
 # ---------------------------------------------------------------------------
 
 
-def build_cached_wrapper(model, text_config, stage_plan, sliding_window=None):
+def splice_image_rows(h, is_img, image_features):
+    """Traceable equivalent of HF's ``h.masked_scatter(is_img[..., None],
+    image_features)`` for batch 1: row k of ``image_features`` [M, hidden]
+    replaces the k-th image position of ``h`` [1, T, hidden]. A zero row is
+    appended so a step without images (M = 0) still gathers from a
+    non-empty tensor; positions that are not images keep ``h``."""
+    import torch as _t
+
+    feats = _t.cat([image_features.to(h.dtype), _t.zeros_like(h[0, :1, :])], dim=0)
+    slot = (_t.cumsum(is_img.to(_t.int64), dim=1) - 1).clamp(min=0)
+    rows = feats[slot[0]].unsqueeze(0)
+    return _t.where(is_img.unsqueeze(-1), rows, h)
+
+
+def build_cached_wrapper(model, text_config, stage_plan, sliding_window=None, vision_ids=None):
     """Build a CachedStageWrapper for one stage. Returns (wrapper,
     head_dims_per_layer, kv_share_info). `sliding_window` is the value
     `run_export` resolved config-first (None = sliding layers stay unbounded;
-    `run_export` only passes None when the model has no sliding layers)."""
+    `run_export` only passes None when the model has no sliding layers).
+
+    `vision_ids` = (image_token_id, pad_token_id) makes the embed stage take
+    a trailing `image_features` [M, hidden] input and splice it in the way
+    HF's Gemma4Model.forward does: image tokens embed (and look up their
+    per-layer embedding) as the pad id, then their rows of the main
+    embedding are replaced, in order, by the image features, and the
+    per-layer projection reads the spliced embedding."""
     import torch
     import torch.nn as nn
 
@@ -766,6 +796,9 @@ def build_cached_wrapper(model, text_config, stage_plan, sliding_window=None):
     if has_head and final_softcap:
         log(f"  Head stage will apply final_logit_softcapping={final_softcap}")
 
+    splice_images = has_embed and vision_ids is not None
+    image_token_id, vision_pad_id = vision_ids if splice_images else (None, None)
+
     class CachedStageWrapper(nn.Module):
         def __init__(self):
             super().__init__()
@@ -810,14 +843,25 @@ def build_cached_wrapper(model, text_config, stage_plan, sliding_window=None):
             ]
 
         def forward(self, main_input, position_ids, *args):
-            # args layout: [*external_shared_kv, *own_past_kv]
+            # args layout: [*external_shared_kv, *own_past_kv(, image_features)]
+            import torch as _t
+
+            image_features = None
+            if splice_images:
+                image_features, args = args[-1], args[:-1]
             n_ext = self._n_external
             ext_kv = args[: n_ext * 2] if n_ext > 0 else ()
             past_kv = args[n_ext * 2 :]
-            import torch as _t
 
             if has_embed:
+                if splice_images:
+                    is_img = main_input == image_token_id
+                    main_input = _t.where(
+                        is_img, _t.full_like(main_input, vision_pad_id), main_input
+                    )
                 h = self.embed(main_input)
+                if splice_images:
+                    h = splice_image_rows(h, is_img, image_features)
                 if pli_dim > 0:
                     raw_pli = self.embed_pli(main_input).reshape(
                         main_input.shape[0],
@@ -1039,115 +1083,23 @@ def make_stateful_with_init_gemma4(ov_model):
     return new_model
 
 
-def export_single_stage(
-    model,
-    text_config,
-    stage_plan,
-    output_dir,
-    quantization,
-    device_verify="CPU",
-    sliding_window=None,
-):
-    """Trace the Gemma 4 wrapper for one stage, convert to OV, make
-    KV state stateful, optionally compress, save under
-    ``output_dir/stage_N/``."""
-    import torch
-    import openvino as ov
+def name_stage_ports(ov_model, has_embed, has_head, splice_images, n_external, n_cross):
+    """Name a converted stage's ports and free its sequence dims.
 
-    idx = stage_plan["stage"]
-    ls, le = stage_plan["layer_start"], stage_plan["layer_end"]
-    has_embed, has_head = stage_plan["has_embed"], stage_plan["has_head"]
-    num_layers = le - ls
-    num_total = text_config.num_hidden_layers
-    hidden_dim = text_config.hidden_size
-    pli_dim = text_config.hidden_size_per_layer_input or 0
-    num_kv_heads = text_config.num_key_value_heads
-    # `or num_kv_heads` guards a present-but-None/0 global field (see
-    # build_cached_wrapper); absent → getattr default already handles E2B/E4B.
-    num_kv_heads_global = getattr(
-        text_config, "num_global_key_value_heads", num_kv_heads
-    ) or num_kv_heads
-    downstream_pli_count = num_total - le if not has_head else 0
-
-    log(f"\n{'=' * 60}")
-    log(
-        f"STAGE {idx}: layers [{ls}, {le}) | embed={has_embed} | head={has_head}"
-    )
-    log("=" * 60)
-
-    wrapper, head_dims, num_kv_heads_per_layer, share = build_cached_wrapper(
-        model, text_config, stage_plan, sliding_window=sliding_window
-    )
-    log("  Wrapper built")
-
-    is_shared = share["is_shared"]
-    cross_stage_sources = share["cross_stage_sources"]
-    external_shared_sources = share["external_shared_sources"]
-
-    own_kv_head_dims = [hd for hd, sh in zip(head_dims, is_shared) if not sh]
-    own_kv_num_heads = [
-        nkv for nkv, sh in zip(num_kv_heads_per_layer, is_shared) if not sh
-    ]
-    non_shared_local_indices = [
-        i for i, sh in enumerate(is_shared) if not sh
-    ]
-    n_own_kv = len(own_kv_head_dims)
-    n_cross = len(cross_stage_sources)
-    n_external = len(external_shared_sources)
-    log(
-        f"  KV: {n_own_kv} own (stateful for all), {n_cross} cross-stage "
-        f"out, {n_external} external in"
-    )
-
-    # Example inputs for trace.
-    seq_len = 4
-    past_seq = 1
-
-    if has_embed:
-        main_input = torch.randint(0, text_config.vocab_size, (1, seq_len))
-    else:
-        if pli_dim > 0:
-            input_dim = hidden_dim + (num_layers + downstream_pli_count) * pli_dim
-        else:
-            input_dim = hidden_dim
-        main_input = torch.randn(1, seq_len, input_dim, dtype=torch.float32)
-
-    position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
-
-    ext_kv = []
-    for _, lt, hd in external_shared_sources:
-        nkv = num_kv_heads_global if lt == "full_attention" else num_kv_heads
-        ext_kv.append(torch.randn(1, nkv, past_seq, hd))
-        ext_kv.append(torch.randn(1, nkv, past_seq, hd))
-
-    own_past_kv = []
-    for nkv, hd in zip(own_kv_num_heads, own_kv_head_dims):
-        own_past_kv.append(torch.randn(1, nkv, past_seq, hd))
-        own_past_kv.append(torch.randn(1, nkv, past_seq, hd))
-
-    example_inputs = (main_input, position_ids, *ext_kv, *own_past_kv)
-
-    log("  Tracing...")
-    t_trace = time.time()
-    with torch.no_grad():
-        traced = torch.jit.trace(wrapper, example_inputs, check_trace=False)
-    log(f"  Trace OK ({time.time() - t_trace:.0f}s)")
-    del wrapper
-    gc.collect()
-
-    log("  ov.convert_model...")
-    t_conv = time.time()
-    ov_model = ov.convert_model(traced, example_input=example_inputs)
-    del traced
-    gc.collect()
-    log(
-        f"  Converted ({time.time() - t_conv:.0f}s); "
-        f"{len(ov_model.inputs)} inputs, {len(ov_model.outputs)} outputs"
-    )
-
-    # Name I/O ports.
+    Inputs, in trace order: `input_ids` (embed stage) or `hidden_states`,
+    `position_ids`, `external_kv.{i}.key|value` (KV shared from an earlier
+    stage), `past_key_values.{i}.key|value`, then, on an embed stage that
+    splices images, `image_features` [M, hidden] with M dynamic (0 on a step
+    without images). Outputs: `logits` or `hidden_states`, then
+    `cross_kv.{i}.key|value` (KV a later stage reads) and
+    `present.{i}.key|value`."""
     for i, inp in enumerate(ov_model.inputs):
         shape = inp.partial_shape
+        if splice_images and i == len(ov_model.inputs) - 1:
+            shape[0] = -1
+            inp.node.set_partial_shape(shape)
+            inp.set_names({"image_features"})
+            continue
         if i == 0:
             name = "input_ids" if has_embed else "hidden_states"
             if len(shape) >= 2:
@@ -1183,6 +1135,123 @@ def export_single_stage(
             kt = "value" if (i - 1 - n_cross * 2) % 2 else "key"
             name = f"present.{oi}.{kt}"
         out.set_names({name})
+
+
+def export_single_stage(
+    model,
+    text_config,
+    stage_plan,
+    output_dir,
+    quantization,
+    device_verify="CPU",
+    sliding_window=None,
+    vision_ids=None,
+):
+    """Trace the Gemma 4 wrapper for one stage, convert to OV, make
+    KV state stateful, optionally compress, save under
+    ``output_dir/stage_N/``."""
+    import torch
+    import openvino as ov
+
+    idx = stage_plan["stage"]
+    ls, le = stage_plan["layer_start"], stage_plan["layer_end"]
+    has_embed, has_head = stage_plan["has_embed"], stage_plan["has_head"]
+    num_layers = le - ls
+    num_total = text_config.num_hidden_layers
+    hidden_dim = text_config.hidden_size
+    pli_dim = text_config.hidden_size_per_layer_input or 0
+    num_kv_heads = text_config.num_key_value_heads
+    # `or num_kv_heads` guards a present-but-None/0 global field (see
+    # build_cached_wrapper); absent → getattr default already handles E2B/E4B.
+    num_kv_heads_global = getattr(
+        text_config, "num_global_key_value_heads", num_kv_heads
+    ) or num_kv_heads
+    downstream_pli_count = num_total - le if not has_head else 0
+
+    log(f"\n{'=' * 60}")
+    log(
+        f"STAGE {idx}: layers [{ls}, {le}) | embed={has_embed} | head={has_head}"
+    )
+    log("=" * 60)
+
+    splice_images = has_embed and vision_ids is not None
+    wrapper, head_dims, num_kv_heads_per_layer, share = build_cached_wrapper(
+        model, text_config, stage_plan, sliding_window=sliding_window,
+        vision_ids=vision_ids,
+    )
+    log("  Wrapper built")
+
+    is_shared = share["is_shared"]
+    cross_stage_sources = share["cross_stage_sources"]
+    external_shared_sources = share["external_shared_sources"]
+
+    own_kv_head_dims = [hd for hd, sh in zip(head_dims, is_shared) if not sh]
+    own_kv_num_heads = [
+        nkv for nkv, sh in zip(num_kv_heads_per_layer, is_shared) if not sh
+    ]
+    non_shared_local_indices = [
+        i for i, sh in enumerate(is_shared) if not sh
+    ]
+    n_own_kv = len(own_kv_head_dims)
+    n_cross = len(cross_stage_sources)
+    n_external = len(external_shared_sources)
+    log(
+        f"  KV: {n_own_kv} own (stateful for all), {n_cross} cross-stage "
+        f"out, {n_external} external in"
+    )
+
+    # Example inputs for trace.
+    seq_len = 4
+    past_seq = 1
+
+    if has_embed:
+        main_input = torch.randint(0, text_config.vocab_size, (1, seq_len))
+        if splice_images:
+            # Two image tokens so the trace exercises the gather.
+            main_input[0, 1:3] = vision_ids[0]
+    else:
+        if pli_dim > 0:
+            input_dim = hidden_dim + (num_layers + downstream_pli_count) * pli_dim
+        else:
+            input_dim = hidden_dim
+        main_input = torch.randn(1, seq_len, input_dim, dtype=torch.float32)
+
+    position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+
+    ext_kv = []
+    for _, lt, hd in external_shared_sources:
+        nkv = num_kv_heads_global if lt == "full_attention" else num_kv_heads
+        ext_kv.append(torch.randn(1, nkv, past_seq, hd))
+        ext_kv.append(torch.randn(1, nkv, past_seq, hd))
+
+    own_past_kv = []
+    for nkv, hd in zip(own_kv_num_heads, own_kv_head_dims):
+        own_past_kv.append(torch.randn(1, nkv, past_seq, hd))
+        own_past_kv.append(torch.randn(1, nkv, past_seq, hd))
+
+    example_inputs = (main_input, position_ids, *ext_kv, *own_past_kv)
+    if splice_images:
+        example_inputs += (torch.randn(2, hidden_dim, dtype=torch.float32),)
+
+    log("  Tracing...")
+    t_trace = time.time()
+    with torch.no_grad():
+        traced = torch.jit.trace(wrapper, example_inputs, check_trace=False)
+    log(f"  Trace OK ({time.time() - t_trace:.0f}s)")
+    del wrapper
+    gc.collect()
+
+    log("  ov.convert_model...")
+    t_conv = time.time()
+    ov_model = ov.convert_model(traced, example_input=example_inputs)
+    del traced
+    gc.collect()
+    log(
+        f"  Converted ({time.time() - t_conv:.0f}s); "
+        f"{len(ov_model.inputs)} inputs, {len(ov_model.outputs)} outputs"
+    )
+
+    name_stage_ports(ov_model, has_embed, has_head, splice_images, n_external, n_cross)
     ov_model.validate_nodes_and_infer_types()
 
     # Make own KV stateful WITH explicit batch-1 zero-length inits (cross_kv
@@ -1304,6 +1373,7 @@ def export_single_stage(
                 external_shared_sources=external_shared_sources,
                 device=device_verify,
                 sliding_window=sliding_window,
+                splice_images=splice_images,
             )
         except Exception as e:
             log(f"  Self-verify FAILED for stage {idx} ({str(e)[:200]})")
@@ -1326,6 +1396,7 @@ def _verify_stage(
     external_shared_sources,
     device,
     sliding_window=None,
+    splice_images=False,
 ):
     """Compile the stage and run a prefill + one decode step.
 
@@ -1374,6 +1445,10 @@ def _verify_stage(
             (1, num_kv_heads, pf_seq, hd), dtype=np.float32
         )
         inp_idx += 1
+    if splice_images:
+        # No image rows: exercises the port and the appended zero row that
+        # every text-only step (and every decode step) relies on.
+        inputs[comp.input("image_features")] = np.zeros((0, hidden_dim), dtype=np.float32)
     result = req.infer(inputs)
     out = result[comp.output(0)]
     if not np.isfinite(out).all():
@@ -1406,6 +1481,8 @@ def _verify_stage(
             (1, num_kv_heads, pf_seq + 1, hd), dtype=np.float32
         )
         inp_idx += 1
+    if splice_images:
+        inputs2[comp.input("image_features")] = np.zeros((0, hidden_dim), dtype=np.float32)
     result2 = req.infer(inputs2)
     out2 = result2[comp.output(0)]
     if not np.isfinite(out2).all():
@@ -1425,8 +1502,15 @@ def run_export(
     quantization: str = "fp16",
     stage: int | None = None,
     device_verify: str | None = None,
+    vision_dir: str | None = None,
 ):
     """Export a Gemma 4 model end-to-end.
+
+    `vision_dir` (``--vision``): a directory holding the model's OpenVINO
+    vision encoder (`openvino_vision_embeddings_model.{xml,bin}`, e.g. from
+    OpenVINO/gemma-4-E2B-it-fp16-ov) and its processor configs. Stage 0
+    then takes `image_features` (see build_cached_wrapper) and the tree
+    carries the encoder for rank 0.
 
     Caller is responsible for ensuring `model_id` resolves to a local
     snapshot with `config.json` and `*.safetensors`. We use HF's
@@ -1531,6 +1615,19 @@ def run_export(
     )
 
     plan = compute_stage_plan(text_config.num_hidden_layers, num_stages)
+    if stage is not None:
+        # The untouched stages must also share this plan's layer split, or
+        # the tree skips or repeats layers.
+        _here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(_here, "gemma4_surgery"))
+        sys.path.insert(0, _here)
+        from export_gemma4_text import check_reused_tree
+
+        check_reused_tree(
+            output_dir, num_stages, text_config.num_hidden_layers, EXPORT_VERSION,
+            [(s["layer_start"], s["layer_end"] - 1) for s in plan],
+            text_config.hidden_size,
+        )
     log(f"\nStage plan ({num_stages} stages):")
     for s in plan:
         log(
@@ -1603,6 +1700,36 @@ def run_export(
         "quantization": quantization,
         "export_version": EXPORT_VERSION,
     }
+    vision_ids = None
+    if vision_dir:
+        if getattr(text_config, "use_bidirectional_attention", None) == "vision":
+            raise SystemExit(
+                "--vision: this Gemma 4 attends bidirectionally inside images "
+                "(use_bidirectional_attention='vision', 26B-A4B/31B), which the "
+                "gemma4 engine's causal mask does not model. Serve its images "
+                "with tools/gemma4_surgery/export_gemma4_text.py --vision on "
+                "--engine ov-runtime."
+            )
+        ids = {}
+        for k in ("image_token_id", "boi_token_id", "eoi_token_id"):
+            ids[k] = getattr(full_config, k, None)
+        ids["pad_token_id"] = getattr(text_config, "pad_token_id", None)
+        missing = [k for k, v in ids.items() if v is None]
+        if missing:
+            raise SystemExit(f"--vision: config lacks {missing}")
+        for fn in VISION_FILES:
+            src = os.path.join(vision_dir, fn)
+            if not os.path.exists(src):
+                raise SystemExit(f"--vision needs {fn} in {vision_dir}")
+            shutil.copy2(src, os.path.join(output_dir, fn))
+        vision_ids = (ids["image_token_id"], ids["pad_token_id"])
+        pipeline_meta["vision"] = {
+            "family": "gemma4",
+            "vision_embeddings": "openvino_vision_embeddings_model.xml",
+            "stage0_input": "image_features",
+            **ids,
+        }
+        log(f"  vision: stage 0 splices image_features; ids {ids}")
     with open(os.path.join(output_dir, "pipeline_config.json"), "w") as f:
         json.dump(pipeline_meta, f, indent=2)
 
@@ -1614,6 +1741,7 @@ def run_export(
             model, text_config, sp, output_dir, quantization,
             device_verify=device_verify,
             sliding_window=sliding_window,
+            vision_ids=vision_ids,
         )
         total_mb += size
         gc.collect()
@@ -1653,6 +1781,16 @@ def main():
         default="CPU",
         help="OV device to self-verify each stage on. 'none' to skip.",
     )
+    p.add_argument(
+        "--vision",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Keep image input: DIR holds the model's OpenVINO vision encoder "
+            "(openvino_vision_embeddings_model.xml/.bin) and processor configs, "
+            "e.g. a download of OpenVINO/gemma-4-E2B-it-fp16-ov. E2B/E4B only."
+        ),
+    )
     args = p.parse_args()
 
     device_verify = None if args.verify_device.lower() == "none" else args.verify_device
@@ -1663,6 +1801,7 @@ def main():
         quantization=args.quantization,
         stage=args.stage,
         device_verify=device_verify,
+        vision_dir=args.vision,
     )
 
 

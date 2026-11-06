@@ -34,6 +34,8 @@ tokenizers = { workspace = true }
 half = "2"
 
 [dev-dependencies]
+# Decodes the PNG fixtures in tests/qwen35_vision_parity.rs.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # `test-util` for tokio::time::pause — the control-ack bound test drives a 15 s
 # timeout on the paused clock instead of sleeping it for real.
 tokio = { workspace = true, features = ["test-util"] }
