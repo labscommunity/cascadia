@@ -90,7 +90,10 @@ fn cb_matches_llm_pipeline_with_and_without_the_chat_template() {
         .generate(prompt, &[], &cfg(false))
         .expect("llm generate")
         .text;
-    let llm_raw = llm.generate(prompt, &[], &cfg(true)).expect("llm generate").text;
+    let llm_raw = llm
+        .generate(prompt, &[], &cfg(true))
+        .expect("llm generate")
+        .text;
 
     eprintln!("cb  templated: {cb_templated:?}");
     eprintln!("llm templated: {llm_templated:?}");
