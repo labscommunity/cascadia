@@ -1617,7 +1617,11 @@ async fn recv_prefill_reply_ceilinged(
 > {
     match tokio::time::timeout(G_PREFILL_REPLY_CEILING, g.recv_reply_prefill()).await {
         Ok(r) => r,
-        Err(_) => Err(cascadia_transport::TransportError::SocketClosed),
+        Err(_) => {
+            // Replies carry no sequence number: left open, the late one answers the next request.
+            g.close().await;
+            Err(cascadia_transport::TransportError::SocketClosed)
+        }
     }
 }
 #[cfg(feature = "kv_coord")]
@@ -1634,6 +1638,8 @@ const G_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 async fn recv_control_ack_bounded(
     g: &mut cascadia_transport::ActivationClient,
 ) -> Result<WireTensor, cascadia_transport::TransportError> {
+    // Left open on purpose, unlike a token reply: capture is best-effort, and a late ack is too
+    // short to be read as a token, so it fails that exchange instead of answering it wrongly.
     let (ack, _) = tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, g.recv())
         .await
         .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
@@ -2412,6 +2418,46 @@ mod tests {
             "prefill reply errored only after {elapsed:?} — the ceiling was not applied \
              (transport budget is {budget:?})"
         );
+    }
+
+    /// #244: a late reply has no sequence number, so a connection left open after the ceiling hands
+    /// it to the next request as that request's answer. Measured on a real chain: HTTP 200 with
+    /// the previous prompt's token spliced into the text.
+    #[tokio::test]
+    async fn prefill_ceiling_closes_the_connection_so_a_late_reply_cannot_answer_the_next_request()
+    {
+        let _knob = crate::timeout_knob_lock();
+        let (mut client, mut peer) = connected_pair().await;
+        tokio::time::pause();
+        assert!(super::recv_prefill_reply_ceilinged(&mut client)
+            .await
+            .is_err());
+        tokio::time::resume();
+        crate::assert_closed(&mut client, &mut peer).await;
+    }
+
+    /// The mirror: a peer on an older build never acks a CAPTURE it can't parse. That costs one
+    /// turn its cache, and must not cost the connection, or every such turn reloads the chain.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_control_ack_timeout_keeps_the_connection() {
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        assert!(super::recv_control_ack_bounded(&mut client).await.is_err());
+        tokio::time::resume();
+        assert!(
+            client.send_raw(b"x").await.is_ok(),
+            "the connection must survive a missing ack"
+        );
+    }
+
+    async fn connected_pair() -> (cascadia_transport::ActivationClient, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = cascadia_transport::ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        (client, accept.await.unwrap())
     }
 
     #[tokio::test]
