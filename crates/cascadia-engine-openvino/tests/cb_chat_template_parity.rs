@@ -50,7 +50,7 @@ fn cfg(skip_chat_template: bool) -> GenConfig {
 
 fn cb_generate(pipe: &CbPipeline, id: u64, prompt: &str, skip: bool) -> String {
     let mut handle = pipe
-        .add_request(id, prompt, &cfg(skip))
+        .add_request(id, prompt, &[], &cfg(skip))
         .expect("cb add_request");
     let mut text = String::new();
     // Bounded: 32 max_new_tokens plus prefill iterations, with slack.
@@ -87,10 +87,10 @@ fn cb_matches_llm_pipeline_with_and_without_the_chat_template() {
 
     let llm = LlmPipeline::new(&model, &device, &PluginConfig::new()).expect("llm pipeline");
     let llm_templated = llm
-        .generate(prompt, &cfg(false))
+        .generate(prompt, &[], &cfg(false))
         .expect("llm generate")
         .text;
-    let llm_raw = llm.generate(prompt, &cfg(true)).expect("llm generate").text;
+    let llm_raw = llm.generate(prompt, &[], &cfg(true)).expect("llm generate").text;
 
     eprintln!("cb  templated: {cb_templated:?}");
     eprintln!("llm templated: {llm_templated:?}");
