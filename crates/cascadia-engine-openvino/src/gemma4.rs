@@ -774,41 +774,28 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let (tensor, _) = self
-            .block_on(async move {
-                let mut guard = downstream.lock().await;
-                // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
-                // A prefill reply waits on every remaining stage's
-                // whole-prompt compute — widened budget (see
-                // `recv_tensor_reply_prefill`), CEILINGED here: the transport
-                // budget multiplies the operator's frame-transfer knob
-                // (recv_timeout × 10 — the rig's 600 s made it 6000 s), and the
-                // waiting head holds its admission slot the whole time, so one
-                // dead downstream turned the node into a refuse-everything wall
-                // for 100 minutes (2026-08-17 incident). ov-runtime ceilings
-                // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
-                // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
-                // leaves ~6x headroom for deeper pipelines / longer prompts.
-                if prefill {
-                    recv_prefill_reply_ceilinged(&mut guard).await
-                } else {
-                    guard.recv_reply().await
-                }
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
-        if tensor.data.len() < 4 {
-            return Err(EngineError::Backend(format!(
-                "downstream sent {}-byte token tensor; need at least 4",
-                tensor.data.len()
-            )));
-        }
-        let token = i32::from_le_bytes([
-            tensor.data[0],
-            tensor.data[1],
-            tensor.data[2],
-            tensor.data[3],
-        ]);
-        Ok(token)
+        self.block_on(async move {
+            let mut guard = downstream.lock().await;
+            // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
+            // A prefill reply waits on every remaining stage's
+            // whole-prompt compute — widened budget (see
+            // `recv_tensor_reply_prefill`), CEILINGED here: the transport
+            // budget multiplies the operator's frame-transfer knob
+            // (recv_timeout × 10 — the rig's 600 s made it 6000 s), and the
+            // waiting head holds its admission slot the whole time, so one
+            // dead downstream turned the node into a refuse-everything wall
+            // for 100 minutes (2026-08-17 incident). ov-runtime ceilings
+            // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
+            // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
+            // leaves ~6x headroom for deeper pipelines / longer prompts.
+            let (tensor, _) = if prefill {
+                recv_prefill_reply_ceilinged(&mut guard).await
+            } else {
+                guard.recv_reply().await
+            }?;
+            token_from_reply(&mut guard, &tensor.data).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64)> {
@@ -1599,6 +1586,19 @@ const G_OPCODE_ABORT_ACK: u8 = 6;
 /// H.1b (R2): CAPTURE whose body also carries the turn's TENANT (`capture_body_bytes_v2`). Separate
 /// opcode, not a wider v1 body — the v1 codec enforces an exact length and hard-errors mid-chain on
 /// a mismatch. Emitted only for a non-empty tenant, so a chain that names none stays on v1.
+/// A reply too short to be a token is a control ack that arrived after its exchange gave up. This
+/// frame's real reply is still coming and would answer the next one, so the connection goes too.
+async fn token_from_reply(
+    g: &mut cascadia_transport::ActivationClient,
+    data: &[u8],
+) -> Result<i32, cascadia_transport::TransportError> {
+    let Some(token) = data.first_chunk::<4>() else {
+        g.close().await;
+        return Err(cascadia_transport::TransportError::SocketClosed);
+    };
+    Ok(i32::from_le_bytes(*token))
+}
+
 /// Ceiling on the widened prefill-reply wait (transport budget = recv_timeout × 10, which is
 /// operator-frame-knob-coupled, not compute-coupled). Measured legit worst: 51 s. See the call site.
 const G_PREFILL_REPLY_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1638,8 +1638,8 @@ const G_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 async fn recv_control_ack_bounded(
     g: &mut cascadia_transport::ActivationClient,
 ) -> Result<WireTensor, cascadia_transport::TransportError> {
-    // Left open on purpose, unlike a token reply: capture is best-effort, and a late ack is too
-    // short to be read as a token, so it fails that exchange instead of answering it wrongly.
+    // Left open on purpose, unlike a token reply: capture is best-effort, and a peer that never
+    // acks must not cost the connection. A late ack ends it at `token_from_reply`.
     let (ack, _) = tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, g.recv())
         .await
         .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
@@ -2433,6 +2433,15 @@ mod tests {
             .await
             .is_err());
         tokio::time::resume();
+        crate::assert_closed(&mut client, &mut peer).await;
+    }
+
+    /// A late control ack read as a token: the frame's real reply is still owed, so keeping the
+    /// connection would shift every later reply by one.
+    #[tokio::test]
+    async fn a_reply_too_short_for_a_token_closes_the_connection() {
+        let (mut client, mut peer) = connected_pair().await;
+        assert!(super::token_from_reply(&mut client, &[7u8]).await.is_err());
         crate::assert_closed(&mut client, &mut peer).await;
     }
 
