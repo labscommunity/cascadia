@@ -14,8 +14,9 @@ set -uo pipefail
 
 BIN="${1:?usage: $0 <path to the cascadia binary>}"
 case "$BIN" in /*|[A-Za-z]:*) ;; *) BIN="$PWD/$BIN" ;; esac
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 MODEL="hf-internal-testing/tiny-random-LlamaForCausalLM"
-CHECKS="no-prompt-outside-terminal doctor-only-looks terminal-prompt setup-from-nothing second-run-installs-nothing int4-means-int4 export-through-private skip-check caller-python-vars-ignored activated-venv-wins broken-venv-falls-through python-flag-wins path-python-used-unasked off-pin-path-python killed-setup-recovers orphaned-install-recovers damaged-env-rebuilds reuses-system-uv-python-packages system-python-unchanged working-folder-ignored changed-package-restored moe-exporters-reachable old-env-removed old-downloads-removed home-folder-untouched remove-deletes-everything"
+CHECKS="no-prompt-outside-terminal doctor-only-looks terminal-prompt setup-from-nothing second-run-installs-nothing int4-means-int4 export-through-private skip-check caller-python-vars-ignored activated-venv-wins broken-venv-falls-through python-flag-wins path-python-used-unasked off-pin-path-python killed-setup-recovers orphaned-install-recovers damaged-env-rebuilds model-code-never-runs reuses-system-uv-python-packages system-python-unchanged working-folder-ignored changed-package-restored moe-exporters-reachable old-env-removed old-downloads-removed home-folder-untouched remove-deletes-everything"
 
 if [ "${DRY_RUN:-0}" = 1 ]; then
     for c in $CHECKS; do echo "would run: $c"; done
@@ -227,6 +228,16 @@ RC_REFUSED=$RC
 shard --yes
 check damaged-env-rebuilds '[ "$RC_REFUSED" != 0 ] && tree_ok && [ -f "$FUNCTIONAL" ]' \
     "without --yes exit $RC_REFUSED; should refuse, then rebuild with --yes"
+
+# --- A downloaded model is data ------------------------------------------------
+# These need every real package, so they run on this Python. pytest goes beside it:
+# anything added to the environment would count as a change to repair.
+env UV_CACHE_DIR="$WORK/pytest-cache" PATH="$RUN_PATH" "$UV" pip install --no-config --quiet --python "$PY" \
+    --target "$WORK/pytest" pytest
+(cd "$REPO" && PYTHONPATH="$WORK/pytest" "$PY" -m pytest tools/tests/test_no_model_code.py -q -p no:cacheprovider) \
+    >"$WORK/out.log" 2>&1
+RC=$?
+check model-code-never-runs '[ "$RC" = 0 ] && said " passed" && ! said skipped' "exit $RC"
 
 # --- Only what's missing -------------------------------------------------------
 # A "system" Python holding torch at the locked version, numpy too, and

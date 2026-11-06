@@ -1,5 +1,10 @@
 """A downloaded model is data: nothing in it, and nothing in the folder someone
-runs from, may execute during an export."""
+runs from, may execute during an export.
+
+Needs every exporter package, so scripts/test-python-env.sh runs this on the Python
+Cascadia installs. A missing package must fail here, not skip: without one the
+exporters die before reaching the code they're meant to refuse, and nothing runs.
+"""
 import ast
 import json
 import os
@@ -8,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 TOOLS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS))
@@ -64,11 +70,20 @@ def shard(repo, tmp_path):
     )
 
 
-@pytest.mark.parametrize("config", [MINIMAX, GEMMA], ids=["minimax_m2", "gemma4"])
-def test_shard_never_runs_code_from_the_model(tmp_path, config):
+@pytest.mark.parametrize(
+    "config,past_auto_map",
+    # What each prints once it has gone past where auto_map would have loaded the
+    # repo's classes. Stopping sooner proves nothing, so it fails. Gemma stops on the
+    # missing weights before its tokenizer; the check below covers that call.
+    [(MINIMAX, "[cfg] "), (GEMMA, "no file named")],
+    ids=["minimax_m2", "gemma4"],
+)
+def test_shard_never_runs_code_from_the_model(tmp_path, config, past_auto_map):
     repo, marker = repo_with_code(tmp_path, config)
     r = shard(repo, tmp_path)
-    assert not marker.exists(), f"the model's code ran\n{r.stdout[-800:]}\n{r.stderr[-800:]}"
+    output = f"{r.stdout[-800:]}\n{r.stderr[-800:]}"
+    assert not marker.exists(), f"the model's code ran\n{output}"
+    assert past_auto_map in r.stdout + r.stderr, f"stopped too early to show anything\n{output}"
 
 
 def test_minimax_keeps_its_rotary_size_without_the_vendor_code(tmp_path):
@@ -100,7 +115,6 @@ def _load(model_dir):
 
 
 def test_a_bin_file_holding_more_than_weights_is_refused(tmp_path):
-    torch = pytest.importorskip("torch")
     marker = tmp_path / "code-ran"
     torch.save({"model.layers.0.w": _WritesAFile(str(marker))}, tmp_path / "pytorch_model.bin")
     with pytest.raises(SystemExit, match="safetensors"):
@@ -111,7 +125,6 @@ def test_a_bin_file_holding_more_than_weights_is_refused(tmp_path):
 @pytest.mark.parametrize("zipped", [True, False], ids=["current-format", "legacy-format"])
 def test_plain_bin_weights_still_load(tmp_path, zipped):
     """The legacy format can't be memory-mapped, so it takes the retry path."""
-    torch = pytest.importorskip("torch")
     weights = {"model.layers.0.w": torch.ones(2, 2), "model.layers.5.w": torch.zeros(1)}
     torch.save(weights, tmp_path / "pytorch_model.bin", _use_new_zipfile_serialization=zipped)
     loaded = _load(tmp_path)
@@ -153,7 +166,6 @@ def _argv_of_optimum_export(monkeypatch):
 
 
 def test_the_optimum_step_ignores_the_working_folder(tmp_path, monkeypatch):
-    pytest.importorskip("optimum.commands.optimum_cli")
     argv = _argv_of_optimum_export(monkeypatch)
     for name in ("json", "runpy", "argparse", "optimum", "transformers", "torch"):
         (tmp_path / f"{name}.py").write_text("open(__file__ + '.ran', 'w').close()\n")
