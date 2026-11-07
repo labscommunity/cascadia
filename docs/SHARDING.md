@@ -11,11 +11,8 @@ the embedding + (on the last stage) the final norm + lm_head.
 ## Quick start
 
 ```bash
-# Optional: the first export offers to install what it needs. To use your own
-# environment instead (export-time only, not needed at runtime), from a source
-# checkout; from a release bundle run `cascadia doctor`, which prints the pins:
-pip install -r tools/requirements.txt
-
+# The first run offers to install the Python packages it needs (export-time
+# only, in Cascadia's own folder). To use your own Python, see INSTALL.md.
 # Two-stage shard from HF:
 cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
              --output-dir ~/cascadia/llama-8b-2stage \

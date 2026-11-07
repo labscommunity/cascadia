@@ -128,13 +128,9 @@ cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
 
 ### Two machines (pipeline parallel)
 
-Shard once, on whichever machine has the RAM and a Python install:
+Shard once, on whichever machine has the RAM. The first run offers to install the Python packages it needs (up to about 1.5 GB, export-time only, in Cascadia's own folder; `--yes` skips the question). To use your own Python instead, see [INSTALL.md](INSTALL.md#export-time-python-only-for-cascadia-shard-and-cascadia-export).
 
 ```bash
-# Export-time deps (~3 GB; not needed at runtime). From a source checkout:
-pip install -r tools/requirements.txt
-# From a release bundle there is no tools/ — `cascadia doctor` prints the pinned line.
-
 # Shard a HuggingFace model into 2 stages with INT4 weights:
 cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
              --output-dir ~/cascadia/llama-8b-2stage \

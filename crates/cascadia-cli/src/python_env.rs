@@ -1554,7 +1554,8 @@ pub(crate) fn managed_status() -> String {
     } else if root.exists() {
         "unfinished (`cascadia python setup`)".to_string()
     } else {
-        "not set up (only needed for `cascadia shard`; offered when needed)".to_string()
+        "not set up (only needed for `cascadia shard` and `cascadia export`; offered when needed)"
+            .to_string()
     }
 }
 
