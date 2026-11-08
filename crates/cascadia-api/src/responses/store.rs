@@ -14,6 +14,7 @@
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 /// A stored item larger than the byte budget the lookup was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,8 +25,9 @@ pub(crate) struct TooLarge {
 
 #[derive(Default)]
 struct Inner {
-    /// id -> (item, its serialized size).
-    map: HashMap<String, (Value, usize)>,
+    /// id -> (item, its serialized size). Shared so a lookup clones a
+    /// pointer under the lock, not the item.
+    map: HashMap<String, (Arc<Value>, usize)>,
     /// Insertion order, oldest first, for eviction.
     order: VecDeque<String>,
     /// Sum of the stored sizes.
@@ -61,47 +63,59 @@ impl ItemCache {
     /// id; an item with no string `id`, or larger than the byte cap, is
     /// skipped. The oldest items are evicted until both caps hold.
     pub fn insert_all(&self, items: &[Value]) {
-        // Size the items outside the lock.
-        let sized: Vec<(&str, usize, &Value)> = items
+        // Size and copy the items outside the lock.
+        let entries: Vec<(String, Arc<Value>, usize)> = items
             .iter()
             .filter_map(|item| {
                 let id = item.get("id")?.as_str()?;
                 let size = serde_json::to_vec(item).map(|b| b.len()).ok()?;
-                (size <= self.max_bytes).then_some((id, size, item))
+                (size <= self.max_bytes).then(|| (id.to_owned(), Arc::new(item.clone()), size))
             })
             .collect();
-        if sized.is_empty() {
+        if entries.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock();
-        for (id, size, item) in sized {
-            if let Some((_, old)) = inner.map.remove(id) {
-                inner.bytes -= old;
-                inner.order.retain(|k| k != id);
+        // Replaced and evicted items are dropped after the lock is released.
+        let mut dropped: Vec<Arc<Value>> = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            for (id, item, size) in entries {
+                if let Some((old, old_size)) = inner.map.remove(&id) {
+                    inner.bytes -= old_size;
+                    inner.order.retain(|k| *k != id);
+                    dropped.push(old);
+                }
+                inner.order.push_back(id.clone());
+                inner.map.insert(id, (item, size));
+                inner.bytes += size;
             }
-            inner.map.insert(id.to_owned(), (item.clone(), size));
-            inner.order.push_back(id.to_owned());
-            inner.bytes += size;
-        }
-        while inner.map.len() > self.max_items || inner.bytes > self.max_bytes {
-            let Some(oldest) = inner.order.pop_front() else {
-                break;
-            };
-            if let Some((_, size)) = inner.map.remove(&oldest) {
-                inner.bytes -= size;
+            while inner.map.len() > self.max_items || inner.bytes > self.max_bytes {
+                let Some(oldest) = inner.order.pop_front() else {
+                    break;
+                };
+                if let Some((old, size)) = inner.map.remove(&oldest) {
+                    inner.bytes -= size;
+                    dropped.push(old);
+                }
             }
         }
+        drop(dropped);
     }
 
     /// The item stored under `id` and its stored size, if that size fits
-    /// `budget`; over it, [`TooLarge`] without cloning the item.
+    /// `budget`; over it, [`TooLarge`] without cloning the item. The item is
+    /// copied after the lock is released.
     pub fn get_within(&self, id: &str, budget: usize) -> Result<Option<(Value, usize)>, TooLarge> {
-        let inner = self.inner.lock();
-        match inner.map.get(id) {
-            None => Ok(None),
-            Some(&(_, size)) if size > budget => Err(TooLarge { size }),
-            Some((item, size)) => Ok(Some((item.clone(), *size))),
-        }
+        let found = {
+            let inner = self.inner.lock();
+            match inner.map.get(id) {
+                None => return Ok(None),
+                Some(&(_, size)) if size > budget => return Err(TooLarge { size }),
+                Some((item, size)) => (Arc::clone(item), *size),
+            }
+        };
+        let (item, size) = found;
+        Ok(Some((Value::clone(&item), size)))
     }
 }
 

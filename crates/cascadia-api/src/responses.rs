@@ -2343,6 +2343,7 @@ mod tests {
             let (kind, data) = ev.last().unwrap();
             assert_eq!(kind, terminal, "{text}");
             let id = &data["response"]["output"][0]["id"];
+            assert!(id.is_string(), "no output item id: {text}");
             let (status, v) = send_refs(app, &[id]).await;
             if found {
                 assert_eq!(data["response"]["status"], "cancelled");
