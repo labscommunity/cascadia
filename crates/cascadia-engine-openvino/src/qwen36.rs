@@ -835,6 +835,19 @@ pub struct Qwen36Engine {
 /// runner can interleave cancel() between steps (a monolithic step()
 /// holds the engine mutex for the whole generation, making cancel
 /// unreachable) and so streaming emits at the engine's real cadence.
+/// The streamed chunk for decoded token `next` of task `t` (already pushed
+/// onto `gen_ids`). The first NEW token (past any resume seed) carries the
+/// prompt count too, as the final chunk does, so a consumer that stops early
+/// still has it (M1 D14).
+fn decode_token_chunk(task_id: TaskId, next: u32, delta: String, t: &ActiveTask) -> Chunk {
+    let chunk = Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]);
+    if t.gen_ids.len() == t.resume_seed_len + 1 {
+        chunk.with_prompt_tokens(t.prompt_ids.len() as u32)
+    } else {
+        chunk
+    }
+}
+
 struct ActiveTask {
     task_id: TaskId,
     /// H.1b R2: the KV namespace this turn belongs to, seeded from `GenerationTask.tenant` at
@@ -1818,10 +1831,8 @@ impl Qwen36Engine {
                     if reanchored {
                         warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                     }
-                    vec![(
-                        task_id.clone(),
-                        Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
-                    )]
+                    let chunk = decode_token_chunk(task_id.clone(), next, delta, t);
+                    vec![(task_id, chunk)]
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "pipeline decode failed");
@@ -2545,10 +2556,8 @@ impl Qwen36Engine {
                     if reanchored {
                         warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                     }
-                    vec![(
-                        task_id.clone(),
-                        Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
-                    )]
+                    let chunk = decode_token_chunk(task_id.clone(), next, delta, t);
+                    vec![(task_id, chunk)]
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "decode failed");
@@ -3447,6 +3456,44 @@ mod tests {
             "empty prompt must be rejected LOUD; got a silent empty success: {chunk:?}"
         );
         assert!(chunk.error.as_deref().unwrap().contains("empty prompt"));
+    }
+
+    #[test]
+    fn first_decoded_token_carries_the_prompt_count() {
+        // M1 D14: known after prefill, so it rides the first NEW token (past
+        // a resume seed) as well as the final marker.
+        let mut t = ActiveTask {
+            task_id: "t0".into(),
+            tenant: String::new(),
+            prompt_ids: vec![1, 2, 3],
+            prefill_idx: 3,
+            step: 4,
+            warm_prefix: 0,
+            snapshot_at: Vec::new(),
+            logits: Vec::new(),
+            next_token: None,
+            gen_ids: vec![9, 5],
+            emitted: Vec::new(),
+            resume_seed_len: 1,
+            max_tokens: 16,
+            started: Instant::now(),
+            snapshot_secs: 0.0,
+            wire_ms: Vec::new(),
+        };
+        let c = decode_token_chunk("t0".into(), 5, "x".into(), &t);
+        assert_eq!(c.prompt_tokens, Some(3));
+        assert_eq!(c.token_ids, vec![5]);
+        t.gen_ids.push(6);
+        assert_eq!(
+            decode_token_chunk("t0".into(), 6, "y".into(), &t).prompt_tokens,
+            None
+        );
+        t.resume_seed_len = 0;
+        t.gen_ids = vec![5];
+        assert_eq!(
+            decode_token_chunk("t0".into(), 5, "x".into(), &t).prompt_tokens,
+            Some(3)
+        );
     }
 
     #[test]

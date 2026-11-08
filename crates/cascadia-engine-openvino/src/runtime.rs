@@ -2802,12 +2802,15 @@ impl OvRuntimeEngine {
         if !is_final {
             // Explicit count for the same reason: a token whose text lands in
             // the next chunk (BPE splitting a glyph) would otherwise count 0.
-            return Ok(Some((
-                task_id.clone(),
-                Chunk::token(task_id, token as i64, delta)
-                    .with_n_tokens(1)
-                    .with_token_ids(vec![token as i64]),
-            )));
+            let mut chunk = Chunk::token(task_id.clone(), token as i64, delta)
+                .with_n_tokens(1)
+                .with_token_ids(vec![token as i64]);
+            // The prompt count rides the first token too, so a consumer that
+            // stops early still has it (M1 D14); the final chunk repeats it.
+            if t.generated.len() == 1 {
+                chunk = chunk.with_prompt_tokens(t.prompt_ids.len() as u32);
+            }
+            return Ok(Some((task_id, chunk)));
         }
         let n_tokens = t.generated.len() as u32;
         let prompt_tokens = t.prompt_ids.len() as u32;
@@ -3106,6 +3109,14 @@ impl OvRuntimeEngine {
         if resynced {
             warn!(task = %task_id, "detokenizer decode diverged; re-anchored");
         }
+        // The prompt as sent (the resume seed is appended to `prompt_ids`
+        // and counted in `generated`). Reported on the first new token and
+        // on the final chunk (M1 D14).
+        let prompt_tokens = active
+            .prompt_ids
+            .len()
+            .saturating_sub(active.resume_seed_len) as u32;
+        let first_new = active.generated.len() == active.resume_seed_len + 1;
         let chunk = if is_final {
             Chunk {
                 task_id: task_id.clone(),
@@ -3114,7 +3125,7 @@ impl OvRuntimeEngine {
                 is_final: true,
                 logprobs: None,
                 n_tokens: None,
-                prompt_tokens: None,
+                prompt_tokens: Some(prompt_tokens),
                 completion_tokens: None,
                 error: None,
                 token_ids: Vec::new(),
@@ -3123,8 +3134,13 @@ impl OvRuntimeEngine {
                 finish_reason: None,
             }
         } else {
-            Chunk::token(task_id.clone(), next_token as i64, delta)
-                .with_token_ids(vec![next_token as i64])
+            let chunk = Chunk::token(task_id.clone(), next_token as i64, delta)
+                .with_token_ids(vec![next_token as i64]);
+            if first_new {
+                chunk.with_prompt_tokens(prompt_tokens)
+            } else {
+                chunk
+            }
         };
 
         if is_final {

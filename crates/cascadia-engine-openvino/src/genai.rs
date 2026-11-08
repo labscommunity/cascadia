@@ -588,6 +588,8 @@ struct ActiveCbTask {
     total_tokens: u32,
     max_tokens: u32,
     prompt_tokens: Option<u32>,
+    /// `prompt_tokens` has ridden a chunk already (the first one, M1 D14).
+    prompt_reported: bool,
     started: Instant,
 }
 
@@ -727,6 +729,7 @@ impl Engine for OvGenaiCbEngine {
             .map_err(map_ov_err)?;
         self.active.push(ActiveCbTask {
             prompt_tokens: self.pipe.count_tokens(&task.prompt),
+            prompt_reported: false,
             task_id: task.task_id,
             handle,
             total_tokens: 0,
@@ -806,12 +809,15 @@ impl Engine for OvGenaiCbEngine {
                     // when the text delta is empty (UTF-8 hold-back) so those
                     // tokens are still counted.
                     if !read.text_delta.is_empty() || read.new_tokens > 0 {
-                        let t = &self.active[idx];
-                        out.push((
-                            t.task_id.clone(),
-                            Chunk::token(t.task_id.clone(), 0, read.text_delta)
-                                .with_n_tokens(read.new_tokens),
-                        ));
+                        let t = &mut self.active[idx];
+                        let mut chunk = Chunk::token(t.task_id.clone(), 0, read.text_delta)
+                            .with_n_tokens(read.new_tokens);
+                        // The first emitted chunk carries the prompt count
+                        // too, so a consumer that stops early has it (D14).
+                        if let Some(n) = t.prompt_tokens {
+                            chunk = chunk.with_first_prompt_tokens(&mut t.prompt_reported, n);
+                        }
+                        out.push((t.task_id.clone(), chunk));
                     }
                     idx += 1;
                 }
@@ -1333,6 +1339,31 @@ mod tests {
         }
         assert_eq!(counts, vec![3, 4, 2], "must be increments, not 3,7,9");
         assert_eq!(text, "abcdefghi");
+    }
+
+    /// M1 D14: the prompt count rides the first emitted chunk as well as the
+    /// final one, so a consumer that stops early (the API on a `stop` match)
+    /// still has it. A zero-token liveness chunk before it does not count.
+    #[test]
+    fn cb_first_and_final_chunks_carry_the_prompt_count() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock().unwrap().reads.push(VecDeque::from(vec![
+            Ok(idle_read()),
+            Ok(read_of(CbStatus::Running, 3, "abc", CbFinish::Unknown)),
+            Ok(read_of(CbStatus::Running, 4, "defg", CbFinish::Unknown)),
+            Ok(read_of(CbStatus::Finished, 2, "hi", CbFinish::Unknown)),
+        ]));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 4096)).unwrap();
+        let mut counts = Vec::new();
+        for _ in 0..4 {
+            for (_, c) in e.step().unwrap() {
+                if !c.is_progress() {
+                    counts.push(c.prompt_tokens);
+                }
+            }
+        }
+        assert_eq!(counts, vec![Some(7), None, Some(7)]);
     }
 
     /// A failed scheduler iteration poisons the whole batch: every in-flight

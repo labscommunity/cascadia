@@ -216,3 +216,55 @@ async fn single_stage_cancel_during_decode_frees_the_slot() {
         assert_eq!(got[i], expected[i], "task {i} next to a cancelled stream");
     }
 }
+
+/// M1 D14: the prompt count rides each task's FIRST chunk as well as its
+/// final one, on the one-task path and the multi-stream scheduler alike, so
+/// a consumer that stops early (the API on a `stop` match) still has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_chunk_carries_the_prompt_count() {
+    let Some(dir) = fixture() else { return };
+    for streams in [None, Some(3)] {
+        let handle = tokio::runtime::Handle::current();
+        let mut e = single_stage(&dir, handle);
+        if let Some(n) = streams {
+            assert_eq!(e.enable_streams(n), n, "stream slots");
+        }
+        let tasks = greedy_tasks();
+        let ids: Vec<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
+        let counts = tokio::task::spawn_blocking(move || {
+            for t in tasks {
+                e.submit(t).unwrap();
+            }
+            // (first chunk's prompt_tokens, final chunk's prompt_tokens)
+            let mut seen: Vec<(Option<Option<u32>>, Option<u32>)> = vec![(None, None); ids.len()];
+            let mut done = vec![false; ids.len()];
+            let mut steps = 0;
+            while done.iter().any(|d| !d) {
+                steps += 1;
+                assert!(steps < 500, "engine did not finish the tasks");
+                for (id, c) in e.step().expect("step") {
+                    let i = ids.iter().position(|x| x == &id).unwrap();
+                    if seen[i].0.is_none() {
+                        seen[i].0 = Some(c.prompt_tokens);
+                    }
+                    if c.is_final {
+                        seen[i].1 = c.prompt_tokens;
+                        done[i] = true;
+                    }
+                }
+            }
+            seen
+        })
+        .await
+        .unwrap();
+        for (i, (first, last)) in counts.into_iter().enumerate() {
+            let last = last.unwrap_or_else(|| panic!("{streams:?} task {i}: no final count"));
+            assert!(last > 0, "{streams:?} task {i}");
+            assert_eq!(
+                first,
+                Some(Some(last)),
+                "{streams:?} task {i}: first chunk's count"
+            );
+        }
+    }
+}

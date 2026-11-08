@@ -6050,6 +6050,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let mut c = Chunk::token(st.id.clone(), st.next, delta);
             c.n_tokens = Some(1);
             c.token_ids = vec![st.next];
+            // The prompt count rides the first token too, so a consumer that
+            // stops early still has it (M1 D14); the final chunk repeats it.
+            if st.generated.len() == 1 {
+                c.prompt_tokens = Some(st.prompt_len as u32);
+            }
             out.push((st.id.clone(), c));
             let n = st.generated.len();
             let natural_stop = n >= st.max_new || eos.contains(&t);
@@ -6635,6 +6640,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let mut c = Chunk::token(st.id.clone(), st.next, delta);
             c.n_tokens = Some(1);
             c.token_ids = vec![st.next];
+            // The prompt count rides the first token too, so a consumer that
+            // stops early still has it (M1 D14); the final chunk repeats it.
+            if st.generated.len() == 1 {
+                c.prompt_tokens = Some(st.prompt_len as u32);
+            }
             out.push((st.id.clone(), c));
             let n = st.generated.len();
             let natural_stop = n >= st.max_new || eos.contains(&t);
@@ -6966,6 +6976,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let mut c = Chunk::token(task.task_id.clone(), generated[i] as i64, delta);
             c.n_tokens = Some(1);
             c.token_ids = vec![generated[i] as i64];
+            if i == 0 {
+                // First chunk carries the prompt count too (M1 D14).
+                c.prompt_tokens = Some(prompt_ids.len() as u32);
+            }
             out.push((task.task_id.clone(), c));
         }
         let mut chunk = Chunk::final_marker(task.task_id.clone(), String::new());
@@ -7329,6 +7343,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // decode paths): token_id==0 with empty token_ids reads as id-less and
         // makes the stream resume-ineligible; token 0 is a legal sample.
         token_chunk.token_ids = vec![next];
+        {
+            // First token: the prompt count rides it too (M1 D14).
+            let a = self.active.as_ref().unwrap();
+            if a.generated.len() == 1 {
+                token_chunk.prompt_tokens = Some(a.n_prefill as u32);
+            }
+        }
 
         let (gen_len, max_new, is_eos, pos, max_seq) = {
             let a = self.active.as_ref().unwrap();

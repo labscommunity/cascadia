@@ -11,7 +11,9 @@ use futures::stream;
 
 #[derive(Default)]
 pub struct MockEngine {
-    pending: Vec<(GenerationTask, usize)>,
+    /// Each task with its echo cursor and where that cursor started (the
+    /// resume seed's length), so its first emitted chunk is known.
+    pending: Vec<(GenerationTask, usize, usize)>,
     fail_next_step: Option<String>,
 }
 
@@ -33,11 +35,15 @@ impl Engine for MockEngine {
         // Step-wise engine: drop the task from the queue so step() stops
         // emitting its words. cancel() and step() never overlap (both
         // &mut self behind the runner mutex), so this is race-free.
-        self.pending.retain(|(t, _)| &t.task_id != task_id);
+        self.pending.retain(|(t, _, _)| &t.task_id != task_id);
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
+        if self
+            .pending
+            .iter()
+            .any(|(t, _, _)| t.task_id == task.task_id)
+        {
             return Ok(());
         }
         // Option B resume: the seed ids are already-emitted, so start the
@@ -53,7 +59,7 @@ impl Engine for MockEngine {
                 "mock resume seed id mismatch at {i}: got {bad}, this stream emitted {i}"
             )));
         }
-        self.pending.push((task, seed.len()));
+        self.pending.push((task, seed.len(), seed.len()));
         Ok(())
     }
 
@@ -64,7 +70,7 @@ impl Engine for MockEngine {
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
-        let (task, emitted) = self.pending.remove(0);
+        let (task, emitted, start) = self.pending.remove(0);
         // Test sentinel: a prompt containing `__engine_error__` fails the
         // task loud (emits an error chunk) so consumers' failure paths —
         // e.g. the API's 5xx mapping — can be exercised deterministically.
@@ -76,6 +82,9 @@ impl Engine for MockEngine {
         }
         let max = task.max_tokens.max(1) as usize;
         let words: Vec<&str> = task.prompt.split_whitespace().collect();
+        // The mock's "tokens" are the prompt's words: the count rides the
+        // first emitted chunk and the final one (M1 D14).
+        let prompt_tokens = words.len() as u32;
         if emitted >= max || emitted >= words.len() {
             // Distinguish the stop reason like a real engine: exhausting the
             // prompt's words is a natural `stop`; hitting the token cap first
@@ -88,14 +97,19 @@ impl Engine for MockEngine {
             };
             return Ok(vec![(
                 task.task_id.clone(),
-                Chunk::final_marker(task.task_id, "").with_finish_reason(reason),
+                Chunk::final_marker(task.task_id, "")
+                    .with_finish_reason(reason)
+                    .with_prompt_tokens(prompt_tokens),
             )]);
         }
         let token = words[emitted].to_string();
-        let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ")
+        let mut chunk = Chunk::token(&task.task_id, emitted as i64, token + " ")
             .with_token_ids(vec![emitted as i64]);
+        if emitted == start {
+            chunk = chunk.with_prompt_tokens(prompt_tokens);
+        }
         let task_id = task.task_id.clone();
-        self.pending.push((task, emitted + 1));
+        self.pending.push((task, emitted + 1, start));
         Ok(vec![(task_id, chunk)])
     }
 }
@@ -177,6 +191,21 @@ mod tests {
         assert!(emitted[0].text.starts_with("the"));
         assert!(emitted[1].text.starts_with("quick"));
         assert!(emitted[2].is_final);
+    }
+
+    #[test]
+    fn prompt_tokens_ride_the_first_and_the_final_chunk() {
+        // M1 D14: the prompt count (the prompt's words) is known up front.
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "the quick brown").with_max_tokens(8))
+            .unwrap();
+        let mut emitted = Vec::new();
+        for _ in 0..6 {
+            emitted.extend(e.step().unwrap().into_iter().map(|(_, c)| c));
+        }
+        let counts: Vec<Option<u32>> = emitted.iter().map(|c| c.prompt_tokens).collect();
+        assert_eq!(counts, [Some(3), None, None, Some(3)]);
+        assert!(emitted[3].is_final);
     }
 
     #[test]

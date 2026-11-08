@@ -63,8 +63,11 @@ pub struct Chunk {
     /// `completion_tokens` on the final chunk instead of guessing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_tokens: Option<u32>,
-    /// Prompt token count, set on the FINAL chunk by engines that know
-    /// it (the API's usage block reads it; None = engine can't tell).
+    /// Prompt token count (None = engine can't tell). Engines that know it
+    /// set it on the FINAL chunk, and token-streaming engines also on their
+    /// FIRST emitted chunk (they know it after prefill), so a consumer that
+    /// stops reading early (the API on a `stop` match) still has it.
+    /// Consumers take the latest `Some`. See [`Chunk::with_first_prompt_tokens`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u32>,
     /// Authoritative total model tokens generated for this task, including
@@ -184,6 +187,17 @@ impl Chunk {
         self
     }
 
+    /// Set the prompt count on a task's first emitted chunk: `reported` is
+    /// that task's flag, false until this sets it. Later chunks pass through
+    /// unchanged (the final chunk sets the count itself).
+    pub fn with_first_prompt_tokens(self, reported: &mut bool, n: u32) -> Self {
+        if *reported {
+            return self;
+        }
+        *reported = true;
+        self.with_prompt_tokens(n)
+    }
+
     /// Set the whole-generation total on a successful final chunk.
     pub fn with_completion_tokens(mut self, n: u32) -> Self {
         self.completion_tokens = Some(n);
@@ -241,6 +255,16 @@ impl Chunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_prompt_tokens_lands_on_the_first_chunk_only() {
+        let mut reported = false;
+        let a = Chunk::token("t", 1, "a").with_first_prompt_tokens(&mut reported, 7);
+        let b = Chunk::token("t", 2, "b").with_first_prompt_tokens(&mut reported, 7);
+        assert_eq!(a.prompt_tokens, Some(7));
+        assert_eq!(b.prompt_tokens, None);
+        assert!(reported);
+    }
 
     #[test]
     fn progress_marker_is_not_a_token_nor_final() {

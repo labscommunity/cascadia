@@ -1354,9 +1354,16 @@ impl Gemma4Engine {
         } else {
             // Explicit count: a token whose text lands in the next chunk (BPE
             // splitting a glyph) would otherwise count 0 via the non-empty fallback.
-            Chunk::token(task_id.clone(), next_token as i64, delta)
+            let chunk = Chunk::token(task_id.clone(), next_token as i64, delta)
                 .with_n_tokens(1)
-                .with_token_ids(vec![next_token as i64])
+                .with_token_ids(vec![next_token as i64]);
+            // The first new token carries the prompt count too, as the final
+            // chunk does, so a consumer that stops early has it (M1 D14).
+            if active.generated.len() == active.resume_seed_len + 1 {
+                chunk.with_prompt_tokens(active.prompt_ids.len() as u32)
+            } else {
+                chunk
+            }
         };
 
         if is_final {
