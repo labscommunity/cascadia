@@ -831,10 +831,6 @@ pub struct Qwen36Engine {
     last_restore_bytes: usize,
 }
 
-/// In-flight task state. `step()` advances one token per call so the
-/// runner can interleave cancel() between steps (a monolithic step()
-/// holds the engine mutex for the whole generation, making cancel
-/// unreachable) and so streaming emits at the engine's real cadence.
 /// The streamed chunk for decoded token `next` of task `t` (already pushed
 /// onto `gen_ids`). The first NEW token (past any resume seed) carries the
 /// prompt count too, as the final chunk does, so a consumer that stops early
@@ -848,6 +844,10 @@ fn decode_token_chunk(task_id: TaskId, next: u32, delta: String, t: &ActiveTask)
     }
 }
 
+/// In-flight task state. `step()` advances one token per call so the
+/// runner can interleave cancel() between steps (a monolithic step()
+/// holds the engine mutex for the whole generation, making cancel
+/// unreachable) and so streaming emits at the engine's real cadence.
 struct ActiveTask {
     task_id: TaskId,
     /// H.1b R2: the KV namespace this turn belongs to, seeded from `GenerationTask.tenant` at

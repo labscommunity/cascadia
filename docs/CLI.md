@@ -232,8 +232,10 @@ To restore the old behaviour:
   ov-genai's default, 1024 / 128, so 1152 with neither); an ov-runtime NPU
   export's `static_context` (`stage_<r>/stage_config.json`); the model's
   `config.json` window (`max_position_embeddings` and similar, `text_config`
-  first, then the top level; model root, then `tokenizer/`); else 4096. Before
-  this change an unset limit silently stopped at 256 tokens.
+  first, then the top level; model root, then `tokenizer/`); else 4096. With
+  `--packed-slots N` the ov-runtime window is one slot's region,
+  `(static_context - 1 - packed_prefix) / N`. Before this change an unset
+  limit silently stopped at 256 tokens.
 - **Explicit limits are capped at a known window.** When the window comes from
   one of the real sources above (an engine limit or `config.json`, not the 4096
   fallback and not `--default-max-tokens`), a request's own `max_tokens` /
@@ -263,9 +265,13 @@ To restore the old behaviour:
   character, the one that starts earliest), cuts the answer there with
   `finish_reason: "stop"`, and cancels the engine task, streaming or not. A
   stream holds back only a tail that could begin a stop sequence, so without
-  `stop` nothing is delayed. `usage` after a cut counts the prompt (engines
-  report it as soon as they have read it) and the completion tokens received
-  up to the cut.
+  `stop` nothing is delayed. `usage` after a cut counts the completion tokens
+  received up to the cut, and the prompt: the token-streaming engines
+  (ov-runtime, gemma4, qwen35, dist-spec, ov-genai `--cb`, sparse-moe) report
+  it on their first token, and the one-shot ones (default ov-genai,
+  single-stage sparse-moe) put everything on one final chunk. sycl-llama
+  learns the count only at the end, so a cut there reports a prompt of 0; that
+  is rare, because `llama-server` applies `stop` itself.
 - **What still runs to the window.** Two engines run a generation as one call
   that cannot be cancelled: the default (non-`--cb`) ov-genai path and
   single-stage sparse-moe. There an answer that never reaches end-of-sequence

@@ -68,6 +68,10 @@ pub struct Chunk {
     /// FIRST emitted chunk (they know it after prefill), so a consumer that
     /// stops reading early (the API on a `stop` match) still has it.
     /// Consumers take the latest `Some`. See [`Chunk::with_first_prompt_tokens`].
+    /// For a resumed turn (`resume_token_ids`) engines differ on whether the
+    /// resume seed counts as prompt: ov-runtime excludes it, gemma4, qwen36
+    /// and dist-spec include it. That is older than this contract and
+    /// unchanged by it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u32>,
     /// Authoritative total model tokens generated for this task, including
