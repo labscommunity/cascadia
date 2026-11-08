@@ -143,14 +143,10 @@ pub(super) fn input_messages(
                     })
                 }
             };
+            // `ItemCache::get_within` refuses over `left` itself; this
+            // guards any other resolver.
             if size > left {
-                return Err(Refusal::too_large(
-                    &at,
-                    format!(
-                        "expanding `item_reference` items would pass {max_expand_bytes} \
-                         bytes (max_prompt_bytes)"
-                    ),
-                ));
+                return Err(Refusal::too_large(&at, max_expand_bytes));
             }
             expanded += size;
             stored = value;
@@ -1007,10 +1003,7 @@ mod tests {
         assert_eq!(*seen.borrow(), [100, 70]);
 
         let over = |_: &str, left: usize| -> Result<Option<(Value, usize)>, Refusal> {
-            Err(Refusal::too_large(
-                "input",
-                format!("over the {left}-byte budget"),
-            ))
+            Err(Refusal::too_large("input", left))
         };
         let err = walk_with(
             json!([{"role": "user", "content": "x"}, {"type": "item_reference", "id": "fc_1"}]),

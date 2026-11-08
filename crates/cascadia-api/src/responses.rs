@@ -143,13 +143,20 @@ impl Refusal {
         }
     }
 
-    /// A 413: expanding `input` would pass the prompt byte budget.
-    pub(super) fn too_large(param: impl Into<String>, message: impl Into<String>) -> Self {
+    /// A 413: expanding `input`'s `item_reference`s would pass the
+    /// `max_bytes` prompt budget.
+    pub(super) fn too_large(param: impl Into<String>, max_bytes: usize) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: Some("prompt_too_large"),
             reason: "prompt_too_large",
-            ..Self::new(param, message)
+            ..Self::new(
+                param,
+                format!(
+                    "expanding `item_reference` items would pass {max_bytes} bytes \
+                     (max_prompt_bytes)"
+                ),
+            )
         }
     }
 
@@ -480,15 +487,10 @@ fn resolver(
     state: &AppState,
 ) -> impl Fn(&str, usize) -> Result<Option<(Value, usize)>, Refusal> + '_ {
     move |id, budget| {
-        state.item_cache.get_within(id, budget).map_err(|_| {
-            Refusal::too_large(
-                "input",
-                format!(
-                    "expanding `item_reference` items would pass {} bytes (max_prompt_bytes)",
-                    state.max_prompt_bytes
-                ),
-            )
-        })
+        state
+            .item_cache
+            .get_within(id, budget)
+            .map_err(|_| Refusal::too_large("input", state.max_prompt_bytes))
     }
 }
 
