@@ -166,6 +166,9 @@ pub fn plan_workers(
 }
 
 pub async fn cmd_run_placement(args: RunPlacementArgs) -> Result<()> {
+    // Same check the worker runs, before any stage is spawned: a bad value
+    // would otherwise start every rank and only fail the head.
+    crate::validate_generation_default_flags(args.default_max_tokens, args.default_temperature)?;
     let raw = std::fs::read_to_string(&args.placement)
         .with_context(|| format!("reading placement {}", args.placement.display()))?;
     let placement: Placement = serde_json::from_str(&raw)

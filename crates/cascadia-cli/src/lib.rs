@@ -1498,7 +1498,8 @@ struct GenerationDefaultSources {
 
 /// The engine's own window, when it has one tighter than `config.json` (D2):
 /// sycl-llama's child runs with `-c --llama-ctx`; ov-genai on NPU compiles
-/// `MAX_PROMPT_LEN + MIN_RESPONSE_LEN` when either flag is set; an ov-runtime
+/// `MAX_PROMPT_LEN + MIN_RESPONSE_LEN` (each flag, else ov-genai's default,
+/// so 1024 + 128 when neither is set); an ov-runtime
 /// NPU export has a fixed `static_context` KV.
 fn engine_window(
     args: &WorkerArgs,
@@ -1506,10 +1507,7 @@ fn engine_window(
 ) -> Option<(u32, &'static str)> {
     match args.engine {
         EngineKind::SyclLlama => (args.llama_ctx > 0).then_some((args.llama_ctx, "--llama-ctx")),
-        EngineKind::OvGenai
-            if device_is_npu(&args.device)
-                && (args.npu_max_prompt_len.is_some() || args.npu_min_response_len.is_some()) =>
-        {
+        EngineKind::OvGenai if device_is_npu(&args.device) => {
             let prompt = args
                 .npu_max_prompt_len
                 .unwrap_or(OVGENAI_NPU_MAX_PROMPT_LEN);
@@ -1565,11 +1563,38 @@ fn resolve_generation_defaults(
     )
 }
 
+/// Warnings for sampling values taken from `generation_config.json` that
+/// fall outside the OpenAI ranges (temperature 0..=2, top_p (0, 1]). The
+/// model author's value is still used; the warning only makes it visible.
+fn file_sampling_warnings(
+    d: &cascadia_api::GenerationDefaults,
+    s: &GenerationDefaultSources,
+) -> Vec<String> {
+    let from_file = |src: &str| src == "generation_config.json";
+    let mut w = Vec::new();
+    if from_file(s.temperature) && !(0.0..=2.0).contains(&d.temperature) {
+        w.push(format!(
+            "generation_config.json temperature {} is outside 0..=2; using it as the default \
+             (override with --default-temperature)",
+            d.temperature
+        ));
+    }
+    if from_file(s.top_p) && !(d.top_p > 0.0 && d.top_p <= 1.0) {
+        w.push(format!(
+            "generation_config.json top_p {} is outside (0, 1]; using it as the default",
+            d.top_p
+        ));
+    }
+    w
+}
+
 /// sparse-moe speculative decoding (`--prompt-lookup`) runs only at
 /// temperature <= 0, so a default temperature above 0 turns it off for every
 /// request that omits `temperature` (D3).
 fn spec_decode_off_by_default(args: &WorkerArgs, default_temperature: f32) -> bool {
+    // Multi-stage sparse-moe ignores --prompt-lookup (see build_builder).
     matches!(args.engine, EngineKind::SparseMoe)
+        && args.total == 1
         && args.prompt_lookup > 0
         && default_temperature > 0.0
 }
@@ -2751,6 +2776,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             "request defaults for unset max_tokens/temperature/top_p \
              (override: --default-max-tokens, --default-temperature)"
         );
+        for w in file_sampling_warnings(&defaults, &sources) {
+            warn!(model = %args.model, "{w}");
+        }
         if spec_decode_off_by_default(&args, defaults.temperature) {
             warn!(
                 temperature = defaults.temperature,
@@ -4907,12 +4935,13 @@ mod generation_defaults_tests {
             context_window: Some(32768),
             ..Default::default()
         };
-        // Neither flag set on NPU: config.json (D2: "when either is set").
+        // Neither flag set on NPU: the pipeline still compiles ov-genai's
+        // default static shape, 1024 + 128, so that is the window.
+        let (d, s) = resolve(&worker(EngineKind::OvGenai, "NPU"), info);
+        assert_eq!(d.max_tokens, 1024 + 128);
         assert_eq!(
-            resolve(&worker(EngineKind::OvGenai, "NPU"), info)
-                .0
-                .max_tokens,
-            32768
+            s.max_tokens,
+            "--npu-max-prompt-len + --npu-min-response-len"
         );
         // Flags on a GPU run, or on another engine, are dropped by the engine.
         for (engine, device) in [(EngineKind::OvGenai, "GPU"), (EngineKind::OvRuntime, "NPU")] {
@@ -4953,9 +4982,84 @@ mod generation_defaults_tests {
         w.prompt_lookup = 3;
         assert!(spec_decode_off_by_default(&w, 1.0));
         assert!(!spec_decode_off_by_default(&w, 0.0));
+        // Multi-stage sparse-moe ignores --prompt-lookup: nothing to turn off.
+        w.total = 2;
+        assert!(!spec_decode_off_by_default(&w, 1.0));
         // Only sparse-moe ties spec decode to temperature <= 0.
         let mut g = worker(EngineKind::OvGenai, "GPU");
         g.prompt_lookup = 3;
         assert!(!spec_decode_off_by_default(&g, 1.0));
+    }
+
+    #[tokio::test]
+    async fn run_placement_rejects_bad_flags_before_spawning() {
+        // The placement file does not exist: an error naming the flag proves
+        // the check ran before anything was read or spawned.
+        let mut argv = vec![
+            "cascadia",
+            "run-placement",
+            "--shard",
+            "/s",
+            "--placement",
+            "/nonexistent/placement.json",
+            "--default-temperature",
+            "5",
+        ];
+        let Command::RunPlacement(a) = parse(&argv) else {
+            panic!("expected run-placement");
+        };
+        let e = run_placement::cmd_run_placement(a)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--default-temperature"), "{e}");
+        argv.truncate(6);
+        argv.extend(["--default-max-tokens", "0"]);
+        let Command::RunPlacement(a) = parse(&argv) else {
+            panic!("expected run-placement");
+        };
+        let e = run_placement::cmd_run_placement(a)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--default-max-tokens"), "{e}");
+    }
+
+    #[test]
+    fn out_of_range_file_sampling_values_are_kept_but_flagged() {
+        let w = worker(EngineKind::OvGenai, "GPU");
+        let warned = |t: f32, p: f32| {
+            let info = ModelGenerationInfo {
+                temperature: Some(t),
+                top_p: Some(p),
+                ..Default::default()
+            };
+            let (d, s) = resolve(&w, info);
+            // The model author's value is used as is.
+            assert_eq!((d.temperature, d.top_p), (t, p));
+            file_sampling_warnings(&d, &s)
+        };
+        assert!(warned(0.7, 0.95).is_empty());
+        assert!(warned(0.0, 1.0).is_empty());
+        assert!(warned(2.0, 0.01).is_empty());
+        let w1 = warned(3.0, 0.9);
+        assert_eq!(w1.len(), 1);
+        assert!(
+            w1[0].contains("temperature") && w1[0].contains("generation_config.json"),
+            "{w1:?}"
+        );
+        let w2 = warned(0.7, 0.0);
+        assert_eq!(w2.len(), 1);
+        assert!(w2[0].contains("top_p"), "{w2:?}");
+        assert_eq!(warned(2.5, 1.5).len(), 2);
+        // A flag-set temperature is not the file's: no warning about it.
+        let mut f = worker(EngineKind::OvGenai, "GPU");
+        f.default_temperature = Some(0.0);
+        let info = ModelGenerationInfo {
+            temperature: Some(9.0),
+            ..Default::default()
+        };
+        let (d, s) = resolve(&f, info);
+        assert!(file_sampling_warnings(&d, &s).is_empty());
     }
 }
