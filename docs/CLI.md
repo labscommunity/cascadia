@@ -256,6 +256,16 @@ and change nothing on a local server: `user`, `safety_identifier`,
 and `stream_options.include_obfuscation`. `store: true` is accepted; nothing is
 stored. `/v1/completions` accepts `user` and `metadata` the same way.
 
+**Deprecated function calling.** `functions` is treated as `tools` and
+`function_call` (`"none"`, `"auto"` or `{"name": ...}`) as `tool_choice`. An
+assistant message's `function_call` becomes a tool call, and the `function`-role
+message after it becomes the `tool` reply to it. A request that used
+`functions` gets the old answer shape: `message.function_call` (or
+`delta.function_call` when streaming) with `finish_reason: "function_call"`,
+and only the first call, since that field holds one. Sending `functions` with
+`tools`, or `function_call` with `tool_choice`, is a 400, as is a
+`function_call` naming a function that is not in `functions`.
+
 **`--ov-config KEY=VALUE`** forwards any plugin property to OpenVINO verbatim,
 alongside the typed `--ov-*` flags — the escape hatch for knobs without a
 dedicated flag (`--ov-config KV_CACHE_PRECISION=u8`,
