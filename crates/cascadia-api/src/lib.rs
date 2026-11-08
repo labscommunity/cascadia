@@ -931,8 +931,8 @@ struct ChatChoiceMessage {
 }
 
 /// OpenAI chat `logprobs` object: one entry per generated token under
-/// `content`. Present only when the request set `logprobs: true` AND the
-/// engine emitted per-token logprobs.
+/// `content`. An object only when the request set `logprobs: true` AND the
+/// engine emitted per-token logprobs; otherwise the choice carries `null`.
 #[derive(Serialize)]
 struct ChatLogprobs {
     content: Vec<cascadia_types::TokenLogprobs>,
@@ -943,7 +943,7 @@ struct ChatChoice {
     index: u32,
     message: ChatChoiceMessage,
     finish_reason: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Required (nullable) by the OpenAI schema: serialized as `null` when absent.
     logprobs: Option<ChatLogprobs>,
 }
 
@@ -1041,9 +1041,9 @@ struct CompletionChoice {
     // text_offset}` vs chat's `{content: [...]}`). We reuse the chat-style
     // `ChatLogprobs` here for now; it's moot until an engine actually emits
     // per-token logprobs (none do yet — same deferral as #14), at which point
-    // converting to the legacy schema is the follow-up. The field is omitted
-    // entirely when empty, so a legacy client sees no malformed object today.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // converting to the legacy schema is the follow-up. The field is `null`
+    // when empty (the OpenAI schema requires it, nullable), so a legacy client
+    // sees no malformed object today.
     logprobs: Option<ChatLogprobs>,
 }
 
@@ -4345,6 +4345,68 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["choices"][0]["finish_reason"], "length");
+    }
+
+    // Response bodies must match the pinned OpenAI spec (see spec_schema.rs).
+
+    #[tokio::test]
+    async fn chat_completion_response_matches_openai_spec() {
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "alpha bravo charlie"}],
+                "max_tokens": 2,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn completion_response_matches_openai_spec() {
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "mock-model",
+                            "prompt": "alpha bravo charlie",
+                            "max_tokens": 2,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn list_models_response_matches_openai_spec() {
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        crate::spec_schema::assert_spec("ListModelsResponse", &v);
     }
 
     #[tokio::test]
