@@ -226,3 +226,6 @@ tool; the turn after its `function_call_output` gets the fixed answer
 `mock: got <first 40 characters of the output>`; and a later user turn without the sentinel,
 after one that had it, gets `mock: ok`. So a client's tool loop runs end to end. It is not a
 feature of real models.
+
+`scripts/responses-clients-check.sh --bin target/debug/cascadia` runs the OpenAI Agents SDK,
+`@ai-sdk/openai`, n8n and Codex CLI tool loops against this mock and ends `RESPONSES_CLIENTS: ALL PASS`.
