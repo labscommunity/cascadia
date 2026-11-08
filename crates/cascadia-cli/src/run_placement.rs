@@ -18,6 +18,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 
 use crate::placement::Placement;
+use crate::GenerationDefaultFlags;
 
 #[derive(Args, Debug, Clone)]
 pub struct RunPlacementArgs {
@@ -51,6 +52,26 @@ pub struct RunPlacementArgs {
     /// Print the worker command lines and exit without spawning.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+
+    /// Output-token limit for a request that sets none, forwarded to the
+    /// API head (rank 0). See `cascadia worker --help`.
+    #[arg(long, value_name = "N")]
+    pub default_max_tokens: Option<u32>,
+
+    /// Temperature for a request that sets none (0..=2), forwarded to the
+    /// API head (rank 0). See `cascadia worker --help`.
+    #[arg(long, value_name = "T")]
+    pub default_temperature: Option<f32>,
+}
+
+impl RunPlacementArgs {
+    /// The request-default flags the API head (rank 0) is launched with.
+    pub fn generation_default_flags(&self) -> GenerationDefaultFlags {
+        GenerationDefaultFlags {
+            max_tokens: self.default_max_tokens,
+            temperature: self.default_temperature,
+        }
+    }
 }
 
 /// Build the argv (after the `worker` subcommand token) for one stage.
@@ -110,6 +131,7 @@ pub fn plan_workers(
     relay_host: &str,
     relay_base: u16,
     ov_cache: Option<&str>,
+    head_defaults: GenerationDefaultFlags,
 ) -> Result<Vec<Vec<String>>> {
     let n = placement.assignment.len();
     if n == 0 {
@@ -133,9 +155,12 @@ pub fn plan_workers(
             Some(format!("{relay_host}:{}", port(rank + 1)?))
         };
         let api = if rank == 0 { Some(api) } else { None };
-        plans.push(worker_argv(
-            rank, n, device, shard, listen, next, api, ov_cache,
-        ));
+        let mut argv = worker_argv(rank, n, device, shard, listen, next, api, ov_cache);
+        // Only the head serves the API, so only it takes request defaults.
+        if rank == 0 {
+            argv.extend(head_defaults.to_argv());
+        }
+        plans.push(argv);
     }
     Ok(plans)
 }
@@ -157,6 +182,7 @@ pub async fn cmd_run_placement(args: RunPlacementArgs) -> Result<()> {
         &args.relay_host,
         args.relay_base,
         args.ov_cache_dir.as_deref(),
+        args.generation_default_flags(),
     )?;
 
     println!(
@@ -253,7 +279,16 @@ mod tests {
     #[test]
     fn single_stage_is_api_head_with_no_relay() {
         let p = placement(&["GPU"]);
-        let plans = plan_workers(&p, "/m", "127.0.0.1:8000", "127.0.0.1", 9100, None).unwrap();
+        let plans = plan_workers(
+            &p,
+            "/m",
+            "127.0.0.1:8000",
+            "127.0.0.1",
+            9100,
+            None,
+            GenerationDefaultFlags::default(),
+        )
+        .unwrap();
         assert_eq!(plans.len(), 1);
         let a = argv_of(&plans, 0);
         assert!(a.contains("--rank 0"));
@@ -267,7 +302,16 @@ mod tests {
     #[test]
     fn three_stage_ring_is_wired_head_to_tail() {
         let p = placement(&["GPU", "NPU", "CPU"]);
-        let plans = plan_workers(&p, "/m", "127.0.0.1:8000", "127.0.0.1", 9100, None).unwrap();
+        let plans = plan_workers(
+            &p,
+            "/m",
+            "127.0.0.1:8000",
+            "127.0.0.1",
+            9100,
+            None,
+            GenerationDefaultFlags::default(),
+        )
+        .unwrap();
         assert_eq!(plans.len(), 3);
 
         // rank 0: API head, dials rank 1, no listen.
@@ -295,8 +339,16 @@ mod tests {
     #[test]
     fn every_stage_uses_ov_runtime_and_the_shard() {
         let p = placement(&["GPU", "CPU"]);
-        let plans =
-            plan_workers(&p, "/srv/shard", "127.0.0.1:8000", "127.0.0.1", 9100, None).unwrap();
+        let plans = plan_workers(
+            &p,
+            "/srv/shard",
+            "127.0.0.1:8000",
+            "127.0.0.1",
+            9100,
+            None,
+            GenerationDefaultFlags::default(),
+        )
+        .unwrap();
         for a in &plans {
             let s = a.join(" ");
             assert!(s.contains("--engine ov-runtime"));
@@ -307,8 +359,16 @@ mod tests {
     #[test]
     fn ov_cache_dir_is_forwarded_to_all_stages() {
         let p = placement(&["GPU", "NPU"]);
-        let plans =
-            plan_workers(&p, "/m", "127.0.0.1:8000", "127.0.0.1", 9100, Some("/c")).unwrap();
+        let plans = plan_workers(
+            &p,
+            "/m",
+            "127.0.0.1:8000",
+            "127.0.0.1",
+            9100,
+            Some("/c"),
+            GenerationDefaultFlags::default(),
+        )
+        .unwrap();
         for a in &plans {
             assert!(a.join(" ").contains("--ov-cache-dir /c"));
         }
@@ -317,6 +377,15 @@ mod tests {
     #[test]
     fn empty_placement_is_an_error() {
         let p = placement(&[]);
-        assert!(plan_workers(&p, "/m", "127.0.0.1:8000", "127.0.0.1", 9100, None).is_err());
+        assert!(plan_workers(
+            &p,
+            "/m",
+            "127.0.0.1:8000",
+            "127.0.0.1",
+            9100,
+            None,
+            GenerationDefaultFlags::default()
+        )
+        .is_err());
     }
 }

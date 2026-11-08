@@ -74,6 +74,8 @@ cascadia run [OPTIONS] <MODEL>
 | `--api <API>` | `:8000` | API bind address. `127.0.0.1:8000` binds loopback only. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only: budget of the in-process prefix cache (system-block + chat-boundary state snapshots, restored for prompts that extend a cached prefix). `0` disables. |
 | `--api-max-body-mb <MB>` | `1` | Largest chat-completions request body (MiB); the rendered prompt is capped at the same size (1 MiB ≈ 250K tokens of English). Only `qwen35` also bounds the prompt in tokens against the model window; on other engines this byte cap is the whole guard, so lower it on an exposed endpoint. |
+| `--default-max-tokens <N>` | one context window | Output-token limit for a request that sets none. `256` restores the old cap. See [Request defaults](#request-defaults). |
+| `--default-temperature <T>` | `generation_config.json`, else `1` | Temperature (0–2) for a request that sets none. `0` restores the old greedy default. See [Request defaults](#request-defaults). |
 
 Note the defaults differ from `worker` (`GPU`/`ov-genai` here, `CPU`/`mock`
 there): `run` assumes you want real inference on the accelerator.
@@ -198,12 +200,49 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~130 KB per context token as serialised (1.2 GB at 8 K, 4.45 GB at 32 K). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
 | `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. `qwen35` additionally rejects prompts at or past `max_position_embeddings` (413). A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
+| `--default-max-tokens <N>` | one context window | Output-token limit for a `/v1/chat/completions` or `/v1/completions` request that sets none (`max_tokens` / `max_completion_tokens` absent or `null`). `256` restores the old cap. See [Request defaults](#request-defaults). `0` is rejected. |
+| `--default-temperature <T>` | `generation_config.json`, else `1` | Temperature for a request that sets none. `0` restores the old greedy default. Must be in 0–2. See [Request defaults](#request-defaults). |
 | `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers (each entry may also be a [unix socket](#unix-domain-sockets) `unix:/path.sock`); this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
 | `--ep-worker-index <N>` / `--ep-worker-count <W>` | — | `sparse-moe` (Inkling) expert-parallel **worker**: serve expert shard N of W (experts with `id % W == N`, shared experts included) for every MoE layer on `--listen`; no API, no attention, no sequence state. |
 | `--ov-config <KEY=VALUE>` | — | Raw OV plugin property passthrough, repeatable. See below. |
 | `--elastic` | off | Elastic memory posture (Linux; file-backed big allocations). On `--engine sycl-llama` it instead enables `GGML_STREAM_WEIGHTS=1` on the spawned `llama-server` (device-side weight streaming; with the default `--elastic-vram auto` a model that fits runs at stock speed) — see below and [engines/sycl-llama.md](engines/sycl-llama.md). |
 | `--elastic-min-mb <MB>` | 1 | Elastic threshold; 16 = weights-only, zero speed cost. |
 | `--elastic-pool-mb <MB>` | 8192 | Elastic retained-mapping pool cap (0 = off). |
+
+<a id="request-defaults"></a>
+**Request defaults.** A request that leaves a sampling field unset (absent or
+`null`) gets the server's value, on `/v1/chat/completions` and `/v1/completions`
+alike. The worker logs the three values and where each came from at startup.
+
+- **Output limit** (`max_tokens` / `max_completion_tokens`): runs until the model
+  stops, capped at one context window, taken from the first of these that
+  applies: `--default-max-tokens`; sycl-llama `--llama-ctx`; ov-genai on NPU
+  `--npu-max-prompt-len` + `--npu-min-response-len` (when either is set; the
+  unset one counts as ov-genai's default, 1024 / 128); an ov-runtime NPU
+  export's `static_context` (`stage_<r>/stage_config.json`); the model's
+  `config.json` window (`max_position_embeddings` and similar, also under
+  `text_config`; model root, then `tokenizer/`); else 4096. Before this change
+  an unset limit silently stopped at 256 tokens.
+- **`temperature` / `top_p`**: the model's `generation_config.json` (root, then
+  `tokenizer/`; `do_sample` is not applied), else `1`. `--default-temperature`
+  overrides the file's temperature. Before this change an unset temperature was
+  `0` (greedy).
+- ov-runtime, dist-spec, `gemma4` and `qwen35` decode greedily whatever the
+  temperature (until sampling lands, M4), so only their limit changes.
+  sycl-llama now always sends a temperature to `llama-server` (the default
+  above, or the flag), overriding the server's own default; it still never
+  sends `top_p`.
+- sparse-moe speculative decoding (`--prompt-lookup`) runs only at temperature
+  0: with a default above 0 it is off for requests that omit `temperature`, and
+  the worker warns at startup. Pass `--default-temperature 0` to keep it on.
+- On the default (non-`--cb`) ov-genai path a generation runs as one
+  uncancellable call: an answer that never reaches end-of-sequence now holds
+  the engine for up to one context window instead of 256 tokens, and a client
+  disconnect does not stop it. ov-runtime (CPU/GPU and NPU), dist-spec,
+  `gemma4` and multi-stage `qwen35` have no window stop of their own, so such
+  an answer runs to the full limit there too. `--default-max-tokens` bounds it
+  per server.
+- To restore the old behaviour: `--default-max-tokens 256 --default-temperature 0`.
 
 **`--ov-config KEY=VALUE`** forwards any plugin property to OpenVINO verbatim,
 alongside the typed `--ov-*` flags — the escape hatch for knobs without a
@@ -476,6 +515,8 @@ cascadia run-placement --shard <DIR> --placement <FILE> [OPTIONS]
 | `--relay-base <PORT>` | `9100` | Base relay port. Stage `r` (r≥1) listens on `relay_base + r`. Concurrent runs on one host must not overlap. |
 | `--ov-cache-dir <DIR>` | — | Forwarded to every worker. |
 | `--dry-run` | off | Print the worker command lines and exit without spawning. |
+| `--default-max-tokens <N>` | one context window | Forwarded to the pipeline head (rank 0). See [Request defaults](#request-defaults). |
+| `--default-temperature <T>` | `generation_config.json`, else `1` | Forwarded to the pipeline head (rank 0). See [Request defaults](#request-defaults). |
 
 This launcher spawns all stages as **local** child processes. To span machines,
 run `cascadia worker` per box by hand.

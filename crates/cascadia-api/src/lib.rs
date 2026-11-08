@@ -149,6 +149,9 @@ pub struct AppState {
     /// `false`, a success flips it back `true` — so `/health` reflects the real
     /// state of the chain instead of always returning 200 while requests 503.
     pub ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Values for the sampling fields a request leaves unset. See
+    /// [`GenerationDefaults`].
+    pub generation_defaults: GenerationDefaults,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -170,6 +173,37 @@ pub struct Config {
     pub engine_applies_template: bool,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
+    /// What a request that leaves `max_tokens`/`temperature`/`top_p` unset
+    /// gets. See [`GenerationDefaults`]; the CLI resolves it per model.
+    pub generation_defaults: GenerationDefaults,
+}
+
+/// Output-token limit for a request that sets none, when the model's context
+/// window is unknown (the repo's default context: sycl-llama `--llama-ctx`,
+/// the sparse-moe staged max sequence).
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// Server-wide values for the sampling fields a request leaves unset (or
+/// sends as `null`). Decision 2: no limit means "until the model stops", sent
+/// to the engines as one context window (`max_tokens`); `temperature`/`top_p`
+/// come from the model's `generation_config.json`, else the OpenAI default 1.
+/// The CLI resolves these per model (`--default-max-tokens`,
+/// `--default-temperature`); the defaults here are the no-model fallback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GenerationDefaults {
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+}
+
+impl Default for GenerationDefaults {
+    fn default() -> Self {
+        Self {
+            max_tokens: DEFAULT_MAX_TOKENS,
+            temperature: 1.0,
+            top_p: 1.0,
+        }
+    }
 }
 
 impl Default for Config {
@@ -182,6 +216,7 @@ impl Default for Config {
             defer_template_on_thinking: false,
             engine_applies_template: false,
             marker_dialect: None,
+            generation_defaults: GenerationDefaults::default(),
         }
     }
 }
@@ -516,6 +551,7 @@ pub fn make_router_with_stats(
         effort_words: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        generation_defaults: cfg.generation_defaults,
     };
     let state = AppState {
         effort_words: state
@@ -741,8 +777,9 @@ pub struct ChatCompletionRequest {
     /// are sent. `null` = unset.
     #[serde(default)]
     pub max_completion_tokens: Option<u32>,
+    /// `null` = unset = the server default ([`GenerationDefaults`]).
     #[serde(default)]
-    pub temperature: f32,
+    pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -815,11 +852,11 @@ impl ChatCompletionRequest {
         self.max_completion_tokens.or(self.max_tokens)
     }
 
-    /// Build the engine-facing `SamplingParams`, applying OpenAI defaults
-    /// (top_p=1.0, penalties=0.0) when a field is omitted.
-    fn sampling_params(&self) -> cascadia_types::SamplingParams {
+    /// Build the engine-facing `SamplingParams`: an omitted `top_p` takes the
+    /// server default, omitted penalties the OpenAI default 0.0.
+    fn sampling_params(&self, defaults: &GenerationDefaults) -> cascadia_types::SamplingParams {
         cascadia_types::SamplingParams {
-            top_p: self.top_p.unwrap_or(1.0),
+            top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(0),
             seed: self.seed,
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
@@ -931,10 +968,6 @@ impl ChatCompletionRequest {
     }
 }
 
-fn default_max_tokens() -> u32 {
-    256
-}
-
 #[derive(Serialize)]
 struct ChatChoiceMessage {
     role: &'static str,
@@ -992,10 +1025,13 @@ pub enum PromptSpec {
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: PromptSpec,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
+    /// `null` = unset = the server default ([`GenerationDefaults`]). This
+    /// endpoint has no `max_completion_tokens` (OpenAI's legacy schema).
     #[serde(default)]
-    pub temperature: f32,
+    pub max_tokens: Option<u32>,
+    /// `null` = unset = the server default ([`GenerationDefaults`]).
+    #[serde(default)]
+    pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -1020,9 +1056,10 @@ pub struct CompletionRequest {
 }
 
 impl CompletionRequest {
-    fn sampling_params(&self) -> cascadia_types::SamplingParams {
+    /// See [`ChatCompletionRequest::sampling_params`].
+    fn sampling_params(&self, defaults: &GenerationDefaults) -> cascadia_types::SamplingParams {
         cascadia_types::SamplingParams {
-            top_p: self.top_p.unwrap_or(1.0),
+            top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(0),
             seed: self.seed,
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
@@ -2587,12 +2624,16 @@ async fn chat_completions(
         messages: chat_turns(&req),
         tools: chat_tools(&req),
         tool_choice: req.tool_choice.clone(),
+        // Unset limit = one context window (Decision 2, D2); unset
+        // temperature/top_p = the model's generation_config.json, else 1 (D3).
         max_tokens: req
             .requested_max_tokens()
-            .unwrap_or_else(default_max_tokens),
-        temperature: req.temperature,
+            .unwrap_or(state.generation_defaults.max_tokens),
+        temperature: req
+            .temperature
+            .unwrap_or(state.generation_defaults.temperature),
         logprobs: req.logprobs_count(),
-        sampling: req.sampling_params(),
+        sampling: req.sampling_params(&state.generation_defaults),
         enable_thinking,
         trust_remote_code: false,
         // H.1b: hardcoded, never read from the request. The tenant is a KV-namespace boundary; a
@@ -2716,7 +2757,7 @@ async fn chat_completions(
     // match. The engines don't early-stop on strings yet (an engine-side
     // follow-up would also save compute), so this enforces the OpenAI output
     // contract at the API boundary and forces finish_reason = "stop".
-    let stops = req.sampling_params().stop;
+    let stops = req.sampling_params(&state.generation_defaults).stop;
     if !stops.is_empty() {
         if let Some(cut) = stops
             .iter()
@@ -2821,10 +2862,15 @@ async fn completions(
         messages: Vec::new(),
         tools: None,
         tool_choice: None,
-        max_tokens: req.max_tokens,
-        temperature: req.temperature,
+        // Same defaults as chat (D4).
+        max_tokens: req
+            .max_tokens
+            .unwrap_or(state.generation_defaults.max_tokens),
+        temperature: req
+            .temperature
+            .unwrap_or(state.generation_defaults.temperature),
         logprobs: req.logprobs_count(),
-        sampling: req.sampling_params(),
+        sampling: req.sampling_params(&state.generation_defaults),
         enable_thinking: false,
         trust_remote_code: false,
         // H.1b: hardcoded server-side; see the note on the chat endpoint's task above.
@@ -2916,7 +2962,7 @@ async fn completions(
         .fetch_add(completion_tokens as u64, Ordering::Relaxed);
 
     // Stop-sequence truncation (same as the chat path).
-    let stops = req.sampling_params().stop;
+    let stops = req.sampling_params(&state.generation_defaults).stop;
     if !stops.is_empty() {
         if let Some(cut) = stops
             .iter()
@@ -7629,6 +7675,344 @@ level={{ effort_map[eff] }}";
         assert!(
             text.contains("cascadia_api_rejected_total{reason=\"empty_prompt\"}"),
             "{text}"
+        );
+    }
+
+    // --- Generation defaults (1.6, D2/D3/D4/D9) ---------------------------
+
+    /// A mock router whose server-wide generation defaults are `defaults`.
+    async fn make_app_with_defaults(defaults: GenerationDefaults) -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            generation_defaults: defaults,
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// `n` distinct words: the mock echoes one per token, so a prompt of `n`
+    /// words finishes with `stop` after `n` tokens unless a limit cuts it.
+    fn words(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    async fn post_chat_big(app: Router, payload: serde_json::Value) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    async fn post_completions_big(app: Router, payload: serde_json::Value) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn unset_chat_limit_runs_past_256_to_the_models_stop() {
+        // Decision 2: no limit = until the model stops (here: the 300-word echo
+        // ends), not the old silent 256-token cut.
+        let (status, v) = post_chat_big(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": words(300)}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["completion_tokens"], 300, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn default_max_tokens_256_restores_the_old_cap_on_chat() {
+        // `--default-max-tokens 256` reaches the API as this default.
+        let defaults = GenerationDefaults {
+            max_tokens: 256,
+            ..GenerationDefaults::default()
+        };
+        let (status, v) = post_chat_big(
+            make_app_with_defaults(defaults).await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": words(300)}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["completion_tokens"], 256, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn unset_completions_limit_runs_past_256_to_the_models_stop() {
+        // D4: /v1/completions follows the same rule as chat.
+        let (status, v) = post_completions_big(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "prompt": words(300)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["completion_tokens"], 300, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn default_max_tokens_256_restores_the_old_cap_on_completions() {
+        let defaults = GenerationDefaults {
+            max_tokens: 256,
+            ..GenerationDefaults::default()
+        };
+        let (status, v) = post_completions_big(
+            make_app_with_defaults(defaults).await,
+            serde_json::json!({"model": "mock-model", "prompt": words(300)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["completion_tokens"], 256, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn completions_ignores_max_completion_tokens() {
+        // /v1/completions has no `max_completion_tokens` in the spec: only
+        // `max_tokens` limits it.
+        let (status, v) = post_completions_big(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": "alpha bravo charlie delta echo",
+                "max_tokens": 2,
+                "max_completion_tokens": 4,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["completion_tokens"], 2, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+    }
+
+    /// Records every task the API submits, then answers with one token.
+    struct CaptureEngine {
+        seen: Arc<parking_lot::Mutex<Vec<GenerationTask>>>,
+        pending: Option<cascadia_types::TaskId>,
+    }
+
+    impl cascadia_engine::Engine for CaptureEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some(task.task_id.clone());
+            self.seen.lock().push(task);
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some(id) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![
+                (id.clone(), Chunk::token(&id, 0, "ok")),
+                (id.clone(), Chunk::final_marker(&id, "")),
+            ])
+        }
+    }
+
+    struct CaptureBuilder {
+        seen: Arc<parking_lot::Mutex<Vec<GenerationTask>>>,
+    }
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for CaptureBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(CaptureEngine {
+                seen: self.seen,
+                pending: None,
+            }))
+        }
+    }
+
+    /// Non-default values, so a test can tell "the server default" from any
+    /// hard-coded fallback (1.0, 0.0, 256, 4096).
+    const TEST_DEFAULTS: GenerationDefaults = GenerationDefaults {
+        max_tokens: 777,
+        temperature: 0.7,
+        top_p: 0.9,
+    };
+
+    /// Sends one request (`/v1/chat/completions` when `chat`, else
+    /// `/v1/completions`) with `extra` merged in, through a capturing engine
+    /// whose server defaults are [`TEST_DEFAULTS`]; returns the task the
+    /// engine received.
+    async fn captured_task(chat: bool, extra: serde_json::Value) -> GenerationTask {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let runner = Runner::new(Box::new(CaptureBuilder { seen: seen.clone() }));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            generation_defaults: TEST_DEFAULTS,
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let mut payload = if chat {
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+        } else {
+            serde_json::json!({"model": "mock-model", "prompt": "hi"})
+        };
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, v) = if chat {
+            post_chat_big(app, payload).await
+        } else {
+            post_completions_big(app, payload).await
+        };
+        assert_eq!(status, StatusCode::OK, "{extra}: {v}");
+        let schema = if chat {
+            "CreateChatCompletionResponse"
+        } else {
+            "CreateCompletionResponse"
+        };
+        crate::spec_schema::assert_spec(schema, &v);
+        let tasks = seen.lock();
+        assert_eq!(tasks.len(), 1, "{extra}");
+        tasks[0].clone()
+    }
+
+    async fn assert_unset_fields_take_server_defaults(chat: bool) {
+        let t = captured_task(chat, serde_json::json!({})).await;
+        assert_eq!(t.max_tokens, TEST_DEFAULTS.max_tokens);
+        assert_eq!(t.temperature, TEST_DEFAULTS.temperature);
+        assert_eq!(t.sampling.top_p, TEST_DEFAULTS.top_p);
+    }
+
+    async fn assert_explicit_fields_beat_server_defaults(chat: bool) {
+        // An explicit 0 is a value (greedy), not "unset".
+        let t = captured_task(
+            chat,
+            serde_json::json!({"temperature": 0, "top_p": 0.5, "max_tokens": 3}),
+        )
+        .await;
+        assert_eq!(t.temperature, 0.0);
+        assert_eq!(t.sampling.top_p, 0.5);
+        assert_eq!(t.max_tokens, 3);
+    }
+
+    async fn assert_null_fields_are_unset(chat: bool) {
+        // D9: `null` is the same as omitting the field.
+        let t = captured_task(
+            chat,
+            serde_json::json!({"temperature": null, "top_p": null, "max_tokens": null}),
+        )
+        .await;
+        assert_eq!(t.max_tokens, TEST_DEFAULTS.max_tokens);
+        assert_eq!(t.temperature, TEST_DEFAULTS.temperature);
+        assert_eq!(t.sampling.top_p, TEST_DEFAULTS.top_p);
+    }
+
+    #[tokio::test]
+    async fn chat_unset_fields_take_server_defaults() {
+        assert_unset_fields_take_server_defaults(true).await;
+    }
+
+    #[tokio::test]
+    async fn chat_explicit_fields_beat_server_defaults() {
+        assert_explicit_fields_beat_server_defaults(true).await;
+    }
+
+    #[tokio::test]
+    async fn chat_null_fields_are_unset() {
+        assert_null_fields_are_unset(true).await;
+        let t = captured_task(true, serde_json::json!({"max_completion_tokens": null})).await;
+        assert_eq!(t.max_tokens, TEST_DEFAULTS.max_tokens);
+    }
+
+    #[tokio::test]
+    async fn completions_unset_fields_take_server_defaults() {
+        assert_unset_fields_take_server_defaults(false).await;
+    }
+
+    #[tokio::test]
+    async fn completions_explicit_fields_beat_server_defaults() {
+        assert_explicit_fields_beat_server_defaults(false).await;
+    }
+
+    #[tokio::test]
+    async fn completions_null_fields_are_unset() {
+        assert_null_fields_are_unset(false).await;
+    }
+
+    #[test]
+    fn generation_defaults_default_is_one_window_fallback_and_spec_sampling() {
+        assert_eq!(
+            GenerationDefaults::default(),
+            GenerationDefaults {
+                max_tokens: 4096,
+                temperature: 1.0,
+                top_p: 1.0,
+            }
+        );
+        assert_eq!(
+            Config::default().generation_defaults,
+            GenerationDefaults::default()
         );
     }
 }
