@@ -609,6 +609,7 @@ impl Runner {
             last_chunk_at: None,
             first_output_recorded: false,
             generated_tokens: 0,
+            prompt_tokens: None,
             metrics_finalized: false,
             closing: self.closing.clone(),
             foreign_yield: None,
@@ -778,6 +779,10 @@ pub struct ChunkStream {
     /// total. Publish once at termination: a counter cannot subtract legacy
     /// fragment estimates if the final model-token count is smaller.
     generated_tokens: u32,
+    /// The latest prompt count any chunk carried (engines report it on the
+    /// first chunk too, M1 D14). Booked once, on completion or cancel, so a
+    /// stream dropped at a `stop` match still counts its prompt.
+    prompt_tokens: Option<u32>,
     /// A terminal outcome (completed / failed / cancelled / teardown) has
     /// been recorded; guards exactly-once accounting between the
     /// final-chunk paths, the cancel path, and `Drop`.
@@ -801,6 +806,9 @@ impl ChunkStream {
             return;
         }
         let now = Instant::now();
+        if chunk.prompt_tokens.is_some() {
+            self.prompt_tokens = chunk.prompt_tokens;
+        }
         if chunk.error.is_some() {
             self.record_generated_tokens();
             cascadia_metrics::TASKS_FAILED_TOTAL
@@ -834,11 +842,7 @@ impl ChunkStream {
         }
         if chunk.is_final {
             self.record_generated_tokens();
-            if let Some(p) = chunk.prompt_tokens {
-                cascadia_metrics::TOKENS_PROMPT_TOTAL
-                    .with_label_values(&[&self.model])
-                    .inc_by(p as u64);
-            }
+            self.record_prompt_tokens();
             // `Cancelled` is surfaced here (metrics-only per FinishReason's
             // contract); the API maps it to "stop" on the wire. An engine
             // that acknowledges a cancel with a Cancelled final marker must
@@ -859,6 +863,17 @@ impl ChunkStream {
                 .with_label_values(&[&self.model, reason])
                 .observe((now - self.submitted_at).as_secs_f64());
             self.metrics_finalized = true;
+        }
+    }
+
+    /// The prompt counter, booked from the latest count seen. Called only
+    /// behind the terminal metrics guard (completion, cancel), before it is
+    /// set, so it books at most once.
+    fn record_prompt_tokens(&self) {
+        if let Some(p) = self.prompt_tokens {
+            cascadia_metrics::TOKENS_PROMPT_TOTAL
+                .with_label_values(&[&self.model])
+                .inc_by(p as u64);
         }
     }
 
@@ -923,6 +938,7 @@ impl ChunkStream {
             return;
         }
         self.record_generated_tokens();
+        self.record_prompt_tokens();
         cascadia_metrics::TASKS_CANCELLED_TOTAL
             .with_label_values(&[&self.model])
             .inc();
@@ -2908,6 +2924,40 @@ mod tests {
                 .get_sample_count(),
             1
         );
+    }
+
+    /// M1 D14: engines report the prompt count on their first chunk, and the
+    /// API drops the stream at a `stop` match before the final one. The
+    /// prompt counter takes the latest count seen and books it once, on
+    /// completion or cancel; a completed stream books the final's value.
+    #[tokio::test]
+    async fn prompt_tokens_are_counted_once_even_when_the_stream_stops_early() {
+        for (model, cancel) in [
+            ("runner-prompt-early-stop", true),
+            ("runner-prompt-complete", false),
+        ] {
+            let runner = usage_sequence_runner(
+                model,
+                vec![
+                    Chunk::token("p", 0, "a").with_prompt_tokens(11),
+                    Chunk::token("p", 1, "b"),
+                    Chunk::final_marker("p", "").with_prompt_tokens(12),
+                ],
+            );
+            let mut stream = runner.generate(GenerationTask::new("p", "x")).unwrap();
+            assert_eq!(stream.next().await.unwrap().prompt_tokens, Some(11));
+            if !cancel {
+                while stream.next().await.is_some() {}
+            }
+            drop(stream);
+            assert_eq!(
+                cascadia_metrics::TOKENS_PROMPT_TOTAL
+                    .with_label_values(&[model])
+                    .get(),
+                if cancel { 11 } else { 12 },
+                "{model}"
+            );
+        }
     }
 
     #[tokio::test]
