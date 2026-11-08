@@ -3981,7 +3981,16 @@ mod tests {
     /// render tool definitions, and the API refuses rather than answering as
     /// though none were sent.
     async fn make_tool_app() -> Router {
-        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        make_template_app(
+            "{% if tools %}{{ tools | tojson }}{% endif %}\
+             {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}",
+        )
+        .await
+    }
+
+    /// A mock router whose model carries chat template `template`.
+    async fn make_template_app(template: &str) -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -3991,11 +4000,7 @@ mod tests {
             .unwrap();
         let cfg = Config {
             chat_template: ChatTemplateConfig {
-                template: Some(
-                    "{% if tools %}{{ tools | tojson }}{% endif %}\
-                     {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}"
-                        .into(),
-                ),
+                template: Some(template.into()),
                 bos_token: None,
                 eos_token: None,
             },
@@ -8014,5 +8019,240 @@ level={{ effort_map[eff] }}";
             Config::default().generation_defaults,
             GenerationDefaults::default()
         );
+    }
+
+    // --- Accepted client fields and real client bodies (1.9, D6/D9) -------
+
+    /// POSTs a chat body; returns the status and the raw (JSON or SSE) body.
+    async fn post_chat_text(app: Router, payload: &Value) -> (StatusCode, String) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Sends `payload` to `/v1/chat/completions` and checks the answer has
+    /// `tokens` completion tokens ending in `finish`. A streamed answer must
+    /// carry that many content frames, the usage frame when the body asked
+    /// for one, and `[DONE]`; a plain one must match the OpenAI spec.
+    async fn assert_chat_body(app: Router, payload: Value, tokens: u64, finish: &str) {
+        let (status, text) = post_chat_text(app, &payload).await;
+        assert_eq!(status, StatusCode::OK, "{payload}: {text}");
+        if payload["stream"] == true {
+            let events = sse_events(&text);
+            let content_frames = events
+                .iter()
+                .filter(|e| {
+                    e["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                })
+                .count() as u64;
+            assert_eq!(content_frames, tokens, "{text}");
+            let finish_seen = events
+                .iter()
+                .find_map(|e| e["choices"][0]["finish_reason"].as_str())
+                .expect("finish_reason frame");
+            assert_eq!(finish_seen, finish, "{text}");
+            if payload["stream_options"]["include_usage"] == true {
+                let usage = events
+                    .iter()
+                    .find(|e| e["usage"].is_object())
+                    .expect("usage frame");
+                assert_eq!(usage["usage"]["completion_tokens"], tokens, "{text}");
+            }
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        } else {
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["usage"]["completion_tokens"], tokens, "{v}");
+            assert_eq!(v["choices"][0]["finish_reason"], finish, "{v}");
+            crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+        }
+    }
+
+    /// The OpenAI fields that change nothing on a local server (1.9, D6),
+    /// with representative values: they are accepted and ignored, never 422.
+    fn harmless_openai_fields() -> Value {
+        serde_json::json!({
+            "user": "user-1234",
+            "safety_identifier": "sid-1234",
+            "prompt_cache_key": "session-1",
+            "prompt_cache_options": {"mode": "auto"},
+            "prompt_cache_retention": "24h",
+            "metadata": {"run": "t4"},
+            "store": true,
+            "service_tier": "auto",
+            "verbosity": "low",
+            "moderation": "auto",
+            "prediction": {"type": "content", "content": "alpha bravo"},
+        })
+    }
+
+    fn five_word_chat(extra: Value) -> Value {
+        let mut payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo charlie delta echo"}],
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        payload
+    }
+
+    #[tokio::test]
+    async fn chat_accepts_and_ignores_harmless_openai_fields() {
+        // Guard (D6): nothing parses these, and nothing may start rejecting them.
+        let fields = harmless_openai_fields();
+        assert_chat_body(make_app().await, five_word_chat(fields.clone()), 5, "stop").await;
+        let mut not_stored = fields.clone();
+        not_stored["store"] = false.into();
+        assert_chat_body(make_app().await, five_word_chat(not_stored), 5, "stop").await;
+        let mut streamed = fields;
+        streamed["stream"] = true.into();
+        streamed["stream_options"] =
+            serde_json::json!({"include_usage": true, "include_obfuscation": false});
+        assert_chat_body(make_app().await, five_word_chat(streamed), 5, "stop").await;
+    }
+
+    #[tokio::test]
+    async fn completions_accepts_and_ignores_user_and_metadata() {
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": "alpha bravo charlie",
+                "user": "user-1234",
+                "metadata": {"run": "t4"},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["completion_tokens"], 3, "{v}");
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+    }
+
+    // Real client bodies (scenario "Clients"). Fields and values come from the
+    // client notes in the openai-compat clients survey; each test names its note.
+
+    #[tokio::test]
+    async fn langchain_and_n8n_streaming_chat_body_is_answered() {
+        // frameworks.md (langchain-openai: ChatOpenAI always sends
+        // max_completion_tokens) and platforms.md (n8n Chat Model: temperature
+        // 0.7, top_p 1, stream + stream_options.include_usage via LangChain;
+        // LibreChat on LangChain injects a top-level `user`).
+        let body = serde_json::json!({
+            "model": "mock-model",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "alpha bravo charlie delta echo"},
+            ],
+            "temperature": 0.7,
+            "top_p": 1,
+            "max_completion_tokens": 1024,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "user": "user-42",
+        });
+        assert_chat_body(make_app().await, body, 5, "stop").await;
+    }
+
+    #[tokio::test]
+    async fn opencode_chat_body_is_answered() {
+        // cli.md "What opencode actually sends for a generic custom provider":
+        // stream true, max_completion_tokens (generic provider default),
+        // stream_options.include_usage on, tools with `strict: true`,
+        // tool_choice with active tools, no `store`. The template renders the
+        // messages before the tools, so the mock's echo is plain text, and the
+        // limit (opencode sends the model's configured output limit) is below
+        // the prompt's length, so the count is exactly the limit.
+        let body = serde_json::json!({
+            "model": "mock-model",
+            "messages": [
+                {"role": "system", "content": "You are opencode."},
+                {"role": "user", "content": "alpha bravo charlie delta echo"},
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"filePath": {"type": "string"}},
+                        "required": ["filePath"],
+                        "additionalProperties": false,
+                    },
+                    "strict": true,
+                },
+            }],
+            "tool_choice": "auto",
+            "stream": true,
+            "temperature": 0,
+            "max_completion_tokens": 3,
+            "stream_options": {"include_usage": true},
+        });
+        let app = make_template_app(
+            "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
+             {% if tools %}{{ tools | tojson }}{% endif %}",
+        )
+        .await;
+        assert_chat_body(app, body, 3, "length").await;
+    }
+
+    #[tokio::test]
+    async fn ai_sdk_openai_compatible_chat_body_is_answered() {
+        // cli.md "Upstream vercel/ai @ai-sdk/openai-compatible": `user`,
+        // `max_tokens` (from maxOutputTokens), temperature, passthrough provider
+        // options (here `store: true`), and stream + stream_options.include_usage
+        // when the provider is created with `includeUsage: true`.
+        let body = serde_json::json!({
+            "model": "mock-model",
+            "user": "user-42",
+            "max_tokens": 2,
+            "temperature": 0.5,
+            "store": true,
+            "messages": [{"role": "user", "content": "alpha bravo charlie delta echo"}],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        assert_chat_body(make_app().await, body, 2, "length").await;
+    }
+
+    fn browser_use_body() -> Value {
+        // agents.md (browser-use): non-streaming, temperature 0.2,
+        // frequency_penalty 0.3, max_completion_tokens 4096 by default.
+        serde_json::json!({
+            "model": "mock-model",
+            "messages": [
+                {"role": "system", "content": "You are a browser agent."},
+                {"role": "user", "content": "alpha bravo charlie delta echo"},
+            ],
+            "temperature": 0.2,
+            "frequency_penalty": 0.3,
+            "max_completion_tokens": 4096,
+        })
+    }
+
+    #[tokio::test]
+    async fn browser_use_chat_body_is_answered() {
+        assert_chat_body(make_app().await, browser_use_body(), 5, "stop").await;
+        // Its sampling values reach the engine.
+        let mut extra = browser_use_body();
+        extra.as_object_mut().unwrap().remove("messages");
+        let t = captured_task(true, extra).await;
+        assert_eq!(t.temperature, 0.2);
+        assert_eq!(t.sampling.frequency_penalty, 0.3);
+        assert_eq!(t.max_tokens, 4096);
     }
 }
