@@ -519,6 +519,8 @@ impl ResponseShell {
         json!({
             "id": self.id,
             "object": "response",
+            "access_programs": null,
+            "background": false,
             "created_at": self.created_at,
             "status": status,
             "completed_at": outcome.filter(|_| status == "completed").map(|_| now_unix()),
@@ -528,6 +530,7 @@ impl ResponseShell {
                 .then(|| json!({"reason": "max_output_tokens"})),
             "instructions": self.instructions,
             "max_output_tokens": self.max_output_tokens,
+            "max_tool_calls": null,
             "model": self.model,
             "output": output,
             "parallel_tool_calls": false,
@@ -871,6 +874,7 @@ async fn stream_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec_schema::{assert_event, assert_spec};
     use crate::tests::{make_app, make_image_app, png_url};
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -966,6 +970,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
         assert!(v["id"].as_str().unwrap().starts_with("resp_"));
         assert_eq!(v["object"], "response");
         assert_eq!(v["status"], "completed");
@@ -1003,6 +1008,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
         assert_eq!(v["status"], "incomplete");
         assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
         assert_eq!(v["output"][0]["status"], "incomplete");
@@ -1057,6 +1063,7 @@ mod tests {
             .all(|k| *k == "response.output_text.delta"));
         assert!(n > 8, "no deltas: {kinds:?}");
         for (i, (kind, data)) in ev.iter().enumerate() {
+            assert_event(data);
             assert_eq!(data["type"], kind.as_str());
             assert_eq!(data["sequence_number"], i as u64);
         }
@@ -1087,6 +1094,7 @@ mod tests {
         )
         .await;
         let ev = events(&body);
+        ev.iter().for_each(|(_, data)| assert_event(data));
         let (kind, data) = ev.last().unwrap();
         assert_eq!(kind, "response.incomplete");
         assert_eq!(
@@ -1487,11 +1495,14 @@ mod tests {
         for cancel_after in [Some(2), None] {
             let (status, body) = scripted(cancel_after, false).await;
             assert_eq!(status, StatusCode::OK, "{body}");
-            assert_cancelled(&serde_json::from_str(&body).unwrap());
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_spec("Response", &v);
+            assert_cancelled(&v);
 
             let (status, body) = scripted(cancel_after, true).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let ev = events(&body);
+            ev.iter().for_each(|(_, data)| assert_event(data));
             assert!(ev.iter().all(|(k, _)| k != "response.completed"), "{body}");
             let (kind, data) = ev.last().unwrap();
             assert_eq!(kind, "response.incomplete");
@@ -1507,6 +1518,7 @@ mod tests {
         let (status, body) = scripted_with(None, Some(2), true).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let ev = events(&body);
+        ev.iter().for_each(|(_, data)| assert_event(data));
         let kinds: Vec<_> = ev.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             kinds,
