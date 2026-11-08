@@ -1908,6 +1908,22 @@ mod tests {
         assert!(!prompt.contains("web_search"), "{prompt}");
     }
 
+    /// A namespace's `description: null` is echoed as `""`, as absent is:
+    /// the schema wants a string.
+    #[tokio::test]
+    async fn null_namespace_description_is_echoed_empty() {
+        let (status, v) = post_json(
+            mock_tools_app().await,
+            json!({"model": "mock-model", "input": "hi", "tools": [
+                {"type": "namespace", "name": "mcp__x", "description": null,
+                    "tools": [{"type": "function", "name": "click"}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        assert_eq!(v["tools"][0]["description"], "", "{v}");
+    }
+
     /// A function tool as n8n sends it (no `strict`) is echoed with
     /// `strict: null`, as the schema requires the key.
     #[tokio::test]

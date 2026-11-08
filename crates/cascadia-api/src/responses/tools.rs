@@ -125,12 +125,15 @@ fn custom_description(tool: &Value) -> String {
     out
 }
 
-/// `tool` with each of `keys` set to `default` where absent.
+/// `tool` with each of `keys` set to `default` where absent or null.
 fn with_defaults(tool: &Value, keys: &[&str], default: Value) -> Value {
     let mut out = tool.clone();
     if let Some(obj) = out.as_object_mut() {
         for k in keys {
-            obj.entry(*k).or_insert_with(|| default.clone());
+            let v = obj.entry(*k).or_insert(Value::Null);
+            if v.is_null() {
+                *v = default.clone();
+            }
         }
     }
     out
