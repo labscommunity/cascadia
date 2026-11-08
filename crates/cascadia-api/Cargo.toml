@@ -53,3 +53,6 @@ tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 cascadia-engine-mock = { workspace = true }
 async-trait = { workspace = true }
+# Validates responses against the pinned OpenAI spec subset (src/spec_schema.rs).
+# No default features: the schemas are local, so no HTTP/file `$ref` resolving.
+jsonschema = { version = "0.60", default-features = false }
