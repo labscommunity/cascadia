@@ -2977,8 +2977,13 @@ async fn chat_completions(
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
         }
+        // The latest count any chunk carries: token-streaming engines report
+        // it on their first chunk too, so it is known before an early stop
+        // (D14).
+        if let Some(n) = chunk.prompt_tokens {
+            prompt_tokens = n;
+        }
         if chunk.is_final {
-            prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
             if let Some(fr) = chunk.finish_reason {
                 finish_reason = fr.as_openai_str();
             }
@@ -3197,8 +3202,13 @@ async fn completions(
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
         }
+        // The latest count any chunk carries: token-streaming engines report
+        // it on their first chunk too, so it is known before an early stop
+        // (D14).
+        if let Some(n) = chunk.prompt_tokens {
+            prompt_tokens = n;
+        }
         if chunk.is_final {
-            prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
             if let Some(fr) = chunk.finish_reason {
                 finish_reason = fr.as_openai_str();
             }
@@ -3746,8 +3756,11 @@ impl TextStream {
                 return Some(error_frame(&self.task_id, reason));
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
+            // Latest count from any chunk, before the stop check (D14).
+            if let Some(n) = chunk.prompt_tokens {
+                self.prompt_tokens = n;
+            }
             if chunk.is_final {
-                self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
                 self.finished =
                     chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
             }
@@ -3945,6 +3958,10 @@ impl ToolStream {
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             self.held_tokens += chunk.token_count();
+            // Latest count from any chunk, before the stop check (D14).
+            if let Some(n) = chunk.prompt_tokens {
+                self.prompt_tokens = n;
+            }
             let translated = self.marker.as_mut().map(|f| {
                 let mut t = f.feed(&chunk);
                 if chunk.is_final {
@@ -3962,7 +3979,6 @@ impl ToolStream {
                 Some(self.close_choice(&text, None, "stop"))
             } else if chunk.is_final {
                 text.push_str(&self.stop.finish());
-                self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
                 self.finished =
                     chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
                 self.phase = ToolStreamPhase::Tail;
@@ -9186,6 +9202,11 @@ level={{ effort_map[eff] }}";
     /// to cancel and how many parts it emitted.
     struct ScriptEngine {
         parts: Vec<String>,
+        /// Text of the final chunk (which always carries `prompt_tokens`).
+        final_text: String,
+        /// Report `prompt_tokens` on the first part too, as token-streaming
+        /// engines do (M1 D14).
+        prompt_first: bool,
         gate: Option<Arc<std::sync::atomic::AtomicBool>>,
         log: Arc<ScriptLog>,
         pending: Option<(cascadia_types::TaskId, usize)>,
@@ -9227,11 +9248,14 @@ level={{ effort_map[eff] }}";
             }
             if let Some(part) = self.parts.get(i) {
                 self.log.emitted.fetch_add(1, Ordering::SeqCst);
-                let chunk = Chunk::token(&id, i as i64, part.clone());
+                let mut chunk = Chunk::token(&id, i as i64, part.clone());
+                if i == 0 && self.prompt_first {
+                    chunk = chunk.with_prompt_tokens(5);
+                }
                 self.pending = Some((id.clone(), i + 1));
                 return Ok(vec![(id, chunk)]);
             }
-            let last = Chunk::final_marker(&id, "")
+            let last = Chunk::final_marker(&id, self.final_text.clone())
                 .with_finish_reason(cascadia_types::FinishReason::Length)
                 .with_prompt_tokens(5);
             Ok(vec![(id, last)])
@@ -9265,10 +9289,24 @@ level={{ effort_map[eff] }}";
         gated: bool,
         keepalive: Duration,
     ) -> (Router, Arc<ScriptLog>, Arc<std::sync::atomic::AtomicBool>) {
+        script_app_full(parts, "", true, gated, keepalive).await
+    }
+
+    /// [`script_app`] with the final chunk's text and whether the first
+    /// part reports `prompt_tokens`.
+    async fn script_app_full(
+        parts: &[&str],
+        final_text: &str,
+        prompt_first: bool,
+        gated: bool,
+        keepalive: Duration,
+    ) -> (Router, Arc<ScriptLog>, Arc<std::sync::atomic::AtomicBool>) {
         let log = Arc::new(ScriptLog::default());
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runner = Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
             parts: parts.iter().map(|p| (*p).to_owned()).collect(),
+            final_text: final_text.to_owned(),
+            prompt_first,
             gate: gated.then(|| gate.clone()),
             log: log.clone(),
             pending: None,
@@ -9452,6 +9490,9 @@ level={{ effort_map[eff] }}";
         assert_eq!(v["choices"][0]["message"]["content"], "alpha bravo");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
         assert_eq!(v["usage"]["completion_tokens"], 3, "tokens received so far");
+        // Reported on the first chunk (D14), so known before the cut.
+        assert_eq!(v["usage"]["prompt_tokens"], 5, "{v}");
+        assert_eq!(v["usage"]["total_tokens"], 8, "{v}");
         crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
         assert_cancelled(&log).await;
     }
@@ -9468,6 +9509,7 @@ level={{ effort_map[eff] }}";
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(v["choices"][0]["text"], "");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens"], 5, "{v}");
         crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
         assert_cancelled(&log).await;
     }
@@ -9509,6 +9551,7 @@ level={{ effort_map[eff] }}";
         assert_eq!(finishes, [&serde_json::json!("stop")], "{body}");
         let usage = &events.last().unwrap()["usage"];
         assert_eq!(usage["completion_tokens"], 3, "{body}");
+        assert_eq!(usage["prompt_tokens"], 5, "{body}");
         assert_cancelled(&log).await;
     }
 
@@ -9524,7 +9567,8 @@ level={{ effort_map[eff] }}";
             app,
             "/v1/completions",
             &serde_json::json!({"model": "mock-model", "prompt": "P: ",
-                "echo": true, "stop": ["END"], "stream": true}),
+                "echo": true, "stop": ["END"], "stream": true,
+                "stream_options": {"include_usage": true}}),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -9534,10 +9578,10 @@ level={{ effort_map[eff] }}";
             .filter_map(|e| e["choices"][0]["text"].as_str())
             .collect();
         assert_eq!(texts, ["P: one ", "two "], "{body}");
-        assert_eq!(
-            events.last().unwrap()["choices"][0]["finish_reason"],
-            "stop"
-        );
+        let n = events.len();
+        assert_eq!(events[n - 2]["choices"][0]["finish_reason"], "stop");
+        assert_eq!(events[n - 1]["usage"]["prompt_tokens"], 5, "{body}");
+        assert_eq!(events[n - 1]["usage"]["completion_tokens"], 2, "{body}");
         assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
         assert_cancelled(&log).await;
     }
@@ -9556,7 +9600,8 @@ level={{ effort_map[eff] }}";
             &serde_json::json!({"model": "mock-model",
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-                "stop": "STOP", "stream": true}),
+                "stop": "STOP", "stream": true,
+                "stream_options": {"include_usage": true}}),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -9565,11 +9610,86 @@ level={{ effort_map[eff] }}";
             crate::spec_schema::assert_spec("CreateChatCompletionStreamResponse", event);
         }
         assert_eq!(streamed_content(&events), "Sure, checking ", "{body}");
-        assert_eq!(
-            events.last().unwrap()["choices"][0]["finish_reason"],
-            "stop"
-        );
+        let n = events.len();
+        assert_eq!(events[n - 2]["choices"][0]["finish_reason"], "stop");
+        assert_eq!(events[n - 1]["usage"]["prompt_tokens"], 5, "{body}");
+        assert_eq!(events[n - 1]["usage"]["completion_tokens"], 2, "{body}");
         assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn stop_inside_the_final_chunk_keeps_its_prompt_count() {
+        // A one-shot engine: everything, and the only prompt count, on the
+        // final chunk. The count must be read before the stop check.
+        for tools in [false, true] {
+            let (app, _log, _) = script_app_full(
+                &["Sure, "],
+                "done STOP tail",
+                false,
+                false,
+                SSE_KEEPALIVE_INTERVAL,
+            )
+            .await;
+            let mut body = serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": "STOP", "stream": true,
+                "stream_options": {"include_usage": true}});
+            if tools {
+                body["tools"] =
+                    serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+            }
+            let (status, text) = post_text(app, "/v1/chat/completions", &body).await;
+            assert_eq!(status, StatusCode::OK);
+            let events = sse_events(&text);
+            assert_eq!(
+                streamed_content(&events),
+                "Sure, done ",
+                "tools={tools}: {text}"
+            );
+            let n = events.len();
+            assert_eq!(
+                events[n - 2]["choices"][0]["finish_reason"],
+                "stop",
+                "{text}"
+            );
+            assert_eq!(
+                events[n - 1]["usage"]["prompt_tokens"],
+                5,
+                "tools={tools}: {text}"
+            );
+        }
+        // Non-streaming, both endpoints.
+        let (app, _log, _) = script_app_full(
+            &["Sure, "],
+            "done STOP tail",
+            false,
+            false,
+            SSE_KEEPALIVE_INTERVAL,
+        )
+        .await;
+        let (_, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}], "stop": "STOP"}),
+        )
+        .await;
+        assert_eq!(v["choices"][0]["message"]["content"], "Sure, done ", "{v}");
+        assert_eq!(v["usage"]["prompt_tokens"], 5, "{v}");
+        let (app, _log, _) = script_app_full(
+            &["Sure, "],
+            "done STOP tail",
+            false,
+            false,
+            SSE_KEEPALIVE_INTERVAL,
+        )
+        .await;
+        let (_, v) = post_completions(
+            app,
+            serde_json::json!({"model": "mock-model", "prompt": "hi", "stop": "STOP"}),
+        )
+        .await;
+        assert_eq!(v["choices"][0]["text"], "Sure, done ", "{v}");
+        assert_eq!(v["usage"]["prompt_tokens"], 5, "{v}");
     }
 
     /// Reads `uri`'s stream from a gated engine until a keep-alive comment
