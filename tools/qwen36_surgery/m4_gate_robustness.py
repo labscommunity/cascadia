@@ -40,8 +40,8 @@ def sse_start(content, max_tokens):
             "model": "default",
             "messages": [{"role": "user", "content": content}],
             "max_tokens": max_tokens,
-            # Greedy, as the checks assume (an unset temperature is no
-            # longer 0: the server default, M1 Decision 2).
+            # Greedy, as the checks assume (an unset temperature now takes
+            # the server default, which is no longer 0).
             "temperature": 0,
             "enable_thinking": True,
             "stream": True,

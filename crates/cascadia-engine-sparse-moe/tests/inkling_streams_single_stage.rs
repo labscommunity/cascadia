@@ -217,7 +217,7 @@ async fn single_stage_cancel_during_decode_frees_the_slot() {
     }
 }
 
-/// M1 D14: the prompt count rides each task's FIRST chunk as well as its
+/// The prompt count rides each task's FIRST chunk as well as its
 /// final one, on the one-task path and the multi-stream scheduler alike, so
 /// a consumer that stops early (the API on a `stop` match) still has it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

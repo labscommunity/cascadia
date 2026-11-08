@@ -158,7 +158,7 @@ pub struct AppState {
 }
 
 /// How long a stream may go without sending anything before it sends the SSE
-/// comment `: keep-alive` (M1 D11). One-shot engines produce no bytes until
+/// comment `: keep-alive`. One-shot engines produce no bytes until
 /// their whole answer is done; proxies with a 60 s idle timeout would cut
 /// such a stream. A comment, not a `data:` frame: OpenAI clients skip it.
 pub const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -198,7 +198,7 @@ pub struct Config {
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Server-wide values for the sampling fields a request leaves unset (or
-/// sends as `null`). Decision 2: no limit means "until the model stops", sent
+/// sends as `null`). No limit means "until the model stops", sent
 /// to the engines as one context window (`max_tokens`); `temperature`/`top_p`
 /// come from the model's `generation_config.json`, else the OpenAI default 1.
 /// The CLI resolves these per model (`--default-max-tokens`,
@@ -211,7 +211,7 @@ pub struct GenerationDefaults {
     /// The model's context window when a real source gives it (the engine's
     /// own limit or `config.json`), never the [`DEFAULT_MAX_TOKENS`] fallback
     /// or `--default-max-tokens`. An explicit request limit above it is sent
-    /// as the window (M1 D13), so the answer ends with `length` there.
+    /// as the window, so the answer ends with `length` there.
     pub context_window: Option<u32>,
 }
 
@@ -911,7 +911,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub function_call: Option<serde_json::Value>,
     /// The request used `functions`, so the answer takes the legacy shape:
-    /// `function_call` instead of `tool_calls` (M1 D5).
+    /// `function_call` instead of `tool_calls`.
     #[serde(skip)]
     legacy_functions: bool,
 }
@@ -1009,7 +1009,7 @@ pub struct ChatTemplateKwargs {
 
 impl ChatCompletionRequest {
     /// Moves the deprecated `functions` / `function_call` onto `tools` /
-    /// `tool_choice` (M1 D5), before [`validate_tool_choice`](Self::validate_tool_choice).
+    /// `tool_choice`, before [`validate_tool_choice`](Self::validate_tool_choice).
     /// Mixing a legacy field with its replacement is a 400, so the answer's
     /// shape (legacy `function_call` or `tool_calls`) is never ambiguous.
     fn apply_legacy_functions(&mut self) -> Result<(), String> {
@@ -1202,7 +1202,7 @@ struct ChatChoiceMessage {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
-    /// The legacy single call, answering a `functions` request (M1 D5).
+    /// The legacy single call, answering a `functions` request.
     #[serde(skip_serializing_if = "Option::is_none")]
     function_call: Option<FunctionCall>,
 }
@@ -2876,9 +2876,9 @@ async fn chat_completions(
         messages: chat_turns(&req),
         tools: chat_tools(&req),
         tool_choice: req.tool_choice.clone(),
-        // Unset limit = one context window (Decision 2, D2), an explicit one
-        // at most the window when it is known (D13); unset temperature/top_p
-        // = the model's generation_config.json, else 1 (D3).
+        // Unset limit = one context window, an explicit one
+        // at most the window when it is known; unset temperature/top_p
+        // = the model's generation_config.json, else 1.
         max_tokens: state
             .generation_defaults
             .max_tokens_for(req.requested_max_tokens()),
@@ -3000,8 +3000,7 @@ async fn chat_completions(
             logprobs_content.push(lp.clone());
         }
         // The latest count any chunk carries: token-streaming engines report
-        // it on their first chunk too, so it is known before an early stop
-        // (D14).
+        // it on their first chunk too, so it is known before an early stop.
         if let Some(n) = chunk.prompt_tokens {
             prompt_tokens = n;
         }
@@ -3010,7 +3009,7 @@ async fn chat_completions(
                 finish_reason = fr.as_openai_str();
             }
         }
-        // Early stop (M1 D11): end at the match. Dropping the stream below
+        // Early stop: end at the match. Dropping the stream below
         // cancels the engine task; usage counts the tokens received so far.
         if stop.stopped() {
             finish_reason = "stop";
@@ -3135,7 +3134,7 @@ async fn completions(
         messages: Vec::new(),
         tools: None,
         tool_choice: None,
-        // Same defaults and window clamp as chat (D4, D13).
+        // Same defaults and window clamp as chat.
         max_tokens: state.generation_defaults.max_tokens_for(req.max_tokens),
         temperature: req
             .temperature
@@ -3225,8 +3224,7 @@ async fn completions(
             logprobs_content.push(lp.clone());
         }
         // The latest count any chunk carries: token-streaming engines report
-        // it on their first chunk too, so it is known before an early stop
-        // (D14).
+        // it on their first chunk too, so it is known before an early stop.
         if let Some(n) = chunk.prompt_tokens {
             prompt_tokens = n;
         }
@@ -3235,7 +3233,7 @@ async fn completions(
                 finish_reason = fr.as_openai_str();
             }
         }
-        // Early stop (M1 D11): end at the match. Dropping the stream below
+        // Early stop: end at the match. Dropping the stream below
         // cancels the engine task; usage counts the tokens received so far.
         if stop.stopped() {
             finish_reason = "stop";
@@ -3483,7 +3481,7 @@ impl Stream for StreamWithPermit {
     }
 }
 
-/// Finds `stop` sequences in generated text as it arrives (M1 D11), so the
+/// Finds `stop` sequences in generated text as it arrives, so the
 /// API can end a generation at the match instead of trimming a whole window
 /// of output afterwards. Pushed text comes back once it can no longer be the
 /// start of a stop sequence: only a tail that is a prefix of some stop is
@@ -3695,7 +3693,7 @@ const FORWARD_BUFFER: usize = 1;
 /// channel. `ChunkStream::poll_next` runs `engine.step()` inline, so a long
 /// one-shot step blocks whichever task polls it; polled here, it blocks this
 /// task's worker, and the SSE body, reading the channel on another worker,
-/// still sends keep-alive comments (D11).
+/// still sends keep-alive comments.
 ///
 /// Disconnect and cancel are unchanged: dropping the receiver (the body
 /// dropped on a client disconnect, or a stop match) ends the forwarder at
@@ -3867,7 +3865,7 @@ impl TextStream {
                 return Some(error_frame(&self.task_id, reason));
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
-            // Latest count from any chunk, before the stop check (D14).
+            // Latest count from any chunk, before the stop check.
             if let Some(n) = chunk.prompt_tokens {
                 self.prompt_tokens = n;
             }
@@ -3891,7 +3889,7 @@ impl TextStream {
             let n_tokens = std::mem::take(&mut self.held_tokens) + chunk.token_count();
             let finish = if self.stop.stopped() {
                 // Cut at the match: end the choice here and drop the engine
-                // stream, which cancels the task (M1 D11).
+                // stream, which cancels the task.
                 self.finished = true;
                 self.chunks = None;
                 self.phase = ToolStreamPhase::Tail;
@@ -4018,7 +4016,7 @@ struct ToolStream {
     task_id: String,
     model: String,
     include_usage: bool,
-    /// Answer a `functions` request: `delta.function_call` (M1 D5).
+    /// Answer a `functions` request: `delta.function_call`.
     legacy_functions: bool,
 }
 
@@ -4069,7 +4067,7 @@ impl ToolStream {
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             self.held_tokens += chunk.token_count();
-            // Latest count from any chunk, before the stop check (D14).
+            // Latest count from any chunk, before the stop check.
             if let Some(n) = chunk.prompt_tokens {
                 self.prompt_tokens = n;
             }
@@ -4083,7 +4081,7 @@ impl ToolStream {
             let mut text = self.stop.push(translated.as_deref().unwrap_or(&chunk.text));
             let frame = if self.stop.stopped() {
                 // Cut at the match: close the choice on what came before it
-                // and drop the engine stream, which cancels the task (M1 D11).
+                // and drop the engine stream, which cancels the task.
                 self.finished = true;
                 self.chunks = None;
                 self.phase = ToolStreamPhase::Tail;
@@ -5071,7 +5069,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_completion_tokens_wins_over_max_tokens() {
-        // D1: the current field beats the deprecated one.
+        // The current field beats the deprecated one.
         assert_chat_limit(
             serde_json::json!({"max_tokens": 4, "max_completion_tokens": 2}),
             2,
@@ -5082,7 +5080,7 @@ mod tests {
 
     #[tokio::test]
     async fn null_token_limits_mean_unset() {
-        // D9: `null` is the same as omitting the field.
+        // `null` is the same as omitting the field.
         assert_chat_limit(
             serde_json::json!({"max_tokens": 2, "max_completion_tokens": null}),
             2,
@@ -8310,7 +8308,7 @@ level={{ effort_map[eff] }}";
         );
     }
 
-    // --- Generation defaults (1.6, D2/D3/D4/D9) ---------------------------
+    // --- Generation defaults ----------------------------------------------
 
     /// A mock router whose server-wide generation defaults are `defaults`.
     async fn make_app_with_defaults(defaults: GenerationDefaults) -> Router {
@@ -8376,7 +8374,7 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn unset_chat_limit_runs_past_256_to_the_models_stop() {
-        // Decision 2: no limit = until the model stops (here: the 300-word echo
+        // No limit = until the model stops (here: the 300-word echo
         // ends), not the old silent 256-token cut.
         let (status, v) = post_chat_big(
             make_app().await,
@@ -8415,7 +8413,7 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn unset_completions_limit_runs_past_256_to_the_models_stop() {
-        // D4: /v1/completions follows the same rule as chat.
+        // /v1/completions follows the same rule as chat.
         let (status, v) = post_completions_big(
             make_app().await,
             serde_json::json!({"model": "mock-model", "prompt": words(300)}),
@@ -8590,7 +8588,7 @@ level={{ effort_map[eff] }}";
     }
 
     async fn assert_null_fields_are_unset(chat: bool) {
-        // D9: `null` is the same as omitting the field.
+        // `null` is the same as omitting the field.
         let t = captured_task(
             chat,
             serde_json::json!({"temperature": null, "top_p": null, "max_tokens": null}),
@@ -8650,7 +8648,7 @@ level={{ effort_map[eff] }}";
         );
     }
 
-    // --- Accepted client fields and real client bodies (1.9, D6/D9) -------
+    // --- Accepted client fields and real client bodies --------------------
 
     /// POSTs a chat body; returns the status and the raw (JSON or SSE) body.
     async fn post_chat_text(app: Router, payload: &Value) -> (StatusCode, String) {
@@ -8709,7 +8707,7 @@ level={{ effort_map[eff] }}";
         }
     }
 
-    /// The OpenAI fields that change nothing on a local server (1.9, D6),
+    /// The OpenAI fields that change nothing on a local server,
     /// with representative values: they are accepted and ignored, never 422.
     fn harmless_openai_fields() -> Value {
         serde_json::json!({
@@ -8741,7 +8739,7 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn chat_accepts_and_ignores_harmless_openai_fields() {
-        // Guard (D6): nothing parses these, and nothing may start rejecting them.
+        // Guard: nothing parses these, and nothing may start rejecting them.
         let fields = harmless_openai_fields();
         assert_chat_body(make_app().await, five_word_chat(fields.clone()), 5, "stop").await;
         let mut not_stored = fields.clone();
@@ -8773,7 +8771,7 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn null_stream_and_logprobs_mean_unset_on_chat() {
-        // D9: the spec marks both nullable; `null` = omitted = false.
+        // The spec marks both nullable; `null` = omitted = false.
         assert_chat_body(
             make_app().await,
             five_word_chat(serde_json::json!({"stream": null, "logprobs": null})),
@@ -8912,7 +8910,7 @@ level={{ effort_map[eff] }}";
         let t = captured_task(true, extra).await;
         assert_eq!(t.temperature, 0.2);
         assert_eq!(t.sampling.frequency_penalty, 0.3);
-        // Its 4096 is above the 777-token window: sent as the window (D13).
+        // Its 4096 is above the 777-token window: sent as the window.
         assert_eq!(t.max_tokens, 777);
     }
 
@@ -8959,7 +8957,7 @@ level={{ effort_map[eff] }}";
         assert_eq!(v["usage"]["completion_tokens"], 280, "{v}");
     }
 
-    // --- Deprecated `functions` / `function_call` / role `function` (1.17, D5) --
+    // --- Deprecated `functions` / `function_call` / role `function` -------------
 
     /// A chat request already through the legacy-field mapping, as the
     /// handler sees it before `validate_tool_choice`.
@@ -9245,7 +9243,7 @@ level={{ effort_map[eff] }}";
         }
     }
 
-    // --- Early stop on `stop` and SSE keep-alive (M1 D11) -----------------
+    // --- Early stop on `stop` and SSE keep-alive --------------------------
 
     /// POSTs `payload` to `uri`; returns the status and the raw body.
     async fn post_text(app: Router, uri: &str, payload: &Value) -> (StatusCode, String) {
@@ -9292,7 +9290,7 @@ level={{ effort_map[eff] }}";
     /// The frames a stream without `stop` sends, recorded before the stop
     /// matcher and keep-alive were added (a9ca3349): they must not change.
     /// (Only the usage frame's prompt count moved, from 0 to 2, when the mock
-    /// engine began reporting its prompt's words, M1 D14.)
+    /// engine began reporting its prompt's words.)
     #[tokio::test]
     async fn streams_without_stop_are_byte_identical_to_before() {
         let chat = serde_json::json!({"model": "mock-model",
@@ -9318,7 +9316,7 @@ level={{ effort_map[eff] }}";
         /// Text of the final chunk (which always carries `prompt_tokens`).
         final_text: String,
         /// Report `prompt_tokens` on the first part too, as token-streaming
-        /// engines do (M1 D14).
+        /// engines do.
         prompt_first: bool,
         /// Each step blocks this long first, like a one-shot engine's step.
         step_delay: Duration,
@@ -9682,7 +9680,7 @@ level={{ effort_map[eff] }}";
         assert_eq!(v["choices"][0]["message"]["content"], "alpha bravo");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
         assert_eq!(v["usage"]["completion_tokens"], 3, "tokens received so far");
-        // Reported on the first chunk (D14), so known before the cut.
+        // Reported on the first chunk, so known before the cut.
         assert_eq!(v["usage"]["prompt_tokens"], 5, "{v}");
         assert_eq!(v["usage"]["total_tokens"], 8, "{v}");
         crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);

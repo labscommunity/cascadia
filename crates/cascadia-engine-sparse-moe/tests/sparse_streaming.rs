@@ -271,7 +271,7 @@ fn multi_stage_streams_per_token_with_empty_final() {
             "token_ids stamped (poison bypass)"
         );
     }
-    // M1 D14: the prompt count rides the first token and the final marker.
+    // The prompt count rides the first token and the final marker.
     let prompt = finals[0]
         .1
         .prompt_tokens

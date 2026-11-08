@@ -780,7 +780,7 @@ pub struct ChunkStream {
     /// fragment estimates if the final model-token count is smaller.
     generated_tokens: u32,
     /// The latest prompt count any chunk carried (engines report it on the
-    /// first chunk too, M1 D14). Booked once, on completion or cancel, so a
+    /// first chunk too). Booked once, on completion or cancel, so a
     /// stream dropped at a `stop` match still counts its prompt.
     prompt_tokens: Option<u32>,
     /// A terminal outcome (completed / failed / cancelled / teardown) has
@@ -2926,7 +2926,7 @@ mod tests {
         );
     }
 
-    /// M1 D14: engines report the prompt count on their first chunk, and the
+    /// Engines report the prompt count on their first chunk, and the
     /// API drops the stream at a `stop` match before the final one. The
     /// prompt counter takes the latest count seen and books it once, on
     /// completion or cancel; a completed stream books the final's value.

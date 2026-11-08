@@ -588,7 +588,7 @@ struct ActiveCbTask {
     total_tokens: u32,
     max_tokens: u32,
     prompt_tokens: Option<u32>,
-    /// `prompt_tokens` has ridden a chunk already (the first one, M1 D14).
+    /// `prompt_tokens` has ridden a chunk already (the first one).
     prompt_reported: bool,
     started: Instant,
 }
@@ -813,7 +813,7 @@ impl Engine for OvGenaiCbEngine {
                         let mut chunk = Chunk::token(t.task_id.clone(), 0, read.text_delta)
                             .with_n_tokens(read.new_tokens);
                         // The first emitted chunk carries the prompt count
-                        // too, so a consumer that stops early has it (D14).
+                        // too, so a consumer that stops early has it.
                         if let Some(n) = t.prompt_tokens {
                             chunk = chunk.with_first_prompt_tokens(&mut t.prompt_reported, n);
                         }
@@ -1341,7 +1341,7 @@ mod tests {
         assert_eq!(text, "abcdefghi");
     }
 
-    /// M1 D14: the prompt count rides the first emitted chunk as well as the
+    /// The prompt count rides the first emitted chunk as well as the
     /// final one, so a consumer that stops early (the API on a `stop` match)
     /// still has it. A zero-token liveness chunk before it does not count.
     #[test]

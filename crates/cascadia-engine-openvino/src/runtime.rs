@@ -2806,7 +2806,7 @@ impl OvRuntimeEngine {
                 .with_n_tokens(1)
                 .with_token_ids(vec![token as i64]);
             // The prompt count rides the first token too, so a consumer that
-            // stops early still has it (M1 D14); the final chunk repeats it.
+            // stops early still has it; the final chunk repeats it.
             if t.generated.len() == 1 {
                 chunk = chunk.with_prompt_tokens(t.prompt_ids.len() as u32);
             }
@@ -3111,7 +3111,7 @@ impl OvRuntimeEngine {
         }
         // The prompt as sent (the resume seed is appended to `prompt_ids`
         // and counted in `generated`). Reported on the first new token and
-        // on the final chunk (M1 D14).
+        // on the final chunk.
         let prompt_tokens = active
             .prompt_ids
             .len()

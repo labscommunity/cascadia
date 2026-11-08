@@ -1557,7 +1557,7 @@ struct GenerationDefaultSources {
     top_p: DefaultSource,
 }
 
-/// The engine's own window, when it has one tighter than `config.json` (D2):
+/// The engine's own window, when it has one tighter than `config.json`:
 /// sycl-llama's child runs with `-c --llama-ctx`; ov-genai on NPU compiles
 /// `MAX_PROMPT_LEN + MIN_RESPONSE_LEN` (each from the plugin properties the
 /// engine gets, so `--npu-*` or a later `--ov-config` entry, last write wins
@@ -1607,11 +1607,11 @@ fn engine_window(
 }
 
 /// The server's values for unset `max_tokens` / `temperature` / `top_p`
-/// (Decision 2, D2, D3, D12): `max_tokens = flag ?? engine window ??
+/// `max_tokens = flag ?? engine window ??
 /// config.json window ?? 4096`, `temperature = flag ?? generation_config.json
 /// ?? 1.0`, `top_p = flag ?? generation_config.json ?? 1.0`, a file value out
 /// of the OpenAI range counting as absent (see [`file_sampling_warnings`]).
-/// `context_window` is the engine or config.json window only (D13). Pure.
+/// `context_window` is the engine or config.json window only. Pure.
 fn resolve_generation_defaults(
     args: &WorkerArgs,
     info: &cascadia_api::ModelGenerationInfo,
@@ -1695,7 +1695,7 @@ fn file_sampling_warnings(
 }
 
 /// The startup warning when speculative decoding meets a default
-/// temperature above 0, for requests that omit `temperature` (D3):
+/// temperature above 0, for requests that omit `temperature`:
 /// sparse-moe's (`--prompt-lookup`) runs only at temperature <= 0, so it is
 /// off for them; ov-genai's (`--draft-model` / `--prompt-lookup`) now
 /// samples, so its output is no longer the greedy one.
@@ -2892,7 +2892,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // windows admit. Both caps follow one operator-facing knob.
         cfg.max_body_bytes = max_body;
         cfg.max_prompt_bytes = max_body;
-        // Values for the request fields a client leaves unset (Decision 2).
+        // Values for the request fields a client leaves unset.
         let model_info =
             cascadia_api::read_model_generation_info(std::path::Path::new(&args.model));
         let (defaults, sources) = resolve_generation_defaults(&args, &model_info);
@@ -4797,7 +4797,7 @@ mod generation_defaults_tests {
             .cmd
     }
 
-    /// The documented restore recipe (D12).
+    /// The documented restore recipe.
     const RESTORE: [&str; 6] = [
         "--default-max-tokens",
         "256",
@@ -4982,7 +4982,7 @@ mod generation_defaults_tests {
                 max_tokens: 4096,
                 temperature: 1.0,
                 top_p: 1.0,
-                // The 4096 fallback is not a known window (D13).
+                // The 4096 fallback is not a known window.
                 context_window: None,
             }
         );

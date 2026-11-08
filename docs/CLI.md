@@ -249,7 +249,7 @@ To restore the old behaviour:
   `1`, with a startup warning naming it. Before this change an unset
   temperature was `0` (greedy) and an unset top_p `1`.
 - ov-runtime, dist-spec, `gemma4` and `qwen35` decode greedily whatever the
-  temperature (until sampling lands, M4), so only their limit changes.
+  temperature (until those engines implement sampling), so only their limit changes.
   sycl-llama now always sends a temperature to `llama-server` (the default
   above, or the flag), overriding the server's own default, and sends `top_p`
   whenever it is not 1, so a `generation_config.json` `top_p` (e.g. 0.95) now

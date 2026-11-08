@@ -1358,7 +1358,7 @@ impl Gemma4Engine {
                 .with_n_tokens(1)
                 .with_token_ids(vec![next_token as i64]);
             // The first new token carries the prompt count too, as the final
-            // chunk does, so a consumer that stops early has it (M1 D14).
+            // chunk does, so a consumer that stops early has it.
             if active.generated.len() == active.resume_seed_len + 1 {
                 chunk.with_prompt_tokens(active.prompt_ids.len() as u32)
             } else {

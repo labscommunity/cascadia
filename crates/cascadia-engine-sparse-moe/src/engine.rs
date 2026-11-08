@@ -2467,7 +2467,7 @@ impl SparseMoEEngine {
         // reads as id-less; stamp the single id explicitly.
         token_chunk.token_ids = vec![next];
         {
-            // First new token: the prompt count rides it too (M1 D14).
+            // First new token: the prompt count rides it too.
             let a = self.active.as_ref().unwrap();
             if a.generated.len() == a.resume_seed_len + 1 {
                 token_chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
@@ -2651,7 +2651,7 @@ impl SparseMoEEngine {
             rank = self.rank, total = self.total, "task done (rank-0 driver, streamed)");
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
-        // Prompt as fed (resume ids included), as the first token reports it (M1 D14).
+        // Prompt as fed (resume ids included), as the first token reports it.
         chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
         chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
         vec![(a.id, chunk)]
@@ -4422,7 +4422,7 @@ impl OvMoeEngine {
         // reads as id-less; stamp the single id explicitly.
         token_chunk.token_ids = vec![next];
         {
-            // First new token: the prompt count rides it too (M1 D14).
+            // First new token: the prompt count rides it too.
             let a = self.active_ov.as_ref().unwrap();
             if a.generated.len() == a.resume_seed_len + 1 {
                 token_chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
@@ -4588,7 +4588,7 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
-        // Prompt as fed (resume ids included), as the first token reports it (M1 D14).
+        // Prompt as fed (resume ids included), as the first token reports it.
         chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
         chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
         vec![(a.id, chunk)]
@@ -6072,7 +6072,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             c.n_tokens = Some(1);
             c.token_ids = vec![st.next];
             // The prompt count rides the first token too, so a consumer that
-            // stops early still has it (M1 D14); the final chunk repeats it.
+            // stops early still has it; the final chunk repeats it.
             if st.generated.len() == 1 {
                 c.prompt_tokens = Some(st.prompt_len as u32);
             }
@@ -6662,7 +6662,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             c.n_tokens = Some(1);
             c.token_ids = vec![st.next];
             // The prompt count rides the first token too, so a consumer that
-            // stops early still has it (M1 D14); the final chunk repeats it.
+            // stops early still has it; the final chunk repeats it.
             if st.generated.len() == 1 {
                 c.prompt_tokens = Some(st.prompt_len as u32);
             }
@@ -6998,7 +6998,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             c.n_tokens = Some(1);
             c.token_ids = vec![generated[i] as i64];
             if i == 0 {
-                // First chunk carries the prompt count too (M1 D14).
+                // First chunk carries the prompt count too.
                 c.prompt_tokens = Some(prompt_ids.len() as u32);
             }
             out.push((task.task_id.clone(), c));
@@ -7365,7 +7365,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // makes the stream resume-ineligible; token 0 is a legal sample.
         token_chunk.token_ids = vec![next];
         {
-            // First token: the prompt count rides it too (M1 D14).
+            // First token: the prompt count rides it too.
             let a = self.active.as_ref().unwrap();
             if a.generated.len() == 1 {
                 token_chunk.prompt_tokens = Some(a.n_prefill as u32);

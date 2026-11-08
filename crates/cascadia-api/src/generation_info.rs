@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn sampling_values_from_generation_config() {
         let d = tempfile::tempdir().unwrap();
-        // `do_sample` is not applied (D3).
+        // `do_sample` is not applied.
         write(
             d.path(),
             "generation_config.json",

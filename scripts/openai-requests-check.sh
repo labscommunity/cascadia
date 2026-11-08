@@ -43,7 +43,7 @@ R=$(post /v1/chat/completions '{"model":"m","messages":[{"role":"user","content"
 [ "$(jq -r '.usage.completion_tokens' <<<"$R")" = 2 ] && verdict "max_tokens: 2 still works" ok || verdict "max_tokens: 2" bad "$R"
 
 R=$(post /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":"a b"}],"max_tokens":4,"user":"u","safety_identifier":"s","prompt_cache_key":"k","prompt_cache_retention":"24h","metadata":{"k":"v"},"store":true,"service_tier":"auto","verbosity":"low","prediction":{"type":"content","content":"x"},"stream_options":{"include_obfuscation":false}}')
-[ "$(jq -r '.object' <<<"$R")" = chat.completion ] && verdict "1.9 fields incl. store: true -> 200" ok || verdict "1.9 fields" bad "$R"
+[ "$(jq -r '.object' <<<"$R")" = chat.completion ] && verdict "harmless fields incl. store: true -> 200" ok || verdict "harmless fields" bad "$R"
 
 R=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$(words 400)\"}]}")
 [ "$(jq -r '.usage.completion_tokens' <<<"$R")" = 300 ] && [ "$(jq -r '.choices[0].finish_reason' <<<"$R")" = length ] \

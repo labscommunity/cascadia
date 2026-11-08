@@ -834,7 +834,7 @@ pub struct Qwen36Engine {
 /// The streamed chunk for decoded token `next` of task `t` (already pushed
 /// onto `gen_ids`). The first NEW token (past any resume seed) carries the
 /// prompt count too, as the final chunk does, so a consumer that stops early
-/// still has it (M1 D14).
+/// still has it.
 fn decode_token_chunk(task_id: TaskId, next: u32, delta: String, t: &ActiveTask) -> Chunk {
     let chunk = Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]);
     if t.gen_ids.len() == t.resume_seed_len + 1 {
@@ -3460,7 +3460,7 @@ mod tests {
 
     #[test]
     fn first_decoded_token_carries_the_prompt_count() {
-        // M1 D14: known after prefill, so it rides the first NEW token (past
+        // Known after prefill, so it rides the first NEW token (past
         // a resume seed) as well as the final marker.
         let mut t = ActiveTask {
             task_id: "t0".into(),

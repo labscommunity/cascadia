@@ -83,7 +83,7 @@ impl Engine for MockEngine {
         let max = task.max_tokens.max(1) as usize;
         let words: Vec<&str> = task.prompt.split_whitespace().collect();
         // The mock's "tokens" are the prompt's words: the count rides the
-        // first emitted chunk and the final one (M1 D14).
+        // first emitted chunk and the final one.
         let prompt_tokens = words.len() as u32;
         if emitted >= max || emitted >= words.len() {
             // Distinguish the stop reason like a real engine: exhausting the
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn prompt_tokens_ride_the_first_and_the_final_chunk() {
-        // M1 D14: the prompt count (the prompt's words) is known up front.
+        // The prompt count (the prompt's words) is known up front.
         let mut e = MockEngine::new();
         e.submit(GenerationTask::new("t1", "the quick brown").with_max_tokens(8))
             .unwrap();

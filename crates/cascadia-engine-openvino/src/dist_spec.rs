@@ -1376,7 +1376,7 @@ struct ActiveSpec {
     #[cfg(feature = "kv_coord")]
     prompt_ids: Vec<i64>,
     /// The prompt's token count as sent (resume ids included), for the first
-    /// and the final chunk (M1 D14).
+    /// and the final chunk.
     prompt_tokens: u32,
     /// Accumulated accepted tokens (including the first sampled token;
     /// preceded by the resume seed on a resumed turn).
@@ -1587,7 +1587,7 @@ impl Engine for OvDistSpecEngine {
                         logprobs: None,
                         n_tokens: Some(1),
                         // The first chunk carries the prompt count (as sent,
-                        // resume ids included), as the final one does (M1 D14).
+                        // resume ids included), as the final one does.
                         prompt_tokens: Some(active.prompt_tokens),
                         completion_tokens: None,
                         error: None,
