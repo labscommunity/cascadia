@@ -5,16 +5,22 @@
 //! template, sampling, image decoding, limits and every refusal there apply
 //! here unchanged. Only the request and response shapes differ.
 //!
-//! Cascadia keeps no state and serves no tools on this endpoint, so the fields
-//! that need either (`previous_response_id`, `store: true`, `conversation`,
-//! `background`, `tools`, file ids) are refused with a 400 naming the field,
-//! never ignored: a dropped `previous_response_id` would have the model answer
-//! without the conversation the caller thinks it sent.
+//! `tools` are mapped onto chat tools (see [`tools`]); hosted tools, which run
+//! on OpenAI's side, are dropped. The fields that need state Cascadia does
+//! not keep (`previous_response_id`, `conversation`, `background`, file ids)
+//! are refused with a 400 naming the field, never ignored: a dropped
+//! `previous_response_id` would have the model answer without the
+//! conversation the caller thinks it sent. Fields Codex and the SDKs send
+//! that change nothing here (`client_metadata`, `prompt_cache_key`,
+//! `service_tier`, `text.verbosity`, ...) are accepted and ignored.
 
 use super::*;
 use serde_json::{json, Value};
 
-/// OpenAI `POST /v1/responses` body. The fields after `metadata` are
+mod tools;
+use tools::{check_include, check_tool_choice, ToolMap};
+
+/// OpenAI `POST /v1/responses` body. The fields after `max_tool_calls` are
 /// accepted only to be refused by name (see [`refuse_unsupported`]); unknown
 /// fields are ignored, as on the chat endpoint.
 #[derive(Deserialize, Debug)]
@@ -35,10 +41,11 @@ pub struct ResponsesRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub stream: bool,
-    /// Only `false` (or absent): nothing is stored.
+    /// Echoed; absent is OpenAI's default, `true`.
     #[serde(default)]
     pub store: Option<bool>,
-    /// `reasoning.effort` is the chat endpoint's `reasoning_effort`.
+    /// `reasoning.effort` is the chat endpoint's `reasoning_effort`;
+    /// `reasoning.summary` is accepted, but no summary is generated.
     #[serde(default)]
     pub reasoning: Option<ReasoningParam>,
     /// Only `{"format": {"type": "text"}}`; structured output is refused.
@@ -48,23 +55,31 @@ pub struct ResponsesRequest {
     /// `context_length_exceeded`, never trimmed.
     #[serde(default)]
     pub truncation: Option<String>,
-    /// Only `"none"` or `"auto"`, which with no tools mean the same.
+    /// Only `"none"` or `"auto"` (see [`check_tool_choice`]).
     #[serde(default)]
     pub tool_choice: Option<Value>,
     /// Echoed back on the response object; held to OpenAI's shape (see
     /// [`check_metadata`]).
     #[serde(default)]
     pub metadata: Option<Value>,
+    /// See [`ToolMap::from_request`].
     #[serde(default)]
     pub tools: Option<Value>,
+    /// Checked against OpenAI's values (see [`check_include`]).
+    #[serde(default)]
+    pub include: Option<Value>,
+    /// Echoed (absent = `true`).
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// Echoed; it caps hosted tool calls, and none runs here.
+    #[serde(default)]
+    pub max_tool_calls: Option<Value>,
     #[serde(default)]
     pub previous_response_id: Option<Value>,
     #[serde(default)]
     pub conversation: Option<Value>,
     #[serde(default)]
     pub background: Option<Value>,
-    #[serde(default)]
-    pub include: Option<Value>,
     #[serde(default)]
     pub prompt: Option<Value>,
     #[serde(default)]
@@ -83,9 +98,11 @@ pub struct ReasoningParam {
     pub summary: Option<Value>,
 }
 
-/// A 400 naming the request field at fault.
+/// An error (a 400 unless `status` says otherwise) naming the request field
+/// at fault.
 #[derive(Debug, PartialEq)]
-struct Refusal {
+pub(super) struct Refusal {
+    status: StatusCode,
     param: String,
     message: String,
     code: Option<&'static str>,
@@ -97,6 +114,7 @@ struct Refusal {
 impl Refusal {
     fn new(param: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            status: StatusCode::BAD_REQUEST,
             param: param.into(),
             message: message.into(),
             code: None,
@@ -122,12 +140,7 @@ impl Refusal {
 
     fn into_response(self) -> Response {
         count_rejected(self.reason);
-        api_error_for(
-            StatusCode::BAD_REQUEST,
-            self.message,
-            Some(&self.param),
-            self.code,
-        )
+        api_error_for(self.status, self.message, Some(&self.param), self.code)
     }
 }
 
@@ -179,12 +192,7 @@ fn check_metadata(metadata: Option<&Value>) -> Result<(), Refusal> {
 /// Refuse every request field this endpoint cannot honor, by name.
 fn refuse_unsupported(req: &ResponsesRequest) -> Result<(), Refusal> {
     check_metadata(req.metadata.as_ref())?;
-    if req.store == Some(true) {
-        return Err(Refusal::new(
-            "store",
-            format!("`store: true` is not supported: {STATELESS}, with `store: false`"),
-        ));
-    }
+    check_include(req.include.as_ref())?;
     if req.previous_response_id.is_some() {
         return Err(Refusal::new(
             "previous_response_id",
@@ -201,28 +209,6 @@ fn refuse_unsupported(req: &ResponsesRequest) -> Result<(), Refusal> {
         return Err(Refusal::new(
             "background",
             "`background` is not supported: responses are generated within the request",
-        ));
-    }
-    if req.tools.as_ref().is_some_and(|t| t != &json!([])) {
-        return Err(Refusal::new(
-            "tools",
-            "`tools` are not supported on `/v1/responses`; use `/v1/chat/completions` \
-             for function calling",
-        ));
-    }
-    if let Some(choice) = &req.tool_choice {
-        if !matches!(choice.as_str(), Some("none" | "auto")) {
-            return Err(Refusal::new(
-                "tool_choice",
-                "`tool_choice` other than `none` or `auto` is not supported: \
-                 `/v1/responses` serves no tools",
-            ));
-        }
-    }
-    if req.include.as_ref().is_some_and(|i| i != &json!([])) {
-        return Err(Refusal::new(
-            "include",
-            "`include` is not supported: responses carry no extra output data",
         ));
     }
     if req.prompt.is_some() {
@@ -256,12 +242,6 @@ fn refuse_unsupported(req: &ResponsesRequest) -> Result<(), Refusal> {
                 ),
             ));
         }
-    }
-    if req.reasoning.as_ref().is_some_and(|r| r.summary.is_some()) {
-        return Err(Refusal::new(
-            "reasoning.summary",
-            "`reasoning.summary` is not supported: reasoning stays in the output text",
-        ));
     }
     if req.truncation.as_deref().is_some_and(|t| t != "disabled") {
         return Err(Refusal::new(
@@ -456,8 +436,14 @@ fn chat_part(part: &Value, at: &str) -> Result<Value, Refusal> {
     }
 }
 
-/// The chat request this Responses request is served as.
-fn chat_request(req: &ResponsesRequest, messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+/// The chat request this Responses request is served as, with `map`'s chat
+/// tools and the checked `tool_choice`.
+fn chat_request(
+    req: &ResponsesRequest,
+    messages: Vec<ChatMessage>,
+    map: &ToolMap,
+    choice: Option<&str>,
+) -> ChatCompletionRequest {
     ChatCompletionRequest {
         model: req.model.clone(),
         messages,
@@ -476,8 +462,8 @@ fn chat_request(req: &ResponsesRequest, messages: Vec<ChatMessage>) -> ChatCompl
         enable_thinking: None,
         reasoning_effort: req.reasoning.as_ref().and_then(|r| r.effort.clone()),
         chat_template_kwargs: None,
-        tools: None,
-        tool_choice: None,
+        tools: (!map.chat_tools.is_empty()).then(|| map.chat_tools.clone()),
+        tool_choice: choice.map(|c| json!(c)),
     }
 }
 
@@ -496,10 +482,21 @@ struct ResponseShell {
     top_p: f32,
     effort: Option<String>,
     metadata: Value,
+    store: bool,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    max_tool_calls: Value,
+    /// The served tools, Responses-shaped ([`ToolMap::echo`]).
+    tools: Vec<Value>,
 }
 
 impl ResponseShell {
-    fn new(req: &ResponsesRequest, id: String) -> Self {
+    fn new(
+        req: &ResponsesRequest,
+        id: String,
+        map: &ToolMap,
+        choice: Option<&'static str>,
+    ) -> Self {
         Self {
             id,
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
@@ -511,6 +508,11 @@ impl ResponseShell {
             top_p: req.top_p.unwrap_or(1.0),
             effort: req.reasoning.as_ref().and_then(|r| r.effort.clone()),
             metadata: req.metadata.clone().unwrap_or_else(|| json!({})),
+            store: req.store.unwrap_or(true),
+            tool_choice: choice.unwrap_or("auto"),
+            parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
+            max_tool_calls: req.max_tool_calls.clone().unwrap_or(Value::Null),
+            tools: map.echo.clone(),
         }
     }
 
@@ -530,17 +532,17 @@ impl ResponseShell {
                 .then(|| json!({"reason": "max_output_tokens"})),
             "instructions": self.instructions,
             "max_output_tokens": self.max_output_tokens,
-            "max_tool_calls": null,
+            "max_tool_calls": self.max_tool_calls,
             "model": self.model,
             "output": output,
-            "parallel_tool_calls": false,
+            "parallel_tool_calls": self.parallel_tool_calls,
             "previous_response_id": null,
             "reasoning": {"effort": self.effort, "summary": null},
-            "store": false,
+            "store": self.store,
             "temperature": self.temperature,
             "text": {"format": {"type": "text"}},
-            "tool_choice": "none",
-            "tools": [],
+            "tool_choice": self.tool_choice,
+            "tools": self.tools,
             "top_p": self.top_p,
             "truncation": "disabled",
             "usage": outcome.map(|o| json!({
@@ -636,13 +638,22 @@ pub(crate) async fn create_response(
     State(state): State<AppState>,
     OpenAiJson(req): OpenAiJson<ResponsesRequest>,
 ) -> Response {
-    let messages = match refuse_unsupported(&req).and_then(|()| input_messages(&req)) {
-        Ok(m) => m,
+    let checked = refuse_unsupported(&req).and_then(|()| {
+        let map = ToolMap::from_request(req.tools.as_ref())?;
+        let choice = check_tool_choice(req.tool_choice.as_ref())?;
+        Ok((map, choice, input_messages(&req)?))
+    });
+    let (map, choice, messages) = match checked {
+        Ok(c) => c,
         Err(refusal) => return refusal.into_response(),
     };
-    let chat = chat_request(&req, messages);
+    if !map.dropped.is_empty() {
+        warn!(types = ?map.dropped, "responses: hosted tools are not served; dropped");
+    }
+    let chat = chat_request(&req, messages, &map, choice);
     // The response id doubles as the task id, so `/v1/cancel/<id>` works.
-    let shell = ResponseShell::new(&req, format!("resp_{}", Uuid::new_v4().simple()));
+    let id = format!("resp_{}", Uuid::new_v4().simple());
+    let shell = ResponseShell::new(&req, id, &map, choice);
     let admitted = match admit_chat(
         &state,
         &chat,
@@ -882,11 +893,15 @@ mod tests {
     use tower::ServiceExt;
 
     async fn post(app: Router, payload: Value) -> (StatusCode, String) {
+        post_to(app, "/v1/responses", payload).await
+    }
+
+    async fn post_to(app: Router, uri: &str, payload: Value) -> (StatusCode, String) {
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/responses")
+                    .uri(uri)
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -953,12 +968,19 @@ mod tests {
             &request(json!({"model": "m", "input": "x", "max_output_tokens": 7,
                 "temperature": 0.5, "top_p": 0.9, "reasoning": {"effort": "low"}})),
             Vec::new(),
+            &ToolMap::default(),
+            None,
         );
         assert_eq!(chat.max_tokens, 7);
         assert_eq!(chat.temperature, 0.5);
         assert_eq!(chat.top_p, Some(0.9));
         assert_eq!(chat.reasoning_effort.as_deref(), Some("low"));
-        let chat = chat_request(&request(json!({"model": "m", "input": "x"})), Vec::new());
+        let chat = chat_request(
+            &request(json!({"model": "m", "input": "x"})),
+            Vec::new(),
+            &ToolMap::default(),
+            None,
+        );
         assert_eq!(chat.max_tokens, default_max_tokens());
     }
 
@@ -1205,31 +1227,21 @@ mod tests {
     /// `param` names the field, before anything reaches the engine.
     #[tokio::test]
     async fn unsupported_fields_are_refused_by_name() {
-        let fn_tool = json!([{"type": "function", "name": "f", "parameters": {}}]);
         let cases = [
-            (json!({"store": true}), "store"),
             (
                 json!({"previous_response_id": "resp_1"}),
                 "previous_response_id",
             ),
             (json!({"conversation": "conv_1"}), "conversation"),
             (json!({"background": true}), "background"),
-            (json!({"tools": fn_tool}), "tools"),
             (json!({"tool_choice": "required"}), "tool_choice"),
-            (
-                json!({"include": ["message.output_text.logprobs"]}),
-                "include",
-            ),
+            (json!({"include": ["bogus"]}), "include"),
             (json!({"prompt": {"id": "pmpt_1"}}), "prompt"),
             (json!({"top_logprobs": 3}), "top_logprobs"),
             (json!({"stop": ["\n"]}), "stop"),
             (
                 json!({"text": {"format": {"type": "json_schema", "name": "x", "schema": {}}}}),
                 "text.format",
-            ),
-            (
-                json!({"reasoning": {"summary": "auto"}}),
-                "reasoning.summary",
             ),
             (json!({"truncation": "auto"}), "truncation"),
             (json!({"input": 5}), "input"),
@@ -1282,11 +1294,26 @@ mod tests {
             json!({"model": "mock-model", "input": "hello there", "store": false,
                 "background": false, "tools": [], "tool_choice": "auto", "include": [],
                 "previous_response_id": null, "truncation": "disabled",
-                "text": {"format": {"type": "text"}}, "metadata": {"k": "v"}}),
+                "metadata": {"k": "v"}, "reasoning": {"summary": "auto"},
+                "client_metadata": {"x-codex-installation-id": "id"},
+                "prompt_cache_key": "k", "prompt_cache_options": {}, "prompt_cache_retention": "24h",
+                "safety_identifier": "s", "user": "u", "service_tier": "auto",
+                "text": {"format": {"type": "text"}, "verbosity": "low"},
+                "stream_options": {"include_obfuscation": false}, "access_programs": null,
+                "context_management": [{"type": "compaction", "compact_threshold": 1000}],
+                "moderation": null, "parallel_tool_calls": false}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
         assert_eq!(v["metadata"], json!({"k": "v"}));
+        let (status, v) = post_json(
+            make_app().await,
+            json!({"model": "mock-model", "input": "hello there", "store": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["store"], true);
     }
 
     /// `metadata` is held to OpenAI's shape: an object of at most 16
@@ -1519,7 +1546,6 @@ mod tests {
 
     /// The mock engine behind [`tools_config`]: it answers a tools request
     /// carrying `__mock_tool_call__` with a tool call.
-    #[allow(dead_code)] // the tools tests use it
     async fn mock_tools_app() -> Router {
         let runner = Runner::new(Box::new(cascadia_engine_mock::MockBuilder::new()));
         runner
@@ -1680,10 +1706,181 @@ mod tests {
         let before = count();
         let (status, _) = post_json(
             make_app().await,
-            json!({"model": "mock-model", "input": "hi", "store": true}),
+            json!({"model": "mock-model", "input": "hi", "previous_response_id": "resp_1"}),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(count() > before);
+    }
+
+    /// A query string such as `?beta=true`, which some clients add, leaves
+    /// the route as it is.
+    #[tokio::test]
+    async fn beta_query_is_served() {
+        let (status, body) = post_to(
+            make_app().await,
+            "/v1/responses?beta=true",
+            json!({"model": "mock-model", "input": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Codex CLI 0.166.0's first request of a turn, trimmed (fake ids, short
+    /// texts, four of its tools), as `tests/fixtures` keeps it.
+    fn codex_turn() -> Value {
+        serde_json::from_str(include_str!("../tests/fixtures/codex-0.166.0-turn1.json")).unwrap()
+    }
+
+    /// The echoed `tools` of a Codex turn: its two functions and the
+    /// namespace, never the hosted `web_search`.
+    fn assert_codex_tools(response: &Value) {
+        let tools = response["tools"].as_array().unwrap();
+        let shape: Vec<_> = tools
+            .iter()
+            .map(|t| (t["type"].as_str().unwrap(), t["name"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("function", "exec_command"),
+                ("function", "view_image"),
+                ("namespace", "multi_agent_v1")
+            ],
+            "{response}"
+        );
+        assert_eq!(tools[2]["tools"].as_array().unwrap().len(), 2);
+    }
+
+    /// A Codex turn as captured (streamed) is served: every event is in the
+    /// spec's shape and the terminal response echoes the served tools.
+    #[tokio::test]
+    async fn codex_turn_is_served_streaming() {
+        let body = codex_turn();
+        assert_eq!(body["stream"], true);
+        let (status, text) = post(mock_tools_app().await, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let ev = events(&text);
+        ev.iter().for_each(|(_, data)| assert_event(data));
+        let (kind, data) = ev.last().unwrap();
+        assert!(
+            kind == "response.completed" || kind == "response.incomplete",
+            "{kind}"
+        );
+        assert_codex_tools(&data["response"]);
+    }
+
+    #[tokio::test]
+    async fn codex_turn_is_served_non_streaming() {
+        let mut body = codex_turn();
+        body["stream"] = json!(false);
+        let (status, v) = post_json(mock_tools_app().await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        assert_codex_tools(&v);
+        assert_eq!(v["store"], false);
+        assert_eq!(v["parallel_tool_calls"], true);
+        assert_eq!(v["tool_choice"], "auto");
+        assert!(v["reasoning"]["summary"].is_null());
+    }
+
+    /// Served tools reach the chat template: a namespace's under their
+    /// flattened names, a custom tool as a function, a hosted one not at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tools_reach_the_template() {
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), tools_config()).await;
+        let (status, v) = post_json(
+            app,
+            json!({"model": "script-model", "input": "hi", "tools": [
+                {"type": "function", "name": "get_weather", "parameters": {"type": "object"}},
+                {"type": "namespace", "name": "mcp__x", "description": "x",
+                    "tools": [{"type": "function", "name": "click"}]},
+                {"type": "custom", "name": "apply_patch", "description": "Patch files."},
+                {"type": "web_search"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let prompt = tasks.lock()[0].prompt.clone();
+        for name in ["get_weather", "mcp__x__click", "apply_patch"] {
+            assert!(prompt.contains(name), "{name} missing: {prompt}");
+        }
+        assert!(!prompt.contains("web_search"), "{prompt}");
+    }
+
+    /// A function tool as n8n sends it (no `strict`) is echoed with
+    /// `strict: null`, as the schema requires the key.
+    #[tokio::test]
+    async fn tool_without_strict_is_echoed_with_null() {
+        let (status, v) = post_json(
+            mock_tools_app().await,
+            json!({"model": "mock-model", "input": "hi", "tools": [{"type": "function",
+                "name": "calculator", "description": "Do math.",
+                "parameters": {"type": "object", "properties": {"input": {"type": "string"}}}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        assert!(v["tools"][0]["strict"].is_null(), "{v}");
+        assert_eq!(v["tools"][0]["name"], "calculator");
+    }
+
+    /// The response object echoes what was asked: `store` (true when
+    /// absent, OpenAI's default), `max_tool_calls`, `tool_choice` (`auto`
+    /// when absent), `parallel_tool_calls` (true when absent), and a
+    /// `reasoning.summary` of null (none is generated).
+    #[tokio::test]
+    async fn request_fields_are_echoed() {
+        let echo = |extra: Value| async move {
+            let mut body = json!({"model": "mock-model", "input": "hi"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (status, v) = post_json(make_app().await, body).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_spec("Response", &v);
+            v
+        };
+        let v = echo(json!({})).await;
+        assert_eq!(v["store"], true);
+        assert_eq!(v["tool_choice"], "auto");
+        assert_eq!(v["parallel_tool_calls"], true);
+        assert!(v["max_tool_calls"].is_null());
+        assert_eq!(v["tools"], json!([]));
+        let v = echo(
+            json!({"store": false, "max_tool_calls": 5, "tool_choice": "none",
+            "parallel_tool_calls": false, "reasoning": {"effort": "low", "summary": "auto"}}),
+        )
+        .await;
+        assert_eq!(v["store"], false);
+        assert_eq!(v["max_tool_calls"], 5);
+        assert_eq!(v["tool_choice"], "none");
+        assert_eq!(v["parallel_tool_calls"], false);
+        assert_eq!(v["reasoning"], json!({"effort": "low", "summary": null}));
+    }
+
+    /// Tool and tool-choice refusals name the field, before the engine.
+    #[tokio::test]
+    async fn tool_refusals_name_the_field() {
+        for (extra, param) in [
+            (json!({"tools": [{"type": "foo"}]}), "tools[0].type"),
+            (json!({"tools": [{"type": "function"}]}), "tools[0].name"),
+            (
+                json!({"tools": [{"type": "function", "name": "f"}],
+                    "tool_choice": {"type": "function", "name": "f"}}),
+                "tool_choice",
+            ),
+            (
+                json!({"tool_choice": {"type": "web_search_preview"}}),
+                "tool_choice",
+            ),
+        ] {
+            let mut body = json!({"model": "mock-model", "input": "hi"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (status, v) = post_json(mock_tools_app().await, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{param}: {v}");
+            assert_eq!(v["error"]["param"], param, "{v}");
+        }
     }
 }

@@ -153,13 +153,17 @@ class OpenAISdkConformance(unittest.TestCase):
 
     def test_responses_refusals_name_the_field(self):
         for kw, param in (({"previous_response_id": "resp_1"}, "previous_response_id"),
-                          ({"store": True}, "store"),
-                          ({"tools": [{"type": "function", "name": "f",
-                                       "parameters": {}}]}, "tools")):
+                          ({"tool_choice": "required"}, "tool_choice"),
+                          ({"include": ["bogus"]}, "include")):
             with self.assertRaises(openai.BadRequestError) as ctx:
                 self.client.responses.create(model="mock-model", input="hi", **kw)
             self.assertEqual(ctx.exception.body["param"], param)
             self.assertEqual(ctx.exception.body["type"], "invalid_request_error")
+        # `store: true` (OpenAI's default) is served, and echoed.
+        r = self.client.responses.create(model="mock-model", input="hi", store=True,
+                                         max_output_tokens=8)
+        self.assertEqual(r.object, "response")
+        self.assertTrue(r.store)
 
 
 if __name__ == "__main__":
