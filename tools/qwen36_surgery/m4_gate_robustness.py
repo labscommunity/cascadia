@@ -40,6 +40,9 @@ def sse_start(content, max_tokens):
             "model": "default",
             "messages": [{"role": "user", "content": content}],
             "max_tokens": max_tokens,
+            # Greedy, as the checks assume (an unset temperature is no
+            # longer 0: the server default, M1 Decision 2).
+            "temperature": 0,
             "enable_thinking": True,
             "stream": True,
         }
@@ -85,6 +88,7 @@ def chat(content, max_tokens=32):
                 "model": "default",
                 "messages": [{"role": "user", "content": content}],
                 "max_tokens": max_tokens,
+                "temperature": 0,
                 "enable_thinking": False,
             }
         ).encode(),

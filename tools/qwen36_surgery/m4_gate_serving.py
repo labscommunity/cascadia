@@ -35,6 +35,9 @@ def chat(content, max_tokens, thinking):
         "model": "default",
         "messages": [{"role": "user", "content": content}],
         "max_tokens": max_tokens,
+        # Greedy: parity compares against a greedy reference, and an unset
+        # temperature is no longer 0 (the server default, M1 Decision 2).
+        "temperature": 0,
         "enable_thinking": thinking,
     }
     req = urllib.request.Request(
