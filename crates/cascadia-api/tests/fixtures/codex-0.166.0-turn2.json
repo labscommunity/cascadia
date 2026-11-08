@@ -1,0 +1,231 @@
+{
+  "model": "qwen3-8b",
+  "stream": true,
+  "input": [
+    {
+      "type": "message",
+      "id": "msg_00000000000000000000000000000001",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "You are a coding agent running in the Codex CLI, a terminal-based coding assistant."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "msg_00000000000000000000000000000002",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<skills_instructions>A skill is a set of local instructions to follow that is stored in a `SKILL.md` file.</skills_instructions>"
+        },
+        {
+          "type": "input_text",
+          "text": "<permissions instructions>Filesystem sandboxing defines which files can be read or written.</permissions instructions>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "msg_00000000000000000000000000000003",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<environment_context>\n  <cwd>/workspace/project</cwd>\n  <shell>zsh</shell>\n</environment_context>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "msg_00000000000000000000000000000004",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "list the files here"
+        }
+      ]
+    },
+    {
+      "type": "reasoning",
+      "id": "rs_1",
+      "summary": [],
+      "content": [
+        {
+          "type": "reasoning_text",
+          "text": "I should list."
+        }
+      ],
+      "encrypted_content": "opaque-blob-1"
+    },
+    {
+      "type": "function_call",
+      "status": "completed",
+      "id": "fc_1",
+      "name": "exec_command",
+      "arguments": "{\"cmd\": \"ls\"}",
+      "call_id": "call_1"
+    },
+    {
+      "type": "function_call_output",
+      "id": "fco_01a1bc02-0a60-7672-b9b8-3c9794f86fcf",
+      "call_id": "call_1",
+      "output": "Process exited with code 0\nOutput:\na.txt\n"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "exec_command",
+      "description": "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "description": "Shell command to execute."
+          },
+          "justification": {
+            "type": "string",
+            "description": "User-facing approval question for `require_escalated`; omit otherwise."
+          },
+          "login": {
+            "type": "boolean",
+            "description": "True runs the shell with -l/-i semantics; false disables them. Defaults to true."
+          },
+          "max_output_tokens": {
+            "type": "number",
+            "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy."
+          },
+          "prefix_rule": {
+            "type": "array",
+            "description": "Reusable approval prefix for `cmd`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"].",
+            "items": {
+              "type": "string"
+            }
+          },
+          "sandbox_permissions": {
+            "type": "string",
+            "description": "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution.",
+            "enum": [
+              "use_default",
+              "require_escalated"
+            ]
+          },
+          "shell": {
+            "type": "string",
+            "description": "Shell binary to launch. Defaults to the user's default shell."
+          },
+          "tty": {
+            "type": "boolean",
+            "description": "True allocates a PTY for the command; false or omitted uses plain pipes."
+          },
+          "workdir": {
+            "type": "string",
+            "description": "Working directory for the command. Defaults to the turn cwd."
+          },
+          "yield_time_ms": {
+            "type": "number",
+            "description": "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "view_image",
+      "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Local filesystem path to an image file."
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "namespace",
+      "name": "multi_agent_v1",
+      "description": "Tools for spawning and managing sub-agents.",
+      "tools": [
+        {
+          "type": "function",
+          "name": "close_agent",
+          "description": "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Completed agents remain open and count toward the concurrency limit until closed. Don't keep agents open for too long if they are not needed anymore.",
+          "strict": false,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "target": {
+                "type": "string",
+                "description": "Agent id to close (from spawn_agent)."
+              }
+            },
+            "required": [
+              "target"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "type": "function",
+          "name": "resume_agent",
+          "description": "Resume a previously closed agent by id so it can receive send_input and wait_agent calls.",
+          "strict": false,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Agent id to resume."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    },
+    {
+      "type": "web_search",
+      "external_web_access": false
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "summary": "auto"
+  },
+  "store": false,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000002",
+  "client_metadata": {
+    "x-codex-installation-id": "00000000-0000-4000-8000-000000000001",
+    "x-codex-window-id": "00000000-0000-4000-8000-000000000002:0",
+    "turn_id": "00000000-0000-4000-8000-000000000003",
+    "thread_id": "00000000-0000-4000-8000-000000000002",
+    "session_id": "00000000-0000-4000-8000-000000000002",
+    "root_turn_id": "00000000-0000-4000-8000-000000000003",
+    "x-codex-turn-metadata": "{\"installation_id\":\"00000000-0000-4000-8000-000000000001\",\"session_id\":\"00000000-0000-4000-8000-000000000002\",\"thread_id\":\"00000000-0000-4000-8000-000000000002\",\"agent_name\":\"/root\",\"turn_id\":\"00000000-0000-4000-8000-000000000003\",\"window_id\":\"00000000-0000-4000-8000-000000000002:0\",\"window_number\":0,\"context_window_id\":\"00000000-0000-4000-8000-000000000004\",\"request_kind\":\"turn\",\"history_initialization\":\"new\",\"root_turn_id\":\"00000000-0000-4000-8000-000000000003\",\"thread_source\":\"user\",\"turn_trigger\":\"exec\",\"sandbox\":\"seatbelt\",\"sandbox_mode\":\"read-only\",\"auto_review_enabled\":false,\"node_repl_auto_review_required\":false,\"node_repl_disabled\":false,\"workspaces\":{\"/workspace/project\":{\"has_changes\":true}},\"turn_started_at_unix_ms\":1794155612387,\"analytics_enabled\":true,\"model\":\"qwen3-8b\"}"
+  }
+}

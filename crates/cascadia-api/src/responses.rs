@@ -132,6 +132,17 @@ impl Refusal {
         }
     }
 
+    /// A 413: expanding `input` would pass the prompt byte budget.
+    #[allow(dead_code)] // first used by `item_reference` expansion
+    pub(super) fn too_large(param: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: Some("prompt_too_large"),
+            reason: "prompt_too_large",
+            ..Self::new(param, message)
+        }
+    }
+
     /// The machine-readable `code` other servers give this refusal.
     fn with_code(self, code: &'static str) -> Self {
         Self {
@@ -460,7 +471,11 @@ pub(crate) async fn create_response(
     let checked = refuse_unsupported(&req).and_then(|()| {
         let map = ToolMap::from_request(req.tools.as_ref())?;
         let choice = check_tool_choice(req.tool_choice.as_ref())?;
-        Ok((map, choice, input_messages(&req)?))
+        Ok((
+            map,
+            choice,
+            input_messages(&req, &|_, _| Ok(None), state.max_prompt_bytes)?,
+        ))
     });
     let (map, choice, messages) = match checked {
         Ok(c) => c,
@@ -741,19 +756,24 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// `input_messages` over `v` with no stored items and a 1 MiB budget.
+    fn walk_request(v: Value) -> Result<Vec<ChatMessage>, Refusal> {
+        input_messages(&request(v), &|_, _| Ok(None), 1 << 20)
+    }
+
     /// `input` as a string is one user message; as items, each part maps to
     /// the chat part it names, `instructions` leads as `system`, and
     /// `developer` reads as `system`.
     #[test]
     fn input_maps_onto_chat_messages() {
-        let m = input_messages(&request(json!({"model": "m", "input": "hi there"}))).unwrap();
+        let m = walk_request(json!({"model": "m", "input": "hi there"})).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(
             (m[0].role.as_str(), m[0].content.as_str()),
             ("user", "hi there")
         );
 
-        let m = input_messages(&request(json!({"model": "m",
+        let m = walk_request(json!({"model": "m",
         "instructions": "be brief",
         "input": [
             {"role": "developer", "content": "terse"},
@@ -763,7 +783,7 @@ mod tests {
                 {"type": "input_text", "text": "is this"}]},
             {"role": "assistant", "id": "msg_1", "status": "completed", "content": [
                 {"type": "output_text", "text": "a dot", "annotations": []}]},
-        ]})))
+        ]}))
         .unwrap();
         let roles: Vec<_> = m.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, ["system", "system", "user", "assistant"]);
@@ -1064,10 +1084,6 @@ mod tests {
             ),
             (json!({"truncation": "auto"}), "truncation"),
             (json!({"input": 5}), "input"),
-            (
-                json!({"input": [{"type": "function_call_output", "call_id": "c", "output": "1"}]}),
-                "input[0]",
-            ),
             (
                 json!({"input": [{"type": "item_reference", "id": "msg_1"}]}),
                 "input[0]",
@@ -1549,6 +1565,29 @@ mod tests {
     /// texts, four of its tools), as `tests/fixtures` keeps it.
     fn codex_turn() -> Value {
         serde_json::from_str(include_str!("../tests/fixtures/codex-0.166.0-turn1.json")).unwrap()
+    }
+
+    /// Codex 0.166.0's second request of the turn: the turn-1 fixture plus
+    /// the replayed reasoning, `exec_command` call and its output.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn codex_turn2_replays_reasoning_and_tool_items() {
+        let body: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/codex-0.166.0-turn2.json"))
+                .unwrap();
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["done"]), tools_config()).await;
+        let (status, text) = post(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let prompt = tasks.lock()[0].prompt.clone();
+        assert!(prompt.contains("<think>I should list.</think>"), "{prompt}");
+        // The system prompt names `<tool_call>` too: some block must hold
+        // the replayed call.
+        let replayed = prompt
+            .split("<tool_call>")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("</tool_call>"))
+            .any(|(call, _)| call.contains("\"exec_command\""));
+        assert!(replayed, "{prompt}");
+        assert!(prompt.contains("a.txt"), "{prompt}");
     }
 
     /// The echoed `tools` of a Codex turn: its two functions and the
