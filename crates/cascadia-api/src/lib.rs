@@ -3317,11 +3317,14 @@ async fn stream_text_completion(
         }
     };
     let text_stream = TextStream {
-        chunks: Some(spawn_engine_forwarder(StreamWithPermit {
-            inner: chunk_stream,
-            _permit: permit,
-            _inflight: inflight,
-        })),
+        chunks: Some(spawn_engine_forwarder(
+            task_id.clone(),
+            StreamWithPermit {
+                inner: chunk_stream,
+                _permit: permit,
+                _inflight: inflight,
+            },
+        )),
         keepalive: KeepAlive::new(state.sse_keepalive),
         kind: TextStreamKind::Completion { echo: echo_prefix },
         // The raw-prompt endpoint streams the engine's text as is.
@@ -3375,11 +3378,14 @@ async fn stream_completion(
     // forwarder task owns: they are released when the forwarder ends (the
     // stream finished, or the body dropped its receiver on a client
     // disconnect or a stop match).
-    let chunks = Some(spawn_engine_forwarder(StreamWithPermit {
-        inner: chunk_stream,
-        _permit: permit,
-        _inflight: inflight,
-    }));
+    let chunks = Some(spawn_engine_forwarder(
+        task_id.clone(),
+        StreamWithPermit {
+            inner: chunk_stream,
+            _permit: permit,
+            _inflight: inflight,
+        },
+    ));
     // Tools present and not disabled: content streams as the splitter
     // releases it; whether the reply is a tool call is decided at the final
     // chunk, on the same text and parse as the non-streaming path.
@@ -3696,20 +3702,49 @@ const FORWARD_BUFFER: usize = 1;
 /// its next poll, which drops the engine stream — that cancels the task and
 /// releases the permit and in-flight guard, as dropping the body did. A
 /// step already running cannot be interrupted either way.
-fn spawn_engine_forwarder(mut chunks: StreamWithPermit) -> EngineChunks {
+///
+/// A panic inside `step()` is caught here and forwarded as an error chunk,
+/// so the client sees an SSE error event rather than a clean `[DONE]` after
+/// partial text; the engine stream is dropped (cancel, permit, in-flight
+/// guard) as on every other exit.
+fn spawn_engine_forwarder(
+    task_id: cascadia_types::TaskId,
+    mut chunks: StreamWithPermit,
+) -> EngineChunks {
+    use futures::FutureExt;
     let (tx, rx) = tokio::sync::mpsc::channel(FORWARD_BUFFER);
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
                 () = tx.closed() => break,
-                chunk = chunks.next() => match chunk {
-                    Some(chunk) => {
+                chunk = std::panic::AssertUnwindSafe(chunks.next()).catch_unwind() => match chunk {
+                    Ok(Some(chunk)) => {
                         if tx.send(chunk).await.is_err() {
                             break;
                         }
+                        // The woken body sits in this worker's LIFO slot; step
+                        // the engine again (which may block for a whole step)
+                        // only after it has run, or the chunk and any
+                        // keep-alive go out a step late.
+                        tokio::task::yield_now().await;
                     }
-                    None => break,
+                    Ok(None) => break,
+                    Err(panic) => {
+                        let what = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_owned())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".into());
+                        warn!(task = %task_id, panic = %what, "engine step panicked mid-stream");
+                        let _ = tx
+                            .send(cascadia_types::Chunk::error(
+                                task_id.clone(),
+                                format!("engine panicked: {what}"),
+                            ))
+                            .await;
+                        break;
+                    }
                 },
             }
         }
@@ -3825,6 +3860,9 @@ impl TextStream {
             }
             if let Some(reason) = &chunk.error {
                 warn!(task = %self.task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+                // Terminal: only `[DONE]` follows (no held text, no usage).
+                self.chunks = None;
+                self.phase = ToolStreamPhase::Tail;
                 tokio::task::yield_now().await;
                 return Some(error_frame(&self.task_id, reason));
             }
@@ -9284,15 +9322,30 @@ level={{ effort_map[eff] }}";
         prompt_first: bool,
         /// Each step blocks this long first, like a one-shot engine's step.
         step_delay: Duration,
+        /// How the task ends once the parts are out.
+        end: ScriptEnd,
         gate: Option<Arc<std::sync::atomic::AtomicBool>>,
         log: Arc<ScriptLog>,
         pending: Option<(cascadia_types::TaskId, usize)>,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    enum ScriptEnd {
+        /// A final chunk (`final_text`, `prompt_tokens` 5).
+        #[default]
+        Final,
+        /// An error chunk.
+        Error,
+        /// `step()` panics.
+        Panic,
     }
 
     #[derive(Default)]
     struct ScriptLog {
         cancelled: std::sync::Mutex<Vec<String>>,
         emitted: std::sync::atomic::AtomicUsize,
+        /// The router's counters.
+        stats: Arc<ApiStats>,
     }
 
     impl cascadia_engine::Engine for ScriptEngine {
@@ -9335,9 +9388,13 @@ level={{ effort_map[eff] }}";
                 self.pending = Some((id.clone(), i + 1));
                 return Ok(vec![(id, chunk)]);
             }
-            let last = Chunk::final_marker(&id, self.final_text.clone())
-                .with_finish_reason(cascadia_types::FinishReason::Length)
-                .with_prompt_tokens(5);
+            let last = match self.end {
+                ScriptEnd::Final => Chunk::final_marker(&id, self.final_text.clone())
+                    .with_finish_reason(cascadia_types::FinishReason::Length)
+                    .with_prompt_tokens(5),
+                ScriptEnd::Error => Chunk::error(&id, "script engine failure"),
+                ScriptEnd::Panic => panic!("script engine panic"),
+            };
             Ok(vec![(id, last)])
         }
     }
@@ -9382,6 +9439,57 @@ level={{ effort_map[eff] }}";
         keepalive: Duration,
         step_delay: Duration,
     ) -> (Router, Arc<ScriptLog>, Arc<std::sync::atomic::AtomicBool>) {
+        script_app_opts(
+            parts,
+            ScriptOpts {
+                final_text,
+                prompt_first,
+                gated,
+                keepalive,
+                step_delay,
+                ..ScriptOpts::default()
+            },
+        )
+        .await
+    }
+
+    struct ScriptOpts<'a> {
+        final_text: &'a str,
+        prompt_first: bool,
+        gated: bool,
+        keepalive: Duration,
+        step_delay: Duration,
+        end: ScriptEnd,
+        max_concurrent: usize,
+    }
+
+    impl Default for ScriptOpts<'_> {
+        fn default() -> Self {
+            Self {
+                final_text: "",
+                prompt_first: true,
+                gated: false,
+                keepalive: SSE_KEEPALIVE_INTERVAL,
+                step_delay: Duration::ZERO,
+                end: ScriptEnd::Final,
+                max_concurrent: DEFAULT_MAX_CONCURRENT,
+            }
+        }
+    }
+
+    async fn script_app_opts(
+        parts: &[&str],
+        opts: ScriptOpts<'_>,
+    ) -> (Router, Arc<ScriptLog>, Arc<std::sync::atomic::AtomicBool>) {
+        let ScriptOpts {
+            final_text,
+            prompt_first,
+            gated,
+            keepalive,
+            step_delay,
+            end,
+            max_concurrent,
+        } = opts;
         let log = Arc::new(ScriptLog::default());
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runner = Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
@@ -9389,6 +9497,7 @@ level={{ effort_map[eff] }}";
             final_text: final_text.to_owned(),
             prompt_first,
             step_delay,
+            end,
             gate: gated.then(|| gate.clone()),
             log: log.clone(),
             pending: None,
@@ -9407,10 +9516,11 @@ level={{ effort_map[eff] }}";
                 eos_token: None,
             },
             sse_keepalive: keepalive,
+            max_concurrent_requests: max_concurrent,
             ..Config::default()
         };
         (
-            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            make_router_with_stats(Arc::new(runner), "mock-model", cfg, log.stats.clone()),
             log,
             gate,
         )
@@ -10134,5 +10244,251 @@ level={{ effort_map[eff] }}";
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // --- Fix round 3: forwarder pacing, errors, panics, slot release -------
+
+    /// Sends `payload` to `uri` and returns each body frame with the time it
+    /// arrived, measured from the request. The body is read on a spawned
+    /// task, as hyper's connection task reads it in the server: a test body
+    /// polled from `block_on` would never sit in a worker's LIFO slot.
+    async fn timed_frames(
+        app: Router,
+        uri: &'static str,
+        payload: &Value,
+    ) -> Vec<(Duration, String)> {
+        let payload = payload.clone();
+        tokio::spawn(async move { timed_frames_inner(app, uri, &payload).await })
+            .await
+            .unwrap()
+    }
+
+    async fn timed_frames_inner(
+        app: Router,
+        uri: &str,
+        payload: &Value,
+    ) -> Vec<(Duration, String)> {
+        let t0 = tokio::time::Instant::now();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        let mut frames = Vec::new();
+        while let Some(frame) = body.next().await {
+            let text = String::from_utf8(frame.unwrap().to_vec()).unwrap();
+            if !text.is_empty() {
+                frames.push((t0.elapsed(), text));
+            }
+        }
+        frames
+    }
+
+    /// The forwarder must hand each chunk over before it steps the engine
+    /// again: with two 300 ms steps, the first chunk lands near 300 ms (not a
+    /// step late, near 600 ms), and a keep-alive goes out during the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_chunks_are_not_a_step_late() {
+        let (app, _log, _) = script_app_opts(
+            &["one ", "two "],
+            ScriptOpts {
+                keepalive: Duration::from_millis(100),
+                step_delay: Duration::from_millis(300),
+                ..ScriptOpts::default()
+            },
+        )
+        .await;
+        let frames = timed_frames(
+            app,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "mock-model", "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        let at = |needle: &str| {
+            frames
+                .iter()
+                .find(|(_, f)| f.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in {frames:?}"))
+                .0
+        };
+        let first = at("\"one \"");
+        let second = at("\"two \"");
+        assert!(
+            first < Duration::from_millis(500),
+            "first chunk at {first:?}: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(t, f)| f == ": keep-alive\n\n" && *t > first && *t < second),
+            "no keep-alive during the second step: {frames:?}"
+        );
+    }
+
+    /// After an SSE error event the stream ends: no held stop prefix (or
+    /// anything else) follows it.
+    #[tokio::test]
+    async fn nothing_follows_an_sse_error_event() {
+        let (app, _log, _) = script_app_opts(
+            &["first ST"],
+            ScriptOpts {
+                end: ScriptEnd::Error,
+                ..ScriptOpts::default()
+            },
+        )
+        .await;
+        let (status, body) = post_text(
+            app,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "mock-model", "stream": true, "stop": ["STOP"],
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let events = sse_events(&body);
+        let err = events
+            .iter()
+            .position(|e| e["object"] == "error")
+            .unwrap_or_else(|| panic!("no error event: {body}"));
+        assert_eq!(err, events.len() - 1, "events after the error: {body}");
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    }
+
+    /// A panicking engine step reaches the client as an error event, never a
+    /// clean `[DONE]` after partial text, on every stream path.
+    #[tokio::test]
+    async fn engine_panic_mid_stream_is_an_error_event() {
+        for (uri, payload) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{"type": "function", "function": {"name": "f"}}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true}),
+            ),
+        ] {
+            let (app, log, _) = script_app_opts(
+                &["partial "],
+                ScriptOpts {
+                    end: ScriptEnd::Panic,
+                    ..ScriptOpts::default()
+                },
+            )
+            .await;
+            let (status, body) = post_text(app, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK);
+            let events = sse_events(&body);
+            assert_eq!(
+                events.last().map(|e| e["object"].clone()),
+                Some(serde_json::json!("error")),
+                "{uri}: {body}"
+            );
+            assert_released(&log).await;
+        }
+    }
+
+    /// The request's slot and in-flight count are given back.
+    async fn assert_released(log: &ScriptLog) {
+        for _ in 0..200 {
+            if log.stats.requests_in_flight.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "requests_in_flight stuck at {}",
+            log.stats.requests_in_flight.load(Ordering::Relaxed)
+        );
+    }
+
+    /// One slot: after each way a stream can end early (a stop match, a
+    /// client disconnect, an engine error), the next request gets the slot
+    /// (not a 503) and the in-flight gauge is back to 0.
+    #[tokio::test]
+    async fn the_slot_is_released_after_stop_disconnect_and_error() {
+        let chat = |stop: Option<&str>| {
+            let mut v = serde_json::json!({"model": "mock-model", "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]});
+            if let Some(s) = stop {
+                v["stop"] = serde_json::json!(s);
+            }
+            v
+        };
+        for (case, end) in [
+            ("stop", ScriptEnd::Final),
+            ("disconnect", ScriptEnd::Final),
+            ("error", ScriptEnd::Error),
+        ] {
+            let (app, log, _) = script_app_opts(
+                &script(&["a STOP "]),
+                ScriptOpts {
+                    end,
+                    max_concurrent: 1,
+                    ..ScriptOpts::default()
+                },
+            )
+            .await;
+            match case {
+                "stop" => {
+                    let (_, body) =
+                        post_text(app.clone(), "/v1/chat/completions", &chat(Some("STOP"))).await;
+                    assert!(body.contains("\"stop\""), "{body}");
+                }
+                "disconnect" => {
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/v1/chat/completions")
+                                .header("content-type", "application/json")
+                                .body(Body::from(chat(None).to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let mut body = resp.into_body().into_data_stream();
+                    let _ = body.next().await;
+                    drop(body);
+                }
+                _ => {
+                    let (app, log2, _) = script_app_opts(
+                        &[],
+                        ScriptOpts {
+                            end: ScriptEnd::Error,
+                            max_concurrent: 1,
+                            ..ScriptOpts::default()
+                        },
+                    )
+                    .await;
+                    let (_, body) =
+                        post_text(app.clone(), "/v1/chat/completions", &chat(None)).await;
+                    assert!(body.contains("\"error\""), "{body}");
+                    assert_released(&log2).await;
+                    let (status, _) = post_text(app, "/v1/chat/completions", &chat(None)).await;
+                    assert_eq!(status, StatusCode::OK, "{case}: slot still held");
+                    continue;
+                }
+            }
+            assert_released(&log).await;
+            let (status, _) = post_text(app, "/v1/chat/completions", &chat(Some("STOP"))).await;
+            assert_eq!(status, StatusCode::OK, "{case}: slot still held");
+        }
     }
 }
