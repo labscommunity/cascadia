@@ -21,6 +21,7 @@ mod input;
 mod output;
 mod tools;
 use input::input_messages;
+use output::OutputBuilder;
 use tools::{check_include, check_tool_choice, ToolMap};
 
 /// OpenAI `POST /v1/responses` body. The fields after `max_tool_calls` are
@@ -202,10 +203,11 @@ fn check_metadata(metadata: Option<&Value>) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Refuse every request field this endpoint cannot honor, by name.
-fn refuse_unsupported(req: &ResponsesRequest) -> Result<(), Refusal> {
+/// Refuse every request field this endpoint cannot honor, by name. `true`
+/// when `include` asks for reasoning items' `encrypted_content`.
+fn refuse_unsupported(req: &ResponsesRequest) -> Result<bool, Refusal> {
     check_metadata(req.metadata.as_ref())?;
-    check_include(req.include.as_ref())?;
+    let encrypted = check_include(req.include.as_ref())?;
     if req.previous_response_id.is_some() {
         return Err(Refusal::new(
             "previous_response_id",
@@ -263,7 +265,7 @@ fn refuse_unsupported(req: &ResponsesRequest) -> Result<(), Refusal> {
              window is refused, not trimmed",
         ));
     }
-    Ok(())
+    Ok(encrypted)
 }
 
 /// The chat request this Responses request is served as, with `map`'s chat
@@ -379,7 +381,7 @@ impl ResponseShell {
                 "input_tokens": o.prompt_tokens,
                 "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                 "output_tokens": o.completion_tokens,
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": o.reasoning_tokens},
                 "total_tokens": o.prompt_tokens + o.completion_tokens,
             })),
             "user": null,
@@ -407,6 +409,8 @@ fn output_text(text: &str) -> Value {
 struct Outcome {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Of `completion_tokens`, those spent reasoning.
+    reasoning_tokens: u32,
     /// The engine's failure, for a `failed` response.
     error: Option<String>,
 }
@@ -468,16 +472,17 @@ pub(crate) async fn create_response(
     State(state): State<AppState>,
     OpenAiJson(req): OpenAiJson<ResponsesRequest>,
 ) -> Response {
-    let checked = refuse_unsupported(&req).and_then(|()| {
+    let checked = refuse_unsupported(&req).and_then(|encrypted| {
         let map = ToolMap::from_request(req.tools.as_ref())?;
         let choice = check_tool_choice(req.tool_choice.as_ref())?;
         Ok((
+            encrypted,
             map,
             choice,
             input_messages(&req, &|_, _| Ok(None), state.max_prompt_bytes)?,
         ))
     });
-    let (map, choice, messages) = match checked {
+    let (wants_encrypted, map, choice, messages) = match checked {
         Ok(c) => c,
         Err(refusal) => return refusal.into_response(),
     };
@@ -502,22 +507,39 @@ pub(crate) async fn create_response(
     if req.stream {
         return stream_response(state, shell, admitted).await;
     }
-    let c = match collect_generation(&state, admitted, &[], "input").await {
+    let task = &admitted.task;
+    let opened = opens_think(
+        state.engine_applies_template,
+        state.defer_template_on_thinking,
+        task.enable_thinking,
+        state.template_opens_think,
+        task,
+    );
+    let mut builder = OutputBuilder::new(
+        task.enable_thinking,
+        opened,
+        map.tools_active(choice),
+        Arc::new(map),
+        req.parallel_tool_calls.unwrap_or(true),
+        wants_encrypted,
+    );
+    let collected = collect_generation_with(&state, admitted, &[], "input", &mut |text, n| {
+        builder.feed(text, n);
+    })
+    .await;
+    let c = match collected {
         Ok(c) => c,
         Err(resp) => return resp,
     };
     let end = End::from_final(c.end);
+    builder.finish(end.item_status());
     let outcome = Outcome {
         prompt_tokens: c.prompt_tokens,
         completion_tokens: c.completion_tokens,
+        reasoning_tokens: builder.reasoning_tokens(c.completion_tokens),
         error: None,
     };
-    Json(shell.object(
-        end.status(),
-        json!([shell.message(end.item_status(), Some(&c.text))]),
-        Some(&outcome),
-    ))
-    .into_response()
+    Json(shell.object(end.status(), json!(builder.items()), Some(&outcome))).into_response()
 }
 
 /// A streamed response's state between SSE frames.
@@ -594,6 +616,7 @@ impl ResponseStream {
             let outcome = Outcome {
                 prompt_tokens: self.prompt_tokens,
                 completion_tokens: self.completion_tokens,
+                reasoning_tokens: 0,
                 error: Some(reason.clone()),
             };
             let failed = self.shell.object("failed", json!([]), Some(&outcome));
@@ -649,6 +672,7 @@ impl ResponseStream {
         let outcome = Outcome {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            reasoning_tokens: 0,
             error: None,
         };
         let response = self
@@ -1744,5 +1768,86 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{param}: {v}");
             assert_eq!(v["error"]["param"], param, "{v}");
         }
+    }
+
+    fn get_weather() -> Value {
+        json!({"type": "function", "name": "get_weather", "parameters": {"type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city", "days"]}})
+    }
+
+    /// A non-streamed turn that reasons, then calls a tool, comes back as a
+    /// reasoning item and a `function_call`, the reasoning tokens counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn non_streaming_returns_reasoning_and_a_call() {
+        let engine = RecordingEngine::script(&[
+            "<think>",
+            "plan",
+            "</think>",
+            "<tool_call>",
+            "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}",
+            "</tool_call>",
+        ]);
+        let (app, _, _) = app_with(engine, tools_config()).await;
+        let (status, v) = post_json(
+            app,
+            json!({"model": "script-model", "input": "weather?", "tools": [get_weather()]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        let kinds: Vec<_> = v["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["reasoning", "function_call"], "{v}");
+        assert_eq!(v["output"][0]["content"][0]["text"], "plan");
+        assert_eq!(v["output"][1]["name"], "get_weather");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(
+            v["usage"]["output_tokens_details"]["reasoning_tokens"], 3,
+            "{v}"
+        );
+    }
+
+    /// The client tool loop against the mock engine: a call, then the
+    /// answer to its output, sending the same tool again.
+    #[tokio::test]
+    async fn mock_tool_loop_round_trips() {
+        let app = mock_tools_app().await;
+        let (status, v) = post_json(
+            app.clone(),
+            json!({"model": "mock-model", "input": "weather __mock_tool_call__",
+                "tools": [get_weather()]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        let output = v["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{v}");
+        let call = &output[0];
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["name"], "get_weather");
+        let args: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"city": "mock", "days": 1}));
+
+        let (status, v) = post_json(
+            app,
+            json!({"model": "mock-model", "tools": [get_weather()], "input": [
+                {"role": "user", "content": "weather __mock_tool_call__"},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather",
+                    "arguments": "{\"city\":\"mock\",\"days\":1}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "sunny"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        assert_eq!(v["status"], "completed");
+        let output = v["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{v}");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "mock: got sunny");
     }
 }

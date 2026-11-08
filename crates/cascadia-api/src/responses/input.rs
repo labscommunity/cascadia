@@ -34,7 +34,6 @@ const COMPACTION: &str = "remote compaction is not supported; compact locally (C
     `[model_providers.<id>] capabilities = { remote_compaction = \"unsupported\" }`)";
 
 /// `text` as our `encrypted_content`.
-#[cfg_attr(not(test), allow(dead_code))] // written by the output builder
 pub(super) fn encode_reasoning(text: &str) -> String {
     format!("{ENCRYPTED_PREFIX}{}", STANDARD.encode(text))
 }

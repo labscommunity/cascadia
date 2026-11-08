@@ -268,14 +268,12 @@ impl ToolMap {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // read by the output builder
     pub fn get(&self, flat: &str) -> Option<&ServedTool> {
         self.by_flat.get(flat)
     }
 
     /// Whether the model's tool calls are parsed: tools are served and
     /// `tool_choice` is not `"none"`.
-    #[cfg_attr(not(test), allow(dead_code))] // read by the output builder
     pub fn tools_active(&self, tool_choice: Option<&str>) -> bool {
         !self.chat_tools.is_empty() && tool_choice != Some("none")
     }
@@ -374,7 +372,6 @@ pub(super) fn check_include(include: Option<&Value>) -> Result<bool, Refusal> {
 /// A `custom` tool call's `input` from the arguments the model wrote for
 /// its one-parameter function (D3): `{"input": s}` → `s`; any other single
 /// string field → that string; otherwise the arguments text as is.
-#[cfg_attr(not(test), allow(dead_code))] // read by the output builder
 pub(super) fn custom_input(arguments: &str) -> String {
     if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(arguments) {
         if let Some(Value::String(s)) = obj.get("input") {

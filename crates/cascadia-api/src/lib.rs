@@ -2318,7 +2318,6 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 /// generation prompt depends on the effort word is right); when `task.prompt`
 /// is a placeholder (the engine renders: sycl-llama, or ov-genai thinking-on
 /// without an API render) the load-time `probe` stands in.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn opens_think(
     engine_applies_template: bool,
     defer: bool,
@@ -4395,6 +4394,17 @@ struct Collected {
 /// until the task completes; drop frees the slot.
 async fn collect_generation(
     state: &AppState,
+    admitted: AdmittedChat,
+    stops: &[String],
+    prompt_param: &str,
+) -> Result<Collected, Response> {
+    collect_generation_with(state, admitted, stops, prompt_param, &mut |_, _| {}).await
+}
+
+/// [`collect_generation`], handing `on_chunk` each chunk's translated text
+/// (before `stops` trims the whole) and its token count, as it arrives.
+async fn collect_generation_with(
+    state: &AppState,
     AdmittedChat {
         task,
         permit,
@@ -4402,6 +4412,7 @@ async fn collect_generation(
     }: AdmittedChat,
     stops: &[String],
     prompt_param: &str,
+    on_chunk: &mut (dyn FnMut(&str, u32) + Send),
 ) -> Result<Collected, Response> {
     let _permit = permit;
     let _inflight = inflight;
@@ -4435,15 +4446,18 @@ async fn collect_generation(
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
-        match marker.as_mut() {
+        let text = match marker.as_mut() {
             Some(f) => {
-                buf.push_str(&f.feed(&chunk));
+                let mut t = f.feed(&chunk);
                 if chunk.is_final {
-                    buf.push_str(&f.finish());
+                    t.push_str(&f.finish());
                 }
+                t
             }
-            None => buf.push_str(&chunk.text),
-        }
+            None => chunk.text.clone(),
+        };
+        buf.push_str(&text);
+        on_chunk(&text, chunk_token_count(&chunk));
         chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
