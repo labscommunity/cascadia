@@ -505,6 +505,9 @@ pub(crate) async fn create_response(
         &chat,
         shell.id.clone(),
         "`input` is empty or rendered to an empty prompt",
+        AdmitOpts {
+            api_render_on_thinking: true,
+        },
     )
     .await
     {

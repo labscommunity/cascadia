@@ -3449,6 +3449,7 @@ fn render_prompt(
     enable_thinking: bool,
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
+    must_render: bool,
 ) -> Result<String, PromptRenderError> {
     // ov-genai applies the model's own template, so the engine gets raw text.
     // Tools would be dropped on the floor here, so refuse rather than pretend.
@@ -3460,7 +3461,9 @@ fn render_prompt(
         // the prompt is a fallback and must simply be non-empty
         return Ok(render_prompt_legacy(messages));
     }
-    if state.defer_template_on_thinking && enable_thinking {
+    // `must_render` (D19, D23): the API renders this thinking request itself
+    // and the engine is told not to template again (`prompt_rendered`).
+    if state.defer_template_on_thinking && enable_thinking && !must_render {
         if tools.is_some_and(|t| !t.is_empty()) {
             return Err(PromptRenderError::Failed(
                 "engine-side templating is active for thinking requests; tools cannot be forwarded"
@@ -4097,6 +4100,17 @@ fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
 
 /// A chat request past every pre-engine check: the task to submit, and the
 /// request slot and in-flight guard it holds until generation ends.
+/// Per-endpoint knobs for [`admit_chat`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AdmitOpts {
+    /// On an engine that templates thinking requests itself (ov-genai,
+    /// `defer_template_on_thinking`), render every thinking request through
+    /// the API instead (D23). That engine's own template sees only the last
+    /// user message, so `instructions`, developer messages and history would
+    /// be lost. Set by `/v1/responses`; chat keeps the engine render.
+    pub(crate) api_render_on_thinking: bool,
+}
+
 struct AdmittedChat {
     task: GenerationTask,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -4113,6 +4127,7 @@ async fn admit_chat(
     req: &ChatCompletionRequest,
     task_id: String,
     empty_hint: &str,
+    opts: AdmitOpts,
 ) -> Result<AdmittedChat, Response> {
     // First, before any scan or render: the body limit was raised for
     // images, so the text alone is held to the text limit here.
@@ -4195,6 +4210,21 @@ async fn admit_chat(
         explicit_thinking: req.enable_thinking.is_some(),
         template_words: state.effort_words,
     };
+    // ov-genai thinking-on hands its own template only the last user message
+    // (`render_prompt_legacy`), so the API renders the full prompt itself
+    // whenever that would lose something: tools (D19), a tool-call history
+    // (D19 amended), or a `/v1/responses` request (D23). Needs a template;
+    // without one, today's behaviour (tools are refused). Plain chat without
+    // tools keeps the engine render, so its output is unchanged.
+    let must_render = state.defer_template_on_thinking
+        && enable_thinking
+        && state.chat_env.is_some()
+        && (req.tools.as_ref().is_some_and(|t| !t.is_empty())
+            || req
+                .messages
+                .iter()
+                .any(|m| m.tool_calls.is_some() || m.role == "tool")
+            || opts.api_render_on_thinking);
     let rendered = match &media {
         // Image requests always render here, thinking or not, so each
         // placeholder sits inside its own message; the engine is told not to
@@ -4214,6 +4244,7 @@ async fn admit_chat(
             enable_thinking,
             effort,
             req.tools.as_deref(),
+            must_render,
         ),
     };
     let prompt = match rendered {
@@ -4313,7 +4344,7 @@ async fn admit_chat(
             None,
         ));
     }
-    let prompt_rendered = media.is_some() && state.chat_env.is_some();
+    let prompt_rendered = (media.is_some() && state.chat_env.is_some()) || must_render;
     let media = media.map(|m| m.inputs).unwrap_or_default();
     let task = GenerationTask {
         task_id,
@@ -4518,6 +4549,7 @@ async fn chat_completions(
         &req,
         task_id.clone(),
         "`messages` is empty or rendered to an empty prompt",
+        AdmitOpts::default(),
     )
     .await
     {
@@ -11166,5 +11198,240 @@ level={{ effort_map[eff] }}";
         let text = echo(v.clone());
         // The echo splits on whitespace: "[ a b ]" comes back as its words.
         assert!(text.contains("[ a b ]"), "{text:?}");
+    }
+
+    /// Records every submitted task and answers each with one token, then stop.
+    struct TaskLogEngine {
+        tasks: Arc<parking_lot::Mutex<Vec<GenerationTask>>>,
+        pending: Option<cascadia_types::TaskId>,
+    }
+
+    impl cascadia_engine::Engine for TaskLogEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some(task.task_id.clone());
+            self.tasks.lock().push(task);
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some(id) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![
+                (id.clone(), Chunk::token(&id, 0, "ok")),
+                (id.clone(), Chunk::final_marker(&id, "")),
+            ])
+        }
+    }
+
+    struct TaskLogBuilder(Arc<parking_lot::Mutex<Vec<GenerationTask>>>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for TaskLogBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(TaskLogEngine {
+                tasks: self.0,
+                pending: None,
+            }))
+        }
+    }
+
+    /// An ov-genai-style router (`defer_template_on_thinking`) whose engine
+    /// logs each task. `template: false` leaves the model without a chat
+    /// template; otherwise it prints the tools and every message.
+    async fn deferred_app(
+        template: bool,
+    ) -> (Router, Arc<parking_lot::Mutex<Vec<GenerationTask>>>) {
+        let tasks = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let runner = Runner::new(Box::new(TaskLogBuilder(tasks.clone())));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let template = template.then(|| {
+            "{% if tools %}TOOLS{{ tools | tojson }}\n{% endif %}\
+             {% for m in messages %}{{ m.role }}: {{ m.content }}\
+             {% if m.tool_calls %} CALLS{{ m.tool_calls | tojson }}{% endif %}\n{% endfor %}"
+                .to_string()
+        });
+        let cfg = Config {
+            defer_template_on_thinking: true,
+            chat_template: ChatTemplateConfig {
+                template,
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        (
+            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            tasks,
+        )
+    }
+
+    fn weather_tool() -> Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Weather for a city",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }])
+    }
+
+    /// D19: ov-genai thinking-on with tools renders through the API (was a 500).
+    #[tokio::test]
+    async fn deferred_thinking_with_tools_renders_through_the_api() {
+        let (app, tasks) = deferred_app(true).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "weather in Paris?"}],
+                "tools": weather_tool(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tasks = tasks.lock();
+        let task = tasks.last().expect("a task was submitted");
+        assert!(task.enable_thinking);
+        assert!(task.prompt_rendered);
+        assert!(task.prompt.contains("get_weather"), "{:?}", task.prompt);
+        assert!(
+            task.prompt.contains("user: weather in Paris?"),
+            "{:?}",
+            task.prompt
+        );
+    }
+
+    /// D19 amended: a tool-call history with `tools: []` renders every turn.
+    #[tokio::test]
+    async fn deferred_thinking_with_tool_history_renders_through_the_api() {
+        let (app, tasks) = deferred_app(true).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "mock-model",
+                "tools": [],
+                "messages": [
+                    {"role": "user", "content": "weather in Paris?"},
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny, 21C"},
+                    {"role": "user", "content": "and tomorrow?"}
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tasks = tasks.lock();
+        let task = tasks.last().expect("a task was submitted");
+        assert!(task.prompt_rendered);
+        assert!(task.prompt.contains("CALLS"), "{:?}", task.prompt);
+        assert!(task.prompt.contains("get_weather"), "{:?}", task.prompt);
+        assert!(
+            task.prompt.contains("tool: sunny, 21C"),
+            "{:?}",
+            task.prompt
+        );
+        assert!(
+            task.prompt.contains("user: and tomorrow?"),
+            "{:?}",
+            task.prompt
+        );
+    }
+
+    /// Scope limit: plain multi-turn chat without tools keeps the legacy
+    /// placeholder and lets ov-genai template it, exactly as before.
+    #[tokio::test]
+    async fn deferred_thinking_plain_chat_is_unchanged() {
+        let (app, tasks) = deferred_app(true).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second question"}
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tasks = tasks.lock();
+        let task = tasks.last().expect("a task was submitted");
+        assert!(task.enable_thinking);
+        assert!(!task.prompt_rendered);
+        assert_eq!(task.prompt, "second question");
+    }
+
+    /// D23: `/v1/responses` always renders through the API on ov-genai
+    /// thinking-on, so `instructions` and history reach the model.
+    #[tokio::test]
+    async fn deferred_thinking_responses_renders_through_the_api() {
+        let (app, tasks) = deferred_app(true).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/responses",
+            serde_json::json!({
+                "model": "mock-model",
+                "instructions": "be terse",
+                "input": [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second question"}
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tasks = tasks.lock();
+        let task = tasks.last().expect("a task was submitted");
+        assert!(task.enable_thinking);
+        assert!(task.prompt_rendered);
+        assert!(task.prompt.contains("be terse"), "{:?}", task.prompt);
+        assert!(task.prompt.contains("first question"), "{:?}", task.prompt);
+        assert!(task.prompt.contains("second question"), "{:?}", task.prompt);
+    }
+
+    /// Without a chat template there is nothing to render tools with: still
+    /// refused, and nothing reaches the engine.
+    #[tokio::test]
+    async fn deferred_thinking_tools_without_template_still_refused() {
+        let (app, tasks) = deferred_app(false).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "weather in Paris?"}],
+                "tools": weather_tool(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(tasks.lock().is_empty());
     }
 }
