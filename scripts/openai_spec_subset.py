@@ -29,6 +29,8 @@ ROOTS = [
     "CreateChatCompletionStreamResponse",
     "CreateCompletionResponse",
     "ListModelsResponse",
+    "Response",
+    "ResponseStreamEvent",
 ]
 REF_PREFIX = "#/components/schemas/"
 
