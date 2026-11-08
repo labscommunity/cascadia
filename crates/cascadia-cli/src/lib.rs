@@ -1581,7 +1581,9 @@ fn engine_window(
             let response = prop("MIN_RESPONSE_LEN")
                 .or(args.npu_min_response_len)
                 .unwrap_or(OVGENAI_NPU_MIN_RESPONSE_LEN);
-            Some((prompt.saturating_add(response), NPU_WINDOW_SOURCE))
+            // A computed 0 is no window: fall through (and clamp nothing).
+            let window = prompt.saturating_add(response);
+            (window > 0).then_some((window, NPU_WINDOW_SOURCE))
         }
         EngineKind::OvRuntime => info
             .static_context
@@ -5166,6 +5168,24 @@ mod generation_defaults_tests {
         g.ov_config = vec!["MAX_PROMPT_LEN=4096".into()];
         assert_eq!(resolve(&g, info).0.max_tokens, 4096);
         assert_eq!(resolve(&g, info).1.max_tokens, DefaultSource::Fallback);
+    }
+
+    #[test]
+    fn a_zero_npu_window_is_unknown() {
+        // MAX_PROMPT_LEN=0 + MIN_RESPONSE_LEN=0 is no window: fall through to
+        // config.json (or the fallback), and clamp nothing.
+        let mut w = worker(EngineKind::OvGenai, "NPU");
+        w.ov_config = vec!["MAX_PROMPT_LEN=0".into(), "MIN_RESPONSE_LEN=0".into()];
+        let info = ModelGenerationInfo {
+            context_window: Some(32768),
+            ..Default::default()
+        };
+        let (d, s) = resolve(&w, info);
+        assert_eq!((d.max_tokens, d.context_window), (32768, Some(32768)));
+        assert_eq!(s.max_tokens, DefaultSource::ConfigJson);
+        let (d, s) = resolve(&w, ModelGenerationInfo::default());
+        assert_eq!((d.max_tokens, d.context_window), (4096, None));
+        assert_eq!(s.max_tokens, DefaultSource::Fallback);
     }
 
     #[test]
