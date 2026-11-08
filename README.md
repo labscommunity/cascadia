@@ -18,7 +18,7 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 
 ## Features
 
-- **OpenAI-compatible API**: `/v1/chat/completions` and `/v1/responses` with SSE streaming; point existing clients at it unchanged
+- **OpenAI-compatible API**: `/v1/chat/completions` and `/v1/responses` (tools, reasoning items; works with Codex CLI) with SSE streaming; point existing clients at it unchanged; see [docs/RESPONSES.md](docs/RESPONSES.md)
 - **Image and video input**: `image_url` / `video_url` parts (and `input_image` / `input_video` on `/v1/responses`) for vision-language models, on one box or staged across machines; see [docs/VLM.md](docs/VLM.md)
 - **Pipeline parallelism**: shard a model into stages and run each stage on a different machine, activations relayed over TCP
 - **Built-in sharder**: `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling

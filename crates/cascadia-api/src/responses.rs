@@ -6,9 +6,14 @@
 //! here unchanged. Only the request and response shapes differ.
 //!
 //! `tools` are mapped onto chat tools (see [`tools`]); hosted tools, which run
-//! on OpenAI's side, are dropped. The fields that need state Cascadia does
-//! not keep (`previous_response_id`, `conversation`, `background`, file ids)
-//! are refused with a 400 naming the field, never ignored: a dropped
+//! on OpenAI's side, are dropped. Replayed reasoning and tool-call items
+//! become one assistant turn (see [`input`]); the output is split into
+//! reasoning, message and call items (see [`output`]). `store` (absent =
+//! `true`) keeps the output items in an in-memory cache so a later
+//! `item_reference` resolves (see [`store`]); no response is stored. The
+//! fields that need state Cascadia does not keep (`previous_response_id`,
+//! `conversation`, `background`, file ids) are refused with a 400 naming
+//! the field, never ignored: a dropped
 //! `previous_response_id` would have the model answer without the
 //! conversation the caller thinks it sent. Fields Codex and the SDKs send
 //! that change nothing here (`client_metadata`, `prompt_cache_key`,

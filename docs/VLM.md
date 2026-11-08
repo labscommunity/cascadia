@@ -65,14 +65,11 @@ the chat path, so every limit and error above applies unchanged:
 `max_output_tokens`, `temperature`, `top_p` and `reasoning.effort` map onto their chat
 counterparts, and `stream: true` sends OpenAI's event sequence (`response.created` through
 `response.completed`, or `response.incomplete` at the token cap and for a cancelled
-turn, whose status is `cancelled`). Cascadia keeps no state
-and serves no tools here: `store: true`, `previous_response_id`, `conversation`,
-`background`, `tools`, `include`, `prompt`, `stop`, structured `text.format`,
-`reasoning.summary`, `truncation: "auto"`, `file_id` images, `input_file` and
-`input_audio` parts and non-message input items are refused with a `400` whose `param`
-names the field. `metadata` is echoed back, held to OpenAI's limits (an object of at most
-16 string pairs, keys up to 64 characters, values up to 512); anything else is a `400`
-with `param: "metadata"`.
+turn, whose status is `cancelled`). Tools, reasoning items, `store` and every other
+field are covered in [RESPONSES.md](RESPONSES.md). Image-specific refusals: `file_id` images
+and `input_file` / `input_audio` parts are refused with a `400` whose `param` names the
+part, and an image inside a tool output (`function_call_output`) is replaced by a text
+note.
 
 ## Video
 

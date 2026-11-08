@@ -1,0 +1,219 @@
+# The Responses API (`POST /v1/responses`)
+
+Cascadia serves OpenAI's Responses API by mapping each request onto the chat path: the
+request becomes a `/v1/chat/completions` request and is admitted by the same code, so the
+chat template, sampling, image input, limits and every chat refusal apply unchanged
+(images: see [VLM.md](VLM.md#the-responses-api)). Only the request and response shapes
+differ. It serves function and custom tools, returns reasoning as reasoning items, and keeps
+recent output items in memory so `item_reference` works. It is enough for the Codex CLI,
+the OpenAI Agents SDK, `@ai-sdk/openai` and n8n's OpenAI Chat Model (Responses on).
+
+Cascadia stores no responses: send the whole conversation in `input` every turn.
+
+## Request fields
+
+| Field | Behaviour |
+|---|---|
+| `model`, `input`, `instructions` | `input` is a string (one user message) or an array of items (see [Input items](#input-items)). `instructions` becomes a leading `system` message. |
+| `max_output_tokens` | The chat path's `max_tokens`. Unset, it follows the server's default for an unset cap: 256 tokens, the chat endpoint's default. The response echoes the cap in force. |
+| `temperature`, `top_p` | As on chat (`temperature` unset = `0.0`). |
+| `reasoning.effort` | The chat endpoint's `reasoning_effort`. |
+| `reasoning.summary` | Accepted; no summary is generated. Echoed as `null`. |
+| `stream` | `true` sends OpenAI's event sequence (see [Streaming](#streaming)). |
+| `tools` | `function`, `custom` and `namespace` tools are served; hosted tools are dropped (see [Tools](#tools)). `[]` or absent = no tools. |
+| `tool_choice` | `"auto"` and `"none"` (`"none"`: calls are not parsed). `"required"`, a named `function` / `custom` tool and `allowed_tools` are refused with `400` ("not enforced yet"); a hosted tool type is refused with `400`. |
+| `parallel_tool_calls` | `false` keeps only the first call the model makes. Echoed (absent = `true`). |
+| `max_tool_calls` | Accepted and echoed; no effect (it caps hosted tool calls, and none run here). |
+| `store` | `true` or absent (OpenAI's default is `true`): the response's output items are kept in the [item cache](#the-item-cache). `false`: nothing is kept. Echoed (`true` when absent). |
+| `include` | Each value must be one of OpenAI's `include` values, else `400`. `reasoning.encrypted_content` adds `encrypted_content` to reasoning items; the others add nothing here. |
+| `metadata` | Echoed, held to OpenAI's limits (an object of at most 16 string pairs, keys up to 64 characters, values up to 512); anything else is a `400`. |
+| `text` | Only `{"format": {"type": "text"}}`; other `text` fields such as `verbosity` are ignored. |
+| `truncation` | Only `"disabled"`: a prompt over the window is a `400` `context_length_exceeded`, never trimmed. |
+| `background` | Only `false`. |
+| `top_logprobs` | Only `0`. |
+
+**Ignored**: `client_metadata`, `prompt_cache_key`, `prompt_cache_options`,
+`prompt_cache_retention`, `safety_identifier`, `user`, `service_tier`, `text.verbosity`,
+`stream_options`, `access_programs`, `context_management`, `moderation`, and any other
+field the server does not know (as on the chat endpoint).
+
+**Refused** with a `400` whose `param` names the field: `previous_response_id`,
+`conversation`, `background: true`, `prompt`, `top_logprobs` above 0, `stop`, a
+`text.format` other than `text`, `truncation` other than `disabled`, `file_id` images and
+videos, `input_file` and `input_audio` message parts.
+
+## Input items
+
+`input` is read in order. A model's turn in the Responses API is several items (reasoning,
+a message, tool calls); they are gathered back into one assistant chat turn.
+
+| Item | Becomes |
+|---|---|
+| `message`, role `user` / `system` | That chat message. `developer` is served as `system`. A `system` right after a `system`, or a `user` right after a `user`, is merged into it, the texts joined by a blank line (so `developer, developer, user, user` reaches the template as `system, user`). |
+| `message`, role `assistant` | The assistant turn's content. |
+| `reasoning` | Replayed as `<think>{text}</think>` at the front of the assistant turn's content. The text is the item's `content[].text`, else Cascadia's own `encrypted_content` decoded. A reasoning item with neither (another provider's blob, a summary-only item) is skipped. |
+| `function_call`, `custom_tool_call` | A tool call on the assistant turn (`call_id` is the call's id; a `namespace` is flattened as the tool was served; a custom call's `input` becomes `{"input": ...}` arguments). |
+| `function_call_output`, `custom_tool_call_output` | A `tool` message. `output` is a string or text parts, joined. An image or file part is replaced by `[image omitted: tool output images are not supported]` / `[file omitted: tool output files are not supported]` and logged, so a Codex `view_image` result does not fail the request (and every later one that resends it). |
+| `item_reference` | Replaced by the cached item with that `id` (see [The item cache](#the-item-cache)), then read as above. An item with an `id` and no `type`, `role` or `content` is an `item_reference`. |
+| `compaction`, `compaction_summary`, `compaction_trigger` | `400`: remote compaction is not supported; compact locally. |
+
+Any other item type is a `400` naming `input[i]`, as is a call or call output without a
+`call_id`.
+
+## Tools
+
+- **`function`**: served as a chat tool, unchanged.
+- **`namespace`**: its nested `function` and `custom` tools are served flattened as
+  `<namespace>__<name>` (the shape Codex names its MCP tools in). A call to one comes back
+  with its own `name` and the `namespace` field. A namespace may hold only `function` and
+  `custom` tools.
+- **`custom`** (freeform): served as a function taking one string parameter `input`. A
+  `grammar` format is written into the tool's description for the model; it is not enforced
+  (there is no constrained decoding on this path). The call comes back as a
+  `custom_tool_call` with that `input`.
+- **Hosted tools** (`web_search*`, `file_search`, `code_interpreter`, `computer_use*`,
+  `image_generation`, `mcp`, `local_shell`, `shell`, `apply_patch`, `tool_search`, ...) run
+  on OpenAI's side, so none runs here. They are dropped with one warning in the server log
+  and left out of the echoed `tools`; the rest of the request is served.
+
+An unknown tool type, a tool without a `name`, or two tools served under the same name are
+refused with a `400`. Tool calls are parsed out of the model's output as the chat endpoint
+parses them (the model's chat template must render tools: with no template, a tools request
+is a `400`; `sycl-llama` templates them itself). A malformed call stays message text. A call to a name not in `tools` comes back as
+a plain `function_call` under that name.
+
+## Output
+
+`output` holds, in order: a reasoning item (if the model reasoned), a message (if there is
+answer text), then one item per tool call. Ids are `rs_`, `msg_`, `fc_` and `ctc_` plus a
+random UUID; a call's `call_id` is the parser's `call_...`. `status` is `completed`;
+`incomplete` (with `incomplete_details.reason: "max_output_tokens"`) at the token cap; or
+`cancelled` after `/v1/cancel/<response id>` (the response id is the task id).
+
+### Reasoning items
+
+With thinking on, text the model writes inside `<think>...</think>` becomes a `reasoning`
+item (`content: [{"type": "reasoning_text", ...}]`, `summary: []`) instead of message text,
+and its share of the output tokens is reported in
+`usage.output_tokens_details.reasoning_tokens`. A reply that never opens `<think>` is
+returned unchanged as message text.
+
+Cascadia tells whether the model starts inside `<think>` (Qwen3-2507-style templates open it
+in the generation prompt) from the rendered prompt. Where the engine renders the prompt
+itself, a probe of the chat template at load decides. Limits:
+
+- `sycl-llama`: no reasoning item; llama-server moves reasoning out of the text it returns,
+  and the engine does not forward it.
+- A model whose prompt opens `<think>` but that has no chat template in its tokenizer
+  config: the probe cannot run, so its reasoning stays in the message text.
+
+With `include: ["reasoning.encrypted_content"]`, each finished reasoning item carries
+`encrypted_content`. It is **not encrypted**: it is the reasoning text in base64 behind a
+`cascadia.v1.` prefix, an opaque blob for clients (like Codex) that replay reasoning from
+it. Cascadia decodes its own blobs when they come back in `input`; anyone holding the blob
+can read it.
+
+### Streaming
+
+```
+response.created, response.in_progress
+reasoning:  output_item.added, content_part.added, reasoning_text.delta*, reasoning_text.done,
+            content_part.done, output_item.done
+message:    output_item.added, content_part.added, output_text.delta*, output_text.done,
+            content_part.done, output_item.done
+each call:  output_item.added, function_call_arguments.delta, function_call_arguments.done,
+            output_item.done (custom: custom_tool_call_input.delta / .done)
+response.completed | response.incomplete | response.failed
+```
+
+Each event has an `event:` line and a `data:` payload with its `type` and a
+`sequence_number` counting from 0; there is no `[DONE]`. A call's arguments arrive in one
+delta, once the call is parsed. The last event carries the full response with every item. A
+cancelled response ends on `response.incomplete` with `status: "cancelled"`. An engine
+failure after the stream started ends on `response.failed`, with the items sent so far. The
+`error` stream event is never sent: a failure before the stream starts is an HTTP error.
+
+## The item cache
+
+`@ai-sdk/openai` (which sends `store: true` by default) replays the previous step's items
+as `item_reference`s, by id. So the output items of every response whose `store` is not
+`false` are kept in process memory, written before the response body or its last event, so
+the client's next request finds them. The cache holds at most 16384 items and 32 MiB,
+evicting the oldest first; failed responses and streams the client dropped are not kept.
+Items are found only by their random id; there is no per-caller scoping.
+
+The cache is lost on restart and items are evicted under load, so an `item_reference` can
+miss. A miss is a `400` naming `input[i]`: `Item with id '<id>' not found (this server keeps
+stored items in memory only; it may have restarted or evicted it; send the item itself, or
+use store: false)`. For long AI SDK chats, turn it off so the SDK sends the items
+themselves:
+
+```js
+await generateText({ model: openai.responses("qwen3-8b"), prompt,
+  providerOptions: { openai: { store: false } } });
+```
+
+References expanded in one request count against the prompt byte cap (`--api-max-body-mb`);
+past it the request is a `413` `prompt_too_large`.
+
+## ov-genai with thinking on
+
+`ov-genai` normally applies its own chat template when thinking is on, and that template
+sees only the last user message. On `/v1/responses`, when the model has a chat template, the
+API renders the full prompt itself instead (instructions, developer messages, history, tools),
+and ov-genai uses it as is. On `/v1/chat/completions` the same happens when the request has
+tools or a tool-call history (it used to be refused with a `500`); plain multi-turn chat
+without tools keeps the engine's own template.
+
+## Codex CLI
+
+Point Codex at Cascadia with a custom provider in `~/.codex/config.toml`:
+
+```toml
+model = "qwen3-8b"
+model_provider = "cascadia"
+model_context_window = 32768
+model_auto_compact_token_limit = 24000
+[model_providers.cascadia]
+name = "cascadia"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+```
+
+Set `model` to the served model's id, `model_context_window` to its context window and
+`model_auto_compact_token_limit` below it.
+
+- Codex never sends `max_output_tokens`, so each turn is capped at the server's unset
+  default, 256 tokens. A long Codex turn (a big reasoning block, a long patch) can end
+  `incomplete` at that cap.
+- Codex's `web_search` tool is hosted: it is dropped (logged once per request) and the rest
+  is served. Its MCP tools arrive as namespaces and are served as `<namespace>__<name>`.
+- Codex compacts the conversation locally with a custom provider; remote compaction items
+  are refused.
+- A tool output with a screenshot (`view_image`) is replaced by a note in the prompt. On a
+  server without image input the request body still carries the image, so raise
+  `--api-max-body-mb` above its size, or every request that resends it is a `413`.
+
+## Known limitations
+
+- Chat templates that require strict user/assistant alternation (the Gemma family) may
+  refuse Codex's `developer` messages in the middle of a history: they become `system` turns
+  after an assistant or tool turn, which such a template rejects. Qwen templates take them.
+- `tool_choice` cannot force a call yet, and structured output (`text.format`) is not
+  served.
+- `reasoning.summary` produces no summary; reasoning is returned whole.
+
+## Testing
+
+To try the API without a model, run the mock engine with a fixture whose chat template
+renders tools:
+
+```bash
+cascadia run tests/fixtures/mock-tools-model --engine mock
+```
+
+The model id is `mock-tools-model`. It echoes by default; as a test aid, a user turn that
+contains `__mock_tool_call__` on a request with tools gets one scripted call of the first
+tool, and the turn after its `function_call_output` gets the fixed answer
+`mock: got <output>`, so a client's tool loop runs end to end. It is not a feature of real
+models.
