@@ -66,6 +66,12 @@ fn record_stream_tokens(
     let mut after = before;
     chunk.accumulate_tokens(&mut after);
     completion.store(after, Ordering::Relaxed);
+    move_tokens_total(stats, before, after);
+}
+
+/// Move the global token counter by a request's change from `before` to
+/// `after` completion tokens (down, when an authoritative total is lower).
+fn move_tokens_total(stats: &ApiStats, before: u32, after: u32) {
     if after >= before {
         stats
             .tokens_total

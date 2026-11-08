@@ -736,11 +736,13 @@ impl ResponseStream {
             self.done = true;
             return out;
         }
+        // Count every chunk, but take the final chunk's authoritative total
+        // when it has one (as `collect_generation_with` and the chat stream
+        // do); the global counter moves by the difference, down included.
         let n = chunk_token_count(&chunk);
-        self.stats
-            .tokens_total
-            .fetch_add(n as u64, Ordering::Relaxed);
-        self.completion_tokens += n;
+        let before = self.completion_tokens;
+        chunk.accumulate_tokens(&mut self.completion_tokens);
+        move_tokens_total(&self.stats, before, self.completion_tokens);
         let text = match self.marker.as_mut() {
             Some(f) => {
                 let mut t = f.feed(&chunk);
@@ -1368,6 +1370,11 @@ mod tests {
         /// The submitted task's `max_tokens`: a [`Text::Script`] stops there
         /// with `Length`, as an engine at the cap does.
         max_tokens: usize,
+        /// `n_tokens` on every token chunk (`None`: one each).
+        chunk_tokens: Option<u32>,
+        /// `completion_tokens` on a [`Text::Script`]'s `Stop` final chunk,
+        /// the engine's authoritative total (as llama.cpp reports it).
+        final_tokens: Option<u32>,
     }
 
     impl RecordingEngine {
@@ -1381,6 +1388,8 @@ mod tests {
                 emitted: Arc::default(),
                 task: None,
                 max_tokens: usize::MAX,
+                chunk_tokens: None,
+                final_tokens: None,
             }
         }
 
@@ -1434,13 +1443,19 @@ mod tests {
                     None if self.never_end => return Ok(Vec::new()),
                     None => {
                         self.task = None;
-                        let end =
+                        let mut end =
                             Chunk::final_marker(&id, "").with_finish_reason(FinishReason::Stop);
+                        if let Some(n) = self.final_tokens {
+                            end = end.with_completion_tokens(n);
+                        }
                         return Ok(vec![(id, end)]);
                     }
                 },
             };
-            let chunk = Chunk::token(&id, n as i64, text);
+            let mut chunk = Chunk::token(&id, n as i64, text);
+            if let Some(k) = self.chunk_tokens {
+                chunk = chunk.with_n_tokens(k);
+            }
             self.emitted.fetch_add(1, SeqCst);
             Ok(vec![(id, chunk)])
         }
@@ -1584,6 +1599,37 @@ mod tests {
         assert_eq!(v["status"], "completed", "{v}");
         assert_eq!(v["output"][0]["content"][0]["text"], "alpha");
         assert_eq!(tasks.lock().len(), 1);
+    }
+
+    /// `body` against `engine` (built afresh per call), streamed (the
+    /// terminal response) and not.
+    async fn usage_both_ways(engine: impl Fn() -> RecordingEngine, body: Value) -> (Value, Value) {
+        let mut streamed = body.clone();
+        streamed["stream"] = json!(true);
+        let (app, _, _) = app_with(engine(), Config::default()).await;
+        let (status, text) = post(app, streamed).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let done = events(&text).last().unwrap().1["response"].clone();
+        let (app, _, _) = app_with(engine(), Config::default()).await;
+        let (status, v) = post_json(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        (done, v)
+    }
+
+    /// An engine whose token chunks carry no count and whose final chunk
+    /// carries the authoritative total (llama.cpp's shape): both ways report
+    /// that total as `output_tokens`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn usage_takes_the_final_chunks_total() {
+        let engine = || RecordingEngine {
+            chunk_tokens: Some(0),
+            final_tokens: Some(7),
+            ..RecordingEngine::script(&["hel", "lo"])
+        };
+        let (done, v) =
+            usage_both_ways(engine, json!({"model": "script-model", "input": "hi"})).await;
+        assert_eq!(done["usage"]["output_tokens"], 7, "{done}");
+        assert_eq!(v["usage"]["output_tokens"], 7, "{v}");
     }
 
     fn assert_cancelled(response: &Value) {
