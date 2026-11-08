@@ -198,6 +198,13 @@ pub(super) fn input_messages(
             "compaction_trigger" | "compaction" | "compaction_summary" => {
                 return Err(Refusal::new(&at, COMPACTION))
             }
+            // Only a resolved item gets here; the walk expands one level.
+            "item_reference" => {
+                return Err(Refusal::new(
+                    &at,
+                    "a stored item cannot itself be an item_reference",
+                ))
+            }
             _ => {
                 return Err(Refusal::new(
                     &at,
@@ -231,9 +238,12 @@ fn item_kind(item: &Value) -> &str {
 }
 
 /// `next` merged into `into`, a message of the same role (D22): the texts
-/// joined by a blank line, and when either side has `parts`, the parts
-/// joined by a `\n\n` text part (a string-form side becoming one text
-/// part), as the image and part-trimming paths rebuild `content` from them.
+/// joined by a blank line. When either side has `parts` (a string-form side
+/// becoming one text part), the image and part-trimming paths rebuild
+/// `content` from them, so the blank line is never a part of its own (a
+/// server that trims each part would erase it): two texts at the boundary
+/// become one part `a\n\nb`; one text there takes it on its inner side; an
+/// image on each side drops it, as the images already separate the texts.
 fn merge(into: &mut ChatMessage, next: ChatMessage) {
     const SEP: &str = "\n\n";
     if !into.parts.is_empty() || !next.parts.is_empty() {
@@ -245,8 +255,20 @@ fn merge(into: &mut ChatMessage, next: ChatMessage) {
             }
         };
         let mut parts = as_parts(&into.content, std::mem::take(&mut into.parts));
-        parts.push(ContentPart::Text(SEP.into()));
-        parts.extend(as_parts(&next.content, next.parts));
+        let mut rest = as_parts(&next.content, next.parts).into_iter().peekable();
+        match (parts.last_mut(), rest.peek_mut()) {
+            (Some(ContentPart::Text(a)), Some(ContentPart::Text(_))) => {
+                let Some(ContentPart::Text(b)) = rest.next() else {
+                    unreachable!("peeked a text part")
+                };
+                a.push_str(SEP);
+                a.push_str(&b);
+            }
+            (Some(ContentPart::Text(a)), _) => a.push_str(SEP),
+            (_, Some(ContentPart::Text(b))) => b.insert_str(0, SEP),
+            _ => {}
+        }
+        parts.extend(rest);
         into.parts = parts;
     }
     into.content.push_str(SEP);
@@ -881,15 +903,14 @@ mod tests {
         .unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].content, "a\n\nb");
-        assert_eq!(
-            m[0].parts,
-            [
-                ContentPart::Text("a".into()),
-                ContentPart::Text("\n\n".into()),
-                ContentPart::Text("b".into())
-            ]
-        );
+        // Two texts at the boundary become one part, so a server that
+        // trims each part cannot erase the blank line between them.
+        assert_eq!(m[0].parts, [ContentPart::Text("a\n\nb".into())]);
 
+        let image = ContentPart::ImageUrl {
+            url: "data:x".into(),
+            detail: Some("low".into()),
+        };
         let m = walk(json!([
             {"role": "user", "content": "c"},
             {"role": "user", "content": [
@@ -899,15 +920,25 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(
             m[0].parts,
-            [
-                ContentPart::Text("c".into()),
-                ContentPart::Text("\n\n".into()),
-                ContentPart::ImageUrl {
-                    url: "data:x".into(),
-                    detail: Some("low".into())
-                }
-            ]
+            [ContentPart::Text("c\n\n".into()), image.clone()]
         );
+
+        let m = walk(json!([
+            {"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:x", "detail": "low"}]},
+            {"role": "user", "content": "b"},
+        ]))
+        .unwrap();
+        assert_eq!(
+            m[0].parts,
+            [image.clone(), ContentPart::Text("\n\nb".into())]
+        );
+
+        // An image on each side already separates them.
+        let img = json!({"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:x", "detail": "low"}]});
+        let m = walk(json!([img, img])).unwrap();
+        assert_eq!(m[0].parts, [image.clone(), image]);
 
         // A turn between them keeps them apart.
         let m = walk(json!([
@@ -917,6 +948,50 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(m.len(), 3);
+    }
+
+    /// A merged message rebuilt as `trim_text_parts` servers rebuild it
+    /// (each text part trimmed, then joined back to back) keeps the blank
+    /// line between the two texts.
+    #[test]
+    fn merge_survives_trimmed_parts() {
+        let m = walk(json!([
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": [{"type": "input_text", "text": "world"}]},
+        ]))
+        .unwrap();
+        let rebuilt: String = m[0]
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.trim()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rebuilt, "hello\n\nworld");
+    }
+
+    /// A stored item that is itself a reference is refused, not expanded.
+    #[test]
+    fn stored_reference_is_refused() {
+        for stored in [
+            json!({"type": "item_reference", "id": "y"}),
+            json!({"id": "y"}),
+        ] {
+            let resolve = |_: &str, _: usize| Ok(Some((stored.clone(), 10)));
+            let err = walk_with(
+                json!([{"type": "item_reference", "id": "x"}]),
+                &resolve,
+                100,
+            )
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert_eq!(err.param, "input[0]");
+            assert_eq!(
+                err.message,
+                "a stored item cannot itself be an item_reference"
+            );
+        }
     }
 
     /// (o) The walk passes the remaining budget to `resolve`, charging each

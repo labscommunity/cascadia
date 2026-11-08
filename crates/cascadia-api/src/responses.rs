@@ -1576,9 +1576,9 @@ mod tests {
         let (app, tasks, _) = app_with(RecordingEngine::script(&["done"]), tools_config()).await;
         let (status, text) = post(app, body).await;
         assert_eq!(status, StatusCode::OK, "{text}");
-        events(&text)
-            .iter()
-            .for_each(|(_, data)| assert_event(data));
+        let ev = events(&text);
+        assert!(!ev.is_empty(), "{text}");
+        ev.iter().for_each(|(_, data)| assert_event(data));
         let prompt = tasks.lock()[0].prompt.clone();
         assert!(prompt.contains("<think>I should list.</think>"), "{prompt}");
         // The system prompt names `<tool_call>` too: some block must hold
