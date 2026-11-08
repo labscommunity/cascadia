@@ -2359,6 +2359,39 @@ fn render_or_fallback(
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
     let has_tools = tools.is_some_and(|t| !t.is_empty());
+    match render_template(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        effort,
+        tools,
+    ) {
+        Err(e @ PromptRenderError::Failed(_)) if !has_tools => {
+            tracing::error!(
+                error = %e,
+                "chat_template render failed; falling back to legacy formatter — prompt will lack role markers"
+            );
+            Ok(render_prompt_legacy(messages))
+        }
+        r => r,
+    }
+}
+
+/// [`render_or_fallback`] without the fallback: a template that fails to
+/// render is `Failed`, tools or not. (No template is still the legacy render,
+/// or a rejection when tools were sent.)
+fn render_template(
+    env: Option<&minijinja::Environment<'static>>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: bool,
+    effort: EffortArgs<'_>,
+    tools: Option<&[Tool]>,
+) -> Result<String, PromptRenderError> {
+    let has_tools = tools.is_some_and(|t| !t.is_empty());
     let Some(env) = env else {
         if has_tools {
             // vLLM likewise refuses tool use without a chat template rather
@@ -2477,20 +2510,10 @@ fn render_or_fallback(
             }
         }
     }
-    match first {
-        Ok(s) => Ok(s),
-        // A raise_exception is the template validating its own input; other
-        // engines surface it rather than papering over it.
-        Err(e @ PromptRenderError::Rejected(_)) => Err(e),
-        Err(e @ PromptRenderError::Failed(_)) if has_tools => Err(e),
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "chat_template render failed; falling back to legacy formatter — prompt will lack role markers"
-            );
-            Ok(render_prompt_legacy(messages))
-        }
-    }
+    // A raise_exception (`Rejected`) is the template validating its own
+    // input; other engines surface it rather than papering over it. A
+    // `Failed` is the caller's to handle (`render_or_fallback` falls back).
+    first
 }
 
 /// A chat request's images, decoded, and its messages with each image part
@@ -3450,7 +3473,7 @@ fn render_prompt(
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
     must_render: bool,
-) -> Result<String, PromptRenderError> {
+) -> Result<(String, bool), PromptRenderError> {
     // ov-genai applies the model's own template, so the engine gets raw text.
     // Tools would be dropped on the floor here, so refuse rather than pretend.
     // `reasoning_effort` (the caller's parameter above) is also dropped on
@@ -3459,18 +3482,43 @@ fn render_prompt(
     if state.engine_applies_template {
         // the child renders the GGUF chat template on the forwarded turns;
         // the prompt is a fallback and must simply be non-empty
-        return Ok(render_prompt_legacy(messages));
+        return Ok((render_prompt_legacy(messages), false));
     }
-    // `must_render` (D19, D23): the API renders this thinking request itself
-    // and the engine is told not to template again (`prompt_rendered`).
-    if state.defer_template_on_thinking && enable_thinking && !must_render {
+    let effort = EffortArgs {
+        template_words: state.effort_words,
+        ..effort
+    };
+    if state.defer_template_on_thinking && enable_thinking {
+        // `must_render` (D19, D23): the API renders this thinking request
+        // itself, and the `true` tells the engine not to template again
+        // (`prompt_rendered`). Only a render that succeeded counts: on a
+        // template failure the request takes the engine path below, as
+        // before, rather than reaching the engine as bare text marked rendered.
+        if must_render {
+            match render_template(
+                state.chat_env.as_deref(),
+                messages,
+                &state.bos_token,
+                &state.eos_token,
+                enable_thinking,
+                effort,
+                tools,
+            ) {
+                Ok(p) => return Ok((p, true)),
+                Err(e @ PromptRenderError::Rejected(_)) => return Err(e),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "chat_template render failed; leaving the thinking request to the engine's template"
+                ),
+            }
+        }
         if tools.is_some_and(|t| !t.is_empty()) {
             return Err(PromptRenderError::Failed(
                 "engine-side templating is active for thinking requests; tools cannot be forwarded"
                     .into(),
             ));
         }
-        return Ok(render_prompt_legacy(messages));
+        return Ok((render_prompt_legacy(messages), false));
     }
     render_or_fallback(
         state.chat_env.as_deref(),
@@ -3478,12 +3526,10 @@ fn render_prompt(
         &state.bos_token,
         &state.eos_token,
         enable_thinking,
-        EffortArgs {
-            template_words: state.effort_words,
-            ..effort
-        },
+        effort,
         tools,
     )
+    .map(|p| (p, false))
 }
 
 /// Decide the response message + finish_reason from accumulated text.
@@ -4098,8 +4144,6 @@ fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
         .and_then(|ts| serde_json::to_value(ts).ok())
 }
 
-/// A chat request past every pre-engine check: the task to submit, and the
-/// request slot and in-flight guard it holds until generation ends.
 /// Per-endpoint knobs for [`admit_chat`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AdmitOpts {
@@ -4111,6 +4155,8 @@ pub(crate) struct AdmitOpts {
     pub(crate) api_render_on_thinking: bool,
 }
 
+/// A chat request past every pre-engine check: the task to submit, and the
+/// request slot and in-flight guard it holds until generation ends.
 struct AdmittedChat {
     task: GenerationTask,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -4223,8 +4269,10 @@ async fn admit_chat(
             || req
                 .messages
                 .iter()
-                .any(|m| m.tool_calls.is_some() || m.role == "tool")
+                .any(|m| m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) || m.role == "tool")
             || opts.api_render_on_thinking);
+    // Set when the API rendered a thinking request for the deferring engine.
+    let mut api_rendered = false;
     let rendered = match &media {
         // Image requests always render here, thinking or not, so each
         // placeholder sits inside its own message; the engine is told not to
@@ -4245,7 +4293,11 @@ async fn admit_chat(
             effort,
             req.tools.as_deref(),
             must_render,
-        ),
+        )
+        .map(|(p, rendered)| {
+            api_rendered = rendered;
+            p
+        }),
     };
     let prompt = match rendered {
         Ok(p) => p,
@@ -4344,7 +4396,7 @@ async fn admit_chat(
             None,
         ));
     }
-    let prompt_rendered = (media.is_some() && state.chat_env.is_some()) || must_render;
+    let prompt_rendered = (media.is_some() && state.chat_env.is_some()) || api_rendered;
     let media = media.map(|m| m.inputs).unwrap_or_default();
     let task = GenerationTask {
         task_id,
@@ -11247,11 +11299,24 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// Prints the tools and every message (with its tool calls).
+    const PRINT_ALL: &str = "{% if tools %}TOOLS{{ tools | tojson }}\n{% endif %}\
+         {% for m in messages %}{{ m.role }}: {{ m.content }}\
+         {% if m.tool_calls %} CALLS{{ m.tool_calls | tojson }}{% endif %}\n{% endfor %}";
+
+    /// Like [`PRINT_ALL`], but the render fails at runtime (an undefined
+    /// function) on a message of role `role`.
+    fn failing_on(role: &str) -> String {
+        format!(
+            "{{% for m in messages %}}{{% if m.role == '{role}' %}}{{{{ no_such_fn() }}}}{{% endif %}}\
+             {{{{ m.role }}}}: {{{{ m.content }}}}\n{{% endfor %}}"
+        )
+    }
+
     /// An ov-genai-style router (`defer_template_on_thinking`) whose engine
-    /// logs each task. `template: false` leaves the model without a chat
-    /// template; otherwise it prints the tools and every message.
+    /// logs each task, with `template` as the model's chat template.
     async fn deferred_app(
-        template: bool,
+        template: Option<&str>,
     ) -> (Router, Arc<parking_lot::Mutex<Vec<GenerationTask>>>) {
         let tasks = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let runner = Runner::new(Box::new(TaskLogBuilder(tasks.clone())));
@@ -11262,12 +11327,7 @@ level={{ effort_map[eff] }}";
             )
             .await
             .unwrap();
-        let template = template.then(|| {
-            "{% if tools %}TOOLS{{ tools | tojson }}\n{% endif %}\
-             {% for m in messages %}{{ m.role }}: {{ m.content }}\
-             {% if m.tool_calls %} CALLS{{ m.tool_calls | tojson }}{% endif %}\n{% endfor %}"
-                .to_string()
-        });
+        let template = template.map(str::to_string);
         let cfg = Config {
             defer_template_on_thinking: true,
             chat_template: ChatTemplateConfig {
@@ -11297,7 +11357,7 @@ level={{ effort_map[eff] }}";
     /// D19: ov-genai thinking-on with tools renders through the API (was a 500).
     #[tokio::test]
     async fn deferred_thinking_with_tools_renders_through_the_api() {
-        let (app, tasks) = deferred_app(true).await;
+        let (app, tasks) = deferred_app(Some(PRINT_ALL)).await;
         let (status, body) = post_to(
             app,
             "/v1/chat/completions",
@@ -11324,7 +11384,7 @@ level={{ effort_map[eff] }}";
     /// D19 amended: a tool-call history with `tools: []` renders every turn.
     #[tokio::test]
     async fn deferred_thinking_with_tool_history_renders_through_the_api() {
-        let (app, tasks) = deferred_app(true).await;
+        let (app, tasks) = deferred_app(Some(PRINT_ALL)).await;
         let (status, body) = post_to(
             app,
             "/v1/chat/completions",
@@ -11365,7 +11425,7 @@ level={{ effort_map[eff] }}";
     /// placeholder and lets ov-genai template it, exactly as before.
     #[tokio::test]
     async fn deferred_thinking_plain_chat_is_unchanged() {
-        let (app, tasks) = deferred_app(true).await;
+        let (app, tasks) = deferred_app(Some(PRINT_ALL)).await;
         let (status, body) = post_to(
             app,
             "/v1/chat/completions",
@@ -11373,7 +11433,8 @@ level={{ effort_map[eff] }}";
                 "model": "mock-model",
                 "messages": [
                     {"role": "user", "content": "first question"},
-                    {"role": "assistant", "content": "first answer"},
+                    // Clients echo an empty array: that is no tool history.
+                    {"role": "assistant", "content": "first answer", "tool_calls": []},
                     {"role": "user", "content": "second question"}
                 ],
             }),
@@ -11391,7 +11452,7 @@ level={{ effort_map[eff] }}";
     /// thinking-on, so `instructions` and history reach the model.
     #[tokio::test]
     async fn deferred_thinking_responses_renders_through_the_api() {
-        let (app, tasks) = deferred_app(true).await;
+        let (app, tasks) = deferred_app(Some(PRINT_ALL)).await;
         let (status, body) = post_to(
             app,
             "/v1/responses",
@@ -11420,7 +11481,75 @@ level={{ effort_map[eff] }}";
     /// refused, and nothing reaches the engine.
     #[tokio::test]
     async fn deferred_thinking_tools_without_template_still_refused() {
-        let (app, tasks) = deferred_app(false).await;
+        let (app, tasks) = deferred_app(None).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "weather in Paris?"}],
+                "tools": weather_tool(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(tasks.lock().is_empty());
+    }
+
+    /// A must-render request whose template fails at runtime keeps today's
+    /// path: the legacy last-user-message prompt, templated by the engine
+    /// (`prompt_rendered` false), never bare text marked as rendered.
+    #[tokio::test]
+    async fn deferred_thinking_failed_render_keeps_the_engine_template() {
+        let (app, tasks) = deferred_app(Some(&failing_on("tool"))).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [
+                    {"role": "user", "content": "weather in Paris?"},
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny, 21C"},
+                    {"role": "user", "content": "and tomorrow?"}
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        {
+            let tasks = tasks.lock();
+            let task = tasks.last().expect("a task was submitted");
+            assert!(!task.prompt_rendered);
+            assert_eq!(task.prompt, "and tomorrow?");
+        }
+
+        // `/v1/responses` (D23): `instructions` arrive as a system message.
+        let (app, tasks) = deferred_app(Some(&failing_on("system"))).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/responses",
+            serde_json::json!({
+                "model": "mock-model",
+                "instructions": "be terse",
+                "input": "the question",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tasks = tasks.lock();
+        let task = tasks.last().expect("a task was submitted");
+        assert!(!task.prompt_rendered);
+        assert_eq!(task.prompt, "the question");
+    }
+
+    /// With tools, a failed render is still refused (no tool-less answer).
+    #[tokio::test]
+    async fn deferred_thinking_failed_render_with_tools_is_refused() {
+        let (app, tasks) = deferred_app(Some(&failing_on("user"))).await;
         let (status, body) = post_to(
             app,
             "/v1/chat/completions",
