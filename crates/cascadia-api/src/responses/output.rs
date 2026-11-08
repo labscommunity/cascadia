@@ -338,9 +338,16 @@ impl OutputBuilder {
     /// The output so far: the finished items, then the open one (status
     /// `in_progress`).
     pub fn items(&self) -> Vec<Value> {
+        self.items_closing_open("in_progress")
+    }
+
+    /// The items announced so far, the open one with `status`, and nothing
+    /// the builder still holds: a failed stream's `output`, which no
+    /// closing event precedes.
+    pub fn items_closing_open(&self, status: &str) -> Vec<Value> {
         let mut items = self.items.clone();
         if let Some(o) = &self.open {
-            items.push(self.item(o, "in_progress"));
+            items.push(self.item(o, status));
         }
         items
     }
@@ -483,15 +490,20 @@ impl OutputBuilder {
     /// The reasoning or message item `o` with `status`.
     fn item(&self, o: &Open, status: &str) -> Value {
         match o.kind {
-            Kind::Reasoning => json!({
-                "id": o.id,
-                "type": "reasoning",
-                "status": status,
-                "summary": [],
-                "content": [{"type": "reasoning_text", "text": o.text}],
-                "encrypted_content": (self.encrypted && status != "in_progress")
-                    .then(|| encode_reasoning(&o.text)),
-            }),
+            Kind::Reasoning => {
+                let mut item = json!({
+                    "id": o.id,
+                    "type": "reasoning",
+                    "status": status,
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": o.text}],
+                });
+                // Only when `include` asks for it, as OpenAI returns it.
+                if self.encrypted && status != "in_progress" {
+                    item["encrypted_content"] = json!(encode_reasoning(&o.text));
+                }
+                item
+            }
             Kind::Message => json!({
                 "id": o.id,
                 "type": "message",

@@ -21,7 +21,7 @@ mod input;
 mod output;
 mod tools;
 use input::input_messages;
-use output::OutputBuilder;
+use output::{OutputBuilder, OutputEvent};
 use tools::{check_include, check_tool_choice, ToolMap};
 
 /// OpenAI `POST /v1/responses` body. The fields after `max_tool_calls` are
@@ -303,7 +303,6 @@ fn chat_request(
 /// non-streaming body and every streamed snapshot of it.
 struct ResponseShell {
     id: String,
-    message_id: String,
     created_at: i64,
     model: String,
     instructions: Option<String>,
@@ -331,7 +330,6 @@ impl ResponseShell {
     ) -> Self {
         Self {
             id,
-            message_id: format!("msg_{}", Uuid::new_v4().simple()),
             created_at: now_unix(),
             model: req.model.clone(),
             instructions: req.instructions.clone(),
@@ -386,17 +384,6 @@ impl ResponseShell {
             })),
             "user": null,
             "metadata": self.metadata,
-        })
-    }
-
-    /// The one output item: an assistant message holding the text.
-    fn message(&self, status: &str, text: Option<&str>) -> Value {
-        json!({
-            "id": self.message_id,
-            "type": "message",
-            "status": status,
-            "role": "assistant",
-            "content": text.map(|t| vec![output_text(t)]).unwrap_or_default(),
         })
     }
 }
@@ -504,9 +491,6 @@ pub(crate) async fn create_response(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    if req.stream {
-        return stream_response(state, shell, admitted).await;
-    }
     let task = &admitted.task;
     let opened = opens_think(
         state.engine_applies_template,
@@ -523,6 +507,9 @@ pub(crate) async fn create_response(
         req.parallel_tool_calls.unwrap_or(true),
         wants_encrypted,
     );
+    if req.stream {
+        return stream_response(state, shell, admitted, builder).await;
+    }
     let collected = collect_generation_with(&state, admitted, &[], "input", &mut |text, n| {
         builder.feed(text, n);
     })
@@ -548,7 +535,9 @@ struct ResponseStream {
     chunks: StreamWithPermit,
     marker: Option<MarkerFilter>,
     stats: Arc<ApiStats>,
-    text: String,
+    /// The output items, built as the chunks arrive (as the non-streaming
+    /// path builds them), and the events announcing them.
+    builder: OutputBuilder,
     prompt_tokens: u32,
     completion_tokens: u32,
     sequence: u64,
@@ -566,17 +555,108 @@ impl ResponseStream {
         out.push_str(&format!("event: {kind}\ndata: {payload}\n\n"));
     }
 
-    /// The part/item address every text event carries.
-    fn at(&self) -> Value {
-        json!({"item_id": self.shell.message_id, "output_index": 0, "content_index": 0})
-    }
-
-    fn with_at(&self, extra: Value) -> Value {
-        let mut v = self.at();
+    /// The address of a text event: the item at `index`, its one part.
+    fn at(index: usize, item_id: &Value, extra: Value) -> Value {
+        let mut v = json!({"item_id": item_id, "output_index": index, "content_index": 0});
         if let (Some(v), Value::Object(extra)) = (v.as_object_mut(), extra) {
             v.extend(extra);
         }
         v
+    }
+
+    /// Render the builder's events as Responses stream events (spec D11).
+    fn render(&mut self, out: &mut String, events: Vec<OutputEvent>) {
+        for e in events {
+            match e {
+                OutputEvent::ItemAdded { index, item } => {
+                    let part = match item["type"].as_str() {
+                        Some("reasoning") => Some(json!({"type": "reasoning_text", "text": ""})),
+                        Some("message") => Some(output_text("")),
+                        _ => None,
+                    };
+                    let id = item["id"].clone();
+                    self.emit(
+                        out,
+                        "response.output_item.added",
+                        json!({"output_index": index, "item": item}),
+                    );
+                    if let Some(part) = part {
+                        let added = Self::at(index, &id, json!({"part": part}));
+                        self.emit(out, "response.content_part.added", added);
+                    }
+                }
+                OutputEvent::ReasoningDelta {
+                    index,
+                    item_id,
+                    delta,
+                } => {
+                    let d = Self::at(index, &json!(item_id), json!({"delta": delta}));
+                    self.emit(out, "response.reasoning_text.delta", d);
+                }
+                OutputEvent::TextDelta {
+                    index,
+                    item_id,
+                    delta,
+                } => {
+                    let d = Self::at(
+                        index,
+                        &json!(item_id),
+                        json!({"delta": delta, "logprobs": []}),
+                    );
+                    self.emit(out, "response.output_text.delta", d);
+                }
+                OutputEvent::CallArgs {
+                    index,
+                    item_id,
+                    custom,
+                    full,
+                } => {
+                    let (prefix, field) = if custom {
+                        ("response.custom_tool_call_input", "input")
+                    } else {
+                        ("response.function_call_arguments", "arguments")
+                    };
+                    let at = json!({"item_id": item_id, "output_index": index});
+                    let mut delta = at.clone();
+                    delta["delta"] = json!(full);
+                    self.emit(out, &format!("{prefix}.delta"), delta);
+                    let mut done = at;
+                    done[field] = json!(full);
+                    self.emit(out, &format!("{prefix}.done"), done);
+                }
+                OutputEvent::ItemDone { index, item } => {
+                    let text_done = match item["type"].as_str() {
+                        Some("reasoning") => Some(("response.reasoning_text.done", json!({}))),
+                        Some("message") => {
+                            Some(("response.output_text.done", json!({"logprobs": []})))
+                        }
+                        _ => None,
+                    };
+                    if let Some((kind, mut extra)) = text_done {
+                        let part = item["content"][0].clone();
+                        extra["text"] = part["text"].clone();
+                        let done = Self::at(index, &item["id"], extra);
+                        self.emit(out, kind, done);
+                        let done = Self::at(index, &item["id"], json!({"part": part}));
+                        self.emit(out, "response.content_part.done", done);
+                    }
+                    self.emit(
+                        out,
+                        "response.output_item.done",
+                        json!({"output_index": index, "item": item}),
+                    );
+                }
+            }
+        }
+    }
+
+    fn outcome(&self, error: Option<String>) -> Outcome {
+        Outcome {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            reasoning_tokens: self.builder.reasoning_tokens(self.completion_tokens),
+            error,
+        }
     }
 
     /// The next frame: the opening events, then one per engine chunk, the
@@ -593,14 +673,6 @@ impl ResponseStream {
                 "response.in_progress",
                 json!({"response": progress}),
             );
-            let item = self.shell.message("in_progress", None);
-            self.emit(
-                &mut out,
-                "response.output_item.added",
-                json!({"output_index": 0, "item": item}),
-            );
-            let part = self.with_at(json!({"part": output_text("")}));
-            self.emit(&mut out, "response.content_part.added", part);
             return out;
         }
         let Some(chunk) = self.chunks.next().await else {
@@ -610,16 +682,14 @@ impl ResponseStream {
         };
         // The 200 is on the wire already, so a failed task is reported the
         // Responses way: a `response.failed` event, as the chat endpoint's
-        // SSE error event does for its stream.
+        // SSE error event does for its stream. No closing events precede
+        // it; its `output` has every item announced so far, the open one
+        // `incomplete`.
         if let Some(reason) = &chunk.error {
             warn!(task = %self.shell.id, reason = %reason, "engine failed task mid-stream; emitting response.failed");
-            let outcome = Outcome {
-                prompt_tokens: self.prompt_tokens,
-                completion_tokens: self.completion_tokens,
-                reasoning_tokens: 0,
-                error: Some(reason.clone()),
-            };
-            let failed = self.shell.object("failed", json!([]), Some(&outcome));
+            let outcome = self.outcome(Some(reason.clone()));
+            let output = json!(self.builder.items_closing_open("incomplete"));
+            let failed = self.shell.object("failed", output, Some(&outcome));
             self.emit(&mut out, "response.failed", json!({"response": failed}));
             self.done = true;
             return out;
@@ -639,11 +709,8 @@ impl ResponseStream {
             }
             None => chunk.text.clone(),
         };
-        if !text.is_empty() {
-            self.text.push_str(&text);
-            let delta = self.with_at(json!({"delta": text, "logprobs": []}));
-            self.emit(&mut out, "response.output_text.delta", delta);
-        }
+        let events = self.builder.feed(&text, n);
+        self.render(&mut out, events);
         if chunk.is_final {
             self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
             let reason = chunk
@@ -656,28 +723,14 @@ impl ResponseStream {
         out
     }
 
-    /// The closing events: text, part and item done, then the response.
+    /// The closing events: the open item's (and any parsed calls'), then
+    /// the response.
     fn finish(&mut self, out: &mut String, end: End) {
-        let text = self.text.clone();
-        let done = self.with_at(json!({"text": text, "logprobs": []}));
-        self.emit(out, "response.output_text.done", done);
-        let part = self.with_at(json!({"part": output_text(&text)}));
-        self.emit(out, "response.content_part.done", part);
-        let item = self.shell.message(end.item_status(), Some(&text));
-        self.emit(
-            out,
-            "response.output_item.done",
-            json!({"output_index": 0, "item": item}),
-        );
-        let outcome = Outcome {
-            prompt_tokens: self.prompt_tokens,
-            completion_tokens: self.completion_tokens,
-            reasoning_tokens: 0,
-            error: None,
-        };
-        let response = self
-            .shell
-            .object(end.status(), json!([item]), Some(&outcome));
+        let events = self.builder.finish(end.item_status());
+        self.render(out, events);
+        let outcome = self.outcome(None);
+        let output = json!(self.builder.items());
+        let response = self.shell.object(end.status(), output, Some(&outcome));
         self.emit(out, end.event(), json!({"response": response}));
         self.done = true;
     }
@@ -694,6 +747,7 @@ async fn stream_response(
         permit,
         inflight,
     }: AdmittedChat,
+    builder: OutputBuilder,
 ) -> Response {
     let chunks = match state.runner.generate_async(task).await {
         Ok(s) => s,
@@ -713,7 +767,7 @@ async fn stream_response(
         },
         marker: state.marker_dialect.clone().map(MarkerFilter::new),
         stats: state.stats.clone(),
-        text: String::new(),
+        builder,
         prompt_tokens: 0,
         completion_tokens: 0,
         sequence: 0,
@@ -1504,6 +1558,13 @@ mod tests {
             let (kind, data) = ev.last().unwrap();
             assert_eq!(kind, "response.incomplete");
             assert_cancelled(&data["response"]);
+            // The open message was closed `incomplete` by its done events.
+            let done: Vec<_> = ev
+                .iter()
+                .filter(|(k, _)| k == "response.output_item.done")
+                .map(|(_, d)| d["item"].clone())
+                .collect();
+            assert_eq!(json!(done), data["response"]["output"], "{body}");
         }
     }
 
@@ -1539,6 +1600,14 @@ mod tests {
         assert_eq!(response["error"]["message"], "peer link dropped");
         assert!(response["completed_at"].is_null());
         assert_eq!(response["usage"]["output_tokens"], 2);
+        // The open message is in `output`, closed `incomplete`, though no
+        // closing event announced it.
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{response}");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["status"], "incomplete");
+        assert_eq!(output[0]["id"], ev[2].1["item"]["id"]);
+        assert_eq!(output[0]["content"][0]["text"], "tok tok ");
     }
 
     /// The cap in force is echoed even when the caller left it to the
@@ -1849,5 +1918,259 @@ mod tests {
         assert_eq!(output.len(), 1, "{v}");
         assert_eq!(output[0]["type"], "message");
         assert_eq!(output[0]["content"][0]["text"], "mock: got sunny");
+    }
+
+    /// The events of a stream, each checked against its schema, numbered
+    /// from 0 and carrying its own `type`.
+    fn checked_events(body: &str) -> Vec<(String, Value)> {
+        let ev = events(body);
+        for (i, (kind, data)) in ev.iter().enumerate() {
+            assert_event(data);
+            assert_eq!(data["type"], kind.as_str(), "{body}");
+            assert_eq!(data["sequence_number"], i as u64, "{body}");
+        }
+        ev
+    }
+
+    fn kinds(ev: &[(String, Value)]) -> Vec<&str> {
+        ev.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// `output` with each item's generated ids dropped.
+    fn without_ids(output: &Value) -> Value {
+        let mut out = output.clone();
+        for item in out.as_array_mut().unwrap() {
+            let item = item.as_object_mut().unwrap();
+            item.remove("id");
+            item.remove("call_id");
+        }
+        out
+    }
+
+    /// `body` against a [`RecordingEngine::script`] of `chunks`, streamed
+    /// (checked events) and not (a checked response).
+    async fn both_ways(chunks: &[&str], body: Value) -> (Vec<(String, Value)>, Value) {
+        let mut streamed = body.clone();
+        streamed["stream"] = json!(true);
+        let (app, _, _) = app_with(RecordingEngine::script(chunks), tools_config()).await;
+        let (status, text) = post(app, streamed).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let ev = checked_events(&text);
+        let (app, _, _) = app_with(RecordingEngine::script(chunks), tools_config()).await;
+        let (status, v) = post_json(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        (ev, v)
+    }
+
+    /// A streamed turn that reasons, then calls a tool: the reasoning item's
+    /// events, then the call's, and the terminal output is the non-streamed
+    /// one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_returns_reasoning_and_a_call() {
+        let (ev, v) = both_ways(
+            &[
+                "<think>",
+                "pl",
+                "an",
+                "</think>",
+                "<tool_call>",
+                "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}",
+                "</tool_call>",
+            ],
+            json!({"model": "script-model", "input": "weather?", "tools": [get_weather()]}),
+        )
+        .await;
+        assert_eq!(
+            kinds(&ev),
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(ev[2].1["item"]["type"], "reasoning");
+        assert_eq!(
+            ev[3].1["part"],
+            json!({"type": "reasoning_text", "text": ""})
+        );
+        assert_eq!(ev[6].1["text"], "plan");
+        assert_eq!(ev[9].1["item"]["type"], "function_call");
+        assert_eq!(ev[9].1["item"]["arguments"], "");
+        let call_id = ev[9].1["item"]["id"].clone();
+        for (i, (_, d)) in ev[2..13].iter().enumerate() {
+            let index = if i < 7 { 0 } else { 1 };
+            assert_eq!(d["output_index"], index, "{d}");
+            if i < 7 {
+                if let Some(c) = d.get("content_index") {
+                    assert_eq!(c, 0, "{d}");
+                }
+            }
+        }
+        assert_eq!(ev[10].1["item_id"], call_id);
+        let args: Value = serde_json::from_str(ev[11].1["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"city": "Paris"}));
+        let done = &ev.last().unwrap().1["response"];
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["output"][0], ev[8].1["item"]);
+        assert_eq!(done["output"][1], ev[12].1["item"]);
+        assert_eq!(without_ids(&done["output"]), without_ids(&v["output"]));
+        assert_eq!(
+            done["usage"]["output_tokens_details"]["reasoning_tokens"],
+            v["usage"]["output_tokens_details"]["reasoning_tokens"]
+        );
+    }
+
+    /// A custom tool's call streams its `input` with the custom events.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_a_custom_tool_call() {
+        let (ev, v) = both_ways(
+            &[
+                "<tool_call>",
+                "{\"name\":\"apply_patch\",\"arguments\":{\"input\":\"*** Begin\"}}",
+                "</tool_call>",
+            ],
+            json!({"model": "script-model", "input": "patch it", "tools": [
+                {"type": "custom", "name": "apply_patch", "description": "Patch files."}]}),
+        )
+        .await;
+        assert_eq!(
+            kinds(&ev),
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(ev[2].1["item"]["type"], "custom_tool_call");
+        assert_eq!(ev[2].1["item"]["input"], "");
+        assert_eq!(ev[3].1["delta"], "*** Begin");
+        assert_eq!(ev[4].1["input"], "*** Begin");
+        let done = &ev.last().unwrap().1["response"];
+        assert_eq!(done["output"][0]["input"], "*** Begin");
+        assert_eq!(without_ids(&done["output"]), without_ids(&v["output"]));
+    }
+
+    /// Whitespace before a call opens no message: a pure tool-call turn has
+    /// no message events.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_call_after_whitespace_has_no_message() {
+        let (ev, v) = both_ways(
+            &[
+                "\n",
+                "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Oslo\"}}</tool_call>",
+            ],
+            json!({"model": "script-model", "input": "weather?", "tools": [get_weather()]}),
+        )
+        .await;
+        assert!(
+            ev.iter().all(|(k, d)| !k.contains("output_text")
+                && !k.contains("content_part")
+                && d["item"]["type"] != "message"),
+            "{ev:?}"
+        );
+        let done = &ev.last().unwrap().1["response"];
+        let output = done["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{done}");
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(without_ids(&done["output"]), without_ids(&v["output"]));
+    }
+
+    /// The mock engine's tool-call sentinel, streamed: one call, its events.
+    #[tokio::test]
+    async fn mock_tool_call_streams() {
+        let (status, text) = post(
+            mock_tools_app().await,
+            json!({"model": "mock-model", "input": "weather __mock_tool_call__",
+                "tools": [get_weather()], "stream": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let ev = checked_events(&text);
+        let k = kinds(&ev);
+        assert!(
+            k.contains(&"response.function_call_arguments.delta"),
+            "{k:?}"
+        );
+        assert!(
+            k.contains(&"response.function_call_arguments.done"),
+            "{k:?}"
+        );
+        let (kind, data) = ev.last().unwrap();
+        assert_eq!(kind, "response.completed");
+        let output = data["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{data}");
+        assert_eq!(output[0]["type"], "function_call");
+        let args: Value = serde_json::from_str(output[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"city": "mock", "days": 1}));
+    }
+
+    /// `include: ["reasoning.encrypted_content"]` fills the reasoning item's
+    /// `encrypted_content` with a blob that decodes to its text; without it
+    /// the key is absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn encrypted_reasoning_is_returned_when_included() {
+        let body = json!({"model": "script-model", "input": "hi",
+            "include": ["reasoning.encrypted_content"]});
+        let (app, _, _) = app_with(
+            RecordingEngine::script(&["<think>r</think>hi"]),
+            tools_config(),
+        )
+        .await;
+        let (status, v) = post_json(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        let r = &v["output"][0];
+        assert_eq!(r["type"], "reasoning", "{v}");
+        let blob = r["encrypted_content"].as_str().expect("encrypted_content");
+        assert_eq!(input::decode_reasoning(blob).as_deref(), Some("r"));
+        assert_eq!(v["output"][1]["content"][0]["text"], "hi");
+
+        let (app, _, _) = app_with(
+            RecordingEngine::script(&["<think>r</think>hi"]),
+            tools_config(),
+        )
+        .await;
+        let (status, v) = post_json(app, json!({"model": "script-model", "input": "hi"})).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        assert_eq!(v["output"][0]["type"], "reasoning", "{v}");
+        assert!(v["output"][0].get("encrypted_content").is_none(), "{v}");
+    }
+
+    /// A generation with no text is a completed response with no items,
+    /// streamed (no item events) or not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_generation_has_no_output() {
+        let (ev, v) = both_ways(&[], json!({"model": "script-model", "input": "hi"})).await;
+        assert_eq!(
+            kinds(&ev),
+            [
+                "response.created",
+                "response.in_progress",
+                "response.completed"
+            ]
+        );
+        let done = &ev[2].1["response"];
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["output"], json!([]));
+        assert_spec("Response", done);
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["output"], json!([]));
     }
 }
