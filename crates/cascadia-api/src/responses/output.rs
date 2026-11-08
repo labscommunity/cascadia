@@ -134,6 +134,7 @@ impl ReasoningSplit {
 
     /// End of the generation: release whatever is held (an undecided prefix
     /// is answer text; a partial `</think>` inside reasoning is reasoning).
+    /// Final: the state is left as it was, so no [`Self::feed`] may follow.
     pub fn finish(&mut self) -> Vec<Seg> {
         let held = std::mem::take(&mut self.held);
         let mut out = Vec::new();
