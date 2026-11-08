@@ -3412,24 +3412,83 @@ impl Stream for StreamWithPermit {
     }
 }
 
-/// Finds the earliest `stop` sequence in generated text as it arrives (M1
-/// D11), so the API can end a generation at the match instead of trimming a
-/// whole window of output afterwards. Pushed text comes back once it can no
-/// longer be the start of a stop sequence: only a tail that is a prefix of
-/// some stop is held, so without a match nothing is delayed.
+/// Finds `stop` sequences in generated text as it arrives (M1 D11), so the
+/// API can end a generation at the match instead of trimming a whole window
+/// of output afterwards. Pushed text comes back once it can no longer be the
+/// start of a stop sequence: only a tail that is a prefix of some stop is
+/// held, so without a match nothing is delayed.
+///
+/// The cut is at the first stop to complete; of several completing on the
+/// same byte, the one that starts earliest. Stop strings are client input of
+/// any length, so the work is linear: each stop is a KMP automaton fed byte
+/// by byte (O(stops) per byte, amortized), and the held tail is an offset
+/// into a buffer compacted as it is released, never rescanned.
 #[derive(Debug, Default)]
 struct StopMatcher {
-    stops: Vec<String>,
-    /// Text not yet released: the longest suffix that could begin a stop.
-    held: String,
+    stops: Vec<StopAutomaton>,
+    /// `buf[start..]` is the text not yet released.
+    buf: String,
+    start: usize,
     stopped: bool,
+}
+
+/// One stop string as a Knuth-Morris-Pratt automaton over its bytes.
+#[derive(Debug)]
+struct StopAutomaton {
+    pattern: Vec<u8>,
+    /// `fail[i]`: length of the longest proper prefix of `pattern[..=i]`
+    /// that is also its suffix.
+    fail: Vec<usize>,
+    /// Bytes of `pattern` matched by the end of the text seen so far.
+    matched: usize,
+}
+
+impl StopAutomaton {
+    fn new(stop: &str) -> Self {
+        let pattern = stop.as_bytes().to_vec();
+        let mut fail = vec![0; pattern.len()];
+        let mut k = 0;
+        for i in 1..pattern.len() {
+            while k > 0 && pattern[i] != pattern[k] {
+                k = fail[k - 1];
+            }
+            if pattern[i] == pattern[k] {
+                k += 1;
+            }
+            fail[i] = k;
+        }
+        Self {
+            pattern,
+            fail,
+            matched: 0,
+        }
+    }
+
+    /// Advances by one byte; true when the whole pattern has just matched.
+    fn step(&mut self, b: u8) -> bool {
+        while self.matched > 0 && self.pattern[self.matched] != b {
+            self.matched = self.fail[self.matched - 1];
+        }
+        if self.pattern[self.matched] == b {
+            self.matched += 1;
+        }
+        if self.matched == self.pattern.len() {
+            self.matched = self.fail[self.matched - 1];
+            return true;
+        }
+        false
+    }
 }
 
 impl StopMatcher {
     /// Empty stop strings match nothing and are dropped.
     fn new(stops: &[String]) -> Self {
         Self {
-            stops: stops.iter().filter(|s| !s.is_empty()).cloned().collect(),
+            stops: stops
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| StopAutomaton::new(s))
+                .collect(),
             ..Self::default()
         }
     }
@@ -3445,7 +3504,7 @@ impl StopMatcher {
     }
 
     /// Adds `text`; returns what can be released now. On a match that is the
-    /// text up to the earliest match, and [`stopped`](Self::stopped) turns true.
+    /// text up to the match, and [`stopped`](Self::stopped) turns true.
     fn push(&mut self, text: &str) -> String {
         if self.stopped {
             return String::new();
@@ -3453,37 +3512,51 @@ impl StopMatcher {
         if self.stops.is_empty() {
             return text.to_owned();
         }
-        self.held.push_str(text);
-        if let Some(cut) = self
-            .stops
-            .iter()
-            .filter_map(|s| self.held.find(s.as_str()))
-            .min()
-        {
-            self.stopped = true;
-            let mut out = std::mem::take(&mut self.held);
-            out.truncate(cut);
-            return out;
+        let base = self.buf.len();
+        self.buf.push_str(text);
+        for (j, &b) in text.as_bytes().iter().enumerate() {
+            let end = base + j + 1;
+            let mut cut: Option<usize> = None;
+            for stop in &mut self.stops {
+                if stop.step(b) {
+                    let at = end - stop.pattern.len();
+                    cut = Some(cut.map_or(at, |c| c.min(at)));
+                }
+            }
+            if let Some(cut) = cut {
+                // `cut` starts a stop string, so it is a char boundary.
+                self.stopped = true;
+                let out = self.buf[self.start..cut].to_owned();
+                self.buf = String::new();
+                self.start = 0;
+                return out;
+            }
         }
-        let keep = self.hold_point();
-        let rest = self.held.split_off(keep);
-        std::mem::replace(&mut self.held, rest)
+        // Hold the longest partial match: the bytes that may begin a stop.
+        // They equal a stop's prefix, so they start on a char boundary.
+        let hold = self.stops.iter().map(|s| s.matched).max().unwrap_or(0);
+        let mut keep = self.buf.len() - hold;
+        while !self.buf.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let keep = keep.max(self.start);
+        let out = self.buf[self.start..keep].to_owned();
+        self.start = keep;
+        // Compact once the released prefix outgrows the held tail, so each
+        // byte is moved O(1) times overall.
+        if self.start > self.buf.len() - self.start {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        out
     }
 
     /// Releases whatever is held (the generation ended without a match).
     fn finish(&mut self) -> String {
-        std::mem::take(&mut self.held)
-    }
-
-    /// Byte offset of the earliest suffix of `held` that is a proper prefix
-    /// of a stop sequence (on a char boundary); `held.len()` when none is.
-    fn hold_point(&self) -> usize {
-        let longest = self.stops.iter().map(String::len).max().unwrap_or(0);
-        let from = self.held.len().saturating_sub(longest.saturating_sub(1));
-        (from..self.held.len())
-            .filter(|&i| self.held.is_char_boundary(i))
-            .find(|&i| self.stops.iter().any(|s| s.starts_with(&self.held[i..])))
-            .unwrap_or(self.held.len())
+        let out = self.buf[self.start..].to_owned();
+        self.buf = String::new();
+        self.start = 0;
+        out
     }
 }
 
@@ -9262,6 +9335,49 @@ level={{ effort_map[eff] }}";
         assert_eq!(out, ["éé", "é"]);
         assert!(!stopped);
         assert_eq!(rest, "é");
+    }
+
+    #[test]
+    fn stop_matcher_is_linear_in_a_huge_client_stop() {
+        // A ~200 KB stop is within the body limit. The matcher must not
+        // rescan the held tail per offset (quadratic in the stop's length).
+        let stop = format!("{}b", "a".repeat(200_000));
+        let mut m = StopMatcher::new(&[stop, "zz".into()]);
+        let chunk = "a".repeat(1000);
+        let started = std::time::Instant::now();
+        let mut released = 0;
+        for _ in 0..400 {
+            released += m.push(&chunk).len();
+        }
+        // Everything but the 200 000-byte partial match has gone out.
+        assert_eq!(released, 400_000 - 200_000);
+        assert!(!m.stopped());
+        assert_eq!(m.push("b"), "", "the held tail was the match itself");
+        assert!(m.stopped(), "the stop completes on the final byte");
+        // Generous bound: the quadratic version took hours here.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        // The same stream with a near-miss byte releases the held tail.
+        let mut m = StopMatcher::new(&[format!("{}b", "a".repeat(200_000))]);
+        assert_eq!(m.push(&"a".repeat(250_000)).len(), 50_000);
+        assert_eq!(m.push("c").len(), 200_001);
+    }
+
+    #[test]
+    fn stop_matcher_handles_self_overlapping_stops() {
+        // KMP fallbacks: a failed partial match may still end in a shorter one.
+        let (out, stopped, _) = stop_matcher_run(&["aab"], &["aa", "aab"]);
+        assert_eq!(out, ["", "aa"], "\"aaaab\" matches at byte 2");
+        assert!(stopped);
+        let (out, stopped, _) = stop_matcher_run(&["abab"], &["xaba", "bab"]);
+        assert_eq!(out, ["x", ""]);
+        assert!(stopped);
+        let (out, _, rest) = stop_matcher_run(&["abac"], &["ababa"]);
+        assert_eq!(out, ["ab"]);
+        assert_eq!(rest, "aba");
     }
 
     async fn assert_cancelled(log: &ScriptLog) {
