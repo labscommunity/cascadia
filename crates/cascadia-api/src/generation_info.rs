@@ -42,7 +42,9 @@ pub fn read_model_generation_info(model_dir: &Path) -> ModelGenerationInfo {
         first(&dirs, "generation_config.json", |v| {
             v.get(key)
                 .and_then(|x| x.as_f64())
-                .filter(|x| x.is_finite() && *x >= 0.0)
+                // The range is the CLI's call (it warns about a value it
+                // ignores); only non-numbers are dropped here.
+                .filter(|x| x.is_finite())
                 .map(|x| x as f32)
         })
     };

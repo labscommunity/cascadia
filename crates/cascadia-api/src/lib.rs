@@ -208,6 +208,11 @@ pub struct GenerationDefaults {
     pub max_tokens: u32,
     pub temperature: f32,
     pub top_p: f32,
+    /// The model's context window when a real source gives it (the engine's
+    /// own limit or `config.json`), never the [`DEFAULT_MAX_TOKENS`] fallback
+    /// or `--default-max-tokens`. An explicit request limit above it is sent
+    /// as the window (M1 D13), so the answer ends with `length` there.
+    pub context_window: Option<u32>,
 }
 
 impl Default for GenerationDefaults {
@@ -216,6 +221,20 @@ impl Default for GenerationDefaults {
             max_tokens: DEFAULT_MAX_TOKENS,
             temperature: 1.0,
             top_p: 1.0,
+            context_window: None,
+        }
+    }
+}
+
+impl GenerationDefaults {
+    /// The limit sent to the engine for a request that asked for
+    /// `requested`: the server default when unset, else the request's own
+    /// limit, at most the known context window.
+    pub fn max_tokens_for(&self, requested: Option<u32>) -> u32 {
+        match (requested, self.context_window) {
+            (None, _) => self.max_tokens,
+            (Some(n), Some(window)) => n.min(window),
+            (Some(n), None) => n,
         }
     }
 }
@@ -2803,11 +2822,12 @@ async fn chat_completions(
         messages: chat_turns(&req),
         tools: chat_tools(&req),
         tool_choice: req.tool_choice.clone(),
-        // Unset limit = one context window (Decision 2, D2); unset
-        // temperature/top_p = the model's generation_config.json, else 1 (D3).
-        max_tokens: req
-            .requested_max_tokens()
-            .unwrap_or(state.generation_defaults.max_tokens),
+        // Unset limit = one context window (Decision 2, D2), an explicit one
+        // at most the window when it is known (D13); unset temperature/top_p
+        // = the model's generation_config.json, else 1 (D3).
+        max_tokens: state
+            .generation_defaults
+            .max_tokens_for(req.requested_max_tokens()),
         temperature: req
             .temperature
             .unwrap_or(state.generation_defaults.temperature),
@@ -3056,10 +3076,8 @@ async fn completions(
         messages: Vec::new(),
         tools: None,
         tool_choice: None,
-        // Same defaults as chat (D4).
-        max_tokens: req
-            .max_tokens
-            .unwrap_or(state.generation_defaults.max_tokens),
+        // Same defaults and window clamp as chat (D4, D13).
+        max_tokens: state.generation_defaults.max_tokens_for(req.max_tokens),
         temperature: req
             .temperature
             .unwrap_or(state.generation_defaults.temperature),
@@ -8269,6 +8287,7 @@ level={{ effort_map[eff] }}";
         max_tokens: 777,
         temperature: 0.7,
         top_p: 0.9,
+        context_window: Some(777),
     };
 
     /// Sends one request (`/v1/chat/completions` when `chat`, else
@@ -8390,6 +8409,7 @@ level={{ effort_map[eff] }}";
                 max_tokens: 4096,
                 temperature: 1.0,
                 top_p: 1.0,
+                context_window: None,
             }
         );
         assert_eq!(
@@ -8660,7 +8680,51 @@ level={{ effort_map[eff] }}";
         let t = captured_task(true, extra).await;
         assert_eq!(t.temperature, 0.2);
         assert_eq!(t.sampling.frequency_penalty, 0.3);
-        assert_eq!(t.max_tokens, 4096);
+        // Its 4096 is above the 777-token window: sent as the window (D13).
+        assert_eq!(t.max_tokens, 777);
+    }
+
+    #[tokio::test]
+    async fn explicit_limits_are_clamped_to_a_known_window() {
+        for chat in [true, false] {
+            let t = captured_task(chat, serde_json::json!({"max_tokens": 5000})).await;
+            assert_eq!(t.max_tokens, 777, "chat={chat}");
+            let t = captured_task(chat, serde_json::json!({"max_tokens": 776})).await;
+            assert_eq!(t.max_tokens, 776, "chat={chat}");
+        }
+        let t = captured_task(true, serde_json::json!({"max_completion_tokens": 9999})).await;
+        assert_eq!(t.max_tokens, 777);
+    }
+
+    #[tokio::test]
+    async fn default_max_tokens_does_not_cap_an_explicit_limit() {
+        // `--default-max-tokens 256` bounds requests that set no limit; it is
+        // not the window, so an explicit 1000 passes.
+        let defaults = GenerationDefaults {
+            max_tokens: 256,
+            context_window: Some(32768),
+            ..GenerationDefaults::default()
+        };
+        let (status, v) = post_chat_big(
+            make_app_with_defaults(defaults).await,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": words(300)}],
+                "max_tokens": 1000}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["completion_tokens"], 300, "{v}");
+        // No window known: an explicit limit is sent as is.
+        let defaults = GenerationDefaults {
+            max_tokens: 256,
+            ..GenerationDefaults::default()
+        };
+        let (_, v) = post_completions_big(
+            make_app_with_defaults(defaults).await,
+            serde_json::json!({"model": "mock-model", "prompt": words(300), "max_tokens": 280}),
+        )
+        .await;
+        assert_eq!(v["usage"]["completion_tokens"], 280, "{v}");
     }
 
     // --- Deprecated `functions` / `function_call` / role `function` (1.17, D5) --

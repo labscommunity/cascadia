@@ -425,6 +425,12 @@ pub struct WorkerArgs {
     #[arg(long, value_name = "T")]
     pub default_temperature: Option<f32>,
 
+    /// top_p for a request that sets none (0 < P <= 1). Default: the model's
+    /// `generation_config.json`, else 1.0. With `--default-max-tokens 256
+    /// --default-temperature 0` it restores the old defaults: `1`.
+    #[arg(long, value_name = "P")]
+    pub default_top_p: Option<f32>,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -834,6 +840,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "T")]
     pub default_temperature: Option<f32>,
 
+    /// top_p for a request that sets none (0 < P <= 1). Default: the model's
+    /// `generation_config.json`, else 1.0. See `cascadia worker --help`.
+    #[arg(long, value_name = "P")]
+    pub default_top_p: Option<f32>,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -952,6 +963,7 @@ impl WorkerArgs {
             api_max_body_mb,
             default_max_tokens: None,
             default_temperature: None,
+            default_top_p: None,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1288,6 +1300,7 @@ fn worker_from_run(args: RunArgs) -> WorkerArgs {
     worker.llama_mtp = args.llama_mtp;
     worker.default_max_tokens = args.default_max_tokens;
     worker.default_temperature = args.default_temperature;
+    worker.default_top_p = args.default_top_p;
     worker
 }
 
@@ -1440,12 +1453,13 @@ fn resolve_api_max_body_bytes(mb: f64) -> Result<usize> {
     Ok((mb * (1u64 << 20) as f64) as usize)
 }
 
-/// The `--default-max-tokens` / `--default-temperature` pair, as one value so
-/// `run-placement` can forward it to the API head.
+/// The `--default-max-tokens` / `--default-temperature` / `--default-top-p`
+/// flags, as one value so `run-placement` can forward them to the API head.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GenerationDefaultFlags {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
 }
 
 impl GenerationDefaultFlags {
@@ -1458,17 +1472,29 @@ impl GenerationDefaultFlags {
         if let Some(t) = self.temperature {
             a.extend(["--default-temperature".to_string(), t.to_string()]);
         }
+        if let Some(p) = self.top_p {
+            a.extend(["--default-top-p".to_string(), p.to_string()]);
+        }
         a
     }
 }
 
-/// `--default-temperature` outside 0..=2 (the OpenAI range) and
-/// `--default-max-tokens 0` are configuration errors, reported before the
-/// model loads.
-fn validate_generation_default_flags(
-    max_tokens: Option<u32>,
-    temperature: Option<f32>,
-) -> Result<()> {
+/// `--default-temperature` outside 0..=2 and `--default-top-p` outside
+/// (0, 1] (the OpenAI ranges), and `--default-max-tokens 0`, are
+/// configuration errors, reported before the model loads.
+fn validate_generation_default_flags(flags: GenerationDefaultFlags) -> Result<()> {
+    let GenerationDefaultFlags {
+        max_tokens,
+        temperature,
+        top_p,
+    } = flags;
+    if let Some(p) = top_p {
+        if !(p > 0.0 && p <= 1.0) {
+            return Err(anyhow!(
+                "--default-top-p must be a number in (0, 1] (got {p})"
+            ));
+        }
+    }
     if let Some(t) = temperature {
         if !(0.0..=2.0).contains(&t) {
             return Err(anyhow!(
@@ -1487,20 +1513,53 @@ fn validate_generation_default_flags(
 const OVGENAI_NPU_MAX_PROMPT_LEN: u32 = 1024;
 const OVGENAI_NPU_MIN_RESPONSE_LEN: u32 = 128;
 
+/// The source label of an ov-genai NPU window.
+const NPU_WINDOW_SOURCE: &str =
+    "MAX_PROMPT_LEN + MIN_RESPONSE_LEN (--npu-max-prompt-len, --npu-min-response-len, --ov-config)";
+
+/// Where a resolved [`cascadia_api::GenerationDefaults`] value came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultSource {
+    /// The `--default-*` flag named.
+    Flag(&'static str),
+    /// The engine's own window, named by what sets it.
+    EngineWindow(&'static str),
+    /// `config.json`'s context window.
+    ConfigJson,
+    /// `generation_config.json`'s sampling value.
+    GenerationConfig,
+    /// None of the above: 4096 tokens, or the OpenAI default 1.
+    Fallback,
+}
+
+impl DefaultSource {
+    /// The name in the startup log line.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flag(name) | Self::EngineWindow(name) => name,
+            Self::ConfigJson => "config.json",
+            Self::GenerationConfig => "generation_config.json",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
 /// Where each resolved [`cascadia_api::GenerationDefaults`] value came from,
 /// for the startup log line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GenerationDefaultSources {
-    max_tokens: &'static str,
-    temperature: &'static str,
-    top_p: &'static str,
+    max_tokens: DefaultSource,
+    temperature: DefaultSource,
+    top_p: DefaultSource,
 }
 
 /// The engine's own window, when it has one tighter than `config.json` (D2):
 /// sycl-llama's child runs with `-c --llama-ctx`; ov-genai on NPU compiles
-/// `MAX_PROMPT_LEN + MIN_RESPONSE_LEN` (each flag, else ov-genai's default,
-/// so 1024 + 128 when neither is set); an ov-runtime
-/// NPU export has a fixed `static_context` KV.
+/// `MAX_PROMPT_LEN + MIN_RESPONSE_LEN` (each from the plugin properties the
+/// engine gets, so `--npu-*` or a later `--ov-config` entry, last write wins
+/// and the key matched without regard to case; else ov-genai's default, so
+/// 1024 + 128 when neither is set); an ov-runtime NPU export has a fixed
+/// `static_context` KV.
 fn engine_window(
     args: &WorkerArgs,
     info: &cascadia_api::ModelGenerationInfo,
@@ -1508,16 +1567,21 @@ fn engine_window(
     match args.engine {
         EngineKind::SyclLlama => (args.llama_ctx > 0).then_some((args.llama_ctx, "--llama-ctx")),
         EngineKind::OvGenai if device_is_npu(&args.device) => {
-            let prompt = args
-                .npu_max_prompt_len
+            let props = ov_perf_properties(args);
+            let prop = |key: &str| {
+                props
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .and_then(|(_, v)| v.trim().parse::<u32>().ok())
+            };
+            let prompt = prop("MAX_PROMPT_LEN")
+                .or(args.npu_max_prompt_len)
                 .unwrap_or(OVGENAI_NPU_MAX_PROMPT_LEN);
-            let response = args
-                .npu_min_response_len
+            let response = prop("MIN_RESPONSE_LEN")
+                .or(args.npu_min_response_len)
                 .unwrap_or(OVGENAI_NPU_MIN_RESPONSE_LEN);
-            Some((
-                prompt.saturating_add(response),
-                "--npu-max-prompt-len + --npu-min-response-len",
-            ))
+            Some((prompt.saturating_add(response), NPU_WINDOW_SOURCE))
         }
         EngineKind::OvRuntime => info
             .static_context
@@ -1527,33 +1591,47 @@ fn engine_window(
 }
 
 /// The server's values for unset `max_tokens` / `temperature` / `top_p`
-/// (Decision 2, D2, D3): `max_tokens = flag ?? engine window ?? config.json
-/// window ?? 4096`, `temperature = flag ?? generation_config.json ?? 1.0`,
-/// `top_p = generation_config.json ?? 1.0`. Pure.
+/// (Decision 2, D2, D3, D12): `max_tokens = flag ?? engine window ??
+/// config.json window ?? 4096`, `temperature = flag ?? generation_config.json
+/// ?? 1.0`, `top_p = flag ?? generation_config.json ?? 1.0`, a file value out
+/// of the OpenAI range counting as absent (see [`file_sampling_warnings`]).
+/// `context_window` is the engine or config.json window only (D13). Pure.
 fn resolve_generation_defaults(
     args: &WorkerArgs,
     info: &cascadia_api::ModelGenerationInfo,
 ) -> (cascadia_api::GenerationDefaults, GenerationDefaultSources) {
+    let window = engine_window(args, info)
+        .map(|(w, src)| (w, DefaultSource::EngineWindow(src)))
+        .or_else(|| info.context_window.map(|w| (w, DefaultSource::ConfigJson)));
     let (max_tokens, max_tokens_src) = args
         .default_max_tokens
-        .map(|n| (n, "--default-max-tokens"))
-        .or_else(|| engine_window(args, info))
-        .or_else(|| info.context_window.map(|w| (w, "config.json")))
-        .unwrap_or((cascadia_api::DEFAULT_MAX_TOKENS, "fallback"));
+        .map(|n| (n, DefaultSource::Flag("--default-max-tokens")))
+        .or(window)
+        .unwrap_or((cascadia_api::DEFAULT_MAX_TOKENS, DefaultSource::Fallback));
     let (temperature, temperature_src) = args
         .default_temperature
-        .map(|t| (t, "--default-temperature"))
-        .or_else(|| info.temperature.map(|t| (t, "generation_config.json")))
-        .unwrap_or((1.0, "fallback"));
-    let (top_p, top_p_src) = info
-        .top_p
-        .map(|p| (p, "generation_config.json"))
-        .unwrap_or((1.0, "fallback"));
+        .map(|t| (t, DefaultSource::Flag("--default-temperature")))
+        .or_else(|| {
+            info.temperature
+                .filter(|t| temperature_in_range(*t))
+                .map(|t| (t, DefaultSource::GenerationConfig))
+        })
+        .unwrap_or((1.0, DefaultSource::Fallback));
+    let (top_p, top_p_src) = args
+        .default_top_p
+        .map(|p| (p, DefaultSource::Flag("--default-top-p")))
+        .or_else(|| {
+            info.top_p
+                .filter(|p| top_p_in_range(*p))
+                .map(|p| (p, DefaultSource::GenerationConfig))
+        })
+        .unwrap_or((1.0, DefaultSource::Fallback));
     (
         cascadia_api::GenerationDefaults {
             max_tokens,
             temperature,
             top_p,
+            context_window: window.map(|(w, _)| w),
         },
         GenerationDefaultSources {
             max_tokens: max_tokens_src,
@@ -1563,27 +1641,39 @@ fn resolve_generation_defaults(
     )
 }
 
-/// Warnings for sampling values taken from `generation_config.json` that
-/// fall outside the OpenAI ranges (temperature 0..=2, top_p (0, 1]). The
-/// model author's value is still used; the warning only makes it visible.
+/// The OpenAI temperature range, 0..=2.
+fn temperature_in_range(t: f32) -> bool {
+    (0.0..=2.0).contains(&t)
+}
+
+/// The OpenAI top_p range, (0, 1].
+fn top_p_in_range(p: f32) -> bool {
+    p > 0.0 && p <= 1.0
+}
+
+/// Warnings for `generation_config.json` sampling values outside the OpenAI
+/// ranges (temperature 0..=2, top_p (0, 1]) that no flag replaces: such a
+/// value is ignored (the default falls back to 1.0), and the warning says so.
 fn file_sampling_warnings(
-    d: &cascadia_api::GenerationDefaults,
-    s: &GenerationDefaultSources,
+    args: &WorkerArgs,
+    info: &cascadia_api::ModelGenerationInfo,
 ) -> Vec<String> {
-    let from_file = |src: &str| src == "generation_config.json";
     let mut w = Vec::new();
-    if from_file(s.temperature) && !(0.0..=2.0).contains(&d.temperature) {
-        w.push(format!(
-            "generation_config.json temperature {} is outside 0..=2; using it as the default \
-             (override with --default-temperature)",
-            d.temperature
-        ));
+    if let Some(t) = info.temperature {
+        if args.default_temperature.is_none() && !temperature_in_range(t) {
+            w.push(format!(
+                "generation_config.json temperature {t} is outside 0..=2; ignoring it and \
+                 using 1.0 (set --default-temperature to choose)"
+            ));
+        }
     }
-    if from_file(s.top_p) && !(d.top_p > 0.0 && d.top_p <= 1.0) {
-        w.push(format!(
-            "generation_config.json top_p {} is outside (0, 1]; using it as the default",
-            d.top_p
-        ));
+    if let Some(p) = info.top_p {
+        if args.default_top_p.is_none() && !top_p_in_range(p) {
+            w.push(format!(
+                "generation_config.json top_p {p} is outside (0, 1]; ignoring it and using \
+                 1.0 (set --default-top-p to choose)"
+            ));
+        }
     }
     w
 }
@@ -2410,7 +2500,11 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // engine). Cheap, pure, and the same answer either side of the load.
     let prefix_cache_bytes = resolve_prefix_cache_bytes(args.prefix_cache_gb)?;
     let max_body = resolve_api_max_body_bytes(args.api_max_body_mb)?;
-    validate_generation_default_flags(args.default_max_tokens, args.default_temperature)?;
+    validate_generation_default_flags(GenerationDefaultFlags {
+        max_tokens: args.default_max_tokens,
+        temperature: args.default_temperature,
+        top_p: args.default_top_p,
+    })?;
     // Expert-parallel roles (Inkling): a worker relays expert work like a
     // non-first pipeline stage (listens, no API); a driver is a single stage
     // that also dials its workers.
@@ -2762,21 +2856,22 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         cfg.max_body_bytes = max_body;
         cfg.max_prompt_bytes = max_body;
         // Values for the request fields a client leaves unset (Decision 2).
-        let (defaults, sources) = resolve_generation_defaults(
-            &args,
-            &cascadia_api::read_model_generation_info(std::path::Path::new(&args.model)),
-        );
+        let model_info =
+            cascadia_api::read_model_generation_info(std::path::Path::new(&args.model));
+        let (defaults, sources) = resolve_generation_defaults(&args, &model_info);
         info!(
             max_tokens = defaults.max_tokens,
-            max_tokens_source = sources.max_tokens,
+            max_tokens_source = sources.max_tokens.label(),
             temperature = defaults.temperature,
-            temperature_source = sources.temperature,
+            temperature_source = sources.temperature.label(),
             top_p = defaults.top_p,
-            top_p_source = sources.top_p,
+            top_p_source = sources.top_p.label(),
+            context_window = ?defaults.context_window,
             "request defaults for unset max_tokens/temperature/top_p \
-             (override: --default-max-tokens, --default-temperature)"
+             (override: --default-max-tokens, --default-temperature, --default-top-p); \
+             explicit limits are capped at context_window when known"
         );
-        for w in file_sampling_warnings(&defaults, &sources) {
+        for w in file_sampling_warnings(&args, &model_info) {
             warn!(model = %args.model, "{w}");
         }
         if spec_decode_off_by_default(&args, defaults.temperature) {
@@ -4671,7 +4766,15 @@ mod generation_defaults_tests {
             .cmd
     }
 
-    const RESTORE: [&str; 4] = ["--default-max-tokens", "256", "--default-temperature", "0"];
+    /// The documented restore recipe (D12).
+    const RESTORE: [&str; 6] = [
+        "--default-max-tokens",
+        "256",
+        "--default-temperature",
+        "0",
+        "--default-top-p",
+        "1",
+    ];
 
     #[test]
     fn worker_parses_both_flags() {
@@ -4684,6 +4787,7 @@ mod generation_defaults_tests {
         };
         assert_eq!(w.default_max_tokens, Some(256));
         assert_eq!(w.default_temperature, Some(0.0));
+        assert_eq!(w.default_top_p, Some(1.0));
     }
 
     #[test]
@@ -4695,6 +4799,7 @@ mod generation_defaults_tests {
         };
         assert_eq!(w.default_max_tokens, None);
         assert_eq!(w.default_temperature, None);
+        assert_eq!(w.default_top_p, None);
     }
 
     #[test]
@@ -4706,9 +4811,11 @@ mod generation_defaults_tests {
         };
         assert_eq!(r.default_max_tokens, Some(256));
         assert_eq!(r.default_temperature, Some(0.0));
+        assert_eq!(r.default_top_p, Some(1.0));
         let w = worker_from_run(r);
         assert_eq!(w.default_max_tokens, Some(256));
         assert_eq!(w.default_temperature, Some(0.0));
+        assert_eq!(w.default_top_p, Some(1.0));
     }
 
     #[test]
@@ -4731,6 +4838,7 @@ mod generation_defaults_tests {
             GenerationDefaultFlags {
                 max_tokens: Some(256),
                 temperature: Some(0.0),
+                top_p: Some(1.0),
             }
         );
         let placement = crate::placement::Placement {
@@ -4756,6 +4864,7 @@ mod generation_defaults_tests {
         };
         assert_eq!(w.default_max_tokens, Some(256));
         assert_eq!(w.default_temperature, Some(0.0));
+        assert_eq!(w.default_top_p, Some(1.0));
         // Non-head stages serve no API: no request defaults to carry.
         assert!(!plans[1].join(" ").contains("--default-"));
     }
@@ -4767,7 +4876,14 @@ mod generation_defaults_tests {
 
     #[test]
     fn flag_validation_rejects_out_of_range_values() {
-        let ok = |t: Option<f32>, n: Option<u32>| validate_generation_default_flags(n, t).is_ok();
+        let ok = |t: Option<f32>, n: Option<u32>| {
+            validate_generation_default_flags(GenerationDefaultFlags {
+                max_tokens: n,
+                temperature: t,
+                top_p: None,
+            })
+            .is_ok()
+        };
         assert!(ok(None, None));
         assert!(ok(Some(0.0), Some(1)));
         assert!(ok(Some(2.0), Some(256)));
@@ -4776,6 +4892,18 @@ mod generation_defaults_tests {
         assert!(!ok(Some(f32::NAN), None));
         assert!(!ok(Some(f32::INFINITY), None));
         assert!(!ok(None, Some(0)));
+        let top_p_ok = |p: f32| {
+            validate_generation_default_flags(GenerationDefaultFlags {
+                top_p: Some(p),
+                ..Default::default()
+            })
+        };
+        assert!(top_p_ok(1.0).is_ok());
+        assert!(top_p_ok(0.01).is_ok());
+        for bad in [0.0, -0.5, 1.01, f32::NAN] {
+            let e = top_p_ok(bad).unwrap_err().to_string();
+            assert!(e.contains("--default-top-p"), "{bad}: {e}");
+        }
     }
 
     #[tokio::test]
@@ -4789,8 +4917,12 @@ mod generation_defaults_tests {
         assert!(e.contains("--default-temperature"), "{e}");
         w.default_temperature = None;
         w.default_max_tokens = Some(0);
-        let e = cmd_worker(w).await.unwrap_err().to_string();
+        let e = cmd_worker(w.clone()).await.unwrap_err().to_string();
         assert!(e.contains("--default-max-tokens"), "{e}");
+        w.default_max_tokens = None;
+        w.default_top_p = Some(0.0);
+        let e = cmd_worker(w).await.unwrap_err().to_string();
+        assert!(e.contains("--default-top-p"), "{e}");
     }
 
     fn resolve(
@@ -4818,12 +4950,14 @@ mod generation_defaults_tests {
             GenerationDefaults {
                 max_tokens: 4096,
                 temperature: 1.0,
-                top_p: 1.0
+                top_p: 1.0,
+                // The 4096 fallback is not a known window (D13).
+                context_window: None,
             }
         );
-        assert_eq!(s.max_tokens, "fallback");
-        assert_eq!(s.temperature, "fallback");
-        assert_eq!(s.top_p, "fallback");
+        assert_eq!(s.max_tokens, DefaultSource::Fallback);
+        assert_eq!(s.temperature, DefaultSource::Fallback);
+        assert_eq!(s.top_p, DefaultSource::Fallback);
     }
 
     #[test]
@@ -4835,8 +4969,8 @@ mod generation_defaults_tests {
         let (d, s) = resolve(&worker(EngineKind::OvGenai, "GPU"), info);
         assert_eq!(d.temperature, 0.6);
         assert_eq!(d.top_p, 0.95);
-        assert_eq!(s.temperature, "generation_config.json");
-        assert_eq!(s.top_p, "generation_config.json");
+        assert_eq!(s.temperature, DefaultSource::GenerationConfig);
+        assert_eq!(s.top_p, DefaultSource::GenerationConfig);
     }
 
     #[test]
@@ -4849,9 +4983,55 @@ mod generation_defaults_tests {
         w.default_temperature = Some(0.0);
         let (d, s) = resolve(&w, info);
         assert_eq!(d.temperature, 0.0);
-        assert_eq!(s.temperature, "--default-temperature");
-        // No --default-top-p (D3): top_p still comes from the file.
+        assert_eq!(s.temperature, DefaultSource::Flag("--default-temperature"));
+        // Each flag is its own: top_p still comes from the file.
         assert_eq!(d.top_p, 0.95);
+    }
+
+    #[test]
+    fn top_p_flag_beats_the_file() {
+        let info = info_from_dir(&[(
+            "generation_config.json",
+            r#"{"temperature": 0.6, "top_p": 0.95}"#,
+        )]);
+        let mut w = worker(EngineKind::OvGenai, "GPU");
+        w.default_top_p = Some(1.0);
+        let (d, s) = resolve(&w, info);
+        assert_eq!(d.top_p, 1.0);
+        assert_eq!(s.top_p, DefaultSource::Flag("--default-top-p"));
+        assert_eq!(d.temperature, 0.6);
+        assert_eq!(s.top_p.label(), "--default-top-p");
+        assert_eq!(
+            DefaultSource::GenerationConfig.label(),
+            "generation_config.json"
+        );
+    }
+
+    #[test]
+    fn context_window_is_known_only_from_a_real_source() {
+        let config = ModelGenerationInfo {
+            context_window: Some(32768),
+            ..Default::default()
+        };
+        let gpu = worker(EngineKind::OvGenai, "GPU");
+        assert_eq!(resolve(&gpu, config).0.context_window, Some(32768));
+        assert_eq!(
+            resolve(&gpu, ModelGenerationInfo::default())
+                .0
+                .context_window,
+            None
+        );
+        // --default-max-tokens sets the unset-limit default, not the window.
+        let mut flagged = gpu.clone();
+        flagged.default_max_tokens = Some(256);
+        let (d, _) = resolve(&flagged, config);
+        assert_eq!((d.max_tokens, d.context_window), (256, Some(32768)));
+        let (d, _) = resolve(&flagged, ModelGenerationInfo::default());
+        assert_eq!((d.max_tokens, d.context_window), (256, None));
+        // An engine window beats config.json here too.
+        let mut sycl = worker(EngineKind::SyclLlama, "GPU");
+        sycl.llama_ctx = 8192;
+        assert_eq!(resolve(&sycl, config).0.context_window, Some(8192));
     }
 
     #[test]
@@ -4859,7 +5039,7 @@ mod generation_defaults_tests {
         let info = info_from_dir(&[("config.json", r#"{"max_position_embeddings": 32768}"#)]);
         let (d, s) = resolve(&worker(EngineKind::OvGenai, "GPU"), info);
         assert_eq!(d.max_tokens, 32768);
-        assert_eq!(s.max_tokens, "config.json");
+        assert_eq!(s.max_tokens, DefaultSource::ConfigJson);
     }
 
     #[test]
@@ -4879,7 +5059,11 @@ mod generation_defaults_tests {
             w.default_max_tokens = Some(256);
             let (d, s) = resolve(&w, info);
             assert_eq!(d.max_tokens, 256, "{engine:?}");
-            assert_eq!(s.max_tokens, "--default-max-tokens", "{engine:?}");
+            assert_eq!(
+                s.max_tokens,
+                DefaultSource::Flag("--default-max-tokens"),
+                "{engine:?}"
+            );
         }
     }
 
@@ -4893,7 +5077,7 @@ mod generation_defaults_tests {
         w.llama_ctx = 8192;
         let (d, s) = resolve(&w, info);
         assert_eq!(d.max_tokens, 8192);
-        assert_eq!(s.max_tokens, "--llama-ctx");
+        assert_eq!(s.max_tokens, DefaultSource::EngineWindow("--llama-ctx"));
     }
 
     #[test]
@@ -4903,7 +5087,7 @@ mod generation_defaults_tests {
         w.llama_ctx = 0;
         let (d, s) = resolve(&w, ModelGenerationInfo::default());
         assert_eq!(d.max_tokens, 4096);
-        assert_eq!(s.max_tokens, "fallback");
+        assert_eq!(s.max_tokens, DefaultSource::Fallback);
     }
 
     #[test]
@@ -4917,10 +5101,7 @@ mod generation_defaults_tests {
         w.npu_min_response_len = Some(512);
         let (d, s) = resolve(&w, info);
         assert_eq!(d.max_tokens, 2560);
-        assert_eq!(
-            s.max_tokens,
-            "--npu-max-prompt-len + --npu-min-response-len"
-        );
+        assert_eq!(s.max_tokens, DefaultSource::EngineWindow(NPU_WINDOW_SOURCE));
         // One flag set: the other takes ov-genai's NPU default (1024 / 128).
         w.npu_min_response_len = None;
         assert_eq!(resolve(&w, info).0.max_tokens, 2048 + 128);
@@ -4939,16 +5120,37 @@ mod generation_defaults_tests {
         // default static shape, 1024 + 128, so that is the window.
         let (d, s) = resolve(&worker(EngineKind::OvGenai, "NPU"), info);
         assert_eq!(d.max_tokens, 1024 + 128);
-        assert_eq!(
-            s.max_tokens,
-            "--npu-max-prompt-len + --npu-min-response-len"
-        );
+        assert_eq!(s.max_tokens, DefaultSource::EngineWindow(NPU_WINDOW_SOURCE));
         // Flags on a GPU run, or on another engine, are dropped by the engine.
         for (engine, device) in [(EngineKind::OvGenai, "GPU"), (EngineKind::OvRuntime, "NPU")] {
             let mut w = worker(engine, device);
             w.npu_max_prompt_len = Some(2048);
             assert_eq!(resolve(&w, info).0.max_tokens, 32768, "{engine:?} {device}");
         }
+    }
+
+    #[test]
+    fn ov_genai_npu_window_follows_ov_config_last_write_wins() {
+        let info = ModelGenerationInfo::default();
+        let mut w = worker(EngineKind::OvGenai, "NPU");
+        w.ov_config = vec!["MAX_PROMPT_LEN=4096".into()];
+        assert_eq!(resolve(&w, info).0.max_tokens, 4096 + 128);
+        // A later --ov-config beats the typed flag; the key is matched
+        // without regard to case.
+        w.npu_max_prompt_len = Some(2048);
+        w.ov_config = vec!["max_prompt_len=3000".into(), "MIN_RESPONSE_LEN=256".into()];
+        assert_eq!(resolve(&w, info).0.max_tokens, 3000 + 256);
+        // The last of several entries wins.
+        w.ov_config = vec!["MIN_RESPONSE_LEN=256".into(), "min_response_len=64".into()];
+        assert_eq!(resolve(&w, info).0.max_tokens, 2048 + 64);
+        // An unparsable value leaves the flag / default in place.
+        w.ov_config = vec!["MAX_PROMPT_LEN=lots".into()];
+        assert_eq!(resolve(&w, info).0.max_tokens, 2048 + 128);
+        // On a GPU run the keys are not the window.
+        let mut g = worker(EngineKind::OvGenai, "GPU");
+        g.ov_config = vec!["MAX_PROMPT_LEN=4096".into()];
+        assert_eq!(resolve(&g, info).0.max_tokens, 4096);
+        assert_eq!(resolve(&g, info).1.max_tokens, DefaultSource::Fallback);
     }
 
     #[test]
@@ -4962,7 +5164,10 @@ mod generation_defaults_tests {
         ]);
         let (d, s) = resolve(&worker(EngineKind::OvRuntime, "NPU"), info);
         assert_eq!(d.max_tokens, 1024);
-        assert_eq!(s.max_tokens, "stage_config.json static_context");
+        assert_eq!(
+            s.max_tokens,
+            DefaultSource::EngineWindow("stage_config.json static_context")
+        );
         // Other engines do not read stage configs.
         assert_eq!(
             resolve(&worker(EngineKind::OvGenai, "GPU"), info)
@@ -5013,53 +5218,60 @@ mod generation_defaults_tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("--default-temperature"), "{e}");
-        argv.truncate(6);
-        argv.extend(["--default-max-tokens", "0"]);
-        let Command::RunPlacement(a) = parse(&argv) else {
-            panic!("expected run-placement");
-        };
-        let e = run_placement::cmd_run_placement(a)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("--default-max-tokens"), "{e}");
+        for (flag, bad) in [("--default-max-tokens", "0"), ("--default-top-p", "2")] {
+            argv.truncate(6);
+            argv.extend([flag, bad]);
+            let Command::RunPlacement(a) = parse(&argv) else {
+                panic!("expected run-placement");
+            };
+            let e = run_placement::cmd_run_placement(a)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(flag), "{e}");
+        }
     }
 
     #[test]
-    fn out_of_range_file_sampling_values_are_kept_but_flagged() {
+    fn out_of_range_file_sampling_values_are_ignored_and_flagged() {
         let w = worker(EngineKind::OvGenai, "GPU");
-        let warned = |t: f32, p: f32| {
+        let run = |t: f32, p: f32| {
             let info = ModelGenerationInfo {
                 temperature: Some(t),
                 top_p: Some(p),
                 ..Default::default()
             };
-            let (d, s) = resolve(&w, info);
-            // The model author's value is used as is.
-            assert_eq!((d.temperature, d.top_p), (t, p));
-            file_sampling_warnings(&d, &s)
+            let (d, _) = resolve(&w, info);
+            (d.temperature, d.top_p, file_sampling_warnings(&w, &info))
         };
-        assert!(warned(0.7, 0.95).is_empty());
-        assert!(warned(0.0, 1.0).is_empty());
-        assert!(warned(2.0, 0.01).is_empty());
-        let w1 = warned(3.0, 0.9);
+        assert_eq!(run(0.7, 0.95), (0.7, 0.95, vec![]));
+        assert_eq!(run(0.0, 1.0), (0.0, 1.0, vec![]));
+        assert_eq!(run(2.0, 0.01), (2.0, 0.01, vec![]));
+        // Out of range: treated as absent (the fallback 1.0), and warned.
+        let (t, p, w1) = run(3.0, 0.9);
+        assert_eq!((t, p), (1.0, 0.9));
         assert_eq!(w1.len(), 1);
         assert!(
             w1[0].contains("temperature") && w1[0].contains("generation_config.json"),
             "{w1:?}"
         );
-        let w2 = warned(0.7, 0.0);
-        assert_eq!(w2.len(), 1);
-        assert!(w2[0].contains("top_p"), "{w2:?}");
-        assert_eq!(warned(2.5, 1.5).len(), 2);
-        // A flag-set temperature is not the file's: no warning about it.
+        let (t, p, w2) = run(-0.5, 0.0);
+        assert_eq!((t, p), (1.0, 1.0));
+        assert_eq!(w2.len(), 2, "{w2:?}");
+        assert!(
+            w2[1].contains("top_p") && w2[1].contains("--default-top-p"),
+            "{w2:?}"
+        );
+        assert_eq!(run(0.7, 1.5).1, 1.0);
+        // A flag replaces the file's value: no warning about it.
         let mut f = worker(EngineKind::OvGenai, "GPU");
         f.default_temperature = Some(0.0);
+        f.default_top_p = Some(1.0);
         let info = ModelGenerationInfo {
             temperature: Some(9.0),
+            top_p: Some(0.0),
             ..Default::default()
         };
-        let (d, s) = resolve(&f, info);
-        assert!(file_sampling_warnings(&d, &s).is_empty());
+        assert!(file_sampling_warnings(&f, &info).is_empty());
     }
 }
