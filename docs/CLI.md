@@ -217,24 +217,27 @@ alike. The worker logs the three values and where each came from at startup.
 - **Output limit** (`max_tokens` / `max_completion_tokens`): runs until the model
   stops, capped at one context window, taken from the first of these that
   applies: `--default-max-tokens`; sycl-llama `--llama-ctx`; ov-genai on NPU
-  `--npu-max-prompt-len` + `--npu-min-response-len` (when either is set; the
-  unset one counts as ov-genai's default, 1024 / 128); an ov-runtime NPU
+  `--npu-max-prompt-len` + `--npu-min-response-len` (an unset one counts as
+  ov-genai's default, 1024 / 128, so 1152 with neither); an ov-runtime NPU
   export's `static_context` (`stage_<r>/stage_config.json`); the model's
-  `config.json` window (`max_position_embeddings` and similar, also under
-  `text_config`; model root, then `tokenizer/`); else 4096. Before this change
+  `config.json` window (`max_position_embeddings` and similar, `text_config`
+  first, then the top level; model root, then `tokenizer/`); else 4096. Before this change
   an unset limit silently stopped at 256 tokens.
 - **`temperature` / `top_p`**: the model's `generation_config.json` (root, then
   `tokenizer/`; `do_sample` is not applied), else `1`. `--default-temperature`
-  overrides the file's temperature. Before this change an unset temperature was
+  overrides the file's temperature. A file value outside the OpenAI range
+  (temperature 0–2, top_p above 0 and at most 1) is still used, with a startup
+  warning. Before this change an unset temperature was
   `0` (greedy).
 - ov-runtime, dist-spec, `gemma4` and `qwen35` decode greedily whatever the
   temperature (until sampling lands, M4), so only their limit changes.
   sycl-llama now always sends a temperature to `llama-server` (the default
-  above, or the flag), overriding the server's own default; it still never
-  sends `top_p`.
+  above, or the flag), overriding the server's own default, and sends `top_p`
+  whenever it is not 1, so a `generation_config.json` `top_p` (e.g. 0.95) now
+  reaches `llama-server` for requests that omit it.
 - sparse-moe speculative decoding (`--prompt-lookup`) runs only at temperature
   0: with a default above 0 it is off for requests that omit `temperature`, and
-  the worker warns at startup. Pass `--default-temperature 0` to keep it on.
+  a single-stage worker warns at startup. Pass `--default-temperature 0` to keep it on.
 - On the default (non-`--cb`) ov-genai path a generation runs as one
   uncancellable call: an answer that never reaches end-of-sequence now holds
   the engine for up to one context window instead of 256 tokens, and a client
