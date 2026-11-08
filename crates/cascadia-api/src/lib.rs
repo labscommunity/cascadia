@@ -3779,10 +3779,19 @@ impl TextStream {
                     return Some(Bytes::from_static(SSE_KEEPALIVE_COMMENT.as_bytes()))
                 }
                 StreamNext::Chunk(Some(chunk)) => chunk,
-                // Ended without a final chunk (cancelled): no usage.
+                // Ended without a final chunk (cancelled): no usage. Text
+                // the stop matcher held never matched, so it goes out first
+                // (as the tools stream settles what it holds).
                 StreamNext::Chunk(None) => {
                     self.phase = ToolStreamPhase::Done;
-                    return Some(self.tail());
+                    let rest = self.stop.finish();
+                    if rest.is_empty() {
+                        return Some(self.tail());
+                    }
+                    let n_tokens = std::mem::take(&mut self.held_tokens);
+                    let mut out = self.frame(rest, n_tokens, None, None).into_bytes();
+                    out.extend_from_slice(&self.tail());
+                    return Some(Bytes::from(out));
                 }
             };
             // A progress marker (a long prompt still going down the
@@ -10005,5 +10014,65 @@ level={{ effort_map[eff] }}";
         assert_eq!(&frame[..], b": keep-alive\n\n");
         drop(body);
         assert_cancelled(&log).await;
+    }
+
+    /// A stream that ends without a final chunk (the task was cancelled)
+    /// still sends the text the stop matcher was holding: it never matched.
+    #[tokio::test]
+    async fn cancelled_stream_releases_a_held_stop_prefix() {
+        for tools in [false, true] {
+            let (app, _log, gate) =
+                script_app(&["first ST", "never sent"], true, SSE_KEEPALIVE_INTERVAL).await;
+            let mut payload = serde_json::json!({"model": "mock-model", "stream": true,
+                "messages": [{"role": "user", "content": "hi"}], "stop": "STOP"});
+            if tools {
+                payload["tools"] =
+                    serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+            }
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut body = resp.into_body().into_data_stream();
+            let mut text = String::new();
+            while !text.contains("first ") {
+                let frame = tokio::time::timeout(Duration::from_secs(10), body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                text.push_str(std::str::from_utf8(&frame).unwrap());
+            }
+            let id = sse_events(&text)[0]["id"].as_str().unwrap().to_owned();
+            let cancel = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/cancel/{id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cancel.status(), StatusCode::OK);
+            while let Some(frame) = body.next().await {
+                text.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+            }
+            drop(gate);
+            assert_eq!(
+                streamed_content(&sse_events(&text)),
+                "first ST",
+                "tools={tools}: {text}"
+            );
+            assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        }
     }
 }
