@@ -5,8 +5,10 @@
 //! (non-streaming + SSE streaming). Tools, logprobs, /events, /state,
 //! Ollama dialect deferred — see Phase 5 follow-up.
 
+mod generation_info;
 #[cfg(test)]
 mod spec_schema;
+pub use generation_info::{read_model_generation_info, ModelGenerationInfo};
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
