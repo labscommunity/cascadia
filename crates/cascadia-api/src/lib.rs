@@ -712,7 +712,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
 #[derive(Deserialize, Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default, deserialize_with = "de_null_content")]
+    #[serde(default, deserialize_with = "de_null_default")]
     pub content: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -745,9 +745,15 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-/// null/missing content -> "" (assistant tool-call turns send content: null).
-fn de_null_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+/// `null` -> the type's default, for fields the spec marks nullable: message
+/// `content` (assistant tool-call turns send `null`), `stream`, `logprobs`,
+/// `echo`. Pair with `#[serde(default)]` so an absent field is the same.
+fn de_null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 /// OpenAI `stop` is either a single string or an array of strings.
@@ -793,13 +799,14 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub presence_penalty: Option<f32>,
     /// OpenAI `logprobs` (bool). When true, per-token logprobs are returned
-    /// (engine-permitting).
-    #[serde(default)]
+    /// (engine-permitting). `null` = unset.
+    #[serde(default, deserialize_with = "de_null_default")]
     pub logprobs: bool,
     /// OpenAI `top_logprobs` (0..=20): how many alternatives per position.
     #[serde(default)]
     pub top_logprobs: Option<u32>,
-    #[serde(default)]
+    /// `null` = unset.
+    #[serde(default, deserialize_with = "de_null_default")]
     pub stream: bool,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
@@ -1046,12 +1053,13 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub logprobs: Option<u32>,
-    #[serde(default)]
+    /// `null` = unset.
+    #[serde(default, deserialize_with = "de_null_default")]
     pub stream: bool,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
-    /// Prepend the prompt to the returned text (OpenAI `echo`).
-    #[serde(default)]
+    /// Prepend the prompt to the returned text (OpenAI `echo`). `null` = unset.
+    #[serde(default, deserialize_with = "de_null_default")]
     pub echo: bool,
 }
 
@@ -8139,6 +8147,36 @@ level={{ effort_map[eff] }}";
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(v["usage"]["completion_tokens"], 3, "{v}");
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn null_stream_and_logprobs_mean_unset_on_chat() {
+        // D9: the spec marks both nullable; `null` = omitted = false.
+        assert_chat_body(
+            make_app().await,
+            five_word_chat(serde_json::json!({"stream": null, "logprobs": null})),
+            5,
+            "stop",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn null_stream_and_echo_mean_unset_on_completions() {
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": "alpha bravo charlie",
+                "stream": null,
+                "echo": null,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["completion_tokens"], 3, "{v}");
+        assert_eq!(v["choices"][0]["text"], "alpha bravo charlie ", "{v}");
         crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
     }
 
