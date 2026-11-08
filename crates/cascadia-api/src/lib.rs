@@ -12,7 +12,7 @@ pub use generation_info::{read_model_generation_info, ModelGenerationInfo};
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -152,7 +152,19 @@ pub struct AppState {
     /// Values for the sampling fields a request leaves unset. See
     /// [`GenerationDefaults`].
     pub generation_defaults: GenerationDefaults,
+    /// Idle time after which a stream sends an SSE keep-alive comment. See
+    /// [`SSE_KEEPALIVE_INTERVAL`].
+    pub sse_keepalive: Duration,
 }
+
+/// How long a stream may go without sending anything before it sends the SSE
+/// comment `: keep-alive` (M1 D11). One-shot engines produce no bytes until
+/// their whole answer is done; proxies with a 60 s idle timeout would cut
+/// such a stream. A comment, not a `data:` frame: OpenAI clients skip it.
+pub const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The SSE keep-alive comment line (see [`SSE_KEEPALIVE_INTERVAL`]).
+const SSE_KEEPALIVE_COMMENT: &str = ": keep-alive\n\n";
 
 #[derive(Clone, Debug, Default)]
 pub struct ChatTemplateConfig {
@@ -176,6 +188,8 @@ pub struct Config {
     /// What a request that leaves `max_tokens`/`temperature`/`top_p` unset
     /// gets. See [`GenerationDefaults`]; the CLI resolves it per model.
     pub generation_defaults: GenerationDefaults,
+    /// See [`AppState::sse_keepalive`]; [`SSE_KEEPALIVE_INTERVAL`] by default.
+    pub sse_keepalive: Duration,
 }
 
 /// Output-token limit for a request that sets none, when the model's context
@@ -217,6 +231,7 @@ impl Default for Config {
             engine_applies_template: false,
             marker_dialect: None,
             generation_defaults: GenerationDefaults::default(),
+            sse_keepalive: SSE_KEEPALIVE_INTERVAL,
         }
     }
 }
@@ -552,6 +567,7 @@ pub fn make_router_with_stats(
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         generation_defaults: cfg.generation_defaults,
+        sse_keepalive: cfg.sse_keepalive,
     };
     let state = AppState {
         effort_words: state
@@ -2876,6 +2892,8 @@ async fn chat_completions(
     // `stop`. Engines that don't distinguish leave it None → "stop".
     let mut finish_reason: &'static str = "stop";
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    let stops = req.sampling_params(&state.generation_defaults).stop;
+    let mut stop = StopMatcher::new(&stops);
     while let Some(chunk) = chunk_stream.next().await {
         // A failed task carries `error` on its final chunk. Without this
         // branch the empty text below would build a normal 200 with empty
@@ -2892,15 +2910,17 @@ async fn chat_completions(
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
-        match marker.as_mut() {
+        let text = match marker.as_mut() {
             Some(f) => {
-                buf.push_str(&f.feed(&chunk));
+                let mut t = f.feed(&chunk);
                 if chunk.is_final {
-                    buf.push_str(&f.finish());
+                    t.push_str(&f.finish());
                 }
+                t
             }
-            None => buf.push_str(&chunk.text),
-        }
+            None => chunk.text.clone(),
+        };
+        buf.push_str(&stop.push(&text));
         chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
@@ -2911,17 +2931,23 @@ async fn chat_completions(
                 finish_reason = fr.as_openai_str();
             }
         }
+        // Early stop (M1 D11): end at the match. Dropping the stream below
+        // cancels the engine task; usage counts the tokens received so far.
+        if stop.stopped() {
+            finish_reason = "stop";
+            break;
+        }
     }
+    drop(chunk_stream);
+    buf.push_str(&stop.finish());
     state
         .stats
         .tokens_total
         .fetch_add(completion_tokens as u64, Ordering::Relaxed);
 
-    // Honor `stop` sequences by trimming the assembled text at the earliest
-    // match. The engines don't early-stop on strings yet (an engine-side
-    // follow-up would also save compute), so this enforces the OpenAI output
-    // contract at the API boundary and forces finish_reason = "stop".
-    let stops = req.sampling_params(&state.generation_defaults).stop;
+    // Final guard on `stop`: the matcher above already ended the generation
+    // at the earliest match; trimming the assembled text again keeps the
+    // OpenAI output contract whatever reached `buf`.
     if !stops.is_empty() {
         if let Some(cut) = stops
             .iter()
@@ -3095,6 +3121,8 @@ async fn completions(
     let mut prompt_tokens: u32 = 0;
     let mut finish_reason: &'static str = "stop";
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    let stops = req.sampling_params(&state.generation_defaults).stop;
+    let mut stop = StopMatcher::new(&stops);
     while let Some(chunk) = chunk_stream.next().await {
         if let Some(reason) = &chunk.error {
             warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
@@ -3104,15 +3132,17 @@ async fn completions(
             )
                 .into_response();
         }
-        match marker.as_mut() {
+        let text = match marker.as_mut() {
             Some(f) => {
-                buf.push_str(&f.feed(&chunk));
+                let mut t = f.feed(&chunk);
                 if chunk.is_final {
-                    buf.push_str(&f.finish());
+                    t.push_str(&f.finish());
                 }
+                t
             }
-            None => buf.push_str(&chunk.text),
-        }
+            None => chunk.text.clone(),
+        };
+        buf.push_str(&stop.push(&text));
         chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
@@ -3123,14 +3153,21 @@ async fn completions(
                 finish_reason = fr.as_openai_str();
             }
         }
+        // Early stop (M1 D11): end at the match. Dropping the stream below
+        // cancels the engine task; usage counts the tokens received so far.
+        if stop.stopped() {
+            finish_reason = "stop";
+            break;
+        }
     }
+    drop(chunk_stream);
+    buf.push_str(&stop.finish());
     state
         .stats
         .tokens_total
         .fetch_add(completion_tokens as u64, Ordering::Relaxed);
 
-    // Stop-sequence truncation (same as the chat path).
-    let stops = req.sampling_params(&state.generation_defaults).stop;
+    // Stop-sequence final guard (same as the chat path).
     if !stops.is_empty() {
         if let Some(cut) = stops
             .iter()
@@ -3189,6 +3226,7 @@ async fn stream_text_completion(
     include_usage: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
+    let stop = task.sampling.stop.clone();
     let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => {
@@ -3196,113 +3234,32 @@ async fn stream_text_completion(
             return engine_error_response(err);
         }
     };
-    let stats = state.stats.clone();
-    let usage_completion = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let usage_prompt = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let usage_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let final_finished = usage_finished.clone();
-    let final_completion = usage_completion.clone();
-    let final_prompt = usage_prompt.clone();
-    let usage_model = model.clone();
-    let usage_task_id = task_id.clone();
-    // First-frame flag for `echo` (prepend the prompt once).
-    let echo_pending = Arc::new(std::sync::Mutex::new(echo_prefix));
-    let permit_carrier = StreamWithPermit {
-        inner: chunk_stream,
-        _permit: permit,
-        _inflight: inflight,
+    let text_stream = TextStream {
+        chunks: Some(StreamWithPermit {
+            inner: chunk_stream,
+            _permit: permit,
+            _inflight: inflight,
+        }),
+        keepalive: KeepAlive::new(state.sse_keepalive),
+        kind: TextStreamKind::Completion { echo: echo_prefix },
+        // The raw-prompt endpoint streams the engine's text as is.
+        marker: None,
+        stop: StopMatcher::new(&stop),
+        stats: state.stats.clone(),
+        completion: std::sync::atomic::AtomicU32::new(0),
+        held_tokens: 0,
+        prompt_tokens: 0,
+        finished: false,
+        phase: ToolStreamPhase::Streaming,
+        task_id,
+        model,
+        include_usage,
     };
-    let body_stream = permit_carrier
-        .then(move |chunk| {
-            let model = model.clone();
-            let task_id = task_id.clone();
-            let stats = stats.clone();
-            let usage_completion = usage_completion.clone();
-            let usage_prompt = usage_prompt.clone();
-            let usage_finished = usage_finished.clone();
-            let echo_pending = echo_pending.clone();
-            async move {
-                // A progress marker (a long prompt still going down the
-                // pipeline, one window per engine step): nothing to send,
-                // nothing to count; the connection stays open.
-                if chunk.is_progress() {
-                    return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
-                }
-                if chunk.error.is_none() {
-                    record_stream_tokens(&chunk, &stats, &usage_completion);
-                    if chunk.is_final {
-                        usage_prompt.store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
-                        usage_finished.store(chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled), Ordering::Relaxed);
-                    }
-                }
-                if let Some(reason) = &chunk.error {
-                    warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
-                    let payload = serde_json::json!({
-                        "id": task_id,
-                        "object": "error",
-                        "error": { "message": reason, "type": "engine_error" },
-                    });
-                    tokio::task::yield_now().await;
-                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
-                }
-                // Prepend the echo prefix to the first content frame, once.
-                let mut text = chunk.text.clone();
-                if let Some(prefix) = echo_pending.lock().unwrap().take() {
-                    text = format!("{prefix}{text}");
-                }
-                let payload = serde_json::json!({
-                    "id": task_id,
-                    "object": "text_completion",
-                    "created": now_unix(),
-                    "model": model,
-                    "n_tokens": chunk.token_count(),
-                    "completion_tokens": chunk.completion_tokens,
-                    "choices": [{
-                        "index": 0,
-                        "text": text,
-                        "finish_reason": if chunk.is_final {
-                            Some(chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"))
-                        } else {
-                            None
-                        },
-                    }],
-                });
-                let line = format!("data: {payload}\n\n");
-                tokio::task::yield_now().await;
-                Ok::<Bytes, std::convert::Infallible>(Bytes::from(line))
-            }
-        })
-        .chain(stream::once(async move {
-            let mut out = String::new();
-            if include_usage && final_finished.load(Ordering::Relaxed) {
-                let prompt = final_prompt.load(Ordering::Relaxed);
-                let completion = final_completion.load(Ordering::Relaxed);
-                let usage = serde_json::json!({
-                    "id": usage_task_id,
-                    "object": "text_completion",
-                    "created": now_unix(),
-                    "model": usage_model,
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": prompt,
-                        "completion_tokens": completion,
-                        "total_tokens": prompt + completion,
-                    },
-                });
-                out.push_str(&format!("data: {usage}\n\n"));
-            }
-            out.push_str("data: [DONE]\n\n");
-            Ok::<Bytes, std::convert::Infallible>(Bytes::from(out))
-        }));
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header("x-accel-buffering", "no")
-        .body(Body::from_stream(body_stream))
-        .unwrap()
-        .into_response()
+    sse_response(stream::unfold(text_stream, |mut s| async move {
+        let frame = s.next_frame().await?;
+        s.keepalive.sent();
+        Some((frame, s))
+    }))
 }
 
 // Streaming carries the usage handles (inflight/include_usage) and the tool
@@ -3323,7 +3280,7 @@ async fn stream_completion(
     // Captured before `task` moves into `generate` below — arms the tool-call
     // scan the same way the non-streaming path does (see `tool_call_scan_text`).
     let enable_thinking = task.enable_thinking;
-    let _ = SystemTime::now();
+    let stop = StopMatcher::new(&task.sampling.stop);
 
     let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
@@ -3332,6 +3289,14 @@ async fn stream_completion(
             return engine_error_response(err);
         }
     };
+    // Move the permit + in-flight guard into the stream so they're released
+    // only when the body is dropped (client disconnect, final chunk, or a
+    // stop match).
+    let chunks = Some(StreamWithPermit {
+        inner: chunk_stream,
+        _permit: permit,
+        _inflight: inflight,
+    });
     // Tools present and not disabled: content streams as the splitter
     // releases it; whether the reply is a tool call is decided at the final
     // chunk, on the same text and parse as the non-streaming path.
@@ -3339,12 +3304,10 @@ async fn stream_completion(
         tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
     if tools_active {
         let tool_stream = ToolStream {
-            chunks: StreamWithPermit {
-                inner: chunk_stream,
-                _permit: permit,
-                _inflight: inflight,
-            },
+            chunks,
+            keepalive: KeepAlive::new(state.sse_keepalive),
             marker: state.marker_dialect.clone().map(MarkerFilter::new),
+            stop,
             splitter: ToolStreamSplitter::new(enable_thinking),
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
@@ -3357,43 +3320,14 @@ async fn stream_completion(
             include_usage,
             legacy_functions,
         };
-        let body = stream::unfold(tool_stream, |mut s| async move {
+        return sse_response(stream::unfold(tool_stream, |mut s| async move {
             let frame = s.next_frame().await?;
-            Some((Ok::<Bytes, std::convert::Infallible>(frame), s))
-        });
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header("x-accel-buffering", "no")
-            .body(Body::from_stream(body))
-            .unwrap()
-            .into_response();
+            s.keepalive.sent();
+            Some((frame, s))
+        }));
     }
-    // Clone the counter handle for per-chunk token accounting in the
-    // formatter closure below.
-    let stats = state.stats.clone();
-    // Per-request token tallies for the OpenAI `stream_options.include_usage`
-    // final chunk (the global `stats.tokens_total` is cross-request). The
-    // `final_*` handles are read by the trailing usage frame after the body
-    // stream drains; the per-chunk closure gets the originals.
-    let usage_completion = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let usage_prompt = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let usage_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let final_finished = usage_finished.clone();
-    let final_completion = usage_completion.clone();
-    let final_prompt = usage_prompt.clone();
-    let usage_model = model.clone();
-    let usage_task_id = task_id.clone();
-    // Move the permit + in-flight guard into the stream so they're released
-    // only when the body is dropped (client disconnect or final chunk).
-    let permit_carrier = StreamWithPermit {
-        inner: chunk_stream,
-        _permit: permit,
-        _inflight: inflight,
-    };
-    // Format each chunk as a raw SSE frame `data: <json>\n\n` and send
-    // it as a one-byte-shy-of-MTU frame via `Body::from_stream`.
+    // Each chunk becomes a raw SSE frame `data: <json>\n\n`, sent as its
+    // own body chunk via `Body::from_stream`.
     //
     // Why raw bytes instead of `axum::response::sse::Sse`:
     // `Sse::new(stream).keep_alive(KeepAlive::default())` wraps the
@@ -3405,140 +3339,39 @@ async fn stream_completion(
     // makes each chunk its own HTTP/1.1 chunked-encoding frame, which
     // Hyper writes immediately (combined with TCP_NODELAY set on the
     // accepted connection in cascadia-cli's serve loop, this lands the
-    // per-token chunk on the wire as a separate ~220 B packet).
-    let marker: Arc<std::sync::Mutex<Option<MarkerFilter>>> = Arc::new(std::sync::Mutex::new(
-        state.marker_dialect.clone().map(MarkerFilter::new),
-    ));
-    let body_stream = permit_carrier
-        .then(move |chunk| {
-            let model = model.clone();
-            let task_id = task_id.clone();
-            let stats = stats.clone();
-            let usage_completion = usage_completion.clone();
-            let usage_prompt = usage_prompt.clone();
-            let usage_finished = usage_finished.clone();
-            let marker = marker.clone();
-            async move {
-                // Publish real per-chunk counts live; authoritative-only
-                // engines reconcile their full model count at completion.
-                if chunk.is_progress() {
-                    return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
-                }
-                if chunk.error.is_none() {
-                    record_stream_tokens(&chunk, &stats, &usage_completion);
-                    if chunk.is_final {
-                        usage_prompt
-                            .store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
-                        usage_finished.store(chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled), Ordering::Relaxed);
-                    }
-                }
-                // A failed task carries `error` on its final chunk. The 200
-                // headers are already on the wire by the time the body
-                // streams, so unlike the non-streaming path we cannot
-                // downgrade to a 5xx here. Surface the failure as an explicit
-                // SSE error event instead of a silent empty delta + [DONE].
-                if let Some(reason) = &chunk.error {
-                    warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
-                    let payload = serde_json::json!({
-                        "id": task_id,
-                        "object": "error",
-                        "error": { "message": reason, "type": "engine_error" },
-                    });
-                    tokio::task::yield_now().await;
-                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
-                }
-                // Custom (non-OpenAI) `n_tokens` field: how many model
-                // tokens this chunk carries. Spec-decode emits 1..=K+1
-                // tokens per chunk; downstream tok/s would be wrong if
-                // it counted chunks. Standard clients ignore unknown
-                // fields; our orchestrator reads it.
-                // Special-token framing (Inkling) → textual delimiters, same
-                // translation as the non-streaming path; withheld text (a
-                // tool call's name/JSON) surfaces on the closing marker.
-                let text = {
-                    let mut guard = marker.lock().unwrap();
-                    match guard.as_mut() {
-                        Some(f) => {
-                            let mut t = f.feed(&chunk);
-                            if chunk.is_final {
-                                t.push_str(&f.finish());
-                            }
-                            t
-                        }
-                        None => chunk.text.clone(),
-                    }
-                };
-                let payload = serde_json::json!({
-                    "id": task_id,
-                    "object": "chat.completion.chunk",
-                    "created": now_unix(),
-                    "model": model,
-                    "n_tokens": chunk.token_count(),
-                    "completion_tokens": chunk.completion_tokens,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "content": text,
-                        },
-                        "finish_reason": if chunk.is_final {
-                            Some(chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"))
-                        } else {
-                            None
-                        },
-                    }],
-                });
-                let line = format!("data: {payload}\n\n");
-                // Yield between chunks so the body-sink task can drain
-                // this frame to TCP. cascadia_runner::ChunkStream::poll_next
-                // calls engine.step() inside a parking_lot::Mutex, which
-                // blocks the tokio worker for ~80 ms per chunk without
-                // yielding. Without an explicit yield here, tokio's
-                // cooperative scheduling lets this task hog its worker
-                // for ~1 s at a time, and the per-chunk body writes
-                // accumulate in Hyper's buffer and flush as one ~3500 B
-                // burst — visible in the demo as 16 tokens at once
-                // every ~1 s. Yielding here lets the body sink run
-                // between chunks so each frame goes to TCP individually.
-                tokio::task::yield_now().await;
-                Ok::<Bytes, std::convert::Infallible>(Bytes::from(line))
-            }
-        })
-        .chain(stream::once(async move {
-            // OpenAI: when stream_options.include_usage is set, emit one final
-            // chunk with empty `choices` carrying `usage`, just before [DONE].
-            // Combined into a single HTTP frame with [DONE] (SSE events are
-            // delimited by \n\n regardless of HTTP chunk boundaries).
-            let mut out = String::new();
-            if include_usage && final_finished.load(Ordering::Relaxed) {
-                let prompt = final_prompt.load(Ordering::Relaxed);
-                let completion = final_completion.load(Ordering::Relaxed);
-                let usage = serde_json::json!({
-                    "id": usage_task_id,
-                    "object": "chat.completion.chunk",
-                    "created": now_unix(),
-                    "model": usage_model,
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": prompt,
-                        "completion_tokens": completion,
-                        "total_tokens": prompt + completion,
-                    },
-                });
-                out.push_str(&format!("data: {usage}\n\n"));
-            }
-            out.push_str("data: [DONE]\n\n");
-            Ok::<Bytes, std::convert::Infallible>(Bytes::from(out))
-        }));
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header("x-accel-buffering", "no")
-        .body(Body::from_stream(body_stream))
-        .unwrap()
-        .into_response()
+    // per-token chunk on the wire as a separate ~220 B packet). Our own
+    // keep-alive ([`KeepAlive`]) times out the engine `next()` instead.
+    //
+    // Each frame is followed by a `yield_now`: cascadia_runner's
+    // ChunkStream::poll_next calls engine.step() inside a
+    // parking_lot::Mutex, which blocks the tokio worker for ~80 ms per
+    // chunk without yielding. Without an explicit yield, tokio's
+    // cooperative scheduling lets this task hog its worker for ~1 s at a
+    // time, and the per-chunk body writes accumulate in Hyper's buffer and
+    // flush as one ~3500 B burst — visible in the demo as 16 tokens at once
+    // every ~1 s. Yielding lets the body sink run between chunks so each
+    // frame goes to TCP individually.
+    let text_stream = TextStream {
+        chunks,
+        keepalive: KeepAlive::new(state.sse_keepalive),
+        kind: TextStreamKind::Chat,
+        marker: state.marker_dialect.clone().map(MarkerFilter::new),
+        stop,
+        stats: state.stats.clone(),
+        completion: std::sync::atomic::AtomicU32::new(0),
+        held_tokens: 0,
+        prompt_tokens: 0,
+        finished: false,
+        phase: ToolStreamPhase::Streaming,
+        task_id,
+        model,
+        include_usage,
+    };
+    sse_response(stream::unfold(text_stream, |mut s| async move {
+        let frame = s.next_frame().await?;
+        s.keepalive.sent();
+        Some((frame, s))
+    }))
 }
 
 /// Wraps a [`cascadia_runner::ChunkStream`] so it carries its concurrency
@@ -3561,12 +3394,370 @@ impl Stream for StreamWithPermit {
     }
 }
 
+/// Finds the earliest `stop` sequence in generated text as it arrives (M1
+/// D11), so the API can end a generation at the match instead of trimming a
+/// whole window of output afterwards. Pushed text comes back once it can no
+/// longer be the start of a stop sequence: only a tail that is a prefix of
+/// some stop is held, so without a match nothing is delayed.
+#[derive(Debug, Default)]
+struct StopMatcher {
+    stops: Vec<String>,
+    /// Text not yet released: the longest suffix that could begin a stop.
+    held: String,
+    stopped: bool,
+}
+
+impl StopMatcher {
+    /// Empty stop strings match nothing and are dropped.
+    fn new(stops: &[String]) -> Self {
+        Self {
+            stops: stops.iter().filter(|s| !s.is_empty()).cloned().collect(),
+            ..Self::default()
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.stops.is_empty()
+    }
+
+    /// A stop sequence matched: the text before it has been released and
+    /// every later push returns nothing.
+    fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Adds `text`; returns what can be released now. On a match that is the
+    /// text up to the earliest match, and [`stopped`](Self::stopped) turns true.
+    fn push(&mut self, text: &str) -> String {
+        if self.stopped {
+            return String::new();
+        }
+        if self.stops.is_empty() {
+            return text.to_owned();
+        }
+        self.held.push_str(text);
+        if let Some(cut) = self
+            .stops
+            .iter()
+            .filter_map(|s| self.held.find(s.as_str()))
+            .min()
+        {
+            self.stopped = true;
+            let mut out = std::mem::take(&mut self.held);
+            out.truncate(cut);
+            return out;
+        }
+        let keep = self.hold_point();
+        let rest = self.held.split_off(keep);
+        std::mem::replace(&mut self.held, rest)
+    }
+
+    /// Releases whatever is held (the generation ended without a match).
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+
+    /// Byte offset of the earliest suffix of `held` that is a proper prefix
+    /// of a stop sequence (on a char boundary); `held.len()` when none is.
+    fn hold_point(&self) -> usize {
+        let longest = self.stops.iter().map(String::len).max().unwrap_or(0);
+        let from = self.held.len().saturating_sub(longest.saturating_sub(1));
+        (from..self.held.len())
+            .filter(|&i| self.held.is_char_boundary(i))
+            .find(|&i| self.stops.iter().any(|s| s.starts_with(&self.held[i..])))
+            .unwrap_or(self.held.len())
+    }
+}
+
+/// What a stream got while waiting on the engine.
+enum StreamNext {
+    Chunk(Option<cascadia_types::Chunk>),
+    /// Nothing was sent for the keep-alive interval: send the comment.
+    Idle,
+}
+
+/// Idle timer of an SSE stream (see [`SSE_KEEPALIVE_INTERVAL`]). The timeout
+/// wraps the engine stream's `next()`, which is cancel-safe; axum's
+/// `KeepAlive` is not used for the batching reason noted in
+/// [`stream_completion`].
+struct KeepAlive {
+    interval: Duration,
+    last_sent: tokio::time::Instant,
+}
+
+impl KeepAlive {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_sent: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Something was just sent.
+    fn sent(&mut self) {
+        self.last_sent = tokio::time::Instant::now();
+    }
+
+    /// The next engine chunk, or [`StreamNext::Idle`] once the interval
+    /// passes with nothing sent. `None` chunks (no stream) end the body.
+    async fn next(&mut self, chunks: Option<&mut StreamWithPermit>) -> StreamNext {
+        let Some(chunks) = chunks else {
+            return StreamNext::Chunk(None);
+        };
+        let deadline = self.last_sent + self.interval;
+        // Checked first: an engine that keeps returning chunks that send
+        // nothing (progress markers, held text) never lets the timeout fire.
+        if tokio::time::Instant::now() >= deadline {
+            self.sent();
+            return StreamNext::Idle;
+        }
+        match tokio::time::timeout_at(deadline, chunks.next()).await {
+            Ok(chunk) => StreamNext::Chunk(chunk),
+            Err(_) => {
+                self.sent();
+                StreamNext::Idle
+            }
+        }
+    }
+}
+
+/// The OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
+fn usage_tail(task_id: &str, model: &str, object: &str, usage: Option<(u32, u32)>) -> Bytes {
+    let mut out = String::new();
+    if let Some((prompt, completion)) = usage {
+        let usage = serde_json::json!({
+            "id": task_id,
+            "object": object,
+            "created": now_unix(),
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion,
+            },
+        });
+        out.push_str(&format!("data: {usage}\n\n"));
+    }
+    out.push_str("data: [DONE]\n\n");
+    Bytes::from(out)
+}
+
+/// SSE `data:` frame for an engine error. The 200 headers are already on the
+/// wire, so the failure travels as an explicit error event.
+fn error_frame(task_id: &str, reason: &str) -> Bytes {
+    let payload = serde_json::json!({
+        "id": task_id,
+        "object": "error",
+        "error": { "message": reason, "type": "engine_error" },
+    });
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
+/// Which wire shape a [`TextStream`] sends.
+enum TextStreamKind {
+    /// `chat.completion.chunk` deltas (`/v1/chat/completions` without tools).
+    Chat,
+    /// `text_completion` chunks (`/v1/completions`); `echo` is prepended to
+    /// the first frame, once.
+    Completion { echo: Option<String> },
+}
+
+/// Body state of a plain (no tools) chat stream or a `/v1/completions`
+/// stream: one frame per engine chunk, `stop` applied as the text arrives,
+/// keep-alive comments while idle. Owns the permit + in-flight guard through
+/// `chunks`; dropping `chunks` (client disconnect, or a stop match) releases
+/// both and cancels the engine task.
+struct TextStream {
+    chunks: Option<StreamWithPermit>,
+    keepalive: KeepAlive,
+    kind: TextStreamKind,
+    marker: Option<MarkerFilter>,
+    stop: StopMatcher,
+    stats: Arc<ApiStats>,
+    completion: std::sync::atomic::AtomicU32,
+    /// Model tokens whose text the stop matcher still holds.
+    held_tokens: u32,
+    prompt_tokens: u32,
+    /// Completed normally (not failed, not cancelled): gates the usage frame.
+    finished: bool,
+    phase: ToolStreamPhase,
+    task_id: String,
+    model: String,
+    include_usage: bool,
+}
+
+impl TextStream {
+    /// Next SSE frame; `None` once `[DONE]` has been sent.
+    async fn next_frame(&mut self) -> Option<Bytes> {
+        loop {
+            match self.phase {
+                ToolStreamPhase::Streaming => {}
+                ToolStreamPhase::Tail => {
+                    self.phase = ToolStreamPhase::Done;
+                    return Some(self.tail());
+                }
+                ToolStreamPhase::Done => return None,
+            }
+            let chunk = match self.keepalive.next(self.chunks.as_mut()).await {
+                StreamNext::Idle => {
+                    return Some(Bytes::from_static(SSE_KEEPALIVE_COMMENT.as_bytes()))
+                }
+                StreamNext::Chunk(Some(chunk)) => chunk,
+                // Ended without a final chunk (cancelled): no usage.
+                StreamNext::Chunk(None) => {
+                    self.phase = ToolStreamPhase::Done;
+                    return Some(self.tail());
+                }
+            };
+            // A progress marker (a long prompt still going down the
+            // pipeline): nothing to send, nothing to count. Yield so a run of
+            // them cannot hold this worker.
+            if chunk.is_progress() {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if let Some(reason) = &chunk.error {
+                warn!(task = %self.task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+                tokio::task::yield_now().await;
+                return Some(error_frame(&self.task_id, reason));
+            }
+            record_stream_tokens(&chunk, &self.stats, &self.completion);
+            if chunk.is_final {
+                self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
+                self.finished =
+                    chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
+            }
+            // Special-token framing (Inkling) → textual delimiters, same
+            // translation as the non-streaming path.
+            let text = match self.marker.as_mut() {
+                Some(f) => {
+                    let mut t = f.feed(&chunk);
+                    if chunk.is_final {
+                        t.push_str(&f.finish());
+                    }
+                    t
+                }
+                None => chunk.text.clone(),
+            };
+            let mut released = self.stop.push(&text);
+            let n_tokens = std::mem::take(&mut self.held_tokens) + chunk.token_count();
+            let finish = if self.stop.stopped() {
+                // Cut at the match: end the choice here and drop the engine
+                // stream, which cancels the task (M1 D11).
+                self.finished = true;
+                self.chunks = None;
+                self.phase = ToolStreamPhase::Tail;
+                Some("stop")
+            } else if chunk.is_final {
+                released.push_str(&self.stop.finish());
+                self.phase = ToolStreamPhase::Tail;
+                Some(
+                    chunk
+                        .finish_reason
+                        .map(|f| f.as_openai_str())
+                        .unwrap_or("stop"),
+                )
+            } else {
+                None
+            };
+            if finish.is_none() && self.stop.is_active() && released.is_empty() {
+                // All of it may begin a stop sequence: hold it (and its
+                // token count) for the next frame.
+                self.held_tokens = n_tokens;
+                continue;
+            }
+            let completion_tokens = if self.stop.stopped() {
+                None
+            } else {
+                chunk.completion_tokens
+            };
+            let frame = self.frame(released, n_tokens, completion_tokens, finish);
+            // Yield between chunks so the body-sink task can drain this
+            // frame to TCP (see the note in `stream_completion`).
+            tokio::task::yield_now().await;
+            return Some(Bytes::from(frame));
+        }
+    }
+
+    fn frame(
+        &mut self,
+        mut text: String,
+        n_tokens: u32,
+        completion_tokens: Option<u32>,
+        finish_reason: Option<&str>,
+    ) -> String {
+        match &mut self.kind {
+            TextStreamKind::Chat => content_frame(
+                &self.task_id,
+                &self.model,
+                &text,
+                n_tokens,
+                completion_tokens,
+                finish_reason,
+            ),
+            TextStreamKind::Completion { echo } => {
+                if let Some(prefix) = echo.take() {
+                    text.insert_str(0, &prefix);
+                }
+                let payload = serde_json::json!({
+                    "id": self.task_id,
+                    "object": "text_completion",
+                    "created": now_unix(),
+                    "model": self.model,
+                    "n_tokens": n_tokens,
+                    "completion_tokens": completion_tokens,
+                    "choices": [{
+                        "index": 0,
+                        "text": text,
+                        "finish_reason": finish_reason,
+                    }],
+                });
+                format!("data: {payload}\n\n")
+            }
+        }
+    }
+
+    fn tail(&self) -> Bytes {
+        let object = match self.kind {
+            TextStreamKind::Chat => "chat.completion.chunk",
+            TextStreamKind::Completion { .. } => "text_completion",
+        };
+        let usage = (self.include_usage && self.finished)
+            .then(|| (self.prompt_tokens, self.completion.load(Ordering::Relaxed)));
+        usage_tail(&self.task_id, &self.model, object, usage)
+    }
+}
+
+/// The SSE response around a stream body. Raw `Body::from_stream`, not
+/// axum's `Sse`: see the batching note in [`stream_completion`].
+fn sse_response<S>(body: S) -> axum::response::Response
+where
+    S: Stream<Item = Bytes> + Send + 'static,
+{
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(
+            body.map(Ok::<Bytes, std::convert::Infallible>),
+        ))
+        .unwrap()
+        .into_response()
+}
+
 /// Body state of a tools-active chat stream. Owns the permit + in-flight
 /// guard through `chunks`, so dropping the body (client disconnect) releases
 /// both and cancels the engine task, exactly like the plain stream.
 struct ToolStream {
-    chunks: StreamWithPermit,
+    /// `None` once a stop match has dropped (and so cancelled) the task.
+    chunks: Option<StreamWithPermit>,
+    keepalive: KeepAlive,
     marker: Option<MarkerFilter>,
+    /// Applied before the splitter, as the non-streaming path trims before
+    /// parsing.
+    stop: StopMatcher,
     splitter: ToolStreamSplitter,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
@@ -3603,14 +3794,22 @@ impl ToolStream {
                 }
                 ToolStreamPhase::Done => return None,
             }
-            let Some(chunk) = self.chunks.next().await else {
-                // Ended without a final chunk (cancelled): settle what is
-                // held instead of dropping it.
-                self.phase = ToolStreamPhase::Tail;
-                return Some(self.close_choice("", None, "stop"));
+            let chunk = match self.keepalive.next(self.chunks.as_mut()).await {
+                StreamNext::Idle => {
+                    return Some(Bytes::from_static(SSE_KEEPALIVE_COMMENT.as_bytes()))
+                }
+                StreamNext::Chunk(Some(chunk)) => chunk,
+                StreamNext::Chunk(None) => {
+                    // Ended without a final chunk (cancelled): settle what
+                    // is held instead of dropping it.
+                    self.phase = ToolStreamPhase::Tail;
+                    let rest = self.stop.finish();
+                    return Some(self.close_choice(&rest, None, "stop"));
+                }
             };
             // Progress chunks carry nothing to send or count.
             if chunk.is_progress() {
+                tokio::task::yield_now().await;
                 continue;
             }
             // The 200 headers are already on the wire: surface the failure
@@ -3618,13 +3817,8 @@ impl ToolStream {
             if let Some(reason) = &chunk.error {
                 warn!(task = %self.task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
                 self.phase = ToolStreamPhase::Tail;
-                let payload = serde_json::json!({
-                    "id": self.task_id,
-                    "object": "error",
-                    "error": { "message": reason, "type": "engine_error" },
-                });
                 tokio::task::yield_now().await;
-                return Some(Bytes::from(format!("data: {payload}\n\n")));
+                return Some(error_frame(&self.task_id, reason));
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             self.held_tokens += chunk.token_count();
@@ -3635,8 +3829,16 @@ impl ToolStream {
                 }
                 t
             });
-            let text = translated.as_deref().unwrap_or(&chunk.text);
-            let frame = if chunk.is_final {
+            let mut text = self.stop.push(translated.as_deref().unwrap_or(&chunk.text));
+            let frame = if self.stop.stopped() {
+                // Cut at the match: close the choice on what came before it
+                // and drop the engine stream, which cancels the task (M1 D11).
+                self.finished = true;
+                self.chunks = None;
+                self.phase = ToolStreamPhase::Tail;
+                Some(self.close_choice(&text, None, "stop"))
+            } else if chunk.is_final {
+                text.push_str(&self.stop.finish());
                 self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
                 self.finished =
                     chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
@@ -3645,9 +3847,9 @@ impl ToolStream {
                     .finish_reason
                     .map(|f| f.as_openai_str())
                     .unwrap_or("stop");
-                Some(self.close_choice(text, chunk.completion_tokens, reason))
+                Some(self.close_choice(&text, chunk.completion_tokens, reason))
             } else {
-                let content = self.splitter.feed(text);
+                let content = self.splitter.feed(&text);
                 if content.is_empty() {
                     None
                 } else {
@@ -3745,22 +3947,9 @@ impl ToolStream {
 
     /// OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
     fn tail(&self) -> Bytes {
-        let mut out = String::new();
-        if self.include_usage && self.finished {
-            let completion = self.completion.load(Ordering::Relaxed);
-            let usage = serde_json::json!({
-                "id": self.task_id, "object": "chat.completion.chunk",
-                "created": now_unix(), "model": self.model, "choices": [],
-                "usage": {
-                    "prompt_tokens": self.prompt_tokens,
-                    "completion_tokens": completion,
-                    "total_tokens": self.prompt_tokens + completion,
-                },
-            });
-            out.push_str(&format!("data: {usage}\n\n"));
-        }
-        out.push_str("data: [DONE]\n\n");
-        Bytes::from(out)
+        let usage = (self.include_usage && self.finished)
+            .then(|| (self.prompt_tokens, self.completion.load(Ordering::Relaxed)));
+        usage_tail(&self.task_id, &self.model, "chat.completion.chunk", usage)
     }
 }
 
@@ -8758,5 +8947,491 @@ level={{ effort_map[eff] }}";
         for event in &events {
             crate::spec_schema::assert_spec("CreateChatCompletionStreamResponse", event);
         }
+    }
+
+    // --- Early stop on `stop` and SSE keep-alive (M1 D11) -----------------
+
+    /// POSTs `payload` to `uri`; returns the status and the raw body.
+    async fn post_text(app: Router, uri: &str, payload: &Value) -> (StatusCode, String) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// `body` with each `"created":<digits>` set to 0 and each response id
+    /// set to `ID`, so two runs compare byte for byte.
+    fn normalize_sse(body: &str) -> String {
+        let mut out = String::new();
+        let mut rest = body;
+        while let Some(i) = rest.find("\"created\":") {
+            let (head, tail) = rest.split_at(i + "\"created\":".len());
+            out.push_str(head);
+            out.push('0');
+            rest = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+        }
+        out.push_str(rest);
+        let mut norm = String::new();
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find("\"id\":\"") {
+            let (head, tail) = rest.split_at(i + "\"id\":\"".len());
+            norm.push_str(head);
+            norm.push_str("ID");
+            rest = &tail[tail.find('"').unwrap()..];
+        }
+        norm.push_str(rest);
+        norm
+    }
+
+    /// The frames a stream without `stop` sends, recorded before the stop
+    /// matcher and keep-alive were added (a9ca3349): they must not change.
+    #[tokio::test]
+    async fn streams_without_stop_are_byte_identical_to_before() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo"}],
+            "max_tokens": 8, "stream": true,
+            "stream_options": {"include_usage": true}});
+        let (status, body) = post_text(make_app().await, "/v1/chat/completions", &chat).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(normalize_sse(&body), "data: {\"choices\":[{\"delta\":{\"content\":\"alpha \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"bravo \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\",\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":0,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":0,\"total_tokens\":2}}\n\ndata: [DONE]\n\n", "chat");
+        let text = serde_json::json!({"model": "mock-model", "prompt": "alpha bravo",
+            "max_tokens": 8, "stream": true, "echo": true,
+            "stream_options": {"include_usage": true}});
+        let (status, body) = post_text(make_app().await, "/v1/completions", &text).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(normalize_sse(&body), "data: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"alpha bravoalpha \"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"bravo \"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"text\":\"\"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":0,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"text_completion\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":0,\"total_tokens\":2}}\n\ndata: [DONE]\n\n", "completions");
+    }
+
+    /// Emits `parts` one per step (`gate` after the first holds the rest,
+    /// sending progress markers, until it is set), then a final chunk; records every task it was told
+    /// to cancel and how many parts it emitted.
+    struct ScriptEngine {
+        parts: Vec<String>,
+        gate: Option<Arc<std::sync::atomic::AtomicBool>>,
+        log: Arc<ScriptLog>,
+        pending: Option<(cascadia_types::TaskId, usize)>,
+    }
+
+    #[derive(Default)]
+    struct ScriptLog {
+        cancelled: std::sync::Mutex<Vec<String>>,
+        emitted: std::sync::atomic::AtomicUsize,
+    }
+
+    impl cascadia_engine::Engine for ScriptEngine {
+        fn warmup(&mut self) {}
+        fn cancel(&mut self, task_id: &cascadia_types::TaskId) {
+            self.log.cancelled.lock().unwrap().push(task_id.to_string());
+            if self.pending.as_ref().is_some_and(|(id, _)| id == task_id) {
+                self.pending = None;
+            }
+        }
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some((task.task_id, 0));
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some((id, i)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            if i > 0
+                && self
+                    .gate
+                    .as_ref()
+                    .is_some_and(|g| !g.load(Ordering::SeqCst))
+            {
+                // Busy but silent, like a long prefill: progress markers
+                // only (an empty step would trip the runner's stall guard).
+                std::thread::sleep(Duration::from_millis(2));
+                self.pending = Some((id.clone(), i));
+                return Ok(vec![(id.clone(), Chunk::progress(id))]);
+            }
+            if let Some(part) = self.parts.get(i) {
+                self.log.emitted.fetch_add(1, Ordering::SeqCst);
+                let chunk = Chunk::token(&id, i as i64, part.clone());
+                self.pending = Some((id.clone(), i + 1));
+                return Ok(vec![(id, chunk)]);
+            }
+            let last = Chunk::final_marker(&id, "")
+                .with_finish_reason(cascadia_types::FinishReason::Length)
+                .with_prompt_tokens(5);
+            Ok(vec![(id, last)])
+        }
+    }
+
+    struct ScriptBuilder(Option<ScriptEngine>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ScriptBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            mut self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0.take().unwrap()))
+        }
+    }
+
+    /// Router over a [`ScriptEngine`] (tools-capable template), its log, and
+    /// the gate when `gated`; `keepalive` overrides the SSE idle interval.
+    async fn script_app(
+        parts: &[&str],
+        gated: bool,
+        keepalive: Duration,
+    ) -> (Router, Arc<ScriptLog>, Arc<std::sync::atomic::AtomicBool>) {
+        let log = Arc::new(ScriptLog::default());
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
+            parts: parts.iter().map(|p| (*p).to_owned()).collect(),
+            gate: gated.then(|| gate.clone()),
+            log: log.clone(),
+            pending: None,
+        }))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            sse_keepalive: keepalive,
+            ..Config::default()
+        };
+        (
+            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            log,
+            gate,
+        )
+    }
+
+    /// Twenty filler parts after `head`: an engine that ran to its end would
+    /// emit all of them.
+    fn script(head: &[&'static str]) -> Vec<&'static str> {
+        let mut parts = head.to_vec();
+        parts.extend(std::iter::repeat_n("filler ", 20));
+        parts
+    }
+
+    fn stop_matcher_run(stops: &[&str], pieces: &[&str]) -> (Vec<String>, bool, String) {
+        let stops: Vec<String> = stops.iter().map(|s| (*s).to_owned()).collect();
+        let mut m = StopMatcher::new(&stops);
+        let out = pieces.iter().map(|p| m.push(p)).collect();
+        let stopped = m.stopped();
+        (out, stopped, m.finish())
+    }
+
+    #[test]
+    fn stop_matcher_cuts_at_a_match_split_across_pieces() {
+        let (out, stopped, rest) = stop_matcher_run(
+            &["\nObservation:"],
+            &["Thought: x\nObs", "ervation: y", "z"],
+        );
+        assert_eq!(out, ["Thought: x", "", ""]);
+        assert!(stopped);
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn stop_matcher_releases_text_that_cannot_start_a_stop() {
+        // No added latency: nothing is held unless it may begin a stop.
+        let (out, stopped, rest) = stop_matcher_run(&["STOP"], &["alpha ", "bravo S", "ix"]);
+        assert_eq!(out, ["alpha ", "bravo ", "Six"]);
+        assert!(!stopped);
+        assert_eq!(rest, "");
+        let (out, _, rest) = stop_matcher_run(&["STOP"], &["alpha ST"]);
+        assert_eq!(out, ["alpha "]);
+        assert_eq!(rest, "ST", "an unmatched prefix comes back at the end");
+        let (out, _, _) = stop_matcher_run(&[], &["a", "b"]);
+        assert_eq!(out, ["a", "b"], "no stop: everything passes through");
+        let (out, _, _) = stop_matcher_run(&[""], &["a"]);
+        assert_eq!(out, ["a"], "an empty stop matches nothing");
+    }
+
+    #[test]
+    fn stop_matcher_handles_a_stop_at_the_start_and_the_earliest_of_several() {
+        let (out, stopped, _) = stop_matcher_run(&["STOP"], &["STOP and more"]);
+        assert_eq!(out, [""]);
+        assert!(stopped);
+        let (out, _, _) = stop_matcher_run(&["zeta", "beta"], &["alpha beta gamma zeta"]);
+        assert_eq!(out, ["alpha "], "earliest match wins, not first listed");
+        let (out, _, _) = stop_matcher_run(&["ab", "b"], &["xa", "b"]);
+        assert_eq!(out, ["x", ""]);
+        let (out, stopped, _) = stop_matcher_run(&["STOP"], &["a", "b"]);
+        assert_eq!(out, ["a", "b"]);
+        assert!(!stopped);
+        let mut m = StopMatcher::new(&["x".into()]);
+        assert_eq!(m.push("ax"), "a");
+        assert_eq!(m.push("more"), "", "nothing after the match");
+    }
+
+    #[test]
+    fn stop_matcher_keeps_multibyte_chars_whole() {
+        let (out, stopped, rest) = stop_matcher_run(&["日本語"], &["xx日本", "語の"]);
+        assert_eq!(out, ["xx", ""]);
+        assert!(stopped);
+        assert_eq!(rest, "");
+        // The hold-back window starts mid-char here; it must not split one.
+        let (out, stopped, rest) = stop_matcher_run(&["é!!"], &["ééé", "é"]);
+        assert_eq!(out, ["éé", "é"]);
+        assert!(!stopped);
+        assert_eq!(rest, "é");
+    }
+
+    async fn assert_cancelled(log: &ScriptLog) {
+        // The cancel is applied when the engine stream drops; a body read to
+        // its end has dropped it.
+        for _ in 0..100 {
+            if !log.cancelled.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            log.cancelled.lock().unwrap().len(),
+            1,
+            "engine saw no cancel"
+        );
+        assert!(
+            log.emitted.load(Ordering::SeqCst) < 10,
+            "engine kept generating: {} parts",
+            log.emitted.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_chat_stops_at_the_match_and_cancels_the_engine() {
+        let (app, log, _) = script_app(
+            &script(&["alpha ", "bravo\nObs", "ervation: x"]),
+            false,
+            SSE_KEEPALIVE_INTERVAL,
+        )
+        .await;
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": ["zzz", "\nObservation:"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["message"]["content"], "alpha bravo");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["completion_tokens"], 3, "tokens received so far");
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+        assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn non_streaming_completions_stop_at_the_match_and_cancel_the_engine() {
+        let (app, log, _) =
+            script_app(&script(&["STOP right away"]), false, SSE_KEEPALIVE_INTERVAL).await;
+        let (status, v) = post_completions(
+            app,
+            serde_json::json!({"model": "mock-model", "prompt": "hi", "stop": "STOP"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["text"], "");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+        assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_cuts_at_the_match_and_cancels_the_engine() {
+        let (app, log, _) = script_app(
+            &script(&["héllo wör", "ld ST", "OP tail"]),
+            false,
+            SSE_KEEPALIVE_INTERVAL,
+        )
+        .await;
+        let (status, body) = post_text(
+            app,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": "STOP", "stream": true,
+                "stream_options": {"include_usage": true}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        let events = sse_events(&body);
+        for event in &events {
+            crate::spec_schema::assert_spec("CreateChatCompletionStreamResponse", event);
+        }
+        let contents: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        // "héllo wör" goes out at once; "ST" is held until "OP" completes the stop.
+        assert_eq!(contents, ["héllo wör", "ld ", ""], "{body}");
+        let finishes: Vec<&Value> = events
+            .iter()
+            .map(|e| &e["choices"][0]["finish_reason"])
+            .filter(|f| !f.is_null())
+            .collect();
+        assert_eq!(finishes, [&serde_json::json!("stop")], "{body}");
+        let usage = &events.last().unwrap()["usage"];
+        assert_eq!(usage["completion_tokens"], 3, "{body}");
+        assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_completions_cut_at_the_match_and_cancel_the_engine() {
+        let (app, log, _) = script_app(
+            &script(&["one ", "two END three"]),
+            false,
+            SSE_KEEPALIVE_INTERVAL,
+        )
+        .await;
+        let (status, body) = post_text(
+            app,
+            "/v1/completions",
+            &serde_json::json!({"model": "mock-model", "prompt": "P: ",
+                "echo": true, "stop": ["END"], "stream": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let events = sse_events(&body);
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["text"].as_str())
+            .collect();
+        assert_eq!(texts, ["P: one ", "two "], "{body}");
+        assert_eq!(
+            events.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_requests_cut_at_the_match_too() {
+        let (app, log, _) = script_app(
+            &script(&["Sure, ", "checking STOP now"]),
+            false,
+            SSE_KEEPALIVE_INTERVAL,
+        )
+        .await;
+        let (status, body) = post_text(
+            app,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "stop": "STOP", "stream": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let events = sse_events(&body);
+        for event in &events {
+            crate::spec_schema::assert_spec("CreateChatCompletionStreamResponse", event);
+        }
+        assert_eq!(streamed_content(&events), "Sure, checking ", "{body}");
+        assert_eq!(
+            events.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
+        assert_cancelled(&log).await;
+    }
+
+    /// Reads `uri`'s stream from a gated engine until a keep-alive comment
+    /// arrives, then opens the gate and reads the rest.
+    async fn read_with_keepalive(uri: &str, payload: Value) -> String {
+        let (app, _log, gate) =
+            script_app(&["first ", "second "], true, Duration::from_millis(50)).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        let mut text = String::new();
+        while !text.contains(": keep-alive") {
+            let frame = tokio::time::timeout(Duration::from_secs(10), body.next())
+                .await
+                .expect("a keep-alive comment while the engine is idle")
+                .unwrap_or_else(|| panic!("body ended before a keep-alive: {text}"))
+                .unwrap();
+            text.push_str(std::str::from_utf8(&frame).unwrap());
+        }
+        gate.store(true, Ordering::SeqCst);
+        while let Some(frame) = body.next().await {
+            text.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+        text
+    }
+
+    fn assert_keepalive_body(body: &str, object: &str) {
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        // SSE events are separated by a blank line: each one is either the
+        // comment or a single `data:` line, never a mix.
+        let events: Vec<&str> = body.split("\n\n").filter(|e| !e.is_empty()).collect();
+        assert!(events.contains(&": keep-alive"), "{body}");
+        for event in events {
+            if event == ": keep-alive" || event == "data: [DONE]" {
+                continue;
+            }
+            let json = event
+                .strip_prefix("data: ")
+                .unwrap_or_else(|| panic!("{event:?}"));
+            assert!(!json.contains("keep-alive"), "{event}");
+            let v: Value = serde_json::from_str(json).unwrap();
+            assert_eq!(v["object"], object, "{event}");
+            if object == "chat.completion.chunk" {
+                crate::spec_schema::assert_spec("CreateChatCompletionStreamResponse", &v);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_streams_send_keepalive_comments() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}], "stream": true});
+        let body = read_with_keepalive("/v1/chat/completions", chat.clone()).await;
+        assert_keepalive_body(&body, "chat.completion.chunk");
+        assert_eq!(
+            streamed_content(&sse_events(&body.replace(": keep-alive\n\n", ""))),
+            "first second "
+        );
+        let mut tools = chat;
+        tools["tools"] = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        let body = read_with_keepalive("/v1/chat/completions", tools).await;
+        assert_keepalive_body(&body, "chat.completion.chunk");
+        let text = serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true});
+        let body = read_with_keepalive("/v1/completions", text).await;
+        assert_keepalive_body(&body, "text_completion");
     }
 }
