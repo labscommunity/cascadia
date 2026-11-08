@@ -15,7 +15,7 @@ Cascadia stores no responses: send the whole conversation in `input` every turn.
 | Field | Behaviour |
 |---|---|
 | `model`, `input`, `instructions` | `input` is a string (one user message) or an array of items (see [Input items](#input-items)). `instructions` becomes a leading `system` message. |
-| `max_output_tokens` | The chat path's `max_tokens`. Unset, it follows the server's default for an unset cap: 256 tokens, the chat endpoint's default. The response echoes the cap in force. |
+| `max_output_tokens` | The chat path's `max_tokens`. Unset, it follows the server's unset default (256 tokens today, the chat endpoint's default). The response echoes the cap in force. |
 | `temperature`, `top_p` | As on chat (`temperature` unset = `0.0`). |
 | `reasoning.effort` | The chat endpoint's `reasoning_effort`. |
 | `reasoning.summary` | Accepted; no summary is generated. Echoed as `null`. |
@@ -71,15 +71,17 @@ Any other item type is a `400` naming `input[i]`, as is a call or call output wi
   `grammar` format is written into the tool's description for the model; it is not enforced
   (there is no constrained decoding on this path). The call comes back as a
   `custom_tool_call` with that `input`.
-- **Hosted tools** (`web_search*`, `file_search`, `code_interpreter`, `computer_use*`,
-  `image_generation`, `mcp`, `local_shell`, `shell`, `apply_patch`, `tool_search`, ...) run
-  on OpenAI's side, so none runs here. They are dropped with one warning in the server log
-  and left out of the echoed `tools`; the rest of the request is served.
+- **Tools this server cannot serve**: OpenAI-hosted ones such as `web_search*`,
+  `file_search`, `code_interpreter`, `computer_use*`, `image_generation` and `mcp`, and the
+  client-side `shell`, `local_shell`, `apply_patch` and `tool_search` types. They are dropped
+  with one warning in the server log and left out of the echoed `tools`; the rest of the
+  request is served.
 
 An unknown tool type, a tool without a `name`, or two tools served under the same name are
 refused with a `400`. Tool calls are parsed out of the model's output as the chat endpoint
-parses them (the model's chat template must render tools: with no template, a tools request
-is a `400`; `sycl-llama` templates them itself). A malformed call stays message text. A call to a name not in `tools` comes back as
+parses them. The model's chat template must render the tools: with no template, a tools
+request is a `400`, or a `500` on `ov-genai` with thinking on (`sycl-llama` templates them
+itself). A malformed call stays message text. A call to a name not in `tools` comes back as
 a plain `function_call` under that name.
 
 ## Output
@@ -104,8 +106,8 @@ itself, a probe of the chat template at load decides. Limits:
 
 - `sycl-llama`: no reasoning item; llama-server moves reasoning out of the text it returns,
   and the engine does not forward it.
-- A model whose prompt opens `<think>` but that has no chat template in its tokenizer
-  config: the probe cannot run, so its reasoning stays in the message text.
+- On engine-rendered paths whose template cannot be probed (no chat template loaded, or a
+  probe render error), a prompt-opened model's reasoning stays in the message text.
 
 With `include: ["reasoning.encrypted_content"]`, each finished reasoning item carries
 `encrypted_content`. It is **not encrypted**: it is the reasoning text in base64 behind a
@@ -162,8 +164,9 @@ past it the request is a `413` `prompt_too_large`.
 sees only the last user message. On `/v1/responses`, when the model has a chat template, the
 API renders the full prompt itself instead (instructions, developer messages, history, tools),
 and ov-genai uses it as is. On `/v1/chat/completions` the same happens when the request has
-tools or a tool-call history (it used to be refused with a `500`); plain multi-turn chat
-without tools keeps the engine's own template.
+tools or a tool-call history; plain multi-turn chat without tools keeps the engine's own
+template. If the API's render fails, ov-genai falls back to its own template (which sees
+only the last user message), and a request with tools is then a `500`.
 
 ## Codex CLI
 
@@ -178,18 +181,19 @@ model_auto_compact_token_limit = 24000
 name = "cascadia"
 base_url = "http://127.0.0.1:8000/v1"
 wire_api = "responses"
+capabilities = { remote_compaction = "unsupported" }
 ```
 
 Set `model` to the served model's id, `model_context_window` to its context window and
-`model_auto_compact_token_limit` below it.
+`model_auto_compact_token_limit` below it. `remote_compaction = "unsupported"` makes Codex
+compact the conversation locally (the server refuses `compaction_trigger` items).
 
 - Codex never sends `max_output_tokens`, so each turn is capped at the server's unset
-  default, 256 tokens. A long Codex turn (a big reasoning block, a long patch) can end
+  default (256 tokens today). A long Codex turn (a big reasoning block, a long patch) can end
   `incomplete` at that cap.
-- Codex's `web_search` tool is hosted: it is dropped (logged once per request) and the rest
-  is served. Its MCP tools arrive as namespaces and are served as `<namespace>__<name>`.
-- Codex compacts the conversation locally with a custom provider; remote compaction items
-  are refused.
+- The model sees only Codex's `function`, `namespace` and `custom` tools. Its `web_search`
+  tool (and any other type in the list above) is dropped, logged once per request. Its MCP
+  tools arrive as namespaces and are served as `<namespace>__<name>`.
 - A tool output with a screenshot (`view_image`) is replaced by a note in the prompt. On a
   server without image input the request body still carries the image, so raise
   `--api-max-body-mb` above its size, or every request that resends it is a `413`.
@@ -214,6 +218,7 @@ cascadia run tests/fixtures/mock-tools-model --engine mock
 
 The model id is `mock-tools-model`. It echoes by default; as a test aid, a user turn that
 contains `__mock_tool_call__` on a request with tools gets one scripted call of the first
-tool, and the turn after its `function_call_output` gets the fixed answer
-`mock: got <output>`, so a client's tool loop runs end to end. It is not a feature of real
-models.
+tool; the turn after its `function_call_output` gets the fixed answer
+`mock: got <first 40 characters of the output>`; and a later user turn without the sentinel,
+after one that had it, gets `mock: ok`. So a client's tool loop runs end to end. It is not a
+feature of real models.

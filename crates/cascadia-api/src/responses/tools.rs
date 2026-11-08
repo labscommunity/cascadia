@@ -8,9 +8,10 @@
 //! - `custom` (freeform) tools become a function taking one string
 //!   parameter `input`; a grammar is put in the description, not enforced
 //!   (D3).
-//! - Hosted tools (`web_search`, `file_search`, ...) run on OpenAI's side.
-//!   None runs here, so each is dropped with one `warn!` per request and
-//!   left out of the echoed `tools` (D4).
+//! - Tool types this server cannot serve (OpenAI-hosted ones such as
+//!   `web_search`, `file_search`, `mcp`, and the client-side `shell`,
+//!   `local_shell`, `apply_patch`, `tool_search` types) are dropped with one
+//!   `warn!` per request and left out of the echoed `tools` (D4).
 
 use super::Refusal;
 use serde_json::{json, Map, Value};
@@ -48,7 +49,8 @@ pub(super) struct ToolMap {
     pub dropped: Vec<String>,
 }
 
-/// OpenAI's hosted tool types: run on OpenAI's side, never here.
+/// Tool types this server cannot serve: OpenAI-hosted ones and the
+/// client-side `shell`, `local_shell`, `apply_patch` and `tool_search`.
 fn is_hosted(kind: &str) -> bool {
     kind.starts_with("web_search")
         || matches!(
