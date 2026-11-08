@@ -10,6 +10,10 @@
 //! turn's content (D8): its `content[].text`, else our own
 //! `encrypted_content` decoded, else nothing (another provider's blob or a
 //! summary-only item cannot be rendered, so it is dropped).
+//!
+//! A `system` right after a `system`, or a `user` right after a `user`, is
+//! merged into it (D22). An `item_reference` is replaced by the stored item
+//! it names, against a byte budget for everything expanded so.
 
 use super::*;
 use base64::engine::general_purpose::STANDARD;
@@ -25,6 +29,9 @@ pub(super) const ENCRYPTED_PREFIX: &str = "cascadia.v1.";
 /// Codex resends on every later turn.
 const IMAGE_OMITTED: &str = "[image omitted: tool output images are not supported]";
 const FILE_OMITTED: &str = "[file omitted: tool output files are not supported]";
+
+const COMPACTION: &str = "remote compaction is not supported; compact locally (Codex: \
+    `[model_providers.<id>] capabilities = { remote_compaction = \"unsupported\" }`)";
 
 /// `text` as our `encrypted_content`.
 #[cfg_attr(not(test), allow(dead_code))] // written by the output builder
@@ -85,14 +92,14 @@ pub(super) type Resolve<'a> = dyn Fn(&str, usize) -> Result<Option<(Value, usize
 /// types and parsed by its own [`parse_content`], so text joining and image
 /// placement match `/v1/chat/completions` exactly.
 ///
-/// `resolve` and `max_expand_bytes` serve `item_reference` expansion: not
-/// taken yet, so such an item is refused like any unknown type.
+/// An `item_reference` is looked up through `resolve`, which is given what is
+/// left of `max_expand_bytes`; each stored item found is charged its size.
+/// Any refusal from `resolve` names the referencing item.
 pub(super) fn input_messages(
     req: &ResponsesRequest,
     resolve: &Resolve,
     max_expand_bytes: usize,
 ) -> Result<Vec<ChatMessage>, Refusal> {
-    let _ = (resolve, max_expand_bytes);
     let mut out = Vec::new();
     if let Some(instructions) = &req.instructions {
         out.push(text_message("system", instructions.clone()));
@@ -111,13 +118,48 @@ pub(super) fn input_messages(
         }
     };
     let mut turn = Turn::default();
+    let mut expanded = 0usize;
     for (i, item) in items.iter().enumerate() {
         let at = format!("input[{i}]");
-        // `type` is optional on the shorthand message form `{role, content}`.
-        let kind = item
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("message");
+        let stored;
+        let item = if item_kind(item) == "item_reference" {
+            let id = str_field(item, "id", &at, true)?;
+            let left = max_expand_bytes.saturating_sub(expanded);
+            let (value, size) = match resolve(id, left) {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    return Err(Refusal::new(
+                        &at,
+                        format!(
+                            "Item with id '{id}' not found (this server keeps stored items \
+                             in memory only; it may have restarted or evicted it; send the \
+                             item itself, or use store: false)"
+                        ),
+                    ))
+                }
+                Err(refusal) => {
+                    return Err(Refusal {
+                        param: at,
+                        ..refusal
+                    })
+                }
+            };
+            if size > left {
+                return Err(Refusal::too_large(
+                    &at,
+                    format!(
+                        "expanding `item_reference` items would pass {max_expand_bytes} \
+                         bytes (max_prompt_bytes)"
+                    ),
+                ));
+            }
+            expanded += size;
+            stored = value;
+            &stored
+        } else {
+            item
+        };
+        let kind = item_kind(item);
         match kind {
             "message" => {
                 let message = input_message(item, &at)?;
@@ -128,7 +170,10 @@ pub(super) fn input_messages(
                     turn.content = Some((message.content, message.parts));
                 } else {
                     turn.flush(&mut out);
-                    out.push(message);
+                    match out.last_mut() {
+                        Some(last) if last.role == message.role => merge(last, message),
+                        _ => out.push(message),
+                    }
                 }
             }
             // A reasoning item with no text we can render changes nothing.
@@ -150,13 +195,16 @@ pub(super) fn input_messages(
                 turn.flush(&mut out);
                 out.push(output);
             }
+            "compaction_trigger" | "compaction" | "compaction_summary" => {
+                return Err(Refusal::new(&at, COMPACTION))
+            }
             _ => {
                 return Err(Refusal::new(
                     &at,
                     format!(
                         "input item type `{kind}` is not supported; `message`, `reasoning`, \
-                         `function_call`, `custom_tool_call` and their outputs are accepted \
-                         (no stored items)"
+                         `function_call`, `custom_tool_call`, their outputs and \
+                         `item_reference` are accepted"
                     ),
                 ))
             }
@@ -164,6 +212,45 @@ pub(super) fn input_messages(
     }
     turn.flush(&mut out);
     Ok(out)
+}
+
+/// An input item's `type`. It is optional: an item with an `id` and neither
+/// `role` nor `content` is an `item_reference` (the spec makes `type`
+/// optional there), any other a shorthand `{role, content}` message.
+fn item_kind(item: &Value) -> &str {
+    match item.get("type").and_then(Value::as_str) {
+        Some(kind) => kind,
+        None if item.get("id").is_some()
+            && item.get("role").is_none()
+            && item.get("content").is_none() =>
+        {
+            "item_reference"
+        }
+        None => "message",
+    }
+}
+
+/// `next` merged into `into`, a message of the same role (D22): the texts
+/// joined by a blank line, and when either side has `parts`, the parts
+/// joined by a `\n\n` text part (a string-form side becoming one text
+/// part), as the image and part-trimming paths rebuild `content` from them.
+fn merge(into: &mut ChatMessage, next: ChatMessage) {
+    const SEP: &str = "\n\n";
+    if !into.parts.is_empty() || !next.parts.is_empty() {
+        let as_parts = |content: &str, parts: Vec<ContentPart>| {
+            if parts.is_empty() {
+                vec![ContentPart::Text(content.to_owned())]
+            } else {
+                parts
+            }
+        };
+        let mut parts = as_parts(&into.content, std::mem::take(&mut into.parts));
+        parts.push(ContentPart::Text(SEP.into()));
+        parts.extend(as_parts(&next.content, next.parts));
+        into.parts = parts;
+    }
+    into.content.push_str(SEP);
+    into.content.push_str(&next.content);
 }
 
 /// A `message` item as the chat message it is.
@@ -684,6 +771,182 @@ mod tests {
         .unwrap();
         let calls = vec![call("A", "f", "{}")];
         assert_eq!(shape(&m), [("assistant", "a", Some(&calls), None)]);
+    }
+
+    fn walk_with(
+        input: Value,
+        resolve: &Resolve,
+        budget: usize,
+    ) -> Result<Vec<ChatMessage>, Refusal> {
+        let req: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": input})).unwrap();
+        input_messages(&req, resolve, budget)
+    }
+
+    /// A resolver that knows `fc_1` (a function call, 30 bytes).
+    fn known_fc(id: &str, _: usize) -> Result<Option<(Value, usize)>, Refusal> {
+        Ok((id == "fc_1").then(|| {
+            (
+                json!({"type": "function_call", "id": "fc_1", "call_id": "A",
+                    "name": "f", "arguments": "{}"}),
+                30,
+            )
+        }))
+    }
+
+    /// (i) An `item_reference` is replaced by the stored item; an unknown
+    /// one is refused naming it.
+    #[test]
+    fn item_reference_is_resolved_or_refused() {
+        let m = walk_with(
+            json!([{"type": "item_reference", "id": "fc_1"}]),
+            &known_fc,
+            100,
+        )
+        .unwrap();
+        let calls = vec![call("A", "f", "{}")];
+        assert_eq!(shape(&m), [("assistant", "", Some(&calls), None)]);
+
+        let err = walk(json!([{"type": "item_reference", "id": "x"}])).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.param, "input[0]");
+        assert!(
+            err.message.starts_with("Item with id 'x' not found"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("store: false"), "{}", err.message);
+    }
+
+    /// (q) A typeless item with an `id` and no `role`/`content` is a
+    /// reference; with `role` it is still the shorthand message.
+    #[test]
+    fn typeless_items() {
+        let m = walk_with(json!([{"id": "fc_1"}]), &known_fc, 100).unwrap();
+        let calls = vec![call("A", "f", "{}")];
+        assert_eq!(shape(&m), [("assistant", "", Some(&calls), None)]);
+        let err = walk(json!([{"id": "msg_1"}])).unwrap_err();
+        assert!(
+            err.message.starts_with("Item with id 'msg_1' not found"),
+            "{}",
+            err.message
+        );
+        let m = walk(json!([{"role": "user", "content": "x"}])).unwrap();
+        assert_eq!(shape(&m), [("user", "x", None, None)]);
+    }
+
+    /// (r) Compaction items are refused, pointing at local compaction.
+    #[test]
+    fn compaction_items_are_refused() {
+        for kind in ["compaction_trigger", "compaction", "compaction_summary"] {
+            let err = walk(json!([{"type": kind}])).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{kind}");
+            assert_eq!(err.param, "input[0]", "{kind}");
+            assert!(err.message.contains("remote_compaction"), "{}", err.message);
+        }
+    }
+
+    /// (j) A hosted tool's call item is refused naming it.
+    #[test]
+    fn hosted_call_item_is_refused() {
+        let err = walk(json!([{"type": "web_search_call", "id": "ws_1"}])).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.param, "input[0]");
+    }
+
+    /// (l) A `system` after a `system`, or a `user` after a `user`, merges
+    /// into it (D22); `parts` are joined with a `\n\n` text part.
+    #[test]
+    fn same_role_turns_merge() {
+        let m = walk(json!([
+            {"role": "developer", "content": "a"},
+            {"role": "developer", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "user", "content": "d"},
+        ]))
+        .unwrap();
+        assert_eq!(
+            shape(&m),
+            [
+                ("system", "a\n\nb", None, None),
+                ("user", "c\n\nd", None, None)
+            ]
+        );
+        assert!(m.iter().all(|m| m.parts.is_empty()));
+
+        let m = walk(json!([
+            {"role": "user", "content": "a"},
+            {"role": "user", "content": [{"type": "input_text", "text": "b"}]},
+        ]))
+        .unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].content, "a\n\nb");
+        assert_eq!(
+            m[0].parts,
+            [
+                ContentPart::Text("a".into()),
+                ContentPart::Text("\n\n".into()),
+                ContentPart::Text("b".into())
+            ]
+        );
+
+        let m = walk(json!([
+            {"role": "user", "content": "c"},
+            {"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:x", "detail": "low"}]},
+        ]))
+        .unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].parts,
+            [
+                ContentPart::Text("c".into()),
+                ContentPart::Text("\n\n".into()),
+                ContentPart::ImageUrl {
+                    url: "data:x".into(),
+                    detail: Some("low".into())
+                }
+            ]
+        );
+
+        // A turn between them keeps them apart.
+        let m = walk(json!([
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+        ]))
+        .unwrap();
+        assert_eq!(m.len(), 3);
+    }
+
+    /// (o) The walk passes the remaining budget to `resolve`, charging each
+    /// resolved item; a 413 from `resolve` propagates, naming the item.
+    #[test]
+    fn expansion_is_bounded() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let resolve = |id: &str, left: usize| {
+            seen.borrow_mut().push(left);
+            known_fc(id, left)
+        };
+        let refs = json!([{"type": "item_reference", "id": "fc_1"}, {"id": "fc_1"}]);
+        walk_with(refs, &resolve, 100).unwrap();
+        assert_eq!(*seen.borrow(), [100, 70]);
+
+        let over = |_: &str, left: usize| -> Result<Option<(Value, usize)>, Refusal> {
+            Err(Refusal::too_large(
+                "input",
+                format!("over the {left}-byte budget"),
+            ))
+        };
+        let err = walk_with(
+            json!([{"role": "user", "content": "x"}, {"type": "item_reference", "id": "fc_1"}]),
+            &over,
+            100,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(err.code, Some("prompt_too_large"));
+        assert_eq!(err.param, "input[1]");
     }
 
     #[test]

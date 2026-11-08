@@ -133,7 +133,6 @@ impl Refusal {
     }
 
     /// A 413: expanding `input` would pass the prompt byte budget.
-    #[allow(dead_code)] // first used by `item_reference` expansion
     pub(super) fn too_large(param: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -763,7 +762,7 @@ mod tests {
 
     /// `input` as a string is one user message; as items, each part maps to
     /// the chat part it names, `instructions` leads as `system`, and
-    /// `developer` reads as `system`.
+    /// `developer` reads as `system` (merged into the `instructions`, D22).
     #[test]
     fn input_maps_onto_chat_messages() {
         let m = walk_request(json!({"model": "m", "input": "hi there"})).unwrap();
@@ -786,11 +785,11 @@ mod tests {
         ]}))
         .unwrap();
         let roles: Vec<_> = m.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, ["system", "system", "user", "assistant"]);
-        assert_eq!(m[0].content, "be brief");
-        assert_eq!(m[2].content, "whatis this");
+        assert_eq!(roles, ["system", "user", "assistant"]);
+        assert_eq!(m[0].content, "be brief\n\nterse");
+        assert_eq!(m[1].content, "whatis this");
         assert_eq!(
-            m[2].parts,
+            m[1].parts,
             vec![
                 ContentPart::Text("what".into()),
                 ContentPart::ImageUrl {
@@ -800,8 +799,8 @@ mod tests {
                 ContentPart::Text("is this".into()),
             ]
         );
-        assert_eq!(m[3].content, "a dot");
-        assert_eq!(m[3].parts, vec![ContentPart::Text("a dot".into())]);
+        assert_eq!(m[2].content, "a dot");
+        assert_eq!(m[2].parts, vec![ContentPart::Text("a dot".into())]);
 
         let chat = chat_request(
             &request(json!({"model": "m", "input": "x", "max_output_tokens": 7,
