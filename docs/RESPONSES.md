@@ -8,7 +8,10 @@ differ. It serves function and custom tools, returns reasoning as reasoning item
 recent output items in memory so `item_reference` works. It is enough for the Codex CLI,
 the OpenAI Agents SDK, `@ai-sdk/openai` and n8n's OpenAI Chat Model (Responses on).
 
-Cascadia stores no responses: send the whole conversation in `input` every turn.
+Cascadia keeps no conversation state (`previous_response_id` and `conversation` are refused):
+send the whole conversation in `input` every turn. The output items of responses whose
+`store` is not `false` are kept in a bounded in-memory cache (16384 items / 32 MiB, on by
+default) so `item_reference` resolves (see [The item cache](#the-item-cache)).
 
 ## Request fields
 
@@ -19,11 +22,11 @@ Cascadia stores no responses: send the whole conversation in `input` every turn.
 | `temperature`, `top_p` | As on chat (`temperature` unset = `0.0`). |
 | `reasoning.effort` | The chat endpoint's `reasoning_effort`. |
 | `reasoning.summary` | Accepted; no summary is generated. Echoed as `null`. |
-| `stream` | `true` sends OpenAI's event sequence (see [Streaming](#streaming)). |
+| `stream` | `true` sends OpenAI's event sequence (see [Streaming](#streaming)). `false`, `null` or absent: one JSON response. |
 | `tools` | `function`, `custom` and `namespace` tools are served; hosted tools are dropped (see [Tools](#tools)). `[]` or absent = no tools. |
 | `tool_choice` | `"auto"` and `"none"` (`"none"`: calls are not parsed). `"required"`, a named `function` / `custom` tool and `allowed_tools` are refused with `400` ("not enforced yet"); a hosted tool type is refused with `400`. |
 | `parallel_tool_calls` | `false` keeps only the first call the model makes. Echoed (absent = `true`). |
-| `max_tool_calls` | Accepted and echoed; no effect (it caps hosted tool calls, and none run here). |
+| `max_tool_calls` | A non-negative integer or `null` (else `400`), echoed; no effect (it caps hosted tool calls, and none run here). |
 | `store` | `true` or absent (OpenAI's default is `true`): the response's output items are kept in the [item cache](#the-item-cache). `false`: nothing is kept. Echoed (`true` when absent). |
 | `include` | Each value must be one of OpenAI's `include` values, else `400`. `reasoning.encrypted_content` adds `encrypted_content` to reasoning items; the others add nothing here. |
 | `metadata` | Echoed, held to OpenAI's limits (an object of at most 16 string pairs, keys up to 64 characters, values up to 512); anything else is a `400`. |
@@ -90,7 +93,8 @@ a plain `function_call` under that name.
 answer text), then one item per tool call. Ids are `rs_`, `msg_`, `fc_` and `ctc_` plus a
 random UUID; a call's `call_id` is the parser's `call_...`. `status` is `completed`;
 `incomplete` (with `incomplete_details.reason: "max_output_tokens"`) at the token cap; or
-`cancelled` after `/v1/cancel/<response id>` (the response id is the task id).
+`cancelled` after `/v1/cancel/<response id>` (the response id is the task id). An empty
+generation returns `output: []`.
 
 ### Reasoning items
 
