@@ -246,6 +246,15 @@ alike. The worker logs the three values and where each came from at startup.
   an answer runs to the full limit there too. `--default-max-tokens` bounds it
   per server.
 - To restore the old behaviour: `--default-max-tokens 256 --default-temperature 0`.
+- `null` on `stream` and `logprobs` (and on `/v1/completions`' `stream` and
+  `echo`) means unset, i.e. `false`, as for the fields above.
+
+**Accepted and ignored.** These OpenAI request fields are accepted (no 422)
+and change nothing on a local server: `user`, `safety_identifier`,
+`prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`,
+`metadata`, `store`, `service_tier`, `verbosity`, `moderation`, `prediction`,
+and `stream_options.include_obfuscation`. `store: true` is accepted; nothing is
+stored. `/v1/completions` accepts `user` and `metadata` the same way.
 
 **`--ov-config KEY=VALUE`** forwards any plugin property to OpenVINO verbatim,
 alongside the typed `--ov-*` flags — the escape hatch for knobs without a
