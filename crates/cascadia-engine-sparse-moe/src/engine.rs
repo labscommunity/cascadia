@@ -2005,6 +2005,7 @@ impl SparseMoEEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.prompt_tokens = Some(prompt_ids.len() as u32);
         chunk.token_ids = generated;
         chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
@@ -2272,6 +2273,7 @@ impl SparseMoEEngine {
             );
             let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
             chunk.n_tokens = Some(n_tokens);
+            chunk.prompt_tokens = Some(prompt_ids.len() as u32);
             chunk.token_ids = result_tokens;
             chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
             return Some(vec![(task.task_id.clone(), chunk)]);
@@ -2464,6 +2466,13 @@ impl SparseMoEEngine {
         // Splicer poison bypass (id-less chunks read as resume-ineligible): token_id==0 with empty token_ids
         // reads as id-less; stamp the single id explicitly.
         token_chunk.token_ids = vec![next];
+        {
+            // First new token: the prompt count rides it too (M1 D14).
+            let a = self.active.as_ref().unwrap();
+            if a.generated.len() == a.resume_seed_len + 1 {
+                token_chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
+            }
+        }
         let (gen_new, max_new) = {
             let a = self.active.as_ref().unwrap();
             (a.generated.len() - a.resume_seed_len, a.max_new)
@@ -2642,6 +2651,8 @@ impl SparseMoEEngine {
             rank = self.rank, total = self.total, "task done (rank-0 driver, streamed)");
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
+        // Prompt as fed (resume ids included), as the first token reports it (M1 D14).
+        chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
         chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
         vec![(a.id, chunk)]
     }
@@ -4083,6 +4094,7 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.prompt_tokens = Some(prompt_ids.len() as u32);
         chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
     }
@@ -4409,6 +4421,13 @@ impl OvMoeEngine {
         // Splicer poison bypass (id-less chunks read as resume-ineligible): token_id==0 with empty token_ids
         // reads as id-less; stamp the single id explicitly.
         token_chunk.token_ids = vec![next];
+        {
+            // First new token: the prompt count rides it too (M1 D14).
+            let a = self.active_ov.as_ref().unwrap();
+            if a.generated.len() == a.resume_seed_len + 1 {
+                token_chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
+            }
+        }
         let (gen_new, max_new, is_eos, pos) = {
             let a = self.active_ov.as_ref().unwrap();
             (
@@ -4569,6 +4588,8 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
+        // Prompt as fed (resume ids included), as the first token reports it (M1 D14).
+        chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
         chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
         vec![(a.id, chunk)]
     }
