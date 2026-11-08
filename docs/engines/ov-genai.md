@@ -1,6 +1,10 @@
 # `ov-genai` — single-stage `openvino_genai.LLMPipeline`
 
-Wraps Intel's `openvino_genai.LLMPipeline` to expose **FastDraft speculative decode** and **Prompt Lookup decoding**. Both are mathematically lossless under greedy decoding.
+Wraps Intel's `openvino_genai.LLMPipeline` to expose **FastDraft speculative decode** and **Prompt Lookup decoding**. Both are mathematically lossless under greedy decoding, which a request gets
+with `temperature: 0`. A request that omits `temperature` gets the server
+default (the model's `generation_config.json`, else 1), so it samples; start
+the worker with `--default-temperature 0` to keep greedy decoding by default
+(see [Request defaults](../CLI.md#request-defaults)).
 
 ## When to use
 

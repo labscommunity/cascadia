@@ -79,8 +79,10 @@ cascadia worker --rank 0 --total 1 --engine sparse-moe --model /path/to/m2_expor
 
 The builder reads `manifest.json`; `shell_backend: "ov_ir"` automatically
 selects the M2 engine (no extra flag). Generation honors the request's
-sampling config (temperature / top-p / repetition penalty); with the
-defaults it is greedy. Bound expert RAM with `--max-cached-experts N` /
+sampling config (temperature / top-p / repetition penalty); a request that
+omits them gets the server defaults (the model's `generation_config.json`,
+else temperature 1), so it samples. Pass `--default-temperature 0` for greedy
+decoding by default (see [Request defaults](../CLI.md#request-defaults)). Bound expert RAM with `--max-cached-experts N` /
 `CASCADIA_MAX_EXPERTS_CACHED` so experts stream rather than all staying
 resident.
 

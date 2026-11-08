@@ -1678,15 +1678,36 @@ fn file_sampling_warnings(
     w
 }
 
-/// sparse-moe speculative decoding (`--prompt-lookup`) runs only at
-/// temperature <= 0, so a default temperature above 0 turns it off for every
-/// request that omits `temperature` (D3).
-fn spec_decode_off_by_default(args: &WorkerArgs, default_temperature: f32) -> bool {
-    // Multi-stage sparse-moe ignores --prompt-lookup (see build_builder).
-    matches!(args.engine, EngineKind::SparseMoe)
-        && args.total == 1
-        && args.prompt_lookup > 0
-        && default_temperature > 0.0
+/// The startup warning when speculative decoding meets a default
+/// temperature above 0, for requests that omit `temperature` (D3):
+/// sparse-moe's (`--prompt-lookup`) runs only at temperature <= 0, so it is
+/// off for them; ov-genai's (`--draft-model` / `--prompt-lookup`) now
+/// samples, so its output is no longer the greedy one.
+fn spec_decode_sampling_warning(args: &WorkerArgs, default_temperature: f32) -> Option<String> {
+    if default_temperature <= 0.0 {
+        return None;
+    }
+    match args.engine {
+        // Multi-stage sparse-moe ignores --prompt-lookup (see build_builder).
+        EngineKind::SparseMoe if args.total == 1 && args.prompt_lookup > 0 => Some(format!(
+            "sparse-moe speculative decoding runs only at temperature 0; requests that omit \
+             temperature get {default_temperature} and decode without it. Pass \
+             --default-temperature 0 to keep it on"
+        )),
+        EngineKind::OvGenai if args.draft_model.is_some() || args.prompt_lookup > 0 => {
+            let flag = if args.draft_model.is_some() {
+                "--draft-model"
+            } else {
+                "--prompt-lookup"
+            };
+            Some(format!(
+                "ov-genai {flag} decoding samples at temperature {default_temperature} for \
+                 requests that omit temperature (it was greedy before). Pass \
+                 --default-temperature 0 for the greedy output"
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// True when `device` names an OpenVINO NPU plugin (e.g. "NPU", "NPU.0").
@@ -2874,14 +2895,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         for w in file_sampling_warnings(&args, &model_info) {
             warn!(model = %args.model, "{w}");
         }
-        if spec_decode_off_by_default(&args, defaults.temperature) {
-            warn!(
-                temperature = defaults.temperature,
-                "sparse-moe speculative decoding runs only at temperature 0; requests that \
-                 omit temperature get {} and decode without it. Pass --default-temperature 0 \
-                 to keep it on",
-                defaults.temperature
-            );
+        if let Some(w) = spec_decode_sampling_warning(&args, defaults.temperature) {
+            warn!(temperature = defaults.temperature, "{w}");
         }
         cfg.generation_defaults = defaults;
         // ov-genai owns native templating: render the template API-side only for
@@ -5181,19 +5196,40 @@ mod generation_defaults_tests {
     fn spec_decode_warning_fires_only_when_sampling_turns_it_off() {
         let mut w = worker(EngineKind::SparseMoe, "CPU");
         assert!(
-            !spec_decode_off_by_default(&w, 1.0),
+            spec_decode_sampling_warning(&w, 1.0).is_none(),
             "spec decode not enabled"
         );
         w.prompt_lookup = 3;
-        assert!(spec_decode_off_by_default(&w, 1.0));
-        assert!(!spec_decode_off_by_default(&w, 0.0));
+        let msg = spec_decode_sampling_warning(&w, 1.0).unwrap();
+        assert!(
+            msg.contains("sparse-moe") && msg.contains("--default-temperature 0"),
+            "{msg}"
+        );
+        assert!(spec_decode_sampling_warning(&w, 0.0).is_none());
         // Multi-stage sparse-moe ignores --prompt-lookup: nothing to turn off.
         w.total = 2;
-        assert!(!spec_decode_off_by_default(&w, 1.0));
-        // Only sparse-moe ties spec decode to temperature <= 0.
+        assert!(spec_decode_sampling_warning(&w, 1.0).is_none());
+        // Other engines: no speculative decoding, no warning.
+        let mut r = worker(EngineKind::OvRuntime, "GPU");
+        r.prompt_lookup = 3;
+        assert!(spec_decode_sampling_warning(&r, 1.0).is_none());
+    }
+
+    #[test]
+    fn ov_genai_spec_decode_warns_that_it_now_samples() {
         let mut g = worker(EngineKind::OvGenai, "GPU");
+        assert!(spec_decode_sampling_warning(&g, 1.0).is_none());
         g.prompt_lookup = 3;
-        assert!(!spec_decode_off_by_default(&g, 1.0));
+        let msg = spec_decode_sampling_warning(&g, 1.0).unwrap();
+        assert!(
+            msg.contains("--prompt-lookup") && msg.contains("--default-temperature 0"),
+            "{msg}"
+        );
+        assert!(spec_decode_sampling_warning(&g, 0.0).is_none());
+        g.prompt_lookup = 0;
+        g.draft_model = Some("/draft".into());
+        let msg = spec_decode_sampling_warning(&g, 0.7).unwrap();
+        assert!(msg.contains("--draft-model"), "{msg}");
     }
 
     #[tokio::test]
