@@ -1517,6 +1517,10 @@ const OVGENAI_NPU_MIN_RESPONSE_LEN: u32 = 128;
 const NPU_WINDOW_SOURCE: &str =
     "MAX_PROMPT_LEN + MIN_RESPONSE_LEN (--npu-max-prompt-len, --npu-min-response-len, --ov-config)";
 
+/// The source label of an ov-runtime `--packed-slots` window.
+const PACKED_WINDOW_SOURCE: &str =
+    "per-slot KV region ((static_context - 1 - packed_prefix) / packed_slots)";
+
 /// Where a resolved [`cascadia_api::GenerationDefaults`] value came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DefaultSource {
@@ -1585,9 +1589,19 @@ fn engine_window(
             let window = prompt.saturating_add(response);
             (window > 0).then_some((window, NPU_WINDOW_SOURCE))
         }
-        EngineKind::OvRuntime => info
-            .static_context
-            .map(|c| (c, "stage_config.json static_context")),
+        // A 0 is no window. With --packed-slots each request gets one slot's
+        // region of the static KV, by the engine's own formula
+        // (`PackedKv::new`): the prefix is clamped to leave a row per slot.
+        EngineKind::OvRuntime => info.static_context.filter(|&c| c > 0).and_then(|c| {
+            if args.packed_slots == 0 {
+                return Some((c, "stage_config.json static_context"));
+            }
+            let slots = args.packed_slots;
+            let past_len = c - 1;
+            let prefix = args.packed_prefix.min(past_len.saturating_sub(slots));
+            let region = (past_len - prefix) / slots;
+            (region > 0).then_some((region, PACKED_WINDOW_SOURCE))
+        }),
         _ => None,
     }
 }
@@ -5168,6 +5182,52 @@ mod generation_defaults_tests {
         g.ov_config = vec!["MAX_PROMPT_LEN=4096".into()];
         assert_eq!(resolve(&g, info).0.max_tokens, 4096);
         assert_eq!(resolve(&g, info).1.max_tokens, DefaultSource::Fallback);
+    }
+
+    #[test]
+    fn ov_runtime_packed_slots_use_the_per_slot_region() {
+        // The engine's formula (packed.rs): past_len = static_context - 1,
+        // prefix = min(packed_prefix, past_len - slots), region =
+        // (past_len - prefix) / slots.
+        let info = info_from_dir(&[
+            ("config.json", r#"{"max_position_embeddings": 131072}"#),
+            (
+                "stage_0/stage_config.json",
+                r#"{"stateful": false, "static_context": 1025, "packed_slots": 8,
+                    "packed_seq": 8, "packed_context": 1032}"#,
+            ),
+        ]);
+        let mut w = worker(EngineKind::OvRuntime, "NPU");
+        w.packed_slots = 8;
+        let (d, s) = resolve(&w, info);
+        assert_eq!((d.max_tokens, d.context_window), (128, Some(128)));
+        assert_eq!(
+            s.max_tokens,
+            DefaultSource::EngineWindow(PACKED_WINDOW_SOURCE)
+        );
+        w.packed_prefix = 512;
+        assert_eq!(resolve(&w, info).0.max_tokens, (1024 - 512) / 8);
+        // A prefix larger than the window is clamped as the engine clamps it.
+        w.packed_prefix = 5000;
+        assert_eq!(resolve(&w, info).0.max_tokens, (1024 - (1024 - 8)) / 8);
+        // Without --packed-slots the whole static context is the window.
+        w.packed_slots = 0;
+        w.packed_prefix = 0;
+        assert_eq!(resolve(&w, info).0.max_tokens, 1025);
+    }
+
+    #[test]
+    fn a_zero_static_context_is_unknown() {
+        let info = ModelGenerationInfo {
+            context_window: Some(32768),
+            static_context: Some(0),
+            ..Default::default()
+        };
+        let (d, s) = resolve(&worker(EngineKind::OvRuntime, "NPU"), info);
+        assert_eq!(
+            (d.max_tokens, s.max_tokens),
+            (32768, DefaultSource::ConfigJson)
+        );
     }
 
     #[test]
