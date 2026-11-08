@@ -8608,6 +8608,62 @@ mod tests {
         assert_eq!(calls[0].function.arguments, "{\"k\":1}");
     }
 
+    #[test]
+    fn mock_tools_fixture_loads() {
+        // tests/fixtures/mock-tools-model: the template `cascadia run … --engine
+        // mock` renders tools with, so OpenAI clients can run tool loops on it.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mock-tools-model");
+        let cfg = load_chat_template_config(&dir);
+        let src = cfg
+            .template
+            .as_deref()
+            .expect("fixture has a chat_template");
+        assert_eq!(cfg.bos_token, None);
+        assert_eq!(cfg.eos_token.as_deref(), Some("<|im_end|>"));
+        let env = build_chat_env(src).expect("fixture template parses");
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            parts: Vec::new(),
+        };
+        let mut assistant = msg("assistant", "");
+        assistant.tool_calls = Some(vec![serde_json::from_value(serde_json::json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"mock\"}"}
+        }))
+        .expect("tool call")]);
+        let mut tool = msg("tool", "sunny and 20C");
+        tool.tool_call_id = Some("call_1".into());
+        let msgs = [msg("user", "weather __mock_tool_call__"), assistant, tool];
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name": "get_weather", "parameters": {"type": "object"}}),
+        }];
+        let out = render_with_chat_env(&env, &msgs, "", "<|im_end|>", false, None, Some(&tools))
+            .expect("fixture renders");
+        assert!(out.contains("<tools>"), "no tools block: {out}");
+        assert!(out.contains("get_weather"), "tool not listed: {out}");
+        assert!(
+            out.contains(
+                r#"<tool_call>{"name": "get_weather", "arguments": {"city": "mock"}}</tool_call>"#
+            ),
+            "assistant call not rendered: {out}"
+        );
+        assert!(
+            out.contains("sunny and 20C"),
+            "tool result not rendered: {out}"
+        );
+        assert!(
+            out.ends_with("<|im_start|>assistant\n"),
+            "no generation prompt: {out}"
+        );
+    }
+
     const TOOL_TEMPLATE: &str = "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}\
         {% if m.tool_calls %}[CALLS:{% for c in m.tool_calls %}{{ c.function.name }}{% endfor %}]{% endif %}\
         {% if m.tool_call_id %}[TCID:{{ m.tool_call_id }}]{% endif %}\n{% endfor %}\

@@ -1,0 +1,5 @@
+{
+  "chat_template": "{%- if tools %}<|im_start|>system\n# Tools\n<tools>{% for t in tools %}{{ t | tojson }}{% endfor %}</tools>\nCall one with <tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call><|im_end|>\n{% endif %}\n{%- for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}{% if m.tool_calls %}{% for c in m.tool_calls %}<tool_call>{\"name\": \"{{ c.function.name }}\", \"arguments\": {{ c.function.arguments | tojson }}}</tool_call>{% endfor %}{% endif %}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
+  "bos_token": null,
+  "eos_token": "<|im_end|>"
+}

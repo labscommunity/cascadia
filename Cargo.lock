@@ -457,6 +457,7 @@ dependencies = [
  "cascadia-engine",
  "cascadia-types",
  "futures",
+ "serde_json",
  "tokio",
 ]
 
