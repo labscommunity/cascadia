@@ -8,7 +8,8 @@ use std::path::Path;
 /// the files are missing, malformed, or do not carry the key.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ModelGenerationInfo {
-    /// The model's context window from `config.json`.
+    /// The model's context window from `config.json` (its `text_config`
+    /// first, then the root).
     pub context_window: Option<u32>,
     /// The compiled KV size of a static-shape (NPU) `cascadia shard` export:
     /// the smallest `static_context` over the `stage_<r>/stage_config.json`
@@ -46,8 +47,12 @@ pub fn read_model_generation_info(model_dir: &Path) -> ModelGenerationInfo {
         })
     };
     ModelGenerationInfo {
+        // `text_config` first: a multimodal config's root window belongs to
+        // the wrapper, not the language model (qwen35 `read_max_ctx`, vLLM).
         context_window: first(&dirs, "config.json", |v| {
-            window_of(v).or_else(|| v.get("text_config").and_then(window_of))
+            v.get("text_config")
+                .and_then(window_of)
+                .or_else(|| window_of(v))
         }),
         static_context: static_context(model_dir),
         temperature: sampling("temperature"),
@@ -170,6 +175,36 @@ mod tests {
         assert_eq!(
             read_model_generation_info(d.path()).context_window,
             Some(131072)
+        );
+    }
+
+    #[test]
+    fn text_config_window_wins_over_the_root() {
+        // The repo's rule (qwen35 `read_max_ctx`) and vLLM's: a multimodal
+        // config's root window is the vision/wrapper one, not the LM's.
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "config.json",
+            r#"{"text_config": {"max_position_embeddings": 262144}, "max_position_embeddings": 4096}"#,
+        );
+        assert_eq!(
+            read_model_generation_info(d.path()).context_window,
+            Some(262144)
+        );
+    }
+
+    #[test]
+    fn root_window_when_text_config_has_none() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "config.json",
+            r#"{"text_config": {"hidden_size": 8}, "max_position_embeddings": 4096}"#,
+        );
+        assert_eq!(
+            read_model_generation_info(d.path()).context_window,
+            Some(4096)
         );
     }
 
