@@ -878,6 +878,7 @@ mod tests {
     use crate::tests::{make_app, make_image_app, png_url};
     use axum::body::to_bytes;
     use axum::http::Request;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use tower::ServiceExt;
 
     async fn post(app: Router, payload: Value) -> (StatusCode, String) {
@@ -1349,25 +1350,62 @@ mod tests {
         assert!(v["error"]["message"].as_str().unwrap().contains("`input`"));
     }
 
-    /// Echoes `tok ` for its one task. With `cancel_after: Some(n)` it ends
-    /// the task after `n` tokens with a `Cancelled` final marker; with `None`
-    /// it never ends on its own, so only `/v1/cancel` stops it (and the
-    /// runner then ends the stream with no final chunk at all). With
-    /// `fail_after: Some(n)` it fails the task after `n` tokens instead (a
-    /// final chunk with `error` set).
-    struct ScriptEngine {
-        task: Option<cascadia_types::TaskId>,
-        cancel_after: Option<usize>,
-        fail_after: Option<usize>,
-        emitted: Arc<std::sync::atomic::AtomicUsize>,
-        seen: Arc<parking_lot::Mutex<Option<cascadia_types::TaskId>>>,
+    /// What a [`RecordingEngine`] writes.
+    enum Text {
+        /// These chunk texts, one token each, then a final chunk (unless
+        /// `never_end`).
+        Script(Vec<String>),
+        /// `tok ` forever.
+        Tok,
     }
 
-    impl cascadia_engine::Engine for ScriptEngine {
+    /// A test engine recording every submitted [`GenerationTask`]; its
+    /// emitted count resets on every submit. With `cancel_after: Some(n)` it
+    /// ends the task after `n` tokens with a `Cancelled` final marker; with
+    /// `fail_after: Some(n)` it fails the task after `n` tokens instead (a
+    /// final chunk with `error` set). A [`Text::Tok`] engine with neither
+    /// never ends on its own, so only `/v1/cancel` stops it (and the runner
+    /// then ends the stream with no final chunk at all).
+    struct RecordingEngine {
+        text: Text,
+        /// No final chunk once the script is out.
+        never_end: bool,
+        cancel_after: Option<usize>,
+        fail_after: Option<usize>,
+        tasks: Arc<parking_lot::Mutex<Vec<GenerationTask>>>,
+        /// Tokens out so far; tests wait on it before `/v1/cancel`.
+        emitted: Arc<AtomicUsize>,
+        task: Option<cascadia_types::TaskId>,
+    }
+
+    impl RecordingEngine {
+        fn new(text: Text) -> Self {
+            Self {
+                text,
+                never_end: false,
+                cancel_after: None,
+                fail_after: None,
+                tasks: Arc::default(),
+                emitted: Arc::default(),
+                task: None,
+            }
+        }
+
+        fn script(chunks: &[&str]) -> Self {
+            Self::new(Text::Script(chunks.iter().map(|c| c.to_string()).collect()))
+        }
+
+        fn tok() -> Self {
+            Self::new(Text::Tok)
+        }
+    }
+
+    impl cascadia_engine::Engine for RecordingEngine {
         fn warmup(&mut self) {}
         fn submit(&mut self, task: GenerationTask) -> Result<(), cascadia_engine::EngineError> {
-            *self.seen.lock() = Some(task.task_id.clone());
-            self.task = Some(task.task_id);
+            self.emitted.store(0, SeqCst);
+            self.task = Some(task.task_id.clone());
+            self.tasks.lock().push(task);
             Ok(())
         }
         fn step(
@@ -1376,34 +1414,43 @@ mod tests {
             Vec<(cascadia_types::TaskId, cascadia_types::Chunk)>,
             cascadia_engine::EngineError,
         > {
-            use std::sync::atomic::Ordering::SeqCst;
+            use cascadia_types::{Chunk, FinishReason};
             let Some(id) = self.task.clone() else {
                 return Ok(Vec::new());
             };
             let n = self.emitted.load(SeqCst);
             if self.fail_after.is_some_and(|max| n >= max) {
                 self.task = None;
-                let end = cascadia_types::Chunk::error(&id, "peer link dropped");
-                return Ok(vec![(id, end)]);
+                return Ok(vec![(id.clone(), Chunk::error(&id, "peer link dropped"))]);
             }
             if self.cancel_after.is_some_and(|max| n >= max) {
                 self.task = None;
-                let end = cascadia_types::Chunk::final_marker(&id, "")
-                    .with_finish_reason(cascadia_types::FinishReason::Cancelled);
+                let end = Chunk::final_marker(&id, "").with_finish_reason(FinishReason::Cancelled);
                 return Ok(vec![(id, end)]);
             }
+            let text = match &self.text {
+                Text::Tok => "tok ",
+                Text::Script(chunks) => match chunks.get(n) {
+                    Some(c) => c.as_str(),
+                    None if self.never_end => return Ok(Vec::new()),
+                    None => {
+                        self.task = None;
+                        let end =
+                            Chunk::final_marker(&id, "").with_finish_reason(FinishReason::Stop);
+                        return Ok(vec![(id, end)]);
+                    }
+                },
+            };
+            let chunk = Chunk::token(&id, n as i64, text);
             self.emitted.fetch_add(1, SeqCst);
-            Ok(vec![(
-                id.clone(),
-                cascadia_types::Chunk::token(&id, n as i64, "tok "),
-            )])
+            Ok(vec![(id, chunk)])
         }
     }
 
-    struct ScriptBuilder(Option<ScriptEngine>);
+    struct RecordingBuilder(Option<RecordingEngine>);
 
     #[::async_trait::async_trait]
-    impl cascadia_engine::Builder for ScriptBuilder {
+    impl cascadia_engine::Builder for RecordingBuilder {
         async fn connect(
             &mut self,
             _peers: cascadia_types::PeerLayout,
@@ -1423,27 +1470,39 @@ mod tests {
         }
     }
 
-    /// Run one request against a [`ScriptEngine`]. Without `cancel_after`,
-    /// the request is cancelled through `/v1/cancel/<id>` once a token is out.
-    async fn scripted(cancel_after: Option<usize>, stream: bool) -> (StatusCode, String) {
-        scripted_with(cancel_after, None, stream).await
+    /// Byte limits of 1 MiB and the mock-tools fixture's chat template
+    /// (tests/fixtures/mock-tools-model), which renders tools and tool calls.
+    fn tools_config() -> Config {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mock-tools-model");
+        let template = load_chat_template_config(&dir).template;
+        assert!(
+            template.is_some(),
+            "mock-tools fixture has no chat_template"
+        );
+        Config {
+            max_prompt_bytes: 1 << 20,
+            max_body_bytes: 1 << 20,
+            chat_template: ChatTemplateConfig {
+                template,
+                bos_token: None,
+                eos_token: Some("<|im_end|>".into()),
+            },
+            ..Config::default()
+        }
     }
 
-    async fn scripted_with(
-        cancel_after: Option<usize>,
-        fail_after: Option<usize>,
-        stream: bool,
-    ) -> (StatusCode, String) {
-        use std::sync::atomic::Ordering::SeqCst;
-        let emitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = Arc::new(parking_lot::Mutex::new(None));
-        let runner = Arc::new(Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
-            task: None,
-            cancel_after,
-            fail_after,
-            emitted: emitted.clone(),
-            seen: seen.clone(),
-        })))));
+    /// A router over `engine`, with the engine's task log and emitted count.
+    async fn app_with(
+        engine: RecordingEngine,
+        cfg: Config,
+    ) -> (
+        Router,
+        Arc<parking_lot::Mutex<Vec<GenerationTask>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let (tasks, emitted) = (engine.tasks.clone(), engine.emitted.clone());
+        let runner = Arc::new(Runner::new(Box::new(RecordingBuilder(Some(engine)))));
         runner
             .start(
                 cascadia_types::PeerLayout::single_stage(),
@@ -1451,7 +1510,47 @@ mod tests {
             )
             .await
             .unwrap();
-        let app = make_router(runner.clone(), "script-model");
+        (
+            make_router_with_config(runner, "script-model", cfg),
+            tasks,
+            emitted,
+        )
+    }
+
+    /// The mock engine behind [`tools_config`]: it answers a tools request
+    /// carrying `__mock_tool_call__` with a tool call.
+    #[allow(dead_code)] // the tools tests use it
+    async fn mock_tools_app() -> Router {
+        let runner = Runner::new(Box::new(cascadia_engine_mock::MockBuilder::new()));
+        runner
+            .start(
+                cascadia_types::PeerLayout::single_stage(),
+                cascadia_types::ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        make_router_with_config(Arc::new(runner), "mock-model", tools_config())
+    }
+
+    /// Run one request against a [`RecordingEngine::tok`]. Without
+    /// `cancel_after`, the request is cancelled through `/v1/cancel/<id>`
+    /// once a token is out.
+    async fn scripted(cancel_after: Option<usize>, stream: bool) -> (StatusCode, String) {
+        scripted_with(cancel_after, None, stream, Config::default()).await
+    }
+
+    async fn scripted_with(
+        cancel_after: Option<usize>,
+        fail_after: Option<usize>,
+        stream: bool,
+        cfg: Config,
+    ) -> (StatusCode, String) {
+        let engine = RecordingEngine {
+            cancel_after,
+            fail_after,
+            ..RecordingEngine::tok()
+        };
+        let (app, tasks, emitted) = app_with(engine, cfg).await;
         let req = tokio::spawn(post(
             app.clone(),
             json!({"model": "script-model", "input": "hello", "stream": stream}),
@@ -1460,7 +1559,7 @@ mod tests {
             while emitted.load(SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
-            let id = seen.lock().clone().unwrap();
+            let id = tasks.lock().last().unwrap().task_id.clone();
             let response = app
                 .oneshot(
                     Request::builder()
@@ -1474,6 +1573,19 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
         req.await.unwrap()
+    }
+
+    /// A [`RecordingEngine::script`] writes its chunks, then ends, and the
+    /// task it got is recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recording_engine_plays_its_script() {
+        let (app, tasks, _) =
+            app_with(RecordingEngine::script(&["al", "pha"]), Config::default()).await;
+        let (status, v) = post_json(app, json!({"model": "script-model", "input": "hi"})).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["status"], "completed", "{v}");
+        assert_eq!(v["output"][0]["content"][0]["text"], "alpha");
+        assert_eq!(tasks.lock().len(), 1);
     }
 
     fn assert_cancelled(response: &Value) {
@@ -1515,7 +1627,7 @@ mod tests {
     /// `error`, the tokens so far in `usage`, and nothing after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mid_stream_failure_ends_with_response_failed() {
-        let (status, body) = scripted_with(None, Some(2), true).await;
+        let (status, body) = scripted_with(None, Some(2), true, Config::default()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let ev = events(&body);
         ev.iter().for_each(|(_, data)| assert_event(data));
