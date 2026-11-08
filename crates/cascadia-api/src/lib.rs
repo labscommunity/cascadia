@@ -774,6 +774,9 @@ pub struct StreamOptions {
 #[derive(Deserialize, Debug)]
 pub struct ChatCompletionRequest {
     pub model: String,
+    /// Legacy `function_call` / role `function` turns arrive already mapped
+    /// onto tool calls (see [`de_chat_messages`]).
+    #[serde(deserialize_with = "de_chat_messages")]
     pub messages: Vec<ChatMessage>,
     /// Deprecated in the OpenAI spec in favour of `max_completion_tokens`;
     /// still honoured when that field is absent. `null` = unset.
@@ -841,6 +844,77 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Deprecated `functions` (bare function definitions): moved onto `tools`
+    /// by [`ChatCompletionRequest::apply_legacy_functions`].
+    #[serde(default)]
+    pub functions: Option<Vec<serde_json::Value>>,
+    /// Deprecated `function_call` (`"none"`, `"auto"` or `{"name": N}`):
+    /// moved onto `tool_choice` the same way.
+    #[serde(default)]
+    pub function_call: Option<serde_json::Value>,
+    /// The request used `functions`, so the answer takes the legacy shape:
+    /// `function_call` instead of `tool_calls` (M1 D5).
+    #[serde(skip)]
+    legacy_functions: bool,
+}
+
+/// A request message as sent: today's [`ChatMessage`] plus the deprecated
+/// assistant `function_call`. `ChatMessage` itself stays unchanged because
+/// callers outside this crate build it as a struct literal.
+#[derive(Deserialize)]
+struct WireChatMessage {
+    #[serde(flatten)]
+    message: ChatMessage,
+    #[serde(default)]
+    function_call: Option<FunctionCall>,
+}
+
+/// `messages`, with the deprecated function-calling turns mapped onto tool
+/// calls: an assistant `function_call` becomes one `tool_calls` entry with a
+/// synthesised id (`call_0`, `call_1`, … in message order), and the
+/// `function`-role reply right after it becomes a `tool` turn carrying that
+/// id. A `function` turn with no such call before it still becomes a `tool`
+/// turn, with a fresh id of its own: templates that require an id get one,
+/// and it matches no call, which is what the history says.
+fn de_chat_messages<'de, D>(d: D) -> Result<Vec<ChatMessage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let wire = Vec::<WireChatMessage>::deserialize(d)?;
+    let mut next_id = 0usize;
+    let mut fresh_id = || {
+        let id = format!("call_{next_id}");
+        next_id += 1;
+        id
+    };
+    // The id of the call made by the message just before, awaiting its reply.
+    let mut awaiting: Option<String> = None;
+    let mut messages = Vec::with_capacity(wire.len());
+    for WireChatMessage {
+        mut message,
+        function_call,
+    } in wire
+    {
+        let call_id = awaiting.take();
+        if message.role == "function" {
+            message.role = "tool".into();
+            if message.tool_call_id.is_none() {
+                message.tool_call_id = Some(call_id.unwrap_or_else(&mut fresh_id));
+            }
+        } else if let Some(function) = function_call {
+            if message.role == "assistant" && message.tool_calls.is_none() {
+                let id = fresh_id();
+                awaiting = Some(id.clone());
+                message.tool_calls = Some(vec![ToolCall {
+                    id,
+                    r#type: "function".into(),
+                    function,
+                }]);
+            }
+        }
+        messages.push(message);
+    }
+    Ok(messages)
 }
 
 /// `chat_template_kwargs` as sent by vLLM/SGLang-shaped clients. Only
@@ -853,6 +927,66 @@ pub struct ChatTemplateKwargs {
 }
 
 impl ChatCompletionRequest {
+    /// Moves the deprecated `functions` / `function_call` onto `tools` /
+    /// `tool_choice` (M1 D5), before [`validate_tool_choice`](Self::validate_tool_choice).
+    /// Mixing a legacy field with its replacement is a 400, so the answer's
+    /// shape (legacy `function_call` or `tool_calls`) is never ambiguous.
+    fn apply_legacy_functions(&mut self) -> Result<(), String> {
+        if self.functions.is_some() && self.tools.is_some() {
+            return Err(
+                "`functions` and `tools` cannot be sent together; send only `tools` \
+                 (`functions` is deprecated)"
+                    .into(),
+            );
+        }
+        if self.function_call.is_some() && self.tool_choice.is_some() {
+            return Err(
+                "`function_call` and `tool_choice` cannot be sent together; send only \
+                 `tool_choice` (`function_call` is deprecated)"
+                    .into(),
+            );
+        }
+        if let Some(functions) = self.functions.take() {
+            self.tools = Some(
+                functions
+                    .into_iter()
+                    .map(|function| Tool {
+                        r#type: "function".into(),
+                        function,
+                    })
+                    .collect(),
+            );
+            self.legacy_functions = true;
+        }
+        let Some(call) = self.function_call.take() else {
+            return Ok(());
+        };
+        if matches!(call.as_str(), Some("none" | "auto")) {
+            self.tool_choice = Some(call);
+            return Ok(());
+        }
+        let name = call
+            .get("name")
+            .and_then(|n| n.as_str())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| {
+                "function_call must be \"none\", \"auto\" or {\"name\":...}".to_string()
+            })?;
+        let declared = self
+            .tools
+            .iter()
+            .flatten()
+            .any(|t| t.function.get("name").and_then(|n| n.as_str()) == Some(name));
+        if !declared {
+            return Err(format!(
+                "function_call names function '{name}', which is not in functions"
+            ));
+        }
+        self.tool_choice =
+            Some(serde_json::json!({"type": "function", "function": {"name": name}}));
+        Ok(())
+    }
+
     /// The output-token limit the client asked for, if any:
     /// `max_completion_tokens` wins over the deprecated `max_tokens` (as vLLM).
     fn requested_max_tokens(&self) -> Option<u32> {
@@ -982,6 +1116,22 @@ struct ChatChoiceMessage {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+    /// The legacy single call, answering a `functions` request (M1 D5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_call: Option<FunctionCall>,
+}
+
+impl ChatChoiceMessage {
+    /// The legacy shape: the first tool call as `function_call` (the legacy
+    /// field holds one call), no `tool_calls`.
+    fn into_legacy(mut self) -> Self {
+        self.function_call = self
+            .tool_calls
+            .take()
+            .and_then(|calls| calls.into_iter().next())
+            .map(|c| c.function);
+        self
+    }
 }
 
 /// OpenAI chat `logprobs` object: one entry per generated token under
@@ -1911,6 +2061,7 @@ fn build_choice(
                     role: "assistant",
                     content: None,
                     tool_calls: Some(calls),
+                    function_call: None,
                 },
                 "tool_calls",
             );
@@ -1921,6 +2072,7 @@ fn build_choice(
             role: "assistant",
             content: Some(buf),
             tool_calls: None,
+            function_call: None,
         },
         "stop",
     )
@@ -2508,10 +2660,13 @@ fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
 
 async fn chat_completions(
     State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    Json(mut req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    if let Err(e) = req.validate_tool_choice() {
+    if let Err(e) = req
+        .apply_legacy_functions()
+        .and_then(|()| req.validate_tool_choice())
+    {
         count_rejected("invalid_request");
         return (
             StatusCode::BAD_REQUEST,
@@ -2699,6 +2854,7 @@ async fn chat_completions(
             include_usage,
             tool_choice,
             tools_present,
+            req.legacy_functions,
         )
         .await
         .into_response();
@@ -2778,7 +2934,7 @@ async fn chat_completions(
         }
     }
 
-    let (message, choice_finish) = build_choice(
+    let (mut message, choice_finish) = build_choice(
         buf,
         &req.tool_choice,
         req.tools.as_ref().is_some_and(|t| !t.is_empty()),
@@ -2788,6 +2944,10 @@ async fn chat_completions(
     // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
     if choice_finish == "tool_calls" {
         finish_reason = "tool_calls";
+        if req.legacy_functions {
+            message = message.into_legacy();
+            finish_reason = "function_call";
+        }
     }
     Json(ChatCompletionResponse {
         id: task_id,
@@ -3157,6 +3317,7 @@ async fn stream_completion(
     include_usage: bool,
     tool_choice: Option<serde_json::Value>,
     tools_present: bool,
+    legacy_functions: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     // Captured before `task` moves into `generate` below — arms the tool-call
@@ -3194,6 +3355,7 @@ async fn stream_completion(
             task_id,
             model,
             include_usage,
+            legacy_functions,
         };
         let body = stream::unfold(tool_stream, |mut s| async move {
             let frame = s.next_frame().await?;
@@ -3418,6 +3580,8 @@ struct ToolStream {
     task_id: String,
     model: String,
     include_usage: bool,
+    /// Answer a `functions` request: `delta.function_call` (M1 D5).
+    legacy_functions: bool,
 }
 
 enum ToolStreamPhase {
@@ -3509,7 +3673,9 @@ impl ToolStream {
 
     /// Close the choice: the rest as content with the engine's
     /// finish_reason, or the still-releasable content, one indexed
-    /// tool_calls delta, and a `tool_calls` finish.
+    /// tool_calls delta, and a `tool_calls` finish — for a `functions`
+    /// request, one `function_call` delta (the first call) and a
+    /// `function_call` finish instead.
     fn close_choice(
         &mut self,
         text: &str,
@@ -3518,6 +3684,7 @@ impl ToolStream {
     ) -> Bytes {
         let n_tokens = std::mem::take(&mut self.held_tokens);
         let (task_id, model) = (&self.task_id, &self.model);
+        let legacy = self.legacy_functions;
         let out = match self.splitter.finish(text) {
             ToolStreamEnd::Content(content) => content_frame(
                 task_id,
@@ -3534,28 +3701,40 @@ impl ToolStream {
                 if !content.is_empty() {
                     out.push_str(&content_frame(task_id, model, content, 0, None, None));
                 }
-                let tool_calls: Vec<serde_json::Value> = calls
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        serde_json::json!({
-                            "index": i, "id": c.id, "type": c.r#type,
-                            "function": { "name": c.function.name, "arguments": c.function.arguments },
+                let (call_delta, finish_reason) = if legacy {
+                    let first = calls.into_iter().next().map(|c| c.function);
+                    (
+                        serde_json::json!({ "role": "assistant", "function_call": first }),
+                        "function_call",
+                    )
+                } else {
+                    let tool_calls: Vec<serde_json::Value> = calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            serde_json::json!({
+                                "index": i, "id": c.id, "type": c.r#type,
+                                "function": { "name": c.function.name, "arguments": c.function.arguments },
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
+                    (
+                        serde_json::json!({ "role": "assistant", "tool_calls": tool_calls }),
+                        "tool_calls",
+                    )
+                };
                 let delta = serde_json::json!({
                     "id": task_id, "object": "chat.completion.chunk",
                     "created": now_unix(), "model": model,
                     "n_tokens": n_tokens, "completion_tokens": completion_tokens,
                     "choices": [{ "index": 0,
-                        "delta": { "role": "assistant", "tool_calls": tool_calls },
+                        "delta": call_delta,
                         "finish_reason": serde_json::Value::Null }],
                 });
                 let finish = serde_json::json!({
                     "id": task_id, "object": "chat.completion.chunk",
                     "created": now_unix(), "model": model,
-                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
                 });
                 out.push_str(&format!("data: {delta}\n\ndata: {finish}\n\n"));
                 out
@@ -5199,6 +5378,7 @@ mod tests {
             role: "assistant",
             content: Some("hi".into()),
             tool_calls: None,
+            function_call: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["content"], "hi");
@@ -8292,5 +8472,291 @@ level={{ effort_map[eff] }}";
         assert_eq!(t.temperature, 0.2);
         assert_eq!(t.sampling.frequency_penalty, 0.3);
         assert_eq!(t.max_tokens, 4096);
+    }
+
+    // --- Deprecated `functions` / `function_call` / role `function` (1.17, D5) --
+
+    /// A chat request already through the legacy-field mapping, as the
+    /// handler sees it before `validate_tool_choice`.
+    fn legacy_request(extra: serde_json::Value) -> ChatCompletionRequest {
+        let mut req = chat_request(extra);
+        req.apply_legacy_functions().unwrap();
+        req
+    }
+
+    #[test]
+    fn legacy_functions_reach_the_template_as_tools() {
+        // (a) `functions` entries are function definitions; they reach the
+        // template as `tools` of type function.
+        let req = legacy_request(serde_json::json!({
+            "functions": [{"name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}],
+            "messages": [{"role": "user", "content": "weather?"}],
+        }));
+        assert!(req.legacy_functions);
+        let env = build_chat_env(TOOL_TEMPLATE).unwrap();
+        let out = render_with_chat_env(
+            &env,
+            &req.messages,
+            "",
+            "",
+            true,
+            None,
+            req.tools.as_deref(),
+        )
+        .unwrap();
+        assert!(
+            out.contains("[TOOLS:get_weather]"),
+            "functions not forwarded: {out}"
+        );
+        let tools = chat_tools(&req).expect("tools forwarded to the engine");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn legacy_function_call_maps_to_tool_choice() {
+        // (b) "none" / "auto" / {"name"} → the matching tool_choice.
+        for (fc, want) in [
+            (serde_json::json!("none"), serde_json::json!("none")),
+            (serde_json::json!("auto"), serde_json::json!("auto")),
+            (
+                serde_json::json!({"name": "get_weather"}),
+                serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+            ),
+        ] {
+            let req = legacy_request(serde_json::json!({
+                "functions": [{"name": "get_weather"}],
+                "function_call": fc,
+            }));
+            assert_eq!(req.tool_choice.as_ref(), Some(&want), "{fc}");
+            req.validate_tool_choice().unwrap();
+        }
+        // A request without the legacy fields is left alone.
+        let req = legacy_request(serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        }));
+        assert!(!req.legacy_functions);
+        assert!(req.tool_choice.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_function_errors_name_the_legacy_field() {
+        // (b) unknown name, (c) functions + tools, function_call + tool_choice,
+        // and a malformed function_call: all 400 before the engine, each
+        // naming the legacy field the client sent.
+        let functions = serde_json::json!([{"name": "get_weather"}]);
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "get_weather"}}]);
+        for (extra, field) in [
+            (
+                serde_json::json!({"functions": functions, "function_call": {"name": "get_time"}}),
+                "function_call",
+            ),
+            (
+                serde_json::json!({"functions": functions, "tools": tools}),
+                "functions",
+            ),
+            (
+                serde_json::json!({"functions": functions, "function_call": "auto",
+                    "tool_choice": "auto"}),
+                "function_call",
+            ),
+            (
+                serde_json::json!({"functions": functions, "function_call": "sometimes"}),
+                "function_call",
+            ),
+        ] {
+            let mut payload = serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "weather in Paris?"}],
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (status, v) = post_chat(make_tool_app().await, payload).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {v}");
+            let msg = v["error"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains(field),
+                "{extra}: error must name `{field}`: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_function_history_becomes_tool_call_and_tool_turn() {
+        // (d) assistant `function_call` + the `function` reply → one tool call
+        // and a `tool` turn sharing a synthesised id.
+        let req = legacy_request(serde_json::json!({
+            "functions": [{"name": "get_weather"}],
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": null,
+                 "function_call": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+                {"role": "function", "name": "get_weather", "content": "{\"temp_c\":18}"},
+                {"role": "assistant", "content": null,
+                 "function_call": {"name": "get_weather", "arguments": "{\"city\":\"Rome\"}"}},
+                {"role": "function", "name": "get_weather", "content": "{\"temp_c\":25}"},
+            ],
+        }));
+        let m = &req.messages;
+        let call = &m[1]
+            .tool_calls
+            .as_ref()
+            .expect("function_call → tool_calls")[0];
+        assert_eq!(call.id, "call_0");
+        assert_eq!(call.r#type, "function");
+        assert_eq!(call.function.name, "get_weather");
+        assert_eq!(call.function.arguments, "{\"city\":\"Paris\"}");
+        assert_eq!(m[2].role, "tool");
+        assert_eq!(m[2].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(m[2].name.as_deref(), Some("get_weather"));
+        assert_eq!(m[2].content, "{\"temp_c\":18}");
+        assert_eq!(m[3].tool_calls.as_ref().unwrap()[0].id, "call_1");
+        assert_eq!(m[4].tool_call_id.as_deref(), Some("call_1"));
+        let env = build_chat_env(TOOL_TEMPLATE).unwrap();
+        let out = render_with_chat_env(&env, m, "", "", true, None, req.tools.as_deref()).unwrap();
+        assert!(out.contains("<|assistant|>[CALLS:get_weather]"), "{out}");
+        assert!(
+            out.contains("<|tool|>{\"temp_c\":18}[TCID:call_0]"),
+            "{out}"
+        );
+        // The structured turns (sycl-llama) carry the same mapping.
+        let turns = chat_turns(&req);
+        assert_eq!(turns[1].tool_calls.as_ref().unwrap()[0]["id"], "call_0");
+        assert_eq!(turns[2].role, "tool");
+        assert_eq!(turns[2].tool_call_id.as_deref(), Some("call_0"));
+    }
+
+    #[test]
+    fn orphan_function_turn_gets_its_own_id() {
+        // A `function` turn with no assistant `function_call` before it still
+        // becomes a `tool` turn, with a fresh id no call shares.
+        let req = legacy_request(serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "function", "name": "get_weather", "content": "18"},
+            ],
+        }));
+        assert_eq!(req.messages[1].role, "tool");
+        assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("call_0"));
+        // Modern messages are untouched.
+        let req = legacy_request(serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "abc",
+                    "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "abc", "content": "1"},
+            ],
+        }));
+        assert_eq!(req.messages[0].tool_calls.as_ref().unwrap()[0].id, "abc");
+        assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn legacy_functions_answer_in_the_legacy_shape() {
+        // (e) + (g): a `functions` request gets `message.function_call` and
+        // finish_reason `function_call`; the spec accepts it.
+        let (status, v) = post_chat(
+            make_tool_app().await,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": WEATHER_CALL}],
+                "functions": [{"name": "get_weather"}], "function_call": "auto"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], "function_call", "{v}");
+        assert_eq!(
+            choice["message"]["function_call"],
+            serde_json::json!({"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}),
+            "{v}"
+        );
+        assert!(choice["message"].get("tool_calls").is_none(), "{v}");
+        assert!(choice["message"]["content"].is_null(), "{v}");
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn legacy_shape_carries_only_the_first_call() {
+        let two = format!(
+            "{WEATHER_CALL}<tool_call>{{\"name\":\"get_time\",\"arguments\":{{}}}}</tool_call>"
+        );
+        let (status, v) = post_chat(
+            make_tool_app().await,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": two}],
+                "functions": [{"name": "get_weather"}, {"name": "get_time"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "function_call", "{v}");
+        assert_eq!(
+            v["choices"][0]["message"]["function_call"]["name"], "get_weather",
+            "{v}"
+        );
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn tools_request_keeps_the_tool_calls_shape() {
+        // (e) the same request with `tools` is unchanged, and (Task 1 review)
+        // the modern tool-call response passes the spec too.
+        let (status, v) = post_chat(
+            make_tool_app().await,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": WEATHER_CALL}],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "tool_choice": "auto"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{v}");
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert!(choice["message"].get("function_call").is_none(), "{v}");
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn streaming_legacy_functions_emit_function_call_delta() {
+        // (f) streaming: `delta.function_call`, then finish_reason `function_call`.
+        let (status, body) = post_chat_text(
+            make_tool_app().await,
+            &serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": WEATHER_CALL}],
+                "functions": [{"name": "get_weather"}], "stream": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let events = sse_events(&body);
+        let deltas: Vec<&Value> = events
+            .iter()
+            .map(|e| &e["choices"][0]["delta"])
+            .filter(|d| d.get("function_call").is_some())
+            .collect();
+        assert_eq!(deltas.len(), 1, "one function_call delta: {body}");
+        assert_eq!(deltas[0]["role"], "assistant");
+        assert_eq!(
+            deltas[0]["function_call"],
+            serde_json::json!({"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"})
+        );
+        let finishes: Vec<&Value> = events
+            .iter()
+            .map(|e| &e["choices"][0]["finish_reason"])
+            .filter(|f| !f.is_null())
+            .collect();
+        assert_eq!(finishes, [&serde_json::json!("function_call")], "{body}");
+        assert!(
+            !body.contains("tool_calls"),
+            "legacy stream mentions tool_calls: {body}"
+        );
+        assert!(!body.contains("<tool_call>"), "marker leaked: {body}");
+        for event in &events {
+            crate::spec_schema::assert_spec("CreateChatCompletionStreamResponse", event);
+        }
     }
 }
