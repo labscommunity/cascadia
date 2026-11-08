@@ -280,6 +280,11 @@ pub struct AppState {
     /// caller's own word reaches the template; when false the GLM high/max
     /// mapping applies. See [`EffortArgs`].
     pub effort_words: bool,
+    /// The chat template's generation prompt opens `<think>` with thinking on
+    /// (probed at load, see [`template_opens_think`]). Used by `/v1/responses`
+    /// only where `task.prompt` is a placeholder (see [`opens_think`]).
+    /// `false` without a chat template.
+    pub template_opens_think: bool,
     /// Special-token message framing to translate back into text delimiters
     /// (Inkling). See [`MarkerDialect`].
     pub marker_dialect: Option<MarkerDialect>,
@@ -697,6 +702,7 @@ pub fn make_router_with_stats(
         defer_template_on_thinking: cfg.defer_template_on_thinking,
         engine_applies_template: cfg.engine_applies_template,
         effort_words: false,
+        template_opens_think: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         media: cfg.media.clone().map(Arc::new),
@@ -709,6 +715,11 @@ pub fn make_router_with_stats(
             .chat_env
             .as_deref()
             .map(|env| template_speaks_effort_words(env, &state.bos_token, &state.eos_token))
+            .unwrap_or(false),
+        template_opens_think: state
+            .chat_env
+            .as_deref()
+            .map(|env| template_opens_think(env, &state.bos_token, &state.eos_token))
             .unwrap_or(false),
         ..state
     };
@@ -2274,6 +2285,53 @@ pub fn template_speaks_effort_words(
             );
             false
         }
+    }
+}
+
+/// Does `env`'s generation prompt open `<think>` with thinking on? Probed once
+/// at load by rendering one user message (no tools): Qwen3-style templates end
+/// the prompt in `<think>\n`, so the model's reply starts inside reasoning. A
+/// render error is a `false` with a warning, like the effort probe.
+pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eos: &str) -> bool {
+    let msgs = [ChatMessage {
+        role: "user".into(),
+        content: "probe".into(),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        parts: Vec::new(),
+    }];
+    match render_with_chat_env(env, &msgs, bos, eos, true, None, None) {
+        Ok(prompt) => prompt.trim_end().ends_with("<think>"),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "<think> probe could not render the chat template; assuming the generation prompt does not open reasoning"
+            );
+            false
+        }
+    }
+}
+
+/// Did this request's generation prompt open `<think>`? When the API rendered
+/// the prompt it is read off `task.prompt` (per request, so a template whose
+/// generation prompt depends on the effort word is right); when `task.prompt`
+/// is a placeholder (the engine renders: sycl-llama, or ov-genai thinking-on
+/// without an API render) the load-time `probe` stands in.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn opens_think(
+    engine_applies_template: bool,
+    defer: bool,
+    enable_thinking: bool,
+    probe: bool,
+    task: &GenerationTask,
+) -> bool {
+    let placeholder =
+        engine_applies_template || (defer && enable_thinking && !task.prompt_rendered);
+    if placeholder {
+        probe
+    } else {
+        task.prompt.trim_end().ends_with("<think>")
     }
 }
 
@@ -9453,6 +9511,43 @@ level={{ effort_map[eff] }}";
             render_or_fallback(Some(&env), &msgs, "", "", true, effort, None).unwrap(),
             "effort=max"
         );
+    }
+
+    #[test]
+    fn think_probe_reads_the_generation_prompt() {
+        let opens = build_chat_env("{{ '<|im_start|>assistant\n<think>\n' }}").unwrap();
+        assert!(template_opens_think(&opens, "", ""));
+        let plain = build_chat_env("{{ 'x' }}").unwrap();
+        assert!(!template_opens_think(&plain, "", ""));
+        let broken = build_chat_env("{{ raise_exception('no') }}").unwrap();
+        assert!(!template_opens_think(&broken, "", ""));
+    }
+
+    #[test]
+    fn opens_think_reads_the_prompt_unless_it_is_a_placeholder() {
+        let rendered = |prompt: &str, prompt_rendered: bool| {
+            let mut t = GenerationTask::new("t", prompt);
+            t.prompt_rendered = prompt_rendered;
+            t
+        };
+        // API-rendered prompt: read per request, whatever the probe says
+        let t = rendered("<|im_start|>assistant\n<think>\n", false);
+        assert!(opens_think(false, false, true, false, &t));
+        let t = rendered("<|im_start|>assistant\n", false);
+        assert!(!opens_think(false, false, true, true, &t));
+        // ov-genai with an API render (`prompt_rendered`) is read too
+        let t = rendered("<|im_start|>assistant\n<think>\n", true);
+        assert!(opens_think(false, true, true, false, &t));
+        // placeholder (deferred, thinking on, not rendered): the probe
+        let t = rendered("hi", false);
+        assert!(opens_think(false, true, true, true, &t));
+        assert!(!opens_think(false, true, true, false, &t));
+        // deferred but thinking off: the API rendered it
+        assert!(!opens_think(false, true, false, true, &t));
+        // the engine applies the template: always the probe
+        let t = rendered("<think>", true);
+        assert!(opens_think(true, false, true, true, &t));
+        assert!(!opens_think(true, false, true, false, &t));
     }
 
     /// Inkling's special-token framing → the textual delimiters the rest of

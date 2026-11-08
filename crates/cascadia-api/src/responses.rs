@@ -18,6 +18,7 @@ use super::*;
 use serde_json::{json, Value};
 
 mod input;
+mod output;
 mod tools;
 use input::input_messages;
 use tools::{check_include, check_tool_choice, ToolMap};
