@@ -196,6 +196,8 @@ pub(super) enum OutputEvent {
     CallArgs {
         index: usize,
         item_id: String,
+        /// The call's `name`, as its item has it.
+        name: String,
         custom: bool,
         full: String,
     },
@@ -550,6 +552,7 @@ impl OutputBuilder {
         ev.push(OutputEvent::CallArgs {
             index,
             item_id: id,
+            name: item["name"].as_str().unwrap_or_default().to_owned(),
             custom,
             full: full.clone(),
         });

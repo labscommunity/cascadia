@@ -307,6 +307,8 @@ pub struct AppState {
     /// full-size source image, so this bounds the API's decode memory to
     /// about this many times the largest accepted image.
     pub decode_permits: Arc<Semaphore>,
+    /// The output items `/v1/responses` keeps for `item_reference` (`store`).
+    pub(crate) item_cache: Arc<responses::ItemCache>,
 }
 
 /// See [`AppState::decode_permits`].
@@ -709,6 +711,7 @@ pub fn make_router_with_stats(
         no_media_reason: cfg.no_media_reason.as_deref().map(Arc::from),
         max_text_bytes: cfg.media.as_ref().map(|_| cfg.max_body_bytes),
         decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+        item_cache: Arc::default(),
     };
     let state = AppState {
         effort_words: state

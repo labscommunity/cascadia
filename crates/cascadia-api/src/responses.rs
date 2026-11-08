@@ -19,9 +19,11 @@ use serde_json::{json, Value};
 
 mod input;
 mod output;
+mod store;
 mod tools;
 use input::input_messages;
 use output::{OutputBuilder, OutputEvent};
+pub(crate) use store::ItemCache;
 use tools::{check_include, check_tool_choice, ToolMap};
 
 /// OpenAI `POST /v1/responses` body. The fields after `max_tool_calls` are
@@ -454,6 +456,24 @@ impl End {
     }
 }
 
+/// Looks `item_reference`s up in the item cache; an item past what is left
+/// of the prompt budget is a 413 (the walk names the reference).
+fn resolver(
+    state: &AppState,
+) -> impl Fn(&str, usize) -> Result<Option<(Value, usize)>, Refusal> + '_ {
+    move |id, budget| {
+        state.item_cache.get_within(id, budget).map_err(|_| {
+            Refusal::too_large(
+                "input",
+                format!(
+                    "expanding `item_reference` items would pass {} bytes (max_prompt_bytes)",
+                    state.max_prompt_bytes
+                ),
+            )
+        })
+    }
+}
+
 /// `POST /v1/responses`.
 pub(crate) async fn create_response(
     State(state): State<AppState>,
@@ -466,7 +486,7 @@ pub(crate) async fn create_response(
             encrypted,
             map,
             choice,
-            input_messages(&req, &|_, _| Ok(None), state.max_prompt_bytes)?,
+            input_messages(&req, &resolver(&state), state.max_prompt_bytes)?,
         ))
     });
     let (wants_encrypted, map, choice, messages) = match checked {
@@ -507,8 +527,11 @@ pub(crate) async fn create_response(
         req.parallel_tool_calls.unwrap_or(true),
         wants_encrypted,
     );
+    // Where the final items are kept for `item_reference`; `store: false`
+    // keeps nothing.
+    let cache = (req.store != Some(false)).then(|| state.item_cache.clone());
     if req.stream {
-        return stream_response(state, shell, admitted, builder).await;
+        return stream_response(state, shell, admitted, builder, cache).await;
     }
     let collected = collect_generation_with(&state, admitted, &[], "input", &mut |text, n| {
         builder.feed(text, n);
@@ -526,7 +549,11 @@ pub(crate) async fn create_response(
         reasoning_tokens: builder.reasoning_tokens(c.completion_tokens),
         error: None,
     };
-    Json(shell.object(end.status(), json!(builder.items()), Some(&outcome))).into_response()
+    let items = builder.items();
+    if let Some(cache) = &cache {
+        cache.insert_all(&items);
+    }
+    Json(shell.object(end.status(), json!(items), Some(&outcome))).into_response()
 }
 
 /// A streamed response's state between SSE frames.
@@ -538,6 +565,8 @@ struct ResponseStream {
     /// The output items, built as the chunks arrive (as the non-streaming
     /// path builds them), and the events announcing them.
     builder: OutputBuilder,
+    /// Where the final items are kept (`None` for `store: false`).
+    cache: Option<Arc<ItemCache>>,
     prompt_tokens: u32,
     completion_tokens: u32,
     sequence: u64,
@@ -608,6 +637,7 @@ impl ResponseStream {
                 OutputEvent::CallArgs {
                     index,
                     item_id,
+                    name,
                     custom,
                     full,
                 } => {
@@ -622,6 +652,10 @@ impl ResponseStream {
                     self.emit(out, &format!("{prefix}.delta"), delta);
                     let mut done = at;
                     done[field] = json!(full);
+                    // OpenAI's arguments `done` names the function too.
+                    if !custom {
+                        done["name"] = json!(name);
+                    }
                     self.emit(out, &format!("{prefix}.done"), done);
                 }
                 OutputEvent::ItemDone { index, item } => {
@@ -724,12 +758,17 @@ impl ResponseStream {
     }
 
     /// The closing events: the open item's (and any parsed calls'), then
-    /// the response.
+    /// the response. The items are stored before the terminal event is
+    /// written, so a client that has read it finds them.
     fn finish(&mut self, out: &mut String, end: End) {
         let events = self.builder.finish(end.item_status());
         self.render(out, events);
         let outcome = self.outcome(None);
-        let output = json!(self.builder.items());
+        let items = self.builder.items();
+        if let Some(cache) = &self.cache {
+            cache.insert_all(&items);
+        }
+        let output = json!(items);
         let response = self.shell.object(end.status(), output, Some(&outcome));
         self.emit(out, end.event(), json!({"response": response}));
         self.done = true;
@@ -748,6 +787,7 @@ async fn stream_response(
         inflight,
     }: AdmittedChat,
     builder: OutputBuilder,
+    cache: Option<Arc<ItemCache>>,
 ) -> Response {
     let chunks = match state.runner.generate_async(task).await {
         Ok(s) => s,
@@ -768,6 +808,7 @@ async fn stream_response(
         marker: state.marker_dialect.clone().map(MarkerFilter::new),
         stats: state.stats.clone(),
         builder,
+        cache,
         prompt_tokens: 0,
         completion_tokens: 0,
         sequence: 0,
@@ -1316,6 +1357,9 @@ mod tests {
         /// Tokens out so far; tests wait on it before `/v1/cancel`.
         emitted: Arc<AtomicUsize>,
         task: Option<cascadia_types::TaskId>,
+        /// The submitted task's `max_tokens`: a [`Text::Script`] stops there
+        /// with `Length`, as an engine at the cap does.
+        max_tokens: usize,
     }
 
     impl RecordingEngine {
@@ -1328,6 +1372,7 @@ mod tests {
                 tasks: Arc::default(),
                 emitted: Arc::default(),
                 task: None,
+                max_tokens: usize::MAX,
             }
         }
 
@@ -1345,6 +1390,7 @@ mod tests {
         fn submit(&mut self, task: GenerationTask) -> Result<(), cascadia_engine::EngineError> {
             self.emitted.store(0, SeqCst);
             self.task = Some(task.task_id.clone());
+            self.max_tokens = task.max_tokens as usize;
             self.tasks.lock().push(task);
             Ok(())
         }
@@ -1370,6 +1416,11 @@ mod tests {
             }
             let text = match &self.text {
                 Text::Tok => "tok ",
+                Text::Script(_) if n >= self.max_tokens => {
+                    self.task = None;
+                    let end = Chunk::final_marker(&id, "").with_finish_reason(FinishReason::Length);
+                    return Ok(vec![(id, end)]);
+                }
                 Text::Script(chunks) => match chunks.get(n) {
                     Some(c) => c.as_str(),
                     None if self.never_end => return Ok(Vec::new()),
@@ -2021,6 +2072,7 @@ mod tests {
         assert_eq!(ev[10].1["item_id"], call_id);
         let args: Value = serde_json::from_str(ev[11].1["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args, json!({"city": "Paris"}));
+        assert_eq!(ev[11].1["name"], "get_weather", "{:?}", ev[11]);
         let done = &ev.last().unwrap().1["response"];
         assert_eq!(done["status"], "completed");
         assert_eq!(done["output"][0], ev[8].1["item"]);
@@ -2172,5 +2224,283 @@ mod tests {
         assert_spec("Response", done);
         assert_eq!(v["status"], "completed");
         assert_eq!(v["output"], json!([]));
+    }
+
+    /// A follow-up request sending `refs` as `item_reference`s between two
+    /// user turns.
+    async fn send_refs(app: Router, refs: &[&Value]) -> (StatusCode, Value) {
+        let mut input = vec![json!({"role": "user", "content": "first"})];
+        input.extend(
+            refs.iter()
+                .map(|id| json!({"type": "item_reference", "id": id})),
+        );
+        input.push(json!({"role": "user", "content": "again"}));
+        post_json(app, json!({"model": "script-model", "input": input})).await
+    }
+
+    /// The script the stored-item tests answer request 1 with.
+    const REASON_THEN_HELLO: &[&str] = &["<think>", "r", "</think>", "hello"];
+
+    /// Request 1's output items (non-streamed), with `store` as given.
+    async fn first_output(app: Router, store: Option<bool>) -> Vec<Value> {
+        let mut body = json!({"model": "script-model", "input": "hi"});
+        if let Some(store) = store {
+            body["store"] = json!(store);
+        }
+        let (status, v) = post_json(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_spec("Response", &v);
+        v["output"].as_array().unwrap().clone()
+    }
+
+    /// With `store` absent or `true`, a response's output items resolve as
+    /// `item_reference`s in a later request: the reasoning and the answer
+    /// reach the prompt as the assistant turn they were.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stored_items_resolve_by_reference() {
+        for store in [None, Some(true)] {
+            let (app, tasks, _) =
+                app_with(RecordingEngine::script(REASON_THEN_HELLO), tools_config()).await;
+            let output = first_output(app.clone(), store).await;
+            let (rs, msg) = (&output[0]["id"], &output[1]["id"]);
+            assert!(rs.as_str().unwrap().starts_with("rs_"), "{output:?}");
+            assert!(msg.as_str().unwrap().starts_with("msg_"), "{output:?}");
+            let (status, v) = send_refs(app, &[rs, msg]).await;
+            assert_eq!(status, StatusCode::OK, "{store:?}: {v}");
+            let prompt = tasks.lock()[1].prompt.clone();
+            assert!(prompt.contains("<think>r</think>hello"), "{prompt}");
+        }
+    }
+
+    /// `store: false` keeps nothing: a reference to its item is a 400
+    /// naming the reference, its message pointing at `store: false`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unstored_items_are_not_found() {
+        let (app, _, _) =
+            app_with(RecordingEngine::script(REASON_THEN_HELLO), tools_config()).await;
+        let output = first_output(app.clone(), Some(false)).await;
+        let (status, v) = send_refs(app, &[&output[0]["id"]]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["param"], "input[1]", "{v}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains("store: false"), "{message}");
+    }
+
+    /// A streamed response's items are stored by the time its terminal
+    /// event is read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streamed_items_resolve_after_the_terminal_event() {
+        let (app, tasks, _) =
+            app_with(RecordingEngine::script(REASON_THEN_HELLO), tools_config()).await;
+        let (status, text) = post(
+            app.clone(),
+            json!({"model": "script-model", "input": "hi", "stream": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let ev = checked_events(&text);
+        let (kind, data) = ev.last().unwrap();
+        assert_eq!(kind, "response.completed");
+        let output = &data["response"]["output"];
+        let (status, v) = send_refs(app, &[&output[0]["id"], &output[1]["id"]]).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let prompt = tasks.lock()[1].prompt.clone();
+        assert!(prompt.contains("<think>r</think>hello"), "{prompt}");
+    }
+
+    /// A `failed` response's items are not stored; a cancelled one's are.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_items_are_not_stored_cancelled_ones_are() {
+        for (engine, terminal, found) in [
+            (
+                RecordingEngine {
+                    fail_after: Some(2),
+                    ..RecordingEngine::tok()
+                },
+                "response.failed",
+                false,
+            ),
+            (
+                RecordingEngine {
+                    cancel_after: Some(2),
+                    ..RecordingEngine::tok()
+                },
+                "response.incomplete",
+                true,
+            ),
+        ] {
+            let (app, tasks, _) = app_with(engine, tools_config()).await;
+            let (status, text) = post(
+                app.clone(),
+                json!({"model": "script-model", "input": "hi", "stream": true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            let ev = checked_events(&text);
+            let (kind, data) = ev.last().unwrap();
+            assert_eq!(kind, terminal, "{text}");
+            let id = &data["response"]["output"][0]["id"];
+            let (status, v) = send_refs(app, &[id]).await;
+            if found {
+                assert_eq!(data["response"]["status"], "cancelled");
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let prompt = tasks.lock()[1].prompt.clone();
+                assert!(prompt.contains("tok tok"), "{prompt}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+                assert_eq!(v["error"]["param"], "input[1]", "{v}");
+            }
+        }
+    }
+
+    /// A client that disconnects mid-stream leaves nothing stored: the
+    /// announced item never resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_disconnected_stream_stores_nothing() {
+        use futures::StreamExt;
+        let (app, _, _) = app_with(RecordingEngine::tok(), tools_config()).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "script-model", "input": "hi", "stream": true}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut text = String::new();
+        let id = loop {
+            let frame = body.next().await.expect("stream ended").unwrap();
+            text.push_str(&String::from_utf8_lossy(&frame));
+            let added = events(&text)
+                .into_iter()
+                .find(|(k, _)| k == "response.output_item.added");
+            if let Some((_, data)) = added {
+                break data["item"]["id"].clone();
+            }
+        };
+        drop(body);
+        let (status, v) = send_refs(app, &[&id]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["param"], "input[1]", "{v}");
+    }
+
+    /// References past `max_prompt_bytes` are a 413 from the walk itself
+    /// (`code: prompt_too_large`, naming the reference that passed it),
+    /// before any item past the budget is cloned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn references_past_the_prompt_budget_are_refused() {
+        let text = "x".repeat(480);
+        let cfg = Config {
+            max_prompt_bytes: 1000,
+            ..Config::default()
+        };
+        let (app, _, _) = app_with(RecordingEngine::script(&[&text]), cfg).await;
+        let output = first_output(app.clone(), None).await;
+        let size = serde_json::to_vec(&output[0]).unwrap().len();
+        assert!((501..1000).contains(&size), "{size}");
+        let id = &output[0]["id"];
+        let (status, v) = send_refs(app, &[id, id, id]).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(v["error"]["code"], "prompt_too_large", "{v}");
+        assert_eq!(v["error"]["param"], "input[2]", "{v}");
+    }
+
+    /// A turn that says something, calls a tool and then hits
+    /// `max_output_tokens`: the message is complete, the call parsed, the
+    /// response `incomplete`. (The [`RecordingEngine`] stops a script at the
+    /// task's `max_tokens` with `Length`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_a_call_then_the_token_cap() {
+        let (app, _, _) = app_with(
+            RecordingEngine::script(&[
+                "Let me check",
+                "<tool_call>",
+                "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}",
+                "</tool_call>",
+                "never sent",
+            ]),
+            tools_config(),
+        )
+        .await;
+        let (status, text) = post(
+            app,
+            json!({"model": "script-model", "input": "weather?", "tools": [get_weather()],
+                "max_output_tokens": 4, "stream": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let ev = checked_events(&text);
+        let (kind, data) = ev.last().unwrap();
+        assert_eq!(kind, "response.incomplete", "{text}");
+        let response = &data["response"];
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2, "{response}");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["status"], "completed", "{response}");
+        assert_eq!(output[0]["content"][0]["text"], "Let me check");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["name"], "get_weather");
+        let args: Value = serde_json::from_str(output[1]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"city": "Paris"}));
+        let done = ev
+            .iter()
+            .find(|(k, _)| k == "response.function_call_arguments.done")
+            .expect("arguments done");
+        assert_eq!(done.1["name"], "get_weather");
+    }
+
+    /// A stream cancelled through `/v1/cancel` while reasoning ends on
+    /// `response.incomplete`, status `cancelled`, the reasoning item
+    /// `incomplete` in `output`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_while_reasoning() {
+        let engine = RecordingEngine {
+            never_end: true,
+            ..RecordingEngine::script(&["<think>", "hmm"])
+        };
+        let (app, tasks, emitted) = app_with(engine, tools_config()).await;
+        let req = tokio::spawn(post(
+            app.clone(),
+            json!({"model": "script-model", "input": "hi", "stream": true}),
+        ));
+        while emitted.load(SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        let id = tasks.lock().last().unwrap().task_id.clone();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/cancel/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (status, text) = req.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let ev = checked_events(&text);
+        let (kind, data) = ev.last().unwrap();
+        assert_eq!(kind, "response.incomplete", "{text}");
+        let response = &data["response"];
+        assert_eq!(response["status"], "cancelled", "{response}");
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{response}");
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["status"], "incomplete", "{response}");
     }
 }
