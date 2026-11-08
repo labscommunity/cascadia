@@ -72,7 +72,7 @@
     },
     {
       "type": "function_call_output",
-      "id": "fco_01a1bc02-0a60-7672-b9b8-3c9794f86fcf",
+      "id": "fco_1",
       "call_id": "call_1",
       "output": "Process exited with code 0\nOutput:\na.txt\n"
     }

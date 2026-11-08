@@ -671,6 +671,21 @@ mod tests {
         assert_eq!(m[0].parts[1], ContentPart::Text("x".into()));
     }
 
+    /// A reasoning item with no renderable text is skipped: it neither
+    /// flushes the assistant's content nor holds, so the call after it
+    /// stays in the same turn.
+    #[test]
+    fn unrenderable_reasoning_keeps_the_turn() {
+        let m = walk(json!([
+            {"role": "assistant", "content": "a"},
+            {"type": "reasoning", "id": "rs_x", "encrypted_content": "foreign"},
+            fc("A"),
+        ]))
+        .unwrap();
+        let calls = vec![call("A", "f", "{}")];
+        assert_eq!(shape(&m), [("assistant", "a", Some(&calls), None)]);
+    }
+
     #[test]
     fn reasoning_blob_round_trips() {
         let text = "pensée — 考える\n🙂";
