@@ -258,11 +258,14 @@ To restore the old behaviour:
 - ov-genai `--draft-model` / `--prompt-lookup` now sample for requests that
   omit `temperature` (they were greedy, so lossless against plain decoding);
   the worker warns at startup. `--default-temperature 0` keeps them greedy.
-- **`stop` ends the generation.** The API checks the text for the earliest
-  `stop` sequence as it arrives, cuts the answer there with
+- **`stop` ends the generation.** The API watches the text as it arrives for
+  the first `stop` sequence to complete (of several completing on the same
+  character, the one that starts earliest), cuts the answer there with
   `finish_reason: "stop"`, and cancels the engine task, streaming or not. A
   stream holds back only a tail that could begin a stop sequence, so without
-  `stop` nothing is delayed. `usage` counts the tokens received up to the cut.
+  `stop` nothing is delayed. `usage` after a cut counts the prompt (engines
+  report it as soon as they have read it) and the completion tokens received
+  up to the cut.
 - **What still runs to the window.** Two engines run a generation as one call
   that cannot be cancelled: the default (non-`--cb`) ov-genai path and
   single-stage sparse-moe. There an answer that never reaches end-of-sequence
@@ -274,10 +277,9 @@ To restore the old behaviour:
   client disconnects. `--default-max-tokens` bounds it per server.
 - **Keep-alive.** A stream that has sent nothing for 15 s sends the SSE comment
   line `: keep-alive` (not a `data:` event; OpenAI clients skip it), so a proxy
-  with an idle timeout does not cut a long silent generation. It is sent while
-  the stream waits on the engine; an engine that runs its whole answer inside
-  one blocking step (the two above) can hold the stream's worker until that
-  step ends.
+  with an idle timeout does not cut a long silent generation. It keeps going
+  during a long one-shot step (the two engines above): the engine runs on its
+  own task, and the stream sends the comment from another worker.
 - `null` on `stream` and `logprobs` (and on `/v1/completions`' `stream` and
   `echo`) means unset, i.e. `false`, as for the fields above.
 - Responses now always carry `choices[].logprobs` (`null` unless logprobs were
