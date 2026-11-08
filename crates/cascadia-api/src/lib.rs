@@ -791,6 +791,25 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
+/// `seed`: a signed or an unsigned 64-bit integer (or `null`), as the
+/// engine's `u64`; negative values wrap (`-1` → `u64::MAX`), a stable
+/// mapping so the same seed always gives the same stream.
+fn de_seed<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum AnySeed {
+        Unsigned(u64),
+        Signed(i64),
+    }
+    Ok(Option::<AnySeed>::deserialize(d)?.map(|s| match s {
+        AnySeed::Unsigned(u) => u,
+        AnySeed::Signed(i) => i as u64,
+    }))
+}
+
 /// OpenAI `stop` is either a single string or an array of strings.
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
@@ -802,7 +821,8 @@ pub enum StopSpec {
 /// OpenAI `stream_options`. Only `include_usage` is honored today.
 #[derive(Deserialize, Debug, Default)]
 pub struct StreamOptions {
-    #[serde(default)]
+    /// `null` = unset = false.
+    #[serde(default, deserialize_with = "de_null_default")]
     pub include_usage: bool,
 }
 
@@ -828,10 +848,11 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<u32>,
-    /// Any integer, negative included (the spec's `seed` is a plain integer);
-    /// the engine gets its two's-complement `u64` (`-1` → `u64::MAX`).
-    #[serde(default)]
-    pub seed: Option<i64>,
+    /// Any integer from `i64::MIN` to `u64::MAX` (the spec's `seed` is a
+    /// plain integer); a negative one reaches the engine as its
+    /// two's-complement `u64` (`-1` → `u64::MAX`). See [`de_seed`].
+    #[serde(default, deserialize_with = "de_seed")]
+    pub seed: Option<u64>,
     #[serde(default)]
     pub stop: Option<StopSpec>,
     #[serde(default)]
@@ -1064,7 +1085,7 @@ impl ChatCompletionRequest {
         cascadia_types::SamplingParams {
             top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(0),
-            seed: self.seed.map(|s| s as u64),
+            seed: self.seed,
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
             presence_penalty: self.presence_penalty.unwrap_or(0.0),
             stop: self
@@ -1258,10 +1279,11 @@ pub struct CompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<u32>,
-    /// Any integer, negative included (the spec's `seed` is a plain integer);
-    /// the engine gets its two's-complement `u64` (`-1` → `u64::MAX`).
-    #[serde(default)]
-    pub seed: Option<i64>,
+    /// Any integer from `i64::MIN` to `u64::MAX` (the spec's `seed` is a
+    /// plain integer); a negative one reaches the engine as its
+    /// two's-complement `u64` (`-1` → `u64::MAX`). See [`de_seed`].
+    #[serde(default, deserialize_with = "de_seed")]
+    pub seed: Option<u64>,
     #[serde(default)]
     pub stop: Option<StopSpec>,
     #[serde(default)]
@@ -1286,7 +1308,7 @@ impl CompletionRequest {
         cascadia_types::SamplingParams {
             top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(0),
-            seed: self.seed.map(|s| s as u64),
+            seed: self.seed,
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
             presence_penalty: self.presence_penalty.unwrap_or(0.0),
             stop: self
@@ -9930,6 +9952,11 @@ level={{ effort_map[eff] }}";
             assert_eq!(t.sampling.seed, Some(u64::MAX), "chat={chat}");
             let t = captured_task(chat, serde_json::json!({"seed": 1234})).await;
             assert_eq!(t.sampling.seed, Some(1234), "chat={chat}");
+            // Above i64::MAX, as main accepted (u64).
+            let t = captured_task(chat, serde_json::json!({"seed": u64::MAX})).await;
+            assert_eq!(t.sampling.seed, Some(u64::MAX), "chat={chat}");
+            let t = captured_task(chat, serde_json::json!({"seed": null})).await;
+            assert_eq!(t.sampling.seed, None, "chat={chat}");
         }
     }
 
@@ -10074,5 +10101,38 @@ level={{ effort_map[eff] }}";
             );
             assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn null_include_usage_means_false() {
+        let (status, body) = post_text(
+            make_app().await,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "mock-model", "stream": true,
+                "messages": [{"role": "user", "content": "alpha"}],
+                "stream_options": {"include_usage": null}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("\"usage\""), "{body}");
+        let (status, body) = post_text(
+            make_app().await,
+            "/v1/completions",
+            &serde_json::json!({"model": "mock-model", "prompt": "alpha", "stream": true,
+                "stream_options": {"include_usage": null}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn non_integer_seed_is_still_rejected() {
+        let (status, _) = post_chat(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "seed": 1.5,
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
