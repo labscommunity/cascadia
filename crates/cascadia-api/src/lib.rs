@@ -8804,10 +8804,10 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn langchain_and_n8n_streaming_chat_body_is_answered() {
-        // frameworks.md (langchain-openai: ChatOpenAI always sends
-        // max_completion_tokens) and platforms.md (n8n Chat Model: temperature
+        // langchain-openai's ChatOpenAI always sends max_completion_tokens;
+        // n8n's Chat Model (on LangChain) sends temperature
         // 0.7, top_p 1, stream + stream_options.include_usage via LangChain;
-        // LibreChat on LangChain injects a top-level `user`).
+        // LibreChat on LangChain injects a top-level `user`.
         let body = serde_json::json!({
             "model": "mock-model",
             "messages": [
@@ -8826,7 +8826,7 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn opencode_chat_body_is_answered() {
-        // cli.md "What opencode actually sends for a generic custom provider":
+        // What opencode sends for a generic custom provider:
         // stream true, max_completion_tokens (generic provider default),
         // stream_options.include_usage on, tools with `strict: true`,
         // tool_choice with active tools, no `store`. The template renders the
@@ -8869,7 +8869,7 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn ai_sdk_openai_compatible_chat_body_is_answered() {
-        // cli.md "Upstream vercel/ai @ai-sdk/openai-compatible": `user`,
+        // What vercel/ai's @ai-sdk/openai-compatible sends: `user`,
         // `max_tokens` (from maxOutputTokens), temperature, passthrough provider
         // options (here `store: true`), and stream + stream_options.include_usage
         // when the provider is created with `includeUsage: true`.
@@ -8887,7 +8887,7 @@ level={{ effort_map[eff] }}";
     }
 
     fn browser_use_body() -> Value {
-        // agents.md (browser-use): non-streaming, temperature 0.2,
+        // browser-use's request: non-streaming, temperature 0.2,
         // frequency_penalty 0.3, max_completion_tokens 4096 by default.
         serde_json::json!({
             "model": "mock-model",
@@ -9183,8 +9183,8 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn tools_request_keeps_the_tool_calls_shape() {
-        // (e) the same request with `tools` is unchanged, and (Task 1 review)
-        // the modern tool-call response passes the spec too.
+        // (e) the same request with `tools` is unchanged, and the modern
+        // tool-call response passes the spec too.
         let (status, v) = post_chat(
             make_tool_app().await,
             serde_json::json!({"model": "mock-model",
@@ -9960,7 +9960,7 @@ level={{ effort_map[eff] }}";
         assert_keepalive_body(&body, "text_completion");
     }
 
-    // --- Legacy functions polish (fix wave C) ------------------------------
+    // --- Legacy functions: streaming and edge cases -------------------------
 
     #[test]
     fn unknown_function_call_names_the_list_the_request_used() {
@@ -10068,7 +10068,7 @@ level={{ effort_map[eff] }}";
         }
     }
 
-    // --- Keep-alive during a blocking engine step (fix round 2) -----------
+    // --- Keep-alive during a blocking engine step ------------------------
 
     /// One `step()` that blocks well past the keep-alive interval: the comment
     /// must still go out, from the body task, while the engine is stuck.
@@ -10244,7 +10244,7 @@ level={{ effort_map[eff] }}";
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    // --- Fix round 3: forwarder pacing, errors, panics, slot release -------
+    // --- Forwarder pacing, errors, panics, slot release ------------------
 
     /// Sends `payload` to `uri` and returns each body frame with the time it
     /// arrived, measured from the request. The body is read on a spawned
