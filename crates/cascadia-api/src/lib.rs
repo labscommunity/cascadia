@@ -731,8 +731,14 @@ pub struct StreamOptions {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
+    /// Deprecated in the OpenAI spec in favour of `max_completion_tokens`;
+    /// still honoured when that field is absent. `null` = unset.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// OpenAI's current output-token limit; wins over `max_tokens` when both
+    /// are sent. `null` = unset.
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: f32,
     #[serde(default)]
@@ -801,6 +807,12 @@ pub struct ChatTemplateKwargs {
 }
 
 impl ChatCompletionRequest {
+    /// The output-token limit the client asked for, if any:
+    /// `max_completion_tokens` wins over the deprecated `max_tokens` (as vLLM).
+    fn requested_max_tokens(&self) -> Option<u32> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
+
     /// Build the engine-facing `SamplingParams`, applying OpenAI defaults
     /// (top_p=1.0, penalties=0.0) when a field is omitted.
     fn sampling_params(&self) -> cascadia_types::SamplingParams {
@@ -2573,7 +2585,9 @@ async fn chat_completions(
         messages: chat_turns(&req),
         tools: chat_tools(&req),
         tool_choice: req.tool_choice.clone(),
-        max_tokens: req.max_tokens,
+        max_tokens: req
+            .requested_max_tokens()
+            .unwrap_or_else(default_max_tokens),
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
         sampling: req.sampling_params(),
@@ -4345,6 +4359,133 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["choices"][0]["finish_reason"], "length");
+    }
+
+    /// Posts a 5-word chat prompt with the given limit fields and asserts the
+    /// mock stopped at `expected` tokens for `finish_reason`, with a body that
+    /// matches the spec.
+    async fn assert_chat_limit(limits: serde_json::Value, expected: u64, finish: &str) {
+        let mut payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo charlie delta echo"}],
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(limits.as_object().unwrap().clone());
+        let (status, v) = post_chat(make_app().await, payload).await;
+        assert_eq!(status, StatusCode::OK, "{limits}: {v}");
+        assert_eq!(v["usage"]["completion_tokens"], expected, "{limits}: {v}");
+        assert_eq!(v["choices"][0]["finish_reason"], finish, "{limits}: {v}");
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_limits_chat_completion() {
+        assert_chat_limit(serde_json::json!({"max_completion_tokens": 2}), 2, "length").await;
+    }
+
+    #[tokio::test]
+    async fn max_tokens_still_limits_chat_completion() {
+        assert_chat_limit(serde_json::json!({"max_tokens": 2}), 2, "length").await;
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_wins_over_max_tokens() {
+        // D1: the current field beats the deprecated one.
+        assert_chat_limit(
+            serde_json::json!({"max_tokens": 4, "max_completion_tokens": 2}),
+            2,
+            "length",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn null_token_limits_mean_unset() {
+        // D9: `null` is the same as omitting the field.
+        assert_chat_limit(
+            serde_json::json!({"max_tokens": 2, "max_completion_tokens": null}),
+            2,
+            "length",
+        )
+        .await;
+        assert_chat_limit(
+            serde_json::json!({"max_tokens": null, "max_completion_tokens": 2}),
+            2,
+            "length",
+        )
+        .await;
+        // Both unset: the 5-word echo finishes well under the fallback limit.
+        assert_chat_limit(
+            serde_json::json!({"max_tokens": null, "max_completion_tokens": null}),
+            5,
+            "stop",
+        )
+        .await;
+    }
+
+    #[test]
+    fn requested_max_tokens_prefers_max_completion_tokens() {
+        let limit = |extra| chat_request(extra).requested_max_tokens();
+        assert_eq!(limit(serde_json::json!({})), None);
+        assert_eq!(limit(serde_json::json!({"max_tokens": 4})), Some(4));
+        assert_eq!(
+            limit(serde_json::json!({"max_completion_tokens": 2})),
+            Some(2)
+        );
+        assert_eq!(
+            limit(serde_json::json!({"max_tokens": 4, "max_completion_tokens": 2})),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_honours_max_completion_tokens() {
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "mock-model",
+                            "messages": [{"role": "user", "content": "alpha bravo charlie delta echo"}],
+                            "max_completion_tokens": 2,
+                            "stream": true,
+                            "stream_options": {"include_usage": true},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        let events = sse_events(&text);
+        let content_frames = events
+            .iter()
+            .filter(|e| {
+                e["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+            })
+            .count();
+        assert_eq!(content_frames, 2, "{text}");
+        let usage = events
+            .iter()
+            .find(|e| e["usage"].is_object())
+            .expect("usage frame");
+        assert_eq!(usage["usage"]["completion_tokens"], 2, "{text}");
+        let finish = events
+            .iter()
+            .find_map(|e| e["choices"][0]["finish_reason"].as_str())
+            .expect("finish_reason frame");
+        assert_eq!(finish, "length", "{text}");
     }
 
     // Response bodies must match the pinned OpenAI spec (see spec_schema.rs).
