@@ -3295,11 +3295,11 @@ async fn stream_text_completion(
         }
     };
     let text_stream = TextStream {
-        chunks: Some(StreamWithPermit {
+        chunks: Some(spawn_engine_forwarder(StreamWithPermit {
             inner: chunk_stream,
             _permit: permit,
             _inflight: inflight,
-        }),
+        })),
         keepalive: KeepAlive::new(state.sse_keepalive),
         kind: TextStreamKind::Completion { echo: echo_prefix },
         // The raw-prompt endpoint streams the engine's text as is.
@@ -3349,14 +3349,15 @@ async fn stream_completion(
             return engine_error_response(err);
         }
     };
-    // Move the permit + in-flight guard into the stream so they're released
-    // only when the body is dropped (client disconnect, final chunk, or a
-    // stop match).
-    let chunks = Some(StreamWithPermit {
+    // Move the permit + in-flight guard into the engine stream, which its
+    // forwarder task owns: they are released when the forwarder ends (the
+    // stream finished, or the body dropped its receiver on a client
+    // disconnect or a stop match).
+    let chunks = Some(spawn_engine_forwarder(StreamWithPermit {
         inner: chunk_stream,
         _permit: permit,
         _inflight: inflight,
-    });
+    }));
     // Tools present and not disabled: content streams as the splitter
     // releases it; whether the reply is a tool call is decided at the final
     // chunk, on the same text and parse as the non-streaming path.
@@ -3633,7 +3634,7 @@ impl KeepAlive {
 
     /// The next engine chunk, or [`StreamNext::Idle`] once the interval
     /// passes with nothing sent. `None` chunks (no stream) end the body.
-    async fn next(&mut self, chunks: Option<&mut StreamWithPermit>) -> StreamNext {
+    async fn next(&mut self, chunks: Option<&mut EngineChunks>) -> StreamNext {
         let Some(chunks) = chunks else {
             return StreamNext::Chunk(None);
         };
@@ -3644,7 +3645,7 @@ impl KeepAlive {
             self.sent();
             return StreamNext::Idle;
         }
-        match tokio::time::timeout_at(deadline, chunks.next()).await {
+        match tokio::time::timeout_at(deadline, chunks.recv()).await {
             Ok(chunk) => StreamNext::Chunk(chunk),
             Err(_) => {
                 self.sent();
@@ -3652,6 +3653,47 @@ impl KeepAlive {
             }
         }
     }
+}
+
+/// The receiving end of an engine stream run by [`spawn_engine_forwarder`].
+type EngineChunks = tokio::sync::mpsc::Receiver<cascadia_types::Chunk>;
+
+/// Chunks the forwarder may hold ahead of the SSE body. One keeps the
+/// engine paced by the body as before (it can be at most a chunk or two
+/// ahead), so a stop match or a disconnect still stops it within a step.
+const FORWARD_BUFFER: usize = 1;
+
+/// Drives `chunks` on its own task and forwards each chunk into a bounded
+/// channel. `ChunkStream::poll_next` runs `engine.step()` inline, so a long
+/// one-shot step blocks whichever task polls it; polled here, it blocks this
+/// task's worker, and the SSE body, reading the channel on another worker,
+/// still sends keep-alive comments (D11).
+///
+/// Disconnect and cancel are unchanged: dropping the receiver (the body
+/// dropped on a client disconnect, or a stop match) ends the forwarder at
+/// its next poll, which drops the engine stream — that cancels the task and
+/// releases the permit and in-flight guard, as dropping the body did. A
+/// step already running cannot be interrupted either way.
+fn spawn_engine_forwarder(mut chunks: StreamWithPermit) -> EngineChunks {
+    let (tx, rx) = tokio::sync::mpsc::channel(FORWARD_BUFFER);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                () = tx.closed() => break,
+                chunk = chunks.next() => match chunk {
+                    Some(chunk) => {
+                        if tx.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+        drop(chunks);
+    });
+    rx
 }
 
 /// The OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
@@ -3702,7 +3744,7 @@ enum TextStreamKind {
 /// `chunks`; dropping `chunks` (client disconnect, or a stop match) releases
 /// both and cancels the engine task.
 struct TextStream {
-    chunks: Option<StreamWithPermit>,
+    chunks: Option<EngineChunks>,
     keepalive: KeepAlive,
     kind: TextStreamKind,
     marker: Option<MarkerFilter>,
@@ -3888,7 +3930,7 @@ where
 /// both and cancels the engine task, exactly like the plain stream.
 struct ToolStream {
     /// `None` once a stop match has dropped (and so cancelled) the task.
-    chunks: Option<StreamWithPermit>,
+    chunks: Option<EngineChunks>,
     keepalive: KeepAlive,
     marker: Option<MarkerFilter>,
     /// Applied before the splitter, as the non-streaming path trims before
@@ -9209,6 +9251,8 @@ level={{ effort_map[eff] }}";
         /// Report `prompt_tokens` on the first part too, as token-streaming
         /// engines do (M1 D14).
         prompt_first: bool,
+        /// Each step blocks this long first, like a one-shot engine's step.
+        step_delay: Duration,
         gate: Option<Arc<std::sync::atomic::AtomicBool>>,
         log: Arc<ScriptLog>,
         pending: Option<(cascadia_types::TaskId, usize)>,
@@ -9236,6 +9280,9 @@ level={{ effort_map[eff] }}";
             let Some((id, i)) = self.pending.take() else {
                 return Ok(Vec::new());
             };
+            if !self.step_delay.is_zero() {
+                std::thread::sleep(self.step_delay);
+            }
             if i > 0
                 && self
                     .gate
@@ -9291,7 +9338,7 @@ level={{ effort_map[eff] }}";
         gated: bool,
         keepalive: Duration,
     ) -> (Router, Arc<ScriptLog>, Arc<std::sync::atomic::AtomicBool>) {
-        script_app_full(parts, "", true, gated, keepalive).await
+        script_app_full(parts, "", true, gated, keepalive, Duration::ZERO).await
     }
 
     /// [`script_app`] with the final chunk's text and whether the first
@@ -9302,6 +9349,7 @@ level={{ effort_map[eff] }}";
         prompt_first: bool,
         gated: bool,
         keepalive: Duration,
+        step_delay: Duration,
     ) -> (Router, Arc<ScriptLog>, Arc<std::sync::atomic::AtomicBool>) {
         let log = Arc::new(ScriptLog::default());
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -9309,6 +9357,7 @@ level={{ effort_map[eff] }}";
             parts: parts.iter().map(|p| (*p).to_owned()).collect(),
             final_text: final_text.to_owned(),
             prompt_first,
+            step_delay,
             gate: gated.then(|| gate.clone()),
             log: log.clone(),
             pending: None,
@@ -9630,6 +9679,7 @@ level={{ effort_map[eff] }}";
                 false,
                 false,
                 SSE_KEEPALIVE_INTERVAL,
+                Duration::ZERO,
             )
             .await;
             let mut body = serde_json::json!({"model": "mock-model",
@@ -9667,6 +9717,7 @@ level={{ effort_map[eff] }}";
             false,
             false,
             SSE_KEEPALIVE_INTERVAL,
+            Duration::ZERO,
         )
         .await;
         let (_, v) = post_chat(
@@ -9683,6 +9734,7 @@ level={{ effort_map[eff] }}";
             false,
             false,
             SSE_KEEPALIVE_INTERVAL,
+            Duration::ZERO,
         )
         .await;
         let (_, v) = post_completions(
@@ -9870,5 +9922,88 @@ level={{ effort_map[eff] }}";
             let t = captured_task(chat, serde_json::json!({"seed": 1234})).await;
             assert_eq!(t.sampling.seed, Some(1234), "chat={chat}");
         }
+    }
+
+    // --- Keep-alive during a blocking engine step (fix round 2) -----------
+
+    /// One `step()` that blocks well past the keep-alive interval: the comment
+    /// must still go out, from the body task, while the engine is stuck.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn keepalive_goes_out_during_a_blocking_engine_step() {
+        for (uri, payload) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{"type": "function", "function": {"name": "f"}}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true}),
+            ),
+        ] {
+            let (app, _log, _) = script_app_full(
+                &["only "],
+                "",
+                true,
+                false,
+                Duration::from_millis(50),
+                Duration::from_millis(400),
+            )
+            .await;
+            let (status, body) = post_text(app, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK);
+            let first_data = body.find("data: ").expect("a data frame");
+            let first_ping = body
+                .find(": keep-alive")
+                .unwrap_or_else(|| panic!("{uri}: no keep-alive while the step blocked: {body}"));
+            assert!(first_ping < first_data, "{uri}: {body}");
+            assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        }
+    }
+
+    /// A client that disconnects while a step blocks still cancels the task
+    /// once the step returns, and frees its slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_during_a_blocking_step_still_cancels() {
+        let (app, log, _) = script_app_full(
+            &script(&["a "]),
+            "",
+            true,
+            false,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        )
+        .await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model": "mock-model", "stream": true,
+                            "messages": [{"role": "user", "content": "hi"}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        // A keep-alive first (the first step blocks), then disconnect.
+        let frame = tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&frame[..], b": keep-alive\n\n");
+        drop(body);
+        assert_cancelled(&log).await;
     }
 }
