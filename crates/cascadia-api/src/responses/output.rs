@@ -240,7 +240,14 @@ pub(super) struct OutputBuilder {
     split_held: usize,
     /// Tokens of feeds that released nothing yet.
     carried: u32,
+    /// Reasoning tokens by the per-chunk counts.
     reasoning: f64,
+    /// The per-chunk counts' sum.
+    observed: u32,
+    /// Bytes released or consumed, and the reasoning share of them
+    /// (`<think>`/`</think>` included).
+    out_bytes: usize,
+    reasoning_bytes: usize,
 }
 
 impl OutputBuilder {
@@ -270,6 +277,9 @@ impl OutputBuilder {
             split_held: 0,
             carried: 0,
             reasoning: 0.0,
+            observed: 0,
+            out_bytes: 0,
+            reasoning_bytes: 0,
         }
     }
 
@@ -354,16 +364,30 @@ impl OutputBuilder {
         items
     }
 
-    /// `usage.output_tokens_details.reasoning_tokens`, clamped to
-    /// `output_tokens`.
+    /// `usage.output_tokens_details.reasoning_tokens` of an `output_tokens`
+    /// total, clamped to it. A total other than the per-chunk counts' sum
+    /// (an engine's authoritative final count) scales the counted reasoning
+    /// to it; when the chunks counted nothing, the reasoning share of the
+    /// bytes splits it.
     pub fn reasoning_tokens(&self, output_tokens: u32) -> u32 {
-        (self.reasoning.round() as u32).min(output_tokens)
+        let total = f64::from(output_tokens);
+        let reasoning = if self.observed == output_tokens {
+            self.reasoning
+        } else if self.observed > 0 {
+            self.reasoning * total / f64::from(self.observed)
+        } else if self.out_bytes > 0 {
+            total * self.reasoning_bytes as f64 / self.out_bytes as f64
+        } else {
+            0.0
+        };
+        (reasoning.round() as u32).min(output_tokens)
     }
 
     /// Split a feed's tokens by the share of the bytes it released or
     /// consumed that went to reasoning (`<think>`/`</think>` included); a
     /// feed that only held text carries its tokens to the next one.
     fn count(&mut self, fed: usize, segs: &[Seg], tokens: u32) {
+        self.observed += tokens;
         let pool = self.split_held + fed;
         self.split_held = self.split.held_len();
         let out = pool - self.split_held;
@@ -380,6 +404,8 @@ impl OutputBuilder {
                 Seg::Reasoning(_) => 0,
             })
             .sum();
+        self.out_bytes += out;
+        self.reasoning_bytes += out - answer;
         self.reasoning += f64::from(tokens) * (out - answer) as f64 / out as f64;
     }
 
@@ -867,8 +893,41 @@ mod tests {
         assert_eq!(kinds(&b.items()), ["reasoning", "message"]);
         // 19 of 25 bytes (tags included) are reasoning: 7.6 → 8
         assert_eq!(b.reasoning_tokens(10), 8);
-        // clamped to the output tokens
-        assert_eq!(b.reasoning_tokens(5), 5);
+        // an authoritative total of 5 scales it: 3.8 → 4
+        assert_eq!(b.reasoning_tokens(5), 4);
+    }
+
+    /// Chunks that carried no tokens, then an authoritative total: the
+    /// reasoning share of every released byte (tags included) splits it.
+    #[test]
+    fn uncounted_chunks_split_the_total_by_bytes() {
+        let mut b = plain(true, false);
+        b.feed("<think>plan</think>", 0);
+        b.feed("answer", 0);
+        b.finish("completed");
+        // 19 of 25 bytes are reasoning: 7.6 → 8
+        assert_eq!(b.reasoning_tokens(10), 8);
+        assert_eq!(b.reasoning_tokens(0), 0);
+        // nothing released at all: none
+        let mut b = plain(true, false);
+        b.finish("completed");
+        assert_eq!(b.reasoning_tokens(3), 0);
+    }
+
+    /// Per-chunk counts that disagree with the authoritative total are
+    /// scaled to it.
+    #[test]
+    fn counted_chunks_are_scaled_to_the_total() {
+        let mut b = plain(true, false);
+        // 1 token all reasoning, then 1 token 8 of 10 bytes reasoning: 1.8
+        b.feed("<think>ab", 1);
+        b.feed("</think>xy", 1);
+        b.finish("completed");
+        assert_eq!(b.reasoning_tokens(2), 2);
+        // ×5: 9
+        assert_eq!(b.reasoning_tokens(10), 9);
+        // ×0.5: 0.9 → 1
+        assert_eq!(b.reasoning_tokens(1), 1);
     }
 
     #[test]
@@ -878,7 +937,7 @@ mod tests {
         drive(&mut b, &["<th", "ink>ab", "</think>x"], "completed");
         // feed 2: 3 + 4 bytes all reasoning, 2 tokens; feed 3: 8 of 9 bytes
         // of 1 token: 2.89 → 3
-        assert_eq!(b.reasoning_tokens(100), 3);
+        assert_eq!(b.reasoning_tokens(3), 3);
         // finish attributes what is still carried
         let mut b = plain(true, false);
         b.feed("\n", 4);

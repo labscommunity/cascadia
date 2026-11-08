@@ -1632,6 +1632,28 @@ mod tests {
         assert_eq!(v["usage"]["output_tokens"], 7, "{v}");
     }
 
+    /// The same engine shape reasoning: the authoritative total is split by
+    /// the reasoning share of the bytes (19 of 25, tags included: 7.6 → 8).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reasoning_tokens_split_the_final_chunks_total() {
+        let engine = || RecordingEngine {
+            chunk_tokens: Some(0),
+            final_tokens: Some(10),
+            ..RecordingEngine::script(&["<think>plan</think>", "answer"])
+        };
+        let body = json!({"model": "script-model", "input": "hi",
+            "reasoning": {"effort": "low"}});
+        let (done, v) = usage_both_ways(engine, body).await;
+        for r in [&done, &v] {
+            assert_eq!(r["output"][0]["type"], "reasoning", "{r}");
+            assert_eq!(r["usage"]["output_tokens"], 10, "{r}");
+            assert_eq!(
+                r["usage"]["output_tokens_details"]["reasoning_tokens"], 8,
+                "{r}"
+            );
+        }
+    }
+
     fn assert_cancelled(response: &Value) {
         assert_eq!(response["status"], "cancelled", "{response}");
         assert!(response["completed_at"].is_null());
