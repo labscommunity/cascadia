@@ -828,8 +828,10 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<u32>,
+    /// Any integer, negative included (the spec's `seed` is a plain integer);
+    /// the engine gets its two's-complement `u64` (`-1` → `u64::MAX`).
     #[serde(default)]
-    pub seed: Option<u64>,
+    pub seed: Option<i64>,
     #[serde(default)]
     pub stop: Option<StopSpec>,
     #[serde(default)]
@@ -893,24 +895,39 @@ pub struct ChatCompletionRequest {
     legacy_functions: bool,
 }
 
-/// A request message as sent: today's [`ChatMessage`] plus the deprecated
-/// assistant `function_call`. `ChatMessage` itself stays unchanged because
-/// callers outside this crate build it as a struct literal.
+/// A request message as sent: today's [`ChatMessage`] fields plus the
+/// deprecated assistant `function_call`. `ChatMessage` itself stays
+/// unchanged because callers outside this crate build it as a struct literal.
+/// The fields are spelled out (no `#[serde(flatten)]`) so a 422 names the
+/// field's full path, e.g. `messages[0].content`.
 #[derive(Deserialize)]
 struct WireChatMessage {
-    #[serde(flatten)]
-    message: ChatMessage,
+    role: String,
+    #[serde(default, deserialize_with = "de_null_default")]
+    content: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
     #[serde(default)]
     function_call: Option<FunctionCall>,
 }
 
+/// Prefix of the ids synthesised for legacy calls: no client sends it, so a
+/// synthesised id never collides with a client's own `call_0`.
+const LEGACY_CALL_ID_PREFIX: &str = "call_fn_";
+
 /// `messages`, with the deprecated function-calling turns mapped onto tool
 /// calls: an assistant `function_call` becomes one `tool_calls` entry with a
-/// synthesised id (`call_0`, `call_1`, … in message order), and the
+/// synthesised id (`call_fn_0`, `call_fn_1`, … in message order), and the
 /// `function`-role reply right after it becomes a `tool` turn carrying that
-/// id. A `function` turn with no such call before it still becomes a `tool`
-/// turn, with a fresh id of its own: templates that require an id get one,
-/// and it matches no call, which is what the history says.
+/// id. An assistant turn that also sends non-empty `tool_calls` keeps those
+/// (the reply then answers their first call); an empty `tool_calls` is the
+/// same as none. A `function` turn with no call before it still becomes a
+/// `tool` turn, with a fresh id of its own: templates that require an id get
+/// one, and it matches no call, which is what the history says.
 fn de_chat_messages<'de, D>(d: D) -> Result<Vec<ChatMessage>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -918,33 +935,41 @@ where
     let wire = Vec::<WireChatMessage>::deserialize(d)?;
     let mut next_id = 0usize;
     let mut fresh_id = || {
-        let id = format!("call_{next_id}");
+        let id = format!("{LEGACY_CALL_ID_PREFIX}{next_id}");
         next_id += 1;
         id
     };
     // The id of the call made by the message just before, awaiting its reply.
     let mut awaiting: Option<String> = None;
     let mut messages = Vec::with_capacity(wire.len());
-    for WireChatMessage {
-        mut message,
-        function_call,
-    } in wire
-    {
+    for w in wire {
+        let mut message = ChatMessage {
+            role: w.role,
+            content: w.content,
+            name: w.name,
+            tool_calls: w.tool_calls.filter(|c| !c.is_empty()),
+            tool_call_id: w.tool_call_id,
+        };
         let call_id = awaiting.take();
         if message.role == "function" {
             message.role = "tool".into();
             if message.tool_call_id.is_none() {
                 message.tool_call_id = Some(call_id.unwrap_or_else(&mut fresh_id));
             }
-        } else if let Some(function) = function_call {
-            if message.role == "assistant" && message.tool_calls.is_none() {
-                let id = fresh_id();
-                awaiting = Some(id.clone());
-                message.tool_calls = Some(vec![ToolCall {
-                    id,
-                    r#type: "function".into(),
-                    function,
-                }]);
+        } else if let Some(function) = w.function_call {
+            if message.role == "assistant" {
+                match &message.tool_calls {
+                    Some(calls) => awaiting = Some(calls[0].id.clone()),
+                    None => {
+                        let id = fresh_id();
+                        awaiting = Some(id.clone());
+                        message.tool_calls = Some(vec![ToolCall {
+                            id,
+                            r#type: "function".into(),
+                            function,
+                        }]);
+                    }
+                }
             }
         }
         messages.push(message);
@@ -1013,8 +1038,13 @@ impl ChatCompletionRequest {
             .flatten()
             .any(|t| t.function.get("name").and_then(|n| n.as_str()) == Some(name));
         if !declared {
+            let list = if self.legacy_functions {
+                "functions"
+            } else {
+                "tools"
+            };
             return Err(format!(
-                "function_call names function '{name}', which is not in functions"
+                "function_call names function '{name}', which is not in {list}"
             ));
         }
         self.tool_choice =
@@ -1034,7 +1064,7 @@ impl ChatCompletionRequest {
         cascadia_types::SamplingParams {
             top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(0),
-            seed: self.seed,
+            seed: self.seed.map(|s| s as u64),
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
             presence_penalty: self.presence_penalty.unwrap_or(0.0),
             stop: self
@@ -1228,8 +1258,10 @@ pub struct CompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<u32>,
+    /// Any integer, negative included (the spec's `seed` is a plain integer);
+    /// the engine gets its two's-complement `u64` (`-1` → `u64::MAX`).
     #[serde(default)]
-    pub seed: Option<u64>,
+    pub seed: Option<i64>,
     #[serde(default)]
     pub stop: Option<StopSpec>,
     #[serde(default)]
@@ -1254,7 +1286,7 @@ impl CompletionRequest {
         cascadia_types::SamplingParams {
             top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(0),
-            seed: self.seed,
+            seed: self.seed.map(|s| s as u64),
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
             presence_penalty: self.presence_penalty.unwrap_or(0.0),
             stop: self
@@ -8931,28 +8963,28 @@ level={{ effort_map[eff] }}";
             .tool_calls
             .as_ref()
             .expect("function_call → tool_calls")[0];
-        assert_eq!(call.id, "call_0");
+        assert_eq!(call.id, "call_fn_0");
         assert_eq!(call.r#type, "function");
         assert_eq!(call.function.name, "get_weather");
         assert_eq!(call.function.arguments, "{\"city\":\"Paris\"}");
         assert_eq!(m[2].role, "tool");
-        assert_eq!(m[2].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(m[2].tool_call_id.as_deref(), Some("call_fn_0"));
         assert_eq!(m[2].name.as_deref(), Some("get_weather"));
         assert_eq!(m[2].content, "{\"temp_c\":18}");
-        assert_eq!(m[3].tool_calls.as_ref().unwrap()[0].id, "call_1");
-        assert_eq!(m[4].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(m[3].tool_calls.as_ref().unwrap()[0].id, "call_fn_1");
+        assert_eq!(m[4].tool_call_id.as_deref(), Some("call_fn_1"));
         let env = build_chat_env(TOOL_TEMPLATE).unwrap();
         let out = render_with_chat_env(&env, m, "", "", true, None, req.tools.as_deref()).unwrap();
         assert!(out.contains("<|assistant|>[CALLS:get_weather]"), "{out}");
         assert!(
-            out.contains("<|tool|>{\"temp_c\":18}[TCID:call_0]"),
+            out.contains("<|tool|>{\"temp_c\":18}[TCID:call_fn_0]"),
             "{out}"
         );
         // The structured turns (sycl-llama) carry the same mapping.
         let turns = chat_turns(&req);
-        assert_eq!(turns[1].tool_calls.as_ref().unwrap()[0]["id"], "call_0");
+        assert_eq!(turns[1].tool_calls.as_ref().unwrap()[0]["id"], "call_fn_0");
         assert_eq!(turns[2].role, "tool");
-        assert_eq!(turns[2].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(turns[2].tool_call_id.as_deref(), Some("call_fn_0"));
     }
 
     #[test]
@@ -8966,7 +8998,7 @@ level={{ effort_map[eff] }}";
             ],
         }));
         assert_eq!(req.messages[1].role, "tool");
-        assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("call_fn_0"));
         // Modern messages are untouched.
         let req = legacy_request(serde_json::json!({
             "messages": [
@@ -9613,5 +9645,108 @@ level={{ effort_map[eff] }}";
         let text = serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true});
         let body = read_with_keepalive("/v1/completions", text).await;
         assert_keepalive_body(&body, "text_completion");
+    }
+
+    // --- Legacy functions polish (fix wave C) ------------------------------
+
+    #[test]
+    fn unknown_function_call_names_the_list_the_request_used() {
+        let mut req = chat_request(serde_json::json!({
+            "functions": [{"name": "get_weather"}],
+            "function_call": {"name": "get_time"},
+        }));
+        let e = req.apply_legacy_functions().unwrap_err();
+        assert!(e.contains("not in functions"), "{e}");
+        let mut req = chat_request(serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "function_call": {"name": "get_time"},
+        }));
+        let e = req.apply_legacy_functions().unwrap_err();
+        assert!(e.contains("not in tools"), "{e}");
+        assert!(e.contains("function_call"), "{e}");
+    }
+
+    #[test]
+    fn synthesised_ids_cannot_collide_with_a_clients_call_n() {
+        // A client's own `call_0` next to a legacy call: the synthesised id
+        // uses a prefix no client sends.
+        let req = legacy_request(serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "call_0",
+                    "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call_0", "content": "1"},
+                {"role": "assistant", "content": null,
+                 "function_call": {"name": "f", "arguments": "{}"}},
+                {"role": "function", "name": "f", "content": "2"},
+            ],
+        }));
+        let m = &req.messages;
+        let id = &m[2].tool_calls.as_ref().unwrap()[0].id;
+        assert_ne!(id, "call_0");
+        assert_eq!(m[3].tool_call_id.as_ref(), Some(id));
+    }
+
+    #[test]
+    fn empty_tool_calls_beside_function_call_maps_the_function_call() {
+        let req = legacy_request(serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [],
+                 "function_call": {"name": "f", "arguments": "{\"a\":1}"}},
+                {"role": "function", "name": "f", "content": "2"},
+            ],
+        }));
+        let calls = req.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.arguments, "{\"a\":1}");
+        assert_eq!(req.messages[1].tool_call_id.as_ref(), Some(&calls[0].id));
+    }
+
+    #[test]
+    fn function_reply_after_tool_calls_takes_the_first_call_id() {
+        // Both sent: `tool_calls` wins as the history, and the `function`
+        // reply answers its first call instead of an id nothing matches.
+        let req = legacy_request(serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": null,
+                 "tool_calls": [
+                    {"id": "abc", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "def", "type": "function", "function": {"name": "g", "arguments": "{}"}}],
+                 "function_call": {"name": "f", "arguments": "{}"}},
+                {"role": "function", "name": "f", "content": "2"},
+            ],
+        }));
+        assert_eq!(req.messages[0].tool_calls.as_ref().unwrap().len(), 2);
+        assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn bad_message_field_422_names_its_path() {
+        let (status, body) = post_chat_text(
+            make_app().await,
+            &serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": 5}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("messages[0].content"), "{body}");
+        let (status, body) = post_chat_text(
+            make_app().await,
+            &serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "assistant", "content": null,
+                    "function_call": {"name": 1}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("messages[0].function_call.name"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn negative_seed_is_accepted_and_reaches_the_engine() {
+        for chat in [true, false] {
+            let t = captured_task(chat, serde_json::json!({"seed": -1})).await;
+            assert_eq!(t.sampling.seed, Some(u64::MAX), "chat={chat}");
+            let t = captured_task(chat, serde_json::json!({"seed": 1234})).await;
+            assert_eq!(t.sampling.seed, Some(1234), "chat={chat}");
+        }
     }
 }
