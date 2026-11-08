@@ -50,8 +50,9 @@ pub struct ResponsesRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// Nullable: `null` is the default, `false`.
     #[serde(default)]
-    pub stream: bool,
+    pub stream: Option<bool>,
     /// Echoed; absent is OpenAI's default, `true`.
     #[serde(default)]
     pub store: Option<bool>,
@@ -82,7 +83,8 @@ pub struct ResponsesRequest {
     /// Echoed (absent = `true`).
     #[serde(default)]
     pub parallel_tool_calls: Option<bool>,
-    /// Echoed; it caps hosted tool calls, and none runs here.
+    /// Echoed; it caps hosted tool calls, and none runs here. A
+    /// non-negative integer or null (see [`refuse_unsupported`]).
     #[serde(default)]
     pub max_tool_calls: Option<Value>,
     #[serde(default)]
@@ -215,6 +217,17 @@ fn check_metadata(metadata: Option<&Value>) -> Result<(), Refusal> {
 fn refuse_unsupported(req: &ResponsesRequest) -> Result<bool, Refusal> {
     check_metadata(req.metadata.as_ref())?;
     let encrypted = check_include(req.include.as_ref())?;
+    // Echoed on the response, so held to the schema's integer.
+    if req
+        .max_tool_calls
+        .as_ref()
+        .is_some_and(|n| n.as_u64().is_none())
+    {
+        return Err(Refusal::malformed(
+            "max_tool_calls",
+            "`max_tool_calls` must be a non-negative integer or null",
+        ));
+    }
     if req.previous_response_id.is_some() {
         return Err(Refusal::new(
             "previous_response_id",
@@ -296,7 +309,7 @@ fn chat_request(
         presence_penalty: None,
         logprobs: false,
         top_logprobs: None,
-        stream: req.stream,
+        stream: req.stream.unwrap_or(false),
         stream_options: None,
         enable_thinking: None,
         reasoning_effort: req.reasoning.as_ref().and_then(|r| r.effort.clone()),
@@ -538,7 +551,7 @@ pub(crate) async fn create_response(
     // Where the final items are kept for `item_reference`; `store: false`
     // keeps nothing.
     let cache = (req.store != Some(false)).then(|| state.item_cache.clone());
-    if req.stream {
+    if req.stream.unwrap_or(false) {
         return stream_response(state, shell, admitted, builder, cache).await;
     }
     let collected = collect_generation_with(&state, admitted, &[], "input", &mut |text, n| {
@@ -1212,6 +1225,10 @@ mod tests {
                 "text.format",
             ),
             (json!({"truncation": "auto"}), "truncation"),
+            (json!({"max_tool_calls": "many"}), "max_tool_calls"),
+            (json!({"max_tool_calls": {}}), "max_tool_calls"),
+            (json!({"max_tool_calls": -1}), "max_tool_calls"),
+            (json!({"max_tool_calls": 1.5}), "max_tool_calls"),
             (json!({"input": 5}), "input"),
             (
                 json!({"input": [{"type": "item_reference", "id": "msg_1"}]}),
@@ -1938,6 +1955,21 @@ mod tests {
         assert_eq!(v["tool_choice"], "none");
         assert_eq!(v["parallel_tool_calls"], false);
         assert_eq!(v["reasoning"], json!({"effort": "low", "summary": null}));
+        let v = echo(json!({"max_tool_calls": null, "stream": null})).await;
+        assert!(v["max_tool_calls"].is_null(), "{v}");
+    }
+
+    /// `stream: null` is the spec's nullable default: not streamed.
+    #[tokio::test]
+    async fn null_stream_is_not_streamed() {
+        let (status, v) = post_json(
+            make_app().await,
+            json!({"model": "mock-model", "input": "hi", "stream": null}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["object"], "response", "{v}");
+        assert_spec("Response", &v);
     }
 
     /// Tool and tool-choice refusals name the field, before the engine.
