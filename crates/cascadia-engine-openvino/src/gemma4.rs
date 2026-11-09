@@ -1170,6 +1170,69 @@ fn middle_reply(w: MaskedWait) -> (StageReply, Option<EngineError>) {
     }
 }
 
+/// One step's frames, in send order (see [`send_step`]).
+struct StepFrames {
+    pos: WireTensor,
+    hid: WireTensor,
+    header: WireTensor,
+    cross: Vec<WireTensor>,
+}
+
+/// A masked step on the downstream link, as the head and every middle run
+/// it: discard late replies, send the step, wait for its reply. The bool
+/// says a discarded late reply was acknowledged.
+async fn masked_round(
+    g: &mut ActivationClient,
+    frames: &StepFrames,
+    budget: Duration,
+) -> (MaskedWait, bool) {
+    let late_ack = match drain_late_replies(g).await {
+        Ok(late_ack) => late_ack,
+        Err(e) => return (MaskedWait::Failed(e), false),
+    };
+    if let Err(e) = send_step(g, &frames.pos, &frames.hid, &frames.header, &frames.cross).await {
+        return (
+            MaskedWait::Failed(EngineError::Backend(e.to_string())),
+            late_ack,
+        );
+    }
+    (wait_masked_reply(g, budget).await, late_ack)
+}
+
+/// A middle stage's masked step after it has read the step from upstream:
+/// `prepared` is its relayed step (or why it couldn't relay it). Returns the
+/// reply it owes upstream (always one, so the head never waits out its
+/// deadline on a failed middle) and the error that still fails its step.
+async fn middle_masked_step(
+    down: &mut ActivationClient,
+    prepared: EngineResult<StepFrames>,
+    budget: Duration,
+) -> (StageReply, Option<EngineError>) {
+    match prepared {
+        Err(e) => (StageReply::Nack, Some(e)),
+        Ok(frames) => middle_reply(masked_round(down, &frames, budget).await.0),
+    }
+}
+
+/// The tail's masked step after its relay: the reply it owes upstream and
+/// the error that still fails its step.
+fn tail_masked_reply(
+    relayed: EngineResult<(Vec<f32>, Vec<usize>)>,
+    words: &[u32],
+) -> (StageReply, Option<EngineError>) {
+    let (out, out_shape) = match relayed {
+        Ok(r) => r,
+        Err(e) => return (StageReply::Nack, Some(e)),
+    };
+    match tail_masked_pick(&out, &out_shape, words) {
+        Ok(token) => (StageReply::Token(token), None),
+        Err(why) => {
+            warn!(%why, "gemma4: can't apply a structured-output mask; answering NACK");
+            (StageReply::Nack, None)
+        }
+    }
+}
+
 /// "This pipeline can't mask": set by an unacknowledged masked step, it makes
 /// structured-output tasks fail at once (no frames sent) until a late
 /// acknowledged reply clears it or [`MASK_LATCH_REPROBE`] has passed. Lives on
@@ -1474,6 +1537,23 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let f = self.step_frames(hidden, shape, position, mask)?;
+        self.block_on(async move {
+            let mut guard = downstream.lock().await;
+            send_step(&mut guard, &f.pos, &f.hid, &f.header, &f.cross).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The frames of one step from this stage's last inference.
+    fn step_frames(
+        &mut self,
+        hidden: &[f32],
+        shape: [usize; 3],
+        position: i64,
+        mask: Option<&[u32]>,
+    ) -> EngineResult<StepFrames> {
         // Gemma 4 activations are f32 (the IR's hidden_states input/output are
         // f32). Send raw f32 so the downstream stage feeds it without a lossy
         // f16 round-trip — matches the f32 Core reference.
@@ -1517,13 +1597,12 @@ impl Gemma4Engine {
             cross_frames.push(pack_cross_kv_frame(dt, &oshape, bytes)?);
             tags.push(o.tag);
         }
-        let header = encode_cross_kv_header(&tags);
-        self.block_on(async move {
-            let mut guard = downstream.lock().await;
-            send_step(&mut guard, &pos, &hid, &header, &cross_frames).await
+        Ok(StepFrames {
+            pos,
+            hid,
+            header: encode_cross_kv_header(&tags),
+            cross: cross_frames,
         })
-        .map_err(|e| EngineError::Backend(e.to_string()))?;
-        Ok(())
     }
 
     /// A plain step's token (see [`wait_plain_reply`]). A late acknowledged
@@ -1541,34 +1620,6 @@ impl Gemma4Engine {
             self.mask_latch.clear();
         }
         Ok(token)
-    }
-
-    /// Before a masked step: discard late replies to an earlier one.
-    fn drain_downstream(&mut self) -> EngineResult<()> {
-        let downstream = self
-            .downstream
-            .clone()
-            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let late_ack = self.block_on(async move {
-            let mut guard = downstream.lock().await;
-            drain_late_replies(&mut guard).await
-        })?;
-        if late_ack {
-            self.mask_latch.clear();
-        }
-        Ok(())
-    }
-
-    /// A masked step's reply (see [`wait_masked_reply`]).
-    fn recv_masked_from_downstream(&mut self, prefill: bool) -> MaskedWait {
-        let Some(downstream) = self.downstream.clone() else {
-            return MaskedWait::Failed(EngineError::Backend("no downstream".into()));
-        };
-        let budget = masked_wait_budget(prefill, self.stages_below);
-        self.block_on(async move {
-            let mut guard = downstream.lock().await;
-            wait_masked_reply(&mut guard, budget).await
-        })
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(HiddenIn, i64)> {
@@ -2067,9 +2118,19 @@ impl Gemma4Engine {
             let words = mask_words(mask, width).inspect_err(|_| {
                 self.grammar_failure = (width > 0).then_some(GrammarFailure::DeadEnd)
             })?;
-            self.drain_downstream()?;
-            self.send_hidden_downstream(out, s3, position, Some(&words))?;
-            let wait = self.recv_masked_from_downstream(prefill);
+            let frames = self.step_frames(out, s3, position, Some(&words))?;
+            let downstream = self
+                .downstream
+                .clone()
+                .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+            let budget = masked_wait_budget(prefill, self.stages_below);
+            let (wait, late_ack) = self.block_on(async move {
+                let mut guard = downstream.lock().await;
+                masked_round(&mut guard, &frames, budget).await
+            });
+            if late_ack {
+                self.mask_latch.clear();
+            }
             match head_masked_token(wait, &mut self.mask_latch, std::time::Instant::now()) {
                 Ok(token) => Ok((token, ts.elapsed())),
                 Err((e, kind)) => {
@@ -2266,21 +2327,15 @@ impl Gemma4Engine {
                 shape,
                 words,
             } => {
-                let (out, out_shape) = match self.relay(&floats, shape, position) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = self.send_masked_reply_upstream(StageReply::Nack);
-                        return Err(e);
-                    }
-                };
-                let reply = match tail_masked_pick(&out, &out_shape, &words) {
-                    Ok(token) => StageReply::Token(token),
-                    Err(why) => {
-                        warn!(%why, "gemma4: can't apply a structured-output mask; answering NACK");
-                        StageReply::Nack
-                    }
-                };
-                self.send_masked_reply_upstream(reply)
+                let relayed = self.relay(&floats, shape, position);
+                let (reply, err) = tail_masked_reply(relayed, &words);
+                // A failed relay still answers (an acknowledged NACK), so the
+                // head fails this task instead of waiting out its deadline.
+                let sent = self.send_masked_reply_upstream(reply);
+                match err {
+                    Some(e) => Err(e),
+                    None => sent,
+                }
             }
             HiddenIn::BadMask(why) => {
                 warn!(%why, "gemma4: can't read a structured-output step; answering NACK");
@@ -2318,21 +2373,26 @@ impl Gemma4Engine {
         // acknowledgement up only when the downstream acknowledged. A failure
         // here still answers upstream (an acknowledged NACK), so the head
         // fails this task instead of waiting out its deadline.
-        let sent = self
+        let prepared = self
             .relay(&hidden, shape, position)
             .and_then(|(out, out_shape)| {
-                self.drain_downstream()?;
-                self.send_hidden_downstream(&out, to_shape3(&out_shape), position, Some(&words))
+                self.step_frames(&out, to_shape3(&out_shape), position, Some(&words))
             });
-        if let Err(e) = sent {
-            let _ = self.send_masked_reply_upstream(StageReply::Nack);
-            return Err(e);
-        }
-        let (reply, err) = middle_reply(self.recv_masked_from_downstream(prefill_reply));
-        self.send_masked_reply_upstream(reply)?;
+        let budget = masked_wait_budget(prefill_reply, self.stages_below);
+        let (reply, err) = match self.downstream.clone() {
+            Some(downstream) => self.block_on(async move {
+                let mut guard = downstream.lock().await;
+                middle_masked_step(&mut guard, prepared, budget).await
+            }),
+            None => (
+                StageReply::Nack,
+                Some(EngineError::Backend("no downstream".into())),
+            ),
+        };
+        let sent = self.send_masked_reply_upstream(reply);
         match err {
             Some(e) => Err(e),
-            None => Ok(()),
+            None => sent,
         }
     }
 }
@@ -3941,10 +4001,9 @@ mod tests {
         let reply = match hidden_in {
             HiddenIn::Masked { words, .. } => {
                 let (row, shape) = tail_row();
-                match tail_masked_pick(&row, &shape, &words) {
-                    Ok(t) => StageReply::Token(t),
-                    Err(_) => StageReply::Nack,
-                }
+                let (reply, err) = tail_masked_reply(Ok((row, shape)), &words);
+                assert!(err.is_none());
+                reply
             }
             HiddenIn::BadMask(_) => StageReply::Nack,
             HiddenIn::Plain { .. } => panic!("expected a masked step"),
@@ -3968,12 +4027,13 @@ mod tests {
         else {
             panic!("expected a masked step")
         };
-        assert!(!drain_late_replies(down).await.unwrap());
-        let out = encode_hidden_frame(&floats, shape, Some(&words)).unwrap();
-        send_step(down, &pos_t, &out, &encode_cross_kv_header(&tags), &frames)
-            .await
-            .unwrap();
-        let (reply, err) = middle_reply(wait_masked_reply(down, budget).await);
+        let prepared = encode_hidden_frame(&floats, shape, Some(&words)).map(|hid| StepFrames {
+            pos: pos_t,
+            hid,
+            header: encode_cross_kv_header(&tags),
+            cross: frames,
+        });
+        let (reply, err) = middle_masked_step(down, prepared, budget).await;
         up.send(&encode_masked_reply(reply)).await.unwrap();
         assert!(err.is_none());
     }
@@ -4530,6 +4590,88 @@ mod tests {
             (21, false)
         );
         mid.await.unwrap();
+        tail.await.unwrap();
+    }
+
+    #[test]
+    fn a_tail_whose_relay_fails_still_answers_with_an_acknowledged_nack() {
+        let words = ok_words();
+        let (reply, err) =
+            tail_masked_reply(Err(EngineError::Backend("infer failed".into())), &words);
+        assert_eq!(reply, StageReply::Nack);
+        assert!(err.is_some(), "the tail's step still fails");
+        // A mask it can't apply: NACK, but the step itself is fine.
+        let (reply, err) = tail_masked_reply(Ok((vec![1.0; 64], vec![1, 1, 64])), &words);
+        assert_eq!(reply, StageReply::Nack);
+        assert!(err.is_none());
+        let (row, shape) = tail_row();
+        assert_eq!(
+            tail_masked_reply(Ok((row, shape)), &words).0,
+            StageReply::Token(b'"' as i32)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_middle_whose_relay_fails_answers_nack_and_sends_nothing_down() {
+        let (mut tail_up, mut down) = link().await;
+        let (reply, err) = middle_masked_step(
+            &mut down,
+            Err(EngineError::Backend("infer failed".into())),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(reply, StageReply::Nack);
+        assert!(err.is_some());
+        // Nothing reached the tail.
+        let nothing = tokio::time::timeout(Duration::from_millis(100), tail_up.recv()).await;
+        assert!(nothing.is_err(), "{nothing:?}");
+    }
+
+    #[tokio::test]
+    async fn a_middle_whose_downstream_link_fails_answers_nack() {
+        let (tail_up, mut down) = link().await;
+        drop(tail_up);
+        let words = ok_words();
+        let (hidden, shape) = sample_hidden();
+        let (tags, cross) = sample_cross();
+        let frames = StepFrames {
+            pos: encode_wire_position(0),
+            hid: encode_hidden_frame(&hidden, shape, Some(&words)).unwrap(),
+            header: encode_cross_kv_header(&tags),
+            cross,
+        };
+        let (reply, err) = middle_masked_step(&mut down, Ok(frames), Duration::from_secs(5)).await;
+        assert_eq!(reply, StageReply::Nack);
+        assert!(err.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_masked_round_drains_then_sends_then_waits() {
+        let (mut server, mut client) = link().await;
+        // A late acknowledged reply already queued.
+        server
+            .send(&encode_masked_reply(StageReply::Token(5)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let words = ok_words();
+        let tail = tokio::spawn(async move {
+            new_tail_step(&mut server).await;
+        });
+        let (hidden, shape) = sample_hidden();
+        let (tags, cross) = sample_cross();
+        let frames = StepFrames {
+            pos: encode_wire_position(0),
+            hid: encode_hidden_frame(&hidden, shape, Some(&words)).unwrap(),
+            header: encode_cross_kv_header(&tags),
+            cross,
+        };
+        let (w, late_ack) = masked_round(&mut client, &frames, Duration::from_secs(5)).await;
+        assert!(late_ack);
+        assert!(
+            matches!(w, MaskedWait::Token(t) if t == b'"' as i32),
+            "{w:?}"
+        );
         tail.await.unwrap();
     }
 }
