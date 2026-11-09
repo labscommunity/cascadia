@@ -1611,3 +1611,91 @@ fn a_redial_starts_the_link_with_full_masks() {
     assert_eq!(log.repeats(), 2);
     let _ = &rt;
 }
+
+/// A re-dial that fails keeps the link down and the retry spaced out: the
+/// next step neither treats it as a new connection nor dials again at once.
+#[test]
+fn a_failed_redial_keeps_the_backoff_and_the_link_down() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let mut head = head_engine(&rt, JsonStub::new(), down, 2, 2);
+    // Nothing listens on the downstream's address any more.
+    rt.block_on(async { srv.lock().await.close().await });
+    drop(srv);
+    head.peer_disconnected = true;
+    let epoch = head.link_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    let _ = head.step();
+    assert!(
+        head.redial_next.is_some(),
+        "the re-dial was tried and spaced out"
+    );
+    let _ = head.step();
+    assert_eq!(
+        head.link_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        epoch,
+        "no new connection was counted"
+    );
+    assert!(head.peer_disconnected, "the link is still down");
+    assert!(head.redial_next.is_some(), "the backoff is kept");
+}
+
+/// The last rank, a marker it can't resolve on a stream's prompt window:
+/// it answers that row with the mask-miss token at once, without opening
+/// the slot or running its layers.
+#[test]
+fn a_stream_window_miss_at_the_last_rank_runs_no_layer() {
+    use crate::dist::*;
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, cli) = l.remove(0);
+    let mut tail = PipelineEngine::new(
+        JsonStub::new(),
+        None,
+        StageTransport {
+            upstream: Some(srv),
+            downstream: None,
+        },
+        rt.handle().clone(),
+        1,
+        2,
+        None,
+    );
+    assert_eq!(tail.enable_streams(2), 2);
+    let words = vec![u32::MAX; VOCAB.div_ceil(32)];
+    let mut cols = MaskCols::new(1, words.len());
+    cols.set(0, 7, &words);
+    // The sender believes the tail holds this mask; the tail is fresh.
+    let send = MaskSendLink::default();
+    send.record_for_tests(&words);
+    rt.block_on(send_stream_open_step(
+        &cli,
+        3,
+        1,
+        &crate::sampling::SamplingConfig::default(),
+        &[0.5; 4],
+        1,
+        4,
+        Some(&cols),
+        Some(&send),
+    ))
+    .unwrap();
+    assert_eq!(send.markers_sent(), 1);
+    tail.step().unwrap();
+    let reply = rt.block_on(async {
+        assert_eq!(
+            recv_kind_client_raw(&cli).await.unwrap(),
+            Some(FrameKind::StreamTokensAck)
+        );
+        recv_stream_tokens_ack_body_client(&cli).await.unwrap()
+    });
+    assert_eq!(
+        reply,
+        (
+            3,
+            MASK_ACK,
+            vec![(1, i64::from(cascadia_grammar::MASK_MISS_TOKEN))]
+        )
+    );
+    assert_eq!(tail.runner.stream_pos(1), None, "the slot was never opened");
+}

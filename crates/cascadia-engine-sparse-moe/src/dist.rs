@@ -52,7 +52,7 @@
 
 use std::sync::Arc;
 
-use cascadia_grammar::{MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_TOKEN, REPEAT};
+use cascadia_grammar::{MaskRecvCache, MaskSendCache, MASK_MISS_TOKEN, REPEAT};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult,
     MAX_RAW_BYTES,
@@ -3244,12 +3244,12 @@ impl MaskRecvLink {
     pub fn resolve(&self, cols: MaskCols) -> MaskCols {
         let mut cache = self.cache();
         if cols.is_repeat() {
-            let Ok(words) = cache.resolve(WireMask::Repeat) else {
+            let Some(words) = cache.last() else {
                 return cols;
             };
             let (row, tag) = cols.masked[0];
             let mut full = MaskCols::new(cols.rows, words.len());
-            full.set(row, tag, &words);
+            full.set(row, tag, words);
             return full;
         }
         if let Some(words) = cols.single_words() {

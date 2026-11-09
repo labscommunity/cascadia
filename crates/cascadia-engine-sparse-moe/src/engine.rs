@@ -7406,8 +7406,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
             c.close().await;
             let res = c.connect_with_timeout(REDIAL_BUDGET).await;
             // A new connection, counted under the lock like the keeper's:
-            // the next masked frame on it goes full.
-            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // the next masked frame on it goes full. A failed dial is no
+            // connection (counting it would read as the keeper's re-dial and
+            // drop this retry's backoff).
+            if res.is_ok() {
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             res
         });
         match res {
@@ -8991,6 +8995,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // `stream_mask_miss`).
         let cols = cols.map(|c| self.mask_recv.resolve(c));
         self.stream_mask_miss(cols.as_ref())?;
+        // The last rank: the window's only masked row is its sampled one, so a
+        // miss is answered at once, with the slot left as it was and no layer
+        // run (rank 0 fails this stream and closes the slot).
+        if self.is_last() && cols.as_ref().is_some_and(MaskCols::is_repeat) {
+            let row = [(slot, i64::from(cascadia_grammar::MASK_MISS_TOKEN))];
+            warn!(
+                slot,
+                "a repeat token mask arrived with no mask to repeat; answering a mask miss"
+            );
+            return self
+                .block_on(crate::dist::send_stream_tokens_ack_upstream(
+                    upstream, batch_id, MASK_ACK, &row,
+                ))
+                .map_err(|e| format!("send_stream_tokens_ack (mask miss): {e}"));
+        }
         let have = if open {
             Some(0)
         } else {
@@ -9036,8 +9055,6 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 rng,
             };
             let token = match cols.as_ref() {
-                // A marker with no mask to repeat: the mask-miss token.
-                Some(c) if c.is_repeat() => None,
                 Some(c) => sample_wire_masked(
                     &logits,
                     &sampler.history,
@@ -9058,7 +9075,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
             self.stream_samplers.insert(s, sampler);
             let send_started = Instant::now();
-            let row = [(slot, token.unwrap_or(miss_or_nack(cols.as_ref())))];
+            let row = [(slot, token.unwrap_or(-1))];
             let sent = match cols {
                 Some(_) => self
                     .block_on(crate::dist::send_stream_tokens_ack_upstream(
@@ -9138,6 +9155,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         // A repeat marker resolves here, before any layer runs (see
         // `stream_mask_miss`).
+        // The last rank still runs this frame's layers on a miss: the other
+        // rows share the batch. Only the missed row goes unsampled (-2).
         let cols = cols.map(|c| self.mask_recv.resolve(c));
         self.stream_mask_miss(cols.as_ref())?;
         if hidden_f32.len() != rows.len() * hs {
