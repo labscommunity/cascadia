@@ -4261,8 +4261,9 @@ pub(crate) struct AdmitOpts {
     pub(crate) fold_refused_system_turns: bool,
     /// Ask the engine for reasoning it gets on a separate channel as text
     /// inside `<think>` / `</think>` (`GenerationTask::reasoning_as_text`),
-    /// so it can be returned as a reasoning item. Set by `/v1/responses`;
-    /// chat keeps the engine's output as it was.
+    /// so it can be returned as a reasoning item; only for a thinking
+    /// request. Set by `/v1/responses`; chat keeps the engine's output as it
+    /// was.
     pub(crate) reasoning_as_text: bool,
 }
 
@@ -4565,7 +4566,10 @@ async fn admit_chat(
         resume_token_ids: None,
         media,
         prompt_rendered,
-        reasoning_as_text: opts.reasoning_as_text,
+        // Only a thinking request's reply is split into reasoning; with
+        // thinking off, markers around a model's unasked reasoning would
+        // land in the answer.
+        reasoning_as_text: opts.reasoning_as_text && enable_thinking,
     };
 
     // Acquire a request slot before touching the engine. Contended streams

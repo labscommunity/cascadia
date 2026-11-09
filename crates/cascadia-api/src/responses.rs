@@ -2858,8 +2858,8 @@ mod tests {
 
     /// On an engine that templates itself with no template here
     /// (sycl-llama), the task asks for reasoning as text, and reasoning sent
-    /// as `<think>`…`</think>` ahead of the answer is a reasoning item; the
-    /// chat endpoint does not ask.
+    /// as `<think>`…`</think>` ahead of the answer is a reasoning item; with
+    /// thinking off, or on the chat endpoint, it does not ask.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reasoning_sent_as_text_is_a_reasoning_item() {
         let cfg = || Config {
@@ -2884,6 +2884,19 @@ mod tests {
         assert_eq!(kinds, ["reasoning", "message"], "{v}");
         assert_eq!(v["output"][0]["content"][0]["text"], "17 times 3 is 51");
         assert_eq!(v["output"][1]["content"][0]["text"], "51");
+
+        // Thinking off: the reply is not split, so reasoning is not asked
+        // for as text (a model that reasons anyway would show its markers).
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["51"]), cfg()).await;
+        let (status, v) = post_json(
+            app,
+            json!({"model": "script-model", "input": "What is 17 times 3?",
+                "reasoning": {"effort": "none"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(!tasks.lock()[0].enable_thinking);
+        assert!(!tasks.lock()[0].reasoning_as_text);
 
         let (app, tasks, _) = app_with(RecordingEngine::script(&["51"]), cfg()).await;
         let (status, body) = post_to(
