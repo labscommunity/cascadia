@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
 use cascadia_ov_genai_shim::{
     DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -261,6 +262,12 @@ fn bytes_to_f32(dtype: ShimDType, bytes: &[u8]) -> EngineResult<Vec<f32>> {
 /// rank-0 / zero-width / short logits buffer returns a clear error instead
 /// of panicking with a slice/underflow.
 fn argmax_logits(logits: &[f32], shape: &[usize]) -> EngineResult<i32> {
+    let vocab = logits_vocab(logits, shape)?;
+    Ok(argmax_last_row(logits, vocab))
+}
+
+/// The row width of a logits output, checked against the buffer.
+fn logits_vocab(logits: &[f32], shape: &[usize]) -> EngineResult<usize> {
     let vocab = match shape.last() {
         Some(&v) if v > 0 => v,
         _ => {
@@ -275,7 +282,7 @@ fn argmax_logits(logits: &[f32], shape: &[usize]) -> EngineResult<i32> {
             logits.len()
         )));
     }
-    Ok(argmax_last_row(logits, vocab))
+    Ok(vocab)
 }
 
 /// Normalize an output shape to a 3D `[batch, seq, hidden]` for the wire.
@@ -441,6 +448,9 @@ struct ActiveTask {
     /// Cumulative time inside `send_hidden_downstream` +
     /// `recv_token_from_downstream` — i.e. wire send + downstream wait + recv.
     t_wire: std::time::Duration,
+    /// The grammar matcher of a structured-output task, advanced over every
+    /// token in `generated`. `None` for every other task (unmasked path).
+    grammar: Option<GrammarMask>,
 }
 
 /// One prefill span's end. Prompt segment (`i < seed_split`): the engine's
@@ -485,13 +495,10 @@ fn prefill_chunk() -> usize {
 /// value double-counts every interim token. It is set explicitly so an empty
 /// final delta (EOS decoding to "") still counts its token. Mirrors
 /// `runtime.rs` / `qwen36.rs`.
-fn final_chunk(
-    task_id: TaskId,
-    token: i64,
-    delta: String,
-    prompt_len: usize,
-    is_eos: bool,
-) -> Chunk {
+///
+/// `stop` is a natural stop (EOS, or a structured-output task whose JSON is
+/// complete); otherwise the task hit `max_tokens`.
+fn final_chunk(task_id: TaskId, token: i64, delta: String, prompt_len: usize, stop: bool) -> Chunk {
     Chunk {
         task_id,
         token_id: token,
@@ -504,12 +511,126 @@ fn final_chunk(
         error: None,
         invalid_request: false,
         token_ids: Vec::new(),
-        finish_reason: Some(if is_eos {
+        finish_reason: Some(if stop {
             FinishReason::Stop
         } else {
             FinishReason::Length
         }),
     }
+}
+
+/// How a task ends after `generated` tokens: `Stop` on EOS or a grammar finish
+/// (also when that lands on the last allowed token), `Length` on the budget,
+/// `None` while it continues. Without a grammar `grammar_finished` is false
+/// and this is the plain EOS / `max_tokens` check.
+fn step_end(
+    generated: usize,
+    max_tokens: usize,
+    is_eos: bool,
+    grammar_finished: bool,
+) -> Option<FinishReason> {
+    if is_eos || grammar_finished {
+        Some(FinishReason::Stop)
+    } else if generated >= max_tokens {
+        Some(FinishReason::Length)
+    } else {
+        None
+    }
+}
+
+// -------- structured output (grammar-masked picks) --------
+
+/// The submit-time answer to a structured-output task on a multi-stage
+/// pipeline: the last stage picks the token and has no grammar to mask with.
+fn refuse_multi_stage_grammar() -> EngineError {
+    EngineError::InvalidConfig(
+        "structured output (response_format) is not supported on multi-stage gemma4 pipelines yet"
+            .into(),
+    )
+}
+
+/// Submit-time grammar build: `None` for a task without a grammar; an
+/// `InvalidConfig` (400) on a multi-stage pipeline, when the model can't do
+/// structured output, or when the schema doesn't compile.
+fn compile_task_grammar(
+    factory: &Result<GrammarFactory, String>,
+    single_stage: bool,
+    task: &GenerationTask,
+) -> EngineResult<Option<CompiledGrammar>> {
+    let Some(spec) = task.grammar.as_ref() else {
+        return Ok(None);
+    };
+    if !single_stage {
+        return Err(refuse_multi_stage_grammar());
+    }
+    let factory = factory.as_ref().map_err(|reason| {
+        EngineError::InvalidConfig(format!(
+            "structured output is not available for this model: {reason}"
+        ))
+    })?;
+    factory.compile(spec).map(Some)
+}
+
+/// Activation: a fresh matcher advanced over the resume seed. A seed the
+/// grammar rejects is a backend error.
+fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineResult<GrammarMask> {
+    let mut mask = compiled.matcher()?;
+    if !seed.is_empty() {
+        let seed: Vec<u32> = seed.iter().map(|&t| t as u32).collect();
+        mask.replay(&seed)?;
+    }
+    Ok(mask)
+}
+
+/// Picks the token from the last row of a logits output. `mask` is passed
+/// only when that row picks the next generated token of a structured-output
+/// task; then the pick is the best token the grammar allows (an error when it
+/// allows none). `None` is the plain argmax.
+fn pick_next_token(
+    logits: &[f32],
+    shape: &[usize],
+    mask: Option<&mut GrammarMask>,
+) -> EngineResult<i32> {
+    let Some(mask) = mask else {
+        return argmax_logits(logits, shape);
+    };
+    let vocab = logits_vocab(logits, shape)?;
+    let mut row = logits[logits.len() - vocab..].to_vec();
+    mask.apply(&mut row)?;
+    Ok(argmax_last_row(&row, vocab))
+}
+
+/// Runs the prefill spans of a `len`-token prefill in order (see
+/// [`prefill_span_end`]) and returns the last span's token, the first
+/// generated one. `span` gets the grammar mask only for that last span: the
+/// earlier spans' picks are discarded.
+fn fold_prefill<F>(
+    len: usize,
+    chunk: usize,
+    seed_split: usize,
+    mut mask: Option<&mut GrammarMask>,
+    mut span: F,
+) -> EngineResult<i32>
+where
+    F: FnMut(std::ops::Range<usize>, Option<&mut GrammarMask>) -> EngineResult<i32>,
+{
+    let mut i = 0usize;
+    loop {
+        let end = prefill_span_end(i, chunk, seed_split);
+        let last = end >= len;
+        let m = if last { mask.as_deref_mut() } else { None };
+        let token = span(i..end, m)?;
+        if last {
+            return Ok(token);
+        }
+        i = end;
+    }
+}
+
+/// A queued task with its grammar compiled at submit.
+struct PendingTask {
+    task: GenerationTask,
+    grammar: Option<CompiledGrammar>,
 }
 
 pub struct Gemma4Engine {
@@ -525,6 +646,9 @@ pub struct Gemma4Engine {
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
+    /// Builds structured-output grammars for this tokenizer; `Err` holds why
+    /// it couldn't be built (structured-output tasks are then refused).
+    grammar_factory: Result<GrammarFactory, String>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
@@ -539,7 +663,7 @@ pub struct Gemma4Engine {
     /// alias lookup (the IR's primary name is sometimes an internal
     /// node id, not the canonical name). Empty for v3 IRs.
     canonical_inputs: std::collections::HashMap<String, String>,
-    pending: Vec<GenerationTask>,
+    pending: Vec<PendingTask>,
     active: Option<ActiveTask>,
     /// Cross-stage shared KV this stage PRODUCES (Gemma 4 E2B/E4B KV-sharing):
     /// each `cross_kv.*` output port + its wire tag (source layer + key/value).
@@ -948,7 +1072,7 @@ impl Gemma4Engine {
 
     fn step_first(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.active.is_none() && !self.pending.is_empty() {
-            let task = self.pending.remove(0);
+            let PendingTask { task, grammar } = self.pending.remove(0);
             let tok = self
                 .tokenizer
                 .clone()
@@ -982,6 +1106,19 @@ impl Gemma4Engine {
                     return Ok(vec![(task.task_id.clone(), c)]);
                 }
             }
+            // Structured output: the matcher starts after the resume seed (if
+            // any), before any model work, so a seed the grammar rejects costs
+            // nothing and fails this task only.
+            let grammar = match grammar.as_ref().map(|g| {
+                start_grammar(g, &cascadia_types::resume_generated_seed(resume.as_deref()))
+            }) {
+                None => None,
+                Some(Ok(mask)) => Some(mask),
+                Some(Err(e)) => {
+                    let id = task.task_id.clone();
+                    return Ok(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+                }
+            };
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
             // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
@@ -1118,6 +1255,7 @@ impl Gemma4Engine {
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
+                grammar,
             });
         }
 
@@ -1210,31 +1348,35 @@ impl Gemma4Engine {
         };
         let mut alpha = std::time::Duration::ZERO;
         let mut wire = std::time::Duration::ZERO;
-        let mut next_token: i32;
+        let next_token: i32;
         let position = self.position;
+        // A structured-output task's matcher, held out of `active` for this
+        // step's pick (emit_token puts it back). `None` for every other task.
+        let mut grammar = self.active.as_mut().and_then(|a| a.grammar.take());
         if prefill && tokens.len() > 1 && (chunk < tokens.len() || seed_split < tokens.len()) {
-            let mut i = 0usize;
-            loop {
-                let end = prefill_span_end(i, chunk, seed_split);
-                let span = &tokens[i..end];
-                let pos = self.position;
-                let ts = std::time::Instant::now();
-                let (out, shape) = self.run_first(span, pos)?;
-                alpha += ts.elapsed();
-                self.position += span.len() as i64;
-                // Every span goes downstream so each stage folds the same way; the tokens from all but
-                // the final span are discarded (the last one is the first decode token).
-                // Always use the PREFILL (widened) deadline here even for T=1 spans: this is a prefill,
-                // and the first span after a warm RESTORE follows a heavy set_state on the downstream
-                // stage — the strict decode budget wedges there and the turn returns empty.
-                let (tok, w) = self.resolve_next_token(&out, &shape, single_stage, pos, true)?;
-                wire += w;
-                next_token = tok;
-                i = end;
-                if i >= tokens.len() {
-                    break;
-                }
-            }
+            next_token = fold_prefill(
+                tokens.len(),
+                chunk,
+                seed_split,
+                grammar.as_mut(),
+                |range, mask| {
+                    let span = &tokens[range];
+                    let pos = self.position;
+                    let ts = std::time::Instant::now();
+                    let (out, shape) = self.run_first(span, pos)?;
+                    alpha += ts.elapsed();
+                    self.position += span.len() as i64;
+                    // Every span goes downstream so each stage folds the same way; the tokens from all
+                    // but the final span are discarded (the last one is the first decode token).
+                    // Always use the PREFILL (widened) deadline here even for T=1 spans: this is a
+                    // prefill, and the first span after a warm RESTORE follows a heavy set_state on the
+                    // downstream stage — the strict decode budget wedges there and the turn returns empty.
+                    let (tok, w) =
+                        self.resolve_next_token(&out, &shape, single_stage, pos, true, mask)?;
+                    wire += w;
+                    Ok(tok)
+                },
+            )?;
         } else {
             let ts = std::time::Instant::now();
             let (out, shape) = self.run_first(&tokens, position)?;
@@ -1249,6 +1391,7 @@ impl Gemma4Engine {
                 single_stage,
                 position,
                 prefill && tokens.len() > 1,
+                grammar.as_mut(),
             )?;
             wire = w;
             next_token = tok;
@@ -1256,6 +1399,7 @@ impl Gemma4Engine {
         if let Some(a) = self.active.as_mut() {
             a.t_alpha_compute += alpha;
             a.t_wire += wire;
+            a.grammar = grammar;
         }
 
         self.emit_token(next_token)
@@ -1265,6 +1409,10 @@ impl Gemma4Engine {
     /// this is the only stage, otherwise forward the hidden state downstream
     /// and await the token from the pipeline tail. Returns the token + the
     /// wire round-trip time (zero for single-stage).
+    ///
+    /// `mask` is the structured-output matcher, passed only when this output's
+    /// token is the next generated one (see [`pick_next_token`]). Multi-stage
+    /// pipelines never get one: grammar tasks are refused at submit there.
     fn resolve_next_token(
         &mut self,
         out: &[f32],
@@ -1272,9 +1420,15 @@ impl Gemma4Engine {
         single_stage: bool,
         position: i64,
         prefill: bool,
+        mask: Option<&mut GrammarMask>,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
-            Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
+            Ok((
+                pick_next_token(out, shape, mask)?,
+                std::time::Duration::ZERO,
+            ))
+        } else if mask.is_some() {
+            Err(refuse_multi_stage_grammar())
         } else {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
@@ -1291,6 +1445,15 @@ impl Gemma4Engine {
             .active
             .as_mut()
             .ok_or_else(|| EngineError::Backend("emit_token with no active task".into()))?;
+        // Structured output: advance the matcher past the picked token (a
+        // rejection fails the task); a complete JSON ends it with `stop`.
+        let grammar_finished = match active.grammar.as_mut() {
+            Some(mask) => {
+                mask.accept(next_token as u32)?;
+                mask.finished()
+            }
+            None => false,
+        };
         active.last_token = next_token;
         active.generated.push(next_token);
 
@@ -1341,7 +1504,8 @@ impl Gemma4Engine {
 
         let max_tokens = active.task.max_tokens.max(1) as usize;
         let is_eos = self.eos_token_ids.contains(&(next_token as u32));
-        let is_final = active.generated.len() >= max_tokens || is_eos;
+        let end = step_end(active.generated.len(), max_tokens, is_eos, grammar_finished);
+        let is_final = end.is_some();
 
         let task_id = active.task.task_id.clone();
         let chunk = if is_final {
@@ -1350,7 +1514,7 @@ impl Gemma4Engine {
                 next_token as i64,
                 delta,
                 active.prompt_ids.len(),
-                is_eos,
+                end == Some(FinishReason::Stop),
             )
         } else {
             // Explicit count: a token whose text lands in the next chunk (BPE
@@ -1496,7 +1660,7 @@ impl Engine for Gemma4Engine {
                 "non-first stage does not accept tasks directly".into(),
             ));
         }
-        if self.pending.iter().any(|t| t.task_id == task.task_id)
+        if self.pending.iter().any(|p| p.task.task_id == task.task_id)
             || self
                 .active
                 .as_ref()
@@ -1515,14 +1679,23 @@ impl Engine for Gemma4Engine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
-        self.pending.push(task);
+        let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
+        let grammar = compile_task_grammar(&self.grammar_factory, single_stage, &task)?;
+        if let Some(g) = grammar.as_ref().filter(|g| !g.warnings().is_empty()) {
+            info!(
+                task = %task.task_id,
+                warnings = ?g.warnings(),
+                "gemma4: response_format keywords accepted but not enforced"
+            );
+        }
+        self.pending.push(PendingTask { task, grammar });
         Ok(())
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
         // Step-wise engine: drop the queued task and clear the active one so
         // step() stops decoding it. cancel/step never overlap (runner mutex).
-        self.pending.retain(|t| &t.task_id != task_id);
+        self.pending.retain(|p| &p.task.task_id != task_id);
         if self
             .active
             .as_ref()
@@ -2309,6 +2482,21 @@ impl Builder for Gemma4Builder {
             );
         }
 
+        // Structured output is built on the stage that receives tasks.
+        let grammar_factory = match self.tokenizer.as_deref() {
+            Some(tok) if spec.is_first_stage => {
+                GrammarFactory::from_tokenizer(tok, &self.eos_token_ids)
+                    .map_err(|e| match e {
+                        EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
+                        other => other.to_string(),
+                    })
+                    .inspect_err(|reason| {
+                        warn!(%reason, "gemma4: structured output unavailable for this model");
+                    })
+            }
+            _ => Err("this stage has no tokenizer".into()),
+        };
+
         Ok(Box::new(Gemma4Engine {
             spec,
             num_kv_shared_layers: self.num_kv_shared_layers,
@@ -2316,6 +2504,7 @@ impl Builder for Gemma4Builder {
             runtime,
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
+            grammar_factory,
             upstream: self.upstream,
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
@@ -2603,5 +2792,205 @@ mod tests {
         let c = final_chunk("t1".to_string(), 106, String::new(), 93, true);
         assert_eq!(c.n_tokens, Some(1));
         assert_eq!(c.token_count(), 1);
+    }
+
+    // ---- structured output (grammar-masked picks) ----
+
+    /// EOS of the single-byte test vocab.
+    const TEST_EOS: u32 = 261;
+    /// A control byte JSON never allows: the raw argmax the mask must reject.
+    const BAD: u8 = 0x01;
+    const OK_ENUM: &str = r#"{"type":"string","enum":["ok"]}"#;
+
+    fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
+        cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: body.to_string(),
+        }
+    }
+
+    fn ok_grammar() -> CompiledGrammar {
+        GrammarFactory::single_byte_for_tests()
+            .compile(&json_spec(OK_ENUM))
+            .unwrap()
+    }
+
+    fn seed(s: &str) -> Vec<i64> {
+        s.bytes().map(i64::from).collect()
+    }
+
+    /// A one-row logits output peaking on `BAD`, with `t` as the runner-up.
+    fn bad_then(width: usize, t: u32) -> (Vec<f32>, Vec<usize>) {
+        let mut r = vec![0.0f32; width];
+        r[BAD as usize] = 10.0;
+        r[t as usize] = 5.0;
+        (r, vec![1, 1, width])
+    }
+
+    #[test]
+    fn plain_pick_is_the_unmasked_argmax() {
+        let (row, shape) = bad_then(300, b'"' as u32);
+        assert_eq!(pick_next_token(&row, &shape, None).unwrap(), BAD as i32);
+        assert_eq!(
+            pick_next_token(&row, &shape, None).unwrap(),
+            argmax_logits(&row, &shape).unwrap()
+        );
+    }
+
+    #[test]
+    fn masked_pick_takes_the_best_allowed_token_of_the_last_row() {
+        let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
+        // Two rows: the earlier one is a prompt position and is never read.
+        let mut logits = vec![0.0f32; 600];
+        logits[b'"' as usize] = 20.0;
+        logits[300 + BAD as usize] = 10.0;
+        logits[300 + b'"' as usize] = 5.0;
+        let shape = [1, 2, 300];
+        assert_eq!(
+            pick_next_token(&logits, &shape, Some(&mut mask)).unwrap(),
+            b'"' as i32
+        );
+    }
+
+    #[test]
+    fn only_the_last_prefill_span_is_masked() {
+        let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
+        let mut masked = Vec::new();
+        // 7 tokens in spans of 3: [0,3) [3,6) [6,7).
+        let tok = fold_prefill(7, 3, 7, Some(&mut mask), |span, m| {
+            masked.push((span.clone(), m.is_some()));
+            let (row, shape) = bad_then(300, b'"' as u32);
+            pick_next_token(&row, &shape, m)
+        })
+        .unwrap();
+        assert_eq!(
+            masked,
+            vec![(0..3, false), (3..6, false), (6..7, true)],
+            "earlier spans' picks are discarded and must not be masked"
+        );
+        assert_eq!(tok, b'"' as i32);
+    }
+
+    #[test]
+    fn prefill_spans_fold_the_seed_and_mask_only_the_last() {
+        let mut masked = Vec::new();
+        // 4 prompt tokens in one span, then a 2-token seed at T=1.
+        let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
+        fold_prefill(6, usize::MAX, 4, Some(&mut mask), |span, m| {
+            masked.push((span, m.is_some()));
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(masked, vec![(0..4, false), (4..5, false), (5..6, true)]);
+    }
+
+    #[test]
+    fn prefill_without_a_grammar_passes_no_mask() {
+        let mut seen = Vec::new();
+        let tok = fold_prefill(5, 2, 5, None, |span, m| {
+            seen.push(m.is_some());
+            Ok(span.end as i32)
+        })
+        .unwrap();
+        assert_eq!(seen, vec![false, false, false]);
+        assert_eq!(tok, 5);
+    }
+
+    #[test]
+    fn a_dead_end_is_an_error_not_an_unmasked_pick() {
+        let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
+        // A row narrower than any allowed token: nothing in it is allowed.
+        let row = vec![10.0f32; 4];
+        let err = pick_next_token(&row, &[1, 1, 4], Some(&mut mask)).unwrap_err();
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_grammar_finish_on_the_last_allowed_token_is_stop() {
+        // `"ok` replayed; the closing quote both finishes the JSON and reaches max_tokens.
+        let mut mask = start_grammar(&ok_grammar(), &seed("\"ok")).unwrap();
+        mask.accept(b'"' as u32).unwrap();
+        assert!(mask.finished());
+        assert_eq!(
+            step_end(4, 4, false, mask.finished()),
+            Some(FinishReason::Stop)
+        );
+        let c = final_chunk("t".into(), b'"' as i64, "\"".into(), 3, true);
+        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn step_end_without_a_grammar_is_unchanged() {
+        assert_eq!(step_end(3, 4, false, false), None);
+        assert_eq!(step_end(4, 4, false, false), Some(FinishReason::Length));
+        assert_eq!(step_end(2, 4, true, false), Some(FinishReason::Stop));
+        assert_eq!(step_end(4, 4, true, false), Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn a_grammar_task_on_the_budget_without_a_finish_is_length() {
+        assert_eq!(step_end(4, 4, false, false), Some(FinishReason::Length));
+        assert_eq!(step_end(2, 4, false, true), Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn a_rejected_token_is_an_error() {
+        let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
+        assert!(mask.accept(BAD as u32).is_err());
+    }
+
+    #[test]
+    fn the_resume_seed_is_replayed_and_a_rejected_seed_is_a_backend_error() {
+        let mut mask = start_grammar(&ok_grammar(), &seed("\"o")).unwrap();
+        assert!(mask.allowed(b'k' as u32));
+        assert!(!mask.allowed(b'o' as u32));
+        let err = start_grammar(&ok_grammar(), &seed("x")).err().unwrap();
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+        // The EOS of a finished grammar is still allowed.
+        let mut done = start_grammar(&ok_grammar(), &seed("\"ok\"")).unwrap();
+        assert!(done.allowed(TEST_EOS));
+    }
+
+    #[test]
+    fn multi_stage_pipelines_refuse_grammar_tasks_at_submit() {
+        let factory = Ok(GrammarFactory::single_byte_for_tests());
+        let task = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
+        let err = compile_task_grammar(&factory, false, &task).err().unwrap();
+        assert_eq!(err.to_string(), refuse_multi_stage_grammar().to_string());
+        assert!(matches!(
+            refuse_multi_stage_grammar(),
+            EngineError::InvalidConfig(m)
+                if m == "structured output (response_format) is not supported on multi-stage gemma4 pipelines yet"
+        ));
+        // Tasks without a grammar are unaffected on any topology.
+        let plain = GenerationTask::new("t", "p");
+        assert!(compile_task_grammar(&factory, false, &plain)
+            .unwrap()
+            .is_none());
+        assert!(compile_task_grammar(&factory, true, &plain)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn single_stage_compiles_at_submit_and_reports_bad_schemas_and_missing_factories() {
+        let factory = Ok(GrammarFactory::single_byte_for_tests());
+        let good = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
+        assert!(compile_task_grammar(&factory, true, &good)
+            .unwrap()
+            .is_some());
+        let bad = GenerationTask::new("t", "p").with_grammar(json_spec(r#"{"type":42}"#));
+        assert!(matches!(
+            compile_task_grammar(&factory, true, &bad),
+            Err(EngineError::InvalidConfig(_))
+        ));
+        let none: Result<GrammarFactory, String> = Err("no tokenizer".into());
+        match compile_task_grammar(&none, true, &good) {
+            Err(EngineError::InvalidConfig(m)) => assert_eq!(
+                m,
+                "structured output is not available for this model: no tokenizer"
+            ),
+            other => panic!("{:?}", other.map(|g| g.is_some())),
+        }
     }
 }
