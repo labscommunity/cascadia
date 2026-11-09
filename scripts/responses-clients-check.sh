@@ -60,6 +60,9 @@ if [[ -n "$KEY_ENV" ]]; then
   # The helpers and Codex read the key from this variable by name; only the name is ever passed or printed.
   export "${KEY_ENV?}"
   export RESPONSES_CHECK_KEY_ENV="$KEY_ENV"
+else
+  # The helpers send a key whenever this is set, so one inherited from the caller must not reach a keyless run.
+  unset RESPONSES_CHECK_KEY_ENV
 fi
 
 PYTHON="${PYTHON:-python3}"
