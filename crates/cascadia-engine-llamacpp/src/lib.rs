@@ -1235,6 +1235,16 @@ impl LlamaCppEngine {
             if let Some(tools) = &task.tools {
                 body["tools"] = tools.clone();
             }
+            // The API has already validated and capped the schema; the
+            // child compiles it to its own grammar.
+            if let Some(g) = &task.grammar {
+                if let Ok(schema) = serde_json::from_str::<serde_json::Value>(&g.body) {
+                    body["response_format"] = serde_json::json!({
+                        "type": "json_schema",
+                        "json_schema": {"name": "response", "schema": schema},
+                    });
+                }
+            }
             // tool_choice only means anything alongside tools, but it is
             // validated unconditionally: a named choice without tools is a
             // caller bug that must not pass silently, and string forms are
@@ -2773,6 +2783,51 @@ mod unix_tests {
         assert_eq!(texts, ["h\u{e9}llo", ""], "no U+FFFD may appear");
         assert!(!texts.iter().any(|t| t.contains('\u{FFFD}')));
         server.join().unwrap();
+    }
+
+    /// Submit `task` to a mock child and return the JSON body it received.
+    fn captured_chat_body(task: GenerationTask) -> serde_json::Value {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (port, server) = mock_server(move |req, s| {
+            let req = String::from_utf8_lossy(req).into_owned();
+            let body = req.split_once("\r\n\r\n").map(|(_, b)| b.to_string());
+            tx.send(body.unwrap_or_default()).unwrap();
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            s.write_all(head.as_bytes()).unwrap();
+            for p in [
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+                "data: [DONE]\n",
+            ] {
+                s.write_all(chunked(p).as_bytes()).unwrap();
+            }
+            s.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let mut engine = test_engine(port);
+        engine.submit(task).unwrap();
+        drain(&mut engine);
+        server.join().unwrap();
+        serde_json::from_str(&rx.recv().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn chat_body_forwards_grammar_as_response_format() {
+        let schema = r#"{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}"#;
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: schema.into(),
+        });
+        let body = captured_chat_body(task);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["name"], "response");
+        let want: serde_json::Value = serde_json::from_str(schema).unwrap();
+        assert_eq!(body["response_format"]["json_schema"]["schema"], want);
+    }
+
+    #[test]
+    fn chat_body_without_grammar_has_no_response_format() {
+        let body = captured_chat_body(chat_task());
+        assert!(body.get("response_format").is_none(), "{body}");
+        assert_eq!(body["messages"][0]["content"], "hi");
     }
 
     #[test]
