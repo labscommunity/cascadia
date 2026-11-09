@@ -4259,6 +4259,11 @@ pub(crate) struct AdmitOpts {
     /// Codex histories carry `developer` turns mid-history; chat keeps the
     /// template's 400.
     pub(crate) fold_refused_system_turns: bool,
+    /// Ask the engine for reasoning it gets on a separate channel as text
+    /// inside `<think>` / `</think>` (`GenerationTask::reasoning_as_text`),
+    /// so it can be returned as a reasoning item. Set by `/v1/responses`;
+    /// chat keeps the engine's output as it was.
+    pub(crate) reasoning_as_text: bool,
 }
 
 /// A chat request past every pre-engine check: the task to submit, and the
@@ -4560,6 +4565,7 @@ async fn admit_chat(
         resume_token_ids: None,
         media,
         prompt_rendered,
+        reasoning_as_text: opts.reasoning_as_text,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -4889,6 +4895,7 @@ async fn completions(
         resume_token_ids: None,
         media: Vec::new(),
         prompt_rendered: false,
+        reasoning_as_text: false,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {

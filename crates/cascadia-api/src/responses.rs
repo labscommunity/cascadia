@@ -530,6 +530,7 @@ pub(crate) async fn create_response(
         AdmitOpts {
             api_render_on_thinking: true,
             fold_refused_system_turns: true,
+            reasoning_as_text: true,
         },
     )
     .await
@@ -2853,6 +2854,47 @@ mod tests {
             forwarded(&task),
             [("user".to_owned(), "be brief\n\ndescribe".to_owned())]
         );
+    }
+
+    /// On an engine that templates itself with no template here
+    /// (sycl-llama), the task asks for reasoning as text, and reasoning sent
+    /// as `<think>`…`</think>` ahead of the answer is a reasoning item; the
+    /// chat endpoint does not ask.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reasoning_sent_as_text_is_a_reasoning_item() {
+        let cfg = || Config {
+            engine_applies_template: true,
+            ..Config::default()
+        };
+        let script = ["<think>", "17 times 3 is 51", "</think>", "51"];
+        let (app, tasks, _) = app_with(RecordingEngine::script(&script), cfg()).await;
+        let (status, v) = post_json(
+            app,
+            json!({"model": "script-model", "input": "What is 17 times 3?"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(tasks.lock()[0].reasoning_as_text);
+        let kinds: Vec<_> = v["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["reasoning", "message"], "{v}");
+        assert_eq!(v["output"][0]["content"][0]["text"], "17 times 3 is 51");
+        assert_eq!(v["output"][1]["content"][0]["text"], "51");
+
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["51"]), cfg()).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            json!({"model": "script-model",
+                "messages": [{"role": "user", "content": "What is 17 times 3?"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!tasks.lock()[0].reasoning_as_text);
     }
 
     /// A template that takes no system role gets every system turn folded,

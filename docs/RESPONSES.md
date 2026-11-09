@@ -108,8 +108,9 @@ Cascadia tells whether the model starts inside `<think>` (Qwen3-2507-style templ
 in the generation prompt) from the rendered prompt. Where the engine renders the prompt
 itself, a probe of the chat template at load decides. Limits:
 
-- `sycl-llama`: no reasoning item; llama-server moves reasoning out of the text it returns,
-  and the engine does not forward it.
+- `sycl-llama`: llama-server moves reasoning out of the text into `reasoning_content`; for
+  `/v1/responses` the engine forwards it as text inside `<think>...</think>`, ahead of the
+  answer, so it becomes a reasoning item. `/v1/chat/completions` still drops it.
 - On engine-rendered paths whose template cannot be probed (no chat template loaded, or a
   probe render error), a prompt-opened model's reasoning stays in the message text.
 

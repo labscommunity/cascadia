@@ -155,6 +155,13 @@ pub struct GenerationTask {
     /// placeholder lands inside the right message.
     #[serde(default)]
     pub prompt_rendered: bool,
+    /// Return reasoning as text. An engine that receives the model's
+    /// reasoning on a separate channel (llama-server's
+    /// `delta.reasoning_content`) streams it as text framed by the model's
+    /// `<think>` / `</think>` markers instead of dropping it, so the API can
+    /// split it from the answer. Off the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_as_text: bool,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -233,6 +240,7 @@ impl GenerationTask {
             resume_token_ids: None,
             media: Vec::new(),
             prompt_rendered: false,
+            reasoning_as_text: false,
         }
     }
 
@@ -281,6 +289,7 @@ mod tests {
             resume_token_ids: None,
             media: Vec::new(),
             prompt_rendered: false,
+            reasoning_as_text: false,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();
@@ -294,6 +303,24 @@ mod tests {
         });
         let back: GenerationTask = serde_json::from_value(without_field).unwrap();
         assert_eq!(back.resume_token_ids, None);
+    }
+
+    /// `reasoning_as_text` is left out of the wire form when false, so a
+    /// task that does not set it serializes as before, and round-trips.
+    #[test]
+    fn reasoning_as_text_is_off_the_wire_unless_set() {
+        let t = GenerationTask::new("t1", "hello");
+        assert!(!t.reasoning_as_text);
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json.get("reasoning_as_text").is_none(), "{json}");
+        let set = GenerationTask {
+            reasoning_as_text: true,
+            ..t
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["reasoning_as_text"], true);
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert!(back.reasoning_as_text);
     }
 
     #[test]
