@@ -891,16 +891,11 @@ fn mask_words(mask: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
 
 /// The tail's pick on a masked step: the best token of the last row the mask
 /// words allow (tokens past the words never), the lowest allowed one when
-/// every allowed logit is `-inf`/NaN. `Err` when the words are wider than the
-/// row or allow nothing in it.
+/// every allowed logit is `-inf`/NaN. Words wider than the row allow nothing
+/// past it. `Err` when they allow nothing in the row.
 fn tail_masked_pick(logits: &[f32], shape: &[usize], words: &[u32]) -> Result<i32, String> {
     let vocab = logits_vocab(logits, shape).map_err(|e| e.to_string())?;
-    if words.len() > vocab.div_ceil(32) {
-        return Err(format!(
-            "the mask covers {} tokens but this stage's logits row has {vocab}",
-            words.len() * 32,
-        ));
-    }
+    // A mask wider than the row: tokens past the row are not allowed.
     cascadia_grammar::argmax_allowed(&logits[logits.len() - vocab..], words)
         .map(|t| t as i32)
         .ok_or_else(|| "the mask allows no token of this stage's logits row".into())
@@ -4145,10 +4140,15 @@ mod tests {
         let (row, shape) = tail_row();
         assert_eq!(argmax_logits(&row, &shape).unwrap(), BAD as i32);
         assert_eq!(tail_masked_pick(&row, &shape, &words).unwrap(), b'"' as i32);
-        // Words wider than the tail's logits row: a width mismatch.
+        // Words wider than the tail's logits row: tokens past the row are
+        // simply not allowed, as on the other engines' tails.
         let narrow = vec![1.0f32; 64];
-        let err = tail_masked_pick(&narrow, &[1, 1, 64], &words).unwrap_err();
-        assert!(err.contains("logits row"), "{err}");
+        assert_eq!(
+            tail_masked_pick(&narrow, &[1, 1, 64], &words).unwrap(),
+            b'"' as i32
+        );
+        let err = tail_masked_pick(&narrow[..16], &[1, 1, 16], &words).unwrap_err();
+        assert!(err.contains("allows no token"), "{err}");
         // Nothing allowed in the row.
         assert!(tail_masked_pick(&row, &shape, &[0; 9]).is_err());
         // A padded row (wider than the mask): the excess is masked.
@@ -4612,8 +4612,8 @@ mod tests {
             tail_masked_reply(Err(EngineError::Backend("infer failed".into())), &words);
         assert_eq!(reply, StageReply::Nack);
         assert!(err.is_some(), "the tail's step still fails");
-        // A mask it can't apply: NACK, but the step itself is fine.
-        let (reply, err) = tail_masked_reply(Ok((vec![1.0; 64], vec![1, 1, 64])), &words);
+        // A mask that allows nothing in its row: NACK, but the step itself is fine.
+        let (reply, err) = tail_masked_reply(Ok((vec![1.0; 16], vec![1, 1, 16])), &words);
         assert_eq!(reply, StageReply::Nack);
         assert!(err.is_none());
         let (row, shape) = tail_row();
