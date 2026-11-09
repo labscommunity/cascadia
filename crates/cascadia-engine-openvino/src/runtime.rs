@@ -962,10 +962,11 @@ const NACK_TOKEN: i32 = -1;
 // the lead and the hidden, then rejects the lead's shape: the stream stays
 // aligned, and it never answers.
 //
-// Packed: the plan frame grows mask lanes under its three rows, I64
-// `[1, 3 + ceil(W/2), S]`; a column whose lanes are all zero is unmasked (a
-// real mask always allows something). A stage that predates it NACKs the
-// batch before writing any slot's KV.
+// Packed: the plan frame grows rows under its three, I64 `[1, 4 + R, S]`:
+// a column-index row (per masked column, ascending, `col | L << 32` with L =
+// ceil(W/2) lanes per column; -1 after the last), then the masked columns'
+// L lanes each, one column after the other, zero-padded to R whole rows of
+// S. A stage that predates it NACKs the batch before writing any slot's KV.
 //
 // The reply to a masked step carries an acknowledgement only stages with this
 // support send: `[token, seq, MASK_ACK]` (I32 `[1,1,3]`, NACK token -1 when
@@ -1216,8 +1217,8 @@ type PlanMasks = Vec<Option<Vec<u32>>>;
 type PlanRows = Vec<Option<(usize, i64, usize)>>;
 
 /// A packed step's plan frame: today's [`encode_wire_plan`] when no row is
-/// masked, else with the mask lanes under its three rows (see the stage-wire
-/// notes above `MASK_ACK`).
+/// masked, else with a column-index row and the masked columns' mask lanes
+/// under its three rows (see the stage-wire notes above `MASK_ACK`).
 fn encode_packed_plan(
     rows: &[Option<(usize, i64, usize)>],
     masks: Option<&[Option<Vec<u32>>]>,
@@ -1226,58 +1227,100 @@ fn encode_packed_plan(
         return encode_wire_plan(rows);
     };
     let s = rows.len();
-    let words = masks.iter().flatten().map(Vec::len).max().unwrap_or(0);
+    let masked: Vec<(usize, &Vec<u32>)> = masks
+        .iter()
+        .enumerate()
+        .take(s)
+        .filter_map(|(col, m)| m.as_ref().map(|w| (col, w)))
+        .collect();
+    let words = masked.iter().map(|(_, w)| w.len()).max().unwrap_or(0);
     let lanes = words.div_ceil(2).max(1);
     let mut t = encode_wire_plan(rows);
-    let word = |col: usize, i: usize| -> u32 {
-        masks
-            .get(col)
-            .and_then(Option::as_ref)
-            .and_then(|w| w.get(i).copied())
-            .unwrap_or(0)
-    };
-    for k in 0..lanes {
-        for col in 0..s {
-            let lane = word(col, 2 * k) as u64 | (word(col, 2 * k + 1) as u64) << 32;
-            t.data.extend_from_slice(&lane.to_le_bytes());
-        }
+    // Column-index row: one entry per masked column, the lane count in the
+    // high half; -1 after the last.
+    for i in 0..s {
+        let entry = masked
+            .get(i)
+            .map_or(-1i64, |&(col, _)| ((lanes as i64) << 32) | col as i64);
+        t.data.extend_from_slice(&entry.to_le_bytes());
     }
-    t.shape[1] = (3 + lanes) as u32;
+    // The masked columns' lanes, one column after the other, zero-padded to
+    // whole rows of S.
+    let flat = masked.len() * lanes;
+    let rows_needed = flat.div_ceil(s);
+    for (_, w) in &masked {
+        let mut padded = (*w).clone();
+        padded.resize(2 * lanes, 0);
+        push_mask_lanes(&mut t.data, &padded);
+    }
+    t.data
+        .resize(t.data.len() + (rows_needed * s - flat) * 8, 0);
+    t.shape[1] = (4 + rows_needed) as u32;
     t
 }
 
 /// Decode a plan frame that may carry masks: today's frame decodes through
-/// [`decode_wire_plan`] (no masks); a taller one must carry whole mask lanes
-/// under the same three rows. A column whose lanes are all zero is unmasked.
+/// [`decode_wire_plan`] (no masks); a taller one must carry a well-formed
+/// column-index row (masked columns ascending, one lane count) and exactly
+/// the rows its lanes fill, zero-padded.
 fn decode_packed_plan(t: &WireTensor, slots: usize) -> EngineResult<(PlanRows, Option<PlanMasks>)> {
     if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] <= 3 {
         return decode_wire_plan(t, slots).map(|rows| (rows, None));
     }
-    let s = t.shape[2] as usize;
-    let lanes = t.shape[1] as usize - 3;
-    if s == 0 || t.data.len() != (3 + lanes) * s * 8 {
-        return Err(EngineError::Backend(format!(
-            "structured-output packed plan frame payload {} bytes does not match shape {:?}",
-            t.data.len(),
+    let bad = |why: &str| {
+        EngineError::Backend(format!(
+            "structured-output packed plan frame (shape {:?}): {why}",
             t.shape
-        )));
+        ))
+    };
+    let s = t.shape[2] as usize;
+    let height = t.shape[1] as usize;
+    if s == 0 || height < 4 || t.data.len() != height * s * 8 {
+        return Err(bad("payload does not match the shape"));
     }
+    let lane = |i: usize| -> i64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&t.data[i * 8..i * 8 + 8]);
+        i64::from_le_bytes(b)
+    };
     let plain = WireTensor::new(
         WireDType::I64,
         [1, 3, s as u32],
         t.data[..3 * s * 8].to_vec(),
     );
     let rows = decode_wire_plan(&plain, slots)?;
-    let masks = (0..s)
-        .map(|col| {
-            let mut words = Vec::with_capacity(2 * lanes);
-            for k in 0..lanes {
-                let at = ((3 + k) * s + col) * 8;
-                words.extend(read_mask_words(&t.data[at..at + 8], 2));
-            }
-            words.iter().any(|&w| w != 0).then_some(words)
-        })
-        .collect();
+    let index: Vec<i64> = (0..s).map(|i| lane(3 * s + i)).collect();
+    let m = index.iter().take_while(|&&e| e >= 0).count();
+    if m == 0 || index[m..].iter().any(|&e| e != -1) {
+        return Err(bad("the column-index row lists no masked column"));
+    }
+    let lanes = (index[0] >> 32) as usize;
+    let mut cols = Vec::with_capacity(m);
+    for &e in &index[..m] {
+        let col = (e & 0xffff_ffff) as usize;
+        if (e >> 32) as usize != lanes || lanes == 0 {
+            return Err(bad("the column-index row's lane counts disagree"));
+        }
+        if col >= s || cols.last().is_some_and(|&last| col <= last) {
+            return Err(bad(
+                "the column-index row's columns are out of order or range",
+            ));
+        }
+        cols.push(col);
+    }
+    let flat = m * lanes;
+    if height - 4 != flat.div_ceil(s) {
+        return Err(bad("the mask rows don't match the lane count"));
+    }
+    let base = 4 * s;
+    if (base + flat..height * s).any(|i| lane(i) != 0) {
+        return Err(bad("non-zero padding after the mask lanes"));
+    }
+    let mut masks: PlanMasks = vec![None; s];
+    for (j, &col) in cols.iter().enumerate() {
+        let at = (base + j * lanes) * 8;
+        masks[col] = Some(read_mask_words(&t.data[at..at + lanes * 8], 2 * lanes));
+    }
     Ok((rows, Some(masks)))
 }
 
@@ -9813,7 +9856,9 @@ mod tests {
         let t = encode_packed_plan(&plan, Some(&masks));
         let lanes = words.len().div_ceil(2);
         assert_eq!(t.dtype, WireDType::I64);
-        assert_eq!(t.shape, [1, 3 + lanes as u32, 3]);
+        // The three plan rows, the column-index row, then the one masked
+        // column's lanes packed across the S = 3 columns.
+        assert_eq!(t.shape, [1, 4 + lanes.div_ceil(3) as u32, 3]);
         assert_eq!(&t.data[..3 * 3 * 8], &encode_wire_plan(&plan).data[..]);
         assert!(plan_frame_is_masked(&t) && !plan_frame_is_masked(&encode_wire_plan(&plan)));
 
@@ -9844,6 +9889,77 @@ mod tests {
         let mut short = t.clone();
         short.data.truncate(short.data.len() - 8);
         assert!(decode_packed_plan(&short, 2).is_err());
+    }
+
+    /// Only masked columns carry mask lanes: a plan of 8 rows with one json
+    /// row is about an eighth of the all-columns layout. Several masked
+    /// columns round-trip, each with its own words.
+    #[test]
+    fn a_masked_plan_carries_lanes_for_masked_columns_only() {
+        let plan: PlanRows = (0..8).map(|r| Some((r % 2, 10 + r as i64, 0))).collect();
+        let wide: Vec<u32> = (0..7760u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        let lanes = wide.len().div_ceil(2);
+        let mut masks: PlanMasks = vec![None; 8];
+        masks[5] = Some(wide.clone());
+        let t = encode_packed_plan(&plan, Some(&masks));
+        assert_eq!(t.shape, [1, 4 + lanes.div_ceil(8) as u32, 8]);
+        assert!(
+            t.data.len() < (3 + lanes) * 8 * 8 / 7,
+            "{} bytes",
+            t.data.len()
+        );
+        let (rows, got) = decode_packed_plan(&t, 2).unwrap();
+        assert_eq!(rows, plan);
+        let mut want: PlanMasks = vec![None; 8];
+        want[5] = Some(wide.clone());
+        assert_eq!(got.unwrap(), want);
+
+        // Two masked columns of different widths: both padded to the wider.
+        let mut two: PlanMasks = vec![None; 8];
+        two[1] = Some(vec![1, 2, 3]);
+        two[6] = Some(vec![4, 5, 6, 7, 8]);
+        let (_, got) = decode_packed_plan(&encode_packed_plan(&plan, Some(&two)), 2).unwrap();
+        let got = got.unwrap();
+        assert_eq!(got[1], Some(vec![1, 2, 3, 0, 0, 0]));
+        assert_eq!(got[6], Some(vec![4, 5, 6, 7, 8, 0]));
+        assert!(got
+            .iter()
+            .enumerate()
+            .all(|(c, m)| m.is_some() == (c == 1 || c == 6)));
+        // An older stage still refuses the taller plan.
+        assert!(decode_wire_plan(&encode_packed_plan(&plan, Some(&two)), 2).is_err());
+    }
+
+    #[test]
+    fn a_malformed_column_index_row_is_refused() {
+        let plan = plan_rows_fixture();
+        let masks: PlanMasks = vec![None, Some(vec![9, 9, 9]), None];
+        let good = encode_packed_plan(&plan, Some(&masks));
+        assert!(decode_packed_plan(&good, 2).is_ok());
+        let index_at = |col: usize| (3 * 3 + col) * 8;
+        let set = |col: usize, v: i64| {
+            let mut t = good.clone();
+            t.data[index_at(col)..index_at(col) + 8].copy_from_slice(&v.to_le_bytes());
+            t
+        };
+        let lanes = 2i64 << 32;
+        for bad in [
+            set(0, lanes | 3),        // a column past S
+            set(0, -1),               // no masked column
+            set(1, lanes | 1),        // the same column twice
+            set(0, 1),                // zero lanes
+            set(0, (5i64 << 32) | 1), // lane count disagrees with the rows
+        ] {
+            assert!(
+                decode_packed_plan(&bad, 2).is_err(),
+                "{:?}",
+                &bad.data[index_at(0)..]
+            );
+        }
+        let mut padded = good.clone();
+        let last = padded.data.len() - 8;
+        padded.data[last..].copy_from_slice(&7i64.to_le_bytes());
+        assert!(decode_packed_plan(&padded, 2).is_err(), "non-zero padding");
     }
 
     #[test]
