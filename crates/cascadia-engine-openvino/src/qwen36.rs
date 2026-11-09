@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
 use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, Runtime};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
@@ -339,6 +340,8 @@ pub struct Qwen36Builder {
     stages: Option<Vec<Runtime>>,
     tokenizer: Option<Tokenizer>,
     eos: Option<u32>,
+    /// Every EOS id the config lists (see [`read_eos_ids`]).
+    eos_ids: Vec<u32>,
     last_logits_only: bool,
     /// Activation width from the manifest (set by `load`).
     hidden: usize,
@@ -429,6 +432,7 @@ impl Qwen36Builder {
             stages: None,
             tokenizer: None,
             eos: None,
+            eos_ids: Vec::new(),
             last_logits_only: false,
             hidden: LEGACY_HIDDEN,
             kv_cache_precision: None,
@@ -456,6 +460,118 @@ fn read_eos(dir: &Path) -> Option<u32> {
         serde_json::Value::Array(a) => a.first()?.as_u64().map(|x| x as u32),
         _ => None,
     }
+}
+
+/// Every id `generation_config.json`'s `eos_token_id` lists (one number or an
+/// array). Structured-output tasks stop on any of them; plain tasks keep
+/// [`read_eos`]'s first id.
+fn read_eos_ids(dir: &Path) -> Vec<u32> {
+    let Some(v) = std::fs::read_to_string(dir.join("generation_config.json"))
+        .ok()
+        .and_then(|gc| serde_json::from_str::<serde_json::Value>(&gc).ok())
+    else {
+        return Vec::new();
+    };
+    match &v["eos_token_id"] {
+        serde_json::Value::Number(n) => n.as_u64().map(|x| x as u32).into_iter().collect(),
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_u64().map(|x| x as u32))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+// -------- structured output (grammar-masked decode) --------
+
+/// The submit-time answer to a structured-output task on a multi-rank
+/// pipeline: the last rank picks the token and has no grammar to mask with.
+fn refuse_multi_stage_grammar() -> EngineError {
+    EngineError::InvalidConfig(
+        "structured output (response_format) is not supported on multi-stage qwen35 pipelines yet"
+            .into(),
+    )
+}
+
+/// Submit-time grammar build: `None` for a task without a grammar; an
+/// `InvalidConfig` (400) on a multi-rank pipeline, when the model can't do
+/// structured output, or when the schema doesn't compile.
+fn compile_task_grammar(
+    factory: &Result<GrammarFactory, String>,
+    single_box: bool,
+    task: &GenerationTask,
+) -> EngineResult<Option<CompiledGrammar>> {
+    let Some(spec) = task.grammar.as_ref() else {
+        return Ok(None);
+    };
+    if !single_box {
+        return Err(refuse_multi_stage_grammar());
+    }
+    let factory = factory.as_ref().map_err(|reason| {
+        EngineError::InvalidConfig(format!(
+            "structured output is not available for this model: {reason}"
+        ))
+    })?;
+    factory.compile(spec).map(Some)
+}
+
+/// Activation: a fresh matcher advanced over the resume seed. A seed the
+/// grammar rejects is a backend error.
+fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineResult<GrammarMask> {
+    let mut mask = compiled.matcher()?;
+    if !seed.is_empty() {
+        let seed: Vec<u32> = seed.iter().map(|&t| t as u32).collect();
+        mask.replay(&seed)?;
+    }
+    Ok(mask)
+}
+
+/// The decode pick from the last position's logits row: the argmax, or for a
+/// structured-output task the best token the grammar allows (an error when it
+/// allows none).
+fn pick_decode_token(logits: &[f32], mask: Option<&mut GrammarMask>) -> EngineResult<u32> {
+    let argmax = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0)
+    };
+    let Some(mask) = mask else {
+        return Ok(argmax(logits));
+    };
+    let mut row = logits.to_vec();
+    mask.apply(&mut row)?;
+    Ok(argmax(&row))
+}
+
+/// Whether the decode pick ends the task as EOS: a plain task stops on the
+/// first configured id only (unchanged), a structured-output task on any id
+/// the config lists (the ids its grammar ends with).
+fn is_stop_token(next: u32, first_eos: Option<u32>, eos_ids: &[u32], grammar_task: bool) -> bool {
+    if grammar_task {
+        eos_ids.contains(&next)
+    } else {
+        Some(next) == first_eos
+    }
+}
+
+/// Checked before each decode pick: `Stop` once the grammar finished (also on
+/// the token that reached the budget), `Length` on the budget, else `None`.
+fn decode_end(generated: usize, max_tokens: usize, grammar_finished: bool) -> Option<FinishReason> {
+    if grammar_finished {
+        Some(FinishReason::Stop)
+    } else if generated >= max_tokens {
+        Some(FinishReason::Length)
+    } else {
+        None
+    }
+}
+
+/// A queued task with its grammar compiled at submit.
+struct PendingTask {
+    task: GenerationTask,
+    grammar: Option<CompiledGrammar>,
 }
 
 #[async_trait]
@@ -577,6 +693,7 @@ impl Builder for Qwen36Builder {
             }
             self.max_ctx = read_max_ctx(&dir);
             self.eos = read_eos(&dir);
+            self.eos_ids = read_eos_ids(&dir);
         }
 
         let mut stages = Vec::new();
@@ -625,11 +742,25 @@ impl Builder for Qwen36Builder {
             max_ctx = ?self.max_ctx,
             "qwen35 prefix cache"
         );
+        // Structured output is built on the rank that receives tasks.
+        let grammar_factory = match self.tokenizer.as_ref() {
+            Some(tok) => GrammarFactory::from_tokenizer(tok, &self.eos_ids)
+                .map_err(|e| match e {
+                    EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
+                    other => other.to_string(),
+                })
+                .inspect_err(|reason| {
+                    warn!(%reason, "qwen35: structured output unavailable for this model");
+                }),
+            None => Err("this rank has no tokenizer".into()),
+        };
         Ok(Box::new(Qwen36Engine {
             emb: self.emb,
             stages: self.stages.ok_or(EngineError::NotLoaded)?,
             tokenizer: self.tokenizer,
             eos: self.eos,
+            eos_ids: self.eos_ids,
+            grammar_factory,
             max_tokens_default: self.max_tokens_default,
             last_logits_only: self.last_logits_only,
             hidden: self.hidden,
@@ -750,7 +881,13 @@ pub struct Qwen36Engine {
     stages: Vec<Runtime>,
     /// Rank 0 only in pipeline mode.
     tokenizer: Option<Tokenizer>,
+    /// The id plain tasks stop on (the config's first EOS id).
     eos: Option<u32>,
+    /// Every EOS id the config lists: what structured-output tasks stop on.
+    eos_ids: Vec<u32>,
+    /// Builds structured-output grammars for this tokenizer; `Err` holds why
+    /// it couldn't be built (structured-output tasks are then refused).
+    grammar_factory: Result<GrammarFactory, String>,
     max_tokens_default: u32,
     last_logits_only: bool,
     /// Activation width ([1, T, hidden]) the stage IRs exchange; sizes
@@ -779,7 +916,7 @@ pub struct Qwen36Engine {
     /// Set when the startup handshake found a config mismatch (handshake
     /// rule: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
-    pending: Vec<GenerationTask>,
+    pending: Vec<PendingTask>,
     active: Option<ActiveTask>,
     /// Issue-34 Option C: opaque multi-stage KV blob cache for the coordination plane.
     #[cfg(feature = "kv_coord")]
@@ -876,6 +1013,9 @@ struct ActiveTask {
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
     /// decode frames (n=1), for the pipeline gate-4 wire histogram.
     wire_ms: Vec<f64>,
+    /// Single-box: the grammar matcher of a structured-output task, advanced
+    /// over every token in `gen_ids`. `None` for every other task.
+    grammar: Option<GrammarMask>,
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -1488,7 +1628,8 @@ impl Qwen36Engine {
             if self.pending.is_empty() {
                 return Vec::new();
             }
-            let task = self.pending.remove(0);
+            // Structured-output tasks never reach a pipeline (refused at submit).
+            let PendingTask { task, .. } = self.pending.remove(0);
             if let Some(reason) = &self.poisoned {
                 warn!(task = %task.task_id, reason = %reason, "qwen36: refusing task (handshake mismatch)");
                 let reason = format!("qwen36 pipeline poisoned by handshake mismatch: {reason}");
@@ -1666,6 +1807,7 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
+                grammar: None,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -2220,7 +2362,7 @@ impl Qwen36Engine {
             if self.pending.is_empty() {
                 return Vec::new();
             }
-            let task = self.pending.remove(0);
+            let PendingTask { task, grammar } = self.pending.remove(0);
             // reset moved below — Issue-34 warm-resume may restore a cached prefix blob instead.
             let tokenizer = self.tokenizer.as_ref().expect("single-box has tokenizer");
             let mut prompt_ids: Vec<u32> = match admitted_prompt_ids(tokenizer, &task) {
@@ -2250,6 +2392,22 @@ impl Qwen36Engine {
                 cascadia_types::append_resume_ids(&mut prompt_ids_i64, resume.as_deref());
                 prompt_ids = prompt_ids_i64.into_iter().map(|t| t as u32).collect();
             }
+            // Structured output: the matcher starts after the resume seed (if
+            // any), before any model work, so a seed the grammar rejects costs
+            // nothing and fails this task only.
+            let grammar = match grammar.as_ref().map(|g| {
+                start_grammar(g, &cascadia_types::resume_generated_seed(resume.as_deref()))
+            }) {
+                None => None,
+                Some(Ok(mask)) => Some(mask),
+                Some(Err(e)) => {
+                    warn!(task = %task.task_id, error = %e, "structured output start failed");
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, e.to_string()),
+                    )];
+                }
+            };
             // An empty prompt leaves logits empty and would fabricate token 0
             // (garbage decode); reject at admission to match the pipeline path.
             if prompt_ids.is_empty() {
@@ -2398,6 +2556,7 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
+                grammar,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -2506,18 +2665,26 @@ impl Qwen36Engine {
             }
             Vec::new()
         } else {
-            if t.gen_ids.len() >= t.max_tokens {
-                return self.finalize(FinishReason::Length);
+            // A structured-output task ends with `stop` once its JSON is
+            // complete, also on the token that reached the budget.
+            let grammar_finished = t.grammar.as_ref().is_some_and(GrammarMask::finished);
+            if let Some(reason) = decode_end(t.gen_ids.len(), t.max_tokens, grammar_finished) {
+                return self.finalize(reason);
             }
-            let next = t
-                .logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
-            if Some(next) == self.eos {
+            let t = self.active.as_mut().unwrap();
+            let next = match pick_decode_token(&t.logits, t.grammar.as_mut()) {
+                Ok(next) => next,
+                Err(e) => {
+                    warn!(task = %task_id, error = %e, "structured output decode failed");
+                    return self.finalize_error(format!("structured output failed: {e}"));
+                }
+            };
+            if is_stop_token(next, self.eos, &self.eos_ids, t.grammar.is_some()) {
                 return self.finalize(FinishReason::Stop);
+            }
+            if let Some(Err(e)) = t.grammar.as_mut().map(|m| m.accept(next)) {
+                warn!(task = %task_id, error = %e, "structured output decode failed");
+                return self.finalize_error(format!("structured output failed: {e}"));
             }
             let step = t.step;
             match self.run_span(&[next], step) {
@@ -2593,7 +2760,7 @@ impl Engine for Qwen36Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        if self.pending.iter().any(|t| t.task_id == task.task_id) {
+        if self.pending.iter().any(|p| p.task.task_id == task.task_id) {
             return Ok(());
         }
         if self.pending.len() >= crate::dist_spec::MAX_PENDING_TASKS {
@@ -2624,7 +2791,15 @@ impl Engine for Qwen36Engine {
                 }
             }
         }
-        self.pending.push(task);
+        let grammar = compile_task_grammar(&self.grammar_factory, self.total <= 1, &task)?;
+        if let Some(g) = grammar.as_ref().filter(|g| !g.warnings().is_empty()) {
+            info!(
+                task = %task.task_id,
+                warnings = ?g.warnings(),
+                "qwen35: response_format keywords accepted but not enforced"
+            );
+        }
+        self.pending.push(PendingTask { task, grammar });
         Ok(())
     }
 
@@ -2659,7 +2834,7 @@ impl Engine for Qwen36Engine {
         // Pipeline mode: the session is quiescent between steps
         // (lockstep frames), and the next admission's RESET + epoch
         // bump clears the downstream.
-        self.pending.retain(|t| &t.task_id != task_id);
+        self.pending.retain(|p| &p.task.task_id != task_id);
         if self.active.as_ref().is_some_and(|t| &t.task_id == task_id) {
             info!(task = %task_id, "qwen36: cancelled; dropping active task");
             self.active = None;
@@ -3193,6 +3368,8 @@ mod tests {
             stages: Vec::new(),
             tokenizer: None,
             eos: None,
+            eos_ids: Vec::new(),
+            grammar_factory: Err("no tokenizer".into()),
             max_tokens_default: 256,
             last_logits_only: false,
             hidden: LEGACY_HIDDEN,
@@ -3329,7 +3506,10 @@ mod tests {
         let mut e = bare_engine(2, "{}");
         e.rank = 0;
         e.poisoned = Some("manifest mismatch between ranks".into());
-        e.pending.push(GenerationTask::new("t0", "hello"));
+        e.pending.push(PendingTask {
+            task: GenerationTask::new("t0", "hello"),
+            grammar: None,
+        });
 
         let out = e.step_pipe_first();
         assert_eq!(out.len(), 1);
@@ -3436,7 +3616,10 @@ mod tests {
         e.tokenizer = Some(tiny_tokenizer());
         let mut task = GenerationTask::new("t-empty", "");
         task.enable_thinking = true;
-        e.pending.push(task);
+        e.pending.push(PendingTask {
+            task,
+            grammar: None,
+        });
 
         let out = e.step_local();
         assert_eq!(out.len(), 1);
@@ -3472,6 +3655,7 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            grammar: None,
         });
 
         let out = e.finalize_error("pipeline decode failed: wire closed".into());
@@ -3504,6 +3688,7 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            grammar: None,
         }
     }
 
@@ -3587,6 +3772,7 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            grammar: None,
         });
 
         let id: TaskId = "t0".into();
@@ -3674,5 +3860,184 @@ mod tests {
             Err(EngineError::QueueFull { queued, cap })
                 if queued == MAX_PENDING_TASKS && cap == MAX_PENDING_TASKS
         ));
+    }
+
+    // ---- structured output (grammar-masked decode) ----
+
+    /// EOS of the single-byte test vocab.
+    const TEST_EOS: u32 = 261;
+    /// A control byte JSON never allows: the raw argmax the mask must reject.
+    const BAD: u8 = 0x01;
+    const OK_ENUM: &str = r#"{"type":"string","enum":["ok"]}"#;
+    const INTEGER: &str = r#"{"type":"integer"}"#;
+
+    fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
+        cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: body.to_string(),
+        }
+    }
+
+    fn compiled(body: &str) -> CompiledGrammar {
+        GrammarFactory::single_byte_for_tests()
+            .compile(&json_spec(body))
+            .unwrap()
+    }
+
+    fn seed(s: &str) -> Vec<i64> {
+        s.bytes().map(i64::from).collect()
+    }
+
+    /// A row of `width` zeros with the given `(token, logit)` peaks.
+    fn row(width: usize, peaks: &[(u32, f32)]) -> Vec<f32> {
+        let mut r = vec![0.0f32; width];
+        for &(t, l) in peaks {
+            r[t as usize] = l;
+        }
+        r
+    }
+
+    /// A single-box grammar task parked at a decode step: `done` already
+    /// generated (and accepted by the matcher), the next pick from `logits`.
+    fn grammar_task(body: &str, done: &str, max_tokens: usize, logits: Vec<f32>) -> ActiveTask {
+        let mut t = finalizable_task(max_tokens, 0);
+        t.gen_ids = done.bytes().map(u32::from).collect();
+        t.step = 3 + t.gen_ids.len();
+        t.logits = logits;
+        t.grammar = Some(start_grammar(&compiled(body), &seed(done)).unwrap());
+        t
+    }
+
+    #[test]
+    fn plain_decode_pick_is_the_unmasked_argmax() {
+        let r = row(300, &[(BAD as u32, 10.0), (b'"' as u32, 5.0)]);
+        assert_eq!(pick_decode_token(&r, None).unwrap(), BAD as u32);
+        // An empty row keeps the old fallback token 0.
+        assert_eq!(pick_decode_token(&[], None).unwrap(), 0);
+    }
+
+    #[test]
+    fn masked_decode_pick_takes_the_best_allowed_token() {
+        let mut mask = start_grammar(&compiled(OK_ENUM), &[]).unwrap();
+        let r = row(300, &[(BAD as u32, 10.0), (b'"' as u32, 5.0)]);
+        assert_eq!(pick_decode_token(&r, Some(&mut mask)).unwrap(), b'"' as u32);
+    }
+
+    #[test]
+    fn a_grammar_finish_on_the_last_allowed_token_is_stop() {
+        // The JSON completed on the token that also reached max_tokens.
+        let mut e = bare_engine(1, "{}");
+        e.active = Some(grammar_task(OK_ENUM, "\"ok\"", 4, row(300, &[])));
+        let out = e.step_local();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_final);
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+        assert!(e.active.is_none());
+    }
+
+    #[test]
+    fn decode_end_without_a_grammar_is_unchanged() {
+        assert_eq!(decode_end(3, 4, false), None);
+        assert_eq!(decode_end(4, 4, false), Some(FinishReason::Length));
+        assert_eq!(decode_end(4, 4, true), Some(FinishReason::Stop));
+        assert_eq!(decode_end(1, 4, true), Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn a_dead_end_is_an_error_chunk_not_an_unmasked_pick() {
+        let mut e = bare_engine(1, "{}");
+        // A row narrower than any allowed token: nothing in it is allowed.
+        e.active = Some(grammar_task(OK_ENUM, "", 16, vec![10.0; 4]));
+        let out = e.step_local();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_final);
+        assert!(out[0].1.error.is_some(), "{:?}", out[0].1);
+        assert!(e.active.is_none());
+    }
+
+    #[test]
+    fn a_second_eos_id_ends_a_grammar_task() {
+        let mut e = bare_engine(1, "{}");
+        // The config lists two EOS ids; the matcher allows the second one.
+        e.eos = Some(5);
+        e.eos_ids = vec![5, TEST_EOS];
+        let logits = row(300, &[(BAD as u32, 10.0), (TEST_EOS, 5.0)]);
+        e.active = Some(grammar_task(INTEGER, "12", 16, logits));
+        let out = e.step_local();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+        assert!(out[0].1.error.is_none());
+    }
+
+    #[test]
+    fn plain_tasks_stop_only_on_the_first_eos_id() {
+        let ids = [5, TEST_EOS];
+        assert!(is_stop_token(5, Some(5), &ids, false));
+        assert!(!is_stop_token(TEST_EOS, Some(5), &ids, false));
+        assert!(!is_stop_token(7, None, &ids, false));
+        assert!(is_stop_token(5, Some(5), &ids, true));
+        assert!(is_stop_token(TEST_EOS, Some(5), &ids, true));
+    }
+
+    #[test]
+    fn read_eos_ids_keeps_every_listed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_eos_ids(dir.path()).is_empty());
+        let gc = dir.path().join("generation_config.json");
+        std::fs::write(&gc, r#"{"eos_token_id":[248046,248044]}"#).unwrap();
+        assert_eq!(read_eos_ids(dir.path()), vec![248046, 248044]);
+        assert_eq!(
+            read_eos(dir.path()),
+            Some(248046),
+            "plain tasks keep the first id"
+        );
+        std::fs::write(&gc, r#"{"eos_token_id":7}"#).unwrap();
+        assert_eq!(read_eos_ids(dir.path()), vec![7]);
+    }
+
+    #[test]
+    fn the_resume_seed_is_replayed_and_a_rejected_seed_is_a_backend_error() {
+        let mut mask = start_grammar(&compiled(OK_ENUM), &seed("\"o")).unwrap();
+        assert!(mask.allowed(b'k' as u32));
+        assert!(!mask.allowed(b'o' as u32));
+        let err = start_grammar(&compiled(OK_ENUM), &seed("x")).err().unwrap();
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn multi_stage_pipelines_refuse_grammar_tasks_at_submit() {
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.grammar_factory = Ok(GrammarFactory::single_byte_for_tests());
+        let task = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
+        match e.submit(task) {
+            Err(EngineError::InvalidConfig(m)) => assert_eq!(
+                m,
+                "structured output (response_format) is not supported on multi-stage qwen35 pipelines yet"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(e.pending.is_empty());
+        // Tasks without a grammar are unaffected.
+        assert!(e.submit(GenerationTask::new("p", "p")).is_ok());
+        assert!(e.pending[0].grammar.is_none());
+    }
+
+    #[test]
+    fn single_box_compiles_at_submit_and_reports_bad_schemas_and_missing_factories() {
+        let mut e = bare_engine(1, "{}");
+        let good = GenerationTask::new("g", "p").with_grammar(json_spec(OK_ENUM));
+        match e.submit(good.clone()) {
+            Err(EngineError::InvalidConfig(m)) => assert!(
+                m.starts_with("structured output is not available for this model: "),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        e.grammar_factory = Ok(GrammarFactory::single_byte_for_tests());
+        let bad = GenerationTask::new("b", "p").with_grammar(json_spec(r#"{"type":42}"#));
+        assert!(matches!(e.submit(bad), Err(EngineError::InvalidConfig(_))));
+        assert!(e.submit(good).is_ok());
+        assert!(e.pending[0].grammar.is_some());
     }
 }
