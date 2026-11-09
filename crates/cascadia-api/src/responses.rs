@@ -226,6 +226,13 @@ fn check_metadata(metadata: Option<&Value>) -> Result<(), Refusal> {
 fn refuse_unsupported(req: &ResponsesRequest) -> Result<bool, Refusal> {
     check_metadata(req.metadata.as_ref())?;
     let encrypted = check_include(req.include.as_ref())?;
+    // A cap of 0 asks for no output; the engine would answer regardless.
+    if req.max_output_tokens == Some(0) {
+        return Err(Refusal::malformed(
+            "max_output_tokens",
+            "`max_output_tokens` must be at least 1",
+        ));
+    }
     // Echoed on the response, so held to the schema's integer.
     if req
         .max_tool_calls
@@ -1363,6 +1370,32 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
         assert!(v["error"]["message"].as_str().unwrap().contains("`input`"));
+    }
+
+    /// A `max_output_tokens` of 0 asks for no output at all: a 400 naming
+    /// it, not a reply. A negative one is not an integer the field takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_zero_token_cap_is_a_400() {
+        let (app, tasks, _) = app_with(
+            RecordingEngine::script(&["ok"]),
+            template_config(PERMISSIVE_TEMPLATE),
+        )
+        .await;
+        let (status, v) = post_json(
+            app.clone(),
+            json!({"model": "script-model", "input": "hi", "max_output_tokens": 0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        assert_eq!(v["error"]["param"], "max_output_tokens", "{v}");
+        let (status, v) = post_json(
+            app,
+            json!({"model": "script-model", "input": "hi", "max_output_tokens": -1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(tasks.lock().is_empty());
     }
 
     /// What a [`RecordingEngine`] writes.
