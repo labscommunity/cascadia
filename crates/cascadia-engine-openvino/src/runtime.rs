@@ -493,33 +493,6 @@ fn packed_slot_error_chunk(ps: crate::packed_exec::PackedSlot, e: &EngineError) 
     )
 }
 
-/// The refusal for grammar tasks on a pipeline of more than one stage: the
-/// last stage picks the token and has no grammar.
-fn refuse_multi_stage_grammar() -> EngineError {
-    EngineError::InvalidConfig(
-        "structured output (response_format) is not supported on multi-stage ov-runtime \
-         pipelines yet"
-            .into(),
-    )
-}
-
-/// Submit-time grammar build: `None` for a task without a grammar; an
-/// `InvalidConfig` (400) on a multi-stage pipeline, when the model can't do
-/// structured output, or when the schema doesn't compile.
-fn compile_task_grammar(
-    factory: &Result<GrammarFactory, String>,
-    task: &GenerationTask,
-    multi_stage: bool,
-) -> EngineResult<Option<CompiledGrammar>> {
-    if task.grammar.is_none() {
-        return Ok(None);
-    }
-    if multi_stage {
-        return Err(refuse_multi_stage_grammar());
-    }
-    structured::compile_task_grammar(factory, task)
-}
-
 /// Normalize an output shape to a 3D `[batch, seq, hidden]` for the wire.
 fn to_shape3(shape: &[usize]) -> [usize; 3] {
     match shape.len() {
@@ -977,6 +950,508 @@ fn decode_token_with_seq(t: &WireTensor) -> EngineResult<(i32, u32)> {
 /// packed I64 reply.
 const NACK_TOKEN: i32 = -1;
 
+// -------- structured output on the stage wire --------
+//
+// The head (the stage with the tokenizer and the task) runs a structured-output
+// task's grammar; the tail picks the token. On a MASKED step — the row that
+// picks a grammar task's next token: the final prompt row, or a decode row —
+// the head sends the step's token mask with the activation, and the tail
+// applies it before its argmax. Every other step's frames are unchanged.
+//
+// Non-packed: the mask rides INSIDE the I64 lead frame, after the lanes it
+// always carries: `[seq, (position,) W, mask lanes…]`, shape
+// `[1, 1, L + 1 + ceil(W/2)]` (L = 1 stateful, 2 static). W is the number of
+// u32 mask words (bit t of word t/32 = token t allowed; the high half of W's
+// lane is a tag, see `mask_count_lane`), and each mask lane packs two words,
+// low word first. A stage that predates this reads
+// the lead and the hidden, then rejects the lead's shape: the stream stays
+// aligned, and it never answers.
+//
+// Packed: the plan frame grows mask lanes under its three rows, I64
+// `[1, 3 + ceil(W/2), S]`; a column whose lanes are all zero is unmasked (a
+// real mask always allows something). A stage that predates it NACKs the
+// batch before writing any slot's KV.
+//
+// The reply to a masked step carries an acknowledgement only stages with this
+// support send: `[token, seq, MASK_ACK]` (I32 `[1,1,3]`, NACK token -1 when
+// the step failed); packed, I64 `[1, 2, S]` (tokens, then MASK_ACK lanes) or
+// the acknowledged NACK I64 `[1, 2, 0]`. A masked step answered without it — a
+// plain NACK, an unacknowledged token, or silence — means some later stage
+// can't mask: the head fails that task and latches (see `MaskLink`).
+
+/// The acknowledgement lane of a reply to a masked step.
+const MASK_ACK: i32 = 0x4d41_534b;
+
+/// High half of a masked lead's `W` lane, ORed with the lane count before it
+/// (1 stateful, 2 static). It keeps a static lead from reading as a
+/// stateful one (or the reverse): with a bare `W` the two layouts can agree
+/// on the frame length by coincidence.
+const MASK_LEAD_TAG: u32 = 0x4d53_4b00;
+
+/// The `W` lane of a masked lead after `base` plain lanes: `W` in the low
+/// half, `MASK_LEAD_TAG | base` in the high half.
+fn mask_count_lane(base: usize, words: usize) -> i64 {
+    (((MASK_LEAD_TAG | base as u32) as u64) << 32 | words as u64) as i64
+}
+
+/// The error a structured-output task gets when a later stage can't mask.
+const MASK_UPGRADE_ERROR: &str = "a later pipeline stage runs a build without structured-output \
+                                  support; upgrade every stage";
+
+/// How long a latched link refuses structured-output tasks before the next
+/// one probes it again.
+const MASK_REPROBE_AFTER: Duration = Duration::from_secs(600);
+
+/// Appends `words` as i64 lanes, two u32 words per lane, low word first
+/// (little-endian: exactly the words' own bytes, padded to a whole lane).
+fn push_mask_lanes(bytes: &mut Vec<u8>, words: &[u32]) {
+    for pair in words.chunks(2) {
+        let lane = pair[0] as u64 | (pair.get(1).copied().unwrap_or(0) as u64) << 32;
+        bytes.extend_from_slice(&lane.to_le_bytes());
+    }
+}
+
+/// The first `words` u32 words of i64 mask lanes.
+fn read_mask_words(lanes: &[u8], words: usize) -> Vec<u32> {
+    lanes
+        .chunks_exact(4)
+        .take(words)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// The token mask of a grammar task's next pick, as u32 words over `width`
+/// tokens (the tokenizer vocab). `Err` on a grammar dead end: the head fails
+/// the task rather than send a mask that allows nothing.
+fn grammar_mask_words(mask: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
+    let mut row = vec![0f32; width];
+    mask.apply(&mut row)?;
+    let mut words = vec![0u32; width.div_ceil(32)];
+    for (i, v) in row.iter().enumerate() {
+        if v.is_finite() {
+            words[i / 32] |= 1 << (i % 32);
+        }
+    }
+    Ok(words)
+}
+
+/// Greedy pick among the tokens a wire mask allows (indices past the mask are
+/// disallowed). `Err` when nothing in the row is allowed with a finite logit:
+/// never an unmasked token.
+fn wire_masked_argmax(row: &[f32], words: &[u32]) -> EngineResult<i32> {
+    let mut masked = row.to_vec();
+    let mut any = false;
+    for (i, v) in masked.iter_mut().enumerate() {
+        let allowed = words.get(i / 32).is_some_and(|w| w >> (i % 32) & 1 == 1);
+        if !allowed {
+            *v = f32::NEG_INFINITY;
+        } else if v.is_finite() {
+            any = true;
+        }
+    }
+    if !any {
+        return Err(EngineError::Backend(
+            "structured output: the step's token mask allows nothing in the logits row".into(),
+        ));
+    }
+    Ok(argmax_last_row(&masked, masked.len()))
+}
+
+/// The tail's pick from the last row of its logits: masked on a masked step,
+/// the plain argmax otherwise (today's path).
+fn tail_pick(logits: &[f32], shape: &[usize], mask: Option<&[u32]>) -> EngineResult<i32> {
+    match mask {
+        None => argmax_logits(logits, shape),
+        Some(words) => {
+            let last = logits_row_count(logits, shape)?
+                .checked_sub(1)
+                .ok_or_else(|| EngineError::Backend("logits output has no rows".into()))?;
+            wire_masked_argmax(logits_row(logits, shape, last)?, words)
+        }
+    }
+}
+
+/// The lead of a masked step: [`encode_wire_lead`]'s lanes, then `W` and the
+/// mask lanes.
+fn encode_wire_lead_masked(seq: u32, position: Option<i64>, words: &[u32]) -> WireTensor {
+    let mut t = encode_wire_lead(seq, position);
+    let base = t.data.len() / 8;
+    t.data
+        .extend_from_slice(&mask_count_lane(base, words.len()).to_le_bytes());
+    push_mask_lanes(&mut t.data, words);
+    t.shape[2] = (t.data.len() / 8) as u32;
+    t
+}
+
+/// Decode a lead that may carry a mask: `(seq, position, mask words)`. A lead
+/// with exactly the lanes this stage expects is [`decode_wire_lead`]'s; one
+/// with more must carry a consistent `W` and its mask lanes.
+fn decode_wire_lead_any(
+    t: &WireTensor,
+    want_pos: bool,
+) -> EngineResult<(u32, Option<i64>, Option<Vec<u32>>)> {
+    let base = if want_pos { 2usize } else { 1 };
+    let lanes = t.shape[2] as usize;
+    if t.dtype != WireDType::I64 || t.shape[..2] != [1, 1] || lanes <= base {
+        let (seq, pos) = decode_wire_lead(t, want_pos)?;
+        return Ok((seq, pos, None));
+    }
+    let lane = |i: usize| -> Option<i64> {
+        t.data
+            .get(i * 8..i * 8 + 8)
+            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+    };
+    let count = lane(base).unwrap_or(0) as u64;
+    if (count >> 32) as u32 != MASK_LEAD_TAG | base as u32 {
+        // Not a masked lead: today's decoder names the mismatch.
+        let (seq, pos) = decode_wire_lead(t, want_pos)?;
+        return Ok((seq, pos, None));
+    }
+    let words = (count & 0xffff_ffff) as usize;
+    let consistent =
+        t.data.len() == lanes * 8 && words > 0 && lanes == base + 1 + words.div_ceil(2);
+    if !consistent {
+        return Err(EngineError::Backend(format!(
+            "malformed structured-output lead frame: shape={:?} len={} mask words={words} \
+             (expected [1,1,{base}+1+ceil(W/2)] with a tagged W lane) — a stateful/static \
+             pipeline mismatch or a desynced activation stream",
+            t.shape,
+            t.data.len()
+        )));
+    }
+    let plain = WireTensor::new(
+        WireDType::I64,
+        [1, 1, base as u32],
+        t.data[..base * 8].to_vec(),
+    );
+    let (seq, pos) = decode_wire_lead(&plain, want_pos)?;
+    let mask = read_mask_words(&t.data[(base + 1) * 8..], words);
+    Ok((seq, pos, Some(mask)))
+}
+
+/// A token reply: [`encode_token_with_seq`]'s `[token, seq]`, or on a masked
+/// step the acknowledged `[token, seq, MASK_ACK]` (I32 `[1,1,3]`).
+fn encode_token_reply(token: i32, seq: u32, acked: bool) -> WireTensor {
+    let mut t = encode_token_with_seq(token, seq);
+    if acked {
+        t.data.extend_from_slice(&MASK_ACK.to_le_bytes());
+        t.shape = [1, 1, 3];
+    }
+    t
+}
+
+/// Decode either token reply into `(token, echo_seq, acked)`. The seq sits in
+/// the same lane in both shapes, so the caller checks it first and a late
+/// acknowledged reply goes down the same stale-discard path as any other.
+fn decode_token_reply(t: &WireTensor) -> EngineResult<(i32, u32, bool)> {
+    if t.dtype == WireDType::I32 && t.shape == [1, 1, 3] && t.data.len() == 12 {
+        let lane = |i: usize| i32::from_le_bytes(t.data[i * 4..i * 4 + 4].try_into().unwrap());
+        if lane(2) != MASK_ACK {
+            return Err(EngineError::Backend(format!(
+                "token reply [1,1,3] carries {:#x} where the structured-output acknowledgement \
+                 belongs — a desynced or foreign frame",
+                lane(2)
+            )));
+        }
+        return Ok((lane(0), lane(1) as u32, true));
+    }
+    let (token, seq) = decode_token_with_seq(t)?;
+    Ok((token, seq, false))
+}
+
+/// The reply a relay stage sends upstream for one step: its token, or
+/// [`NACK_TOKEN`] when the step failed, acknowledged only when `acked`.
+fn relay_reply_frame(step: &EngineResult<i32>, seq: u32, acked: bool) -> WireTensor {
+    let token = match step {
+        Ok(t) => *t,
+        Err(_) => NACK_TOKEN,
+    };
+    encode_token_reply(token, seq, acked)
+}
+
+/// What a relay stage answers after its downstream's reply to a masked step:
+/// the outcome to pass up, and whether to acknowledge it. Only an
+/// acknowledged downstream reply (token or NACK), or a failure of this stage's
+/// own (a malformed frame, a dead socket), is acknowledged; a plain NACK, an
+/// unacknowledged token or silence from downstream goes up as a plain NACK, so
+/// the head learns that some stage below can't mask.
+fn masked_relay_answer<T>(downstream: Result<T, TokenWaitFailure>) -> (EngineResult<T>, bool) {
+    match downstream {
+        Ok(t) => (Ok(t), true),
+        Err(TokenWaitFailure::AckedNack(e) | TokenWaitFailure::Other(e)) => (Err(e), true),
+        Err(TokenWaitFailure::NoAck(e) | TokenWaitFailure::TimedOut(e)) => (Err(e), false),
+    }
+}
+
+/// Per plan row: the token mask of that row's pick, `None` for an unmasked
+/// row (a plain slot, an idle row, a prefill row before the last).
+type PlanMasks = Vec<Option<Vec<u32>>>;
+
+/// A decoded packed plan: per row `(slot, position, shared prefix)`, `None`
+/// for an idle row.
+type PlanRows = Vec<Option<(usize, i64, usize)>>;
+
+/// A packed step's plan frame: today's [`encode_wire_plan`] when no row is
+/// masked, else with the mask lanes under its three rows (see the stage-wire
+/// notes above `MASK_ACK`).
+fn encode_packed_plan(
+    rows: &[Option<(usize, i64, usize)>],
+    masks: Option<&[Option<Vec<u32>>]>,
+) -> WireTensor {
+    let Some(masks) = masks else {
+        return encode_wire_plan(rows);
+    };
+    let s = rows.len();
+    let words = masks.iter().flatten().map(Vec::len).max().unwrap_or(0);
+    let lanes = words.div_ceil(2).max(1);
+    let mut t = encode_wire_plan(rows);
+    let word = |col: usize, i: usize| -> u32 {
+        masks
+            .get(col)
+            .and_then(Option::as_ref)
+            .and_then(|w| w.get(i).copied())
+            .unwrap_or(0)
+    };
+    for k in 0..lanes {
+        for col in 0..s {
+            let lane = word(col, 2 * k) as u64 | (word(col, 2 * k + 1) as u64) << 32;
+            t.data.extend_from_slice(&lane.to_le_bytes());
+        }
+    }
+    t.shape[1] = (3 + lanes) as u32;
+    t
+}
+
+/// Decode a plan frame that may carry masks: today's frame decodes through
+/// [`decode_wire_plan`] (no masks); a taller one must carry whole mask lanes
+/// under the same three rows. A column whose lanes are all zero is unmasked.
+fn decode_packed_plan(t: &WireTensor, slots: usize) -> EngineResult<(PlanRows, Option<PlanMasks>)> {
+    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] <= 3 {
+        return decode_wire_plan(t, slots).map(|rows| (rows, None));
+    }
+    let s = t.shape[2] as usize;
+    let lanes = t.shape[1] as usize - 3;
+    if s == 0 || t.data.len() != (3 + lanes) * s * 8 {
+        return Err(EngineError::Backend(format!(
+            "structured-output packed plan frame payload {} bytes does not match shape {:?}",
+            t.data.len(),
+            t.shape
+        )));
+    }
+    let plain = WireTensor::new(
+        WireDType::I64,
+        [1, 3, s as u32],
+        t.data[..3 * s * 8].to_vec(),
+    );
+    let rows = decode_wire_plan(&plain, slots)?;
+    let masks = (0..s)
+        .map(|col| {
+            let mut words = Vec::with_capacity(2 * lanes);
+            for k in 0..lanes {
+                let at = ((3 + k) * s + col) * 8;
+                words.extend(read_mask_words(&t.data[at..at + 8], 2));
+            }
+            words.iter().any(|&w| w != 0).then_some(words)
+        })
+        .collect();
+    Ok((rows, Some(masks)))
+}
+
+/// Whether a plan frame carries masks (decides the reply's acknowledgement,
+/// even when the frame then fails to decode).
+fn plan_frame_is_masked(t: &WireTensor) -> bool {
+    t.dtype == WireDType::I64 && t.shape[0] == 1 && t.shape[1] > 3
+}
+
+/// The tail's reply to a masked packed step: I64 `[1, 2, S]`, the tokens in
+/// row 0 and [`MASK_ACK`] in every lane of row 1.
+fn encode_wire_tokens_acked(tokens: &[i32]) -> WireTensor {
+    let mut t = encode_wire_tokens(tokens);
+    for _ in tokens {
+        t.data.extend_from_slice(&(MASK_ACK as i64).to_le_bytes());
+    }
+    t.shape[1] = 2;
+    t
+}
+
+/// The acknowledged NACK of a masked packed step: I64 `[1, 2, 0]`. Empty, so
+/// [`is_packed_nack`] still reads it as a NACK; the row count carries the
+/// acknowledgement.
+fn packed_acked_nack_frame() -> WireTensor {
+    WireTensor::new(WireDType::I64, [1, 2, 0], Vec::new())
+}
+
+/// The reply a packed stage sends upstream: the tokens or a NACK,
+/// acknowledged when `acked`.
+fn packed_reply_frame(step: &EngineResult<Vec<i32>>, acked: bool) -> WireTensor {
+    match (step, acked) {
+        (Ok(tokens), false) => encode_wire_tokens(tokens),
+        (Ok(tokens), true) => encode_wire_tokens_acked(tokens),
+        (Err(_), false) => packed_nack_frame(),
+        (Err(_), true) => packed_acked_nack_frame(),
+    }
+}
+
+/// Classify a packed downstream reply like a token wait: the tokens, or why
+/// the step failed. `masked`: the plan carried masks, so only an acknowledged
+/// reply answers it.
+fn packed_reply_outcome(reply: &WireTensor, masked: bool) -> Result<Vec<i32>, TokenWaitFailure> {
+    let acked = reply.dtype == WireDType::I64 && reply.shape[0] == 1 && reply.shape[1] == 2;
+    if masked && !acked {
+        let what = if is_packed_nack(reply) {
+            "NACK"
+        } else {
+            "token frame"
+        };
+        return Err(TokenWaitFailure::NoAck(EngineError::Backend(format!(
+            "the downstream answered a masked packed step with a {what} without the \
+             structured-output acknowledgement"
+        ))));
+    }
+    if !masked && acked {
+        return Err(TokenWaitFailure::Other(EngineError::Backend(
+            "the downstream acknowledged a packed step that carried no token mask — a desynced \
+             activation stream"
+                .into(),
+        )));
+    }
+    // An EMPTY token frame is the downstream's NACK (see `step_relay_packed`):
+    // its step failed AFTER it consumed our pair, so the batch is lost but the
+    // link is still frame-aligned. `BatchAborted`, not `Backend`: this error
+    // travels up a middle rank's relay loop, which must back off and keep
+    // driving rather than exit for a supervisor rebuild.
+    if is_packed_nack(reply) {
+        let lost = EngineError::BatchAborted(
+            "downstream stage failed its packed step and NACKed this batch (empty token \
+             frame); the pipeline link stays aligned"
+                .into(),
+        );
+        return Err(if masked {
+            TokenWaitFailure::AckedNack(lost)
+        } else {
+            TokenWaitFailure::Other(lost)
+        });
+    }
+    if !masked {
+        return decode_wire_tokens(reply).map_err(TokenWaitFailure::Other);
+    }
+    let s = reply.shape[2] as usize;
+    let lanes: Vec<i64> = reply
+        .data
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    if lanes.len() != 2 * s || lanes[s..].iter().any(|&a| a != MASK_ACK as i64) {
+        return Err(TokenWaitFailure::Other(EngineError::Backend(format!(
+            "malformed acknowledged packed token frame: shape={:?} len={}",
+            reply.shape,
+            reply.data.len()
+        ))));
+    }
+    Ok(lanes[..s].iter().map(|&t| t as i32).collect())
+}
+
+/// The tail's per-row picks of a packed step: masked where the plan carries
+/// a mask, the plain argmax elsewhere, 0 for idle rows (never read).
+fn pick_plan_rows(
+    logits: &[f32],
+    shape: &[usize],
+    rows: &[Option<(usize, i64, usize)>],
+    masks: Option<&[Option<Vec<u32>>]>,
+) -> EngineResult<Vec<i32>> {
+    let mut tokens = Vec::with_capacity(rows.len());
+    for (r, row) in rows.iter().enumerate() {
+        let mask = masks.and_then(|m| m.get(r)).and_then(Option::as_deref);
+        tokens.push(match (row, mask) {
+            (None, _) => 0,
+            (Some(_), Some(words)) => wire_masked_argmax(logits_row(logits, shape, r)?, words)?,
+            (Some(_), None) => argmax_logits_row(logits, shape, r)?,
+        });
+    }
+    Ok(tokens)
+}
+
+/// Whether this head's downstream link can carry structured-output tasks.
+///
+/// Latched after a masked step that came back without an acknowledgement (or
+/// not at all): structured-output tasks then fail at once with
+/// [`MASK_UPGRADE_ERROR`] instead of each stalling a full token deadline. The
+/// latch is the engine's, so it survives a re-dial; an acknowledged reply —
+/// even a late one discarded as stale, i.e. a slow but capable tail — clears
+/// it, and after [`MASK_REPROBE_AFTER`] the next structured-output task
+/// probes the link again.
+#[derive(Debug, Default)]
+struct MaskLink {
+    /// A masked step on this link has been acknowledged since the last
+    /// failure. Until then, structured-output tasks skip the warm-resume path.
+    acked: bool,
+    /// When the link last failed a masked step.
+    latched_at: Option<std::time::Instant>,
+}
+
+impl MaskLink {
+    /// The error a structured-output task gets now, while latched.
+    fn refusal(&self, now: std::time::Instant) -> Option<EngineError> {
+        self.latched_at
+            .filter(|at| now.saturating_duration_since(*at) < MASK_REPROBE_AFTER)
+            .map(|_| EngineError::Backend(MASK_UPGRADE_ERROR.into()))
+    }
+
+    /// An acknowledged reply arrived: the chain masks.
+    fn on_acked(&mut self) {
+        if self.latched_at.take().is_some() {
+            info!("structured output: a later stage acknowledged a masked step; link unlatched");
+        }
+        self.acked = true;
+    }
+
+    /// A masked step got no acknowledged reply. Latches the link and returns
+    /// the task's error, which names the upgrade and the cause.
+    fn on_unacked(&mut self, now: std::time::Instant, cause: &EngineError) -> EngineError {
+        if self.latched_at.is_none() {
+            warn!(cause = %cause, "structured output: a masked step got no acknowledged reply; \
+                  refusing structured-output tasks on this pipeline (likely a later stage on \
+                  an older build)");
+        }
+        self.acked = false;
+        self.latched_at = Some(now);
+        EngineError::Backend(format!(
+            "{MASK_UPGRADE_ERROR} (a masked step got no acknowledged reply: {cause})"
+        ))
+    }
+
+    /// The head's verdict on its downstream's reply to a masked step.
+    fn verdict<T>(
+        &mut self,
+        now: std::time::Instant,
+        reply: Result<T, TokenWaitFailure>,
+    ) -> EngineResult<T> {
+        match reply {
+            Ok(token) => {
+                self.on_acked();
+                Ok(token)
+            }
+            Err(TokenWaitFailure::AckedNack(e)) => {
+                self.on_acked();
+                Err(e)
+            }
+            Err(TokenWaitFailure::Other(e)) => Err(e),
+            Err(TokenWaitFailure::NoAck(e) | TokenWaitFailure::TimedOut(e)) => {
+                Err(self.on_unacked(now, &e))
+            }
+        }
+    }
+}
+
+/// Whether a task may warm-resume from a cached KV blob. A structured-output
+/// task on a pipeline whose link hasn't acknowledged a masked step takes the
+/// cold path: a tail that can't mask would drop the step after RESTORE armed
+/// it warm, and the next plain request would prefill on that stale KV.
+#[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
+fn warm_resume_allowed(has_grammar: bool, multi_stage: bool, link_acked: bool) -> bool {
+    !(has_grammar && multi_stage) || link_acked
+}
+
 /// Send the downstream activation frames in wire order: `[lead] [hidden]`,
 /// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`).
 ///
@@ -989,9 +1464,15 @@ async fn send_hidden_frames(
     downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
     seq: u32,
     position: Option<i64>,
+    mask: Option<&[u32]>,
     hid: WireTensor,
 ) -> Result<(), cascadia_transport::TransportError> {
-    let lead = encode_wire_lead(seq, position);
+    // A masked step's mask rides inside the lead; every other step's lead is
+    // today's frame.
+    let lead = match mask {
+        Some(words) => encode_wire_lead_masked(seq, position, words),
+        None => encode_wire_lead(seq, position),
+    };
     let mut guard = downstream.lock().await;
     guard.send(&lead).await?;
     guard.send(&hid).await?;
@@ -1032,6 +1513,48 @@ async fn recv_hidden_frames(
     let _ = want_pos;
     let hid = guard.recv_reply().await?.0;
     Ok((lead, Some(hid)))
+}
+
+/// Read a kv-coord control ack (an I8 frame) within `budget`, skipping any
+/// token reply ahead of it. A step whose token wait already gave up — a masked
+/// step on a slow tail, or any timed-out step — can still be answered late;
+/// read as the ack, that reply would shift every later read on the link by one
+/// frame and hand plain requests the previous step's token. Returns the ack
+/// (or why none came) and whether a skipped reply was acknowledged (a tail
+/// that masks, see [`MaskLink`]).
+#[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
+async fn recv_control_ack(
+    g: &mut ActivationClient,
+    budget: Duration,
+    what: &str,
+) -> (EngineResult<WireTensor>, bool) {
+    let deadline_at = std::time::Instant::now() + budget;
+    let mut stale_ack = false;
+    loop {
+        let remaining = deadline_at.saturating_duration_since(std::time::Instant::now());
+        let frame = match tokio::time::timeout(remaining, g.recv()).await {
+            Ok(Ok((t, _))) => t,
+            Ok(Err(e)) => return (Err(EngineError::Backend(e.to_string())), stale_ack),
+            Err(_) => {
+                return (
+                    Err(EngineError::Backend(format!(
+                        "ov-runtime: {what} ack timed out"
+                    ))),
+                    stale_ack,
+                )
+            }
+        };
+        match decode_token_reply(&frame) {
+            Ok((_, seq, acked)) => {
+                debug!(
+                    seq,
+                    acked, "late token reply skipped while awaiting a {what} ack"
+                );
+                stale_ack |= acked;
+            }
+            Err(_) => return (Ok(frame), stale_ack),
+        }
+    }
 }
 
 /// Hard ceiling on the active token-response wait, independent of the body
@@ -1077,6 +1600,26 @@ fn token_recv_deadline(recv_timeout: std::time::Duration, prefill: bool) -> std:
     recv_timeout
         .saturating_mul(factor)
         .min(TOKEN_RECV_DEADLINE_CEILING.saturating_mul(factor))
+}
+
+/// A middle stage's wait on a masked step: its share of the `budget` its
+/// upstream waits, in proportion to the layers still below it
+/// (`total_layers - layer_end`). Each stage down the chain waits strictly
+/// less than the one above it, so when the tail never answers (a build that
+/// can't mask), the deepest middle times out first and its plain NACK reaches
+/// the head before the head's own deadline, instead of being left on the link
+/// as a late reply.
+fn masked_relay_budget(
+    budget: std::time::Duration,
+    layer_end: u32,
+    total_layers: u32,
+) -> std::time::Duration {
+    let below = total_layers.saturating_sub(layer_end);
+    if total_layers == 0 || below >= total_layers {
+        // No layer geometry: half the upstream's budget still lands first.
+        return budget / 2;
+    }
+    budget.mul_f64(below as f64 / total_layers as f64)
 }
 
 /// Consecutive token-wait timeouts after which a RELAY rank gives up on its
@@ -1133,12 +1676,22 @@ enum TokenWaitFailure {
     /// Bytes arrived or the verdict is already decided elsewhere, so the link
     /// is not the suspect and the escalation counter resets.
     Other(EngineError),
+    /// Masked steps only: the downstream acknowledged the step and NACKed it
+    /// (a stage failure on a chain that masks).
+    AckedNack(EngineError),
+    /// Masked steps only: the reply for this step came without the
+    /// acknowledgement (a plain NACK or a plain token), so some later stage
+    /// can't mask.
+    NoAck(EngineError),
 }
 
 impl TokenWaitFailure {
     fn into_error(self) -> EngineError {
         match self {
-            TokenWaitFailure::TimedOut(e) | TokenWaitFailure::Other(e) => e,
+            TokenWaitFailure::TimedOut(e)
+            | TokenWaitFailure::Other(e)
+            | TokenWaitFailure::AckedNack(e)
+            | TokenWaitFailure::NoAck(e) => e,
         }
     }
 }
@@ -1175,18 +1728,36 @@ fn token_wait_timeout_error(
     ))
 }
 
-/// Read a seq-tagged token from `downstream`, discarding any STALE orphan
-/// (echoed seq != `awaiting_seq`) and continuing to read. The whole wait is
-/// bounded by ONE overall deadline = `min(recv_timeout(), TOKEN_RECV_DEADLINE_CEILING)`:
-/// each `recv_token` gets the REMAINING budget, and the deadline elapsing (or a
-/// bounded frame-start timeout) returns the Err so the engine lock releases for a
-/// retry (#40 self-heal). Returns the token whose echoed seq matches `awaiting_seq`.
+/// [`recv_token_reply`] for a plain (unmasked) step.
+#[cfg(test)]
 async fn recv_token_seq_checked(
     downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
     awaiting_seq: u32,
     prefill: bool,
 ) -> Result<i32, TokenWaitFailure> {
     let budget = token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
+    recv_token_reply(downstream, awaiting_seq, budget, false, &mut false).await
+}
+
+/// Read a seq-tagged token reply from `downstream`, discarding any STALE
+/// orphan (echoed seq != `awaiting_seq`) and continuing to read. The whole
+/// wait is bounded by ONE overall deadline = `min(recv_timeout(),
+/// TOKEN_RECV_DEADLINE_CEILING)`: each `recv_token` gets the REMAINING budget,
+/// and the deadline elapsing (or a bounded frame-start timeout) returns the
+/// Err so the engine lock releases for a retry (#40 self-heal). Returns the
+/// token whose echoed seq matches `awaiting_seq`. `masked`: the step carried a
+/// token mask, so only an acknowledged reply answers it (see
+/// [`MASK_ACK`]); a matching reply without the acknowledgement is
+/// [`TokenWaitFailure::NoAck`]. Either kind of reply is discarded by seq when
+/// stale; `stale_ack` is set when a discarded one was acknowledged (a slow tail
+/// that masks).
+async fn recv_token_reply(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    awaiting_seq: u32,
+    budget: std::time::Duration,
+    masked: bool,
+    stale_ack: &mut bool,
+) -> Result<i32, TokenWaitFailure> {
     let deadline_at = std::time::Instant::now() + budget;
     // Discards are summarised into the terminal error rather than logged per
     // frame. A peer echoing the wrong seq every time — a version skew, or a
@@ -1232,8 +1803,10 @@ async fn recv_token_seq_checked(
                 other => TokenWaitFailure::Other(EngineError::Backend(other.to_string())),
             }
         })?;
-        let (token, echo_seq) = decode_token_with_seq(&tensor).map_err(TokenWaitFailure::Other)?;
+        let (token, echo_seq, acked) =
+            decode_token_reply(&tensor).map_err(TokenWaitFailure::Other)?;
         if echo_seq != awaiting_seq {
+            *stale_ack |= acked;
             // First discard only: one line says the guard fired and names the
             // seqs, which is what the rig validation looks for. Any further
             // discards in the same wait are counted, not logged, and reported
@@ -1267,6 +1840,27 @@ async fn recv_token_seq_checked(
         //
         // A NACK for a generation we already abandoned is a stale orphan and
         // was discarded above, by seq, before reaching here.
+        if masked && !acked {
+            return Err(TokenWaitFailure::NoAck(EngineError::Backend(format!(
+                "the downstream answered a masked step with a {} without the structured-output \
+                 acknowledgement",
+                if token < 0 { "NACK" } else { "token" }
+            ))));
+        }
+        if !masked && acked {
+            return Err(TokenWaitFailure::Other(EngineError::Backend(
+                "the downstream acknowledged a step that carried no token mask — a desynced \
+                 activation stream"
+                    .into(),
+            )));
+        }
+        if token < 0 && masked {
+            return Err(TokenWaitFailure::AckedNack(EngineError::BatchAborted(
+                "downstream stage failed its structured-output step and NACKed this \
+                 generation; the pipeline link stays aligned"
+                    .into(),
+            )));
+        }
         if token < 0 {
             return Err(TokenWaitFailure::Other(EngineError::BatchAborted(
                 "downstream stage failed its step and NACKed this generation; the pipeline \
@@ -1771,6 +2365,10 @@ pub struct OvRuntimeEngine {
     /// link. Reset by any answer at all (a token, a NACK, even a malformed
     /// frame). Drives `escalate_if_downstream_is_gone`.
     consecutive_token_timeouts: u32,
+    /// Head only: whether the downstream chain acknowledges masked
+    /// (structured-output) steps, and the latch that refuses them when it
+    /// doesn't. See [`MaskLink`].
+    mask_link: MaskLink,
     /// Issue-34 Option C: opaque KV blob cache + NEGOTIATE/GET offers for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
@@ -2198,6 +2796,7 @@ impl OvRuntimeEngine {
         hidden: &[f32],
         shape: [usize; 3],
         position: i64,
+        mask: Option<&[u32]>,
     ) -> EngineResult<()> {
         debug!(?shape, position, "downstream send: start");
         let downstream = self
@@ -2222,7 +2821,7 @@ impl OvRuntimeEngine {
         // [seq] (stateful) or [seq, position] (static);
         // recv_hidden_from_upstream mirrors it.
         let pos = self.static_kv.is_some().then_some(position);
-        self.block_on(send_hidden_frames(&downstream, seq, pos, hid))
+        self.block_on(send_hidden_frames(&downstream, seq, pos, mask, hid))
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!(position, "downstream send: done");
         Ok(())
@@ -2258,17 +2857,115 @@ impl OvRuntimeEngine {
         //
         // Unlike the idle-between-requests wait in `recv_hidden_from_upstream`,
         // this one has a real deadline: an active generation owes a token.
+        self.wait_token(&downstream, prefill, false)
+            .map_err(TokenWaitFailure::into_error)
+    }
+
+    /// The bounded, socket-keeping token wait behind every downstream reply;
+    /// `masked` when the step carried a token mask. A late acknowledged reply
+    /// discarded as stale proves the chain masks, so it clears the latch.
+    fn wait_token(
+        &mut self,
+        downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+        prefill: bool,
+        masked: bool,
+    ) -> Result<i32, TokenWaitFailure> {
         let awaiting = self.awaiting_token_seq;
-        let outcome = self.block_on(recv_token_seq_checked(&downstream, awaiting, prefill));
+        let mut stale_ack = false;
+        let mut budget = token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
+        if masked && !self.spec.is_first_stage {
+            budget = masked_relay_budget(budget, self.spec.layer_end, self.spec.total_layers);
+        }
+        let outcome = self.block_on(recv_token_reply(
+            downstream,
+            awaiting,
+            budget,
+            masked,
+            &mut stale_ack,
+        ));
+        if stale_ack {
+            self.mask_link.on_acked();
+        }
         // Only SILENCE moves the escalation streak. A token, a downstream NACK
         // and a malformed frame all reset it — see `next_timeout_streak`.
         let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
         self.consecutive_token_timeouts =
             next_timeout_streak(self.consecutive_token_timeouts, timed_out);
-        outcome.map_err(TokenWaitFailure::into_error)
+        outcome
     }
 
-    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
+    /// The reply to a masked step this stage sent: acknowledged, or the
+    /// failure that says a later stage can't mask.
+    fn wait_masked_token(&mut self, prefill: bool) -> Result<i32, TokenWaitFailure> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| TokenWaitFailure::Other(EngineError::Backend("no downstream".into())))?;
+        self.wait_token(&downstream, prefill, true)
+    }
+
+    /// Head: the token mask to send with a step whose last row is at
+    /// `last_row_position`, or `None` when the step isn't masked (no grammar,
+    /// or a prompt row before the last). Fails a structured-output task at
+    /// once while the link is latched, and on a grammar dead end.
+    fn step_mask_words(&mut self, last_row_position: i64) -> EngineResult<Option<Vec<u32>>> {
+        let Some(prompt_len) = self
+            .active
+            .as_ref()
+            .filter(|a| a.grammar.is_some())
+            .map(|a| a.prompt_ids.len())
+        else {
+            return Ok(None);
+        };
+        if !row_picks_next_token(last_row_position, prompt_len) {
+            return Ok(None);
+        }
+        if let Some(refused) = self.mask_link.refusal(std::time::Instant::now()) {
+            return Err(refused);
+        }
+        let width = self
+            .grammar_factory
+            .as_ref()
+            .map(GrammarFactory::mask_width)
+            .map_err(|reason| {
+                EngineError::Backend(format!(
+                    "structured output is not available for this model: {reason}"
+                ))
+            })?;
+        let grammar = self.active.as_mut().and_then(|a| a.grammar.as_mut());
+        match grammar {
+            Some(g) => grammar_mask_words(g, width).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Head, multi-stage: send one step's hidden rows downstream and take back
+    /// the tail's token. A structured-output task's masked step carries its
+    /// token mask and needs an acknowledged reply (see [`MaskLink::verdict`]);
+    /// every other step is today's exchange, frame for frame.
+    fn exchange_downstream(
+        &mut self,
+        hidden: &[f32],
+        shape: [usize; 3],
+        position: i64,
+        last_row_position: i64,
+        prefill: bool,
+    ) -> EngineResult<i32> {
+        let mask = self.step_mask_words(last_row_position)?;
+        self.send_hidden_downstream(hidden, shape, position, mask.as_deref())?;
+        if mask.is_none() {
+            return self.recv_token_from_downstream(prefill);
+        }
+        let reply = self.wait_masked_token(prefill);
+        self.mask_link.verdict(std::time::Instant::now(), reply)
+    }
+
+    /// The upstream's next activation: hidden rows, their shape, the static
+    /// position, and the token mask of a masked step.
+    #[allow(clippy::type_complexity)]
+    fn recv_hidden_from_upstream(
+        &mut self,
+    ) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>, Option<Vec<u32>>)> {
         // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
         // [seq] or [seq, position]. The LEAD frame's wait is lenient
         // (idle-between-requests); the hidden that must follow it is deadlined,
@@ -2309,7 +3006,7 @@ impl OvRuntimeEngine {
             // Record the seq this stage must echo back on the token it sends
             // upstream; decode/validate outside the transport closure so a bad
             // frame yields a clear EngineError, not a desync.
-            let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
+            let (inbound_seq, position, mask) = decode_wire_lead_any(&lead, want_pos)?;
             self.inbound_seq = Some(inbound_seq);
             let shape = [
                 tensor.shape[0] as usize,
@@ -2329,11 +3026,17 @@ impl OvRuntimeEngine {
                     )))
                 }
             };
-            return Ok((floats, shape, position));
+            return Ok((floats, shape, position, mask));
         }
     }
 
-    fn send_token_to_upstream(&mut self, token: i32) -> EngineResult<()> {
+    /// Answer the upstream's last activation with `step`'s token (or a
+    /// NACK), acknowledged when `acked` (masked steps only).
+    fn send_token_to_upstream(
+        &mut self,
+        step: &EngineResult<i32>,
+        acked: bool,
+    ) -> EngineResult<()> {
         let upstream = self
             .upstream
             .clone()
@@ -2348,7 +3051,7 @@ impl OvRuntimeEngine {
                 "no upstream seq recorded: a token was sent before any hidden was received".into(),
             )
         })?;
-        let tensor = encode_token_with_seq(token, inbound);
+        let tensor = relay_reply_frame(step, inbound, acked);
         self.block_on(async move {
             let mut guard = upstream.lock().await;
             guard.send(&tensor).await
@@ -2416,14 +3119,31 @@ impl OvRuntimeEngine {
                 }
                 None => None,
             };
+            // A later stage that can't mask latched this pipeline: refuse the
+            // structured-output task now, before any warm-resume exchange or
+            // model work.
+            if grammar.is_some() && !self.spec.is_last_stage {
+                if let Some(refused) = self.mask_link.refusal(std::time::Instant::now()) {
+                    let id = task.task_id.clone();
+                    return Ok(vec![(id.clone(), Chunk::error(id, refused.to_string()))]);
+                }
+            }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
             // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
             // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
+            // A structured-output task skips it until this link has acknowledged
+            // a masked step (see `warm_resume_allowed`).
             #[cfg(feature = "kv_coord")]
-            if self.static_kv.is_none() {
+            if self.static_kv.is_none()
+                && warm_resume_allowed(
+                    grammar.is_some(),
+                    self.downstream.is_some() && !self.spec.is_last_stage,
+                    self.mask_link.acked,
+                )
+            {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
                 if let Some((blob, len, plane_pulled)) =
                     self.kv.take_warm(&task.tenant, &prompt_i32)
@@ -2723,15 +3443,7 @@ impl OvRuntimeEngine {
             let emitted = if single_stage {
                 self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)
             } else {
-                // Pipeline: this stage produced hidden rows. Ship the plan (so
-                // every downstream stage can rebuild the same mask and route
-                // rows to the same slots) plus the hidden block, then take back
-                // one sampled token per row from the tail.
-                bytes_to_f32(odt, &obytes).and_then(|hidden| {
-                    let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
-                    let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
-                    self.emit_packed_tokens(&tokens, kind, &mut out)
-                })
+                self.pipeline_packed_step(odt, &oshape, &obytes, kind, &mut out)
             };
             if let Err(e) = emitted {
                 return self.abort_packed_batch(e, out);
@@ -2784,19 +3496,101 @@ impl OvRuntimeEngine {
         Ok(out)
     }
 
+    /// Pipeline head: this stage produced hidden rows. Ship the plan (so every
+    /// downstream stage can rebuild the same mask and route rows to the same
+    /// slots, plus the token masks of grammar slots' sampled rows) and the
+    /// hidden block, then take back one sampled token per row from the tail.
+    fn pipeline_packed_step(
+        &mut self,
+        odt: ShimDType,
+        oshape: &[usize],
+        obytes: &[u8],
+        kind: crate::packed_exec::PackedStepKind,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> EngineResult<()> {
+        let hidden = bytes_to_f32(odt, obytes)?;
+        let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
+        let masks = self.packed_step_masks(&kind, plan_rows.len(), out);
+        let reply = self.exchange_packed_downstream(&hidden, oshape, &plan_rows, masks.as_deref());
+        let tokens = match masks {
+            None => reply.map_err(TokenWaitFailure::into_error)?,
+            // A masked plan answered without acknowledgement loses this batch
+            // (its plain slots too) and latches the link.
+            Some(_) => self.mask_link.verdict(std::time::Instant::now(), reply)?,
+        };
+        self.emit_packed_tokens(&tokens, kind, out)
+    }
+
+    /// The token masks of one packed pipeline step: one per sampled row of a
+    /// grammar slot, `None` when no row is masked (today's plan frame). A
+    /// grammar slot that can't be masked — the link is latched, or its grammar
+    /// hit a dead end — fails alone here, with its own error chunk.
+    fn packed_step_masks(
+        &mut self,
+        kind: &crate::packed_exec::PackedStepKind,
+        rows: usize,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> Option<PlanMasks> {
+        let width = self
+            .grammar_factory
+            .as_ref()
+            .map(GrammarFactory::mask_width);
+        let refused = self.mask_link.refusal(std::time::Instant::now());
+        let mut masks: PlanMasks = vec![None; rows];
+        let mut failed = Vec::new();
+        let packed = self.packed.as_mut().unwrap();
+        for (row, slot) in kind.sampled_rows() {
+            let Some(grammar) = packed
+                .slots
+                .get_mut(slot)
+                .and_then(|s| s.as_mut())
+                .and_then(|s| s.grammar.as_mut())
+            else {
+                continue;
+            };
+            let words = match (&refused, &width) {
+                (Some(e), _) => Err(EngineError::Backend(e.to_string())),
+                (None, Err(reason)) => Err(EngineError::Backend(format!(
+                    "structured output is not available for this model: {reason}"
+                ))),
+                (None, Ok(width)) => grammar_mask_words(grammar, *width),
+            };
+            match words {
+                Ok(w) if row < rows => masks[row] = Some(w),
+                Ok(_) => failed.push((
+                    slot,
+                    EngineError::Backend(format!("packed row {row} is outside the plan")),
+                )),
+                Err(e) => failed.push((slot, e)),
+            }
+        }
+        for (slot, e) in failed {
+            let e = match (e, &refused) {
+                (_, Some(_)) => EngineError::Backend(MASK_UPGRADE_ERROR.into()),
+                (e, None) => e,
+            };
+            out.extend(self.fail_packed_slot(slot, e));
+        }
+        masks.iter().any(Option::is_some).then_some(masks)
+    }
+
     /// Send `[1, S, hidden]` + the packed plan downstream and wait for the tail
-    /// stage's per-row tokens.
+    /// stage's per-row tokens. `masks`: the plan's token masks, when any row
+    /// is masked; the reply must then be acknowledged.
     fn exchange_packed_downstream(
         &mut self,
         hidden: &[f32],
         shape: &[usize],
         plan_rows: &[Option<(usize, i64, usize)>],
-    ) -> EngineResult<Vec<i32>> {
+        masks: Option<&[Option<Vec<u32>>]>,
+    ) -> Result<Vec<i32>, TokenWaitFailure> {
         let down = self.downstream.clone().ok_or_else(|| {
-            EngineError::Backend("packed pipeline stage has no downstream".into())
+            TokenWaitFailure::Other(EngineError::Backend(
+                "packed pipeline stage has no downstream".into(),
+            ))
         })?;
         let s3 = to_shape3(shape);
-        let plan_frame = encode_wire_plan(plan_rows);
+        let plan_frame = encode_packed_plan(plan_rows, masks);
         // f16 on the wire, matching the non-packed path: the receiving stage
         // converts to f16 before feeding the IR regardless, so f32 doubled the
         // bytes per stage hop and bought nothing.
@@ -2837,26 +3631,10 @@ impl OvRuntimeEngine {
                 guard.recv_reply().await
             }
             .map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?;
-            // An EMPTY token frame is the downstream's NACK (see
-            // `step_relay_packed`): its step failed AFTER it consumed our
-            // pair, so the batch is lost but the link is still
-            // frame-aligned. Abort the batch; do not poison the connection.
-            //
-            // `BatchAborted`, not `Backend`: this error travels up a middle
-            // rank's relay loop, which must back off and keep driving rather
-            // than exit for a supervisor rebuild. The variant says "healthy
-            // link" structurally instead of relying on this message never
-            // happening to contain a word the fatal-substring classifier
-            // looks for.
-            if is_packed_nack(&reply) {
-                return Err(EngineError::BatchAborted(
-                    "downstream stage failed its packed step and NACKed this batch \
-                     (empty token frame); the pipeline link stays aligned"
-                        .into(),
-                ));
-            }
-            decode_wire_tokens(&reply)
+            Ok::<_, EngineError>(reply)
         })
+        .map_err(TokenWaitFailure::Other)
+        .and_then(|reply| packed_reply_outcome(&reply, masks.is_some()))
     }
 
     /// Emit chunks from a pipeline tail's per-row tokens.
@@ -2889,7 +3667,7 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
         let slots = self.packed.as_ref().unwrap().kv.slots;
-        let (plan_res, hidden, hshape) = self.block_on(async {
+        let (masked, plan_res, hidden, hshape) = self.block_on(async {
             let mut guard = up.lock().await;
             // The plan frame is this stage's idle wait for the next unit of
             // work — idle-tolerant `recv`. Once it arrives the upstream owes
@@ -2909,7 +3687,8 @@ impl OvRuntimeEngine {
                 .recv_reply()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
-            let plan_res = decode_wire_plan(&pf, slots);
+            let masked = plan_frame_is_masked(&pf);
+            let plan_res = decode_packed_plan(&pf, slots);
             let hidden: Vec<f32> = match hf.dtype {
                 WireDType::F16 => f16_bytes_to_f32(&hf.data),
                 _ => hf
@@ -2918,7 +3697,7 @@ impl OvRuntimeEngine {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             };
-            Ok::<_, EngineError>((plan_res, hidden, hf.shape))
+            Ok::<_, EngineError>((masked, plan_res, hidden, hf.shape))
         })?;
 
         // The pair is consumed. From here on, any failure MUST still answer
@@ -2928,19 +3707,19 @@ impl OvRuntimeEngine {
         // frame ([1,1,0]): wire-aligned, unambiguous (a real reply always
         // has one token per row), and it tells the upstream "batch lost,
         // link healthy".
-        let step = self.relay_packed_body(plan_res, hidden, hshape);
-        let frame = match &step {
-            Ok(tokens) => encode_wire_tokens(tokens),
-            Err(e) => {
-                // Log the root cause HERE, before the NACK goes out: a dead
-                // upstream is exactly when the send fails too, and then the
-                // send error is the only thing that would ever reach the
-                // operator. This rank is where the batch actually died, so
-                // this is where the reason has to be recorded.
-                warn!(error = %e, "packed relay step failed; NACKing the upstream");
-                packed_nack_frame()
-            }
-        };
+        //
+        // A masked plan's reply is acknowledged unless a stage below this one
+        // didn't acknowledge it (see `masked_relay_answer`).
+        let (step, vouch) = self.relay_packed_body(plan_res, hidden, hshape);
+        if let Err(e) = &step {
+            // Log the root cause HERE, before the NACK goes out: a dead
+            // upstream is exactly when the send fails too, and then the send
+            // error is the only thing that would ever reach the operator. This
+            // rank is where the batch actually died, so this is where the
+            // reason has to be recorded.
+            warn!(error = %e, masked, "packed relay step failed; NACKing the upstream");
+        }
+        let frame = packed_reply_frame(&step, masked && vouch);
         let sent = self.block_on(async {
             let mut guard = up.lock().await;
             guard
@@ -2957,13 +3736,50 @@ impl OvRuntimeEngine {
     /// Everything `step_relay_packed` does between consuming the (plan,
     /// hidden) pair and answering the upstream. Split out so the caller can
     /// turn any failure into an on-wire NACK instead of a swallowed error.
+    ///
+    /// The second value: whether this stage may acknowledge a masked plan (see
+    /// `relay_middle_body`).
     fn relay_packed_body(
         &mut self,
-        plan_res: EngineResult<Vec<Option<(usize, i64, usize)>>>,
+        plan_res: EngineResult<(PlanRows, Option<PlanMasks>)>,
         hidden: Vec<f32>,
         hshape: [u32; MAX_RANK],
-    ) -> EngineResult<Vec<i32>> {
-        let plan_rows = plan_res?;
+    ) -> (EngineResult<Vec<i32>>, bool) {
+        let (plan_rows, masks) = match plan_res {
+            Ok(p) => p,
+            Err(e) => return (Err(e), true),
+        };
+        let (odt, oshape, obytes) = match self.relay_packed_run(&plan_rows, hidden, hshape) {
+            Ok(o) => o,
+            Err(e) => return (Err(e), true),
+        };
+        if self.spec.is_last_stage {
+            let picks = bytes_to_f32(odt, &obytes)
+                .and_then(|logits| pick_plan_rows(&logits, &oshape, &plan_rows, masks.as_deref()));
+            return (picks, true);
+        }
+        let hidden_out = match bytes_to_f32(odt, &obytes) {
+            Ok(h) => h,
+            Err(e) => return (Err(e), true),
+        };
+        // A downstream failure (including its NACK) propagates as Err — the
+        // caller NACKs our own upstream in turn, so the abort reaches rank 0
+        // no matter how deep the pipeline is.
+        let reply =
+            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows, masks.as_deref());
+        match masks {
+            None => (reply.map_err(TokenWaitFailure::into_error), true),
+            Some(_) => masked_relay_answer(reply),
+        }
+    }
+
+    /// This stage's own inference for one relayed packed plan.
+    fn relay_packed_run(
+        &mut self,
+        plan_rows: &[Option<(usize, i64, usize)>],
+        hidden: Vec<f32>,
+        hshape: [u32; MAX_RANK],
+    ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
         let hidden_size = hshape[2] as usize;
         let plan = crate::packed::PackedPlan {
             rows: plan_rows
@@ -2988,31 +3804,12 @@ impl OvRuntimeEngine {
             .iter()
             .map(|r| r.map(|(_, _, sh)| sh).unwrap_or(0))
             .collect();
-        let (odt, oshape, obytes) = self.packed.as_mut().unwrap().run_plan(
+        self.packed.as_mut().unwrap().run_plan(
             &plan,
             crate::packed_exec::PackedPrimary::Hidden(&hidden, hidden_size),
             &positions,
             &reuse,
-        )?;
-
-        if self.spec.is_last_stage {
-            let logits = bytes_to_f32(odt, &obytes)?;
-            let mut tokens = Vec::with_capacity(plan.rows.len());
-            for (r, row) in plan.rows.iter().enumerate() {
-                tokens.push(if row.is_some() {
-                    argmax_logits_row(&logits, &oshape, r)?
-                } else {
-                    0
-                });
-            }
-            Ok(tokens)
-        } else {
-            let hidden_out = bytes_to_f32(odt, &obytes)?;
-            // A downstream failure (including its NACK) propagates as Err —
-            // the caller NACKs our own upstream in turn, so the abort
-            // reaches rank 0 no matter how deep the pipeline is.
-            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)
-        }
+        )
     }
 
     /// Sample the rows one packed inference produced and append their chunks.
@@ -3350,7 +4147,6 @@ impl OvRuntimeEngine {
                 std::time::Duration::ZERO,
             ));
         }
-        self.ensure_no_grammar_downstream()?;
         let x = *shape.last().unwrap_or(&0);
         if x == 0 || out.len() != take * x {
             return Err(EngineError::Backend(format!(
@@ -3359,8 +4155,10 @@ impl OvRuntimeEngine {
             )));
         }
         let ts = std::time::Instant::now();
-        self.send_hidden_downstream(out, [1, take, x], chunk_start)?;
-        let token = self.recv_token_from_downstream(take > 1)?;
+        // The tail picks from the chunk's last real row.
+        let last_row_position = chunk_start + take as i64 - 1;
+        let token =
+            self.exchange_downstream(out, [1, take, x], chunk_start, last_row_position, take > 1)?;
         Ok((token, ts.elapsed()))
     }
 
@@ -3395,23 +4193,11 @@ impl OvRuntimeEngine {
             )?;
             Ok((token, std::time::Duration::ZERO))
         } else {
-            self.ensure_no_grammar_downstream()?;
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
-            self.send_hidden_downstream(out, s3, position)?;
-            let token = self.recv_token_from_downstream(prefill)?;
+            let token = self.exchange_downstream(out, s3, position, last_row_position, prefill)?;
             Ok((token, ts.elapsed()))
         }
-    }
-
-    /// A grammar task never reaches the stage wire: the tail would pick its
-    /// token unmasked. Submit refuses those tasks on multi-stage pipelines;
-    /// this keeps that true if a path ever slips past it.
-    fn ensure_no_grammar_downstream(&self) -> EngineResult<()> {
-        if self.active.as_ref().is_some_and(|a| a.grammar.is_some()) {
-            return Err(refuse_multi_stage_grammar());
-        }
-        Ok(())
     }
 
     /// Decode the delta text for `next_token`, append it to the active task,
@@ -3866,15 +4652,15 @@ impl OvRuntimeEngine {
     /// the transport error outermost (it is what decides whether the relay loop
     /// exits) while carrying the root cause in its text — a dead upstream is
     /// exactly when the NACK cannot be delivered either.
-    fn answer_upstream(&mut self, step: EngineResult<i32>) -> EngineResult<()> {
-        let token = match &step {
-            Ok(t) => *t,
-            Err(e) => {
-                warn!(error = %e, "relay step failed; NACKing the upstream");
-                NACK_TOKEN
-            }
-        };
-        match self.send_token_to_upstream(token) {
+    ///
+    /// `acked`: the step was masked and this stage vouches for the chain below
+    /// it (see [`masked_relay_answer`]), so the reply carries the
+    /// acknowledgement.
+    fn answer_upstream(&mut self, step: EngineResult<i32>, acked: bool) -> EngineResult<()> {
+        if let Err(e) = &step {
+            warn!(error = %e, acked, "relay step failed; NACKing the upstream");
+        }
+        match self.send_token_to_upstream(&step, acked) {
             Ok(()) => step.map(|_| ()),
             Err(send_err) => Err(nack_send_error(send_err, step.as_ref().err())),
         }
@@ -3901,9 +4687,11 @@ impl OvRuntimeEngine {
         // at all, or lost frame alignment, in which case the socket is gone and
         // there is nothing to answer on. After it, `inbound_seq` is set and
         // every failure must answer.
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
-        let step = self.relay_last_body(hidden, shape, pos_opt);
-        self.answer_upstream(step)
+        let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
+        let step = self.relay_last_body(hidden, shape, pos_opt, mask.as_deref());
+        // A masked step is always acknowledged by the tail: the mask was
+        // applied, or the step failed here.
+        self.answer_upstream(step, mask.is_some())
     }
 
     /// Everything `step_last` does between consuming the activation group and
@@ -3914,6 +4702,7 @@ impl OvRuntimeEngine {
         hidden: Vec<f32>,
         shape: [usize; 3],
         pos_opt: Option<i64>,
+        mask: Option<&[u32]>,
     ) -> EngineResult<i32> {
         // A seq=1 static frame means this task's prefill chunks are done —
         // with --park-prefill, release the prefill model's weights now.
@@ -3937,7 +4726,7 @@ impl OvRuntimeEngine {
                 r
             }
         };
-        argmax_logits(&out, &out_shape)
+        tail_pick(&out, &out_shape, mask)
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
@@ -3945,9 +4734,9 @@ impl OvRuntimeEngine {
             return self.step_relay_packed();
         }
         // See `step_last`: nothing is owed until the group is consumed.
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
-        let step = self.relay_middle_body(hidden, shape, pos_opt);
-        let answered = self.answer_upstream(step);
+        let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
+        let (step, vouch) = self.relay_middle_body(hidden, shape, pos_opt, mask.as_deref());
+        let answered = self.answer_upstream(step, mask.is_some() && vouch);
         self.escalate_if_downstream_is_gone(answered)
     }
 
@@ -4001,12 +4790,42 @@ impl OvRuntimeEngine {
     /// failure (its NACK included) propagates as an Err and this stage NACKs its
     /// own upstream in turn. That is what carries an abort all the way to the
     /// head however deep the pipeline is.
+    ///
+    /// A masked step's mask is forwarded with the activation. The second value
+    /// says whether this stage may acknowledge the step to its upstream: not
+    /// when the downstream's reply was unacknowledged or never came.
     fn relay_middle_body(
         &mut self,
         hidden: Vec<f32>,
         shape: [usize; 3],
         pos_opt: Option<i64>,
-    ) -> EngineResult<i32> {
+        mask: Option<&[u32]>,
+    ) -> (EngineResult<i32>, bool) {
+        let forwarded = self.relay_middle_forward(hidden, shape, pos_opt).and_then(
+            |(out, s3, fwd_pos, prefill_reply)| {
+                self.send_hidden_downstream(&out, s3, fwd_pos, mask)
+                    .map(|()| prefill_reply)
+            },
+        );
+        let prefill_reply = match forwarded {
+            Ok(p) => p,
+            Err(e) => return (Err(e), true),
+        };
+        if mask.is_none() {
+            return (self.recv_token_from_downstream(prefill_reply), true);
+        }
+        masked_relay_answer(self.wait_masked_token(prefill_reply))
+    }
+
+    /// A middle stage's own part of a step: run its layers on the upstream's
+    /// hidden rows. Returns the rows to forward, their shape, the position to
+    /// stamp, and whether the downstream's reply gets the prefill budget.
+    fn relay_middle_forward(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos_opt: Option<i64>,
+    ) -> EngineResult<(Vec<f32>, [usize; 3], i64, bool)> {
         // Multi-token hidden = prefill work downstream: a stateful
         // whole-prompt frame, or (static path) a prefill CHUNK — either way
         // the token reply waits on multi-token compute across every remaining
@@ -4034,9 +4853,7 @@ impl OvRuntimeEngine {
                 (o, s, 0)
             }
         };
-        let s3 = to_shape3(&out_shape);
-        self.send_hidden_downstream(&out, s3, fwd_pos)?;
-        self.recv_token_from_downstream(prefill_reply)
+        Ok((out, to_shape3(&out_shape), fwd_pos, prefill_reply))
     }
 }
 
@@ -4178,7 +4995,14 @@ impl Engine for OvRuntimeEngine {
                 }
             }
         }
-        let grammar = compile_task_grammar(&self.grammar_factory, &task, !self.spec.is_last_stage)?;
+        // A later stage that can't mask latched this pipeline: structured-output
+        // tasks fail at once (5xx) instead of each stalling a token deadline.
+        if task.grammar.is_some() && !self.spec.is_last_stage {
+            if let Some(refused) = self.mask_link.refusal(std::time::Instant::now()) {
+                return Err(refused);
+            }
+        }
+        let grammar = structured::compile_task_grammar(&self.grammar_factory, &task)?;
         structured::log_grammar_warnings("ov-runtime", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
@@ -4646,14 +5470,11 @@ impl OvRuntimeEngine {
             // meeting CAPTURE_V2) never ACKs, and an unbounded wait wedges the head while it holds
             // the downstream lock. Timing out degrades exactly as a failed capture already does —
             // the caller warns and the turn simply isn't cached.
-            match tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await {
-                Ok(Ok((ack, _))) => Ok(ack),
-                Ok(Err(e)) => Err(EngineError::Backend(e.to_string())),
-                Err(_) => Err(EngineError::Backend(
-                    "ov-runtime: CAPTURE ack timed out; turn not cached".into(),
-                )),
-            }
+            Ok::<_, EngineError>(
+                recv_control_ack(&mut g, RESTORE_ACK_TIMEOUT, "CAPTURE (turn not cached)").await,
+            )
         })?;
+        let ack = self.control_ack_seen(ack)?;
         if ack.dtype == WireDType::I8 && ack.data.first() == Some(&OPCODE_CAPTURE_ACK) {
             Ok(())
         } else {
@@ -4720,14 +5541,11 @@ impl OvRuntimeEngine {
             g.send(&t)
                 .await
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
-            match tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await {
-                Ok(Ok((ack, _))) => Ok(ack),
-                Ok(Err(e)) => Err(EngineError::Backend(e.to_string())),
-                Err(_) => Err(EngineError::Backend(
-                    "ov-runtime: RESTORE ack timed out; cold reprefill".into(),
-                )),
-            }
+            Ok::<_, EngineError>(
+                recv_control_ack(&mut g, RESTORE_ACK_TIMEOUT, "RESTORE (cold reprefill)").await,
+            )
         })?;
+        let ack = self.control_ack_seen(ack)?;
         if ack.dtype == WireDType::I8 && ack.data.first() == Some(&OPCODE_RESTORE_ACK) {
             Ok(ack.data.get(1) == Some(&1))
         } else {
@@ -4742,14 +5560,31 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
         let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_ABORT]);
-        self.block_on(async move {
-            let mut g = downstream.lock().await;
-            g.send(&t).await?;
-            // Best-effort ack, bounded: a silent downstream must not wedge the abort path.
-            let _ = tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await;
-            Ok::<_, cascadia_transport::TransportError>(())
-        })
-        .map_err(|e| EngineError::Backend(e.to_string()))
+        let ack = self
+            .block_on(async move {
+                let mut g = downstream.lock().await;
+                g.send(&t).await?;
+                // Best-effort ack, bounded: a silent downstream must not wedge the abort path.
+                Ok::<_, cascadia_transport::TransportError>(
+                    recv_control_ack(&mut g, RESTORE_ACK_TIMEOUT, "ABORT").await,
+                )
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let _ = self.control_ack_seen(ack);
+        Ok(())
+    }
+
+    /// A control ack read by [`recv_control_ack`]: an acknowledged late token
+    /// reply skipped on the way proves the chain masks (clears the latch).
+    fn control_ack_seen(
+        &mut self,
+        read: (EngineResult<WireTensor>, bool),
+    ) -> EngineResult<WireTensor> {
+        let (ack, stale_ack) = read;
+        if stale_ack {
+            self.mask_link.on_acked();
+        }
+        ack
     }
 
     /// Handle an inbound I8 control tensor on a worker (called transparently inside the recv loop).
@@ -5761,6 +6596,7 @@ impl Builder for OvRuntimeBuilder {
             awaiting_token_seq: 0,
             inbound_seq: None,
             consecutive_token_timeouts: 0,
+            mask_link: MaskLink::default(),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
@@ -7100,7 +7936,7 @@ mod tests {
 
         let stamped = 7u32;
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![1, 2, 3, 4]);
-        send_hidden_frames(&downstream, stamped, None, hid.clone())
+        send_hidden_frames(&downstream, stamped, None, None, hid.clone())
             .await
             .unwrap();
 
@@ -7148,7 +7984,7 @@ mod tests {
 
         // The very next activation must be unaffected.
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![4, 3, 2, 1]);
-        send_hidden_frames(&downstream, 9, None, hid.clone())
+        send_hidden_frames(&downstream, 9, None, None, hid.clone())
             .await
             .unwrap();
         let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
@@ -7169,7 +8005,7 @@ mod tests {
         let upstream = Arc::new(tokio::sync::Mutex::new(server));
 
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![9, 8, 7, 6]);
-        send_hidden_frames(&downstream, 3, Some(11), hid.clone())
+        send_hidden_frames(&downstream, 3, Some(11), None, hid.clone())
             .await
             .unwrap();
 
@@ -7459,35 +8295,16 @@ mod tests {
     }
 
     #[test]
-    fn multi_stage_pipelines_refuse_grammar_tasks() {
-        let gf: Result<GrammarFactory, String> = Ok(test_factory());
-        let json = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
-        match compile_task_grammar(&gf, &json, true) {
-            Err(EngineError::InvalidConfig(m)) => assert_eq!(
-                m,
-                "structured output (response_format) is not supported on multi-stage \
-                 ov-runtime pipelines yet"
-            ),
-            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
-            Ok(_) => panic!("expected InvalidConfig, got Ok"),
-        }
-        assert!(compile_task_grammar(&gf, &json, false).unwrap().is_some());
-        let plain = GenerationTask::new("t", "p");
-        assert!(compile_task_grammar(&gf, &plain, true).unwrap().is_none());
-        assert!(compile_task_grammar(&gf, &plain, false).unwrap().is_none());
-    }
-
-    #[test]
     fn grammar_compile_errors_are_invalid_config() {
         let gf: Result<GrammarFactory, String> = Ok(test_factory());
         let bad = GenerationTask::new("t", "p").with_grammar(json_spec(r#"{"type":42}"#));
         assert!(matches!(
-            compile_task_grammar(&gf, &bad, false),
+            structured::compile_task_grammar(&gf, &bad),
             Err(EngineError::InvalidConfig(_))
         ));
         let none: Result<GrammarFactory, String> = Err("no tokenizer".into());
         let json = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
-        match compile_task_grammar(&none, &json, false) {
+        match structured::compile_task_grammar(&none, &json) {
             Err(EngineError::InvalidConfig(m)) => assert_eq!(
                 m,
                 "structured output is not available for this model: no tokenizer"
@@ -7495,6 +8312,794 @@ mod tests {
             Err(other) => panic!("expected InvalidConfig, got {other:?}"),
             Ok(_) => panic!("expected InvalidConfig, got Ok"),
         }
+    }
+
+    // ---- structured output on the stage wire ----
+
+    /// The mask a grammar task at the start of `OK_ENUM` sends: only `"`.
+    /// The real decode-step token budget at the current timeout setting.
+    fn decode_budget() -> std::time::Duration {
+        token_recv_deadline(cascadia_transport::recv_timeout(), false)
+    }
+
+    fn ok_enum_words() -> Vec<u32> {
+        grammar_mask_words(&mut test_mask(OK_ENUM, ""), test_factory().mask_width()).unwrap()
+    }
+
+    fn f16_hidden(tag: u8) -> WireTensor {
+        WireTensor::new(WireDType::F16, [1, 1, 2], vec![tag, 0, tag, 0])
+    }
+
+    /// Requests without a grammar keep today's frames, byte for byte: the
+    /// lead on both paths, the token reply, its NACK, and what
+    /// `send_hidden_frames` puts on the wire.
+    #[tokio::test]
+    async fn plain_frames_are_byte_identical_to_the_base_encoding() {
+        let i64s = |v: &[i64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        assert_eq!(
+            encode_wire_lead(5, None),
+            WireTensor::new(WireDType::I64, [1, 1, 1], i64s(&[5]))
+        );
+        assert_eq!(
+            encode_wire_lead(5, Some(258)),
+            WireTensor::new(WireDType::I64, [1, 1, 2], i64s(&[5, 258]))
+        );
+        assert_eq!(
+            relay_reply_frame(&Ok(42), 9, false),
+            WireTensor::new(WireDType::I32, [1, 1, 2], vec![42, 0, 0, 0, 9, 0, 0, 0])
+        );
+        assert_eq!(
+            relay_reply_frame(&Err(EngineError::Backend("x".into())), 9, false),
+            WireTensor::new(
+                WireDType::I32,
+                [1, 1, 2],
+                vec![0xff, 0xff, 0xff, 0xff, 9, 0, 0, 0]
+            )
+        );
+        assert_eq!(
+            encode_token_reply(42, 9, false),
+            encode_token_with_seq(42, 9)
+        );
+
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        send_hidden_frames(&downstream, 5, None, None, f16_hidden(1))
+            .await
+            .unwrap();
+        send_hidden_frames(&downstream, 6, Some(258), None, f16_hidden(2))
+            .await
+            .unwrap();
+        let (lead, hid) = recv_hidden_frames(&upstream, false).await.unwrap();
+        assert_eq!(lead, WireTensor::new(WireDType::I64, [1, 1, 1], i64s(&[5])));
+        assert_eq!(hid.unwrap(), f16_hidden(1));
+        let (lead, hid) = recv_hidden_frames(&upstream, true).await.unwrap();
+        assert_eq!(
+            lead,
+            WireTensor::new(WireDType::I64, [1, 1, 2], i64s(&[6, 258]))
+        );
+        assert_eq!(hid.unwrap(), f16_hidden(2));
+    }
+
+    #[test]
+    fn a_grammar_mask_packs_into_words_and_lanes() {
+        let width = test_factory().mask_width();
+        let words = ok_enum_words();
+        assert_eq!(words.len(), width.div_ceil(32));
+        let quote = b'"' as usize;
+        for (w, &word) in words.iter().enumerate() {
+            let want = if w == quote / 32 {
+                1u32 << (quote % 32)
+            } else {
+                0
+            };
+            assert_eq!(word, want, "word {w}");
+        }
+        // Two words per lane, low word first; an odd count pads the last lane.
+        let mut lanes = Vec::new();
+        push_mask_lanes(&mut lanes, &[1, 2, 3]);
+        assert_eq!(lanes.len(), 16);
+        assert_eq!(&lanes[..8], &(1u64 | 2 << 32).to_le_bytes());
+        assert_eq!(&lanes[8..], &3u64.to_le_bytes());
+        assert_eq!(read_mask_words(&lanes, 3), vec![1, 2, 3]);
+        // A dead end never becomes a mask that allows nothing.
+        let mut done = test_mask(OK_ENUM, "\"ok\"");
+        assert!(grammar_mask_words(&mut done, 256).is_err());
+    }
+
+    /// A masked step round-trips its mask through the lead, and the tail
+    /// picks under it; the same logits without the mask pick the raw argmax.
+    #[tokio::test]
+    async fn a_masked_step_round_trips_the_mask_and_the_tail_masks() {
+        let words = ok_enum_words();
+        let lead = encode_wire_lead_masked(7, None, &words);
+        assert_eq!(lead.dtype, WireDType::I64);
+        assert_eq!(lead.shape, [1, 1, 2 + words.len().div_ceil(2) as u32]);
+        assert_eq!(&lead.data[..8], &7i64.to_le_bytes(), "seq stays lane 0");
+        assert_eq!(
+            &lead.data[8..16],
+            &mask_count_lane(1, words.len()).to_le_bytes()
+        );
+        assert_eq!(&lead.data[8..12], &(words.len() as u32).to_le_bytes());
+
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        send_hidden_frames(&downstream, 7, None, Some(&words), f16_hidden(3))
+            .await
+            .unwrap();
+        let (lead, hid) = recv_hidden_frames(&upstream, false).await.unwrap();
+        assert_eq!(
+            hid.unwrap(),
+            f16_hidden(3),
+            "the hidden still follows the lead"
+        );
+        let (seq, pos, mask) = decode_wire_lead_any(&lead, false).unwrap();
+        assert_eq!((seq, pos), (7, None));
+        assert_eq!(mask.as_deref(), Some(words.as_slice()));
+
+        let w = test_factory().mask_width();
+        let (out, shape) = rows(&[bad_then(w, b'x'), bad_then(w, b'"')]);
+        assert_eq!(tail_pick(&out, &shape, None).unwrap(), BAD as i32);
+        let token = tail_pick(&out, &shape, mask.as_deref()).unwrap();
+        assert_eq!(token, b'"' as i32);
+
+        // The tail acknowledges; the head takes the token and the link is good.
+        upstream
+            .lock()
+            .await
+            .send(&relay_reply_frame(&Ok(token), seq, true))
+            .await
+            .unwrap();
+        let mut link = MaskLink::default();
+        let reply = recv_token_reply(&downstream, 7, decode_budget(), true, &mut false).await;
+        assert_eq!(
+            link.verdict(std::time::Instant::now(), reply).unwrap(),
+            token
+        );
+        assert!(link.acked);
+    }
+
+    #[test]
+    fn the_acknowledged_reply_keeps_token_and_seq_lanes() {
+        let t = encode_token_reply(42, 9, true);
+        assert_eq!(t.dtype, WireDType::I32);
+        assert_eq!(t.shape, [1, 1, 3]);
+        assert_eq!(&t.data[..8], &encode_token_with_seq(42, 9).data[..]);
+        assert_eq!(&t.data[8..], &MASK_ACK.to_le_bytes());
+        assert_eq!(decode_token_reply(&t).unwrap(), (42, 9, true));
+        assert_eq!(
+            decode_token_reply(&encode_token_with_seq(42, 9)).unwrap(),
+            (42, 9, false)
+        );
+        let mut forged = t.clone();
+        forged.data[8..].copy_from_slice(&7i32.to_le_bytes());
+        assert!(decode_token_reply(&forged).is_err());
+        // The tail's failed masked step is an acknowledged NACK.
+        let nack = relay_reply_frame(&Err(EngineError::Backend("dead end".into())), 9, true);
+        assert_eq!(decode_token_reply(&nack).unwrap(), (NACK_TOKEN, 9, true));
+        // A masked tail with nothing allowed fails instead of picking.
+        let (out, shape) = rows(&[peaks(256, &[(BAD as u32, 1.0)])]);
+        assert!(tail_pick(&out, &shape, Some(&[0u32; 8])).is_err());
+    }
+
+    /// A masked step answered by a plain NACK, a plain token, or nothing at
+    /// all fails the task with the upgrade message and latches the link; the
+    /// next structured-output task is refused at once, until the re-probe.
+    #[tokio::test]
+    // The timeout knob is process-global: hold its lock for the whole wait.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_masked_step_without_acknowledgement_latches_the_upgrade_error() {
+        let replies = [
+            encode_token_with_seq(NACK_TOKEN, 5),
+            encode_token_with_seq(42, 5),
+        ];
+        for reply in replies {
+            let (client, mut server) = loopback().await;
+            server.send(&reply).await.unwrap();
+            let downstream = Arc::new(tokio::sync::Mutex::new(client));
+            let got = recv_token_reply(&downstream, 5, decode_budget(), true, &mut false).await;
+            assert!(matches!(got, Err(TokenWaitFailure::NoAck(_))), "{got:?}");
+            let now = std::time::Instant::now();
+            let mut link = MaskLink {
+                acked: true,
+                latched_at: None,
+            };
+            let err = link.verdict(now, got).unwrap_err();
+            assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+            assert!(
+                err.to_string().contains("acknowledgement"),
+                "cause named: {err}"
+            );
+            assert!(!err.is_connection_fatal(), "{err}");
+            assert!(!link.acked, "warm resume closes again");
+            match link.refusal(now) {
+                Some(EngineError::Backend(m)) => assert_eq!(m, MASK_UPGRADE_ERROR),
+                other => panic!("expected the latched refusal, got {other:?}"),
+            }
+            assert!(link.refusal(now + MASK_REPROBE_AFTER).is_none(), "re-probe");
+        }
+
+        // Silence: the bounded wait times out, which latches the same way.
+        let (client, _server) = loopback().await;
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(1);
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let got = recv_token_reply(&downstream, 5, decode_budget(), true, &mut false).await;
+        cascadia_transport::set_activation_timeout_secs(0);
+        assert!(matches!(got, Err(TokenWaitFailure::TimedOut(_))), "{got:?}");
+        let mut link = MaskLink::default();
+        let err = link.verdict(std::time::Instant::now(), got).unwrap_err();
+        assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+        assert!(link.refusal(std::time::Instant::now()).is_some());
+    }
+
+    /// An acknowledged NACK is a stage failure on a chain that masks: the task
+    /// fails as a lost batch, the link is not latched.
+    #[tokio::test]
+    async fn an_acknowledged_nack_fails_the_task_without_latching() {
+        let (client, mut server) = loopback().await;
+        server
+            .send(&encode_token_reply(NACK_TOKEN, 5, true))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let got = recv_token_reply(&downstream, 5, decode_budget(), true, &mut false).await;
+        assert!(
+            matches!(got, Err(TokenWaitFailure::AckedNack(_))),
+            "{got:?}"
+        );
+        let mut link = MaskLink::default();
+        let now = std::time::Instant::now();
+        let err = link.verdict(now, got).unwrap_err();
+        assert!(matches!(err, EngineError::BatchAborted(_)), "{err:?}");
+        assert!(link.refusal(now).is_none());
+        assert!(link.acked);
+
+        // An acknowledgement on an unmasked step is a desync, not a token.
+        let (client, mut server) = loopback().await;
+        server.send(&encode_token_reply(3, 6, true)).await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let got = recv_token_reply(&downstream, 6, decode_budget(), false, &mut false).await;
+        assert!(matches!(got, Err(TokenWaitFailure::Other(_))), "{got:?}");
+    }
+
+    /// What a stage predating the mask does with one: read the lead and the
+    /// hidden, reject the lead (today's decoder), and stay aligned so the next
+    /// plain activation decodes. It never answers the masked step.
+    #[tokio::test]
+    async fn an_old_stage_rejects_a_masked_lead_after_reading_both_frames() {
+        let words = ok_enum_words();
+        for want_pos in [false, true] {
+            let pos = want_pos.then_some(4);
+            let (client, server) = loopback().await;
+            let downstream = Arc::new(tokio::sync::Mutex::new(client));
+            let upstream = Arc::new(tokio::sync::Mutex::new(server));
+            send_hidden_frames(&downstream, 1, pos, Some(&words), f16_hidden(1))
+                .await
+                .unwrap();
+            send_hidden_frames(&downstream, 2, pos, None, f16_hidden(2))
+                .await
+                .unwrap();
+            let (lead, hid) = recv_hidden_frames(&upstream, want_pos).await.unwrap();
+            assert!(hid.is_some(), "both frames of the masked step are consumed");
+            assert!(decode_wire_lead(&lead, want_pos).is_err());
+            let (lead, hid) = recv_hidden_frames(&upstream, want_pos).await.unwrap();
+            assert_eq!(decode_wire_lead(&lead, want_pos).unwrap(), (2, pos));
+            assert_eq!(hid.unwrap(), f16_hidden(2), "the stream stayed aligned");
+        }
+    }
+
+    /// Head → middle → tail on loopback. The middle relays the mask and passes
+    /// the tail's acknowledged token up acknowledged; when the tail can't
+    /// mask (it reads both frames and goes silent), the middle's wait times
+    /// out and it answers with a plain NACK, which latches the head.
+    #[tokio::test]
+    // The timeout knob is process-global: hold its lock for the whole wait.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_middle_relays_the_mask_and_the_acknowledgement() {
+        let words = ok_enum_words();
+        let w = test_factory().mask_width();
+        let (head_c, mid_s) = loopback().await;
+        let (mid_c, tail_s) = loopback().await;
+        let head_down = Arc::new(tokio::sync::Mutex::new(head_c));
+        let mid_up = Arc::new(tokio::sync::Mutex::new(mid_s));
+        let mid_down = Arc::new(tokio::sync::Mutex::new(mid_c));
+        let tail_up = Arc::new(tokio::sync::Mutex::new(tail_s));
+
+        // The middle's step: relay, wait, answer.
+        async fn middle(
+            mid_up: &Arc<tokio::sync::Mutex<ActivationServer>>,
+            mid_down: &Arc<tokio::sync::Mutex<ActivationClient>>,
+            seq_down: u32,
+            budget: std::time::Duration,
+        ) -> u32 {
+            let (lead, hid) = recv_hidden_frames(mid_up, false).await.unwrap();
+            let (seq_up, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
+            send_hidden_frames(mid_down, seq_down, None, mask.as_deref(), hid.unwrap())
+                .await
+                .unwrap();
+            let reply =
+                recv_token_reply(mid_down, seq_down, budget, mask.is_some(), &mut false).await;
+            let (step, vouch) = masked_relay_answer(reply);
+            let frame = relay_reply_frame(&step, seq_up, mask.is_some() && vouch);
+            mid_up.lock().await.send(&frame).await.unwrap();
+            seq_up
+        }
+
+        // 1. A tail that masks.
+        send_hidden_frames(&head_down, 1, None, Some(&words), f16_hidden(1))
+            .await
+            .unwrap();
+        let tail = {
+            let tail_up = tail_up.clone();
+            tokio::spawn(async move {
+                let (lead, _) = recv_hidden_frames(&tail_up, false).await.unwrap();
+                let (seq, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
+                assert!(mask.is_some(), "the middle forwarded the mask");
+                let (out, shape) = rows(&[bad_then(w, b'"')]);
+                let step = tail_pick(&out, &shape, mask.as_deref());
+                let frame = relay_reply_frame(&step, seq, true);
+                tail_up.lock().await.send(&frame).await.unwrap();
+            })
+        };
+        middle(&mid_up, &mid_down, 11, decode_budget()).await;
+        tail.await.unwrap();
+        let mut link = MaskLink::default();
+        let reply = recv_token_reply(&head_down, 1, decode_budget(), true, &mut false).await;
+        assert_eq!(
+            link.verdict(std::time::Instant::now(), reply).unwrap(),
+            b'"' as i32
+        );
+
+        // 2. A tail that can't mask: it reads the step, rejects the lead, and
+        // never answers.
+        send_hidden_frames(&head_down, 2, None, Some(&words), f16_hidden(2))
+            .await
+            .unwrap();
+        let old_tail = {
+            let tail_up = tail_up.clone();
+            tokio::spawn(async move {
+                let (lead, hid) = recv_hidden_frames(&tail_up, false).await.unwrap();
+                assert!(hid.is_some());
+                assert!(decode_wire_lead(&lead, false).is_err());
+            })
+        };
+        // The real budgets, run concurrently: the head waits its full token
+        // budget; the middle (layers 8..16 of 32, so 16 layers below it)
+        // waits its share, times out first, and its plain NACK reaches the
+        // head inside the head's own deadline.
+        let reply = {
+            let _knob = crate::timeout_knob_lock();
+            cascadia_transport::set_activation_timeout_secs(2);
+            let head_budget = decode_budget();
+            let mid_budget = masked_relay_budget(head_budget, 16, 32);
+            assert!(mid_budget < head_budget);
+            let mut no_stale = false;
+            let (_, reply) = tokio::join!(
+                middle(&mid_up, &mid_down, 12, mid_budget),
+                recv_token_reply(&head_down, 2, head_budget, true, &mut no_stale)
+            );
+            cascadia_transport::set_activation_timeout_secs(0);
+            reply
+        };
+        old_tail.await.unwrap();
+        assert!(
+            matches!(reply, Err(TokenWaitFailure::NoAck(_))),
+            "{reply:?}"
+        );
+        let err = link.verdict(std::time::Instant::now(), reply).unwrap_err();
+        assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+    }
+
+    /// A masked step's late reply still in the socket when the head sends a
+    /// kv-coord control frame (RESTORE here) is skipped by the control-ack
+    /// read — never taken as the ack — and the plain step after it gets its
+    /// own token, not the previous step's. The skipped acknowledged reply
+    /// proves the tail masks.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_late_masked_reply_before_a_restore_does_not_shift_the_link() {
+        const RESTORE: u8 = 3;
+        const RESTORE_ACK: u8 = 4;
+        let words = ok_enum_words();
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let mut link = MaskLink::default();
+
+        // Masked step 1 times out at the head...
+        send_hidden_frames(&downstream, 1, None, Some(&words), f16_hidden(1))
+            .await
+            .unwrap();
+        let got = {
+            let _knob = crate::timeout_knob_lock();
+            cascadia_transport::set_activation_timeout_secs(1);
+            let got = recv_token_reply(&downstream, 1, decode_budget(), true, &mut false).await;
+            cascadia_transport::set_activation_timeout_secs(0);
+            got
+        };
+        assert!(link.verdict(std::time::Instant::now(), got).is_err());
+        // ...and the slow tail answers it late.
+        let (lead, _) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (seq, _, _) = decode_wire_lead_any(&lead, false).unwrap();
+        upstream
+            .lock()
+            .await
+            .send(&relay_reply_frame(&Ok(b'"' as i32), seq, true))
+            .await
+            .unwrap();
+
+        // The next request warm-resumes: RESTORE, then its ack.
+        let restore = WireTensor::new(WireDType::I8, [1, 1, 9], {
+            let mut d = vec![RESTORE];
+            d.extend_from_slice(&7u64.to_le_bytes());
+            d
+        });
+        downstream.lock().await.send(&restore).await.unwrap();
+        let (ctrl, _) = upstream.lock().await.recv().await.unwrap();
+        assert_eq!(ctrl, restore);
+        upstream
+            .lock()
+            .await
+            .send(&WireTensor::new(
+                WireDType::I8,
+                [1, 1, 2],
+                vec![RESTORE_ACK, 1],
+            ))
+            .await
+            .unwrap();
+        let (ack, stale_ack) = {
+            let mut g = downstream.lock().await;
+            recv_control_ack(&mut g, Duration::from_secs(5), "RESTORE").await
+        };
+        let ack = ack.unwrap();
+        assert_eq!(
+            ack.data,
+            vec![RESTORE_ACK, 1],
+            "the ack, not the late token"
+        );
+        assert!(stale_ack, "the skipped late reply was acknowledged");
+        link.on_acked();
+        assert!(link.refusal(std::time::Instant::now()).is_none());
+
+        // The plain step after it gets its own token.
+        send_hidden_frames(&downstream, 2, None, None, f16_hidden(2))
+            .await
+            .unwrap();
+        let (lead, _) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (seq, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
+        assert!(mask.is_none());
+        upstream
+            .lock()
+            .await
+            .send(&relay_reply_frame(&Ok(42), seq, false))
+            .await
+            .unwrap();
+        let tok = recv_token_reply(&downstream, 2, decode_budget(), false, &mut false)
+            .await
+            .unwrap();
+        assert_eq!(tok, 42);
+
+        // A silent downstream still times the control read out.
+        let (ack, _) = {
+            let mut g = downstream.lock().await;
+            recv_control_ack(&mut g, Duration::from_millis(200), "ABORT").await
+        };
+        assert!(ack.unwrap_err().to_string().contains("ABORT ack timed out"));
+    }
+
+    /// Each stage down the chain waits strictly less on a masked step than
+    /// the one above it, at the real default and prefill budgets.
+    #[test]
+    fn a_middle_waits_less_than_its_upstream_on_a_masked_step() {
+        use std::time::Duration;
+        for base in [Duration::from_secs(60), Duration::from_secs(120)] {
+            for prefill in [false, true] {
+                let head = token_recv_deadline(base, prefill);
+                // Four stages over 32 layers: head 0..8, middles 8..16 and 16..24.
+                let m1 = masked_relay_budget(head, 16, 32);
+                let m2 = masked_relay_budget(head, 24, 32);
+                assert!(m1 < head && m2 < m1, "{head:?} {m1:?} {m2:?}");
+                // A margin of seconds, not microseconds, at every hop.
+                assert!(head - m1 >= Duration::from_secs(10), "{head:?} {m1:?}");
+                assert!(m1 - m2 >= Duration::from_secs(5), "{m1:?} {m2:?}");
+            }
+        }
+        // No layer geometry: still strictly less.
+        let b = Duration::from_secs(60);
+        assert_eq!(masked_relay_budget(b, 0, 0), b / 2);
+    }
+
+    /// A masked step that times out keeps the socket: a later plain request
+    /// is served on it, the tail's late acknowledged reply is discarded by
+    /// seq, and that discard proves the tail masks (it clears the latch).
+    #[tokio::test]
+    // The timeout knob is process-global: hold its lock for the whole wait.
+    #[allow(clippy::await_holding_lock)]
+    async fn the_socket_survives_a_masked_step_timeout() {
+        let words = ok_enum_words();
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let mut link = MaskLink::default();
+
+        send_hidden_frames(&downstream, 1, None, Some(&words), f16_hidden(1))
+            .await
+            .unwrap();
+        let got = {
+            let _knob = crate::timeout_knob_lock();
+            cascadia_transport::set_activation_timeout_secs(1);
+            let got = recv_token_reply(&downstream, 1, decode_budget(), true, &mut false).await;
+            cascadia_transport::set_activation_timeout_secs(0);
+            got
+        };
+        assert!(matches!(got, Err(TokenWaitFailure::TimedOut(_))), "{got:?}");
+        assert!(link.verdict(std::time::Instant::now(), got).is_err());
+        assert!(link.refusal(std::time::Instant::now()).is_some());
+
+        // The slow tail answers the masked step late, then the next request.
+        let (lead, _) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (seq, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
+        assert!(mask.is_some());
+        upstream
+            .lock()
+            .await
+            .send(&relay_reply_frame(&Ok(b'"' as i32), seq, true))
+            .await
+            .unwrap();
+        send_hidden_frames(&downstream, 2, None, None, f16_hidden(2))
+            .await
+            .unwrap();
+        let (lead, _) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (seq, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
+        assert!(mask.is_none());
+        upstream
+            .lock()
+            .await
+            .send(&relay_reply_frame(&Ok(42), seq, false))
+            .await
+            .unwrap();
+        let mut stale_ack = false;
+        let tok = recv_token_reply(&downstream, 2, decode_budget(), false, &mut stale_ack)
+            .await
+            .unwrap();
+        assert_eq!(tok, 42, "the plain request is served on the same socket");
+        assert!(
+            stale_ack,
+            "the late acknowledged reply was discarded as stale"
+        );
+        link.on_acked();
+        assert!(link.refusal(std::time::Instant::now()).is_none());
+    }
+
+    /// Warm resume (RESTORE) needs a link that has acknowledged a masked step
+    /// when the task is a multi-stage structured-output one; once it has, the
+    /// mask rides the suffix prefill, whose last row is the last prompt row.
+    #[test]
+    fn a_structured_output_task_on_an_unacknowledged_link_takes_the_cold_path() {
+        let mut link = MaskLink::default();
+        assert!(!warm_resume_allowed(true, true, link.acked));
+        assert!(
+            warm_resume_allowed(false, true, link.acked),
+            "plain tasks unchanged"
+        );
+        assert!(
+            warm_resume_allowed(true, false, link.acked),
+            "single stage unchanged"
+        );
+        link.on_acked();
+        assert!(warm_resume_allowed(true, true, link.acked));
+        let _ = link.on_unacked(std::time::Instant::now(), &EngineError::Backend("x".into()));
+        assert!(!warm_resume_allowed(true, true, link.acked));
+        // Suffix prefill after a warm prefix of 6: rows 6..10 of a 10-token
+        // prompt; its last row picks the first token, so the step is masked.
+        assert!(row_picks_next_token(9, 10));
+        assert!(!row_picks_next_token(8, 10));
+    }
+
+    /// The static (NPU) lead keeps its position lane ahead of the mask.
+    #[tokio::test]
+    async fn a_static_lead_carries_seq_position_and_mask() {
+        let words = ok_enum_words();
+        let lead = encode_wire_lead_masked(3, Some(11), &words);
+        assert_eq!(lead.shape, [1, 1, 3 + words.len().div_ceil(2) as u32]);
+        assert_eq!(&lead.data[8..16], &11i64.to_le_bytes());
+        assert_eq!(
+            decode_wire_lead_any(&lead, true).unwrap(),
+            (3, Some(11), Some(words.clone()))
+        );
+        assert!(
+            decode_wire_lead_any(&lead, false).is_err(),
+            "stateful/static mismatch"
+        );
+        let err = decode_wire_lead_any(&encode_wire_lead(3, Some(11)), false).unwrap_err();
+        assert!(
+            err.to_string().contains("[1,1,1]"),
+            "today's diagnosis: {err}"
+        );
+        assert!(decode_wire_lead_any(&encode_wire_lead_masked(3, None, &words), true).is_err());
+        assert_eq!(
+            decode_wire_lead_any(&encode_wire_lead(3, Some(11)), true).unwrap(),
+            (3, Some(11), None)
+        );
+        let mut bad = lead.clone();
+        bad.data[16..24].copy_from_slice(&0i64.to_le_bytes());
+        assert!(
+            decode_wire_lead_any(&bad, true).is_err(),
+            "W must match the lanes"
+        );
+
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        send_hidden_frames(&downstream, 3, Some(11), Some(&words), f16_hidden(5))
+            .await
+            .unwrap();
+        let (lead, hid) = recv_hidden_frames(&upstream, true).await.unwrap();
+        assert_eq!(hid.unwrap(), f16_hidden(5));
+        assert_eq!(
+            decode_wire_lead_any(&lead, true).unwrap(),
+            (3, Some(11), Some(words))
+        );
+    }
+
+    fn plan_rows_fixture() -> Vec<Option<(usize, i64, usize)>> {
+        vec![Some((0, 5, 0)), Some((1, 3, 1)), None]
+    }
+
+    #[test]
+    fn plain_packed_frames_are_byte_identical_to_the_base_encoding() {
+        let i64s = |v: &[i64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let plan = plan_rows_fixture();
+        let base = WireTensor::new(
+            WireDType::I64,
+            [1, 3, 3],
+            i64s(&[0, 1, -1, 5, 3, 0, 0, 1, 0]),
+        );
+        assert_eq!(encode_wire_plan(&plan), base);
+        assert_eq!(encode_packed_plan(&plan, None), base);
+        assert_eq!(
+            packed_reply_frame(&Ok(vec![7, 8, 0]), false),
+            WireTensor::new(WireDType::I64, [1, 1, 3], i64s(&[7, 8, 0]))
+        );
+        assert_eq!(
+            packed_reply_frame(&Err(EngineError::Backend("x".into())), false),
+            WireTensor::new(WireDType::I64, [1, 1, 0], Vec::new())
+        );
+        assert_eq!(
+            packed_reply_outcome(&base_reply(), false).unwrap(),
+            vec![7, 8, 0]
+        );
+    }
+
+    fn base_reply() -> WireTensor {
+        encode_wire_tokens(&[7, 8, 0])
+    }
+
+    /// One masked plan carrying a grammar slot's row and a plain slot's row:
+    /// the plan plan are today's, the grammar row's mask round-trips, and the
+    /// tail masks that row only.
+    #[test]
+    fn a_masked_plan_carries_grammar_and_plain_rows() {
+        let words = ok_enum_words();
+        let plan = plan_rows_fixture();
+        let masks: PlanMasks = vec![Some(words.clone()), None, None];
+        let t = encode_packed_plan(&plan, Some(&masks));
+        let lanes = words.len().div_ceil(2);
+        assert_eq!(t.dtype, WireDType::I64);
+        assert_eq!(t.shape, [1, 3 + lanes as u32, 3]);
+        assert_eq!(&t.data[..3 * 3 * 8], &encode_wire_plan(&plan).data[..]);
+        assert!(plan_frame_is_masked(&t) && !plan_frame_is_masked(&encode_wire_plan(&plan)));
+
+        let (got_rows, got_masks) = decode_packed_plan(&t, 2).unwrap();
+        assert_eq!(got_rows, plan);
+        let got_masks = got_masks.expect("masked plan");
+        let mut padded = words.clone();
+        padded.resize(2 * lanes, 0);
+        assert_eq!(got_masks, vec![Some(padded), None, None]);
+        assert_eq!(
+            decode_packed_plan(&encode_wire_plan(&plan), 2).unwrap(),
+            (plan.clone(), None)
+        );
+
+        let w = test_factory().mask_width();
+        let (out, shape) = rows(&[bad_then(w, b'"'), bad_then(w, b'"'), bad_then(w, b'"')]);
+        let picks = pick_plan_rows(&out, &shape, &plan, Some(&got_masks)).unwrap();
+        assert_eq!(picks, vec![b'"' as i32, BAD as i32, 0]);
+        assert_eq!(
+            pick_plan_rows(&out, &shape, &plan, None).unwrap(),
+            vec![BAD as i32, BAD as i32, 0]
+        );
+
+        // The tail acknowledges; the head takes the tokens.
+        let reply = packed_reply_frame(&Ok(picks.clone()), true);
+        assert_eq!(reply.shape, [1, 2, 3]);
+        assert_eq!(packed_reply_outcome(&reply, true).unwrap(), picks);
+        let mut short = t.clone();
+        short.data.truncate(short.data.len() - 8);
+        assert!(decode_packed_plan(&short, 2).is_err());
+    }
+
+    #[test]
+    fn a_masked_packed_step_needs_an_acknowledged_reply() {
+        let plain_nack = packed_nack_frame();
+        let acked_nack = packed_acked_nack_frame();
+        assert!(
+            is_packed_nack(&acked_nack),
+            "an old reader still sees a NACK"
+        );
+        let no_ack = |r: &WireTensor| {
+            matches!(
+                packed_reply_outcome(r, true),
+                Err(TokenWaitFailure::NoAck(_))
+            )
+        };
+        assert!(no_ack(&plain_nack), "an old tail's NACK");
+        assert!(no_ack(&base_reply()), "tokens without acknowledgement");
+        assert!(matches!(
+            packed_reply_outcome(&acked_nack, true),
+            Err(TokenWaitFailure::AckedNack(EngineError::BatchAborted(_)))
+        ));
+        assert!(matches!(
+            packed_reply_outcome(&plain_nack, false),
+            Err(TokenWaitFailure::Other(EngineError::BatchAborted(_)))
+        ));
+        for acked in [acked_nack, encode_wire_tokens_acked(&[1, 2])] {
+            assert!(matches!(
+                packed_reply_outcome(&acked, false),
+                Err(TokenWaitFailure::Other(EngineError::Backend(_)))
+            ));
+        }
+        let mut forged = encode_wire_tokens_acked(&[1, 2]);
+        forged.data[16..24].copy_from_slice(&3i64.to_le_bytes());
+        assert!(matches!(
+            packed_reply_outcome(&forged, true),
+            Err(TokenWaitFailure::Other(_))
+        ));
+
+        // The head's verdict on an old tail's NACK: the batch is lost once,
+        // with the upgrade message, and the link latches.
+        let mut link = MaskLink::default();
+        let now = std::time::Instant::now();
+        let err = link
+            .verdict(now, packed_reply_outcome(&plain_nack, true))
+            .unwrap_err();
+        assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+        assert!(link.refusal(now).is_some());
+        // A packed middle passes an old tail's NACK up unacknowledged.
+        let (step, vouch) = masked_relay_answer(packed_reply_outcome(&plain_nack, true));
+        assert!(step.is_err() && !vouch);
+        assert_eq!(
+            packed_reply_frame(&step, vouch),
+            packed_nack_frame(),
+            "plain NACK upstream"
+        );
+    }
+
+    /// A stage predating masked plans reads the masked (plan, hidden) pair,
+    /// NACKs it from `decode_wire_plan` before any slot's KV is touched, and
+    /// the next plain pair on the stream decodes.
+    #[tokio::test]
+    async fn an_old_packed_stage_rejects_a_masked_plan_after_reading_both_frames() {
+        let plan = plan_rows_fixture();
+        let masks: PlanMasks = vec![Some(ok_enum_words()), None, None];
+        let (mut client, mut server) = loopback().await;
+        client
+            .send(&encode_packed_plan(&plan, Some(&masks)))
+            .await
+            .unwrap();
+        client.send(&f16_hidden(1)).await.unwrap();
+        client.send(&encode_packed_plan(&plan, None)).await.unwrap();
+        client.send(&f16_hidden(2)).await.unwrap();
+        let (pf, _) = server.recv().await.unwrap();
+        let (hf, _) = server.recv_reply().await.unwrap();
+        assert_eq!(hf, f16_hidden(1));
+        assert!(decode_wire_plan(&pf, 2).is_err());
+        let (pf, _) = server.recv().await.unwrap();
+        let (hf, _) = server.recv_reply().await.unwrap();
+        assert_eq!(decode_wire_plan(&pf, 2).unwrap(), plan);
+        assert_eq!(hf, f16_hidden(2), "the stream stayed aligned");
     }
 
     fn packed_slot(grammar: Option<GrammarMask>) -> crate::packed_exec::PackedSlot {
