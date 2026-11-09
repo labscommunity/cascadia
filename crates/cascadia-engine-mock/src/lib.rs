@@ -3,16 +3,59 @@
 //! Deterministically echoes the prompt back, one token per `step()`,
 //! capped at `max_tokens`. Useful for testing the runner, API, and CLI
 //! without real model weights.
+//!
+//! A task carrying a JSON Schema grammar is answered instead with a
+//! deterministic minimal instance of that schema (see [`minimal_instance`]),
+//! streamed in short pieces whose concatenation is the compact JSON.
+
+mod instance;
+
+pub use instance::minimal_instance;
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::stream;
 
+/// Longest piece (in chars) a JSON-schema answer is streamed in.
+const PIECE_CHARS: usize = 8;
+
+/// A queued task and how far its output has been emitted.
+struct Pending {
+    task: GenerationTask,
+    emitted: usize,
+    /// The precomputed answer for a JSON-schema task, in streaming order.
+    /// `None` echoes the prompt's words.
+    pieces: Option<Vec<String>>,
+}
+
 #[derive(Default)]
 pub struct MockEngine {
-    pending: Vec<(GenerationTask, usize)>,
+    pending: Vec<Pending>,
     fail_next_step: Option<String>,
+}
+
+/// The minimal instance of the task's JSON Schema, compact, split into
+/// pieces of at most `PIECE_CHARS` chars. `None` when the task has no grammar.
+fn schema_pieces(task: &GenerationTask) -> EngineResult<Option<Vec<String>>> {
+    let Some(grammar) = &task.grammar else {
+        return Ok(None);
+    };
+    match grammar.kind {
+        cascadia_types::GrammarKind::JsonSchema => {
+            let schema: serde_json::Value = serde_json::from_str(&grammar.body).map_err(|e| {
+                EngineError::InvalidConfig(format!("response_format json_schema: {e}"))
+            })?;
+            let text = minimal_instance(&schema).to_string();
+            let chars: Vec<char> = text.chars().collect();
+            Ok(Some(
+                chars
+                    .chunks(PIECE_CHARS)
+                    .map(|c| c.iter().collect())
+                    .collect(),
+            ))
+        }
+    }
 }
 
 impl MockEngine {
@@ -33,11 +76,11 @@ impl Engine for MockEngine {
         // Step-wise engine: drop the task from the queue so step() stops
         // emitting its words. cancel() and step() never overlap (both
         // &mut self behind the runner mutex), so this is race-free.
-        self.pending.retain(|(t, _)| &t.task_id != task_id);
+        self.pending.retain(|p| &p.task.task_id != task_id);
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
+        if self.pending.iter().any(|p| p.task.task_id == task.task_id) {
             return Ok(());
         }
         // Option B resume: the seed ids are already-emitted, so start the
@@ -53,7 +96,12 @@ impl Engine for MockEngine {
                 "mock resume seed id mismatch at {i}: got {bad}, this stream emitted {i}"
             )));
         }
-        self.pending.push((task, seed.len()));
+        let pieces = schema_pieces(&task)?;
+        self.pending.push(Pending {
+            task,
+            emitted: seed.len(),
+            pieces,
+        });
         Ok(())
     }
 
@@ -64,7 +112,11 @@ impl Engine for MockEngine {
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
-        let (task, emitted) = self.pending.remove(0);
+        let Pending {
+            task,
+            emitted,
+            pieces,
+        } = self.pending.remove(0);
         // Test sentinel: a prompt containing `__engine_error__` fails the
         // task loud (emits an error chunk) so consumers' failure paths —
         // e.g. the API's 5xx mapping — can be exercised deterministically.
@@ -75,7 +127,10 @@ impl Engine for MockEngine {
             )]);
         }
         let max = task.max_tokens.max(1) as usize;
-        let words: Vec<&str> = task.prompt.split_whitespace().collect();
+        let words: Vec<&str> = match &pieces {
+            Some(p) => p.iter().map(String::as_str).collect(),
+            None => task.prompt.split_whitespace().collect(),
+        };
         if emitted >= max || emitted >= words.len() {
             // Distinguish the stop reason like a real engine: exhausting the
             // prompt's words is a natural `stop`; hitting the token cap first
@@ -91,11 +146,20 @@ impl Engine for MockEngine {
                 Chunk::final_marker(task.task_id, "").with_finish_reason(reason),
             )]);
         }
-        let token = words[emitted].to_string();
-        let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ")
-            .with_token_ids(vec![emitted as i64]);
+        // Prompt words are echoed with a trailing space; schema pieces are
+        // emitted exactly so their concatenation is the compact JSON.
+        let text = match pieces {
+            Some(_) => words[emitted].to_string(),
+            None => words[emitted].to_string() + " ",
+        };
+        let chunk =
+            Chunk::token(&task.task_id, emitted as i64, text).with_token_ids(vec![emitted as i64]);
         let task_id = task.task_id.clone();
-        self.pending.push((task, emitted + 1));
+        self.pending.push(Pending {
+            task,
+            emitted: emitted + 1,
+            pieces,
+        });
         Ok(vec![(task_id, chunk)])
     }
 }
@@ -298,5 +362,98 @@ mod tests {
         assert!(matches!(res, Err(EngineError::Backend(ref m)) if m == "boom"));
         // Error is one-shot; the engine resumes on the next step.
         assert!(!e.step().unwrap().is_empty());
+    }
+
+    fn json_schema_task(id: &str, body: &str) -> GenerationTask {
+        GenerationTask::new(id, "ignored prompt words").with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: body.to_string(),
+        })
+    }
+
+    fn drain(e: &mut MockEngine) -> Vec<Chunk> {
+        let mut out = Vec::new();
+        for _ in 0..64 {
+            out.extend(e.step().unwrap().into_iter().map(|(_, c)| c));
+        }
+        out
+    }
+
+    const OBJECT_WITH_INT: &str =
+        r#"{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}"#;
+
+    #[test]
+    fn json_schema_task_streams_the_minimal_instance() {
+        let mut e = MockEngine::new();
+        e.submit(json_schema_task("t1", OBJECT_WITH_INT)).unwrap();
+        let chunks = drain(&mut e);
+        let (last, tokens) = chunks.split_last().unwrap();
+        let text: String = tokens.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(text, r#"{"a":0}"#);
+        assert!(last.is_final);
+        assert_eq!(last.finish_reason, Some(cascadia_types::FinishReason::Stop));
+    }
+
+    #[test]
+    fn json_schema_pieces_are_short_and_rejoin_exactly() {
+        let mut e = MockEngine::new();
+        let body = r#"{"type":"object","properties":{"name":{"type":"string","minLength":20}},"required":["name"]}"#;
+        e.submit(json_schema_task("t1", body).with_max_tokens(64))
+            .unwrap();
+        let chunks = drain(&mut e);
+        let (last, tokens) = chunks.split_last().unwrap();
+        assert!(
+            tokens.len() > 1,
+            "the instance is split into several pieces"
+        );
+        for (i, c) in tokens.iter().enumerate() {
+            assert!(c.text.chars().count() <= 8, "piece too long: {:?}", c.text);
+            assert_eq!(c.token_ids, vec![i as i64]);
+        }
+        let text: String = tokens.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(text, format!(r#"{{"name":"{}"}}"#, "a".repeat(20)));
+        assert_eq!(last.finish_reason, Some(cascadia_types::FinishReason::Stop));
+    }
+
+    #[test]
+    fn json_schema_task_respects_max_tokens() {
+        let mut e = MockEngine::new();
+        let body = r#"{"type":"object","properties":{"name":{"type":"string","minLength":20}},"required":["name"]}"#;
+        e.submit(json_schema_task("t1", body).with_max_tokens(1))
+            .unwrap();
+        let chunks = drain(&mut e);
+        assert_eq!(chunks.len(), 2, "one piece then the final marker");
+        assert!(!chunks[0].is_final);
+        assert!(chunks[1].is_final);
+        assert_eq!(
+            chunks[1].finish_reason,
+            Some(cascadia_types::FinishReason::Length)
+        );
+    }
+
+    #[test]
+    fn json_schema_task_with_invalid_body_is_rejected() {
+        let mut e = MockEngine::new();
+        let res = e.submit(json_schema_task("t1", "{not json"));
+        match res {
+            Err(EngineError::InvalidConfig(m)) => {
+                assert!(m.starts_with("response_format json_schema: "), "{m}")
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        assert!(e.step().unwrap().is_empty(), "nothing was queued");
+    }
+
+    #[test]
+    fn task_without_grammar_still_echoes_words_with_trailing_spaces() {
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "alpha bravo")).unwrap();
+        let chunks = drain(&mut e);
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["alpha ", "bravo ", ""]);
+        assert_eq!(
+            chunks[2].finish_reason,
+            Some(cascadia_types::FinishReason::Stop)
+        );
     }
 }

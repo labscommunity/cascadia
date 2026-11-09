@@ -13,6 +13,8 @@ cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+jsonschema = { version = "0.60", default-features = false }
