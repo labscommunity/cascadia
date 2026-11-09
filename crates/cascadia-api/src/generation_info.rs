@@ -9,7 +9,8 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ModelGenerationInfo {
     /// The model's context window from `config.json` (its `text_config`
-    /// first, then the root).
+    /// first, then the root), with that object's `rope_scaling` applied as
+    /// vLLM does.
     pub context_window: Option<u32>,
     /// The compiled KV size of a static-shape (NPU) `cascadia shard` export:
     /// the smallest `static_context` over the `stage_<r>/stage_config.json`
@@ -51,10 +52,11 @@ pub fn read_model_generation_info(model_dir: &Path) -> ModelGenerationInfo {
     ModelGenerationInfo {
         // `text_config` first: a multimodal config's root window belongs to
         // the wrapper, not the language model (qwen35 `read_max_ctx`, vLLM).
+        // Each takes the `rope_scaling` of the object it came from.
         context_window: first(&dirs, "config.json", |v| {
             v.get("text_config")
-                .and_then(window_of)
-                .or_else(|| window_of(v))
+                .and_then(scaled_window_of)
+                .or_else(|| scaled_window_of(v))
         }),
         static_context: static_context(model_dir),
         temperature: sampling("temperature"),
@@ -86,6 +88,47 @@ fn window_of(v: &serde_json::Value) -> Option<u32> {
             .filter(|&w| w > 0)
             .and_then(|w| u32::try_from(w).ok())
     })
+}
+
+/// [`window_of`] with `v`'s `rope_scaling` applied, by vLLM's rule: an
+/// object with a numeric `factor` whose `rope_type` (or `type`) is not one
+/// that already counts the scaling in the window (`su`, `longrope`,
+/// `llama3`, `mrope`, `default`) makes the window `factor` times its base.
+/// The base is `original_max_position_embeddings` for `yarn` when given,
+/// else the window read.
+fn scaled_window_of(v: &serde_json::Value) -> Option<u32> {
+    let window = window_of(v)?;
+    let Some(scaling) = v.get("rope_scaling").and_then(|r| r.as_object()) else {
+        return Some(window);
+    };
+    let kind = scaling
+        .get("rope_type")
+        .or_else(|| scaling.get("type"))
+        .and_then(|t| t.as_str());
+    if matches!(
+        kind,
+        Some("su" | "longrope" | "llama3" | "mrope" | "default")
+    ) {
+        return Some(window);
+    }
+    let Some(factor) = scaling
+        .get("factor")
+        .and_then(|f| f.as_f64())
+        .filter(|f| f.is_finite() && *f > 0.0)
+    else {
+        return Some(window);
+    };
+    let base = match kind {
+        Some("yarn") => scaling
+            .get("original_max_position_embeddings")
+            .and_then(|o| o.as_u64())
+            .filter(|&o| o > 0)
+            .unwrap_or(u64::from(window)),
+        _ => u64::from(window),
+    };
+    // Truncated as vLLM's `int()`; a result past `u32` saturates.
+    let scaled = (base as f64 * factor) as u64;
+    Some(u32::try_from(scaled).unwrap_or(u32::MAX).max(1))
 }
 
 /// Smallest `static_context` over `stage_*/stage_config.json` with
@@ -352,5 +395,109 @@ mod tests {
             r#"{"stateful": true}"#,
         );
         assert_eq!(read_model_generation_info(d.path()).static_context, None);
+    }
+
+    fn window_with(config: &str) -> Option<u32> {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "config.json", config);
+        read_model_generation_info(d.path()).context_window
+    }
+
+    #[test]
+    fn rope_scaling_multiplies_the_window_as_vllm_does() {
+        for (config, want) in [
+            // yarn: factor x original_max_position_embeddings.
+            (
+                r#"{"max_position_embeddings": 40960, "rope_scaling":
+                    {"rope_type": "yarn", "factor": 4.0,
+                     "original_max_position_embeddings": 32768}}"#,
+                131072,
+            ),
+            // yarn without the original: factor x the read window.
+            (
+                r#"{"max_position_embeddings": 32768, "rope_scaling":
+                    {"type": "yarn", "factor": 4.0}}"#,
+                131072,
+            ),
+            (
+                r#"{"max_position_embeddings": 4096, "rope_scaling":
+                    {"type": "linear", "factor": 2.0}}"#,
+                8192,
+            ),
+            (
+                r#"{"max_position_embeddings": 4096, "rope_scaling":
+                    {"rope_type": "dynamic", "factor": 1.5}}"#,
+                6144,
+            ),
+            // Types whose window already includes the scaling.
+            (
+                r#"{"max_position_embeddings": 131072, "rope_scaling":
+                    {"rope_type": "llama3", "factor": 8.0,
+                     "original_max_position_embeddings": 8192}}"#,
+                131072,
+            ),
+            (
+                r#"{"max_position_embeddings": 131072, "rope_scaling":
+                    {"type": "longrope", "factor": 32.0,
+                     "original_max_position_embeddings": 4096}}"#,
+                131072,
+            ),
+            (
+                r#"{"max_position_embeddings": 4096, "rope_scaling":
+                    {"type": "su", "factor": 2.0}}"#,
+                4096,
+            ),
+            (
+                r#"{"max_position_embeddings": 32768, "rope_scaling":
+                    {"type": "mrope", "factor": 2.0}}"#,
+                32768,
+            ),
+            (
+                r#"{"max_position_embeddings": 4096, "rope_scaling":
+                    {"rope_type": "default", "factor": 2.0}}"#,
+                4096,
+            ),
+            // Absent, null, or without a numeric factor: unchanged.
+            (r#"{"max_position_embeddings": 4096}"#, 4096),
+            (
+                r#"{"max_position_embeddings": 4096, "rope_scaling": null}"#,
+                4096,
+            ),
+            (
+                r#"{"max_position_embeddings": 4096, "rope_scaling": {"type": "linear"}}"#,
+                4096,
+            ),
+            (
+                r#"{"max_position_embeddings": 4096, "rope_scaling":
+                    {"type": "linear", "factor": "2"}}"#,
+                4096,
+            ),
+        ] {
+            assert_eq!(window_with(config), Some(want), "{config}");
+        }
+    }
+
+    #[test]
+    fn rope_scaling_comes_from_where_the_window_came_from() {
+        // The window from text_config takes text_config's scaling, not the
+        // root's.
+        assert_eq!(
+            window_with(
+                r#"{"text_config": {"max_position_embeddings": 4096,
+                     "rope_scaling": {"type": "linear", "factor": 2.0}},
+                    "rope_scaling": {"type": "linear", "factor": 8.0}}"#
+            ),
+            Some(8192)
+        );
+        // A root window with the root's scaling.
+        assert_eq!(
+            window_with(
+                r#"{"text_config": {"hidden_size": 8,
+                     "rope_scaling": {"type": "linear", "factor": 8.0}},
+                    "max_position_embeddings": 4096,
+                    "rope_scaling": {"type": "linear", "factor": 2.0}}"#
+            ),
+            Some(8192)
+        );
     }
 }
