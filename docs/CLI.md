@@ -610,7 +610,7 @@ Schema limits (each is a 400 `invalid response_format: …`):
 | Limit | Value |
 |---|---|
 | Schema size (JSON without whitespace) | 64 KiB (65 536 bytes) |
-| Nesting depth of objects and arrays, also counted through `$ref`: each local `$ref` (`#/…`) adds one level and continues in its target, and a `$ref` back to an object on the current path (a recursive schema) stops there | 64 |
+| Nesting depth of objects and arrays, also counted through `$ref`: each local `$ref` (`#/…`) adds one level and continues in its target, and a `$ref` back to an object on the current path (a recursive schema) stops there. The count is an upper bound: definitions that refer to each other in a loop count together, as if one path ran through all of them | 64 |
 | Any one `minItems`, `maxItems`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, or number in a `pattern` / `patternProperties` repetition quantifier (`{n}`, `{n,}`, `{n,m}`, `{,m}`) | 10 000 |
 | Sum of all those counts in one schema; a `minX`/`maxX` pair on one object counts once, at the larger value | 200 000 |
 

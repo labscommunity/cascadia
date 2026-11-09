@@ -420,70 +420,172 @@ fn reject_duplicate_keys(text: &str) -> Result<(), String> {
     walked.map_err(|e| format!("{FIELD}: {e}"))
 }
 
-/// True when `root` nests more than `levels` deep once every local `$ref`
-/// (`#` or `#/<JSON pointer>`) is followed: a ref's target counts as one
+/// True when `root` may nest more than `levels` deep once every local `$ref`
+/// (`#` or `#/<JSON pointer>`) is followed, a ref's target counting as one
 /// level below the object holding it. Backends compile a schema by following
 /// refs, so a long alias chain is as deep for them as nested objects. A ref
 /// back to an object already on the path (a recursive schema) stops there,
-/// and a ref that does not resolve locally is left to the backend. Each
-/// object's height is memoized, so shared targets are walked once; the walk
-/// stops as soon as it passes `levels`, so it never recurses deeper than
-/// that, whatever the schema.
+/// and a ref that does not resolve locally is left to the backend.
+///
+/// The depth is bounded from above, never under-counted, whatever order a
+/// backend walks the schema in: [`ref_depth_bound`]. Linear in the schema's
+/// size and iterative, so it never recurses whatever the schema.
 fn ref_nests_deeper_than(root: &Value, levels: usize) -> bool {
-    RefDepth {
-        root,
-        levels,
-        heights: HashMap::new(),
-        path: HashSet::new(),
-    }
-    .height(root, 1)
-    .is_none()
+    ref_depth_bound(root) > levels
 }
 
-struct RefDepth<'a> {
-    root: &'a Value,
-    levels: usize,
-    /// Levels from an object or array down to its deepest leaf, itself
-    /// included, keyed by its address in `root`.
-    heights: HashMap<*const Value, usize>,
-    /// Objects and arrays on the current path.
-    path: HashSet<*const Value>,
-}
-
-impl<'a> RefDepth<'a> {
-    /// The height of `v`, found at level `level`; `None` once any path
-    /// through it passes `self.levels`.
-    fn height(&mut self, v: &'a Value, level: usize) -> Option<usize> {
-        let children: Vec<&'a Value> = match v {
-            Value::Object(o) => o.values().collect(),
-            Value::Array(a) => a.iter().collect(),
-            _ => return Some(0),
-        };
-        if level > self.levels {
-            return None;
-        }
-        let key: *const Value = v;
-        if let Some(&h) = self.heights.get(&key) {
-            return (level + h - 1 <= self.levels).then_some(h);
-        }
-        self.path.insert(key);
-        let mut below = 0;
-        for c in children {
-            below = below.max(self.height(c, level + 1)?);
-        }
-        if let Some(target) = v
-            .get("$ref")
-            .and_then(Value::as_str)
-            .and_then(|r| resolve_local_ref(self.root, r))
-        {
-            if !self.path.contains(&(target as *const Value)) {
-                below = below.max(self.height(target, level + 1)?);
+/// An upper bound on how deep `root` nests with its local refs followed.
+///
+/// The graph's nodes are the root and every ref target reached from it. A
+/// node's subtree stops at any other target inside it, and has an edge to
+/// it, as it has to the target of each `$ref` in it. Each node's height is
+/// its own structural nesting (objects and arrays, the node itself
+/// included). Entering a node from another puts it at most the other's
+/// height below the other's top, so a path's depth is at most the sum of
+/// its nodes' heights. A path visits a node once (a ref back to one on the
+/// path stops), so within one strongly connected set of nodes it is at most
+/// the sum of their heights. The bound is the heaviest path through the
+/// condensed graph from the root.
+fn ref_depth_bound(root: &Value) -> usize {
+    let targets = ref_targets(root);
+    let mut ids: HashMap<*const Value, usize> = HashMap::from([(root as *const Value, 0)]);
+    let mut nodes: Vec<&Value> = vec![root];
+    let mut heights: Vec<usize> = Vec::new();
+    let mut edges: Vec<Vec<usize>> = Vec::new();
+    let mut next = 0;
+    while next < nodes.len() {
+        let node = nodes[next];
+        let mut out = Vec::new();
+        let mut height = 0;
+        let mut stack = vec![(node, 1)];
+        while let Some((v, level)) = stack.pop() {
+            let children: Box<dyn Iterator<Item = &Value>> = match v {
+                Value::Object(o) => Box::new(o.values()),
+                Value::Array(a) => Box::new(a.iter()),
+                _ => continue,
+            };
+            height = height.max(level);
+            if let Some(t) = v
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|r| resolve_local_ref(root, r))
+            {
+                out.push(node_id(t, &mut ids, &mut nodes));
+            }
+            for c in children {
+                if targets.contains(&(c as *const Value)) {
+                    out.push(node_id(c, &mut ids, &mut nodes));
+                } else {
+                    stack.push((c, level + 1));
+                }
             }
         }
-        self.path.remove(&key);
-        self.heights.insert(key, below + 1);
-        Some(below + 1)
+        heights.push(height);
+        edges.push(out);
+        next += 1;
     }
+    heaviest_path(&heights, &edges)
+}
+
+/// The graph node for `t`, added when new.
+fn node_id<'a>(
+    t: &'a Value,
+    ids: &mut HashMap<*const Value, usize>,
+    nodes: &mut Vec<&'a Value>,
+) -> usize {
+    *ids.entry(t as *const Value).or_insert_with(|| {
+        nodes.push(t);
+        nodes.len() - 1
+    })
+}
+
+/// Every value some local `$ref` in `root` points to, by address.
+fn ref_targets(root: &Value) -> HashSet<*const Value> {
+    let mut targets = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(o) => {
+                if let Some(t) = o
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .and_then(|r| resolve_local_ref(root, r))
+                {
+                    targets.insert(t as *const Value);
+                }
+                stack.extend(o.values());
+            }
+            Value::Array(a) => stack.extend(a.iter()),
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// The heaviest path from node 0 through the graph `edges` once each strongly
+/// connected set is condensed into one node weighing its members' `weights`
+/// summed. Iterative Tarjan: it emits a set only after every set reachable
+/// from it, so each set's heaviest path is final when it is emitted.
+fn heaviest_path(weights: &[usize], edges: &[Vec<usize>]) -> usize {
+    let n = weights.len();
+    let mut index: Vec<Option<usize>> = vec![None; n];
+    let mut low = vec![0; n];
+    let mut on_stack = vec![false; n];
+    let mut set_of: Vec<Option<usize>> = vec![None; n];
+    let mut best: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut counter = 0;
+    let mut calls: Vec<(usize, usize)> = vec![(0, 0)];
+    index[0] = Some(0);
+    low[0] = 0;
+    counter += 1;
+    stack.push(0);
+    on_stack[0] = true;
+    while let Some(&mut (v, ref mut e)) = calls.last_mut() {
+        if let Some(&w) = edges[v].get(*e) {
+            *e += 1;
+            match index[w] {
+                None => {
+                    index[w] = Some(counter);
+                    low[w] = counter;
+                    counter += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    calls.push((w, 0));
+                }
+                Some(iw) if on_stack[w] => low[v] = low[v].min(iw),
+                Some(_) => {}
+            }
+            continue;
+        }
+        calls.pop();
+        if let Some(&(parent, _)) = calls.last() {
+            low[parent] = low[parent].min(low[v]);
+        }
+        if Some(low[v]) != index[v] {
+            continue;
+        }
+        let set = best.len();
+        let mut members = Vec::new();
+        while let Some(w) = stack.pop() {
+            on_stack[w] = false;
+            set_of[w] = Some(set);
+            members.push(w);
+            if w == v {
+                break;
+            }
+        }
+        let weight: usize = members.iter().map(|&m| weights[m]).sum();
+        let after = members
+            .iter()
+            .flat_map(|&m| edges[m].iter())
+            .filter_map(|&w| set_of[w].filter(|&s| s != set))
+            .map(|s| best[s])
+            .max()
+            .unwrap_or(0);
+        best.push(weight.saturating_add(after));
+    }
+    set_of[0].map_or(0, |s| best[s])
 }
 
 /// The value a local `$ref` (`#` or `#/<JSON pointer>`, percent-encoded or
@@ -1600,6 +1702,74 @@ mod tests {
         ));
         assert_eq!(parse_schema(ref_diamond(30, 2)), Err(REF_DEPTH_ERR.into()));
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// `n` alias definitions `{prefix}0` .. `{prefix}{n-1}`, each a `$ref` to
+    /// the next, the last one a `$ref` to `next_of_last`.
+    fn aliases(defs: &mut serde_json::Map<String, Value>, prefix: &str, n: usize, last: &str) {
+        for i in 0..n {
+            let next = if i + 1 < n {
+                format!("#/$defs/{prefix}{}", i + 1)
+            } else {
+                last.to_string()
+            };
+            defs.insert(format!("{prefix}{i}"), json!({"$ref": next}));
+        }
+    }
+
+    #[test]
+    fn a_long_ref_cycle_entered_from_two_properties_is_rejected() {
+        let mut defs = serde_json::Map::new();
+        aliases(&mut defs, "d", 101, "#/$defs/d0");
+        let defs = Value::Object(defs).to_string();
+        // Raw order "b" before "a"; sorted order is the other way round.
+        let schema = format!(
+            r##"{{"type":"object","properties":{{"b":{{"$ref":"#/$defs/d50"}},"a":{{"$ref":"#/$defs/d0"}}}},"$defs":{defs}}}"##
+        );
+        let format = format!(r#"{{"type":"json_schema","json_schema":{{"schema":{schema}}}}}"#);
+        assert_eq!(
+            parse_response_format(Some(&format)),
+            Err(REF_DEPTH_ERR.into())
+        );
+    }
+
+    #[test]
+    fn a_ref_cycle_does_not_hide_a_deep_branch_behind_it() {
+        // A and B refer to each other; A also leads into a chain of 57
+        // aliases. Entered at B, the path B -> A -> chain is deeper than
+        // the path entered at A.
+        let mut defs = serde_json::Map::new();
+        defs.insert(
+            "A".into(),
+            json!({"anyOf": [{"$ref": "#/$defs/B"}, {"$ref": "#/$defs/D0"}]}),
+        );
+        defs.insert(
+            "B".into(),
+            json!({"anyOf": [{"$ref": "#/$defs/A"}, {"type": "null"}]}),
+        );
+        aliases(&mut defs, "D", 57, "#/$defs/end");
+        defs.insert("end".into(), json!({"type": "string"}));
+        let schema = json!({
+            "$defs": defs,
+            "type": "object",
+            "properties": {"x": {"$ref": "#/$defs/B"}},
+        });
+        assert_eq!(parse_schema(schema), Err(REF_DEPTH_ERR.into()));
+    }
+
+    #[test]
+    fn a_mutually_recursive_pair_passes() {
+        let schema = json!({
+            "$defs": {
+                "A": {"type": "object", "properties": {"b": {"$ref": "#/$defs/B"}}},
+                "B": {"type": "object", "properties": {"a": {"$ref": "#/$defs/A"}}},
+            },
+            "$ref": "#/$defs/A",
+        });
+        assert!(matches!(
+            parse_schema(schema),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
     }
 
     #[test]
