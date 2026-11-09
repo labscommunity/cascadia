@@ -3046,13 +3046,19 @@ async fn chat_completions(
         req.tools.as_ref().is_some_and(|t| !t.is_empty()),
         enable_thinking,
     );
-    // A parsed tool call overrides the streamed length/stop detection;
-    // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
+    // A parsed tool call overrides `stop`. A generation cut at its limit
+    // keeps `length` and still carries the calls that came out whole, as
+    // OpenAI sends what was generated with `length`.
     if choice_finish == "tool_calls" {
-        finish_reason = "tool_calls";
         if req.legacy_functions {
             message = message.into_legacy();
-            finish_reason = "function_call";
+        }
+        if finish_reason != "length" {
+            finish_reason = if req.legacy_functions {
+                "function_call"
+            } else {
+                "tool_calls"
+            };
         }
     }
     Json(ChatCompletionResponse {
@@ -4204,7 +4210,8 @@ impl ToolStream {
     /// finish_reason, or the still-releasable content, one indexed
     /// tool_calls delta, and a `tool_calls` finish — for a `functions`
     /// request, one `function_call` delta (the first call) and a
-    /// `function_call` finish instead.
+    /// `function_call` finish instead. A `length` finish stays `length`,
+    /// after the calls that came out whole.
     fn close_choice(
         &mut self,
         text: &str,
@@ -4230,7 +4237,7 @@ impl ToolStream {
                 if !content.is_empty() {
                     out.push_str(&content_frame(task_id, model, content, 0, None, None));
                 }
-                let (call_delta, finish_reason) = if legacy {
+                let (call_delta, call_finish) = if legacy {
                     let first = calls.into_iter().next().map(|c| c.function);
                     (
                         serde_json::json!({ "role": "assistant", "function_call": first }),
@@ -4260,6 +4267,13 @@ impl ToolStream {
                         "delta": call_delta,
                         "finish_reason": serde_json::Value::Null }],
                 });
+                // A generation cut at its limit keeps `length`, with the
+                // calls that came out whole above.
+                let finish_reason = if finish_reason == "length" {
+                    finish_reason
+                } else {
+                    call_finish
+                };
                 let finish = serde_json::json!({
                     "id": task_id, "object": "chat.completion.chunk",
                     "created": now_unix(), "model": model,
@@ -10940,6 +10954,128 @@ level={{ effort_map[eff] }}";
                 assert_eq!(v["choices"][0]["message"]["content"], "alpha bravo x ");
                 assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
                 assert_usage(&v["usage"], 5, 3, &text);
+            }
+        }
+    }
+
+    // --- A length cut inside a tool call ------------------------------------
+
+    /// A complete call, then a second one the window (5 prompt + 2) cuts in
+    /// the middle.
+    const CUT_CALLS: [&str; 3] = [
+        r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#,
+        r#"<tool_call>{"name":"get_time","#,
+        r#""arguments":{}}</tool_call>"#,
+    ];
+
+    #[tokio::test]
+    async fn a_length_cut_inside_a_second_tool_call_ends_with_length() {
+        for legacy in [false, true] {
+            for stream in [false, true] {
+                let ctx = format!("legacy={legacy} stream={stream}");
+                let (app, _log, _) = script_app_opts(
+                    &script(&CUT_CALLS),
+                    ScriptOpts {
+                        window: Some(7),
+                        ..ScriptOpts::default()
+                    },
+                )
+                .await;
+                let mut body = serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}], "stream": stream});
+                if legacy {
+                    body["functions"] =
+                        serde_json::json!([{"name": "get_weather"}, {"name": "get_time"}]);
+                } else {
+                    body["tools"] = serde_json::json!([
+                        {"type": "function", "function": {"name": "get_weather"}},
+                        {"type": "function", "function": {"name": "get_time"}}]);
+                }
+                let (status, text) = post_text(app, "/v1/chat/completions", &body).await;
+                assert_eq!(status, StatusCode::OK, "{ctx}: {text}");
+                let (finish, calls) = if stream {
+                    let events = sse_events(&text);
+                    for event in &events {
+                        crate::spec_schema::assert_spec(
+                            "CreateChatCompletionStreamResponse",
+                            event,
+                        );
+                    }
+                    let finishes: Vec<Value> = events
+                        .iter()
+                        .map(|e| e["choices"][0]["finish_reason"].clone())
+                        .filter(|f| !f.is_null())
+                        .collect();
+                    assert_eq!(finishes.len(), 1, "{ctx}: {text}");
+                    let key = if legacy {
+                        "function_call"
+                    } else {
+                        "tool_calls"
+                    };
+                    let deltas: Vec<Value> = events
+                        .iter()
+                        .filter_map(|e| e["choices"][0]["delta"].get(key).cloned())
+                        .collect();
+                    assert_eq!(deltas.len(), 1, "{ctx}: {text}");
+                    (finishes[0].clone(), deltas[0].clone())
+                } else {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+                    let message = &v["choices"][0]["message"];
+                    let key = if legacy {
+                        "function_call"
+                    } else {
+                        "tool_calls"
+                    };
+                    (
+                        v["choices"][0]["finish_reason"].clone(),
+                        message[key].clone(),
+                    )
+                };
+                assert_eq!(finish, "length", "{ctx}: {text}");
+                if legacy {
+                    assert_eq!(calls["name"], "get_weather", "{ctx}: {text}");
+                } else {
+                    let calls = calls.as_array().expect("tool_calls array");
+                    assert_eq!(calls.len(), 1, "{ctx}: {text}");
+                    assert_eq!(calls[0]["function"]["name"], "get_weather", "{ctx}");
+                }
+                assert!(
+                    !text.contains("<tool_call>"),
+                    "{ctx}: marker leaked: {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_tool_calls_that_end_with_stop_still_report_tool_calls() {
+        let two = format!(
+            "{WEATHER_CALL}<tool_call>{{\"name\":\"get_time\",\"arguments\":{{}}}}</tool_call>"
+        );
+        for stream in [false, true] {
+            let (status, text) = post_text(
+                make_tool_app().await,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": two}], "stream": stream,
+                    "tools": [{"type": "function", "function": {"name": "get_weather"}},
+                              {"type": "function", "function": {"name": "get_time"}}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            if stream {
+                assert!(text.contains(r#""finish_reason":"tool_calls""#), "{text}");
+            } else {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
+                assert_eq!(
+                    v["choices"][0]["message"]["tool_calls"]
+                        .as_array()
+                        .map(Vec::len),
+                    Some(2),
+                    "{v}"
+                );
             }
         }
     }
