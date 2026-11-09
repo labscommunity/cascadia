@@ -3,6 +3,9 @@
 //! All sampling math runs on f32 logits. The deterministic argmax path
 //! is preserved for `temperature == 0`.
 
+use cascadia_engine::EngineResult;
+use cascadia_grammar::GrammarMask;
+
 /// Sampling configuration for one decode call.
 #[derive(Clone, Debug)]
 pub struct SamplingConfig {
@@ -48,10 +51,42 @@ impl Default for SamplingConfig {
     }
 }
 
-/// Pick the next token id given raw logits + running history.
-pub fn sample(logits: &[f32], history: &[i64], cfg: &SamplingConfig, rng_state: &mut u64) -> i64 {
-    let mut work: Vec<f32> = logits.to_vec();
+/// Pick the next token id given raw logits + running history. `mask` (a
+/// structured-output grammar) first sets every token that may not come next
+/// to `-inf`, before penalties, temperature, top-k and top-p, so no later
+/// step can bring a masked token back. `Err` only from the mask: nothing in
+/// the row is allowed (a grammar dead end).
+pub fn sample(
+    logits: &[f32],
+    history: &[i64],
+    cfg: &SamplingConfig,
+    rng_state: &mut u64,
+    mask: Option<&mut GrammarMask>,
+) -> EngineResult<i64> {
+    let mut work = logits.to_vec();
+    if let Some(mask) = mask {
+        mask.apply(&mut work)?;
+    }
+    Ok(sample_row(work, history, cfg, rng_state))
+}
 
+/// [`sample`] for a row no grammar constrains (normal requests, and the
+/// stages that never see a grammar task).
+pub fn sample_unmasked(
+    logits: &[f32],
+    history: &[i64],
+    cfg: &SamplingConfig,
+    rng_state: &mut u64,
+) -> i64 {
+    sample_row(logits.to_vec(), history, cfg, rng_state)
+}
+
+fn sample_row(
+    mut work: Vec<f32>,
+    history: &[i64],
+    cfg: &SamplingConfig,
+    rng_state: &mut u64,
+) -> i64 {
     // Repetition penalty.
     if (cfg.repetition_penalty - 1.0).abs() > f32::EPSILON {
         let start = if cfg.repetition_window == 0 {
@@ -62,7 +97,8 @@ pub fn sample(logits: &[f32], history: &[i64], cfg: &SamplingConfig, rng_state: 
         let alpha = cfg.repetition_penalty;
         for &tok in history[start..].iter() {
             let i = tok as usize;
-            if i < work.len() {
+            // A masked (`-inf`) logit stays masked whatever alpha is.
+            if i < work.len() && work[i] != f32::NEG_INFINITY {
                 let l = work[i];
                 work[i] = if l > 0.0 { l / alpha } else { l * alpha };
             }
@@ -78,7 +114,7 @@ pub fn sample(logits: &[f32], history: &[i64], cfg: &SamplingConfig, rng_state: 
         let mut seen = std::collections::HashSet::new();
         for &tok in history.iter() {
             let i = tok as usize;
-            if i < work.len() {
+            if i < work.len() && work[i] != f32::NEG_INFINITY {
                 // frequency: once per occurrence => count * penalty in total.
                 work[i] -= cfg.frequency_penalty;
                 // presence: once per distinct token.
@@ -175,15 +211,29 @@ pub fn sample(logits: &[f32], history: &[i64], cfg: &SamplingConfig, rng_state: 
 
     // Categorical sample.
     let u = next_uniform(rng_state);
+    pick_categorical(&work, u) as i64
+}
+
+/// Inverse-CDF draw from normalized `probs` at `u` in [0, 1).
+fn pick_categorical(probs: &[f32], u: f32) -> usize {
     let mut cum = 0.0f32;
-    for (i, &p) in work.iter().enumerate() {
+    for (i, &p) in probs.iter().enumerate() {
+        // A token without mass (cut by top-k/top-p, or masked) is never drawn,
+        // even at `u == 0`.
+        if p <= 0.0 {
+            continue;
+        }
         cum += p;
         if cum >= u {
-            return i as i64;
+            return i;
         }
     }
-    // Numerical fallback if cum < u due to fp rounding.
-    (work.len() - 1) as i64
+    // Numerical fallback if cum < u due to fp rounding: the last token that
+    // has any mass (the old `len - 1` could be a token top-k/top-p cut).
+    probs
+        .iter()
+        .rposition(|&p| p > 0.0)
+        .unwrap_or(probs.len() - 1)
 }
 
 /// xorshift64*: small, deterministic, dependency-free PRNG. Seeded from
@@ -238,7 +288,10 @@ mod tests {
     fn greedy_picks_max() {
         let l = vec![0.1, 0.4, 0.2, 0.05];
         let mut s = 1;
-        assert_eq!(sample(&l, &[], &SamplingConfig::default(), &mut s), 1);
+        assert_eq!(
+            sample_unmasked(&l, &[], &SamplingConfig::default(), &mut s),
+            1
+        );
     }
 
     #[test]
@@ -247,7 +300,7 @@ mod tests {
         let mut s = 1;
         let mut cfg = SamplingConfig::default();
         cfg.temperature = 1.0;
-        let r = sample(&l, &[], &cfg, &mut s);
+        let r = sample_unmasked(&l, &[], &cfg, &mut s);
         assert!((0..100).contains(&(r as usize)));
     }
 
@@ -264,7 +317,7 @@ mod tests {
         cfg.repetition_penalty = 10.0;
         // After penalty: logit[5] = 10.0 / 10.0 = 1.0. logit[3] = 2.0
         // wins. Greedy → 3.
-        assert_eq!(sample(&l, &history, &cfg, &mut s), 3);
+        assert_eq!(sample_unmasked(&l, &history, &cfg, &mut s), 3);
     }
 
     #[test]
@@ -278,7 +331,7 @@ mod tests {
         let mut s = 1;
         let mut cfg = SamplingConfig::default();
         cfg.frequency_penalty = 2.0;
-        assert_eq!(sample(&l, &history, &cfg, &mut s), 3);
+        assert_eq!(sample_unmasked(&l, &history, &cfg, &mut s), 3);
     }
 
     #[test]
@@ -292,7 +345,7 @@ mod tests {
         let mut s = 1;
         let mut cfg = SamplingConfig::default();
         cfg.presence_penalty = 1.5;
-        assert_eq!(sample(&l, &history, &cfg, &mut s), 5);
+        assert_eq!(sample_unmasked(&l, &history, &cfg, &mut s), 5);
     }
 
     #[test]
@@ -306,7 +359,7 @@ mod tests {
         cfg.temperature = 1.0;
         cfg.top_k = 1;
         for _ in 0..20 {
-            assert_eq!(sample(&l, &[], &cfg, &mut s), 4);
+            assert_eq!(sample_unmasked(&l, &[], &cfg, &mut s), 4);
         }
     }
 
@@ -319,7 +372,7 @@ mod tests {
         let mut cfg = SamplingConfig::default();
         cfg.temperature = 1.0;
         cfg.top_p = 0.5;
-        let r = sample(&l, &[], &cfg, &mut s);
+        let r = sample_unmasked(&l, &[], &cfg, &mut s);
         assert_eq!(r, 0);
     }
 
@@ -337,7 +390,7 @@ mod tests {
         let mut s = 0xDEAD_BEEF_u64;
         let before = s;
         for _ in 0..16 {
-            assert_eq!(sample(&l, &[], &cfg, &mut s), 7);
+            assert_eq!(sample_unmasked(&l, &[], &cfg, &mut s), 7);
         }
         assert_eq!(
             s, before,
@@ -354,10 +407,128 @@ mod tests {
         cfg.temperature = 1.0;
         let mut s = 0xDEAD_BEEF_u64;
         let before = s;
-        let _ = sample(&l, &[], &cfg, &mut s);
+        let _ = sample_unmasked(&l, &[], &cfg, &mut s);
         assert_ne!(
             s, before,
             "temperature>0 sampling must advance the RNG state"
         );
+    }
+
+    // ---- grammar mask ----
+
+    use crate::constrained::test_env;
+
+    /// The request defaults a json task gets (repetition penalty 1.05 over 64
+    /// tokens), at `temperature`.
+    fn task_cfg(temperature: f32) -> SamplingConfig {
+        SamplingConfig {
+            temperature,
+            repetition_penalty: 1.05,
+            repetition_window: 64,
+            ..SamplingConfig::default()
+        }
+    }
+
+    /// Mid-string state of the weather schema: many bytes allowed, but not
+    /// control bytes, not the EOS, not a raw newline.
+    fn mid_string_mask() -> GrammarMask {
+        let mut gm = test_env::mask(test_env::WEATHER);
+        gm.replay(&br#"{"city":"Pa"#.map(u32::from)).unwrap();
+        gm
+    }
+
+    /// Logits that favour masked tokens: control bytes and EOS score highest,
+    /// and every masked id also appears in the history (so the penalties
+    /// touch `-inf` entries).
+    fn adversarial_logits(seed: u64) -> (Vec<f32>, Vec<i64>) {
+        let mut s = seed.max(1);
+        let mut l: Vec<f32> = (0..test_env::VOCAB)
+            .map(|_| next_uniform(&mut s) * 4.0 - 2.0)
+            .collect();
+        l[..0x20].fill(50.0);
+        l[test_env::EOS as usize] = 60.0;
+        let history: Vec<i64> = (0..0x20).chain([test_env::EOS as i64, 0x41]).collect();
+        (l, history)
+    }
+
+    #[test]
+    fn masked_greedy_never_picks_a_masked_id() {
+        for seed in 1..50u64 {
+            let mut gm = mid_string_mask();
+            let (l, history) = adversarial_logits(seed);
+            let mut s = 7;
+            let t = sample(&l, &history, &task_cfg(0.0), &mut s, Some(&mut gm)).unwrap();
+            assert!(gm.allowed(t as u32), "seed {seed}: picked masked id {t}");
+        }
+    }
+
+    #[test]
+    fn masked_sampling_at_temperature_one_never_picks_a_masked_id() {
+        let mut gm = mid_string_mask();
+        let (l, history) = adversarial_logits(3);
+        let mut cfg = task_cfg(1.0);
+        cfg.top_p = 0.95;
+        cfg.top_k = 40;
+        cfg.frequency_penalty = 0.5;
+        cfg.presence_penalty = 0.5;
+        let mut s = init_rng(Some(42));
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..1000 {
+            let t = sample(&l, &history, &cfg, &mut s, Some(&mut gm)).unwrap();
+            assert!(gm.allowed(t as u32), "draw {i}: picked masked id {t}");
+            seen.insert(t);
+        }
+        assert!(seen.len() > 5, "sampling should still vary: {seen:?}");
+    }
+
+    #[test]
+    fn masked_sampling_without_top_k_or_top_p_never_picks_a_masked_id() {
+        let mut gm = mid_string_mask();
+        let (l, history) = adversarial_logits(9);
+        let mut s = init_rng(Some(1));
+        for i in 0..1000 {
+            let t = sample(&l, &history, &task_cfg(1.0), &mut s, Some(&mut gm)).unwrap();
+            assert!(gm.allowed(t as u32), "draw {i}: picked masked id {t}");
+        }
+    }
+
+    #[test]
+    fn mask_dead_end_is_an_error_not_a_pick() {
+        let mut gm = test_env::mask(test_env::WEATHER);
+        // The first token must be `{`; a row too short to hold it has nothing allowed.
+        let l = vec![1.0f32; usize::from(b'{')];
+        let mut s = 1;
+        assert!(sample(&l, &[], &task_cfg(0.0), &mut s, Some(&mut gm)).is_err());
+    }
+
+    #[test]
+    fn no_mask_is_the_unmasked_sampler() {
+        let (l, history) = adversarial_logits(5);
+        let cfg = SamplingConfig {
+            temperature: 0.8,
+            top_p: 0.9,
+            ..task_cfg(0.8)
+        };
+        let (mut a, mut b) = (11u64, 11u64);
+        for _ in 0..200 {
+            assert_eq!(
+                sample(&l, &history, &cfg, &mut a, None).unwrap(),
+                sample_unmasked(&l, &history, &cfg, &mut b)
+            );
+        }
+    }
+
+    #[test]
+    fn rounding_fallback_returns_the_last_token_with_mass() {
+        // The kept mass sums a little under `u`: the draw must land on the
+        // last token top-k/top-p kept, never on a zeroed tail token.
+        let probs = [0.5f32, 0.499, 0.0, 0.0];
+        assert_eq!(pick_categorical(&probs, 0.9999), 1);
+    }
+
+    #[test]
+    fn zero_mass_tokens_are_never_drawn_even_at_u_zero() {
+        let probs = [0.0f32, 0.0, 1.0];
+        assert_eq!(pick_categorical(&probs, 0.0), 2);
     }
 }

@@ -7,7 +7,7 @@
 //! `generate` / `generate_argmax` are provided (default) methods built on the
 //! required primitives, so every backend shares one single-stage sampling loop.
 
-use crate::sampling::{init_rng, sample, SamplingConfig};
+use crate::sampling::{init_rng, sample_unmasked, SamplingConfig};
 
 /// Wall-clock split of one generation: the prompt forward plus the first
 /// sample, then the decode steps (each a full forward + head + sample) after
@@ -269,7 +269,7 @@ pub trait StagedRunner: Send + 'static {
             }
             ll
         };
-        let mut next = sample(&last_logits, &history, cfg, &mut rng);
+        let mut next = sample_unmasked(&last_logits, &history, cfg, &mut rng);
         let prefill_s = started.elapsed().as_secs_f64();
         let decode_started = std::time::Instant::now();
         let mut decode_steps = 0usize;
@@ -295,7 +295,7 @@ pub trait StagedRunner: Send + 'static {
             let h = self.embed_token(tok);
             let h = self.forward_layers(h, pos, Some(tok));
             let logits = self.head_logits(&h);
-            next = sample(&logits, &history, cfg, &mut rng);
+            next = sample_unmasked(&logits, &history, cfg, &mut rng);
             pos += 1;
             decode_steps += 1;
         }

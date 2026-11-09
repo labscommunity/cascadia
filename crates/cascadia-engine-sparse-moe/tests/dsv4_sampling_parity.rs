@@ -10,7 +10,7 @@
 //! temp>0 test.
 
 use cascadia_engine_sparse_moe::dsv4::stage::Dsv4Runner;
-use cascadia_engine_sparse_moe::sampling::{init_rng, sample};
+use cascadia_engine_sparse_moe::sampling::{init_rng, sample_unmasked};
 use cascadia_engine_sparse_moe::staged::StagedRunner;
 use cascadia_engine_sparse_moe::SamplingConfig;
 use std::path::PathBuf;
@@ -70,7 +70,7 @@ fn pipeline_generate(
         }
     }
     let mut history: Vec<i64> = Vec::new();
-    let mut next = sample(&last_logits, &history, cfg, &mut rng);
+    let mut next = sample_unmasked(&last_logits, &history, cfg, &mut rng);
     let mut out: Vec<u32> = Vec::new();
     let mut pos = n;
     loop {
@@ -82,7 +82,7 @@ fn pipeline_generate(
         }
         let h0 = r0.forward_layers(r0.embed_token(tok), pos, Some(tok));
         let h1 = r1.forward_layers(h0, pos, None);
-        next = sample(&r1.head_logits(&h1), &history, cfg, &mut rng);
+        next = sample_unmasked(&r1.head_logits(&h1), &history, cfg, &mut rng);
         pos += 1;
     }
     out

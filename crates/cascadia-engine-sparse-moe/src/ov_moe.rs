@@ -49,7 +49,7 @@ use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use crate::kv_prefix_cache::ModelFingerprint;
 use crate::manifest::{Manifest, ManifestError};
 use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvPrefixCache, OvMoeKvSnapshot};
-use crate::sampling::{init_rng, sample, SamplingConfig};
+use crate::sampling::{init_rng, sample_unmasked, SamplingConfig};
 
 /// Group size of the int4_bin quantization (cols per scale group).
 const INT4_GROUP: usize = 32;
@@ -841,7 +841,7 @@ impl OvMoeRunner {
         let mut history: Vec<i64> = Vec::with_capacity(max_new);
         let mut out: Vec<u32> = Vec::with_capacity(max_new);
         loop {
-            let next = sample(&logits, &history, cfg, &mut rng) as u32;
+            let next = sample_unmasked(&logits, &history, cfg, &mut rng) as u32;
             out.push(next);
             history.push(next as i64);
             if out.len() >= max_new || eos.contains(&next) {
@@ -944,7 +944,7 @@ impl OvMoeRunner {
             return Ok((out, cached_snap));
         }
         loop {
-            let next = sample(&logits, &history, cfg, &mut rng) as u32;
+            let next = sample_unmasked(&logits, &history, cfg, &mut rng) as u32;
             out.push(next);
             history.push(next as i64);
             if out.len() >= max_new || eos.contains(&next) {

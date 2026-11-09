@@ -3438,7 +3438,7 @@ impl SparseMoEEngine {
                         self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                         self.last_rank_rng_seeded = true;
                     }
-                    let token = crate::sampling::sample(
+                    let token = crate::sampling::sample_unmasked(
                         &logits,
                         &self.last_rank_history,
                         &sampling_cfg,
@@ -3743,7 +3743,7 @@ impl SparseMoEEngine {
                     .runner
                     .forward_head_last(&h_after, 1)
                     .map_err(|e| format!("forward_head (batch step {i}): {e}"))?;
-                let token = crate::sampling::sample(
+                let token = crate::sampling::sample_unmasked(
                     &logits,
                     &self.last_rank_history,
                     &sampling_cfg,
@@ -4957,7 +4957,7 @@ impl OvMoeEngine {
             // head throws these tokens away, so take the deterministic argmax via a temperature-0
             // config, which returns before touching the RNG.
             let token = if push_history {
-                crate::sampling::sample(
+                crate::sampling::sample_unmasked(
                     &logits,
                     &self.last_rank_history,
                     &sampling_cfg,
@@ -4966,7 +4966,7 @@ impl OvMoeEngine {
             } else {
                 let mut discard_cfg = sampling_cfg.clone();
                 discard_cfg.temperature = 0.0;
-                crate::sampling::sample(
+                crate::sampling::sample_unmasked(
                     &logits,
                     &self.last_rank_history,
                     &discard_cfg,
@@ -6710,7 +6710,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let vocab = logits.len() / rows;
         for (i, st) in self.streams.iter_mut().enumerate() {
             let l = &logits[i * vocab..(i + 1) * vocab];
-            st.next = crate::sampling::sample(l, &st.history, &st.cfg, &mut st.rng);
+            st.next = crate::sampling::sample_unmasked(l, &st.history, &st.cfg, &mut st.rng);
             st.pos += 1;
         }
         // ---- aggregate log every ~16 steps ----
@@ -6793,7 +6793,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 return Err((task.task_id.clone(), Chunk::error(task.task_id, msg)));
             }
         };
-        let next = crate::sampling::sample(&logits, &history, &cfg, &mut rng);
+        let next = crate::sampling::sample_unmasked(&logits, &history, &cfg, &mut rng);
         let prefill_s = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,
@@ -7797,8 +7797,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 history: Vec::new(),
                 rng,
             };
-            let token =
-                crate::sampling::sample(&logits, &sampler.history, &sampler.cfg, &mut sampler.rng);
+            let token = crate::sampling::sample_unmasked(
+                &logits,
+                &sampler.history,
+                &sampler.cfg,
+                &mut sampler.rng,
+            );
             sampler.history.push(token);
             self.stream_samplers.insert(s, sampler);
             let send_started = Instant::now();
@@ -7905,8 +7909,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     format!("stream decode: slot {s} has no sampler (no StreamOpen seen)")
                 })?;
                 let l = &logits[i * vocab..(i + 1) * vocab];
-                let token =
-                    crate::sampling::sample(l, &sampler.history, &sampler.cfg, &mut sampler.rng);
+                let token = crate::sampling::sample_unmasked(
+                    l,
+                    &sampler.history,
+                    &sampler.cfg,
+                    &mut sampler.rng,
+                );
                 sampler.history.push(token);
                 toks.push((s as u32, token));
             }
@@ -8003,7 +8011,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                 self.last_rank_rng_seeded = true;
             }
-            let token = crate::sampling::sample(
+            let token = crate::sampling::sample_unmasked(
                 &logits,
                 &self.last_rank_history,
                 &sampling_cfg,
@@ -8104,7 +8112,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                 self.last_rank_rng_seeded = true;
             }
-            let token = crate::sampling::sample(
+            let token = crate::sampling::sample_unmasked(
                 &logits,
                 &self.last_rank_history,
                 &sampling_cfg,

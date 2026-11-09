@@ -2377,7 +2377,7 @@ impl Runner {
 
         // First generated token from the LAST prefill step's logits.
         if let Some(l) = last_logits {
-            let next = crate::sampling::sample(&l, &history, cfg, &mut rng);
+            let next = crate::sampling::sample_unmasked(&l, &history, cfg, &mut rng);
             if eos.contains(&next) {
                 return Ok(generated);
             }
@@ -2389,7 +2389,7 @@ impl Runner {
         for step_i in 1..max_tokens {
             let t_step = Instant::now();
             let logits = self.step(&history, 1)?;
-            let next = crate::sampling::sample(&logits, &history, cfg, &mut rng);
+            let next = crate::sampling::sample_unmasked(&logits, &history, cfg, &mut rng);
             if eos.contains(&next) {
                 debug!(step = step_i, token = next, "EOS — stopping");
                 break;
