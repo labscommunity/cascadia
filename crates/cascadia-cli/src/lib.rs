@@ -2093,6 +2093,10 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             // enable_thinking) and the engine tells ov-genai to skip its own
             // internal apply. No template → leave ov-genai's apply on.
             b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
+            // Without --cb one generate() call makes the whole answer, so the
+            // engine cuts its limit to what the prompt leaves of the window.
+            let info = cascadia_api::read_model_generation_info(std::path::Path::new(&args.model));
+            b = b.with_context_window(resolve_generation_defaults(args, &info).0.context_window);
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {

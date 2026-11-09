@@ -48,6 +48,10 @@ pub struct OvGenaiBuilder {
     /// Continuous batching (#20): serve concurrent requests through one
     /// `ContinuousBatchingPipeline` instead of one-generation-per-`step()`.
     pub continuous_batching: Option<CbSchedulerConfig>,
+    /// The server's known context window. Without `--cb` one `generate()`
+    /// call makes the whole answer, so its limit is cut to what the prompt
+    /// leaves of this window.
+    pub context_window: Option<u32>,
     pipe: Option<LlmPipeline>,
     cb_pipe: Option<CbPipeline>,
 }
@@ -67,9 +71,16 @@ impl OvGenaiBuilder {
             prompt_lookup_ngram: 0,
             prompt_pretemplated: false,
             continuous_batching: None,
+            context_window: None,
             pipe: None,
             cb_pipe: None,
         }
+    }
+
+    /// The server's known context window (see [`Self::context_window`]).
+    pub fn with_context_window(mut self, window: Option<u32>) -> Self {
+        self.context_window = window;
+        self
     }
 
     /// Enable continuous batching (#20) with the given scheduler knobs.
@@ -340,6 +351,7 @@ impl Builder for OvGenaiBuilder {
             prompt_pretemplated: self.prompt_pretemplated,
             pending: Vec::new(),
             max_tokens_default: 256,
+            context_window: self.context_window,
         }))
     }
 }
@@ -354,6 +366,18 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+/// The answer limit for one stateful `generate()` call: `max_new`, cut to
+/// what is left of the server's known context window after the prompt, so
+/// the prompt plus the answer never run past it. Unchanged when either count
+/// is unknown, or when the prompt alone reaches the window (the pipeline
+/// accepted it, so that window is not its real limit).
+fn stateful_max_new(max_new: u32, prompt_tokens: Option<u32>, window: Option<u32>) -> u32 {
+    match (prompt_tokens, window) {
+        (Some(prompt), Some(window)) if prompt < window => max_new.min(window - prompt),
+        _ => max_new,
+    }
+}
+
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
     speculative_k: u32,
@@ -361,6 +385,9 @@ pub struct OvGenaiEngine {
     prompt_pretemplated: bool,
     pending: Vec<GenerationTask>,
     max_tokens_default: u32,
+    /// The server's known context window: one `generate()` call makes the
+    /// whole answer, so its limit is cut to what the prompt leaves of it.
+    context_window: Option<u32>,
 }
 
 impl Engine for OvGenaiEngine {
@@ -429,6 +456,10 @@ impl Engine for OvGenaiEngine {
         } else {
             self.max_tokens_default
         };
+        let prompt_tokens = self.pipe.count_tokens(&task.prompt);
+        // The pipeline does not stop at the window itself; capped here, the
+        // `tokens >= max_new` inference below reports `length` there.
+        let max_new = stateful_max_new(max_new, prompt_tokens, self.context_window);
         let cfg = self.gen_config(
             max_new,
             task.temperature,
@@ -496,7 +527,7 @@ impl Engine for OvGenaiEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
             .with_n_tokens(tokens)
             .with_finish_reason(finish);
-        if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt) {
+        if let Some(prompt_tokens) = prompt_tokens {
             chunk = chunk.with_prompt_tokens(prompt_tokens);
         }
         Ok(vec![(task.task_id, chunk)])
@@ -1046,6 +1077,32 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn stateful_answers_end_where_prompt_plus_answer_fill_the_window() {
+        // (max_new, prompt, window) -> limit
+        for (max_new, prompt, window, want) in [
+            // An unset limit is the whole window: cut to what the prompt left.
+            (4096, Some(1000), Some(4096), 3096),
+            // A smaller explicit limit stays.
+            (256, Some(1000), Some(4096), 256),
+            (3096, Some(1000), Some(4096), 3096),
+            // Unknown prompt count or window: unchanged.
+            (4096, None, Some(4096), 4096),
+            (4096, Some(1000), None, 4096),
+            // A prompt that alone reaches the window: unchanged.
+            (4096, Some(4096), Some(4096), 4096),
+            (4096, Some(5000), Some(4096), 4096),
+            // One token of room left.
+            (4096, Some(4095), Some(4096), 1),
+        ] {
+            assert_eq!(
+                stateful_max_new(max_new, prompt, window),
+                want,
+                "max_new {max_new}, prompt {prompt:?}, window {window:?}"
+            );
+        }
+    }
 
     // ---- CB engine state machine -------------------------------------------
     //
