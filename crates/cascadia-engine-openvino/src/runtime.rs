@@ -1315,6 +1315,101 @@ fn relay_token_answer(
     }
 }
 
+/// What a non-packed relay step needs from its stage. The step's logic over
+/// it ([`relay_last_step`], [`relay_middle_step`]) is the same code for the
+/// engine and for its loopback tests.
+trait RelayStage {
+    /// The tail: run this stage's layers on the upstream's rows and pick the
+    /// token, under `mask` on a masked step.
+    fn run_last(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos: Option<i64>,
+        mask: Option<&[u32]>,
+    ) -> EngineResult<i32>;
+    /// A middle: run this stage's layers and send the rows downstream with
+    /// `mask`. `Ok(prefill)`: the reply gets the prefill budget. `Err`: this
+    /// stage failed before its downstream exchange.
+    fn run_and_forward(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos: Option<i64>,
+        mask: Option<&[u32]>,
+    ) -> EngineResult<bool>;
+    /// A middle: the downstream's reply to the step just forwarded.
+    fn wait_downstream(&mut self, prefill: bool, masked: bool) -> Result<i32, TokenWaitFailure>;
+    /// Answer the upstream for the consumed step (`masked`: it carried a
+    /// mask; `vouch`: see [`masked_relay_answer`]). The step's error, if any,
+    /// comes back after the answer is sent.
+    fn reply_upstream(
+        &mut self,
+        step: EngineResult<i32>,
+        masked: bool,
+        vouch: bool,
+    ) -> EngineResult<()>;
+    /// The chain below this stage has acknowledged a masked step.
+    fn link_acked(&self) -> bool;
+    /// Drop a warm resume armed for a step that won't run.
+    fn drop_warm_resume(&mut self);
+}
+
+/// The tail's step once its upstream pair is read and decoded.
+fn relay_last_step<S: RelayStage>(
+    stage: &mut S,
+    hidden: Vec<f32>,
+    shape: [usize; 3],
+    pos: Option<i64>,
+    mask: Option<Result<Vec<u32>, MaskMiss>>,
+) -> EngineResult<()> {
+    let mask = match mask {
+        Some(Err(MaskMiss)) => return answer_mask_miss(stage, true),
+        Some(Ok(words)) => Some(words),
+        None => None,
+    };
+    let step = stage.run_last(hidden, shape, pos, mask.as_deref());
+    // A masked step is always acknowledged by the tail: the mask was
+    // applied, or the step failed here.
+    stage.reply_upstream(step, mask.is_some(), true)
+}
+
+/// A middle's step once its upstream pair is read and decoded: run and
+/// forward with the mask, then pass the downstream's answer up (a mask miss
+/// below goes up unchanged, see [`relay_token_answer`]). A failure before the
+/// downstream exchange is [`own_failure_answer`]'s.
+fn relay_middle_step<S: RelayStage>(
+    stage: &mut S,
+    hidden: Vec<f32>,
+    shape: [usize; 3],
+    pos: Option<i64>,
+    mask: Option<Result<Vec<u32>, MaskMiss>>,
+) -> EngineResult<()> {
+    let mask = match mask {
+        Some(Err(MaskMiss)) => return answer_mask_miss(stage, false),
+        Some(Ok(words)) => Some(words),
+        None => None,
+    };
+    let masked = mask.is_some();
+    let (step, vouch) = match stage.run_and_forward(hidden, shape, pos, mask.as_deref()) {
+        Err(e) => own_failure_answer(e, stage.link_acked()),
+        Ok(prefill) => relay_token_answer(stage.wait_downstream(prefill, masked), masked),
+    };
+    stage.reply_upstream(step, masked, vouch)
+}
+
+/// Answer a repeat marker this stage has no mask for: the mask-miss token,
+/// with no layer run and nothing forwarded; a warm resume armed for the step
+/// is dropped, so the next prefill starts cold. Acknowledged by the tail
+/// (it applies masks itself), by a middle only once its chain below has
+/// acknowledged a masked step, as for its own failures.
+fn answer_mask_miss<S: RelayStage>(stage: &mut S, tail: bool) -> EngineResult<()> {
+    warn!("structured output: a repeat token mask arrived with no mask to repeat; answering a mask miss");
+    stage.drop_warm_resume();
+    let vouch = tail || stage.link_acked();
+    stage.reply_upstream(Ok(MASK_MISS_TOKEN), true, vouch)
+}
+
 /// The frames a relay stage sends upstream for one step: the reply
 /// ([`relay_reply_frame`], acknowledged on a masked step it vouches for),
 /// preceded — on a middle that once answered a masked step unacknowledged and
@@ -1802,12 +1897,13 @@ async fn recv_control_ack(
             }
         };
         match decode_token_reply(&frame) {
-            Ok((_, seq, acked)) => {
+            Ok((token, seq, acked)) => {
                 debug!(
                     seq,
                     acked, "late token reply skipped while awaiting a {what} ack"
                 );
-                stale_ack |= acked;
+                // A late mask miss proves nothing about the chain.
+                stale_ack |= acked && token != MASK_MISS_TOKEN;
             }
             Err(_) => return (Ok(frame), stale_ack),
         }
@@ -2324,7 +2420,8 @@ async fn recv_token_reply(
         let (token, echo_seq, acked) =
             decode_token_reply(&tensor).map_err(TokenWaitFailure::Other)?;
         if echo_seq != awaiting_seq {
-            *stale_ack |= acked;
+            // A late mask miss proves nothing about the chain.
+            *stale_ack |= acked && token != MASK_MISS_TOKEN;
             // First discard only: one line says the guard fired and names the
             // seqs, which is what the rig validation looks for. Any further
             // discards in the same wait are counted, not logged, and reported
@@ -5255,16 +5352,6 @@ impl OvRuntimeEngine {
         }
     }
 
-    /// Answer a repeat marker this stage has no mask for: the acknowledged
-    /// mask-miss token, with no layer run and nothing forwarded. A warm
-    /// resume armed for this step is dropped (the step never ran), so the
-    /// next prefill starts cold.
-    fn answer_mask_miss(&mut self) -> EngineResult<()> {
-        warn!("structured output: a repeat token mask arrived with no mask to repeat; answering a mask miss");
-        let _ = self.kv_consume_warm_pending();
-        self.send_token_to_upstream(&Ok(MASK_MISS_TOKEN), true, true)
-    }
-
     /// Issue-34: consume the one-shot warm-resume flag. `true` ⇒ this prefill continues a RESTOREd
     /// state, so the worker must NOT reset. Always `false` in the default build (no-op).
     fn kv_consume_warm_pending(&mut self) -> bool {
@@ -5287,15 +5374,7 @@ impl OvRuntimeEngine {
         // there is nothing to answer on. After it, `inbound_seq` is set and
         // every failure must answer.
         let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
-        let mask = match mask {
-            Some(Err(MaskMiss)) => return self.answer_mask_miss(),
-            Some(Ok(words)) => Some(words),
-            None => None,
-        };
-        let step = self.relay_last_body(hidden, shape, pos_opt, mask.as_deref());
-        // A masked step is always acknowledged by the tail: the mask was
-        // applied, or the step failed here.
-        self.answer_upstream(step, mask.is_some(), true)
+        relay_last_step(self, hidden, shape, pos_opt, mask)
     }
 
     /// Everything `step_last` does between consuming the activation group and
@@ -5339,13 +5418,7 @@ impl OvRuntimeEngine {
         }
         // See `step_last`: nothing is owed until the group is consumed.
         let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
-        let mask = match mask {
-            Some(Err(MaskMiss)) => return self.answer_mask_miss(),
-            Some(Ok(words)) => Some(words),
-            None => None,
-        };
-        let (step, vouch) = self.relay_middle_body(hidden, shape, pos_opt, mask.as_deref());
-        let answered = self.answer_upstream(step, mask.is_some(), vouch);
+        let answered = relay_middle_step(self, hidden, shape, pos_opt, mask);
         self.escalate_if_downstream_is_gone(answered)
     }
 
@@ -5396,41 +5469,6 @@ impl OvRuntimeEngine {
         res
     }
 
-    /// Everything `step_middle` does between consuming the activation group and
-    /// answering the upstream — including the downstream hop, so a downstream
-    /// failure (its NACK included) propagates as an Err and this stage NACKs its
-    /// own upstream in turn. That is what carries an abort all the way to the
-    /// head however deep the pipeline is.
-    ///
-    /// A masked step's mask is forwarded with the activation. The second value
-    /// says whether this stage may acknowledge the step to its upstream: only
-    /// when the downstream exchange ran and its reply was acknowledged — not
-    /// when this stage failed before reaching it (see [`own_failure_answer`]).
-    fn relay_middle_body(
-        &mut self,
-        hidden: Vec<f32>,
-        shape: [usize; 3],
-        pos_opt: Option<i64>,
-        mask: Option<&[u32]>,
-    ) -> (EngineResult<i32>, bool) {
-        let forwarded = self.relay_middle_forward(hidden, shape, pos_opt).and_then(
-            |(out, s3, fwd_pos, prefill_reply)| {
-                self.send_hidden_downstream(&out, s3, fwd_pos, mask)
-                    .map(|()| prefill_reply)
-            },
-        );
-        let prefill_reply = match forwarded {
-            Ok(p) => p,
-            Err(e) => return own_failure_answer(e, self.mask_link.acked),
-        };
-        let downstream = match self.downstream.clone() {
-            Some(d) => d,
-            None => return own_failure_answer(EngineError::Backend("no downstream".into()), false),
-        };
-        let reply = self.wait_token(&downstream, prefill_reply, mask.is_some());
-        relay_token_answer(reply, mask.is_some())
-    }
-
     /// A middle stage's own part of a step: run its layers on the upstream's
     /// hidden rows. Returns the rows to forward, their shape, the position to
     /// stamp, and whether the downstream's reply gets the prefill budget.
@@ -5468,6 +5506,62 @@ impl OvRuntimeEngine {
             }
         };
         Ok((out, to_shape3(&out_shape), fwd_pos, prefill_reply))
+    }
+}
+
+/// The engine's side of a non-packed relay step (see [`RelayStage`]).
+impl RelayStage for OvRuntimeEngine {
+    fn run_last(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos: Option<i64>,
+        mask: Option<&[u32]>,
+    ) -> EngineResult<i32> {
+        self.relay_last_body(hidden, shape, pos, mask)
+    }
+
+    /// Everything a middle does between consuming the activation group and
+    /// its downstream reply: run its layers, forward with the mask. The
+    /// downstream hop is part of the step, so a downstream failure (its NACK
+    /// included) comes back as an Err and this stage NACKs its own upstream in
+    /// turn, carrying an abort to the head however deep the pipeline is.
+    fn run_and_forward(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos: Option<i64>,
+        mask: Option<&[u32]>,
+    ) -> EngineResult<bool> {
+        let (out, s3, fwd_pos, prefill_reply) = self.relay_middle_forward(hidden, shape, pos)?;
+        self.send_hidden_downstream(&out, s3, fwd_pos, mask)?;
+        Ok(prefill_reply)
+    }
+
+    fn wait_downstream(&mut self, prefill: bool, masked: bool) -> Result<i32, TokenWaitFailure> {
+        let Some(downstream) = self.downstream.clone() else {
+            return Err(TokenWaitFailure::Other(EngineError::Backend(
+                "no downstream".into(),
+            )));
+        };
+        self.wait_token(&downstream, prefill, masked)
+    }
+
+    fn reply_upstream(
+        &mut self,
+        step: EngineResult<i32>,
+        masked: bool,
+        vouch: bool,
+    ) -> EngineResult<()> {
+        self.answer_upstream(step, masked, vouch)
+    }
+
+    fn link_acked(&self) -> bool {
+        self.mask_link.acked
+    }
+
+    fn drop_warm_resume(&mut self) {
+        let _ = self.kv_consume_warm_pending();
     }
 }
 
@@ -10710,33 +10804,135 @@ mod tests {
         want
     }
 
-    /// The tail's step as `step_last` runs it: decode the pair against the
-    /// link's receive cache, answer a miss with the mask-miss token, else pick
-    /// under the mask.
+    /// A relay stage on loopback for [`RelayStage`]: the step logic the
+    /// engine runs ([`relay_last_step`], [`relay_middle_step`]) over real
+    /// frames, with the model replaced by `logits` (the tail) or an identity
+    /// (a middle; `fail_own` fails its own work before it forwards).
+    struct LoopStage {
+        handle: tokio::runtime::Handle,
+        up: Arc<tokio::sync::Mutex<ActivationServer>>,
+        down: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+        link: MaskLink,
+        seq_up: u32,
+        seq_down: u32,
+        logits: (Vec<f32>, Vec<usize>),
+        fail_own: bool,
+        forwarded: bool,
+        dropped_warm: bool,
+    }
+
+    impl RelayStage for LoopStage {
+        fn run_last(
+            &mut self,
+            _hidden: Vec<f32>,
+            _shape: [usize; 3],
+            _pos: Option<i64>,
+            mask: Option<&[u32]>,
+        ) -> EngineResult<i32> {
+            tail_pick(&self.logits.0, &self.logits.1, mask)
+        }
+        fn run_and_forward(
+            &mut self,
+            _hidden: Vec<f32>,
+            _shape: [usize; 3],
+            _pos: Option<i64>,
+            mask: Option<&[u32]>,
+        ) -> EngineResult<bool> {
+            if self.fail_own {
+                return Err(EngineError::Backend("own".into()));
+            }
+            let down = self.down.clone().expect("a middle has a downstream");
+            self.handle
+                .block_on(send_hidden_frames_cached(
+                    &down,
+                    self.seq_down,
+                    None,
+                    mask,
+                    &mut self.link.send,
+                    f16_hidden(1),
+                ))
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            self.forwarded = true;
+            Ok(false)
+        }
+        fn wait_downstream(
+            &mut self,
+            _prefill: bool,
+            masked: bool,
+        ) -> Result<i32, TokenWaitFailure> {
+            let down = self.down.clone().expect("a middle has a downstream");
+            let mut streak = 0;
+            self.handle.block_on(wait_token_reply(
+                &down,
+                self.seq_down,
+                decode_budget(),
+                masked,
+                &mut streak,
+                &mut self.link,
+            ))
+        }
+        fn reply_upstream(
+            &mut self,
+            step: EngineResult<i32>,
+            masked: bool,
+            vouch: bool,
+        ) -> EngineResult<()> {
+            let frames = upstream_reply_frames(&mut self.link, &step, self.seq_up, masked, vouch);
+            let up = self.up.clone();
+            self.handle.block_on(async move {
+                let mut g = up.lock().await;
+                for f in &frames {
+                    g.send(f).await.unwrap();
+                }
+            });
+            step.map(|_| ())
+        }
+        fn link_acked(&self) -> bool {
+            self.link.acked
+        }
+        fn drop_warm_resume(&mut self) {
+            self.dropped_warm = true;
+        }
+    }
+
+    /// The tail's step as `step_last` runs it: read and decode the pair
+    /// against the link's receive cache, then [`relay_last_step`].
     async fn tail_step(
         up: &Arc<tokio::sync::Mutex<ActivationServer>>,
         recv: &mut MaskRecvCache,
         logits: &(Vec<f32>, Vec<usize>),
     ) -> (u32, Option<Result<Vec<u32>, MaskMiss>>) {
-        let (lead, hid) = recv_hidden_frames(up, false).await.unwrap();
-        let step = decode_upstream_step(&lead, &hid.unwrap(), false, recv).unwrap();
-        let frame = match &step.mask {
-            Some(Err(MaskMiss)) => upstream_reply_frames(
-                &mut MaskLink::default(),
-                &Ok(MASK_MISS_TOKEN),
-                step.seq,
-                true,
-                true,
-            )[0]
-            .clone(),
-            mask => {
-                let words = mask.as_ref().map(|m| m.as_ref().unwrap().as_slice());
-                let pick = tail_pick(&logits.0, &logits.1, words);
-                relay_reply_frame(&pick, step.seq, words.is_some())
-            }
-        };
-        up.lock().await.send(&frame).await.unwrap();
-        (step.seq, step.mask)
+        let (up, mut cache, logits) = (up.clone(), std::mem::take(recv), logits.clone());
+        let handle = tokio::runtime::Handle::current();
+        let (cache, out) = tokio::task::spawn_blocking(move || {
+            let (lead, hid) = handle.block_on(recv_hidden_frames(&up, false)).unwrap();
+            let step = decode_upstream_step(&lead, &hid.unwrap(), false, &mut cache).unwrap();
+            let mut stage = LoopStage {
+                handle,
+                up,
+                down: None,
+                link: MaskLink::default(),
+                seq_up: step.seq,
+                seq_down: 0,
+                logits,
+                fail_own: false,
+                forwarded: false,
+                dropped_warm: false,
+            };
+            let mask = step.mask.clone();
+            let _ = relay_last_step(
+                &mut stage,
+                step.hidden,
+                step.shape,
+                step.position,
+                step.mask,
+            );
+            (cache, (step.seq, mask))
+        })
+        .await
+        .unwrap();
+        *recv = cache;
+        out
     }
 
     /// A repeated mask goes as the short marker: a lead of today's lanes plus
@@ -10902,11 +11098,9 @@ mod tests {
         assert!(link.acked);
     }
 
-    /// The middle's step exactly as `step_middle` runs it on the cached wire:
-    /// decode against its receive cache (a miss answers the mask-miss token
-    /// up without running anything), forward with its own send cache, and
-    /// relay the reply (a miss from below goes up as the mask-miss token).
-    /// `fail_own_step` fails the middle's own work before it forwards.
+    /// The middle's step as `step_middle` runs it: read and decode the pair
+    /// against its receive cache, then [`relay_middle_step`] with its own send
+    /// cache. Returns whether it forwarded anything and dropped a warm resume.
     async fn cached_middle_step(
         mid_up: &Arc<tokio::sync::Mutex<ActivationServer>>,
         mid_down: &Arc<tokio::sync::Mutex<ActivationClient>>,
@@ -10914,48 +11108,40 @@ mod tests {
         recv: &mut MaskRecvCache,
         link: &mut MaskLink,
         fail_own_step: bool,
-    ) {
-        let (lead, hid) = recv_hidden_frames(mid_up, false).await.unwrap();
-        let step = decode_upstream_step(&lead, &hid.unwrap(), false, recv).unwrap();
-        let (outcome, masked, vouch) = match step.mask {
-            Some(Err(MaskMiss)) => (Ok(MASK_MISS_TOKEN), true, true),
-            _ if fail_own_step => {
-                let masked = step.mask.is_some();
-                let (s, v) = own_failure_answer(EngineError::Backend("own".into()), link.acked);
-                (s, masked, v)
-            }
-            mask => {
-                let words = mask.map(Result::unwrap);
-                let masked = words.is_some();
-                send_hidden_frames_cached(
-                    mid_down,
-                    seq_down,
-                    None,
-                    words.as_deref(),
-                    &mut link.send,
-                    f16_hidden(1),
-                )
-                .await
-                .unwrap();
-                let mut streak = 0;
-                let reply = wait_token_reply(
-                    mid_down,
-                    seq_down,
-                    decode_budget(),
-                    masked,
-                    &mut streak,
-                    link,
-                )
-                .await;
-                let (s, v) = relay_token_answer(reply, masked);
-                (s, masked, v)
-            }
-        };
-        let frames = upstream_reply_frames(link, &outcome, step.seq, masked, vouch);
-        let mut g = mid_up.lock().await;
-        for f in &frames {
-            g.send(f).await.unwrap();
-        }
+    ) -> (bool, bool) {
+        let (up, down) = (mid_up.clone(), mid_down.clone());
+        let (mut cache, owned) = (std::mem::take(recv), std::mem::take(link));
+        let handle = tokio::runtime::Handle::current();
+        let (cache, owned, out) = tokio::task::spawn_blocking(move || {
+            let (lead, hid) = handle.block_on(recv_hidden_frames(&up, false)).unwrap();
+            let step = decode_upstream_step(&lead, &hid.unwrap(), false, &mut cache).unwrap();
+            let mut stage = LoopStage {
+                handle,
+                up,
+                down: Some(down),
+                link: owned,
+                seq_up: step.seq,
+                seq_down,
+                logits: (Vec::new(), Vec::new()),
+                fail_own: fail_own_step,
+                forwarded: false,
+                dropped_warm: false,
+            };
+            let _ = relay_middle_step(
+                &mut stage,
+                step.hidden,
+                step.shape,
+                step.position,
+                step.mask,
+            );
+            let out = (stage.forwarded, stage.dropped_warm);
+            (cache, stage.link, out)
+        })
+        .await
+        .unwrap();
+        *recv = cache;
+        *link = owned;
+        out
     }
 
     type Pipe = (
@@ -10994,7 +11180,7 @@ mod tests {
         // The middle believes the tail holds `words`; the tail is fresh.
         mid_link.send.record(0, &words);
         let mut streak = 0;
-        let (head, (), tail) = tokio::join!(
+        let (head, _, tail) = tokio::join!(
             masked_exchange(
                 &head_down,
                 1,
@@ -11020,7 +11206,7 @@ mod tests {
         assert!(mid_link.refusal(std::time::Instant::now()).is_none());
 
         // The next step goes full on both hops and succeeds.
-        let (head, (), tail) = tokio::join!(
+        let (head, _, tail) = tokio::join!(
             masked_exchange(
                 &head_down,
                 2,
@@ -11078,7 +11264,7 @@ mod tests {
                 let frame = relay_reply_frame(&Ok(b'"' as i32), step.seq, true);
                 tail_up.lock().await.send(&frame).await.unwrap();
             };
-            let ((), ()) = tokio::join!(
+            let (_, ()) = tokio::join!(
                 cached_middle_step(
                     &mid_up,
                     &mid_down,
@@ -11147,7 +11333,7 @@ mod tests {
             tail_up.lock().await.send(&frame).await.unwrap();
             (lead, step.mask)
         };
-        let ((), (lead, mask)) = tokio::join!(
+        let (_, (lead, mask)) = tokio::join!(
             cached_middle_step(&mid_up, &mid_down, 12, &mut mid_recv, &mut mid_link, false),
             tail
         );
@@ -11295,8 +11481,9 @@ mod tests {
         );
     }
 
-    /// A late acknowledged reply — the mask-miss token included — echoing an
-    /// older seq is discarded as stale, and the wait returns its own token.
+    /// A late mask-miss reply echoing an older seq is discarded as stale and,
+    /// unlike other late acknowledged replies, doesn't count as evidence that
+    /// the chain masks; the wait returns its own token.
     #[tokio::test]
     async fn a_late_mask_miss_reply_is_discarded_as_stale() {
         let (client, mut server) = loopback().await;
@@ -11309,7 +11496,10 @@ mod tests {
         let mut stale_ack = false;
         let got = recv_token_reply(&downstream, 5, decode_budget(), true, &mut stale_ack).await;
         assert_eq!(got.unwrap(), 9);
-        assert!(stale_ack);
+        assert!(
+            !stale_ack,
+            "a late mask miss proves nothing about the chain"
+        );
         // A mask-miss token on a plain step is a desync, not a token.
         let (client, mut server) = loopback().await;
         server
@@ -11335,5 +11525,117 @@ mod tests {
         let (_, decoded) = decode_packed_plan(&one, 1).unwrap();
         let got = decoded.unwrap()[0].clone().unwrap();
         assert_eq!(&got[..words.len()], words.as_slice());
+    }
+
+    /// A middle that gets a marker it can't resolve answers the mask-miss
+    /// token without forwarding anything (dropping any armed warm resume),
+    /// acknowledged only once its chain below has acknowledged a masked step:
+    /// a middle that can't vouch for the stages below answers unacknowledged.
+    #[tokio::test]
+    async fn a_miss_at_a_middle_answers_without_forwarding_and_vouches_only_when_acked() {
+        let words = ok_enum_words();
+        for acked in [true, false] {
+            let (head_down, mid_up, mid_down, tail_up) = three_stage_pipe().await;
+            let mut head_link = MaskLink::default();
+            head_link.send.record(0, &words);
+            let mut mid_link = MaskLink {
+                acked,
+                ..MaskLink::default()
+            };
+            let mut mid_recv = MaskRecvCache::default();
+            let mut streak = 0;
+            let (head, (forwarded, dropped_warm)) = tokio::join!(
+                masked_exchange(
+                    &head_down,
+                    1,
+                    None,
+                    &words,
+                    f16_hidden(1),
+                    decode_budget(),
+                    &mut streak,
+                    &mut head_link,
+                ),
+                cached_middle_step(&mid_up, &mid_down, 11, &mut mid_recv, &mut mid_link, false)
+            );
+            assert!(!forwarded, "nothing forwarded on a miss");
+            assert!(dropped_warm, "the armed warm resume is dropped");
+            let nothing = tokio::time::timeout(Duration::from_secs(1), async {
+                tail_up.lock().await.wait_readable().await
+            })
+            .await;
+            assert!(nothing.is_err(), "the tail got nothing");
+            let err = head.unwrap_err();
+            if acked {
+                assert!(err.to_string().contains(MASK_MISS_MESSAGE), "{err}");
+                assert!(head_link.refusal(std::time::Instant::now()).is_none());
+            } else {
+                assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+            }
+        }
+    }
+
+    /// The tail answers a miss acknowledged (it applies masks itself), and
+    /// drops any armed warm resume.
+    #[tokio::test]
+    async fn a_miss_at_the_tail_is_always_acknowledged() {
+        let words = ok_enum_words();
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let mut send = MaskSendCache::default();
+        send.record(0, &words);
+        send_hidden_frames_cached(&downstream, 4, None, Some(&words), &mut send, f16_hidden(1))
+            .await
+            .unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let up = upstream.clone();
+        let dropped = tokio::task::spawn_blocking(move || {
+            let (lead, hid) = handle.block_on(recv_hidden_frames(&up, false)).unwrap();
+            let step =
+                decode_upstream_step(&lead, &hid.unwrap(), false, &mut MaskRecvCache::default())
+                    .unwrap();
+            let mut stage = LoopStage {
+                handle,
+                up,
+                down: None,
+                link: MaskLink::default(),
+                seq_up: step.seq,
+                seq_down: 0,
+                logits: (Vec::new(), Vec::new()),
+                fail_own: false,
+                forwarded: false,
+                dropped_warm: false,
+            };
+            relay_last_step(
+                &mut stage,
+                step.hidden,
+                step.shape,
+                step.position,
+                step.mask,
+            )
+            .unwrap();
+            stage.dropped_warm
+        })
+        .await
+        .unwrap();
+        assert!(dropped);
+        let (t, _) = downstream.lock().await.recv().await.unwrap();
+        assert_eq!(t, encode_token_reply(MASK_MISS_TOKEN, 4, true));
+    }
+
+    /// A late mask-miss reply skipped by a control-ack read doesn't count as
+    /// evidence that the chain masks.
+    #[tokio::test]
+    async fn a_late_mask_miss_before_a_control_ack_is_no_evidence() {
+        let (mut client, mut server) = loopback().await;
+        server
+            .send(&encode_token_reply(MASK_MISS_TOKEN, 3, true))
+            .await
+            .unwrap();
+        let ack = WireTensor::new(WireDType::I8, [1, 1, 1], vec![6]);
+        server.send(&ack).await.unwrap();
+        let (got, stale_ack) = recv_control_ack(&mut client, Duration::from_secs(5), "ABORT").await;
+        assert_eq!(got.unwrap(), ack);
+        assert!(!stale_ack);
     }
 }
