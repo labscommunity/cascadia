@@ -173,7 +173,8 @@ const COUNT_KEYWORDS: [[&str; 2]; 3] = [
 
 const FIELD: &str = "response_format.json_schema.schema";
 
-/// Reject a schema over [`MAX_SCHEMA_BYTES`], nested deeper than
+/// Reject a schema over [`MAX_SCHEMA_BYTES`], with a repeated key in any
+/// object, nested deeper than
 /// [`MAX_SCHEMA_DEPTH`], with a count keyword or pattern quantifier above
 /// [`MAX_SCHEMA_COUNT`], or whose counts sum above [`MAX_SCHEMA_COUNT_TOTAL`].
 /// `text` is the schema's compact text.
@@ -184,6 +185,7 @@ fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
             "{FIELD} is {n} bytes; the limit is {MAX_SCHEMA_BYTES}"
         ));
     }
+    reject_duplicate_keys(text)?;
     if nests_deeper_than(schema, MAX_SCHEMA_DEPTH) {
         return Err(format!(
             "{FIELD} nests deeper than {MAX_SCHEMA_DEPTH} levels"
@@ -304,6 +306,102 @@ fn quantifier_at(b: &[u8], start: usize) -> (Vec<&str>, usize) {
         return not_one;
     }
     (numbers, i + 1)
+}
+
+/// Deepest nesting [`reject_duplicate_keys`] walks before giving up.
+const DUPLICATE_CHECK_DEPTH: usize = 128;
+
+/// Reject a schema text in which any object repeats a key. The limits are
+/// checked on a parsed `Value`, which keeps the last of repeated keys, while
+/// the backend compiles the text and may keep the first: without this check
+/// `{"maxLength":1000000,"maxLength":5}` would pass the limits and compile
+/// the large one.
+fn reject_duplicate_keys(text: &str) -> Result<(), String> {
+    use serde::de::{DeserializeSeed, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::fmt;
+
+    /// Walks one JSON value; records the first repeated key in `found`.
+    #[derive(Clone, Copy)]
+    struct Walk<'a> {
+        depth: usize,
+        found: &'a RefCell<Option<String>>,
+    }
+
+    impl<'de> DeserializeSeed<'de> for Walk<'_> {
+        type Value = ();
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            if self.depth > DUPLICATE_CHECK_DEPTH {
+                return Err(D::Error::custom("nested too deep"));
+            }
+            d.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Walk<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            let inner = Walk {
+                depth: self.depth + 1,
+                ..self
+            };
+            while seq.next_element_seed(inner)?.is_some() {}
+            Ok(())
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let inner = Walk {
+                depth: self.depth + 1,
+                ..self
+            };
+            let mut keys = HashSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if keys.contains(&key) {
+                    *self.found.borrow_mut() = Some(key);
+                    return Err(A::Error::custom("duplicate key"));
+                }
+                map.next_value_seed(inner)?;
+                keys.insert(key);
+            }
+            Ok(())
+        }
+    }
+
+    let found = RefCell::new(None);
+    let mut de = serde_json::Deserializer::from_str(text);
+    let walked = Walk {
+        depth: 1,
+        found: &found,
+    }
+    .deserialize(&mut de);
+    if let Some(key) = found.into_inner() {
+        return Err(format!(
+            "{FIELD} has a duplicate key {}",
+            Value::String(key)
+        ));
+    }
+    walked.map_err(|e| format!("{FIELD}: {e}"))
 }
 
 /// True when objects and arrays in `v` nest more than `levels` deep, counting
@@ -513,6 +611,58 @@ mod tests {
         );
         assert_eq!(minify_json(" [ 1 ,\n\t2 ] "), "[1,2]");
         assert_eq!(minify_json(r#"" \\" , " x ""#), r#"" \\"," x ""#);
+    }
+
+    #[test]
+    fn duplicate_keys_in_the_schema_are_rejected() {
+        let parse_text = |schema: &str| {
+            parse_response_format(Some(&format!(
+                r#"{{"type":"json_schema","json_schema":{{"schema":{schema}}}}}"#
+            )))
+        };
+        let dup = |k: &str| {
+            Err(format!(
+                "response_format.json_schema.schema has a duplicate key \"{k}\""
+            ))
+        };
+        assert_eq!(
+            parse_text(r#"{"type":"string","maxLength":5,"maxLength":1000000}"#),
+            dup("maxLength")
+        );
+        assert_eq!(
+            parse_text(r#"{"type":"string","maxLength":1000000,"maxLength":5}"#),
+            dup("maxLength")
+        );
+        assert_eq!(
+            parse_text(
+                r#"{"type":"object","properties":{"a":{"type":"string"},"a":{"type":"integer"}}}"#
+            ),
+            dup("a")
+        );
+        assert_eq!(
+            parse_text(
+                r##"{"$ref":"#/$defs/A","$defs":{"A":{"type":"array","items":[{"minItems":1,"minItems":2}]}}}"##
+            ),
+            dup("minItems")
+        );
+        // An escaped spelling of the same key is the same key.
+        assert_eq!(
+            parse_text(r#"{"type":"string","\u0074ype":"integer"}"#),
+            dup("type")
+        );
+        // The same key in sibling or nested objects is fine.
+        assert!(parse_text(
+            r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string","properties":{"type":{"type":"string"}}}}}"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn duplicate_key_check_is_depth_limited() {
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        assert!(reject_duplicate_keys(&format!(r#"{{"enum":{deep}}}"#)).is_err());
+        let ok = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        assert!(reject_duplicate_keys(&ok).is_ok());
     }
 
     #[test]
