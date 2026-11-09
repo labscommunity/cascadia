@@ -226,6 +226,20 @@ fn check_metadata(metadata: Option<&Value>) -> Result<(), Refusal> {
 fn refuse_unsupported(req: &ResponsesRequest) -> Result<bool, Refusal> {
     check_metadata(req.metadata.as_ref())?;
     let encrypted = check_include(req.include.as_ref())?;
+    // An empty `input` with no instructions is an empty conversation: a
+    // template still renders its generation prompt, so the model would
+    // answer nothing in particular.
+    let empty = match &req.input {
+        Value::String(s) => s.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    };
+    if empty && req.instructions.as_deref().is_none_or(str::is_empty) {
+        return Err(Refusal::malformed(
+            "input",
+            "`input` is empty and there are no `instructions`: nothing to respond to",
+        ));
+    }
     // A cap of 0 asks for no output; the engine would answer regardless.
     if req.max_output_tokens == Some(0) {
         return Err(Refusal::malformed(
@@ -1396,6 +1410,36 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
         assert!(tasks.lock().is_empty());
+    }
+
+    /// An empty `input` with no `instructions` is an empty conversation: a
+    /// 400 naming `input`, even where the template would still render a
+    /// prompt. With `instructions` there is something to answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_input_without_instructions_is_a_400() {
+        let (app, tasks, _) = app_with(
+            RecordingEngine::script(&["ok"]),
+            template_config(PERMISSIVE_TEMPLATE),
+        )
+        .await;
+        for input in [json!(""), json!([])] {
+            let (status, v) = post_json(
+                app.clone(),
+                json!({"model": "script-model", "input": input}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{input}: {v}");
+            assert_eq!(v["error"]["param"], "input", "{v}");
+        }
+        assert!(tasks.lock().is_empty());
+        for input in [json!(""), json!([])] {
+            let (status, v) = post_json(
+                app.clone(),
+                json!({"model": "script-model", "input": input, "instructions": "Say hi."}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{input}: {v}");
+        }
     }
 
     /// What a [`RecordingEngine`] writes.
