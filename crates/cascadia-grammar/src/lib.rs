@@ -46,6 +46,7 @@ fn backend(e: impl std::fmt::Display) -> EngineError {
 pub struct GrammarFactory {
     factory: Arc<ParserFactory>,
     mask_width: usize,
+    eos: Arc<[u32]>,
 }
 
 impl GrammarFactory {
@@ -68,10 +69,10 @@ impl GrammarFactory {
         }
         bt.set_eos_tokens(&eos);
         let tok_env = bt.into_tok_env(None).map_err(backend)?;
-        Self::from_tok_env(tok_env)
+        Self::from_tok_env(tok_env, eos.into())
     }
 
-    fn from_tok_env(tok_env: TokEnv) -> EngineResult<Self> {
+    fn from_tok_env(tok_env: TokEnv, eos: Arc<[u32]>) -> EngineResult<Self> {
         let mask_width = tok_env.tok_trie().vocab_size();
         let mut factory = ParserFactory::new_simple(&tok_env).map_err(backend)?;
         // A server: errors and warnings come back as values, nothing goes to stderr.
@@ -79,6 +80,7 @@ impl GrammarFactory {
         Ok(Self {
             factory: Arc::new(factory),
             mask_width,
+            eos,
         })
     }
 
@@ -128,6 +130,7 @@ impl GrammarFactory {
             pristine: Arc::new(matcher),
             warnings,
             mask_width: self.mask_width,
+            eos: self.eos.clone(),
         })
     }
 }
@@ -139,6 +142,7 @@ pub struct CompiledGrammar {
     pristine: Arc<Matcher>,
     warnings: Arc<[String]>,
     mask_width: usize,
+    eos: Arc<[u32]>,
 }
 
 impl CompiledGrammar {
@@ -157,6 +161,7 @@ impl CompiledGrammar {
         Ok(GrammarMask {
             matcher,
             mask_width: self.mask_width,
+            eos: self.eos.clone(),
             current: None,
         })
     }
@@ -166,20 +171,20 @@ impl CompiledGrammar {
 pub struct GrammarMask {
     matcher: Matcher,
     mask_width: usize,
+    eos: Arc<[u32]>,
     /// Mask for the current position, computed once per step.
     current: Option<SimpleVob>,
 }
 
 impl GrammarMask {
-    /// Accepts tokens already in the output (a resumed sequence). A token the
-    /// grammar rejects means the continuation can never be valid: `InvalidConfig`.
+    /// Accepts tokens already in the output (a resumed sequence). The server
+    /// produced those tokens, so one the grammar rejects is a server-side
+    /// failure (`Backend`), not the client's.
     pub fn replay(&mut self, tokens: &[u32]) -> EngineResult<()> {
         self.current = None;
-        self.matcher.consume_tokens(tokens).map_err(|e| {
-            EngineError::InvalidConfig(clean_message(&format!(
-                "resumed output does not match the response_format schema: {e}"
-            )))
-        })
+        self.matcher
+            .consume_tokens(tokens)
+            .map_err(|e| backend(format!("resumed output does not match the schema: {e}")))
     }
 
     fn current_mask(&mut self) -> EngineResult<&SimpleVob> {
@@ -195,16 +200,33 @@ impl GrammarMask {
     /// the tokenizer vocab (a padded model head). `Err` when nothing in `row`
     /// is allowed.
     pub fn apply(&mut self, row: &mut [f32]) -> EngineResult<()> {
-        let width = self.mask_width;
+        let width = self.mask_width.min(row.len());
         let mask = self.current_mask()?;
+        let words = mask.as_slice();
         let mut any = false;
-        for (i, l) in row.iter_mut().enumerate() {
-            if i < width && mask.is_allowed(i as u32) {
-                any = true;
-            } else {
-                *l = f32::NEG_INFINITY;
+        // 32 tokens per mask word: whole words are filled or skipped, only
+        // mixed words are tested bit by bit.
+        for (w, chunk) in row[..width].chunks_mut(32).enumerate() {
+            let mut bits = words.get(w).copied().unwrap_or(0);
+            if chunk.len() < 32 {
+                // The last, partial word: only the bits that index into the row.
+                bits &= (1u32 << chunk.len()) - 1;
+            }
+            if bits == 0 {
+                chunk.fill(f32::NEG_INFINITY);
+                continue;
+            }
+            any = true;
+            if bits == u32::MAX && chunk.len() == 32 {
+                continue;
+            }
+            for (b, l) in chunk.iter_mut().enumerate() {
+                if bits & (1u32 << b) == 0 {
+                    *l = f32::NEG_INFINITY;
+                }
             }
         }
+        row[width..].fill(f32::NEG_INFINITY);
         if any {
             Ok(())
         } else {
@@ -222,8 +244,13 @@ impl GrammarMask {
 
     /// Advances past the token the engine picked. A token the grammar rejects
     /// is an error, and the mask stays in that error state: [`Self::apply`]
-    /// and later accepts fail, [`Self::finished`] stays false.
+    /// and later accepts fail, [`Self::finished`] stays false. An EOS token
+    /// after a clean finish is accepted and changes nothing (the engine may
+    /// commit the EOS it picked from the finished mask).
     pub fn accept(&mut self, token: u32) -> EngineResult<()> {
+        if self.finished() && self.eos.contains(&token) {
+            return Ok(());
+        }
         self.current = None;
         self.matcher.consume_token(token).map_err(backend)
     }
@@ -236,7 +263,7 @@ impl GrammarMask {
         !self.matcher.is_error()
             && matches!(
                 self.matcher.stop_reason(),
-                StopReason::NoExtension | StopReason::NoExtensionBias | StopReason::EndOfSentence
+                StopReason::NoExtension | StopReason::EndOfSentence
             )
     }
 }

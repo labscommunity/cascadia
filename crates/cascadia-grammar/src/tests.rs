@@ -14,7 +14,11 @@ const PYDANTIC_OUTPUT_SCHEMA: &str =
     include_str!("../../cascadia-engine-mock/tests/fixtures/pydantic_output_schema.json");
 
 fn single_byte() -> GrammarFactory {
-    GrammarFactory::from_tok_env(ApproximateTokEnv::single_byte_env()).unwrap()
+    GrammarFactory::from_tok_env(
+        ApproximateTokEnv::single_byte_env(),
+        vec![SINGLE_BYTE_EOS as u32].into(),
+    )
+    .unwrap()
 }
 
 fn spec(body: &str) -> GrammarSpec {
@@ -142,11 +146,49 @@ fn replay_of_a_valid_prefix_succeeds() {
 }
 
 #[test]
-fn replay_of_an_invalid_prefix_is_invalid_config() {
+fn replay_of_an_invalid_prefix_is_a_backend_error() {
+    // The server produced a resumed prefix, so a mismatch is not the client's fault.
     let gf = single_byte();
     let mut gm = mask_for(&gf, WEATHER);
     let err = gm.replay(&bytes(r#"{"x"#)).unwrap_err();
-    assert!(matches!(err, EngineError::InvalidConfig(_)), "{err:?}");
+    assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+}
+
+#[test]
+fn eos_after_a_closed_object_keeps_the_finish() {
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, WEATHER);
+    walk(&gf, &mut gm, &bytes(WEATHER_OK)).unwrap();
+    assert!(gm.finished());
+    let row = masked_row(&gf, &mut gm);
+    assert!(row[SINGLE_BYTE_EOS].is_finite());
+    gm.accept(SINGLE_BYTE_EOS as u32).unwrap();
+    assert!(gm.finished());
+}
+
+#[test]
+fn eos_ends_a_value_that_could_continue() {
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, r#"{"type":"integer"}"#);
+    walk(&gf, &mut gm, &bytes("12")).unwrap();
+    assert!(!gm.finished());
+    gm.accept(SINGLE_BYTE_EOS as u32).unwrap();
+    assert!(gm.finished());
+}
+
+#[test]
+fn word_wise_mask_matches_bit_by_bit() {
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, WEATHER);
+    for &t in &bytes(r#"{"city":"P"#) {
+        let mut row: Vec<f32> = (0..gf.mask_width() + 37).map(|i| i as f32).collect();
+        gm.apply(&mut row).unwrap();
+        for (i, v) in row.iter().enumerate() {
+            let want = i < gf.mask_width() && gm.allowed(i as u32);
+            assert_eq!(v.is_finite(), want, "index {i}");
+        }
+        gm.accept(t).unwrap();
+    }
 }
 
 #[test]
