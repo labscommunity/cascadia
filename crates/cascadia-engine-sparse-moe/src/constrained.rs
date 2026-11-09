@@ -8,6 +8,8 @@
 
 use cascadia_engine::{EngineError, EngineResult};
 use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
+
+use crate::dist::{MaskCols, MaskLatch, MaskedReply};
 use cascadia_types::GenerationTask;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
@@ -39,6 +41,11 @@ impl GrammarSlot {
         }
     }
 
+    /// Tokens a mask covers (the tokenizer vocab); `None` without a factory.
+    pub(crate) fn mask_width(&self) -> Option<usize> {
+        self.0.as_ref().ok().map(GrammarFactory::mask_width)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_factory(f: GrammarFactory) -> Self {
         Self(Ok(f))
@@ -67,12 +74,86 @@ impl GrammarSlot {
     }
 }
 
-/// The submit-time refusal for a json task on a multi-stage pipeline.
-pub(crate) fn refuse_multi_stage_grammar() -> EngineError {
-    EngineError::InvalidConfig(
-        "structured output (response_format) is not supported on multi-stage sparse-moe pipelines yet"
-            .into(),
+/// What a json task is told while its pipeline can't apply masks.
+pub(crate) const UPGRADE_EVERY_STAGE: &str =
+    "a later pipeline stage runs a build without structured-output support; upgrade every stage";
+
+/// A masked step that came back without an acknowledgement.
+pub(crate) fn unconfirmed_step(reason: &str) -> String {
+    format!(
+        "structured output: the pipeline did not acknowledge the masked step ({reason}); \
+         likely cause: {UPGRADE_EVERY_STAGE}"
     )
+}
+
+/// A masked step a later stage acknowledged but could not serve.
+pub(crate) const REFUSED_STEP: &str =
+    "structured output: a later pipeline stage could not apply the mask for this step";
+
+/// The mask for the task's next token as wire words over `width` tokens
+/// (bit `i` allows token `i`). `Err` at a grammar dead end.
+pub(crate) fn mask_words(gm: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
+    let mut row = vec![0.0f32; width];
+    gm.apply(&mut row)?;
+    let mut words = vec![0u32; width.div_ceil(32)];
+    for (i, v) in row.iter().enumerate() {
+        if *v != f32::NEG_INFINITY {
+            words[i / 32] |= 1 << (i % 32);
+        }
+    }
+    Ok(words)
+}
+
+/// Rank 0 of a pipeline: tags for masked steps, and the latch that remembers
+/// the pipeline could not apply one.
+#[derive(Debug, Default)]
+pub(crate) struct StageMasks {
+    pub(crate) latch: MaskLatch,
+    tag: u32,
+}
+
+impl StageMasks {
+    /// A fresh non-zero tag.
+    pub(crate) fn next_tag(&mut self) -> u32 {
+        self.tag = self.tag.wrapping_add(1).max(1);
+        self.tag
+    }
+
+    /// The error for a json task while the latch refuses, else `None`.
+    pub(crate) fn refusal(&self) -> Option<String> {
+        self.latch
+            .refuses()
+            .then(|| UPGRADE_EVERY_STAGE.to_string())
+    }
+
+    /// Mask columns for a `rows`-row frame whose last row picks the next
+    /// token of `gm`'s task, with that row's tag. `Err` at a dead end.
+    pub(crate) fn last_row(
+        &mut self,
+        gm: &mut GrammarMask,
+        width: usize,
+        rows: usize,
+    ) -> EngineResult<(MaskCols, u32)> {
+        let words = mask_words(gm, width)?;
+        let tag = self.next_tag();
+        let mut cols = MaskCols::new(rows, words.len());
+        cols.set(rows - 1, tag, &words);
+        Ok((cols, tag))
+    }
+
+    /// The token of a masked step's reply, or the task's error; latches on
+    /// a reply without acknowledgement.
+    pub(crate) fn outcome(&self, reply: MaskedReply) -> Result<i64, String> {
+        match reply {
+            MaskedReply::Token(t) => Ok(t),
+            MaskedReply::Refused => Err(REFUSED_STEP.to_string()),
+            MaskedReply::Unconfirmed(reason) => {
+                self.latch.set();
+                warn!(%reason, "masked step not acknowledged; json requests refused until a stage acknowledges or the re-probe interval passes");
+                Err(unconfirmed_step(&reason))
+            }
+        }
+    }
 }
 
 /// A fresh matcher for a starting task, advanced over the resume seed (tokens
@@ -231,13 +312,5 @@ mod tests {
         let mut gm = mask(WEATHER);
         assert!(commit(Some(&mut gm), i64::from(b'x')).is_err());
         assert!(!commit(None, 5).unwrap());
-    }
-
-    #[test]
-    fn multi_stage_refusal_is_a_400() {
-        assert!(matches!(
-            refuse_multi_stage_grammar(),
-            EngineError::InvalidConfig(m) if m == "structured output (response_format) is not supported on multi-stage sparse-moe pipelines yet"
-        ));
     }
 }

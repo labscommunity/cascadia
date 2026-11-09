@@ -68,6 +68,43 @@ pub fn sample(
     };
     let mut masked = logits.to_vec();
     mask.apply(&mut masked)?;
+    sample_masked_row(masked, history, cfg, rng_state)
+}
+
+/// [`sample`] under a mask that came over the stage wire: bit `i` of
+/// `words` (32 tokens per word, little bit first) allows token `i`; tokens
+/// past the last word are not allowed. `Err` when nothing in the row is.
+pub fn sample_with_words(
+    logits: &[f32],
+    history: &[i64],
+    cfg: &SamplingConfig,
+    rng_state: &mut u64,
+    words: &[u32],
+) -> EngineResult<i64> {
+    let mut masked = logits.to_vec();
+    let mut any = false;
+    for (i, l) in masked.iter_mut().enumerate() {
+        if words.get(i / 32).is_some_and(|w| (w >> (i % 32)) & 1 == 1) {
+            any = true;
+        } else {
+            *l = f32::NEG_INFINITY;
+        }
+    }
+    if !any {
+        return Err(EngineError::Backend(
+            "grammar: no token of the logits row is allowed".into(),
+        ));
+    }
+    sample_masked_row(masked, history, cfg, rng_state)
+}
+
+/// Sample a row whose disallowed entries are already `-inf`.
+fn sample_masked_row(
+    masked: Vec<f32>,
+    history: &[i64],
+    cfg: &SamplingConfig,
+    rng_state: &mut u64,
+) -> EngineResult<i64> {
     let pick = sample_row(masked.clone(), history, cfg, rng_state);
     if masked.get(pick as usize) != Some(&f32::NEG_INFINITY) {
         return Ok(pick);

@@ -1,6 +1,6 @@
-//! Structured output on the single-stage pipeline engine: the one-task path
-//! and multi-stream decode, driven by a fake runner whose logits favour
-//! tokens the schema forbids.
+//! Structured output on the pipeline engine: the one-task path and
+//! multi-stream decode, on a single stage and across stages, driven by a fake
+//! runner whose logits favour tokens the schema forbids.
 
 use super::*;
 use crate::constrained::test_env::{self, EOS, VOCAB, WEATHER};
@@ -26,6 +26,7 @@ fn preferences(width: usize) -> Vec<f32> {
 struct JsonStub {
     width: usize,
     slots: Vec<Option<usize>>,
+    batched: bool,
 }
 
 impl JsonStub {
@@ -33,6 +34,15 @@ impl JsonStub {
         Self {
             width: VOCAB,
             slots: Vec::new(),
+            batched: false,
+        }
+    }
+
+    /// Prefills a prompt as one batch (`ForwardBatchPrefill` on a pipeline).
+    fn batched() -> Self {
+        Self {
+            batched: true,
+            ..Self::new()
         }
     }
 }
@@ -59,6 +69,9 @@ impl StagedRunner for JsonStub {
     }
     fn head_logits(&self, _hidden: &[f32]) -> Vec<f32> {
         preferences(self.width)
+    }
+    fn supports_batched_prefill(&self) -> bool {
+        self.batched
     }
     fn stream_capacity(&self) -> usize {
         self.slots.len()
@@ -354,13 +367,11 @@ fn submit_without_a_factory_is_invalid_config() {
 }
 
 #[test]
-fn submit_refuses_json_on_a_multi_stage_pipeline() {
+fn submit_queues_json_on_a_multi_stage_pipeline() {
     let mut r = rig(JsonStub::new(), 2, 0);
-    assert!(matches!(
-        r.eng.submit(json_task("j", 8)),
-        Err(EngineError::InvalidConfig(m)) if m.contains("multi-stage")
-    ));
-    assert!(r.eng.pending.is_empty());
+    r.eng.submit(json_task("j", 8)).unwrap();
+    assert_eq!(r.eng.pending.len(), 1);
+    assert_eq!(r.eng.grammars.len(), 1);
 }
 
 #[test]
@@ -437,4 +448,304 @@ fn early_returns_do_not_leak_the_compiled_grammar() {
         drive(&mut r.eng, &["e"]);
         assert!(r.eng.grammars.is_empty(), "streams={streams}");
     }
+}
+
+// ---- multi-stage: the mask on the stage wire --------------------------------
+
+use crate::constrained::UPGRADE_EVERY_STAGE;
+use cascadia_transport::{ActivationClient, ActivationServer};
+
+/// Rank 0 of a pipeline whose other ranks run on their own threads over
+/// loopback links. The head is dropped first, which closes the links and
+/// lets the workers exit.
+struct Chain {
+    head: PipelineEngine<JsonStub>,
+    rt: tokio::runtime::Runtime,
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+type Link = (
+    Arc<TokioMutex<ActivationServer>>,
+    Arc<TokioMutex<ActivationClient>>,
+);
+
+/// `n` loopback links: `(server side, client side)`.
+fn links(rt: &tokio::runtime::Runtime, n: usize) -> Vec<Link> {
+    rt.block_on(async {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let mut srv = ActivationServer::new("127.0.0.1", 0);
+            srv.start().await.unwrap();
+            let port = srv.port();
+            let srv = Arc::new(TokioMutex::new(srv));
+            let s = srv.clone();
+            let accept = tokio::spawn(async move { s.lock().await.accept().await.unwrap() });
+            let mut cli = ActivationClient::new("127.0.0.1", port);
+            cli.connect_with_timeout(Duration::from_secs(5))
+                .await
+                .unwrap();
+            accept.await.unwrap();
+            out.push((srv, Arc::new(TokioMutex::new(cli))));
+        }
+        out
+    })
+}
+
+fn head_engine(
+    rt: &tokio::runtime::Runtime,
+    runner: JsonStub,
+    down: Arc<TokioMutex<ActivationClient>>,
+    ranks: u32,
+    streams: usize,
+) -> PipelineEngine<JsonStub> {
+    let mut head = PipelineEngine::new(
+        runner,
+        Some(test_env::tokenizer()),
+        StageTransport {
+            upstream: None,
+            downstream: Some(down),
+        },
+        rt.handle().clone(),
+        0,
+        ranks,
+        None,
+    );
+    head.set_grammar_slot(GrammarSlot::from_factory(test_env::factory()));
+    if streams > 0 {
+        assert_eq!(head.enable_streams(streams), streams);
+    }
+    head
+}
+
+fn chain(ranks: u32, streams: usize, make: fn() -> JsonStub) -> Chain {
+    let rt = runtime();
+    let mut l = links(&rt, ranks as usize - 1);
+    let head = head_engine(&rt, make(), l[0].1.clone(), ranks, streams);
+    for r in 1..ranks as usize {
+        let up = l[r - 1].0.clone();
+        let down = l.get(r).map(|x| x.1.clone());
+        let mut w = PipelineEngine::new(
+            make(),
+            None,
+            StageTransport {
+                upstream: Some(up),
+                downstream: down,
+            },
+            rt.handle().clone(),
+            r as u32,
+            ranks,
+            None,
+        );
+        if streams > 0 {
+            assert_eq!(w.enable_streams(streams), streams);
+        }
+        std::thread::spawn(move || while w.step().is_ok() {});
+    }
+    l.clear();
+    Chain { head, rt }
+}
+
+#[test]
+fn json_task_is_enforced_through_a_three_stage_chain() {
+    for make in [JsonStub::new as fn() -> JsonStub, JsonStub::batched] {
+        let mut c = chain(3, 0, make);
+        c.head.submit(json_task("j", 400)).unwrap();
+        let out = drive(&mut c.head, &["j"]);
+        assert_schema_valid(&out["j"]);
+        assert_eq!(
+            final_chunk(&out["j"]).finish_reason,
+            Some(FinishReason::Stop)
+        );
+        assert!(!c.head.stage_masks.latch.is_set());
+        // A plain task on the same chain afterwards is unchanged.
+        let mut alone = rig(make(), 1, 0);
+        alone.eng.submit(plain_task("p", 12)).unwrap();
+        let want = drive(&mut alone.eng, &["p"]).remove("p").unwrap();
+        c.head.submit(plain_task("p", 12)).unwrap();
+        let got = drive(&mut c.head, &["p"]).remove("p").unwrap();
+        assert_eq!(got.tokens, want.tokens);
+        assert_eq!(final_chunk(&got).error, None);
+        let _ = &c.rt;
+    }
+}
+
+#[test]
+fn json_and_plain_streams_share_batches_across_stages() {
+    let mut alone = rig(JsonStub::new(), 1, 3);
+    alone.eng.submit(plain_task("p", 30)).unwrap();
+    let want = drive(&mut alone.eng, &["p"]).remove("p").unwrap();
+
+    let mut c = chain(3, 3, JsonStub::new);
+    c.head.submit(json_task("j", 400)).unwrap();
+    c.head.submit(plain_task("p", 30)).unwrap();
+    // A prompt longer than one prefill window: its final window is masked.
+    let mut long = json_task("l", 400);
+    long.prompt = "x".repeat(300);
+    c.head.submit(long).unwrap();
+    let out = drive(&mut c.head, &["j", "p", "l"]);
+    for id in ["j", "l"] {
+        assert_schema_valid(&out[id]);
+        assert_eq!(
+            final_chunk(&out[id]).finish_reason,
+            Some(FinishReason::Stop),
+            "{id}"
+        );
+    }
+    assert_eq!(out["p"].tokens, want.tokens, "plain stream changed");
+    assert_eq!(final_chunk(&out["p"]).error, None);
+    assert!(!c.head.stage_masks.latch.is_set());
+}
+
+/// A last stage that reads frames with this build's decoders but answers a
+/// masked step with a plain `Token`, as a stage that does not acknowledge
+/// masks would. Counts the masked frames it saw.
+fn plain_answering_tail(
+    rt: &tokio::runtime::Runtime,
+    srv: Arc<TokioMutex<ActivationServer>>,
+    masked: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let handle = rt.handle().clone();
+    std::thread::spawn(move || {
+        handle.block_on(async move {
+            loop {
+                match crate::dist::recv_kind_server(&srv).await {
+                    Ok(Some(FrameKind::Reset)) => {}
+                    Ok(Some(FrameKind::Forward | FrameKind::ForwardNoSample)) => {
+                        let (_, _, _, step) = crate::dist::recv_forward_step_body_server(&srv)
+                            .await
+                            .unwrap();
+                        if step.is_masked() {
+                            masked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        send_token_upstream(&srv, i64::from(b'a')).await.unwrap();
+                    }
+                    _ => return,
+                }
+            }
+        })
+    });
+}
+
+#[test]
+fn an_unacknowledged_masked_step_fails_the_task_and_latches() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let masked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    plain_answering_tail(&rt, l[0].0.clone(), masked.clone());
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 0);
+
+    head.submit(json_task("j1", 32)).unwrap();
+    let out = drive(&mut head, &["j1"]);
+    assert!(out["j1"].tokens.is_empty(), "no unmasked token is emitted");
+    let first = final_chunk(&out["j1"]).error.clone().expect("error chunk");
+    assert!(first.contains("likely cause"), "{first}");
+    assert!(first.ends_with(UPGRADE_EVERY_STAGE), "{first}");
+    assert!(head.stage_masks.latch.is_set());
+    assert_eq!(masked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Later json tasks fail at once, without a masked frame.
+    head.submit(json_task("j2", 32)).unwrap();
+    let out = drive(&mut head, &["j2"]);
+    assert_eq!(
+        final_chunk(&out["j2"]).error.as_deref(),
+        Some(UPGRADE_EVERY_STAGE)
+    );
+    assert_eq!(masked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Plain tasks keep working.
+    head.submit(plain_task("p", 4)).unwrap();
+    let out = drive(&mut head, &["p"]);
+    assert_eq!(final_chunk(&out["p"]).error, None);
+    assert_eq!(out["p"].tokens, vec![u32::from(b'a'); 4]);
+
+    // After the re-probe interval the next json task probes again.
+    head.stage_masks
+        .latch
+        .set_at(Instant::now() - crate::dist::MASK_REPROBE - Duration::from_secs(1));
+    head.submit(json_task("j3", 32)).unwrap();
+    let out = drive(&mut head, &["j3"]);
+    assert!(final_chunk(&out["j3"])
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("likely cause")));
+    assert_eq!(masked.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A stream tail that answers a masked stream frame with a plain
+/// `StreamTokens`.
+fn plain_answering_stream_tail(
+    rt: &tokio::runtime::Runtime,
+    srv: Arc<TokioMutex<ActivationServer>>,
+) {
+    let handle = rt.handle().clone();
+    std::thread::spawn(move || {
+        handle.block_on(async move {
+            loop {
+                match crate::dist::recv_kind_server(&srv).await {
+                    Ok(Some(FrameKind::StreamOpen)) => {
+                        let (bid, slot, ..) = crate::dist::recv_stream_open_step_body_server(&srv)
+                            .await
+                            .unwrap();
+                        send_stream_tokens_upstream(&srv, bid, &[(slot, i64::from(b'{'))])
+                            .await
+                            .unwrap();
+                    }
+                    Ok(Some(FrameKind::StreamClose)) => {
+                        crate::dist::recv_stream_close_body_server(&srv)
+                            .await
+                            .unwrap();
+                    }
+                    _ => return,
+                }
+            }
+        })
+    });
+}
+
+#[test]
+fn an_unacknowledged_masked_stream_frame_fails_and_latches() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    plain_answering_stream_tail(&rt, l[0].0.clone());
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 2);
+    head.submit(json_task("j", 32)).unwrap();
+    let out = drive(&mut head, &["j"]);
+    assert!(out["j"].tokens.is_empty());
+    let e = final_chunk(&out["j"]).error.clone().expect("error chunk");
+    assert!(e.ends_with(UPGRADE_EVERY_STAGE), "{e}");
+    assert!(head.stage_masks.latch.is_set());
+}
+
+/// With the real reply budgets: a middle stage's masked wait ends before
+/// the wait of every stage above it, so its unconfirmed reply reaches rank 0
+/// before rank 0 gives up.
+#[test]
+fn middle_masked_budgets_end_before_the_heads_with_the_real_budgets() {
+    for head in [
+        decode_reply_deadline(),
+        prefill_reply_deadline(),
+        PipelineEngine::<JsonStub>::reply_deadline(),
+        PipelineEngine::<JsonStub>::reply_deadline_prefill(),
+    ] {
+        assert!(head > Duration::ZERO);
+        for total in 2..=12u32 {
+            let mut upstream = head;
+            for rank in 1..total {
+                let b = crate::dist::mid_mask_budget(head, rank, total);
+                assert!(b < upstream, "{head:?} rank {rank}/{total}");
+                upstream = b;
+            }
+        }
+    }
+    // A middle stage takes the prefill budget only for the first sampled
+    // step after a reset (the prompt's last token), which is the step rank 0
+    // waits on with the prefill budget; decode steps get the decode budget.
+    assert!(decode_reply_deadline() <= prefill_reply_deadline());
 }

@@ -29,16 +29,14 @@ use tokenizers::Tokenizer;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
-use crate::constrained::{activate, commit, refuse_multi_stage_grammar, GrammarSlot};
+use crate::constrained::{activate, commit, unconfirmed_step, GrammarSlot, StageMasks};
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
     recv_kind_client, recv_kind_server, recv_stream_close_body_server,
-    recv_stream_decode_body_server, recv_stream_feed_body_server, recv_stream_open_body_server,
-    recv_stream_tokens_body_client, recv_stream_tokens_reply, recv_token_batch_body_client,
-    recv_token_body_client, send_cache_prefix, send_forward, send_forward_batch,
-    send_forward_batch_prefill, send_forward_batch_prefill_nosample, send_forward_nosample,
-    send_forward_prefill, send_reset, send_restore_prefix, send_stream_close, send_stream_decode,
-    send_stream_feed, send_stream_open, send_stream_tokens_upstream, send_token_batch_upstream,
+    recv_stream_tokens_body_client, recv_token_batch_body_client, send_cache_prefix, send_forward,
+    send_forward_batch, send_forward_batch_prefill, send_forward_batch_prefill_nosample,
+    send_forward_nosample, send_forward_prefill, send_reset, send_restore_prefix,
+    send_stream_close, send_stream_feed, send_stream_tokens_upstream, send_token_batch_upstream,
     send_token_upstream, FrameKind, StageTransport, STREAM_FEED_FINAL, STREAM_FEED_OPEN,
 };
 #[cfg(feature = "kv_coord")]
@@ -48,6 +46,7 @@ use crate::dist::{
     send_capture_ack_upstream, send_restore, send_restore_ack_upstream, send_restore_carry,
     CAPTURE_ACK_TIMEOUT,
 };
+use crate::dist::{MaskCols, MASK_ACK};
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
 use crate::ov_moe::OvMoeRunner;
@@ -1189,6 +1188,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
+            mid_sampled: false,
             spec_decode_k,
             kv_prefix_cache,
             #[cfg(feature = "kv_coord")]
@@ -1210,6 +1210,7 @@ impl Builder for SparseMoEBuilder {
             active: None,
             grammar: self.grammar,
             grammars: HashMap::new(),
+            stage_masks: StageMasks::default(),
         }))
     }
 }
@@ -1255,6 +1256,50 @@ fn decline_resumed_grammar_task(id: &TaskId) -> (TaskId, Chunk) {
                 .to_string(),
         ),
     )
+}
+
+/// Last stage, a row that arrived with mask columns: the token sampled under
+/// the row's mask, or `None` when the row's mask is unusable (no mask words,
+/// a frame this stage can't serve) or allows nothing in the logits row. The
+/// caller answers `None` with an acknowledged `-1`.
+fn sample_wire_masked(
+    logits: &[f32],
+    history: &[i64],
+    cfg: &crate::sampling::SamplingConfig,
+    rng: &mut u64,
+    cols: &MaskCols,
+    row: usize,
+) -> Option<i64> {
+    let Some(words) = cols.words(row) else {
+        warn!(
+            row,
+            width = cols.width(),
+            "masked row carries no usable mask"
+        );
+        return None;
+    };
+    match crate::sampling::sample_with_words(logits, history, cfg, rng, words) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            warn!(row, error = %e, "masked row allows no token");
+            None
+        }
+    }
+}
+
+/// Rank 0: the mask columns of a `rows`-row frame whose last row picks the
+/// next token of `gm`'s task, and that row's tag. A dead end is the task's
+/// error.
+fn stage_mask_cols(
+    masks: &mut StageMasks,
+    slot: &GrammarSlot,
+    gm: &mut GrammarMask,
+    rows: usize,
+) -> Result<(MaskCols, u32), String> {
+    let width = slot
+        .mask_width()
+        .ok_or_else(|| "structured output: no grammar factory on this stage".to_string())?;
+    masks.last_row(gm, width, rows).map_err(|e| e.to_string())
 }
 
 /// Whether a single-stage task runs n-gram speculative decoding: configured,
@@ -1549,6 +1594,10 @@ struct SparseActive {
     prompt_ids: Vec<i64>,
     #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
     tenant: String,
+    /// Structured output: the task's matcher (json tasks only), advanced
+    /// over each token the last rank returns, and whether the JSON is done.
+    grammar: Option<GrammarMask>,
+    grammar_finished: bool,
 }
 
 pub struct SparseMoEEngine {
@@ -1580,6 +1629,9 @@ pub struct SparseMoEEngine {
     /// from the first Forward frame's `SamplingConfig.seed` after a
     /// `Reset` so deterministic-seed mode reproduces across runs.
     last_rank_rng: u64,
+    /// Middle rank: a sampling Forward was relayed since the last Reset (the
+    /// first one is the prompt's last token, owed the prefill budget).
+    mid_sampled: bool,
     last_rank_rng_seeded: bool,
     /// If `Some(k > 0)`, single-stage path runs n-gram speculative
     /// decode with draft K. Only honored when `total == 1` — checked at
@@ -1631,6 +1683,8 @@ pub struct SparseMoEEngine {
     /// grammar (compiled at `submit`, taken when the task starts).
     grammar: GrammarSlot,
     grammars: HashMap<TaskId, CompiledGrammar>,
+    /// Rank 0 of a pipeline: tags of masked steps and the "can't mask" latch.
+    stage_masks: StageMasks,
 }
 
 impl SparseMoEEngine {
@@ -1737,9 +1791,6 @@ impl Engine for SparseMoEEngine {
                 queued: self.pending.len(),
                 cap: MAX_PENDING_TASKS,
             });
-        }
-        if task.grammar.is_some() && self.total > 1 {
-            return Err(refuse_multi_stage_grammar());
         }
         if let Some(compiled) = self.grammar.compile(&task)? {
             self.grammars.insert(task.task_id.clone(), compiled);
@@ -2130,6 +2181,13 @@ impl SparseMoEEngine {
             Some(t) => t,
             None => return Some(Vec::new()),
         };
+        let compiled = self.grammars.remove(&task.task_id);
+        if compiled.is_some() {
+            if let Some(msg) = self.stage_masks.refusal() {
+                let id = task.task_id.clone();
+                return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+            }
+        }
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
         let started = std::time::Instant::now();
@@ -2169,6 +2227,24 @@ impl SparseMoEEngine {
                 let id = task.task_id.clone();
                 return Some(vec![(id.clone(), Chunk::error(id, e))]);
             }
+        };
+        // Structured output: the matcher starts past the resumed prefix.
+        let mut grammar = match compiled.as_ref() {
+            Some(c) => {
+                let seed = seed_opt
+                    .as_ref()
+                    .map(|s| s.generated_u32.as_slice())
+                    .unwrap_or(&[]);
+                match activate(c, seed) {
+                    Ok(gm) => Some(gm),
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "structured output failed; task aborted");
+                        let id = task.task_id.clone();
+                        return Some(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+                    }
+                }
+            }
+            None => None,
         };
         if prompt_ids.is_empty() {
             return Some(vec![(
@@ -2244,7 +2320,8 @@ impl SparseMoEEngine {
         // forced prefix is honored; spec-decode is an optimization only.
         let use_spec = self.spec_decode_k.map(|k| k > 0).unwrap_or(false)
             && sampling_cfg.temperature <= 0.0
-            && seed_opt.is_none();
+            && seed_opt.is_none()
+            && grammar.is_none();
 
         // Issue-34 consume (§8): SAME-CHAIN warm-resume. On a kv-prefix-cache hit, restore the head's
         // own rank-0 slice and RESTORE the whole downstream chain (all-or-nothing); on success skip
@@ -2413,6 +2490,7 @@ impl SparseMoEEngine {
                     &downstream,
                     true,
                     prefill_reply_deadline(),
+                    grammar.as_mut(),
                 ) {
                     Ok(t) => token_back = t,
                     Err(e) => {
@@ -2430,6 +2508,7 @@ impl SparseMoEEngine {
                     &downstream,
                     false,
                     prefill_reply_deadline(),
+                    None,
                 ) {
                     return Some(vec![(
                         task.task_id.clone(),
@@ -2458,6 +2537,14 @@ impl SparseMoEEngine {
                 Chunk::error(task.task_id, "prefill produced no token"),
             )]);
         }
+        let grammar_finished = match commit(grammar.as_mut(), token_back) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(task = %task.task_id, error = %e, "structured output failed; task aborted");
+                let id = task.task_id.clone();
+                return Some(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+            }
+        };
 
         // SparseMoE EXCLUDES the EOS token: `active` is not set yet at this
         // point, so an EOS on the very first generated token can't route
@@ -2490,6 +2577,8 @@ impl SparseMoEEngine {
             next: token_back,
             prompt_ids,
             tenant: task.tenant.clone(),
+            grammar,
+            grammar_finished,
         });
         None
     }
@@ -2558,11 +2647,15 @@ impl SparseMoEEngine {
         // Splicer poison bypass (id-less chunks read as resume-ineligible): token_id==0 with empty token_ids
         // reads as id-less; stamp the single id explicitly.
         token_chunk.token_ids = vec![next];
-        let (gen_new, max_new) = {
+        let (gen_new, max_new, grammar_finished) = {
             let a = self.active.as_ref().unwrap();
-            (a.generated.len() - a.resume_seed_len, a.max_new)
+            (
+                a.generated.len() - a.resume_seed_len,
+                a.max_new,
+                a.grammar_finished,
+            )
         };
-        if gen_new >= max_new {
+        if gen_new >= max_new || grammar_finished {
             let mut out = vec![(id, token_chunk)];
             out.extend(self.finalize_sparse(true));
             return out;
@@ -2573,18 +2666,35 @@ impl SparseMoEEngine {
         // memcpy over the turn. forward only reads the slice; put it back on
         // success (the Err arm drops the whole slot, history with it).
         let history = std::mem::take(&mut self.active.as_mut().unwrap().history);
+        let mut gm = self.active.as_mut().unwrap().grammar.take();
         match self.forward_one_token_first(
             &history,
             &cfg,
             &downstream,
             true,
             decode_reply_deadline(),
+            gm.as_mut(),
         ) {
             Ok(tok_back) => {
+                let committed = commit(gm.as_mut(), tok_back);
                 let a = self.active.as_mut().unwrap();
                 a.history = history;
                 a.next = tok_back;
-                vec![(id, token_chunk)]
+                a.grammar = gm;
+                match committed {
+                    Ok(finished) => {
+                        a.grammar_finished = finished;
+                        vec![(id, token_chunk)]
+                    }
+                    Err(e) => {
+                        warn!(task = %id, error = %e, "structured output failed; task aborted");
+                        self.active = None;
+                        vec![
+                            (id.clone(), token_chunk),
+                            (id.clone(), Chunk::error(id, e.to_string())),
+                        ]
+                    }
+                }
             }
             Err(e) => {
                 // A mid-decode forward failure is the chain-death signal
@@ -2736,7 +2846,11 @@ impl SparseMoEEngine {
             rank = self.rank, total = self.total, "task done (rank-0 driver, streamed)");
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
-        chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new, false));
+        chunk.finish_reason = Some(finish_reason_for(
+            n_new as usize,
+            a.max_new,
+            a.grammar_finished,
+        ));
         vec![(a.id, chunk)]
     }
 
@@ -2830,6 +2944,7 @@ impl SparseMoEEngine {
         downstream: &Arc<TokioMutex<ActivationClient>>,
         sample_back: bool,
         reply_deadline: std::time::Duration,
+        grammar: Option<&mut GrammarMask>,
     ) -> Result<i64, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
         let past_seq_len: u32 = history
@@ -2837,6 +2952,16 @@ impl SparseMoEEngine {
             .checked_sub(1)
             .ok_or_else(|| "forward_one_token_first: empty history".to_string())?
             as u32;
+        // Structured output: this step's mask, computed before any KV moves.
+        let masked = match grammar {
+            Some(gm) => Some(stage_mask_cols(
+                &mut self.stage_masks,
+                &self.grammar,
+                gm,
+                1,
+            )?),
+            None => None,
+        };
 
         // Layer 0 (stateful) on the most recently appended token.
         // The history grows by one each prefill/decode step, so each
@@ -2855,6 +2980,31 @@ impl SparseMoEEngine {
 
         // Send hidden downstream and wait for token to come back.
         let wire_t0 = Instant::now();
+        if let Some((cols, tag)) = masked {
+            let stage_masks = &self.stage_masks;
+            return self.block_on(async {
+                crate::dist::send_forward_step(
+                    downstream,
+                    FrameKind::Forward,
+                    past_seq_len,
+                    cfg,
+                    &h_after_shells,
+                    [1, 1, hidden as u32],
+                    true,
+                    Some(&cols),
+                )
+                .await
+                .map_err(|e| format!("send_forward: {e}"))?;
+                let reply = crate::dist::recv_token_reply_masked(
+                    downstream,
+                    reply_deadline,
+                    tag,
+                    &stage_masks.latch,
+                )
+                .await;
+                stage_masks.outcome(reply)
+            });
+        }
         let result = self.block_on(async {
             if sample_back {
                 send_forward(
@@ -2883,7 +3033,12 @@ impl SparseMoEEngine {
             // BOUNDED reply wait (closes the connection on elapse — the late
             // Token would otherwise pair with the next request). See
             // `decode_reply_deadline` for why a dead peer never errors here.
-            let token = crate::dist::recv_token_reply(downstream, reply_deadline).await?;
+            let token = crate::dist::recv_token_reply_with(
+                downstream,
+                reply_deadline,
+                Some(&self.stage_masks.latch),
+            )
+            .await?;
             Ok((token, send_done_us))
         });
         match result {
@@ -2954,6 +3109,7 @@ impl SparseMoEEngine {
                     downstream,
                     i + 1 == prompt_ids.len(),
                     prefill_reply_deadline(),
+                    None,
                 )
                 .map_err(|e| format!("spec prefill step {i}: {e}"))?;
             if i + 1 == prompt_ids.len() {
@@ -2988,6 +3144,7 @@ impl SparseMoEEngine {
                         downstream,
                         true,
                         decode_reply_deadline(),
+                        None,
                     )
                     .map_err(|e| format!("spec fallback step: {e}"))?;
                 if eos.contains(&token_back) {
@@ -3030,6 +3187,7 @@ impl SparseMoEEngine {
                     downstream,
                     true,
                     decode_reply_deadline(),
+                    None,
                 )
                 .map_err(|e| format!("spec bonus forward (round {n_rounds}): {e}"))?
             };
@@ -3465,6 +3623,7 @@ impl SparseMoEEngine {
                 // rep-penalty history + an unseeded RNG.
                 self.last_rank_history.clear();
                 self.last_rank_rng_seeded = false;
+                self.mid_sampled = false;
                 if let Some(down) = downstream.as_ref() {
                     self.block_on(forward_reset(down))
                         .map_err(|e| format!("forward_reset: {e}"))?;
@@ -3491,10 +3650,16 @@ impl SparseMoEEngine {
                 // and acks with a dummy Token(-1) — keeps phantom prefill
                 // samples out of the penalty history.
                 let sample = matches!(k, FrameKind::Forward);
-                let (past_seq_len, sampling_cfg, push_history, hidden_f32, in_shape) = self
-                    .block_on(recv_forward_body_server(upstream))
+                let (past_seq_len, sampling_cfg, push_history, step) = self
+                    .block_on(crate::dist::recv_forward_step_body_server(upstream))
                     .map_err(|e| format!("recv_forward: {e}"))?;
                 let hidden = self.runner.manifest.hidden_size as usize;
+                // Structured output: a masked step carries mask columns after
+                // the hidden (sampling frames only).
+                let (hidden_f32, in_shape, cols) = step.split(hidden)?;
+                if cols.is_some() && !sample {
+                    return Err(format!("{k:?} frame carries a mask; only sampling frames may"));
+                }
                 if in_shape[0] != 1 || in_shape[1] != 1 || in_shape[2] as usize != hidden {
                     return Err(format!(
                         "forward shape unexpected {:?} vs hidden {}",
@@ -3532,6 +3697,27 @@ impl SparseMoEEngine {
                         self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                         self.last_rank_rng_seeded = true;
                     }
+                    if let Some(cols) = cols.as_ref() {
+                        let token = sample_wire_masked(
+                            &logits,
+                            &self.last_rank_history,
+                            &sampling_cfg,
+                            &mut self.last_rank_rng,
+                            cols,
+                            0,
+                        );
+                        if let Some(t) = token {
+                            self.last_rank_history.push(t);
+                        }
+                        return self
+                            .block_on(crate::dist::send_token_ack_upstream(
+                                upstream,
+                                token.unwrap_or(-1),
+                                cols.tag(0),
+                                MASK_ACK,
+                            ))
+                            .map_err(|e| format!("send_token_ack: {e}"));
+                    }
                     let token = crate::sampling::sample_unmasked(
                         &logits,
                         &self.last_rank_history,
@@ -3545,6 +3731,46 @@ impl SparseMoEEngine {
                 } else {
                     let down =
                         downstream.ok_or_else(|| "mid rank missing downstream".to_string())?;
+                    // A masked step's wait here must end before the one upstream does,
+                    // so an unacknowledged step reaches rank 0 as such: the head's
+                    // budget for this step, shortened by this rank's place.
+                    let mid_budget = crate::dist::mid_mask_budget(
+                        if self.mid_sampled {
+                            decode_reply_deadline()
+                        } else {
+                            prefill_reply_deadline()
+                        },
+                        self.rank,
+                        self.total,
+                    );
+                    if sample {
+                        self.mid_sampled = true;
+                    }
+                    if let Some(cols) = cols {
+                        // Relay the mask; pass the reply up only as acknowledged
+                        // by the stages below.
+                        return self.block_on(async {
+                            crate::dist::send_forward_step(
+                                &down,
+                                FrameKind::Forward,
+                                past_seq_len,
+                                &sampling_cfg,
+                                &h_after,
+                                [1, 1, hidden as u32],
+                                push_history,
+                                Some(&cols),
+                            )
+                            .await
+                            .map_err(|e| format!("send_forward: {e}"))?;
+                            crate::dist::relay_masked_token_reply(
+                                upstream,
+                                &down,
+                                mid_budget,
+                                cols.tag(0),
+                            )
+                            .await
+                        });
+                    }
                     self.block_on(async {
                         if sample {
                             send_forward(
@@ -3568,16 +3794,7 @@ impl SparseMoEEngine {
                             .await
                             .map_err(|e| format!("send_forward_nosample: {e}"))?;
                         }
-                        let token = match recv_kind_client(&down).await {
-                            Ok(Some(FrameKind::Token)) => recv_token_body_client(&down)
-                                .await
-                                .map_err(|e| format!("recv_token: {e}"))?,
-                            Ok(Some(other)) => {
-                                return Err(format!("unexpected mid-rank frame: {other:?}"));
-                            }
-                            Ok(None) => return Err("downstream closed mid-frame".into()),
-                            Err(e) => return Err(format!("recv_kind: {e}")),
-                        };
+                        let token = crate::dist::recv_token_relay(&down).await?;
                         send_token_upstream(upstream, token)
                             .await
                             .map_err(|e| format!("send_token: {e}"))
@@ -3586,7 +3803,7 @@ impl SparseMoEEngine {
                 }
             }
             FrameKind::ForwardBatch => self.handle_forward_batch_frame(upstream, downstream),
-            FrameKind::Token => Err(format!(
+            FrameKind::Token | FrameKind::TokenAck | FrameKind::StreamTokensAck => Err(format!(
                 "rank {} received unexpected TOKEN from upstream",
                 self.rank
             )),
@@ -3934,6 +4151,10 @@ struct OvMoeActive {
     prompt_ids: Vec<u32>,
     #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
     tenant: String,
+    /// Structured output: the task's matcher (json tasks only), advanced
+    /// over each token the last rank returns, and whether the JSON is done.
+    grammar: Option<GrammarMask>,
+    grammar_finished: bool,
 }
 
 pub struct OvMoeEngine {
@@ -3954,6 +4175,9 @@ pub struct OvMoeEngine {
     /// (`repetition_penalty == 1.0`) is unaffected, so a greedy pipeline
     /// run matches the single-stage greedy output exactly.
     last_rank_history: Vec<i64>,
+    /// Middle rank: a sampling Forward was relayed since the last Reset (the
+    /// first one is the prompt's last token, owed the prefill budget).
+    mid_sampled: bool,
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
     /// Multi-stage warm-resume (Issue-34 §8): head (rank 0) maps a prompt
@@ -3994,6 +4218,8 @@ pub struct OvMoeEngine {
     /// grammar (compiled at `submit`, taken when the task starts).
     grammar: GrammarSlot,
     grammars: HashMap<TaskId, CompiledGrammar>,
+    /// Rank 0 of a pipeline: tags of masked steps and the "can't mask" latch.
+    stage_masks: StageMasks,
 }
 
 impl OvMoeEngine {
@@ -4026,6 +4252,7 @@ impl OvMoeEngine {
             peer_disconnected: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
+            mid_sampled: false,
             last_rank_rng_seeded: false,
             kv_prefix_cache,
             #[cfg(feature = "kv_coord")]
@@ -4047,6 +4274,7 @@ impl OvMoeEngine {
             active_ov: None,
             grammar: GrammarSlot::default(),
             grammars: HashMap::new(),
+            stage_masks: StageMasks::default(),
         }
     }
 
@@ -4214,6 +4442,7 @@ impl OvMoeEngine {
     /// `sample_back = false` sends ForwardNoSample (prefill-intermediate):
     /// the last rank advances state but skips head/sample/record so
     /// discarded prefill tokens never pollute its penalty history.
+    #[allow(clippy::too_many_arguments)]
     fn forward_one_token_first(
         &mut self,
         token: u32,
@@ -4222,7 +4451,18 @@ impl OvMoeEngine {
         downstream: &Arc<TokioMutex<ActivationClient>>,
         sample_back: bool,
         reply_deadline: std::time::Duration,
+        grammar: Option<&mut GrammarMask>,
     ) -> Result<i64, String> {
+        // Structured output: this step's mask, computed before any KV moves.
+        let masked = match grammar {
+            Some(gm) => Some(stage_mask_cols(
+                &mut self.stage_masks,
+                &self.grammar,
+                gm,
+                1,
+            )?),
+            None => None,
+        };
         let hidden = self
             .runner
             .embed_token(token)
@@ -4232,6 +4472,31 @@ impl OvMoeEngine {
             .forward_layers(hidden, pos)
             .map_err(|e| format!("forward: {e}"))?;
         let h = self.runner.hidden_size() as u32;
+        if let Some((cols, tag)) = masked {
+            let stage_masks = &self.stage_masks;
+            return self.block_on(async {
+                crate::dist::send_forward_step(
+                    downstream,
+                    FrameKind::Forward,
+                    pos as u32,
+                    cfg,
+                    &hidden,
+                    [1, 1, h],
+                    true,
+                    Some(&cols),
+                )
+                .await
+                .map_err(|e| format!("send_forward: {e}"))?;
+                let reply = crate::dist::recv_token_reply_masked(
+                    downstream,
+                    reply_deadline,
+                    tag,
+                    &stage_masks.latch,
+                )
+                .await;
+                stage_masks.outcome(reply)
+            });
+        }
         self.block_on(async {
             if sample_back {
                 send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h], true)
@@ -4244,7 +4509,12 @@ impl OvMoeEngine {
             }
             // BOUNDED reply wait — see `decode_reply_deadline` for why a dead
             // peer never errors this recv on its own (bridge parks the leg).
-            crate::dist::recv_token_reply(downstream, reply_deadline).await
+            crate::dist::recv_token_reply_with(
+                downstream,
+                reply_deadline,
+                Some(&self.stage_masks.latch),
+            )
+            .await
         })
     }
 
@@ -4275,6 +4545,13 @@ impl OvMoeEngine {
             Some(t) => t,
             None => return Some(Vec::new()),
         };
+        let compiled = self.grammars.remove(&task.task_id);
+        if compiled.is_some() {
+            if let Some(msg) = self.stage_masks.refusal() {
+                let id = task.task_id.clone();
+                return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+            }
+        }
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
         let id = task.task_id.clone();
@@ -4325,6 +4602,23 @@ impl OvMoeEngine {
                 let id = task.task_id.clone();
                 return Some(vec![(id.clone(), Chunk::error(id, e))]);
             }
+        };
+        // Structured output: the matcher starts past the resumed prefix.
+        let mut grammar = match compiled.as_ref() {
+            Some(c) => {
+                let seed = seed_opt
+                    .as_ref()
+                    .map(|s| s.generated_u32.as_slice())
+                    .unwrap_or(&[]);
+                match activate(c, seed) {
+                    Ok(gm) => Some(gm),
+                    Err(e) => {
+                        warn!(task = %id, error = %e, "structured output failed; task aborted");
+                        return Some(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+                    }
+                }
+            }
+            None => None,
         };
         if prompt64.is_empty() {
             return Some(vec![(id.clone(), Chunk::final_marker(id, ""))]);
@@ -4431,6 +4725,7 @@ impl OvMoeEngine {
         let n_prompt = prompt_ids.len();
         for (i, &t) in prompt_ids.iter().enumerate().skip(warm_prefix) {
             let sample_back = i + 1 == n_prompt;
+            let gm = if sample_back { grammar.as_mut() } else { None };
             match self.forward_one_token_first(
                 t,
                 pos,
@@ -4438,6 +4733,7 @@ impl OvMoeEngine {
                 &downstream,
                 sample_back,
                 prefill_reply_deadline(),
+                gm,
             ) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
@@ -4447,6 +4743,14 @@ impl OvMoeEngine {
             }
             pos += 1;
         }
+
+        let grammar_finished = match commit(grammar.as_mut(), next) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(task = %id, error = %e, "structured output failed; task aborted");
+                return Some(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+            }
+        };
 
         // Non-spec path: PREFILL ONLY. `next` is the first generated token
         // (stashed below); `decode_step_ovmoe` pushes it (OvMoe INCLUDES
@@ -4471,6 +4775,8 @@ impl OvMoeEngine {
             pos,
             prompt_ids,
             tenant: task.tenant.clone(),
+            grammar,
+            grammar_finished,
         });
         None
     }
@@ -4531,22 +4837,24 @@ impl OvMoeEngine {
         // Splicer poison bypass (id-less chunks read as resume-ineligible): token_id==0 with empty token_ids
         // reads as id-less; stamp the single id explicitly.
         token_chunk.token_ids = vec![next];
-        let (gen_new, max_new, is_eos, pos) = {
+        let (gen_new, max_new, is_eos, pos, grammar_finished) = {
             let a = self.active_ov.as_ref().unwrap();
             (
                 a.generated.len() - a.resume_seed_len,
                 a.max_new,
                 a.eos.contains(&next_u),
                 a.pos,
+                a.grammar_finished,
             )
         };
-        if gen_new >= max_new || is_eos {
+        if gen_new >= max_new || is_eos || grammar_finished {
             let mut out = vec![(id, token_chunk)];
             out.extend(self.finalize_ovmoe(true));
             return out;
         }
         let downstream = self.active_ov.as_ref().unwrap().downstream.clone();
         let cfg = self.active_ov.as_ref().unwrap().cfg.clone();
+        let mut gm = self.active_ov.as_mut().unwrap().grammar.take();
         match self.forward_one_token_first(
             next_u,
             pos,
@@ -4554,12 +4862,28 @@ impl OvMoeEngine {
             &downstream,
             true,
             decode_reply_deadline(),
+            gm.as_mut(),
         ) {
             Ok(tok_back) => {
+                let committed = commit(gm.as_mut(), tok_back);
                 let a = self.active_ov.as_mut().unwrap();
                 a.next = tok_back;
                 a.pos += 1;
-                vec![(id, token_chunk)]
+                a.grammar = gm;
+                match committed {
+                    Ok(finished) => {
+                        a.grammar_finished = finished;
+                        vec![(id, token_chunk)]
+                    }
+                    Err(e) => {
+                        warn!(task = %id, error = %e, "structured output failed; task aborted");
+                        self.active_ov = None;
+                        vec![
+                            (id.clone(), token_chunk),
+                            (id.clone(), Chunk::error(id, e.to_string())),
+                        ]
+                    }
+                }
             }
             Err(e) => {
                 // Same rationale as decode_step_sparse: an error chunk, never a
@@ -4691,7 +5015,11 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
-        chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new, false));
+        chunk.finish_reason = Some(finish_reason_for(
+            n_new as usize,
+            a.max_new,
+            a.grammar_finished,
+        ));
         vec![(a.id, chunk)]
     }
 
@@ -5004,6 +5332,7 @@ impl OvMoeEngine {
                 self.runner.reset();
                 self.last_rank_history.clear();
                 self.last_rank_rng_seeded = false;
+                self.mid_sampled = false;
                 match downstream.as_ref() {
                     Some(down) => self
                         .block_on(forward_reset(down))
@@ -5050,9 +5379,15 @@ impl OvMoeEngine {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
         sample: bool,
     ) -> Result<(), String> {
-        let (past_seq_len, sampling_cfg, push_history, hidden_f32, _shape) = self
-            .block_on(recv_forward_body_server(upstream))
+        let (past_seq_len, sampling_cfg, push_history, step) = self
+            .block_on(crate::dist::recv_forward_step_body_server(upstream))
             .map_err(|e| format!("recv_forward_body: {e}"))?;
+        // Structured output: a masked step carries mask columns after the
+        // hidden (sampling frames only).
+        let (hidden_f32, _shape, cols) = step.split(self.runner.hidden_size())?;
+        if cols.is_some() && !sample {
+            return Err("a ForwardNoSample frame carries a mask; only sampling frames may".into());
+        }
         let pos = past_seq_len as usize;
         let hidden = self
             .runner
@@ -5071,6 +5406,27 @@ impl OvMoeEngine {
             if !self.last_rank_rng_seeded {
                 self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                 self.last_rank_rng_seeded = true;
+            }
+            if let Some(cols) = cols.as_ref() {
+                let token = sample_wire_masked(
+                    &logits,
+                    &self.last_rank_history,
+                    &sampling_cfg,
+                    &mut self.last_rank_rng,
+                    cols,
+                    0,
+                );
+                if let (Some(t), true) = (token, push_history) {
+                    self.last_rank_history.push(t);
+                }
+                return self
+                    .block_on(crate::dist::send_token_ack_upstream(
+                        upstream,
+                        token.unwrap_or(-1),
+                        cols.tag(0),
+                        MASK_ACK,
+                    ))
+                    .map_err(|e| format!("send_token_ack: {e}"));
             }
             // A DISCARDED prefill sample must not advance the RNG. `sample` draws one uniform per
             // call when temperature > 0, and a warm-resumed run skips `warm_prefix` of these
@@ -5107,6 +5463,41 @@ impl OvMoeEngine {
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let h = self.runner.hidden_size() as u32;
+            // A masked step's wait here must end before the one upstream does,
+            // so an unacknowledged step reaches rank 0 as such: the head's
+            // budget for this step, shortened by this rank's place.
+            let mid_budget = crate::dist::mid_mask_budget(
+                if self.mid_sampled {
+                    decode_reply_deadline()
+                } else {
+                    prefill_reply_deadline()
+                },
+                self.rank,
+                self.total,
+            );
+            if sample {
+                self.mid_sampled = true;
+            }
+            if let Some(cols) = cols {
+                // Relay the mask; pass the reply up only as acknowledged by
+                // the stages below.
+                return self.block_on(async {
+                    crate::dist::send_forward_step(
+                        down,
+                        FrameKind::Forward,
+                        past_seq_len,
+                        &sampling_cfg,
+                        &hidden,
+                        [1, 1, h],
+                        push_history,
+                        Some(&cols),
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
+                    crate::dist::relay_masked_token_reply(upstream, down, mid_budget, cols.tag(0))
+                        .await
+                });
+            }
             self.block_on(async {
                 if sample {
                     send_forward(
@@ -5124,20 +5515,11 @@ impl OvMoeEngine {
                         .await
                         .map_err(|e| format!("send_forward_nosample: {e}"))?;
                 }
-                match recv_kind_client(down).await {
-                    Ok(Some(FrameKind::Token)) => {
-                        let t = recv_token_body_client(down)
-                            .await
-                            .map_err(|e| format!("recv_token: {e}"))?;
-                        send_token_upstream(upstream, t)
-                            .await
-                            .map_err(|e| format!("relay token: {e}"))?;
-                        Ok(())
-                    }
-                    Ok(Some(other)) => Err(format!("mid rank expected Token, got {other:?}")),
-                    Ok(None) => Err("downstream closed before Token".into()),
-                    Err(e) => Err(format!("recv_kind: {e}")),
-                }
+                let t = crate::dist::recv_token_relay(down).await?;
+                send_token_upstream(upstream, t)
+                    .await
+                    .map_err(|e| format!("relay token: {e}"))?;
+                Ok(())
             })
         }
     }
@@ -5172,9 +5554,6 @@ impl Engine for OvMoeEngine {
                 queued: self.pending.len(),
                 cap: OV_MAX_PENDING,
             });
-        }
-        if task.grammar.is_some() && self.total > 1 {
-            return Err(refuse_multi_stage_grammar());
         }
         if let Some(compiled) = self.grammar.compile(&task)? {
             self.grammars.insert(task.task_id.clone(), compiled);
@@ -5516,6 +5895,8 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// grammar (compiled at `submit`, taken when the task starts).
     grammar: GrammarSlot,
     grammars: HashMap<TaskId, CompiledGrammar>,
+    /// Rank 0 of a pipeline: tags of masked steps and the "can't mask" latch.
+    stage_masks: StageMasks,
 }
 
 /// Per-slot sampling state on the last rank (the driver keeps the tokens).
@@ -5581,6 +5962,8 @@ struct StreamInFlight {
     slots: Vec<usize>,
     open: bool,
     sent_at: Instant,
+    /// The frame carried masks: its reply must be acknowledged.
+    masked: bool,
 }
 
 /// Where a multi-stream pipeline rank's wall time goes, logged once per
@@ -5822,6 +6205,10 @@ struct PipeActive {
     generated: Vec<u32>,
     emitted: usize,
     hit_context_cap: bool,
+    /// Structured output: the task's matcher (json tasks only), advanced
+    /// over each token the last rank returns, and whether the JSON is done.
+    grammar: Option<GrammarMask>,
+    grammar_finished: bool,
 }
 
 impl<R: StagedRunner> PipelineEngine<R> {
@@ -5878,6 +6265,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stage_profile: None,
             grammar: GrammarSlot::default(),
             grammars: HashMap::new(),
+            stage_masks: StageMasks::default(),
         }
     }
 
@@ -6080,10 +6468,24 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 Self::reply_deadline() * groups as u32
             };
             let wait_started = Instant::now();
-            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
+            let reply = match self.block_on(crate::dist::recv_stream_reply(
+                &down,
+                deadline,
+                f.batch_id,
+                Some(&self.stage_masks.latch),
+            )) {
                 Ok(r) => r,
                 Err(e) => {
-                    self.fail_streams_into(out, e, true);
+                    // A masked frame's link is dropped like any other on a
+                    // failed reply (other groups' frames share the reply
+                    // order), and json requests are refused for a while.
+                    let msg = if f.masked {
+                        self.stage_masks.latch.set();
+                        unconfirmed_step(&e)
+                    } else {
+                        e
+                    };
+                    self.fail_streams_into(out, msg, true);
                     return false;
                 }
             };
@@ -6091,6 +6493,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 p.wait += wait_started.elapsed();
                 p.replied(f.sent_at.elapsed());
             }
+            let (bid, toks) = (reply.batch_id, reply.tokens);
             if bid != f.batch_id || toks.len() != f.slots.len() {
                 let msg = format!(
                     "stream reply mismatch: batch {bid} vs {}, {} rows vs {}",
@@ -6101,6 +6504,26 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 self.fail_streams_into(out, msg, true);
                 return false;
             }
+            // Structured output: a masked frame's reply must be acknowledged
+            // by every stage, and only a masked frame's may be.
+            match (f.masked, reply.ack) {
+                (true, Some(MASK_ACK)) | (false, None) => {}
+                (true, other) => {
+                    self.stage_masks.latch.set();
+                    let reason = match other {
+                        None => "a reply without acknowledgement".to_string(),
+                        Some(s) => format!("acknowledgement status 0x{s:08x}"),
+                    };
+                    self.fail_streams_into(out, unconfirmed_step(&reason), true);
+                    return false;
+                }
+                (false, Some(_)) => {
+                    let msg = "stream reply acknowledges a frame without masks".to_string();
+                    self.fail_streams_into(out, msg, true);
+                    return false;
+                }
+            }
+            let mut failed: Vec<(usize, String)> = Vec::new();
             for (&slot, &(wslot, token)) in f.slots.iter().zip(&toks) {
                 if wslot as usize != slot {
                     let msg = format!("stream reply row names slot {wslot}, expected {slot}");
@@ -6108,12 +6531,27 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     return false;
                 }
                 if let Some(st) = self.streams.iter_mut().find(|s| s.slot == slot) {
+                    if token < 0 {
+                        // An acknowledged row the last stage could not serve.
+                        failed.push((slot, crate::constrained::REFUSED_STEP.to_string()));
+                        continue;
+                    }
+                    match commit(st.grammar.as_mut(), token) {
+                        Ok(finished) => st.grammar_finished = finished,
+                        Err(e) => {
+                            failed.push((slot, e.to_string()));
+                            continue;
+                        }
+                    }
                     st.next = token;
                     if !f.open {
                         st.pos += 1;
                     }
                     st.state = StreamState::Ready;
                 }
+            }
+            for (slot, msg) in failed {
+                self.fail_stream_slot(slot, msg, &down, out);
             }
         }
         // ---- 2. admissions into this group ----
@@ -6149,7 +6587,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let task = self.pending.pop_front().expect("non-empty");
             admitted += 1;
             let admit_started = Instant::now();
-            let prompt_rows = match self.admit_stream_pipeline(task, g, &down) {
+            let compiled = self.grammars.remove(&task.task_id);
+            let prompt_rows = match self.admit_stream_pipeline(task, g, &down, compiled) {
                 Ok(rows) => rows,
                 Err((id, chunk)) => {
                     out.push((id, chunk));
@@ -6196,7 +6635,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             c.token_ids = vec![st.next];
             out.push((st.id.clone(), c));
             let n = st.generated.len();
-            let natural_stop = n >= st.max_new || eos.contains(&t);
+            let natural_stop = n >= st.max_new || eos.contains(&t) || st.grammar_finished;
             let cap_stop = !natural_stop && st.pos >= max_seq;
             if natural_stop || cap_stop {
                 let mut chunk = Chunk::final_marker(st.id.clone(), String::new());
@@ -6205,7 +6644,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 chunk.finish_reason = Some(if cap_stop {
                     FinishReason::Length
                 } else {
-                    finish_reason_for(n, st.max_new, false)
+                    finish_reason_for(n, st.max_new, st.grammar_finished)
                 });
                 out.push((st.id.clone(), chunk));
                 let decode_s = st.decode_started.elapsed().as_secs_f64();
@@ -6231,6 +6670,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
         }
         // ---- 4. one decode micro-batch for this group's survivors ----
+        // Structured output: each json row's mask for its token after `next`;
+        // a stream at a grammar dead end ends here.
+        let width = self.grammar.mask_width().unwrap_or(0);
+        let mut row_masks: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut dead: Vec<(usize, String)> = Vec::new();
+        for st in self
+            .streams
+            .iter_mut()
+            .filter(|st| st.group == g && st.state == StreamState::Ready)
+        {
+            if let Some(gm) = st.grammar.as_mut() {
+                match crate::constrained::mask_words(gm, width) {
+                    Ok(w) => {
+                        row_masks.insert(st.slot, w);
+                    }
+                    Err(e) => dead.push((st.slot, e.to_string())),
+                }
+            }
+        }
+        for (slot, msg) in dead {
+            self.fail_stream_slot(slot, msg, &down, out);
+        }
         let rows_idx: Vec<usize> = self
             .streams
             .iter()
@@ -6279,11 +6740,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 return false;
             }
         };
+        let cols = if row_masks.is_empty() {
+            None
+        } else {
+            let mut c = MaskCols::new(rows_idx.len(), width.div_ceil(32));
+            for (r, &i) in rows_idx.iter().enumerate() {
+                if let Some(w) = row_masks.get(&self.streams[i].slot) {
+                    let tag = self.stage_masks.next_tag();
+                    c.set(r, tag, w);
+                }
+            }
+            Some(c)
+        };
         self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
         let batch_id = self.stream_batch_seq;
         let send_started = Instant::now();
-        if let Err(e) = self.block_on(send_stream_decode(
-            &down, batch_id, &wire_rows, &h, hs as u32,
+        if let Err(e) = self.block_on(crate::dist::send_stream_decode_step(
+            &down,
+            batch_id,
+            &wire_rows,
+            &h,
+            hs as u32,
+            cols.as_ref(),
         )) {
             self.fail_streams_into(out, format!("send_stream_decode: {e}"), true);
             return false;
@@ -6300,6 +6778,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             slots,
             open: false,
             sent_at: Instant::now(),
+            masked: cols.is_some(),
         });
         // ---- aggregate log ----
         let rows = rows_idx.len();
@@ -6321,6 +6800,29 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         self.flush_stage_profile();
         true
+    }
+
+    /// End one pipeline stream with an error (its slot freed here and on the
+    /// ranks behind), leaving the others running.
+    fn fail_stream_slot(
+        &mut self,
+        slot: usize,
+        msg: String,
+        down: &Arc<TokioMutex<ActivationClient>>,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) {
+        let Some(i) = self.streams.iter().position(|s| s.slot == slot) else {
+            return;
+        };
+        let st = self.streams.swap_remove(i);
+        warn!(task = %st.id, error = %msg, "stream aborted");
+        self.runner.close_stream(st.slot);
+        if let Err(e) = self.block_on(send_stream_close(down, st.slot as u32)) {
+            warn!(slot = st.slot, "stream close not relayed: {e}");
+        }
+        if !st.cancelled {
+            out.push((st.id.clone(), Chunk::error(st.id, msg)));
+        }
     }
 
     /// Whether a new stream may join group `g` now: only the emptiest group
@@ -6359,8 +6861,29 @@ impl<R: StagedRunner> PipelineEngine<R> {
         task: GenerationTask,
         g: usize,
         down: &Arc<TokioMutex<ActivationClient>>,
+        compiled: Option<CompiledGrammar>,
     ) -> Result<usize, (TaskId, Chunk)> {
         let started = Instant::now();
+        // Structured output: no forced-prefix path here, refused at once
+        // while the pipeline is known not to mask, else a fresh matcher.
+        if compiled.is_some() {
+            if task.resume_ids().is_some() {
+                return Err(decline_resumed_grammar_task(&task.task_id));
+            }
+            if let Some(msg) = self.stage_masks.refusal() {
+                return Err((task.task_id.clone(), Chunk::error(task.task_id, msg)));
+            }
+        }
+        let mut grammar = match compiled.as_ref().map(|c| activate(c, &[])).transpose() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(task = %task.task_id, error = %e, "structured output failed; task aborted");
+                return Err((
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, e.to_string()),
+                ));
+            }
+        };
         let Some(tok) = self.tokenizer.as_ref() else {
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
             return Err((task.task_id, e));
@@ -6404,6 +6927,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
             feed.extend(prompt_ids.drain(window..));
         }
         let rows = prompt_ids.len();
+        // A whole prompt in one `StreamOpen` samples its last row: masked for
+        // a json task (a windowed prompt masks its final window instead).
+        let cols = match grammar.as_mut().filter(|_| !windowed) {
+            Some(gm) => match stage_mask_cols(&mut self.stage_masks, &self.grammar, gm, rows) {
+                Ok((c, _)) => Some(c),
+                Err(e) => {
+                    self.runner.close_stream(slot);
+                    return Err((task.task_id.clone(), Chunk::error(task.task_id, e)));
+                }
+            },
+            None => None,
+        };
         let mut hidden = Vec::with_capacity(rows * hs);
         for &t in &prompt_ids {
             hidden.extend(self.runner.embed_token(t));
@@ -6436,7 +6971,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 hs as u32,
             ))
         } else {
-            self.block_on(send_stream_open(
+            self.block_on(crate::dist::send_stream_open_step(
                 down,
                 batch_id,
                 slot as u32,
@@ -6444,6 +6979,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 &h,
                 rows as u32,
                 hs as u32,
+                cols.as_ref(),
             ))
         };
         if let Err(e) = sent {
@@ -6461,6 +6997,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 slots: vec![slot],
                 open: true,
                 sent_at: Instant::now(),
+                masked: cols.is_some(),
             });
         }
         let prefill_s = started.elapsed().as_secs_f64();
@@ -6497,8 +7034,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::new(),
             emitted: 0,
             feed,
-            // Multi-stage json tasks are refused at submit.
-            grammar: None,
+            grammar,
             grammar_finished: false,
         });
         Ok(rows)
@@ -6558,11 +7094,25 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 return Err(fail(self, msg));
             }
         };
+        // Structured output: a json prompt's final window samples its last
+        // row under the mask.
+        let cols = match self.streams[i].grammar.as_mut().filter(|_| last) {
+            Some(gm) => match stage_mask_cols(&mut self.stage_masks, &self.grammar, gm, rows) {
+                Ok((c, _)) => Some(c),
+                Err(msg) => {
+                    if let Err(e) = self.block_on(send_stream_close(down, slot as u32)) {
+                        warn!(slot, "stream close not relayed: {e}");
+                    }
+                    return Err(fail(self, msg));
+                }
+            },
+            None => None,
+        };
         self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
         let batch_id = self.stream_batch_seq;
         let cfg = self.streams[i].cfg.clone();
         let flags = if last { STREAM_FEED_FINAL } else { 0 };
-        if let Err(e) = self.block_on(send_stream_feed(
+        if let Err(e) = self.block_on(crate::dist::send_stream_feed_step(
             down,
             batch_id,
             slot as u32,
@@ -6571,6 +7121,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             &h,
             rows as u32,
             hs as u32,
+            cols.as_ref(),
         )) {
             warn!(task = %id, "send_stream_feed failed: {e}");
             self.peer_disconnected = true;
@@ -6586,6 +7137,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 slots: vec![slot],
                 open: true,
                 sent_at: Instant::now(),
+                masked: cols.is_some(),
             });
         }
         Ok(rows)
@@ -6704,9 +7256,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
             } else {
                 Self::reply_deadline() * groups
             };
-            match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
-                Ok((bid, _)) if bid == f.batch_id => {}
-                Ok((bid, _)) => {
+            match self.block_on(crate::dist::recv_stream_reply(
+                &down,
+                deadline,
+                f.batch_id,
+                Some(&self.stage_masks.latch),
+            )) {
+                Ok(r) if r.batch_id == f.batch_id => {}
+                Ok(crate::dist::StreamReply { batch_id: bid, .. }) => {
                     warn!(
                         batch = bid,
                         expected = f.batch_id,
@@ -7221,6 +7778,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// `sample_back = false` sends ForwardNoSample (prefill-intermediate):
     /// the last rank advances state but must NOT head/sample/record, so
     /// discarded prefill tokens never pollute its penalty history.
+    #[allow(clippy::too_many_arguments)]
     fn forward_one_token_first(
         &mut self,
         token: u32,
@@ -7229,10 +7787,46 @@ impl<R: StagedRunner> PipelineEngine<R> {
         downstream: &Arc<TokioMutex<ActivationClient>>,
         sample_back: bool,
         reply_deadline: std::time::Duration,
+        grammar: Option<&mut GrammarMask>,
     ) -> Result<i64, String> {
+        // Structured output: this step's mask, computed before any KV moves.
+        let masked = match grammar {
+            Some(gm) => Some(stage_mask_cols(
+                &mut self.stage_masks,
+                &self.grammar,
+                gm,
+                1,
+            )?),
+            None => None,
+        };
         let hidden = self.runner.embed_token(token);
         let hidden = self.runner.forward_layers(hidden, pos, Some(token));
         let h = self.runner.hidden_size() as u32;
+        if let Some((cols, tag)) = masked {
+            let stage_masks = &self.stage_masks;
+            return self.block_on(async {
+                crate::dist::send_forward_step(
+                    downstream,
+                    FrameKind::Forward,
+                    pos as u32,
+                    cfg,
+                    &hidden,
+                    [1, 1, h],
+                    true,
+                    Some(&cols),
+                )
+                .await
+                .map_err(|e| format!("send_forward: {e}"))?;
+                let reply = crate::dist::recv_token_reply_masked(
+                    downstream,
+                    reply_deadline,
+                    tag,
+                    &stage_masks.latch,
+                )
+                .await;
+                stage_masks.outcome(reply)
+            });
+        }
         self.block_on(async {
             if sample_back {
                 send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h], true)
@@ -7247,7 +7841,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
             // a strict deadline (never the idle ceiling) so a downstream that dies
             // mid-request surfaces as a fast error instead of wedging the task and
             // every upstream rank; see [`crate::dist::recv_token_reply`].
-            crate::dist::recv_token_reply(downstream, reply_deadline).await
+            crate::dist::recv_token_reply_with(
+                downstream,
+                reply_deadline,
+                Some(&self.stage_masks.latch),
+            )
+            .await
         })
     }
 
@@ -7316,6 +7915,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             Some(t) => t,
             None => return Some(Vec::new()),
         };
+        let compiled = self.grammars.remove(&task.task_id);
         // No forced-prefix path here: silently ignoring the ids would regenerate
         // from scratch and the caller would splice that after the client's
         // already-received prefix as if it were the resumed tail. Decline with the
@@ -7365,6 +7965,20 @@ impl<R: StagedRunner> PipelineEngine<R> {
         if prompt_ids.is_empty() {
             return Some(vec![(id.clone(), Chunk::final_marker(id, ""))]);
         }
+        // Structured output: refused at once while the pipeline is known not
+        // to mask; else a fresh matcher (this path declines resumed turns).
+        if compiled.is_some() {
+            if let Some(msg) = self.stage_masks.refusal() {
+                return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+            }
+        }
+        let mut grammar = match compiled.as_ref().map(|c| activate(c, &[])).transpose() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(task = %id, error = %e, "structured output failed; task aborted");
+                return Some(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+            }
+        };
         let max_new = task.max_tokens.max(1) as usize;
         let cfg = sampling_from_task(&task);
         let eos = self.runner.eos_token_ids().to_vec();
@@ -7464,7 +8078,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let mut wbase = reuse;
             for (wi, chunk) in suffix.chunks(win).enumerate() {
                 let is_last = wi + 1 == n_windows;
-                match self.forward_prompt_batch_first(chunk, wbase, &cfg, &downstream, is_last) {
+                let gm = if is_last { grammar.as_mut() } else { None };
+                match self.forward_prompt_batch_first(chunk, wbase, &cfg, &downstream, is_last, gm)
+                {
                     Ok(tok_back) => {
                         if is_last {
                             next = tok_back;
@@ -7481,6 +8097,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         } else {
             for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
                 let sample_back = i + 1 == n_prefill;
+                let gm = if sample_back { grammar.as_mut() } else { None };
                 match self.forward_one_token_first(
                     t,
                     pos,
@@ -7488,6 +8105,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     &downstream,
                     sample_back,
                     Self::reply_deadline(),
+                    gm,
                 ) {
                     Ok(tok_back) => next = tok_back,
                     Err(e) => {
@@ -7498,6 +8116,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 pos += 1;
             }
         }
+
+        let grammar_finished = match commit(grammar.as_mut(), next) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(task = %id, error = %e, "structured output failed; task aborted");
+                return Some(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+            }
+        };
 
         // Prefill produced the first token (`next`) at KV position `pos`. Stash
         // the in-flight state; `decode_step` emits `next` on the next (this)
@@ -7517,6 +8143,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::with_capacity(max_new),
             emitted: 0,
             hit_context_cap: false,
+            grammar,
+            grammar_finished,
         });
         None
     }
@@ -7562,7 +8190,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // makes the stream resume-ineligible; token 0 is a legal sample.
         token_chunk.token_ids = vec![next];
 
-        let (gen_len, max_new, is_eos, pos, max_seq) = {
+        let (gen_len, max_new, is_eos, pos, max_seq, grammar_finished) = {
             let a = self.active.as_ref().unwrap();
             (
                 a.generated.len(),
@@ -7570,11 +8198,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 a.eos.contains(&next_u),
                 a.pos,
                 a.max_seq,
+                a.grammar_finished,
             )
         };
-        // Stop on the token cap or an EOS (checked after the push, as the loop
-        // did): the just-emitted token was the last one.
-        if gen_len >= max_new || is_eos {
+        // Stop on the token cap, an EOS or a completed JSON (checked after the
+        // push, as the loop did): the just-emitted token was the last one.
+        if gen_len >= max_new || is_eos || grammar_finished {
             let mut out = vec![(id, token_chunk)];
             out.extend(self.finalize_pipeline(true));
             return out;
@@ -7592,6 +8221,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // Forward the emitted token to sample the next one.
         let downstream = self.active.as_ref().unwrap().downstream.clone();
         let cfg = self.active.as_ref().unwrap().cfg.clone();
+        let mut gm = self.active.as_mut().unwrap().grammar.take();
+        let json = gm.is_some();
         match self.forward_one_token_first(
             next_u,
             pos,
@@ -7599,12 +8230,35 @@ impl<R: StagedRunner> PipelineEngine<R> {
             &downstream,
             true,
             Self::reply_deadline(),
+            gm.as_mut(),
         ) {
             Ok(tok_back) => {
+                let committed = commit(gm.as_mut(), tok_back);
                 let a = self.active.as_mut().unwrap();
                 a.next = tok_back;
                 a.pos += 1;
-                vec![(id, token_chunk)]
+                a.grammar = gm;
+                match committed {
+                    Ok(finished) => {
+                        a.grammar_finished = finished;
+                        vec![(id, token_chunk)]
+                    }
+                    Err(e) => {
+                        warn!(task = %id, error = %e, "structured output failed; task aborted");
+                        self.active = None;
+                        vec![
+                            (id.clone(), token_chunk),
+                            (id.clone(), Chunk::error(id, e.to_string())),
+                        ]
+                    }
+                }
+            }
+            Err(e) if json => {
+                // A json task never ends as a clean completion on a failed
+                // step: its output is an unfinished JSON document.
+                warn!(task = %id, "decode forward failed: {e}");
+                self.active = None;
+                vec![(id.clone(), token_chunk), (id.clone(), Chunk::error(id, e))]
             }
             Err(e) => {
                 // A mid-decode wire failure emits the partial output as a clean
@@ -7676,7 +8330,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         chunk.finish_reason = Some(if a.hit_context_cap {
             FinishReason::Length
         } else {
-            finish_reason_for(n_tokens as usize, a.max_new, false)
+            finish_reason_for(n_tokens as usize, a.max_new, a.grammar_finished)
         });
         vec![(a.id, chunk)]
     }
@@ -7730,7 +8384,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         let relay_started = Instant::now();
                         let down = relay.as_ref().expect("Ready::Down only with a downstream");
                         let res = self.block_on(async {
-                            match recv_kind_client(down).await {
+                            match crate::dist::recv_kind_client_raw(down).await {
                                 Ok(Some(FrameKind::StreamTokens)) => {
                                     let (bid, toks) = recv_stream_tokens_body_client(down)
                                         .await
@@ -7738,6 +8392,19 @@ impl<R: StagedRunner> PipelineEngine<R> {
                                     send_stream_tokens_upstream(&upstream, bid, &toks)
                                         .await
                                         .map_err(|e| format!("relay stream tokens: {e}"))
+                                }
+                                // A masked frame's reply goes up as it came:
+                                // acknowledged only by the stages that masked.
+                                Ok(Some(FrameKind::StreamTokensAck)) => {
+                                    let (bid, status, toks) =
+                                        crate::dist::recv_stream_tokens_ack_body_client(down)
+                                            .await
+                                            .map_err(|e| format!("recv_stream_tokens_ack: {e}"))?;
+                                    crate::dist::send_stream_tokens_ack_upstream(
+                                        &upstream, bid, status, &toks,
+                                    )
+                                    .await
+                                    .map_err(|e| format!("relay stream tokens ack: {e}"))
                                 }
                                 Ok(Some(other)) => Err(format!(
                                     "expected StreamTokens from downstream, got {other:?}"
@@ -7904,6 +8571,36 @@ impl<R: StagedRunner> PipelineEngine<R> {
 
     // ---- multi-stream pipeline: worker side ------------------------------
 
+    /// Last rank, a masked sampling frame: sample `row` under its mask and
+    /// answer `TokenAck` (an acknowledged `-1` when the row can't be served).
+    fn answer_masked_row(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        logits: &[f32],
+        cfg: &crate::sampling::SamplingConfig,
+        cols: &MaskCols,
+        row: usize,
+    ) -> Result<(), String> {
+        let token = sample_wire_masked(
+            logits,
+            &self.last_rank_history,
+            cfg,
+            &mut self.last_rank_rng,
+            cols,
+            row,
+        );
+        if let Some(t) = token {
+            self.last_rank_history.push(t);
+        }
+        self.block_on(crate::dist::send_token_ack_upstream(
+            upstream,
+            token.unwrap_or(-1),
+            cols.tag(row),
+            MASK_ACK,
+        ))
+        .map_err(|e| format!("send_token_ack: {e}"))
+    }
+
     /// A stream frame that names a slot this rank cannot hold is a protocol
     /// violation (rank 0 and the workers must share `CASCADIA_STREAMS`).
     fn stream_slot_ok(&mut self, slot: u32) -> Result<usize, String> {
@@ -7926,8 +8623,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
     ) -> Result<(), String> {
         let recv_started = Instant::now();
-        let (batch_id, slot, rows, sampling_cfg, hidden_f32) = self
-            .block_on(recv_stream_open_body_server(upstream))
+        let (batch_id, slot, rows, sampling_cfg, step) = self
+            .block_on(crate::dist::recv_stream_open_step_body_server(upstream))
             .map_err(|e| format!("recv_stream_open: {e}"))?;
         let window = StreamWindow {
             batch_id,
@@ -7936,7 +8633,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             flags: None,
             sampling_cfg,
         };
-        self.stream_prefill_window(upstream, downstream, window, hidden_f32, recv_started)
+        self.stream_prefill_window(upstream, downstream, window, step, recv_started)
     }
 
     /// `StreamFeed`: one window of a long prompt (see [`FrameKind::StreamFeed`]).
@@ -7946,8 +8643,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
     ) -> Result<(), String> {
         let recv_started = Instant::now();
-        let (batch_id, slot, rows, flags, sampling_cfg, hidden_f32) = self
-            .block_on(recv_stream_feed_body_server(upstream))
+        let (batch_id, slot, rows, flags, sampling_cfg, step) = self
+            .block_on(crate::dist::recv_stream_feed_step_body_server(upstream))
             .map_err(|e| format!("recv_stream_feed: {e}"))?;
         let window = StreamWindow {
             batch_id,
@@ -7956,7 +8653,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             flags: Some(flags),
             sampling_cfg,
         };
-        self.stream_prefill_window(upstream, downstream, window, hidden_f32, recv_started)
+        self.stream_prefill_window(upstream, downstream, window, step, recv_started)
     }
 
     /// Prompt rows of one slot through my layers. A `StreamOpen` is the whole
@@ -7968,7 +8665,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         upstream: &Arc<TokioMutex<ActivationServer>>,
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
         w: StreamWindow,
-        hidden_f32: Vec<f32>,
+        step: crate::dist::StepTensor,
         recv_started: Instant,
     ) -> Result<(), String> {
         let received = Instant::now();
@@ -7985,6 +8682,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         let s = self.stream_slot_ok(slot)?;
         let hs = self.runner.hidden_size();
+        // Structured output: a json prompt's sampled window carries mask
+        // columns after the hidden.
+        let (hidden_f32, _, cols) = match step.split(hs) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.peer_disconnected = true;
+                return Err(format!("stream prefill: {e}"));
+            }
+        };
         let have = if open {
             Some(0)
         } else {
@@ -8029,22 +8735,38 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 history: Vec::new(),
                 rng,
             };
-            let token = crate::sampling::sample_unmasked(
-                &logits,
-                &sampler.history,
-                &sampler.cfg,
-                &mut sampler.rng,
-            );
-            sampler.history.push(token);
+            let token = match cols.as_ref() {
+                Some(c) => sample_wire_masked(
+                    &logits,
+                    &sampler.history,
+                    &sampler.cfg,
+                    &mut sampler.rng,
+                    c,
+                    rows as usize - 1,
+                ),
+                None => Some(crate::sampling::sample_unmasked(
+                    &logits,
+                    &sampler.history,
+                    &sampler.cfg,
+                    &mut sampler.rng,
+                )),
+            };
+            if let Some(t) = token {
+                sampler.history.push(t);
+            }
             self.stream_samplers.insert(s, sampler);
             let send_started = Instant::now();
-            let sent = self
-                .block_on(send_stream_tokens_upstream(
-                    upstream,
-                    batch_id,
-                    &[(slot, token)],
-                ))
-                .map_err(|e| format!("send_stream_tokens: {e}"));
+            let row = [(slot, token.unwrap_or(-1))];
+            let sent = match cols {
+                Some(_) => self
+                    .block_on(crate::dist::send_stream_tokens_ack_upstream(
+                        upstream, batch_id, MASK_ACK, &row,
+                    ))
+                    .map_err(|e| format!("send_stream_tokens_ack: {e}")),
+                None => self
+                    .block_on(send_stream_tokens_upstream(upstream, batch_id, &row))
+                    .map_err(|e| format!("send_stream_tokens: {e}")),
+            };
             if let Some(p) = self.stage_profile.as_mut() {
                 p.head += send_started - computed;
                 p.send += send_started.elapsed();
@@ -8056,7 +8778,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             // `step_worker` and is relayed upstream there.
             let sent = match flags {
                 None => self
-                    .block_on(send_stream_open(
+                    .block_on(crate::dist::send_stream_open_step(
                         down,
                         batch_id,
                         slot,
@@ -8064,10 +8786,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         &hidden,
                         rows,
                         hs as u32,
+                        cols.as_ref(),
                     ))
                     .map_err(|e| format!("send_stream_open: {e}")),
                 Some(f) => self
-                    .block_on(send_stream_feed(
+                    .block_on(crate::dist::send_stream_feed_step(
                         down,
                         batch_id,
                         slot,
@@ -8076,6 +8799,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         &hidden,
                         rows,
                         hs as u32,
+                        cols.as_ref(),
                     ))
                     .map_err(|e| format!("send_stream_feed: {e}")),
             };
@@ -8094,11 +8818,19 @@ impl<R: StagedRunner> PipelineEngine<R> {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
     ) -> Result<(), String> {
         let recv_started = Instant::now();
-        let (batch_id, rows, hidden_f32) = self
-            .block_on(recv_stream_decode_body_server(upstream))
+        let (batch_id, rows, step) = self
+            .block_on(crate::dist::recv_stream_decode_step_body_server(upstream))
             .map_err(|e| format!("recv_stream_decode: {e}"))?;
         let received = Instant::now();
         let hs = self.runner.hidden_size();
+        // Structured output: json rows carry mask columns after the hidden.
+        let (hidden_f32, _, cols) = match step.split(hs) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.peer_disconnected = true;
+                return Err(format!("stream decode: {e}"));
+            }
+        };
         if hidden_f32.len() != rows.len() * hs {
             self.peer_disconnected = true;
             return Err(format!(
@@ -8141,19 +8873,38 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     format!("stream decode: slot {s} has no sampler (no StreamOpen seen)")
                 })?;
                 let l = &logits[i * vocab..(i + 1) * vocab];
-                let token = crate::sampling::sample_unmasked(
-                    l,
-                    &sampler.history,
-                    &sampler.cfg,
-                    &mut sampler.rng,
-                );
-                sampler.history.push(token);
-                toks.push((s as u32, token));
+                let token = match cols.as_ref().filter(|c| c.tag(i) != 0) {
+                    Some(c) => sample_wire_masked(
+                        l,
+                        &sampler.history,
+                        &sampler.cfg,
+                        &mut sampler.rng,
+                        c,
+                        i,
+                    ),
+                    None => Some(crate::sampling::sample_unmasked(
+                        l,
+                        &sampler.history,
+                        &sampler.cfg,
+                        &mut sampler.rng,
+                    )),
+                };
+                if let Some(t) = token {
+                    sampler.history.push(t);
+                }
+                toks.push((s as u32, token.unwrap_or(-1)));
             }
             let send_started = Instant::now();
-            let sent = self
-                .block_on(send_stream_tokens_upstream(upstream, batch_id, &toks))
-                .map_err(|e| format!("send_stream_tokens: {e}"));
+            let sent = match cols {
+                Some(_) => self
+                    .block_on(crate::dist::send_stream_tokens_ack_upstream(
+                        upstream, batch_id, MASK_ACK, &toks,
+                    ))
+                    .map_err(|e| format!("send_stream_tokens_ack: {e}")),
+                None => self
+                    .block_on(send_stream_tokens_upstream(upstream, batch_id, &toks))
+                    .map_err(|e| format!("send_stream_tokens: {e}")),
+            };
             if let Some(p) = self.stage_profile.as_mut() {
                 p.head += send_started - computed;
                 p.send += send_started.elapsed();
@@ -8162,8 +8913,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let sent = self
-                .block_on(send_stream_decode(
-                    down, batch_id, &rows, &hidden, hs as u32,
+                .block_on(crate::dist::send_stream_decode_step(
+                    down,
+                    batch_id,
+                    &rows,
+                    &hidden,
+                    hs as u32,
+                    cols.as_ref(),
                 ))
                 .map_err(|e| format!("send_stream_decode: {e}"));
             if let Some(p) = self.stage_profile.as_mut() {
@@ -8205,10 +8961,23 @@ impl<R: StagedRunner> PipelineEngine<R> {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
         sample: bool,
     ) -> Result<(), String> {
-        let (past_seq_len, sampling_cfg, push_history, hidden_f32, _shape) = self
-            .block_on(recv_forward_body_server(upstream))
+        let (past_seq_len, sampling_cfg, push_history, step) = self
+            .block_on(crate::dist::recv_forward_step_body_server(upstream))
             .map_err(|e| format!("recv_forward_body: {e}"))?;
         let pos = past_seq_len as usize;
+        // Structured output: a masked step carries mask columns after the
+        // hidden (sampling frames only).
+        let (hidden_f32, _shape, cols) = match step.split(self.runner.hidden_size()) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.peer_disconnected = true;
+                return Err(format!("forward frame: {e}"));
+            }
+        };
+        if cols.is_some() && !sample {
+            self.peer_disconnected = true;
+            return Err("a ForwardNoSample frame carries a mask; only sampling frames may".into());
+        }
         // A malformed or over-range frame is a protocol violation we cannot
         // serve: forwarding a wrong-width hidden, or one at a position the
         // caches can't hold, would panic (OOB) mid-pipeline. Latch the peer as
@@ -8243,6 +9012,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                 self.last_rank_rng_seeded = true;
             }
+            if let Some(cols) = cols.as_ref() {
+                return self.answer_masked_row(upstream, &logits, &sampling_cfg, cols, 0);
+            }
             let token = crate::sampling::sample_unmasked(
                 &logits,
                 &self.last_rank_history,
@@ -8256,6 +9028,31 @@ impl<R: StagedRunner> PipelineEngine<R> {
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let h = self.runner.hidden_size() as u32;
+            if let Some(cols) = cols {
+                // Relay the mask; pass the reply up only as acknowledged by
+                // the stages below.
+                return self.block_on(async {
+                    crate::dist::send_forward_step(
+                        down,
+                        FrameKind::Forward,
+                        past_seq_len,
+                        &sampling_cfg,
+                        &hidden,
+                        [1, 1, h],
+                        push_history,
+                        Some(&cols),
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
+                    crate::dist::relay_masked_token_reply(
+                        upstream,
+                        down,
+                        crate::dist::mid_mask_budget(Self::reply_deadline(), self.rank, self.total),
+                        cols.tag(0),
+                    )
+                    .await
+                });
+            }
             // Same design rule as rank 0's head: the Token reply is owed to a frame
             // we just forwarded, so bound the wait on the strict deadline. If our
             // own downstream is dead, this relay must surface an error that tears
@@ -8300,10 +9097,26 @@ impl<R: StagedRunner> PipelineEngine<R> {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
         sample: bool,
     ) -> Result<(), String> {
-        let (base, batch_count, sampling_cfg, hidden_f32, in_shape) = self
-            .block_on(recv_forward_batch_body_server(upstream))
+        let (base, batch_count, sampling_cfg, step) = self
+            .block_on(crate::dist::recv_forward_batch_step_body_server(upstream))
             .map_err(|e| format!("recv_forward_batch(prefill): {e}"))?;
         let hidden = self.runner.hidden_size();
+        // Structured output: a masked final window carries mask columns after
+        // the hidden; only its last row is masked.
+        let (hidden_f32, in_shape, cols) = match step.split(hidden) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.peer_disconnected = true;
+                return Err(format!("forward_batch_prefill: {e}"));
+            }
+        };
+        if cols.is_some() && !sample {
+            self.peer_disconnected = true;
+            return Err(
+                "a ForwardBatchPrefillNoSample frame carries a mask; only sampling frames may"
+                    .into(),
+            );
+        }
         let rows = batch_count as usize;
         let base = base as usize;
         if in_shape[0] != 1 || in_shape[1] != batch_count || in_shape[2] as usize != hidden {
@@ -8344,6 +9157,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                 self.last_rank_rng_seeded = true;
             }
+            if let Some(cols) = cols.as_ref() {
+                return self.answer_masked_row(upstream, &logits, &sampling_cfg, cols, rows - 1);
+            }
             let token = crate::sampling::sample_unmasked(
                 &logits,
                 &self.last_rank_history,
@@ -8355,6 +9171,35 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 .map_err(|e| format!("send_token (batch prefill): {e}"))
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
+            if let Some(cols) = cols {
+                // Relay the mask; pass the reply up only as acknowledged by
+                // the stages below.
+                return self.block_on(async {
+                    crate::dist::send_forward_batch_step(
+                        FrameKind::ForwardBatchPrefill,
+                        down,
+                        base as u32,
+                        batch_count,
+                        &sampling_cfg,
+                        &h,
+                        [1, batch_count, hidden as u32],
+                        Some(&cols),
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+                    crate::dist::relay_masked_token_reply(
+                        upstream,
+                        down,
+                        crate::dist::mid_mask_budget(
+                            Self::reply_deadline_prefill(),
+                            self.rank,
+                            self.total,
+                        ),
+                        cols.tag(rows - 1),
+                    )
+                    .await
+                });
+            }
             self.block_on(async {
                 // Relay with the matching kind so the last rank knows whether to
                 // sample this window.
@@ -8408,9 +9253,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
         sample: bool,
+        grammar: Option<&mut GrammarMask>,
     ) -> Result<i64, String> {
         let hidden = self.runner.hidden_size();
         let rows = prompt.len();
+        // Structured output: the final row's mask (only the final window of
+        // a json task's prompt samples).
+        let masked = match grammar {
+            Some(gm) => Some(stage_mask_cols(
+                &mut self.stage_masks,
+                &self.grammar,
+                gm,
+                rows,
+            )?),
+            None => None,
+        };
         let mut batch = vec![0.0f32; rows * hidden];
         for (r, &t) in prompt.iter().enumerate() {
             batch[r * hidden..(r + 1) * hidden].copy_from_slice(&self.runner.embed_token(t));
@@ -8421,6 +9278,31 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // without sampling and reply with a dummy Token(-1).
         let h = self.runner.forward_layers_batch(batch, base, rows);
         let cfg = cfg.clone();
+        if let Some((cols, tag)) = masked {
+            let stage_masks = &self.stage_masks;
+            return self.block_on(async {
+                crate::dist::send_forward_batch_step(
+                    FrameKind::ForwardBatchPrefill,
+                    downstream,
+                    base as u32,
+                    rows as u32,
+                    &cfg,
+                    &h,
+                    [1, rows as u32, hidden as u32],
+                    Some(&cols),
+                )
+                .await
+                .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+                let reply = crate::dist::recv_token_reply_masked(
+                    downstream,
+                    Self::reply_deadline_prefill(),
+                    tag,
+                    &stage_masks.latch,
+                )
+                .await;
+                stage_masks.outcome(reply)
+            });
+        }
         self.block_on(async {
             if sample {
                 send_forward_batch_prefill(
@@ -8451,7 +9333,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
             // per-token one — and never the raw, unbounded recv (see the
             // comment on the mid-rank relay above `handle_forward_batch_prefill`
             // for why that's connection-fatal, not just slow).
-            crate::dist::recv_token_reply(downstream, Self::reply_deadline_prefill()).await
+            crate::dist::recv_token_reply_with(
+                downstream,
+                Self::reply_deadline_prefill(),
+                Some(&self.stage_masks.latch),
+            )
+            .await
         })
     }
 }
@@ -8509,9 +9396,6 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 queued: self.pending.len(),
                 cap: OV_MAX_PENDING,
             });
-        }
-        if task.grammar.is_some() && self.total > 1 {
-            return Err(refuse_multi_stage_grammar());
         }
         if let Some(compiled) = self.grammar.compile(&task)? {
             self.grammars.insert(task.task_id.clone(), compiled);

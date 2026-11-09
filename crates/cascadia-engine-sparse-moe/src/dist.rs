@@ -195,6 +195,15 @@ pub enum FrameKind {
     /// Windows travel the pipeline back to back, so rank 1 works on the first
     /// while rank 0 computes the second.
     StreamFeed = 0x534D_4564, // "SME\x64"
+    /// up: `token i64 | tag u32 | status u32` — the reply to a sampling
+    /// frame that carried a structured-output mask (see [`MaskCols`]). Only
+    /// stages that apply masks send it; `tag` echoes the masked row's tag and
+    /// `status` is [`MASK_ACK`] (token `-1` = this step could not be served)
+    /// or [`MASK_UNCONFIRMED`] (a stage further down did not acknowledge).
+    TokenAck = 0x53_4D_45_22, // "SME\x22"
+    /// up: `batch_id u32 | status u32 | rows u32 | (slot u32, token i64) × rows`
+    /// — the reply to a stream frame that carried masks.
+    StreamTokensAck = 0x53_4D_45_65, // "SME\x65"
 }
 
 impl FrameKind {
@@ -227,6 +236,8 @@ impl FrameKind {
             x if x == FrameKind::StreamClose as u32 => Some(FrameKind::StreamClose),
             x if x == FrameKind::StreamTokens as u32 => Some(FrameKind::StreamTokens),
             x if x == FrameKind::StreamFeed as u32 => Some(FrameKind::StreamFeed),
+            x if x == FrameKind::TokenAck as u32 => Some(FrameKind::TokenAck),
+            x if x == FrameKind::StreamTokensAck as u32 => Some(FrameKind::StreamTokensAck),
             _ => None,
         }
     }
@@ -247,7 +258,30 @@ pub async fn recv_kind_server(srv: &Mutex<ActivationServer>) -> TransportResult<
     }
 }
 
+/// Read the next reply frame's kind from downstream, first reading and
+/// dropping any late structured-output reply (`TokenAck`,
+/// `StreamTokensAck`): a masked step that timed out keeps its socket, and
+/// its reply may land in front of any later exchange (token waits, KV
+/// capture/restore acks, batched replies). The waits that own such replies
+/// use [`recv_kind_client_raw`].
 pub async fn recv_kind_client(cli: &Mutex<ActivationClient>) -> TransportResult<Option<FrameKind>> {
+    loop {
+        match recv_kind_client_raw(cli).await? {
+            Some(FrameKind::TokenAck) => {
+                recv_token_ack_body_client(cli).await?;
+            }
+            Some(FrameKind::StreamTokensAck) => {
+                recv_stream_tokens_ack_body_client(cli).await?;
+            }
+            other => return Ok(other),
+        }
+    }
+}
+
+/// [`recv_kind_client`] without dropping late acknowledged replies.
+pub async fn recv_kind_client_raw(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<Option<FrameKind>> {
     let raw = {
         let mut guard = cli.lock().await;
         guard.recv_raw(4).await
@@ -615,18 +649,48 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
 /// This is the same hazard [`cascadia_transport::ActivationServer`] poisons its
 /// own connection for on a failed reply recv; the deadline here made this the
 /// one reply-wait that kept its socket.
+///
+/// A structured-output step's late acknowledged reply (`TokenAck` /
+/// `StreamTokensAck`, see [`recv_token_reply_masked`]) is read and dropped
+/// first: no unmasked step is ever answered with one.
 pub async fn recv_token_reply(
     down: &Mutex<ActivationClient>,
     deadline: std::time::Duration,
 ) -> Result<i64, String> {
+    recv_token_reply_with(down, deadline, None).await
+}
+
+/// [`recv_token_reply`] that clears rank 0's `latch` when the late reply it
+/// drops was acknowledged (the stage behind is slow, not old).
+pub async fn recv_token_reply_with(
+    down: &Mutex<ActivationClient>,
+    deadline: std::time::Duration,
+    latch: Option<&MaskLatch>,
+) -> Result<i64, String> {
     match tokio::time::timeout(deadline, async {
-        match recv_kind_client(down).await {
-            Ok(Some(FrameKind::Token)) => recv_token_body_client(down)
-                .await
-                .map_err(|e| format!("recv_token: {e}")),
-            Ok(Some(other)) => Err(format!("expected Token reply, got {other:?}")),
-            Ok(None) => Err("downstream closed before Token".into()),
-            Err(e) => Err(format!("recv_kind: {e}")),
+        loop {
+            match recv_kind_client_raw(down).await {
+                Ok(Some(FrameKind::Token)) => {
+                    return recv_token_body_client(down)
+                        .await
+                        .map_err(|e| format!("recv_token: {e}"))
+                }
+                Ok(Some(FrameKind::TokenAck)) => {
+                    let (_, _, status) = recv_token_ack_body_client(down)
+                        .await
+                        .map_err(|e| format!("recv_token_ack: {e}"))?;
+                    note_stale_ack(latch, status);
+                }
+                Ok(Some(FrameKind::StreamTokensAck)) => {
+                    let (_, status, _) = recv_stream_tokens_ack_body_client(down)
+                        .await
+                        .map_err(|e| format!("recv_stream_tokens_ack: {e}"))?;
+                    note_stale_ack(latch, status);
+                }
+                Ok(Some(other)) => return Err(format!("expected Token reply, got {other:?}")),
+                Ok(None) => return Err("downstream closed before Token".into()),
+                Err(e) => return Err(format!("recv_kind: {e}")),
+            }
         }
     })
     .await
@@ -2179,5 +2243,1521 @@ mod expert_frame_tests {
         // An F32 tensor where ids are expected is a framing error, not a silent reinterpretation.
         let f = hidden_to_tensor(&[1.0, 2.0], [1, 2, 1]);
         assert!(tensor_to_ids(&f).is_err());
+    }
+}
+
+// ───────────────────── structured-output masks on the stage wire ─────────────────────
+//
+// A json request's sampling steps (the last prompt row and every decode row) carry the
+// grammar mask rank 0 computed, so the last stage, which samples but has no grammar, can
+// apply it. Frame kinds and headers stay as they are; only the trailing tensor changes:
+// I32 `[1, rows, H + C]` instead of F32 `[1, rows, H]`. Each row is the f32 bits of its
+// hidden followed by C mask columns `[tag u32, mask words…]` (all little-endian, like
+// every tensor payload). Tag 0 marks a row without a mask; bit `i` of the words allows
+// token `i`, and tokens past the last word are not allowed. Every masked row of a frame
+// has the same column count.
+//
+// A stage on an older build reads the whole tensor and then fails on its dtype in
+// `tensor_to_hidden`, so the byte stream stays aligned. Such a stage never answers the
+// step; a masked step is only answered by `TokenAck` / `StreamTokensAck`, kinds only
+// stages on this build send. Requests without a grammar send exactly the old bytes: the
+// `*_step` encoders hand an unmasked frame to the original encoder.
+
+/// Acknowledgement status: every stage down the chain applied the mask.
+pub const MASK_ACK: u32 = 0x4D41_534B; // "MASK"
+/// Acknowledgement status from a middle stage: its downstream did not
+/// acknowledge the mask (timed out, closed, or replied without an ack).
+pub const MASK_UNCONFIRMED: u32 = 0x4E4F_4D4B; // "NOMK"
+/// How long a link that could not mask stays refused before the next json
+/// request probes it again.
+pub const MASK_REPROBE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The mask columns of a masked frame: one row per tensor row,
+/// `[tag, mask words…]` each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaskCols {
+    rows: usize,
+    width: usize,
+    data: Vec<u32>,
+}
+
+impl MaskCols {
+    /// `rows` unmasked rows with room for `words` mask words each.
+    pub fn new(rows: usize, words: usize) -> Self {
+        let width = 1 + words;
+        Self {
+            rows,
+            width,
+            data: vec![0; rows * width],
+        }
+    }
+
+    /// Mask `row` with `words` under the non-zero `tag`.
+    pub fn set(&mut self, row: usize, tag: u32, words: &[u32]) {
+        assert_ne!(tag, 0, "tag 0 marks an unmasked row");
+        assert_eq!(words.len() + 1, self.width, "mask word count");
+        let r = &mut self.data[row * self.width..(row + 1) * self.width];
+        r[0] = tag;
+        r[1..].copy_from_slice(words);
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Columns per row (tag + mask words).
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// The row's tag; 0 for an unmasked row (or no columns at all).
+    pub fn tag(&self, row: usize) -> u32 {
+        if self.width == 0 || row >= self.rows {
+            return 0;
+        }
+        self.data[row * self.width]
+    }
+
+    /// The row's mask words: `None` for an unmasked row, and also for a
+    /// masked row that carries no word (a frame this stage can't serve).
+    pub fn words(&self, row: usize) -> Option<&[u32]> {
+        if self.tag(row) == 0 || self.width < 2 {
+            return None;
+        }
+        Some(&self.data[row * self.width + 1..(row + 1) * self.width])
+    }
+
+    /// Whether any row is masked.
+    pub fn any(&self) -> bool {
+        (0..self.rows).any(|r| self.tag(r) != 0)
+    }
+}
+
+/// `hidden` (`shape` = `[a, b, h]`) plus `cols` as one I32 tensor
+/// `[a, b, h + cols.width()]`. Refused when it would exceed the transport's
+/// tensor cap.
+fn masked_tensor(hidden: &[f32], shape: [u32; 3], cols: &MaskCols) -> TransportResult<Tensor> {
+    let rows = shape[0] as usize * shape[1] as usize;
+    let h = shape[2] as usize;
+    if hidden.len() != rows * h || cols.rows() != rows {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "masked frame: {} floats and {} mask rows for shape {shape:?}",
+            hidden.len(),
+            cols.rows()
+        ))));
+    }
+    let total = h + cols.width();
+    let bytes = rows
+        .checked_mul(total)
+        .and_then(|n| n.checked_mul(4))
+        .filter(|&n| n <= cascadia_transport::MAX_TENSOR_BYTES)
+        .ok_or_else(|| {
+            TransportError::Io(std::io::Error::other(format!(
+                "masked frame of {rows} rows x {total} columns exceeds the tensor cap"
+            )))
+        })?;
+    let mut data = Vec::with_capacity(bytes);
+    for r in 0..rows {
+        for v in &hidden[r * h..(r + 1) * h] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        for w in &cols.data[r * cols.width()..(r + 1) * cols.width()] {
+            data.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    Ok(Tensor::new(
+        DType::I32,
+        [shape[0], shape[1], total as u32],
+        data,
+    ))
+}
+
+/// A step tensor's hidden rows, the shape a plain frame would carry, and
+/// the mask columns of a masked frame.
+pub type SplitStep = (Vec<f32>, [u32; 3], Option<MaskCols>);
+
+/// The trailing tensor of a sampling-family frame as this build reads it.
+#[derive(Debug)]
+pub enum StepTensor {
+    /// F32 hidden rows, as every older build sends.
+    Plain(Vec<f32>, [u32; 3]),
+    /// Hidden rows plus mask columns; [`StepTensor::split`] separates them.
+    Masked(Tensor),
+}
+
+fn step_tensor(t: Tensor) -> TransportResult<StepTensor> {
+    match t.dtype {
+        DType::F32 => {
+            let (h, shape) = tensor_to_hidden(&t)?;
+            Ok(StepTensor::Plain(h, shape))
+        }
+        DType::I32 => Ok(StepTensor::Masked(t)),
+        other => Err(TransportError::Io(std::io::Error::other(format!(
+            "expected F32 hidden tensor, got {other:?}"
+        )))),
+    }
+}
+
+impl StepTensor {
+    pub fn is_masked(&self) -> bool {
+        matches!(self, StepTensor::Masked(_))
+    }
+
+    /// Rows of hidden width `h`, the shape a plain frame would have carried,
+    /// and the mask columns of a masked frame. `Err` when a masked frame's
+    /// rows are narrower than `h`.
+    pub fn split(self, h: usize) -> Result<SplitStep, String> {
+        let t = match self {
+            StepTensor::Plain(hidden, shape) => return Ok((hidden, shape, None)),
+            StepTensor::Masked(t) => t,
+        };
+        let [a, b, total] = t.shape;
+        let total = total as usize;
+        if total < h {
+            return Err(format!(
+                "masked frame rows are {total} wide, narrower than the hidden width {h}"
+            ));
+        }
+        let rows = a as usize * b as usize;
+        let width = total - h;
+        let word = |i: usize| {
+            let c = &t.data[i * 4..i * 4 + 4];
+            u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+        };
+        let mut hidden = Vec::with_capacity(rows * h);
+        let mut data = Vec::with_capacity(rows * width);
+        for r in 0..rows {
+            let base = r * total;
+            hidden.extend((base..base + h).map(|i| f32::from_bits(word(i))));
+            data.extend((base + h..base + total).map(word));
+        }
+        Ok((
+            hidden,
+            [a, b, h as u32],
+            Some(MaskCols { rows, width, data }),
+        ))
+    }
+}
+
+fn forward_header(
+    kind: FrameKind,
+    past_seq_len: u32,
+    sampling: &SamplingConfig,
+    push_history: bool,
+) -> [u8; 8 + SAMPLING_WIRE_BYTES + 1] {
+    let mut header = [0u8; 8 + SAMPLING_WIRE_BYTES + 1];
+    header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&past_seq_len.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[8..8 + SAMPLING_WIRE_BYTES].copy_from_slice(&sbytes);
+    header[8 + SAMPLING_WIRE_BYTES] = u8::from(push_history);
+    header
+}
+
+async fn send_header_and_tensor(
+    cli: &Mutex<ActivationClient>,
+    header: &[u8],
+    tensor: &Tensor,
+) -> TransportResult<()> {
+    let mut guard = cli.lock().await;
+    guard.send_raw(header).await?;
+    guard.send(tensor).await?;
+    Ok(())
+}
+
+/// A single-row Forward-family frame (`Forward`, `ForwardNoSample`,
+/// `ForwardPrefill`); `cols: None` sends exactly what [`send_forward`] and
+/// its siblings send.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_forward_step(
+    cli: &Mutex<ActivationClient>,
+    kind: FrameKind,
+    past_seq_len: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+    push_history: bool,
+    cols: Option<&MaskCols>,
+) -> TransportResult<()> {
+    let Some(cols) = cols else {
+        return send_forward_kind(
+            cli,
+            kind,
+            past_seq_len,
+            sampling,
+            hidden_f32,
+            hidden_shape,
+            push_history,
+        )
+        .await;
+    };
+    let tensor = masked_tensor(hidden_f32, hidden_shape, cols)?;
+    let header = forward_header(kind, past_seq_len, sampling, push_history);
+    send_header_and_tensor(cli, &header, &tensor).await
+}
+
+/// Body of a Forward-family frame (kind consumed), masked or not:
+/// `(past_seq_len, sampling, push_history, tensor)`. Reads the whole frame
+/// before returning.
+pub async fn recv_forward_step_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, SamplingConfig, bool, StepTensor)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(4 + SAMPLING_WIRE_BYTES + 1).await?;
+    if raw.len() != 4 + SAMPLING_WIRE_BYTES + 1 {
+        return Err(TransportError::SocketClosed);
+    }
+    let past_seq_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[4..4 + SAMPLING_WIRE_BYTES]);
+    let sampling = decode_sampling(&sbytes);
+    let push_history = raw[4 + SAMPLING_WIRE_BYTES] != 0;
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    Ok((past_seq_len, sampling, push_history, step_tensor(tensor)?))
+}
+
+/// A batched forward (`ForwardBatch`, `ForwardBatchPrefill`,
+/// `ForwardBatchPrefillNoSample`); `cols: None` sends exactly what
+/// [`send_forward_batch_prefill`] and its siblings send.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_forward_batch_step(
+    kind: FrameKind,
+    cli: &Mutex<ActivationClient>,
+    past_seq_len_start: u32,
+    batch_count: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+    cols: Option<&MaskCols>,
+) -> TransportResult<()> {
+    let Some(cols) = cols else {
+        return send_forward_batch_kind(
+            kind,
+            cli,
+            past_seq_len_start,
+            batch_count,
+            sampling,
+            hidden_f32,
+            hidden_shape,
+        )
+        .await;
+    };
+    if batch_count == 0 || batch_count > MAX_BATCH_COUNT || hidden_shape[1] != batch_count {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_forward_batch: batch_count {batch_count} (shape {hidden_shape:?}) out of range 1..={MAX_BATCH_COUNT}"
+        ))));
+    }
+    let tensor = masked_tensor(hidden_f32, hidden_shape, cols)?;
+    let mut header = [0u8; 12 + SAMPLING_WIRE_BYTES];
+    header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&past_seq_len_start.to_be_bytes());
+    header[8..12].copy_from_slice(&batch_count.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[12..12 + SAMPLING_WIRE_BYTES].copy_from_slice(&sbytes);
+    send_header_and_tensor(cli, &header, &tensor).await
+}
+
+/// Body of a batched forward (kind consumed), masked or not:
+/// `(past_seq_len_start, batch_count, sampling, tensor)`.
+pub async fn recv_forward_batch_step_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32, SamplingConfig, StepTensor)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8 + SAMPLING_WIRE_BYTES).await?;
+    if raw.len() != 8 + SAMPLING_WIRE_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    let past_seq_len_start = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let batch_count = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    if batch_count == 0 || batch_count > MAX_BATCH_COUNT {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "recv_forward_batch_body: batch_count {batch_count} out of range 1..={MAX_BATCH_COUNT}"
+        ))));
+    }
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[8..8 + SAMPLING_WIRE_BYTES]);
+    let sampling = decode_sampling(&sbytes);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != batch_count {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "recv_forward_batch_body: tensor shape[1]={} != batch_count={batch_count}",
+            tensor.shape[1]
+        ))));
+    }
+    Ok((
+        past_seq_len_start,
+        batch_count,
+        sampling,
+        step_tensor(tensor)?,
+    ))
+}
+
+fn stream_rows_tensor(
+    hidden_f32: &[f32],
+    rows: u32,
+    h: u32,
+    cols: Option<&MaskCols>,
+) -> TransportResult<Tensor> {
+    match cols {
+        None => Ok(hidden_to_tensor(hidden_f32, [1, rows, h])),
+        Some(c) => masked_tensor(hidden_f32, [1, rows, h], c),
+    }
+}
+
+/// [`send_stream_open`] with optional mask columns (`None`: the same bytes).
+#[allow(clippy::too_many_arguments)]
+pub async fn send_stream_open_step(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    slot: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    rows: u32,
+    h: u32,
+    cols: Option<&MaskCols>,
+) -> TransportResult<()> {
+    if cols.is_none() {
+        return send_stream_open(cli, batch_id, slot, sampling, hidden_f32, rows, h).await;
+    }
+    let tensor = stream_rows_tensor(hidden_f32, rows, h, cols)?;
+    let mut header = [0u8; 16 + SAMPLING_WIRE_BYTES];
+    header[0..4].copy_from_slice(&(FrameKind::StreamOpen as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&batch_id.to_be_bytes());
+    header[8..12].copy_from_slice(&slot.to_be_bytes());
+    header[12..16].copy_from_slice(&rows.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[16..].copy_from_slice(&sbytes);
+    send_header_and_tensor(cli, &header, &tensor).await
+}
+
+/// Body of a `StreamOpen` (kind consumed), masked or not:
+/// `(batch_id, slot, rows, sampling, tensor)`.
+pub async fn recv_stream_open_step_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32, u32, SamplingConfig, StepTensor)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(12 + SAMPLING_WIRE_BYTES).await?;
+    if raw.len() != 12 + SAMPLING_WIRE_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, slot, rows) = (be_u32(&raw[0..4]), be_u32(&raw[4..8]), be_u32(&raw[8..12]));
+    if rows == 0 || rows > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open: rows {rows} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[12..]);
+    let sampling = decode_sampling(&sbytes);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != rows {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open: tensor shape[1]={} != rows {rows}",
+            tensor.shape[1]
+        ))));
+    }
+    Ok((batch_id, slot, rows, sampling, step_tensor(tensor)?))
+}
+
+/// [`send_stream_feed`] with optional mask columns (`None`: the same bytes).
+#[allow(clippy::too_many_arguments)]
+pub async fn send_stream_feed_step(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    slot: u32,
+    flags: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    rows: u32,
+    h: u32,
+    cols: Option<&MaskCols>,
+) -> TransportResult<()> {
+    if cols.is_none() {
+        return send_stream_feed(cli, batch_id, slot, flags, sampling, hidden_f32, rows, h).await;
+    }
+    let tensor = stream_rows_tensor(hidden_f32, rows, h, cols)?;
+    let mut header = [0u8; 20 + SAMPLING_WIRE_BYTES];
+    header[0..4].copy_from_slice(&(FrameKind::StreamFeed as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&batch_id.to_be_bytes());
+    header[8..12].copy_from_slice(&slot.to_be_bytes());
+    header[12..16].copy_from_slice(&rows.to_be_bytes());
+    header[16..20].copy_from_slice(&flags.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[20..].copy_from_slice(&sbytes);
+    send_header_and_tensor(cli, &header, &tensor).await
+}
+
+/// Body of a `StreamFeed` (kind consumed), masked or not:
+/// `(batch_id, slot, rows, flags, sampling, tensor)`.
+pub async fn recv_stream_feed_step_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32, u32, u32, SamplingConfig, StepTensor)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(16 + SAMPLING_WIRE_BYTES).await?;
+    if raw.len() != 16 + SAMPLING_WIRE_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, slot, rows, flags) = (
+        be_u32(&raw[0..4]),
+        be_u32(&raw[4..8]),
+        be_u32(&raw[8..12]),
+        be_u32(&raw[12..16]),
+    );
+    if rows == 0 || rows > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream feed: rows {rows} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[16..]);
+    let sampling = decode_sampling(&sbytes);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != rows {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream feed: tensor shape[1]={} != rows {rows}",
+            tensor.shape[1]
+        ))));
+    }
+    Ok((batch_id, slot, rows, flags, sampling, step_tensor(tensor)?))
+}
+
+/// [`send_stream_decode`] with optional mask columns (`None`: the same bytes).
+pub async fn send_stream_decode_step(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    rows: &[(u32, u32)],
+    hidden_f32: &[f32],
+    h: u32,
+    cols: Option<&MaskCols>,
+) -> TransportResult<()> {
+    if cols.is_none() {
+        return send_stream_decode(cli, batch_id, rows, hidden_f32, h).await;
+    }
+    let n = rows.len() as u32;
+    if n == 0 || n > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream decode: rows {n} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let tensor = stream_rows_tensor(hidden_f32, n, h, cols)?;
+    let mut header = Vec::with_capacity(12 + rows.len() * 8);
+    header.extend_from_slice(&(FrameKind::StreamDecode as u32).to_be_bytes());
+    header.extend_from_slice(&batch_id.to_be_bytes());
+    header.extend_from_slice(&n.to_be_bytes());
+    for &(slot, pos) in rows {
+        header.extend_from_slice(&slot.to_be_bytes());
+        header.extend_from_slice(&pos.to_be_bytes());
+    }
+    send_header_and_tensor(cli, &header, &tensor).await
+}
+
+/// Body of a `StreamDecode` (kind consumed), masked or not:
+/// `(batch_id, [(slot, pos)], tensor)`.
+pub async fn recv_stream_decode_step_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, Vec<(u32, u32)>, StepTensor)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, n) = (be_u32(&raw[0..4]), be_u32(&raw[4..8]));
+    if n == 0 || n > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream decode: rows {n} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let raw = guard.recv_raw(n as usize * 8).await?;
+    if raw.len() != n as usize * 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let rows: Vec<(u32, u32)> = raw
+        .chunks_exact(8)
+        .map(|c| (be_u32(&c[0..4]), be_u32(&c[4..8])))
+        .collect();
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != n {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream decode: tensor shape[1]={} != rows {n}",
+            tensor.shape[1]
+        ))));
+    }
+    Ok((batch_id, rows, step_tensor(tensor)?))
+}
+
+fn token_ack_bytes(token_id: i64, tag: u32, status: u32) -> [u8; 20] {
+    let mut bytes = [0u8; 20];
+    bytes[0..4].copy_from_slice(&(FrameKind::TokenAck as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&token_id.to_be_bytes());
+    bytes[12..16].copy_from_slice(&tag.to_be_bytes());
+    bytes[16..20].copy_from_slice(&status.to_be_bytes());
+    bytes
+}
+
+/// Reply to a masked step: `TokenAck(token, tag, status)`.
+pub async fn send_token_ack_upstream(
+    srv: &Mutex<ActivationServer>,
+    token_id: i64,
+    tag: u32,
+    status: u32,
+) -> TransportResult<()> {
+    let bytes = token_ack_bytes(token_id, tag, status);
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Body of a `TokenAck` (kind consumed): `(token, tag, status)`.
+pub async fn recv_token_ack_body_client(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<(i64, u32, u32)> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(16).await?;
+    drop(guard);
+    if raw.len() != 16 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok((
+        i64::from_be_bytes(raw[0..8].try_into().unwrap()),
+        be_u32(&raw[8..12]),
+        be_u32(&raw[12..16]),
+    ))
+}
+
+/// Reply to a masked stream frame: `StreamTokensAck(batch_id, status, rows)`.
+pub async fn send_stream_tokens_ack_upstream(
+    srv: &Mutex<ActivationServer>,
+    batch_id: u32,
+    status: u32,
+    tokens: &[(u32, i64)],
+) -> TransportResult<()> {
+    let n = tokens.len() as u32;
+    if n == 0 || n > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream tokens: rows {n} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let mut bytes = Vec::with_capacity(16 + tokens.len() * 12);
+    bytes.extend_from_slice(&(FrameKind::StreamTokensAck as u32).to_be_bytes());
+    bytes.extend_from_slice(&batch_id.to_be_bytes());
+    bytes.extend_from_slice(&status.to_be_bytes());
+    bytes.extend_from_slice(&n.to_be_bytes());
+    for &(slot, tok) in tokens {
+        bytes.extend_from_slice(&slot.to_be_bytes());
+        bytes.extend_from_slice(&tok.to_be_bytes());
+    }
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Body of a `StreamTokensAck` (kind consumed): `(batch_id, status, rows)`.
+pub async fn recv_stream_tokens_ack_body_client(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<(u32, u32, Vec<(u32, i64)>)> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(12).await?;
+    if raw.len() != 12 {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, status, n) = (be_u32(&raw[0..4]), be_u32(&raw[4..8]), be_u32(&raw[8..12]));
+    if n == 0 || n > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream tokens: rows {n} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let raw = guard.recv_raw(n as usize * 12).await?;
+    drop(guard);
+    if raw.len() != n as usize * 12 {
+        return Err(TransportError::SocketClosed);
+    }
+    let toks = raw
+        .chunks_exact(12)
+        .map(|c| {
+            (
+                be_u32(&c[0..4]),
+                i64::from_be_bytes(c[4..12].try_into().unwrap()),
+            )
+        })
+        .collect();
+    Ok((batch_id, status, toks))
+}
+
+/// Rank 0's per-engine memory that its pipeline could not apply a mask: set
+/// after a masked step that timed out or came back without an
+/// acknowledgement, so later json requests fail at once instead of stalling
+/// the pipeline each time. It outlives a re-dial, is cleared when a late
+/// acknowledged reply turns up (the stage was slow, not old), and stops
+/// refusing after [`MASK_REPROBE`] so the next json request probes again.
+#[derive(Debug, Default)]
+pub struct MaskLatch(std::sync::Mutex<Option<std::time::Instant>>);
+
+impl MaskLatch {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set(&self) {
+        self.set_at(std::time::Instant::now());
+    }
+
+    pub fn set_at(&self, at: std::time::Instant) {
+        *self.slot() = Some(at);
+    }
+
+    pub fn clear(&self) {
+        *self.slot() = None;
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.slot().is_some()
+    }
+
+    /// Whether a json request must be refused now.
+    pub fn refuses(&self) -> bool {
+        self.refuses_at(std::time::Instant::now())
+    }
+
+    pub fn refuses_at(&self, now: std::time::Instant) -> bool {
+        self.slot()
+            .is_some_and(|t| now.saturating_duration_since(t) < MASK_REPROBE)
+    }
+}
+
+/// A late acknowledged reply read and dropped: the stage behind it does mask.
+fn note_stale_ack(latch: Option<&MaskLatch>, status: u32) {
+    if status == MASK_ACK {
+        if let Some(l) = latch {
+            l.clear();
+        }
+    }
+}
+
+/// How a masked step's reply wait ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MaskedReply {
+    /// Every later stage applied the mask; the token it sampled.
+    Token(i64),
+    /// The stages apply masks, but the last one could not serve this step
+    /// (its mask columns did not fit, or nothing in the row was allowed).
+    Refused,
+    /// No acknowledgement: a timeout, a closed link, a reply without an ack,
+    /// or a middle stage whose downstream did not acknowledge. The likely
+    /// cause is a stage on an older build.
+    Unconfirmed(String),
+}
+
+enum AckWait {
+    Acked(i64, u32),
+    NoAck(String),
+}
+
+/// Wait for the `TokenAck` tagged `tag`, dropping stale acknowledged replies
+/// on the way. The socket is kept on timeout (a stage on an older build
+/// stays aligned and simply never answers; a slow new stage's late reply is
+/// recognised and dropped by the next wait), and dropped only when the
+/// stream is out of step (an unexpected frame).
+async fn wait_token_ack(
+    down: &Mutex<ActivationClient>,
+    deadline: std::time::Duration,
+    tag: u32,
+    latch: Option<&MaskLatch>,
+) -> AckWait {
+    let waited = tokio::time::timeout(deadline, async {
+        loop {
+            match recv_kind_client_raw(down).await {
+                Ok(Some(FrameKind::TokenAck)) => {
+                    let (token, got, status) = recv_token_ack_body_client(down)
+                        .await
+                        .map_err(|e| (format!("recv_token_ack: {e}"), true))?;
+                    if got != tag {
+                        note_stale_ack(latch, status);
+                        continue;
+                    }
+                    return Ok((token, status));
+                }
+                Ok(Some(FrameKind::StreamTokensAck)) => {
+                    let (_, status, _) = recv_stream_tokens_ack_body_client(down)
+                        .await
+                        .map_err(|e| (format!("recv_stream_tokens_ack: {e}"), true))?;
+                    note_stale_ack(latch, status);
+                }
+                Ok(Some(FrameKind::Token)) => {
+                    recv_token_body_client(down)
+                        .await
+                        .map_err(|e| (format!("recv_token: {e}"), true))?;
+                    return Err(("a reply without acknowledgement".to_string(), false));
+                }
+                Ok(Some(other)) => return Err((format!("unexpected {other:?} reply"), true)),
+                Ok(None) => return Err(("downstream closed before the reply".to_string(), false)),
+                Err(e) => return Err((format!("recv_kind: {e}"), true)),
+            }
+        }
+    })
+    .await;
+    match waited {
+        Ok(Ok((token, status))) => AckWait::Acked(token, status),
+        Ok(Err((reason, out_of_step))) => {
+            if out_of_step {
+                down.lock().await.close().await;
+            }
+            AckWait::NoAck(reason)
+        }
+        Err(_) => AckWait::NoAck(format!("no reply within {deadline:?}")),
+    }
+}
+
+/// Rank 0: await the reply to a masked step tagged `tag`, bounded by
+/// `deadline`, keeping the socket on timeout (see [`wait_token_ack`]).
+pub async fn recv_token_reply_masked(
+    down: &Mutex<ActivationClient>,
+    deadline: std::time::Duration,
+    tag: u32,
+    latch: &MaskLatch,
+) -> MaskedReply {
+    match wait_token_ack(down, deadline, tag, Some(latch)).await {
+        AckWait::Acked(token, MASK_ACK) if token >= 0 => MaskedReply::Token(token),
+        AckWait::Acked(_, MASK_ACK) => MaskedReply::Refused,
+        AckWait::Acked(_, MASK_UNCONFIRMED) => {
+            MaskedReply::Unconfirmed("a later stage did not acknowledge the mask".into())
+        }
+        AckWait::Acked(_, s) => {
+            MaskedReply::Unconfirmed(format!("unknown acknowledgement status 0x{s:08x}"))
+        }
+        AckWait::NoAck(reason) => MaskedReply::Unconfirmed(reason),
+    }
+}
+
+/// A middle stage on a masked step: pass the downstream's acknowledged reply
+/// up as it came, or `TokenAck(-1, tag, MASK_UNCONFIRMED)` when the
+/// downstream did not acknowledge within `deadline` (socket kept, as on
+/// rank 0). The answer upstream is always a `TokenAck`, so a late one is
+/// recognised as stale there too.
+pub async fn relay_masked_token_reply(
+    up: &Mutex<ActivationServer>,
+    down: &Mutex<ActivationClient>,
+    deadline: std::time::Duration,
+    tag: u32,
+) -> Result<(), String> {
+    let (token, status) = match wait_token_ack(down, deadline, tag, None).await {
+        AckWait::Acked(token, status) => (token, status),
+        AckWait::NoAck(reason) => {
+            tracing::warn!(%reason, "masked step not acknowledged downstream");
+            (-1, MASK_UNCONFIRMED)
+        }
+    };
+    send_token_ack_upstream(up, token, tag, status)
+        .await
+        .map_err(|e| format!("relay token ack: {e}"))
+}
+
+/// The masked-step budget of the stage at `rank` of `total`, given rank 0's
+/// budget `head` for that step: `head · (total − rank) / total`. Each stage
+/// waits less than the one upstream of it (by `head / total`), so a middle
+/// stage whose downstream never answers sends its unconfirmed reply before
+/// any stage above it gives up.
+pub fn mid_mask_budget(head: std::time::Duration, rank: u32, total: u32) -> std::time::Duration {
+    let total = total.max(1);
+    head * total.saturating_sub(rank) / total
+}
+
+/// A middle stage's unbounded wait for the `Token` owed to an unmasked frame
+/// it relayed, dropping any late acknowledged reply first.
+pub async fn recv_token_relay(down: &Mutex<ActivationClient>) -> Result<i64, String> {
+    loop {
+        match recv_kind_client_raw(down).await {
+            Ok(Some(FrameKind::Token)) => {
+                return recv_token_body_client(down)
+                    .await
+                    .map_err(|e| format!("recv_token: {e}"))
+            }
+            Ok(Some(FrameKind::TokenAck)) => {
+                recv_token_ack_body_client(down)
+                    .await
+                    .map_err(|e| format!("recv_token_ack: {e}"))?;
+            }
+            Ok(Some(other)) => return Err(format!("mid rank expected Token, got {other:?}")),
+            Ok(None) => return Err("downstream closed before Token".into()),
+            Err(e) => return Err(format!("recv_kind: {e}")),
+        }
+    }
+}
+
+/// One reply to a stream frame: plain (`ack: None`) or acknowledged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamReply {
+    pub batch_id: u32,
+    pub tokens: Vec<(u32, i64)>,
+    pub ack: Option<u32>,
+}
+
+/// Await the reply to the stream frame `expect`, bounded by `deadline`
+/// (dropping the connection on timeout, as [`recv_stream_tokens_reply`]
+/// does: the frames of other groups share the reply order). Acknowledged
+/// replies for other frames are stale and dropped; a plain reply is returned
+/// whatever its batch id, for the caller's mismatch check.
+pub async fn recv_stream_reply(
+    down: &Mutex<ActivationClient>,
+    deadline: std::time::Duration,
+    expect: u32,
+    latch: Option<&MaskLatch>,
+) -> Result<StreamReply, String> {
+    match tokio::time::timeout(deadline, async {
+        loop {
+            match recv_kind_client_raw(down).await {
+                Ok(Some(FrameKind::StreamTokens)) => {
+                    let (batch_id, tokens) = recv_stream_tokens_body_client(down)
+                        .await
+                        .map_err(|e| format!("recv_stream_tokens: {e}"))?;
+                    return Ok(StreamReply {
+                        batch_id,
+                        tokens,
+                        ack: None,
+                    });
+                }
+                Ok(Some(FrameKind::StreamTokensAck)) => {
+                    let (batch_id, status, tokens) = recv_stream_tokens_ack_body_client(down)
+                        .await
+                        .map_err(|e| format!("recv_stream_tokens_ack: {e}"))?;
+                    if batch_id != expect {
+                        note_stale_ack(latch, status);
+                        continue;
+                    }
+                    return Ok(StreamReply {
+                        batch_id,
+                        tokens,
+                        ack: Some(status),
+                    });
+                }
+                Ok(Some(FrameKind::TokenAck)) => {
+                    let (_, _, status) = recv_token_ack_body_client(down)
+                        .await
+                        .map_err(|e| format!("recv_token_ack: {e}"))?;
+                    note_stale_ack(latch, status);
+                }
+                Ok(Some(other)) => {
+                    return Err(format!("expected StreamTokens reply, got {other:?}"))
+                }
+                Ok(None) => return Err("downstream closed before StreamTokens".into()),
+                Err(e) => return Err(format!("recv_kind: {e}")),
+            }
+        }
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => {
+            down.lock().await.close().await;
+            Err(format!(
+                "stream reply timeout after {deadline:?}: downstream silent (dead peer?); \
+                 connection dropped"
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod mask_wire_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn pair() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let server = Arc::new(Mutex::new(server));
+        let s = server.clone();
+        let accept = tokio::spawn(async move { s.lock().await.accept().await.unwrap() });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client
+            .connect_with_timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
+        accept.await.unwrap();
+        (server, Arc::new(Mutex::new(client)))
+    }
+
+    /// Every byte the client sent since the last call (reads until 200 ms
+    /// pass without one).
+    async fn raw_bytes(srv: &Mutex<ActivationServer>) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let read = tokio::time::timeout(Duration::from_millis(200), async {
+                srv.lock().await.recv_raw(1).await
+            })
+            .await;
+            match read {
+                Ok(Ok(b)) => out.extend(b),
+                _ => return out,
+            }
+        }
+    }
+
+    fn cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 5,
+            seed: Some(11),
+            ..SamplingConfig::default()
+        }
+    }
+
+    fn rows_hidden(rows: usize, h: usize) -> Vec<f32> {
+        (0..rows * h).map(|i| i as f32 * 0.25 - 1.0).collect()
+    }
+
+    fn one_mask(rows: usize, tag: u32) -> MaskCols {
+        let mut c = MaskCols::new(rows, 2);
+        c.set(rows - 1, tag, &[0b1010, 1 << 31]);
+        c
+    }
+
+    #[test]
+    fn ack_kinds_are_new_codes() {
+        for (k, code) in [
+            (FrameKind::TokenAck, 0x53_4D_45_22u32),
+            (FrameKind::StreamTokensAck, 0x53_4D_45_65),
+        ] {
+            assert_eq!(k as u32, code);
+            assert_eq!(FrameKind::from_code(code), Some(k));
+        }
+        assert_eq!(token_ack_bytes(-1, 7, MASK_ACK).len(), 20);
+    }
+
+    #[tokio::test]
+    async fn unmasked_forward_bytes_are_the_original_encoders() {
+        let (srv, cli) = pair().await;
+        let h = rows_hidden(1, 3);
+        send_forward(&cli, 9, &cfg(), &h, [1, 1, 3], true)
+            .await
+            .unwrap();
+        let old = raw_bytes(&srv).await;
+        send_forward_step(
+            &cli,
+            FrameKind::Forward,
+            9,
+            &cfg(),
+            &h,
+            [1, 1, 3],
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_bytes(&srv).await, old);
+        // Pinned layout: kind, past_seq_len, sampling, push byte, then the
+        // F32 tensor frame (len, dtype 0, shape, little-endian payload).
+        let mut want = Vec::new();
+        want.extend((FrameKind::Forward as u32).to_be_bytes());
+        want.extend(9u32.to_be_bytes());
+        let mut sb = [0u8; SAMPLING_WIRE_BYTES];
+        encode_sampling(&cfg(), &mut sb);
+        want.extend(sb);
+        want.push(1);
+        want.extend(12u32.to_be_bytes());
+        want.extend(0u32.to_be_bytes());
+        for d in [1u32, 1, 3] {
+            want.extend(d.to_be_bytes());
+        }
+        for v in &h {
+            want.extend(v.to_le_bytes());
+        }
+        assert_eq!(old, want);
+    }
+
+    #[tokio::test]
+    async fn unmasked_batch_and_stream_bytes_are_the_original_encoders() {
+        let (srv, cli) = pair().await;
+        let h = rows_hidden(3, 2);
+        let c = cfg();
+        send_forward_batch_prefill(&cli, 4, 3, &c, &h, [1, 3, 2])
+            .await
+            .unwrap();
+        let old = raw_bytes(&srv).await;
+        send_forward_batch_step(
+            FrameKind::ForwardBatchPrefill,
+            &cli,
+            4,
+            3,
+            &c,
+            &h,
+            [1, 3, 2],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_bytes(&srv).await, old, "ForwardBatchPrefill");
+
+        send_stream_open(&cli, 5, 1, &c, &h, 3, 2).await.unwrap();
+        let old = raw_bytes(&srv).await;
+        send_stream_open_step(&cli, 5, 1, &c, &h, 3, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(raw_bytes(&srv).await, old, "StreamOpen");
+
+        send_stream_feed(&cli, 6, 1, STREAM_FEED_FINAL, &c, &h, 3, 2)
+            .await
+            .unwrap();
+        let old = raw_bytes(&srv).await;
+        send_stream_feed_step(&cli, 6, 1, STREAM_FEED_FINAL, &c, &h, 3, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(raw_bytes(&srv).await, old, "StreamFeed");
+
+        let rows = [(0u32, 7u32), (2, 9), (1, 4)];
+        send_stream_decode(&cli, 8, &rows, &h, 2).await.unwrap();
+        let old = raw_bytes(&srv).await;
+        send_stream_decode_step(&cli, 8, &rows, &h, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(raw_bytes(&srv).await, old, "StreamDecode");
+    }
+
+    #[tokio::test]
+    async fn masked_forward_round_trips_hidden_and_mask() {
+        let (srv, cli) = pair().await;
+        let h = rows_hidden(1, 4);
+        let cols = one_mask(1, 42);
+        send_forward_step(
+            &cli,
+            FrameKind::Forward,
+            3,
+            &cfg(),
+            &h,
+            [1, 1, 4],
+            true,
+            Some(&cols),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recv_kind_server(&srv).await.unwrap(),
+            Some(FrameKind::Forward)
+        );
+        let (psl, sampling, push, step) = recv_forward_step_body_server(&srv).await.unwrap();
+        assert_eq!((psl, push, sampling.top_k), (3, true, 5));
+        assert!(step.is_masked());
+        let (hidden, shape, got) = step.split(4).unwrap();
+        assert_eq!(hidden, h);
+        assert_eq!(shape, [1, 1, 4]);
+        let got = got.unwrap();
+        assert_eq!(got, cols);
+        assert_eq!(got.tag(0), 42);
+        assert_eq!(got.words(0), Some(&[0b1010, 1 << 31][..]));
+
+        // The last stage applies it: the favoured token 0 is not allowed,
+        // so the pick is the best allowed one (3 over 1 and 63).
+        let mut logits = vec![0.0f32; 64];
+        logits[0] = 9.0;
+        logits[3] = 5.0;
+        logits[1] = 4.0;
+        logits[63] = 1.0;
+        let mut rng = 1;
+        let greedy = SamplingConfig::default();
+        let words = got.words(0).unwrap();
+        let t = crate::sampling::sample_with_words(&logits, &[], &greedy, &mut rng, words);
+        assert_eq!(t.unwrap(), 3);
+        // A row the mask leaves empty is an error, not an unmasked pick.
+        assert!(
+            crate::sampling::sample_with_words(&logits[..1], &[], &greedy, &mut rng, words)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn masked_batch_and_stream_frames_round_trip() {
+        let (srv, cli) = pair().await;
+        let h = rows_hidden(3, 2);
+        let cols = one_mask(3, 5);
+        send_forward_batch_step(
+            FrameKind::ForwardBatchPrefill,
+            &cli,
+            0,
+            3,
+            &cfg(),
+            &h,
+            [1, 3, 2],
+            Some(&cols),
+        )
+        .await
+        .unwrap();
+        recv_kind_server(&srv).await.unwrap();
+        let (_, n, _, step) = recv_forward_batch_step_body_server(&srv).await.unwrap();
+        assert_eq!(n, 3);
+        let (hidden, shape, got) = step.split(2).unwrap();
+        assert_eq!(
+            (hidden, shape, got),
+            (h.clone(), [1, 3, 2], Some(cols.clone()))
+        );
+        let got = cols.clone();
+        assert_eq!((got.tag(0), got.tag(1), got.tag(2)), (0, 0, 5));
+        assert_eq!(got.words(0), None);
+
+        let mut dec = MaskCols::new(2, 2);
+        dec.set(0, 9, &[1, 2]);
+        let rows = [(1u32, 4u32), (0, 6)];
+        send_stream_decode_step(&cli, 3, &rows, &h[..4], 2, Some(&dec))
+            .await
+            .unwrap();
+        recv_kind_server(&srv).await.unwrap();
+        let (bid, got_rows, step) = recv_stream_decode_step_body_server(&srv).await.unwrap();
+        assert_eq!((bid, got_rows), (3, rows.to_vec()));
+        let (hidden, _, got) = step.split(2).unwrap();
+        assert_eq!(hidden, h[..4].to_vec());
+        let got = got.unwrap();
+        assert_eq!((got.tag(0), got.tag(1)), (9, 0));
+    }
+
+    #[test]
+    fn a_masked_frame_narrower_than_the_hidden_is_refused_by_split() {
+        let t = masked_tensor(&[1.0, 2.0], [1, 1, 2], &MaskCols::new(1, 0)).unwrap();
+        assert!(StepTensor::Masked(t).split(4).is_err());
+        let cols = MaskCols::new(1, 0);
+        assert_eq!(cols.words(0), None);
+    }
+
+    /// An older stage's body decoders (the original functions, unchanged)
+    /// read the whole masked frame, fail on its dtype, and leave the stream
+    /// aligned: the next plain frame decodes.
+    #[tokio::test]
+    async fn old_decoders_consume_a_masked_frame_and_stay_aligned() {
+        let (srv, cli) = pair().await;
+        let c = cfg();
+        let h1 = rows_hidden(1, 4);
+        let h3 = rows_hidden(3, 4);
+        let next_plain_forward = |s: Arc<Mutex<ActivationServer>>| async move {
+            assert_eq!(
+                recv_kind_server(&s).await.unwrap(),
+                Some(FrameKind::Forward)
+            );
+            let (psl, _, _, h, shape) = recv_forward_body_server(&s).await.unwrap();
+            assert_eq!((psl, shape), (77, [1, 1, 4]));
+            h
+        };
+
+        // Forward.
+        send_forward_step(
+            &cli,
+            FrameKind::Forward,
+            1,
+            &c,
+            &h1,
+            [1, 1, 4],
+            true,
+            Some(&one_mask(1, 1)),
+        )
+        .await
+        .unwrap();
+        send_forward(&cli, 77, &c, &h1, [1, 1, 4], true)
+            .await
+            .unwrap();
+        recv_kind_server(&srv).await.unwrap();
+        let e = recv_forward_body_server(&srv).await.unwrap_err();
+        assert!(e.to_string().contains("expected F32 hidden tensor"), "{e}");
+        assert_eq!(next_plain_forward(srv.clone()).await, h1);
+
+        // ForwardBatchPrefill.
+        send_forward_batch_step(
+            FrameKind::ForwardBatchPrefill,
+            &cli,
+            0,
+            3,
+            &c,
+            &h3,
+            [1, 3, 4],
+            Some(&one_mask(3, 2)),
+        )
+        .await
+        .unwrap();
+        send_forward(&cli, 77, &c, &h1, [1, 1, 4], true)
+            .await
+            .unwrap();
+        recv_kind_server(&srv).await.unwrap();
+        assert!(recv_forward_batch_body_server(&srv).await.is_err());
+        assert_eq!(next_plain_forward(srv.clone()).await, h1);
+
+        // StreamOpen.
+        send_stream_open_step(&cli, 1, 0, &c, &h3, 3, 4, Some(&one_mask(3, 3)))
+            .await
+            .unwrap();
+        send_forward(&cli, 77, &c, &h1, [1, 1, 4], true)
+            .await
+            .unwrap();
+        recv_kind_server(&srv).await.unwrap();
+        assert!(recv_stream_open_body_server(&srv).await.is_err());
+        assert_eq!(next_plain_forward(srv.clone()).await, h1);
+
+        // StreamFeed.
+        send_stream_feed_step(
+            &cli,
+            2,
+            0,
+            STREAM_FEED_FINAL,
+            &c,
+            &h3,
+            3,
+            4,
+            Some(&one_mask(3, 4)),
+        )
+        .await
+        .unwrap();
+        send_forward(&cli, 77, &c, &h1, [1, 1, 4], true)
+            .await
+            .unwrap();
+        recv_kind_server(&srv).await.unwrap();
+        assert!(recv_stream_feed_body_server(&srv).await.is_err());
+        assert_eq!(next_plain_forward(srv.clone()).await, h1);
+
+        // StreamDecode.
+        send_stream_decode_step(&cli, 3, &[(0, 5)], &h1, 4, Some(&one_mask(1, 5)))
+            .await
+            .unwrap();
+        send_forward(&cli, 77, &c, &h1, [1, 1, 4], true)
+            .await
+            .unwrap();
+        recv_kind_server(&srv).await.unwrap();
+        assert!(recv_stream_decode_body_server(&srv).await.is_err());
+        assert_eq!(next_plain_forward(srv.clone()).await, h1);
+    }
+
+    const SHORT: Duration = Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn masked_wait_takes_only_an_acknowledged_reply() {
+        let (srv, cli) = pair().await;
+        let latch = MaskLatch::default();
+        // Acknowledged token.
+        send_token_ack_upstream(&srv, 5, 3, MASK_ACK).await.unwrap();
+        assert_eq!(
+            recv_token_reply_masked(&cli, SHORT, 3, &latch).await,
+            MaskedReply::Token(5)
+        );
+        // Acknowledged NACK: the stages mask, this step failed.
+        send_token_ack_upstream(&srv, -1, 4, MASK_ACK)
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_token_reply_masked(&cli, SHORT, 4, &latch).await,
+            MaskedReply::Refused
+        );
+        // A plain reply (no acknowledgement) is not accepted.
+        send_token_upstream(&srv, 6).await.unwrap();
+        assert!(matches!(
+            recv_token_reply_masked(&cli, SHORT, 5, &latch).await,
+            MaskedReply::Unconfirmed(r) if r.contains("without acknowledgement")
+        ));
+        // A plain NACK neither.
+        send_token_upstream(&srv, -1).await.unwrap();
+        assert!(matches!(
+            recv_token_reply_masked(&cli, SHORT, 6, &latch).await,
+            MaskedReply::Unconfirmed(_)
+        ));
+        // A middle stage whose downstream did not acknowledge.
+        send_token_ack_upstream(&srv, -1, 7, MASK_UNCONFIRMED)
+            .await
+            .unwrap();
+        assert!(matches!(
+            recv_token_reply_masked(&cli, SHORT, 7, &latch).await,
+            MaskedReply::Unconfirmed(_)
+        ));
+        // A stale acknowledged reply is dropped, and clears the latch.
+        latch.set();
+        send_token_ack_upstream(&srv, 1, 99, MASK_ACK)
+            .await
+            .unwrap();
+        send_token_ack_upstream(&srv, 2, 8, MASK_ACK).await.unwrap();
+        assert_eq!(
+            recv_token_reply_masked(&cli, SHORT, 8, &latch).await,
+            MaskedReply::Token(2)
+        );
+        assert!(!latch.is_set());
+    }
+
+    #[tokio::test]
+    async fn masked_timeout_keeps_the_socket_and_the_late_ack_is_dropped() {
+        let (srv, cli) = pair().await;
+        let latch = MaskLatch::default();
+        let r = recv_token_reply_masked(&cli, SHORT, 11, &latch).await;
+        assert!(
+            matches!(r, MaskedReply::Unconfirmed(ref m) if m.starts_with("no reply within")),
+            "{r:?}"
+        );
+        latch.set();
+        // The slow stage's reply lands late, then the next (plain) request's.
+        send_token_ack_upstream(&srv, 3, 11, MASK_ACK)
+            .await
+            .unwrap();
+        send_forward(&cli, 0, &cfg(), &[0.0; 4], [1, 1, 4], true)
+            .await
+            .expect("socket still open after the masked timeout");
+        send_token_upstream(&srv, 21).await.unwrap();
+        assert_eq!(
+            recv_token_reply_with(&cli, SHORT, Some(&latch)).await,
+            Ok(21)
+        );
+        assert!(
+            !latch.is_set(),
+            "an acknowledged late reply clears the latch"
+        );
+        // The server side still reads the plain request in order.
+        assert_eq!(
+            recv_kind_server(&srv).await.unwrap(),
+            Some(FrameKind::Forward)
+        );
+    }
+
+    #[tokio::test]
+    async fn unmasked_waits_drop_late_acks() {
+        let (srv, cli) = pair().await;
+        send_stream_tokens_ack_upstream(&srv, 4, MASK_ACK, &[(0, 1)])
+            .await
+            .unwrap();
+        send_token_ack_upstream(&srv, 3, 1, MASK_UNCONFIRMED)
+            .await
+            .unwrap();
+        send_token_upstream(&srv, 8).await.unwrap();
+        assert_eq!(recv_token_reply(&cli, SHORT).await, Ok(8));
+        send_token_ack_upstream(&srv, 3, 1, MASK_ACK).await.unwrap();
+        send_token_upstream(&srv, 9).await.unwrap();
+        assert_eq!(recv_token_relay(&cli).await, Ok(9));
+        // Stream waits: a stale ack is dropped, the expected one returned.
+        send_stream_tokens_ack_upstream(&srv, 1, MASK_ACK, &[(0, 1)])
+            .await
+            .unwrap();
+        send_stream_tokens_ack_upstream(&srv, 2, MASK_ACK, &[(0, 5), (1, 6)])
+            .await
+            .unwrap();
+        send_stream_tokens_upstream(&srv, 3, &[(1, 7)])
+            .await
+            .unwrap();
+        let r = recv_stream_reply(&cli, SHORT, 2, None).await.unwrap();
+        assert_eq!(
+            r,
+            StreamReply {
+                batch_id: 2,
+                tokens: vec![(0, 5), (1, 6)],
+                ack: Some(MASK_ACK)
+            }
+        );
+        let r = recv_stream_reply(&cli, SHORT, 3, None).await.unwrap();
+        assert_eq!((r.batch_id, r.ack), (3, None));
+    }
+
+    #[tokio::test]
+    async fn a_middle_stage_passes_up_an_ack_only_when_downstream_acked() {
+        // head --cli_up/srv_up-- mid --cli_dn/srv_dn-- tail
+        let (srv_up, cli_up) = pair().await;
+        let (srv_dn, cli_dn) = pair().await;
+        // Downstream acknowledged: relayed as it came.
+        send_token_ack_upstream(&srv_dn, 12, 5, MASK_ACK)
+            .await
+            .unwrap();
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 5)
+            .await
+            .unwrap();
+        recv_kind_client_raw(&cli_up).await.unwrap();
+        assert_eq!(
+            recv_token_ack_body_client(&cli_up).await.unwrap(),
+            (12, 5, MASK_ACK)
+        );
+        // Downstream silent (an older tail): unconfirmed, socket kept.
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 6)
+            .await
+            .unwrap();
+        recv_kind_client_raw(&cli_up).await.unwrap();
+        assert_eq!(
+            recv_token_ack_body_client(&cli_up).await.unwrap(),
+            (-1, 6, MASK_UNCONFIRMED)
+        );
+        // Downstream replied plain: unconfirmed.
+        send_token_upstream(&srv_dn, 4).await.unwrap();
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 7)
+            .await
+            .unwrap();
+        recv_kind_client_raw(&cli_up).await.unwrap();
+        assert_eq!(
+            recv_token_ack_body_client(&cli_up).await.unwrap(),
+            (-1, 7, MASK_UNCONFIRMED)
+        );
+    }
+
+    /// A masked step's reply that lands late must not shift any later
+    /// read: a control exchange in between (KV restore and capture acks)
+    /// still reads its own reply, and the next plain step its own token.
+    #[tokio::test]
+    async fn a_late_ack_before_a_control_exchange_does_not_shift_later_reads() {
+        let (srv, cli) = pair().await;
+        send_token_ack_upstream(&srv, 3, 1, MASK_ACK).await.unwrap();
+        send_restore_ack_upstream(&srv, 9, 1).await.unwrap();
+        assert_eq!(recv_restore_verdict(&cli).await, Ok(true));
+        send_stream_tokens_ack_upstream(&srv, 2, MASK_ACK, &[(0, 4)])
+            .await
+            .unwrap();
+        send_token_ack_upstream(&srv, 5, 2, MASK_UNCONFIRMED)
+            .await
+            .unwrap();
+        send_capture_ack_upstream(&srv, 77).await.unwrap();
+        assert_eq!(
+            recv_kind_client(&cli).await.unwrap(),
+            Some(FrameKind::CaptureAck)
+        );
+        assert_eq!(recv_capture_ack_body_client(&cli).await.unwrap(), 77);
+        send_token_ack_upstream(&srv, 6, 3, MASK_ACK).await.unwrap();
+        send_token_batch_upstream(&srv, &[10, 11]).await.unwrap();
+        assert_eq!(
+            recv_kind_client(&cli).await.unwrap(),
+            Some(FrameKind::TokenBatch)
+        );
+        assert_eq!(
+            recv_token_batch_body_client(&cli).await.unwrap(),
+            vec![10, 11]
+        );
+        send_token_upstream(&srv, 42).await.unwrap();
+        assert_eq!(recv_token_reply(&cli, SHORT).await, Ok(42));
+    }
+
+    #[test]
+    fn each_stage_waits_less_than_the_one_upstream() {
+        for head in [Duration::from_secs(60), Duration::from_secs(600)] {
+            for total in 2..=12u32 {
+                let mut upstream = head;
+                for rank in 1..total {
+                    let b = mid_mask_budget(head, rank, total);
+                    assert!(b + head / total <= upstream, "{head:?} {rank}/{total}");
+                    assert!(b > Duration::ZERO);
+                    upstream = b;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn latch_refuses_until_the_reprobe_interval_passes() {
+        let latch = MaskLatch::default();
+        let t0 = std::time::Instant::now();
+        assert!(!latch.refuses_at(t0));
+        latch.set_at(t0);
+        assert!(latch.refuses_at(t0 + Duration::from_secs(599)));
+        assert!(!latch.refuses_at(t0 + MASK_REPROBE));
+        latch.clear();
+        assert!(!latch.refuses_at(t0));
+    }
+
+    #[test]
+    fn largest_masked_frames_fit_the_tensor_cap() {
+        // 256 rows (the frame row cap) of a 7168-wide hidden with a
+        // 262144-token vocab mask: (7168 + 1 + 8192) * 4 * 256 bytes.
+        let bytes = MAX_BATCH_COUNT as usize * (7168 + 1 + 262_144 / 32) * 4;
+        assert!(bytes <= cascadia_transport::MAX_TENSOR_BYTES, "{bytes}");
     }
 }
