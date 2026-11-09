@@ -385,3 +385,56 @@ fn a_finished_grammar_at_the_cap_is_stop() {
     assert_eq!(finish_reason_for(8, 8, false), FinishReason::Length);
     assert_eq!(finish_reason_for(3, 8, false), FinishReason::Stop);
 }
+
+fn resumed_json_task(id: &str) -> GenerationTask {
+    let mut t = json_task(id, 64);
+    t.resume_token_ids = Some(br#"{"city":"P"#.iter().map(|&b| i32::from(b)).collect());
+    t
+}
+
+fn assert_resume_declined(o: &Outcome) {
+    assert!(o.tokens.is_empty(), "{o:?}");
+    let reason = final_chunk(o).error.as_deref().expect("error chunk");
+    assert!(reason.starts_with("resume_unsupported:"), "{reason}");
+}
+
+#[test]
+fn single_stage_declines_a_resumed_json_task() {
+    let mut r = rig(JsonStub::new(), 1, 0);
+    r.eng.submit(resumed_json_task("j")).unwrap();
+    assert_resume_declined(&drive(&mut r.eng, &["j"])["j"]);
+    assert!(r.eng.grammars.is_empty());
+}
+
+#[test]
+fn streams_decline_a_resumed_json_task() {
+    let mut r = rig(JsonStub::new(), 1, 2);
+    r.eng.submit(resumed_json_task("j")).unwrap();
+    assert_resume_declined(&drive(&mut r.eng, &["j"])["j"]);
+    assert!(r.eng.grammars.is_empty());
+}
+
+#[test]
+fn a_resumed_plain_task_keeps_todays_behaviour() {
+    for streams in [0, 2] {
+        let mut r = rig(JsonStub::new(), 1, streams);
+        let mut t = plain_task("p", 6);
+        t.resume_token_ids = Some(vec![65]);
+        r.eng.submit(t).unwrap();
+        let out = drive(&mut r.eng, &["p"]);
+        assert_eq!(final_chunk(&out["p"]).error, None, "streams={streams}");
+        assert_eq!(out["p"].tokens.len(), 6);
+    }
+}
+
+#[test]
+fn early_returns_do_not_leak_the_compiled_grammar() {
+    for streams in [0, 2] {
+        let mut r = rig(JsonStub::new(), 1, streams);
+        let mut t = json_task("e", 8);
+        t.prompt = String::new();
+        r.eng.submit(t).unwrap();
+        drive(&mut r.eng, &["e"]);
+        assert!(r.eng.grammars.is_empty(), "streams={streams}");
+    }
+}

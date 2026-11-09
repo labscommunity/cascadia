@@ -1242,6 +1242,21 @@ fn finish_reason_for(n_tokens: usize, max_new: usize, grammar_finished: bool) ->
     }
 }
 
+/// A resumed json task on a path with no forced-prefix support: decline it
+/// with the sentinel (the caller re-routes) instead of generating a fresh
+/// JSON document that would be spliced after the client's partial one.
+/// Plain resumed tasks keep their existing behaviour on these paths.
+fn decline_resumed_grammar_task(id: &TaskId) -> (TaskId, Chunk) {
+    (
+        id.clone(),
+        Chunk::error(
+            id.clone(),
+            "resume_unsupported: structured output on this engine has no forced-prefix path"
+                .to_string(),
+        ),
+    )
+}
+
 /// Whether a single-stage task runs n-gram speculative decoding: configured,
 /// greedy, and not a structured-output task (those decode plainly, masked).
 fn use_spec_decode(spec_decode_k: Option<u32>, temperature: f32, has_grammar: bool) -> bool {
@@ -6734,7 +6749,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         {
             let task = self.pending.pop_front().expect("non-empty");
             admitted += 1;
-            match self.admit_stream(task) {
+            let compiled = self.grammars.remove(&task.task_id);
+            match self.admit_stream(task, compiled) {
                 Ok(()) => {}
                 Err((id, chunk)) => out.push((id, chunk)),
             }
@@ -6889,8 +6905,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// Tokenize, prefill and seed one task as a stream. On failure the task's
     /// terminal chunk is returned instead.
     #[allow(clippy::result_large_err)]
-    fn admit_stream(&mut self, task: GenerationTask) -> Result<(), (TaskId, Chunk)> {
+    fn admit_stream(
+        &mut self,
+        task: GenerationTask,
+        compiled: Option<CompiledGrammar>,
+    ) -> Result<(), (TaskId, Chunk)> {
         let started = Instant::now();
+        if compiled.is_some() && task.resume_ids().is_some() {
+            return Err(decline_resumed_grammar_task(&task.task_id));
+        }
         let Some(tok) = self.tokenizer.as_ref() else {
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
             return Err((task.task_id, e));
@@ -6949,7 +6972,6 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         // Structured output: the first token is masked and committed here,
         // every later one in `step_streams`.
-        let compiled = self.grammars.remove(&task.task_id);
         let mut grammar = None;
         let mut grammar_finished = false;
         let next = if let Some(compiled) = compiled {
@@ -7064,6 +7086,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
             Some(t) => t,
             None => return Vec::new(),
         };
+        let compiled = self.grammars.remove(&task.task_id);
+        if compiled.is_some() && task.resume_ids().is_some() {
+            return vec![decline_resumed_grammar_task(&task.task_id)];
+        }
         let Some(tok) = self.tokenizer.as_ref() else {
             warn!(task = %task.task_id, "dsv4 engine has no tokenizer");
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -7103,7 +7129,6 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // has no error channel: catch it here, reset the sequence state the
         // half-finished turn left behind, and fail THIS task instead of the
         // process. The panic message carries the worker/layer diagnostics.
-        let compiled = self.grammars.remove(&task.task_id);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match compiled.as_ref() {
                 // Structured output: a masked run that ends when the JSON does.
