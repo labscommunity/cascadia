@@ -621,6 +621,7 @@ request (or several with the same schema), that schema is then refused for 10
 minutes with `invalid configuration: response_format json_schema: this schema
 failed to compile on this server; retry later or change the schema`. When it
 held several different new schemas, none is refused at once, but a schema in
-two such failed steps within 10 minutes is. Steps failed by resource
+two such failed steps within 10 minutes is, unless a request with it produced
+output in between. Steps failed by resource
 exhaustion, and `json_object`, are never blamed on a schema. Such a failure
 is not counted toward the worker's failure limit, once per run of failures.

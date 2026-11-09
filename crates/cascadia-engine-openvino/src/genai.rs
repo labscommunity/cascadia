@@ -608,6 +608,11 @@ impl StrikeSet {
         entry.0
     }
 
+    /// Drop the strikes against `h`.
+    fn clear(&mut self, h: u64) {
+        self.strikes.remove(&h);
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.strikes.len()
@@ -1196,8 +1201,13 @@ impl Engine for OvGenaiCbEngine {
                 );
             }
             self.active[idx].total_tokens += read.new_tokens;
-            if read.new_tokens > 0 {
+            if read.new_tokens > 0 && !self.active[idx].produced {
                 self.active[idx].produced = true;
+                // Output means the schema compiled, so it did not cause an
+                // earlier failed step it shared with others.
+                if let Some(h) = self.active[idx].grammar_hash {
+                    self.strikes.clear(h);
+                }
             }
             match read.status {
                 CbStatus::Running => {
@@ -2305,6 +2315,43 @@ mod tests {
         assert!(err.to_string().contains("failed to compile"), "{err}");
         e.submit(schema_task("t6", SCHEMA_C)).unwrap();
         e.submit(schema_task("t7", SCHEMA_B)).unwrap();
+    }
+
+    #[test]
+    fn cb_schema_that_produced_output_loses_its_strikes() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("t1", SCHEMA_A)).unwrap();
+        e.submit(schema_task("t2", SCHEMA_B)).unwrap();
+        let _ = e.step().unwrap();
+
+        // A request under schema A produces a token: A compiled fine.
+        {
+            let mut s = st.lock().unwrap();
+            s.step_fails = false;
+            assert_eq!(s.reads.len(), 2, "t3 is the third request");
+            s.reads.push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Running,
+                1,
+                "{",
+                CbFinish::Unknown,
+            ))]));
+        }
+        e.submit(schema_task("t3", SCHEMA_A)).unwrap();
+        let out = e.step().unwrap();
+        assert!(out.iter().all(|(_, c)| c.error.is_none()), "{out:?}");
+
+        st.lock().unwrap().step_fails = true;
+        e.submit(schema_task("t4", SCHEMA_A)).unwrap();
+        e.submit(schema_task("t5", SCHEMA_C)).unwrap();
+        let _ = e.step().unwrap();
+        st.lock().unwrap().step_fails = false;
+        e.submit(schema_task("t6", SCHEMA_A)).unwrap();
+        e.submit(schema_task("t7", SCHEMA_C)).unwrap();
     }
 
     #[test]
