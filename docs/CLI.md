@@ -640,11 +640,19 @@ the 400s below and `engine_error` for anything else):
 
 On `ov-genai --cb`, a schema whose compile fails while a batch runs fails that
 batch step. Every request in a failed step gets 503 (on a stream, the error
-event). When the step held one new schema (below), its requests get
-`cb step failed: <backend reason>`. When it held several, their requests get
-`cb step failed: a schema in this batch may have caused it; retry the
-request`, since the reason may come from any of them. Every other request gets
-`cb step failed: the batch this request ran in failed; retry the request`. When the failed step held exactly one new schema-constrained
+event). When the failure is blamed on the step's new schemas (below: while
+fewer than 8 such failures have run since the last successful step, or when
+the health check after them succeeds), the messages depend on the request.
+When the step held one new schema, its requests get `cb step failed: <backend
+reason>` if the backend's reason reads as a grammar or schema error (the
+reason is cut to one line without source paths or timestamps, at most 300
+characters), and the next
+message otherwise. When it held several, their requests get `cb step failed:
+a schema in this batch may have caused it; retry the request`, since the
+reason may come from any of them. Every other request gets `cb step failed:
+the batch this request ran in failed; retry the request`; so does every
+request in a step not blamed on a schema, including one whose health check
+failed. When the failed step held exactly one new schema-constrained
 request (or several with the same schema), that schema is then refused for 10
 minutes with `invalid configuration: response_format json_schema: this schema
 failed to compile on this server; retry later or change the schema`. When it
@@ -652,7 +660,8 @@ held several different new schemas, none is refused at once, but a schema in
 two such failed steps within 10 minutes is, unless a request with it produced
 output in between. A schema that produced output, for a request still in the
 batch or in the last 10 minutes, compiled, so it is never blamed (and output
-lifts a refusal of it). Steps failed by resource
+lifts a refusal of it); the worker remembers up to 256 such schemas,
+forgetting the oldest first. Steps failed by resource
 exhaustion, and `json_object`, are never blamed on a schema. A failed step
 that held a new request with a schema of its own (one that had not produced
 output yet) is not counted toward the worker's failure limit, whatever else
