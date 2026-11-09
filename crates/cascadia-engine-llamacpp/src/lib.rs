@@ -1218,6 +1218,9 @@ impl LlamaCppEngine {
                     if let Some(n) = &m.name {
                         v["name"] = serde_json::json!(n);
                     }
+                    if let Some(r) = &m.reasoning_content {
+                        v["reasoning_content"] = serde_json::json!(r);
+                    }
                     v
                 })
                 .collect();
@@ -2958,6 +2961,52 @@ mod unix_tests {
             chunk.accumulate_tokens(&mut count);
         }
         assert_eq!(count, 2);
+        server.join().unwrap();
+    }
+
+    /// An assistant turn's replayed reasoning is forwarded as its
+    /// `reasoning_content`, for the GGUF template to place.
+    #[test]
+    fn engine_forwards_an_assistant_turns_reasoning_content() {
+        let (port, server) = mock_server(|req, s| {
+            let req = String::from_utf8_lossy(req);
+            let body: serde_json::Value =
+                serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body["messages"][1]["role"], "assistant", "{body}");
+            assert_eq!(body["messages"][1]["content"], "51", "{body}");
+            assert_eq!(
+                body["messages"][1]["reasoning_content"], "17 times 3",
+                "{body}"
+            );
+            assert!(
+                body["messages"][0].get("reasoning_content").is_none(),
+                "{body}"
+            );
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            s.write_all(head.as_bytes()).unwrap();
+            for p in [
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+                "data: [DONE]\n",
+            ] {
+                s.write_all(chunked(p).as_bytes()).unwrap();
+            }
+            s.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let mut task = chat_task();
+        task.messages.push(ChatTurn {
+            role: "assistant".into(),
+            content: "51".into(),
+            reasoning_content: Some("17 times 3".into()),
+            ..Default::default()
+        });
+        task.messages.push(ChatTurn {
+            role: "user".into(),
+            content: "and 18?".into(),
+            ..Default::default()
+        });
+        let mut engine = test_engine(port);
+        engine.submit(task).unwrap();
+        assert!(drain(&mut engine).last().unwrap().1.is_final);
         server.join().unwrap();
     }
 

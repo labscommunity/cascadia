@@ -69,6 +69,11 @@ pub struct ChatTurn {
     /// Optional participant name (multi-agent / tool messages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// An assistant turn's replayed reasoning, apart from `content`, for a
+    /// downstream template that places it itself (llama-server's
+    /// `reasoning_content`). Off the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// One generation request, end-to-end.
@@ -303,6 +308,27 @@ mod tests {
         });
         let back: GenerationTask = serde_json::from_value(without_field).unwrap();
         assert_eq!(back.resume_token_ids, None);
+    }
+
+    /// A turn's `reasoning_content` is left out of the wire form when
+    /// `None`, and round-trips when set.
+    #[test]
+    fn chat_turn_reasoning_content_is_off_the_wire_unless_set() {
+        let turn = ChatTurn {
+            role: "assistant".into(),
+            content: "51".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&turn).unwrap();
+        assert!(json.get("reasoning_content").is_none(), "{json}");
+        let set = ChatTurn {
+            reasoning_content: Some("17 times 3".into()),
+            ..turn
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["reasoning_content"], "17 times 3");
+        let back: ChatTurn = serde_json::from_value(json).unwrap();
+        assert_eq!(back, set);
     }
 
     /// `reasoning_as_text` is left out of the wire form when false, so a

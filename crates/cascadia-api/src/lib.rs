@@ -4148,19 +4148,36 @@ pub fn render_chat_prompt(
 
 /// The engine-side structured turns from a chat request: tool fields travel
 /// as the OpenAI wire JSON a downstream chat server (llama-server's jinja)
-/// expects verbatim.
-fn chat_turns(messages: &[ChatMessage]) -> Vec<ChatTurn> {
+/// expects verbatim. With
+/// `split_reasoning`, an assistant turn whose content opens with
+/// `<think>…</think>` (a `/v1/responses` replayed reasoning item) carries
+/// that reasoning as `reasoning_content` and the rest as its content, for a
+/// downstream template that places reasoning itself.
+fn chat_turns(messages: &[ChatMessage], split_reasoning: bool) -> Vec<ChatTurn> {
     messages
         .iter()
-        .map(|m| ChatTurn {
-            role: m.role.clone(),
-            content: m.content.clone(),
-            tool_calls: m
-                .tool_calls
-                .as_ref()
-                .and_then(|cs| serde_json::to_value(cs).ok()),
-            tool_call_id: m.tool_call_id.clone(),
-            name: m.name.clone(),
+        .map(|m| {
+            let (reasoning_content, content) = match m
+                .content
+                .strip_prefix("<think>")
+                .and_then(|rest| rest.split_once("</think>"))
+            {
+                Some((r, rest)) if split_reasoning && m.role == "assistant" => {
+                    (Some(r.to_owned()), rest.to_owned())
+                }
+                _ => (None, m.content.clone()),
+            };
+            ChatTurn {
+                role: m.role.clone(),
+                content,
+                tool_calls: m
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|cs| serde_json::to_value(cs).ok()),
+                tool_call_id: m.tool_call_id.clone(),
+                name: m.name.clone(),
+                reasoning_content,
+            }
         })
         .collect()
 }
@@ -4306,6 +4323,11 @@ pub(crate) struct AdmitOpts {
     /// request. Set by `/v1/responses`; chat keeps the engine's output as it
     /// was.
     pub(crate) reasoning_as_text: bool,
+    /// On an engine that templates itself, forward an assistant turn's
+    /// leading `<think>…</think>` (replayed reasoning) as the turn's
+    /// `reasoning_content`, not as text in its content (see [`chat_turns`]).
+    /// Set by `/v1/responses`; chat forwards its turns as sent.
+    pub(crate) reasoning_content_turns: bool,
 }
 
 /// A chat request past every pre-engine check: the task to submit, and the
@@ -4587,7 +4609,10 @@ async fn admit_chat(
         // downstream chat server applying its own template (sycl-llama:
         // llama-server renders the GGUF chat template). Other engines ignore
         // the field and keep consuming `prompt`.
-        messages: chat_turns(messages),
+        messages: chat_turns(
+            messages,
+            opts.reasoning_content_turns && state.engine_applies_template,
+        ),
         tools: chat_tools(&req),
         tool_choice: req.tool_choice.clone(),
         max_tokens: req.max_tokens,
@@ -9441,7 +9466,7 @@ mod tests {
                 {"role":"user","content":"thanks"}
             ]
         }));
-        let turns = chat_turns(&req.messages);
+        let turns = chat_turns(&req.messages, false);
         assert_eq!(turns.len(), 3);
         let calls = turns[0].tool_calls.as_ref().expect("tool_calls forwarded");
         assert_eq!(calls[0]["id"], "call_1");

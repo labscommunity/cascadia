@@ -531,6 +531,7 @@ pub(crate) async fn create_response(
             api_render_on_thinking: true,
             fold_refused_system_turns: true,
             reasoning_as_text: true,
+            reasoning_content_turns: true,
         },
     )
     .await
@@ -2982,6 +2983,44 @@ mod tests {
         assert_eq!(v["status"], "incomplete", "{v}");
         assert_eq!(v["output"][0]["type"], "reasoning", "{v}");
         assert_eq!(v["output"][0]["status"], "incomplete", "{v}");
+    }
+
+    /// A replayed reasoning item reaches an engine that templates itself
+    /// (sycl-llama) as the assistant turn's `reasoning_content`, its content
+    /// free of `<think>` tags; where the API renders, it stays in the
+    /// content as `<think>`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replayed_reasoning_is_reasoning_content_where_the_engine_templates() {
+        let body = || {
+            json!({"model": "script-model", "input": [
+                {"role": "user", "content": "What is 17 times 3?"},
+                {"type": "reasoning", "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "17 times 3"}]},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "51"}]},
+                {"role": "user", "content": "and 18?"},
+            ]})
+        };
+        let cfg = sycl_llama_config(PERMISSIVE_TEMPLATE);
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, text) = post(app, body()).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let turn = tasks.lock()[0].messages[1].clone();
+        assert_eq!(turn.role, "assistant");
+        assert_eq!(turn.content, "51");
+        assert_eq!(turn.reasoning_content.as_deref(), Some("17 times 3"));
+
+        let cfg = template_config(PERMISSIVE_TEMPLATE);
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, text) = post(app, body()).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let task = tasks.lock()[0].clone();
+        assert!(
+            task.prompt
+                .contains("<assistant><think>17 times 3</think>51</assistant>"),
+            "{}",
+            task.prompt
+        );
+        assert_eq!(task.messages[1].reasoning_content, None);
     }
 
     /// A template that takes no system role gets every system turn folded,
