@@ -145,7 +145,9 @@ failure after the stream started ends on `response.failed`, with the items sent 
 as `item_reference`s, by id. So the output items of every response whose `store` is not
 `false` are kept in process memory, written before the response body or its last event, so
 the client's next request finds them. The cache holds at most 16384 items and 32 MiB,
-evicting the oldest first; failed responses and streams the client dropped are not kept.
+evicting the least recently used first (a lookup by `item_reference` counts as a use, so
+the earliest items of a conversation that keeps referencing them stay); failed responses
+and streams the client dropped are not kept.
 Items are found only by their random id; there is no per-caller scoping.
 
 The cache is lost on restart and items are evicted under load, so an `item_reference` can
