@@ -147,6 +147,12 @@ pub struct AppState {
     /// `false`, a success flips it back `true` — so `/health` reflects the real
     /// state of the chain instead of always returning 200 while requests 503.
     pub ready: Arc<std::sync::atomic::AtomicBool>,
+    /// The engine can enforce or forward `response_format`. When false, a
+    /// JSON `response_format` is a 400 unless the request offers callable
+    /// tools.
+    pub structured_output: bool,
+    /// The engine's name, for error messages. Empty when unknown.
+    pub engine_name: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -168,6 +174,10 @@ pub struct Config {
     pub engine_applies_template: bool,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
+    /// See [`AppState::structured_output`].
+    pub structured_output: bool,
+    /// See [`AppState::engine_name`].
+    pub engine_name: String,
 }
 
 impl Default for Config {
@@ -180,6 +190,8 @@ impl Default for Config {
             defer_template_on_thinking: false,
             engine_applies_template: false,
             marker_dialect: None,
+            structured_output: false,
+            engine_name: String::new(),
         }
     }
 }
@@ -514,6 +526,8 @@ pub fn make_router_with_stats(
         effort_words: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        structured_output: cfg.structured_output,
+        engine_name: cfg.engine_name.clone(),
     };
     let state = AppState {
         effort_words: state
@@ -789,6 +803,11 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI `response_format`, kept raw and parsed by
+    /// [`parse_response_format`] so a malformed value is a 400 naming the
+    /// field rather than a generic deserialization error.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// `chat_template_kwargs` as sent by vLLM/SGLang-shaped clients. Only
@@ -910,10 +929,15 @@ impl ChatCompletionRequest {
     /// make "caller chose max" indistinguishable from "caller said nothing"
     /// at the Rust type level.
     fn effective_reasoning_effort(&self) -> &'static str {
-        match self.reasoning_effort.as_deref() {
-            Some("xhigh") | Some("max") => "max",
-            _ => "high",
-        }
+        map_reasoning_effort(self.reasoning_effort.as_deref())
+    }
+}
+
+/// The mapping table of [`ChatCompletionRequest::effective_reasoning_effort`].
+fn map_reasoning_effort(word: Option<&str>) -> &'static str {
+    match word {
+        Some("xhigh") | Some("max") => "max",
+        _ => "high",
     }
 }
 
@@ -2460,7 +2484,71 @@ async fn chat_completions(
         )
             .into_response();
     }
-    let enable_thinking = req.effective_enable_thinking();
+    let response_format = match parse_response_format(req.response_format.as_ref()) {
+        Ok(rf) => rf,
+        Err(msg) => {
+            count_rejected("invalid_request");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid response_format: {msg}") })),
+            )
+                .into_response();
+        }
+    };
+    let tools_callable = req.tools.as_ref().is_some_and(|t| !t.is_empty())
+        && req.tool_choice.as_ref().and_then(|c| c.as_str()) != Some("none");
+    let json = response_format.is_json();
+    // Engines that cannot enforce a JSON format answer 400 rather than
+    // silently ignoring the field. A request that offers callable tools is
+    // let through: the model may answer with a tool call, which the format
+    // does not constrain.
+    if json && !tools_callable && !state.structured_output {
+        count_rejected("invalid_request");
+        let engine = if state.engine_name.is_empty() {
+            "configured"
+        } else {
+            state.engine_name.as_str()
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!(
+                "response_format {} is not supported by the {engine} engine; \
+                 the ov-genai, sycl-llama and mock engines support it",
+                response_format.type_name()
+            ) })),
+        )
+            .into_response();
+    }
+    let structured = json && state.structured_output;
+    let grammar = if structured && !tools_callable {
+        grammar_for(&response_format)
+    } else {
+        None
+    };
+    // A JSON answer has no room for a reasoning preamble: thinking is off.
+    let enable_thinking = if structured {
+        false
+    } else {
+        req.effective_enable_thinking()
+    };
+    // Thinking off reaches the template the same way a bare
+    // `reasoning_effort: "none"` does, so a template that switches thinking
+    // through its effort words renders thinking off too.
+    let effort = if structured {
+        EffortArgs {
+            mapped: Some(map_reasoning_effort(Some("none"))),
+            raw: None,
+            explicit_thinking: false,
+            template_words: state.effort_words,
+        }
+    } else {
+        EffortArgs {
+            mapped: Some(req.effective_reasoning_effort()),
+            raw: req.reasoning_effort.as_deref(),
+            explicit_thinking: req.enable_thinking.is_some(),
+            template_words: state.effort_words,
+        }
+    };
     // effective_reasoning_effort() hardcodes GLM's high/max vocabulary and is
     // applied to every model this server serves, not just GLM-5. A template
     // with its own scale (Qwen3.8: xhigh/medium/low) rejects the mapped word;
@@ -2472,12 +2560,7 @@ async fn chat_completions(
         &state,
         &req.messages,
         enable_thinking,
-        EffortArgs {
-            mapped: Some(req.effective_reasoning_effort()),
-            raw: req.reasoning_effort.as_deref(),
-            explicit_thinking: req.enable_thinking.is_some(),
-            template_words: state.effort_words,
-        },
+        effort,
         req.tools.as_deref(),
     ) {
         Ok(p) => p,
@@ -2588,8 +2671,25 @@ async fn chat_completions(
         // model's context PAST the rendered prompt. Only the scheduler's
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
-        grammar: None,
+        grammar,
     };
+    if let (Some(_), ResponseFormat::JsonSchema { schema, .. }) = (&task.grammar, &response_format)
+    {
+        let keywords = unenforced_keywords(schema);
+        if !keywords.is_empty() {
+            info!(
+                task = %task_id,
+                keywords = ?keywords,
+                "response_format schema uses keywords the output constraint does not enforce"
+            );
+        }
+    }
+    if json && tools_callable {
+        info!(
+            task = %task_id,
+            "response_format not enforced: the request offers tools the model may call"
+        );
+    }
 
     // Acquire a request slot before touching the engine. Contended streams
     // no longer block a tokio worker (#122: they park on a failed `try_lock`,
@@ -7426,6 +7526,503 @@ level={{ effort_map[eff] }}";
         assert!(
             text.contains("cascadia_api_rejected_total{reason=\"empty_prompt\"}"),
             "{text}"
+        );
+    }
+
+    // ---- response_format ----
+
+    const MINIMAL_TEMPLATE: &str = "{% for m in messages %}{{ m.content }}{% endfor %}";
+
+    fn template(src: &str) -> ChatTemplateConfig {
+        ChatTemplateConfig {
+            template: Some(src.into()),
+            bos_token: None,
+            eos_token: None,
+        }
+    }
+
+    /// Router over the mock engine, which answers a constrained task with a
+    /// minimal instance of its schema.
+    async fn so_app(structured: bool) -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            structured_output: structured,
+            engine_name: "mock".into(),
+            chat_template: template(MINIMAL_TEMPLATE),
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    type Captured = Arc<std::sync::Mutex<Vec<GenerationTask>>>;
+
+    /// Records every submitted task and answers `{"ok":true}`, or refuses the
+    /// submit with `reject` as an `InvalidConfig` error.
+    struct CaptureEngine {
+        seen: Captured,
+        reject: Option<String>,
+        pending: Option<(cascadia_types::TaskId, bool)>,
+    }
+
+    impl cascadia_engine::Engine for CaptureEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            if let Some(msg) = &self.reject {
+                return Err(cascadia_engine::EngineError::InvalidConfig(msg.clone()));
+            }
+            self.pending = Some((task.task_id.clone(), false));
+            self.seen.lock().unwrap().push(task);
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some((id, sent)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            if !sent {
+                let chunk = Chunk::token(&id, 0, "{\"ok\":true}".to_owned());
+                self.pending = Some((id.clone(), true));
+                return Ok(vec![(id, chunk)]);
+            }
+            let last = Chunk::final_marker(&id, "")
+                .with_finish_reason(cascadia_types::FinishReason::Stop)
+                .with_prompt_tokens(3)
+                .with_completion_tokens(1);
+            Ok(vec![(id, last)])
+        }
+    }
+
+    struct CaptureBuilder(CaptureEngine);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for CaptureBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0))
+        }
+    }
+
+    async fn capture_app_with(
+        structured: bool,
+        cfg: Config,
+        reject: Option<String>,
+    ) -> (Router, Captured) {
+        let seen: Captured = Arc::default();
+        let runner = Runner::new(Box::new(CaptureBuilder(CaptureEngine {
+            seen: seen.clone(),
+            reject,
+            pending: None,
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            structured_output: structured,
+            engine_name: "mock".into(),
+            ..cfg
+        };
+        (
+            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            seen,
+        )
+    }
+
+    async fn capture_app(structured: bool, cfg: Config) -> (Router, Captured) {
+        capture_app_with(structured, cfg, None).await
+    }
+
+    fn minimal_cfg() -> Config {
+        Config {
+            chat_template: template(MINIMAL_TEMPLATE),
+            ..Config::default()
+        }
+    }
+
+    fn last_task(seen: &Captured) -> GenerationTask {
+        seen.lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("engine saw a task")
+    }
+
+    fn nested_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer"},
+                "inner": {"$ref": "#/$defs/Inner"}
+            },
+            "required": ["count", "inner"],
+            "$defs": {
+                "Inner": {
+                    "type": "object",
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"]
+                }
+            }
+        })
+    }
+
+    fn json_schema_format(schema: Value) -> Value {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": schema, "strict": true}
+        })
+    }
+
+    fn weather_tools() -> Value {
+        serde_json::json!([{"type":"function","function":{"name":"get_weather"}}])
+    }
+
+    #[tokio::test]
+    async fn json_schema_answer_validates() {
+        let schema = nested_schema();
+        let (status, v) = post_chat(
+            so_app(true).await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "give me the answer"}],
+                "response_format": json_schema_format(schema.clone()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        let answer: Value = serde_json::from_str(content).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(
+            validator.is_valid(&answer),
+            "{answer} does not match the schema"
+        );
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn json_schema_stream_concatenates_to_valid_json() {
+        let schema = nested_schema();
+        let resp = so_app(true)
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "mock-model",
+                            "messages": [{"role": "user", "content": "give me the answer"}],
+                            "response_format": json_schema_format(schema.clone()),
+                            "stream": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let events = sse_events(std::str::from_utf8(&body).unwrap());
+        let content = streamed_content(&events);
+        let answer: Value = serde_json::from_str(&content).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(
+            validator.is_valid(&answer),
+            "{answer} does not match the schema"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["choices"][0]["finish_reason"] == "stop"),
+            "no stop frame in {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_object_answers_an_object() {
+        let (status, v) = post_chat(
+            so_app(true).await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "give me an object"}],
+                "response_format": {"type": "json_object"},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        let answer: Value = serde_json::from_str(content).unwrap();
+        assert!(answer.is_object(), "{answer} is not an object");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn malformed_response_format_is_400() {
+        let cases = [
+            serde_json::json!("json"),
+            serde_json::json!({"type": 5}),
+            serde_json::json!({"type": "xml"}),
+            serde_json::json!({"type": "json_schema"}),
+            serde_json::json!({"type": "json_schema", "json_schema": {"schema": "x"}}),
+            serde_json::json!({"type": "json_schema", "json_schema": {"schema": false}}),
+        ];
+        for rf in cases {
+            let (app, seen) = capture_app(true, minimal_cfg()).await;
+            let (status, v) = post_chat(
+                app,
+                serde_json::json!({
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "response_format": rf,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{rf}: {v}");
+            let err = v["error"].as_str().unwrap_or_default();
+            assert!(
+                err.starts_with("invalid response_format:"),
+                "{rf}: error was {v}"
+            );
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{rf}: the engine saw a task"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn text_response_format_is_unchanged() {
+        let base = serde_json::json!({
+            "model": "mock-model",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"}
+            ],
+        });
+        let mut with_text = base.clone();
+        with_text["response_format"] = serde_json::json!({"type": "text"});
+        let mut results = Vec::new();
+        for payload in [base, with_text] {
+            let (app, seen) = capture_app(true, minimal_cfg()).await;
+            let (status, mut v) = post_chat(app, payload).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let obj = v.as_object_mut().unwrap();
+            obj.remove("id");
+            obj.remove("created");
+            let mut task = last_task(&seen);
+            assert_eq!(task.grammar, None);
+            task.task_id = String::new();
+            results.push((v, task));
+        }
+        assert_eq!(results[0].1, results[1].1, "captured tasks differ");
+        assert_eq!(results[0].0, results[1].0, "response bodies differ");
+        assert!(results[0].1.enable_thinking);
+    }
+
+    #[tokio::test]
+    async fn unsupported_engine_rejects_json_but_not_with_tools() {
+        let (app, seen) = capture_app(false, minimal_cfg()).await;
+        let (status, v) = post_chat(
+            app.clone(),
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": {"type": "json_object"},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            v,
+            serde_json::json!({"error": "response_format json_object is not supported by the mock engine; the ov-genai, sycl-llama and mock engines support it"})
+        );
+        assert!(seen.lock().unwrap().is_empty());
+
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": {"type": "json_object"},
+                "tools": weather_tools(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(last_task(&seen).grammar, None);
+    }
+
+    #[tokio::test]
+    async fn tools_callable_skips_grammar_but_turns_thinking_off() {
+        let (app, seen) = capture_app(true, minimal_cfg()).await;
+        let (status, v) = post_chat(
+            app.clone(),
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": json_schema_format(nested_schema()),
+                "tools": weather_tools(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.grammar, None);
+        assert!(!task.enable_thinking);
+
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": json_schema_format(nested_schema()),
+                "tools": weather_tools(),
+                "tool_choice": "none",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(
+            task.grammar,
+            grammar_for(
+                &parse_response_format(Some(&json_schema_format(nested_schema()))).unwrap()
+            )
+        );
+        assert!(task.grammar.is_some());
+        assert!(!task.enable_thinking);
+    }
+
+    #[tokio::test]
+    async fn json_request_renders_with_thinking_off() {
+        let cfg = Config {
+            defer_template_on_thinking: true,
+            chat_template: template(
+                "{% if enable_thinking %}THINK{% else %}NOTHINK{% endif %}\
+                 {% for m in messages %}[{{ m.role }}]{{ m.content }}{% endfor %}",
+            ),
+            ..Config::default()
+        };
+        let (app, seen) = capture_app(true, cfg).await;
+        let base = serde_json::json!({
+            "model": "mock-model",
+            "enable_thinking": true,
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"}
+            ],
+        });
+        let mut json = base.clone();
+        json["response_format"] = json_schema_format(nested_schema());
+
+        let (status, v) = post_chat(app.clone(), json).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert!(!task.enable_thinking);
+        assert!(task.prompt.contains("NOTHINK"), "{}", task.prompt);
+        assert!(task.prompt.contains("[system]"), "{}", task.prompt);
+
+        let (status, v) = post_chat(app, base).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert!(task.enable_thinking);
+        assert!(!task.prompt.contains("[system]"), "{}", task.prompt);
+        assert_eq!(
+            task.prompt,
+            render_prompt_legacy(&[
+                ChatMessage {
+                    role: "system".into(),
+                    content: "be brief".into(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn json_request_overrides_effort_words() {
+        let src = "{% if reasoning_effort == 'high' %}EFFORT{% elif reasoning_effort == 'low' %}LOW{% endif %}\
+                   {% for m in messages %}{{ m.content }}{% endfor %}";
+        let env = build_chat_env(src).unwrap();
+        assert!(
+            template_speaks_effort_words(&env, "", ""),
+            "the test template must speak effort words"
+        );
+        let cfg = Config {
+            chat_template: template(src),
+            ..Config::default()
+        };
+        let (app, seen) = capture_app(true, cfg).await;
+        let base = serde_json::json!({
+            "model": "mock-model",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let mut json = base.clone();
+        json["response_format"] = json_schema_format(nested_schema());
+
+        let (status, v) = post_chat(app.clone(), json).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert!(!task.prompt.contains("EFFORT"), "{}", task.prompt);
+
+        let (status, v) = post_chat(app, base).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert!(task.prompt.contains("EFFORT"), "{}", task.prompt);
+    }
+
+    #[tokio::test]
+    async fn engine_schema_rejection_reaches_the_client() {
+        let (app, _seen) = capture_app_with(
+            true,
+            minimal_cfg(),
+            Some("response_format json_schema: x".into()),
+        )
+        .await;
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": json_schema_format(nested_schema()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            v,
+            serde_json::json!({"error": "invalid configuration: response_format json_schema: x"})
         );
     }
 }

@@ -296,6 +296,7 @@ dependencies = [
  "cascadia-types",
  "chrono",
  "futures",
+ "jsonschema",
  "minijinja",
  "minijinja-contrib",
  "parking_lot",
