@@ -243,8 +243,7 @@ impl GrammarSlot {
 }
 
 /// What a json task is told while its pipeline can't apply masks.
-pub(crate) const UPGRADE_EVERY_STAGE: &str =
-    "a later pipeline stage runs a build without structured-output support; upgrade every stage";
+pub(crate) const UPGRADE_EVERY_STAGE: &str = cascadia_grammar::STAGE_UPGRADE_MESSAGE;
 
 /// A masked step that came back without an acknowledgement.
 pub(crate) fn unconfirmed_step(reason: &str) -> String {

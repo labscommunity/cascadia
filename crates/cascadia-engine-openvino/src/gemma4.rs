@@ -750,8 +750,7 @@ const MASK_NACK_TOKEN: i32 = -1;
 /// output before it probes the chain again.
 const MASK_LATCH_REPROBE: Duration = Duration::from_secs(600);
 /// What a structured-output task on an unacknowledging chain fails with.
-const UPGRADE_EVERY_STAGE: &str =
-    "a later pipeline stage runs a build without structured-output support; upgrade every stage";
+const UPGRADE_EVERY_STAGE: &str = cascadia_grammar::STAGE_UPGRADE_MESSAGE;
 
 /// Encodes a step's hidden frame. `mask = None` is the plain F32 frame (the
 /// encoding every step used before masks); `Some(words)` the masked I32

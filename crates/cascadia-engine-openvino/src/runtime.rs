@@ -991,8 +991,7 @@ fn mask_count_lane(base: usize, words: usize) -> i64 {
 }
 
 /// The error a structured-output task gets when a later stage can't mask.
-const MASK_UPGRADE_ERROR: &str = "a later pipeline stage runs a build without structured-output \
-                                  support; upgrade every stage";
+const MASK_UPGRADE_ERROR: &str = cascadia_grammar::STAGE_UPGRADE_MESSAGE;
 
 /// How long a latched link refuses structured-output tasks before the next
 /// one probes it again.

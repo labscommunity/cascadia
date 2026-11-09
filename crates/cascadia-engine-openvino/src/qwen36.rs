@@ -230,8 +230,7 @@ const FRAME_FORWARD_MASKED: u32 = 13;
 /// (or a malformed mask). Only this kind accepts a masked step.
 const FRAME_TOKEN_MASKED: u32 = 14;
 /// Why a structured-output task can't run on this pipeline.
-const UPGRADE_EVERY_STAGE: &str =
-    "a later pipeline stage runs a build without structured-output support; upgrade every stage";
+const UPGRADE_EVERY_STAGE: &str = cascadia_grammar::STAGE_UPGRADE_MESSAGE;
 
 /// A rank's own HELLO_ACK capabilities: its capture level, plus
 /// [`GRAMMAR_MASK_CAP`] when the head's HELLO asked for masks (an older head

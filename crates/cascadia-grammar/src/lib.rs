@@ -22,6 +22,13 @@ use llguidance::toktrie::{SimpleVob, TokEnv};
 use llguidance::{Matcher, ParserFactory};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
+/// What a structured-output request fails with when a later pipeline stage
+/// runs a build that can't apply a grammar mask (or didn't acknowledge one).
+/// Engines report it verbatim, so an embedder can recognise it and route the
+/// request elsewhere.
+pub const STAGE_UPGRADE_MESSAGE: &str =
+    "a later pipeline stage runs a build without structured-output support; upgrade every stage";
+
 /// Longest error message handed back to the client.
 const MAX_ERROR_CHARS: usize = 300;
 
