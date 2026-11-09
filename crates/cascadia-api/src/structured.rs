@@ -6,6 +6,7 @@ use cascadia_types::{GrammarKind, GrammarSpec};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
 
 /// Grammar body used for `json_object` (and for `json_schema` whose schema is
 /// missing, `null`, `true` or `{}`): any JSON object.
@@ -184,8 +185,8 @@ const COUNT_KEYWORDS: [[&str; 2]; 3] = [
 const FIELD: &str = "response_format.json_schema.schema";
 
 /// Reject a schema over [`MAX_SCHEMA_BYTES`], with a repeated key in any
-/// object, nested deeper than
-/// [`MAX_SCHEMA_DEPTH`], with a count keyword or pattern quantifier above
+/// object, nested deeper than [`MAX_SCHEMA_DEPTH`] (also when its local
+/// `$ref`s are followed), with a count keyword or pattern quantifier above
 /// [`MAX_SCHEMA_COUNT`], or whose counts sum above [`MAX_SCHEMA_COUNT_TOTAL`].
 /// `text` is the schema's compact text.
 fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
@@ -199,6 +200,11 @@ fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
     if nests_deeper_than(schema, MAX_SCHEMA_DEPTH) {
         return Err(format!(
             "{FIELD} nests deeper than {MAX_SCHEMA_DEPTH} levels"
+        ));
+    }
+    if ref_nests_deeper_than(schema, MAX_SCHEMA_DEPTH) {
+        return Err(format!(
+            "{FIELD} nests deeper than {MAX_SCHEMA_DEPTH} levels through $ref"
         ));
     }
     let mut total = 0;
@@ -412,6 +418,102 @@ fn reject_duplicate_keys(text: &str) -> Result<(), String> {
         ));
     }
     walked.map_err(|e| format!("{FIELD}: {e}"))
+}
+
+/// True when `root` nests more than `levels` deep once every local `$ref`
+/// (`#` or `#/<JSON pointer>`) is followed: a ref's target counts as one
+/// level below the object holding it. Backends compile a schema by following
+/// refs, so a long alias chain is as deep for them as nested objects. A ref
+/// back to an object already on the path (a recursive schema) stops there,
+/// and a ref that does not resolve locally is left to the backend. Each
+/// object's height is memoized, so shared targets are walked once; the walk
+/// stops as soon as it passes `levels`, so it never recurses deeper than
+/// that, whatever the schema.
+fn ref_nests_deeper_than(root: &Value, levels: usize) -> bool {
+    RefDepth {
+        root,
+        levels,
+        heights: HashMap::new(),
+        path: HashSet::new(),
+    }
+    .height(root, 1)
+    .is_none()
+}
+
+struct RefDepth<'a> {
+    root: &'a Value,
+    levels: usize,
+    /// Levels from an object or array down to its deepest leaf, itself
+    /// included, keyed by its address in `root`.
+    heights: HashMap<*const Value, usize>,
+    /// Objects and arrays on the current path.
+    path: HashSet<*const Value>,
+}
+
+impl<'a> RefDepth<'a> {
+    /// The height of `v`, found at level `level`; `None` once any path
+    /// through it passes `self.levels`.
+    fn height(&mut self, v: &'a Value, level: usize) -> Option<usize> {
+        let children: Vec<&'a Value> = match v {
+            Value::Object(o) => o.values().collect(),
+            Value::Array(a) => a.iter().collect(),
+            _ => return Some(0),
+        };
+        if level > self.levels {
+            return None;
+        }
+        let key: *const Value = v;
+        if let Some(&h) = self.heights.get(&key) {
+            return (level + h - 1 <= self.levels).then_some(h);
+        }
+        self.path.insert(key);
+        let mut below = 0;
+        for c in children {
+            below = below.max(self.height(c, level + 1)?);
+        }
+        if let Some(target) = v
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| resolve_local_ref(self.root, r))
+        {
+            if !self.path.contains(&(target as *const Value)) {
+                below = below.max(self.height(target, level + 1)?);
+            }
+        }
+        self.path.remove(&key);
+        self.heights.insert(key, below + 1);
+        Some(below + 1)
+    }
+}
+
+/// The value a local `$ref` (`#` or `#/<JSON pointer>`, percent-encoded or
+/// not) points to in `root`.
+fn resolve_local_ref<'a>(root: &'a Value, r: &str) -> Option<&'a Value> {
+    let pointer = r.strip_prefix('#')?;
+    root.pointer(pointer)
+        .or_else(|| root.pointer(&percent_decode(pointer)?))
+}
+
+/// `s` with `%XX` escapes decoded, or `None` when it has none or they do not
+/// decode to UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    if !s.contains('%') {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// True when objects and arrays in `v` nest more than `levels` deep, counting
@@ -1409,6 +1511,113 @@ mod tests {
             parse_schema(object_of(17, mixed)),
             Err("response_format.json_schema.schema: repetition counts add up to 204000; the limit is 200000".into())
         );
+    }
+
+    /// A chain of `$ref` aliases, `d0` to `d{last}`, entered from the root.
+    fn alias_chain(last: usize) -> serde_json::Value {
+        let mut defs = serde_json::Map::new();
+        for i in 0..last {
+            defs.insert(
+                format!("d{i}"),
+                json!({"$ref": format!("#/$defs/d{}", i + 1)}),
+            );
+        }
+        defs.insert(format!("d{last}"), json!({"type": "string"}));
+        json!({"$defs": defs, "$ref": "#/$defs/d0"})
+    }
+
+    const REF_DEPTH_ERR: &str =
+        "response_format.json_schema.schema nests deeper than 64 levels through $ref";
+
+    #[test]
+    fn a_long_ref_alias_chain_is_rejected() {
+        let schema = alias_chain(2000);
+        assert!(schema.to_string().len() <= MAX_SCHEMA_BYTES);
+        assert_eq!(parse_schema(schema), Err(REF_DEPTH_ERR.into()));
+    }
+
+    #[test]
+    fn ref_depth_counts_each_link_as_a_level() {
+        // `$defs/d{i}` sits at level 3 + i, so `d61` is at 64.
+        assert!(matches!(
+            parse_schema(alias_chain(61)),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+        assert_eq!(parse_schema(alias_chain(62)), Err(REF_DEPTH_ERR.into()));
+    }
+
+    #[test]
+    fn a_huge_ref_alias_chain_is_rejected_without_deep_recursion() {
+        let schema = alias_chain(100_000);
+        // Run on a small stack: the walk must stop at the cap.
+        let deeper = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || ref_nests_deeper_than(&schema, MAX_SCHEMA_DEPTH))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(deeper);
+    }
+
+    #[test]
+    fn a_recursive_schema_passes_the_ref_depth_check() {
+        let tree = json!({
+            "$defs": {"node": {"type": "object", "properties": {
+                "name": {"type": "string"},
+                "children": {"type": "array", "items": {"$ref": "#/$defs/node"}},
+            }}},
+            "$ref": "#/$defs/node",
+        });
+        assert!(matches!(
+            parse_schema(tree),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+        let self_ref = json!({"type": "object", "properties": {"next": {"$ref": "#"}}});
+        assert!(matches!(
+            parse_schema(self_ref),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+    }
+
+    /// `levels` definitions, each an `anyOf` of `fan` refs to the next.
+    fn ref_diamond(levels: usize, fan: usize) -> serde_json::Value {
+        let mut defs = serde_json::Map::new();
+        for i in 0..levels {
+            let next = json!({"$ref": format!("#/$defs/d{}", i + 1)});
+            defs.insert(format!("d{i}"), json!({"anyOf": vec![next; fan]}));
+        }
+        defs.insert(format!("d{levels}"), json!({"type": "string"}));
+        json!({"$defs": defs, "$ref": "#/$defs/d0"})
+    }
+
+    #[test]
+    fn a_ref_diamond_is_checked_in_linear_time() {
+        let start = std::time::Instant::now();
+        // Each level is three deep (object, anyOf, ref): 20 fit, 30 do not.
+        assert!(matches!(
+            parse_schema(ref_diamond(20, 4)),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+        assert_eq!(parse_schema(ref_diamond(30, 2)), Err(REF_DEPTH_ERR.into()));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_unresolvable_or_remote_ref_is_left_to_the_backend() {
+        for r in ["#/$defs/missing", "https://example.com/s.json", "#anchor"] {
+            let schema = json!({"type": "object", "properties": {"a": {"$ref": r}}});
+            assert!(!ref_nests_deeper_than(&schema, MAX_SCHEMA_DEPTH), "{r}");
+        }
+        // Pointers resolve with their escapes.
+        let root = json!({"$defs": {"a/b c": {"type": "string"}, "x~y": 1}});
+        let s = json!({"type": "string"});
+        assert_eq!(resolve_local_ref(&root, "#/$defs/a~1b%20c"), Some(&s));
+        assert_eq!(resolve_local_ref(&root, "#/$defs/a~1b c"), Some(&s));
+        assert_eq!(resolve_local_ref(&root, "#/$defs/x~0y"), Some(&json!(1)));
+        assert_eq!(resolve_local_ref(&root, "#"), Some(&root));
+        assert_eq!(resolve_local_ref(&root, "#/$defs/nope"), None);
+        assert_eq!(resolve_local_ref(&root, "#/$defs/a~1b%2"), None);
+        assert_eq!(resolve_local_ref(&root, "s.json#/$defs/x~0y"), None);
     }
 
     #[test]
