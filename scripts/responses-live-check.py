@@ -18,10 +18,17 @@ Sends what Codex and the agent SDKs send and checks the answers' shape:
 
 Usage:
   python3 scripts/responses-live-check.py http://127.0.0.1:18100 [--max-output-tokens 1024]
-          [--only text,tool_call] [--timeout 1800] [--mock]
+          [--only text,tool_call] [--timeout 1800] [--mock] [--expect-reasoning]
 
 `--mock` adds the mock engine's `__mock_tool_call__` marker to the tool prompt,
 so `cascadia run tests/fixtures/mock-tools-model --engine mock` scripts a call.
+
+Every response body and every streamed event is validated against the pinned
+OpenAI spec subset (`crates/cascadia-api/tests/fixtures/openai-spec-subset.json`:
+`Response`, `ResponseStreamEvent`), no `<think>`/`</think>` may appear in any
+output text or delta, and `usage.output_tokens_details.reasoning_tokens` must be
+present and at most `output_tokens`. `--expect-reasoning` (a thinking model)
+also requires the `text` check to return a `reasoning` item.
 
 Every check prints `<NAME>: PASS` or `<NAME>: FAIL <why>`; the last line is
 `RESPONSES_LIVE: ALL PASS` only when all ran and passed. Stdlib only.
@@ -36,6 +43,90 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "crates" / "cascadia-api" / "tests" / "fixtures"
+SCHEMAS = json.loads((FIXTURES / "openai-spec-subset.json").read_text())["components"]["schemas"]
+MARKERS = ("<think>", "</think>")
+TYPES = {
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "null": lambda v: v is None,
+}
+
+
+def spec_errors(schema, v, at="$", depth=0):
+    """The ways `v` breaks `schema` (the JSON-schema keywords the pinned
+    subset uses); empty when it validates."""
+    if depth > 64:
+        return [f"{at}: schema too deep"]
+    if "$ref" in schema:
+        return spec_errors(SCHEMAS[schema["$ref"].rsplit("/", 1)[-1]], v, at, depth + 1)
+    errs = []
+    for sub in schema.get("allOf", []):
+        errs += spec_errors(sub, v, at, depth + 1)
+    if "not" in schema and not spec_errors(schema["not"], v, at, depth + 1):
+        errs.append(f"{at}: matches a `not` schema")
+    for key, need_one in (("anyOf", False), ("oneOf", True)):
+        if key in schema:
+            branches = [spec_errors(b, v, at, depth + 1) for b in schema[key]]
+            ok = sum(1 for b in branches if not b)
+            if ok == 0:
+                # Name the branch whose `type` const matches, else the shortest.
+                typed = [b for b in branches if not any(e.startswith(f"{at}.type:") for e in b)]
+                best = min(typed or branches, key=len)
+                errs.append(f"{at}: matches no {key} branch (closest: {best[:2]})")
+            elif need_one and ok > 1:
+                errs.append(f"{at}: matches {ok} oneOf branches")
+    t = schema.get("type")
+    if t is not None:
+        ts = t if isinstance(t, list) else [t]
+        if not any(TYPES[x](v) for x in ts if x in TYPES):
+            return errs + [f"{at}: {type(v).__name__} is not {t}"]
+    if "enum" in schema and v not in schema["enum"]:
+        errs.append(f"{at}: {v!r} not in {schema['enum'][:6]}")
+    if isinstance(v, str):
+        if len(v) < schema.get("minLength", 0) or len(v) > schema.get("maxLength", 1 << 62):
+            errs.append(f"{at}: string length {len(v)}")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if v < schema.get("minimum", float("-inf")) or v > schema.get("maximum", float("inf")):
+            errs.append(f"{at}: {v} out of range")
+    if isinstance(v, dict):
+        for k in schema.get("required", []):
+            if k not in v:
+                errs.append(f"{at}: missing required {k!r}")
+        props = schema.get("properties", {})
+        for k, sub in props.items():
+            if k in v:
+                errs += spec_errors(sub, v[k], f"{at}.{k}", depth + 1)
+        extra = schema.get("additionalProperties")
+        if extra is False:
+            errs += [f"{at}: unexpected {k!r}" for k in v if k not in props]
+        elif isinstance(extra, dict):
+            for k in v:
+                if k not in props:
+                    errs += spec_errors(extra, v[k], f"{at}.{k}", depth + 1)
+    if isinstance(v, list):
+        if len(v) < schema.get("minItems", 0):
+            errs.append(f"{at}: fewer than {schema['minItems']} items")
+        if "items" in schema:
+            for i, x in enumerate(v):
+                errs += spec_errors(schema["items"], x, f"{at}[{i}]", depth + 1)
+    return errs
+
+
+def conform(name, v, what):
+    errs = spec_errors({"$ref": "#/components/schemas/" + name}, v)
+    if errs:
+        raise Fail(f"{what} breaks the spec's {name}: {errs[:3]}")
+
+
+def check_usage(resp):
+    u = resp.get("usage") or {}
+    rt = (u.get("output_tokens_details") or {}).get("reasoning_tokens")
+    if not isinstance(rt, int) or rt > u.get("output_tokens", 0):
+        raise Fail(f"usage reasoning_tokens {rt!r} vs output_tokens {u.get('output_tokens')!r}")
 
 WEATHER = {
     "type": "function",
@@ -74,7 +165,12 @@ def post(base, body, timeout):
 
 def call(base, body, timeout):
     with post(base, body, timeout) as r:
-        return json.loads(r.read())
+        resp = json.loads(r.read())
+    conform("Response", resp, "the response body")
+    if resp.get("usage") is not None:
+        check_usage(resp)
+    no_think_markers(resp)
+    return resp
 
 
 def stream(base, body, timeout):
@@ -87,6 +183,17 @@ def stream(base, body, timeout):
                 data = line[5:].strip()
                 if data and data != "[DONE]":
                     events.append(json.loads(data))
+    for e in events:
+        conform("ResponseStreamEvent", e, f"event {e.get('type')} #{e.get('sequence_number')}")
+        if e.get("type") in ("response.output_text.delta", "response.output_text.done"):
+            t = e.get("delta", e.get("text", ""))
+            if any(m in t for m in MARKERS):
+                raise Fail(f"think marker in {e['type']}: {t[:120]!r}")
+    if events and isinstance(events[-1].get("response"), dict):
+        final = events[-1]["response"]
+        no_think_markers(final)
+        if final.get("usage") is not None:
+            check_usage(final)
     return events
 
 
@@ -109,8 +216,13 @@ def check_finished(resp, allow_incomplete=True):
 
 def no_think_markers(resp):
     for t in texts(resp):
-        if "<think>" in t or "</think>" in t:
+        if any(m in t for m in MARKERS):
             raise Fail(f"think marker in output_text: {t[:200]!r}")
+    for item in resp.get("output", []):
+        if item.get("type") == "reasoning":
+            for part in item.get("content") or []:
+                if any(m in part.get("text", "") for m in MARKERS):
+                    raise Fail(f"think marker in reasoning text: {part.get('text', '')[:120]!r}")
 
 
 def summary(resp):
@@ -139,16 +251,22 @@ def run(args):
     if args.mock:
         TOOL_PROMPT += " __mock_tool_call__"
     base, mot, to = args.url, args.max_output_tokens, args.timeout
-    model = call(base, {"model": "x", "input": "hi", "max_output_tokens": 1}, to)["model"]
+    try:
+        model = call(base, {"model": "x", "input": "hi", "max_output_tokens": 1}, to)["model"]
+    except Exception as e:  # noqa: BLE001 - the verdict line must still come
+        print(f"SERVER: FAIL {type(e).__name__}: {e}")
+        print("RESPONSES_LIVE: FAIL (server)")
+        return 1
     state = {}
 
     def text():
         r = call(base, {"model": model, "input": "What is 17 times 3? Answer with the number.",
                         "max_output_tokens": mot}, to)
         check_finished(r)
-        no_think_markers(r)
         if not "".join(texts(r)).strip() and r.get("status") == "completed":
             raise Fail(f"empty answer: {summary(r)}")
+        if args.expect_reasoning and not any(i.get("type") == "reasoning" for i in r["output"]):
+            raise Fail(f"--expect-reasoning: no reasoning item: {summary(r)}")
         return summary(r)
 
     def tool_call():
@@ -228,6 +346,10 @@ def run(args):
         ("codex_late_dev", lambda: codex("codex-0.166.0-turn2.json", late_dev)),
     ]
     only = set(args.only.split(",")) if args.only else None
+    unknown = (only or set()) - {name for name, _ in checks}
+    if unknown:
+        print(f"RESPONSES_LIVE: FAIL (unknown checks: {', '.join(sorted(unknown))})")
+        return 2
     failed, ran = [], 0
     print(f"model: {model}")
     for name, fn in checks:
@@ -239,8 +361,8 @@ def run(args):
             print(f"{name.upper()}: PASS  {detail}", flush=True)
         except Exception as e:  # noqa: BLE001 - every failure is a verdict line
             failed.append(name)
-            print(f"{name.upper()}: FAIL {type(e).__name__ if not isinstance(e, Fail) else ''}{e}",
-                  flush=True)
+            why = str(e) if isinstance(e, Fail) else f"{type(e).__name__}: {e}"
+            print(f"{name.upper()}: FAIL {why}", flush=True)
     if failed:
         print(f"RESPONSES_LIVE: FAIL ({', '.join(failed)})")
         return 1
@@ -255,6 +377,7 @@ def main():
     p.add_argument("--only", default="")
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--mock", action="store_true")
+    p.add_argument("--expect-reasoning", action="store_true")
     sys.exit(run(p.parse_args()))
 
 
