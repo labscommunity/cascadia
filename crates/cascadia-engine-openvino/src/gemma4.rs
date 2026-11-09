@@ -1219,6 +1219,55 @@ fn tail_masked_reply(
     }
 }
 
+/// Middles: what this stage owes upstream after answering a masked step
+/// without an acknowledgement. Once a stage below acknowledges anything (a
+/// slow but capable tail), the head's latch can clear: this stage passes an
+/// acknowledged NACK up before its next plain reply or control ack, which
+/// the head skips as a late reply and reads as that evidence. Never before a
+/// masked reply: those carry no sequence number, so the head would take it
+/// for the current step's answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OwedLateAck {
+    #[default]
+    Nothing,
+    /// Answered a masked step unacknowledged; nothing below has acked since.
+    Owed,
+    /// And a stage below has acknowledged since: pass it up.
+    Proven,
+}
+
+impl OwedLateAck {
+    /// This stage answered a masked step upstream with `reply`.
+    fn on_masked_reply_sent(&mut self, reply: StageReply) {
+        *self = if matches!(reply, StageReply::NotAcked) {
+            Self::Owed
+        } else {
+            // An acknowledged reply already told the head.
+            Self::Nothing
+        };
+    }
+
+    /// A stage below acknowledged a reply this stage discarded as late.
+    fn on_ack_from_below(&mut self) {
+        if *self == Self::Owed {
+            *self = Self::Proven;
+        }
+    }
+}
+
+/// The frames that answer upstream with `reply` (a plain token reply or a
+/// control ack): an acknowledged NACK first when a late acknowledgement is
+/// owed and proven (see [`OwedLateAck`]).
+fn upstream_plain_frames(owed: &mut OwedLateAck, reply: WireTensor) -> Vec<WireTensor> {
+    let mut frames = Vec::with_capacity(2);
+    if *owed == OwedLateAck::Proven {
+        *owed = OwedLateAck::Nothing;
+        frames.push(encode_masked_reply(StageReply::Nack));
+    }
+    frames.push(reply);
+    frames
+}
+
 /// "This pipeline can't mask": set by an unacknowledged masked step, it makes
 /// structured-output tasks fail at once (no frames sent) until a late
 /// acknowledged reply clears it or [`MASK_LATCH_REPROBE`] has passed. Lives on
@@ -1364,6 +1413,8 @@ pub struct Gemma4Engine {
     grammar_failure: Option<GrammarFailure>,
     /// Head: set when a later stage didn't acknowledge a masked step.
     mask_latch: MaskLatch,
+    /// Middles: see [`OwedLateAck`].
+    owed_late_ack: OwedLateAck,
     /// Pipeline stages after this one (0 on the tail); sizes masked waits.
     stages_below: u32,
     /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
@@ -1604,6 +1655,7 @@ impl Gemma4Engine {
         })?;
         if late_ack {
             self.mask_latch.clear();
+            self.owed_late_ack.on_ack_from_below();
         }
         Ok(token)
     }
@@ -1683,10 +1735,13 @@ impl Gemma4Engine {
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        let tensor = encode_token_reply(token);
+        let frames = upstream_plain_frames(&mut self.owed_late_ack, encode_token_reply(token));
         self.block_on(async move {
             let mut guard = upstream.lock().await;
-            guard.send(&tensor).await
+            for f in &frames {
+                guard.send(f).await?;
+            }
+            Ok::<_, cascadia_transport::TransportError>(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
         Ok(())
@@ -1699,6 +1754,7 @@ impl Gemma4Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
         let tensor = encode_masked_reply(reply);
+        self.owed_late_ack.on_masked_reply_sent(reply);
         self.block_on(async move {
             let mut guard = upstream.lock().await;
             guard.send(&tensor).await
@@ -2691,6 +2747,7 @@ impl Gemma4Engine {
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         if late_ack {
             self.mask_latch.clear();
+            self.owed_late_ack.on_ack_from_below();
         }
         Ok(ack)
     }
@@ -2700,10 +2757,14 @@ impl Gemma4Engine {
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        let t = control_frame(ack_opcode, payload);
+        let frames =
+            upstream_plain_frames(&mut self.owed_late_ack, control_frame(ack_opcode, payload));
         self.block_on(async move {
             let mut g = upstream.lock().await;
-            g.send(&t).await
+            for f in &frames {
+                g.send(f).await?;
+            }
+            Ok::<_, cascadia_transport::TransportError>(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
         Ok(())
@@ -3304,6 +3365,7 @@ impl Builder for Gemma4Builder {
             grammar_warn: StepWarnLimiter::default(),
             grammar_failure: None,
             mask_latch: MaskLatch::default(),
+            owed_late_ack: OwedLateAck::default(),
             stages_below: self.total.saturating_sub(self.rank + 1),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
@@ -4441,6 +4503,56 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// A middle that answered a masked step unacknowledged, and then sees an
+    /// acknowledged reply from below (a slow but capable tail), passes an
+    /// acknowledged NACK up before its next plain reply, so the head's latch
+    /// clears. Never before a masked reply: those carry no sequence number,
+    /// so the head would read it as the current step's answer.
+    #[tokio::test]
+    async fn a_middle_passes_a_late_acknowledgement_up_before_its_next_plain_reply() {
+        let mut owed = OwedLateAck::default();
+        // Nothing owed: today's frames.
+        assert_eq!(
+            upstream_plain_frames(&mut owed, encode_token_reply(5)).len(),
+            1
+        );
+        owed.on_masked_reply_sent(StageReply::NotAcked);
+        // Owed but nothing below has acknowledged yet: nothing extra.
+        assert_eq!(
+            upstream_plain_frames(&mut owed, encode_token_reply(5)).len(),
+            1
+        );
+        owed.on_ack_from_below();
+        let frames = upstream_plain_frames(&mut owed, encode_token_reply(6));
+        assert_eq!(
+            frames,
+            vec![encode_masked_reply(StageReply::Nack), encode_token_reply(6)]
+        );
+        // Paid once.
+        assert_eq!(
+            upstream_plain_frames(&mut owed, encode_token_reply(7)).len(),
+            1
+        );
+        // An acknowledged masked reply settles what was owed.
+        owed.on_masked_reply_sent(StageReply::NotAcked);
+        owed.on_masked_reply_sent(StageReply::Token(3));
+        owed.on_ack_from_below();
+        assert_eq!(
+            upstream_plain_frames(&mut owed, encode_token_reply(8)).len(),
+            1
+        );
+
+        // The head reads the pair: the token, and the latch-clearing ack.
+        let (mut server, mut client) = link().await;
+        for f in &frames {
+            server.send(f).await.unwrap();
+        }
+        assert_eq!(
+            wait_plain_reply(&mut client, false).await.unwrap(),
+            (6, true)
+        );
     }
 
     #[tokio::test]
