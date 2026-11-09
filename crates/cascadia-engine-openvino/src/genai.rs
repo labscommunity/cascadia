@@ -331,11 +331,13 @@ impl Builder for OvGenaiBuilder {
         let accepts_images = takes_images(dir);
         let max_ctx = crate::read_max_ctx(dir, "ov-genai");
         let media_sizer = load_media_sizer(dir, accepts_images, max_ctx);
+        let npu_prompt_cap = npu_prompt_cap(&self.device, &self.ov_properties);
         if let Some(pipe) = self.cb_pipe {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
                 accepts_images,
                 max_ctx,
+                npu_prompt_cap,
                 media_sizer,
                 pipe: Box::new(pipe),
                 prompt_pretemplated: self.prompt_pretemplated,
@@ -350,6 +352,7 @@ impl Builder for OvGenaiBuilder {
             pipe,
             accepts_images,
             max_ctx,
+            npu_prompt_cap,
             media_sizer,
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
@@ -380,8 +383,36 @@ fn map_ov_err(err: OvError) -> EngineError {
             EngineError::Backend("openvino-genai shim built without the `openvino` feature".into())
         }
         OvError::Utf8(s) => EngineError::InvalidConfig(s),
+        // The stateful NPU pipeline's own prompt-length refusal (a prompt, or
+        // a held chat history, past MAX_PROMPT_LEN) can never fit on a retry:
+        // a 400 `context_length_exceeded`, not a retryable backend error.
+        OvError::Native(s) if s.contains(NPU_PROMPT_LEN_ERROR) => EngineError::PromptTooLong(s),
         OvError::Native(s) => EngineError::Backend(s),
     }
+}
+
+/// What GenAI's stateful NPU pipeline says when a prompt passes its
+/// MAX_PROMPT_LEN ("Stateful LLM pipeline on NPU may only process prompts or
+/// hold chat history up to N tokens").
+const NPU_PROMPT_LEN_ERROR: &str = "may only process prompts or hold chat history up to";
+
+/// GenAI's MAX_PROMPT_LEN when a run sets none (its NPU default).
+const NPU_DEFAULT_MAX_PROMPT_LEN: usize = 1024;
+
+/// The most prompt tokens the pipeline takes on `device`: on NPU, the
+/// MAX_PROMPT_LEN the run configured in `props` (the last one set, as OV
+/// keeps the last write), else GenAI's default; `None` elsewhere, where only
+/// the model's window bounds a prompt.
+fn npu_prompt_cap(device: &str, props: &[(String, String)]) -> Option<usize> {
+    if !device.trim().to_ascii_uppercase().starts_with("NPU") {
+        return None;
+    }
+    let set = props
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "MAX_PROMPT_LEN")
+        .and_then(|(_, v)| v.trim().parse().ok());
+    Some(set.unwrap_or(NPU_DEFAULT_MAX_PROMPT_LEN))
 }
 
 /// Borrow a task's decoded media in the shim's form. A kind this engine
@@ -439,18 +470,32 @@ fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
 fn window_check(
     task: &GenerationTask,
     max_ctx: Option<usize>,
+    npu_prompt_cap: Option<usize>,
     media: Option<&MediaSizer>,
     count_tokens: impl FnOnce(&str) -> Option<u32>,
 ) -> EngineResult<()> {
-    let Some(max) = max_ctx else {
+    if max_ctx.is_none() && npu_prompt_cap.is_none() {
         return Ok(());
-    };
+    }
+    // A prompt of exactly MAX_PROMPT_LEN tokens fits the NPU pipeline; one of
+    // the model's whole window leaves no room to generate.
+    let over_cap = |n: usize| npu_prompt_cap.filter(|cap| n > *cap);
+    let over_window = |n: usize| max_ctx.filter(|max| n >= *max);
     if task.media.is_empty() {
-        return match count_tokens(&task.prompt) {
-            Some(n) if n as usize >= max => Err(EngineError::PromptTooLong(format!(
+        let Some(n) = count_tokens(&task.prompt).map(|n| n as usize) else {
+            return Ok(());
+        };
+        if let Some(cap) = over_cap(n) {
+            return Err(EngineError::PromptTooLong(format!(
+                "prompt is {n} tokens but the NPU pipeline takes at most {cap} prompt tokens \
+                 (MAX_PROMPT_LEN); send a shorter prompt"
+            )));
+        }
+        return match over_window(n) {
+            Some(max) => Err(EngineError::PromptTooLong(format!(
                 "prompt is {n} tokens but the model's context is {max}; send a shorter prompt"
             ))),
-            _ => Ok(()),
+            None => Ok(()),
         };
     }
     let Some(sizer) = media else {
@@ -468,7 +513,15 @@ fn window_check(
         return Ok(());
     };
     let planned = (n as usize + soft).saturating_sub(tags);
-    if planned >= max {
+    if let Some(cap) = over_cap(planned) {
+        warn!(task = %task.task_id, prompt_tokens = planned, cap, "ov-genai: refusing a media prompt over the NPU prompt cap");
+        return Err(EngineError::PromptTooLong(format!(
+            "prompt is at least {planned} tokens with its images and videos expanded but the \
+             NPU pipeline takes at most {cap} prompt tokens (MAX_PROMPT_LEN); send a shorter \
+             prompt (or fewer or smaller images)"
+        )));
+    }
+    if let Some(max) = over_window(planned) {
         warn!(task = %task.task_id, prompt_tokens = planned, max, "ov-genai: refusing over-window media prompt");
         return Err(EngineError::PromptTooLong(format!(
             "prompt is at least {planned} tokens with its images and videos expanded but the \
@@ -534,6 +587,9 @@ pub struct OvGenaiEngine {
     accepts_images: bool,
     /// The model's window from its config.json; see [`window_check`].
     max_ctx: Option<usize>,
+    /// On NPU, the most prompt tokens the pipeline takes (MAX_PROMPT_LEN);
+    /// see [`npu_prompt_cap`] and [`window_check`].
+    npu_prompt_cap: Option<usize>,
     /// Sizes media prompts for [`window_check`]; `None` leaves them to GenAI.
     media_sizer: Option<MediaSizer>,
     speculative_k: u32,
@@ -576,9 +632,13 @@ impl Engine for OvGenaiEngine {
         if !self.accepts_images {
             cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
         }
-        window_check(&task, self.max_ctx, self.media_sizer.as_ref(), |p| {
-            self.pipe.count_tokens(p)
-        })?;
+        window_check(
+            &task,
+            self.max_ctx,
+            self.npu_prompt_cap,
+            self.media_sizer.as_ref(),
+            |p| self.pipe.count_tokens(p),
+        )?;
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -818,6 +878,9 @@ pub struct OvGenaiCbEngine {
     accepts_images: bool,
     /// The model's window from its config.json; see [`window_check`].
     max_ctx: Option<usize>,
+    /// On NPU, the most prompt tokens the pipeline takes (MAX_PROMPT_LEN);
+    /// see [`npu_prompt_cap`] and [`window_check`].
+    npu_prompt_cap: Option<usize>,
     /// Sizes media prompts for [`window_check`]; `None` leaves them to GenAI.
     media_sizer: Option<MediaSizer>,
     pipe: Box<dyn CbPipe>,
@@ -895,9 +958,13 @@ impl Engine for OvGenaiCbEngine {
         if !self.accepts_images {
             cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
         }
-        window_check(&task, self.max_ctx, self.media_sizer.as_ref(), |p| {
-            self.pipe.count_tokens(p)
-        })?;
+        window_check(
+            &task,
+            self.max_ctx,
+            self.npu_prompt_cap,
+            self.media_sizer.as_ref(),
+            |p| self.pipe.count_tokens(p),
+        )?;
         if self.active.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -1400,6 +1467,7 @@ mod tests {
             active: Vec::new(),
             accepts_images: true,
             max_ctx: None,
+            npu_prompt_cap: None,
             media_sizer: None,
             pipe: Box::new(MockPipe { st: st.clone() }),
             prompt_pretemplated: false,
@@ -1432,6 +1500,80 @@ mod tests {
         e.max_ctx = None;
         assert!(e.submit(task("unknown", 4)).is_ok());
         assert_eq!(st.lock().unwrap().added.len(), 2);
+    }
+
+    /// On NPU the stateful pipeline takes at most MAX_PROMPT_LEN prompt tokens: a prompt
+    /// over it is a 400 naming that limit before anything is enrolled, though the model's
+    /// window would take it. The mock tokenizer counts every prompt as 7 tokens.
+    #[test]
+    fn cb_submit_refuses_prompts_over_the_npu_prompt_cap() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.max_ctx = Some(40960);
+        e.npu_prompt_cap = Some(6);
+        let err = e.submit(task("over", 4)).unwrap_err();
+        let EngineError::PromptTooLong(msg) = err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            msg.contains("7 tokens")
+                && msg.contains("NPU")
+                && msg.contains("6 prompt tokens")
+                && msg.contains("MAX_PROMPT_LEN"),
+            "{msg}"
+        );
+        assert!(st.lock().unwrap().added.is_empty());
+        e.npu_prompt_cap = Some(7);
+        assert!(e.submit(task("at", 4)).is_ok(), "the cap itself fits");
+        e.max_ctx = None;
+        e.npu_prompt_cap = Some(6);
+        assert!(
+            e.submit(task("no-window", 4)).is_err(),
+            "checked with no window known"
+        );
+    }
+
+    /// The NPU prompt cap is the MAX_PROMPT_LEN the run configured (the last one set),
+    /// else GenAI's NPU default of 1024; other devices have none.
+    #[test]
+    fn the_npu_prompt_cap_follows_max_prompt_len() {
+        let props = |kv: &[(&str, &str)]| {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            npu_prompt_cap("CPU", &props(&[("MAX_PROMPT_LEN", "4096")])),
+            None
+        );
+        assert_eq!(npu_prompt_cap("GPU.0", &[]), None);
+        assert_eq!(npu_prompt_cap("NPU", &[]), Some(1024));
+        assert_eq!(npu_prompt_cap("npu", &[]), Some(1024));
+        assert_eq!(
+            npu_prompt_cap(
+                "NPU",
+                &props(&[("MAX_PROMPT_LEN", "2048"), ("MAX_PROMPT_LEN", "4096")])
+            ),
+            Some(4096)
+        );
+        assert_eq!(
+            npu_prompt_cap("NPU", &props(&[("MAX_PROMPT_LEN", "x")])),
+            Some(1024)
+        );
+    }
+
+    /// GenAI's own NPU prompt-length refusal (the chat-history case a pre-check cannot
+    /// see) is a prompt-too-long, a 400; other native errors stay backend errors.
+    #[test]
+    fn the_npu_prompt_length_error_is_prompt_too_long() {
+        let npu = "Check 'data->input_ids.get_size() <= m_max_prompt_len' failed at \
+                   src\\cpp\\src\\llm\\pipeline_stateful.cpp:364: Stateful LLM pipeline on NPU \
+                   may only process prompts or hold chat history up to 1024 tokens. 3114 is passed.";
+        let err = map_ov_err(OvError::Native(npu.into()));
+        assert!(matches!(err, EngineError::PromptTooLong(_)), "{err:?}");
+        assert!(err.to_string().starts_with("prompt too long: "), "{err}");
+        let other = map_ov_err(OvError::Native("device lost".into()));
+        assert!(matches!(other, EngineError::Backend(_)), "{other:?}");
     }
 
     /// A media turn is sized before `add_request` (text 7 + a Gemma 3 image's 256 soft
@@ -1484,23 +1626,27 @@ mod tests {
             Some(10)
         };
         // 10 text + 2 x 256 - 2 tags = 520.
-        let err = window_check(&t, Some(520), Some(&gemma3), count).unwrap_err();
+        let err = window_check(&t, Some(520), None, Some(&gemma3), count).unwrap_err();
         assert!(matches!(err, EngineError::PromptTooLong(_)), "{err:?}");
         assert_eq!(*seen.borrow(), "AB", "the tags are not counted as text");
-        assert!(window_check(&t, Some(521), Some(&gemma3), |_| Some(10)).is_ok());
+        assert!(window_check(&t, Some(521), None, Some(&gemma3), |_| Some(10)).is_ok());
+        // The NPU prompt cap holds a media turn too, with no window known.
+        let err = window_check(&t, None, Some(1), Some(&gemma3), |_| Some(10)).unwrap_err();
+        assert!(err.to_string().contains("MAX_PROMPT_LEN"), "{err}");
+        assert!(window_check(&t, None, Some(100_000), Some(&gemma3), |_| Some(10)).is_ok());
         // No window, no sizer, or no token count: nothing is refused.
-        assert!(window_check(&t, None, Some(&gemma3), |_| Some(10_000)).is_ok());
-        assert!(window_check(&t, Some(8), None, |_| Some(10_000)).is_ok());
-        assert!(window_check(&t, Some(8), Some(&gemma3), |_| None).is_ok());
+        assert!(window_check(&t, None, None, Some(&gemma3), |_| Some(10_000)).is_ok());
+        assert!(window_check(&t, Some(8), None, None, |_| Some(10_000)).is_ok());
+        assert!(window_check(&t, Some(8), None, Some(&gemma3), |_| None).is_ok());
         // An item the family cannot size (Gemma 3 takes no native video) is left to GenAI.
         let mut v = image_task("vid");
         v.media[0].kind = MediaKind::Video;
         v.media[0].timestamps_ms = Some(vec![0]);
-        assert!(window_check(&v, Some(8), Some(&gemma3), |_| Some(10_000)).is_ok());
+        assert!(window_check(&v, Some(8), None, Some(&gemma3), |_| Some(10_000)).is_ok());
         // Text-only turns are counted whole, at or past the window refused.
         let text = task("txt", 4);
-        assert!(window_check(&text, Some(10), Some(&gemma3), |_| Some(10)).is_err());
-        assert!(window_check(&text, Some(11), None, |_| Some(10)).is_ok());
+        assert!(window_check(&text, Some(10), None, Some(&gemma3), |_| Some(10)).is_err());
+        assert!(window_check(&text, Some(11), None, None, |_| Some(10)).is_ok());
     }
 
     /// Option B: the CB engine has no forced-prefix path — a resumed submit
