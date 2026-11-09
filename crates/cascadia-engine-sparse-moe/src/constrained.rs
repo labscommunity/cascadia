@@ -1,6 +1,6 @@
 //! Structured output (`response_format`): the per-engine glue around
-//! [`cascadia_grammar`]. One [`GrammarSlot`] per engine (built where rank 0
-//! loads its tokenizer), one [`CompiledGrammar`] per queued task (compiled at
+//! [`cascadia_grammar`]. One [`GrammarSlot`] per engine (set up where rank 0
+//! loads its tokenizer, built on the first json task), one [`CompiledGrammar`] per queued task (compiled at
 //! `submit`, so a schema that can't be built is a 400 before the task queues),
 //! one [`GrammarMask`] per running sequence (created when the task starts).
 //!
@@ -14,41 +14,96 @@ use cascadia_types::GenerationTask;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
-/// The engine's grammar factory, or why it has none.
-#[derive(Clone)]
-pub(crate) struct GrammarSlot(Result<GrammarFactory, String>);
+/// Builds the factory; run at most once per slot.
+type BuildFactory = Box<dyn FnOnce() -> EngineResult<GrammarFactory> + Send>;
 
-impl Default for GrammarSlot {
-    fn default() -> Self {
-        Self(Err("the model has no tokenizer on this stage".into()))
-    }
+/// The engine's grammar factory, built on the first json task (building it
+/// costs about half a second and over 100 MiB for a large vocabulary, which
+/// requests without a grammar never need), or why it has none. Copies share
+/// the build and its result.
+#[derive(Clone, Default)]
+pub(crate) struct GrammarSlot(Option<std::sync::Arc<LazyFactory>>);
+
+struct LazyFactory {
+    build: std::sync::Mutex<Option<BuildFactory>>,
+    built: std::sync::OnceLock<Result<GrammarFactory, String>>,
 }
 
+/// Why a slot without a build has no factory.
+const NO_TOKENIZER: &str = "the model has no tokenizer on this stage";
+
 impl GrammarSlot {
-    /// Built once at load from the tokenizer and every EOS id the engine
-    /// stops on. A failure is logged here, once; json tasks then get a 400.
-    pub(crate) fn build(tokenizer: &Tokenizer, eos: &[u32]) -> Self {
-        match GrammarFactory::from_tokenizer(tokenizer, eos) {
-            Ok(f) => Self(Ok(f)),
-            Err(e) => {
-                let reason = match e {
-                    EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
-                    other => other.to_string(),
-                };
-                warn!(error = %reason, "structured output unavailable for this model");
-                Self(Err(reason))
-            }
-        }
+    /// A slot whose factory `build` makes on first use. A failure is
+    /// logged then, once, and kept: json tasks get a 400 naming it.
+    pub(crate) fn lazy(
+        build: impl FnOnce() -> EngineResult<GrammarFactory> + Send + 'static,
+    ) -> Self {
+        Self(Some(std::sync::Arc::new(LazyFactory {
+            build: std::sync::Mutex::new(Some(Box::new(build))),
+            built: std::sync::OnceLock::new(),
+        })))
     }
 
-    /// Tokens a mask covers (the tokenizer vocab); `None` without a factory.
-    pub(crate) fn mask_width(&self) -> Option<usize> {
-        self.0.as_ref().ok().map(GrammarFactory::mask_width)
+    /// The factory for the tokenizer at `path` and every EOS id the engine
+    /// stops on; the file is read again on first use, so the engine keeps
+    /// no second copy of the tokenizer meanwhile.
+    pub(crate) fn from_tokenizer_file(path: std::path::PathBuf, eos: Vec<u32>) -> Self {
+        Self::lazy(move || {
+            let tok = Tokenizer::from_file(&path)
+                .map_err(|e| EngineError::Backend(format!("load {}: {e}", path.display())))?;
+            GrammarFactory::from_tokenizer(&tok, &eos)
+        })
+    }
+
+    /// [`Self::lazy`] over a tokenizer in memory.
+    #[cfg(test)]
+    pub(crate) fn build(tokenizer: &Tokenizer, eos: &[u32]) -> Self {
+        let (tok, eos) = (tokenizer.clone(), eos.to_vec());
+        Self::lazy(move || GrammarFactory::from_tokenizer(&tok, &eos))
     }
 
     #[cfg(test)]
     pub(crate) fn from_factory(f: GrammarFactory) -> Self {
-        Self(Ok(f))
+        Self::lazy(move || Ok(f))
+    }
+
+    /// The factory, built now if this is its first use.
+    fn factory(&self) -> Result<&GrammarFactory, &str> {
+        let Some(lazy) = self.0.as_ref() else {
+            return Err(NO_TOKENIZER);
+        };
+        let built = lazy.built.get_or_init(|| {
+            let build = lazy.build.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some(build) = build else {
+                return Err("the grammar factory build did not finish".into());
+            };
+            let started = std::time::Instant::now();
+            match build() {
+                Ok(f) => {
+                    info!(
+                        mask_width = f.mask_width(),
+                        build_ms = started.elapsed().as_millis() as u64,
+                        "structured output: grammar factory built"
+                    );
+                    Ok(f)
+                }
+                Err(e) => {
+                    let reason = match e {
+                        EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
+                        other => other.to_string(),
+                    };
+                    warn!(error = %reason, "structured output unavailable for this model");
+                    Err(reason)
+                }
+            }
+        });
+        built.as_ref().map_err(String::as_str)
+    }
+
+    /// Tokens a mask covers (the tokenizer vocab); `None` without a factory.
+    /// Builds the factory on first use.
+    pub(crate) fn mask_width(&self) -> Option<usize> {
+        self.factory().ok().map(GrammarFactory::mask_width)
     }
 
     /// Compiles the task's grammar at submit. `Ok(None)` for a task without
@@ -57,7 +112,7 @@ impl GrammarSlot {
         let Some(spec) = task.grammar.as_ref() else {
             return Ok(None);
         };
-        let factory = self.0.as_ref().map_err(|reason| {
+        let factory = self.factory().map_err(|reason| {
             EngineError::InvalidConfig(format!(
                 "structured output is not available for this model: {reason}"
             ))
@@ -272,6 +327,63 @@ mod tests {
             matches!(err, Some(EngineError::InvalidConfig(_))),
             "{err:?}"
         );
+    }
+
+    /// A slot whose factory build counts its runs and ends in `result`.
+    fn counting_slot(ok: bool) -> (GrammarSlot, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = runs.clone();
+        let slot = GrammarSlot::lazy(move || {
+            r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if ok {
+                Ok(factory())
+            } else {
+                Err(EngineError::InvalidConfig("no EOS in the vocab".into()))
+            }
+        });
+        (slot, runs)
+    }
+
+    #[test]
+    fn the_factory_is_built_on_the_first_json_task_only() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (slot, runs) = counting_slot(true);
+        let copy = slot.clone();
+        assert!(slot.compile(&task_with(None)).unwrap().is_none());
+        assert_eq!(runs.load(SeqCst), 0, "built before a json task");
+        assert!(slot.compile(&task_with(Some(WEATHER))).unwrap().is_some());
+        assert!(copy.compile(&task_with(Some(WEATHER))).unwrap().is_some());
+        assert_eq!(slot.mask_width(), Some(VOCAB));
+        assert_eq!(runs.load(SeqCst), 1, "built once, shared by copies");
+    }
+
+    #[test]
+    fn a_failed_factory_build_is_cached_and_every_json_task_gets_a_400() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (slot, runs) = counting_slot(false);
+        for _ in 0..2 {
+            match slot.compile(&task_with(Some(WEATHER))).err() {
+                Some(EngineError::InvalidConfig(m)) => assert_eq!(
+                    m,
+                    "structured output is not available for this model: no EOS in the vocab"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(runs.load(SeqCst), 1);
+        assert_eq!(slot.mask_width(), None);
+    }
+
+    #[test]
+    fn a_slot_from_a_tokenizer_file_reads_it_on_the_first_json_task() {
+        let dir = std::env::temp_dir().join(format!("grammar-slot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokenizer.json");
+        let slot = GrammarSlot::from_tokenizer_file(path.clone(), vec![EOS]);
+        // Written after the slot exists: construction did not read it.
+        tokenizer().save(&path, false).unwrap();
+        assert!(slot.compile(&task_with(Some(WEATHER))).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

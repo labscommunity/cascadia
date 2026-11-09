@@ -342,8 +342,8 @@ pub struct SparseMoEBuilder {
     /// Expert-parallel worker: its expert shard, loaded in `load`.
     ep_bank: Option<crate::inkling::ep::ExpertBank>,
     tokenizer: Option<Tokenizer>,
-    /// Structured output: built next to rank 0's tokenizer from the EOS ids
-    /// the engine stops on.
+    /// Structured output: set up next to rank 0's tokenizer with the EOS ids
+    /// the engine stops on; the factory is built on the first json task.
     grammar: GrammarSlot,
     listen_host: String,
     listen_port: Option<u16>,
@@ -386,7 +386,7 @@ impl SparseMoEBuilder {
     /// Rank 0 (the API rank) needs the tokenizer; workers drive themselves from
     /// the hidden states on the wire. Shared by every Rust-shell family.
     /// `eos` is every id the engine stops on, for the structured-output
-    /// grammar factory built next to the tokenizer.
+    /// grammar factory (built from the same file on the first json task).
     fn load_rank0_tokenizer(&mut self, rank: u32, family: &str, eos: &[u32]) -> EngineResult<()> {
         if rank != 0 {
             return Ok(());
@@ -397,7 +397,7 @@ impl SparseMoEBuilder {
                 Tokenizer::from_file(&tok_path)
                     .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?,
             );
-            self.build_grammar(eos);
+            self.grammar = GrammarSlot::from_tokenizer_file(tok_path, eos.to_vec());
         } else {
             warn!(
                 "no tokenizer.json at {} — {family} engine will only accept pre-tokenized inputs",
@@ -405,14 +405,6 @@ impl SparseMoEBuilder {
             );
         }
         Ok(())
-    }
-
-    /// Structured output: the grammar factory for the loaded tokenizer. A
-    /// failure is logged once; json tasks then get a 400 naming it.
-    fn build_grammar(&mut self, eos: &[u32]) {
-        if let Some(tok) = self.tokenizer.as_ref() {
-            self.grammar = GrammarSlot::build(tok, eos);
-        }
     }
 
     pub fn new(config: SparseMoEBuilderConfig) -> Self {
@@ -798,7 +790,10 @@ impl Builder for SparseMoEBuilder {
                         Some(Tokenizer::from_file(&tok_path).map_err(|e| {
                             EngineError::Backend(format!("load tokenizer.json: {e}"))
                         })?);
-                    self.build_grammar(ov_runner.eos_token_ids());
+                    self.grammar = GrammarSlot::from_tokenizer_file(
+                        tok_path,
+                        ov_runner.eos_token_ids().to_vec(),
+                    );
                 } else {
                     warn!(
                         "no tokenizer.json at {} — engine will only accept pre-tokenized inputs",
@@ -902,7 +897,7 @@ impl Builder for SparseMoEBuilder {
                     .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?;
                 self.tokenizer = Some(t);
                 let eos = runner.manifest.eos_token_ids.clone();
-                self.build_grammar(&eos);
+                self.grammar = GrammarSlot::from_tokenizer_file(tok_path, eos);
             } else {
                 warn!(
                     "no tokenizer.json at {} — engine will only accept pre-tokenized inputs",
@@ -6759,7 +6754,6 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // ---- 4. one decode micro-batch for this group's survivors ----
         // Structured output: each json row's mask for its token after `next`;
         // a stream at a grammar dead end ends here.
-        let width = self.grammar.mask_width().unwrap_or(0);
         let mut row_masks: HashMap<usize, Vec<u32>> = HashMap::new();
         let mut dead: Vec<(usize, String)> = Vec::new();
         for st in self
@@ -6830,7 +6824,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let cols = if row_masks.is_empty() {
             None
         } else {
-            let mut c = MaskCols::new(rows_idx.len(), width.div_ceil(32));
+            // Every json row's words come from the same factory.
+            let words = row_masks.values().next().map_or(0, Vec::len);
+            let mut c = MaskCols::new(rows_idx.len(), words);
             for (r, &i) in rows_idx.iter().enumerate() {
                 if let Some(w) = row_masks.get(&self.streams[i].slot) {
                     let tag = self.stage_masks.next_tag();
