@@ -1905,9 +1905,30 @@ impl OvDistSpecEngine {
                 completion_tokens: None,
                 error: None,
                 token_ids,
-                finish_reason: None,
+                finish_reason: Some(spec_finish_reason(
+                    active.out.last().copied(),
+                    &self.eos_token_ids,
+                    active.out.len(),
+                    active.task.max_tokens.max(1) as usize,
+                )),
             },
         )]
+    }
+}
+
+/// Why a finished answer ended: its last token is EOS → `stop`; it reached
+/// `max_tokens` (counted on `out`, as the decode loop counts it) → `length`.
+fn spec_finish_reason(
+    last: Option<i64>,
+    eos: &[u32],
+    out_len: usize,
+    max_tokens: usize,
+) -> cascadia_types::FinishReason {
+    let ended_on_eos = last.is_some_and(|t| u32::try_from(t).is_ok_and(|t| eos.contains(&t)));
+    if !ended_on_eos && out_len >= max_tokens {
+        cascadia_types::FinishReason::Length
+    } else {
+        cascadia_types::FinishReason::Stop
     }
 }
 
@@ -3319,6 +3340,19 @@ fn lookup_eos(model_dir: &std::path::Path) -> Vec<u32> {
 mod tests {
     use super::*;
     use cascadia_transport::{ActivationClient, ActivationServer};
+
+    /// A finished answer says why it ended: its last token is EOS → `stop`;
+    /// it reached `max_tokens` → `length` (it used to carry no reason, so
+    /// every capped answer read as `stop`).
+    #[test]
+    fn finished_answer_reports_length_at_the_cap_and_stop_at_eos() {
+        use cascadia_types::FinishReason::{Length, Stop};
+        let eos = [2u32];
+        assert_eq!(spec_finish_reason(Some(7), &eos, 4, 4), Length);
+        assert_eq!(spec_finish_reason(Some(2), &eos, 3, 4), Stop);
+        assert_eq!(spec_finish_reason(Some(2), &eos, 4, 4), Stop);
+        assert_eq!(spec_finish_reason(None, &eos, 0, 4), Stop);
+    }
 
     /// `decode_delta` used to remember a byte LENGTH and slice `full[len..]`.
     /// Its only guard was `full.len() <= last_text_len`, which catches a decode
