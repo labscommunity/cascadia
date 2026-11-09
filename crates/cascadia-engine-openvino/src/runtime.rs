@@ -46,6 +46,9 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 #[cfg(test)]
 use cascadia_grammar::GrammarFactory;
 use cascadia_grammar::{CompiledGrammar, GrammarMask};
+use cascadia_grammar::{
+    MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT,
+};
 use cascadia_ov_genai_shim::{
     advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -974,6 +977,14 @@ const NACK_TOKEN: i32 = -1;
 // the acknowledged NACK I64 `[1, 2, 0]`. A masked step answered without it — a
 // plain NACK, an unacknowledged token, or silence — means some later stage
 // can't mask: the head fails that task and latches (see `MaskLink`).
+//
+// Repeated masks: a non-packed masked step whose mask equals the last one
+// sent on the link goes as the lead `[seq, (position,) W]` with `W` =
+// `REPEAT` and no mask lanes; the receiver uses the last mask it decoded
+// (`MaskSendCache` / `MaskRecvCache`). A receiver with no mask to repeat runs
+// nothing and answers the acknowledged `[MASK_MISS_TOKEN, seq, MASK_ACK]`;
+// middles pass that up unchanged and the head fails the task with
+// `MASK_MISS_MESSAGE`, without latching. Packed plans always carry full masks.
 
 /// The acknowledgement lane of a reply to a masked step.
 const MASK_ACK: i32 = 0x4d41_534b;
@@ -1062,13 +1073,39 @@ fn encode_wire_lead_masked(seq: u32, position: Option<i64>, words: &[u32]) -> Wi
     t
 }
 
-/// Decode a lead that may carry a mask: `(seq, position, mask words)`. A lead
-/// with exactly the lanes this stage expects is [`decode_wire_lead`]'s; one
-/// with more must carry a consistent `W` and its mask lanes.
+/// The lead of a masked step that repeats the link's last mask: today's
+/// lanes, then the tagged `W` lane with `W` = [`REPEAT`] and no mask lanes.
+fn encode_wire_lead_repeat(seq: u32, position: Option<i64>) -> WireTensor {
+    let mut t = encode_wire_lead(seq, position);
+    let base = t.data.len() / 8;
+    t.data
+        .extend_from_slice(&mask_count_lane(base, REPEAT as usize).to_le_bytes());
+    t.shape[2] = (t.data.len() / 8) as u32;
+    t
+}
+
+/// [`decode_wire_lead_masks`] for a receiver with no mask to repeat.
+#[cfg(test)]
 fn decode_wire_lead_any(
     t: &WireTensor,
     want_pos: bool,
 ) -> EngineResult<(u32, Option<i64>, Option<Vec<u32>>)> {
+    let (seq, pos, wire) = decode_wire_lead_masks(t, want_pos)?;
+    let mask = wire
+        .map(|w| MaskRecvCache::default().resolve(w))
+        .transpose()
+        .map_err(|miss| EngineError::Backend(miss.to_string()))?;
+    Ok((seq, pos, mask))
+}
+
+/// Decode a lead that may carry a mask: `(seq, position, mask)`. A lead with
+/// exactly the lanes this stage expects is [`decode_wire_lead`]'s; one with
+/// more must carry a consistent `W` and either its mask lanes or, with `W` =
+/// [`REPEAT`], none.
+fn decode_wire_lead_masks(
+    t: &WireTensor,
+    want_pos: bool,
+) -> EngineResult<(u32, Option<i64>, Option<WireMask>)> {
     let base = if want_pos { 2usize } else { 1 };
     let lanes = t.shape[2] as usize;
     if t.dtype != WireDType::I64 || t.shape[..2] != [1, 1] || lanes <= base {
@@ -1087,8 +1124,14 @@ fn decode_wire_lead_any(
         return Ok((seq, pos, None));
     }
     let words = (count & 0xffff_ffff) as usize;
-    let consistent =
-        t.data.len() == lanes * 8 && words > 0 && lanes == base + 1 + words.div_ceil(2);
+    // The marker is checked first: its `W` is no word count.
+    let repeat = words == REPEAT as usize;
+    let consistent = t.data.len() == lanes * 8
+        && if repeat {
+            lanes == base + 1
+        } else {
+            words > 0 && lanes == base + 1 + words.div_ceil(2)
+        };
     if !consistent {
         return Err(EngineError::Backend(format!(
             "malformed structured-output lead frame: shape={:?} len={} mask words={words} \
@@ -1104,8 +1147,71 @@ fn decode_wire_lead_any(
         t.data[..base * 8].to_vec(),
     );
     let (seq, pos) = decode_wire_lead(&plain, want_pos)?;
+    if repeat {
+        return Ok((seq, pos, Some(WireMask::Repeat)));
+    }
     let mask = read_mask_words(&t.data[(base + 1) * 8..], words);
-    Ok((seq, pos, Some(mask)))
+    Ok((seq, pos, Some(WireMask::Full(mask))))
+}
+
+/// One decoded upstream activation: the seq to echo, the static position,
+/// the hidden rows and their shape, and on a masked step its mask — or
+/// [`MaskMiss`] for a repeat marker this link has no mask for.
+#[derive(Debug)]
+struct UpstreamStep {
+    seq: u32,
+    position: Option<i64>,
+    hidden: Vec<f32>,
+    shape: [usize; 3],
+    mask: Option<Result<Vec<u32>, MaskMiss>>,
+}
+
+/// Decode an upstream `[lead] [hidden]` pair against the link's receive
+/// cache. A repeat marker resolves to the last mask decoded on the link; the
+/// mask is committed only once the hidden decoded too. Any decode error
+/// clears the cache, so a marker after it misses instead of applying a mask
+/// the sender didn't mean.
+fn decode_upstream_step(
+    lead: &WireTensor,
+    hidden: &WireTensor,
+    want_pos: bool,
+    cache: &mut MaskRecvCache,
+) -> EngineResult<UpstreamStep> {
+    let decoded = decode_wire_lead_masks(lead, want_pos).and_then(|(seq, position, wire)| {
+        let floats = decode_hidden_floats(hidden)?;
+        Ok((seq, position, wire, floats))
+    });
+    let (seq, position, wire, floats) = decoded.inspect_err(|_| cache.clear())?;
+    let mask = wire.map(|w| cache.resolve(w));
+    if let Some(Ok(words)) = &mask {
+        cache.commit(words);
+    }
+    Ok(UpstreamStep {
+        seq,
+        position,
+        hidden: floats,
+        shape: [
+            hidden.shape[0] as usize,
+            hidden.shape[1] as usize,
+            hidden.shape[2] as usize,
+        ],
+        mask,
+    })
+}
+
+/// The hidden rows of an upstream activation frame (F32 or F16).
+fn decode_hidden_floats(tensor: &WireTensor) -> EngineResult<Vec<f32>> {
+    match tensor.dtype {
+        WireDType::F32 => Ok(tensor
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()),
+        WireDType::F16 => Ok(f16_bytes_to_f32(&tensor.data)),
+        other => Err(EngineError::Backend(format!(
+            "unexpected upstream dtype {other:?}"
+        ))),
+    }
 }
 
 /// A token reply: [`encode_token_with_seq`]'s `[token, seq]`, or on a masked
@@ -1160,6 +1266,9 @@ fn masked_relay_answer<T>(downstream: Result<T, TokenWaitFailure>) -> (EngineRes
         Ok(t) => (Ok(t), true),
         // An acknowledged NACK: the stage below is new and refused the step itself.
         Err(TokenWaitFailure::AckedNack(e)) => (Err(e), true),
+        // A stage below lost its mask state: acknowledged (see
+        // [`relay_token_answer`], which passes it up as the mask-miss token).
+        Err(TokenWaitFailure::MaskMiss(e)) => (Err(e), true),
         // Anything else from below — no acknowledgement, silence, a dead or
         // desynced link — proves nothing about the stages below, so it goes up
         // unacknowledged.
@@ -1190,6 +1299,19 @@ fn relay_downstream_answer<T>(
         masked_relay_answer(reply)
     } else {
         (reply.map_err(TokenWaitFailure::into_error), true)
+    }
+}
+
+/// [`relay_downstream_answer`] for a non-packed step: a mask miss below goes
+/// up as the acknowledged mask-miss token, unchanged, so the head can tell it
+/// from a failed step (which goes up as [`NACK_TOKEN`]).
+fn relay_token_answer(
+    reply: Result<i32, TokenWaitFailure>,
+    masked: bool,
+) -> (EngineResult<i32>, bool) {
+    match reply {
+        Err(TokenWaitFailure::MaskMiss(_)) if masked => (Ok(MASK_MISS_TOKEN), true),
+        reply => relay_downstream_answer(reply, masked),
     }
 }
 
@@ -1470,6 +1592,9 @@ struct MaskLink {
     owed_late_ack: Option<u32>,
     /// An acknowledged reply from below arrived since `owed_late_ack` was set.
     acked_since_owed: bool,
+    /// The last mask sent downstream on this link, so a repeat goes as the
+    /// short marker. Cleared on every failed step, an ABORT and a latch.
+    send: MaskSendCache,
 }
 
 impl MaskLink {
@@ -1516,6 +1641,7 @@ impl MaskLink {
         }
         self.acked = false;
         self.latched_at = Some(now);
+        self.send.clear();
         EngineError::Backend(format!(
             "{MASK_UPGRADE_ERROR} (a masked step got no acknowledged reply: {cause})"
         ))
@@ -1536,7 +1662,9 @@ impl MaskLink {
                 self.on_acked();
                 Err(e)
             }
-            Err(TokenWaitFailure::Other(e)) => Err(e),
+            // A stage below lost its mask state: fail the task, but neither
+            // latch nor count the link as acknowledged.
+            Err(TokenWaitFailure::Other(e) | TokenWaitFailure::MaskMiss(e)) => Err(e),
             Err(TokenWaitFailure::NoAck(e) | TokenWaitFailure::TimedOut(e)) => {
                 Err(self.on_unacked(now, &e))
             }
@@ -1561,6 +1689,7 @@ fn warm_resume_allowed(has_grammar: bool, multi_stage: bool, link_acked: bool) -
 /// transposed at the call site and still compile — on a wire whose frames were
 /// already hard to tell apart. Shared by `send_hidden_downstream` and its
 /// loopback tests so the order is defined in exactly one place.
+#[cfg(test)]
 async fn send_hidden_frames(
     downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
     seq: u32,
@@ -1568,16 +1697,43 @@ async fn send_hidden_frames(
     mask: Option<&[u32]>,
     hid: WireTensor,
 ) -> Result<(), cascadia_transport::TransportError> {
+    let mut fresh = MaskSendCache::default();
+    send_hidden_frames_cached(downstream, seq, position, mask, &mut fresh, hid).await
+}
+
+/// [`send_hidden_frames`] with the link's send cache: a mask equal to the
+/// last one sent on the link goes as the repeat marker. The cache is checked
+/// and updated under the same lock as the write; a write error clears it.
+async fn send_hidden_frames_cached(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    seq: u32,
+    position: Option<i64>,
+    mask: Option<&[u32]>,
+    cache: &mut MaskSendCache,
+    hid: WireTensor,
+) -> Result<(), cascadia_transport::TransportError> {
+    // The links of this engine never re-dial, so one connection generation.
+    const GENERATION: u64 = 0;
+    let mut guard = downstream.lock().await;
     // A masked step's mask rides inside the lead; every other step's lead is
     // today's frame.
     let lead = match mask {
+        Some(words) if cache.repeats(GENERATION, words) => encode_wire_lead_repeat(seq, position),
         Some(words) => encode_wire_lead_masked(seq, position, words),
         None => encode_wire_lead(seq, position),
     };
-    let mut guard = downstream.lock().await;
-    guard.send(&lead).await?;
-    guard.send(&hid).await?;
-    Ok(())
+    let sent = async {
+        guard.send(&lead).await?;
+        guard.send(&hid).await?;
+        Ok(())
+    }
+    .await;
+    match (&sent, mask) {
+        (Err(_), _) => cache.clear(),
+        (Ok(()), Some(words)) => cache.record(GENERATION, words),
+        (Ok(()), None) => {}
+    }
+    sent
 }
 
 /// Receive the upstream activation frames in wire order: `[lead] [hidden]` —
@@ -1776,6 +1932,11 @@ async fn wait_token_reply(
     if stale_ack {
         link.on_acked();
     }
+    // Any failed step on the link may have left the receiver without the
+    // last mask: the next masked step goes full.
+    if outcome.is_err() {
+        link.send.clear();
+    }
     let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
     // A masked step's timeout leaves the streak as it was (below an older
     // stage every masked step times out); any other masked outcome proves the
@@ -1799,7 +1960,7 @@ async fn masked_exchange(
     streak: &mut u32,
     link: &mut MaskLink,
 ) -> EngineResult<i32> {
-    send_hidden_frames(downstream, seq, position, Some(words), hid)
+    send_hidden_frames_cached(downstream, seq, position, Some(words), &mut link.send, hid)
         .await
         .map_err(|e| EngineError::Backend(e.to_string()))?;
     let reply = wait_token_reply(downstream, seq, budget, true, streak, link).await;
@@ -2027,6 +2188,9 @@ enum TokenWaitFailure {
     /// acknowledgement (a plain NACK or a plain token), so some later stage
     /// can't mask.
     NoAck(EngineError),
+    /// Masked steps only: a stage below got a repeat marker with no mask to
+    /// repeat and answered the acknowledged mask-miss token.
+    MaskMiss(EngineError),
 }
 
 impl TokenWaitFailure {
@@ -2035,7 +2199,8 @@ impl TokenWaitFailure {
             TokenWaitFailure::TimedOut(e)
             | TokenWaitFailure::Other(e)
             | TokenWaitFailure::AckedNack(e)
-            | TokenWaitFailure::NoAck(e) => e,
+            | TokenWaitFailure::NoAck(e)
+            | TokenWaitFailure::MaskMiss(e) => e,
         }
     }
 }
@@ -2205,6 +2370,11 @@ async fn recv_token_reply(
                 "the downstream acknowledged a step that carried no token mask — a desynced \
                  activation stream"
                     .into(),
+            )));
+        }
+        if token == MASK_MISS_TOKEN && masked {
+            return Err(TokenWaitFailure::MaskMiss(EngineError::Backend(
+                MASK_MISS_MESSAGE.into(),
             )));
         }
         if token < 0 && masked {
@@ -2726,6 +2896,10 @@ pub struct OvRuntimeEngine {
     /// (structured-output) steps, and the latch that refuses them when it
     /// doesn't. See [`MaskLink`].
     mask_link: MaskLink,
+    /// Relay ranks: the last token mask decoded from the upstream, which a
+    /// repeat marker stands for. The upstream link never re-dials, so it
+    /// lives as long as the engine.
+    mask_recv: MaskRecvCache,
     /// Issue-34 Option C: opaque KV blob cache + NEGOTIATE/GET offers for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
@@ -3161,8 +3335,12 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
         let (seq, pos, hid) = self.stamp_hidden(hidden, shape, position);
-        self.block_on(send_hidden_frames(&downstream, seq, pos, mask, hid))
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let handle = self.runtime_handle.clone();
+        crate::dist_spec::run_async_pub(
+            &handle,
+            send_hidden_frames_cached(&downstream, seq, pos, mask, &mut self.mask_link.send, hid),
+        )
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!(position, "downstream send: done");
         Ok(())
     }
@@ -3333,11 +3511,17 @@ impl OvRuntimeEngine {
     }
 
     /// The upstream's next activation: hidden rows, their shape, the static
-    /// position, and the token mask of a masked step.
+    /// position, and the token mask of a masked step ([`MaskMiss`] for a
+    /// repeat marker this stage has no mask for).
     #[allow(clippy::type_complexity)]
     fn recv_hidden_from_upstream(
         &mut self,
-    ) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>, Option<Vec<u32>>)> {
+    ) -> EngineResult<(
+        Vec<f32>,
+        [usize; 3],
+        Option<i64>,
+        Option<Result<Vec<u32>, MaskMiss>>,
+    )> {
         // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
         // [seq] or [seq, position]. The LEAD frame's wait is lenient
         // (idle-between-requests); the hidden that must follow it is deadlined,
@@ -3377,28 +3561,11 @@ impl OvRuntimeEngine {
             debug!("upstream recv: frames arrived");
             // Record the seq this stage must echo back on the token it sends
             // upstream; decode/validate outside the transport closure so a bad
-            // frame yields a clear EngineError, not a desync.
-            let (inbound_seq, position, mask) = decode_wire_lead_any(&lead, want_pos)?;
-            self.inbound_seq = Some(inbound_seq);
-            let shape = [
-                tensor.shape[0] as usize,
-                tensor.shape[1] as usize,
-                tensor.shape[2] as usize,
-            ];
-            let floats = match tensor.dtype {
-                WireDType::F32 => tensor
-                    .data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                WireDType::F16 => f16_bytes_to_f32(&tensor.data),
-                other => {
-                    return Err(EngineError::Backend(format!(
-                        "unexpected upstream dtype {other:?}"
-                    )))
-                }
-            };
-            return Ok((floats, shape, position, mask));
+            // frame yields a clear EngineError, not a desync. A repeat marker
+            // resolves here, before any layer runs.
+            let step = decode_upstream_step(&lead, &tensor, want_pos, &mut self.mask_recv)?;
+            self.inbound_seq = Some(step.seq);
+            return Ok((step.hidden, step.shape, step.position, step.mask));
         }
     }
 
@@ -5088,6 +5255,16 @@ impl OvRuntimeEngine {
         }
     }
 
+    /// Answer a repeat marker this stage has no mask for: the acknowledged
+    /// mask-miss token, with no layer run and nothing forwarded. A warm
+    /// resume armed for this step is dropped (the step never ran), so the
+    /// next prefill starts cold.
+    fn answer_mask_miss(&mut self) -> EngineResult<()> {
+        warn!("structured output: a repeat token mask arrived with no mask to repeat; answering a mask miss");
+        let _ = self.kv_consume_warm_pending();
+        self.send_token_to_upstream(&Ok(MASK_MISS_TOKEN), true, true)
+    }
+
     /// Issue-34: consume the one-shot warm-resume flag. `true` ⇒ this prefill continues a RESTOREd
     /// state, so the worker must NOT reset. Always `false` in the default build (no-op).
     fn kv_consume_warm_pending(&mut self) -> bool {
@@ -5110,6 +5287,11 @@ impl OvRuntimeEngine {
         // there is nothing to answer on. After it, `inbound_seq` is set and
         // every failure must answer.
         let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
+        let mask = match mask {
+            Some(Err(MaskMiss)) => return self.answer_mask_miss(),
+            Some(Ok(words)) => Some(words),
+            None => None,
+        };
         let step = self.relay_last_body(hidden, shape, pos_opt, mask.as_deref());
         // A masked step is always acknowledged by the tail: the mask was
         // applied, or the step failed here.
@@ -5157,6 +5339,11 @@ impl OvRuntimeEngine {
         }
         // See `step_last`: nothing is owed until the group is consumed.
         let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
+        let mask = match mask {
+            Some(Err(MaskMiss)) => return self.answer_mask_miss(),
+            Some(Ok(words)) => Some(words),
+            None => None,
+        };
         let (step, vouch) = self.relay_middle_body(hidden, shape, pos_opt, mask.as_deref());
         let answered = self.answer_upstream(step, mask.is_some(), vouch);
         self.escalate_if_downstream_is_gone(answered)
@@ -5241,7 +5428,7 @@ impl OvRuntimeEngine {
             None => return own_failure_answer(EngineError::Backend("no downstream".into()), false),
         };
         let reply = self.wait_token(&downstream, prefill_reply, mask.is_some());
-        relay_downstream_answer(reply, mask.is_some())
+        relay_token_answer(reply, mask.is_some())
     }
 
     /// A middle stage's own part of a step: run its layers on the upstream's
@@ -5988,6 +6175,8 @@ impl OvRuntimeEngine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        // The chain resets: the next masked step goes full.
+        self.mask_link.send.clear();
         // Best-effort ack, bounded: a silent downstream must not wedge the abort path.
         let ack = self
             .block_on(send_abort_frame(&downstream, RESTORE_ACK_TIMEOUT))
@@ -7014,6 +7203,7 @@ impl Builder for OvRuntimeBuilder {
             inbound_seq: None,
             consecutive_token_timeouts: 0,
             mask_link: MaskLink::default(),
+            mask_recv: MaskRecvCache::default(),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
@@ -10502,5 +10692,648 @@ mod tests {
         let mut slots = vec![Some(packed_slot(Some(test_mask(OK_ENUM, ""))))];
         let (out, shape) = rows(&[bad_then(w, b'"')]);
         assert!(pick_packed_rows(&out, &shape, &[(3, 0)], &mut slots).is_err());
+    }
+
+    // ---- repeated masks on the stage wire ----
+
+    /// A different mask of the same width as [`ok_enum_words`].
+    fn other_words() -> Vec<u32> {
+        vec![u32::MAX; ok_enum_words().len()]
+    }
+
+    /// The repeat lead's exact bytes: today's lead lanes, then the tagged `W`
+    /// lane with `W` = `REPEAT`, and nothing after it.
+    fn repeat_lead_bytes(seq: u32, position: Option<i64>) -> Vec<u8> {
+        let mut want = encode_wire_lead(seq, position).data;
+        let base = want.len() / 8;
+        want.extend_from_slice(&mask_count_lane(base, REPEAT as usize).to_le_bytes());
+        want
+    }
+
+    /// The tail's step as `step_last` runs it: decode the pair against the
+    /// link's receive cache, answer a miss with the mask-miss token, else pick
+    /// under the mask.
+    async fn tail_step(
+        up: &Arc<tokio::sync::Mutex<ActivationServer>>,
+        recv: &mut MaskRecvCache,
+        logits: &(Vec<f32>, Vec<usize>),
+    ) -> (u32, Option<Result<Vec<u32>, MaskMiss>>) {
+        let (lead, hid) = recv_hidden_frames(up, false).await.unwrap();
+        let step = decode_upstream_step(&lead, &hid.unwrap(), false, recv).unwrap();
+        let frame = match &step.mask {
+            Some(Err(MaskMiss)) => upstream_reply_frames(
+                &mut MaskLink::default(),
+                &Ok(MASK_MISS_TOKEN),
+                step.seq,
+                true,
+                true,
+            )[0]
+            .clone(),
+            mask => {
+                let words = mask.as_ref().map(|m| m.as_ref().unwrap().as_slice());
+                let pick = tail_pick(&logits.0, &logits.1, words);
+                relay_reply_frame(&pick, step.seq, words.is_some())
+            }
+        };
+        up.lock().await.send(&frame).await.unwrap();
+        (step.seq, step.mask)
+    }
+
+    /// A repeated mask goes as the short marker: a lead of today's lanes plus
+    /// the `W` lane, no mask words, whatever the vocab. The tail resolves it
+    /// to the same mask and picks the same token as with the full mask.
+    #[tokio::test]
+    async fn a_repeated_mask_goes_as_a_short_marker_and_the_tail_picks_the_same_token() {
+        let words = ok_enum_words();
+        let w = test_factory().mask_width();
+        let (out, shape) = rows(&[bad_then(w, b'"')]);
+        for want_pos in [false, true] {
+            let pos = want_pos.then_some(4);
+            let base = if want_pos { 2u32 } else { 1 };
+            let (client, server) = loopback().await;
+            let downstream = Arc::new(tokio::sync::Mutex::new(client));
+            let upstream = Arc::new(tokio::sync::Mutex::new(server));
+            let mut send = MaskSendCache::default();
+            let mut recv = MaskRecvCache::default();
+            for seq in 1..=3u32 {
+                send_hidden_frames_cached(
+                    &downstream,
+                    seq,
+                    pos,
+                    Some(&words),
+                    &mut send,
+                    f16_hidden(seq as u8),
+                )
+                .await
+                .unwrap();
+                let (lead, hid) = recv_hidden_frames(&upstream, want_pos).await.unwrap();
+                if seq == 1 {
+                    assert_eq!(
+                        lead.shape,
+                        [1, 1, base + 1 + words.len().div_ceil(2) as u32],
+                        "the first step goes full"
+                    );
+                } else {
+                    assert_eq!(lead.dtype, WireDType::I64);
+                    assert_eq!(lead.shape, [1, 1, base + 1]);
+                    assert_eq!(lead.data, repeat_lead_bytes(seq, pos));
+                    assert_eq!(lead.data.len(), (base as usize + 1) * 8, "no mask words");
+                }
+                let step = decode_upstream_step(&lead, &hid.unwrap(), want_pos, &mut recv).unwrap();
+                assert_eq!((step.seq, step.position), (seq, pos));
+                let mask = step.mask.unwrap().unwrap();
+                assert_eq!(mask, words);
+                assert_eq!(tail_pick(&out, &shape, Some(&mask)).unwrap(), b'"' as i32);
+            }
+        }
+    }
+
+    /// The first masked step and every changed mask go full; a plain step in
+    /// between keeps today's lead and doesn't reset the link.
+    #[tokio::test]
+    async fn the_first_mask_and_every_changed_mask_go_full() {
+        let (a, b) = (ok_enum_words(), other_words());
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let mut send = MaskSendCache::default();
+        let mut recv = MaskRecvCache::default();
+        let steps: [(Option<&[u32]>, bool); 6] = [
+            (Some(&a), false),
+            (Some(&a), true),
+            (None, false),
+            (Some(&a), true),
+            (Some(&b), false),
+            (Some(&a), false),
+        ];
+        for (i, (mask, repeat)) in steps.into_iter().enumerate() {
+            let seq = i as u32 + 1;
+            send_hidden_frames_cached(&downstream, seq, None, mask, &mut send, f16_hidden(1))
+                .await
+                .unwrap();
+            let (lead, hid) = recv_hidden_frames(&upstream, false).await.unwrap();
+            match mask {
+                None => assert_eq!(lead, encode_wire_lead(seq, None), "plain lead unchanged"),
+                Some(_) if repeat => assert_eq!(lead.data, repeat_lead_bytes(seq, None)),
+                Some(words) => assert_eq!(lead, encode_wire_lead_masked(seq, None, words)),
+            }
+            let step = decode_upstream_step(&lead, &hid.unwrap(), false, &mut recv).unwrap();
+            assert_eq!(step.mask.map(Result::unwrap).as_deref(), mask, "step {seq}");
+        }
+    }
+
+    /// A repeat marker on a fresh receiver (nothing committed) is a miss: the
+    /// tail runs no layer and answers the acknowledged mask-miss token. The
+    /// head fails the task with the retry message, clears its send cache, and
+    /// neither latches nor counts the link as acknowledged; the next masked
+    /// step goes full.
+    #[tokio::test]
+    async fn a_repeat_on_a_fresh_receiver_fails_the_task_without_latching() {
+        let words = ok_enum_words();
+        let w = test_factory().mask_width();
+        let logits = rows(&[bad_then(w, b'"')]);
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let mut link = MaskLink::default();
+        // The head believes the tail holds `words`; the tail is fresh.
+        link.send.record(0, &words);
+        let mut recv = MaskRecvCache::default();
+        let mut streak = 0;
+        let (head, tail) = tokio::join!(
+            masked_exchange(
+                &downstream,
+                1,
+                None,
+                &words,
+                f16_hidden(1),
+                decode_budget(),
+                &mut streak,
+                &mut link,
+            ),
+            tail_step(&upstream, &mut recv, &logits)
+        );
+        assert_eq!(tail, (1, Some(Err(MaskMiss))));
+        let err = head.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("backend error: {MASK_MISS_MESSAGE}")
+        );
+        assert!(!err.is_connection_fatal(), "{err}");
+        assert!(!link.acked, "a miss never vouches for the link");
+        assert!(
+            link.refusal(std::time::Instant::now()).is_none(),
+            "no latch"
+        );
+        assert!(link.send.is_empty(), "the head forgets the mask");
+
+        // The miss reply's exact bytes: [-2, seq, ACK].
+        let miss = upstream_reply_frames(
+            &mut MaskLink::default(),
+            &Ok(MASK_MISS_TOKEN),
+            9,
+            true,
+            true,
+        );
+        assert_eq!(miss, vec![encode_token_reply(MASK_MISS_TOKEN, 9, true)]);
+        let lanes: Vec<i32> = miss[0]
+            .data
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(lanes, vec![-2, 9, MASK_ACK]);
+
+        // The next task's first masked step goes full, and the tail answers it.
+        let (head, tail) = tokio::join!(
+            masked_exchange(
+                &downstream,
+                2,
+                None,
+                &words,
+                f16_hidden(2),
+                decode_budget(),
+                &mut streak,
+                &mut link,
+            ),
+            tail_step(&upstream, &mut recv, &logits)
+        );
+        assert_eq!(tail, (2, Some(Ok(words.clone()))));
+        assert_eq!(head.unwrap(), b'"' as i32);
+        assert!(link.acked);
+    }
+
+    /// The middle's step exactly as `step_middle` runs it on the cached wire:
+    /// decode against its receive cache (a miss answers the mask-miss token
+    /// up without running anything), forward with its own send cache, and
+    /// relay the reply (a miss from below goes up as the mask-miss token).
+    /// `fail_own_step` fails the middle's own work before it forwards.
+    async fn cached_middle_step(
+        mid_up: &Arc<tokio::sync::Mutex<ActivationServer>>,
+        mid_down: &Arc<tokio::sync::Mutex<ActivationClient>>,
+        seq_down: u32,
+        recv: &mut MaskRecvCache,
+        link: &mut MaskLink,
+        fail_own_step: bool,
+    ) {
+        let (lead, hid) = recv_hidden_frames(mid_up, false).await.unwrap();
+        let step = decode_upstream_step(&lead, &hid.unwrap(), false, recv).unwrap();
+        let (outcome, masked, vouch) = match step.mask {
+            Some(Err(MaskMiss)) => (Ok(MASK_MISS_TOKEN), true, true),
+            _ if fail_own_step => {
+                let masked = step.mask.is_some();
+                let (s, v) = own_failure_answer(EngineError::Backend("own".into()), link.acked);
+                (s, masked, v)
+            }
+            mask => {
+                let words = mask.map(Result::unwrap);
+                let masked = words.is_some();
+                send_hidden_frames_cached(
+                    mid_down,
+                    seq_down,
+                    None,
+                    words.as_deref(),
+                    &mut link.send,
+                    f16_hidden(1),
+                )
+                .await
+                .unwrap();
+                let mut streak = 0;
+                let reply = wait_token_reply(
+                    mid_down,
+                    seq_down,
+                    decode_budget(),
+                    masked,
+                    &mut streak,
+                    link,
+                )
+                .await;
+                let (s, v) = relay_token_answer(reply, masked);
+                (s, masked, v)
+            }
+        };
+        let frames = upstream_reply_frames(link, &outcome, step.seq, masked, vouch);
+        let mut g = mid_up.lock().await;
+        for f in &frames {
+            g.send(f).await.unwrap();
+        }
+    }
+
+    type Pipe = (
+        Arc<tokio::sync::Mutex<ActivationClient>>,
+        Arc<tokio::sync::Mutex<ActivationServer>>,
+        Arc<tokio::sync::Mutex<ActivationClient>>,
+        Arc<tokio::sync::Mutex<ActivationServer>>,
+    );
+
+    async fn three_stage_pipe() -> Pipe {
+        let (head_c, mid_s) = loopback().await;
+        let (mid_c, tail_s) = loopback().await;
+        (
+            Arc::new(tokio::sync::Mutex::new(head_c)),
+            Arc::new(tokio::sync::Mutex::new(mid_s)),
+            Arc::new(tokio::sync::Mutex::new(mid_c)),
+            Arc::new(tokio::sync::Mutex::new(tail_s)),
+        )
+    }
+
+    /// Head → middle → tail, miss at the tail: the middle repeats a mask the
+    /// tail no longer holds, the tail answers the mask-miss token, the middle
+    /// passes it up unchanged (acknowledged, not turned into a NACK), and the
+    /// head fails the task without latching or counting the link as
+    /// acknowledged.
+    #[tokio::test]
+    async fn a_miss_at_the_tail_reaches_the_head_through_a_middle() {
+        let words = ok_enum_words();
+        let w = test_factory().mask_width();
+        let logits = rows(&[bad_then(w, b'"')]);
+        let (head_down, mid_up, mid_down, tail_up) = three_stage_pipe().await;
+        let mut head_link = MaskLink::default();
+        let mut mid_link = MaskLink::default();
+        let mut mid_recv = MaskRecvCache::default();
+        let mut tail_recv = MaskRecvCache::default();
+        // The middle believes the tail holds `words`; the tail is fresh.
+        mid_link.send.record(0, &words);
+        let mut streak = 0;
+        let (head, (), tail) = tokio::join!(
+            masked_exchange(
+                &head_down,
+                1,
+                None,
+                &words,
+                f16_hidden(1),
+                decode_budget(),
+                &mut streak,
+                &mut head_link,
+            ),
+            cached_middle_step(&mid_up, &mid_down, 11, &mut mid_recv, &mut mid_link, false),
+            tail_step(&tail_up, &mut tail_recv, &logits)
+        );
+        assert_eq!(tail, (11, Some(Err(MaskMiss))));
+        let err = head.unwrap_err();
+        assert!(err.to_string().contains(MASK_MISS_MESSAGE), "{err}");
+        assert!(!head_link.acked, "the head never calls on_acked on a miss");
+        assert!(head_link.refusal(std::time::Instant::now()).is_none());
+        assert!(
+            mid_link.send.is_empty(),
+            "the middle forgets its downstream mask"
+        );
+        assert!(mid_link.refusal(std::time::Instant::now()).is_none());
+
+        // The next step goes full on both hops and succeeds.
+        let (head, (), tail) = tokio::join!(
+            masked_exchange(
+                &head_down,
+                2,
+                None,
+                &words,
+                f16_hidden(2),
+                decode_budget(),
+                &mut streak,
+                &mut head_link,
+            ),
+            cached_middle_step(&mid_up, &mid_down, 12, &mut mid_recv, &mut mid_link, false),
+            tail_step(&tail_up, &mut tail_recv, &logits)
+        );
+        assert_eq!(tail, (12, Some(Ok(words.clone()))));
+        assert_eq!(head.unwrap(), b'"' as i32);
+        assert!(head_link.acked);
+    }
+
+    /// A middle resolves the upstream's marker from its own receive cache and
+    /// re-encodes for its downstream with its own send cache. When it fails a
+    /// step it decoded without forwarding it, its downstream still holds the
+    /// older mask, so the upstream's next marker goes downstream full.
+    #[tokio::test]
+    async fn a_middle_re_encodes_and_a_step_it_did_not_forward_goes_down_full() {
+        let (a, b) = (ok_enum_words(), other_words());
+        let (head_down, mid_up, mid_down, tail_up) = three_stage_pipe().await;
+        let mut head_send = MaskSendCache::default();
+        let mut mid_link = MaskLink::default();
+        let mut mid_recv = MaskRecvCache::default();
+        let mut tail_recv = MaskRecvCache::default();
+        let mut tail_leads = Vec::new();
+        // (mask the head sends, whether the middle fails its own step)
+        let steps: [(&[u32], bool); 4] = [(&a, false), (&a, false), (&b, true), (&b, false)];
+        for (i, (words, fail)) in steps.into_iter().enumerate() {
+            let seq = i as u32 + 1;
+            send_hidden_frames_cached(
+                &head_down,
+                seq,
+                None,
+                Some(words),
+                &mut head_send,
+                f16_hidden(1),
+            )
+            .await
+            .unwrap();
+            let tail = async {
+                if fail {
+                    return;
+                }
+                let (lead, hid) = recv_hidden_frames(&tail_up, false).await.unwrap();
+                tail_leads.push(lead.clone());
+                let step =
+                    decode_upstream_step(&lead, &hid.unwrap(), false, &mut tail_recv).unwrap();
+                assert_eq!(step.mask.unwrap().unwrap(), words);
+                let frame = relay_reply_frame(&Ok(b'"' as i32), step.seq, true);
+                tail_up.lock().await.send(&frame).await.unwrap();
+            };
+            let ((), ()) = tokio::join!(
+                cached_middle_step(
+                    &mid_up,
+                    &mid_down,
+                    10 + seq,
+                    &mut mid_recv,
+                    &mut mid_link,
+                    fail
+                ),
+                tail
+            );
+            let reply = recv_token_reply(&head_down, seq, decode_budget(), true, &mut false).await;
+            if fail {
+                assert!(reply.is_err());
+                // A failed step on the head's link clears its send cache.
+                head_send.clear();
+            } else {
+                assert_eq!(reply.unwrap(), b'"' as i32);
+            }
+        }
+        assert_eq!(tail_leads.len(), 3);
+        assert_eq!(tail_leads[0], encode_wire_lead_masked(11, None, &a));
+        assert_eq!(
+            tail_leads[1].data,
+            repeat_lead_bytes(12, None),
+            "middle re-encodes as a marker"
+        );
+        assert_eq!(
+            tail_leads[2],
+            encode_wire_lead_masked(14, None, &b),
+            "the tail never saw b: it goes full"
+        );
+    }
+
+    /// The same, with the head keeping its cache across the middle's failure
+    /// (the middle answered, so the head's frames were all decoded): the
+    /// head's next frame is a marker, and the middle still sends full.
+    #[tokio::test]
+    async fn a_marker_from_upstream_goes_down_full_after_the_middle_dropped_a_step() {
+        let (a, b) = (ok_enum_words(), other_words());
+        let (head_down, mid_up, mid_down, tail_up) = three_stage_pipe().await;
+        let mut head_send = MaskSendCache::default();
+        let mut mid_link = MaskLink::default();
+        let mut mid_recv = MaskRecvCache::default();
+        let mut tail_recv = MaskRecvCache::default();
+        // a (ok), b (middle fails), b again as a marker from the head.
+        head_send.record(0, &a);
+        mid_recv.commit(&a);
+        mid_link.send.record(0, &a);
+        tail_recv.commit(&a);
+        send_hidden_frames_cached(&head_down, 1, None, Some(&b), &mut head_send, f16_hidden(1))
+            .await
+            .unwrap();
+        cached_middle_step(&mid_up, &mid_down, 11, &mut mid_recv, &mut mid_link, true).await;
+        assert!(
+            recv_token_reply(&head_down, 1, decode_budget(), true, &mut false)
+                .await
+                .is_err()
+        );
+        send_hidden_frames_cached(&head_down, 2, None, Some(&b), &mut head_send, f16_hidden(1))
+            .await
+            .unwrap();
+        let tail = async {
+            let (lead, hid) = recv_hidden_frames(&tail_up, false).await.unwrap();
+            let step = decode_upstream_step(&lead, &hid.unwrap(), false, &mut tail_recv).unwrap();
+            let frame = relay_reply_frame(&Ok(1), step.seq, true);
+            tail_up.lock().await.send(&frame).await.unwrap();
+            (lead, step.mask)
+        };
+        let ((), (lead, mask)) = tokio::join!(
+            cached_middle_step(&mid_up, &mid_down, 12, &mut mid_recv, &mut mid_link, false),
+            tail
+        );
+        assert_eq!(lead, encode_wire_lead_masked(12, None, &b));
+        assert_eq!(mask, Some(Ok(b.clone())));
+        assert_eq!(
+            recv_token_reply(&head_down, 2, decode_budget(), true, &mut false)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// Every failed step on a link clears its send cache: a plain NACK, an
+    /// acknowledged NACK, a timeout, a write error. A good reply keeps it.
+    #[tokio::test]
+    // The timeout knob is process-global: hold its lock for the whole wait.
+    #[allow(clippy::await_holding_lock)]
+    async fn the_sender_forgets_the_mask_on_every_failed_step() {
+        let words = ok_enum_words();
+        let replies = [
+            (encode_token_with_seq(NACK_TOKEN, 5), false, false),
+            (encode_token_reply(NACK_TOKEN, 5, true), true, false),
+            (encode_token_reply(7, 5, true), true, true),
+            (encode_token_with_seq(7, 5), false, true),
+        ];
+        for (reply, masked, kept) in replies {
+            let (client, mut server) = loopback().await;
+            server.send(&reply).await.unwrap();
+            let downstream = Arc::new(tokio::sync::Mutex::new(client));
+            let mut link = MaskLink::default();
+            link.send.record(0, &words);
+            let mut streak = 0;
+            let got = wait_token_reply(
+                &downstream,
+                5,
+                decode_budget(),
+                masked,
+                &mut streak,
+                &mut link,
+            )
+            .await;
+            assert_eq!(got.is_ok(), kept, "{got:?}");
+            assert_eq!(!link.send.is_empty(), kept, "{reply:?}");
+        }
+
+        // Silence on a plain step.
+        let (client, _server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut link = MaskLink::default();
+        link.send.record(0, &words);
+        {
+            let _knob = crate::timeout_knob_lock();
+            cascadia_transport::set_activation_timeout_secs(1);
+            let mut streak = 0;
+            let got = wait_token_reply(
+                &downstream,
+                5,
+                decode_budget(),
+                false,
+                &mut streak,
+                &mut link,
+            )
+            .await;
+            cascadia_transport::set_activation_timeout_secs(0);
+            assert!(matches!(got, Err(TokenWaitFailure::TimedOut(_))), "{got:?}");
+        }
+        assert!(link.send.is_empty(), "a timed-out plain step clears it");
+
+        // A write error.
+        let (mut client, server) = loopback().await;
+        drop(server);
+        client.close().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut send = MaskSendCache::default();
+        send.record(0, &words);
+        assert!(send_hidden_frames_cached(
+            &downstream,
+            1,
+            None,
+            Some(&words),
+            &mut send,
+            f16_hidden(1)
+        )
+        .await
+        .is_err());
+        assert!(send.is_empty(), "a failed write clears it");
+    }
+
+    /// A stage that predates the marker reads a repeat lead and its hidden,
+    /// rejects the lead (today's decoder, the same as a full masked lead), and
+    /// stays aligned: the same latch path as a full mask.
+    #[tokio::test]
+    async fn an_old_stage_rejects_a_repeat_lead_after_reading_both_frames() {
+        let words = ok_enum_words();
+        for want_pos in [false, true] {
+            let pos = want_pos.then_some(4);
+            let (client, server) = loopback().await;
+            let downstream = Arc::new(tokio::sync::Mutex::new(client));
+            let upstream = Arc::new(tokio::sync::Mutex::new(server));
+            let mut send = MaskSendCache::default();
+            send.record(0, &words);
+            send_hidden_frames_cached(&downstream, 1, pos, Some(&words), &mut send, f16_hidden(1))
+                .await
+                .unwrap();
+            send_hidden_frames_cached(&downstream, 2, pos, None, &mut send, f16_hidden(2))
+                .await
+                .unwrap();
+            let (lead, hid) = recv_hidden_frames(&upstream, want_pos).await.unwrap();
+            assert_eq!(lead.data, repeat_lead_bytes(1, pos));
+            assert!(hid.is_some(), "both frames of the marker step are consumed");
+            assert!(decode_wire_lead(&lead, want_pos).is_err());
+            let (lead, hid) = recv_hidden_frames(&upstream, want_pos).await.unwrap();
+            assert_eq!(decode_wire_lead(&lead, want_pos).unwrap(), (2, pos));
+            assert_eq!(hid.unwrap(), f16_hidden(2), "the stream stayed aligned");
+        }
+    }
+
+    /// A malformed masked lead, or a masked lead whose hidden has the wrong
+    /// dtype, fails to decode and clears the receive cache: a marker after it
+    /// misses. A marker with mask words after it is malformed.
+    #[test]
+    fn a_masked_decode_error_clears_the_receive_cache() {
+        let words = ok_enum_words();
+        let mut recv = MaskRecvCache::default();
+        recv.commit(&words);
+        let mut bad = encode_wire_lead(1, None);
+        bad.data
+            .extend_from_slice(&mask_count_lane(1, REPEAT as usize).to_le_bytes());
+        push_mask_lanes(&mut bad.data, &words);
+        bad.shape[2] = (bad.data.len() / 8) as u32;
+        assert!(decode_upstream_step(&bad, &f16_hidden(1), false, &mut recv).is_err());
+        let repeat = encode_wire_lead_repeat(2, None);
+        let step = decode_upstream_step(&repeat, &f16_hidden(1), false, &mut recv).unwrap();
+        assert_eq!(step.mask, Some(Err(MaskMiss)));
+
+        let full = encode_wire_lead_masked(3, None, &words);
+        let i8_hidden = WireTensor::new(WireDType::I8, [1, 1, 2], vec![0, 0]);
+        assert!(decode_upstream_step(&full, &i8_hidden, false, &mut recv).is_err());
+        let step = decode_upstream_step(&repeat, &f16_hidden(1), false, &mut recv).unwrap();
+        assert_eq!(
+            step.mask,
+            Some(Err(MaskMiss)),
+            "not committed before the hidden decoded"
+        );
+    }
+
+    /// A late acknowledged reply — the mask-miss token included — echoing an
+    /// older seq is discarded as stale, and the wait returns its own token.
+    #[tokio::test]
+    async fn a_late_mask_miss_reply_is_discarded_as_stale() {
+        let (client, mut server) = loopback().await;
+        server
+            .send(&encode_token_reply(MASK_MISS_TOKEN, 4, true))
+            .await
+            .unwrap();
+        server.send(&encode_token_reply(9, 5, true)).await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut stale_ack = false;
+        let got = recv_token_reply(&downstream, 5, decode_budget(), true, &mut stale_ack).await;
+        assert_eq!(got.unwrap(), 9);
+        assert!(stale_ack);
+        // A mask-miss token on a plain step is a desync, not a token.
+        let (client, mut server) = loopback().await;
+        server
+            .send(&encode_token_reply(MASK_MISS_TOKEN, 6, true))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let got = recv_token_reply(&downstream, 6, decode_budget(), false, &mut false).await;
+        assert!(matches!(got, Err(TokenWaitFailure::Other(_))), "{got:?}");
+    }
+
+    /// Packed plans carry full masks every step: the same masks twice encode
+    /// to the same full frame.
+    #[test]
+    fn packed_plans_never_carry_the_marker() {
+        let words = ok_enum_words();
+        let plan: PlanRows = vec![Some((0, 3, 0))];
+        let masks: PlanMasks = vec![Some(words.clone())];
+        let one = encode_packed_plan(&plan, Some(&masks));
+        let two = encode_packed_plan(&plan, Some(&masks));
+        assert_eq!(one, two);
+        assert!(one.data.len() > words.len() * 4, "the words travel in full");
+        let (_, decoded) = decode_packed_plan(&one, 1).unwrap();
+        let got = decoded.unwrap()[0].clone().unwrap();
+        assert_eq!(&got[..words.len()], words.as_slice());
     }
 }
