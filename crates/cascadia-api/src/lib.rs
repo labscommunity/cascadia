@@ -4178,6 +4178,11 @@ fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
 struct FoldedTurns {
     messages: Vec<ChatMessage>,
     media: Option<Vec<ChatMessage>>,
+    /// The prompt the probe rendered, and whether the API rendered it for
+    /// a deferring engine (`api_rendered`), where that is the prompt admit
+    /// serves (`templated_here`), so it is not rendered twice; `None` where
+    /// the engine renders, and the API's prompt is its own fallback render.
+    prompt: Option<(String, bool)>,
 }
 
 /// `messages` with their system turns folded into user turns, when the chat
@@ -4205,6 +4210,7 @@ fn fold_refused_system_turns(
     messages: &[ChatMessage],
     media: Option<&[ChatMessage]>,
     rendered: &Result<(String, bool), PromptRenderError>,
+    must_render: bool,
     enable_thinking: bool,
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
@@ -4257,16 +4263,23 @@ fn fold_refused_system_turns(
     let folds = [Fold::Later, Fold::All]
         .into_iter()
         .filter(|f| later || *f == Fold::All);
+    // Where the API renders, the probe is admit's own render: the template
+    // with the same inputs, rendered for the deferring engine (`true`) on its
+    // thinking path.
+    let api_rendered =
+        media.is_none() && state.defer_template_on_thinking && enable_thinking && must_render;
     for fold in folds {
-        let folded = FoldedTurns {
-            messages: fold_system_turns(messages.to_vec(), fold),
-            media: media.map(|m| fold_system_turns(m.to_vec(), fold)),
-        };
-        if probe(&folded.messages, folded.media.as_deref()).is_ok() {
+        let messages = fold_system_turns(messages.to_vec(), fold);
+        let media = media.map(|m| fold_system_turns(m.to_vec(), fold));
+        if let Ok(prompt) = probe(&messages, media.as_deref()) {
             info!(
                 "the chat template refuses system turns where they stand; folded them into user turns"
             );
-            return Some(folded);
+            return Some(FoldedTurns {
+                messages,
+                media,
+                prompt: templated_here.then_some((prompt, api_rendered)),
+            });
         }
     }
     None
@@ -4449,11 +4462,15 @@ async fn admit_chat(
             &req.messages,
             media.as_ref().map(|m| &m.messages[..]),
             &rendered,
+            must_render,
             enable_thinking,
             effort,
             req.tools.as_deref(),
         ) {
-            rendered = render(&f.messages, f.media.as_deref());
+            rendered = match f.prompt {
+                Some(p) => Ok(p),
+                None => render(&f.messages, f.media.as_deref()),
+            };
             if let (Some(m), Some(fm)) = (media.as_mut(), f.media) {
                 m.messages = fm;
             }
