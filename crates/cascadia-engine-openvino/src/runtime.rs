@@ -1178,9 +1178,54 @@ fn relay_reply_frame(step: &EngineResult<i32>, seq: u32, acked: bool) -> WireTen
 fn masked_relay_answer<T>(downstream: Result<T, TokenWaitFailure>) -> (EngineResult<T>, bool) {
     match downstream {
         Ok(t) => (Ok(t), true),
-        Err(TokenWaitFailure::AckedNack(e) | TokenWaitFailure::Other(e)) => (Err(e), true),
-        Err(TokenWaitFailure::NoAck(e) | TokenWaitFailure::TimedOut(e)) => (Err(e), false),
+        // An acknowledged NACK: the stage below is new and refused the step itself.
+        Err(TokenWaitFailure::AckedNack(e)) => (Err(e), true),
+        // Anything else from below — no acknowledgement, silence, a dead or
+        // desynced link — proves nothing about the stages below, so it goes up
+        // unacknowledged.
+        Err(
+            TokenWaitFailure::NoAck(e) | TokenWaitFailure::TimedOut(e) | TokenWaitFailure::Other(e),
+        ) => (Err(e), false),
     }
+}
+
+/// A relay stage's answer from its downstream's reply: a plain step passes the
+/// outcome up as today (the acknowledgement flag is unused); a masked step
+/// goes through [`masked_relay_answer`].
+fn relay_downstream_answer<T>(
+    reply: Result<T, TokenWaitFailure>,
+    masked: bool,
+) -> (EngineResult<T>, bool) {
+    if masked {
+        masked_relay_answer(reply)
+    } else {
+        (reply.map_err(TokenWaitFailure::into_error), true)
+    }
+}
+
+/// The frames a relay stage sends upstream for one step: the reply
+/// ([`relay_reply_frame`], acknowledged on a masked step it vouches for),
+/// preceded — on a middle that once answered a masked step unacknowledged and
+/// has since seen an acknowledged reply from below — by an acknowledged NACK
+/// for that old step's seq. The upstream discards that one as stale, which
+/// clears its latch (see [`MaskLink::on_acked`]).
+fn upstream_reply_frames(
+    link: &mut MaskLink,
+    step: &EngineResult<i32>,
+    seq: u32,
+    masked: bool,
+    vouch: bool,
+) -> Vec<WireTensor> {
+    let mut frames = Vec::with_capacity(2);
+    if let Some(old) = link.take_late_ack_evidence() {
+        frames.push(encode_token_reply(NACK_TOKEN, old, true));
+    }
+    let acked = masked && vouch;
+    if masked && !acked {
+        link.owe_late_ack(seq);
+    }
+    frames.push(relay_reply_frame(step, seq, acked));
+    frames
 }
 
 /// Per plan row: the token mask of that row's pick, `None` for an unmasked
@@ -1387,9 +1432,32 @@ struct MaskLink {
     acked: bool,
     /// When the link last failed a masked step.
     latched_at: Option<std::time::Instant>,
+    /// Middles: the upstream seq of the last masked step this stage answered
+    /// unacknowledged. Once a stage below acknowledges anything after it, the
+    /// upstream is told (see [`upstream_reply_frames`]).
+    owed_late_ack: Option<u32>,
+    /// An acknowledged reply from below arrived since `owed_late_ack` was set.
+    acked_since_owed: bool,
 }
 
 impl MaskLink {
+    /// Middles: this stage just answered the masked step `seq` without an
+    /// acknowledgement.
+    fn owe_late_ack(&mut self, seq: u32) {
+        self.owed_late_ack = Some(seq);
+        self.acked_since_owed = false;
+    }
+
+    /// The old seq to acknowledge upstream, once a stage below has proved it
+    /// masks after this stage answered a masked step unacknowledged.
+    fn take_late_ack_evidence(&mut self) -> Option<u32> {
+        if !self.acked_since_owed {
+            return None;
+        }
+        self.acked_since_owed = false;
+        self.owed_late_ack.take()
+    }
+
     /// The error a structured-output task gets now, while latched.
     fn refusal(&self, now: std::time::Instant) -> Option<EngineError> {
         self.latched_at
@@ -1403,6 +1471,7 @@ impl MaskLink {
             info!("structured output: a later stage acknowledged a masked step; link unlatched");
         }
         self.acked = true;
+        self.acked_since_owed = true;
     }
 
     /// A masked step got no acknowledged reply. Latches the link and returns
@@ -1557,6 +1626,19 @@ async fn recv_control_ack(
     }
 }
 
+/// Send `ABORT` downstream (reset cold, clear any armed warm resume) and read
+/// its ack within `budget` through [`recv_control_ack`].
+#[cfg(feature = "kv_coord")]
+async fn send_abort_frame(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    budget: Duration,
+) -> Result<(EngineResult<WireTensor>, bool), cascadia_transport::TransportError> {
+    let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_ABORT]);
+    let mut g = downstream.lock().await;
+    g.send(&t).await?;
+    Ok(recv_control_ack(&mut g, budget, "ABORT").await)
+}
+
 /// Hard ceiling on the active token-response wait, independent of the body
 /// `recv_timeout()`. `recv_timeout` is operator-tunable for slow stages, and
 /// letting it govern the token wait would re-couple the engine-lock hold to it —
@@ -1602,24 +1684,169 @@ fn token_recv_deadline(recv_timeout: std::time::Duration, prefill: bool) -> std:
         .min(TOKEN_RECV_DEADLINE_CEILING.saturating_mul(factor))
 }
 
-/// A middle stage's wait on a masked step: its share of the `budget` its
-/// upstream waits, in proportion to the layers still below it
-/// (`total_layers - layer_end`). Each stage down the chain waits strictly
-/// less than the one above it, so when the tail never answers (a build that
-/// can't mask), the deepest middle times out first and its plain NACK reaches
-/// the head before the head's own deadline, instead of being left on the link
-/// as a late reply.
+/// A middle stage's wait on a masked step, out of the `budget` its upstream
+/// waits: `budget · (total + below + 1) / (2·total + 1)` with `below =
+/// total_layers - layer_end` layers still below it. Strictly less than the
+/// upstream's budget and falling with every stage down the chain, so when the
+/// tail never answers (a build that can't mask) the deepest middle times out
+/// first and its plain NACK reaches the head inside the head's own deadline,
+/// instead of being left on the link as a late reply. Never below about half
+/// the budget, so a fully upgraded pipeline's tail (lm_head, a long prefill)
+/// keeps most of its time. Without layer geometry the stage's first layer
+/// orders the chain instead: `budget · 64 / (64 + layer_start)`.
 fn masked_relay_budget(
     budget: std::time::Duration,
+    layer_start: u32,
     layer_end: u32,
     total_layers: u32,
 ) -> std::time::Duration {
-    let below = total_layers.saturating_sub(layer_end);
-    if total_layers == 0 || below >= total_layers {
-        // No layer geometry: half the upstream's budget still lands first.
-        return budget / 2;
+    if total_layers > 0 && (1..=total_layers).contains(&layer_end) {
+        let total = total_layers as f64;
+        let below = (total_layers - layer_end) as f64;
+        return budget.mul_f64((total + below + 1.0) / (2.0 * total + 1.0));
     }
-    budget.mul_f64(below as f64 / total_layers as f64)
+    budget.mul_f64(64.0 / (64.0 + layer_start.max(1) as f64))
+}
+
+/// The budget of one downstream token wait: [`token_recv_deadline`], or a
+/// middle stage's share of it on a masked step ([`masked_relay_budget`]).
+fn token_wait_budget(
+    recv_timeout: std::time::Duration,
+    prefill: bool,
+    masked: bool,
+    spec: &ShardSpec,
+) -> std::time::Duration {
+    let budget = token_recv_deadline(recv_timeout, prefill);
+    if masked && !spec.is_first_stage {
+        masked_relay_budget(budget, spec.layer_start, spec.layer_end, spec.total_layers)
+    } else {
+        budget
+    }
+}
+
+/// One downstream token wait with its bookkeeping: an acknowledged reply
+/// discarded as stale proves the chain below masks ([`MaskLink::on_acked`]),
+/// and only silence moves the escalation `streak` (see
+/// [`next_timeout_streak`]).
+async fn wait_token_reply(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    awaiting: u32,
+    budget: std::time::Duration,
+    masked: bool,
+    streak: &mut u32,
+    link: &mut MaskLink,
+) -> Result<i32, TokenWaitFailure> {
+    let mut stale_ack = false;
+    let outcome = recv_token_reply(downstream, awaiting, budget, masked, &mut stale_ack).await;
+    if stale_ack {
+        link.on_acked();
+    }
+    let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
+    *streak = next_timeout_streak(*streak, timed_out);
+    outcome
+}
+
+/// Head: one masked step — the activation with its mask, the bounded wait
+/// for the acknowledged reply, and the latch's verdict on it.
+#[allow(clippy::too_many_arguments)]
+async fn masked_exchange(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    seq: u32,
+    position: Option<i64>,
+    words: &[u32],
+    hid: WireTensor,
+    budget: std::time::Duration,
+    streak: &mut u32,
+    link: &mut MaskLink,
+) -> EngineResult<i32> {
+    send_hidden_frames(downstream, seq, position, Some(words), hid)
+        .await
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+    let reply = wait_token_reply(downstream, seq, budget, true, streak, link).await;
+    link.verdict(std::time::Instant::now(), reply)
+}
+
+/// Head: the token mask to send with a step whose last row is at
+/// `last_row_position`, or `None` when the step isn't masked (no grammar, or
+/// a prompt row before the last). Fails a structured-output task at once
+/// while the link is latched, and on a grammar dead end.
+fn step_mask_words(
+    active: Option<&mut ActiveTask>,
+    factory: &Result<GrammarFactory, String>,
+    link: &MaskLink,
+    last_row_position: i64,
+    now: std::time::Instant,
+) -> EngineResult<Option<Vec<u32>>> {
+    let Some(active) = active else {
+        return Ok(None);
+    };
+    let prompt_len = active.prompt_ids.len();
+    let Some(grammar) = active.grammar.as_mut() else {
+        return Ok(None);
+    };
+    if !row_picks_next_token(last_row_position, prompt_len) {
+        return Ok(None);
+    }
+    if let Some(refused) = link.refusal(now) {
+        return Err(refused);
+    }
+    let width = factory
+        .as_ref()
+        .map(GrammarFactory::mask_width)
+        .map_err(|reason| {
+            EngineError::Backend(format!(
+                "structured output is not available for this model: {reason}"
+            ))
+        })?;
+    grammar_mask_words(grammar, width).map(Some)
+}
+
+/// Whether the step just finished on a warm-resumed chain must ABORT it: the
+/// task's first masked step after RESTORE failed. Either outcome settles the
+/// task's warm state, so this answers `true` at most once per task.
+fn warm_abort_needed(active: Option<&mut ActiveTask>, ok: bool) -> bool {
+    active.is_some_and(|a| std::mem::take(&mut a.warm_unconfirmed)) && !ok
+}
+
+/// The token masks of one packed pipeline step over `slots`: one per sampled
+/// row of a grammar slot, `None` when no row is masked (today's plan frame).
+/// A grammar slot that can't be masked — the link is latched (`refused`), or
+/// its grammar hit a dead end — comes back with its error, for the caller to
+/// fail alone.
+fn packed_step_masks(
+    slots: &mut [Option<crate::packed_exec::PackedSlot>],
+    sampled: &[(usize, usize)],
+    rows: usize,
+    width: &Result<usize, String>,
+    refused: bool,
+) -> (Option<PlanMasks>, Vec<(usize, EngineError)>) {
+    let mut masks: PlanMasks = vec![None; rows];
+    let mut failed = Vec::new();
+    for &(row, slot) in sampled {
+        let Some(grammar) = slots
+            .get_mut(slot)
+            .and_then(|s| s.as_mut())
+            .and_then(|s| s.grammar.as_mut())
+        else {
+            continue;
+        };
+        let words = match width {
+            _ if refused => Err(EngineError::Backend(MASK_UPGRADE_ERROR.into())),
+            Err(reason) => Err(EngineError::Backend(format!(
+                "structured output is not available for this model: {reason}"
+            ))),
+            Ok(width) => grammar_mask_words(grammar, *width),
+        };
+        match words {
+            Ok(w) if row < rows => masks[row] = Some(w),
+            Ok(_) => failed.push((
+                slot,
+                EngineError::Backend(format!("packed row {row} is outside the plan")),
+            )),
+            Err(e) => failed.push((slot, e)),
+        }
+    }
+    (masks.iter().any(Option::is_some).then_some(masks), failed)
 }
 
 /// Consecutive token-wait timeouts after which a RELAY rank gives up on its
@@ -1803,6 +2030,15 @@ async fn recv_token_reply(
                 other => TokenWaitFailure::Other(EngineError::Backend(other.to_string())),
             }
         })?;
+        // A kv-coord control ack (I8) that arrived after its own read gave up
+        // is never this step's answer: skip it like a stale token.
+        if tensor.dtype == WireDType::I8 {
+            debug!(
+                len = tensor.data.len(),
+                "late control ack skipped in a token wait"
+            );
+            continue;
+        }
         let (token, echo_seq, acked) =
             decode_token_reply(&tensor).map_err(TokenWaitFailure::Other)?;
         if echo_seq != awaiting_seq {
@@ -2283,6 +2519,10 @@ struct ActiveTask {
     /// The grammar matcher of a structured-output task, advanced over every
     /// token in `generated`. `None` for every other task (unmasked path).
     grammar: Option<GrammarMask>,
+    /// The task warm-resumed a multi-stage chain (RESTORE) and no masked step
+    /// has confirmed the chain consumed that warm state yet. A failed masked
+    /// step then ABORTs the chain (see `settle_warm_resume`).
+    warm_unconfirmed: bool,
 }
 
 /// A queued task with its grammar compiled at submit.
@@ -2803,6 +3043,20 @@ impl OvRuntimeEngine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let (seq, pos, hid) = self.stamp_hidden(hidden, shape, position);
+        self.block_on(send_hidden_frames(&downstream, seq, pos, mask, hid))
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        debug!(position, "downstream send: done");
+        Ok(())
+    }
+
+    /// The next activation's seq, static position and hidden frame.
+    fn stamp_hidden(
+        &mut self,
+        hidden: &[f32],
+        shape: [usize; 3],
+        position: i64,
+    ) -> (u32, Option<i64>, WireTensor) {
         // Stamp the monotonic per-link seq this stage expects the downstream
         // neighbor to echo back on the token (so a late orphan is detectable).
         self.awaiting_token_seq = self.awaiting_token_seq.wrapping_add(1);
@@ -2821,10 +3075,7 @@ impl OvRuntimeEngine {
         // [seq] (stateful) or [seq, position] (static);
         // recv_hidden_from_upstream mirrors it.
         let pos = self.static_kv.is_some().then_some(position);
-        self.block_on(send_hidden_frames(&downstream, seq, pos, mask, hid))
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
-        debug!(position, "downstream send: done");
-        Ok(())
+        (seq, pos, hid)
     }
 
     /// `prefill` widens the wait: the reply is owed only after every remaining
@@ -2871,72 +3122,24 @@ impl OvRuntimeEngine {
         masked: bool,
     ) -> Result<i32, TokenWaitFailure> {
         let awaiting = self.awaiting_token_seq;
-        let mut stale_ack = false;
-        let mut budget = token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
-        if masked && !self.spec.is_first_stage {
-            budget = masked_relay_budget(budget, self.spec.layer_end, self.spec.total_layers);
-        }
-        let outcome = self.block_on(recv_token_reply(
-            downstream,
-            awaiting,
-            budget,
+        let budget = token_wait_budget(
+            cascadia_transport::recv_timeout(),
+            prefill,
             masked,
-            &mut stale_ack,
-        ));
-        if stale_ack {
-            self.mask_link.on_acked();
-        }
-        // Only SILENCE moves the escalation streak. A token, a downstream NACK
-        // and a malformed frame all reset it — see `next_timeout_streak`.
-        let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
-        self.consecutive_token_timeouts =
-            next_timeout_streak(self.consecutive_token_timeouts, timed_out);
-        outcome
-    }
-
-    /// The reply to a masked step this stage sent: acknowledged, or the
-    /// failure that says a later stage can't mask.
-    fn wait_masked_token(&mut self, prefill: bool) -> Result<i32, TokenWaitFailure> {
-        let downstream = self
-            .downstream
-            .clone()
-            .ok_or_else(|| TokenWaitFailure::Other(EngineError::Backend("no downstream".into())))?;
-        self.wait_token(&downstream, prefill, true)
-    }
-
-    /// Head: the token mask to send with a step whose last row is at
-    /// `last_row_position`, or `None` when the step isn't masked (no grammar,
-    /// or a prompt row before the last). Fails a structured-output task at
-    /// once while the link is latched, and on a grammar dead end.
-    fn step_mask_words(&mut self, last_row_position: i64) -> EngineResult<Option<Vec<u32>>> {
-        let Some(prompt_len) = self
-            .active
-            .as_ref()
-            .filter(|a| a.grammar.is_some())
-            .map(|a| a.prompt_ids.len())
-        else {
-            return Ok(None);
-        };
-        if !row_picks_next_token(last_row_position, prompt_len) {
-            return Ok(None);
-        }
-        if let Some(refused) = self.mask_link.refusal(std::time::Instant::now()) {
-            return Err(refused);
-        }
-        let width = self
-            .grammar_factory
-            .as_ref()
-            .map(GrammarFactory::mask_width)
-            .map_err(|reason| {
-                EngineError::Backend(format!(
-                    "structured output is not available for this model: {reason}"
-                ))
-            })?;
-        let grammar = self.active.as_mut().and_then(|a| a.grammar.as_mut());
-        match grammar {
-            Some(g) => grammar_mask_words(g, width).map(Some),
-            None => Ok(None),
-        }
+            &self.spec,
+        );
+        let handle = self.runtime_handle.clone();
+        crate::dist_spec::run_async_pub(
+            &handle,
+            wait_token_reply(
+                downstream,
+                awaiting,
+                budget,
+                masked,
+                &mut self.consecutive_token_timeouts,
+                &mut self.mask_link,
+            ),
+        )
     }
 
     /// Head, multi-stage: send one step's hidden rows downstream and take back
@@ -2951,13 +3154,65 @@ impl OvRuntimeEngine {
         last_row_position: i64,
         prefill: bool,
     ) -> EngineResult<i32> {
-        let mask = self.step_mask_words(last_row_position)?;
-        self.send_hidden_downstream(hidden, shape, position, mask.as_deref())?;
-        if mask.is_none() {
+        let words = step_mask_words(
+            self.active.as_mut(),
+            &self.grammar_factory,
+            &self.mask_link,
+            last_row_position,
+            std::time::Instant::now(),
+        )?;
+        let Some(words) = words else {
+            self.send_hidden_downstream(hidden, shape, position, None)?;
             return self.recv_token_from_downstream(prefill);
+        };
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let (seq, pos, hid) = self.stamp_hidden(hidden, shape, position);
+        let budget = token_wait_budget(
+            cascadia_transport::recv_timeout(),
+            prefill,
+            true,
+            &self.spec,
+        );
+        let handle = self.runtime_handle.clone();
+        let reply = crate::dist_spec::run_async_pub(
+            &handle,
+            masked_exchange(
+                &downstream,
+                seq,
+                pos,
+                &words,
+                hid,
+                budget,
+                &mut self.consecutive_token_timeouts,
+                &mut self.mask_link,
+            ),
+        );
+        self.settle_warm_resume(reply.is_ok());
+        reply
+    }
+
+    /// After a task's first masked step on a warm-resumed (RESTOREd) chain:
+    /// success confirms the chain consumed its warm state; a failure ABORTs the
+    /// chain, because a stage that rejected the masked frame (an older build)
+    /// is still armed warm and would prefill the next request on stale KV.
+    fn settle_warm_resume(&mut self, ok: bool) {
+        let abort = warm_abort_needed(self.active.as_mut(), ok);
+        #[cfg(feature = "kv_coord")]
+        if abort {
+            warn!("ov-runtime: masked step failed on a warm-resumed chain; ABORTing downstream");
+            if let Err(e) = self.send_abort_downstream() {
+                error!(
+                    error = %e,
+                    "ov-runtime: ABORT after a failed masked step failed; downstream ranks may \
+                     stay armed warm"
+                );
+            }
         }
-        let reply = self.wait_masked_token(prefill);
-        self.mask_link.verdict(std::time::Instant::now(), reply)
+        #[cfg(not(feature = "kv_coord"))]
+        let _ = abort;
     }
 
     /// The upstream's next activation: hidden rows, their shape, the static
@@ -3035,7 +3290,8 @@ impl OvRuntimeEngine {
     fn send_token_to_upstream(
         &mut self,
         step: &EngineResult<i32>,
-        acked: bool,
+        masked: bool,
+        vouch: bool,
     ) -> EngineResult<()> {
         let upstream = self
             .upstream
@@ -3051,10 +3307,13 @@ impl OvRuntimeEngine {
                 "no upstream seq recorded: a token was sent before any hidden was received".into(),
             )
         })?;
-        let tensor = relay_reply_frame(step, inbound, acked);
+        let frames = upstream_reply_frames(&mut self.mask_link, step, inbound, masked, vouch);
         self.block_on(async move {
             let mut guard = upstream.lock().await;
-            guard.send(&tensor).await
+            for f in &frames {
+                guard.send(f).await?;
+            }
+            Ok::<_, cascadia_transport::TransportError>(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
         Ok(())
@@ -3269,6 +3528,10 @@ impl OvRuntimeEngine {
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
                 t_prefill: std::time::Duration::ZERO,
+                warm_unconfirmed: grammar.is_some()
+                    && warm_prefix > 0
+                    && self.downstream.is_some()
+                    && !self.spec.is_last_stage,
                 grammar,
             });
         }
@@ -3534,44 +3797,20 @@ impl OvRuntimeEngine {
         let width = self
             .grammar_factory
             .as_ref()
-            .map(GrammarFactory::mask_width);
-        let refused = self.mask_link.refusal(std::time::Instant::now());
-        let mut masks: PlanMasks = vec![None; rows];
-        let mut failed = Vec::new();
-        let packed = self.packed.as_mut().unwrap();
-        for (row, slot) in kind.sampled_rows() {
-            let Some(grammar) = packed
-                .slots
-                .get_mut(slot)
-                .and_then(|s| s.as_mut())
-                .and_then(|s| s.grammar.as_mut())
-            else {
-                continue;
-            };
-            let words = match (&refused, &width) {
-                (Some(e), _) => Err(EngineError::Backend(e.to_string())),
-                (None, Err(reason)) => Err(EngineError::Backend(format!(
-                    "structured output is not available for this model: {reason}"
-                ))),
-                (None, Ok(width)) => grammar_mask_words(grammar, *width),
-            };
-            match words {
-                Ok(w) if row < rows => masks[row] = Some(w),
-                Ok(_) => failed.push((
-                    slot,
-                    EngineError::Backend(format!("packed row {row} is outside the plan")),
-                )),
-                Err(e) => failed.push((slot, e)),
-            }
-        }
+            .map(GrammarFactory::mask_width)
+            .map_err(Clone::clone);
+        let refused = self.mask_link.refusal(std::time::Instant::now()).is_some();
+        let (masks, failed) = packed_step_masks(
+            &mut self.packed.as_mut().unwrap().slots,
+            &kind.sampled_rows(),
+            rows,
+            &width,
+            refused,
+        );
         for (slot, e) in failed {
-            let e = match (e, &refused) {
-                (_, Some(_)) => EngineError::Backend(MASK_UPGRADE_ERROR.into()),
-                (e, None) => e,
-            };
             out.extend(self.fail_packed_slot(slot, e));
         }
-        masks.iter().any(Option::is_some).then_some(masks)
+        masks
     }
 
     /// Send `[1, S, hidden]` + the packed plan downstream and wait for the tail
@@ -3767,10 +4006,7 @@ impl OvRuntimeEngine {
         // no matter how deep the pipeline is.
         let reply =
             self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows, masks.as_deref());
-        match masks {
-            None => (reply.map_err(TokenWaitFailure::into_error), true),
-            Some(_) => masked_relay_answer(reply),
-        }
+        relay_downstream_answer(reply, masks.is_some())
     }
 
     /// This stage's own inference for one relayed packed plan.
@@ -4656,11 +4892,16 @@ impl OvRuntimeEngine {
     /// `acked`: the step was masked and this stage vouches for the chain below
     /// it (see [`masked_relay_answer`]), so the reply carries the
     /// acknowledgement.
-    fn answer_upstream(&mut self, step: EngineResult<i32>, acked: bool) -> EngineResult<()> {
+    fn answer_upstream(
+        &mut self,
+        step: EngineResult<i32>,
+        masked: bool,
+        vouch: bool,
+    ) -> EngineResult<()> {
         if let Err(e) = &step {
-            warn!(error = %e, acked, "relay step failed; NACKing the upstream");
+            warn!(error = %e, masked, vouch, "relay step failed; NACKing the upstream");
         }
-        match self.send_token_to_upstream(&step, acked) {
+        match self.send_token_to_upstream(&step, masked, vouch) {
             Ok(()) => step.map(|_| ()),
             Err(send_err) => Err(nack_send_error(send_err, step.as_ref().err())),
         }
@@ -4691,7 +4932,7 @@ impl OvRuntimeEngine {
         let step = self.relay_last_body(hidden, shape, pos_opt, mask.as_deref());
         // A masked step is always acknowledged by the tail: the mask was
         // applied, or the step failed here.
-        self.answer_upstream(step, mask.is_some())
+        self.answer_upstream(step, mask.is_some(), true)
     }
 
     /// Everything `step_last` does between consuming the activation group and
@@ -4736,7 +4977,7 @@ impl OvRuntimeEngine {
         // See `step_last`: nothing is owed until the group is consumed.
         let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
         let (step, vouch) = self.relay_middle_body(hidden, shape, pos_opt, mask.as_deref());
-        let answered = self.answer_upstream(step, mask.is_some() && vouch);
+        let answered = self.answer_upstream(step, mask.is_some(), vouch);
         self.escalate_if_downstream_is_gone(answered)
     }
 
@@ -4811,10 +5052,12 @@ impl OvRuntimeEngine {
             Ok(p) => p,
             Err(e) => return (Err(e), true),
         };
-        if mask.is_none() {
-            return (self.recv_token_from_downstream(prefill_reply), true);
-        }
-        masked_relay_answer(self.wait_masked_token(prefill_reply))
+        let downstream = match self.downstream.clone() {
+            Some(d) => d,
+            None => return (Err(EngineError::Backend("no downstream".into())), true),
+        };
+        let reply = self.wait_token(&downstream, prefill_reply, mask.is_some());
+        relay_downstream_answer(reply, mask.is_some())
     }
 
     /// A middle stage's own part of a step: run its layers on the upstream's
@@ -5559,16 +5802,9 @@ impl OvRuntimeEngine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_ABORT]);
+        // Best-effort ack, bounded: a silent downstream must not wedge the abort path.
         let ack = self
-            .block_on(async move {
-                let mut g = downstream.lock().await;
-                g.send(&t).await?;
-                // Best-effort ack, bounded: a silent downstream must not wedge the abort path.
-                Ok::<_, cascadia_transport::TransportError>(
-                    recv_control_ack(&mut g, RESTORE_ACK_TIMEOUT, "ABORT").await,
-                )
-            })
+            .block_on(send_abort_frame(&downstream, RESTORE_ACK_TIMEOUT))
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         let _ = self.control_ack_seen(ack);
         Ok(())
@@ -8503,7 +8739,7 @@ mod tests {
             let now = std::time::Instant::now();
             let mut link = MaskLink {
                 acked: true,
-                latched_at: None,
+                ..MaskLink::default()
             };
             let err = link.verdict(now, got).unwrap_err();
             assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
@@ -8590,10 +8826,55 @@ mod tests {
         }
     }
 
-    /// Head → middle → tail on loopback. The middle relays the mask and passes
-    /// the tail's acknowledged token up acknowledged; when the tail can't
-    /// mask (it reads both frames and goes silent), the middle's wait times
-    /// out and it answers with a plain NACK, which latches the head.
+    fn spec(first: bool, last: bool, layers: (u32, u32), total: u32) -> ShardSpec {
+        ShardSpec {
+            model_id: "m".into(),
+            layer_start: layers.0,
+            layer_end: layers.1,
+            total_layers: total,
+            device: "CPU".into(),
+            is_first_stage: first,
+            is_last_stage: last,
+            tp_size: 1,
+            tp_rank: 0,
+        }
+    }
+
+    /// The middle's step exactly as `relay_middle_body` + `answer_upstream`
+    /// run it: relay the mask, wait with the middle's own budget
+    /// (`token_wait_budget`, as `wait_token` derives it), answer through
+    /// `relay_downstream_answer` and `upstream_reply_frames`.
+    async fn middle_step(
+        mid_up: &Arc<tokio::sync::Mutex<ActivationServer>>,
+        mid_down: &Arc<tokio::sync::Mutex<ActivationClient>>,
+        seq_down: u32,
+        mid_spec: &ShardSpec,
+        link: &mut MaskLink,
+    ) {
+        let (lead, hid) = recv_hidden_frames(mid_up, false).await.unwrap();
+        let (seq_up, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
+        let masked = mask.is_some();
+        send_hidden_frames(mid_down, seq_down, None, mask.as_deref(), hid.unwrap())
+            .await
+            .unwrap();
+        let budget = token_wait_budget(cascadia_transport::recv_timeout(), false, masked, mid_spec);
+        let mut streak = 0;
+        let reply = wait_token_reply(mid_down, seq_down, budget, masked, &mut streak, link).await;
+        let (step, vouch) = relay_downstream_answer(reply, masked);
+        let frames = upstream_reply_frames(link, &step, seq_up, masked, vouch);
+        let mut g = mid_up.lock().await;
+        for f in &frames {
+            g.send(f).await.unwrap();
+        }
+    }
+
+    /// Head → middle → tail on loopback, each wait on its real budget. The
+    /// middle relays the mask and passes the tail's acknowledged token up
+    /// acknowledged. When the tail can't mask (it reads both frames and goes
+    /// silent), the middle's shorter wait times out first and its plain NACK
+    /// reaches the head inside the head's own deadline. When the slow tail's
+    /// acknowledged reply turns up later, the middle passes that evidence up
+    /// with its next answer and the head's latch clears.
     #[tokio::test]
     // The timeout knob is process-global: hold its lock for the whole wait.
     #[allow(clippy::await_holding_lock)]
@@ -8606,26 +8887,11 @@ mod tests {
         let mid_up = Arc::new(tokio::sync::Mutex::new(mid_s));
         let mid_down = Arc::new(tokio::sync::Mutex::new(mid_c));
         let tail_up = Arc::new(tokio::sync::Mutex::new(tail_s));
-
-        // The middle's step: relay, wait, answer.
-        async fn middle(
-            mid_up: &Arc<tokio::sync::Mutex<ActivationServer>>,
-            mid_down: &Arc<tokio::sync::Mutex<ActivationClient>>,
-            seq_down: u32,
-            budget: std::time::Duration,
-        ) -> u32 {
-            let (lead, hid) = recv_hidden_frames(mid_up, false).await.unwrap();
-            let (seq_up, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
-            send_hidden_frames(mid_down, seq_down, None, mask.as_deref(), hid.unwrap())
-                .await
-                .unwrap();
-            let reply =
-                recv_token_reply(mid_down, seq_down, budget, mask.is_some(), &mut false).await;
-            let (step, vouch) = masked_relay_answer(reply);
-            let frame = relay_reply_frame(&step, seq_up, mask.is_some() && vouch);
-            mid_up.lock().await.send(&frame).await.unwrap();
-            seq_up
-        }
+        let head_spec = spec(true, false, (0, 8), 32);
+        let mid_spec = spec(false, false, (8, 16), 32);
+        let mut head_link = MaskLink::default();
+        let mut mid_link = MaskLink::default();
+        let mut head_streak = 0;
 
         // 1. A tail that masks.
         send_hidden_frames(&head_down, 1, None, Some(&words), f16_hidden(1))
@@ -8643,53 +8909,105 @@ mod tests {
                 tail_up.lock().await.send(&frame).await.unwrap();
             })
         };
-        middle(&mid_up, &mid_down, 11, decode_budget()).await;
+        middle_step(&mid_up, &mid_down, 11, &mid_spec, &mut mid_link).await;
         tail.await.unwrap();
-        let mut link = MaskLink::default();
-        let reply = recv_token_reply(&head_down, 1, decode_budget(), true, &mut false).await;
+        let budget = token_wait_budget(decode_budget(), false, true, &head_spec);
+        let reply = wait_token_reply(
+            &head_down,
+            1,
+            budget,
+            true,
+            &mut head_streak,
+            &mut head_link,
+        )
+        .await;
         assert_eq!(
-            link.verdict(std::time::Instant::now(), reply).unwrap(),
+            head_link.verdict(std::time::Instant::now(), reply).unwrap(),
             b'"' as i32
         );
 
-        // 2. A tail that can't mask: it reads the step, rejects the lead, and
-        // never answers.
+        // 2. A tail that can't answer (reads the step, never replies).
         send_hidden_frames(&head_down, 2, None, Some(&words), f16_hidden(2))
             .await
             .unwrap();
-        let old_tail = {
-            let tail_up = tail_up.clone();
-            tokio::spawn(async move {
-                let (lead, hid) = recv_hidden_frames(&tail_up, false).await.unwrap();
-                assert!(hid.is_some());
-                assert!(decode_wire_lead(&lead, false).is_err());
-            })
-        };
-        // The real budgets, run concurrently: the head waits its full token
-        // budget; the middle (layers 8..16 of 32, so 16 layers below it)
-        // waits its share, times out first, and its plain NACK reaches the
-        // head inside the head's own deadline.
-        let reply = {
+        let (reply, tail_seq) = {
             let _knob = crate::timeout_knob_lock();
             cascadia_transport::set_activation_timeout_secs(2);
-            let head_budget = decode_budget();
-            let mid_budget = masked_relay_budget(head_budget, 16, 32);
-            assert!(mid_budget < head_budget);
-            let mut no_stale = false;
-            let (_, reply) = tokio::join!(
-                middle(&mid_up, &mid_down, 12, mid_budget),
-                recv_token_reply(&head_down, 2, head_budget, true, &mut no_stale)
+            let head_budget =
+                token_wait_budget(cascadia_transport::recv_timeout(), false, true, &head_spec);
+            let mid_budget =
+                token_wait_budget(cascadia_transport::recv_timeout(), false, true, &mid_spec);
+            assert!(mid_budget < head_budget, "{mid_budget:?} {head_budget:?}");
+            let slow_tail = async {
+                let (lead, hid) = recv_hidden_frames(&tail_up, false).await.unwrap();
+                assert!(hid.is_some());
+                decode_wire_lead_any(&lead, false).unwrap().0
+            };
+            let (tail_seq, _, reply) = tokio::join!(
+                slow_tail,
+                middle_step(&mid_up, &mid_down, 12, &mid_spec, &mut mid_link),
+                wait_token_reply(
+                    &head_down,
+                    2,
+                    head_budget,
+                    true,
+                    &mut head_streak,
+                    &mut head_link
+                )
             );
             cascadia_transport::set_activation_timeout_secs(0);
-            reply
+            (reply, tail_seq)
         };
-        old_tail.await.unwrap();
         assert!(
             matches!(reply, Err(TokenWaitFailure::NoAck(_))),
-            "{reply:?}"
+            "the middle's NACK, not the head's own timeout: {reply:?}"
         );
-        let err = link.verdict(std::time::Instant::now(), reply).unwrap_err();
+        let err = head_link
+            .verdict(std::time::Instant::now(), reply)
+            .unwrap_err();
         assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+        assert!(head_link.refusal(std::time::Instant::now()).is_some());
+
+        // 3. The slow tail answers step 2 late (acknowledged), then a plain
+        // step flows through; the middle discards the late reply, and its next
+        // answer carries the evidence up. The head discards it as stale and
+        // unlatches.
+        tail_up
+            .lock()
+            .await
+            .send(&relay_reply_frame(&Ok(b'"' as i32), tail_seq, true))
+            .await
+            .unwrap();
+        send_hidden_frames(&head_down, 3, None, None, f16_hidden(3))
+            .await
+            .unwrap();
+        let tail = {
+            let tail_up = tail_up.clone();
+            tokio::spawn(async move {
+                let (lead, _) = recv_hidden_frames(&tail_up, false).await.unwrap();
+                let (seq, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
+                assert!(mask.is_none());
+                let frame = relay_reply_frame(&Ok(42), seq, false);
+                tail_up.lock().await.send(&frame).await.unwrap();
+            })
+        };
+        middle_step(&mid_up, &mid_down, 13, &mid_spec, &mut mid_link).await;
+        tail.await.unwrap();
+        let reply = wait_token_reply(
+            &head_down,
+            3,
+            decode_budget(),
+            false,
+            &mut head_streak,
+            &mut head_link,
+        )
+        .await;
+        assert_eq!(reply.unwrap(), 42, "the plain step's own token");
+        assert!(
+            head_link.refusal(std::time::Instant::now()).is_none(),
+            "the evidence from below cleared the head's latch"
+        );
+        assert_eq!(head_streak, 0);
     }
 
     /// A masked step's late reply still in the socket when the head sends a
@@ -8789,26 +9107,424 @@ mod tests {
         assert!(ack.unwrap_err().to_string().contains("ABORT ack timed out"));
     }
 
-    /// Each stage down the chain waits strictly less on a masked step than
-    /// the one above it, at the real default and prefill budgets.
+    /// The middle's masked wait is never zero, always strictly less than its
+    /// upstream's, falls with every stage down the chain, and keeps about
+    /// half the budget even with one layer below — at the real budgets.
     #[test]
     fn a_middle_waits_less_than_its_upstream_on_a_masked_step() {
         use std::time::Duration;
         for base in [Duration::from_secs(60), Duration::from_secs(120)] {
             for prefill in [false, true] {
-                let head = token_recv_deadline(base, prefill);
+                let head = token_wait_budget(base, prefill, true, &spec(true, false, (0, 8), 32));
+                assert_eq!(
+                    head,
+                    token_recv_deadline(base, prefill),
+                    "the head waits in full"
+                );
                 // Four stages over 32 layers: head 0..8, middles 8..16 and 16..24.
-                let m1 = masked_relay_budget(head, 16, 32);
-                let m2 = masked_relay_budget(head, 24, 32);
-                assert!(m1 < head && m2 < m1, "{head:?} {m1:?} {m2:?}");
-                // A margin of seconds, not microseconds, at every hop.
+                let m1 = token_wait_budget(base, prefill, true, &spec(false, false, (8, 16), 32));
+                let m2 = token_wait_budget(base, prefill, true, &spec(false, false, (16, 24), 32));
+                assert!(m2 < m1 && m1 < head, "{head:?} {m1:?} {m2:?}");
                 assert!(head - m1 >= Duration::from_secs(10), "{head:?} {m1:?}");
                 assert!(m1 - m2 >= Duration::from_secs(5), "{m1:?} {m2:?}");
+                // One layer of 40 below, and none below at all.
+                for (layers, total) in [((8, 39), 40), ((8, 40), 40)] {
+                    let m =
+                        token_wait_budget(base, prefill, true, &spec(false, false, layers, total));
+                    assert!(m < head && m >= head / 2, "{layers:?}: {m:?} of {head:?}");
+                }
+                // Plain steps keep the full budget on every stage.
+                assert_eq!(
+                    token_wait_budget(base, prefill, false, &spec(false, false, (8, 16), 32)),
+                    token_recv_deadline(base, prefill)
+                );
             }
         }
-        // No layer geometry: still strictly less.
+        // Without layer geometry the first layer still orders the chain.
         let b = Duration::from_secs(60);
-        assert_eq!(masked_relay_budget(b, 0, 0), b / 2);
+        let a = masked_relay_budget(b, 8, 0, 0);
+        let c = masked_relay_budget(b, 16, 0, 0);
+        assert!(c < a && a < b && !c.is_zero(), "{a:?} {c:?}");
+        assert!(masked_relay_budget(b, 0, 0, 0) < b);
+    }
+
+    /// `wait_token_reply`, the engine's wait: a discarded acknowledged reply
+    /// clears the latch; only silence moves the streak; a late control ack is
+    /// skipped instead of failing the step.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_engine_wait_learns_from_late_replies_and_skips_late_control_acks() {
+        let (client, mut server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut link = MaskLink::default();
+        let _ = link.on_unacked(std::time::Instant::now(), &EngineError::Backend("x".into()));
+        let mut streak = 2;
+        server.send(&encode_token_reply(7, 4, true)).await.unwrap();
+        server
+            .send(&WireTensor::new(WireDType::I8, [1, 1, 2], vec![4, 1]))
+            .await
+            .unwrap();
+        server
+            .send(&encode_token_reply(42, 5, false))
+            .await
+            .unwrap();
+        let tok = wait_token_reply(
+            &downstream,
+            5,
+            decode_budget(),
+            false,
+            &mut streak,
+            &mut link,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tok, 42);
+        assert!(link.refusal(std::time::Instant::now()).is_none());
+        assert_eq!(streak, 0);
+
+        let got = {
+            let _knob = crate::timeout_knob_lock();
+            cascadia_transport::set_activation_timeout_secs(1);
+            let got = wait_token_reply(
+                &downstream,
+                6,
+                decode_budget(),
+                true,
+                &mut streak,
+                &mut link,
+            )
+            .await;
+            cascadia_transport::set_activation_timeout_secs(0);
+            got
+        };
+        assert!(matches!(got, Err(TokenWaitFailure::TimedOut(_))), "{got:?}");
+        assert_eq!(streak, 1);
+    }
+
+    /// A relay's answer to a masked step: only an acknowledged reply from
+    /// below, or the stage's own failure, is acknowledged upward. A dead or
+    /// desynced downstream is not proof the stage below masks.
+    #[test]
+    fn a_relay_acknowledges_only_what_the_stage_below_acknowledged() {
+        let e = || EngineError::Backend("x".into());
+        let cases: [(Result<i32, TokenWaitFailure>, bool); 5] = [
+            (Ok(3), true),
+            (Err(TokenWaitFailure::AckedNack(e())), true),
+            (Err(TokenWaitFailure::NoAck(e())), false),
+            (Err(TokenWaitFailure::TimedOut(e())), false),
+            (Err(TokenWaitFailure::Other(e())), false),
+        ];
+        for (reply, want) in cases {
+            let label = format!("{reply:?}");
+            assert_eq!(relay_downstream_answer(reply, true).1, want, "{label}");
+        }
+        // Plain steps pass the outcome through untouched.
+        let (step, _) = relay_downstream_answer(Err::<i32, _>(TokenWaitFailure::Other(e())), false);
+        assert!(step.is_err());
+
+        // What goes up the wire: acknowledged only on a vouched masked step,
+        // and a plain NACK records the debt that later evidence repays.
+        let mut link = MaskLink::default();
+        let frames = upstream_reply_frames(&mut link, &Err(e()), 9, true, false);
+        assert_eq!(frames, vec![encode_token_with_seq(NACK_TOKEN, 9)]);
+        assert_eq!(
+            upstream_reply_frames(&mut link, &Ok(5), 10, false, true),
+            vec![encode_token_with_seq(5, 10)],
+            "no evidence yet"
+        );
+        link.on_acked();
+        assert_eq!(
+            upstream_reply_frames(&mut link, &Ok(5), 11, false, true),
+            vec![
+                encode_token_reply(NACK_TOKEN, 9, true),
+                encode_token_with_seq(5, 11)
+            ]
+        );
+        assert_eq!(
+            upstream_reply_frames(&mut link, &Ok(6), 12, true, true),
+            vec![encode_token_reply(6, 12, true)],
+            "the debt is paid once"
+        );
+    }
+
+    fn active_task(prompt_len: usize, grammar: Option<GrammarMask>) -> ActiveTask {
+        ActiveTask {
+            task: GenerationTask::new("t", "p"),
+            prompt_ids: (0..prompt_len as i64).collect(),
+            generated: Vec::new(),
+            emitted: Vec::new(),
+            prefilled: true,
+            last_token: 0,
+            warm_prefix: 0,
+            resume_seed_len: 0,
+            started: std::time::Instant::now(),
+            t_alpha_compute: std::time::Duration::ZERO,
+            t_wire: std::time::Duration::ZERO,
+            t_prefill: std::time::Duration::ZERO,
+            grammar,
+            warm_unconfirmed: false,
+        }
+    }
+
+    #[test]
+    fn a_failed_first_masked_step_after_restore_aborts_the_chain_once() {
+        let mut t = active_task(4, Some(test_mask(OK_ENUM, "")));
+        t.warm_unconfirmed = true;
+        assert!(warm_abort_needed(Some(&mut t), false));
+        assert!(!warm_abort_needed(Some(&mut t), false), "once per task");
+        t.warm_unconfirmed = true;
+        assert!(
+            !warm_abort_needed(Some(&mut t), true),
+            "a success confirms the warm chain"
+        );
+        assert!(!t.warm_unconfirmed);
+        let mut cold = active_task(4, Some(test_mask(OK_ENUM, "")));
+        assert!(!warm_abort_needed(Some(&mut cold), false));
+        assert!(!warm_abort_needed(None, false));
+    }
+
+    /// The head's mask choice (`step_mask_words`) and its masked exchange
+    /// (`masked_exchange`), as `exchange_downstream` runs them.
+    #[tokio::test]
+    async fn the_head_masks_only_the_picking_row_and_exchanges_it() {
+        let gf: Result<GrammarFactory, String> = Ok(test_factory());
+        let now = std::time::Instant::now();
+        let link = MaskLink::default();
+        let mut plain = active_task(4, None);
+        assert_eq!(
+            step_mask_words(Some(&mut plain), &gf, &link, 3, now).unwrap(),
+            None
+        );
+        assert_eq!(step_mask_words(None, &gf, &link, 3, now).unwrap(), None);
+        let mut json = active_task(4, Some(test_mask(OK_ENUM, "")));
+        assert_eq!(
+            step_mask_words(Some(&mut json), &gf, &link, 2, now).unwrap(),
+            None
+        );
+        let words = step_mask_words(Some(&mut json), &gf, &link, 3, now)
+            .unwrap()
+            .expect("the last prompt row is masked");
+        assert_eq!(words, ok_enum_words());
+        let mut latched = MaskLink::default();
+        let _ = latched.on_unacked(now, &EngineError::Backend("x".into()));
+        assert!(step_mask_words(Some(&mut json), &gf, &latched, 3, now).is_err());
+        let none: Result<GrammarFactory, String> = Err("no tokenizer".into());
+        assert!(step_mask_words(Some(&mut json), &none, &link, 3, now).is_err());
+
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let tail = {
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let (lead, _) = recv_hidden_frames(&upstream, false).await.unwrap();
+                let (seq, _, mask) = decode_wire_lead_any(&lead, false).unwrap();
+                let w = test_factory().mask_width();
+                let (out, shape) = rows(&[bad_then(w, b'"')]);
+                let step = tail_pick(&out, &shape, mask.as_deref());
+                let frame = relay_reply_frame(&step, seq, true);
+                upstream.lock().await.send(&frame).await.unwrap();
+            })
+        };
+        let mut link = MaskLink::default();
+        let mut streak = 0;
+        let tok = masked_exchange(
+            &downstream,
+            1,
+            None,
+            &words,
+            f16_hidden(1),
+            decode_budget(),
+            &mut streak,
+            &mut link,
+        )
+        .await
+        .unwrap();
+        tail.await.unwrap();
+        assert_eq!(tok, b'"' as i32);
+        assert!(link.acked);
+    }
+
+    /// `packed_step_masks`, as the packed head runs it: a mask for the grammar
+    /// slot's sampled row only; a latched link or a dead end hands the slot
+    /// back to fail alone (its error chunk via `packed_slot_error_chunk`).
+    #[test]
+    fn packed_masks_cover_grammar_rows_and_fail_unmaskable_slots_alone() {
+        let width: Result<usize, String> = Ok(test_factory().mask_width());
+        let mut slots = vec![
+            Some(packed_slot(Some(test_mask(OK_ENUM, "")))),
+            Some(packed_slot(None)),
+        ];
+        let (masks, failed) = packed_step_masks(&mut slots, &[(0, 0), (1, 1)], 3, &width, false);
+        assert!(failed.is_empty());
+        assert_eq!(masks, Some(vec![Some(ok_enum_words()), None, None]));
+        // Only plain slots sampled: today's plan.
+        let (masks, _) = packed_step_masks(&mut slots, &[(1, 1)], 3, &width, false);
+        assert_eq!(masks, None);
+        // Latched: the grammar slot fails with the upgrade error, alone.
+        let (masks, failed) = packed_step_masks(&mut slots, &[(0, 0), (1, 1)], 3, &width, true);
+        assert_eq!(masks, None);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, 0);
+        assert_eq!(
+            failed[0].1.to_string(),
+            EngineError::Backend(MASK_UPGRADE_ERROR.into()).to_string()
+        );
+        let (id, chunk) = packed_slot_error_chunk(slots[0].take().unwrap(), &failed[0].1);
+        assert_eq!(id, chunk.task_id);
+        assert!(chunk.error.unwrap().contains(MASK_UPGRADE_ERROR));
+        // A dead end fails its slot too.
+        let mut slots = vec![Some(packed_slot(Some(test_mask(OK_ENUM, "\"ok\""))))];
+        let narrow: Result<usize, String> = Ok(256);
+        let (masks, failed) = packed_step_masks(&mut slots, &[(0, 0)], 1, &narrow, false);
+        assert!(masks.is_none() && failed.len() == 1);
+    }
+
+    /// The relay side of a packed masked plan: `relay_downstream_answer`
+    /// picks the vouch that `step_relay_packed` turns into its reply frame.
+    #[test]
+    fn a_packed_middle_vouches_only_for_an_acknowledged_reply() {
+        let frame_for = |reply: &WireTensor| {
+            let (step, vouch) = relay_downstream_answer(packed_reply_outcome(reply, true), true);
+            packed_reply_frame(&step, vouch)
+        };
+        assert_eq!(
+            frame_for(&encode_wire_tokens_acked(&[4, 5])),
+            encode_wire_tokens_acked(&[4, 5])
+        );
+        assert_eq!(
+            frame_for(&packed_acked_nack_frame()),
+            packed_acked_nack_frame()
+        );
+        assert_eq!(frame_for(&packed_nack_frame()), packed_nack_frame());
+        assert_eq!(frame_for(&encode_wire_tokens(&[4, 5])), packed_nack_frame());
+    }
+
+    /// An older tail (the stage wire before masks: today's lead decoder and
+    /// its RESTORE/ABORT arms) armed warm by RESTORE rejects the masked
+    /// suffix-prefill lead without consuming its warm state. The head's
+    /// masked step fails, it ABORTs the chain, and the next plain request
+    /// prefills cold — the right token, not one from stale KV.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_old_tail_armed_by_restore_is_aborted_after_a_rejected_masked_step() {
+        /// The old tail's step: control frames as its RESTORE/ABORT arms
+        /// handle them, activations through today's `decode_wire_lead`. A
+        /// prefill (seq > 1 rows) consumes the warm flag; the token says
+        /// whether it ran warm (stale) or cold.
+        async fn old_tail_step(up: &Arc<tokio::sync::Mutex<ActivationServer>>, warm: &mut bool) {
+            const STALE: i32 = 666;
+            const COLD: i32 = 42;
+            let (lead, hid) = recv_hidden_frames(up, false).await.unwrap();
+            let Some(hid) = hid else {
+                let ack = match lead.data[0] {
+                    OPCODE_RESTORE => {
+                        *warm = true;
+                        vec![OPCODE_RESTORE_ACK, 1]
+                    }
+                    OPCODE_ABORT => {
+                        *warm = false;
+                        vec![OPCODE_ABORT_ACK]
+                    }
+                    op => panic!("unexpected control opcode {op}"),
+                };
+                let ack = WireTensor::new(WireDType::I8, [1, 1, ack.len() as u32], ack);
+                up.lock().await.send(&ack).await.unwrap();
+                return;
+            };
+            let Ok((seq, _)) = decode_wire_lead(&lead, false) else {
+                return; // rejected before the warm flag is consumed; no answer
+            };
+            let was_warm = std::mem::take(warm) && hid.shape[1] > 1;
+            let token = if was_warm { STALE } else { COLD };
+            up.lock()
+                .await
+                .send(&encode_token_with_seq(token, seq))
+                .await
+                .unwrap();
+        }
+
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let mut warm = false;
+        // The link once acknowledged (a tail since swapped for an old build).
+        let mut link = MaskLink::default();
+        link.on_acked();
+        let mut streak = 0;
+
+        // RESTORE arms the old tail warm.
+        let restore = {
+            let mut d = vec![OPCODE_RESTORE];
+            d.extend_from_slice(&7u64.to_le_bytes());
+            WireTensor::new(WireDType::I8, [1, 1, 9], d)
+        };
+        downstream.lock().await.send(&restore).await.unwrap();
+        old_tail_step(&upstream, &mut warm).await;
+        let (ack, _) = {
+            let mut g = downstream.lock().await;
+            recv_control_ack(&mut g, Duration::from_secs(5), "RESTORE").await
+        };
+        assert_eq!(ack.unwrap().data, vec![OPCODE_RESTORE_ACK, 1]);
+        assert!(warm);
+
+        // The masked suffix prefill: rejected, never answered; the head's
+        // step fails and latches.
+        let hid = WireTensor::new(WireDType::F16, [1, 3, 1], vec![0; 6]);
+        let words = ok_enum_words();
+        let failed = {
+            let _knob = crate::timeout_knob_lock();
+            cascadia_transport::set_activation_timeout_secs(1);
+            let (_, r) = tokio::join!(
+                old_tail_step(&upstream, &mut warm),
+                masked_exchange(
+                    &downstream,
+                    1,
+                    None,
+                    &words,
+                    hid.clone(),
+                    decode_budget(),
+                    &mut streak,
+                    &mut link,
+                )
+            );
+            cascadia_transport::set_activation_timeout_secs(0);
+            r
+        };
+        assert!(failed.unwrap_err().to_string().contains(MASK_UPGRADE_ERROR));
+        assert!(warm, "the old tail is still armed warm");
+        assert!(
+            !link.acked,
+            "warm resume closes for structured-output tasks"
+        );
+
+        // `settle_warm_resume`: the failed masked step ABORTs the chain.
+        let (abort, (ack, _)) = tokio::join!(old_tail_step(&upstream, &mut warm), async {
+            send_abort_frame(&downstream, Duration::from_secs(5))
+                .await
+                .unwrap()
+        });
+        let () = abort;
+        assert_eq!(ack.unwrap().data, vec![OPCODE_ABORT_ACK]);
+        assert!(!warm);
+
+        // The next plain request prefills cold and gets the right token.
+        send_hidden_frames(&downstream, 2, None, None, hid)
+            .await
+            .unwrap();
+        old_tail_step(&upstream, &mut warm).await;
+        let tok = wait_token_reply(
+            &downstream,
+            2,
+            decode_budget(),
+            false,
+            &mut streak,
+            &mut link,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tok, 42, "cold prefill, not the stale warm state");
     }
 
     /// A masked step that times out keeps the socket: a later plain request
