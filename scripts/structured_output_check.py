@@ -141,9 +141,9 @@ def run_json_case(base, case, schema, rf, messages, stream=False, **extra):
 
 def case_json_object(base):
     body = chat(
-        [{"role": "user", "content": "Describe a cat as a JSON object."}],
+        [{"role": "user", "content": "Describe a cat as a short JSON object with three keys."}],
         response_format={"type": "json_object"},
-        max_tokens=256,
+        max_tokens=1024,
     )
     status, raw, dt = post(base, body)
     if status != 200:
