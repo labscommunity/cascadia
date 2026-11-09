@@ -570,20 +570,31 @@ Every engine enforces `json_object` and `json_schema`:
 The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
 `sparse-moe`):
 
-- Emit compact JSON, with no whitespace between tokens.
+- Emit JSON with Python `json.dumps` separators: `": "` after each key and
+  `", "` between items, and no other whitespace between tokens.
 - Treat `oneOf` as `anyOf` (pydantic's discriminated unions compile).
 - Accept the schema keywords llguidance does not enforce (`not`,
   `if`/`then`/`else`, `dependentRequired`, `dependentSchemas`,
-  `uniqueItems`, `contains`, `propertyNames`, unknown `format`s) and log
-  them per request (`response_format keywords accepted but not enforced`).
+  `uniqueItems`, `contains`, `propertyNames`, unknown `format`s, and
+  `minProperties`/`maxProperties` where llguidance can't enforce them, such
+  as on objects with optional properties) and log them per request
+  (`response_format keywords accepted but not enforced`). A `pattern` (or
+  `patternProperties` key) the regex engine can't parse, such as one with
+  look-around or a backreference, is dropped and logged the same way; the
+  rest of the schema is still enforced.
 - Compile the schema when the request is submitted: a schema llguidance
   cannot build (for example `{"type": 42}` or an unresolvable `$ref`) is a
   400 before the request queues. A client's own top-level `x-guidance`
-  object is replaced by the server's settings.
-- Need a tokenizer with an end-of-sequence token; when the engine cannot
-  build its grammar from the model's tokenizer, it logs why once at startup
-  and JSON requests get 400 `invalid configuration: structured output is not
-  available for this model: <reason>`.
+  object is replaced by the server's settings. Before the request queues,
+  the server also builds each new schema once off the engine, at most 2 at
+  a time and within 2 seconds (see the errors below); a schema that passed
+  is remembered (up to 256) and `json_object` is never built there.
+- Build their grammar factory from the model's tokenizer on the first JSON
+  request, not at startup: that request pays for it once (about half a
+  second). The tokenizer needs an end-of-sequence token; when the factory
+  can't be built, the engine logs why then (`structured output unavailable
+  for this model`) and JSON requests get 400 `invalid configuration:
+  structured output is not available for this model: <reason>`.
 - Requests without `response_format` take the same decode path as before:
   no mask, no grammar.
 
@@ -659,6 +670,9 @@ Schema limits (each is a 400 `invalid response_format: …`):
 | A coarse bound on the same depth whatever order a backend walks the schema in: each definition a `$ref` points to counts its own nesting, and definitions that refer to each other in a loop count together. A backstop to the limit above (a UI tree whose node is a union of 30 component types bounds at 126); over it the request gets `… may nest deeper than 512 levels through $ref` | 512 |
 | Any one `minItems`, `maxItems`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, or number in a `pattern` / `patternProperties` repetition quantifier (`{n}`, `{n,}`, `{n,m}`, `{,m}`) | 10 000 |
 | Sum of all those counts in one schema; a `minX`/`maxX` pair on one object counts once, at the larger value | 200 000 |
+| `patternProperties` keys on one object | 64 |
+| `patternProperties` keys in one schema, all objects together, counted again each time the grammar builder visits or merges an object anew (each entry of a `type` list, each `allOf` that merges it) | 128 |
+| Sum of the lengths of every `pattern` and `patternProperties` key in one schema | 16 KiB (16 384 bytes) |
 
 Counts are taken everywhere in the schema, including inside `default` and
 `examples` (a `$ref` can point there). Each count keyword, and
@@ -686,7 +700,10 @@ the 400s below and `engine_error` for anything else):
 | 400 | `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai`: the startup check found structured output does not work for the loaded model or runtime. The llguidance engines: the grammar could not be built from the model's tokenizer (logged at startup). |
 | 400 | `invalid configuration: response_format schema: <reason>` | The llguidance engines: llguidance could not build a grammar from the schema; The message is cut to one line of at most 300 characters. |
 | 5xx | `… a later pipeline stage runs a build without structured-output support; upgrade every stage` | Multi-stage `ov-runtime`, `gemma4`, `qwen35` or `sparse-moe`: a later stage runs an older build (see above). |
-| 5xx | `… grammar: <reason>` | The llguidance engines: decoding hit a state the grammar allows no token from, or a resumed request's earlier output does not match the grammar. The request ends with this error, never with unconstrained output. |
+| 400 | `invalid response_format: response_format schema is too complex to compile` | The llguidance engines: building the schema's grammar took longer than 2 seconds in the server's check before the request queues. |
+| 503 | `busy compiling response_format schemas; retry shortly` | The llguidance engines: the server's schema check had no free slot (2 builds at once) within half a second. Retry. |
+| 5xx | `… grammar: no token of the … is allowed` | The llguidance engines: decoding hit a state the grammar allows no token from. The request ends with this error, never with unconstrained output. |
+| 5xx | `… structured output generation failed` | The llguidance engines: the grammar failed while generating, or a resumed request's earlier output does not match the grammar. The grammar's own reason is logged, not sent. The request ends with this error, never with unconstrained output. |
 | 400 | `llama-server rejected the request: <reason>` | `sycl-llama`: llama-server answered 4xx (other than 408/429), for example a schema its grammar converter rejects; `<reason>` is llama-server's `error.message`, or the start of its reply. On a streamed request the SSE stream has already started, so this message arrives as the stream's error event instead, with `"type":"invalid_request_error"`. |
 
 On `ov-genai --cb`, a schema whose compile fails while a batch runs fails that
