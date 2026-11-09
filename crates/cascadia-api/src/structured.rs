@@ -241,6 +241,11 @@ fn sum_counts(v: &Value, total: &mut u64) -> Result<(), String> {
                 }
                 *total += largest;
             }
+            for key in INTEGER_KEYWORDS {
+                if obj.get(key).is_some_and(|v| !is_plain_count(v)) {
+                    return Err(format!("{FIELD}: {key} must be a non-negative integer"));
+                }
+            }
             for (key, value) in obj {
                 let key = key.as_str();
                 match value {
@@ -257,6 +262,34 @@ fn sum_counts(v: &Value, total: &mut u64) -> Result<(), String> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// Keywords JSON Schema defines as non-negative integers: the count
+/// keywords and `minContains`/`maxContains`.
+const INTEGER_KEYWORDS: [&str; 8] = [
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "minProperties",
+    "maxProperties",
+    "minContains",
+    "maxContains",
+];
+
+/// True when `v` may stand where a count keyword is: a number written as a
+/// plain non-negative integer (`0`, `10`; not `0.0`, `0e0`, `-0` or `1.5`,
+/// which the converter reads as a double), or an object, array or boolean,
+/// which is a property map entry (a property named `maxItems`) or data,
+/// not a count. serde_json keeps an integer literal as an integer and reads
+/// any number with a fraction, an exponent or a minus sign on zero as a
+/// float, so `is_u64` holds exactly for the plain literals.
+fn is_plain_count(v: &Value) -> bool {
+    match v {
+        Value::Number(n) => n.is_u64(),
+        Value::Object(_) | Value::Array(_) | Value::Bool(_) => true,
+        Value::String(_) | Value::Null => false,
     }
 }
 
@@ -718,8 +751,9 @@ impl<'a> Walk<'a, '_> {
     /// otherwise the `properties` values in order, then the schema for
     /// other properties.
     fn object_children(&self, node: &'a Node, out: &mut Vec<Child<'a>>) {
+        // [`check_limits`] has made it a plain non-negative integer literal.
         if let Some(Node::Scalar(max)) = node.get("maxProperties") {
-            if matches!(max.get(), "0" | "-0") {
+            if max.get().parse::<u64>() == Ok(0) {
                 return;
             }
         }
@@ -1938,6 +1972,40 @@ mod tests {
             parse_schema(json!({"type": "string", "maxLength": 10_000})),
             Ok(ResponseFormat::JsonSchema { .. })
         ));
+    }
+
+    #[test]
+    fn count_keywords_must_be_plain_non_negative_integers() {
+        let keys = [
+            "minItems",
+            "maxItems",
+            "minLength",
+            "maxLength",
+            "minProperties",
+            "maxProperties",
+            "minContains",
+            "maxContains",
+        ];
+        for k in keys {
+            for v in ["0.0", "0e0", "0E+0", "-0", "1.5", "-1", r#""0""#, "null"] {
+                let text = format!(
+                    r#"{{"type": "json_schema", "json_schema": {{"schema": {{"type": "object", "properties": {{"a": {{"type": "array", "{k}": {v}}}}}}}}}}}"#
+                );
+                assert_eq!(
+                    parse_response_format(Some(&text)),
+                    Err(format!(
+                        "response_format.json_schema.schema: {k} must be a non-negative integer"
+                    )),
+                    "{k}: {v}"
+                );
+            }
+            for v in ["0", "10"] {
+                let text = format!(
+                    r#"{{"type": "json_schema", "json_schema": {{"schema": {{"type": "array", "{k}": {v}}}}}}}"#
+                );
+                assert!(parse_response_format(Some(&text)).is_ok(), "{k}: {v}");
+            }
+        }
     }
 
     #[test]
