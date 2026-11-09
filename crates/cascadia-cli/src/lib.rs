@@ -59,16 +59,19 @@ fn engine_name(kind: EngineKind) -> &'static str {
 }
 
 /// Whether `kind` can constrain its output to a JSON Schema
-/// (`response_format`). The API refuses json requests on the others.
+/// (`response_format`). The API refuses json requests on the others. Every
+/// engine does today; the exhaustive match makes a new engine decide.
 fn structured_output_for(kind: EngineKind) -> bool {
-    matches!(
-        kind,
+    match kind {
         EngineKind::OvGenai
-            | EngineKind::Mock
-            | EngineKind::SyclLlama
-            | EngineKind::OvDistSpec
-            | EngineKind::SparseMoe
-    )
+        | EngineKind::Mock
+        | EngineKind::SyclLlama
+        | EngineKind::OvRuntime
+        | EngineKind::OvDistSpec
+        | EngineKind::Gemma4
+        | EngineKind::SparseMoe
+        | EngineKind::Qwen36Moe => true,
+    }
 }
 
 /// Whether `kind` constrains output with OpenVINO GenAI's xgrammar backend,
@@ -3830,15 +3833,11 @@ mod tests {
             EngineKind::SyclLlama,
             EngineKind::OvDistSpec,
             EngineKind::SparseMoe,
-        ] {
-            assert!(structured_output_for(kind), "{}", engine_name(kind));
-        }
-        for kind in [
             EngineKind::Qwen36Moe,
             EngineKind::Gemma4,
             EngineKind::OvRuntime,
         ] {
-            assert!(!structured_output_for(kind), "{}", engine_name(kind));
+            assert!(structured_output_for(kind), "{}", engine_name(kind));
         }
     }
 
