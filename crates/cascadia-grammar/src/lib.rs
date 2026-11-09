@@ -84,6 +84,18 @@ impl GrammarFactory {
         })
     }
 
+    /// A factory over a test vocab where token id `b` is byte `b` (0..=255)
+    /// and 256..=261 are special tokens; 261 is its EOS. For engine tests that
+    /// drive a mask over hand-built logits rows.
+    #[cfg(feature = "test-util")]
+    pub fn single_byte_for_tests() -> Self {
+        Self::from_tok_env(
+            llguidance::toktrie::ApproximateTokEnv::single_byte_env(),
+            vec![261].into(),
+        )
+        .expect("single-byte test vocab builds")
+    }
+
     /// Number of real tokens the mask covers (the tokenizer vocab). A model's
     /// logits row may be longer; [`GrammarMask::apply`] masks the excess.
     pub fn mask_width(&self) -> usize {

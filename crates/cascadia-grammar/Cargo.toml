@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 description = "Token masks that keep a model's output inside a JSON Schema (llguidance)."
 
+[features]
+# Test vocab for other crates' unit tests (`GrammarFactory::single_byte_for_tests`).
+test-util = []
+
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
