@@ -25,6 +25,85 @@ pub(crate) fn build_grammar_factory(
         .inspect_err(|reason| unavailable(engine, reason))
 }
 
+/// The grammar factory, built on the first task that asks for a grammar
+/// rather than at load: building it walks the whole tokenizer vocab (about
+/// half a second and 120 MiB on a large vocab), which a server that never
+/// sees a json task shouldn't pay. A build that fails is kept too, so every
+/// json task gets the same refusal.
+pub(crate) struct LazyGrammarFactory {
+    engine: &'static str,
+    eos: Vec<u32>,
+    cell: std::sync::OnceLock<Result<GrammarFactory, String>>,
+}
+
+impl LazyGrammarFactory {
+    /// Built from the tokenizer handed to [`Self::get`] and every EOS id
+    /// generation stops on.
+    pub(crate) fn new(engine: &'static str, eos: Vec<u32>) -> Self {
+        Self {
+            engine,
+            eos,
+            cell: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Never built: structured output is unavailable for `reason`.
+    pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
+        Self::ready(Err(reason.into()))
+    }
+
+    /// Already built (or failed); for stages that never take tasks and tests.
+    pub(crate) fn ready(factory: Result<GrammarFactory, String>) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(factory);
+        Self {
+            engine: "",
+            eos: Vec::new(),
+            cell,
+        }
+    }
+
+    /// The factory, built now if this is the first call.
+    pub(crate) fn get(&self, tokenizer: Option<&Tokenizer>) -> &Result<GrammarFactory, String> {
+        self.cell.get_or_init(|| match tokenizer {
+            Some(tok) => build_grammar_factory(self.engine, tok, &self.eos),
+            None => {
+                let reason = "no tokenizer loaded".to_string();
+                unavailable(self.engine, &reason);
+                Err(reason)
+            }
+        })
+    }
+
+    /// The factory if it has been built (or failed), without building it.
+    pub(crate) fn built(&self) -> Option<&Result<GrammarFactory, String>> {
+        self.cell.get()
+    }
+
+    /// [`compile_task_grammar`], building the factory only for a task that
+    /// has a grammar.
+    pub(crate) fn compile(
+        &self,
+        tokenizer: Option<&Tokenizer>,
+        task: &GenerationTask,
+    ) -> EngineResult<Option<CompiledGrammar>> {
+        if task.grammar.is_none() {
+            return Ok(None);
+        }
+        compile_task_grammar(self.get(tokenizer), task)
+    }
+
+    /// The mask width of the built factory. Only a task whose grammar was
+    /// compiled can ask, so the factory is built by then.
+    pub(crate) fn mask_width(&self) -> Result<usize, String> {
+        match self.built() {
+            Some(Ok(f)) => Ok(f.mask_width()),
+            Some(Err(reason)) => Err(reason.clone()),
+            None => Err("the grammar factory is not built".into()),
+        }
+    }
+}
+
 /// Logs why structured output is unavailable on `engine`.
 pub(crate) fn unavailable(engine: &str, reason: &str) {
     warn!(%reason, "{engine}: structured output unavailable for this model");
@@ -133,6 +212,89 @@ mod tests {
 
     fn ids(s: &str) -> Vec<i64> {
         s.bytes().map(i64::from).collect()
+    }
+
+    /// A byte-level BPE where token `b` is byte `b`, plus `</s>` (256).
+    fn byte_tokenizer() -> Tokenizer {
+        // GPT-2's byte-to-char table.
+        let byte_char = |b: u8| {
+            let self_mapped = |c: u32| {
+                (0x21..=0x7E).contains(&c)
+                    || (0xA1..=0xAC).contains(&c)
+                    || (0xAE..=0xFF).contains(&c)
+            };
+            if self_mapped(u32::from(b)) {
+                return char::from(b);
+            }
+            let shifted = (0..b).filter(|&x| !self_mapped(u32::from(x))).count() as u32;
+            char::from_u32(0x100 + shifted).unwrap()
+        };
+        let vocab: serde_json::Map<String, serde_json::Value> = (0..=255u8)
+            .map(|b| (byte_char(b).to_string(), u32::from(b).into()))
+            .collect();
+        let byte_level = serde_json::json!({"type": "ByteLevel", "add_prefix_space": false,
+            "trim_offsets": true, "use_regex": true});
+        serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [{"id": 256, "content": "</s>", "single_word": false,
+                "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+            "normalizer": null, "pre_tokenizer": byte_level, "post_processor": null,
+            "decoder": byte_level,
+            "model": {"type": "BPE", "dropout": null, "unk_token": null,
+                "continuing_subword_prefix": null, "end_of_word_suffix": null,
+                "fuse_unk": false, "byte_fallback": false, "vocab": vocab, "merges": []},
+        })
+        .to_string()
+        .parse()
+        .unwrap()
+    }
+
+    #[test]
+    fn the_factory_is_built_on_the_first_grammar_task_only() {
+        let tok = byte_tokenizer();
+        let lazy = LazyGrammarFactory::new("test", vec![256]);
+        assert!(lazy.built().is_none(), "built at construction");
+        let plain = GenerationTask::new("t", "p");
+        assert!(lazy.compile(Some(&tok), &plain).unwrap().is_none());
+        assert!(lazy.built().is_none(), "built for a plain task");
+        let json = GenerationTask::new("t", "p").with_grammar(json_spec(
+            r#"{"type":"object","additionalProperties":false}"#,
+        ));
+        assert!(lazy.compile(Some(&tok), &json).unwrap().is_some());
+        assert!(matches!(lazy.built(), Some(Ok(_))));
+    }
+
+    #[test]
+    fn a_factory_that_cannot_be_built_refuses_every_grammar_task() {
+        let tok = byte_tokenizer();
+        // EOS 999 is outside the vocab: no factory.
+        let lazy = LazyGrammarFactory::new("test", vec![999]);
+        let json = GenerationTask::new("t", "p").with_grammar(json_spec(WEATHER));
+        for _ in 0..2 {
+            match lazy.compile(Some(&tok), &json) {
+                Err(EngineError::InvalidConfig(m)) => assert!(
+                    m.starts_with("structured output is not available for this model: "),
+                    "{m}"
+                ),
+                other => panic!(
+                    "expected InvalidConfig, got {:?}",
+                    other.map(|g| g.is_some())
+                ),
+            }
+        }
+        assert!(
+            matches!(lazy.built(), Some(Err(_))),
+            "the failure is cached"
+        );
+        let none = LazyGrammarFactory::unavailable("this stage has no tokenizer");
+        assert!(matches!(
+            none.compile(None, &json),
+            Err(EngineError::InvalidConfig(_))
+        ));
+        assert!(none
+            .compile(None, &GenerationTask::new("t", "p"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

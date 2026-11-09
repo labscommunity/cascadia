@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
+#[cfg(test)]
+use cascadia_grammar::GrammarFactory;
+use cascadia_grammar::{CompiledGrammar, GrammarMask};
 use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, Runtime};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
@@ -818,9 +820,10 @@ impl Builder for Qwen36Builder {
             "qwen35 prefix cache"
         );
         // Structured output is built on the rank that receives tasks.
-        let grammar_factory = match self.tokenizer.as_ref() {
-            Some(tok) => structured::build_grammar_factory("qwen35", tok, &self.eos_ids),
-            None => Err("this rank has no tokenizer".into()),
+        let grammar_factory = if self.tokenizer.is_some() {
+            structured::LazyGrammarFactory::new("qwen35", self.eos_ids.clone())
+        } else {
+            structured::LazyGrammarFactory::unavailable("this rank has no tokenizer")
         };
         Ok(Box::new(Qwen36Engine {
             emb: self.emb,
@@ -963,7 +966,7 @@ pub struct Qwen36Engine {
     eos_ids: Vec<u32>,
     /// Builds structured-output grammars for this tokenizer; `Err` holds why
     /// it couldn't be built (structured-output tasks are then refused).
-    grammar_factory: Result<GrammarFactory, String>,
+    grammar_factory: structured::LazyGrammarFactory,
     max_tokens_default: u32,
     last_logits_only: bool,
     /// Activation width ([1, T, hidden]) the stage IRs exchange; sizes
@@ -1760,10 +1763,10 @@ impl Qwen36Engine {
         if !picks {
             return Ok(None);
         }
-        let width = match &self.grammar_factory {
-            Ok(f) => f.mask_width(),
-            Err(reason) => return Err(EngineError::Backend(reason.clone())),
-        };
+        let width = self
+            .grammar_factory
+            .mask_width()
+            .map_err(EngineError::Backend)?;
         encode_wire_mask(grammar, width)
             .map(Some)
             .map_err(|e| EngineError::Backend(format!("structured output failed: {e}")))
@@ -3039,7 +3042,9 @@ impl Engine for Qwen36Engine {
         }
         // A pipeline head compiles here too; whether its chain can mask is
         // known at the first admission (the handshake), checked there.
-        let grammar = structured::compile_task_grammar(&self.grammar_factory, &task)?;
+        let grammar = self
+            .grammar_factory
+            .compile(self.tokenizer.as_ref(), &task)?;
         structured::log_grammar_warnings("qwen35", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
@@ -3611,7 +3616,7 @@ mod tests {
             tokenizer: None,
             eos: None,
             eos_ids: Vec::new(),
-            grammar_factory: Err("no tokenizer".into()),
+            grammar_factory: structured::LazyGrammarFactory::unavailable("no tokenizer"),
             max_tokens_default: 256,
             last_logits_only: false,
             hidden: LEGACY_HIDDEN,
@@ -4244,7 +4249,8 @@ mod tests {
     fn a_pipeline_head_compiles_grammar_tasks_at_submit() {
         let mut e = bare_engine(2, "{}");
         e.rank = 0;
-        e.grammar_factory = Ok(GrammarFactory::single_byte_for_tests());
+        e.grammar_factory =
+            structured::LazyGrammarFactory::ready(Ok(GrammarFactory::single_byte_for_tests()));
         let task = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
         assert!(e.submit(task).is_ok());
         assert!(e.pending[0].grammar.is_some());
@@ -4266,7 +4272,8 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
-        e.grammar_factory = Ok(GrammarFactory::single_byte_for_tests());
+        e.grammar_factory =
+            structured::LazyGrammarFactory::ready(Ok(GrammarFactory::single_byte_for_tests()));
         let bad = GenerationTask::new("b", "p").with_grammar(json_spec(r#"{"type":42}"#));
         assert!(matches!(e.submit(bad), Err(EngineError::InvalidConfig(_))));
         assert!(e.submit(good).is_ok());
@@ -4506,7 +4513,8 @@ mod tests {
         let mut e = pipe_rank(0, total, rt);
         e.tokenizer = Some(tiny_tokenizer());
         e.eos_ids = vec![TEST_EOS];
-        e.grammar_factory = Ok(GrammarFactory::single_byte_for_tests());
+        e.grammar_factory =
+            structured::LazyGrammarFactory::ready(Ok(GrammarFactory::single_byte_for_tests()));
         e.fake_embed = Some(bad_peak_rows);
         e
     }

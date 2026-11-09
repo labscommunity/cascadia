@@ -27,10 +27,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::structured::{self, compile_task_grammar, start_grammar};
+use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
+#[cfg(test)]
+use cascadia_grammar::GrammarFactory;
+use cascadia_grammar::{CompiledGrammar, GrammarMask};
 use cascadia_ov_genai_shim::{
     advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -1586,7 +1588,7 @@ pub struct OvDistSpecEngine {
     eos_token_ids: Vec<u32>,
     /// Builds structured-output grammars for this tokenizer; `Err` holds why
     /// it couldn't be built (structured-output tasks are then refused).
-    grammar_factory: Result<GrammarFactory, String>,
+    grammar_factory: structured::LazyGrammarFactory,
     k: usize,
     pending: Vec<PendingSpec>,
     active: Option<ActiveSpec>,
@@ -1652,7 +1654,7 @@ impl Engine for OvDistSpecEngine {
                 cap: MAX_PENDING_TASKS,
             });
         }
-        let grammar = compile_task_grammar(&self.grammar_factory, &task)?;
+        let grammar = self.grammar_factory.compile(Some(&self.tokenizer), &task)?;
         structured::log_grammar_warnings("ov-dist-spec", &task.task_id, grammar.as_ref());
         self.pending.push(PendingSpec { task, grammar });
         Ok(())
@@ -2415,7 +2417,7 @@ impl Builder for OvDistSpecBuilder {
             DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
         let masked_draft = MaskedReq::new(draft)?;
         let grammar_factory =
-            structured::build_grammar_factory("ov-dist-spec", &tokenizer, &self.eos_token_ids);
+            structured::LazyGrammarFactory::new("ov-dist-spec", self.eos_token_ids.clone());
         Ok(Box::new(OvDistSpecEngine {
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),

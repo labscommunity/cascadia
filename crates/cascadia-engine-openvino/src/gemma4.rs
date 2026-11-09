@@ -39,7 +39,9 @@ use std::time::Duration;
 use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
+#[cfg(test)]
+use cascadia_grammar::GrammarFactory;
+use cascadia_grammar::{CompiledGrammar, GrammarMask};
 use cascadia_ov_genai_shim::{
     DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -549,6 +551,7 @@ fn step_end(
 /// `InvalidConfig` (400) when the model can't do structured output or the
 /// schema doesn't compile. Any topology: on a multi-stage pipeline the mask
 /// rides the stage wire.
+#[cfg(test)]
 fn compile_task_grammar(
     factory: &Result<GrammarFactory, String>,
     task: &GenerationTask,
@@ -1315,7 +1318,7 @@ pub struct Gemma4Engine {
     eos_token_ids: Vec<u32>,
     /// Builds structured-output grammars for this tokenizer; `Err` holds why
     /// it couldn't be built (structured-output tasks are then refused).
-    grammar_factory: Result<GrammarFactory, String>,
+    grammar_factory: structured::LazyGrammarFactory,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
@@ -2085,10 +2088,10 @@ impl Gemma4Engine {
         } else if let Some(mask) = mask {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
-            let width = match &self.grammar_factory {
-                Ok(f) => f.mask_width(),
-                Err(reason) => return Err(EngineError::Backend(reason.clone())),
-            };
+            let width = self
+                .grammar_factory
+                .mask_width()
+                .map_err(EngineError::Backend)?;
             // A zero width is a broken factory, not a schema dead end.
             let words = mask_words(mask, width).inspect_err(|_| {
                 self.grammar_failure = (width > 0).then_some(GrammarFailure::DeadEnd)
@@ -2431,7 +2434,9 @@ impl Engine for Gemma4Engine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
-        let grammar = compile_task_grammar(&self.grammar_factory, &task)?;
+        let grammar = self
+            .grammar_factory
+            .compile(self.tokenizer.as_deref(), &task)?;
         structured::log_grammar_warnings("gemma4", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
@@ -3260,12 +3265,12 @@ impl Builder for Gemma4Builder {
             );
         }
 
-        // Structured output is built on the stage that receives tasks.
-        let grammar_factory = match self.tokenizer.as_deref() {
-            Some(tok) if spec.is_first_stage => {
-                structured::build_grammar_factory("gemma4", tok, &self.eos_token_ids)
-            }
-            _ => Err("this stage has no tokenizer".into()),
+        // Structured output is built on the first json task, on the stage
+        // that receives tasks.
+        let grammar_factory = if spec.is_first_stage {
+            structured::LazyGrammarFactory::new("gemma4", self.eos_token_ids.clone())
+        } else {
+            structured::LazyGrammarFactory::unavailable("this stage has no tokenizer")
         };
 
         Ok(Box::new(Gemma4Engine {

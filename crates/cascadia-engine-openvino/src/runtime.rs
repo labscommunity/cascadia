@@ -43,7 +43,9 @@ use std::time::Duration;
 use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
+#[cfg(test)]
+use cascadia_grammar::GrammarFactory;
+use cascadia_grammar::{CompiledGrammar, GrammarMask};
 use cascadia_ov_genai_shim::{
     advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -1749,7 +1751,7 @@ async fn masked_exchange(
 /// while the link is latched, and on a grammar dead end.
 fn step_mask_words(
     active: Option<&mut ActiveTask>,
-    factory: &Result<GrammarFactory, String>,
+    factory: &structured::LazyGrammarFactory,
     link: &MaskLink,
     last_row_position: i64,
     now: std::time::Instant,
@@ -1767,14 +1769,11 @@ fn step_mask_words(
     if let Some(refused) = link.refusal(now) {
         return Err(refused);
     }
-    let width = factory
-        .as_ref()
-        .map(GrammarFactory::mask_width)
-        .map_err(|reason| {
-            EngineError::Backend(format!(
-                "structured output is not available for this model: {reason}"
-            ))
-        })?;
+    let width = factory.mask_width().map_err(|reason| {
+        EngineError::Backend(format!(
+            "structured output is not available for this model: {reason}"
+        ))
+    })?;
     grammar_mask_words(grammar, width).map(Some)
 }
 
@@ -2520,7 +2519,7 @@ pub struct OvRuntimeEngine {
     /// Builds structured-output grammars for this tokenizer (first stage);
     /// `Err` holds why it couldn't be built (structured-output tasks are then
     /// refused).
-    grammar_factory: Result<GrammarFactory, String>,
+    grammar_factory: structured::LazyGrammarFactory,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
@@ -3771,11 +3770,7 @@ impl OvRuntimeEngine {
         rows: usize,
         out: &mut Vec<(TaskId, Chunk)>,
     ) -> Option<PlanMasks> {
-        let width = self
-            .grammar_factory
-            .as_ref()
-            .map(GrammarFactory::mask_width)
-            .map_err(Clone::clone);
+        let width = self.grammar_factory.mask_width();
         let refused = self.mask_link.refusal(std::time::Instant::now()).is_some();
         let (masks, failed) = packed_step_masks(
             &mut self.packed.as_mut().unwrap().slots,
@@ -5222,7 +5217,9 @@ impl Engine for OvRuntimeEngine {
                 return Err(refused);
             }
         }
-        let grammar = structured::compile_task_grammar(&self.grammar_factory, &task)?;
+        let grammar = self
+            .grammar_factory
+            .compile(self.tokenizer.as_deref(), &task)?;
         structured::log_grammar_warnings("ov-runtime", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
@@ -6769,18 +6766,13 @@ impl Builder for OvRuntimeBuilder {
             }
         };
 
-        // Structured output: built once on the stage that holds the tokenizer
-        // and takes tasks, from every EOS id generation stops on.
-        let grammar_factory = match self.tokenizer.as_deref() {
-            Some(tok) if spec.is_first_stage => {
-                structured::build_grammar_factory("ov-runtime", tok, &self.eos_token_ids)
-            }
-            None if spec.is_first_stage => {
-                let reason = "no tokenizer loaded".to_string();
-                structured::unavailable("ov-runtime", &reason);
-                Err(reason)
-            }
-            _ => Err("not the first pipeline stage".to_string()),
+        // Structured output: built on the first json task, on the stage that
+        // holds the tokenizer and takes tasks, from every EOS id generation
+        // stops on.
+        let grammar_factory = if spec.is_first_stage {
+            structured::LazyGrammarFactory::new("ov-runtime", self.eos_token_ids.clone())
+        } else {
+            structured::LazyGrammarFactory::unavailable("not the first pipeline stage")
         };
 
         Ok(Box::new(OvRuntimeEngine {
@@ -9264,7 +9256,7 @@ mod tests {
     /// (`masked_exchange`), as `exchange_downstream` runs them.
     #[tokio::test]
     async fn the_head_masks_only_the_picking_row_and_exchanges_it() {
-        let gf: Result<GrammarFactory, String> = Ok(test_factory());
+        let gf = structured::LazyGrammarFactory::ready(Ok(test_factory()));
         let now = std::time::Instant::now();
         let link = MaskLink::default();
         let mut plain = active_task(4, None);
@@ -9285,7 +9277,7 @@ mod tests {
         let mut latched = MaskLink::default();
         let _ = latched.on_unacked(now, &EngineError::Backend("x".into()));
         assert!(step_mask_words(Some(&mut json), &gf, &latched, 3, now).is_err());
-        let none: Result<GrammarFactory, String> = Err("no tokenizer".into());
+        let none = structured::LazyGrammarFactory::unavailable("no tokenizer");
         assert!(step_mask_words(Some(&mut json), &none, &link, 3, now).is_err());
 
         let (client, server) = loopback().await;
