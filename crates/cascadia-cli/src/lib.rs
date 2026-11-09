@@ -1599,11 +1599,12 @@ fn engine_window(
         // A 0 is no window. With --packed-slots each request gets one slot's
         // region of the static KV, by the engine's own formula
         // (`PackedKv::new`): the prefix is clamped to leave a row per slot.
-        // The region is the default answer limit. The packed engine does not
-        // end a request when its region fills (it slides the region,
-        // `PackedKv::absorb_row`), and a slot reusing the shared prefix holds
-        // those tokens plus its region while the prompt count includes them,
-        // so the window is the region plus the prefix.
+        // The region is the default answer limit and the window. The packed
+        // engine does not end a request when its region fills (it slides the
+        // region, `PackedKv::absorb_row`), so the window must not pass it: a
+        // slot that reuses k shared-prefix tokens could hold k more, but one
+        // that reuses none starts sliding at the region. Requests that reuse
+        // the prefix therefore end up to k tokens early, with `length`.
         EngineKind::OvRuntime => info.static_context.filter(|&c| c > 0).and_then(|c| {
             if args.packed_slots == 0 {
                 return Some(same((c, "stage_config.json static_context")));
@@ -1612,7 +1613,7 @@ fn engine_window(
             let past_len = c - 1;
             let prefix = args.packed_prefix.min(past_len.saturating_sub(slots));
             let region = (past_len - prefix) / slots;
-            (region > 0).then_some((region, region + prefix, PACKED_WINDOW_SOURCE))
+            (region > 0).then_some((region, region, PACKED_WINDOW_SOURCE))
         }),
         _ => None,
     }
@@ -5224,24 +5225,22 @@ mod generation_defaults_tests {
             s.max_tokens,
             DefaultSource::EngineWindow(PACKED_WINDOW_SOURCE)
         );
-        // A slot that reuses the shared prefix holds it plus its region, and
-        // the prompt count includes the prefix, so the window is both; the
-        // default answer limit stays one region.
+        // With a shared prefix the window is still one region: a slot that
+        // does not reuse the prefix starts sliding its region there, so the
+        // region is the only bound that holds for every request (one that
+        // reuses k prefix tokens ends up to k tokens early, with `length`).
         w.packed_prefix = 512;
         let d = resolve(&w, info).0;
         assert_eq!(
             (d.max_tokens, d.context_window),
-            ((1024 - 512) / 8, Some((1024 - 512) / 8 + 512))
+            ((1024 - 512) / 8, Some((1024 - 512) / 8))
         );
         // A prefix larger than the window is clamped as the engine clamps it.
         w.packed_prefix = 5000;
         let d = resolve(&w, info).0;
         assert_eq!(
             (d.max_tokens, d.context_window),
-            (
-                (1024 - (1024 - 8)) / 8,
-                Some((1024 - (1024 - 8)) / 8 + 1016)
-            )
+            ((1024 - (1024 - 8)) / 8, Some((1024 - (1024 - 8)) / 8))
         );
         // Without --packed-slots the whole static context is the window.
         w.packed_slots = 0;

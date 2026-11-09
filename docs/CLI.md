@@ -239,11 +239,11 @@ context window still ends an answer where the prompt plus the answer fill it
   numeric `factor` multiplies the window, except for the types whose window
   already counts the scaling (`su`, `longrope`, `llama3`, `yarn`,
   `deepseek_yarn`, `deepseek_llama_scaling`) and for Gemma 3); else 4096. With `--packed-slots N` the ov-runtime limit is one slot's region,
-  `(static_context - 1 - packed_prefix) / N`, and its context window is that
-  region plus the shared prefix (`packed_prefix`, clamped as the engine
-  clamps it), since a slot that reuses the prefix holds both and the prompt
-  count includes it; the packed engine itself slides a full region rather
-  than ending the request. Before this change an unset limit silently
+  `(static_context - 1 - packed_prefix) / N`, and so is its context window:
+  the packed engine slides a full region rather than ending the request, and
+  a slot that doesn't reuse the shared prefix fills its region first. An
+  answer whose prompt reuses k shared-prefix tokens therefore ends up to k
+  tokens early, with `length`. Before this change an unset limit silently
   stopped at 256 tokens.
 - **Explicit limits are capped at a known window.** When the window comes from
   one of the real sources above (an engine limit or `config.json`, not the 4096
@@ -265,8 +265,8 @@ context window still ends an answer where the prompt plus the answer fill it
     e.g. 400 to a 512-token slot).
   - A prompt that alone reaches the window is not cut: the engine took it, so
     the window read is not its real limit, and the engine bounds the answer.
-  - The window includes `rope_scaling` (above); with `--packed-slots` it is a
-    slot's region plus the shared prefix.
+  - The window includes `rope_scaling` (above); with `--packed-slots` it is
+    one slot's region.
   - ov-genai without `--cb` makes the whole answer in one call, so the engine
     itself cuts that call's limit to what the prompt leaves of the window and
     reports `length` there. When ov-genai applies the chat template itself
