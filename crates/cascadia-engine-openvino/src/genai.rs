@@ -377,10 +377,11 @@ const JSON_OBJECT_PROBE: &str = r#"{"type":"object","additionalProperties":true}
 /// Schema, prompt and token budget for the warmup structured-output probe.
 /// The prompt does not ask for JSON and the schema allows exactly one
 /// answer, so the expected output appears only when the constraint is
-/// really applied.
+/// really applied. The answer is a handful of tokens; the rest of the budget
+/// is room for the whitespace the grammar allows between them.
 const PROBE_SCHEMA: &str = r#"{"type":"object","properties":{"k":{"const":"zq"}},"required":["k"],"additionalProperties":false}"#;
 const PROBE_PROMPT: &str = "Say hello.";
-const PROBE_MAX_TOKENS: u32 = 16;
+const PROBE_MAX_TOKENS: u32 = 48;
 
 /// Request id of the CB structured-output probe, and `- 1` of its retry (the
 /// plain warmup uses `u64::MAX`); none can collide with the sequential
@@ -445,17 +446,53 @@ fn client_message(err: OvError, what: &str) -> String {
     clean
 }
 
+/// The probe schema's one answer, without whitespace.
+const PROBE_ANSWER: &str = r#"{"k":"zq"}"#;
+
+/// `text` with the whitespace outside JSON strings removed.
+fn strip_json_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Decide the warmup structured-output probe. `None` means available: the
 /// trimmed output is exactly the probe schema's one answer `{"k":"zq"}`, or
-/// it is empty (the grammar allows leading whitespace, so the budget can
-/// end before the object starts: inconclusive, not a failure). `Some(reason)`
-/// means unavailable; an error's text is cleaned for clients.
+/// it is empty or a proper prefix of that answer (the grammar allows
+/// whitespace between tokens, so the budget can end before the object is
+/// complete: inconclusive, not a failure). `Some(reason)` means unavailable;
+/// an error's text is cleaned for clients.
 fn probe_verdict(r: Result<String, OvError>) -> Option<String> {
     match r {
         Ok(text) => {
             let t = text.trim();
             if t.is_empty() {
                 info!("structured output probe inconclusive: no output within the token budget");
+                return None;
+            }
+            let compact = strip_json_whitespace(t);
+            if compact.len() < PROBE_ANSWER.len() && PROBE_ANSWER.starts_with(&compact) {
+                info!(
+                    output = %t,
+                    "structured output probe inconclusive: the token budget ended inside the answer"
+                );
                 return None;
             }
             let want = serde_json::json!({"k": "zq"});
@@ -2239,7 +2276,28 @@ mod tests {
         assert_eq!(probe_verdict(Ok(" {\"k\": \"zq\"}\n".into())), None);
         assert_eq!(probe_verdict(Ok("   \n".into())), None, "inconclusive");
         assert_eq!(probe_verdict(Ok(String::new())), None, "inconclusive");
-        for text in ["hello", "{\"a\":1}", "{\"k\":\"zz\"}", "{\"k\":\"z"] {
+        // The budget ran out part-way through the one allowed answer.
+        for text in [
+            "{",
+            "\n{ \"k\"",
+            "{\"k\" :\n \"z",
+            "{\"k\":\"zq\"",
+            "{\"k\":\"zq\" ",
+        ] {
+            assert_eq!(
+                probe_verdict(Ok(text.into())),
+                None,
+                "{text:?} is inconclusive"
+            );
+        }
+        for text in [
+            "hello",
+            "{\"a\":1}",
+            "{\"k\":\"zz\"}",
+            "{\"k\":\"z q",
+            "{\"k\":\"zq\"}}",
+            "[",
+        ] {
             let r = probe_verdict(Ok(text.into())).expect("must fail");
             assert_eq!(r, format!("the output constraint was not applied: {text}"));
         }
