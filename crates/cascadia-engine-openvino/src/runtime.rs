@@ -3124,6 +3124,7 @@ impl OvRuntimeEngine {
             is_final,
             first_new,
             prompt_tokens,
+            is_eos,
         );
 
         if is_final {
@@ -5430,6 +5431,7 @@ fn single_task_token_chunk(
     is_final: bool,
     first_new: bool,
     prompt_tokens: u32,
+    is_eos: bool,
 ) -> Chunk {
     if is_final {
         Chunk {
@@ -5443,9 +5445,12 @@ fn single_task_token_chunk(
             completion_tokens: None,
             error: None,
             token_ids: Vec::new(),
-            // ov-runtime doesn't yet distinguish length vs stop here; the
-            // API falls back to "stop" (unchanged behavior). #14 follow-up.
-            finish_reason: None,
+            // EOS ended it, else `max_tokens` did.
+            finish_reason: Some(if is_eos {
+                cascadia_types::FinishReason::Stop
+            } else {
+                cascadia_types::FinishReason::Length
+            }),
         }
     } else {
         let chunk = Chunk::token(task_id, token as i64, delta)
@@ -5471,9 +5476,9 @@ mod tests {
     #[test]
     fn single_task_chunks_count_every_decoded_token() {
         let chunks = [
-            single_task_token_chunk("t".into(), 1, String::new(), false, true, 7),
-            single_task_token_chunk("t".into(), 2, "é".into(), false, false, 7),
-            single_task_token_chunk("t".into(), 3, String::new(), true, false, 7),
+            single_task_token_chunk("t".into(), 1, String::new(), false, true, 7, false),
+            single_task_token_chunk("t".into(), 2, "é".into(), false, false, 7, false),
+            single_task_token_chunk("t".into(), 3, String::new(), true, false, 7, true),
         ];
         for c in &chunks {
             assert_eq!(c.token_count(), 1, "{c:?}");
@@ -5485,6 +5490,22 @@ mod tests {
         assert_eq!(chunks[1].prompt_tokens, None);
         assert_eq!(chunks[2].prompt_tokens, Some(7));
         assert!(chunks[2].is_final);
+    }
+
+    /// The final chunk says why the answer ended: EOS is `stop`, reaching
+    /// `max_tokens` is `length` (it used to carry no reason, so the API
+    /// reported every capped answer as `stop`).
+    #[test]
+    fn single_task_final_chunk_reports_length_at_the_cap_and_stop_at_eos() {
+        let capped = single_task_token_chunk("t".into(), 5, "x".into(), true, false, 7, false);
+        let eos = single_task_token_chunk("t".into(), 2, String::new(), true, false, 7, true);
+        let mid = single_task_token_chunk("t".into(), 5, "x".into(), false, false, 7, false);
+        assert_eq!(
+            capped.finish_reason,
+            Some(cascadia_types::FinishReason::Length)
+        );
+        assert_eq!(eos.finish_reason, Some(cascadia_types::FinishReason::Stop));
+        assert_eq!(mid.finish_reason, None);
     }
 
     #[tokio::test]
