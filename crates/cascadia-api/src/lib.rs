@@ -28,7 +28,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod structured;
-pub use structured::*;
+pub use structured::{
+    grammar_for, parse_response_format, unenforced_keywords, ResponseFormat, JSON_OBJECT_SCHEMA,
+    MAX_SCHEMA_BYTES, MAX_SCHEMA_COUNT, MAX_SCHEMA_COUNT_TOTAL, MAX_SCHEMA_DEPTH,
+};
 
 /// Maximum HTTP request body the chat-completions endpoint accepts. 64
 /// KiB is plenty for any legitimate chat completion (prompt + system +
