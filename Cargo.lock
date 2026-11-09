@@ -465,6 +465,7 @@ version = "0.2.7"
 dependencies = [
  "async-trait",
  "cascadia-engine",
+ "cascadia-grammar",
  "cascadia-kv-wire",
  "cascadia-ov-genai-shim",
  "cascadia-runner",

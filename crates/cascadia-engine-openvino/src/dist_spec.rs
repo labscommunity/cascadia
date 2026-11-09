@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
 use cascadia_ov_genai_shim::{
     advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -36,7 +37,9 @@ use cascadia_transport::{
     recv_tensor, send_tensor, ActivationClient, ActivationServer, DType as WireDType,
     Tensor as WireTensor, MAX_RANK, MAX_RAW_BYTES,
 };
-use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{
+    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId,
+};
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -163,6 +166,141 @@ fn argmax(slice: &[f32]) -> usize {
         );
     }
     best_i
+}
+
+// -------- structured output (grammar-masked verify) --------
+
+/// Why a grammar task's round stopped before using every verify row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaskedEnd {
+    /// The JSON is complete and nothing may follow; the completing token was emitted.
+    Finished,
+    /// The masked pick was an EOS id (not emitted, as on the unmasked path).
+    Eos,
+    /// The token that reached `max_tokens` was emitted.
+    Budget,
+}
+
+impl MaskedEnd {
+    fn finish_reason(self) -> FinishReason {
+        match self {
+            MaskedEnd::Finished | MaskedEnd::Eos => FinishReason::Stop,
+            MaskedEnd::Budget => FinishReason::Length,
+        }
+    }
+}
+
+/// Result of [`masked_accept`].
+#[derive(Debug, PartialEq, Eq)]
+struct MaskedRound {
+    /// Tokens to append to the output, in order (all grammar-allowed).
+    tokens: Vec<i64>,
+    /// How many leading drafts were emitted as-is. Those stay in the target's
+    /// (and draft's) KV; everything after them is rewound.
+    kept: usize,
+    /// `Some` when the task ends with this round.
+    end: Option<MaskedEnd>,
+}
+
+/// Masked greedy pick: the argmax of `row` among the tokens the grammar allows.
+fn masked_pick(mask: &mut GrammarMask, row: &[f32]) -> EngineResult<i64> {
+    let mut masked = row.to_vec();
+    mask.apply(&mut masked)?;
+    Ok(argmax(&masked) as i64)
+}
+
+/// Greedy acceptance for a grammar task. `rows[i]` is the target's logits
+/// after the output so far plus `drafts[..i]` (row `drafts.len()` is the bonus
+/// row); the drafts were proposed unmasked. Row `i` is masked with the
+/// matcher advanced over the tokens accepted before it; a draft is accepted
+/// while it equals the masked argmax, and the first mismatch's masked argmax
+/// is the correction. Stops at a clean grammar finish (the completing token is
+/// emitted, nothing after it), at EOS (not emitted) and once `remaining`
+/// tokens were emitted. The matcher ends advanced over exactly `tokens`.
+fn masked_accept(
+    mask: &mut GrammarMask,
+    rows: &[&[f32]],
+    drafts: &[i64],
+    eos: &[u32],
+    remaining: usize,
+) -> EngineResult<MaskedRound> {
+    let mut tokens = Vec::with_capacity(drafts.len() + 1);
+    let mut kept = 0usize;
+    let mut end = None;
+    for (i, row) in rows.iter().enumerate().take(drafts.len() + 1) {
+        let m = masked_pick(mask, row)?;
+        if eos.contains(&(m as u32)) {
+            end = Some(MaskedEnd::Eos);
+            break;
+        }
+        mask.accept(m as u32)?;
+        tokens.push(m);
+        let matched = drafts.get(i) == Some(&m);
+        if matched {
+            kept += 1;
+        }
+        if mask.finished() {
+            end = Some(MaskedEnd::Finished);
+            break;
+        }
+        if tokens.len() >= remaining {
+            end = Some(MaskedEnd::Budget);
+            break;
+        }
+        if !matched {
+            // The correction (or the bonus token): the round ends here.
+            break;
+        }
+    }
+    Ok(MaskedRound { tokens, kept, end })
+}
+
+/// Picks the first generated token from the last prompt row: plain argmax for
+/// a task without a grammar, else the masked argmax (accepted into the matcher
+/// unless it is EOS). `Some(end)` when the grammar task ends on this token.
+fn pick_first_token(
+    row: &[f32],
+    mask: Option<&mut GrammarMask>,
+    eos: &[u32],
+) -> EngineResult<(i64, Option<MaskedEnd>)> {
+    let Some(mask) = mask else {
+        return Ok((argmax(row) as i64, None));
+    };
+    let m = masked_pick(mask, row)?;
+    if eos.contains(&(m as u32)) {
+        return Ok((m, Some(MaskedEnd::Eos)));
+    }
+    mask.accept(m as u32)?;
+    Ok((m, mask.finished().then_some(MaskedEnd::Finished)))
+}
+
+/// Submit-time grammar build: `None` for a task without a grammar; an
+/// `InvalidConfig` (400) when the model can't do structured output or the
+/// schema doesn't compile.
+fn compile_task_grammar(
+    factory: &Result<GrammarFactory, String>,
+    task: &GenerationTask,
+) -> EngineResult<Option<CompiledGrammar>> {
+    let Some(spec) = task.grammar.as_ref() else {
+        return Ok(None);
+    };
+    let factory = factory.as_ref().map_err(|reason| {
+        EngineError::InvalidConfig(format!(
+            "structured output is not available for this model: {reason}"
+        ))
+    })?;
+    factory.compile(spec).map(Some)
+}
+
+/// Activation: a fresh matcher advanced over the resume seed. A seed the
+/// grammar rejects is a backend error.
+fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineResult<GrammarMask> {
+    let mut mask = compiled.matcher()?;
+    if !seed.is_empty() {
+        let seed: Vec<u32> = seed.iter().map(|&t| t as u32).collect();
+        mask.replay(&seed)?;
+    }
+    Ok(mask)
 }
 
 fn map_ov_err(err: OvError) -> EngineError {
@@ -1398,6 +1536,17 @@ struct ActiveSpec {
     stats: SpecDecodeStats,
     /// Whether we already emitted the first sampled token's chunk.
     initialized: bool,
+    /// The grammar matcher of a structured-output task, advanced over every
+    /// token in `out`. `None` for every other task (unmasked path).
+    grammar: Option<GrammarMask>,
+    /// A grammar task that already ends on its first token.
+    first_end: Option<MaskedEnd>,
+}
+
+/// A queued task with its grammar compiled at submit.
+struct PendingSpec {
+    task: GenerationTask,
+    grammar: Option<CompiledGrammar>,
 }
 
 pub struct OvDistSpecEngine {
@@ -1407,8 +1556,11 @@ pub struct OvDistSpecEngine {
     /// All EOS token ids configured for the model. Generation truncates
     /// at the first token that matches ANY of these.
     eos_token_ids: Vec<u32>,
+    /// Builds structured-output grammars for this tokenizer; `Err` holds why
+    /// it couldn't be built (structured-output tasks are then refused).
+    grammar_factory: Result<GrammarFactory, String>,
     k: usize,
-    pending: Vec<GenerationTask>,
+    pending: Vec<PendingSpec>,
     active: Option<ActiveSpec>,
     /// Issue-34: opaque KV blob cache + a stable model id (the target pipeline dir) for the
     /// coordination-plane fingerprint. `kv_coord` only.
@@ -1453,7 +1605,7 @@ impl Engine for OvDistSpecEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        if self.pending.iter().any(|t| t.task_id == task.task_id)
+        if self.pending.iter().any(|p| p.task.task_id == task.task_id)
             || self
                 .active
                 .as_ref()
@@ -1472,7 +1624,15 @@ impl Engine for OvDistSpecEngine {
                 cap: MAX_PENDING_TASKS,
             });
         }
-        self.pending.push(task);
+        let grammar = compile_task_grammar(&self.grammar_factory, &task)?;
+        if let Some(g) = grammar.as_ref().filter(|g| !g.warnings().is_empty()) {
+            info!(
+                task = %task.task_id,
+                warnings = ?g.warnings(),
+                "ov-dist-spec: response_format keywords accepted but not enforced"
+            );
+        }
+        self.pending.push(PendingSpec { task, grammar });
         Ok(())
     }
 
@@ -1480,7 +1640,7 @@ impl Engine for OvDistSpecEngine {
         // Step-wise driver (rank 0): drop the queued task and clear the active
         // speculation so step() stops verifying rounds for it. The next
         // admission's reset re-syncs the worker downstream.
-        self.pending.retain(|t| &t.task_id != task_id);
+        self.pending.retain(|p| &p.task.task_id != task_id);
         if self
             .active
             .as_ref()
@@ -1496,7 +1656,7 @@ impl Engine for OvDistSpecEngine {
             if self.pending.is_empty() {
                 return Ok(Vec::new());
             }
-            let task = self.pending.remove(0);
+            let PendingSpec { task, grammar } = self.pending.remove(0);
             let enc = match self.tokenizer.encode(task.prompt.clone(), false) {
                 Ok(e) => e,
                 Err(e) => {
@@ -1539,7 +1699,7 @@ impl Engine for OvDistSpecEngine {
             );
 
             let task_id = task.task_id.clone();
-            match self.start_task(task, &prompt_ids) {
+            match self.start_task(task, grammar, &prompt_ids) {
                 Ok(active) => self.active = Some(active),
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec start failed");
@@ -1568,11 +1728,18 @@ impl Engine for OvDistSpecEngine {
             // here would test a fabricated id for EOS.
             let first_new = *active.out.last().expect("out seeded before init step");
             let hit_eos = self.eos_token_ids.contains(&(first_new as u32));
-            let finished = active.out.len() >= max_tokens || hit_eos;
+            // A grammar task also ends on a clean grammar finish, and says why.
+            let grammar_end = active.grammar.as_ref().and(
+                active
+                    .first_end
+                    .or((active.out.len() >= max_tokens).then_some(MaskedEnd::Budget)),
+            );
+            let finished = active.out.len() >= max_tokens || hit_eos || grammar_end.is_some();
             let new_text =
                 decode_delta(&self.tokenizer, &active.out, &mut active.emitted, !finished);
             if finished {
-                self.finish_task(task_id.clone(), new_text, 1)
+                let reason = grammar_end.map(MaskedEnd::finish_reason);
+                self.finish_task(task_id.clone(), new_text, 1, reason)
             } else {
                 vec![(
                     task_id,
@@ -1613,9 +1780,10 @@ impl Engine for OvDistSpecEngine {
                     finished,
                     n_tokens,
                     token_ids,
+                    finish_reason,
                 }) => {
                     if finished {
-                        self.finish_task(task_id, delta, n_tokens)
+                        self.finish_task(task_id, delta, n_tokens, finish_reason)
                     } else {
                         let active_ref = self.active.as_ref().unwrap();
                         let last_id = *active_ref.out.last().unwrap_or(&0);
@@ -1669,6 +1837,8 @@ struct RoundResult {
     /// plus the correction). Surfaced via `Chunk::token_ids` so a dist-spec
     /// multi-token chunk can serve as a resume source.
     token_ids: Vec<i64>,
+    /// Set by grammar tasks only; `None` keeps the final chunk as before.
+    finish_reason: Option<FinishReason>,
 }
 
 impl OvDistSpecEngine {
@@ -1678,8 +1848,18 @@ impl OvDistSpecEngine {
     fn start_task(
         &mut self,
         task: GenerationTask,
+        grammar: Option<CompiledGrammar>,
         prompt_ids: &[i64],
     ) -> Result<ActiveSpec, EngineError> {
+        // Structured output: the matcher starts after the resume seed (if any),
+        // before any model work, so a seed the grammar rejects costs nothing.
+        let mut grammar = match grammar.as_ref() {
+            Some(g) => Some(start_grammar(
+                g,
+                &cascadia_types::resume_generated_seed(task.resume_ids()),
+            )?),
+            None => None,
+        };
         // Issue-34: warm-resume a cached strict prefix (restores draft+target+chain, all-or-nothing)
         // and feed only the suffix; else cold-reset + feed the full prompt. 0 on the default build.
         #[cfg(feature = "kv_coord")]
@@ -1699,7 +1879,11 @@ impl OvDistSpecEngine {
         let (t_logits, t_shape) = self.target.feed(feed_ids)?;
         self.draft.feed(feed_ids)?;
         let vocab = t_shape[2];
-        let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
+        let (first, first_end) = pick_first_token(
+            &t_logits[t_logits.len() - vocab..],
+            grammar.as_mut(),
+            &self.eos_token_ids,
+        )?;
 
         let (d_logits, d_shape) = self.draft.feed(&[first])?;
         let dv = d_shape[2];
@@ -1739,12 +1923,17 @@ impl OvDistSpecEngine {
             d_last_logit,
             stats: SpecDecodeStats::default(),
             initialized: false,
+            grammar,
+            first_end,
         })
     }
 
     /// Run one spec round: generate K drafts → target verifies → emit
     /// accepted tokens (truncated at EOS) → set up state for next round.
     fn do_one_round(&mut self, max_tokens: usize) -> Result<RoundResult, EngineError> {
+        if self.active.as_ref().is_some_and(|a| a.grammar.is_some()) {
+            return self.do_one_masked_round(max_tokens);
+        }
         let active = self.active.as_mut().expect("active set");
         active.stats.n_steps += 1;
 
@@ -1838,6 +2027,83 @@ impl OvDistSpecEngine {
             finished: hit_eos || hit_max,
             n_tokens: n_tokens_added,
             token_ids: token_ids_added,
+            finish_reason: None,
+        })
+    }
+
+    /// One spec round for a structured-output task: drafts proposed unmasked,
+    /// every target verify row masked (see [`masked_accept`]), so the output is
+    /// what masked greedy decoding of the target alone would produce.
+    fn do_one_masked_round(&mut self, max_tokens: usize) -> Result<RoundResult, EngineError> {
+        let active = self.active.as_mut().expect("active set");
+        active.stats.n_steps += 1;
+
+        let mut drafts: Vec<i64> = vec![argmax(&active.d_last_logit) as i64];
+        for _ in 1..self.k {
+            if active.out.len() + drafts.len() >= max_tokens {
+                break;
+            }
+            let prev = *drafts.last().unwrap();
+            let (l, sh) = self.draft.feed(&[prev])?;
+            let dv = sh[2];
+            drafts.push(argmax(&l[l.len() - dv..]) as i64);
+        }
+        // Drafts the draft model has fed past `prev_correction` (the last one isn't).
+        let d_advanced = drafts.len() - 1;
+        active.stats.total_drafts += drafts.len() as u32;
+
+        let mut verify = Vec::with_capacity(drafts.len() + 1);
+        verify.push(active.prev_correction);
+        verify.extend_from_slice(&drafts);
+        let (t_logits, t_shape) = self.target.feed(&verify)?;
+        let v = t_shape[2];
+        if t_logits.len() < verify.len() * v {
+            return Err(EngineError::Backend(format!(
+                "verify returned {} logits for {} rows of {v}",
+                t_logits.len(),
+                verify.len()
+            )));
+        }
+        let rows: Vec<&[f32]> = t_logits.chunks_exact(v).take(verify.len()).collect();
+        let mask = active.grammar.as_mut().expect("grammar task");
+        let remaining = max_tokens.saturating_sub(active.out.len());
+        let round = masked_accept(mask, &rows, &drafts, &self.eos_token_ids, remaining)?;
+        active.stats.total_accepted += round.kept as u32;
+
+        let out_len_before = active.out.len();
+        active.out.extend_from_slice(&round.tokens);
+
+        // Only the drafts emitted as-is stay in the target's KV; the round's
+        // last token (a correction or the bonus) is fed next round.
+        self.target.rewind(drafts.len() - round.kept);
+        match round.end {
+            None => {
+                let correction = *round.tokens.last().expect("an open round emits a token");
+                let l_sh = if round.kept == drafts.len() {
+                    // Every draft accepted: the draft model hasn't fed the last
+                    // one yet, so it goes in ahead of the bonus token.
+                    self.draft.feed(&[drafts[d_advanced], correction])?
+                } else {
+                    self.draft.rewind(d_advanced - round.kept);
+                    self.draft.feed(&[correction])?
+                };
+                let (l, sh) = l_sh;
+                let dv = sh[2];
+                active.d_last_logit = l[l.len() - dv..].to_vec();
+                active.prev_correction = correction;
+            }
+            // The task ends: keep both KV caches on the emitted tokens only.
+            Some(_) => self.draft.rewind(d_advanced - round.kept.min(d_advanced)),
+        }
+
+        let finished = round.end.is_some();
+        let delta = decode_delta(&self.tokenizer, &active.out, &mut active.emitted, !finished);
+        Ok(RoundResult {
+            delta,
+            finished,
+            n_tokens: (active.out.len() - out_len_before) as u32,
+            token_ids: round.tokens,
+            finish_reason: round.end.map(MaskedEnd::finish_reason),
         })
     }
 
@@ -1848,9 +2114,12 @@ impl OvDistSpecEngine {
         task_id: TaskId,
         last_delta: String,
         n_tokens: u32,
+        finish_reason: Option<FinishReason>,
     ) -> Vec<(TaskId, Chunk)> {
         let Some(active) = self.active.take() else {
-            return vec![(task_id.clone(), Chunk::final_marker(task_id, last_delta))];
+            let mut c = Chunk::final_marker(task_id.clone(), last_delta);
+            c.finish_reason = finish_reason;
+            return vec![(task_id, c)];
         };
         // Issue-34: capture draft+target KV under (prompt ++ accepted) before the next start_task
         // resets. Best-effort + gated.
@@ -1902,7 +2171,7 @@ impl OvDistSpecEngine {
                 error: None,
                 invalid_request: false,
                 token_ids,
-                finish_reason: None,
+                finish_reason,
             },
         )]
     }
@@ -2122,6 +2391,14 @@ impl Builder for OvDistSpecBuilder {
         let target =
             DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
         let masked_draft = MaskedReq::new(draft)?;
+        let grammar_factory = GrammarFactory::from_tokenizer(&tokenizer, &self.eos_token_ids)
+            .map_err(|e| match e {
+                EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
+                other => other.to_string(),
+            })
+            .inspect_err(|reason| {
+                warn!(%reason, "ov-dist-spec: structured output unavailable for this model");
+            });
         Ok(Box::new(OvDistSpecEngine {
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
@@ -2129,6 +2406,7 @@ impl Builder for OvDistSpecBuilder {
             draft: masked_draft,
             tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
+            grammar_factory,
             k: self.k as usize,
             pending: Vec::new(),
             active: None,
@@ -3361,6 +3639,386 @@ mod tests {
         assert_eq!(FrameKind::from_u32(99), None);
         assert_eq!(FrameKind::from_u32(0), None);
         assert_eq!(FrameKind::from_u32(2), None); // gap between 1 and 3
+    }
+
+    // ---- structured output: grammar-masked verify ----
+
+    /// EOS of the single-byte test vocab.
+    const TEST_EOS: u32 = 261;
+    /// A control byte JSON never allows: the raw argmax that the mask must reject.
+    const BAD: u8 = 0x01;
+    const OK_ENUM: &str = r#"{"type":"string","enum":["ok"]}"#;
+    const INTEGER: &str = r#"{"type":"integer"}"#;
+    const WEATHER: &str = r#"{"type":"object","properties":{"city":{"type":"string"},"temperature_celsius":{"type":"number"},"conditions":{"type":"string","enum":["sunny","cloudy","rainy"]}},"required":["city","temperature_celsius","conditions"],"additionalProperties":false}"#;
+    const WEATHER_DOC: &str = r#"{"city":"Paris","temperature_celsius":18,"conditions":"sunny"}"#;
+
+    fn test_factory() -> GrammarFactory {
+        GrammarFactory::single_byte_for_tests()
+    }
+
+    fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
+        cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: body.to_string(),
+        }
+    }
+
+    fn compiled(gf: &GrammarFactory, body: &str) -> CompiledGrammar {
+        gf.compile(&json_spec(body)).unwrap()
+    }
+
+    fn ids(s: &str) -> Vec<i64> {
+        s.bytes().map(i64::from).collect()
+    }
+
+    /// A row of `width` zeros with the given `(token, logit)` peaks.
+    fn row(width: usize, peaks: &[(u32, f32)]) -> Vec<f32> {
+        let mut r = vec![0.0f32; width];
+        for &(t, l) in peaks {
+            r[t as usize] = l;
+        }
+        r
+    }
+
+    fn peak(width: usize, t: u8) -> Vec<f32> {
+        row(width, &[(t as u32, 10.0)])
+    }
+
+    fn refs(rows: &[Vec<f32>]) -> Vec<&[f32]> {
+        rows.iter().map(Vec::as_slice).collect()
+    }
+
+    #[test]
+    fn masked_accept_takes_matching_drafts_and_the_masked_bonus() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let mut mask = start_grammar(&compiled(&gf, OK_ENUM), &[]).unwrap();
+        let rows = vec![peak(w, b'"'), peak(w, b'o'), peak(w, b'k')];
+        let r = masked_accept(&mut mask, &refs(&rows), &ids("\"o"), &[TEST_EOS], 16).unwrap();
+        assert_eq!(
+            r,
+            MaskedRound {
+                tokens: ids("\"ok"),
+                kept: 2,
+                end: None
+            }
+        );
+        // The matcher advanced over exactly the emitted tokens: only `"` may follow.
+        assert!(mask.allowed(b'"' as u32));
+        assert!(!mask.allowed(b'k' as u32));
+    }
+
+    #[test]
+    fn masked_accept_rejects_a_disallowed_draft_equal_to_the_raw_argmax() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let mut mask = start_grammar(&compiled(&gf, OK_ENUM), &[]).unwrap();
+        // Raw argmax of row 0 is BAD and so is the draft; the masked argmax is `"`.
+        let rows = vec![
+            row(w, &[(BAD as u32, 10.0), (b'"' as u32, 5.0)]),
+            peak(w, b'o'),
+        ];
+        let r = masked_accept(&mut mask, &refs(&rows), &[BAD as i64], &[TEST_EOS], 16).unwrap();
+        assert_eq!(
+            r,
+            MaskedRound {
+                tokens: ids("\""),
+                kept: 0,
+                end: None
+            }
+        );
+        assert!(mask.allowed(b'o' as u32));
+    }
+
+    #[test]
+    fn masked_accept_stops_at_a_grammar_finish_mid_round() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let mut mask = start_grammar(&compiled(&gf, OK_ENUM), &ids("\"o")).unwrap();
+        let rows = vec![peak(w, b'k'), peak(w, b'"'), peak(w, b'X'), peak(w, b'Y')];
+        let r = masked_accept(&mut mask, &refs(&rows), &ids("k\"X"), &[TEST_EOS], 16).unwrap();
+        assert_eq!(
+            r,
+            MaskedRound {
+                tokens: ids("k\""),
+                kept: 2,
+                end: Some(MaskedEnd::Finished)
+            }
+        );
+        assert!(mask.finished());
+    }
+
+    #[test]
+    fn masked_accept_does_not_emit_eos() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let mut mask = start_grammar(&compiled(&gf, INTEGER), &ids("12")).unwrap();
+        let rows = vec![peak(w, b'3'), row(w, &[(TEST_EOS, 10.0)]), peak(w, b'5')];
+        let r = masked_accept(&mut mask, &refs(&rows), &ids("34"), &[TEST_EOS], 16).unwrap();
+        assert_eq!(
+            r,
+            MaskedRound {
+                tokens: ids("3"),
+                kept: 1,
+                end: Some(MaskedEnd::Eos)
+            }
+        );
+    }
+
+    #[test]
+    fn masked_accept_emits_the_token_that_reaches_the_budget_and_nothing_after() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let mut mask = start_grammar(&compiled(&gf, OK_ENUM), &[]).unwrap();
+        let rows = vec![peak(w, b'"'), peak(w, b'o'), peak(w, b'k')];
+        let r = masked_accept(&mut mask, &refs(&rows), &ids("\"o"), &[TEST_EOS], 1).unwrap();
+        assert_eq!(
+            r,
+            MaskedRound {
+                tokens: ids("\""),
+                kept: 1,
+                end: Some(MaskedEnd::Budget)
+            }
+        );
+    }
+
+    #[test]
+    fn masked_accept_reports_a_finish_that_lands_on_the_budget_as_finished() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let mut mask = start_grammar(&compiled(&gf, OK_ENUM), &ids("\"ok")).unwrap();
+        let rows = vec![peak(w, b'"'), peak(w, b'X')];
+        let r = masked_accept(&mut mask, &refs(&rows), &ids("\""), &[TEST_EOS], 1).unwrap();
+        assert_eq!(r.end, Some(MaskedEnd::Finished));
+        assert_eq!(MaskedEnd::Finished.finish_reason(), FinishReason::Stop);
+        assert_eq!(MaskedEnd::Eos.finish_reason(), FinishReason::Stop);
+        assert_eq!(MaskedEnd::Budget.finish_reason(), FinishReason::Length);
+    }
+
+    #[test]
+    fn masked_accept_dead_end_is_an_error_not_an_unmasked_pick() {
+        let gf = test_factory();
+        let mut mask = start_grammar(&compiled(&gf, OK_ENUM), &[]).unwrap();
+        // A row narrower than any allowed token: nothing in it is allowed.
+        let narrow = vec![10.0f32; 4];
+        let rows = vec![narrow.clone(), narrow];
+        assert!(masked_accept(&mut mask, &refs(&rows), &[BAD as i64], &[TEST_EOS], 16).is_err());
+    }
+
+    /// A deterministic fake target: logits as a function of the output so far.
+    /// The raw argmax is always BAD (never allowed); the doc byte comes next;
+    /// `Z` competes and wins every fourth position where the grammar allows it.
+    fn fake_target(width: usize, doc: &[u8], perturb: bool, prefix: &[i64]) -> Vec<f32> {
+        let n = prefix.len();
+        let mut peaks = vec![(BAD as u32, 10.0)];
+        if let Some(&b) = doc.get(n) {
+            peaks.push((b as u32, 5.0));
+        }
+        let z = if perturb && n.is_multiple_of(4) {
+            6.0
+        } else {
+            3.0
+        };
+        peaks.push((b'Z' as u32, z));
+        row(width, &peaks)
+    }
+
+    /// A fake draft that is right most of the time, proposes the disallowed raw
+    /// argmax sometimes and an allowed-but-wrong byte other times.
+    fn fake_draft(doc: &[u8], prefix: &[i64]) -> i64 {
+        let n = prefix.len();
+        if n % 3 == 1 {
+            BAD as i64
+        } else if n % 5 == 2 {
+            b'Q' as i64
+        } else {
+            doc.get(n).map_or(TEST_EOS as i64, |&b| b as i64)
+        }
+    }
+
+    /// Plain masked greedy decoding, one token at a time.
+    fn sequential_masked(
+        cg: &CompiledGrammar,
+        max_tokens: usize,
+        target: &dyn Fn(&[i64]) -> Vec<f32>,
+    ) -> (Vec<i64>, MaskedEnd) {
+        let mut mask = start_grammar(cg, &[]).unwrap();
+        let mut out = Vec::new();
+        loop {
+            if out.len() >= max_tokens {
+                return (out, MaskedEnd::Budget);
+            }
+            let m = masked_pick(&mut mask, &target(&out)).unwrap();
+            if m == TEST_EOS as i64 {
+                return (out, MaskedEnd::Eos);
+            }
+            mask.accept(m as u32).unwrap();
+            out.push(m);
+            if mask.finished() {
+                return (out, MaskedEnd::Finished);
+            }
+        }
+    }
+
+    /// The engine's round structure: first token, then draft K, verify, accept.
+    fn speculative_masked(
+        cg: &CompiledGrammar,
+        k: usize,
+        max_tokens: usize,
+        target: &dyn Fn(&[i64]) -> Vec<f32>,
+        draft: &dyn Fn(&[i64]) -> i64,
+    ) -> (Vec<i64>, MaskedEnd) {
+        let mut mask = start_grammar(cg, &[]).unwrap();
+        let (first, end) = pick_first_token(&target(&[]), Some(&mut mask), &[TEST_EOS]).unwrap();
+        if end == Some(MaskedEnd::Eos) {
+            return (Vec::new(), MaskedEnd::Eos);
+        }
+        let mut out = vec![first];
+        if let Some(e) = end {
+            return (out, e);
+        }
+        if out.len() >= max_tokens {
+            return (out, MaskedEnd::Budget);
+        }
+        loop {
+            let mut drafts = vec![draft(&out)];
+            for _ in 1..k {
+                if out.len() + drafts.len() >= max_tokens {
+                    break;
+                }
+                let p: Vec<i64> = out.iter().chain(&drafts).copied().collect();
+                drafts.push(draft(&p));
+            }
+            let rows: Vec<Vec<f32>> = (0..=drafts.len())
+                .map(|i| {
+                    let p: Vec<i64> = out.iter().chain(&drafts[..i]).copied().collect();
+                    target(&p)
+                })
+                .collect();
+            let r = masked_accept(
+                &mut mask,
+                &refs(&rows),
+                &drafts,
+                &[TEST_EOS],
+                max_tokens - out.len(),
+            )
+            .unwrap();
+            assert!(r.kept <= drafts.len());
+            assert_eq!(&r.tokens[..r.kept], &drafts[..r.kept]);
+            out.extend(&r.tokens);
+            if let Some(e) = r.end {
+                return (out, e);
+            }
+        }
+    }
+
+    #[test]
+    fn speculative_masked_output_equals_sequential_masked_greedy() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let cg = compiled(&gf, WEATHER);
+        let doc = WEATHER_DOC.as_bytes();
+        for perturb in [false, true] {
+            let target = |p: &[i64]| fake_target(w, doc, perturb, p);
+            let draft = |p: &[i64]| fake_draft(doc, p);
+            for k in 1..=4 {
+                for max_tokens in [1, 2, 3, 7, 20, 200] {
+                    let seq = sequential_masked(&cg, max_tokens, &target);
+                    let spec = speculative_masked(&cg, k, max_tokens, &target, &draft);
+                    assert_eq!(spec, seq, "k={k} max_tokens={max_tokens} perturb={perturb}");
+                }
+            }
+        }
+        // Unperturbed, the grammar finishes on the document exactly.
+        let target = |p: &[i64]| fake_target(w, doc, false, p);
+        assert_eq!(
+            sequential_masked(&cg, 200, &target),
+            (ids(WEATHER_DOC), MaskedEnd::Finished)
+        );
+    }
+
+    #[test]
+    fn first_token_is_plain_argmax_without_a_grammar() {
+        let w = test_factory().mask_width();
+        let r = row(w, &[(BAD as u32, 10.0), (b'{' as u32, 5.0)]);
+        assert_eq!(
+            pick_first_token(&r, None, &[TEST_EOS]).unwrap(),
+            (argmax(&r) as i64, None)
+        );
+        assert_eq!(argmax(&r), BAD as usize);
+    }
+
+    #[test]
+    fn first_token_is_masked_for_a_grammar_task() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let mut mask = start_grammar(&compiled(&gf, WEATHER), &[]).unwrap();
+        let r = row(w, &[(BAD as u32, 10.0), (b'{' as u32, 1.0)]);
+        assert_eq!(
+            pick_first_token(&r, Some(&mut mask), &[TEST_EOS]).unwrap(),
+            (b'{' as i64, None)
+        );
+        // Accepted into the matcher: a key's quote may follow, `{` may not.
+        assert!(mask.allowed(b'"' as u32));
+        assert!(!mask.allowed(b'{' as u32));
+    }
+
+    #[test]
+    fn first_token_reports_eos_and_finish() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        let mut mask = start_grammar(&compiled(&gf, INTEGER), &ids("12")).unwrap();
+        let r = row(w, &[(TEST_EOS, 10.0)]);
+        assert_eq!(
+            pick_first_token(&r, Some(&mut mask), &[TEST_EOS]).unwrap(),
+            (TEST_EOS as i64, Some(MaskedEnd::Eos))
+        );
+        let mut mask = start_grammar(&compiled(&gf, OK_ENUM), &ids("\"ok")).unwrap();
+        assert_eq!(
+            pick_first_token(&peak(w, b'"'), Some(&mut mask), &[TEST_EOS]).unwrap(),
+            (b'"' as i64, Some(MaskedEnd::Finished))
+        );
+    }
+
+    #[test]
+    fn submit_compiles_the_grammar_or_refuses_with_invalid_config() {
+        let gf: Result<GrammarFactory, String> = Ok(test_factory());
+        let plain = GenerationTask::new("t", "p");
+        assert!(compile_task_grammar(&gf, &plain).unwrap().is_none());
+
+        let good = GenerationTask::new("t", "p").with_grammar(json_spec(WEATHER));
+        assert!(compile_task_grammar(&gf, &good).unwrap().is_some());
+
+        let bad = GenerationTask::new("t", "p").with_grammar(json_spec(r#"{"type":42}"#));
+        assert!(matches!(
+            compile_task_grammar(&gf, &bad),
+            Err(EngineError::InvalidConfig(_))
+        ));
+
+        let none: Result<GrammarFactory, String> = Err("no EOS in vocab".into());
+        assert!(compile_task_grammar(&none, &plain).unwrap().is_none());
+        match compile_task_grammar(&none, &good) {
+            Err(EngineError::InvalidConfig(m)) => assert_eq!(
+                m,
+                "structured output is not available for this model: no EOS in vocab"
+            ),
+            other => panic!(
+                "expected InvalidConfig, got {:?}",
+                other.map(|g| g.is_some())
+            ),
+        }
+    }
+
+    #[test]
+    fn activation_replays_the_resume_seed_and_fails_on_a_rejected_one() {
+        let gf = test_factory();
+        let cg = compiled(&gf, OK_ENUM);
+        let mut mask = start_grammar(&cg, &ids("\"o")).unwrap();
+        assert!(mask.allowed(b'k' as u32));
+        assert!(matches!(
+            start_grammar(&cg, &ids("\"x")),
+            Err(EngineError::Backend(_))
+        ));
     }
 
     #[test]
