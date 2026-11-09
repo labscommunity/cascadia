@@ -66,9 +66,13 @@ pub fn sample(
     let Some(mask) = mask else {
         return Ok(sample_row(logits.to_vec(), history, cfg, rng_state));
     };
-    let mut masked = logits.to_vec();
-    mask.apply(&mut masked)?;
-    sample_masked_row(masked, history, cfg, rng_state)
+    let words = mask.mask_words()?;
+    sample_with_words(logits, history, cfg, rng_state, &words)
+}
+
+/// Whether bit `i` of `words` is set (tokens past the last word are not).
+fn word_allows(words: &[u32], i: usize) -> bool {
+    words.get(i / 32).is_some_and(|w| (w >> (i % 32)) & 1 == 1)
 }
 
 /// [`sample`] under a mask that came over the stage wire: bit `i` of
@@ -83,11 +87,24 @@ pub fn sample_with_words(
 ) -> EngineResult<i64> {
     let mut masked = logits.to_vec();
     let mut any = false;
-    for (i, l) in masked.iter_mut().enumerate() {
-        if words.get(i / 32).is_some_and(|w| (w >> (i % 32)) & 1 == 1) {
-            any = true;
-        } else {
-            *l = f32::NEG_INFINITY;
+    // Whole words are kept or filled; only mixed words go bit by bit.
+    for (w, chunk) in masked.chunks_mut(32).enumerate() {
+        let mut bits = words.get(w).copied().unwrap_or(0);
+        if chunk.len() < 32 {
+            bits &= (1u32 << chunk.len()) - 1;
+        }
+        if bits == 0 {
+            chunk.fill(f32::NEG_INFINITY);
+            continue;
+        }
+        any = true;
+        if bits == u32::MAX {
+            continue;
+        }
+        for (b, l) in chunk.iter_mut().enumerate() {
+            if bits & (1u32 << b) == 0 {
+                *l = f32::NEG_INFINITY;
+            }
         }
     }
     if !any {
@@ -95,36 +112,30 @@ pub fn sample_with_words(
             "grammar: no token of the logits row is allowed".into(),
         ));
     }
-    sample_masked_row(masked, history, cfg, rng_state)
-}
-
-/// Sample a row whose disallowed entries are already `-inf`.
-fn sample_masked_row(
-    masked: Vec<f32>,
-    history: &[i64],
-    cfg: &SamplingConfig,
-    rng_state: &mut u64,
-) -> EngineResult<i64> {
-    let pick = sample_row(masked.clone(), history, cfg, rng_state);
-    if masked.get(pick as usize) != Some(&f32::NEG_INFINITY) {
+    // An entry of the masked row is `-inf` when the mask or the logit makes
+    // it so; that is what the checks below read, from `logits` and `words`.
+    let open = |i: usize| word_allows(words, i) && logits[i] != f32::NEG_INFINITY;
+    let pick = sample_row(masked, history, cfg, rng_state);
+    if open(pick as usize) {
         return Ok(pick);
     }
     // No finite positive mass survived (a temperature so small that 1/t
     // overflows, NaN logits): the row's fallback can land on a masked id.
     // Take the best allowed logit instead.
-    masked_argmax(&masked).map(|i| i as i64).ok_or_else(|| {
-        EngineError::Backend("grammar: no token of the logits row is allowed".into())
-    })
+    masked_argmax(logits, open)
+        .map(|i| i as i64)
+        .ok_or_else(|| {
+            EngineError::Backend("grammar: no token of the logits row is allowed".into())
+        })
 }
 
-/// The highest finite logit among the allowed (not `-inf`) entries of a
-/// masked row; the first allowed entry when none is finite (NaN logits).
-/// `None` when nothing is allowed.
-fn masked_argmax(masked: &[f32]) -> Option<usize> {
+/// The highest finite logit among the `open` entries of `logits`; the first
+/// open entry when none is finite (NaN logits). `None` when none is open.
+fn masked_argmax(logits: &[f32], open: impl Fn(usize) -> bool) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
     let mut first_allowed = None;
-    for (i, &v) in masked.iter().enumerate() {
-        if v == f32::NEG_INFINITY {
+    for (i, &v) in logits.iter().enumerate() {
+        if !open(i) {
             continue;
         }
         first_allowed.get_or_insert(i);
@@ -554,6 +565,24 @@ mod tests {
         for i in 0..1000 {
             let t = sample(&l, &history, &task_cfg(1.0), &mut s, Some(&mut gm)).unwrap();
             assert!(gm.allowed(t as u32), "draw {i}: picked masked id {t}");
+        }
+    }
+
+    /// A grammar mask and its wire words pick the same tokens.
+    #[test]
+    fn grammar_and_wire_masks_sample_alike() {
+        let mut gm = mid_string_mask();
+        let words = gm.mask_words().unwrap();
+        let (l, history) = adversarial_logits(6);
+        for temperature in [0.0, 0.7, 1e-40] {
+            let cfg = task_cfg(temperature);
+            let (mut a, mut b) = (init_rng(Some(9)), init_rng(Some(9)));
+            for _ in 0..100 {
+                assert_eq!(
+                    sample(&l, &history, &cfg, &mut a, Some(&mut gm)).unwrap(),
+                    sample_with_words(&l, &history, &cfg, &mut b, &words).unwrap()
+                );
+            }
         }
     }
 

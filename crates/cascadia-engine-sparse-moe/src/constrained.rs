@@ -90,18 +90,10 @@ pub(crate) fn unconfirmed_step(reason: &str) -> String {
 pub(crate) const REFUSED_STEP: &str =
     "structured output: a later pipeline stage could not apply the mask for this step";
 
-/// The mask for the task's next token as wire words over `width` tokens
-/// (bit `i` allows token `i`). `Err` at a grammar dead end.
-pub(crate) fn mask_words(gm: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
-    let mut row = vec![0.0f32; width];
-    gm.apply(&mut row)?;
-    let mut words = vec![0u32; width.div_ceil(32)];
-    for (i, v) in row.iter().enumerate() {
-        if *v != f32::NEG_INFINITY {
-            words[i / 32] |= 1 << (i % 32);
-        }
-    }
-    Ok(words)
+/// The mask for the task's next token as wire words over the tokenizer
+/// vocab (bit `i` allows token `i`). `Err` at a grammar dead end.
+pub(crate) fn mask_words(gm: &mut GrammarMask) -> EngineResult<Vec<u32>> {
+    gm.mask_words()
 }
 
 /// Rank 0 of a pipeline: tags for masked steps, and the latch that remembers
@@ -131,10 +123,9 @@ impl StageMasks {
     pub(crate) fn last_row(
         &mut self,
         gm: &mut GrammarMask,
-        width: usize,
         rows: usize,
     ) -> EngineResult<(MaskCols, u32)> {
-        let words = mask_words(gm, width)?;
+        let words = mask_words(gm)?;
         let tag = self.next_tag();
         let mut cols = MaskCols::new(rows, words.len());
         cols.set(rows - 1, tag, &words);
@@ -300,6 +291,21 @@ mod tests {
         assert!(gm.allowed(u32::from(b'a')));
         let err = activate(&compiled, b"[1]".map(u32::from).as_slice()).err();
         assert!(matches!(err, Some(EngineError::Backend(_))), "{err:?}");
+    }
+
+    #[test]
+    fn mask_words_are_the_matchers_allowed_set() {
+        let mut gm = mask(WEATHER);
+        gm.replay(&br#"{"city":"P"#.map(u32::from)).unwrap();
+        let words = mask_words(&mut gm).unwrap();
+        assert_eq!(words.len(), VOCAB.div_ceil(32));
+        for t in 0..VOCAB as u32 {
+            let bit = words[t as usize / 32] >> (t % 32) & 1 == 1;
+            assert_eq!(bit, gm.allowed(t), "token {t}");
+        }
+        // A rejected token leaves the matcher in its error state: an error.
+        let _ = gm.accept(0x01);
+        assert!(mask_words(&mut gm).is_err());
     }
 
     #[test]

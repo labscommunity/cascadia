@@ -1297,10 +1297,10 @@ fn stage_mask_cols(
     gm: &mut GrammarMask,
     rows: usize,
 ) -> Result<(MaskCols, u32), String> {
-    let width = slot
-        .mask_width()
-        .ok_or_else(|| "structured output: no grammar factory on this stage".to_string())?;
-    masks.last_row(gm, width, rows).map_err(|e| e.to_string())
+    if slot.mask_width().is_none() {
+        return Err("structured output: no grammar factory on this stage".to_string());
+    }
+    masks.last_row(gm, rows).map_err(|e| e.to_string())
 }
 
 /// Rank 0, a masked single-row step: send the masked `Forward` and wait for
@@ -6768,7 +6768,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             .filter(|st| st.group == g && st.state == StreamState::Ready)
         {
             if let Some(gm) = st.grammar.as_mut() {
-                match crate::constrained::mask_words(gm, width) {
+                match crate::constrained::mask_words(gm) {
                     Ok(w) => {
                         row_masks.insert(st.slot, w);
                     }
