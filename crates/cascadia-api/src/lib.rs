@@ -6432,9 +6432,14 @@ level={{ effort_map[eff] }}";
             }
             out.push_str(&piece);
         }
+        // compare the JSON, not its text: object key order is not part of the contract
+        let inner = out
+            .strip_prefix("<tool_call>")
+            .and_then(|s| s.strip_suffix("</tool_call>"))
+            .expect("one Hermes block");
         assert_eq!(
-            out,
-            "<tool_call>{\"arguments\":{\"city\":\"Paris\"},\"name\":\"get_weather\"}</tool_call>"
+            serde_json::from_str::<serde_json::Value>(inner).unwrap(),
+            serde_json::json!({"name": "get_weather", "arguments": {"city": "Paris"}})
         );
         let calls = parse_tool_calls(&out).expect("Hermes block parses");
         assert_eq!(calls[0].function.name, "get_weather");

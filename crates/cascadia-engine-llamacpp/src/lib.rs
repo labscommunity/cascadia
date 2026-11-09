@@ -2047,9 +2047,15 @@ mod tests {
         let (_go, out) = collect("data: [DONE]", &tid, &mut st);
         let chunks: Vec<Chunk> = out.into_iter().map(|r| r.unwrap().1).collect();
         assert_eq!(chunks.len(), 2);
+        // compare the JSON, not its text: object key order is not part of the contract
+        let inner = chunks[0]
+            .text
+            .strip_prefix("<tool_call>")
+            .and_then(|s| s.strip_suffix("</tool_call>"))
+            .expect("one Hermes block");
         assert_eq!(
-            chunks[0].text,
-            r#"<tool_call>{"arguments":{"city":"Paris"},"name":"get_weather"}</tool_call>"#
+            serde_json::from_str::<serde_json::Value>(inner).unwrap(),
+            serde_json::json!({"name": "get_weather", "arguments": {"city": "Paris"}})
         );
         assert!(!chunks[0].is_final);
         assert!(chunks[1].is_final);
@@ -2063,9 +2069,13 @@ mod tests {
         );
         let (_go, out) = collect("data: [DONE]", &tid2, &mut st2);
         let text = &out[0].as_ref().unwrap().1.text;
+        let inner = text
+            .strip_prefix("<tool_call>")
+            .and_then(|s| s.strip_suffix("</tool_call>"))
+            .expect("one Hermes block");
         assert_eq!(
-            text,
-            r#"<tool_call>{"arguments":"not-json","name":"f"}</tool_call>"#
+            serde_json::from_str::<serde_json::Value>(inner).unwrap(),
+            serde_json::json!({"name": "f", "arguments": "not-json"})
         );
     }
 
