@@ -58,6 +58,15 @@ fn engine_name(kind: EngineKind) -> &'static str {
     }
 }
 
+/// Whether `kind` can constrain its output to a JSON Schema
+/// (`response_format`). The API refuses json requests on the others.
+fn structured_output_for(kind: EngineKind) -> bool {
+    matches!(
+        kind,
+        EngineKind::OvGenai | EngineKind::Mock | EngineKind::SyclLlama
+    )
+}
+
 /// Measure round-trip time to a peer via a 1 s-timeout TCP connect.
 /// Returns `None` if the peer is unreachable or the connect timed out.
 /// The connect handshake gives the best low-overhead RTT signal we can
@@ -2575,6 +2584,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
+        cfg.structured_output = structured_output_for(args.engine);
+        cfg.engine_name = engine_name(args.engine).to_string();
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
         // once, so a client that sends that many requests at once needs the
@@ -3798,6 +3809,22 @@ mod tests {
         assert_eq!(api_max_concurrent(Some("0"), 64), 64);
         assert_eq!(api_max_concurrent(Some("-1"), 64), 64);
         assert_eq!(api_max_concurrent(Some("8"), 64), 8);
+    }
+
+    #[test]
+    fn structured_output_support_per_engine() {
+        for kind in [EngineKind::OvGenai, EngineKind::Mock, EngineKind::SyclLlama] {
+            assert!(structured_output_for(kind), "{}", engine_name(kind));
+        }
+        for kind in [
+            EngineKind::Qwen36Moe,
+            EngineKind::Gemma4,
+            EngineKind::OvRuntime,
+            EngineKind::OvDistSpec,
+            EngineKind::SparseMoe,
+        ] {
+            assert!(!structured_output_for(kind), "{}", engine_name(kind));
+        }
     }
 
     /// Parse a `cascadia shard …` argv into its `ShardArgs` (panics on a
