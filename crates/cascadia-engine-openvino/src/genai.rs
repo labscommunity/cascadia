@@ -823,17 +823,32 @@ impl Engine for OvGenaiCbEngine {
                 }
                 CbStatus::Ignored => {
                     // OpenVINO ran out of KV cache and abandoned the request.
-                    // Finalising it like a normal completion handed the client
-                    // HTTP 200, finish_reason "stop" and a truncated body —
-                    // indistinguishable from a model that chose to stop. Fail
-                    // it loudly and name the knobs that fix it.
+                    // Name the knobs that fix it either way.
                     let t = self.active.swap_remove(idx);
                     warn!(
                         task = %t.task_id,
                         tokens = t.total_tokens,
                         in_flight = self.active.len(),
-                        "cb scheduler dropped a request: KV cache exhausted"
+                        "cb scheduler dropped a request: KV cache exhausted. Raise \
+                         --cb-cache-size or lower --cb-max-num-seqs."
                     );
+                    if t.total_tokens > 0 {
+                        // It already produced output: keep it and end like an
+                        // answer that hit its limit (`length`), counted as the
+                        // Finished branch counts, rather than losing the text
+                        // to an error.
+                        let mut chunk = Chunk::final_marker(t.task_id.clone(), read.text_delta)
+                            .with_n_tokens(read.new_tokens)
+                            .with_finish_reason(FinishReason::Length);
+                        if let Some(prompt_tokens) = t.prompt_tokens {
+                            chunk = chunk.with_prompt_tokens(prompt_tokens);
+                        }
+                        out.push((t.task_id, chunk));
+                        continue;
+                    }
+                    // Nothing produced: finalising it like a normal completion
+                    // would hand the client HTTP 200 with an empty body, so
+                    // fail it loudly.
                     let chunk = Chunk::error(
                         t.task_id.clone(),
                         format!(
@@ -1268,6 +1283,58 @@ mod tests {
         assert!(err.contains("KV cache exhausted"), "{err}");
         assert!(c.is_final);
         assert!(e.active.is_empty());
+    }
+
+    /// A request dropped for want of KV cache AFTER it produced output keeps
+    /// that output: its last text goes out and it ends with `length`, like an
+    /// answer that hit its limit, not as an error.
+    #[test]
+    fn cb_ignored_after_output_ends_with_length_and_keeps_the_text() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock().unwrap().reads.push(VecDeque::from(vec![
+            Ok(read_of(CbStatus::Running, 3, "abc", CbFinish::Unknown)),
+            Ok(read_of(CbStatus::Ignored, 2, "de", CbFinish::Unknown)),
+        ]));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 4096)).unwrap();
+
+        let first = e.step().unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let c = &out[0].1;
+        assert!(c.error.is_none(), "{:?}", c.error);
+        assert!(c.is_final);
+        assert_eq!(c.text, "de");
+        assert_eq!(c.n_tokens, Some(2));
+        assert_eq!(c.finish_reason, Some(FinishReason::Length));
+        assert_eq!(c.prompt_tokens, Some(7));
+        assert!(e.active.is_empty());
+        let mut total = 0;
+        first[0].1.accumulate_tokens(&mut total);
+        c.accumulate_tokens(&mut total);
+        assert_eq!(total, 5);
+    }
+
+    /// Tokens produced by the very read that reports the drop count too.
+    #[test]
+    fn cb_ignored_on_the_first_read_with_tokens_ends_with_length() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock()
+            .unwrap()
+            .reads
+            .push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Ignored,
+                1,
+                "x",
+                CbFinish::Unknown,
+            ))]));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+        let out = e.step().unwrap();
+        let c = &out[0].1;
+        assert!(c.error.is_none(), "{:?}", c.error);
+        assert_eq!(c.text, "x");
+        assert_eq!(c.finish_reason, Some(FinishReason::Length));
     }
 
     /// Prefer OpenVINO's own reason over guessing from token counts.
