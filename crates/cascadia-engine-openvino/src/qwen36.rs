@@ -39,7 +39,7 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_grammar::GrammarFactory;
 use cascadia_grammar::{CompiledGrammar, GrammarMask};
 use cascadia_grammar::{
-    MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT,
+    MaskMiss, MaskRecvCache, MaskSendCache, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT,
 };
 use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, Runtime};
 use cascadia_transport::{
@@ -329,8 +329,7 @@ fn resolve_wire_mask(
     cache: &mut MaskRecvCache,
 ) -> Result<Option<(usize, Vec<u32>)>, MaskMiss> {
     if *t == encode_repeat_mask() {
-        let lanes = cache.resolve(WireMask::Repeat)?;
-        return Ok(decode_mask_lanes(&lanes));
+        return Ok(decode_mask_lanes(cache.last().ok_or(MaskMiss)?));
     }
     match decode_wire_mask(t) {
         Some(mask) => {
