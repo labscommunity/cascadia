@@ -214,6 +214,65 @@ compact the conversation locally (the server refuses `compaction_trigger` items)
   server without image input the request body still carries the image, so raise
   `--api-max-body-mb` above its size, or every request that resends it is a `413`.
 
+## Using the mapping from another crate
+
+`cascadia_api::responses_api` exposes this mapping without the engine, for a gateway that
+serves the Responses API over its own OpenAI chat-completion backends. It parses and
+validates a request as `/v1/responses` does (`ResponsesRequest`, `refuse_unsupported`,
+`ToolMap::from_request`, `check_tool_choice`, `is_empty_conversation`), maps `input` to chat
+messages (`input_messages`, resolving `item_reference` through a closure, for example over
+the gateway's own `ItemCache`), and turns the backend's answer back into Responses output:
+`OutputBuilder` splits streamed text, with reasoning folded in as `<think>…</think>`, into
+reasoning and message items, and `OutputBuilder::push_calls` takes the backend's already
+parsed tool calls (build the builder with `tools_active: false`, so text is not scanned for
+calls). `ResponseEvents` renders the same SSE events, sequence numbers and terminal event
+as this server's stream, and returns the final items and response object; `End::from_finish_reason`
+reads the chat `finish_reason`. A `Refusal`'s `to_error_json()` is the error body the server
+sends, with `status()`. `fold_system_turns` and `folds_to_try` retry a conversation whose
+template refuses a later `system` turn. The chat types (`ChatMessage`, `Tool`, `ToolCall`,
+`FunctionCall`) are re-exported too.
+
+```rust
+use cascadia_api::responses_api::*;
+use std::sync::Arc;
+
+let req: ResponsesRequest = serde_json::from_slice(&body)?;
+let cache = ItemCache::default();
+let mapped = refuse_unsupported(&req).and_then(|encrypted| {
+    let tools = ToolMap::from_request(req.tools.as_ref())?;
+    let choice = check_tool_choice(req.tool_choice.as_ref())?;
+    let resolve = |id: &str, budget: usize| {
+        cache.get_within(id, budget).map_err(|_| Refusal::too_large("input", MAX_BYTES))
+    };
+    let messages = input_messages(&req, &resolve, MAX_BYTES)?;
+    Ok((encrypted, tools, choice, messages))
+});
+let (encrypted, tools, choice, messages) = match mapped {
+    Ok(m) => m,
+    Err(refusal) => return reply(refusal.status(), refusal.to_error_json()),
+};
+// Send `messages`, `tools.chat_tools` and `choice` to a backend, then:
+let shell = ResponseShell::new(&req, new_response_id(), &tools, choice);
+let parallel = req.parallel_tool_calls.unwrap_or(true);
+let mut builder = OutputBuilder::new(true, false, false, Arc::new(tools), parallel, encrypted);
+let mut events = ResponseEvents::new(shell);
+send(events.start());
+for delta in content_deltas {
+    send(events.push(builder.feed(&delta, 1)));
+}
+send(events.push(builder.push_calls(tool_calls)));
+let end = End::from_finish_reason(&finish_reason);
+let (closing, items, _response) =
+    events.finish(&mut builder, end, prompt_tokens, completion_tokens, None);
+if req.store != Some(false) {
+    cache.insert_all(&items); // before the terminal event is sent
+}
+send(closing);
+```
+
+A non-streaming reply is the same flow with the frames discarded: the returned response
+object is the body. `crates/cascadia-api/tests/responses_api.rs` drives it end to end.
+
 ## Known limitations
 
 - Codex sends `developer` messages in the middle of a history; they become `system` turns

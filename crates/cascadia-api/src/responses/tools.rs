@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// What a call to a served tool becomes in the output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Served {
+pub enum Served {
     /// A `function_call` item.
     Function,
     /// A `custom_tool_call` item, its `input` recovered by [`custom_input`].
@@ -28,7 +28,7 @@ pub(super) enum Served {
 
 /// A tool the chat template sees, by its flattened name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ServedTool {
+pub struct ServedTool {
     pub kind: Served,
     /// The name the caller gave it (inside its namespace, if any).
     pub name: String,
@@ -37,7 +37,7 @@ pub(super) struct ServedTool {
 
 /// A request's `tools`, as served and as echoed.
 #[derive(Debug, Default)]
-pub(super) struct ToolMap {
+pub struct ToolMap {
     /// Flattened name → what a call to it becomes.
     pub by_flat: HashMap<String, ServedTool>,
     /// The chat tools, in request order.
@@ -288,7 +288,7 @@ impl ToolMap {
 /// Forcing a call (`"required"`, a named function or custom tool,
 /// `allowed_tools`) is refused until it is enforced (D5); a hosted tool
 /// can never be called here (D4).
-pub(super) fn check_tool_choice(choice: Option<&Value>) -> Result<Option<&'static str>, Refusal> {
+pub fn check_tool_choice(choice: Option<&Value>) -> Result<Option<&'static str>, Refusal> {
     let not_enforced = |what: &str| {
         Err(Refusal::new(
             "tool_choice",

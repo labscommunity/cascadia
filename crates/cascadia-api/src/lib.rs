@@ -95,6 +95,8 @@ pub use video::{video_url_bytes, Ffmpeg};
 mod responses;
 pub use responses::{ReasoningParam, ResponsesRequest};
 
+pub mod responses_api;
+
 /// Tokens a chunk contributes to the cumulative counter. The convention
 /// (engine `n_tokens` authoritative, else one per non-empty chunk — #55)
 /// lives on [`cascadia_types::Chunk::token_count`] so the API's `usage`,
@@ -151,23 +153,33 @@ fn api_error_for(
     param: Option<&str>,
     code: Option<&str>,
 ) -> Response {
+    (
+        status,
+        Json(error_json(status, &message.into(), param, code)),
+    )
+        .into_response()
+}
+
+/// The body of [`api_error_for`].
+fn error_json(
+    status: StatusCode,
+    message: &str,
+    param: Option<&str>,
+    code: Option<&str>,
+) -> serde_json::Value {
     let kind = if status.is_client_error() {
         "invalid_request_error"
     } else {
         "server_error"
     };
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "message": message.into(),
-                "type": kind,
-                "param": param,
-                "code": code,
-            }
-        })),
-    )
-        .into_response()
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "type": kind,
+            "param": param,
+            "code": code,
+        }
+    })
 }
 
 /// `Json<T>` whose rejections (bad JSON, wrong field types, unsupported

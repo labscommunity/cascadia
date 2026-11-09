@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 /// A stored item larger than the byte budget the lookup was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TooLarge {
+pub struct TooLarge {
     /// The item's stored size.
     pub size: usize,
 }
@@ -79,7 +79,7 @@ impl Inner {
 }
 
 /// Output items by id, bounded by [`Self::MAX_ITEMS`] and [`Self::MAX_BYTES`].
-pub(crate) struct ItemCache {
+pub struct ItemCache {
     inner: Mutex<Inner>,
     max_items: usize,
     max_bytes: usize,

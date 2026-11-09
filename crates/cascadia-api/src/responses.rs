@@ -27,11 +27,11 @@ mod input;
 mod output;
 mod store;
 mod tools;
-use input::input_messages;
-pub(crate) use input::{fold_system_turns, folds_to_try};
-use output::{OutputBuilder, OutputEvent};
-pub(crate) use store::ItemCache;
-use tools::{check_include, check_tool_choice, ToolMap};
+pub use input::{fold_system_turns, folds_to_try, input_messages, Fold, Resolve};
+pub use output::{OutputBuilder, OutputEvent};
+pub use store::{ItemCache, TooLarge};
+use tools::check_include;
+pub use tools::{check_tool_choice, Served, ServedTool, ToolMap};
 
 /// OpenAI `POST /v1/responses` body. The fields after `max_tool_calls` are
 /// accepted only to be refused by name (see [`refuse_unsupported`]); unknown
@@ -116,7 +116,7 @@ pub struct ReasoningParam {
 /// An error (a 400 unless `status` says otherwise) naming the request field
 /// at fault.
 #[derive(Debug, PartialEq)]
-pub(super) struct Refusal {
+pub struct Refusal {
     status: StatusCode,
     param: String,
     message: String,
@@ -147,7 +147,7 @@ impl Refusal {
 
     /// A 413: expanding `input`'s `item_reference`s would pass the
     /// `max_bytes` prompt budget.
-    pub(super) fn too_large(param: impl Into<String>, max_bytes: usize) -> Self {
+    pub fn too_large(param: impl Into<String>, max_bytes: usize) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: Some("prompt_too_large"),
@@ -173,6 +173,31 @@ impl Refusal {
     fn into_response(self) -> Response {
         count_rejected(self.reason);
         api_error_for(self.status, self.message, Some(&self.param), self.code)
+    }
+
+    /// The HTTP status: 400, or 413 for [`Self::too_large`].
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The request field at fault (`"tools"`, `"input[3].content[0]"`).
+    pub fn param(&self) -> &str {
+        &self.param
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The machine-readable `code`, when OpenAI gives one.
+    pub fn code(&self) -> Option<&'static str> {
+        self.code
+    }
+
+    /// The OpenAI error body `/v1/responses` sends for this refusal:
+    /// `{"error": {"message", "type", "param", "code"}}`.
+    pub fn to_error_json(&self) -> Value {
+        error_json(self.status, &self.message, Some(&self.param), self.code)
     }
 }
 
@@ -223,7 +248,7 @@ fn check_metadata(metadata: Option<&Value>) -> Result<(), Refusal> {
 
 /// Refuse every request field this endpoint cannot honor, by name. `true`
 /// when `include` asks for reasoning items' `encrypted_content`.
-fn refuse_unsupported(req: &ResponsesRequest) -> Result<bool, Refusal> {
+pub fn refuse_unsupported(req: &ResponsesRequest) -> Result<bool, Refusal> {
     check_metadata(req.metadata.as_ref())?;
     let encrypted = check_include(req.include.as_ref())?;
     // A cap of 0 asks for no output; the engine would answer regardless.
@@ -337,7 +362,7 @@ fn chat_request(
 
 /// The request-derived fields of the response object, shared by the
 /// non-streaming body and every streamed snapshot of it.
-struct ResponseShell {
+pub struct ResponseShell {
     id: String,
     created_at: i64,
     model: String,
@@ -358,7 +383,9 @@ struct ResponseShell {
 }
 
 impl ResponseShell {
-    fn new(
+    /// The shell of the response `id` (see [`new_response_id`]) to `req`,
+    /// echoing `map`'s tools and the checked `choice`.
+    pub fn new(
         req: &ResponsesRequest,
         id: String,
         map: &ToolMap,
@@ -382,8 +409,12 @@ impl ResponseShell {
         }
     }
 
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// The OpenAI `response` object. `outcome` is `None` while in progress.
-    fn object(&self, status: &str, output: Value, outcome: Option<&Outcome>) -> Value {
+    pub fn object(&self, status: &str, output: Value, outcome: Option<&Outcome>) -> Value {
         json!({
             "id": self.id,
             "object": "response",
@@ -394,8 +425,10 @@ impl ResponseShell {
             "completed_at": outcome.filter(|_| status == "completed").map(|_| now_unix()),
             "error": outcome.and_then(|o| o.error.as_ref()).map(|e| json!({
                 "code": "server_error", "message": e})),
-            "incomplete_details": (status == "incomplete")
-                .then(|| json!({"reason": "max_output_tokens"})),
+            "incomplete_details": (status == "incomplete").then(|| json!({
+                "reason": outcome
+                    .and_then(|o| o.incomplete_reason)
+                    .unwrap_or("max_output_tokens")})),
             "instructions": self.instructions,
             "max_output_tokens": self.max_output_tokens,
             "max_tool_calls": self.max_tool_calls,
@@ -428,22 +461,56 @@ fn output_text(text: &str) -> Value {
     json!({"type": "output_text", "text": text, "annotations": [], "logprobs": []})
 }
 
-/// How a generation ended.
-struct Outcome {
+/// How a generation ended: the response object's `usage` and `error`.
+pub struct Outcome {
     prompt_tokens: u32,
     completion_tokens: u32,
     /// Of `completion_tokens`, those spent reasoning.
     reasoning_tokens: u32,
     /// The engine's failure, for a `failed` response.
     error: Option<String>,
+    /// `incomplete_details.reason` of an `incomplete` response; `None` is
+    /// `max_output_tokens`.
+    incomplete_reason: Option<&'static str>,
+}
+
+impl Outcome {
+    /// `reasoning_tokens` is [`OutputBuilder::reasoning_tokens`] of
+    /// `completion_tokens`; `error` makes a `failed` response's `error`.
+    pub fn new(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        reasoning_tokens: u32,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            reasoning_tokens,
+            error,
+            incomplete_reason: None,
+        }
+    }
+
+    /// This outcome of a generation that ended `end`: an `incomplete`
+    /// response names why ([`End::incomplete_reason`]).
+    pub fn ended(self, end: End) -> Self {
+        Self {
+            incomplete_reason: end.incomplete_reason(),
+            ..self
+        }
+    }
 }
 
 /// How the generation ended, in Responses terms.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum End {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
     Completed,
     /// Stopped at `max_output_tokens`.
     TokenCap,
+    /// Stopped by a content filter (OpenAI's `content_filter` finish
+    /// reason); the server's own engines never end so.
+    ContentFilter,
     /// Cancelled (`/v1/cancel`, or the engine's `Cancelled`), or the stream
     /// ended without a final chunk: the text is partial either way, so it is
     /// never reported `completed`.
@@ -451,6 +518,19 @@ enum End {
 }
 
 impl End {
+    /// From an OpenAI chat completion's `finish_reason`: `stop`,
+    /// `tool_calls` (and the legacy `function_call`) complete, `length` is
+    /// the token cap, `content_filter` the filter; any other reason (a
+    /// backend's `abort`, say) is a cancelled, partial turn.
+    pub fn from_finish_reason(reason: &str) -> Self {
+        match reason {
+            "stop" | "tool_calls" | "function_call" => End::Completed,
+            "length" => End::TokenCap,
+            "content_filter" => End::ContentFilter,
+            _ => End::Cancelled,
+        }
+    }
+
     /// From the final chunk's reason; `None` = no final chunk.
     fn from_final(reason: Option<cascadia_types::FinishReason>) -> Self {
         use cascadia_types::FinishReason;
@@ -463,31 +543,46 @@ impl End {
 
     /// The response's `status`: `incomplete` at the token cap and
     /// `cancelled` for a cancelled turn, as OpenAI's `ResponseStatus` has them.
-    fn status(self) -> &'static str {
+    pub fn status(self) -> &'static str {
         match self {
             End::Completed => "completed",
-            End::TokenCap => "incomplete",
+            End::TokenCap | End::ContentFilter => "incomplete",
             End::Cancelled => "cancelled",
         }
     }
 
     /// The message item's `status` (items have no `cancelled`).
-    fn item_status(self) -> &'static str {
+    pub fn item_status(self) -> &'static str {
         match self {
             End::Completed => "completed",
-            End::TokenCap | End::Cancelled => "incomplete",
+            End::TokenCap | End::ContentFilter | End::Cancelled => "incomplete",
+        }
+    }
+
+    /// `incomplete_details.reason` when [`Self::status`] is `incomplete`.
+    pub fn incomplete_reason(self) -> Option<&'static str> {
+        match self {
+            End::TokenCap => Some("max_output_tokens"),
+            End::ContentFilter => Some("content_filter"),
+            End::Completed | End::Cancelled => None,
         }
     }
 
     /// The terminal stream event. OpenAI defines none for a cancelled
     /// response, so it ends on `response.incomplete`, carrying `status:
     /// "cancelled"`: never `response.completed` for partial text.
-    fn event(self) -> &'static str {
+    pub fn event(self) -> &'static str {
         match self {
             End::Completed => "response.completed",
-            End::TokenCap | End::Cancelled => "response.incomplete",
+            End::TokenCap | End::ContentFilter | End::Cancelled => "response.incomplete",
         }
     }
+}
+
+/// A fresh response id, `resp_` and a v4 UUID's hex: unguessable, as the
+/// item cache's isolation needs.
+pub fn new_response_id() -> String {
+    format!("resp_{}", Uuid::new_v4().simple())
 }
 
 /// Looks `item_reference`s up in the item cache; an item past what is left
@@ -507,7 +602,7 @@ fn resolver(
 /// included), no image or video, no tool call and no tool output. A template
 /// would still render its generation prompt, and the model answer nothing in
 /// particular.
-fn is_empty_conversation(messages: &[ChatMessage]) -> bool {
+pub fn is_empty_conversation(messages: &[ChatMessage]) -> bool {
     messages.iter().all(|m| {
         m.role != "tool"
             && m.tool_calls.as_ref().is_none_or(Vec::is_empty)
@@ -545,7 +640,7 @@ pub(crate) async fn create_response(
     }
     let chat = chat_request(&req, messages, &map, choice);
     // The response id doubles as the task id, so `/v1/cancel/<id>` works.
-    let id = format!("resp_{}", Uuid::new_v4().simple());
+    let id = new_response_id();
     let shell = ResponseShell::new(&req, id, &map, choice);
     let admitted = match admit_chat(
         &state,
@@ -596,12 +691,13 @@ pub(crate) async fn create_response(
     };
     let end = End::from_final(c.end);
     builder.finish(end.item_status());
-    let outcome = Outcome {
-        prompt_tokens: c.prompt_tokens,
-        completion_tokens: c.completion_tokens,
-        reasoning_tokens: builder.reasoning_tokens(c.completion_tokens),
-        error: None,
-    };
+    let outcome = Outcome::new(
+        c.prompt_tokens,
+        c.completion_tokens,
+        builder.reasoning_tokens(c.completion_tokens),
+        None,
+    )
+    .ended(end);
     let items = builder.items();
     if let Some(cache) = &cache {
         cache.insert_all(&items);
@@ -609,25 +705,85 @@ pub(crate) async fn create_response(
     Json(shell.object(end.status(), json!(items), Some(&outcome))).into_response()
 }
 
-/// A streamed response's state between SSE frames.
-struct ResponseStream {
+/// Renders a response's stream: OpenAI's Responses SSE events, each an
+/// `event: <type>` line and a `data:` payload carrying its `type` and
+/// `sequence_number`, numbered from 0. Engine-free: it is given the
+/// [`OutputBuilder`]'s events and, at the end, the builder itself.
+pub struct ResponseEvents {
     shell: ResponseShell,
-    chunks: StreamWithPermit,
-    marker: Option<MarkerFilter>,
-    stats: Arc<ApiStats>,
-    /// The output items, built as the chunks arrive (as the non-streaming
-    /// path builds them), and the events announcing them.
-    builder: OutputBuilder,
-    /// Where the final items are kept (`None` for `store: false`).
-    cache: Option<Arc<ItemCache>>,
-    prompt_tokens: u32,
-    completion_tokens: u32,
     sequence: u64,
-    started: bool,
-    done: bool,
 }
 
-impl ResponseStream {
+impl ResponseEvents {
+    pub fn new(shell: ResponseShell) -> Self {
+        Self { shell, sequence: 0 }
+    }
+
+    pub fn shell(&self) -> &ResponseShell {
+        &self.shell
+    }
+
+    /// The opening frames: `response.created`, then `response.in_progress`.
+    pub fn start(&mut self) -> String {
+        let mut out = String::new();
+        let created = self.shell.object("in_progress", json!([]), None);
+        self.emit(&mut out, "response.created", json!({"response": created}));
+        let progress = self.shell.object("in_progress", json!([]), None);
+        self.emit(
+            &mut out,
+            "response.in_progress",
+            json!({"response": progress}),
+        );
+        out
+    }
+
+    /// The frames announcing the builder's `events`.
+    pub fn push(&mut self, events: Vec<OutputEvent>) -> String {
+        let mut out = String::new();
+        self.render(&mut out, events);
+        out
+    }
+
+    /// The closing frames, the final output items and the final response
+    /// object. Without `error`: the builder's closing events (the open
+    /// item's, and any parsed calls'), then `end`'s terminal event
+    /// ([`End::event`]). With `error`: one `response.failed` and no closing
+    /// events, its `output` every item announced so far, the open one
+    /// `incomplete` (`end` is not used). `prompt_tokens` and
+    /// `completion_tokens` make the `usage`.
+    pub fn finish(
+        &mut self,
+        builder: &mut OutputBuilder,
+        end: End,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        error: Option<String>,
+    ) -> (String, Vec<Value>, Value) {
+        let mut out = String::new();
+        if let Some(error) = error {
+            let reasoning = builder.reasoning_tokens(completion_tokens);
+            let outcome = Outcome::new(prompt_tokens, completion_tokens, reasoning, Some(error));
+            let items = builder.items_closing_open("incomplete");
+            let failed = self.shell.object("failed", json!(items), Some(&outcome));
+            self.emit(
+                &mut out,
+                "response.failed",
+                json!({"response": failed.clone()}),
+            );
+            return (out, items, failed);
+        }
+        let events = builder.finish(end.item_status());
+        self.render(&mut out, events);
+        let reasoning = builder.reasoning_tokens(completion_tokens);
+        let outcome = Outcome::new(prompt_tokens, completion_tokens, reasoning, None).ended(end);
+        let items = builder.items();
+        let response = self
+            .shell
+            .object(end.status(), json!(items), Some(&outcome));
+        self.emit(&mut out, end.event(), json!({"response": response.clone()}));
+        (out, items, response)
+    }
+
     /// Append one SSE event: `event: <type>` plus the payload carrying its
     /// `type` and `sequence_number`, as OpenAI streams them.
     fn emit(&mut self, out: &mut String, kind: &str, mut payload: Value) {
@@ -736,36 +892,36 @@ impl ResponseStream {
             }
         }
     }
+}
 
-    fn outcome(&self, error: Option<String>) -> Outcome {
-        Outcome {
-            prompt_tokens: self.prompt_tokens,
-            completion_tokens: self.completion_tokens,
-            reasoning_tokens: self.builder.reasoning_tokens(self.completion_tokens),
-            error,
-        }
-    }
+/// A streamed response's state between SSE frames.
+struct ResponseStream {
+    events: ResponseEvents,
+    chunks: StreamWithPermit,
+    marker: Option<MarkerFilter>,
+    stats: Arc<ApiStats>,
+    /// The output items, built as the chunks arrive (as the non-streaming
+    /// path builds them), and the events announcing them.
+    builder: OutputBuilder,
+    /// Where the final items are kept (`None` for `store: false`).
+    cache: Option<Arc<ItemCache>>,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    started: bool,
+    done: bool,
+}
 
+impl ResponseStream {
     /// The next frame: the opening events, then one per engine chunk, the
     /// closing events riding on the final one.
     async fn next_frame(&mut self) -> String {
-        let mut out = String::new();
         if !self.started {
             self.started = true;
-            let created = self.shell.object("in_progress", json!([]), None);
-            self.emit(&mut out, "response.created", json!({"response": created}));
-            let progress = self.shell.object("in_progress", json!([]), None);
-            self.emit(
-                &mut out,
-                "response.in_progress",
-                json!({"response": progress}),
-            );
-            return out;
+            return self.events.start();
         }
         let Some(chunk) = self.chunks.next().await else {
             // No final chunk: the runner ends a cancelled task's stream so.
-            self.finish(&mut out, End::Cancelled);
-            return out;
+            return self.finish(End::Cancelled);
         };
         // The 200 is on the wire already, so a failed task is reported the
         // Responses way: a `response.failed` event, as the chat endpoint's
@@ -773,11 +929,14 @@ impl ResponseStream {
         // it; its `output` has every item announced so far, the open one
         // `incomplete`.
         if let Some(reason) = &chunk.error {
-            warn!(task = %self.shell.id, reason = %reason, "engine failed task mid-stream; emitting response.failed");
-            let outcome = self.outcome(Some(reason.clone()));
-            let output = json!(self.builder.items_closing_open("incomplete"));
-            let failed = self.shell.object("failed", output, Some(&outcome));
-            self.emit(&mut out, "response.failed", json!({"response": failed}));
+            warn!(task = %self.events.shell().id, reason = %reason, "engine failed task mid-stream; emitting response.failed");
+            let (out, _, _) = self.events.finish(
+                &mut self.builder,
+                End::Cancelled,
+                self.prompt_tokens,
+                self.completion_tokens,
+                Some(reason.clone()),
+            );
             self.done = true;
             return out;
         }
@@ -799,34 +958,35 @@ impl ResponseStream {
             None => chunk.text.clone(),
         };
         let events = self.builder.feed(&text, n);
-        self.render(&mut out, events);
+        let mut out = self.events.push(events);
         if chunk.is_final {
             self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
             let reason = chunk
                 .finish_reason
                 .unwrap_or(cascadia_types::FinishReason::Stop);
-            self.finish(&mut out, End::from_final(Some(reason)));
+            out.push_str(&self.finish(End::from_final(Some(reason))));
         }
         // Let the body sink drain this frame first (see `stream_completion`).
         tokio::task::yield_now().await;
         out
     }
 
-    /// The closing events: the open item's (and any parsed calls'), then
-    /// the response. The items are stored before the terminal event is
-    /// written, so a client that has read it finds them.
-    fn finish(&mut self, out: &mut String, end: End) {
-        let events = self.builder.finish(end.item_status());
-        self.render(out, events);
-        let outcome = self.outcome(None);
-        let items = self.builder.items();
+    /// The closing frames: the open item's (and any parsed calls'), then
+    /// the response. The items are stored before the frames are written,
+    /// so a client that has read the terminal event finds them.
+    fn finish(&mut self, end: End) -> String {
+        let (out, items, _) = self.events.finish(
+            &mut self.builder,
+            end,
+            self.prompt_tokens,
+            self.completion_tokens,
+            None,
+        );
         if let Some(cache) = &self.cache {
             cache.insert_all(&items);
         }
-        let output = json!(items);
-        let response = self.shell.object(end.status(), output, Some(&outcome));
-        self.emit(out, end.event(), json!({"response": response}));
         self.done = true;
+        out
     }
 }
 
@@ -852,7 +1012,7 @@ async fn stream_response(
         }
     };
     let st = ResponseStream {
-        shell,
+        events: ResponseEvents::new(shell),
         // The permit + in-flight guard ride in the stream, released when the
         // body is dropped (client disconnect or the terminal event).
         chunks: StreamWithPermit {
@@ -866,7 +1026,6 @@ async fn stream_response(
         cache,
         prompt_tokens: 0,
         completion_tokens: 0,
-        sequence: 0,
         started: false,
         done: false,
     };
@@ -3363,5 +3522,23 @@ mod tests {
             body.contains("chat template rejected the request: System role must come first"),
             "{body}"
         );
+    }
+
+    /// `to_error_json` is the body `into_response` sends, for a 400 and a
+    /// 413 alike.
+    #[tokio::test]
+    async fn refusal_json_is_the_sent_body() {
+        let refused = refuse_unsupported(&request(
+            json!({"model": "m", "input": "x", "previous_response_id": "resp_1"}),
+        ))
+        .unwrap_err();
+        for refusal in [refused, Refusal::too_large("input[2]", 64)] {
+            let json = refusal.to_error_json();
+            let status = refusal.status();
+            let response = refusal.into_response();
+            assert_eq!(response.status(), status);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json);
+        }
     }
 }

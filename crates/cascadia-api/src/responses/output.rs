@@ -180,7 +180,7 @@ fn partial_suffix(buf: &str, tag: &str) -> usize {
 /// What the output builder announces, in order: enough to render the
 /// stream (each item added, its deltas, done), and to rebuild its items.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum OutputEvent {
+pub enum OutputEvent {
     /// An item opened at `index`, status `in_progress`, no text yet.
     ItemAdded { index: usize, item: Value },
     ReasoningDelta {
@@ -221,7 +221,7 @@ struct Open {
 
 /// Turns translated engine text into Responses output items (spec
 /// "Output"): reasoning, message, then the calls.
-pub(super) struct OutputBuilder {
+pub struct OutputBuilder {
     split: ReasoningSplit,
     thinking: bool,
     tools_active: bool,
@@ -232,6 +232,8 @@ pub(super) struct OutputBuilder {
     encrypted: bool,
     /// Finished items, in output order.
     items: Vec<Value>,
+    /// Call items emitted so far.
+    calls: usize,
     open: Option<Open>,
     /// The reasoning is over (its item, if any, closed).
     reasoning_done: bool,
@@ -272,6 +274,7 @@ impl OutputBuilder {
             parallel,
             encrypted,
             items: Vec::new(),
+            calls: 0,
             open: None,
             reasoning_done: false,
             held: String::new(),
@@ -335,17 +338,52 @@ impl OutputBuilder {
         if self.open.is_some() {
             self.close("completed", &mut ev);
         }
-        if !self.parallel && calls.len() > 1 {
-            tracing::debug!(
-                dropped = calls.len() - 1,
-                "responses: parallel_tool_calls is false; keeping the first call"
-            );
-            calls.truncate(1);
+        self.emit_calls(calls, &mut ev);
+        ev
+    }
+
+    /// Tool calls a backend returned already parsed (a chat completion's
+    /// `tool_calls`), for a builder made with `tools_active: false`, whose
+    /// text is never scanned for calls. Ends the text: what the reasoning
+    /// split still holds is released, the open item closes `completed`, and
+    /// each call becomes a `function_call` (or `custom_tool_call`, or a
+    /// namespaced `function_call`, by the [`ToolMap`]) item as [`Self::finish`]
+    /// makes a parsed call; with `parallel: false` only the first call of the
+    /// response is kept. No [`Self::feed`] may follow; [`Self::finish`] still
+    /// closes the response (and adds no item). No calls: no events.
+    pub fn push_calls(&mut self, calls: Vec<ToolCall>) -> Vec<OutputEvent> {
+        let mut ev = Vec::new();
+        if calls.is_empty() {
+            return ev;
+        }
+        let segs = self.split.finish();
+        self.count(0, &segs, 0);
+        self.route(segs, &mut ev);
+        // Reasoning still open (`</think>` never came) closes with the text.
+        self.held.clear();
+        if self.open.is_some() {
+            self.close("completed", &mut ev);
+        }
+        self.reasoning_done = true;
+        self.emit_calls(calls, &mut ev);
+        ev
+    }
+
+    /// Emit `calls`, only the response's first with `parallel: false`.
+    fn emit_calls(&mut self, mut calls: Vec<ToolCall>, ev: &mut Vec<OutputEvent>) {
+        if !self.parallel {
+            let room = usize::from(self.calls == 0);
+            if calls.len() > room {
+                tracing::debug!(
+                    dropped = calls.len() - room,
+                    "responses: parallel_tool_calls is false; keeping the first call"
+                );
+                calls.truncate(room);
+            }
         }
         for c in calls {
-            self.emit_call(c, &mut ev);
+            self.emit_call(c, ev);
         }
-        ev
     }
 
     /// The output so far: the finished items, then the open one (status
@@ -592,6 +630,7 @@ impl OutputBuilder {
             item: item.clone(),
         });
         self.items.push(item);
+        self.calls += 1;
     }
 }
 
@@ -1102,5 +1141,142 @@ mod tests {
         assert_eq!(kinds(&items), ["message", "function_call"]);
         assert_eq!(text_of(&items[0]), format!("{draft}</think>"));
         assert!(items[1]["arguments"].as_str().unwrap().contains("Real"));
+    }
+
+    /// A function, a custom and a namespaced tool.
+    fn three_tools() -> Arc<ToolMap> {
+        tool_map(json!([
+            {"type": "function", "name": "get_weather", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "apply_patch"},
+            {"type": "namespace", "name": "mcp__x", "description": "x",
+                "tools": [{"type": "function", "name": "click"}]},
+        ]))
+    }
+
+    fn structured(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            r#type: "function".into(),
+            function: crate::FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    /// `items` without the generated `id` and `call_id`.
+    fn without_ids(items: &[Value]) -> Vec<Value> {
+        items
+            .iter()
+            .map(|i| {
+                let mut i = i.clone();
+                i.as_object_mut().unwrap().remove("id");
+                i.as_object_mut().unwrap().remove("call_id");
+                i
+            })
+            .collect()
+    }
+
+    /// Structured calls pushed after the text make the items, and the
+    /// events, that the same calls parsed out of the text make.
+    #[test]
+    fn pushed_calls_match_parsed_calls() {
+        let calls = [
+            // Compact, as the text parser re-serializes a call's arguments.
+            ("get_weather", r#"{"city":"A"}"#),
+            ("apply_patch", r#"{"input":"*** Begin Patch"}"#),
+            ("mcp__x__click", "{}"),
+            ("not_served", r#"{"k":1}"#),
+        ];
+        let text: String = calls.iter().map(|(n, a)| call(n, a)).collect();
+        let mut parsed = OutputBuilder::new(true, true, true, three_tools(), true, false);
+        let parsed_ev = drive(&mut parsed, &["r</think>answer ", &text], "completed");
+
+        let mut pushed = OutputBuilder::new(true, true, false, three_tools(), true, false);
+        let mut ev = pushed.feed("r</think>answer ", 1);
+        let structured_calls = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (n, a))| structured(&format!("call_{i}"), n, a))
+            .collect();
+        ev.extend(pushed.push_calls(structured_calls));
+        assert!(pushed.finish("completed").is_empty(), "finish adds nothing");
+        let items = pushed.items();
+        assert_eq!(
+            kinds(&items),
+            [
+                "reasoning",
+                "message",
+                "function_call",
+                "custom_tool_call",
+                "function_call",
+                "function_call"
+            ]
+        );
+        assert_eq!(without_ids(&items), without_ids(&parsed.items()));
+        assert_eq!(items[2]["call_id"], "call_0");
+        assert_eq!(items[3]["input"], "*** Begin Patch");
+        assert_eq!(
+            (&items[4]["name"], &items[4]["namespace"]),
+            (&json!("click"), &json!("mcp__x"))
+        );
+        assert_eq!(items[5]["name"], "not_served");
+        let shape = |ev: &[OutputEvent]| -> Vec<String> {
+            ev.iter()
+                .map(|e| match e {
+                    OutputEvent::ItemAdded { index, .. } => format!("added {index}"),
+                    OutputEvent::ReasoningDelta { index, .. } => format!("reasoning {index}"),
+                    OutputEvent::TextDelta { index, .. } => format!("text {index}"),
+                    OutputEvent::CallArgs {
+                        index,
+                        name,
+                        custom,
+                        full,
+                        ..
+                    } => format!("args {index} {name} {custom} {full}"),
+                    OutputEvent::ItemDone { index, .. } => format!("done {index}"),
+                })
+                .collect()
+        };
+        let mut squashed = shape(&ev);
+        squashed.dedup();
+        let mut expected = shape(&parsed_ev);
+        expected.dedup();
+        assert_eq!(squashed, expected);
+    }
+
+    /// With `parallel_tool_calls: false` only the response's first call is
+    /// kept, across pushes too; no calls push nothing.
+    #[test]
+    fn pushed_calls_keep_the_first_when_not_parallel() {
+        let mut b = OutputBuilder::new(false, false, false, weather(), false, false);
+        assert!(b.push_calls(Vec::new()).is_empty());
+        b.feed("text", 1);
+        b.push_calls(vec![
+            structured("call_a", "get_weather", r#"{"city": "A"}"#),
+            structured("call_b", "get_weather", r#"{"city": "B"}"#),
+        ]);
+        b.push_calls(vec![structured("call_c", "get_weather", "{}")]);
+        b.finish("completed");
+        let items = b.items();
+        assert_eq!(kinds(&items), ["message", "function_call"]);
+        assert_eq!(items[0]["status"], "completed");
+        assert_eq!(items[1]["call_id"], "call_a");
+    }
+
+    /// Reasoning that never closed ends with the pushed calls: its item
+    /// closes `completed`, before them.
+    #[test]
+    fn pushed_calls_close_open_reasoning() {
+        let mut b = OutputBuilder::new(true, true, false, weather(), true, false);
+        b.feed("still thinking</thi", 2);
+        let ev = b.push_calls(vec![structured("call_1", "get_weather", "{}")]);
+        assert!(b.finish("incomplete").is_empty());
+        let items = b.items();
+        assert_eq!(kinds(&items), ["reasoning", "function_call"]);
+        assert_eq!(items[0]["status"], "completed");
+        assert_eq!(text_of(&items[0]), "still thinking</thi");
+        assert!(matches!(&ev[0], OutputEvent::ReasoningDelta { delta, .. } if delta == "</thi"));
+        assert_eq!(b.reasoning_tokens(2), 2);
     }
 }

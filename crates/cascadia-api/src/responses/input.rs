@@ -84,7 +84,7 @@ impl Turn {
 
 /// Looks a stored item up by id against the remaining byte budget: the item
 /// and its stored size, `Ok(None)` if unknown, `Err` (a 413) if over budget.
-pub(super) type Resolve<'a> = dyn Fn(&str, usize) -> Result<Option<(Value, usize)>, Refusal> + 'a;
+pub type Resolve<'a> = dyn Fn(&str, usize) -> Result<Option<(Value, usize)>, Refusal> + 'a;
 
 /// `input` as chat messages, `instructions` first as a `system` message.
 /// Each item's content parts are rewritten into the chat endpoint's part
@@ -94,7 +94,7 @@ pub(super) type Resolve<'a> = dyn Fn(&str, usize) -> Result<Option<(Value, usize
 /// An `item_reference` is looked up through `resolve`, which is given what is
 /// left of `max_expand_bytes`; each stored item found is charged its size.
 /// Any refusal from `resolve` names the referencing item.
-pub(super) fn input_messages(
+pub fn input_messages(
     req: &ResponsesRequest,
     resolve: &Resolve,
     max_expand_bytes: usize,
@@ -272,7 +272,7 @@ fn merge(into: &mut ChatMessage, next: ChatMessage) {
 
 /// Which `system` turns [`fold_system_turns`] folds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Fold {
+pub enum Fold {
     /// Those after the first non-`system` turn; a leading one stays.
     Later,
     /// Every one, leading ones too.
@@ -295,7 +295,7 @@ pub(crate) enum Fold {
 /// user and assistant still alternate: `[user1, system, user2]` becomes one
 /// user turn `user1`, `system`, `user2`. Assistant and tool turns pass
 /// through.
-pub(crate) fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<ChatMessage> {
+pub fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<ChatMessage> {
     // A folded turn joins a user turn just before it rather than standing
     // next to it, so user and assistant still alternate.
     fn push_user(out: &mut Vec<ChatMessage>, m: ChatMessage) {
@@ -347,7 +347,7 @@ pub(crate) fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<C
 /// The folds of `messages` worth trying, in order: the later system turns
 /// when there are any, then every one when that differs from the first (a
 /// leading system turn exists); none without a system turn.
-pub(crate) fn folds_to_try(messages: &[ChatMessage]) -> Vec<Fold> {
+pub fn folds_to_try(messages: &[ChatMessage]) -> Vec<Fold> {
     let leading = messages.first().is_some_and(|m| m.role == "system");
     let later = messages
         .iter()
