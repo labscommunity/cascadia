@@ -2251,11 +2251,13 @@ mod expert_frame_tests {
 // A json request's sampling steps (the last prompt row and every decode row) carry the
 // grammar mask rank 0 computed, so the last stage, which samples but has no grammar, can
 // apply it. Frame kinds and headers stay as they are; only the trailing tensor changes:
-// I32 `[1, rows, H + C]` instead of F32 `[1, rows, H]`. Each row is the f32 bits of its
-// hidden followed by C mask columns `[tag u32, mask words…]` (all little-endian, like
-// every tensor payload). Tag 0 marks a row without a mask; bit `i` of the words allows
-// token `i`, and tokens past the last word are not allowed. Every masked row of a frame
-// has the same column count.
+// I32 `[a, b, H + X]` instead of F32 `[a, b, H]`, `rows = a·b`. Its payload is the f32
+// bits of the `rows × H` hidden values, then the mask section
+// `[W, n, n × (row, tag, W mask words)]`, zero-padded to `rows · (H + X)` words, with X
+// the smallest count that fits it (all u32, little-endian, like every tensor payload).
+// Only masked rows are listed, in increasing row order, each under a non-zero tag; an
+// unlisted row has no mask. Bit `i` of a row's words allows token `i`, and tokens past
+// the last word are not allowed.
 //
 // A stage on an older build reads the whole tensor and then fails on its dtype in
 // `tensor_to_hidden`, so the byte stream stays aligned. Such a stage never answers the
@@ -2272,99 +2274,157 @@ pub const MASK_UNCONFIRMED: u32 = 0x4E4F_4D4B; // "NOMK"
 /// request probes it again.
 pub const MASK_REPROBE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// The mask columns of a masked frame: one row per tensor row,
-/// `[tag, mask words…]` each.
+/// The masks of a masked frame's rows: `[tag, mask words…]` for each
+/// masked row, nothing for the others.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaskCols {
     rows: usize,
-    width: usize,
+    words: usize,
+    /// `(row, tag)` of each masked row, in increasing row order; its words
+    /// are at the same index of `data`, `words` per entry.
+    masked: Vec<(usize, u32)>,
     data: Vec<u32>,
 }
 
 impl MaskCols {
-    /// `rows` unmasked rows with room for `words` mask words each.
+    /// `rows` unmasked rows; a masked row carries `words` mask words.
     pub fn new(rows: usize, words: usize) -> Self {
-        let width = 1 + words;
         Self {
             rows,
-            width,
-            data: vec![0; rows * width],
+            words,
+            masked: Vec::new(),
+            data: Vec::new(),
         }
     }
 
     /// Mask `row` with `words` under the non-zero `tag`.
     pub fn set(&mut self, row: usize, tag: u32, words: &[u32]) {
         assert_ne!(tag, 0, "tag 0 marks an unmasked row");
-        assert_eq!(words.len() + 1, self.width, "mask word count");
-        let r = &mut self.data[row * self.width..(row + 1) * self.width];
-        r[0] = tag;
-        r[1..].copy_from_slice(words);
+        assert!(row < self.rows, "row {row} of {}", self.rows);
+        assert_eq!(words.len(), self.words, "mask word count");
+        let w = self.words;
+        match self.masked.binary_search_by_key(&row, |&(r, _)| r) {
+            Ok(i) => {
+                self.masked[i].1 = tag;
+                self.data[i * w..(i + 1) * w].copy_from_slice(words);
+            }
+            Err(i) => {
+                self.masked.insert(i, (row, tag));
+                self.data.splice(i * w..i * w, words.iter().copied());
+            }
+        }
     }
 
     pub fn rows(&self) -> usize {
         self.rows
     }
 
-    /// Columns per row (tag + mask words).
+    /// Columns of a masked row (tag + mask words).
     pub fn width(&self) -> usize {
-        self.width
+        1 + self.words
     }
 
-    /// The row's tag; 0 for an unmasked row (or no columns at all).
+    fn entry(&self, row: usize) -> Option<usize> {
+        self.masked.binary_search_by_key(&row, |&(r, _)| r).ok()
+    }
+
+    /// The row's tag; 0 for an unmasked row.
     pub fn tag(&self, row: usize) -> u32 {
-        if self.width == 0 || row >= self.rows {
-            return 0;
-        }
-        self.data[row * self.width]
+        self.entry(row).map_or(0, |i| self.masked[i].1)
     }
 
     /// The row's mask words: `None` for an unmasked row, and also for a
     /// masked row that carries no word (a frame this stage can't serve).
     pub fn words(&self, row: usize) -> Option<&[u32]> {
-        if self.tag(row) == 0 || self.width < 2 {
+        let i = self.entry(row)?;
+        if self.words == 0 {
             return None;
         }
-        Some(&self.data[row * self.width + 1..(row + 1) * self.width])
+        Some(&self.data[i * self.words..(i + 1) * self.words])
     }
 
     /// Whether any row is masked.
     pub fn any(&self) -> bool {
-        (0..self.rows).any(|r| self.tag(r) != 0)
+        !self.masked.is_empty()
+    }
+
+    /// The mask section on the wire: `[W, n, n × (row, tag, W words)]`.
+    fn section(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(2 + self.masked.len() * (2 + self.words));
+        out.push(self.words as u32);
+        out.push(self.masked.len() as u32);
+        for (i, &(row, tag)) in self.masked.iter().enumerate() {
+            out.push(row as u32);
+            out.push(tag);
+            out.extend_from_slice(&self.data[i * self.words..(i + 1) * self.words]);
+        }
+        out
+    }
+
+    /// Reads a mask section (padding after it is ignored).
+    fn from_section(rows: usize, sec: &[u32]) -> Result<Self, String> {
+        let bad = |why: &str| format!("masked frame: bad mask section ({why})");
+        let (&w, &n) = match sec {
+            [w, n, ..] => (w, n),
+            _ => return Err(bad("too short")),
+        };
+        let (w, n) = (w as usize, n as usize);
+        let need = w
+            .checked_add(2)
+            .and_then(|e| e.checked_mul(n))
+            .and_then(|b| b.checked_add(2))
+            .filter(|&need| need <= sec.len())
+            .ok_or_else(|| bad("longer than the tensor"))?;
+        let mut cols = Self::new(rows, w);
+        cols.masked.reserve(n);
+        cols.data.reserve(n * w);
+        for e in sec[2..need].chunks_exact(2 + w) {
+            let (row, tag) = (e[0] as usize, e[1]);
+            if row >= rows || tag == 0 {
+                return Err(bad("row out of range or tag 0"));
+            }
+            if cols.masked.last().is_some_and(|&(r, _)| r >= row) {
+                return Err(bad("rows out of order"));
+            }
+            cols.masked.push((row, tag));
+            cols.data.extend_from_slice(&e[2..]);
+        }
+        Ok(cols)
     }
 }
 
 /// `hidden` (`shape` = `[a, b, h]`) plus `cols` as one I32 tensor
-/// `[a, b, h + cols.width()]`. Refused when it would exceed the transport's
-/// tensor cap.
+/// `[a, b, h + x]` (see the layout above). Refused when it would exceed the
+/// transport's tensor cap.
 fn masked_tensor(hidden: &[f32], shape: [u32; 3], cols: &MaskCols) -> TransportResult<Tensor> {
     let rows = shape[0] as usize * shape[1] as usize;
     let h = shape[2] as usize;
-    if hidden.len() != rows * h || cols.rows() != rows {
+    if hidden.len() != rows * h || cols.rows() != rows || rows == 0 {
         return Err(TransportError::Io(std::io::Error::other(format!(
             "masked frame: {} floats and {} mask rows for shape {shape:?}",
             hidden.len(),
             cols.rows()
         ))));
     }
-    let total = h + cols.width();
+    let section = cols.section();
+    let total = h + section.len().div_ceil(rows);
     let bytes = rows
         .checked_mul(total)
         .and_then(|n| n.checked_mul(4))
-        .filter(|&n| n <= cascadia_transport::MAX_TENSOR_BYTES)
+        .filter(|&n| n <= cascadia_transport::MAX_TENSOR_BYTES && total <= u32::MAX as usize)
         .ok_or_else(|| {
             TransportError::Io(std::io::Error::other(format!(
                 "masked frame of {rows} rows x {total} columns exceeds the tensor cap"
             )))
         })?;
     let mut data = Vec::with_capacity(bytes);
-    for r in 0..rows {
-        for v in &hidden[r * h..(r + 1) * h] {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        for w in &cols.data[r * cols.width()..(r + 1) * cols.width()] {
-            data.extend_from_slice(&w.to_le_bytes());
-        }
+    for v in hidden {
+        data.extend_from_slice(&v.to_le_bytes());
     }
+    for w in &section {
+        data.extend_from_slice(&w.to_le_bytes());
+    }
+    data.resize(bytes, 0);
     Ok(Tensor::new(
         DType::I32,
         [shape[0], shape[1], total as u32],
@@ -2419,23 +2479,24 @@ impl StepTensor {
             ));
         }
         let rows = a as usize * b as usize;
-        let width = total - h;
+        let Some(len) = rows
+            .checked_mul(total)
+            .filter(|&n| n.checked_mul(4) == Some(t.data.len()))
+        else {
+            return Err(format!(
+                "masked frame of shape {:?} carries {} bytes",
+                t.shape,
+                t.data.len()
+            ));
+        };
         let word = |i: usize| {
             let c = &t.data[i * 4..i * 4 + 4];
             u32::from_le_bytes([c[0], c[1], c[2], c[3]])
         };
-        let mut hidden = Vec::with_capacity(rows * h);
-        let mut data = Vec::with_capacity(rows * width);
-        for r in 0..rows {
-            let base = r * total;
-            hidden.extend((base..base + h).map(|i| f32::from_bits(word(i))));
-            data.extend((base + h..base + total).map(word));
-        }
-        Ok((
-            hidden,
-            [a, b, h as u32],
-            Some(MaskCols { rows, width, data }),
-        ))
+        let section: Vec<u32> = (rows * h..len).map(word).collect();
+        let cols = MaskCols::from_section(rows, &section)?;
+        let hidden = (0..rows * h).map(|i| f32::from_bits(word(i))).collect();
+        Ok((hidden, [a, b, h as u32], Some(cols)))
     }
 }
 
@@ -3504,6 +3565,85 @@ mod mask_wire_tests {
         assert_eq!((got.tag(0), got.tag(1)), (9, 0));
     }
 
+    /// A frame carries mask words only for its masked rows: a prompt
+    /// window whose last row is masked costs one column per row plus that
+    /// row's words, not the words on every row.
+    #[test]
+    fn a_masked_frame_carries_words_only_for_its_masked_rows() {
+        let (rows, h, words) = (256usize, 8usize, 100usize);
+        let hidden = rows_hidden(rows, h);
+        let mut cols = MaskCols::new(rows, words);
+        cols.set(rows - 1, 7, &vec![u32::MAX; words]);
+        let t = masked_tensor(&hidden, [1, rows as u32, h as u32], &cols).unwrap();
+        assert_eq!(t.dtype, DType::I32);
+        assert_eq!(t.shape, [1, rows as u32, h as u32 + 1]);
+        assert_eq!(t.data.len(), rows * (h + 1) * 4);
+        // Pinned layout: the hidden bits, `[W, n, row, tag, words…]`, zeros.
+        let le: Vec<u32> = t
+            .data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let hb: Vec<u32> = hidden.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(le[..rows * h], hb[..]);
+        let sec = &le[rows * h..];
+        assert_eq!(sec[..4], [words as u32, 1, rows as u32 - 1, 7]);
+        assert!(sec[4..4 + words].iter().all(|&w| w == u32::MAX));
+        assert!(sec[4 + words..].iter().all(|&w| w == 0));
+        let (got_h, shape, got) = StepTensor::Masked(t).split(h).unwrap();
+        assert_eq!((got_h, shape), (hidden, [1, rows as u32, h as u32]));
+        let got = got.unwrap();
+        assert_eq!(got, cols);
+        assert_eq!(got.tag(rows - 1), 7);
+        assert_eq!(got.words(rows - 1).map(<[u32]>::len), Some(words));
+        assert_eq!((got.tag(0), got.words(0)), (0, None));
+        assert!(got.any());
+
+        // Two of three stream rows masked: two rows of words.
+        let mut cols = MaskCols::new(3, 4);
+        cols.set(2, 9, &[1, 2, 3, 4]);
+        cols.set(0, 8, &[5, 6, 7, 8]);
+        let t = masked_tensor(&rows_hidden(3, 2), [1, 3, 2], &cols).unwrap();
+        let trailer: usize = 2 + 2 * (2 + 4);
+        assert_eq!(t.shape[2] as usize, 2 + trailer.div_ceil(3));
+        let (_, _, got) = StepTensor::Masked(t).split(2).unwrap();
+        let got = got.unwrap();
+        assert_eq!(got, cols);
+        assert_eq!((got.tag(0), got.tag(1), got.tag(2)), (8, 0, 9));
+        assert_eq!(got.words(0), Some(&[5, 6, 7, 8][..]));
+        assert_eq!(got.words(2), Some(&[1, 2, 3, 4][..]));
+    }
+
+    /// A masked tensor whose mask section names a row out of range or runs
+    /// past the tensor is refused, not read out of bounds.
+    #[test]
+    fn a_malformed_mask_section_is_refused_by_split() {
+        let tensor = |words: &[u32]| {
+            let mut data = Vec::new();
+            for v in [1.0f32, 2.0] {
+                data.extend(v.to_le_bytes());
+            }
+            for w in words {
+                data.extend(w.to_le_bytes());
+            }
+            let total = data.len() / 4;
+            assert_eq!(total % 2, 0);
+            StepTensor::Masked(Tensor::new(DType::I32, [1, 2, total as u32 / 2], data))
+        };
+        // h = 1, two rows: words per row 0, one masked row.
+        assert!(tensor(&[0, 1, 1, 5]).split(1).is_ok());
+        // Row 2 of 2.
+        assert!(tensor(&[0, 1, 2, 5]).split(1).is_err());
+        // Tag 0 on a listed row.
+        assert!(tensor(&[0, 1, 1, 0]).split(1).is_err());
+        // More rows listed than the section holds.
+        assert!(tensor(&[0, 3, 1, 5]).split(1).is_err());
+        // A word count that overflows.
+        assert!(tensor(&[u32::MAX, 1, 1, 5]).split(1).is_err());
+        // The same row twice.
+        assert!(tensor(&[0, 2, 1, 5, 1, 6, 0, 0]).split(1).is_err());
+    }
+
     #[test]
     fn a_masked_frame_narrower_than_the_hidden_is_refused_by_split() {
         let t = masked_tensor(&[1.0, 2.0], [1, 1, 2], &MaskCols::new(1, 0)).unwrap();
@@ -3908,9 +4048,11 @@ mod mask_wire_tests {
 
     #[test]
     fn largest_masked_frames_fit_the_tensor_cap() {
-        // 256 rows (the frame row cap) of a 7168-wide hidden with a
-        // 262144-token vocab mask: (7168 + 1 + 8192) * 4 * 256 bytes.
-        let bytes = MAX_BATCH_COUNT as usize * (7168 + 1 + 262_144 / 32) * 4;
+        // 256 rows (the frame row cap) of a 7168-wide hidden, every row
+        // masked with a 262144-token vocab mask.
+        let rows = MAX_BATCH_COUNT as usize;
+        let section = 2 + rows * (2 + 262_144 / 32);
+        let bytes = rows * (7168 + section.div_ceil(rows)) * 4;
         assert!(bytes <= cascadia_transport::MAX_TENSOR_BYTES, "{bytes}");
     }
 }
