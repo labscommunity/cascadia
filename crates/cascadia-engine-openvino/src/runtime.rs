@@ -1151,10 +1151,11 @@ fn relay_reply_frame(step: &EngineResult<i32>, seq: u32, acked: bool) -> WireTen
 
 /// What a relay stage answers after its downstream's reply to a masked step:
 /// the outcome to pass up, and whether to acknowledge it. Only an
-/// acknowledged downstream reply (token or NACK), or a failure of this stage's
-/// own (a malformed frame, a dead socket), is acknowledged; a plain NACK, an
-/// unacknowledged token or silence from downstream goes up as a plain NACK, so
-/// the head learns that some stage below can't mask.
+/// acknowledged downstream reply (token or NACK) is acknowledged; a plain
+/// NACK, an unacknowledged token, silence, or a dead or desynced link below
+/// goes up as a plain NACK, so the head learns that some stage below can't
+/// mask (or can't prove it does). A middle's failure before the downstream
+/// exchange ran is [`own_failure_answer`]'s.
 fn masked_relay_answer<T>(downstream: Result<T, TokenWaitFailure>) -> (EngineResult<T>, bool) {
     match downstream {
         Ok(t) => (Ok(t), true),
@@ -1167,6 +1168,15 @@ fn masked_relay_answer<T>(downstream: Result<T, TokenWaitFailure>) -> (EngineRes
             TokenWaitFailure::NoAck(e) | TokenWaitFailure::TimedOut(e) | TokenWaitFailure::Other(e),
         ) => (Err(e), false),
     }
+}
+
+/// A relay stage's answer when the step failed on this stage, before any
+/// downstream exchange: the tail acknowledges it (it applies the mask itself,
+/// so the NACK proves the chain masks); a middle doesn't, since nothing from
+/// below vouched for the step. The acknowledgement flag is unused on a plain
+/// step.
+fn own_failure_answer<T>(e: EngineError, is_last_stage: bool) -> (EngineResult<T>, bool) {
+    (Err(e), is_last_stage)
 }
 
 /// A relay stage's answer from its downstream's reply: a plain step passes the
@@ -4105,8 +4115,9 @@ impl OvRuntimeEngine {
         // has one token per row), and it tells the upstream "batch lost,
         // link healthy".
         //
-        // A masked plan's reply is acknowledged unless a stage below this one
-        // didn't acknowledge it (see `masked_relay_answer`).
+        // A masked plan's reply is acknowledged by the tail, and by a middle
+        // only when its downstream exchange ran and was acknowledged (see
+        // `masked_relay_answer`, `own_failure_answer`).
         let (step, vouch) = self.relay_packed_body(plan_res, hidden, hshape);
         if let Err(e) = &step {
             // Log the root cause HERE, before the NACK goes out: a dead
@@ -4142,22 +4153,23 @@ impl OvRuntimeEngine {
         hidden: Vec<f32>,
         hshape: [u32; MAX_RANK],
     ) -> (EngineResult<Vec<i32>>, bool) {
+        let tail = self.spec.is_last_stage;
         let (plan_rows, masks) = match plan_res {
             Ok(p) => p,
-            Err(e) => return (Err(e), true),
+            Err(e) => return own_failure_answer(e, tail),
         };
         let (odt, oshape, obytes) = match self.relay_packed_run(&plan_rows, hidden, hshape) {
             Ok(o) => o,
-            Err(e) => return (Err(e), true),
+            Err(e) => return own_failure_answer(e, tail),
         };
-        if self.spec.is_last_stage {
+        if tail {
             let picks = bytes_to_f32(odt, &obytes)
                 .and_then(|logits| pick_plan_rows(&logits, &oshape, &plan_rows, masks.as_deref()));
             return (picks, true);
         }
         let hidden_out = match bytes_to_f32(odt, &obytes) {
             Ok(h) => h,
-            Err(e) => return (Err(e), true),
+            Err(e) => return own_failure_answer(e, false),
         };
         // A downstream failure (including its NACK) propagates as Err — the
         // caller NACKs our own upstream in turn, so the abort reaches rank 0
@@ -5193,8 +5205,9 @@ impl OvRuntimeEngine {
     /// head however deep the pipeline is.
     ///
     /// A masked step's mask is forwarded with the activation. The second value
-    /// says whether this stage may acknowledge the step to its upstream: not
-    /// when the downstream's reply was unacknowledged or never came.
+    /// says whether this stage may acknowledge the step to its upstream: only
+    /// when the downstream exchange ran and its reply was acknowledged — not
+    /// when this stage failed before reaching it (see [`own_failure_answer`]).
     fn relay_middle_body(
         &mut self,
         hidden: Vec<f32>,
@@ -5210,11 +5223,11 @@ impl OvRuntimeEngine {
         );
         let prefill_reply = match forwarded {
             Ok(p) => p,
-            Err(e) => return (Err(e), true),
+            Err(e) => return own_failure_answer(e, false),
         };
         let downstream = match self.downstream.clone() {
             Some(d) => d,
-            None => return (Err(EngineError::Backend("no downstream".into())), true),
+            None => return own_failure_answer(EngineError::Backend("no downstream".into()), false),
         };
         let reply = self.wait_token(&downstream, prefill_reply, mask.is_some());
         relay_downstream_answer(reply, mask.is_some())
@@ -9397,8 +9410,36 @@ mod tests {
         assert_eq!(streak, 1);
     }
 
+    /// A stage's own failure before it reached its downstream: the tail
+    /// vouches for itself (it applies the mask), a middle vouches for nothing,
+    /// so its NACK goes up plain and the head never takes it as proof that the
+    /// chain below masks. The middle then owes the step a late acknowledgement.
+    #[test]
+    fn a_middle_failing_before_its_downstream_nacks_plain() {
+        let e = || EngineError::Backend("x".into());
+        let (step, vouch) = own_failure_answer::<i32>(e(), true);
+        assert!(
+            step.is_err() && vouch,
+            "the tail acknowledges its own failure"
+        );
+        let (step, vouch) = own_failure_answer::<i32>(e(), false);
+        assert!(
+            step.is_err() && !vouch,
+            "a middle can't vouch for the chain below"
+        );
+
+        let mut link = MaskLink::default();
+        let frames = upstream_reply_frames(&mut link, &step, 9, true, vouch);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            decode_token_reply(&frames[0]).unwrap(),
+            (NACK_TOKEN, 9, false),
+            "a plain NACK"
+        );
+    }
+
     /// A relay's answer to a masked step: only an acknowledged reply from
-    /// below, or the stage's own failure, is acknowledged upward. A dead or
+    /// below is acknowledged upward. A dead or
     /// desynced downstream is not proof the stage below masks.
     #[test]
     fn a_relay_acknowledges_only_what_the_stage_below_acknowledged() {
