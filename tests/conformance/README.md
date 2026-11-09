@@ -14,9 +14,10 @@ server and read the process's own memory split:
 Guards, so a pass means something:
 
 - the elastic leg must log `elastic posture active` — hook off is invalid, not a pass;
-- the backing dir must be disk-backed: on tmpfs the pages cannot be written
-  back, so the posture gives no survival benefit even though `RssAnon` still
-  collapses (measured: tmpfs backing dies at the same caps as stock);
+- the backing dir must be usable: on tmpfs the pages cannot be written back, so
+  the shim escapes to `/var/tmp` or `~/.cache`, and the guard fails only when no
+  disk-backed alternative exists (then the posture is a no-op even though
+  `RssAnon` still collapses);
 - the interposer `.so` is selected by **mtime**, not lexicographic order: cargo
   leaves the previous build's `.so` beside the new one, and picking the wrong
   one silently measures an unpatched hook (this cost a whole C1 leg once);

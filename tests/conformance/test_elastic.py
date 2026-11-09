@@ -57,6 +57,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -287,6 +288,29 @@ def cgroup_file(pid, name):
         return None
 
 
+def escape_target(edir, pool_mb=8192):
+    """Where elastic_unix.c's resolve_backing_dir() will move a tmpfs/ramfs dir.
+
+    Mirrors the shim so the guard checks the directory the posture will really
+    use, not the one the user asked for. None = the shim will refuse to escape.
+    """
+    need = (min(pool_mb, 1 << 20) << 20) + (1 << 30)
+    for cand in ("/var/tmp", os.path.expanduser("~/.cache")):
+        if not cand or os.path.abspath(cand) == os.path.abspath(edir):
+            continue
+        if not os.path.isdir(cand) or not os.access(cand, os.W_OK):
+            continue
+        if fstype(cand) in ("tmpfs", "ramfs"):
+            continue
+        try:
+            if shutil.disk_usage(cand).free < need:
+                continue
+        except OSError:
+            continue
+        return cand
+    return None
+
+
 def fstype(path):
     try:
         r = sh(["findmnt", "-no", "FSTYPE", "-T", path])
@@ -432,6 +456,9 @@ def main():
     base_env = dict(os.environ)
     base_env.pop("LD_PRELOAD", None)          # pristine: no ambient preloads
     base_env.pop("CASCADIA_ELASTIC_ACTIVE", None)
+    # escape_target() mirrors the shim without the opt-in, so strip it: an
+    # ambient value would make the guard approve a config the legs then run.
+    base_env.pop("ELASTIC_ALLOW_TMPFS", None)
     sdk = os.environ.get("INTEL_OPENVINO_DIR")
     if sdk:
         lp = base_env.get("LD_LIBRARY_PATH", "")
@@ -463,13 +490,21 @@ def main():
         record("guard: backing dir usable", False, f"{edir} is not writable")
         finish(1)
     if ft in ("tmpfs", "ramfs"):
-        record("guard: backing dir disk-backed", False,
-               f"{edir} is on {ft}: pages cannot be written back, so the posture "
-               f"gives NO survival benefit under a memory cap (measured: dies at "
-               f"the same caps as stock). Point --elastic-dir/ELASTIC_DIR at a "
-               f"disk-backed directory (ext4/xfs).")
-        finish(1)
-    record("guard: backing dir disk-backed", True, f"{edir} ({ft})")
+        # The shim escapes a memory-backed dir; that is the supported config now.
+        # It only stays fatal when no disk-backed alternative exists, because then
+        # the posture really is a no-op under a cap.
+        esc = escape_target(edir)
+        if not esc:
+            record("guard: backing dir disk-backed", False,
+                   f"{edir} is on {ft} and no disk-backed alternative was found "
+                   f"(/var/tmp, ~/.cache); pages cannot be written back, so the "
+                   f"posture gives NO survival benefit under a memory cap. Point "
+                   f"--elastic-dir/ELASTIC_DIR at a disk-backed directory.")
+            finish(1)
+        record("guard: backing dir disk-backed", True,
+               f"{edir} is on {ft}; the shim escapes to {esc}")
+    else:
+        record("guard: backing dir disk-backed", True, f"{edir} ({ft})")
 
     used = set()
     prompt = DEFAULT_PROMPT
