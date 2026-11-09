@@ -110,7 +110,11 @@ itself, a probe of the chat template at load decides. Limits:
 
 - `sycl-llama`: llama-server moves reasoning out of the text into `reasoning_content`; for
   `/v1/responses` the engine forwards it as text inside `<think>...</think>`, ahead of the
-  answer, so it becomes a reasoning item. `/v1/chat/completions` still drops it.
+  answer, so it becomes a reasoning item. `/v1/chat/completions` still drops it. A replayed
+  reasoning item goes back to llama-server as the assistant turn's `reasoning_content`,
+  except on a turn with both text and tool calls when the template refuses that (gpt-oss) or
+  cannot be read (no template in the GGUF, or one set with `--chat-template*` in the llama
+  args); there it is left out.
 - On engine-rendered paths whose template cannot be probed (no chat template loaded, or a
   probe render error), a prompt-opened model's reasoning stays in the message text.
 

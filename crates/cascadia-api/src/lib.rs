@@ -291,8 +291,9 @@ pub struct AppState {
     pub fold_probe_env: Option<Arc<minijinja::Environment<'static>>>,
     /// The engine's template ([`Config::fold_probe_template`]) refuses an
     /// assistant turn with tool calls, content and thinking all at once
-    /// (gpt-oss: "Cannot pass both content and thinking"), so a replayed
-    /// reasoning beside content is dropped there (see [`chat_turns`]).
+    /// (gpt-oss: "Cannot pass both content and thinking"), or is unknown, so
+    /// a replayed reasoning beside content is dropped there (see
+    /// [`chat_turns`]). Only read where the engine applies its own template.
     pub probe_refuses_content_with_thinking: bool,
     /// The chat template distinguishes OpenAI's `reasoning_effort` words
     /// (probed at load: "low" and "medium" render differently). When true the
@@ -736,10 +737,15 @@ pub fn make_router_with_stats(
                     None
                 }
             }),
+        // Without the engine's template text (none in the GGUF, unreadable,
+        // or replaced by the operator's `--chat-template*` llama args) it may
+        // be one that refuses, so the reasoning is dropped there too: losing
+        // a replayed thought beside content costs little, a refusal fails the
+        // turn.
         probe_refuses_content_with_thinking: cfg
             .fold_probe_template
             .as_deref()
-            .is_some_and(|src| src.contains("Cannot pass both content and thinking")),
+            .is_none_or(|src| src.contains("Cannot pass both content and thinking")),
         effort_words: false,
         template_opens_think: false,
         marker_dialect: cfg.marker_dialect.clone(),

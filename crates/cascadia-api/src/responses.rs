@@ -3234,6 +3234,19 @@ mod tests {
             assert_eq!(sent.reasoning_content.as_deref(), reasoning, "{text:?}");
             assert_eq!(sent.content, content, "{text:?}");
         }
+        // No template text to read (none in the GGUF, or the operator's
+        // `--chat-template*` llama args replace it): it may refuse, so the
+        // reasoning beside content is dropped.
+        let cfg = Config {
+            engine_applies_template: true,
+            ..Config::default()
+        };
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, body) = post(app, turn("Let me look.", true)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sent = tasks.lock()[0].messages[1].clone();
+        assert_eq!(sent.reasoning_content, None);
+        assert_eq!(sent.content, "Let me look.");
     }
 
     /// A template that takes no system role gets every system turn folded,
