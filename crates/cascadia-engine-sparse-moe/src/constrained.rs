@@ -87,6 +87,7 @@ impl GrammarSlot {
     /// A slot whose factory `build` makes on first use. A failure (or a
     /// panic) is logged then, once, and kept: json tasks get a 400 naming
     /// it.
+    #[cfg(test)]
     pub(crate) fn lazy(
         build: impl FnOnce() -> EngineResult<GrammarFactory> + Send + 'static,
     ) -> Self {
