@@ -1748,8 +1748,11 @@ fn token_wait_budget(
 
 /// One downstream token wait with its bookkeeping: an acknowledged reply
 /// discarded as stale proves the chain below masks ([`MaskLink::on_acked`]),
-/// and only silence moves the escalation `streak` (see
-/// [`next_timeout_streak`]).
+/// and only a plain step's silence moves the escalation `streak` (see
+/// [`next_timeout_streak`]). A masked step's timeout doesn't count: below an
+/// older stage that can't mask, every masked step times out while plain
+/// traffic flows, and a middle that exits over that strands its head (which
+/// never re-dials).
 async fn wait_token_reply(
     downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
     awaiting: u32,
@@ -1764,7 +1767,7 @@ async fn wait_token_reply(
         link.on_acked();
     }
     let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
-    *streak = next_timeout_streak(*streak, timed_out);
+    *streak = next_timeout_streak(*streak, timed_out && !masked);
     outcome
 }
 
@@ -5149,7 +5152,9 @@ impl OvRuntimeEngine {
     /// loop backing off and retrying forever, with no self-heal and no
     /// operator-visible terminal state.
     ///
-    /// Only CONSECUTIVE token-wait timeouts count, and only timeouts: a NACK or
+    /// Only CONSECUTIVE token-wait timeouts of plain steps count (a masked
+    /// step's timeout proves only that a stage below can't mask; see
+    /// `wait_token_reply`), and only timeouts: a NACK or
     /// a malformed frame proves bytes are still flowing, and
     /// `recv_token_from_downstream` resets the counter on both. Each timeout
     /// already costs a full token budget, so the threshold is a small count
@@ -8212,6 +8217,45 @@ mod tests {
         assert_eq!(streak, 3);
     }
 
+    /// A middle whose tail is an older build that can't mask times out on
+    /// every masked step, while plain traffic flows. Those timeouts must not
+    /// tear the middle down (the head can't re-dial it); a plain step's
+    /// silence still counts.
+    #[tokio::test]
+    async fn masked_timeouts_never_escalate_a_middle() {
+        let (client, _server) = loopback().await;
+        let down = Arc::new(tokio::sync::Mutex::new(client));
+        let budget = std::time::Duration::from_millis(50);
+        let n = RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT;
+        let mut link = MaskLink::default();
+
+        let mut streak = 0;
+        for _ in 0..n + 2 {
+            let reply = wait_token_reply(&down, 1, budget, true, &mut streak, &mut link).await;
+            assert!(
+                matches!(reply, Err(TokenWaitFailure::TimedOut(_))),
+                "{reply:?}"
+            );
+            assert!(
+                !should_escalate(streak, true),
+                "masked timeouts escalated at {streak}"
+            );
+        }
+
+        let mut streak = 0;
+        for _ in 0..n {
+            let reply = wait_token_reply(&down, 1, budget, false, &mut streak, &mut link).await;
+            assert!(
+                matches!(reply, Err(TokenWaitFailure::TimedOut(_))),
+                "{reply:?}"
+            );
+        }
+        assert!(
+            should_escalate(streak, true),
+            "plain timeouts still escalate"
+        );
+    }
+
     /// The escalation error must be classifiable by TYPE. `Io(TimedOut)` is
     /// what makes the relay loop exit for a supervisor rebuild; a `Backend`
     /// string that merely happens to contain a fatal substring would be one
@@ -9301,7 +9345,7 @@ mod tests {
     }
 
     /// `wait_token_reply`, the engine's wait: a discarded acknowledged reply
-    /// clears the latch; only silence moves the streak; a late control ack is
+    /// clears the latch; only a plain step's silence moves the streak; a late control ack is
     /// skipped instead of failing the step.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -9341,7 +9385,7 @@ mod tests {
                 &downstream,
                 6,
                 decode_budget(),
-                true,
+                false,
                 &mut streak,
                 &mut link,
             )
