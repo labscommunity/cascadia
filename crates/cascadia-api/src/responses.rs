@@ -28,7 +28,7 @@ mod output;
 mod store;
 mod tools;
 use input::input_messages;
-pub(crate) use input::{fold_system_turns, Fold};
+pub(crate) use input::{fold_system_turns, folds_to_try, Fold};
 use output::{OutputBuilder, OutputEvent};
 pub(crate) use store::ItemCache;
 use tools::{check_include, check_tool_choice, ToolMap};

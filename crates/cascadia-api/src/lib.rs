@@ -4232,7 +4232,7 @@ fn fold_refused_system_turns(
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
 ) -> Option<FoldedTurns> {
-    use responses::{fold_system_turns, Fold};
+    use responses::{fold_system_turns, folds_to_try};
     if !messages.iter().any(|m| m.role == "system") {
         return None;
     }
@@ -4273,13 +4273,7 @@ fn fold_refused_system_turns(
     if !refused {
         return None;
     }
-    let later = messages
-        .iter()
-        .skip_while(|m| m.role == "system")
-        .any(|m| m.role == "system");
-    let folds = [Fold::Later, Fold::All]
-        .into_iter()
-        .filter(|f| later || *f == Fold::All);
+    let folds = folds_to_try(messages);
     // Where the API renders, the probe is admit's own render: the template
     // with the same inputs, rendered for the deferring engine (`true`) on its
     // thinking path.

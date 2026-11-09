@@ -344,6 +344,21 @@ pub(crate) fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<C
     out
 }
 
+/// The folds of `messages` worth trying, in order: the later system turns
+/// when there are any, then every one when that differs from the first (a
+/// leading system turn exists); none without a system turn.
+pub(crate) fn folds_to_try(messages: &[ChatMessage]) -> Vec<Fold> {
+    let leading = messages.first().is_some_and(|m| m.role == "system");
+    let later = messages
+        .iter()
+        .skip_while(|m| m.role == "system")
+        .any(|m| m.role == "system");
+    [(Fold::Later, later), (Fold::All, leading)]
+        .into_iter()
+        .filter_map(|(fold, worth)| worth.then_some(fold))
+        .collect()
+}
+
 /// A `message` item as the chat message it is.
 fn input_message(item: &Value, at: &str) -> Result<ChatMessage, Refusal> {
     let role = match item.get("role").and_then(Value::as_str) {
@@ -1178,6 +1193,23 @@ mod tests {
             Fold::Later,
         );
         assert_eq!(shape(&m), [("user", "u1\n\nsys\n\nu2", None, None)]);
+    }
+
+    /// The folds worth trying: the later system turns when there are any,
+    /// then every one only when that differs (a leading system turn).
+    #[test]
+    fn folds_are_tried_only_when_they_differ() {
+        let roles = |r: &[&str]| r.iter().map(|r| msg(r, "x")).collect::<Vec<_>>();
+        assert_eq!(folds_to_try(&roles(&["user"])), []);
+        assert_eq!(folds_to_try(&roles(&["system", "user"])), [Fold::All]);
+        assert_eq!(
+            folds_to_try(&roles(&["user", "system", "user"])),
+            [Fold::Later]
+        );
+        assert_eq!(
+            folds_to_try(&roles(&["system", "user", "system", "user"])),
+            [Fold::Later, Fold::All]
+        );
     }
 
     /// Several folded turns accumulate; with no `user` turn after them they
