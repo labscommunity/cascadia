@@ -3788,7 +3788,12 @@ impl SparseMoEEngine {
                     // A masked step's wait here must end before the one upstream does,
                     // so an unacknowledged step reaches rank 0 as such: the head's
                     // budget for this step, shortened by this rank's place.
-                    let mid_budget =                        mid_forward_budget(&mut self.mid_sampled, sample, self.rank, self.total);
+                    let mid_budget = mid_forward_budget(
+                        &mut self.mid_sampled,
+                        sample,
+                        self.rank,
+                        self.total,
+                    );
                     if let Some(cols) = cols {
                         // Relay the mask; pass the reply up only as acknowledged
                         // by the stages below.
