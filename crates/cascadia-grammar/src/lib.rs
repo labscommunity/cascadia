@@ -429,15 +429,38 @@ impl GrammarMask {
 pub fn argmax_allowed(row: &[f32], words: &[u32]) -> Option<usize> {
     let mut lowest = None;
     let mut best: Option<(usize, f32)> = None;
-    'words: for (w, &word) in words.iter().enumerate() {
-        let mut bits = word;
+    // 32 indices per word: empty words are skipped, full words take a plain
+    // max, only mixed words are walked bit by bit.
+    for (w, (&word, chunk)) in words.iter().zip(row.chunks(32)).enumerate() {
+        let base = w * 32;
+        let bits = if chunk.len() < 32 {
+            word & ((1u32 << chunk.len()) - 1)
+        } else {
+            word
+        };
+        if bits == 0 {
+            continue;
+        }
+        lowest.get_or_insert(base + bits.trailing_zeros() as usize);
+        if bits == u32::MAX {
+            // NaN never compares greater, so it never becomes the max.
+            let m = chunk
+                .iter()
+                .fold(f32::NEG_INFINITY, |m, &v| if v > m { v } else { m });
+            if m > f32::NEG_INFINITY && best.is_none_or(|(_, b)| m > b) {
+                let i = chunk
+                    .iter()
+                    .position(|&v| v == m)
+                    .expect("max is in the chunk");
+                best = Some((base + i, m));
+            }
+            continue;
+        }
+        let mut bits = bits;
         while bits != 0 {
-            let t = w * 32 + bits.trailing_zeros() as usize;
+            let t = base + bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            let Some(&v) = row.get(t) else {
-                break 'words;
-            };
-            lowest.get_or_insert(t);
+            let v = row[t];
             if v > f32::NEG_INFINITY && best.is_none_or(|(_, b)| v > b) {
                 best = Some((t, v));
             }

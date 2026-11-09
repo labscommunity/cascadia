@@ -707,3 +707,61 @@ fn runtime_grammar_errors_hide_the_parser_state() {
     let mut gm = mask_for(&gf, WEATHER);
     generic(gm.replay(&bytes(r#"{"x"#)).unwrap_err());
 }
+
+/// The bit-by-bit pick `argmax_allowed` must match.
+fn argmax_allowed_bitwise(row: &[f32], words: &[u32]) -> Option<usize> {
+    let mut lowest = None;
+    let mut best: Option<(usize, f32)> = None;
+    'words: for (w, &word) in words.iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let t = w * 32 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let Some(&v) = row.get(t) else {
+                break 'words;
+            };
+            lowest.get_or_insert(t);
+            if v > f32::NEG_INFINITY && best.is_none_or(|(_, b)| v > b) {
+                best = Some((t, v));
+            }
+        }
+    }
+    best.map(|(t, _)| t).or(lowest)
+}
+
+#[test]
+fn word_wise_argmax_matches_bit_by_bit() {
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as u32
+    };
+    for case in 0..3000 {
+        let len = (next() % 300) as usize;
+        let n_words = (next() % 12) as usize;
+        let words: Vec<u32> = (0..n_words)
+            .map(|_| match next() % 4 {
+                0 => 0,
+                1 => u32::MAX,
+                2 => next() & next(),
+                _ => next(),
+            })
+            .collect();
+        // Few distinct values, so ties are common.
+        let row: Vec<f32> = (0..len)
+            .map(|_| match next() % 16 {
+                0 => f32::NAN,
+                1 => f32::NEG_INFINITY,
+                2 => f32::INFINITY,
+                _ => (next() % 5) as f32 - 2.0,
+            })
+            .collect();
+        assert_eq!(
+            argmax_allowed(&row, &words),
+            argmax_allowed_bitwise(&row, &words),
+            "case {case}: row {row:?} words {words:x?}"
+        );
+    }
+}
