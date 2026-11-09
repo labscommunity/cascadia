@@ -5,8 +5,8 @@
 use cascadia_types::{GrammarKind, GrammarSpec};
 use serde_json::{Map, Value};
 
-/// Grammar body used for `json_object` (and for `json_schema` without a
-/// usable schema): any JSON object.
+/// Grammar body used for `json_object` (and for `json_schema` whose schema is
+/// missing, `null` or `true`): any JSON object.
 pub const JSON_OBJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":true}"#;
 
 /// The output format a chat request asked for.
@@ -56,12 +56,14 @@ pub fn parse_response_format(v: Option<&Value>) -> Result<ResponseFormat, String
     }
 }
 
+/// Parse `response_format.json_schema`. A missing, `null` or `true` schema
+/// asks for any JSON object; `false` and non-object schemas are rejected.
 fn parse_json_schema(js: Option<&Value>) -> Result<ResponseFormat, String> {
     let Some(Value::Object(js)) = js else {
         return Err("response_format.json_schema must be an object".into());
     };
     match js.get("schema") {
-        None | Some(Value::Bool(true)) => Ok(ResponseFormat::JsonObject),
+        None | Some(Value::Null) | Some(Value::Bool(true)) => Ok(ResponseFormat::JsonObject),
         Some(Value::Bool(false)) => {
             Err("response_format.json_schema.schema is false: no output can match it".into())
         }
@@ -278,9 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn json_schema_without_schema_or_true_is_json_object() {
+    fn json_schema_without_schema_null_or_true_is_json_object() {
         assert_eq!(
             parse(json!({"type": "json_schema", "json_schema": {"name": "x"}})),
+            Ok(ResponseFormat::JsonObject)
+        );
+        assert_eq!(
+            parse(json!({"type": "json_schema", "json_schema": {"schema": null}})),
             Ok(ResponseFormat::JsonObject)
         );
         assert_eq!(
@@ -327,7 +333,7 @@ mod tests {
     #[test]
     fn schema_not_object_is_rejected() {
         let msg = "response_format.json_schema.schema must be a JSON Schema object";
-        for s in [json!("object"), json!(1), json!([]), json!(null)] {
+        for s in [json!("object"), json!(1), json!([])] {
             assert_eq!(
                 parse(json!({"type": "json_schema", "json_schema": {"schema": s}})),
                 Err(msg.into())
