@@ -1,6 +1,6 @@
 //! Deterministic minimal instance of a JSON Schema.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde_json::{Map, Number, Value};
 
@@ -164,7 +164,8 @@ impl<'a> Generator<'a> {
     /// `allOf` reached many times through a recursive `$ref` runs out of
     /// budget instead of re-walking all its properties on every visit.
     fn merged_object(&mut self, members: &[Value], depth: usize) -> Result<Value, OutOfBudget> {
-        let mut objects: Vec<&Map<String, Value>> = Vec::with_capacity(members.len());
+        // Property name -> schema; the first member that defines it wins.
+        let mut defined: HashMap<&str, &Value> = HashMap::new();
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         let mut required: Vec<&str> = Vec::new();
         for member in members {
@@ -174,6 +175,9 @@ impl<'a> Generator<'a> {
             };
             if let Some(p) = m.get("properties").and_then(Value::as_object) {
                 self.spend(p.len())?;
+                for (name, schema) in p {
+                    defined.entry(name.as_str()).or_insert(schema);
+                }
             }
             for name in m
                 .get("required")
@@ -188,18 +192,11 @@ impl<'a> Generator<'a> {
                     }
                 }
             }
-            objects.push(m);
         }
         let mut out = Map::new();
         for name in required {
             self.spend(name.len())?;
-            // The first member that defines the property wins.
-            let schema = objects.iter().find_map(|m| {
-                m.get("properties")
-                    .and_then(Value::as_object)
-                    .and_then(|p| p.get(name))
-            });
-            let value = match schema {
+            let value = match defined.get(name) {
                 Some(s) => self.instance(s, depth + 1)?,
                 None => Value::Object(Map::new()),
             };
@@ -577,6 +574,28 @@ mod tests {
             "required": ["a", "a", "a"],
         });
         assert_eq!(minimal_instance(&s), json!({"a": "aa"}));
+    }
+
+    #[test]
+    fn wide_all_of_with_many_required_names_is_linear() {
+        let names: Vec<String> = (0..5_000).map(|i| format!("p{i}")).collect();
+        let props: Map<String, Value> = names
+            .iter()
+            .map(|n| (n.clone(), json!({"type": "string"})))
+            .collect();
+        let mut members = vec![json!({}); 10_000];
+        members.push(json!({"properties": props, "required": names}));
+        let s = json!({"allOf": members});
+        let start = Instant::now();
+        let v = minimal_instance(&s);
+        let took = start.elapsed();
+        let obj = v.as_object().expect("an object");
+        assert_eq!(obj.len(), 5_000);
+        assert_eq!(obj["p4999"], json!(""));
+        assert!(
+            took < Duration::from_millis(250),
+            "one name lookup per required name: {took:?}"
+        );
     }
 
     #[test]
