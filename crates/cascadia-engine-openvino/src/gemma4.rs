@@ -1076,14 +1076,28 @@ enum MaskedWait {
     Failed(EngineError),
 }
 
-/// The bound of a masked step's wait: the plain step's budget.
-fn masked_wait_budget(prefill: bool) -> Duration {
+/// Extra wait per stage between this one and the last middle, on a masked
+/// decode step: covers that middle's compute and its reply hop.
+const MASK_HOP_MARGIN: Duration = Duration::from_secs(5);
+/// The same on a masked prefill step (a middle's whole-prompt slice; the
+/// measured worst for a whole 2-stage prefill is 51 s).
+const MASK_HOP_MARGIN_PREFILL: Duration = Duration::from_secs(60);
+
+/// The bound of a masked step's wait at a stage with `stages_below` stages
+/// after it (the head of a 2-stage pipeline: 1). The stage just before the
+/// tail waits the plain step's budget; each stage before it waits one margin
+/// more than the next, so a middle in front of an old tail times out and its
+/// not-acknowledged reply reaches every stage above while it still waits
+/// (leaving no late reply on the link).
+fn masked_wait_budget(prefill: bool, stages_below: u32) -> Duration {
     let base = cascadia_transport::recv_timeout();
+    let hops = stages_below.saturating_sub(1);
     if prefill {
         base.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
             .min(G_PREFILL_REPLY_CEILING)
+            .saturating_add(MASK_HOP_MARGIN_PREFILL.saturating_mul(hops))
     } else {
-        base
+        base.saturating_add(MASK_HOP_MARGIN.saturating_mul(hops))
     }
 }
 
@@ -1273,6 +1287,8 @@ pub struct Gemma4Engine {
     grammar_failure: Option<GrammarFailure>,
     /// Head: set when a later stage didn't acknowledge a masked step.
     mask_latch: MaskLatch,
+    /// Pipeline stages after this one (0 on the tail); sizes masked waits.
+    stages_below: u32,
     /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
@@ -1520,7 +1536,7 @@ impl Gemma4Engine {
         let Some(downstream) = self.downstream.clone() else {
             return MaskedWait::Failed(EngineError::Backend("no downstream".into()));
         };
-        let budget = masked_wait_budget(prefill);
+        let budget = masked_wait_budget(prefill, self.stages_below);
         self.block_on(async move {
             let mut guard = downstream.lock().await;
             wait_masked_reply(&mut guard, budget).await
@@ -3208,6 +3224,7 @@ impl Builder for Gemma4Builder {
             step_warn: StepWarnLimiter::default(),
             grammar_failure: None,
             mask_latch: MaskLatch::default(),
+            stages_below: self.total.saturating_sub(self.rank + 1),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
@@ -4245,29 +4262,73 @@ mod tests {
         mid.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn a_middle_whose_downstream_is_old_answers_not_acknowledged() {
-        let (mut mid_up, mut head) = link().await;
-        let (mut tail_up, mut mid_down) = link().await;
-        let words = ok_words();
-        let tail = tokio::spawn(async move {
-            assert!(old_stage_read(&mut tail_up, 2).await.is_err());
-            tail_up
+    #[test]
+    fn each_stage_waits_longer_than_the_stage_after_it() {
+        let _knob = crate::timeout_knob_lock();
+        for prefill in [false, true] {
+            // A 2-stage head waits exactly the plain step's budget.
+            let plain = if prefill {
+                cascadia_transport::recv_timeout()
+                    .saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
+                    .min(G_PREFILL_REPLY_CEILING)
+            } else {
+                cascadia_transport::recv_timeout()
+            };
+            assert_eq!(masked_wait_budget(prefill, 1), plain);
+            for k in 1..6 {
+                assert!(
+                    masked_wait_budget(prefill, k + 1)
+                        >= masked_wait_budget(prefill, k) + Duration::from_secs(5),
+                    "prefill={prefill} k={k}"
+                );
+            }
+        }
+    }
+
+    /// With the engine's own budgets (base 1 s), a middle in front of an old
+    /// tail times out first and its not-acknowledged reply reaches the head
+    /// inside the head's wait, so no late reply is left on the link.
+    #[test]
+    fn a_middle_whose_downstream_is_old_answers_not_acknowledged_in_time() {
+        let _knob = crate::timeout_knob_lock();
+        /// Puts the process-wide knob back even when an assertion fails.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                cascadia_transport::set_activation_timeout_secs(0);
+            }
+        }
+        cascadia_transport::set_activation_timeout_secs(1);
+        let _reset = Reset;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (mut mid_up, mut head) = link().await;
+            let (mut tail_up, mut mid_down) = link().await;
+            let words = ok_words();
+            let tail = tokio::spawn(async move {
+                assert!(old_stage_read(&mut tail_up, 2).await.is_err());
+                tail_up
+            });
+            let mid = tokio::spawn(async move {
+                new_middle_step(&mut mid_up, &mut mid_down, masked_wait_budget(false, 1)).await;
+                (mid_up, mid_down)
+            });
+            send_sample_step(&mut head, 0, Some(&words)).await;
+            let w = wait_masked_reply(&mut head, masked_wait_budget(false, 2)).await;
+            assert!(
+                matches!(&w, MaskedWait::Unacked(m) if m.contains("relayed")),
+                "the head must get the middle's answer, not time out: {w:?}"
+            );
+            let mut latch = MaskLatch::default();
+            let (e, _) = head_masked_token(w, &mut latch, std::time::Instant::now()).unwrap_err();
+            assert!(e.to_string().contains(UPGRADE_EVERY_STAGE));
+            let _links = mid.await.unwrap();
+            let _tail = tail.await.unwrap();
+            assert!(!drain_late_replies(&mut head).await.unwrap());
         });
-        let mid = tokio::spawn(async move {
-            new_middle_step(&mut mid_up, &mut mid_down, Duration::from_millis(200)).await;
-        });
-        send_sample_step(&mut head, 0, Some(&words)).await;
-        let w = wait_masked_reply(&mut head, Duration::from_secs(10)).await;
-        assert!(
-            matches!(&w, MaskedWait::Unacked(m) if m.contains("acknowledge")),
-            "{w:?}"
-        );
-        let mut latch = MaskLatch::default();
-        let (e, _) = head_masked_token(w, &mut latch, std::time::Instant::now()).unwrap_err();
-        assert!(e.to_string().contains(UPGRADE_EVERY_STAGE));
-        mid.await.unwrap();
-        tail.await.unwrap();
     }
 
     #[test]
