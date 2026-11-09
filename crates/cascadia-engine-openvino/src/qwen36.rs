@@ -267,13 +267,10 @@ fn hello_asks_mask(payload: &[u8]) -> bool {
 /// A tensor, not raw bytes: raw reads are capped at 64 KiB. `Err` when the
 /// grammar allows nothing (a dead end; no frame is sent).
 fn encode_wire_mask(mask: &mut GrammarMask, width: usize) -> EngineResult<WireTensor> {
-    let mut probe = vec![0f32; width];
-    mask.apply(&mut probe)?;
-    let mut lanes = vec![0i32; 1 + width.div_ceil(32)];
-    lanes[0] = width as i32;
-    for (i, _) in probe.iter().enumerate().filter(|(_, v)| v.is_finite()) {
-        lanes[1 + i / 32] |= (1u32 << (i % 32)) as i32;
-    }
+    let words = structured::mask_words_over(mask, width)?;
+    let mut lanes = Vec::with_capacity(1 + words.len());
+    lanes.push(width as i32);
+    lanes.extend(words.iter().map(|&w| w as i32));
     Ok(WireTensor::new(
         WireDType::I32,
         [1, 1, lanes.len() as u32],
@@ -302,19 +299,11 @@ fn decode_wire_mask(t: &WireTensor) -> Option<(usize, Vec<u32>)> {
     (words.len() == width.div_ceil(32)).then_some((width, words))
 }
 
-/// The argmax of `row` with every index the mask disallows at `-inf` (the
-/// local path's masked pick), or `None` when no index of the row is allowed.
+/// The tail's masked pick: the best token of `row` the mask allows (indices
+/// at or past `width` never), the lowest allowed one when every allowed logit
+/// is `-inf`/NaN, or `None` when no index of the row is allowed.
 fn masked_argmax(row: &[f32], width: usize, words: &[u32]) -> Option<u32> {
-    let allowed = |i: usize| i < width && words[i / 32] & (1 << (i % 32)) != 0;
-    if !(0..row.len()).any(allowed) {
-        return None;
-    }
-    let masked: Vec<f32> = row
-        .iter()
-        .enumerate()
-        .map(|(i, &l)| if allowed(i) { l } else { f32::NEG_INFINITY })
-        .collect();
-    pick_decode_token(&masked, None).ok()
+    cascadia_grammar::argmax_allowed(&row[..width.min(row.len())], words).map(|t| t as u32)
 }
 
 /// Read exactly `n` body bytes in ≤`MAX_RAW_BYTES` chunks, bounded by [`MAX_CARRY_BLOB_BYTES`].
@@ -594,7 +583,8 @@ fn read_eos_ids(dir: &Path) -> Vec<u32> {
 // -------- structured output (grammar-masked decode) --------
 
 /// The decode pick from the last position's logits row: the argmax, or for a
-/// structured-output task the best token the grammar allows (an error when it
+/// structured-output task the best token the grammar allows (the lowest
+/// allowed one when every allowed logit is `-inf`/NaN; an error when it
 /// allows none).
 fn pick_decode_token(logits: &[f32], mask: Option<&mut GrammarMask>) -> EngineResult<u32> {
     let argmax = |row: &[f32]| {
@@ -607,9 +597,7 @@ fn pick_decode_token(logits: &[f32], mask: Option<&mut GrammarMask>) -> EngineRe
     let Some(mask) = mask else {
         return Ok(argmax(logits));
     };
-    let mut row = logits.to_vec();
-    mask.apply(&mut row)?;
-    Ok(argmax(&row))
+    mask.pick_greedy(logits).map(|t| t as u32)
 }
 
 /// Whether the decode pick ends the task as EOS: a plain task stops on the
@@ -621,6 +609,26 @@ fn is_stop_token(next: u32, first_eos: Option<u32>, eos_ids: &[u32], grammar_tas
     } else {
         Some(next) == first_eos
     }
+}
+
+/// Whether the decode pick `next` ends the task as EOS ([`is_stop_token`]).
+/// For a structured-output task the grammar is checked first: a token it
+/// disallows (an EOS before the JSON is complete) is an error, never a stop.
+fn decode_stop(
+    next: u32,
+    grammar: Option<&mut GrammarMask>,
+    first_eos: Option<u32>,
+    eos_ids: &[u32],
+) -> EngineResult<bool> {
+    if let Some(mask) = grammar {
+        if !mask.allowed(next) {
+            return Err(EngineError::Backend(format!(
+                "grammar: token {next} is not allowed here"
+            )));
+        }
+        return Ok(is_stop_token(next, first_eos, eos_ids, true));
+    }
+    Ok(is_stop_token(next, first_eos, eos_ids, false))
 }
 
 /// Checked before each decode pick: `Stop` once the grammar finished (also on
@@ -2068,12 +2076,18 @@ impl Qwen36Engine {
                 return self.finalize(reason);
             }
             let next = t.next_token.expect("pipeline decode without pending token");
-            if is_stop_token(next, self.eos, &self.eos_ids, t.grammar.is_some()) {
-                return self.finalize(FinishReason::Stop);
-            }
-            // The chain picked `next` one step ago; it enters the matcher now, before the mask
-            // for the token after it.
+            // The chain picked `next` one step ago under the mask of the matcher's current
+            // position: a token that mask disallows never stops the task.
             let t = self.active.as_mut().unwrap();
+            match decode_stop(next, t.grammar.as_mut(), self.eos, &self.eos_ids) {
+                Ok(true) => return self.finalize(FinishReason::Stop),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(task = %task_id, error = %e, "structured output decode failed");
+                    return self.finalize_error(format!("structured output failed: {e}"));
+                }
+            }
+            // `next` enters the matcher now, before the mask for the token after it.
             if let Some(Err(e)) = t.grammar.as_mut().map(|m| m.accept(next)) {
                 warn!(task = %task_id, error = %e, "structured output decode failed");
                 return self.finalize_error(format!("structured output failed: {e}"));
@@ -2906,8 +2920,13 @@ impl Qwen36Engine {
                     return self.finalize_error(format!("structured output failed: {e}"));
                 }
             };
-            if is_stop_token(next, self.eos, &self.eos_ids, t.grammar.is_some()) {
-                return self.finalize(FinishReason::Stop);
+            match decode_stop(next, t.grammar.as_mut(), self.eos, &self.eos_ids) {
+                Ok(true) => return self.finalize(FinishReason::Stop),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(task = %task_id, error = %e, "structured output decode failed");
+                    return self.finalize_error(format!("structured output failed: {e}"));
+                }
             }
             if let Some(Err(e)) = t.grammar.as_mut().map(|m| m.accept(next)) {
                 warn!(task = %task_id, error = %e, "structured output decode failed");
@@ -4260,15 +4279,15 @@ mod tests {
     /// so the masked argmax lands on a disallowed index. The matcher refuses
     /// it and the task fails instead of emitting it.
     #[test]
-    fn a_pick_the_grammar_rejects_is_an_error_chunk() {
+    fn an_all_neg_inf_row_padded_past_the_vocab_is_not_a_grammar_error() {
+        // The pick is '"' (the only allowed token), not the padded last
+        // index; the bare engine then fails on its missing embeddings.
         let mut e = bare_engine(1, "{}");
         e.active = Some(grammar_task(OK_ENUM, "", 16, vec![f32::NEG_INFINITY; 300]));
         let out = e.step_local();
         assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].1.is_final);
         let err = out[0].1.error.as_deref().unwrap_or_default();
-        assert!(err.contains("structured output failed"), "{err}");
-        assert!(e.active.is_none());
+        assert!(!err.contains("structured output failed"), "{err}");
     }
 
     /// One rank of a test chain: an old build (from before masked frames) or
@@ -4397,6 +4416,66 @@ mod tests {
     fn the_wire_mask_of_a_dead_end_is_an_error() {
         let mut mask = start_grammar(&compiled(OK_ENUM), &[]).unwrap();
         assert!(encode_wire_mask(&mut mask, 4).is_err());
+    }
+
+    /// The encoder reads the allowed set from the matcher, not from `apply`
+    /// on a zero row; the wire lanes are unchanged.
+    #[test]
+    fn the_wire_mask_equals_the_apply_readback() {
+        let width = GrammarFactory::single_byte_for_tests().mask_width();
+        for (body, done) in [
+            (OK_ENUM, ""),
+            (OK_ENUM, "\"o"),
+            (OK_ENUM, "\"ok\""),
+            (INTEGER, "12"),
+        ] {
+            let mut mask = start_grammar(&compiled(body), &seed(done)).unwrap();
+            let want = structured::words_via_apply(&mut mask, width).unwrap();
+            let (w, words) =
+                decode_wire_mask(&encode_wire_mask(&mut mask, width).unwrap()).unwrap();
+            assert_eq!((w, words), (width, want), "{body} after {done:?}");
+        }
+    }
+
+    /// An all `-inf` row whose last index is the (disallowed) EOS: the pick
+    /// is the lowest allowed token, never the EOS that would end the task.
+    #[test]
+    fn an_all_neg_inf_row_never_picks_a_disallowed_eos() {
+        let width = GrammarFactory::single_byte_for_tests().mask_width();
+        assert_eq!(width - 1, TEST_EOS as usize);
+        let r = vec![f32::NEG_INFINITY; width];
+        let mut mask = start_grammar(&compiled(OK_ENUM), &[]).unwrap();
+        assert!(!mask.allowed(TEST_EOS));
+        assert_eq!(pick_decode_token(&r, Some(&mut mask)).unwrap(), b'"' as u32);
+        let (w, words) = decode_wire_mask(&encode_wire_mask(&mut mask, width).unwrap()).unwrap();
+        assert_eq!(masked_argmax(&r, w, &words), Some(b'"' as u32));
+        let nan = vec![f32::NAN; width];
+        assert_eq!(masked_argmax(&nan, w, &words), Some(b'"' as u32));
+
+        let mut e = bare_engine(1, "{}");
+        e.eos_ids = vec![TEST_EOS];
+        e.active = Some(grammar_task(OK_ENUM, "", 16, r));
+        let out = e.step_local();
+        assert!(
+            out.iter()
+                .all(|(_, c)| c.finish_reason != Some(FinishReason::Stop)),
+            "{out:?}"
+        );
+    }
+
+    /// A grammar task never stops on an EOS its grammar disallows.
+    #[test]
+    fn a_disallowed_eos_is_an_error_not_a_stop() {
+        let ids = [5, TEST_EOS];
+        let mut open = start_grammar(&compiled(OK_ENUM), &seed("\"o")).unwrap();
+        assert!(decode_stop(TEST_EOS, Some(&mut open), Some(5), &ids).is_err());
+        assert!(!decode_stop(b'k' as u32, Some(&mut open), Some(5), &ids).unwrap());
+        // A disallowed non-EOS token (from a misbehaving tail) is an error too.
+        assert!(decode_stop(BAD as u32, Some(&mut open), Some(5), &ids).is_err());
+        let mut done = start_grammar(&compiled(OK_ENUM), &seed("\"ok\"")).unwrap();
+        assert!(decode_stop(TEST_EOS, Some(&mut done), Some(5), &ids).unwrap());
+        assert!(decode_stop(5, None, Some(5), &ids).unwrap());
+        assert!(!decode_stop(TEST_EOS, None, Some(5), &ids).unwrap());
     }
 
     const PIPE_HIDDEN: usize = 300;
@@ -4812,15 +4891,17 @@ mod tests {
     /// whose allowed logits are all `-inf` lands on a disallowed index; the
     /// head's matcher refuses it at the next step and the task fails.
     #[test]
-    fn a_disallowed_token_back_from_the_tail_is_an_error_chunk() {
+    fn an_all_neg_inf_row_at_the_tail_still_yields_the_json() {
+        // Every logit is -inf: the tail picks the lowest allowed token each
+        // step, never a disallowed one (the head would reject it).
         let rt = pipe_rt();
         let tail = pipe_rank(1, 2, &rt);
         let mut head = pipe_head(2, &rt);
         head.fake_embed = Some(neg_inf_rows);
         let mut head = wire_chain(&rt, head, vec![tail]);
         let (ids, fin) = run_pipe_task(&mut head, pipe_task("j", 4, Some(OK_ENUM)));
-        assert!(ids.is_empty(), "{ids:?}");
-        let err = fin.error.as_deref().unwrap_or_default();
-        assert!(err.contains("structured output failed"), "{err}");
+        assert_eq!(ids, seed("\"ok\""));
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(fin.finish_reason, Some(FinishReason::Stop));
     }
 }

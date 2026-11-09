@@ -75,6 +75,40 @@ pub(crate) fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineR
     Ok(mask)
 }
 
+/// The allowed set of a grammar task's next pick as u32 words over `width`
+/// tokens (bit `t % 32` of word `t / 32`: token `t` allowed; no bit at or past
+/// `width`), read from the matcher's cached mask without a logits row. `Err`
+/// in the error state and when nothing below `width` is allowed: the head
+/// fails the task rather than send a mask that allows nothing.
+pub(crate) fn mask_words_over(mask: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
+    let mut words = mask.mask_words()?;
+    words.resize(width.div_ceil(32), 0);
+    if let (Some(last), tail @ 1..) = (words.last_mut(), width % 32) {
+        *last &= (1u32 << tail) - 1;
+    }
+    if words.iter().all(|&w| w == 0) {
+        return Err(EngineError::Backend(
+            "grammar: no token of the logits row is allowed".into(),
+        ));
+    }
+    Ok(words)
+}
+
+/// What [`mask_words_over`] replaced: the allowed set read back through
+/// `apply` on a `width`-wide zero row. Tests compare the two.
+#[cfg(test)]
+pub(crate) fn words_via_apply(mask: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
+    let mut row = vec![0f32; width];
+    mask.apply(&mut row)?;
+    let mut words = vec![0u32; width.div_ceil(32)];
+    for (i, v) in row.iter().enumerate() {
+        if v.is_finite() {
+            words[i / 32] |= 1 << (i % 32);
+        }
+    }
+    Ok(words)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +186,35 @@ mod tests {
         let mut mask = start_grammar(&compiled(OK_ENUM), &[]).unwrap();
         assert!(mask.allowed(b'"' as u32));
         assert!(!mask.allowed(b'o' as u32));
+    }
+
+    #[test]
+    fn mask_words_over_equal_the_apply_readback_at_any_width() {
+        let full = GrammarFactory::single_byte_for_tests().mask_width();
+        let cg = compiled(WEATHER);
+        for prefix in [
+            "",
+            "{\"",
+            "{\"city\":\"Pa",
+            "{\"city\":\"P\",\"temperature_celsius\":1",
+        ] {
+            let mut mask = start_grammar(&cg, &ids(prefix)).unwrap();
+            for width in [1, 100, 124, 128, full - 1, full, full + 40] {
+                let want = words_via_apply(&mut mask, width);
+                let got = mask_words_over(&mut mask, width);
+                match (want, got) {
+                    (Ok(w), Ok(g)) => assert_eq!(g, w, "{prefix:?} at {width}"),
+                    (Err(_), Err(_)) => {}
+                    (w, g) => panic!("{prefix:?} at {width}: {w:?} vs {g:?}"),
+                }
+            }
+        }
+        let mut done = start_grammar(&compiled(OK_ENUM), &ids("\"ok\"")).unwrap();
+        assert_eq!(
+            mask_words_over(&mut done, full).unwrap(),
+            words_via_apply(&mut done, full).unwrap()
+        );
+        // EOS (261) lies past 256 tokens: nothing allowed there.
+        assert!(mask_words_over(&mut done, 256).is_err());
     }
 }
