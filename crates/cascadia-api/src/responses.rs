@@ -27,7 +27,7 @@ mod input;
 mod output;
 mod store;
 mod tools;
-use input::input_messages;
+use input::{fold_system_turns, input_messages, Fold};
 use output::{OutputBuilder, OutputEvent};
 pub(crate) use store::ItemCache;
 use tools::{check_include, check_tool_choice, ToolMap};
@@ -495,6 +495,52 @@ fn resolver(
     }
 }
 
+/// Fold `chat`'s system turns into user turns when the loaded chat template
+/// refuses them where they stand. Codex sends `developer` turns (read as
+/// `system`) mid-history; Gemma 3 and Mistral templates take only a leading
+/// system turn, Gemma 2 none at all, and refuse the rest with
+/// `raise_exception`. The messages are probed as `admit_chat` will render
+/// them: when the template takes them, or refuses for another reason (no
+/// fold renders), they are left as they are; otherwise the later system
+/// turns are folded, else every one. The folded messages are what reach the
+/// engine, so an engine that templates itself sees them too.
+fn fold_refused_system_turns(state: &AppState, chat: &mut ChatCompletionRequest) {
+    let Some(env) = state.chat_env.as_deref() else {
+        return;
+    };
+    if !chat.messages.iter().any(|m| m.role == "system") {
+        return;
+    }
+    let effort = EffortArgs {
+        mapped: Some(chat.effective_reasoning_effort()),
+        raw: chat.reasoning_effort.as_deref(),
+        explicit_thinking: chat.enable_thinking.is_some(),
+        template_words: state.effort_words,
+    };
+    let render = |messages: &[ChatMessage]| {
+        render_template(
+            Some(env),
+            &text_messages(state, messages),
+            &state.bos_token,
+            &state.eos_token,
+            chat.effective_enable_thinking(),
+            effort,
+            chat.tools.as_deref(),
+        )
+    };
+    if !matches!(render(&chat.messages), Err(PromptRenderError::Rejected(_))) {
+        return;
+    }
+    let folded = [Fold::Later, Fold::All]
+        .into_iter()
+        .map(|fold| fold_system_turns(chat.messages.clone(), fold))
+        .find(|messages| render(messages).is_ok());
+    if let Some(messages) = folded {
+        info!("responses: the chat template refuses system turns there; folded them into the next user turn");
+        chat.messages = messages;
+    }
+}
+
 /// `POST /v1/responses`.
 pub(crate) async fn create_response(
     State(state): State<AppState>,
@@ -517,7 +563,8 @@ pub(crate) async fn create_response(
     if !map.dropped.is_empty() {
         warn!(types = ?map.dropped, "responses: hosted tools are not served; dropped");
     }
-    let chat = chat_request(&req, messages, &map, choice);
+    let mut chat = chat_request(&req, messages, &map, choice);
+    fold_refused_system_turns(&state, &mut chat);
     // The response id doubles as the task id, so `/v1/cancel/<id>` works.
     let id = format!("resp_{}", Uuid::new_v4().simple());
     let shell = ResponseShell::new(&req, id, &map, choice);
@@ -2630,5 +2677,181 @@ mod tests {
         assert_eq!(output.len(), 1, "{response}");
         assert_eq!(output[0]["type"], "reasoning");
         assert_eq!(output[0]["status"], "incomplete", "{response}");
+    }
+
+    /// Gemma 3 / Mistral style: a leading system turn only, then user and
+    /// assistant alternate (tool turns aside).
+    const STRICT_TEMPLATE: &str = concat!(
+        "{%- set ns = namespace(next='user') -%}",
+        "{%- for m in messages -%}",
+        "{%- if m.role == 'system' -%}",
+        "{%- if not loop.first -%}{{ raise_exception('System role must come first') }}{%- endif -%}",
+        "<sys>{{ m.content }}</sys>",
+        "{%- elif m.role == 'tool' -%}<tool>{{ m.content }}</tool>",
+        "{%- else -%}",
+        "{%- if m.role != ns.next -%}",
+        "{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}",
+        "{%- endif -%}",
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>",
+        "{%- set ns.next = 'assistant' if m.role == 'user' else 'user' -%}",
+        "{%- endif -%}",
+        "{%- endfor -%}",
+        "{%- if add_generation_prompt -%}<assistant>{%- endif -%}",
+    );
+
+    /// Gemma 2 / Gemma 1 style: no system role at all.
+    const NO_SYSTEM_TEMPLATE: &str = concat!(
+        "{%- for m in messages -%}",
+        "{%- if m.role == 'system' -%}{{ raise_exception('System role not supported') }}{%- endif -%}",
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>",
+        "{%- endfor -%}",
+        "{%- if add_generation_prompt -%}<assistant>{%- endif -%}",
+    );
+
+    /// Takes any role anywhere (Gemma 4, Qwen).
+    const PERMISSIVE_TEMPLATE: &str = concat!(
+        "{%- for m in messages -%}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{%- endfor -%}",
+        "{%- if add_generation_prompt -%}<assistant>{%- endif -%}",
+    );
+
+    fn template_config(src: &str) -> Config {
+        Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(src.into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        }
+    }
+
+    /// Codex's shape: instructions, a user turn, a call and its output, then
+    /// a `developer` turn and the next user turn.
+    fn developer_mid_history() -> Value {
+        json!({"model": "script-model", "instructions": "be brief", "input": [
+            {"role": "user", "content": "list files"},
+            {"type": "function_call", "call_id": "call_1", "name": "ls", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "a.txt"},
+            {"role": "developer", "content": "now be terse"},
+            {"role": "user", "content": "and now?"},
+        ]})
+    }
+
+    /// The prompt the engine got for `body` under `template`, with the
+    /// status and body.
+    async fn prompt_under(template: &str, body: Value) -> (StatusCode, String, String) {
+        let (app, tasks, _) =
+            app_with(RecordingEngine::script(&["ok"]), template_config(template)).await;
+        let (status, body) = post(app, body).await;
+        let prompt = tasks.lock().first().map(|t| t.prompt.clone());
+        (status, body, prompt.unwrap_or_default())
+    }
+
+    /// A template that takes only a leading system turn gets the later
+    /// `developer` turn folded into the next user turn, its text first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_system_turn_folds_into_the_next_user_turn() {
+        let (status, body, prompt) = prompt_under(STRICT_TEMPLATE, developer_mid_history()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(prompt.matches("<sys>").count(), 1, "{prompt}");
+        assert!(prompt.starts_with("<sys>be brief</sys>"), "{prompt}");
+        assert!(
+            prompt.ends_with("<user>now be terse\n\nand now?</user><assistant>"),
+            "{prompt}"
+        );
+    }
+
+    /// A template that takes no system role gets every system turn folded,
+    /// the instructions into the first user turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_system_turn_folds_when_the_template_has_no_system_role() {
+        let (status, body, prompt) =
+            prompt_under(NO_SYSTEM_TEMPLATE, developer_mid_history()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!prompt.contains("<system>"), "{prompt}");
+        assert!(
+            prompt.starts_with("<user>be brief\n\nlist files</user>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("<user>now be terse\n\nand now?</user>"),
+            "{prompt}"
+        );
+    }
+
+    /// A template that takes system turns anywhere sees them as sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_template_that_takes_late_system_turns_is_unchanged() {
+        let (status, body, prompt) =
+            prompt_under(PERMISSIVE_TEMPLATE, developer_mid_history()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            prompt,
+            "<system>be brief</system><user>list files</user><assistant></assistant>\
+             <tool>a.txt</tool><system>now be terse</system><user>and now?</user><assistant>"
+        );
+    }
+
+    /// A template that refuses for another reason still refuses: folding
+    /// does not help, so the template's own message is the 400.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_template_refusing_for_another_reason_stays_a_400() {
+        let (status, body, _) = prompt_under(
+            "{{ raise_exception('no thanks') }}",
+            developer_mid_history(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("chat template rejected the request: no thanks"),
+            "{body}"
+        );
+    }
+
+    /// A `developer` turn with no user turn after it becomes the last user
+    /// turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_trailing_developer_turn_becomes_a_user_turn() {
+        let (status, body, prompt) = prompt_under(
+            STRICT_TEMPLATE,
+            json!({"model": "script-model", "input": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "yes"},
+                {"role": "developer", "content": "be terse"},
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            prompt,
+            "<user>hi</user><assistant>yes</assistant><user>be terse</user><assistant>"
+        );
+    }
+
+    /// `/v1/chat/completions` does not fold: a late system message under
+    /// the strict template is the template's 400, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chat_completions_does_not_fold_system_turns() {
+        let (app, _, _) = app_with(
+            RecordingEngine::script(&["ok"]),
+            template_config(STRICT_TEMPLATE),
+        )
+        .await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            json!({"model": "script-model", "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "yes"},
+                {"role": "system", "content": "late"},
+                {"role": "user", "content": "again"},
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("chat template rejected the request: System role must come first"),
+            "{body}"
+        );
     }
 }

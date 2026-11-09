@@ -270,6 +270,65 @@ fn merge(into: &mut ChatMessage, next: ChatMessage) {
     into.content.push_str(&next.content);
 }
 
+/// Which `system` turns [`fold_system_turns`] folds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fold {
+    /// Those after the first non-`system` turn; a leading one stays.
+    Later,
+    /// Every one, leading ones too.
+    All,
+}
+
+/// `messages` with the `system` turns `fold` names folded into the next
+/// `user` turn, for a chat template that refuses them where they stand (the
+/// system-role polyfill of llama.cpp's minja). A folded turn's text waits
+/// (several joined by a blank line) and leads the next user turn, merged as
+/// [`merge`] does so image parts stay in place; with no user turn after it,
+/// it becomes the last user turn. Assistant and tool turns pass through.
+pub(super) fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<ChatMessage> {
+    // A folded turn joins a user turn just before it rather than standing
+    // next to it, so user and assistant still alternate.
+    fn push_user(out: &mut Vec<ChatMessage>, m: ChatMessage) {
+        match out.last_mut() {
+            Some(last) if last.role == "user" => merge(last, m),
+            _ => out.push(m),
+        }
+    }
+    let mut out = Vec::with_capacity(messages.len());
+    let mut pending: Option<ChatMessage> = None;
+    let mut leading = true;
+    for mut m in messages {
+        if m.role == "system" {
+            if leading && fold == Fold::Later {
+                out.push(m);
+                continue;
+            }
+            m.role = "user".into();
+            match &mut pending {
+                Some(p) => merge(p, m),
+                None => pending = Some(m),
+            }
+            continue;
+        }
+        leading = false;
+        if m.role != "user" {
+            out.push(m);
+            continue;
+        }
+        match pending.take() {
+            Some(mut p) => {
+                merge(&mut p, m);
+                push_user(&mut out, p);
+            }
+            None => out.push(m),
+        }
+    }
+    if let Some(p) = pending {
+        push_user(&mut out, p);
+    }
+    out
+}
+
 /// A `message` item as the chat message it is.
 fn input_message(item: &Value, at: &str) -> Result<ChatMessage, Refusal> {
     let role = match item.get("role").and_then(Value::as_str) {
@@ -1014,6 +1073,100 @@ mod tests {
         assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(err.code, Some("prompt_too_large"));
         assert_eq!(err.param, "input[1]");
+    }
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        text_message(role, content.into())
+    }
+
+    /// A later `system` turn is folded into the next `user` turn, its text
+    /// first; the leading one stays unless every one is folded; assistant
+    /// and tool turns pass through.
+    #[test]
+    fn system_turns_fold_into_the_next_user_turn() {
+        let mut asked = msg("assistant", "");
+        asked.tool_calls = Some(vec![call("c1", "f", "{}")]);
+        let mut answer = msg("tool", "out");
+        answer.tool_call_id = Some("c1".into());
+        let history = vec![
+            msg("system", "be brief"),
+            msg("user", "hi"),
+            asked.clone(),
+            answer.clone(),
+            msg("system", "now terse"),
+            msg("user", "again"),
+        ];
+        let calls = vec![call("c1", "f", "{}")];
+        assert_eq!(
+            shape(&fold_system_turns(history.clone(), Fold::Later)),
+            [
+                ("system", "be brief", None, None),
+                ("user", "hi", None, None),
+                ("assistant", "", Some(&calls), None),
+                ("tool", "out", None, Some("c1")),
+                ("user", "now terse\n\nagain", None, None),
+            ]
+        );
+        assert_eq!(
+            shape(&fold_system_turns(history, Fold::All)),
+            [
+                ("user", "be brief\n\nhi", None, None),
+                ("assistant", "", Some(&calls), None),
+                ("tool", "out", None, Some("c1")),
+                ("user", "now terse\n\nagain", None, None),
+            ]
+        );
+    }
+
+    /// Several folded turns accumulate; with no `user` turn after them they
+    /// become one at the end, merged into a trailing `user` turn.
+    #[test]
+    fn folded_system_turns_with_no_later_user_turn_end_the_history() {
+        let m = fold_system_turns(
+            vec![
+                msg("user", "hi"),
+                msg("assistant", "yes"),
+                msg("system", "one"),
+                msg("system", "two"),
+            ],
+            Fold::Later,
+        );
+        assert_eq!(
+            shape(&m),
+            [
+                ("user", "hi", None, None),
+                ("assistant", "yes", None, None),
+                ("user", "one\n\ntwo", None, None),
+            ]
+        );
+        let m = fold_system_turns(vec![msg("user", "hi"), msg("system", "late")], Fold::Later);
+        assert_eq!(shape(&m), [("user", "hi\n\nlate", None, None)]);
+        let m = fold_system_turns(vec![msg("system", "only")], Fold::All);
+        assert_eq!(shape(&m), [("user", "only", None, None)]);
+    }
+
+    /// Folded into a user turn with an image, the system text is its own
+    /// leading text part, so the image stays where it was.
+    #[test]
+    fn a_folded_system_turn_leads_an_image_turn() {
+        let image = ContentPart::ImageUrl {
+            url: "data:x".into(),
+            detail: None,
+        };
+        let mut user = msg("user", "what");
+        user.parts = vec![image.clone(), ContentPart::Text("what".into())];
+        let m = fold_system_turns(vec![msg("system", "terse"), user], Fold::All);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].role, "user");
+        assert_eq!(
+            m[0].parts,
+            vec![
+                ContentPart::Text("terse\n\n".into()),
+                image,
+                ContentPart::Text("what".into()),
+            ]
+        );
+        assert!(m[0].content.starts_with("terse\n\n"), "{}", m[0].content);
     }
 
     #[test]
