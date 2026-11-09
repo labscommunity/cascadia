@@ -220,7 +220,9 @@ that is rank 0 (`run-placement` forwards them there); on any other rank they
 are accepted and unused.
 
 To restore the old behaviour:
-`--default-max-tokens 256 --default-temperature 0 --default-top-p 1`.
+`--default-max-tokens 256 --default-temperature 0 --default-top-p 1`. A known
+context window still ends an answer where the prompt plus the answer fill it
+(see below); these flags do not turn that off.
 
 - **Output limit** (`max_tokens` / `max_completion_tokens`): an unset limit
   runs until the model stops, capped at one context window, taken from the
@@ -232,10 +234,17 @@ To restore the old behaviour:
   ov-genai's default, 1024 / 128, so 1152 with neither); an ov-runtime NPU
   export's `static_context` (`stage_<r>/stage_config.json`); the model's
   `config.json` window (`max_position_embeddings` and similar, `text_config`
-  first, then the top level; model root, then `tokenizer/`); else 4096. With
-  `--packed-slots N` the ov-runtime window is one slot's region,
-  `(static_context - 1 - packed_prefix) / N`. Before this change an unset
-  limit silently stopped at 256 tokens.
+  first, then the top level; model root, then `tokenizer/`; with that
+  object's `rope_scaling` applied as vLLM does: a numeric `factor` of a type
+  other than `su`, `longrope`, `llama3`, `mrope` or `default` multiplies the
+  window, or `original_max_position_embeddings` for `yarn` when given); else
+  4096. With `--packed-slots N` the ov-runtime limit is one slot's region,
+  `(static_context - 1 - packed_prefix) / N`, and its context window is that
+  region plus the shared prefix (`packed_prefix`, clamped as the engine
+  clamps it), since a slot that reuses the prefix holds both and the prompt
+  count includes it; the packed engine itself slides a full region rather
+  than ending the request. Before this change an unset limit silently
+  stopped at 256 tokens.
 - **Explicit limits are capped at a known window.** When the window comes from
   one of the real sources above (an engine limit or `config.json`, not the 4096
   fallback and not `--default-max-tokens`), a request's own `max_tokens` /
@@ -244,11 +253,30 @@ To restore the old behaviour:
   a request that asks for 1000.
 - **A generation ends at a known window.** With the window known from one of
   those real sources, the API ends a generation with `finish_reason: "length"`
-  once the prompt plus the answer fill it, on every engine that streams
-  tokens, whether or not the engine stops there itself; `usage` counts the
-  prompt and the answer up to that point. An ov-genai continuous-batching
-  request whose KV cache runs out after it produced output also ends with
-  `length`, keeping its text; it is an error only if nothing was produced.
+  once the prompt plus the answer fill it, on engines that report per-token
+  counts, whether or not the engine stops there itself; `usage` counts the
+  prompt and the answer up to that point. Some details:
+  - An engine that sends several tokens in one chunk (speculative decoding,
+    dist-spec, continuous batching) ends at or just past the window: the
+    chunk that reaches it is the last.
+  - An engine that reports no prompt count until the end (sycl-llama) is
+    measured on the answer alone; `llama-server` stops at `--llama-ctx`
+    itself anyway.
+  - A prompt that alone reaches the window is not cut: the engine took it, so
+    the window read is not its real limit, and the engine bounds the answer.
+  - The window includes `rope_scaling` (above); with `--packed-slots` it is a
+    slot's region plus the shared prefix.
+  - ov-genai without `--cb` makes the whole answer in one call, so the engine
+    itself cuts that call's limit to what the prompt leaves of the window and
+    reports `length` there.
+  - An ov-genai continuous-batching request whose KV cache runs out after it
+    produced output ends with `length`, keeping its text; it is an error only
+    if nothing was produced. It used to be an HTTP 503 (or an SSE error
+    event), so a client that retried those will not retry it now. Watch
+    `cascadia_kv_cache_exhausted_total` ([METRICS.md](METRICS.md)).
+  - In the metrics, an answer the API ends at the window books
+    `finish_reason="length"` and one it ends at a `stop` match books `stop`;
+    neither counts as a cancel.
 - **`temperature` / `top_p`**: `--default-temperature` / `--default-top-p`,
   else the model's `generation_config.json` (root, then `tokenizer/`;
   `do_sample` is not applied), else `1`. A file value outside the OpenAI range
@@ -284,9 +312,10 @@ To restore the old behaviour:
   (or a `stop` match, which can only be applied once the call returns) holds
   the engine for up to one context window instead of 256 tokens, and a client
   disconnect does not stop it. ov-runtime (CPU/GPU and NPU), dist-spec,
-  `gemma4` and multi-stage `qwen35` have no window stop of their own, so such
-  an answer runs to the full limit there too, unless `stop` matches or the
-  client disconnects. `--default-max-tokens` bounds it per server.
+  `gemma4` and multi-stage `qwen35` have no window stop of their own; with a
+  known window such an answer now runs until the prompt plus the answer fill
+  it (above), not to the full limit, unless `stop` matches or the client
+  disconnects first. `--default-max-tokens` bounds it per server.
 - **Keep-alive.** A stream that has sent nothing for 15 s sends the SSE comment
   line `: keep-alive` (not a `data:` event; OpenAI clients skip it), so a proxy
   with an idle timeout does not cut a long silent generation. It keeps going
