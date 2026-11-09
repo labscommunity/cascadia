@@ -559,18 +559,32 @@ fn compile_task_grammar(
 /// Picks the token from the last row of a logits output. `mask` is passed
 /// only when that row picks the next generated token of a structured-output
 /// task; then the pick is the best token the grammar allows (an error when it
-/// allows none). `None` is the plain argmax.
+/// allows none). `None` is the plain argmax. The engine calls
+/// [`pick_tagged`], which also says how a failure is logged.
+#[cfg(test)]
 fn pick_next_token(
     logits: &[f32],
     shape: &[usize],
     mask: Option<&mut GrammarMask>,
 ) -> EngineResult<i32> {
+    pick_tagged(logits, shape, mask).map_err(|(e, _)| e)
+}
+
+/// [`pick_next_token`] with how a failure is logged: only a mask that allows
+/// nothing in the row is a schema dead end; a malformed logits output is the
+/// stage's own failure.
+fn pick_tagged(
+    logits: &[f32],
+    shape: &[usize],
+    mask: Option<&mut GrammarMask>,
+) -> Result<i32, (EngineError, Option<GrammarFailure>)> {
     let Some(mask) = mask else {
-        return argmax_logits(logits, shape);
+        return argmax_logits(logits, shape).map_err(|e| (e, None));
     };
-    let vocab = logits_vocab(logits, shape)?;
+    let vocab = logits_vocab(logits, shape).map_err(|e| (e, None))?;
     let mut row = logits[logits.len() - vocab..].to_vec();
-    mask.apply(&mut row)?;
+    mask.apply(&mut row)
+        .map_err(|e| (e, Some(GrammarFailure::DeadEnd)))?;
     Ok(argmax_last_row(&row, vocab))
 }
 
@@ -665,16 +679,28 @@ impl GrammarFailure {
     }
 }
 
-/// Logs a failed step: a structured-output failure with its own message,
-/// anything else through the rate-limited step-failure WARN.
+/// Logs a failed step: a structured-output failure with its own message
+/// through its own limiter (clients choose the schemas, so they can make
+/// these as often as they like), anything else through the rate-limited
+/// step-failure WARN.
 fn report_step_error(
     limiter: &mut StepWarnLimiter,
+    grammar_limiter: &mut StepWarnLimiter,
     grammar: Option<GrammarFailure>,
     e: &EngineError,
     now: std::time::Instant,
 ) {
     if let Some(what) = grammar {
-        warn!(error = %e, "gemma4: structured-output task failed: {}", what.describe());
+        let what = what.describe();
+        match grammar_limiter.on_failure(now) {
+            Some(StepWarn::First) => {
+                warn!(error = %e, "gemma4: structured-output task failed: {what}")
+            }
+            Some(StepWarn::StillFailing { suppressed }) => {
+                warn!(error = %e, suppressed, "gemma4: structured-output task failed: {what}")
+            }
+            None => {}
+        }
         return;
     }
     match limiter.on_failure(now) {
@@ -1282,6 +1308,8 @@ pub struct Gemma4Engine {
     /// to feed into the `external_kv.*` inputs. Rebuilt each step.
     pending_external_kv: std::collections::HashMap<i64, (Vec<usize>, Vec<u8>)>,
     step_warn: StepWarnLimiter,
+    /// Rate limit of the structured-output task-failure WARN.
+    grammar_warn: StepWarnLimiter,
     /// Why the current step failed when the failure is a structured-output
     /// task's own (set where it happens, taken by `step`); `None` otherwise.
     grammar_failure: Option<GrammarFailure>,
@@ -2021,13 +2049,13 @@ impl Gemma4Engine {
         mask: Option<&mut GrammarMask>,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
-            let masked = mask.is_some();
-            let token = pick_next_token(out, shape, mask).inspect_err(|_| {
-                if masked {
-                    self.grammar_failure = Some(GrammarFailure::DeadEnd);
+            match pick_tagged(out, shape, mask) {
+                Ok(token) => Ok((token, std::time::Duration::ZERO)),
+                Err((e, kind)) => {
+                    self.grammar_failure = kind;
+                    Err(e)
                 }
-            })?;
-            Ok((token, std::time::Duration::ZERO))
+            }
         } else if let Some(mask) = mask {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
@@ -2035,8 +2063,10 @@ impl Gemma4Engine {
                 Ok(f) => f.mask_width(),
                 Err(reason) => return Err(EngineError::Backend(reason.clone())),
             };
-            let words = mask_words(mask, width)
-                .inspect_err(|_| self.grammar_failure = Some(GrammarFailure::DeadEnd))?;
+            // A zero width is a broken factory, not a schema dead end.
+            let words = mask_words(mask, width).inspect_err(|_| {
+                self.grammar_failure = (width > 0).then_some(GrammarFailure::DeadEnd)
+            })?;
             self.drain_downstream()?;
             self.send_hidden_downstream(out, s3, position, Some(&words))?;
             let wait = self.recv_masked_from_downstream(prefill);
@@ -2412,6 +2442,7 @@ impl Engine for Gemma4Engine {
             }
             Err(e) => report_step_error(
                 &mut self.step_warn,
+                &mut self.grammar_warn,
                 self.grammar_failure.take(),
                 e,
                 std::time::Instant::now(),
@@ -3222,6 +3253,7 @@ impl Builder for Gemma4Builder {
             external_kv_in,
             pending_external_kv: std::collections::HashMap::new(),
             step_warn: StepWarnLimiter::default(),
+            grammar_warn: StepWarnLimiter::default(),
             grammar_failure: None,
             mask_latch: MaskLatch::default(),
             stages_below: self.total.saturating_sub(self.rank + 1),
@@ -3700,16 +3732,64 @@ mod tests {
     #[test]
     fn a_structured_output_failure_does_not_start_a_step_failure_streak() {
         let mut limiter = StepWarnLimiter::default();
+        let mut grammar = StepWarnLimiter::default();
         let now = std::time::Instant::now();
         let e = EngineError::Backend("grammar: no token of the logits row is allowed".into());
-        report_step_error(&mut limiter, Some(GrammarFailure::DeadEnd), &e, now);
-        report_step_error(&mut limiter, Some(GrammarFailure::Rejected), &e, now);
+        report_step_error(
+            &mut limiter,
+            &mut grammar,
+            Some(GrammarFailure::DeadEnd),
+            &e,
+            now,
+        );
+        report_step_error(
+            &mut limiter,
+            &mut grammar,
+            Some(GrammarFailure::Rejected),
+            &e,
+            now,
+        );
         // The next real failure is still the first of a streak (logged in full).
         assert!(matches!(limiter.on_failure(now), Some(StepWarn::First)));
         // A real failure does count.
         let mut limiter = StepWarnLimiter::default();
-        report_step_error(&mut limiter, None, &e, now);
+        let mut grammar = StepWarnLimiter::default();
+        report_step_error(&mut limiter, &mut grammar, None, &e, now);
         assert!(limiter.on_failure(now).is_none());
+        assert!(matches!(grammar.on_failure(now), Some(StepWarn::First)));
+    }
+
+    #[test]
+    fn structured_output_failure_warnings_are_rate_limited() {
+        let mut limiter = StepWarnLimiter::default();
+        let mut grammar = StepWarnLimiter::default();
+        let now = std::time::Instant::now();
+        let e = EngineError::Backend("x".into());
+        report_step_error(
+            &mut limiter,
+            &mut grammar,
+            Some(GrammarFailure::DeadEnd),
+            &e,
+            now,
+        );
+        // Within the interval a further one is suppressed, not logged.
+        assert!(grammar.on_failure(now).is_none());
+    }
+
+    #[test]
+    fn only_a_mask_that_allows_nothing_is_a_dead_end() {
+        let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
+        // A malformed logits output (zero last dim): the stage's own failure.
+        let (_, kind) = pick_tagged(&[], &[1, 1, 0], Some(&mut mask)).unwrap_err();
+        assert_eq!(kind, None);
+        let (_, kind) = pick_tagged(&[1.0; 4], &[1, 1, 8], Some(&mut mask)).unwrap_err();
+        assert_eq!(kind, None);
+        // Nothing in the row allowed: a dead end.
+        let (_, kind) = pick_tagged(&[10.0; 4], &[1, 1, 4], Some(&mut mask)).unwrap_err();
+        assert_eq!(kind, Some(GrammarFailure::DeadEnd));
+        // Without a mask, nothing is tagged.
+        let (_, kind) = pick_tagged(&[], &[1, 1, 0], None).unwrap_err();
+        assert_eq!(kind, None);
     }
 
     #[test]
