@@ -551,9 +551,10 @@ const MERGEABLE_MEMBER_KEYS: [&str; 6] = [
 /// A member is plain when it holds only [`MERGEABLE_MEMBER_KEYS`], with
 /// `type` (if any) `"object"`, `properties` an object, `required` a list of
 /// names and `additionalProperties` a boolean. The merge keeps the
-/// properties in member order (the first definition of a name wins), the
-/// union of `required` in order, and `additionalProperties: false` when any
-/// member has it. The node holding the `allOf` keeps its other keys; it is
+/// properties in member order, the union of `required` in order, and
+/// `additionalProperties: false` when any member has it. A property defined
+/// by more than one member must have the same schema text in each, or the
+/// `allOf` is left alone. The node holding the `allOf` keeps its other keys; it is
 /// left alone if it has its own `properties`, `required`,
 /// `additionalProperties`, another dispatch key or a `type` other than
 /// `"object"`.
@@ -670,8 +671,12 @@ fn merged_all_of(entries: &[(String, Node)]) -> Option<Vec<(String, Node)>> {
             Some(Node::Obj(props)) => {
                 has_properties = true;
                 for (name, schema) in props {
-                    if !properties.iter().any(|(n, _)| n == name) {
-                        properties.push((name.clone(), schema.clone()));
+                    match properties.iter().find(|(n, _)| n == name) {
+                        None => properties.push((name.clone(), schema.clone())),
+                        // Both definitions apply to the value; keeping one
+                        // would drop the other's constraint.
+                        Some((_, kept)) if node_text(kept) != node_text(schema) => return None,
+                        Some(_) => {}
                     }
                 }
             }
@@ -707,6 +712,13 @@ fn merged_all_of(entries: &[(String, Node)]) -> Option<Vec<(String, Node)>> {
         }
     }
     Some(out)
+}
+
+/// The compact text of `node`.
+fn node_text(node: &Node) -> String {
+    let mut out = String::new();
+    node.write(&mut out);
+    out
 }
 
 /// The grammar that enforces `rf`, or `None` for plain text.
@@ -1424,7 +1436,7 @@ mod tests {
     }
 
     /// A zod-style intersection: `z.object({...}).and(z.object({...}))`.
-    const INTERSECTION: &str = r#"{"description":"agent","allOf":[{"type":"object","properties":{"thinking":{"type":"string"},"goal":{"type":"string"}},"required":["thinking","goal"],"additionalProperties":false},{"type":"object","properties":{"action":{"type":"string"},"goal":{"type":"integer"}},"required":["action","goal"]}]}"#;
+    const INTERSECTION: &str = r#"{"description":"agent","allOf":[{"type":"object","properties":{"thinking":{"type":"string"},"goal":{"type":"string"}},"required":["thinking","goal"],"additionalProperties":false},{"type":"object","properties":{"action":{"type":"string"},"goal":{"type": "string"}},"required":["action","goal"]}]}"#;
 
     #[test]
     fn object_all_of_is_merged_into_one_object() {
@@ -1443,6 +1455,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(g.body, raw);
+    }
+
+    #[test]
+    fn all_of_defining_a_property_two_ways_is_left_and_flagged() {
+        for schema in [
+            r#"{"allOf":[{"type":"object","properties":{"goal":{"type":"string"}}},{"type":"object","properties":{"goal":{"type":"integer"}}}]}"#,
+            r#"{"allOf":[{"properties":{"a":{"type":"string"}}},{"properties":{"b":{"type":"string"}}},{"properties":{"a":{"type":"string","maxLength":3}}}]}"#,
+        ] {
+            let (raw, parsed) = parsed_schema_text(schema);
+            assert_eq!(raw, schema);
+            assert!(unenforced_keywords(&parsed).contains(&"allOf"), "{schema}");
+        }
+    }
+
+    #[test]
+    fn all_of_repeating_a_property_the_same_way_is_merged() {
+        let schema = r#"{"allOf":[{"properties":{"a":{"type":"string"}}},{"properties":{"a":{ "type" : "string" },"b":{"type":"integer"}}}]}"#;
+        let (raw, parsed) = parsed_schema_text(schema);
+        assert_eq!(
+            raw,
+            r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"}}}"#
+        );
+        assert!(unenforced_keywords(&parsed).is_empty(), "{parsed}");
     }
 
     #[test]

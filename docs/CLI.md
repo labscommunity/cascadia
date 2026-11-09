@@ -596,8 +596,10 @@ Behaviour:
   `type: "object"`, `properties`, `required`, a boolean
   `additionalProperties`, `title` and `description`), as zod's `.and()`
   emits, is merged into one object before the grammar is built: properties
-  in member order (the first definition of a name wins), `required` joined,
-  and `additionalProperties: false` if any member has it. A node that holds
+  in member order, `required` joined, and `additionalProperties: false` if
+  any member has it. A property defined in more than one member must have
+  the same schema in each (compared as compact text); otherwise the `allOf`
+  is not merged and is reported as not enforced. A node that holds
   such an `allOf` beside its own `properties`, `required`,
   `additionalProperties`, `$ref`/`anyOf`/`oneOf`/`const`/`enum` or a
   non-object `type` is left as is, and so is an `allOf` with any other
