@@ -211,7 +211,9 @@ pub struct GenerationDefaults {
     /// The model's context window when a real source gives it (the engine's
     /// own limit or `config.json`), never the [`DEFAULT_MAX_TOKENS`] fallback
     /// or `--default-max-tokens`. An explicit request limit above it is sent
-    /// as the window, so the answer ends with `length` there.
+    /// as the window. When it is known the API also ends every generation
+    /// with `length` once the prompt plus the answer fill it, on engines that
+    /// do not stop there themselves (see [`WindowGuard`]).
     pub context_window: Option<u32>,
 }
 
@@ -2954,7 +2956,7 @@ async fn chat_completions(
     // until the task completes; drop frees the slot.
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate_async(task.clone()).await {
+    let mut chunk_stream = match generate_in_window(&state, task.clone()).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
     };
@@ -3187,7 +3189,7 @@ async fn completions(
 
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate_async(task).await {
+    let mut chunk_stream = match generate_in_window(&state, task).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
     };
@@ -3307,7 +3309,7 @@ async fn stream_text_completion(
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     let stop = task.sampling.stop.clone();
-    let chunk_stream = match state.runner.generate_async(task).await {
+    let chunk_stream = match generate_in_window(&state, task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "completions-stream: generate failed");
@@ -3365,7 +3367,7 @@ async fn stream_completion(
     let enable_thinking = task.enable_thinking;
     let stop = StopMatcher::new(&task.sampling.stop);
 
-    let chunk_stream = match state.runner.generate_async(task).await {
+    let chunk_stream = match generate_in_window(&state, task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "ov-stream: generate failed");
@@ -3465,7 +3467,7 @@ async fn stream_completion(
 /// permit and the permit is released when the stream is dropped (which
 /// happens on client disconnect — axum drops the SSE response).
 struct StreamWithPermit {
-    inner: cascadia_runner::ChunkStream,
+    inner: WindowGuard<cascadia_runner::ChunkStream>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     /// Decrements `requests_in_flight` when the stream body is dropped.
     _inflight: InFlightGuard,
@@ -3479,6 +3481,83 @@ impl Stream for StreamWithPermit {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.inner).poll_next(cx)
     }
+}
+
+/// Ends a generation at the model's context window. Several engines do not
+/// stop there themselves, so a prompt of P tokens plus an answer of up to one
+/// window would run past it. When a token chunk makes the prompt plus the
+/// answer so far reach `window`, that chunk becomes the final one
+/// (`finish_reason: length`) and the engine stream is dropped, which cancels
+/// the task. The prompt count is the latest one any chunk carried
+/// (token-streaming engines report it on their first chunk), 0 when none
+/// did. Errors, progress markers and the engine's own final chunk pass
+/// through unchanged; with no known window every chunk does.
+struct WindowGuard<S> {
+    /// `None` once the cut has dropped the engine stream.
+    inner: Option<S>,
+    window: Option<u32>,
+    prompt: Option<u32>,
+    /// Answer tokens so far, counted as [`Chunk::accumulate_tokens`] does.
+    completion: u32,
+}
+
+fn guard_window<S>(inner: S, window: Option<u32>) -> WindowGuard<S> {
+    WindowGuard {
+        inner: Some(inner),
+        window,
+        prompt: None,
+        completion: 0,
+    }
+}
+
+impl<S> Stream for WindowGuard<S>
+where
+    S: Stream<Item = cascadia_types::Chunk> + Unpin,
+{
+    type Item = cascadia_types::Chunk;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let Some(mut chunk) = std::task::ready!(std::pin::Pin::new(inner).poll_next(cx)) else {
+            return Poll::Ready(None);
+        };
+        let Some(window) = this.window else {
+            return Poll::Ready(Some(chunk));
+        };
+        if let Some(n) = chunk.prompt_tokens {
+            this.prompt = Some(n);
+        }
+        if chunk.error.is_some() || chunk.is_final || chunk.is_progress() {
+            return Poll::Ready(Some(chunk));
+        }
+        chunk.accumulate_tokens(&mut this.completion);
+        if this.prompt.unwrap_or(0).saturating_add(this.completion) >= window {
+            chunk.is_final = true;
+            chunk.finish_reason = Some(cascadia_types::FinishReason::Length);
+            chunk.prompt_tokens = this.prompt;
+            // The consumers add this chunk's own count to theirs.
+            chunk.completion_tokens = None;
+            this.inner = None;
+        }
+        Poll::Ready(Some(chunk))
+    }
+}
+
+/// Starts `task` with its stream ended at the model's context window (see
+/// [`WindowGuard`]). Every generation path goes through here.
+async fn generate_in_window(
+    state: &AppState,
+    task: GenerationTask,
+) -> Result<WindowGuard<cascadia_runner::ChunkStream>, cascadia_engine::EngineError> {
+    let window = state.generation_defaults.context_window;
+    let stream = state.runner.generate_async(task).await?;
+    Ok(guard_window(stream, window))
 }
 
 /// Finds `stop` sequences in generated text as it arrives, so the
@@ -9459,6 +9538,8 @@ level={{ effort_map[eff] }}";
         step_delay: Duration,
         end: ScriptEnd,
         max_concurrent: usize,
+        /// The model's context window (`GenerationDefaults::context_window`).
+        window: Option<u32>,
     }
 
     impl Default for ScriptOpts<'_> {
@@ -9471,6 +9552,7 @@ level={{ effort_map[eff] }}";
                 step_delay: Duration::ZERO,
                 end: ScriptEnd::Final,
                 max_concurrent: DEFAULT_MAX_CONCURRENT,
+                window: None,
             }
         }
     }
@@ -9487,6 +9569,7 @@ level={{ effort_map[eff] }}";
             step_delay,
             end,
             max_concurrent,
+            window,
         } = opts;
         let log = Arc::new(ScriptLog::default());
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -9515,6 +9598,10 @@ level={{ effort_map[eff] }}";
             },
             sse_keepalive: keepalive,
             max_concurrent_requests: max_concurrent,
+            generation_defaults: GenerationDefaults {
+                context_window: window,
+                ..GenerationDefaults::default()
+            },
             ..Config::default()
         };
         (
@@ -10487,6 +10574,373 @@ level={{ effort_map[eff] }}";
             assert_released(&log).await;
             let (status, _) = post_text(app, "/v1/chat/completions", &chat(Some("STOP"))).await;
             assert_eq!(status, StatusCode::OK, "{case}: slot still held");
+        }
+    }
+
+    // --- Ending a generation at the context window --------------------------
+
+    use cascadia_types::FinishReason;
+
+    /// A chunk stream that records being dropped (the API drops the engine
+    /// stream to cancel the task).
+    struct DropFlagStream {
+        inner: futures::stream::Iter<std::vec::IntoIter<Chunk>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        polled: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Stream for DropFlagStream {
+        type Item = Chunk;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Chunk>> {
+            self.polled.fetch_add(1, Ordering::SeqCst);
+            std::pin::Pin::new(&mut self.inner).poll_next(cx)
+        }
+    }
+
+    impl Drop for DropFlagStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Runs `chunks` through [`guard_window`]; returns what came out, whether
+    /// the engine stream was dropped before the guard was, and how often the
+    /// engine stream was polled.
+    async fn run_guard(chunks: Vec<Chunk>, window: Option<u32>) -> (Vec<Chunk>, bool, usize) {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut guard = guard_window(
+            DropFlagStream {
+                inner: futures::stream::iter(chunks),
+                dropped: dropped.clone(),
+                polled: polled.clone(),
+            },
+            window,
+        );
+        let mut out = Vec::new();
+        while let Some(c) = guard.next().await {
+            out.push(c);
+        }
+        let dropped_early = dropped.load(Ordering::SeqCst);
+        drop(guard);
+        (out, dropped_early, polled.load(Ordering::SeqCst))
+    }
+
+    fn tokens(n: usize) -> Vec<Chunk> {
+        (0..n)
+            .map(|i| Chunk::token("t", i as i64, format!("w{i} ")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn window_guard_passes_everything_through_without_a_window() {
+        let mut chunks = tokens(5);
+        chunks[0].prompt_tokens = Some(100);
+        chunks.push(Chunk::final_marker("t", "").with_finish_reason(FinishReason::Stop));
+        let (out, _, _) = run_guard(chunks.clone(), None).await;
+        assert_eq!(out, chunks);
+    }
+
+    #[tokio::test]
+    async fn window_guard_ends_at_the_window_and_drops_the_engine_stream() {
+        let mut chunks = tokens(10);
+        chunks[0].prompt_tokens = Some(3);
+        let (out, dropped, polled) = run_guard(chunks.clone(), Some(6)).await;
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[..2], chunks[..2], "chunks before the cut are untouched");
+        let last = &out[2];
+        assert!(last.is_final);
+        assert_eq!(last.finish_reason, Some(FinishReason::Length));
+        assert_eq!(last.prompt_tokens, Some(3));
+        assert_eq!(last.completion_tokens, None);
+        assert_eq!(last.text, "w2 ");
+        assert!(dropped, "engine stream not dropped at the cut");
+        assert_eq!(polled, 3, "engine stream polled past the cut");
+        let mut total = 0;
+        out.iter().for_each(|c| c.accumulate_tokens(&mut total));
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn window_guard_counts_batched_tokens_and_takes_the_latest_prompt_count() {
+        let mut chunks = tokens(4);
+        chunks[0].prompt_tokens = Some(1);
+        chunks[1].prompt_tokens = Some(4);
+        chunks[1] = chunks[1].clone().with_n_tokens(3);
+        let (out, _, _) = run_guard(chunks, Some(8)).await;
+        // 4 prompt + 1 + 3 = 8: the second chunk is the last.
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[1].is_final);
+        assert_eq!(out[1].prompt_tokens, Some(4));
+    }
+
+    #[tokio::test]
+    async fn window_guard_without_a_prompt_count_ends_when_the_answer_fills_the_window() {
+        let (out, dropped, _) = run_guard(tokens(10), Some(4)).await;
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert!(out[3].is_final);
+        assert_eq!(out[3].finish_reason, Some(FinishReason::Length));
+        assert_eq!(out[3].prompt_tokens, None);
+        assert!(dropped);
+    }
+
+    #[tokio::test]
+    async fn window_guard_leaves_errors_progress_and_engine_finals_alone() {
+        // An engine's own final before the window wins as sent.
+        let mut chunks = vec![Chunk::progress("t".into())];
+        chunks.extend(tokens(2));
+        chunks[1].prompt_tokens = Some(2);
+        chunks.push(
+            Chunk::final_marker("t", "end")
+                .with_finish_reason(FinishReason::Stop)
+                .with_prompt_tokens(2)
+                .with_completion_tokens(3),
+        );
+        let (out, _, _) = run_guard(chunks.clone(), Some(100)).await;
+        assert_eq!(out, chunks);
+        // A final that lands on the window is the engine's, unchanged.
+        let (out, _, _) = run_guard(chunks.clone(), Some(5)).await;
+        assert_eq!(out, chunks);
+        // Progress markers never count; an error passes through.
+        let chunks = vec![
+            Chunk::progress("t".into()),
+            Chunk::progress("t".into()),
+            Chunk::token("t", 1, "a"),
+            Chunk::error("t", "boom"),
+        ];
+        let (out, _, _) = run_guard(chunks.clone(), Some(2)).await;
+        assert_eq!(out, chunks);
+    }
+
+    /// Twenty-two parts, the first reporting a 5-token prompt; a window of 8
+    /// ends the answer after three tokens.
+    async fn window_app(window: Option<u32>, prompt_first: bool) -> (Router, Arc<ScriptLog>) {
+        let (app, log, _) = script_app_opts(
+            &script(&["alpha ", "bravo "]),
+            ScriptOpts {
+                prompt_first,
+                window,
+                ..ScriptOpts::default()
+            },
+        )
+        .await;
+        (app, log)
+    }
+
+    fn assert_usage(usage: &Value, prompt: u32, completion: u32, ctx: &str) {
+        assert_eq!(usage["prompt_tokens"], prompt, "{ctx}");
+        assert_eq!(usage["completion_tokens"], completion, "{ctx}");
+        assert_eq!(usage["total_tokens"], prompt + completion, "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn non_streaming_chat_ends_at_the_window_with_length() {
+        let (app, log) = window_app(Some(8), true).await;
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["message"]["content"], "alpha bravo filler ");
+        assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+        assert_usage(&v["usage"], 5, 3, &v.to_string());
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+        assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn non_streaming_completions_end_at_the_window_with_length() {
+        let (app, log) = window_app(Some(8), true).await;
+        let (status, v) = post_completions(
+            app,
+            serde_json::json!({"model": "mock-model", "prompt": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["text"], "alpha bravo filler ");
+        assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+        assert_usage(&v["usage"], 5, 3, &v.to_string());
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+        assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_ends_at_the_window_with_length() {
+        for tools in [false, true] {
+            let (app, log) = window_app(Some(8), true).await;
+            let mut body = serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true, "stream_options": {"include_usage": true}});
+            if tools {
+                body["tools"] =
+                    serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+            }
+            let (status, text) = post_text(app, "/v1/chat/completions", &body).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(text.ends_with("data: [DONE]\n\n"), "tools={tools}: {text}");
+            let events = sse_events(&text);
+            for event in &events {
+                crate::spec_schema::assert_spec("CreateChatCompletionStreamResponse", event);
+            }
+            assert_eq!(
+                streamed_content(&events),
+                "alpha bravo filler ",
+                "tools={tools}: {text}"
+            );
+            let finishes: Vec<&Value> = events
+                .iter()
+                .map(|e| &e["choices"][0]["finish_reason"])
+                .filter(|f| !f.is_null())
+                .collect();
+            assert_eq!(
+                finishes,
+                [&serde_json::json!("length")],
+                "tools={tools}: {text}"
+            );
+            assert_usage(&events.last().unwrap()["usage"], 5, 3, &text);
+            assert_cancelled(&log).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_completions_end_at_the_window_with_length() {
+        let (app, log) = window_app(Some(8), true).await;
+        let (status, text) = post_text(
+            app,
+            "/v1/completions",
+            &serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true,
+                "stream_options": {"include_usage": true}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        let events = sse_events(&text);
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["text"].as_str())
+            .collect();
+        assert_eq!(texts, ["alpha ", "bravo ", "filler "], "{text}");
+        let n = events.len();
+        assert_eq!(events[n - 2]["choices"][0]["finish_reason"], "length");
+        assert_usage(&events[n - 1]["usage"], 5, 3, &text);
+        assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn without_a_window_the_answer_runs_to_the_engines_end() {
+        let (app, log) = window_app(None, true).await;
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_usage(&v["usage"], 5, 22, &v.to_string());
+        assert_eq!(log.emitted.load(Ordering::SeqCst), 22);
+    }
+
+    #[tokio::test]
+    async fn without_a_prompt_count_the_answer_ends_when_it_fills_the_window() {
+        let (app, log) = window_app(Some(4), false).await;
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+        assert_usage(&v["usage"], 0, 4, &v.to_string());
+        assert_cancelled(&log).await;
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_ends_before_the_window_is_untouched() {
+        let defaults = GenerationDefaults {
+            context_window: Some(1000),
+            ..GenerationDefaults::default()
+        };
+        let (status, v) = post_chat_big(
+            make_app_with_defaults(defaults).await,
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": words(10)}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+        assert_usage(&v["usage"], 10, 10, &v.to_string());
+    }
+
+    #[tokio::test]
+    async fn the_mock_engine_ends_at_the_window_minus_its_prompt() {
+        // The mock reports its prompt's words as `prompt_tokens` on the first
+        // chunk: a 10-word prompt in a 15-token window gets 5 answer tokens.
+        let defaults = GenerationDefaults {
+            context_window: Some(15),
+            ..GenerationDefaults::default()
+        };
+        let app = make_app_with_defaults(defaults).await;
+        let (status, v) = post_chat_big(
+            app.clone(),
+            serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": words(10)}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+        assert_usage(&v["usage"], 10, 5, &v.to_string());
+        let (status, v) = post_completions_big(
+            app,
+            serde_json::json!({"model": "mock-model", "prompt": words(10)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+        assert_usage(&v["usage"], 10, 5, &v.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_stop_in_the_chunk_that_fills_the_window_ends_with_stop() {
+        let parts = script(&["alpha ", "bravo ", "x STOP y"]);
+        for stream in [false, true] {
+            let (app, _log, _) = script_app_opts(
+                &parts,
+                ScriptOpts {
+                    window: Some(8),
+                    ..ScriptOpts::default()
+                },
+            )
+            .await;
+            let mut body = serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": "STOP", "stream": stream});
+            if stream {
+                body["stream_options"] = serde_json::json!({"include_usage": true});
+            }
+            let (status, text) = post_text(app, "/v1/chat/completions", &body).await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            if stream {
+                let events = sse_events(&text);
+                assert_eq!(streamed_content(&events), "alpha bravo x ", "{text}");
+                let n = events.len();
+                assert_eq!(
+                    events[n - 2]["choices"][0]["finish_reason"],
+                    "stop",
+                    "{text}"
+                );
+                assert_usage(&events[n - 1]["usage"], 5, 3, &text);
+            } else {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(v["choices"][0]["message"]["content"], "alpha bravo x ");
+                assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+                assert_usage(&v["usage"], 5, 3, &text);
+            }
         }
     }
 }
