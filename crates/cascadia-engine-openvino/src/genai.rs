@@ -17,7 +17,7 @@
 //! and CPU.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, RandomState};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -345,6 +345,7 @@ impl Builder for OvGenaiBuilder {
                 quarantined: QuarantineSet::default(),
                 strikes: StrikeSet::default(),
                 compiled: QuarantineSet::default(),
+                schema_keys: RandomState::new(),
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -673,12 +674,6 @@ fn record_probe(verdict: Option<String>) -> Option<String> {
         None => info!("structured output available"),
     }
     verdict
-}
-
-fn schema_hash(body: &str) -> u64 {
-    let mut h = std::hash::DefaultHasher::new();
-    body.hash(&mut h);
-    h.finish()
 }
 
 /// A set of schemas (by body hash): those that recently failed to compile on
@@ -1165,6 +1160,8 @@ pub struct OvGenaiCbEngine {
     /// Schemas that recently produced output, so compiled: never a suspect
     /// in a failed step.
     compiled: QuarantineSet,
+    /// Random keys for [`Self::schema_hash`], drawn once per engine.
+    schema_keys: RandomState,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -1284,7 +1281,9 @@ impl Engine for OvGenaiCbEngine {
             });
         }
         let schema = grammar_json_schema(&task);
-        let grammar_hash = schema.filter(|s| *s != JSON_OBJECT_PROBE).map(schema_hash);
+        let grammar_hash = schema
+            .filter(|s| *s != JSON_OBJECT_PROBE)
+            .map(|s| self.schema_hash(s));
         if let Some(h) = grammar_hash {
             if self.quarantined.contains(h, Instant::now()) {
                 return Err(EngineError::InvalidConfig(
@@ -1685,6 +1684,13 @@ impl OvGenaiCbEngine {
         false
     }
 
+    /// The key the schema sets above use for `body`. Keyed with this
+    /// engine's random keys, so a client cannot craft a schema that collides
+    /// with another's. Kept in memory only: never logged, stored or sent.
+    fn schema_hash(&self, body: &str) -> u64 {
+        self.schema_keys.hash_one(body)
+    }
+
     /// End the current run of failures: a step or canary succeeded. With
     /// `release` (the device was at fault during the run) the schemas blamed
     /// in it are released; otherwise they stay refused.
@@ -2002,6 +2008,7 @@ mod tests {
             quarantined: QuarantineSet::default(),
             strikes: StrikeSet::default(),
             compiled: QuarantineSet::default(),
+            schema_keys: RandomState::new(),
         }
     }
 
@@ -2728,7 +2735,7 @@ mod tests {
             ..Default::default()
         }));
         let mut e = mock_engine(&st);
-        let a = schema_hash(SCHEMA_A);
+        let a = e.schema_hash(SCHEMA_A);
         // Earlier run, ended by an ordinary success: A keeps one strike.
         e.submit(schema_task("a1", SCHEMA_A)).unwrap();
         e.submit(schema_task("b1", SCHEMA_B)).unwrap();
@@ -2761,7 +2768,7 @@ mod tests {
             Some(1),
             "the earlier run's strike stays"
         );
-        assert_eq!(e.strikes.strikes.get(&schema_hash(SCHEMA_C)), None);
+        assert_eq!(e.strikes.strikes.get(&e.schema_hash(SCHEMA_C)), None);
         e.submit(schema_task("a4", SCHEMA_A)).expect("released");
     }
 
@@ -3199,7 +3206,8 @@ mod tests {
         let mut e = mock_engine(&st);
         // A request admitted before its schema was quarantined produces.
         e.submit(schema_task("a", SCHEMA_A)).unwrap();
-        e.quarantined.insert(schema_hash(SCHEMA_A), Instant::now());
+        let h = e.schema_hash(SCHEMA_A);
+        e.quarantined.insert(h, Instant::now());
         script_output(&st, 0, CbStatus::Running);
         let _ = e.step().unwrap();
         assert_eq!(e.quarantined.len(), 0);
@@ -3232,6 +3240,27 @@ mod tests {
         assert_eq!(
             out[0].1.error.as_deref(),
             Some("cb step failed: mock step failure")
+        );
+    }
+
+    #[test]
+    fn cb_schema_hash_is_keyed_per_engine() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let (e1, e2) = (mock_engine(&st), mock_engine(&st));
+        assert_eq!(e1.schema_hash(SCHEMA_A), e1.schema_hash(SCHEMA_A));
+        assert_ne!(e1.schema_hash(SCHEMA_A), e1.schema_hash(SCHEMA_B));
+        assert_ne!(
+            e1.schema_hash(SCHEMA_A),
+            e2.schema_hash(SCHEMA_A),
+            "two engines must not share hash keys"
+        );
+        use std::hash::{Hash, Hasher};
+        let mut fixed = std::hash::DefaultHasher::new();
+        SCHEMA_A.hash(&mut fixed);
+        assert_ne!(
+            e1.schema_hash(SCHEMA_A),
+            fixed.finish(),
+            "not the unkeyed hash"
         );
     }
 
