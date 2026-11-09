@@ -2898,12 +2898,24 @@ pub async fn recv_stream_tokens_ack_body_client(
 /// the pipeline each time. It outlives a re-dial, is cleared when a late
 /// acknowledged reply turns up (the stage was slow, not old), and stops
 /// refusing after [`MASK_REPROBE`] so the next json request probes again.
+///
+/// On a middle stage the same record notes a late acknowledged reply it
+/// dropped ([`MaskLatch::take_owed`]), so it can tell the stages above with
+/// its next reply (see [`send_owed_late_ack`]).
 #[derive(Debug, Default)]
-pub struct MaskLatch(std::sync::Mutex<Option<std::time::Instant>>);
+pub struct MaskLatch {
+    at: std::sync::Mutex<Option<std::time::Instant>>,
+    owed: std::sync::atomic::AtomicBool,
+}
 
 impl MaskLatch {
     fn slot(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether a late acknowledged reply was dropped since the last call.
+    pub fn take_owed(&self) -> bool {
+        self.owed.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn set(&self) {
@@ -2938,7 +2950,70 @@ fn note_stale_ack(latch: Option<&MaskLatch>, status: u32) {
     if status == MASK_ACK {
         if let Some(l) = latch {
             l.clear();
+            l.owed.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+}
+
+/// Tag of the marker a middle stage sends up for a late acknowledged reply
+/// it dropped. Rank 0 never tags a step 0, so every wait above reads the
+/// marker as a stale acknowledged reply: it is dropped, and it clears rank
+/// 0's latch.
+pub const LATE_ACK_TAG: u32 = 0;
+
+/// A middle stage: before its next reply upstream, pass on a late
+/// acknowledged reply it dropped (`TokenAck(-1, LATE_ACK_TAG, MASK_ACK)`).
+pub async fn send_owed_late_ack(
+    up: &Mutex<ActivationServer>,
+    late: &MaskLatch,
+) -> TransportResult<()> {
+    if late.take_owed() {
+        send_token_ack_upstream(up, -1, LATE_ACK_TAG, MASK_ACK).await?;
+    }
+    Ok(())
+}
+
+/// Whether `cols` is the mask-support probe: one masked row with no mask
+/// words. A stage on this build answers it without running its layers or
+/// touching any state (middles pass it on); see [`probe_mask_support`].
+pub fn is_mask_probe(cols: &MaskCols) -> bool {
+    cols.rows() == 1 && cols.width() == 1 && cols.tag(0) != 0
+}
+
+/// Rank 0: ask every stage whether it applies masks, with a masked
+/// single-row `Forward` that carries no mask words. Every stage on this
+/// build acknowledges it without touching any state; a stage on an older
+/// build fails to decode it, survives (a failed `Forward` is not fatal on
+/// any older worker), and never answers. `Err` names why there was no
+/// acknowledgement; the socket is kept as on any masked step.
+pub async fn probe_mask_support(
+    down: &Mutex<ActivationClient>,
+    h: usize,
+    deadline: std::time::Duration,
+    tag: u32,
+    latch: &MaskLatch,
+) -> Result<(), String> {
+    let mut cols = MaskCols::new(1, 0);
+    cols.set(0, tag, &[]);
+    send_forward_step(
+        down,
+        FrameKind::Forward,
+        0,
+        &SamplingConfig::default(),
+        &vec![0.0; h],
+        [1, 1, h as u32],
+        false,
+        Some(&cols),
+    )
+    .await
+    .map_err(|e| format!("send mask probe: {e}"))?;
+    match wait_token_ack(down, deadline, tag, Some(latch)).await {
+        AckWait::Acked(_, MASK_ACK) => Ok(()),
+        AckWait::Acked(_, MASK_UNCONFIRMED) => {
+            Err("a later stage did not acknowledge the mask".into())
+        }
+        AckWait::Acked(_, s) => Err(format!("unknown acknowledgement status 0x{s:08x}")),
+        AckWait::NoAck(reason) => Err(reason),
     }
 }
 
@@ -3047,14 +3122,18 @@ pub async fn relay_masked_token_reply(
     down: &Mutex<ActivationClient>,
     deadline: std::time::Duration,
     tag: u32,
+    late: &MaskLatch,
 ) -> Result<(), String> {
-    let (token, status) = match wait_token_ack(down, deadline, tag, None).await {
+    let (token, status) = match wait_token_ack(down, deadline, tag, Some(late)).await {
         AckWait::Acked(token, status) => (token, status),
         AckWait::NoAck(reason) => {
             tracing::warn!(%reason, "masked step not acknowledged downstream");
             (-1, MASK_UNCONFIRMED)
         }
     };
+    send_owed_late_ack(up, late)
+        .await
+        .map_err(|e| format!("relay late ack: {e}"))?;
     send_token_ack_upstream(up, token, tag, status)
         .await
         .map_err(|e| format!("relay token ack: {e}"))
@@ -3072,7 +3151,13 @@ pub fn mid_mask_budget(head: std::time::Duration, rank: u32, total: u32) -> std:
 
 /// A middle stage's unbounded wait for the `Token` owed to an unmasked frame
 /// it relayed, dropping any late acknowledged reply first.
-pub async fn recv_token_relay(down: &Mutex<ActivationClient>) -> Result<i64, String> {
+///
+/// A dropped acknowledged reply is noted in `late` (see
+/// [`send_owed_late_ack`]).
+pub async fn recv_token_relay(
+    down: &Mutex<ActivationClient>,
+    late: Option<&MaskLatch>,
+) -> Result<i64, String> {
     loop {
         match recv_kind_client_raw(down).await {
             Ok(Some(FrameKind::Token)) => {
@@ -3081,9 +3166,10 @@ pub async fn recv_token_relay(down: &Mutex<ActivationClient>) -> Result<i64, Str
                     .map_err(|e| format!("recv_token: {e}"))
             }
             Ok(Some(FrameKind::TokenAck)) => {
-                recv_token_ack_body_client(down)
+                let (_, _, status) = recv_token_ack_body_client(down)
                     .await
                     .map_err(|e| format!("recv_token_ack: {e}"))?;
+                note_stale_ack(late, status);
             }
             Ok(Some(other)) => return Err(format!("mid rank expected Token, got {other:?}")),
             Ok(None) => return Err("downstream closed before Token".into()),
@@ -3629,7 +3715,7 @@ mod mask_wire_tests {
         assert_eq!(recv_token_reply(&cli, SHORT).await, Ok(8));
         send_token_ack_upstream(&srv, 3, 1, MASK_ACK).await.unwrap();
         send_token_upstream(&srv, 9).await.unwrap();
-        assert_eq!(recv_token_relay(&cli).await, Ok(9));
+        assert_eq!(recv_token_relay(&cli, None).await, Ok(9));
         // Stream waits: a stale ack is dropped, the expected one returned.
         send_stream_tokens_ack_upstream(&srv, 1, MASK_ACK, &[(0, 1)])
             .await
@@ -3662,7 +3748,7 @@ mod mask_wire_tests {
         send_token_ack_upstream(&srv_dn, 12, 5, MASK_ACK)
             .await
             .unwrap();
-        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 5)
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 5, &MaskLatch::default())
             .await
             .unwrap();
         recv_kind_client_raw(&cli_up).await.unwrap();
@@ -3671,7 +3757,7 @@ mod mask_wire_tests {
             (12, 5, MASK_ACK)
         );
         // Downstream silent (an older tail): unconfirmed, socket kept.
-        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 6)
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 6, &MaskLatch::default())
             .await
             .unwrap();
         recv_kind_client_raw(&cli_up).await.unwrap();
@@ -3681,7 +3767,7 @@ mod mask_wire_tests {
         );
         // Downstream replied plain: unconfirmed.
         send_token_upstream(&srv_dn, 4).await.unwrap();
-        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 7)
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 7, &MaskLatch::default())
             .await
             .unwrap();
         recv_kind_client_raw(&cli_up).await.unwrap();
@@ -3724,6 +3810,73 @@ mod mask_wire_tests {
         );
         send_token_upstream(&srv, 42).await.unwrap();
         assert_eq!(recv_token_reply(&cli, SHORT).await, Ok(42));
+    }
+
+    /// A middle that drops a slow tail's late acknowledged reply passes it on
+    /// with its next reply, so rank 0's latch clears.
+    #[tokio::test]
+    async fn a_middle_passes_a_dropped_late_ack_up_with_its_next_reply() {
+        let (srv_up, cli_up) = pair().await;
+        let (srv_dn, cli_dn) = pair().await;
+        let late = MaskLatch::default();
+        send_token_ack_upstream(&srv_dn, 3, 9, MASK_ACK)
+            .await
+            .unwrap();
+        send_token_upstream(&srv_dn, 5).await.unwrap();
+        assert_eq!(recv_token_relay(&cli_dn, Some(&late)).await, Ok(5));
+        send_owed_late_ack(&srv_up, &late).await.unwrap();
+        send_token_upstream(&srv_up, 5).await.unwrap();
+        let head = MaskLatch::default();
+        head.set();
+        assert_eq!(
+            recv_token_reply_with(&cli_up, SHORT, Some(&head)).await,
+            Ok(5)
+        );
+        assert!(!head.is_set(), "the late ack cleared rank 0's latch");
+        // Owed once only.
+        assert!(!late.take_owed());
+        // The masked relay carries it too.
+        send_token_ack_upstream(&srv_dn, 1, 2, MASK_ACK)
+            .await
+            .unwrap();
+        send_token_ack_upstream(&srv_dn, 7, 4, MASK_ACK)
+            .await
+            .unwrap();
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 4, &late)
+            .await
+            .unwrap();
+        head.set();
+        assert_eq!(
+            recv_token_reply_masked(&cli_up, SHORT, 4, &head).await,
+            MaskedReply::Token(7)
+        );
+        assert!(!head.is_set());
+    }
+
+    #[tokio::test]
+    async fn the_probe_is_acknowledged_without_a_mask_word() {
+        let (srv, cli) = pair().await;
+        let latch = MaskLatch::default();
+        let tail = tokio::spawn(async move {
+            recv_kind_server(&srv).await.unwrap();
+            let (_, _, _, step) = recv_forward_step_body_server(&srv).await.unwrap();
+            let (_, _, cols) = step.split(4).unwrap();
+            let cols = cols.unwrap();
+            assert!(is_mask_probe(&cols));
+            send_token_ack_upstream(&srv, -1, cols.tag(0), MASK_ACK)
+                .await
+                .unwrap();
+            srv
+        });
+        assert_eq!(probe_mask_support(&cli, 4, SHORT, 3, &latch).await, Ok(()));
+        let srv = tail.await.unwrap();
+        // Unanswered (an older stage): an error, socket kept.
+        assert!(probe_mask_support(&cli, 4, SHORT, 4, &latch).await.is_err());
+        send_token_upstream(&srv, 8).await.unwrap();
+        assert_eq!(recv_token_reply(&cli, SHORT).await, Ok(8));
+        let mut real = MaskCols::new(1, 1);
+        real.set(0, 1, &[1]);
+        assert!(!is_mask_probe(&real));
     }
 
     #[test]

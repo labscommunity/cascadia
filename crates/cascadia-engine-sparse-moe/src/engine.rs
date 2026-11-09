@@ -1211,6 +1211,7 @@ impl Builder for SparseMoEBuilder {
             grammar: self.grammar,
             grammars: HashMap::new(),
             stage_masks: StageMasks::default(),
+            mid_late: crate::dist::MaskLatch::default(),
         }))
     }
 }
@@ -1300,6 +1301,74 @@ fn stage_mask_cols(
         .mask_width()
         .ok_or_else(|| "structured output: no grammar factory on this stage".to_string())?;
     masks.last_row(gm, width, rows).map_err(|e| e.to_string())
+}
+
+/// Rank 0, a masked single-row step: send the masked `Forward` and wait for
+/// its acknowledged reply. The sampled token, or the task's error (the
+/// latch is set when the pipeline did not acknowledge).
+#[allow(clippy::too_many_arguments)]
+async fn masked_forward_exchange(
+    down: &TokioMutex<ActivationClient>,
+    masks: &StageMasks,
+    past_seq_len: u32,
+    cfg: &crate::sampling::SamplingConfig,
+    hidden: &[f32],
+    shape: [u32; 3],
+    cols: &MaskCols,
+    tag: u32,
+    deadline: std::time::Duration,
+) -> Result<i64, String> {
+    crate::dist::send_forward_step(
+        down,
+        FrameKind::Forward,
+        past_seq_len,
+        cfg,
+        hidden,
+        shape,
+        true,
+        Some(cols),
+    )
+    .await
+    .map_err(|e| format!("send_forward: {e}"))?;
+    let reply = crate::dist::recv_token_reply_masked(down, deadline, tag, &masks.latch).await;
+    masks.outcome(reply)
+}
+
+/// Last stage, a masked sampling row: the token to answer with (`-1` when
+/// the row can't be served, see [`sample_wire_masked`]) and the row's tag.
+/// A sampled token joins `history` when `push` (a kept token).
+fn masked_tail_reply(
+    logits: &[f32],
+    history: &mut Vec<i64>,
+    cfg: &crate::sampling::SamplingConfig,
+    rng: &mut u64,
+    cols: &MaskCols,
+    row: usize,
+    push: bool,
+) -> (i64, u32) {
+    let token = sample_wire_masked(logits, history, cfg, rng, cols, row);
+    if let (Some(t), true) = (token, push) {
+        history.push(t);
+    }
+    (token.unwrap_or(-1), cols.tag(row))
+}
+
+/// A middle stage's budget for a masked single-row `Forward`, shorter than
+/// rank 0's (see [`crate::dist::mid_mask_budget`]). Rank 0 waits on the
+/// prefill budget for the first sampled step after a reset (the prompt's
+/// last token, behind the streamed prefill) and on the decode budget after
+/// that, so `sampled` (cleared on Reset) tracks which this is; a sampling
+/// frame sets it.
+fn mid_forward_budget(sampled: &mut bool, sample: bool, rank: u32, total: u32) -> Duration {
+    let head = if *sampled {
+        decode_reply_deadline()
+    } else {
+        prefill_reply_deadline()
+    };
+    if sample {
+        *sampled = true;
+    }
+    crate::dist::mid_mask_budget(head, rank, total)
 }
 
 /// Whether a single-stage task runs n-gram speculative decoding: configured,
@@ -1685,6 +1754,8 @@ pub struct SparseMoEEngine {
     grammars: HashMap<TaskId, CompiledGrammar>,
     /// Rank 0 of a pipeline: tags of masked steps and the "can't mask" latch.
     stage_masks: StageMasks,
+    /// Middle rank: a late acknowledged reply it dropped, owed upstream.
+    mid_late: crate::dist::MaskLatch,
 }
 
 impl SparseMoEEngine {
@@ -2981,29 +3052,17 @@ impl SparseMoEEngine {
         // Send hidden downstream and wait for token to come back.
         let wire_t0 = Instant::now();
         if let Some((cols, tag)) = masked {
-            let stage_masks = &self.stage_masks;
-            return self.block_on(async {
-                crate::dist::send_forward_step(
-                    downstream,
-                    FrameKind::Forward,
-                    past_seq_len,
-                    cfg,
-                    &h_after_shells,
-                    [1, 1, hidden as u32],
-                    true,
-                    Some(&cols),
-                )
-                .await
-                .map_err(|e| format!("send_forward: {e}"))?;
-                let reply = crate::dist::recv_token_reply_masked(
-                    downstream,
-                    reply_deadline,
-                    tag,
-                    &stage_masks.latch,
-                )
-                .await;
-                stage_masks.outcome(reply)
-            });
+            return self.block_on(masked_forward_exchange(
+                downstream,
+                &self.stage_masks,
+                past_seq_len,
+                cfg,
+                &h_after_shells,
+                [1, 1, hidden as u32],
+                &cols,
+                tag,
+                reply_deadline,
+            ));
         }
         let result = self.block_on(async {
             if sample_back {
@@ -3698,23 +3757,18 @@ impl SparseMoEEngine {
                         self.last_rank_rng_seeded = true;
                     }
                     if let Some(cols) = cols.as_ref() {
-                        let token = sample_wire_masked(
+                        let (token, tag) = masked_tail_reply(
                             &logits,
-                            &self.last_rank_history,
+                            &mut self.last_rank_history,
                             &sampling_cfg,
                             &mut self.last_rank_rng,
                             cols,
                             0,
+                            true,
                         );
-                        if let Some(t) = token {
-                            self.last_rank_history.push(t);
-                        }
                         return self
                             .block_on(crate::dist::send_token_ack_upstream(
-                                upstream,
-                                token.unwrap_or(-1),
-                                cols.tag(0),
-                                MASK_ACK,
+                                upstream, token, tag, MASK_ACK,
                             ))
                             .map_err(|e| format!("send_token_ack: {e}"));
                     }
@@ -3734,18 +3788,7 @@ impl SparseMoEEngine {
                     // A masked step's wait here must end before the one upstream does,
                     // so an unacknowledged step reaches rank 0 as such: the head's
                     // budget for this step, shortened by this rank's place.
-                    let mid_budget = crate::dist::mid_mask_budget(
-                        if self.mid_sampled {
-                            decode_reply_deadline()
-                        } else {
-                            prefill_reply_deadline()
-                        },
-                        self.rank,
-                        self.total,
-                    );
-                    if sample {
-                        self.mid_sampled = true;
-                    }
+                    let mid_budget =                        mid_forward_budget(&mut self.mid_sampled, sample, self.rank, self.total);
                     if let Some(cols) = cols {
                         // Relay the mask; pass the reply up only as acknowledged
                         // by the stages below.
@@ -3767,6 +3810,7 @@ impl SparseMoEEngine {
                                 &down,
                                 mid_budget,
                                 cols.tag(0),
+                                &self.mid_late,
                             )
                             .await
                         });
@@ -3794,7 +3838,11 @@ impl SparseMoEEngine {
                             .await
                             .map_err(|e| format!("send_forward_nosample: {e}"))?;
                         }
-                        let token = crate::dist::recv_token_relay(&down).await?;
+                        let token =
+                            crate::dist::recv_token_relay(&down, Some(&self.mid_late)).await?;
+                        crate::dist::send_owed_late_ack(upstream, &self.mid_late)
+                    .await
+                    .map_err(|e| format!("relay late ack: {e}"))?;
                         send_token_upstream(upstream, token)
                             .await
                             .map_err(|e| format!("send_token: {e}"))
@@ -4220,6 +4268,8 @@ pub struct OvMoeEngine {
     grammars: HashMap<TaskId, CompiledGrammar>,
     /// Rank 0 of a pipeline: tags of masked steps and the "can't mask" latch.
     stage_masks: StageMasks,
+    /// Middle rank: a late acknowledged reply it dropped, owed upstream.
+    mid_late: crate::dist::MaskLatch,
 }
 
 impl OvMoeEngine {
@@ -4275,6 +4325,7 @@ impl OvMoeEngine {
             grammar: GrammarSlot::default(),
             grammars: HashMap::new(),
             stage_masks: StageMasks::default(),
+            mid_late: crate::dist::MaskLatch::default(),
         }
     }
 
@@ -4473,29 +4524,17 @@ impl OvMoeEngine {
             .map_err(|e| format!("forward: {e}"))?;
         let h = self.runner.hidden_size() as u32;
         if let Some((cols, tag)) = masked {
-            let stage_masks = &self.stage_masks;
-            return self.block_on(async {
-                crate::dist::send_forward_step(
-                    downstream,
-                    FrameKind::Forward,
-                    pos as u32,
-                    cfg,
-                    &hidden,
-                    [1, 1, h],
-                    true,
-                    Some(&cols),
-                )
-                .await
-                .map_err(|e| format!("send_forward: {e}"))?;
-                let reply = crate::dist::recv_token_reply_masked(
-                    downstream,
-                    reply_deadline,
-                    tag,
-                    &stage_masks.latch,
-                )
-                .await;
-                stage_masks.outcome(reply)
-            });
+            return self.block_on(masked_forward_exchange(
+                downstream,
+                &self.stage_masks,
+                pos as u32,
+                cfg,
+                &hidden,
+                [1, 1, h],
+                &cols,
+                tag,
+                reply_deadline,
+            ));
         }
         self.block_on(async {
             if sample_back {
@@ -5408,23 +5447,18 @@ impl OvMoeEngine {
                 self.last_rank_rng_seeded = true;
             }
             if let Some(cols) = cols.as_ref() {
-                let token = sample_wire_masked(
+                let (token, tag) = masked_tail_reply(
                     &logits,
-                    &self.last_rank_history,
+                    &mut self.last_rank_history,
                     &sampling_cfg,
                     &mut self.last_rank_rng,
                     cols,
                     0,
+                    push_history,
                 );
-                if let (Some(t), true) = (token, push_history) {
-                    self.last_rank_history.push(t);
-                }
                 return self
                     .block_on(crate::dist::send_token_ack_upstream(
-                        upstream,
-                        token.unwrap_or(-1),
-                        cols.tag(0),
-                        MASK_ACK,
+                        upstream, token, tag, MASK_ACK,
                     ))
                     .map_err(|e| format!("send_token_ack: {e}"));
             }
@@ -5466,18 +5500,8 @@ impl OvMoeEngine {
             // A masked step's wait here must end before the one upstream does,
             // so an unacknowledged step reaches rank 0 as such: the head's
             // budget for this step, shortened by this rank's place.
-            let mid_budget = crate::dist::mid_mask_budget(
-                if self.mid_sampled {
-                    decode_reply_deadline()
-                } else {
-                    prefill_reply_deadline()
-                },
-                self.rank,
-                self.total,
-            );
-            if sample {
-                self.mid_sampled = true;
-            }
+            let mid_budget =
+                mid_forward_budget(&mut self.mid_sampled, sample, self.rank, self.total);
             if let Some(cols) = cols {
                 // Relay the mask; pass the reply up only as acknowledged by
                 // the stages below.
@@ -5494,8 +5518,14 @@ impl OvMoeEngine {
                     )
                     .await
                     .map_err(|e| format!("send_forward: {e}"))?;
-                    crate::dist::relay_masked_token_reply(upstream, down, mid_budget, cols.tag(0))
-                        .await
+                    crate::dist::relay_masked_token_reply(
+                        upstream,
+                        down,
+                        mid_budget,
+                        cols.tag(0),
+                        &self.mid_late,
+                    )
+                    .await
                 });
             }
             self.block_on(async {
@@ -5515,7 +5545,10 @@ impl OvMoeEngine {
                         .await
                         .map_err(|e| format!("send_forward_nosample: {e}"))?;
                 }
-                let t = crate::dist::recv_token_relay(down).await?;
+                let t = crate::dist::recv_token_relay(down, Some(&self.mid_late)).await?;
+                crate::dist::send_owed_late_ack(upstream, &self.mid_late)
+                    .await
+                    .map_err(|e| format!("relay late ack: {e}"))?;
                 send_token_upstream(upstream, t)
                     .await
                     .map_err(|e| format!("relay token: {e}"))?;
@@ -5897,6 +5930,14 @@ pub struct PipelineEngine<R: StagedRunner> {
     grammars: HashMap<TaskId, CompiledGrammar>,
     /// Rank 0 of a pipeline: tags of masked steps and the "can't mask" latch.
     stage_masks: StageMasks,
+    /// Middle rank: a late acknowledged reply it dropped, owed upstream.
+    mid_late: crate::dist::MaskLatch,
+    /// Rank 0: the current downstream link acknowledged a masked single-row
+    /// `Forward`, so every stage on it masks. Until then only that frame
+    /// carries a mask: a stage on an older build survives a masked `Forward`
+    /// it can't decode, but exits on a batched or stream frame it can't
+    /// decode, and its stage reloads. Cleared on every re-dial.
+    mask_evidence: bool,
 }
 
 /// Per-slot sampling state on the last rank (the driver keeps the tokens).
@@ -6266,6 +6307,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             grammar: GrammarSlot::default(),
             grammars: HashMap::new(),
             stage_masks: StageMasks::default(),
+            mid_late: crate::dist::MaskLatch::default(),
+            mask_evidence: false,
         }
     }
 
@@ -6584,6 +6627,30 @@ impl<R: StagedRunner> PipelineEngine<R> {
             && !self.pending.is_empty()
             && self.group_is_emptiest(g)
         {
+            // Structured output: a stream frame carries a mask only on a link
+            // with evidence that every stage masks. Get it with the probe,
+            // which needs the link to itself: admission waits until no frame
+            // is in flight.
+            let needs_probe = self
+                .pending
+                .front()
+                .is_some_and(|t| self.grammars.contains_key(&t.task_id))
+                && !self.mask_evidence
+                && self.stage_masks.refusal().is_none();
+            if needs_probe {
+                let idle =
+                    self.streams.is_empty() && self.stream_inflight.iter().all(|q| q.is_empty());
+                if !idle {
+                    break;
+                }
+                if let Err(msg) = self.probe_link(&down) {
+                    let task = self.pending.pop_front().expect("non-empty");
+                    admitted += 1;
+                    self.grammars.remove(&task.task_id);
+                    out.push((task.task_id.clone(), Chunk::error(task.task_id, msg)));
+                    continue;
+                }
+            }
             let task = self.pending.pop_front().expect("non-empty");
             admitted += 1;
             let admit_started = Instant::now();
@@ -6800,6 +6867,32 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         self.flush_stage_profile();
         true
+    }
+
+    /// Rank 0: get evidence that every stage on the link masks, with the
+    /// mask-support probe (see [`crate::dist::probe_mask_support`]). `Err`
+    /// is the json task's error; the latch is set then.
+    fn probe_link(&mut self, down: &Arc<TokioMutex<ActivationClient>>) -> Result<(), String> {
+        let tag = self.stage_masks.next_tag();
+        let h = self.runner.hidden_size();
+        let probed = self.block_on(crate::dist::probe_mask_support(
+            down,
+            h,
+            Self::reply_deadline(),
+            tag,
+            &self.stage_masks.latch,
+        ));
+        match probed {
+            Ok(()) => {
+                self.mask_evidence = true;
+                Ok(())
+            }
+            Err(reason) => {
+                self.stage_masks.latch.set();
+                warn!(%reason, "mask-support probe not acknowledged; json requests refused for a while");
+                Err(unconfirmed_step(&reason))
+            }
+        }
     }
 
     /// End one pipeline stream with an error (its slot freed here and on the
@@ -7190,6 +7283,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         match res {
             Ok(()) => {
                 info!(rank = self.rank, "downstream link re-dialed; resuming");
+                self.mask_evidence = false;
                 self.peer_disconnected = false;
                 self.disconnect_reported = false;
                 self.redial_next = None;
@@ -7262,7 +7356,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 f.batch_id,
                 Some(&self.stage_masks.latch),
             )) {
-                Ok(r) if r.batch_id == f.batch_id => {}
+                Ok(r) if r.batch_id == f.batch_id => {
+                    if f.masked && r.ack != Some(MASK_ACK) {
+                        self.stage_masks.latch.set();
+                    }
+                }
                 Ok(crate::dist::StreamReply { batch_id: bid, .. }) => {
                     warn!(
                         batch = bid,
@@ -7272,6 +7370,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     return false;
                 }
                 Err(e) => {
+                    if f.masked {
+                        self.stage_masks.latch.set();
+                    }
                     warn!(error = %e, "stale stream reply not read");
                     return false;
                 }
@@ -7803,29 +7904,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let hidden = self.runner.forward_layers(hidden, pos, Some(token));
         let h = self.runner.hidden_size() as u32;
         if let Some((cols, tag)) = masked {
-            let stage_masks = &self.stage_masks;
-            return self.block_on(async {
-                crate::dist::send_forward_step(
-                    downstream,
-                    FrameKind::Forward,
-                    pos as u32,
-                    cfg,
-                    &hidden,
-                    [1, 1, h],
-                    true,
-                    Some(&cols),
-                )
-                .await
-                .map_err(|e| format!("send_forward: {e}"))?;
-                let reply = crate::dist::recv_token_reply_masked(
-                    downstream,
-                    reply_deadline,
-                    tag,
-                    &stage_masks.latch,
-                )
-                .await;
-                stage_masks.outcome(reply)
-            });
+            let token = self.block_on(masked_forward_exchange(
+                downstream,
+                &self.stage_masks,
+                pos as u32,
+                cfg,
+                &hidden,
+                [1, 1, h],
+                &cols,
+                tag,
+                reply_deadline,
+            ))?;
+            // An acknowledged single-row step: every stage of this link
+            // masks, so batched and stream frames may carry masks too.
+            self.mask_evidence = true;
+            return Ok(token);
         }
         self.block_on(async {
             if sample_back {
@@ -8073,11 +8166,22 @@ impl<R: StagedRunner> PipelineEngine<R> {
             // final ForwardBatchPrefill samples the first generated token — so no
             // mid-prompt row is recorded into the last rank's rep-penalty history.
             let suffix = &prompt_ids[reuse..n_prefill];
+            // Structured output on a link without evidence that it masks:
+            // the batch carries every row but the last unmasked and unsampled,
+            // and the last row goes as a masked single-row `Forward` (see
+            // `mask_evidence`).
+            let row_last = grammar.is_some() && !self.mask_evidence && !suffix.is_empty();
+            let (suffix, last_row) = if row_last {
+                let (body, last) = suffix.split_at(suffix.len() - 1);
+                (body, Some(last[0]))
+            } else {
+                (suffix, None)
+            };
             let win = crate::dist::MAX_BATCH_COUNT as usize;
             let n_windows = suffix.len().div_ceil(win);
             let mut wbase = reuse;
             for (wi, chunk) in suffix.chunks(win).enumerate() {
-                let is_last = wi + 1 == n_windows;
+                let is_last = wi + 1 == n_windows && last_row.is_none();
                 let gm = if is_last { grammar.as_mut() } else { None };
                 match self.forward_prompt_batch_first(chunk, wbase, &cfg, &downstream, is_last, gm)
                 {
@@ -8092,6 +8196,23 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     }
                 }
                 wbase += chunk.len();
+            }
+            if let Some(t) = last_row {
+                match self.forward_one_token_first(
+                    t,
+                    n_prefill - 1,
+                    &cfg,
+                    &downstream,
+                    true,
+                    Self::reply_deadline(),
+                    grammar.as_mut(),
+                ) {
+                    Ok(tok_back) => next = tok_back,
+                    Err(e) => {
+                        warn!(task = %id, "prefill final row failed: {e}");
+                        return Some(vec![(id.clone(), Chunk::error(id, e))]);
+                    }
+                }
             }
             pos = n_prefill;
         } else {
@@ -8581,22 +8702,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
         cols: &MaskCols,
         row: usize,
     ) -> Result<(), String> {
-        let token = sample_wire_masked(
+        let (token, tag) = masked_tail_reply(
             logits,
-            &self.last_rank_history,
+            &mut self.last_rank_history,
             cfg,
             &mut self.last_rank_rng,
             cols,
             row,
+            true,
         );
-        if let Some(t) = token {
-            self.last_rank_history.push(t);
-        }
         self.block_on(crate::dist::send_token_ack_upstream(
-            upstream,
-            token.unwrap_or(-1),
-            cols.tag(row),
-            MASK_ACK,
+            upstream, token, tag, MASK_ACK,
         ))
         .map_err(|e| format!("send_token_ack: {e}"))
     }
@@ -8978,6 +9094,38 @@ impl<R: StagedRunner> PipelineEngine<R> {
             self.peer_disconnected = true;
             return Err("a ForwardNoSample frame carries a mask; only sampling frames may".into());
         }
+        // The mask-support probe: acknowledged without running any layer or
+        // touching any state; a middle passes it on unchanged.
+        if let Some(c) = cols.as_ref().filter(|c| crate::dist::is_mask_probe(c)) {
+            let tag = c.tag(0);
+            if self.is_last() {
+                return self
+                    .block_on(crate::dist::send_token_ack_upstream(
+                        upstream, -1, tag, MASK_ACK,
+                    ))
+                    .map_err(|e| format!("send_token_ack (probe): {e}"));
+            }
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            let h = hidden_f32.len() as u32;
+            let budget =
+                crate::dist::mid_mask_budget(Self::reply_deadline(), self.rank, self.total);
+            return self.block_on(async {
+                crate::dist::send_forward_step(
+                    down,
+                    FrameKind::Forward,
+                    past_seq_len,
+                    &sampling_cfg,
+                    &hidden_f32,
+                    [1, 1, h],
+                    push_history,
+                    Some(c),
+                )
+                .await
+                .map_err(|e| format!("relay mask probe: {e}"))?;
+                crate::dist::relay_masked_token_reply(upstream, down, budget, tag, &self.mid_late)
+                    .await
+            });
+        }
         // A malformed or over-range frame is a protocol violation we cannot
         // serve: forwarding a wrong-width hidden, or one at a position the
         // caches can't hold, would panic (OOB) mid-pipeline. Latch the peer as
@@ -9049,6 +9197,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         down,
                         crate::dist::mid_mask_budget(Self::reply_deadline(), self.rank, self.total),
                         cols.tag(0),
+                        &self.mid_late,
                     )
                     .await
                 });
@@ -9076,7 +9225,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         .await
                         .map_err(|e| format!("send_forward_nosample: {e}"))?;
                 }
-                let t = crate::dist::recv_token_reply(down, reply_deadline).await?;
+                let t =
+                    crate::dist::recv_token_reply_with(down, reply_deadline, Some(&self.mid_late))
+                        .await?;
+                crate::dist::send_owed_late_ack(upstream, &self.mid_late)
+                    .await
+                    .map_err(|e| format!("relay late ack: {e}"))?;
                 send_token_upstream(upstream, t)
                     .await
                     .map_err(|e| format!("relay token: {e}"))
@@ -9196,6 +9350,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                             self.total,
                         ),
                         cols.tag(rows - 1),
+                        &self.mid_late,
                     )
                     .await
                 });
@@ -9234,7 +9389,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 // `ActivationClient::sock` for good (only `Builder::connect`
                 // redials it) — killing this link, and every rank upstream of
                 // it, for the rest of the process.
-                let t = crate::dist::recv_token_reply(down, Self::reply_deadline_prefill()).await?;
+                let t = crate::dist::recv_token_reply_with(
+                    down,
+                    Self::reply_deadline_prefill(),
+                    Some(&self.mid_late),
+                )
+                .await?;
+                crate::dist::send_owed_late_ack(upstream, &self.mid_late)
+                    .await
+                    .map_err(|e| format!("relay late ack: {e}"))?;
                 send_token_upstream(upstream, t)
                     .await
                     .map_err(|e| format!("relay token: {e}"))
@@ -9453,6 +9616,10 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                     self.peer_disconnected = false;
                     self.disconnect_reported = false;
                     self.redial_next = None;
+                }
+                if epoch != self.seen_link_epoch {
+                    // A new connection: what the old one proved does not carry over.
+                    self.mask_evidence = false;
                 }
                 self.seen_link_epoch = epoch;
                 let idle =

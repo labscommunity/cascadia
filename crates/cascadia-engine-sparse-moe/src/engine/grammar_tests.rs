@@ -749,3 +749,422 @@ fn middle_masked_budgets_end_before_the_heads_with_the_real_budgets() {
     // waits on with the prefill budget; decode steps get the decode budget.
     assert!(decode_reply_deadline() <= prefill_reply_deadline());
 }
+
+// ---- mask evidence per link: never a frame an older worker dies on ----------
+
+/// What a fixture last stage received: each frame's kind and whether it
+/// carried a mask, and whether it exited.
+#[derive(Default)]
+struct TailLog {
+    frames: std::sync::Mutex<Vec<(FrameKind, bool)>>,
+    died: std::sync::atomic::AtomicBool,
+}
+
+impl TailLog {
+    fn saw(&self, kind: FrameKind, masked: bool) {
+        self.frames.lock().unwrap().push((kind, masked));
+    }
+    fn frames(&self) -> Vec<(FrameKind, bool)> {
+        self.frames.lock().unwrap().clone()
+    }
+    fn died(&self) -> bool {
+        self.died.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn masked(&self, kind: FrameKind) -> usize {
+        self.frames()
+            .iter()
+            .filter(|&&(k, m)| k == kind && m)
+            .count()
+    }
+}
+
+/// The lowest token a mask row allows (the fixture's "sampler").
+fn first_allowed(words: &[u32]) -> i64 {
+    for (w, &bits) in words.iter().enumerate() {
+        if bits != 0 {
+            return (w * 32 + bits.trailing_zeros() as usize) as i64;
+        }
+    }
+    -1
+}
+
+/// A last stage on the wire. `old`: the base build's Pipeline worker, which
+/// reads frames with the original decoders, skips a `Forward` it can't
+/// decode, and exits (closing its link) on a batched or stream frame it
+/// can't decode. Otherwise a stage on this build that answers masked steps
+/// with the lowest allowed token.
+fn fixture_tail(
+    rt: &tokio::runtime::Runtime,
+    srv: Arc<TokioMutex<ActivationServer>>,
+    old: bool,
+) -> Arc<TailLog> {
+    use crate::dist::*;
+    let log = Arc::new(TailLog::default());
+    let l = log.clone();
+    let handle = rt.handle().clone();
+    std::thread::spawn(move || {
+        handle.block_on(async move {
+            let die = |l: &TailLog| l.died.store(true, std::sync::atomic::Ordering::SeqCst);
+            loop {
+                let Ok(Some(kind)) = recv_kind_server(&srv).await else {
+                    return;
+                };
+                let sample = matches!(
+                    kind,
+                    FrameKind::Forward
+                        | FrameKind::ForwardBatchPrefill
+                        | FrameKind::StreamOpen
+                        | FrameKind::StreamDecode
+                );
+                match kind {
+                    FrameKind::Reset => l.saw(kind, false),
+                    FrameKind::Forward | FrameKind::ForwardNoSample if old => {
+                        match recv_forward_body_server(&srv).await {
+                            Ok(_) => {
+                                l.saw(kind, false);
+                                let t = if sample { i64::from(b'a') } else { -1 };
+                                send_token_upstream(&srv, t).await.unwrap();
+                            }
+                            // Logged and skipped: the worker keeps running.
+                            Err(_) => l.saw(kind, true),
+                        }
+                    }
+                    FrameKind::ForwardBatchPrefill | FrameKind::ForwardBatchPrefillNoSample
+                        if old =>
+                    {
+                        match recv_forward_batch_body_server(&srv).await {
+                            Ok(_) => {
+                                l.saw(kind, false);
+                                let t = if sample { i64::from(b'a') } else { -1 };
+                                send_token_upstream(&srv, t).await.unwrap();
+                            }
+                            Err(_) => {
+                                l.saw(kind, true);
+                                die(&l);
+                                srv.lock().await.close().await;
+                                return;
+                            }
+                        }
+                    }
+                    FrameKind::StreamOpen | FrameKind::StreamFeed | FrameKind::StreamDecode
+                        if old =>
+                    {
+                        let ok = match kind {
+                            FrameKind::StreamOpen => recv_stream_open_body_server(&srv)
+                                .await
+                                .map(|(b, s, ..)| (b, vec![s])),
+                            FrameKind::StreamFeed => recv_stream_feed_body_server(&srv)
+                                .await
+                                .map(|(b, s, ..)| (b, vec![s])),
+                            _ => recv_stream_decode_body_server(&srv)
+                                .await
+                                .map(|(b, rows, _)| (b, rows.iter().map(|r| r.0).collect())),
+                        };
+                        match ok {
+                            Ok((bid, slots)) => {
+                                l.saw(kind, false);
+                                let toks: Vec<(u32, i64)> =
+                                    slots.iter().map(|&s| (s, i64::from(b'a'))).collect();
+                                send_stream_tokens_upstream(&srv, bid, &toks).await.unwrap();
+                            }
+                            Err(_) => {
+                                l.saw(kind, true);
+                                die(&l);
+                                srv.lock().await.close().await;
+                                return;
+                            }
+                        }
+                    }
+                    FrameKind::Forward
+                    | FrameKind::ForwardNoSample
+                    | FrameKind::ForwardBatchPrefill
+                    | FrameKind::ForwardBatchPrefillNoSample => {
+                        let (step, rows) =
+                            if matches!(kind, FrameKind::Forward | FrameKind::ForwardNoSample) {
+                                let (_, _, _, step) =
+                                    recv_forward_step_body_server(&srv).await.unwrap();
+                                (step, 1)
+                            } else {
+                                let (_, n, _, step) =
+                                    recv_forward_batch_step_body_server(&srv).await.unwrap();
+                                (step, n as usize)
+                            };
+                        let (_, _, cols) = step.split(4).unwrap();
+                        l.saw(kind, cols.is_some());
+                        match cols {
+                            Some(c) => {
+                                let t = c.words(rows - 1).map_or(-1, first_allowed);
+                                send_token_ack_upstream(&srv, t, c.tag(rows - 1), MASK_ACK)
+                                    .await
+                                    .unwrap();
+                            }
+                            None => {
+                                let t = if sample { i64::from(b'a') } else { -1 };
+                                send_token_upstream(&srv, t).await.unwrap();
+                            }
+                        }
+                    }
+                    FrameKind::StreamOpen | FrameKind::StreamFeed | FrameKind::StreamDecode => {
+                        let (bid, slots, step, last) = match kind {
+                            FrameKind::StreamOpen => {
+                                let (b, s, _, _, st) =
+                                    recv_stream_open_step_body_server(&srv).await.unwrap();
+                                (b, vec![s], st, true)
+                            }
+                            FrameKind::StreamFeed => {
+                                let (b, s, _, f, _, st) =
+                                    recv_stream_feed_step_body_server(&srv).await.unwrap();
+                                (b, vec![s], st, f & STREAM_FEED_FINAL != 0)
+                            }
+                            _ => {
+                                let (b, rows, st) =
+                                    recv_stream_decode_step_body_server(&srv).await.unwrap();
+                                (b, rows.iter().map(|r| r.0).collect(), st, true)
+                            }
+                        };
+                        let (_, shape, cols) = step.split(4).unwrap();
+                        l.saw(kind, cols.is_some());
+                        if !last {
+                            continue;
+                        }
+                        let rows = shape[1] as usize;
+                        let toks: Vec<(u32, i64)> = slots
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &s)| {
+                                // A prompt frame samples its last row.
+                                let r = if kind == FrameKind::StreamDecode {
+                                    i
+                                } else {
+                                    rows - 1
+                                };
+                                let t = match cols.as_ref().filter(|c| c.tag(r) != 0) {
+                                    Some(c) => c.words(r).map_or(-1, first_allowed),
+                                    None => i64::from(b'a'),
+                                };
+                                (s, t)
+                            })
+                            .collect();
+                        match cols {
+                            Some(_) => send_stream_tokens_ack_upstream(&srv, bid, MASK_ACK, &toks)
+                                .await
+                                .unwrap(),
+                            None => send_stream_tokens_upstream(&srv, bid, &toks).await.unwrap(),
+                        }
+                    }
+                    FrameKind::StreamClose => {
+                        recv_stream_close_body_server(&srv).await.unwrap();
+                        l.saw(kind, false);
+                    }
+                    _ => return,
+                }
+            }
+        })
+    });
+    log
+}
+
+/// Steps `head` on its own thread until `done` holds for `log` (or 10 s).
+/// The head may stay blocked waiting on a reply an older stage never sends;
+/// that thread is left behind.
+fn step_until(mut head: PipelineEngine<JsonStub>, log: &TailLog, done: impl Fn(&TailLog) -> bool) {
+    std::thread::spawn(move || loop {
+        if head.step().is_err() {
+            return;
+        }
+    });
+    let t0 = Instant::now();
+    while !done(log) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", log.frames());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn long_json_task(id: &str, max_tokens: u32) -> GenerationTask {
+    let mut t = json_task(id, max_tokens);
+    t.prompt = "a prompt of a few tokens".into();
+    t
+}
+
+#[test]
+fn an_old_worker_never_gets_a_masked_batch_frame_on_a_fresh_link() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), true);
+    let mut head = head_engine(&rt, JsonStub::batched(), l.remove(0).1, 2, 0);
+    head.submit(long_json_task("j", 8)).unwrap();
+    step_until(head, &log, |l| l.masked(FrameKind::Forward) > 0 || l.died());
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!log.died(), "the old worker exited: {:?}", log.frames());
+    let frames = log.frames();
+    assert!(
+        frames.contains(&(FrameKind::ForwardBatchPrefillNoSample, false)),
+        "{frames:?}"
+    );
+    assert!(
+        !frames.iter().any(|&(k, m)| m && k != FrameKind::Forward),
+        "{frames:?}"
+    );
+}
+
+#[test]
+fn an_old_worker_never_gets_a_masked_stream_frame_on_a_fresh_link() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), true);
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 2);
+    head.submit(json_task("j", 8)).unwrap();
+    step_until(head, &log, |l| l.masked(FrameKind::Forward) > 0 || l.died());
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!log.died(), "the old worker exited: {:?}", log.frames());
+    let frames = log.frames();
+    assert_eq!(frames, vec![(FrameKind::Forward, true)], "only the probe");
+}
+
+#[test]
+fn a_new_link_gets_evidence_from_the_first_json_request_then_masks_batches() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), false);
+    let mut head = head_engine(&rt, JsonStub::batched(), l.remove(0).1, 2, 0);
+    assert!(!head.mask_evidence);
+    head.submit(long_json_task("j1", 6)).unwrap();
+    let out = drive(&mut head, &["j1"]);
+    assert_eq!(final_chunk(&out["j1"]).error, None);
+    assert!(head.mask_evidence);
+    assert_eq!(log.masked(FrameKind::ForwardBatchPrefill), 0);
+    head.submit(long_json_task("j2", 6)).unwrap();
+    let out = drive(&mut head, &["j2"]);
+    assert_eq!(final_chunk(&out["j2"]).error, None);
+    assert_eq!(
+        log.masked(FrameKind::ForwardBatchPrefill),
+        1,
+        "{:?}",
+        log.frames()
+    );
+    let _ = &rt;
+}
+
+#[test]
+fn a_new_stream_link_is_probed_once_and_the_evidence_resets_on_redial() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), false);
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 2);
+    head.submit(json_task("j1", 6)).unwrap();
+    let out = drive(&mut head, &["j1"]);
+    assert_eq!(final_chunk(&out["j1"]).error, None);
+    assert!(head.mask_evidence);
+    let frames = log.frames();
+    assert_eq!(
+        frames[0],
+        (FrameKind::Forward, true),
+        "probe first: {frames:?}"
+    );
+    assert_eq!(log.masked(FrameKind::StreamOpen), 1, "{frames:?}");
+    head.submit(json_task("j2", 6)).unwrap();
+    drive(&mut head, &["j2"]);
+    assert_eq!(log.masked(FrameKind::Forward), 1, "no second probe");
+    // The link keeper re-dialed: the new connection must be probed again.
+    head.link_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    head.step().unwrap();
+    assert!(!head.mask_evidence);
+    head.submit(json_task("j3", 6)).unwrap();
+    let out = drive(&mut head, &["j3"]);
+    assert_eq!(final_chunk(&out["j3"]).error, None);
+    assert_eq!(log.masked(FrameKind::Forward), 2, "{:?}", log.frames());
+    let _ = &rt;
+}
+
+#[test]
+fn draining_a_masked_frame_without_ack_sets_the_latch() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let mut head = head_engine(&rt, JsonStub::new(), down, 2, 2);
+    // A frame is in flight: keep the idle link keeper off the socket.
+    head.link_busy.store(1, std::sync::atomic::Ordering::SeqCst);
+    head.stream_inflight[0].push_back(StreamInFlight {
+        batch_id: 7,
+        slots: vec![0],
+        open: false,
+        sent_at: Instant::now(),
+        masked: true,
+    });
+    rt.block_on(send_stream_tokens_upstream(&srv, 7, &[(0, 1)]))
+        .unwrap();
+    assert!(head.drain_stream_link());
+    assert!(head.stage_masks.latch.is_set());
+}
+
+/// The head and tail pieces SparseMoE and OvMoe run on a masked step
+/// (their runners need model files, so the exchange is driven directly):
+/// rank 0's masked `Forward` and acknowledged wait, the last stage's
+/// masked sample and answer.
+#[test]
+fn the_masked_single_row_exchange_round_trips() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let tail = rt.spawn(async move {
+        crate::dist::recv_kind_server(&srv).await.unwrap();
+        let (_, cfg, push, step) = crate::dist::recv_forward_step_body_server(&srv)
+            .await
+            .unwrap();
+        let (_, _, cols) = step.split(4).unwrap();
+        let cols = cols.expect("masked");
+        let mut history = Vec::new();
+        let mut rng = 1;
+        let (t, tag) = masked_tail_reply(
+            &preferences(VOCAB),
+            &mut history,
+            &cfg,
+            &mut rng,
+            &cols,
+            0,
+            push,
+        );
+        crate::dist::send_token_ack_upstream(&srv, t, tag, MASK_ACK)
+            .await
+            .unwrap();
+        history
+    });
+    let mut masks = StageMasks::default();
+    let mut gm = test_env::mask(WEATHER);
+    let slot = GrammarSlot::from_factory(test_env::factory());
+    let (cols, tag) = stage_mask_cols(&mut masks, &slot, &mut gm, 1).unwrap();
+    let t = rt
+        .block_on(masked_forward_exchange(
+            &down,
+            &masks,
+            3,
+            &crate::sampling::SamplingConfig::default(),
+            &[0.5; 4],
+            [1, 1, 4],
+            &cols,
+            tag,
+            Duration::from_secs(5),
+        ))
+        .unwrap();
+    // The stub favours a control byte, EOS and `}`; the mask allows `{` only.
+    assert_eq!(t, i64::from(b'{'));
+    assert_eq!(rt.block_on(tail).unwrap(), vec![i64::from(b'{')]);
+    assert!(!masks.latch.is_set());
+}
+
+#[test]
+fn a_middle_takes_the_prefill_budget_only_for_the_first_sampled_step() {
+    let mut sampled = false;
+    let (rank, total) = (1, 3);
+    let pre = crate::dist::mid_mask_budget(prefill_reply_deadline(), rank, total);
+    let dec = crate::dist::mid_mask_budget(decode_reply_deadline(), rank, total);
+    // Prefill sync steps (not sampled) keep the prefill budget.
+    assert_eq!(mid_forward_budget(&mut sampled, false, rank, total), pre);
+    assert_eq!(mid_forward_budget(&mut sampled, true, rank, total), pre);
+    assert_eq!(mid_forward_budget(&mut sampled, true, rank, total), dec);
+    assert!(dec < decode_reply_deadline() && pre < prefill_reply_deadline());
+    // A Reset clears it.
+    sampled = false;
+    assert_eq!(mid_forward_budget(&mut sampled, true, rank, total), pre);
+}
