@@ -614,6 +614,27 @@ fn stateful_finish(
     }
 }
 
+/// The final chunk for a stateful `generate` that failed. With a client's
+/// schema the failure is most likely that schema (the grammar is compiled
+/// inside `generate`, and one request is all a stateful pipeline runs), so
+/// it is refused as an invalid request with the backend's cleaned message.
+/// Resource exhaustion, the server's own `json_object` schema and requests
+/// without a schema keep the plain failure.
+fn generate_failure_chunk(task: &GenerationTask, err: OvError, resource: bool) -> Chunk {
+    let client_schema = grammar_json_schema(task).is_some_and(|s| s != JSON_OBJECT_PROBE);
+    if client_schema && !resource {
+        Chunk::rejected(
+            task.task_id.clone(),
+            format!(
+                "response_format json_schema: {}",
+                client_message(err, "generate failed with a schema")
+            ),
+        )
+    } else {
+        Chunk::error(task.task_id.clone(), err.to_string())
+    }
+}
+
 /// Log the probe's outcome and turn it into the engine's
 /// `structured_unavailable` value.
 fn record_probe(verdict: Option<String>) -> Option<String> {
@@ -855,14 +876,15 @@ impl Engine for OvGenaiEngine {
             Ok(r) => r,
             Err(err) => {
                 warn!(task = %task.task_id, error = %err, "generate failed");
-                // Chunk::error, not an empty final_marker: the latter reads as
-                // a SUCCESSFUL empty completion, so the client got a 200 with
-                // no content and cascadia_tasks_failed_total never moved —
-                // the failure was booked as finish_reason="stop" with zero
-                // tokens. Same class as the poisoned-head bug guarded in
+                // An error chunk, not an empty final_marker: the latter reads
+                // as a SUCCESSFUL empty completion, so the client got a 200
+                // with no content and cascadia_tasks_failed_total never
+                // moved — the failure was booked as finish_reason="stop" with
+                // zero tokens. Same class as the poisoned-head bug guarded in
                 // qwen36.rs. This is the default engine, so it was the common
                 // failure that the failure metric could not see.
-                let final_chunk = Chunk::error(task.task_id.clone(), err.to_string());
+                let resource = cascadia_ov_genai_shim::last_error_resource_exhausted();
+                let final_chunk = generate_failure_chunk(&task, err, resource);
                 return Ok(vec![(task.task_id, final_chunk)]);
             }
         };
@@ -2061,6 +2083,33 @@ mod tests {
     }
 
     const SCHEMA_A: &str = r#"{"type":"object","properties":{"a":{"type":"integer"}}}"#;
+
+    #[test]
+    fn stateful_generate_failure_with_a_schema_is_a_client_error() {
+        let err = || {
+            OvError::Native(
+                "Exception from src/core.cpp:1:\n[10:00:00] src/grammar.cc:42: bad schema\n".into(),
+            )
+        };
+        let c = generate_failure_chunk(&schema_task("s", SCHEMA_A), err(), false);
+        assert!(c.invalid_request);
+        assert!(c.is_final);
+        assert_eq!(
+            c.error.as_deref(),
+            Some("response_format json_schema: bad schema")
+        );
+
+        // Not the client's schema, or not the schema's fault: unchanged.
+        for (t, resource) in [
+            (task("p", 8), false),
+            (schema_task("j", JSON_OBJECT_PROBE), false),
+            (schema_task("r", SCHEMA_A), true),
+        ] {
+            let c = generate_failure_chunk(&t, err(), resource);
+            assert!(!c.invalid_request, "{}", t.task_id);
+            assert_eq!(c.error, Some(err().to_string()), "{}", t.task_id);
+        }
+    }
     const SCHEMA_B: &str = r#"{"type":"object","properties":{"b":{"type":"string"}}}"#;
 
     #[test]
