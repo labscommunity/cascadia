@@ -619,7 +619,10 @@ impl<'a> Walk<'a, '_> {
     /// `VisitSchema`'s dispatch: `$ref`, then `const`, `enum`,
     /// `anyOf`/`oneOf`, `allOf`, `type`, then object or array keywords.
     /// Keywords the converter would reject are walked anyway when they hold
-    /// schemas (which may over-count, never under-count).
+    /// schemas. Such an over-count is not harmless: with the converter's
+    /// order-dependent ref cache, a `$ref` entered too early is marked
+    /// entered at a shallow level and hides a deeper real first entry. So
+    /// the walk must not enter what the converter never visits.
     fn children(
         &mut self,
         node: &'a Node,
@@ -708,18 +711,34 @@ impl<'a> Walk<'a, '_> {
         Ok(())
     }
 
-    /// The subschemas `VisitObject` visits: with a non-empty
-    /// `patternProperties` its values (else a `propertyNames`, seen as a
-    /// string schema); otherwise the `properties` values in order, then the
-    /// schema for other properties.
+    /// The subschemas `VisitObject` visits: none when `maxProperties` is
+    /// 0 (the object holds no property); with a non-empty
+    /// `patternProperties` its values (else a `propertyNames`, which the
+    /// converter visits with `type: "string"` added to its other keys);
+    /// otherwise the `properties` values in order, then the schema for
+    /// other properties.
     fn object_children(&self, node: &'a Node, out: &mut Vec<Child<'a>>) {
+        if let Some(Node::Scalar(max)) = node.get("maxProperties") {
+            if matches!(max.get(), "0" | "-0") {
+                return;
+            }
+        }
         match (node.get("patternProperties"), node.get("propertyNames")) {
             (Some(Node::Obj(patterns)), _) if !patterns.is_empty() => {
                 out.extend(patterns.iter().map(|(_, s)| (s, TypeView::Own, true)));
                 return;
             }
             (_, Some(names @ Node::Obj(_))) => {
-                out.push((names, TypeView::Is("string"), true));
+                // `VisitSchema` dispatches on these before `type`.
+                let dispatched = ["$ref", "const", "enum", "anyOf", "oneOf", "allOf"]
+                    .iter()
+                    .any(|k| names.get(k).is_some());
+                let ty = if dispatched {
+                    TypeView::Own
+                } else {
+                    TypeView::Is("string")
+                };
+                out.push((names, ty, true));
                 return;
             }
             _ => {}
@@ -813,8 +832,9 @@ const SCHEMA_TYPES: [&str; 7] = [
 /// with no empty key and no `~` or `%`. Where it is, it is read here the way
 /// both RFC 6901 and the converter (which skips empty keys, does not
 /// unescape, and walks into objects only) read it, and must reach the same
-/// schema both ways. Any other local ref is an error, so a ref cannot point
-/// somewhere other than where it seems to.
+/// value both ways, a JSON object or boolean (a schema). Any other local
+/// ref is an error, so a ref cannot point somewhere other than where it
+/// seems to, nor at a value that is not a schema.
 fn local_ref_target<'a>(root: &'a Node, r: &str) -> Result<(Option<&'a Node>, usize), String> {
     let Some(pointer) = r.strip_prefix('#') else {
         return Ok((None, 1));
@@ -837,8 +857,17 @@ fn local_ref_target<'a>(root: &'a Node, r: &str) -> Result<(Option<&'a Node>, us
     let rfc = rfc6901_target(root, pointer, &mut scanned);
     let converter = converter_target(root, pointer, &mut scanned);
     match (rfc, converter) {
-        (Some(a), Some(b)) if std::ptr::eq(a, b) => Ok((Some(a), scanned)),
+        (Some(a), Some(b)) if std::ptr::eq(a, b) && is_schema_value(a) => Ok((Some(a), scanned)),
         _ => Err(unsupported()),
+    }
+}
+
+/// True for a JSON object or boolean, the values that can be a schema.
+fn is_schema_value(node: &Node) -> bool {
+    match node {
+        Node::Obj(_) => true,
+        Node::Scalar(v) => matches!(v.get(), "true" | "false"),
+        Node::Arr(_) => false,
     }
 }
 
@@ -2390,6 +2419,82 @@ mod tests {
         for r in ["#", "https://example.com/s.json", "s.json#/$defs/x~0y"] {
             let schema = json!({"type": "object", "properties": {"a": {"$ref": r}}});
             assert!(parse_schema(schema).is_ok(), "{r}");
+        }
+    }
+
+    #[test]
+    fn refs_to_values_that_are_not_schemas_are_rejected() {
+        for r in ["#/required", "#/properties/a/type"] {
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"$ref": r}},
+                "required": ["a"]
+            });
+            assert_eq!(parse_schema(schema), unsupported_ref(r), "{r}");
+        }
+        // A boolean schema is a schema.
+        let schema = json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/T"}},
+            "$defs": {"T": true}
+        });
+        assert!(parse_schema(schema).is_ok());
+    }
+
+    /// `$defs` entries `{p}0` .. `{p}{n}`: each an array whose items refer
+    /// to the next, the last a string. Each link is two converter levels.
+    fn array_ref_chain(p: &str, n: usize) -> serde_json::Map<String, Value> {
+        let mut defs = serde_json::Map::new();
+        for i in 0..n {
+            defs.insert(
+                format!("{p}{i}"),
+                json!({"type": "array", "items": {"$ref": format!("#/$defs/{p}{}", i + 1)}}),
+            );
+        }
+        defs.insert(format!("{p}{n}"), json!({"type": "string"}));
+        defs
+    }
+
+    #[test]
+    fn property_names_are_walked_as_the_converter_visits_them() {
+        // The converter adds `type: "string"` to `propertyNames` and keeps
+        // its other keys, so a `$ref`, `anyOf` or `allOf` there is followed.
+        let defs = array_ref_chain("D", 40);
+        for names in [
+            json!({"$ref": "#/$defs/D0"}),
+            json!({"anyOf": [{"$ref": "#/$defs/D0"}]}),
+            json!({"allOf": [{"$ref": "#/$defs/D0"}]}),
+        ] {
+            let schema = json!({"type": "object", "propertyNames": names, "$defs": defs});
+            assert_eq!(parse_schema(schema), Err(REF_DEPTH_ERR.into()), "{names}");
+        }
+        let schema = json!({"type": "object", "propertyNames": {"pattern": "^[a-z]+$"}});
+        assert!(parse_schema(schema).is_ok());
+    }
+
+    #[test]
+    fn an_object_with_max_properties_zero_enters_no_refs() {
+        // The converter visits nothing in an object that holds no property,
+        // so `x` must not enter R0 at a shallow level before `y` reaches it
+        // 21 levels down.
+        let defs = array_ref_chain("R", 25);
+        let mut y = json!({"$ref": "#/$defs/R0"});
+        for _ in 0..20 {
+            y = json!({"type": "array", "items": y});
+        }
+        let control = json!({"type": "object", "properties": {"y": y}, "$defs": defs});
+        assert_eq!(parse_schema(control), Err(REF_DEPTH_ERR.into()));
+        for x in [
+            json!({"type": "object", "maxProperties": 0, "properties": {"p": {"$ref": "#/$defs/R0"}}}),
+            json!({"type": "object", "maxProperties": 0, "additionalProperties": {"$ref": "#/$defs/R0"}}),
+            json!({"type": "object", "maxProperties": 0, "patternProperties": {"^a": {"$ref": "#/$defs/R0"}}}),
+        ] {
+            let schema = json!({
+                "type": "object",
+                "properties": {"x": x, "y": y},
+                "$defs": defs
+            });
+            assert_eq!(parse_schema(schema), Err(REF_DEPTH_ERR.into()), "{x}");
         }
     }
 
