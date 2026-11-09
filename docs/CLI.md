@@ -625,6 +625,7 @@ Errors (`{"error": "<message>"}`):
 | 400 | `invalid response_format: <reason>` | Malformed field (unknown `type`, non-object schema, `false` schema, a repeated key) or a schema over the limits above. Every engine. |
 | 400 | `response_format <type> is not supported by the <engine> engine; …` | The engine has no structured output (table above). |
 | 400 | `invalid configuration: response_format json_schema: <reason>` | `ov-genai`: the backend could not build a constraint from the schema. |
+| 400 | `response_format json_schema: <reason>` | `ov-genai` without `--cb`: generation failed for a request with a schema; `<reason>` is the backend's message. |
 | 400 | `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai`: the startup check found structured output does not work for the loaded model or runtime. |
 | 400 | `llama-server rejected the request: <reason>` | `sycl-llama`: llama-server answered 4xx (other than 408/429), for example a schema its grammar converter rejects; `<reason>` is llama-server's `error.message`, or the start of its reply. On a streamed request the SSE stream has already started, so this message arrives as the stream's error event instead. |
 
