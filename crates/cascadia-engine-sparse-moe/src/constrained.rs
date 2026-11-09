@@ -14,8 +14,43 @@ use cascadia_types::GenerationTask;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
-/// Builds the factory; run at most once per slot.
-type BuildFactory = Box<dyn FnOnce() -> EngineResult<GrammarFactory> + Send>;
+/// Builds the factory. Run again only after a [`BuildFailure::transient`]
+/// failure.
+type BuildFactory = Box<dyn FnMut() -> Result<GrammarFactory, BuildFailure> + Send>;
+
+/// Why a factory build failed, and whether a later build may succeed.
+struct BuildFailure {
+    reason: String,
+    /// The tokenizer file could not be read (an I/O error): the next json
+    /// request at least [`FACTORY_RETRY`] later builds again. Otherwise the
+    /// failure comes from the tokenizer's content and is kept.
+    transient: bool,
+}
+
+impl BuildFailure {
+    fn transient(reason: String) -> Self {
+        Self {
+            reason,
+            transient: true,
+        }
+    }
+}
+
+impl From<EngineError> for BuildFailure {
+    fn from(e: EngineError) -> Self {
+        let reason = match e {
+            EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
+            other => other.to_string(),
+        };
+        Self {
+            reason,
+            transient: false,
+        }
+    }
+}
+
+/// The least time between two builds after a transient failure.
+const FACTORY_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The engine's grammar factory, built on the first json task (building it
 /// costs about half a second and over 100 MiB for a large vocabulary, which
@@ -25,33 +60,73 @@ type BuildFactory = Box<dyn FnOnce() -> EngineResult<GrammarFactory> + Send>;
 pub(crate) struct GrammarSlot(Option<std::sync::Arc<LazyFactory>>);
 
 struct LazyFactory {
-    build: std::sync::Mutex<Option<BuildFactory>>,
+    /// The build, until it succeeds or fails for good; and the last
+    /// transient failure with its time.
+    pending: std::sync::Mutex<Pending>,
     built: std::sync::OnceLock<Result<GrammarFactory, String>>,
+}
+
+struct Pending {
+    build: Option<BuildFactory>,
+    retry: Option<(std::time::Instant, String)>,
 }
 
 /// Why a slot without a build has no factory.
 const NO_TOKENIZER: &str = "the model has no tokenizer on this stage";
 
+/// The message carried by a caught panic.
+fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "no message".to_string())
+}
+
 impl GrammarSlot {
-    /// A slot whose factory `build` makes on first use. A failure is
-    /// logged then, once, and kept: json tasks get a 400 naming it.
+    /// A slot whose factory `build` makes on first use. A failure (or a
+    /// panic) is logged then, once, and kept: json tasks get a 400 naming
+    /// it.
     pub(crate) fn lazy(
         build: impl FnOnce() -> EngineResult<GrammarFactory> + Send + 'static,
     ) -> Self {
+        let mut build = Some(build);
+        Self::retrying(move || match build.take() {
+            Some(b) => b().map_err(BuildFailure::from),
+            None => Err(BuildFailure::from(EngineError::Backend(
+                "the grammar factory build ran twice".into(),
+            ))),
+        })
+    }
+
+    fn retrying(
+        build: impl FnMut() -> Result<GrammarFactory, BuildFailure> + Send + 'static,
+    ) -> Self {
         Self(Some(std::sync::Arc::new(LazyFactory {
-            build: std::sync::Mutex::new(Some(Box::new(build))),
+            pending: std::sync::Mutex::new(Pending {
+                build: Some(Box::new(build)),
+                retry: None,
+            }),
             built: std::sync::OnceLock::new(),
         })))
     }
 
     /// The factory for the tokenizer at `path` and every EOS id the engine
     /// stops on; the file is read again on first use, so the engine keeps
-    /// no second copy of the tokenizer meanwhile.
+    /// no second copy of the tokenizer meanwhile. A read error is retried
+    /// on a later json request (see [`FACTORY_RETRY`]); a tokenizer that
+    /// can't be parsed or has no usable EOS is not.
     pub(crate) fn from_tokenizer_file(path: std::path::PathBuf, eos: Vec<u32>) -> Self {
-        Self::lazy(move || {
-            let tok = Tokenizer::from_file(&path)
-                .map_err(|e| EngineError::Backend(format!("load {}: {e}", path.display())))?;
-            GrammarFactory::from_tokenizer(&tok, &eos)
+        Self::retrying(move || {
+            let bytes = std::fs::read(&path)
+                .map_err(|e| BuildFailure::transient(format!("read {}: {e}", path.display())))?;
+            let tok = Tokenizer::from_bytes(&bytes).map_err(|e| {
+                BuildFailure::from(EngineError::Backend(format!(
+                    "load {}: {e}",
+                    path.display()
+                )))
+            })?;
+            Ok(GrammarFactory::from_tokenizer(&tok, &eos)?)
         })
     }
 
@@ -68,36 +143,73 @@ impl GrammarSlot {
     }
 
     /// The factory, built now if this is its first use.
-    fn factory(&self) -> Result<&GrammarFactory, &str> {
+    fn factory(&self) -> Result<&GrammarFactory, String> {
+        self.factory_at(std::time::Instant::now())
+    }
+
+    /// [`Self::factory`] at `now`.
+    fn factory_at(&self, now: std::time::Instant) -> Result<&GrammarFactory, String> {
         let Some(lazy) = self.0.as_ref() else {
-            return Err(NO_TOKENIZER);
+            return Err(NO_TOKENIZER.to_string());
         };
-        let built = lazy.built.get_or_init(|| {
-            let build = lazy.build.lock().unwrap_or_else(|e| e.into_inner()).take();
-            let Some(build) = build else {
-                return Err("the grammar factory build did not finish".into());
-            };
-            let started = std::time::Instant::now();
-            match build() {
-                Ok(f) => {
-                    info!(
-                        mask_width = f.mask_width(),
-                        build_ms = started.elapsed().as_millis() as u64,
-                        "structured output: grammar factory built"
-                    );
-                    Ok(f)
-                }
-                Err(e) => {
-                    let reason = match e {
-                        EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
-                        other => other.to_string(),
-                    };
-                    warn!(error = %reason, "structured output unavailable for this model");
-                    Err(reason)
-                }
+        if let Some(done) = lazy.built.get() {
+            return done.as_ref().map_err(Clone::clone);
+        }
+        let mut pending = lazy.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // Another caller may have finished the build while this one waited.
+        if let Some(done) = lazy.built.get() {
+            return done.as_ref().map_err(Clone::clone);
+        }
+        if let Some((at, reason)) = &pending.retry {
+            if now.saturating_duration_since(*at) < FACTORY_RETRY {
+                return Err(reason.clone());
             }
-        });
-        built.as_ref().map_err(String::as_str)
+        }
+        let Some(build) = pending.build.as_mut() else {
+            return Err("the grammar factory build did not finish".into());
+        };
+        let started = std::time::Instant::now();
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+            Ok(Ok(f)) => {
+                info!(
+                    mask_width = f.mask_width(),
+                    build_ms = started.elapsed().as_millis() as u64,
+                    "structured output: grammar factory built"
+                );
+                Ok(f)
+            }
+            Ok(Err(BuildFailure {
+                reason,
+                transient: true,
+            })) => {
+                warn!(
+                    error = %reason,
+                    retry_after_s = FACTORY_RETRY.as_secs(),
+                    "structured output unavailable for now: reading the tokenizer failed"
+                );
+                pending.retry = Some((now, reason.clone()));
+                return Err(reason);
+            }
+            Ok(Err(BuildFailure { reason, .. })) => {
+                warn!(error = %reason, "structured output unavailable for this model");
+                Err(reason)
+            }
+            Err(payload) => {
+                let reason = format!(
+                    "the grammar factory build panicked: {}",
+                    panic_reason(payload)
+                );
+                warn!(error = %reason, "structured output unavailable for this model");
+                Err(reason)
+            }
+        };
+        *pending = Pending {
+            build: None,
+            retry: None,
+        };
+        let done = lazy.built.get_or_init(|| outcome);
+        drop(pending);
+        done.as_ref().map_err(Clone::clone)
     }
 
     /// Tokens a mask covers (the tokenizer vocab); `None` without a factory.
@@ -398,6 +510,108 @@ mod tests {
         tokenizer().save(&path, false).unwrap();
         assert!(slot.compile(&task_with(Some(WEATHER))).unwrap().is_some());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Warn-level events (their `message` and `error` fields) logged while
+    /// `f` runs on this thread.
+    fn warnings_during<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        #[derive(Clone, Default)]
+        struct Collect(Arc<Mutex<Vec<String>>>);
+        struct Fields(String);
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        impl tracing::Subscriber for Collect {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut v = Fields(String::new());
+                    event.record(&mut v);
+                    self.0.lock().unwrap().push(v.0);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let c = Collect::default();
+        let out = tracing::subscriber::with_default(c.clone(), f);
+        let logged = c.0.lock().unwrap().clone();
+        (out, logged)
+    }
+
+    fn unavailable(slot: &GrammarSlot) -> String {
+        match slot.compile(&task_with(Some(WEATHER))).err() {
+            Some(EngineError::InvalidConfig(m)) => m,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panicking_factory_build_is_logged_once_and_kept() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = runs.clone();
+        let slot = GrammarSlot::lazy(move || {
+            r.fetch_add(1, SeqCst);
+            panic!("vocab table out of range")
+        });
+        let ((first, second), logged) =
+            warnings_during(|| (unavailable(&slot), unavailable(&slot)));
+        assert!(
+            first.contains("panicked: vocab table out of range"),
+            "{first}"
+        );
+        assert_eq!(first, second);
+        assert_eq!(runs.load(SeqCst), 1);
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains("vocab table out of range"), "{logged:?}");
+    }
+
+    #[test]
+    fn a_tokenizer_read_error_is_retried_at_most_once_a_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        let slot = GrammarSlot::from_tokenizer_file(path.clone(), vec![EOS]);
+        let (first, logged) = warnings_during(|| unavailable(&slot));
+        assert!(first.contains("tokenizer.json"), "{first}");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        // The file turns up; within the minute the failure stands.
+        tokenizer().save(&path, false).unwrap();
+        let (again, logged) = warnings_during(|| unavailable(&slot));
+        assert_eq!(again, first);
+        assert!(logged.is_empty(), "{logged:?}");
+        // A minute later the next json request reads it again.
+        let later = std::time::Instant::now() + FACTORY_RETRY;
+        assert_eq!(
+            slot.factory_at(later).map(GrammarFactory::mask_width),
+            Ok(VOCAB)
+        );
+        assert!(slot.compile(&task_with(Some(WEATHER))).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_tokenizer_whose_content_fails_is_kept_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, b"{ not a tokenizer").unwrap();
+        let slot = GrammarSlot::from_tokenizer_file(path.clone(), vec![EOS]);
+        let (first, logged) = warnings_during(|| unavailable(&slot));
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        tokenizer().save(&path, false).unwrap();
+        let later = std::time::Instant::now() + FACTORY_RETRY;
+        let kept = slot.factory_at(later).err().expect("still failed");
+        assert!(first.ends_with(&kept), "{first} / {kept}");
     }
 
     #[test]
