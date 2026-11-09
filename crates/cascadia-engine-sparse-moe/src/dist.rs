@@ -280,12 +280,12 @@ pub async fn recv_kind_client_noting(
     loop {
         match recv_kind_client_raw(cli).await? {
             Some(FrameKind::TokenAck) => {
-                let (_, _, status) = recv_token_ack_body_client(cli).await?;
-                note_stale_ack(latch, status);
+                let (stale_token, _, status) = recv_token_ack_body_client(cli).await?;
+                note_stale_ack(latch, status, &[stale_token]);
             }
             Some(FrameKind::StreamTokensAck) => {
-                let (_, status, _) = recv_stream_tokens_ack_body_client(cli).await?;
-                note_stale_ack(latch, status);
+                let (_, status, stale_rows) = recv_stream_tokens_ack_body_client(cli).await?;
+                note_stale_ack(latch, status, &rows_tokens(&stale_rows));
             }
             other => return Ok(other),
         }
@@ -690,16 +690,16 @@ pub async fn recv_token_reply_with(
                         .map_err(|e| format!("recv_token: {e}"))
                 }
                 Ok(Some(FrameKind::TokenAck)) => {
-                    let (_, _, status) = recv_token_ack_body_client(down)
+                    let (stale_token, _, status) = recv_token_ack_body_client(down)
                         .await
                         .map_err(|e| format!("recv_token_ack: {e}"))?;
-                    note_stale_ack(latch, status);
+                    note_stale_ack(latch, status, &[stale_token]);
                 }
                 Ok(Some(FrameKind::StreamTokensAck)) => {
-                    let (_, status, _) = recv_stream_tokens_ack_body_client(down)
+                    let (_, status, stale_rows) = recv_stream_tokens_ack_body_client(down)
                         .await
                         .map_err(|e| format!("recv_stream_tokens_ack: {e}"))?;
-                    note_stale_ack(latch, status);
+                    note_stale_ack(latch, status, &rows_tokens(&stale_rows));
                 }
                 Ok(Some(other)) => return Err(format!("expected Token reply, got {other:?}")),
                 Ok(None) => return Err("downstream closed before Token".into()),
@@ -3130,8 +3130,18 @@ impl MaskLatch {
     }
 }
 
+/// The tokens of a stream reply's rows.
+pub(crate) fn rows_tokens(rows: &[(u32, i64)]) -> Vec<i64> {
+    rows.iter().map(|&(_, t)| t).collect()
+}
+
 /// A late acknowledged reply read and dropped: the stage behind it does mask.
-pub(crate) fn note_stale_ack(latch: Option<&MaskLatch>, status: u32) {
+/// `tokens` are the reply's tokens: one carrying the mask-miss token proves
+/// nothing about the chain, so it is no evidence.
+pub(crate) fn note_stale_ack(latch: Option<&MaskLatch>, status: u32, tokens: &[i64]) {
+    if tokens.contains(&i64::from(MASK_MISS_TOKEN)) {
+        return;
+    }
     if status == MASK_ACK {
         if let Some(l) = latch {
             l.clear();
@@ -3344,16 +3354,16 @@ async fn wait_token_ack(
                         .await
                         .map_err(|e| (format!("recv_token_ack: {e}"), true))?;
                     if got != tag {
-                        note_stale_ack(latch, status);
+                        note_stale_ack(latch, status, &[token]);
                         continue;
                     }
                     return Ok((token, status));
                 }
                 Ok(Some(FrameKind::StreamTokensAck)) => {
-                    let (_, status, _) = recv_stream_tokens_ack_body_client(down)
+                    let (_, status, stale_rows) = recv_stream_tokens_ack_body_client(down)
                         .await
                         .map_err(|e| (format!("recv_stream_tokens_ack: {e}"), true))?;
-                    note_stale_ack(latch, status);
+                    note_stale_ack(latch, status, &rows_tokens(&stale_rows));
                 }
                 Ok(Some(FrameKind::Token)) => {
                     recv_token_body_client(down)
@@ -3466,10 +3476,10 @@ pub async fn recv_token_relay(
                     .map_err(|e| format!("recv_token: {e}"))
             }
             Ok(Some(FrameKind::TokenAck)) => {
-                let (_, _, status) = recv_token_ack_body_client(down)
+                let (stale_token, _, status) = recv_token_ack_body_client(down)
                     .await
                     .map_err(|e| format!("recv_token_ack: {e}"))?;
-                note_stale_ack(late, status);
+                note_stale_ack(late, status, &[stale_token]);
             }
             Ok(Some(other)) => return Err(format!("mid rank expected Token, got {other:?}")),
             Ok(None) => return Err("downstream closed before Token".into()),
@@ -3515,7 +3525,7 @@ pub async fn recv_stream_reply(
                         .await
                         .map_err(|e| format!("recv_stream_tokens_ack: {e}"))?;
                     if batch_id != expect {
-                        note_stale_ack(latch, status);
+                        note_stale_ack(latch, status, &rows_tokens(&tokens));
                         continue;
                     }
                     return Ok(StreamReply {
@@ -3525,10 +3535,10 @@ pub async fn recv_stream_reply(
                     });
                 }
                 Ok(Some(FrameKind::TokenAck)) => {
-                    let (_, _, status) = recv_token_ack_body_client(down)
+                    let (stale_token, _, status) = recv_token_ack_body_client(down)
                         .await
                         .map_err(|e| format!("recv_token_ack: {e}"))?;
-                    note_stale_ack(latch, status);
+                    note_stale_ack(latch, status, &[stale_token]);
                 }
                 Ok(Some(other)) => {
                     return Err(format!("expected StreamTokens reply, got {other:?}"))
@@ -4670,5 +4680,49 @@ mod repeat_mask_tests {
             assert_eq!(tail_recv.resolve(got).words(0), Some(words));
         }
         assert_eq!(at_tail, vec![false, true, false], "b goes down full");
+    }
+
+    /// A late mask-miss reply is dropped like any stale reply but is no
+    /// evidence that the stages mask: the latch stays set and nothing is
+    /// owed upstream. A late reply that really was acknowledged still clears
+    /// it.
+    #[tokio::test]
+    async fn a_late_mask_miss_reply_is_no_evidence() {
+        let (srv, cli) = pair().await;
+        let latch = MaskLatch::default();
+        latch.set();
+        let miss = i64::from(MASK_MISS_TOKEN);
+        send_token_ack_upstream(&srv, miss, 4, MASK_ACK)
+            .await
+            .unwrap();
+        send_stream_tokens_ack_upstream(&srv, 1, MASK_ACK, &[(0, 5), (1, miss)])
+            .await
+            .unwrap();
+        send_token_ack_upstream(&srv, 9, 5, MASK_ACK).await.unwrap();
+        assert_eq!(
+            recv_token_reply_masked(&cli, SHORT, 5, &latch).await,
+            MaskedReply::Token(9)
+        );
+        assert!(latch.is_set(), "a late miss does not clear the latch");
+        assert!(!latch.take_owed());
+        send_stream_tokens_ack_upstream(&srv, 1, MASK_ACK, &[(0, miss)])
+            .await
+            .unwrap();
+        send_stream_tokens_upstream(&srv, 2, &[(0, 3)])
+            .await
+            .unwrap();
+        let r = recv_stream_reply(&cli, SHORT, 2, Some(&latch))
+            .await
+            .unwrap();
+        assert_eq!(r.batch_id, 2);
+        assert!(latch.is_set());
+        // A real late acknowledgement still clears it.
+        send_token_ack_upstream(&srv, 7, 6, MASK_ACK).await.unwrap();
+        send_token_ack_upstream(&srv, 8, 7, MASK_ACK).await.unwrap();
+        assert_eq!(
+            recv_token_reply_masked(&cli, SHORT, 7, &latch).await,
+            MaskedReply::Token(8)
+        );
+        assert!(!latch.is_set());
     }
 }

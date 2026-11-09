@@ -8686,11 +8686,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
                                 // stage behind it does mask. Dropped here and
                                 // passed on before the next stream reply.
                                 Ok(Some(FrameKind::TokenAck)) => {
-                                    let (_, _, status) =
+                                    let (stale_token, _, status) =
                                         crate::dist::recv_token_ack_body_client(down)
                                             .await
                                             .map_err(|e| format!("recv_token_ack: {e}"))?;
-                                    crate::dist::note_stale_ack(Some(mid_late), status);
+                                    crate::dist::note_stale_ack(
+                                        Some(mid_late),
+                                        status,
+                                        &[stale_token],
+                                    );
                                     Ok(())
                                 }
                                 Ok(Some(other)) => Err(format!(
