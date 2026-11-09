@@ -3507,7 +3507,9 @@ impl Stream for StreamWithPermit {
 /// `length`, which cancels the task. The prompt count is the latest one any chunk carried
 /// (token-streaming engines report it on their first chunk), 0 when none
 /// did. Errors, progress markers and the engine's own final chunk pass
-/// through unchanged; with no known window every chunk does.
+/// through unchanged; with no known window, or a prompt that alone reaches
+/// it (the engine accepted it, so the window read is not its real limit),
+/// every chunk does.
 struct WindowGuard<S> {
     /// `None` once the engine stream has been finished early.
     inner: Option<S>,
@@ -3553,7 +3555,11 @@ where
             return Poll::Ready(Some(chunk));
         }
         chunk.accumulate_tokens(&mut this.completion);
-        if this.prompt.unwrap_or(0).saturating_add(this.completion) >= window {
+        let prompt = this.prompt.unwrap_or(0);
+        // A prompt that alone reaches the window was taken and pre-filled by
+        // the engine, so the window read is not its real limit: the engine
+        // bounds this answer itself.
+        if prompt < window && prompt.saturating_add(this.completion) >= window {
             chunk.is_final = true;
             chunk.finish_reason = Some(cascadia_types::FinishReason::Length);
             chunk.prompt_tokens = this.prompt;
@@ -10773,6 +10779,20 @@ level={{ effort_map[eff] }}";
         assert_eq!(out[3].finish_reason, Some(FinishReason::Length));
         assert_eq!(out[3].prompt_tokens, None);
         assert!(dropped);
+    }
+
+    #[tokio::test]
+    async fn window_guard_does_not_cut_a_prompt_that_alone_reaches_the_window() {
+        // The engine took and pre-filled a prompt at or past the window we
+        // read, so that window is not its real limit: everything passes.
+        for prompt in [8, 12] {
+            let mut chunks = tokens(5);
+            chunks[0].prompt_tokens = Some(prompt);
+            chunks.push(Chunk::final_marker("t", "").with_finish_reason(FinishReason::Stop));
+            let (out, dropped, _) = run_guard(chunks.clone(), Some(8)).await;
+            assert_eq!(out, chunks, "prompt {prompt}");
+            assert!(!dropped, "prompt {prompt}");
+        }
     }
 
     #[tokio::test]
