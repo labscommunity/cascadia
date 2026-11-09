@@ -7,6 +7,11 @@ or `STRUCTURED OUTPUT CHECK: <n> FAILED`. Exit code 0 only when every case passe
 
 Usage:
     python3 scripts/structured_output_check.py http://127.0.0.1:8000 [--mock] [--cases a,b,…] [--concurrency N]
+    python3 scripts/structured_output_check.py http://127.0.0.1:8000 --expect-unavailable
+
+`--expect-unavailable` is for an ov-genai server that reports structured output unavailable
+(started with `--draft-model`, or on NPU): JSON requests must get the 400 that says so, and a
+plain request must still answer 200. It replaces the normal cases.
 
 `--mock` is for `cascadia run mock-model --engine mock`: the mock answers any schema with a
 minimal instance and has no chat template, so the two cases only a real backend can pass
@@ -336,6 +341,17 @@ def case_concurrent(base, n):
     verdict(f"concurrent_{n}_mixed", ok, f"{time.time() - t0:.2f}s " + "; ".join(r[1] for r in results))
 
 
+def case_unavailable(base):
+    for kind, rf in (("json_object", {"type": "json_object"}), ("json_schema", rf_schema(PERSON, "person"))):
+        body = chat([{"role": "user", "content": "hi"}], response_format=rf, max_tokens=16)
+        status, raw, _ = post(base, body)
+        ok = status == 400 and "structured output is not available" in raw
+        verdict(f"unavailable_{kind}_400", ok, f"HTTP {status}: {raw[:240]}")
+    body = chat([{"role": "user", "content": "Say hello."}], max_tokens=16)
+    status, raw, dt = post(base, body)
+    verdict("plain_still_works", status == 200, f"HTTP {status} {dt:.2f}s {raw[:120]}")
+
+
 CASES = {
     "json_object": case_json_object,
     "prose": case_prose_prompt,
@@ -359,6 +375,8 @@ def main():
     ap.add_argument("--cases", default=",".join(CASES))
     ap.add_argument("--concurrency", type=int, default=0, help="also run N mixed requests at once")
     ap.add_argument("--mock", action="store_true", help="the server runs the mock engine (see the module doc)")
+    ap.add_argument("--expect-unavailable", action="store_true",
+                    help="the server reports structured output unavailable (see the module doc)")
     args = ap.parse_args()
     global MOCK
     MOCK = args.mock
@@ -368,9 +386,12 @@ def main():
                   flush=True)
         else:
             verdict("jsonschema_installed", False, "install it with pip install jsonschema")
-    for name in args.cases.split(","):
-        CASES[name](args.base)
-    if args.concurrency:
+    if args.expect_unavailable:
+        case_unavailable(args.base)
+    else:
+        for name in args.cases.split(","):
+            CASES[name](args.base)
+    if args.concurrency and not args.expect_unavailable:
         case_concurrent(args.base, args.concurrency)
     failed = RESULTS.count(False)
     print("STRUCTURED OUTPUT CHECK: ALL PASS" if failed == 0 else f"STRUCTURED OUTPUT CHECK: {failed} FAILED", flush=True)
