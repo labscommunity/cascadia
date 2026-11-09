@@ -3669,7 +3669,8 @@ mod tests {
     const OK_ENUM: &str = r#"{"type":"string","enum":["ok"]}"#;
     const INTEGER: &str = r#"{"type":"integer"}"#;
     const WEATHER: &str = r#"{"type":"object","properties":{"city":{"type":"string"},"temperature_celsius":{"type":"number"},"conditions":{"type":"string","enum":["sunny","cloudy","rainy"]}},"required":["city","temperature_celsius","conditions"],"additionalProperties":false}"#;
-    const WEATHER_DOC: &str = r#"{"city":"Paris","temperature_celsius":18,"conditions":"sunny"}"#;
+    const WEATHER_DOC: &str =
+        r#"{"city": "Paris", "temperature_celsius": 18, "conditions": "sunny"}"#;
 
     fn test_factory() -> GrammarFactory {
         GrammarFactory::single_byte_for_tests()

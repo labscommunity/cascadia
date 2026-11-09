@@ -50,14 +50,49 @@ fn walk(gf: &GrammarFactory, gm: &mut GrammarMask, tokens: &[u32]) -> Result<(),
     Ok(())
 }
 
+/// The tokens of `s`, written compact in the tests, as the grammar wants
+/// it: with `json.dumps` separators (a space after each `:` and `,` outside
+/// strings). Prefixes that stop inside a string work too.
 fn bytes(s: &str) -> Vec<u32> {
+    raw_bytes(&dumps(s))
+}
+
+/// The tokens of `s` exactly as written.
+fn raw_bytes(s: &str) -> Vec<u32> {
     s.bytes().map(u32::from).collect()
 }
 
-/// Whole document accepted and the grammar says nothing may follow.
+/// Compact JSON text `s` with `json.dumps` separators.
+fn dumps(s: &str) -> String {
+    let (mut out, mut in_str, mut esc) = (String::new(), false, false);
+    for c in s.chars() {
+        out.push(c);
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, '\\') => esc = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_str = true;
+        } else if c == ':' || c == ',' {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// Whole document (written compact, see [`bytes`]) accepted and the
+/// grammar says nothing may follow.
 fn accepts(gf: &GrammarFactory, body: &str, doc: &str) -> bool {
+    accepts_raw(gf, body, &dumps(doc))
+}
+
+/// [`accepts`] on `doc` exactly as written.
+fn accepts_raw(gf: &GrammarFactory, body: &str, doc: &str) -> bool {
     let mut gm = mask_for(gf, body);
-    walk(gf, &mut gm, &bytes(doc)).is_ok() && gm.finished()
+    walk(gf, &mut gm, &raw_bytes(doc)).is_ok() && gm.finished()
 }
 
 fn masked_row(gf: &GrammarFactory, gm: &mut GrammarMask) -> Vec<f32> {
@@ -112,15 +147,36 @@ fn first_allowed_token_is_open_brace() {
 }
 
 #[test]
-fn whitespace_after_colon_is_masked() {
+fn exactly_one_space_follows_a_colon_or_comma() {
     let gf = single_byte();
+    let only_space = |row: &[f32]| {
+        let allowed: Vec<usize> = (0..row.len()).filter(|&i| row[i].is_finite()).collect();
+        assert_eq!(allowed, vec![b' ' as usize]);
+    };
     let mut gm = mask_for(&gf, WEATHER);
-    walk(&gf, &mut gm, &bytes(r#"{"city":"#)).unwrap();
+    walk(&gf, &mut gm, &raw_bytes(r#"{"city":"#)).unwrap();
+    only_space(&masked_row(&gf, &mut gm));
+    walk(&gf, &mut gm, &raw_bytes(" ")).unwrap();
     let row = masked_row(&gf, &mut gm);
     for ws in [b' ', b'\n', b'\t', b'\r'] {
         assert_eq!(row[ws as usize], f32::NEG_INFINITY, "byte {ws} allowed");
     }
     assert!(row[b'"' as usize].is_finite());
+    walk(&gf, &mut gm, &raw_bytes(r#""Paris","#)).unwrap();
+    only_space(&masked_row(&gf, &mut gm));
+    walk(&gf, &mut gm, &raw_bytes(" ")).unwrap();
+    let row = masked_row(&gf, &mut gm);
+    assert_eq!(row[b' ' as usize], f32::NEG_INFINITY);
+    assert!(row[b'"' as usize].is_finite());
+    // No whitespace anywhere else: not after `{`, not before `:`.
+    let mut gm = mask_for(&gf, WEATHER);
+    assert_eq!(masked_row(&gf, &mut gm)[b' ' as usize], f32::NEG_INFINITY);
+    walk(&gf, &mut gm, &raw_bytes(r#"{"#)).unwrap();
+    assert_eq!(masked_row(&gf, &mut gm)[b' ' as usize], f32::NEG_INFINITY);
+    walk(&gf, &mut gm, &raw_bytes(r#""city""#)).unwrap();
+    assert_eq!(masked_row(&gf, &mut gm)[b' ' as usize], f32::NEG_INFINITY);
+    // The compact form is refused.
+    assert!(!accepts_raw(&gf, WEATHER, WEATHER_OK));
 }
 
 #[test]
@@ -144,7 +200,8 @@ fn replay_of_a_valid_prefix_succeeds() {
     walk(
         &gf,
         &mut gm,
-        &bytes(r#"ris","temperature_celsius":18,"conditions":"sunny"}"#),
+        // Starts inside a string, so written out as the grammar wants it.
+        &raw_bytes(r#"ris", "temperature_celsius": 18, "conditions": "sunny"}"#),
     )
     .unwrap();
     assert!(gm.finished());
@@ -485,10 +542,14 @@ fn hf_tokenizer_masks_with_merged_tokens_and_every_eos() {
     assert_eq!(row[b'"' as usize], f32::NEG_INFINITY);
     gm.accept(QUOTE_COLON).unwrap();
 
-    // compact JSON: no space after the colon, so the `: ` merge can't come either.
+    // json.dumps separators: the space after the colon comes next (the `: `
+    // merge can't, the colon is already in `":`), then no second one.
     let row = masked_row(&gf, &mut gm);
-    assert_eq!(row[b' ' as usize], f32::NEG_INFINITY);
+    assert!(row[b' ' as usize].is_finite());
     assert_eq!(row[COLON_SPACE as usize], f32::NEG_INFINITY);
+    assert_eq!(row[b'"' as usize], f32::NEG_INFINITY);
+    gm.accept(u32::from(b' ')).unwrap();
+    assert_eq!(masked_row(&gf, &mut gm)[b' ' as usize], f32::NEG_INFINITY);
 
     let mut padded = vec![0.0f32; 300];
     gm.apply(&mut padded).unwrap();

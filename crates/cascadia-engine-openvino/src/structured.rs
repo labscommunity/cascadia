@@ -357,8 +357,8 @@ mod tests {
         for prefix in [
             "",
             "{\"",
-            "{\"city\":\"Pa",
-            "{\"city\":\"P\",\"temperature_celsius\":1",
+            "{\"city\": \"Pa",
+            "{\"city\": \"P\", \"temperature_celsius\": 1",
         ] {
             let mut mask = start_grammar(&cg, &ids(prefix)).unwrap();
             for width in [1, 100, 124, 128, full - 1, full, full + 40] {

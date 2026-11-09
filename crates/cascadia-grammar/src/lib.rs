@@ -5,8 +5,9 @@
 //! engine already loads and every EOS id it stops on), one
 //! [`CompiledGrammar`] per request schema, one [`GrammarMask`] per sequence.
 //!
-//! The grammar is compact JSON: no whitespace between tokens, so a model
-//! can't loop on spaces or newlines. Schema keywords llguidance accepts but
+//! The grammar is JSON with `json.dumps` separators (`": "` and `", "`) and
+//! no other whitespace between tokens, so a model can't loop on spaces or
+//! newlines. Schema keywords llguidance accepts but
 //! does not enforce (`not`, `uniqueItems`, unknown `format`s, ...) compile and
 //! are listed by [`CompiledGrammar::warnings`]; a schema that can't be built
 //! at all (bad type, unresolvable `$ref`) is an error at
@@ -137,7 +138,7 @@ impl GrammarFactory {
                 let obj = schema
                     .as_object_mut()
                     .ok_or_else(|| invalid_schema("must be a JSON object"))?;
-                // Ours replaces any the client sent. Compact JSON; oneOf is
+                // Ours replaces any the client sent. json.dumps separators; oneOf is
                 // treated as anyOf (pydantic's discriminated unions); keywords
                 // llguidance can't enforce become warnings, not errors.
                 obj.insert("x-guidance".into(), guidance_options());
@@ -214,6 +215,11 @@ const DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples", "x-guid
 fn guidance_options() -> serde_json::Value {
     serde_json::json!({
         "whitespace_flexible": false,
+        // `json.dumps` separators: models write JSON this way, and forbidding
+        // the space after `:` and `,` pushes them off their distribution. No
+        // other whitespace, so a model can't loop on spaces or newlines.
+        "key_separator": ": ",
+        "item_separator": ", ",
         "coerce_one_of": true,
         "lenient": true,
     })
