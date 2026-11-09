@@ -8,9 +8,13 @@
 //! * **Plugin properties** (CACHE_DIR, KV_CACHE_PRECISION,
 //!   DYNAMIC_QUANTIZATION_GROUP_SIZE) via `PluginConfig`.
 //!
-//! Token counting uses the LlmPipeline tokenizer (per the c57 lesson —
-//! `perf_metrics` defaults to `max_new_tokens` when EOS fires early on
-//! short greedy decodes, which inflates reported tok/s).
+//! Usage, and the finish reason of a plain request, use the LlmPipeline
+//! tokenizer's count of the decoded text: `perf_metrics` has reported
+//! `max_new_tokens` when EOS fired early on short greedy decodes. A request
+//! with an output constraint also consults the generated-token count for its
+//! finish reason, since re-tokenising constrained output can undercount; on
+//! OpenVINO GenAI 2026.4.1 that count matched short early-EOS answers on GPU
+//! and CPU.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -553,13 +557,20 @@ fn version_gate(v: Result<cascadia_ov_genai_shim::OvVersion, OvError>) -> Option
 }
 
 /// The stateful engine's finish reason. GenAI does not report one, so it is
-/// inferred: `length` when either the tokenizer's count of the decoded text
-/// or the generated-token count reaches the cap, else `stop`. Re-tokenising
-/// can undercount badly (a long run of newlines merges into a few tokens),
-/// so the generated count is consulted too; it is 0 when the backend's
-/// performance metrics are unavailable, which leaves the tokenizer to decide.
-fn stateful_finish(tokenizer_count: u32, generated: u32, max_new: u32) -> FinishReason {
-    if tokenizer_count >= max_new || generated >= max_new {
+/// inferred: `length` when the tokenizer's count of the decoded text reaches
+/// the cap, else `stop`. For a request with an output constraint the
+/// generated-token count is consulted too: re-tokenising constrained output
+/// can undercount badly (a long run of newlines merges into a few tokens).
+/// That count is 0 when the backend's performance metrics are unavailable,
+/// which leaves the tokenizer to decide. A plain request decides on the
+/// tokenizer count alone.
+fn stateful_finish(
+    tokenizer_count: u32,
+    generated: u32,
+    max_new: u32,
+    has_grammar: bool,
+) -> FinishReason {
+    if tokenizer_count >= max_new || (has_grammar && generated >= max_new) {
         FinishReason::Length
     } else {
         FinishReason::Stop
@@ -854,7 +865,12 @@ impl Engine for OvGenaiEngine {
         // so infer — reaching the token cap is `length`, anything short of it
         // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
         // exactly at the cap reports `length` (OpenAI is also ambiguous here).
-        let finish = stateful_finish(tokens, result.generated_tokens, max_new);
+        let finish = stateful_finish(
+            tokens,
+            result.generated_tokens,
+            max_new,
+            task.grammar.is_some(),
+        );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
             .with_n_tokens(tokens)
             .with_finish_reason(finish);
@@ -2546,15 +2562,29 @@ mod tests {
     }
 
     #[test]
-    fn stateful_finish_reports_length_when_either_count_hits_the_cap() {
+    fn stateful_finish_with_a_grammar_reports_length_when_either_count_hits_the_cap() {
         // A whitespace run re-tokenises into far fewer tokens than were
         // generated: the generated count still says the cap was reached.
-        assert_eq!(stateful_finish(100, 4096, 4096), FinishReason::Length);
-        assert_eq!(stateful_finish(4096, 4096, 4096), FinishReason::Length);
-        assert_eq!(stateful_finish(50, 50, 4096), FinishReason::Stop);
+        assert_eq!(stateful_finish(100, 4096, 4096, true), FinishReason::Length);
+        assert_eq!(
+            stateful_finish(4096, 4096, 4096, true),
+            FinishReason::Length
+        );
+        assert_eq!(stateful_finish(50, 50, 4096, true), FinishReason::Stop);
         // No generated count (perf metrics unavailable): the tokenizer decides.
-        assert_eq!(stateful_finish(4096, 0, 4096), FinishReason::Length);
-        assert_eq!(stateful_finish(50, 0, 4096), FinishReason::Stop);
+        assert_eq!(stateful_finish(4096, 0, 4096, true), FinishReason::Length);
+        assert_eq!(stateful_finish(50, 0, 4096, true), FinishReason::Stop);
+    }
+
+    #[test]
+    fn stateful_finish_without_a_grammar_uses_the_tokenizer_count_only() {
+        // The generated count can read as the cap when EOS fires early, so a
+        // plain request never consults it.
+        assert_eq!(stateful_finish(50, 4096, 4096, false), FinishReason::Stop);
+        assert_eq!(stateful_finish(100, 4096, 4096, false), FinishReason::Stop);
+        assert_eq!(stateful_finish(4096, 0, 4096, false), FinishReason::Length);
+        assert_eq!(stateful_finish(4096, 50, 4096, false), FinishReason::Length);
+        assert_eq!(stateful_finish(50, 0, 4096, false), FinishReason::Stop);
     }
 
     #[test]
