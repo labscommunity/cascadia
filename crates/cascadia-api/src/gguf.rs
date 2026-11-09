@@ -244,6 +244,35 @@ mod tests {
         assert_eq!(read(bytes), Ok(Some("{{ messages }}".into())));
     }
 
+    /// A v2 header reads as v3 does, past an array of string arrays.
+    #[test]
+    fn a_v2_file_with_nested_string_arrays_is_read() {
+        let mut merges = ARRAY.to_le_bytes().to_vec();
+        merges.extend(3u64.to_le_bytes());
+        for _ in 0..3 {
+            merges.extend(tokens(4));
+        }
+        let mut bytes = gguf(&[
+            ("nested.strings", ARRAY, merges),
+            (CHAT_TEMPLATE_KEY, STRING, str_value("{{ messages }}")),
+        ]);
+        bytes[4] = 2;
+        assert_eq!(read(bytes), Ok(Some("{{ messages }}".into())));
+    }
+
+    /// A string array whose count runs past the end of the file is an
+    /// error, not a long loop or an allocation.
+    #[test]
+    fn a_string_array_running_past_the_end_is_an_error() {
+        let mut many = STRING.to_le_bytes().to_vec();
+        many.extend(u64::MAX.to_le_bytes());
+        string(&mut many, "only one");
+        assert_eq!(
+            read(gguf(&[("tokenizer.ggml.tokens", ARRAY, many)])),
+            Err("truncated GGUF file".into())
+        );
+    }
+
     #[test]
     fn a_missing_key_is_none() {
         let bytes = gguf(&[("general.architecture", STRING, str_value("qwen3"))]);

@@ -287,6 +287,16 @@ mod tests {
         assert!(inner.order.len() <= 2 * inner.map.len() + 64);
     }
 
+    /// One batch over the count cap keeps only its newest items.
+    #[test]
+    fn a_batch_over_the_count_cap_keeps_its_newest() {
+        let cache = ItemCache::with_limits(2, 1 << 20);
+        cache.insert_all(&[item("a"), item("b"), item("c"), item("d")]);
+        assert!(!has(&cache, "a") && !has(&cache, "b"));
+        assert!(has(&cache, "c") && has(&cache, "d"));
+        assert_eq!(cache.inner.lock().map.len(), 2);
+    }
+
     #[test]
     fn an_item_over_the_byte_cap_is_not_kept() {
         let one = size(&item("a"));
