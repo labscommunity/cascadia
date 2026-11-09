@@ -636,5 +636,11 @@ failed to compile on this server; retry later or change the schema`. When it
 held several different new schemas, none is refused at once, but a schema in
 two such failed steps within 10 minutes is, unless a request with it produced
 output in between. Steps failed by resource
-exhaustion, and `json_object`, are never blamed on a schema. Such a failure
-is not counted toward the worker's failure limit, once per run of failures.
+exhaustion, and `json_object`, are never blamed on a schema. A failed step
+in which every request was new and carried a schema of its own (not
+`json_object`) is not counted
+toward the worker's failure limit, until 8 such steps in a row (no
+successful step between them): from the 8th on they count, so a device that
+fails every step still trips the limit. A failed step that also held a
+request without a schema, or one that had already produced output, counts
+as usual.

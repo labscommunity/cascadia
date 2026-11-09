@@ -337,7 +337,7 @@ impl Builder for OvGenaiBuilder {
                 max_tokens_default: 256,
                 idle_steps: 0,
                 step_failures: 0,
-                excused_since_success: false,
+                suspect_failures: 0,
                 structured_unavailable: None,
                 quarantined: QuarantineSet::default(),
                 strikes: StrikeSet::default(),
@@ -966,6 +966,14 @@ const MAX_IDLE_STEPS: u32 = 2048;
 /// is gone, not that one request was unlucky.
 const MAX_STEP_FAILURES: u32 = 3;
 
+/// Step failures since the last successful step, with only new
+/// schema-constrained requests in flight, that are blamed on those schemas
+/// alone. A failing schema is refused after its first or second such failure,
+/// so each one needs a new schema; past this many in a row the device itself
+/// is the likelier cause, and from this one on each failure counts toward
+/// [`MAX_STEP_FAILURES`] so a dead device still latches.
+const MAX_SUSPECT_ONLY_FAILURES: u32 = 8;
+
 /// The slice of [`CbPipeline`] the continuous-batching engine actually uses.
 ///
 /// Exists so the engine's state machine is testable without OpenVINO. The real
@@ -1068,10 +1076,11 @@ pub struct OvGenaiCbEngine {
     /// Consecutive `pipe.step()` failures. Past MAX_STEP_FAILURES the pipeline
     /// is treated as unusable and `submit()` stops admitting work.
     step_failures: u32,
-    /// A step failure was already blamed on a new schema since the last
-    /// successful step. Only one per run of failures is excused, so a dead
-    /// device still latches even when every request is schema-constrained.
-    excused_since_success: bool,
+    /// Step failures since the last successful step in which every
+    /// in-flight request was a new schema-constrained one. They are not
+    /// counted in `step_failures` until there are
+    /// [`MAX_SUSPECT_ONLY_FAILURES`] of them.
+    suspect_failures: u32,
     /// Set by the warmup probe when this model cannot do structured output.
     structured_unavailable: Option<String>,
     /// Schemas that recently took a scheduler iteration down with them.
@@ -1256,15 +1265,21 @@ impl Engine for OvGenaiCbEngine {
             //
             // OV compiles a request's grammar on its first sampled step, so a
             // step that fails while such a request is new may have failed on
-            // that compile. Counting it would let one client latch the worker
-            // with a bad schema; quarantining the schema stops it from failing
-            // the next batches too. The schema is quarantined only when it is
-            // the one new schema in the step: with several there is no telling
-            // which one failed, and refusing them all would punish innocent
-            // clients (the failure is still excused). Resource exhaustion and
-            // json_object (the server's own schema) are never blamed on one.
+            // that compile. Its schema is a suspect: the one suspect in a
+            // step is refused for a while, and with several there is no
+            // telling which one failed, so each gets a strike and a schema
+            // that keeps turning up in failed steps is refused anyway
+            // (pairing a failing schema with another does not dodge it).
+            // Resource exhaustion and json_object (the server's own schema)
+            // are never blamed on one.
+            //
+            // A step with only suspects in flight is not counted toward the
+            // failure latch, so one client cannot latch the worker with bad
+            // schemas, until MAX_SUSPECT_ONLY_FAILURES of them in a row. A
+            // step that also held a request that produced output or carried
+            // no client schema counts as any other failure.
             let resource = cascadia_ov_genai_shim::last_error_resource_exhausted();
-            let mut suspects: Vec<u64> = if resource || self.excused_since_success {
+            let mut suspects: Vec<u64> = if resource {
                 Vec::new()
             } else {
                 self.active
@@ -1276,34 +1291,41 @@ impl Engine for OvGenaiCbEngine {
             // Several requests with one schema are one suspect.
             suspects.sort_unstable();
             suspects.dedup();
-            if suspects.is_empty() {
-                self.step_failures += 1;
-            } else if let [h] = suspects[..] {
-                self.excused_since_success = true;
-                self.quarantined.insert(h, Instant::now());
-                warn!(
-                    "cb step failed with a new schema-constrained request in the batch; \
-                     not counted toward the failure latch, schema refused for 10 minutes"
-                );
+            let now = Instant::now();
+            let mut refused = 0;
+            if let [h] = suspects[..] {
+                self.quarantined.insert(h, now);
+                refused = 1;
             } else {
-                // No telling which one failed: each gets a strike, and a schema
-                // that keeps turning up in failed steps is refused anyway, so
-                // pairing a failing schema with another does not dodge it.
-                self.excused_since_success = true;
-                let now = Instant::now();
-                let mut refused = 0;
                 for h in &suspects {
                     if self.strikes.strike(*h, now) >= QUARANTINE_STRIKES {
                         self.quarantined.insert(*h, now);
                         refused += 1;
                     }
                 }
+            }
+            let suspect_only = !resource
+                && self
+                    .active
+                    .iter()
+                    .all(|t| !t.produced && t.grammar_hash.is_some());
+            let excused = if suspect_only {
+                self.suspect_failures += 1;
+                self.suspect_failures < MAX_SUSPECT_ONLY_FAILURES
+            } else {
+                false
+            };
+            if !excused {
+                self.step_failures += 1;
+            }
+            if !suspects.is_empty() {
                 warn!(
                     schemas = suspects.len(),
                     refused,
-                    "cb step failed with several new schema-constrained requests in the \
-                     batch; not counted toward the failure latch, schemas that failed \
-                     before are refused for 10 minutes"
+                    counted = !excused,
+                    suspect_only_failures = self.suspect_failures,
+                    "cb step failed with new schema-constrained requests in the batch; \
+                     schemas blamed for it are refused for 10 minutes"
                 );
             }
             warn!(
@@ -1323,7 +1345,7 @@ impl Engine for OvGenaiCbEngine {
             return Ok(failed);
         }
         self.step_failures = 0;
-        self.excused_since_success = false;
+        self.suspect_failures = 0;
 
         let mut out = Vec::new();
         let mut idx = 0;
@@ -1777,7 +1799,7 @@ mod tests {
             max_tokens_default: 256,
             idle_steps: 0,
             step_failures: 0,
-            excused_since_success: false,
+            suspect_failures: 0,
             structured_unavailable: None,
             quarantined: QuarantineSet::default(),
             strikes: StrikeSet::default(),
@@ -2206,7 +2228,7 @@ mod tests {
     }
 
     #[test]
-    fn cb_step_failure_with_a_new_grammar_task_does_not_latch_and_quarantines() {
+    fn cb_step_failure_with_a_plain_task_counts_and_still_quarantines_the_schema() {
         let st = Arc::new(Mutex::new(MockState {
             step_fails: true,
             ..Default::default()
@@ -2216,7 +2238,8 @@ mod tests {
         e.submit(task("t2", 8)).unwrap();
         let out = e.step().unwrap();
         assert_eq!(out.len(), 2, "every in-flight request still fails");
-        assert_eq!(e.step_failures, 0);
+        assert_eq!(e.step_failures, 1, "a plain request in the step: it counts");
+        assert_eq!(e.suspect_failures, 0);
 
         let err = e.submit(schema_task("t3", SCHEMA_A)).unwrap_err();
         assert!(matches!(err, EngineError::InvalidConfig(_)), "{err:?}");
@@ -2248,8 +2271,13 @@ mod tests {
         e.submit(schema_task("t2", SCHEMA_A)).unwrap();
     }
 
+    /// A distinct schema per `i`.
+    fn numbered_schema(i: u32) -> String {
+        format!(r#"{{"type":"object","properties":{{"p{i}":{{"type":"string"}}}}}}"#)
+    }
+
     #[test]
-    fn cb_second_consecutive_failure_with_grammar_counts() {
+    fn cb_consecutive_failures_with_only_new_schemas_do_not_latch() {
         let st = Arc::new(Mutex::new(MockState {
             step_fails: true,
             ..Default::default()
@@ -2259,9 +2287,44 @@ mod tests {
         let _ = e.step().unwrap();
         e.submit(schema_task("t2", SCHEMA_B)).unwrap();
         let _ = e.step().unwrap();
-        assert_eq!(e.step_failures, 1);
-        assert!(e.submit(schema_task("t3", SCHEMA_A)).is_err());
-        e.submit(schema_task("t4", SCHEMA_B)).unwrap();
+        assert_eq!(e.step_failures, 0);
+        // B was the only schema in its failed step: refused from then on.
+        let err = e.submit(schema_task("t3", SCHEMA_B)).unwrap_err();
+        assert!(err.to_string().contains("failed to compile"), "{err}");
+        for (i, id) in ["t4", "t5"].into_iter().enumerate() {
+            e.submit(schema_task(id, &numbered_schema(i as u32)))
+                .unwrap();
+            let _ = e.step().unwrap();
+        }
+        assert_eq!(e.step_failures, 0);
+        assert_eq!(e.suspect_failures, 4);
+        e.submit(task("plain", 8)).unwrap();
+        e.submit(schema_task("t6", SCHEMA_C)).unwrap();
+    }
+
+    #[test]
+    fn cb_suspect_only_failures_count_once_the_backstop_is_reached() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_SUSPECT_ONLY_FAILURES {
+            e.submit(schema_task(&format!("t{i}"), &numbered_schema(i)))
+                .unwrap();
+            let _ = e.step().unwrap();
+            let want = u32::from(i + 1 >= MAX_SUSPECT_ONLY_FAILURES);
+            assert_eq!(e.step_failures, want, "failure {}", i + 1);
+        }
+        assert_eq!(e.suspect_failures, MAX_SUSPECT_ONLY_FAILURES);
+
+        // A successful step resets both counters.
+        st.lock().unwrap().step_fails = false;
+        st.lock().unwrap().default_read = Some(idle_read());
+        e.submit(task("plain", 8)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 0);
+        assert_eq!(e.suspect_failures, 0);
     }
 
     #[test]
@@ -2492,7 +2555,7 @@ mod tests {
         e.submit(schema_task("t2", SCHEMA_B)).unwrap();
         let out = e.step().unwrap();
         assert_eq!(out.len(), 2);
-        assert_eq!(e.step_failures, 0, "still excused once");
+        assert_eq!(e.step_failures, 0, "only new schemas in the step");
         assert_eq!(e.quarantined.len(), 0);
         st.lock().unwrap().step_fails = false;
         e.submit(schema_task("t3", SCHEMA_A)).unwrap();
@@ -2533,7 +2596,7 @@ mod tests {
         st.lock().unwrap().step_fails = false;
         e.submit(task("plain", 8)).unwrap();
         let _ = e.step().unwrap();
-        assert!(!e.excused_since_success);
+        assert_eq!(e.suspect_failures, 0);
         e.cancel(&"plain".to_string());
 
         st.lock().unwrap().step_fails = true;
