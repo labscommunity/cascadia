@@ -1916,8 +1916,11 @@ impl OvDistSpecEngine {
     }
 }
 
-/// Why a finished answer ended: its last token is EOS → `stop`; it reached
-/// `max_tokens` (counted on `out`, as the decode loop counts it) → `length`.
+/// Why a finished answer ended. The first-token path pushes an EOS into
+/// `out`, so a last token that is EOS means `stop`; the round path stops on
+/// EOS without pushing it, while `out` is still below `max_tokens`, which
+/// also reads as `stop`. Reaching `max_tokens` (counted on `out`, as both
+/// loops count it) without a final EOS means `length`.
 fn spec_finish_reason(
     last: Option<i64>,
     eos: &[u32],

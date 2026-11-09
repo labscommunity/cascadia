@@ -105,17 +105,38 @@ fn window_of(v: &serde_json::Value) -> Option<u32> {
 /// [`window_of`] with `v`'s RoPE scaling applied, by vLLM's rule: a
 /// `rope_scaling` (or `rope_parameters`) object with a numeric `factor`
 /// multiplies the window, unless its `rope_type` (or `type`) is one whose
-/// window already counts the scaling: `su`, `longrope`, `llama3`, the YaRN
-/// variants (`yarn`, `deepseek_yarn`, `deepseek_llama_scaling`), and `mrope`
-/// or `default`, which scale nothing.
+/// window already counts the scaling: `su`, `longrope`, `llama3`, or a YaRN
+/// variant (`yarn`, `deepseek_yarn`, `deepseek_llama_scaling`). Per-layer-type
+/// `rope_parameters` (one object per layer type) use the first layer entry
+/// that has a factor, as vLLM assumes they share it.
 fn scaled_window_of(v: &serde_json::Value) -> Option<u32> {
     let window = window_of(v)?;
-    let Some(scaling) = v
+    let Some(params) = v
         .get("rope_scaling")
-        .or_else(|| v.get("rope_parameters"))
         .and_then(|r| r.as_object())
+        .or_else(|| v.get("rope_parameters").and_then(|r| r.as_object()))
     else {
         return Some(window);
+    };
+    let is_entry = |o: &serde_json::Map<String, serde_json::Value>| {
+        ["rope_type", "type", "factor"]
+            .iter()
+            .any(|k| o.contains_key(*k))
+    };
+    let scaling = if is_entry(params) {
+        params
+    } else {
+        // Nested per layer type: the first entry with a factor, else the first.
+        let mut entries = params.values().filter_map(|e| e.as_object());
+        match params
+            .values()
+            .filter_map(|e| e.as_object())
+            .find(|e| e.contains_key("factor"))
+            .or_else(|| entries.next())
+        {
+            Some(e) => e,
+            None => return Some(window),
+        }
     };
     let kind = scaling
         .get("rope_type")
@@ -123,15 +144,7 @@ fn scaled_window_of(v: &serde_json::Value) -> Option<u32> {
         .and_then(|t| t.as_str());
     if matches!(
         kind,
-        Some(
-            "su" | "longrope"
-                | "llama3"
-                | "yarn"
-                | "deepseek_yarn"
-                | "deepseek_llama_scaling"
-                | "mrope"
-                | "default"
-        )
+        Some("su" | "longrope" | "llama3" | "yarn" | "deepseek_yarn" | "deepseek_llama_scaling")
     ) {
         return Some(window);
     }
@@ -478,15 +491,35 @@ mod tests {
                     {"type": "su", "factor": 2.0}}"#,
                 4096,
             ),
+            // vLLM multiplies any other type that carries a factor,
+            // `default` and `mrope` included.
             (
                 r#"{"max_position_embeddings": 32768, "rope_scaling":
                     {"type": "mrope", "factor": 2.0}}"#,
-                32768,
+                65536,
             ),
             (
                 r#"{"max_position_embeddings": 4096, "rope_scaling":
                     {"rope_type": "default", "factor": 2.0}}"#,
-                4096,
+                8192,
+            ),
+            // A null rope_scaling next to rope_parameters: the latter counts.
+            (
+                r#"{"max_position_embeddings": 4096, "rope_scaling": null,
+                    "rope_parameters": {"rope_type": "linear", "factor": 2.0}}"#,
+                8192,
+            ),
+            // Per-layer-type rope_parameters: the layers' own entries count.
+            (
+                r#"{"max_position_embeddings": 4096, "rope_parameters":
+                    {"full_attention": {"rope_type": "linear", "factor": 4.0},
+                     "sliding_attention": {"rope_type": "default"}}}"#,
+                16384,
+            ),
+            (
+                r#"{"max_position_embeddings": 40960, "rope_parameters":
+                    {"full_attention": {"rope_type": "yarn", "factor": 4.0}}}"#,
+                40960,
             ),
             // Absent, null, or without a numeric factor: unchanged.
             (r#"{"max_position_embeddings": 4096}"#, 4096),
