@@ -327,7 +327,9 @@ after one that had it, gets `mock: ok`. So a client's tool loop runs end to end.
 feature of real models.
 
 `scripts/responses-clients-check.sh --bin target/debug/cascadia` runs the OpenAI Agents SDK,
-`@ai-sdk/openai`, n8n and Codex CLI tool loops against this mock and ends `RESPONSES_CLIENTS: ALL PASS`.
+`@ai-sdk/openai`, n8n and Codex CLI tool loops against this mock and ends `RESPONSES_CLIENTS: ALL PASS`. Against
+a server you already run (one serving the same mock script), pass `--url http://HOST:PORT` instead of `--bin`,
+plus `--api-key-env NAME` to send the value of `$NAME` as the Bearer key and `--model ID` for its model id.
 
 `scripts/responses-live-check.py <base-url>` checks a running server, any engine: a text
 answer, a tool call (plain and streamed), the turn after its output, Codex's two request

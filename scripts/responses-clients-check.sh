@@ -16,7 +16,12 @@
 # scripts/responses_clients/max_tokens_proxy.py is for the hardware Codex run against a real model; this
 # script does not use it.
 #
+# --url BASE checks an already-running server instead (one serving the same mock script; --bin is then unused),
+# --api-key-env NAME sends the value of $NAME as every client's API key (Bearer; passed through the environment,
+# never printed or put on a command line), and --model ID picks the model id (default mock-tools-model).
+#
 # Usage: scripts/responses-clients-check.sh [--bin target/debug/cascadia] [--port 18080]
+#                                           [--url http://HOST:PORT] [--api-key-env NAME] [--model ID]
 #                                           [--only agents,aisdk,n8n,codex] [--dry-run]
 # Env: WORK (work dir), PYTHON (interpreter for the venv, default python3).
 set -euo pipefail
@@ -27,6 +32,9 @@ BIN="target/debug/cascadia"
 PORT=18080
 ONLY="agents,aisdk,n8n,codex"
 DRY_RUN=0
+URL=""
+KEY_ENV=""
+MODEL="mock-tools-model"
 
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; }
 while [[ $# -gt 0 ]]; do
@@ -34,6 +42,9 @@ while [[ $# -gt 0 ]]; do
     --bin) BIN="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --only) ONLY="$2"; shift 2 ;;
+    --url) URL="$2"; shift 2 ;;
+    --api-key-env) KEY_ENV="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -43,13 +54,25 @@ for c in ${ONLY//,/ }; do
   case "$c" in agents|aisdk|n8n|codex) ;; *) echo "unknown check in --only: $c" >&2; exit 2 ;; esac
 done
 case "$BIN" in /*) ;; *) BIN="$REPO/$BIN" ;; esac
+if [[ -n "$KEY_ENV" ]]; then
+  [[ "$KEY_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "--api-key-env takes a variable name: $KEY_ENV" >&2; exit 2; }
+  if [[ $DRY_RUN == 0 && -z "${!KEY_ENV:-}" ]]; then echo "\$$KEY_ENV is empty or unset" >&2; exit 2; fi
+  # The helpers and Codex read the key from this variable by name; only the name is ever passed or printed.
+  export "${KEY_ENV?}"
+  export RESPONSES_CHECK_KEY_ENV="$KEY_ENV"
+fi
 
 PYTHON="${PYTHON:-python3}"
 AGENTS_VER="openai-agents==0.24.0"
 AISDK_PKGS=(ai@7.0.165 @ai-sdk/openai@4.0.111 zod@4.6.7)
 N8N_PKG="n8n@2.46.6"
 CODEX_VER="codex-cli 0.166.0"
-BASE="http://127.0.0.1:$PORT/v1"
+if [[ -n "$URL" ]]; then
+  URL="${URL%/}"; URL="${URL%/v1}"
+  BASE="$URL/v1"
+else
+  BASE="http://127.0.0.1:$PORT/v1"
+fi
 
 if [[ $DRY_RUN == 1 ]]; then WORK="${WORK:-<mktemp -d>}"; else WORK="${WORK:-$(mktemp -d)}"; fi
 
@@ -67,6 +90,7 @@ stop_server() {
 trap stop_server EXIT INT TERM
 
 start_server() {
+  if [[ -n "$URL" ]]; then note "use the running server at $BASE"; return 0; fi
   note "start Cascadia mock on 127.0.0.1:$PORT (log: $WORK/cascadia.log)"
   printf '+ %s run tests/fixtures/mock-tools-model --engine mock --api 127.0.0.1:%s\n' "$BIN" "$PORT"
   [[ $DRY_RUN == 1 ]] && { echo "+ wait for $BASE/models"; return 0; }
@@ -91,7 +115,7 @@ check_agents() {
     step "$PYTHON" -m venv "$venv"
     step "$venv/bin/python" -m pip install -q --disable-pip-version-check "$AGENTS_VER"
   fi
-  step "$venv/bin/python" -I "$HERE/agents_sdk_check.py" "$BASE" mock-tools-model
+  step "$venv/bin/python" -I "$HERE/agents_sdk_check.py" "$BASE" "$MODEL"
 }
 
 check_aisdk() {
@@ -102,7 +126,7 @@ check_aisdk() {
   fi
   # Node resolves imports from the script's own directory, so run a copy that sits next to node_modules.
   step cp "$HERE/aisdk_check.mjs" "$dir/aisdk_check.mjs"
-  step node "$dir/aisdk_check.mjs" "$BASE"
+  step node "$dir/aisdk_check.mjs" "$BASE" "$MODEL"
 }
 
 n8n_cmd() {
@@ -119,7 +143,7 @@ check_n8n() {
     note "installing $N8N_PKG (takes a few minutes)"
     step env N8N_USER_FOLDER="$WORK/n8n-home" npm install --prefix "$dir" --no-audit --no-fund --loglevel=error "$N8N_PKG"
   fi
-  step "$PYTHON" -I "$HERE/n8n_workflow.py" gen "$BASE" "$dir/creds.json" "$dir/wf.json"
+  step "$PYTHON" -I "$HERE/n8n_workflow.py" gen "$BASE" "$dir/creds.json" "$dir/wf.json" "$MODEL"
   printf '+ n8n import:credentials / import:workflow / execute  (N8N_USER_FOLDER=%s)\n' "$WORK/n8n-home"
   if [[ $DRY_RUN == 0 ]]; then
     n8n_cmd import:credentials --input "$dir/creds.json" > "$dir/import.log" 2>&1
@@ -129,10 +153,16 @@ check_n8n() {
   step "$PYTHON" -I "$HERE/n8n_workflow.py" verify "$dir/execute.out"
 }
 
+codex_provider() {
+  local env_key=""
+  [[ -n "$KEY_ENV" ]] && env_key=',env_key="'"$KEY_ENV"'"'
+  printf 'model_providers.cascadia={name="cascadia",base_url="%s",wire_api="responses"%s}' "$BASE" "$env_key"
+}
+
 codex_run() {
   (cd "$WORK/codex-work" && CODEX_HOME="$WORK/codex-home" codex exec --skip-git-repo-check \
-    -c 'model_providers.cascadia={name="cascadia",base_url="'"$BASE"'",wire_api="responses"}' \
-    -c model_provider=cascadia -m mock-tools-model "__mock_tool_call__" < /dev/null > "$WORK/codex-out.txt" 2>&1) || true
+    -c "$(codex_provider)" \
+    -c model_provider=cascadia -m "$MODEL" "__mock_tool_call__" < /dev/null > "$WORK/codex-out.txt" 2>&1) || true
 }
 
 check_codex() {
@@ -144,8 +174,8 @@ check_codex() {
     echo "CODEX_MOCK_TOOL_LOOP: SKIP ($CODEX_VER not on PATH)"; return 0
   fi
   step mkdir -p "$WORK/codex-work" "$WORK/codex-home"
-  printf '+ (cd %s && CODEX_HOME=%s codex exec --skip-git-repo-check -c model_providers.cascadia={...base_url="%s",wire_api="responses"} -c model_provider=cascadia -m mock-tools-model "__mock_tool_call__")\n' \
-    "$WORK/codex-work" "$WORK/codex-home" "$BASE"
+  printf '+ (cd %s && CODEX_HOME=%s codex exec --skip-git-repo-check -c %s -c model_provider=cascadia -m %s "__mock_tool_call__")\n' \
+    "$WORK/codex-work" "$WORK/codex-home" "$(codex_provider)" "$MODEL"
   [[ $DRY_RUN == 1 ]] && { echo "+ require \"mock: got\" in its output"; return 0; }
   codex_run
   grep -n "exec\|mock" "$WORK/codex-out.txt" | head -12 || true

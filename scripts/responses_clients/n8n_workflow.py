@@ -3,18 +3,23 @@
 agent output "mock: got ..."). Prints N8N_RESPONSES_AGENT_TOOL_LOOP: PASS or FAIL.
 
 Usage:
-  python3 n8n_workflow.py gen BASE_URL CREDS_JSON WORKFLOW_JSON   write the credential and workflow to import
+  python3 n8n_workflow.py gen BASE_URL CREDS_JSON WORKFLOW_JSON [MODEL]   write the credential and workflow to import
   python3 n8n_workflow.py verify EXECUTE_OUTPUT                     judge `n8n execute --rawOutput` output
-The credential's API key is the placeholder "not-needed"; Cascadia does not check it.
+The credential's API key is the placeholder "not-needed" (the mock does not check it), or, when
+$RESPONSES_CHECK_KEY_ENV names a variable, an expression that n8n resolves from that variable at run time, so
+the key itself is never written to CREDS_JSON.
 """
 import json
+import os
 import sys
 
 WORKFLOW_ID = "v3n8nagent"
 
 
-def gen(base, creds_path, wf_path):
-    creds = [{"id": "cascadia1", "name": "cascadia", "type": "openAiApi", "data": {"apiKey": "not-needed", "url": base}}]
+def gen(base, creds_path, wf_path, model="mock-tools-model"):
+    key_env = os.environ.get("RESPONSES_CHECK_KEY_ENV", "")
+    api_key = "={{ $env." + key_env + " }}" if key_env else "not-needed"
+    creds = [{"id": "cascadia1", "name": "cascadia", "type": "openAiApi", "data": {"apiKey": api_key, "url": base}}]
     wf = {"id": WORKFLOW_ID, "name": "v3 n8n agent", "active": False, "settings": {}, "connections": {
         "Start": {"main": [[{"node": "AI Agent", "type": "main", "index": 0}]]},
         "OpenAI Chat Model": {"ai_languageModel": [[{"node": "AI Agent", "type": "ai_languageModel", "index": 0}]]},
@@ -24,7 +29,7 @@ def gen(base, creds_path, wf_path):
         {"id": "n2", "name": "AI Agent", "type": "@n8n/n8n-nodes-langchain.agent", "typeVersion": 3.1, "position": [200, 0],
          "parameters": {"promptType": "define", "text": "weather __mock_tool_call__", "options": {}}},
         {"id": "n3", "name": "OpenAI Chat Model", "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi", "typeVersion": 1.3, "position": [200, 200],
-         "parameters": {"model": {"__rl": True, "mode": "id", "value": "mock-tools-model"}, "responsesApiEnabled": True, "options": {}},
+         "parameters": {"model": {"__rl": True, "mode": "id", "value": model}, "responsesApiEnabled": True, "options": {}},
          "credentials": {"openAiApi": {"id": "cascadia1", "name": "cascadia"}}},
         {"id": "n4", "name": "get_weather", "type": "@n8n/n8n-nodes-langchain.toolCode", "typeVersion": 1.3, "position": [400, 200],
          "parameters": {"name": "get_weather", "description": "Current weather for a city", "language": "javaScript",
@@ -54,7 +59,7 @@ def verify(out_path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "gen":
+    if len(sys.argv) in (5, 6) and sys.argv[1] == "gen":
         gen(*sys.argv[2:])
     elif len(sys.argv) == 3 and sys.argv[1] == "verify":
         sys.exit(verify(sys.argv[2]))

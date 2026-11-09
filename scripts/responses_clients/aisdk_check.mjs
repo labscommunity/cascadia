@@ -2,16 +2,19 @@
 // loop against Cascadia's mock engine, and that a later turn which sends item_reference inputs (the SDK's
 // default replay of stored items) resolves from Cascadia's item cache. Prints
 // AISDK_TOOL_LOOP_AND_ITEM_REFERENCE: PASS or FAIL.
-// Usage: node aisdk_check.mjs BASE_URL   (run from a dir whose node_modules has ai, @ai-sdk/openai, zod)
+// Usage: node aisdk_check.mjs BASE_URL [MODEL]   (run from a dir whose node_modules has ai, @ai-sdk/openai, zod)
+// The API key is the value of the variable named by $RESPONSES_CHECK_KEY_ENV, else the placeholder "not-needed".
 import { createOpenAI } from '@ai-sdk/openai';
 import { streamText, tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 
 const baseURL = process.argv[2];               // e.g. http://127.0.0.1:18080/v1
+const modelId = process.argv[3] ?? 'mock-tools-model';
+const apiKey = process.env[process.env.RESPONSES_CHECK_KEY_ENV ?? ''] || 'not-needed';
 const bodies = [];
 const fetchLog = async (url, init) => { if (init?.body) bodies.push(JSON.parse(init.body)); return fetch(url, init); };
-const openai = createOpenAI({ baseURL, apiKey: 'not-needed', fetch: fetchLog });
-const model = openai('mock-tools-model');
+const openai = createOpenAI({ baseURL, apiKey, fetch: fetchLog });
+const model = openai(modelId);
 const calls = [];
 const tools = { get_weather: tool({ description: 'Current weather', inputSchema: z.object({ city: z.string() }),
   execute: async ({ city }) => { calls.push(city); return 'sunny'; } }) };
