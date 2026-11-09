@@ -104,8 +104,11 @@ impl GrammarFactory {
 
     /// Builds the grammar for `spec`, failing with `InvalidConfig` when the
     /// schema can't be built (bad JSON, bad type, unresolvable `$ref`, ...).
+    /// A `pattern` (or `patternProperties` key) the regex engine can't parse,
+    /// such as a look-ahead, is dropped and listed in the warnings, like
+    /// the other keywords that compile but aren't enforced.
     pub fn compile(&self, spec: &GrammarSpec) -> EngineResult<CompiledGrammar> {
-        let grammar = match spec.kind {
+        match spec.kind {
             GrammarKind::JsonSchema => {
                 // llguidance's serde_json keeps object key order, so properties
                 // are generated in the order the client listed them.
@@ -117,17 +120,37 @@ impl GrammarFactory {
                 // Ours replaces any the client sent. Compact JSON; oneOf is
                 // treated as anyOf (pydantic's discriminated unions); keywords
                 // llguidance can't enforce become warnings, not errors.
-                obj.insert(
-                    "x-guidance".into(),
-                    serde_json::json!({
-                        "whitespace_flexible": false,
-                        "coerce_one_of": true,
-                        "lenient": true,
-                    }),
-                );
-                TopLevelGrammar::from_json_schema(schema)
+                obj.insert("x-guidance".into(), guidance_options());
+                match self.compile_schema(schema.clone(), Vec::new()) {
+                    Err(e) if is_regex_error(&e) => {
+                        // Only on a regex error: find each pattern that
+                        // fails alone, drop it, and build again.
+                        let dropped = self.drop_unparseable_patterns(&mut schema);
+                        if dropped.is_empty() {
+                            return Err(e);
+                        }
+                        let warnings = dropped
+                            .iter()
+                            .map(|p| {
+                                clean_message(&format!(
+                                    "pattern not enforced (the regex engine can't parse it): {p}"
+                                ))
+                            })
+                            .collect();
+                        self.compile_schema(schema, warnings)
+                    }
+                    other => other,
+                }
             }
-        };
+        }
+    }
+
+    fn compile_schema(
+        &self,
+        schema: serde_json::Value,
+        mut warnings: Vec<String>,
+    ) -> EngineResult<CompiledGrammar> {
+        let grammar = TopLevelGrammar::from_json_schema(schema);
         // Building the parser compiles the schema, so every error surfaces here.
         let parser = self
             .factory
@@ -137,13 +160,93 @@ impl GrammarFactory {
         if let Some(e) = matcher.get_error() {
             return Err(invalid_schema(e));
         }
-        let warnings = matcher.grammar_warnings().into();
+        warnings.extend(matcher.grammar_warnings());
         Ok(CompiledGrammar {
             pristine: Arc::new(matcher),
-            warnings,
+            warnings: warnings.into(),
             mask_width: self.mask_width,
             eos: self.eos.clone(),
         })
+    }
+
+    /// Whether `pattern` builds on its own, as the only constraint of a string.
+    fn pattern_parses(&self, pattern: &str) -> bool {
+        let schema = serde_json::json!({
+            "type": "string",
+            "pattern": pattern,
+            "x-guidance": guidance_options(),
+        });
+        self.factory
+            .create_parser(TopLevelGrammar::from_json_schema(schema))
+            .is_ok()
+    }
+
+    /// Removes every `pattern` and `patternProperties` key in `schema` that
+    /// doesn't build alone; returns them. At most [`MAX_PATTERN_CHECKS`]
+    /// distinct patterns are tried (the schema size cap bounds them anyway).
+    fn drop_unparseable_patterns(&self, schema: &mut serde_json::Value) -> Vec<String> {
+        let mut verdicts = std::collections::HashMap::<String, bool>::new();
+        let mut dropped = Vec::new();
+        let mut parses = |p: &str| -> bool {
+            if let Some(&ok) = verdicts.get(p) {
+                return ok;
+            }
+            // Past the cap, keep the pattern: the rebuild then fails as before.
+            let ok = verdicts.len() >= MAX_PATTERN_CHECKS || self.pattern_parses(p);
+            verdicts.insert(p.to_owned(), ok);
+            if !ok {
+                dropped.push(p.to_owned());
+            }
+            ok
+        };
+        visit_patterns(schema, &mut parses);
+        dropped
+    }
+}
+
+/// Most distinct patterns tried one by one after a regex error.
+const MAX_PATTERN_CHECKS: usize = 256;
+
+/// Schema keywords whose values are data, not schemas: never searched for patterns.
+const DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples", "x-guidance"];
+
+fn guidance_options() -> serde_json::Value {
+    serde_json::json!({
+        "whitespace_flexible": false,
+        "coerce_one_of": true,
+        "lenient": true,
+    })
+}
+
+fn is_regex_error(e: &EngineError) -> bool {
+    matches!(e, EngineError::InvalidConfig(m) if m.contains("regex"))
+}
+
+/// Walks every schema object in `v`, removing a string `pattern` and each
+/// `patternProperties` key for which `keep` is false.
+fn visit_patterns(v: &mut serde_json::Value, keep: &mut impl FnMut(&str) -> bool) {
+    match v {
+        serde_json::Value::Object(obj) => {
+            if let Some(serde_json::Value::String(p)) = obj.get("pattern") {
+                if !keep(p) {
+                    obj.remove("pattern");
+                }
+            }
+            if let Some(serde_json::Value::Object(props)) = obj.get_mut("patternProperties") {
+                props.retain(|k, _| keep(k));
+            }
+            for (k, child) in obj.iter_mut() {
+                if !DATA_KEYWORDS.contains(&k.as_str()) {
+                    visit_patterns(child, keep);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                visit_patterns(child, keep);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -600,3 +600,46 @@ fn a_pick_with_nothing_allowed_in_the_row_is_an_error() {
     assert_eq!(argmax_allowed(&[0.0; 100], &words), None);
     assert_eq!(argmax_allowed(&[0.0; 4], &[]), None);
 }
+
+/// zod 4 before 4.6 emits this look-ahead pattern for `z.email()`; the
+/// regex engine has no look-around.
+const ZOD_EMAIL: &str = r#"{"type":"object","properties":{"email":{"type":"string","format":"email","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"}},"required":["email"],"additionalProperties":false}"#;
+
+#[test]
+fn unparseable_pattern_is_dropped_with_a_warning_and_format_still_applies() {
+    let gf = single_byte();
+    let compiled = gf.compile(&spec(ZOD_EMAIL)).unwrap();
+    let w = compiled.warnings();
+    assert!(
+        w.iter().any(|w| w.contains("pattern") && w.contains("(?!")),
+        "{w:?}"
+    );
+    assert!(accepts(&gf, ZOD_EMAIL, r#"{"email":"ada@example.com"}"#));
+    // `format: email` is still enforced.
+    assert!(!accepts(&gf, ZOD_EMAIL, r#"{"email":"not an email"}"#));
+}
+
+#[test]
+fn unparseable_pattern_property_key_is_dropped_with_a_warning() {
+    let gf = single_byte();
+    let body = r#"{"type":"object","patternProperties":{"^(?!x)[a-z]+$":{"type":"integer"}},"properties":{"id":{"type":"string","pattern":"^[0-9]+$"}}}"#;
+    let compiled = gf.compile(&spec(body)).unwrap();
+    assert!(
+        compiled.warnings().iter().any(|w| w.contains("(?!x)")),
+        "{:?}",
+        compiled.warnings()
+    );
+    // The parseable pattern beside it is still enforced.
+    assert!(accepts(&gf, body, r#"{"id":"42"}"#));
+    assert!(!accepts(&gf, body, r#"{"id":"4a"}"#));
+}
+
+#[test]
+fn a_valid_pattern_is_still_enforced() {
+    let gf = single_byte();
+    let body = r#"{"type":"object","properties":{"code":{"type":"string","pattern":"^[A-Z]{3}$"}},"required":["code"],"additionalProperties":false}"#;
+    let compiled = gf.compile(&spec(body)).unwrap();
+    assert!(compiled.warnings().is_empty(), "{:?}", compiled.warnings());
+    assert!(accepts(&gf, body, r#"{"code":"ABC"}"#));
+    assert!(!accepts(&gf, body, r#"{"code":"abc"}"#));
+}
