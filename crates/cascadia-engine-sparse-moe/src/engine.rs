@@ -8504,12 +8504,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Ok(Ready::Down) => {
                         let relay_started = Instant::now();
                         let down = relay.as_ref().expect("Ready::Down only with a downstream");
+                        let mid_late = &self.mid_late;
                         let res = self.block_on(async {
                             match crate::dist::recv_kind_client_raw(down).await {
                                 Ok(Some(FrameKind::StreamTokens)) => {
                                     let (bid, toks) = recv_stream_tokens_body_client(down)
                                         .await
                                         .map_err(|e| format!("recv_stream_tokens: {e}"))?;
+                                    crate::dist::send_owed_late_ack(&upstream, mid_late)
+                                        .await
+                                        .map_err(|e| format!("relay late ack: {e}"))?;
                                     send_stream_tokens_upstream(&upstream, bid, &toks)
                                         .await
                                         .map_err(|e| format!("relay stream tokens: {e}"))
@@ -8521,11 +8525,26 @@ impl<R: StagedRunner> PipelineEngine<R> {
                                         crate::dist::recv_stream_tokens_ack_body_client(down)
                                             .await
                                             .map_err(|e| format!("recv_stream_tokens_ack: {e}"))?;
+                                    crate::dist::send_owed_late_ack(&upstream, mid_late)
+                                        .await
+                                        .map_err(|e| format!("relay late ack: {e}"))?;
                                     crate::dist::send_stream_tokens_ack_upstream(
                                         &upstream, bid, status, &toks,
                                     )
                                     .await
                                     .map_err(|e| format!("relay stream tokens ack: {e}"))
+                                }
+                                // The late reply to a probe or masked step
+                                // this stage already answered upstream: the
+                                // stage behind it does mask. Dropped here and
+                                // passed on before the next stream reply.
+                                Ok(Some(FrameKind::TokenAck)) => {
+                                    let (_, _, status) =
+                                        crate::dist::recv_token_ack_body_client(down)
+                                            .await
+                                            .map_err(|e| format!("recv_token_ack: {e}"))?;
+                                    crate::dist::note_stale_ack(Some(mid_late), status);
+                                    Ok(())
                                 }
                                 Ok(Some(other)) => Err(format!(
                                     "expected StreamTokens from downstream, got {other:?}"

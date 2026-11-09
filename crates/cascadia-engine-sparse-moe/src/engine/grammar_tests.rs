@@ -1168,3 +1168,63 @@ fn a_middle_takes_the_prefill_budget_only_for_the_first_sampled_step() {
     sampled = false;
     assert_eq!(mid_forward_budget(&mut sampled, true, rank, total), pre);
 }
+
+/// Runs `drive` on its own thread and fails after 10 s instead of hanging on
+/// a reply that never comes.
+fn drive_bounded(
+    mut eng: PipelineEngine<JsonStub>,
+    ids: &'static [&'static str],
+) -> (PipelineEngine<JsonStub>, HashMap<String, Outcome>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = drive(&mut eng, ids);
+        let _ = tx.send((eng, out));
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("tasks did not finish within 10 s")
+}
+
+/// A stream-mode middle stage: a late acknowledged reply to a probe it
+/// already answered upstream (its downstream was slow) turns up between
+/// stream replies. It is dropped, the link stays, and rank 0 hears of it
+/// before the next stream reply (its latch clears).
+#[test]
+fn a_stream_middle_drops_a_late_probe_ack_and_keeps_the_link() {
+    let rt = runtime();
+    let l = links(&rt, 2);
+    // The late reply is already on the middle's downstream link.
+    rt.block_on(crate::dist::send_token_ack_upstream(
+        &l[1].0, -1, 7, MASK_ACK,
+    ))
+    .unwrap();
+    let log = fixture_tail(&rt, l[1].0.clone(), false);
+    let mut mid = PipelineEngine::new(
+        JsonStub::new(),
+        None,
+        StageTransport {
+            upstream: Some(l[0].0.clone()),
+            downstream: Some(l[1].1.clone()),
+        },
+        rt.handle().clone(),
+        1,
+        3,
+        None,
+    );
+    assert_eq!(mid.enable_streams(2), 2);
+    std::thread::spawn(move || while mid.step().is_ok() {});
+    let mut head = head_engine(&rt, JsonStub::new(), l[0].1.clone(), 3, 2);
+    head.stage_masks.latch.set();
+    head.submit(plain_task("p1", 6)).unwrap();
+    let (mut head, out) = drive_bounded(head, &["p1"]);
+    assert_eq!(final_chunk(&out["p1"]).error, None);
+    assert_eq!(out["p1"].tokens, vec![u32::from(b'a'); 6]);
+    assert!(
+        !head.stage_masks.latch.is_set(),
+        "the late ack reached rank 0"
+    );
+    // The streams keep running on the same link.
+    head.submit(plain_task("p2", 4)).unwrap();
+    let (_head, out) = drive_bounded(head, &["p2"]);
+    assert_eq!(final_chunk(&out["p2"]).error, None);
+    assert!(!log.died());
+}

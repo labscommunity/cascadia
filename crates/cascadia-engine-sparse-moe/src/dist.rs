@@ -2946,7 +2946,7 @@ impl MaskLatch {
 }
 
 /// A late acknowledged reply read and dropped: the stage behind it does mask.
-fn note_stale_ack(latch: Option<&MaskLatch>, status: u32) {
+pub(crate) fn note_stale_ack(latch: Option<&MaskLatch>, status: u32) {
     if status == MASK_ACK {
         if let Some(l) = latch {
             l.clear();
