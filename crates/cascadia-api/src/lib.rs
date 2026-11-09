@@ -3116,7 +3116,7 @@ async fn stream_text_completion(
                     let payload = serde_json::json!({
                         "id": task_id,
                         "object": "error",
-                        "error": { "message": reason, "type": "engine_error" },
+                        "error": { "message": reason, "type": stream_error_type(&chunk) },
                     });
                     tokio::task::yield_now().await;
                     return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
@@ -3316,7 +3316,7 @@ async fn stream_completion(
                     let payload = serde_json::json!({
                         "id": task_id,
                         "object": "error",
-                        "error": { "message": reason, "type": "engine_error" },
+                        "error": { "message": reason, "type": stream_error_type(&chunk) },
                     });
                     tokio::task::yield_now().await;
                     return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
@@ -3493,7 +3493,7 @@ impl ToolStream {
                 let payload = serde_json::json!({
                     "id": self.task_id,
                     "object": "error",
-                    "error": { "message": reason, "type": "engine_error" },
+                    "error": { "message": reason, "type": stream_error_type(&chunk) },
                 });
                 tokio::task::yield_now().await;
                 return Some(Bytes::from(format!("data: {payload}\n\n")));
@@ -3644,6 +3644,16 @@ fn content_frame(
         }],
     });
     format!("data: {payload}\n\n")
+}
+
+/// The `type` of a stream's error event for a failed task: the streamed
+/// counterpart of [`failed_task_response`]'s 400 versus 503.
+fn stream_error_type(chunk: &cascadia_types::Chunk) -> &'static str {
+    if chunk.invalid_request {
+        "invalid_request_error"
+    } else {
+        "engine_error"
+    }
 }
 
 /// The reply to a non-streaming request whose task failed: 400 when the
@@ -4216,13 +4226,98 @@ mod tests {
             .unwrap();
         let cfg = Config {
             chat_template: ChatTemplateConfig {
-                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                template: Some(
+                    "{% if tools %}{{ tools | tojson }}{% endif %}\
+                     {% for m in messages %}{{ m.content }}{% endfor %}"
+                        .into(),
+                ),
                 bos_token: None,
                 eos_token: None,
             },
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// POST a streaming request and return the SSE body.
+    async fn post_stream(app: Router, uri: &str, payload: serde_json::Value) -> String {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_streamed_refusal_is_an_invalid_request_error_on_every_stream_path() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "x"}}]);
+        let cases = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "stream": true, "prompt": "hi"}),
+            ),
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tool_choice": "auto", "tools": tools}),
+            ),
+        ];
+        for (uri, payload) in cases {
+            let body = post_stream(rejecting_app().await, uri, payload.clone()).await;
+            assert!(
+                body.contains(r#""type":"invalid_request_error""#),
+                "{uri} {payload}: {body}"
+            );
+            assert!(!body.contains("engine_error"), "{uri} {payload}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_engine_failure_stays_an_engine_error_on_every_stream_path() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "x"}}]);
+        let msgs = serde_json::json!([{"role": "user", "content": "__engine_error__"}]);
+        let cases = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true, "messages": msgs}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "prompt": "__engine_error__"}),
+            ),
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true, "messages": msgs,
+                    "tool_choice": "auto", "tools": tools}),
+            ),
+        ];
+        for (uri, payload) in cases {
+            let body = post_stream(make_tool_app().await, uri, payload.clone()).await;
+            assert!(
+                body.contains(r#""type":"engine_error""#),
+                "{uri} {payload}: {body}"
+            );
+            assert!(
+                !body.contains("invalid_request_error"),
+                "{uri} {payload}: {body}"
+            );
+        }
     }
 
     #[tokio::test]
