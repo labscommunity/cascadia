@@ -432,7 +432,9 @@ fn last_native_error() -> String {
 }
 
 /// Turn a failed validate call's result into an error. `p` is the message the
-/// shim allocated (freed here), or null when it could not allocate one.
+/// shim allocated (freed here), or null when it could not allocate one. The
+/// error carries the backend's raw text, for the caller to log in full; pass
+/// it through [`clean_backend_message`] before showing it to a client.
 ///
 /// # Safety
 /// `p` must be null or a string returned by the shim's validate functions.
@@ -445,7 +447,7 @@ unsafe fn validate_error(p: *mut c_char) -> Error {
         sys::cascadia_free_string(p);
         s
     };
-    Error::Native(clean_backend_message(&msg))
+    Error::Native(msg)
 }
 
 /// Longest message [`clean_backend_message`] returns, in chars.
@@ -770,7 +772,8 @@ impl LlmPipeline {
     }
 
     /// Check that `schema` can be turned into an output constraint for this
-    /// pipeline's tokenizer, without generating anything.
+    /// pipeline's tokenizer, without generating anything. The error is the
+    /// backend's raw text (see [`clean_backend_message`]).
     #[cfg(feature = "openvino")]
     pub fn validate_json_schema(&self, schema: &str) -> Result<()> {
         let schema_c = cstr(schema)?;

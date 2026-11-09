@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
-    CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
-    GenConfig, LlmPipeline, PluginConfig,
+    clean_backend_message, CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus,
+    Error as OvError, GenConfig, LlmPipeline, PluginConfig,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, GrammarKind, LoadProgress, PeerLayout, SamplingParams,
@@ -360,16 +360,23 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
-/// The JSON schema `response_format: {"type":"json_object"}` maps to. The
-/// warmup probe compiles this one, so it is also known to work on this server.
+/// The JSON schema `response_format: {"type":"json_object"}` maps to. It is
+/// the server's own fixed schema, never a client's, so a failed batch is
+/// never blamed on it: quarantining it would refuse every json_object
+/// request.
 const JSON_OBJECT_PROBE: &str = r#"{"type":"object","additionalProperties":true}"#;
 
-/// Prompt and token budget for the warmup structured-output probe.
-const PROBE_PROMPT: &str = "Reply with a JSON object.";
+/// Schema, prompt and token budget for the warmup structured-output probe.
+/// The prompt does not ask for JSON and the schema allows exactly one
+/// answer, so the expected output appears only when the constraint is
+/// really applied.
+const PROBE_SCHEMA: &str = r#"{"type":"object","properties":{"k":{"const":"zq"}},"required":["k"],"additionalProperties":false}"#;
+const PROBE_PROMPT: &str = "Say hello.";
 const PROBE_MAX_TOKENS: u32 = 16;
 
-/// Request id of the CB structured-output probe (the plain warmup uses
-/// `u64::MAX`); neither can collide with the sequential request-id counter.
+/// Request id of the CB structured-output probe, and `- 1` of its retry (the
+/// plain warmup uses `u64::MAX`); none can collide with the sequential
+/// request-id counter.
 const PROBE_REQUEST_ID: u64 = u64::MAX - 1;
 
 /// How many schemas the CB engine remembers as having failed to compile.
@@ -412,27 +419,82 @@ fn check_grammar(
         )));
     }
     validate(schema).map_err(|err| {
-        EngineError::InvalidConfig(format!("response_format json_schema: {}", ov_message(err)))
+        EngineError::InvalidConfig(format!(
+            "response_format json_schema: {}",
+            client_message(err, "schema validation failed")
+        ))
     })
 }
 
+/// The one line of a shim error a client may see: the backend's raw text,
+/// logged here in full, reduced by [`clean_backend_message`].
+fn client_message(err: OvError, what: &str) -> String {
+    let raw = ov_message(err);
+    let clean = clean_backend_message(&raw);
+    if clean != raw {
+        warn!(raw = %raw, "{what}");
+    }
+    clean
+}
+
 /// Decide the warmup structured-output probe. `None` means available: the
-/// output starts with `{`, or is empty or whitespace only (the grammar allows
-/// leading whitespace, so a short budget can end before the object starts —
-/// inconclusive, not a failure). `Some(reason)` means unavailable.
+/// trimmed output is exactly the probe schema's one answer `{"k":"zq"}`, or
+/// it is empty (the grammar allows leading whitespace, so the budget can
+/// end before the object starts: inconclusive, not a failure). `Some(reason)`
+/// means unavailable; an error's text is cleaned for clients.
 fn probe_verdict(r: Result<String, OvError>) -> Option<String> {
     match r {
         Ok(text) => {
-            let t = text.trim_start();
-            if t.is_empty() || t.starts_with('{') {
+            let t = text.trim();
+            if t.is_empty() {
+                info!("structured output probe inconclusive: no output within the token budget");
+                return None;
+            }
+            let want = serde_json::json!({"k": "zq"});
+            if serde_json::from_str::<serde_json::Value>(t).is_ok_and(|v| v == want) {
                 None
             } else {
                 let head: String = t.chars().take(40).collect();
-                Some(format!("probe output did not start with '{{': {head}"))
+                Some(format!("the output constraint was not applied: {head}"))
             }
         }
-        Err(err) => Some(ov_message(err)),
+        Err(err) => Some(client_message(err, "structured output probe failed")),
     }
+}
+
+/// Run the probe, and once more if it fails: one failed generation at
+/// startup is not enough to turn structured output off for the run.
+fn probe_with_retry(mut run: impl FnMut() -> Result<String, OvError>) -> Result<String, OvError> {
+    match run() {
+        Err(err) => {
+            warn!(error = %err, "structured output probe failed; retrying once");
+            run()
+        }
+        ok => ok,
+    }
+}
+
+/// Whether a GenAI runtime build string (`2026.4.1.0-3408-…`) is older than
+/// 2026.4. `None` when it does not start with `<major>.<minor>`.
+fn runtime_older_than_2026_4(build: &str) -> Option<bool> {
+    let head = build.split('-').next()?;
+    let mut parts = head.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor) < (2026, 4))
+}
+
+/// Why structured output cannot run on the loaded GenAI runtime, without
+/// trying it: an output constraint on GenAI older than 2026.4 crashes the
+/// process. `None` (run the probe) when the version is newer or unknown.
+fn version_gate(v: Result<cascadia_ov_genai_shim::OvVersion, OvError>) -> Option<String> {
+    let v = v.ok()?;
+    runtime_older_than_2026_4(&v.runtime_genai)?.then(|| {
+        format!(
+            "needs OpenVINO GenAI 2026.4 or newer; this runtime is {}",
+            v.runtime_genai
+        )
+    })
 }
 
 /// Log the probe's outcome and turn it into the engine's
@@ -531,22 +593,28 @@ impl Engine for OvGenaiEngine {
             Err(err) => warn!(error = %err, "ov-genai warmup failed"),
         }
 
-        // Structured-output probe: one real generation under the json_object
+        // Structured-output probe: one real generation under the probe
         // schema, through this engine's own config (speculative decoding /
         // prompt lookup included), so a model or pipeline that cannot run
         // with an output constraint is found here rather than per request.
+        if let Some(reason) = version_gate(cascadia_ov_genai_shim::ov_version()) {
+            self.structured_unavailable = record_probe(Some(reason));
+            return;
+        }
         let cfg = self.gen_config(
             PROBE_MAX_TOKENS,
             0.0,
             false,
             &SamplingParams::default(),
-            Some(JSON_OBJECT_PROBE.to_owned()),
+            Some(PROBE_SCHEMA.to_owned()),
         );
-        let result = self.pipe.generate(PROBE_PROMPT, &cfg).map(|r| {
-            match r.text.strip_prefix(PROBE_PROMPT) {
-                Some(rest) => rest.to_owned(),
-                None => r.text,
-            }
+        let result = probe_with_retry(|| {
+            self.pipe.generate(PROBE_PROMPT, &cfg).map(|r| {
+                match r.text.strip_prefix(PROBE_PROMPT) {
+                    Some(rest) => rest.to_owned(),
+                    None => r.text,
+                }
+            })
         });
         self.structured_unavailable = record_probe(probe_verdict(result));
     }
@@ -862,8 +930,17 @@ impl Engine for OvGenaiCbEngine {
             Err(err) => warn!(error = %err, "ov-genai cb warmup failed"),
         }
 
-        let verdict = probe_verdict(self.run_structured_probe());
-        self.structured_unavailable = record_probe(verdict);
+        if let Some(reason) = version_gate(cascadia_ov_genai_shim::ov_version()) {
+            self.structured_unavailable = record_probe(Some(reason));
+            return;
+        }
+        let mut request_id = PROBE_REQUEST_ID;
+        let result = probe_with_retry(|| {
+            let r = self.run_structured_probe(request_id);
+            request_id -= 1;
+            r
+        });
+        self.structured_unavailable = record_probe(probe_verdict(result));
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
@@ -978,8 +1055,11 @@ impl Engine for OvGenaiCbEngine {
             // step that fails while such a request is new may have failed on
             // that compile. Counting it would let one client latch the worker
             // with a bad schema; quarantining the schema stops it from failing
-            // the next batches too. Resource exhaustion and json_object (the
-            // warmup probe compiled it) are never blamed on a schema.
+            // the next batches too. The schema is quarantined only when it is
+            // the one new schema in the step: with several there is no telling
+            // which one failed, and refusing them all would punish innocent
+            // clients (the failure is still excused). Resource exhaustion and
+            // json_object (the server's own schema) are never blamed on one.
             let resource = cascadia_ov_genai_shim::last_error_resource_exhausted();
             let suspects: Vec<u64> = if resource || self.excused_since_success {
                 Vec::new()
@@ -992,16 +1072,19 @@ impl Engine for OvGenaiCbEngine {
             };
             if suspects.is_empty() {
                 self.step_failures += 1;
-            } else {
+            } else if let [h] = suspects[..] {
                 self.excused_since_success = true;
-                let now = Instant::now();
-                for h in &suspects {
-                    self.quarantined.insert(*h, now);
-                }
+                self.quarantined.insert(h, Instant::now());
                 warn!(
-                    schemas = suspects.len(),
                     "cb step failed with a new schema-constrained request in the batch; \
                      not counted toward the failure latch, schema refused for 10 minutes"
+                );
+            } else {
+                self.excused_since_success = true;
+                warn!(
+                    schemas = suspects.len(),
+                    "cb step failed with several new schema-constrained requests in the \
+                     batch; not counted toward the failure latch, none refused"
                 );
             }
             warn!(
@@ -1183,10 +1266,11 @@ impl Engine for OvGenaiCbEngine {
 }
 
 impl OvGenaiCbEngine {
-    /// Run the warmup structured-output probe: one request under the
-    /// json_object schema, driven to a terminal status within
-    /// [`WARMUP_MAX_STEPS`]. Returns the text it produced.
-    fn run_structured_probe(&mut self) -> Result<String, OvError> {
+    /// Run the warmup structured-output probe: one request under the probe
+    /// schema, driven to a terminal status within [`WARMUP_MAX_STEPS`].
+    /// Returns the text it produced, or nothing when the scheduler dropped
+    /// or cancelled it (an incomplete probe proves nothing).
+    fn run_structured_probe(&mut self, request_id: u64) -> Result<String, OvError> {
         let cfg = build_gen_config(
             0,
             0,
@@ -1195,11 +1279,9 @@ impl OvGenaiCbEngine {
             0.0,
             false,
             &SamplingParams::default(),
-            Some(JSON_OBJECT_PROBE.to_owned()),
+            Some(PROBE_SCHEMA.to_owned()),
         );
-        let mut handle = self
-            .pipe
-            .add_request(PROBE_REQUEST_ID, PROBE_PROMPT, &cfg)?;
+        let mut handle = self.pipe.add_request(request_id, PROBE_PROMPT, &cfg)?;
         let mut text = String::new();
         for _ in 0..WARMUP_MAX_STEPS {
             if let Err(err) = self.pipe.step() {
@@ -1214,8 +1296,16 @@ impl OvGenaiCbEngine {
                 }
             };
             text.push_str(&r.text_delta);
-            if r.status != CbStatus::Running {
-                return Ok(text);
+            match r.status {
+                CbStatus::Running => {}
+                CbStatus::Finished => return Ok(text),
+                CbStatus::Ignored | CbStatus::Cancelled => {
+                    warn!(
+                        status = ?r.status,
+                        "structured output probe did not complete; treating it as inconclusive"
+                    );
+                    return Ok(String::new());
+                }
             }
         }
         // Not finished in time: judge what it produced so far, and free it.
@@ -1979,15 +2069,189 @@ mod tests {
 
     #[test]
     fn probe_verdict_cases() {
-        assert_eq!(probe_verdict(Ok("  {\"a\":1}".into())), None);
-        assert_eq!(probe_verdict(Ok("   \n".into())), None);
-        assert_eq!(probe_verdict(Ok(String::new())), None);
-        let r = probe_verdict(Ok("hello".into())).expect("must fail");
-        assert!(r.starts_with("probe output did not start with '{'"), "{r}");
-        assert!(r.contains("hello"), "{r}");
-        let r =
-            probe_verdict(Err(OvError::Native("no grammar backend".into()))).expect("must fail");
-        assert!(r.contains("no grammar backend"), "{r}");
+        assert_eq!(probe_verdict(Ok(" {\"k\": \"zq\"}\n".into())), None);
+        assert_eq!(probe_verdict(Ok("   \n".into())), None, "inconclusive");
+        assert_eq!(probe_verdict(Ok(String::new())), None, "inconclusive");
+        for text in ["hello", "{\"a\":1}", "{\"k\":\"zz\"}", "{\"k\":\"z"] {
+            let r = probe_verdict(Ok(text.into())).expect("must fail");
+            assert_eq!(r, format!("the output constraint was not applied: {text}"));
+        }
+        let long = "x".repeat(100);
+        let r = probe_verdict(Ok(long)).expect("must fail");
+        assert_eq!(
+            r,
+            format!("the output constraint was not applied: {}", "x".repeat(40))
+        );
+        let r = probe_verdict(Err(OvError::Native(
+            "Exception from src/core.cpp:1:\n[10:00:00] src/grammar.cc:42: no grammar backend\n"
+                .into(),
+        )))
+        .expect("must fail");
+        assert_eq!(r, "no grammar backend");
+    }
+
+    #[test]
+    fn probe_is_retried_once_after_an_error() {
+        let mut calls = 0;
+        let r = probe_with_retry(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(OvError::Native("transient".into()))
+            } else {
+                Ok("{}".into())
+            }
+        });
+        assert_eq!(r.unwrap(), "{}");
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let r = probe_with_retry(|| {
+            calls += 1;
+            Err(OvError::Native(format!("fail {calls}")))
+        });
+        assert_eq!(ov_message(r.unwrap_err()), "fail 2");
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let _ = probe_with_retry(|| {
+            calls += 1;
+            Ok(String::new())
+        });
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn runtime_version_gate() {
+        assert_eq!(
+            runtime_older_than_2026_4("2026.2.0.0-21903-abc"),
+            Some(true)
+        );
+        assert_eq!(runtime_older_than_2026_4("2025.9.1"), Some(true));
+        assert_eq!(
+            runtime_older_than_2026_4("2026.4.1.0-3408-ab01d1771e4"),
+            Some(false)
+        );
+        assert_eq!(runtime_older_than_2026_4("2026.4"), Some(false));
+        assert_eq!(runtime_older_than_2026_4("2027.0.0"), Some(false));
+        for garbage in ["", "garbage", "2026", "x.4.1", "2026.y"] {
+            assert_eq!(runtime_older_than_2026_4(garbage), None, "{garbage}");
+        }
+
+        let v = |runtime: &str| cascadia_ov_genai_shim::OvVersion {
+            built_genai: "2026.4.1".into(),
+            built_core: "2026.4.1".into(),
+            runtime_genai: runtime.into(),
+            runtime_core: runtime.into(),
+        };
+        assert_eq!(
+            version_gate(Ok(v("2026.2.0.0-21903-abc"))).as_deref(),
+            Some("needs OpenVINO GenAI 2026.4 or newer; this runtime is 2026.2.0.0-21903-abc")
+        );
+        assert_eq!(version_gate(Ok(v("2026.4.1.0-3408-ab01d1771e4"))), None);
+        assert_eq!(version_gate(Ok(v("unknown"))), None);
+        assert_eq!(version_gate(Err(OvError::Stub)), None);
+    }
+
+    #[test]
+    fn check_grammar_cleans_the_backend_message() {
+        let t = schema_task("s", SCHEMA_A);
+        let err = check_grammar(&t, None, |_| {
+            Err(OvError::Native(
+                "Exception from src/x.cpp:3:\n[12:00:01] src/json_schema.cc:77: bad schema\n"
+                    .into(),
+            ))
+        })
+        .unwrap_err();
+        match err {
+            EngineError::InvalidConfig(m) => {
+                assert_eq!(m, "response_format json_schema: bad schema")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn cb_step_failure_with_two_new_schemas_quarantines_neither() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("t1", SCHEMA_A)).unwrap();
+        e.submit(schema_task("t2", SCHEMA_B)).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(e.step_failures, 0, "still excused once");
+        assert_eq!(e.quarantined.len(), 0);
+        st.lock().unwrap().step_fails = false;
+        e.submit(schema_task("t3", SCHEMA_A)).unwrap();
+        e.submit(schema_task("t4", SCHEMA_B)).unwrap();
+    }
+
+    /// A CB engine whose plain warmup request finishes at once, with
+    /// `probe` scripted as the reads of each probe attempt in turn.
+    fn cb_warmup_with(
+        probe: Vec<Vec<Result<CbRead, OvError>>>,
+    ) -> (OvGenaiCbEngine, Arc<Mutex<MockState>>) {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            s.reads.push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Finished,
+                1,
+                "hi",
+                CbFinish::Stop,
+            ))]));
+            for reads in probe {
+                s.reads.push(VecDeque::from(reads));
+            }
+        }
+        let mut e = mock_engine(&st);
+        e.warmup();
+        (e, st)
+    }
+
+    #[test]
+    fn cb_warmup_probe_verdicts() {
+        let finished = |text: &str| Ok(read_of(CbStatus::Finished, 6, text, CbFinish::Stop));
+        let (e, _) = cb_warmup_with(vec![vec![finished("{\"k\":\"zq\"}")]]);
+        assert_eq!(e.structured_unavailable, None);
+
+        let (e, _) = cb_warmup_with(vec![vec![finished("Hello there!")]]);
+        assert_eq!(
+            e.structured_unavailable.as_deref(),
+            Some("the output constraint was not applied: Hello there!")
+        );
+
+        // A probe the scheduler dropped proves nothing either way.
+        let (e, _) = cb_warmup_with(vec![vec![Ok(read_of(
+            CbStatus::Ignored,
+            2,
+            "{\"k",
+            CbFinish::Unknown,
+        ))]]);
+        assert_eq!(e.structured_unavailable, None);
+
+        // A failed attempt is retried once, under a fresh request id.
+        let (e, st) = cb_warmup_with(vec![
+            vec![Err(OvError::Native("transient".into()))],
+            vec![finished("{\"k\":\"zq\"}")],
+        ]);
+        assert_eq!(e.structured_unavailable, None);
+        let st = st.lock().unwrap();
+        assert_eq!(
+            st.added,
+            vec![u64::MAX, PROBE_REQUEST_ID, PROBE_REQUEST_ID - 1]
+        );
+        drop(st);
+
+        let (e, _) = cb_warmup_with(vec![
+            vec![Err(OvError::Native("first".into()))],
+            vec![Err(OvError::Native(
+                "[01:02:03] src/x.cpp:9: second".into(),
+            ))],
+        ]);
+        assert_eq!(e.structured_unavailable.as_deref(), Some("second"));
     }
 
     #[test]
