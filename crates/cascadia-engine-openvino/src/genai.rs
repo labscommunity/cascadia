@@ -339,6 +339,8 @@ impl Builder for OvGenaiBuilder {
                 step_failures: 0,
                 suspect_failures: 0,
                 latched_at: None,
+                blamed_in_run: HashSet::new(),
+                canary_failed_in_run: false,
                 structured_unavailable: None,
                 quarantined: QuarantineSet::default(),
                 strikes: StrikeSet::default(),
@@ -696,6 +698,12 @@ impl QuarantineSet {
         self.members.insert(h);
     }
 
+    fn remove(&mut self, h: u64) {
+        if self.members.remove(&h) {
+            self.order.retain(|&(m, _)| m != h);
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.order.len()
@@ -968,24 +976,26 @@ const MAX_IDLE_STEPS: u32 = 2048;
 const MAX_STEP_FAILURES: u32 = 3;
 
 /// Step failures since the last successful step that are blamed on new
-/// schemas alone. A step that fails with a request whose schema has not yet
+/// schemas. A step that fails with a request whose schema has not yet
 /// produced output in flight is not counted toward [`MAX_STEP_FAILURES`],
 /// whatever else shares the step, and that schema is refused after its first
-/// or second such failure, so each failure needs a new schema; past this many
-/// in a row the device itself is the likelier cause, and from this one on
-/// each failure counts so a dead device still latches.
+/// or second such failure. At this many the engine checks the device itself
+/// with a canary (see [`OvGenaiCbEngine::run_canary`]): if the canary
+/// succeeds the schemas keep the blame and the count starts over; if it fails
+/// the step counts.
 const MAX_SUSPECT_FAILURES: u32 = 8;
 
-/// How long a latched CB pipeline refuses new work before it admits some
-/// again to see whether it recovered. The next step's outcome decides: a
-/// success clears the latch, a failure starts the wait over.
+/// How often a latched CB pipeline runs a canary to see whether it recovered.
+/// Client requests are refused until one succeeds.
 const LATCH_RETRY: Duration = Duration::from_secs(30);
 
-/// Whether a CB pipeline with `step_failures` consecutive failures, the last
-/// counted one at `latched_at`, refuses new work at `now`.
-fn latch_holds(step_failures: u32, latched_at: Option<Instant>, now: Instant) -> bool {
-    step_failures >= MAX_STEP_FAILURES
-        && !matches!(latched_at, Some(at) if now.saturating_duration_since(at) >= LATCH_RETRY)
+/// Token budget of the canary request.
+const CANARY_MAX_TOKENS: u32 = 4;
+
+/// Whether a latched pipeline's next canary is due at `now`, the last one (or
+/// the failure that latched it) having run at `last`.
+fn canary_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_some_and(|at| now.saturating_duration_since(at) >= LATCH_RETRY)
 }
 
 /// The slice of [`CbPipeline`] the continuous-batching engine actually uses.
@@ -1087,16 +1097,21 @@ pub struct OvGenaiCbEngine {
     max_tokens_default: u32,
     /// Consecutive iterations in which the whole batch produced nothing.
     idle_steps: u32,
-    /// Consecutive `pipe.step()` failures. Past MAX_STEP_FAILURES the pipeline
-    /// is treated as unusable and `submit()` stops admitting work.
+    /// Counted `pipe.step()` failures since the last successful step or
+    /// canary. At MAX_STEP_FAILURES the pipeline is treated as unusable and
+    /// `submit()` admits no client work until a canary succeeds.
     step_failures: u32,
-    /// Step failures since the last successful step blamed on new schemas.
-    /// They are not counted in `step_failures` until there are
-    /// [`MAX_SUSPECT_FAILURES`] of them.
+    /// Step failures blamed on new schemas since the last successful step
+    /// or canary. At [`MAX_SUSPECT_FAILURES`] a canary decides.
     suspect_failures: u32,
-    /// When the last counted step failure happened; with `step_failures` at
-    /// the limit, work is refused until [`LATCH_RETRY`] after it.
+    /// With `step_failures` at the limit: when the latch was set or its last
+    /// canary ran. The next canary runs [`LATCH_RETRY`] after it.
     latched_at: Option<Instant>,
+    /// Schemas quarantined or struck during the current run of failures. They
+    /// are released if the run turns out to have been the device's fault.
+    blamed_in_run: HashSet<u64>,
+    /// A canary failed during the current run of failures.
+    canary_failed_in_run: bool,
     /// Set by the warmup probe when this model cannot do structured output.
     structured_unavailable: Option<String>,
     /// Schemas that recently took a scheduler iteration down with them.
@@ -1188,15 +1203,25 @@ impl Engine for OvGenaiCbEngine {
         // A pipeline that has failed every recent scheduler iteration will fail
         // this request too. Admitting it means paying add_request and a step
         // before returning the same 503, forever, with nothing distinguishing a
-        // transient hiccup from a dead device. Refuse up front instead; a
-        // single successful step clears this. After LATCH_RETRY work is
-        // admitted again, so a pipeline that recovered is not refused forever.
-        if latch_holds(self.step_failures, self.latched_at, Instant::now()) {
-            return Err(EngineError::Backend(format!(
-                "cb pipeline unusable: {} consecutive scheduler iterations failed; \
-                 retry later or restart the worker",
-                self.step_failures
-            )));
+        // transient hiccup from a dead device. Refuse up front instead. No
+        // client request is admitted while latched: every LATCH_RETRY an
+        // internal canary checks the device, and only its success clears this.
+        if self.step_failures >= MAX_STEP_FAILURES {
+            let now = Instant::now();
+            let recovered = canary_due(self.latched_at, now) && {
+                self.latched_at = Some(now);
+                self.run_canary()
+            };
+            if !recovered {
+                return Err(EngineError::Backend(format!(
+                    "cb pipeline unusable: {} counted scheduler failures since the last \
+                     successful step; it is checked again every {} s",
+                    self.step_failures,
+                    LATCH_RETRY.as_secs()
+                )));
+            }
+            info!("cb pipeline recovered: the health check succeeded");
+            self.end_failure_run(true);
         }
         if self.active.len() >= crate::dist_spec::MAX_PENDING_TASKS {
             tracing::warn!(
@@ -1291,10 +1316,11 @@ impl Engine for OvGenaiCbEngine {
             // are never blamed on one.
             //
             // A step with a suspect in flight is not counted toward the
-            // failure latch, whatever shares the step, so one client cannot
-            // latch the worker with bad schemas (batched with plain requests
-            // or not) — until MAX_SUSPECT_FAILURES of them in a row. A step
-            // with no suspect counts as any other failure.
+            // failure latch, whatever shares the step, so a client cannot
+            // latch the worker with bad schemas. Client work never decides
+            // whether the device is healthy: after MAX_SUSPECT_FAILURES such
+            // steps an internal canary does. A step with no suspect counts as
+            // any other failure.
             let resource = cascadia_ov_genai_shim::last_error_resource_exhausted();
             let mut suspects: Vec<u64> = if resource {
                 Vec::new()
@@ -1308,26 +1334,51 @@ impl Engine for OvGenaiCbEngine {
             // Several requests with one schema are one suspect.
             suspects.sort_unstable();
             suspects.dedup();
-            let now = Instant::now();
-            let mut refused = 0;
-            if let [h] = suspects[..] {
-                self.quarantined.insert(h, now);
-                refused = 1;
-            } else {
-                for h in &suspects {
-                    if self.strikes.strike(*h, now) >= QUARANTINE_STRIKES {
-                        self.quarantined.insert(*h, now);
-                        refused += 1;
-                    }
-                }
-            }
+            let failed: Vec<(TaskId, Chunk)> = self
+                .active
+                .drain(..)
+                .map(|t| {
+                    // The canary below must run on its own.
+                    let _ = t.handle.cancel();
+                    let chunk = Chunk::error(t.task_id.clone(), format!("cb step failed: {err}"));
+                    (t.task_id, chunk)
+                })
+                .collect();
             let excused = !suspects.is_empty() && {
                 self.suspect_failures += 1;
-                self.suspect_failures < MAX_SUSPECT_FAILURES
+                self.suspect_failures < MAX_SUSPECT_FAILURES || {
+                    let healthy = self.run_canary();
+                    if healthy {
+                        // A canary that failed earlier in this run means the
+                        // device, not the schemas, failed those steps.
+                        self.end_failure_run(self.canary_failed_in_run);
+                    } else {
+                        self.canary_failed_in_run = true;
+                    }
+                    healthy
+                }
             };
-            if !excused {
+            let mut refused = 0;
+            if excused {
+                let now = Instant::now();
+                if let [h] = suspects[..] {
+                    self.quarantined.insert(h, now);
+                    self.blamed_in_run.insert(h);
+                    refused = 1;
+                } else {
+                    for h in &suspects {
+                        if self.strikes.strike(*h, now) >= QUARANTINE_STRIKES {
+                            self.quarantined.insert(*h, now);
+                            refused += 1;
+                        }
+                        self.blamed_in_run.insert(*h);
+                    }
+                }
+            } else {
                 self.step_failures += 1;
-                self.latched_at = Some(now);
+                if self.step_failures >= MAX_STEP_FAILURES {
+                    self.latched_at = Some(Instant::now());
+                }
             }
             if !suspects.is_empty() {
                 warn!(
@@ -1335,29 +1386,18 @@ impl Engine for OvGenaiCbEngine {
                     refused,
                     counted = !excused,
                     suspect_failures = self.suspect_failures,
-                    "cb step failed with new schema-constrained requests in the batch; \
-                     schemas blamed for it are refused for 10 minutes"
+                    "cb step failed with new schema-constrained requests in the batch"
                 );
             }
             warn!(
                 error = %err,
-                in_flight = self.active.len(),
-                consecutive = self.step_failures,
+                in_flight = failed.len(),
+                counted = self.step_failures,
                 "cb step failed"
             );
-            let failed = self
-                .active
-                .drain(..)
-                .map(|t| {
-                    let chunk = Chunk::error(t.task_id.clone(), format!("cb step failed: {err}"));
-                    (t.task_id, chunk)
-                })
-                .collect();
             return Ok(failed);
         }
-        self.step_failures = 0;
-        self.suspect_failures = 0;
-        self.latched_at = None;
+        self.end_failure_run(false);
 
         let mut out = Vec::new();
         let mut idx = 0;
@@ -1528,6 +1568,76 @@ impl OvGenaiCbEngine {
     /// schema, driven to a terminal status within [`WARMUP_MAX_STEPS`].
     /// Returns the text it produced, or nothing when the scheduler dropped
     /// or cancelled it (an incomplete probe proves nothing).
+    /// Check the device with an internal canary: a short plain request (no
+    /// schema), run on its own, as the warmup does. True when it finishes.
+    /// Only ever called with nothing else in flight.
+    fn run_canary(&mut self) -> bool {
+        let cfg = build_gen_config(
+            0,
+            0,
+            self.prompt_pretemplated,
+            CANARY_MAX_TOKENS,
+            0.0,
+            false,
+            &SamplingParams::default(),
+            None,
+        );
+        // A sequential id: a canary abandoned by a failed step can never
+        // collide with the next one.
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let mut handle = match self.pipe.add_request(request_id, "Hi", &cfg) {
+            Ok(h) => h,
+            Err(err) => {
+                warn!(error = %err, "cb health check could not start");
+                return false;
+            }
+        };
+        for _ in 0..WARMUP_MAX_STEPS {
+            if let Err(err) = self.pipe.step() {
+                warn!(error = %err, "cb health check step failed");
+                let _ = handle.cancel();
+                return false;
+            }
+            match handle.read() {
+                Ok(r) if r.status == CbStatus::Running => {}
+                Ok(r) if r.status == CbStatus::Finished => return true,
+                Ok(r) => {
+                    warn!(status = ?r.status, "cb health check did not finish");
+                    return false;
+                }
+                Err(err) => {
+                    warn!(error = %err, "cb health check read failed");
+                    let _ = handle.cancel();
+                    return false;
+                }
+            }
+        }
+        warn!(
+            max_steps = WARMUP_MAX_STEPS,
+            "cb health check never finished"
+        );
+        let _ = handle.cancel();
+        false
+    }
+
+    /// End the current run of failures: a step or canary succeeded. With
+    /// `release` (the device was at fault during the run) the schemas blamed
+    /// in it are released; otherwise they stay refused.
+    fn end_failure_run(&mut self, release: bool) {
+        if release {
+            for h in self.blamed_in_run.drain() {
+                self.quarantined.remove(h);
+                self.strikes.clear(h);
+            }
+        }
+        self.blamed_in_run.clear();
+        self.canary_failed_in_run = false;
+        self.step_failures = 0;
+        self.suspect_failures = 0;
+        self.latched_at = None;
+    }
+
     fn run_structured_probe(&mut self, request_id: u64) -> Result<String, OvError> {
         let cfg = build_gen_config(
             0,
@@ -1710,6 +1820,10 @@ mod tests {
         /// Returned once a request's script runs out.
         default_read: Option<CbRead>,
         step_fails: bool,
+        /// With `step_fails`, fail a step only when the request added last
+        /// carries a schema: bad schemas on a healthy device.
+        fail_only_with_grammar: bool,
+        last_added_grammar: bool,
         steps: usize,
         added: Vec<u64>,
         cancelled: Vec<u64>,
@@ -1732,10 +1846,11 @@ mod tests {
             &self,
             request_id: u64,
             _prompt: &str,
-            _cfg: &GenConfig,
+            cfg: &GenConfig,
         ) -> Result<Box<dyn CbReq>, OvError> {
             let mut st = self.st.lock().unwrap();
             st.added.push(request_id);
+            st.last_added_grammar = cfg.json_schema.is_some();
             let idx = st.added.len() - 1;
             while st.reads.len() <= idx {
                 st.reads.push(VecDeque::new());
@@ -1749,7 +1864,7 @@ mod tests {
         fn step(&self) -> Result<(), OvError> {
             let mut st = self.st.lock().unwrap();
             st.steps += 1;
-            if st.step_fails {
+            if st.step_fails && (!st.fail_only_with_grammar || st.last_added_grammar) {
                 Err(OvError::Native("mock step failure".into()))
             } else {
                 Ok(())
@@ -1813,6 +1928,8 @@ mod tests {
             step_failures: 0,
             suspect_failures: 0,
             latched_at: None,
+            blamed_in_run: HashSet::new(),
+            canary_failed_in_run: false,
             structured_unavailable: None,
             quarantined: QuarantineSet::default(),
             strikes: StrikeSet::default(),
@@ -2317,61 +2434,201 @@ mod tests {
     }
 
     #[test]
-    fn latch_holds_until_the_retry_cooldown_passes() {
+    fn canary_is_due_once_the_retry_interval_passes() {
         let now = Instant::now();
         let ago = |d: Duration| now.checked_sub(d).unwrap();
-        assert!(!latch_holds(MAX_STEP_FAILURES - 1, None, now));
-        assert!(latch_holds(MAX_STEP_FAILURES, Some(now), now));
-        assert!(latch_holds(
-            MAX_STEP_FAILURES,
+        assert!(!canary_due(None, now));
+        assert!(!canary_due(Some(now), now));
+        assert!(!canary_due(
             Some(ago(LATCH_RETRY - Duration::from_secs(1))),
             now
         ));
-        assert!(!latch_holds(MAX_STEP_FAILURES, Some(ago(LATCH_RETRY)), now));
-        assert!(!latch_holds(
-            MAX_STEP_FAILURES + 5,
-            Some(ago(LATCH_RETRY * 2)),
-            now
-        ));
+        assert!(canary_due(Some(ago(LATCH_RETRY)), now));
+        assert!(canary_due(Some(ago(LATCH_RETRY * 2)), now));
+    }
+
+    fn finished_read() -> CbRead {
+        read_of(CbStatus::Finished, 1, "", CbFinish::Stop)
+    }
+
+    /// Drive `n` failed steps, each with one new plain request.
+    fn fail_plain_steps(e: &mut OvGenaiCbEngine, n: u32, tag: &str) {
+        for i in 0..n {
+            e.submit(task(&format!("{tag}{i}"), 8)).unwrap();
+            let _ = e.step().unwrap();
+        }
+    }
+
+    fn past_retry() -> Instant {
+        Instant::now().checked_sub(LATCH_RETRY).unwrap()
     }
 
     #[test]
-    fn cb_latched_worker_retries_after_the_cooldown() {
+    fn cb_many_new_schema_failures_on_a_healthy_device_never_latch() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            fail_only_with_grammar: true,
+            default_read: Some(finished_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..10 {
+            let schema = numbered_schema(i);
+            e.submit(schema_task(&format!("s{i}"), &schema)).unwrap();
+            let _ = e.step().unwrap();
+            assert_eq!(e.step_failures, 0, "failure {}", i + 1);
+            assert!(
+                e.submit(schema_task("again", &schema)).is_err(),
+                "schema {i} is blamed"
+            );
+        }
+        // Ten client requests and one canary at the eighth failure.
+        assert_eq!(st.lock().unwrap().added.len(), 11);
+        assert_eq!(e.suspect_failures, 2);
+        e.submit(task("plain", 8)).unwrap();
+    }
+
+    #[test]
+    fn cb_dead_device_backstop_counts_after_a_failed_canary() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(finished_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_SUSPECT_FAILURES {
+            e.submit(schema_task(&format!("s{i}"), &numbered_schema(i)))
+                .unwrap();
+            let _ = e.step().unwrap();
+        }
+        assert_eq!(e.step_failures, 1, "the canary failed: the eighth counts");
+        // The counted failure blamed no schema.
+        let last = numbered_schema(MAX_SUSPECT_FAILURES - 1);
+        st.lock().unwrap().step_fails = false;
+        e.submit(schema_task("last", &last)).unwrap();
+    }
+
+    #[test]
+    fn cb_latched_worker_admits_nothing_until_a_canary_succeeds() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(finished_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        fail_plain_steps(&mut e, MAX_STEP_FAILURES, "t");
+        let added = || st.lock().unwrap().added.len();
+        let before = added();
+
+        // Within the retry interval: refused, no canary, nothing enrolled.
+        let err = e.submit(task("early", 8)).expect_err("latched");
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("since the last successful step"),
+            "{err}"
+        );
+        assert!(e.submit(schema_task("s", SCHEMA_A)).is_err());
+        assert_eq!(added(), before);
+        assert!(e.active.is_empty());
+
+        // Interval passed, device still dead: the canary runs, fails, and the
+        // wait starts over.
+        e.latched_at = Some(past_retry());
+        assert!(e.submit(task("retry1", 8)).is_err());
+        assert_eq!(added(), before + 1, "only the canary was enrolled");
+        assert!(e.active.is_empty());
+        assert!(e.submit(task("retry2", 8)).is_err());
+        assert_eq!(added(), before + 1, "no canary before the next interval");
+
+        // Device back: the next canary clears the latch and the request is
+        // admitted.
+        st.lock().unwrap().step_fails = false;
+        e.latched_at = Some(past_retry());
+        e.submit(task("retry3", 8)).unwrap();
+        assert_eq!(added(), before + 3, "canary, then the client request");
+        assert_eq!(e.step_failures, 0);
+        assert_eq!(e.suspect_failures, 0);
+        assert!(e.latched_at.is_none());
+    }
+
+    #[test]
+    fn cb_schemas_blamed_while_the_device_was_failing_are_released() {
+        // A failed canary, then a successful one, ends the run.
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(finished_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_SUSPECT_FAILURES {
+            e.submit(schema_task(&format!("s{i}"), &numbered_schema(i)))
+                .unwrap();
+            let _ = e.step().unwrap();
+        }
+        assert!(e.submit(schema_task("x", &numbered_schema(0))).is_err());
+        st.lock().unwrap().fail_only_with_grammar = true;
+        e.submit(schema_task("n", SCHEMA_A)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 0, "the canary succeeded");
+        e.submit(schema_task("x", &numbered_schema(0)))
+            .expect("released");
+        e.cancel(&"x".to_string());
+        let err = e.submit(schema_task("a", SCHEMA_A)).unwrap_err();
+        assert!(err.to_string().contains("failed to compile"), "{err}");
+
+        // The latch clearing ends the run.
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(finished_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("s", SCHEMA_A)).unwrap();
+        let _ = e.step().unwrap();
+        fail_plain_steps(&mut e, MAX_STEP_FAILURES, "t");
+        st.lock().unwrap().step_fails = false;
+        e.latched_at = Some(past_retry());
+        e.submit(task("p", 8)).unwrap();
+        e.submit(schema_task("s2", SCHEMA_A)).expect("released");
+    }
+
+    #[test]
+    fn cb_ordinary_success_after_a_failed_canary_keeps_the_blame() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(finished_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_SUSPECT_FAILURES {
+            e.submit(schema_task(&format!("s{i}"), &numbered_schema(i)))
+                .unwrap();
+            let _ = e.step().unwrap();
+        }
+        assert!(e.canary_failed_in_run);
+        st.lock().unwrap().step_fails = false;
+        st.lock().unwrap().default_read = Some(idle_read());
+        e.submit(task("p", 8)).unwrap();
+        let _ = e.step().unwrap();
+        assert!(e.submit(schema_task("x", &numbered_schema(0))).is_err());
+        assert!(e.blamed_in_run.is_empty());
+        assert!(!e.canary_failed_in_run);
+    }
+
+    #[test]
+    fn cb_schemas_blamed_before_an_ordinary_success_stay_refused() {
         let st = Arc::new(Mutex::new(MockState {
             step_fails: true,
             default_read: Some(idle_read()),
             ..Default::default()
         }));
         let mut e = mock_engine(&st);
-        for i in 0..MAX_STEP_FAILURES {
-            e.submit(task(&format!("t{i}"), 8)).unwrap();
-            let _ = e.step().unwrap();
-        }
-        let err = e.submit(task("early", 8)).expect_err("latched");
-        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
-
-        // The cooldown passes: work is admitted again, and a failure re-arms it.
-        let past = || Instant::now().checked_sub(LATCH_RETRY).unwrap();
-        e.latched_at = Some(past());
-        e.submit(task("retry1", 8)).unwrap();
+        e.submit(schema_task("s", SCHEMA_A)).unwrap();
         let _ = e.step().unwrap();
-        assert_eq!(e.step_failures, MAX_STEP_FAILURES + 1);
-        assert!(matches!(
-            e.submit(task("rearmed", 8)),
-            Err(EngineError::Backend(_))
-        ));
-
-        // A success after the next admission clears the latch.
-        e.latched_at = Some(past());
-        e.submit(task("retry2", 8)).unwrap();
         st.lock().unwrap().step_fails = false;
+        e.submit(task("p", 8)).unwrap();
         let _ = e.step().unwrap();
-        assert_eq!(e.step_failures, 0);
-        assert!(e.latched_at.is_none());
-        st.lock().unwrap().step_fails = true;
-        e.submit(task("after", 8)).unwrap();
-        let _ = e.step().unwrap();
-        e.submit(task("still open", 8)).unwrap();
+        assert!(e.submit(schema_task("s2", SCHEMA_A)).is_err());
     }
 
     #[test]

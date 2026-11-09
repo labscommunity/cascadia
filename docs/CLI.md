@@ -640,10 +640,15 @@ output in between. Steps failed by resource
 exhaustion, and `json_object`, are never blamed on a schema. A failed step
 that held a new request with a schema of its own (one that had not produced
 output yet) is not counted toward the worker's failure limit, whatever else
-was in the batch, until 8 such steps in a row (no successful step between
-them): from the 8th on they count, so a device that fails every step still
-trips the limit. A failed step with no such request counts as usual. After 3
-counted failures in a row the worker refuses new requests (`cb pipeline
-unusable: …`); 30 seconds after the last counted failure it admits
-requests again, and the next step decides: a success clears the limit, a
-failure refuses again for another 30 seconds.
+was in the batch. Client requests never decide whether the device is
+healthy: after 8 such failures since the last successful step the worker
+runs a short internal health check (a plain request of a few tokens, alone
+on the pipeline). If it succeeds, the schemas keep the blame and the count
+starts over; if it fails, the step counts. A failed step with no such
+request counts as usual. After 3 counted failures since the last successful
+step the worker refuses every new request (`cb pipeline unusable: …`) and
+runs the health check every 30 seconds; the first success clears the limit
+and requests are admitted again. Schemas refused during a run of failures
+in which the health check failed, or that ended with the limit clearing, are
+released then; schemas refused before an ordinary successful step stay
+refused.
