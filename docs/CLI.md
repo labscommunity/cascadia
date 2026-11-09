@@ -561,7 +561,7 @@ Engines:
 | `ov-genai` | Enforced by OpenVINO GenAI's structured output, stateful and `--cb`. Needs OpenVINO GenAI 2026.4 or newer. At startup the engine runs one short structured-output check on the loaded model; if it fails, startup continues and JSON requests get 400 `invalid configuration: structured output is not available for this model: <reason>`. With `--draft-model` (speculative decoding) the check is skipped and JSON requests get that 400 with `not supported with a draft model (speculative decoding); run without --draft-model for response_format`: on OpenVINO GenAI 2026.4.1 the draft's proposals break the constraint. `--prompt-lookup` is fine. Not available on NPU either (`--device NPU`, `NPU.0`, or a `HETERO:`/`AUTO:` list that includes NPU): the check is skipped and JSON requests get that 400 with `not reliable on NPU with this OpenVINO GenAI version (the output constraint is not fully applied); use GPU or CPU for response_format`, because on GenAI 2026.4.1 the NPU pipeline does not fully apply the constraint. |
 | `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar. |
 | `mock` | Answers with a minimal instance of the schema, best effort: not every keyword is honoured. |
-| `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe` | 400: `response_format <type> is not supported by the <engine> engine; …`. |
+| `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe` | 400: `structured output (response_format <type>) is not supported by this server's engine (<engine>)`. |
 
 A malformed `response_format` is a 400 on every engine, including those
 without structured output (it used to be ignored).
@@ -637,7 +637,7 @@ the 400s below and `engine_error` for anything else):
 | Status | Message | Cause |
 |---|---|---|
 | 400 | `invalid response_format: <reason>` | Malformed field (unknown `type`, non-object schema, `false` schema, a repeated key) or a schema over the limits above. Every engine. |
-| 400 | `response_format <type> is not supported by the <engine> engine; …` | The engine has no structured output (table above). |
+| 400 | `structured output (response_format <type>) is not supported by this server's engine (<engine>)` | The engine has no structured output (table above). |
 | 400 | `invalid configuration: response_format json_schema: <reason>` | `ov-genai`: the backend could not build a constraint from the schema. |
 | 400 | `response_format json_schema: <reason>` | `ov-genai` without `--cb`: generation failed for a request with a schema, and the backend's message `<reason>` names the grammar or JSON schema. Other generation failures stay 503. On a streamed request this message arrives as the stream's error event, with `"type":"invalid_request_error"`. |
 | 400 | `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai`: the startup check found structured output does not work for the loaded model or runtime. |

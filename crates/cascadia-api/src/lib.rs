@@ -2510,15 +2510,15 @@ async fn chat_completions(
     if json && !tools_callable && !state.structured_output {
         count_rejected("invalid_request");
         let engine = if state.engine_name.is_empty() {
-            "configured"
+            String::new()
         } else {
-            state.engine_name.as_str()
+            format!(" ({})", state.engine_name)
         };
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!(
-                "response_format {} is not supported by the {engine} engine; \
-                 the ov-genai, sycl-llama and mock engines support it",
+                "structured output (response_format {}) is not supported by \
+                 this server's engine{engine}",
                 response_format.type_name()
             ) })),
         )
@@ -8090,7 +8090,7 @@ level={{ effort_map[eff] }}";
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             v,
-            serde_json::json!({"error": "response_format json_object is not supported by the mock engine; the ov-genai, sycl-llama and mock engines support it"})
+            serde_json::json!({"error": "structured output (response_format json_object) is not supported by this server's engine (mock)"})
         );
         assert!(seen.lock().unwrap().is_empty());
 
