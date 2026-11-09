@@ -23,7 +23,11 @@ Sends what Codex and the agent SDKs send and checks the answers' shape:
 Usage:
   python3 scripts/responses-live-check.py http://127.0.0.1:18100 [--max-output-tokens 1024]
           [--only text,tool_call] [--timeout 1800] [--mock] [--expect-reasoning]
-          [--bearer-env NAME]
+          [--bearer-env NAME] [--model ID]
+
+`--model ID` sends that model id (a gateway that routes by model id); without it the
+first request asks for model `x` and uses the id the server answers with (the
+community server serves one model).
 
 `--bearer-env NAME` sends `Authorization: Bearer <value of $NAME>` (a server behind an
 API key or a gateway); the value is never printed.
@@ -277,7 +281,8 @@ def run(args):
         CHECK_MARKERS = False
     base, mot, to = args.url, args.max_output_tokens, args.timeout
     try:
-        model = call(base, {"model": "x", "input": "hi", "max_output_tokens": 1}, to)["model"]
+        model = call(base, {"model": args.model or "x", "input": "hi", "max_output_tokens": 1},
+                     to)["model"]
     except Exception as e:  # noqa: BLE001 - the verdict line must still come
         print(f"SERVER: FAIL {type(e).__name__}: {e}")
         print("RESPONSES_LIVE: FAIL (server)")
@@ -417,6 +422,7 @@ def main():
     p.add_argument("--mock", action="store_true")
     p.add_argument("--expect-reasoning", action="store_true")
     p.add_argument("--bearer-env", default="")
+    p.add_argument("--model", default="")
     sys.exit(run(p.parse_args()))
 
 
