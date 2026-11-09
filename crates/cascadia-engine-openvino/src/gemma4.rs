@@ -1188,15 +1188,21 @@ async fn masked_round(
 /// A middle stage's masked step after it has read the step from upstream:
 /// `prepared` is its relayed step (or why it couldn't relay it). Returns the
 /// reply it owes upstream (always one, so the head never waits out its
-/// deadline on a failed middle) and the error that still fails its step.
+/// deadline on a failed middle), the error that still fails its step, and
+/// whether the round discarded an acknowledged late reply from below (see
+/// [`OwedLateAck::after_masked_reply`]).
 async fn middle_masked_step(
     down: &mut ActivationClient,
     prepared: EngineResult<StepFrames>,
     budget: Duration,
-) -> (StageReply, Option<EngineError>) {
+) -> (StageReply, Option<EngineError>, bool) {
     match prepared {
-        Err(e) => (StageReply::Nack, Some(e)),
-        Ok(frames) => middle_reply(masked_round(down, &frames, budget).await.0),
+        Err(e) => (StageReply::Nack, Some(e), false),
+        Ok(frames) => {
+            let (wait, late_ack) = masked_round(down, &frames, budget).await;
+            let (reply, err) = middle_reply(wait);
+            (reply, err, late_ack)
+        }
     }
 }
 
@@ -1251,6 +1257,17 @@ impl OwedLateAck {
     fn on_ack_from_below(&mut self) {
         if *self == Self::Owed {
             *self = Self::Proven;
+        }
+    }
+
+    /// This stage answered a masked step upstream with `reply`, after its
+    /// masked round discarded a late reply from below (`late_ack`: that reply
+    /// was acknowledged). The step's own answer comes first, then the
+    /// evidence, so an unacknowledged answer still passes it up.
+    fn after_masked_reply(&mut self, reply: StageReply, late_ack: bool) {
+        self.on_masked_reply_sent(reply);
+        if late_ack {
+            self.on_ack_from_below();
         }
     }
 }
@@ -1747,14 +1764,19 @@ impl Gemma4Engine {
         Ok(())
     }
 
-    /// A masked step's two-lane reply upstream.
-    fn send_masked_reply_upstream(&mut self, reply: StageReply) -> EngineResult<()> {
+    /// A masked step's two-lane reply upstream. `late_ack`: this step's
+    /// masked round discarded an acknowledged late reply from below.
+    fn send_masked_reply_upstream(
+        &mut self,
+        reply: StageReply,
+        late_ack: bool,
+    ) -> EngineResult<()> {
         let upstream = self
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
         let tensor = encode_masked_reply(reply);
-        self.owed_late_ack.on_masked_reply_sent(reply);
+        self.owed_late_ack.after_masked_reply(reply, late_ack);
         self.block_on(async move {
             let mut guard = upstream.lock().await;
             guard.send(&tensor).await
@@ -2373,7 +2395,7 @@ impl Gemma4Engine {
                 let (reply, err) = tail_masked_reply(relayed, &words);
                 // A failed relay still answers (an acknowledged NACK), so the
                 // head fails this task instead of waiting out its deadline.
-                let sent = self.send_masked_reply_upstream(reply);
+                let sent = self.send_masked_reply_upstream(reply, false);
                 match err {
                     Some(e) => Err(e),
                     None => sent,
@@ -2381,7 +2403,7 @@ impl Gemma4Engine {
             }
             HiddenIn::BadMask(why) => {
                 warn!(%why, "gemma4: can't read a structured-output step; answering NACK");
-                self.send_masked_reply_upstream(StageReply::Nack)
+                self.send_masked_reply_upstream(StageReply::Nack, false)
             }
         }
     }
@@ -2397,7 +2419,7 @@ impl Gemma4Engine {
             } => (floats, shape, Some(words)),
             HiddenIn::BadMask(why) => {
                 warn!(%why, "gemma4: can't read a structured-output step; answering NACK");
-                return self.send_masked_reply_upstream(StageReply::Nack);
+                return self.send_masked_reply_upstream(StageReply::Nack, false);
             }
         };
         // Multi-token hidden = prefill: the token reply waits on every
@@ -2421,7 +2443,7 @@ impl Gemma4Engine {
                 self.step_frames(&out, to_shape3(&out_shape), position, Some(&words))
             });
         let budget = masked_wait_budget(prefill_reply, self.stages_below);
-        let (reply, err) = match self.downstream.clone() {
+        let (reply, err, late_ack) = match self.downstream.clone() {
             Some(downstream) => self.block_on(async move {
                 let mut guard = downstream.lock().await;
                 middle_masked_step(&mut guard, prepared, budget).await
@@ -2429,9 +2451,10 @@ impl Gemma4Engine {
             None => (
                 StageReply::Nack,
                 Some(EngineError::Backend("no downstream".into())),
+                false,
             ),
         };
-        let sent = self.send_masked_reply_upstream(reply);
+        let sent = self.send_masked_reply_upstream(reply, late_ack);
         match err {
             Some(e) => Err(e),
             None => sent,
@@ -4083,7 +4106,7 @@ mod tests {
             header: encode_cross_kv_header(&tags),
             cross: frames,
         });
-        let (reply, err) = middle_masked_step(down, prepared, budget).await;
+        let (reply, err, _) = middle_masked_step(down, prepared, budget).await;
         up.send(&encode_masked_reply(reply)).await.unwrap();
         assert!(err.is_none());
     }
@@ -4827,7 +4850,7 @@ mod tests {
     #[tokio::test]
     async fn a_middle_whose_relay_fails_answers_nack_and_sends_nothing_down() {
         let (mut tail_up, mut down) = link().await;
-        let (reply, err) = middle_masked_step(
+        let (reply, err, _) = middle_masked_step(
             &mut down,
             Err(EngineError::Backend("infer failed".into())),
             Duration::from_secs(5),
@@ -4853,9 +4876,54 @@ mod tests {
             header: encode_cross_kv_header(&tags),
             cross,
         };
-        let (reply, err) = middle_masked_step(&mut down, Ok(frames), Duration::from_secs(5)).await;
+        let (reply, err, _) =
+            middle_masked_step(&mut down, Ok(frames), Duration::from_secs(5)).await;
         assert_eq!(reply, StageReply::Nack);
         assert!(err.is_some());
+    }
+
+    /// A middle's masked round drains a late acknowledged reply from below,
+    /// then its own step goes unanswered. The drained acknowledgement is not
+    /// dropped: the middle passes it up before its next plain reply.
+    #[tokio::test]
+    async fn a_middle_keeps_the_late_acknowledgement_its_masked_round_drained() {
+        let (mut server, mut down) = link().await;
+        server
+            .send(&encode_masked_reply(StageReply::Token(5)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let words = ok_words();
+        let (hidden, shape) = sample_hidden();
+        let (tags, cross) = sample_cross();
+        let frames = StepFrames {
+            pos: encode_wire_position(0),
+            hid: encode_hidden_frame(&hidden, shape, Some(&words)).unwrap(),
+            header: encode_cross_kv_header(&tags),
+            cross,
+        };
+        // The tail reads nothing and never answers: the wait times out.
+        let (reply, err, late_ack) =
+            middle_masked_step(&mut down, Ok(frames), Duration::from_millis(100)).await;
+        assert_eq!(reply, StageReply::NotAcked);
+        assert!(err.is_none());
+        assert!(late_ack, "the drained reply was acknowledged");
+
+        let mut owed = OwedLateAck::default();
+        owed.after_masked_reply(reply, late_ack);
+        assert_eq!(owed, OwedLateAck::Proven);
+        let frames = upstream_plain_frames(&mut owed, encode_token_reply(7));
+        assert_eq!(frames.len(), 2, "the acknowledged NACK goes up first");
+        assert_eq!(decode_stage_reply(&frames[0]).unwrap(), StageReply::Nack);
+
+        // Without a drained acknowledgement the step is only owed.
+        let mut owed = OwedLateAck::default();
+        owed.after_masked_reply(StageReply::NotAcked, false);
+        assert_eq!(owed, OwedLateAck::Owed);
+        // An acknowledged reply already told the head.
+        let mut owed = OwedLateAck::Owed;
+        owed.after_masked_reply(StageReply::Token(3), true);
+        assert_eq!(owed, OwedLateAck::Nothing);
     }
 
     #[tokio::test]
