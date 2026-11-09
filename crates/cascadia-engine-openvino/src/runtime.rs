@@ -344,18 +344,11 @@ fn logits_row<'a>(logits: &'a [f32], shape: &[usize], row: usize) -> EngineResul
     })
 }
 
-/// Greedy pick among the tokens the grammar allows. `Err` when nothing in the
-/// row is allowed (or every allowed logit is non-finite): never an unmasked
-/// token.
+/// Greedy pick among the tokens the grammar allows, the lowest allowed one
+/// when every allowed logit is `-inf`/NaN. `Err` when nothing in the row is
+/// allowed: never an unmasked token.
 fn masked_argmax(row: &[f32], mask: &mut GrammarMask) -> EngineResult<i32> {
-    let mut masked = row.to_vec();
-    mask.apply(&mut masked)?;
-    if !masked.iter().any(|v| v.is_finite()) {
-        return Err(EngineError::Backend(
-            "grammar: every allowed token has a non-finite logit".into(),
-        ));
-    }
-    Ok(argmax_last_row(&masked, masked.len()))
+    mask.pick_greedy(row).map(|t| t as i32)
 }
 
 /// The one pick helper of the single-task first stage. Picks from row `row`
@@ -1024,37 +1017,21 @@ fn read_mask_words(lanes: &[u8], words: usize) -> Vec<u32> {
 /// tokens (the tokenizer vocab). `Err` on a grammar dead end: the head fails
 /// the task rather than send a mask that allows nothing.
 fn grammar_mask_words(mask: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
-    let mut row = vec![0f32; width];
-    mask.apply(&mut row)?;
-    let mut words = vec![0u32; width.div_ceil(32)];
-    for (i, v) in row.iter().enumerate() {
-        if v.is_finite() {
-            words[i / 32] |= 1 << (i % 32);
-        }
-    }
-    Ok(words)
+    crate::structured::mask_words_over(mask, width)
 }
 
 /// Greedy pick among the tokens a wire mask allows (indices past the mask are
-/// disallowed). `Err` when nothing in the row is allowed with a finite logit:
-/// never an unmasked token.
+/// disallowed), the lowest allowed one when every allowed logit is
+/// `-inf`/NaN. `Err` when nothing in the row is allowed: never an unmasked
+/// token.
 fn wire_masked_argmax(row: &[f32], words: &[u32]) -> EngineResult<i32> {
-    let mut masked = row.to_vec();
-    let mut any = false;
-    for (i, v) in masked.iter_mut().enumerate() {
-        let allowed = words.get(i / 32).is_some_and(|w| w >> (i % 32) & 1 == 1);
-        if !allowed {
-            *v = f32::NEG_INFINITY;
-        } else if v.is_finite() {
-            any = true;
-        }
-    }
-    if !any {
-        return Err(EngineError::Backend(
-            "structured output: the step's token mask allows nothing in the logits row".into(),
-        ));
-    }
-    Ok(argmax_last_row(&masked, masked.len()))
+    cascadia_grammar::argmax_allowed(row, words)
+        .map(|t| t as i32)
+        .ok_or_else(|| {
+            EngineError::Backend(
+                "structured output: the step's token mask allows nothing in the logits row".into(),
+            )
+        })
 }
 
 /// The tail's pick from the last row of its logits: masked on a masked step,
@@ -9846,6 +9823,58 @@ mod tests {
         assert_eq!(*picks[0].1.as_ref().unwrap(), b'"' as i32);
         assert_eq!(picks[1].0, 1);
         assert_eq!(*picks[1].1.as_ref().unwrap(), BAD as i32);
+    }
+
+    /// An all `-inf` (or NaN) row whose last index is the disallowed EOS:
+    /// every masked pick (single task, tail, packed head, packed tail) is the
+    /// lowest allowed token, never a disallowed one.
+    #[test]
+    fn an_all_neg_inf_row_never_picks_a_disallowed_eos() {
+        let w = test_factory().mask_width();
+        assert_eq!(w - 1, TEST_EOS as usize);
+        let words = ok_enum_words();
+        for fill in [f32::NEG_INFINITY, f32::NAN] {
+            let (out, shape) = rows(&[vec![fill; w]]);
+            let mut mask = test_mask(OK_ENUM, "");
+            assert!(!mask.allowed(TEST_EOS));
+            assert_eq!(
+                pick_next_token(&out, &shape, 0, 5, 5, Some(&mut mask)).unwrap(),
+                b'"' as i32
+            );
+            assert_eq!(tail_pick(&out, &shape, Some(&words)).unwrap(), b'"' as i32);
+            let mut slots = vec![Some(packed_slot(Some(test_mask(OK_ENUM, ""))))];
+            let picks = pick_packed_rows(&out, &shape, &[(0, 0)], &mut slots).unwrap();
+            assert_eq!(*picks[0].1.as_ref().unwrap(), b'"' as i32);
+            let plan = pick_plan_rows(
+                &out,
+                &shape,
+                &[Some((0, 5, 0))],
+                Some(&[Some(words.clone())]),
+            )
+            .unwrap();
+            assert_eq!(plan, vec![b'"' as i32]);
+        }
+    }
+
+    /// The head's encoders read the allowed set from the matcher, not from
+    /// `apply` on a zero row; the words are unchanged.
+    #[test]
+    fn head_mask_words_equal_the_apply_readback() {
+        let w = test_factory().mask_width();
+        for (body, done) in [
+            (OK_ENUM, ""),
+            (OK_ENUM, "\"o"),
+            (OK_ENUM, "\"ok\""),
+            (INTEGER, "12"),
+        ] {
+            let mut mask = test_mask(body, done);
+            let want = crate::structured::words_via_apply(&mut mask, w).unwrap();
+            assert_eq!(
+                grammar_mask_words(&mut mask, w).unwrap(),
+                want,
+                "{body} after {done:?}"
+            );
+        }
     }
 
     #[test]
