@@ -179,6 +179,11 @@ tools or a tool-call history; plain multi-turn chat without tools keeps the engi
 template. If the API's render fails, ov-genai falls back to its own template (which sees
 only the last user message), and a request with tools is then a `500`.
 
+On an NPU, ov-genai's pipeline takes at most `MAX_PROMPT_LEN` prompt tokens (1024 unless
+`--npu-max-prompt-len` sets it). A longer prompt is a `400` `context_length_exceeded` naming
+that limit. A Codex request (its instructions and tools) is usually longer than 1024 tokens,
+so serve Codex from the GPU or CPU, or raise `--npu-max-prompt-len`.
+
 ## Codex CLI
 
 Point Codex at Cascadia with a custom provider in `~/.codex/config.toml`:
@@ -247,3 +252,10 @@ feature of real models.
 
 `scripts/responses-clients-check.sh --bin target/debug/cascadia` runs the OpenAI Agents SDK,
 `@ai-sdk/openai`, n8n and Codex CLI tool loops against this mock and ends `RESPONSES_CLIENTS: ALL PASS`.
+
+`scripts/responses-live-check.py <base-url>` checks a running server, any engine: a text
+answer, a tool call (plain and streamed), the turn after its output, Codex's two request
+bodies, and a later `developer` turn. Every body and stream event is validated against the
+pinned OpenAI spec, and no `<think>` marker may reach the answer text. It ends
+`RESPONSES_LIVE: ALL PASS`. Add `--mock` against the mock engine. The tool checks need a
+model that calls tools.
