@@ -344,6 +344,7 @@ impl Builder for OvGenaiBuilder {
                 structured_unavailable: None,
                 quarantined: QuarantineSet::default(),
                 strikes: StrikeSet::default(),
+                compiled: QuarantineSet::default(),
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -447,6 +448,11 @@ fn client_message(err: OvError, what: &str) -> String {
         warn!(raw = %raw, "{what}");
     }
     clean
+}
+
+/// What every in-flight client of a failed CB step is told.
+fn step_failure_message(err: &OvError) -> String {
+    format!("cb step failed: {err}")
 }
 
 /// The probe schema's one answer, without whitespace.
@@ -669,9 +675,10 @@ fn schema_hash(body: &str) -> u64 {
     h.finish()
 }
 
-/// Schemas (by body hash) that recently failed to compile on the CB pipeline.
-/// Bounded and time-limited: the oldest entry is dropped past capacity, and an
-/// entry stops counting after [`QUARANTINE_TTL`].
+/// A set of schemas (by body hash): those that recently failed to compile on
+/// the CB pipeline, or those that recently compiled. Bounded and
+/// time-limited: the oldest entry is dropped past capacity, and an entry
+/// stops counting after [`QUARANTINE_TTL`].
 #[derive(Default)]
 struct QuarantineSet {
     order: VecDeque<(u64, Instant)>,
@@ -714,6 +721,12 @@ impl QuarantineSet {
         if self.members.remove(&h) {
             self.order.retain(|&(m, _)| m != h);
         }
+    }
+
+    /// Insert `h`, or restart its time if it is already in.
+    fn refresh(&mut self, h: u64, now: Instant) {
+        self.remove(h);
+        self.insert(h, now);
     }
 
     #[cfg(test)]
@@ -1143,6 +1156,9 @@ pub struct OvGenaiCbEngine {
     quarantined: QuarantineSet,
     /// Strikes against schemas that shared a failed step with others.
     strikes: StrikeSet,
+    /// Schemas that recently produced output, so compiled: never a suspect
+    /// in a failed step.
+    compiled: QuarantineSet,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -1348,15 +1364,29 @@ impl Engine for OvGenaiCbEngine {
             // whether the device is healthy: after MAX_SUSPECT_FAILURES such
             // steps an internal canary does. A step with no suspect counts as
             // any other failure.
+            //
+            // A schema that already produced output (in this batch or
+            // recently) compiled, so it is never a suspect.
             let resource = cascadia_ov_genai_shim::last_error_resource_exhausted();
             let mut suspects: Vec<u64> = if resource {
                 Vec::new()
             } else {
-                self.active
+                let now = Instant::now();
+                let streaming: HashSet<u64> = self
+                    .active
+                    .iter()
+                    .filter(|t| t.produced)
+                    .filter_map(|t| t.grammar_hash)
+                    .collect();
+                let mut new: Vec<u64> = self
+                    .active
                     .iter()
                     .filter(|t| !t.produced)
                     .filter_map(|t| t.grammar_hash)
-                    .collect()
+                    .filter(|h| !streaming.contains(h))
+                    .collect();
+                new.retain(|h| !self.compiled.contains(*h, now));
+                new
             };
             // Several requests with one schema are one suspect.
             suspects.sort_unstable();
@@ -1367,7 +1397,7 @@ impl Engine for OvGenaiCbEngine {
                 .map(|t| {
                     // The canary below must run on its own.
                     let _ = t.handle.cancel();
-                    let chunk = Chunk::error(t.task_id.clone(), format!("cb step failed: {err}"));
+                    let chunk = Chunk::error(t.task_id.clone(), step_failure_message(&err));
                     (t.task_id, chunk)
                 })
                 .collect();
@@ -1452,9 +1482,12 @@ impl Engine for OvGenaiCbEngine {
             if read.new_tokens > 0 && !self.active[idx].produced {
                 self.active[idx].produced = true;
                 // Output means the schema compiled, so it did not cause an
-                // earlier failed step it shared with others.
+                // earlier failed step it shared with others, and is not a
+                // suspect in a later one.
                 if let Some(h) = self.active[idx].grammar_hash {
                     self.strikes.clear(h);
+                    self.quarantined.remove(h);
+                    self.compiled.refresh(h, Instant::now());
                 }
             }
             match read.status {
@@ -1962,6 +1995,7 @@ mod tests {
             structured_unavailable: None,
             quarantined: QuarantineSet::default(),
             strikes: StrikeSet::default(),
+            compiled: QuarantineSet::default(),
         }
     }
 
@@ -3083,8 +3117,87 @@ mod tests {
         e.submit(schema_task("t5", SCHEMA_C)).unwrap();
         let _ = e.step().unwrap();
         st.lock().unwrap().step_fails = false;
+        // A compiled, so C was the one suspect in that step.
         e.submit(schema_task("t6", SCHEMA_A)).unwrap();
-        e.submit(schema_task("t7", SCHEMA_C)).unwrap();
+        assert!(e.submit(schema_task("t7", SCHEMA_C)).is_err());
+    }
+
+    /// One scripted read that produces a token, for request `n` (enrollment
+    /// order).
+    fn script_output(st: &Arc<Mutex<MockState>>, n: usize, status: CbStatus) {
+        let mut s = st.lock().unwrap();
+        while s.reads.len() <= n {
+            s.reads.push(VecDeque::new());
+        }
+        s.reads[n].push_back(Ok(read_of(status, 1, "{", CbFinish::Unknown)));
+    }
+
+    #[test]
+    fn cb_schema_streaming_for_one_client_is_not_blamed_for_a_failed_step() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        script_output(&st, 0, CbStatus::Running);
+        e.submit(schema_task("a", SCHEMA_A)).unwrap();
+        let out = e.step().unwrap();
+        assert!(out.iter().all(|(_, c)| c.error.is_none()), "{out:?}");
+        assert!(e.active[0].produced);
+
+        // Client B, same schema, joins; an unrelated failure hits the step.
+        e.submit(schema_task("b", SCHEMA_A)).unwrap();
+        st.lock().unwrap().step_fails = true;
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(e.quarantined.len(), 0, "the schema compiled already");
+        assert_eq!(e.strikes.len(), 0, "the schema compiled already");
+        assert_eq!(e.suspect_failures, 0);
+        assert_eq!(e.step_failures, 1, "no suspect: counts as any failure");
+        st.lock().unwrap().step_fails = false;
+        e.submit(schema_task("c", SCHEMA_A)).unwrap();
+    }
+
+    #[test]
+    fn cb_schema_that_produced_earlier_is_not_blamed_later() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        script_output(&st, 0, CbStatus::Finished);
+        e.submit(schema_task("a", SCHEMA_A)).unwrap();
+        let _ = e.step().unwrap();
+        assert!(e.active.is_empty(), "the first request finished");
+
+        // Later, A and C are new together in a failed step: only C is a
+        // suspect, so C alone is refused.
+        st.lock().unwrap().step_fails = true;
+        e.submit(schema_task("a2", SCHEMA_A)).unwrap();
+        e.submit(schema_task("c", SCHEMA_C)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 0);
+        assert_eq!(e.strikes.len(), 0);
+        st.lock().unwrap().step_fails = false;
+        e.submit(schema_task("a3", SCHEMA_A)).unwrap();
+        let err = e.submit(schema_task("c2", SCHEMA_C)).unwrap_err();
+        assert!(err.to_string().contains("failed to compile"), "{err}");
+    }
+
+    #[test]
+    fn cb_schema_that_produced_leaves_quarantine() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        // A request admitted before its schema was quarantined produces.
+        e.submit(schema_task("a", SCHEMA_A)).unwrap();
+        e.quarantined.insert(schema_hash(SCHEMA_A), Instant::now());
+        script_output(&st, 0, CbStatus::Running);
+        let _ = e.step().unwrap();
+        assert_eq!(e.quarantined.len(), 0);
+        e.submit(schema_task("b", SCHEMA_A)).unwrap();
     }
 
     #[test]
