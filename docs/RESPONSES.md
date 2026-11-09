@@ -218,7 +218,9 @@ compact the conversation locally (the server refuses `compaction_trigger` items)
   On `sycl-llama`, which renders the GGUF's own template, the decision is made with the
   template the GGUF carries (`tokenizer.chat_template`, read at startup; the log says whether
   one was found); a GGUF without one, or a server whose `--llama-args` set the template
-  (`--chat-template*`), is not folded.
+  (`--chat-template*`), is not folded. A request that template refuses however it is folded
+  (Gemma 3 has no tool role, so a history with tool outputs) is a `400` naming the template's
+  message, as where the API renders, rather than a failure once the stream has started.
 - `tool_choice` cannot force a call yet, and structured output (`text.format`) is not
   served.
 - `reasoning.summary` produces no summary; reasoning is returned whole.

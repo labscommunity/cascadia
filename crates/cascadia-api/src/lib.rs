@@ -4205,7 +4205,9 @@ struct FoldedTurns {
 /// `messages` with their system turns folded into user turns, when the chat
 /// template refuses them where they stand and a fold makes it take them;
 /// `None` leaves the request as it is (no system turn, the template takes
-/// it, or no fold helps and its 400 stands).
+/// it, or no fold helps and its 400 stands). Where the engine renders the
+/// template, every request is probed, system turn or not, and a rejection
+/// no fold helps is returned as the request's `Err`, its 400.
 ///
 /// `rendered` is the request's own render. Where the API renders the
 /// template (`templated_here`) its rejection is read off that, so a request
@@ -4231,17 +4233,19 @@ fn fold_refused_system_turns(
     enable_thinking: bool,
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
-) -> Option<FoldedTurns> {
+) -> Result<Option<FoldedTurns>, PromptRenderError> {
     use responses::{fold_system_turns, folds_to_try};
-    if !messages.iter().any(|m| m.role == "system") {
-        return None;
-    }
     let templated_here =
         state.chat_env.is_some() && (media.is_some() || !state.engine_applies_template);
+    // Where the API renders, a request with no system turn has nothing to
+    // fold, and a rejection is admit's own 400.
+    if templated_here && !messages.iter().any(|m| m.role == "system") {
+        return Ok(None);
+    }
     let env = match (state.chat_env.as_deref(), state.fold_probe_env.as_deref()) {
         (Some(env), _) => env,
         (None, Some(env)) if state.engine_applies_template => env,
-        _ => return None,
+        _ => return Ok(None),
     };
     let probe = |messages: &[ChatMessage], media: Option<&[ChatMessage]>| {
         let text;
@@ -4265,13 +4269,20 @@ fn fold_refused_system_turns(
             tools,
         )
     };
-    let refused = if templated_here {
-        matches!(rendered, Err(PromptRenderError::Rejected(_)))
+    // Where the engine renders, the probe's rejection (a `raise_exception`,
+    // never a render failure: llama.cpp's Jinja is not minijinja) is the
+    // request's 400 when no fold helps, as where the API renders, rather
+    // than an engine error once the response has started.
+    let rejection = if templated_here {
+        None
     } else {
-        matches!(probe(messages, None), Err(PromptRenderError::Rejected(_)))
+        match probe(messages, None) {
+            Err(e @ PromptRenderError::Rejected(_)) => Some(e),
+            _ => return Ok(None),
+        }
     };
-    if !refused {
-        return None;
+    if templated_here && !matches!(rendered, Err(PromptRenderError::Rejected(_))) {
+        return Ok(None);
     }
     let folds = folds_to_try(messages);
     // Where the API renders, the probe is admit's own render: the template
@@ -4286,14 +4297,14 @@ fn fold_refused_system_turns(
             info!(
                 "the chat template refuses system turns where they stand; folded them into user turns"
             );
-            return Some(FoldedTurns {
+            return Ok(Some(FoldedTurns {
                 messages,
                 media,
                 prompt: templated_here.then_some((prompt, api_rendered)),
-            });
+            }));
         }
     }
-    None
+    rejection.map_or(Ok(None), Err)
 }
 
 /// Per-endpoint knobs for [`admit_chat`].
@@ -4473,7 +4484,7 @@ async fn admit_chat(
     // made the template take them.
     let mut folded: Option<Vec<ChatMessage>> = None;
     if opts.fold_refused_system_turns {
-        if let Some(f) = fold_refused_system_turns(
+        match fold_refused_system_turns(
             state,
             &req.messages,
             media.as_ref().map(|m| &m.messages[..]),
@@ -4483,14 +4494,18 @@ async fn admit_chat(
             effort,
             req.tools.as_deref(),
         ) {
-            rendered = match f.prompt {
-                Some(p) => Ok(p),
-                None => render(&f.messages, f.media.as_deref()),
-            };
-            if let (Some(m), Some(fm)) = (media.as_mut(), f.media) {
-                m.messages = fm;
+            Ok(Some(f)) => {
+                rendered = match f.prompt {
+                    Some(p) => Ok(p),
+                    None => render(&f.messages, f.media.as_deref()),
+                };
+                if let (Some(m), Some(fm)) = (media.as_mut(), f.media) {
+                    m.messages = fm;
+                }
+                folded = Some(f.messages);
             }
-            folded = Some(f.messages);
+            Ok(None) => {}
+            Err(rejection) => rendered = Err(rejection),
         }
     }
     let messages: &[ChatMessage] = folded.as_deref().unwrap_or(&req.messages);

@@ -2808,6 +2808,55 @@ mod tests {
         assert_eq!(forwarded(&tasks.lock()[0]), folded_turns());
     }
 
+    /// Gemma 3 style with no tool role: tool turns are refused, and no fold
+    /// can help.
+    const NO_TOOL_TEMPLATE: &str = concat!(
+        "{%- for m in messages -%}",
+        "{%- if m.role == 'tool' or (m.role == 'system' and not loop.first) -%}",
+        "{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}",
+        "{%- endif -%}",
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>",
+        "{%- endfor -%}",
+    );
+
+    /// On sycl-llama, a request the GGUF's template refuses however it is
+    /// folded is the API's 400 naming the template's message, as where the
+    /// API renders, rather than an engine failure mid-stream: nothing is
+    /// submitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_the_engines_template_refuses_is_a_400() {
+        let cfg = sycl_llama_config(NO_TOOL_TEMPLATE);
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let mut body = developer_mid_history();
+        body["stream"] = json!(true);
+        let (status, text) = post(app, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("chat template rejected the request: Conversation roles must alternate"),
+            "{text}"
+        );
+        assert!(tasks.lock().is_empty());
+    }
+
+    /// A template that fails to render here (not a `raise_exception`) may
+    /// still render in llama-server's own Jinja: the request is forwarded as
+    /// it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_template_that_fails_here_is_left_to_the_engine() {
+        let cfg = sycl_llama_config("{{ no_such_function() }}");
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, text) = post(app, developer_mid_history()).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let roles: Vec<_> = forwarded(&tasks.lock()[0])
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "tool", "system", "user"]
+        );
+    }
+
     /// The probe template is the fold's only: chat on sycl-llama forwards a
     /// late system turn as it was, and a template the probe accepts leaves
     /// a `/v1/responses` request unfolded.
