@@ -42,6 +42,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
 use cascadia_ov_genai_shim::{
     advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -255,6 +256,12 @@ fn bytes_to_f32(dtype: ShimDType, bytes: &[u8]) -> EngineResult<Vec<f32>> {
 /// case of `argmax_logits_row`, kept as the common entry point. Shares its
 /// shape guards so degenerate-logits handling cannot diverge.
 fn argmax_logits(logits: &[f32], shape: &[usize]) -> EngineResult<i32> {
+    argmax_logits_row(logits, shape, logits_row_count(logits, shape)? - 1)
+}
+
+/// Number of whole `vocab`-wide rows in a logits output (at least one), with
+/// the shape guards `argmax_logits` relies on.
+fn logits_row_count(logits: &[f32], shape: &[usize]) -> EngineResult<usize> {
     let vocab = match shape.last() {
         Some(&v) if v > 0 => v,
         _ => {
@@ -279,7 +286,7 @@ fn argmax_logits(logits: &[f32], shape: &[usize]) -> EngineResult<i32> {
             logits.len()
         )));
     }
-    argmax_logits_row(logits, shape, rows - 1)
+    Ok(rows)
 }
 
 /// Argmax over row `row` of a `[.., seq, vocab]` logits output. The chunked
@@ -304,6 +311,200 @@ fn argmax_logits_row(logits: &[f32], shape: &[usize], row: usize) -> EngineResul
             ))
         })?;
     Ok(argmax_last_row(&logits[..end], vocab))
+}
+
+// -------- structured output (grammar-masked picks) --------
+
+/// Whether the row at absolute position `row_position` picks the next
+/// generated token: the last prompt row (position `prompt_len - 1`) or any
+/// decode row after it. Earlier prompt rows only fill the KV; whatever is
+/// picked from them is discarded, so they are never masked.
+fn row_picks_next_token(row_position: i64, prompt_len: usize) -> bool {
+    row_position + 1 >= prompt_len as i64
+}
+
+/// Row `row` of a `[.., seq, vocab]` logits output, with the same shape
+/// guards as [`argmax_logits_row`].
+fn logits_row<'a>(logits: &'a [f32], shape: &[usize], row: usize) -> EngineResult<&'a [f32]> {
+    let vocab = match shape.last() {
+        Some(&v) if v > 0 => v,
+        _ => {
+            return Err(EngineError::Backend(format!(
+                "logits output has empty/zero last dim: shape={shape:?}"
+            )))
+        }
+    };
+    let start = row * vocab;
+    logits.get(start..start + vocab).ok_or_else(|| {
+        EngineError::Backend(format!(
+            "logits row {row} out of range: len {} vocab {vocab} (shape={shape:?})",
+            logits.len()
+        ))
+    })
+}
+
+/// Greedy pick among the tokens the grammar allows. `Err` when nothing in the
+/// row is allowed (or every allowed logit is non-finite): never an unmasked
+/// token.
+fn masked_argmax(row: &[f32], mask: &mut GrammarMask) -> EngineResult<i32> {
+    let mut masked = row.to_vec();
+    mask.apply(&mut masked)?;
+    if !masked.iter().any(|v| v.is_finite()) {
+        return Err(EngineError::Backend(
+            "grammar: every allowed token has a non-finite logit".into(),
+        ));
+    }
+    Ok(argmax_last_row(&masked, masked.len()))
+}
+
+/// The one pick helper of the single-task first stage. Picks from row `row`
+/// (absolute position `row_position`) of `logits`; a grammar task's mask
+/// applies only when that row picks the next generated token
+/// ([`row_picks_next_token`]), whichever prefill or decode path produced it.
+/// The matcher is not advanced here: the caller commits the token.
+fn pick_next_token(
+    logits: &[f32],
+    shape: &[usize],
+    row: usize,
+    row_position: i64,
+    prompt_len: usize,
+    grammar: Option<&mut GrammarMask>,
+) -> EngineResult<i32> {
+    match grammar.filter(|_| row_picks_next_token(row_position, prompt_len)) {
+        Some(mask) => masked_argmax(logits_row(logits, shape, row)?, mask),
+        None => argmax_logits_row(logits, shape, row),
+    }
+}
+
+/// [`pick_next_token`] for a static prefill chunk of `take` real rows that
+/// starts at `chunk_start`: the last real row, never a pad row.
+fn pick_chunk_token(
+    out: &[f32],
+    shape: &[usize],
+    take: usize,
+    chunk_start: i64,
+    prompt_len: usize,
+    grammar: Option<&mut GrammarMask>,
+) -> EngineResult<i32> {
+    let last = take
+        .checked_sub(1)
+        .ok_or_else(|| EngineError::Backend("prefill chunk with no real rows".into()))?;
+    pick_next_token(
+        out,
+        shape,
+        last,
+        chunk_start + last as i64,
+        prompt_len,
+        grammar,
+    )
+}
+
+/// Packed decode: one pick per sampled `(row, slot)`. A row-shape error is the
+/// whole batch's (outer `Err`); a grammar slot's dead end is that slot's only
+/// (its inner `Err`), so the other slots keep their tokens. Plain slots keep
+/// the unmasked argmax.
+fn pick_packed_rows(
+    logits: &[f32],
+    shape: &[usize],
+    sampled: &[(usize, usize)],
+    slots: &mut [Option<crate::packed_exec::PackedSlot>],
+) -> EngineResult<Vec<(usize, EngineResult<i32>)>> {
+    let mut picks = Vec::with_capacity(sampled.len());
+    for &(row, slot) in sampled {
+        let grammar = slots
+            .get_mut(slot)
+            .and_then(|s| s.as_mut())
+            .and_then(|s| s.grammar.as_mut());
+        let pick = match grammar {
+            Some(mask) => masked_argmax(logits_row(logits, shape, row)?, mask),
+            None => Ok(argmax_logits_row(logits, shape, row)?),
+        };
+        picks.push((slot, pick));
+    }
+    Ok(picks)
+}
+
+/// After a token is committed: advance a grammar task's matcher. `Ok(true)`
+/// when the JSON is complete (the task ends with `stop`); `Err` when the
+/// grammar rejects the token. Always `Ok(false)` without a grammar.
+fn commit_grammar_token(grammar: Option<&mut GrammarMask>, token: i32) -> EngineResult<bool> {
+    let Some(mask) = grammar else {
+        return Ok(false);
+    };
+    mask.accept(token as u32)?;
+    Ok(mask.finished())
+}
+
+/// Whether the task ends on the token just committed, and why. A grammar
+/// finish is a stop even when it lands on the last allowed token.
+fn token_finish(
+    generated: usize,
+    max_tokens: usize,
+    is_eos: bool,
+    grammar_finished: bool,
+) -> Option<cascadia_types::FinishReason> {
+    if grammar_finished || is_eos {
+        Some(cascadia_types::FinishReason::Stop)
+    } else if generated >= max_tokens {
+        Some(cascadia_types::FinishReason::Length)
+    } else {
+        None
+    }
+}
+
+/// The refusal for grammar tasks on a pipeline of more than one stage: the
+/// last stage picks the token and has no grammar.
+fn refuse_multi_stage_grammar() -> EngineError {
+    EngineError::InvalidConfig(
+        "structured output (response_format) is not supported on multi-stage ov-runtime \
+         pipelines yet"
+            .into(),
+    )
+}
+
+/// Submit-time grammar build: `None` for a task without a grammar; an
+/// `InvalidConfig` (400) on a multi-stage pipeline, when the model can't do
+/// structured output, or when the schema doesn't compile.
+fn compile_task_grammar(
+    factory: &Result<GrammarFactory, String>,
+    task: &GenerationTask,
+    multi_stage: bool,
+) -> EngineResult<Option<CompiledGrammar>> {
+    let Some(spec) = task.grammar.as_ref() else {
+        return Ok(None);
+    };
+    if multi_stage {
+        return Err(refuse_multi_stage_grammar());
+    }
+    let factory = factory.as_ref().map_err(|reason| {
+        EngineError::InvalidConfig(format!(
+            "structured output is not available for this model: {reason}"
+        ))
+    })?;
+    factory.compile(spec).map(Some)
+}
+
+/// Activation: a fresh matcher advanced over the resume seed. A seed the
+/// grammar rejects is a backend error.
+fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineResult<GrammarMask> {
+    let mut mask = compiled.matcher()?;
+    if !seed.is_empty() {
+        let seed: Vec<u32> = seed.iter().map(|&t| t as u32).collect();
+        mask.replay(&seed)?;
+    }
+    Ok(mask)
+}
+
+/// The first stage's grammar factory, or why structured output is unavailable.
+fn build_grammar_factory(
+    tokenizer: Option<&Tokenizer>,
+    eos: &[u32],
+) -> Result<GrammarFactory, String> {
+    let tokenizer = tokenizer.ok_or_else(|| "no tokenizer loaded".to_string())?;
+    GrammarFactory::from_tokenizer(tokenizer, eos).map_err(|e| match e {
+        EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
+        other => other.to_string(),
+    })
 }
 
 /// Normalize an output shape to a 3D `[batch, seq, hidden]` for the wire.
@@ -1430,6 +1631,15 @@ struct ActiveTask {
     /// and including the first generated token). TTFT proxy for the task-done
     /// log; also splits decode tok/s out of the blended rate.
     t_prefill: std::time::Duration,
+    /// The grammar matcher of a structured-output task, advanced over every
+    /// token in `generated`. `None` for every other task (unmasked path).
+    grammar: Option<GrammarMask>,
+}
+
+/// A queued task with its grammar compiled at submit.
+struct PendingTask {
+    task: GenerationTask,
+    grammar: Option<CompiledGrammar>,
 }
 
 pub struct OvRuntimeEngine {
@@ -1441,6 +1651,10 @@ pub struct OvRuntimeEngine {
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
+    /// Builds structured-output grammars for this tokenizer (first stage);
+    /// `Err` holds why it couldn't be built (structured-output tasks are then
+    /// refused).
+    grammar_factory: Result<GrammarFactory, String>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
@@ -1451,7 +1665,7 @@ pub struct OvRuntimeEngine {
     /// alias lookup (the IR's primary name is sometimes an internal
     /// node id, not the canonical name). Empty for v3 IRs.
     canonical_inputs: std::collections::HashMap<String, String>,
-    pending: Vec<GenerationTask>,
+    pending: Vec<PendingTask>,
     active: Option<ActiveTask>,
     /// `--packed-slots`: multi-slot packed decode state (own compiled variant,
     /// per-slot KV regions, slot table). Mutually exclusive with `static_kv`
@@ -2093,7 +2307,7 @@ impl OvRuntimeEngine {
             return self.step_first_packed();
         }
         if self.active.is_none() && !self.pending.is_empty() {
-            let task = self.pending.remove(0);
+            let PendingTask { task, grammar } = self.pending.remove(0);
             info!(prompt_len = task.prompt.len(), "ov_prefill_begin");
             let tok = self
                 .tokenizer
@@ -2131,6 +2345,22 @@ impl OvRuntimeEngine {
                     return Ok(vec![(task.task_id.clone(), c)]);
                 }
             }
+            // Structured output: the matcher starts after the resume seed (if
+            // any), before any model work, so a seed the grammar rejects costs
+            // nothing and fails only this task.
+            let grammar = match grammar.as_ref() {
+                Some(g) => {
+                    let seed = cascadia_types::resume_generated_seed(resume.as_deref());
+                    match start_grammar(g, &seed) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            let id = task.task_id.clone();
+                            return Ok(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+                        }
+                    }
+                }
+                None => None,
+            };
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
             // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
@@ -2264,6 +2494,7 @@ impl OvRuntimeEngine {
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
                 t_prefill: std::time::Duration::ZERO,
+                grammar,
             });
         }
 
@@ -2334,7 +2565,12 @@ impl OvRuntimeEngine {
             let out = self
                 .pending
                 .drain(..)
-                .map(|t| (t.task_id.clone(), Chunk::error(t.task_id, msg.clone())))
+                .map(|p| {
+                    (
+                        p.task.task_id.clone(),
+                        Chunk::error(p.task.task_id, msg.clone()),
+                    )
+                })
                 .collect();
             return self.abort_packed_batch(fatal, out);
         }
@@ -2345,7 +2581,7 @@ impl OvRuntimeEngine {
             let Some(slot) = self.packed.as_ref().unwrap().free_slot() else {
                 break;
             };
-            let task = self.pending.remove(0);
+            let PendingTask { task, grammar } = self.pending.remove(0);
             // Option B: the packed path has no forced-prefix support — it neither
             // appends `resume_token_ids` to the prompt nor seeds `generated`/`emitted`.
             // Admitting a resume task here would regenerate the turn FROM SCRATCH and
@@ -2385,13 +2621,28 @@ impl OvRuntimeEngine {
                         .for_task(task.task_id),
                 );
             }
+            // Structured output: a fresh matcher (no resume seed on this path).
+            // A failure is this task's error chunk only.
+            let grammar = match grammar.as_ref().map(|g| start_grammar(g, &[])).transpose() {
+                Ok(g) => g,
+                Err(e) => {
+                    out.push((
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, e.to_string()),
+                    ));
+                    continue;
+                }
+            };
             info!(
                 task = %task.task_id,
                 slot,
                 prompt_tokens = prompt_ids.len(),
                 "task admitted to packed slot"
             );
-            self.packed.as_mut().unwrap().admit(slot, task, prompt_ids);
+            self.packed
+                .as_mut()
+                .unwrap()
+                .admit(slot, task, prompt_ids, grammar);
         }
 
         // Keep inferring until this call produces at least one chunk. A prompt
@@ -2752,13 +3003,37 @@ impl OvRuntimeEngine {
             return Ok(());
         }
         let logits = bytes_to_f32(odt, obytes)?;
-        for (row, slot) in sampled {
-            let token = argmax_logits_row(&logits, oshape, row)?;
-            if let Some(chunk) = self.emit_packed_token(slot, token)? {
+        // Grammar slots are masked per row; a dead end fails that slot only.
+        let picks = pick_packed_rows(
+            &logits,
+            oshape,
+            &sampled,
+            &mut self.packed.as_mut().unwrap().slots,
+        )?;
+        for (slot, pick) in picks {
+            let chunk = match pick {
+                Ok(token) => self.emit_packed_token(slot, token)?,
+                Err(e) => self.fail_packed_slot(slot, e),
+            };
+            if let Some(chunk) = chunk {
                 out.push(chunk);
             }
         }
         Ok(())
+    }
+
+    /// Ends one packed slot's request with its own error chunk and frees the
+    /// slot; the other slots of the batch carry on. Used for a structured-output
+    /// failure (a grammar dead end, a token the grammar rejects), which is that
+    /// request's alone.
+    fn fail_packed_slot(&mut self, slot: usize, e: EngineError) -> Option<(TaskId, Chunk)> {
+        let packed = self.packed.as_mut().unwrap();
+        let ps = packed.retire(slot)?;
+        warn!(task = %ps.task.task_id, slot, error = %e, "packed slot failed");
+        Some((
+            ps.task.task_id.clone(),
+            Chunk::error(ps.task.task_id, e.to_string()),
+        ))
     }
 
     /// Append `token` to `slot`'s sequence, decode its text delta, and build the
@@ -2779,6 +3054,11 @@ impl OvRuntimeEngine {
         let Some(t) = packed.slots[slot].as_mut() else {
             return Ok(None);
         };
+        // Structured output: a token the grammar rejects fails this slot only.
+        let grammar_finished = match commit_grammar_token(t.grammar.as_mut(), token) {
+            Ok(f) => f,
+            Err(e) => return Ok(self.fail_packed_slot(slot, e)),
+        };
         t.last_token = token;
         t.generated.push(token);
         // Stop conditions first: they decide `running`, which tells
@@ -2786,8 +3066,8 @@ impl OvRuntimeEngine {
         // replacement-char run or must flush it.
         let max_tokens = t.task.max_tokens.max(1) as usize;
         let is_eos = eos.contains(&(token as u32));
-        let hit_cap = t.generated.len() >= max_tokens;
-        let is_final = hit_cap || is_eos;
+        let finish = token_finish(t.generated.len(), max_tokens, is_eos, grammar_finished);
+        let is_final = finish.is_some();
         let task_id = t.task.task_id.clone();
 
         let all_ids: Vec<u32> = t.generated.iter().map(|&x| x as u32).collect();
@@ -2821,11 +3101,7 @@ impl OvRuntimeEngine {
         let chunk = Chunk::final_marker(task_id.clone(), delta)
             .with_n_tokens(1)
             .with_prompt_tokens(prompt_tokens)
-            .with_finish_reason(if is_eos {
-                cascadia_types::FinishReason::Stop
-            } else {
-                cascadia_types::FinishReason::Length
-            });
+            .with_finish_reason(finish.unwrap_or(cascadia_types::FinishReason::Length));
         packed.retire(slot);
         info!(
             task = %task_id,
@@ -2946,7 +3222,14 @@ impl OvRuntimeEngine {
                         if let Some(a) = self.active.as_mut() {
                             a.t_alpha_compute += alpha;
                         }
-                        self.resolve_next_token(&out, &shape, single_stage, chunk_start, false)?
+                        self.resolve_next_token(
+                            &out,
+                            &shape,
+                            single_stage,
+                            chunk_start,
+                            chunk_start,
+                            false,
+                        )?
                     };
                     nt = token;
                     if let Some(a) = self.active.as_mut() {
@@ -2965,8 +3248,14 @@ impl OvRuntimeEngine {
                     // Static prefill round-trips per prompt token — each reply
                     // covers one token's relay compute, so it is never a
                     // prefill-budget wait.
-                    let (token, wire) =
-                        self.resolve_next_token(&out, &shape, single_stage, position, false)?;
+                    let (token, wire) = self.resolve_next_token(
+                        &out,
+                        &shape,
+                        single_stage,
+                        position,
+                        position,
+                        false,
+                    )?;
                     nt = token;
                     if let Some(a) = self.active.as_mut() {
                         a.t_alpha_compute += alpha;
@@ -3002,6 +3291,7 @@ impl OvRuntimeEngine {
                 &shape,
                 single_stage,
                 position,
+                position + tokens.len() as i64 - 1,
                 prefill && tokens.len() > 1,
             )?;
             if let Some(a) = self.active.as_mut() {
@@ -3033,11 +3323,14 @@ impl OvRuntimeEngine {
         chunk_start: i64,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
+            let prompt_len = self.active.as_ref().map_or(0, |a| a.prompt_ids.len());
+            let grammar = self.active.as_mut().and_then(|a| a.grammar.as_mut());
             return Ok((
-                argmax_logits_row(out, shape, take - 1)?,
+                pick_chunk_token(out, shape, take, chunk_start, prompt_len, grammar)?,
                 std::time::Duration::ZERO,
             ));
         }
+        self.ensure_no_grammar_downstream()?;
         let x = *shape.last().unwrap_or(&0);
         if x == 0 || out.len() != take * x {
             return Err(EngineError::Backend(format!(
@@ -3054,24 +3347,51 @@ impl OvRuntimeEngine {
     /// From a first-stage output, produce the next token: argmax locally when
     /// this is the only stage, otherwise forward the hidden state downstream
     /// and await the token from the pipeline tail. Returns the token + the
-    /// wire round-trip time (zero for single-stage).
+    /// wire round-trip time (zero for single-stage). `last_row_position` is
+    /// the absolute position of the last row fed, which decides whether a
+    /// grammar task's mask applies (see [`pick_next_token`]).
     fn resolve_next_token(
         &mut self,
         out: &[f32],
         shape: &[usize],
         single_stage: bool,
         position: i64,
+        last_row_position: i64,
         prefill: bool,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
-            Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
+            let Some(active) = self.active.as_mut().filter(|a| a.grammar.is_some()) else {
+                return Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO));
+            };
+            let row = logits_row_count(out, shape)? - 1;
+            let prompt_len = active.prompt_ids.len();
+            let token = pick_next_token(
+                out,
+                shape,
+                row,
+                last_row_position,
+                prompt_len,
+                active.grammar.as_mut(),
+            )?;
+            Ok((token, std::time::Duration::ZERO))
         } else {
+            self.ensure_no_grammar_downstream()?;
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
             self.send_hidden_downstream(out, s3, position)?;
             let token = self.recv_token_from_downstream(prefill)?;
             Ok((token, ts.elapsed()))
         }
+    }
+
+    /// A grammar task never reaches the stage wire: the tail would pick its
+    /// token unmasked. Submit refuses those tasks on multi-stage pipelines;
+    /// this keeps that true if a path ever slips past it.
+    fn ensure_no_grammar_downstream(&self) -> EngineResult<()> {
+        if self.active.as_ref().is_some_and(|a| a.grammar.is_some()) {
+            return Err(refuse_multi_stage_grammar());
+        }
+        Ok(())
     }
 
     /// Decode the delta text for `next_token`, append it to the active task,
@@ -3082,6 +3402,9 @@ impl OvRuntimeEngine {
             .active
             .as_mut()
             .ok_or_else(|| EngineError::Backend("emit_token with no active task".into()))?;
+        // Structured output: the matcher advances past the committed token; a
+        // token it rejects fails the task (the caller attributes the error).
+        let grammar_finished = commit_grammar_token(active.grammar.as_mut(), next_token)?;
         active.last_token = next_token;
         active.generated.push(next_token);
 
@@ -3090,7 +3413,8 @@ impl OvRuntimeEngine {
         // replacement-char run or must flush it.
         let max_tokens = active.task.max_tokens.max(1) as usize;
         let is_eos = self.eos_token_ids.contains(&(next_token as u32));
-        let is_final = active.generated.len() >= max_tokens || is_eos;
+        let finish = token_finish(active.generated.len(), max_tokens, is_eos, grammar_finished);
+        let is_final = finish.is_some();
         let task_id = active.task.task_id.clone();
 
         let tok = self
@@ -3121,7 +3445,9 @@ impl OvRuntimeEngine {
                 token_ids: Vec::new(),
                 // ov-runtime doesn't yet distinguish length vs stop here; the
                 // API falls back to "stop" (unchanged behavior). #14 follow-up.
-                finish_reason: None,
+                // Structured-output tasks say why: stop on a grammar finish or
+                // EOS, length on the budget.
+                finish_reason: active.grammar.as_ref().and(finish),
             }
         } else {
             Chunk::token(task_id.clone(), next_token as i64, delta)
@@ -3797,7 +4123,7 @@ impl Engine for OvRuntimeEngine {
                    "refusing task: packed downstream link is dead");
             return Err(fatal);
         }
-        if self.pending.iter().any(|t| t.task_id == task.task_id)
+        if self.pending.iter().any(|p| p.task.task_id == task.task_id)
             || self
                 .active
                 .as_ref()
@@ -3836,7 +4162,15 @@ impl Engine for OvRuntimeEngine {
                 }
             }
         }
-        self.pending.push(task);
+        let grammar = compile_task_grammar(&self.grammar_factory, &task, !self.spec.is_last_stage)?;
+        if let Some(g) = grammar.as_ref().filter(|g| !g.warnings().is_empty()) {
+            info!(
+                task = %task.task_id,
+                warnings = ?g.warnings(),
+                "ov-runtime: response_format keywords accepted but not enforced"
+            );
+        }
+        self.pending.push(PendingTask { task, grammar });
         Ok(())
     }
 
@@ -3876,7 +4210,7 @@ impl Engine for OvRuntimeEngine {
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
-        self.pending.retain(|t| t.task_id != *task_id);
+        self.pending.retain(|p| p.task.task_id != *task_id);
         // Packed path: drop just this request's slot. Its KV region is cleared
         // and returned to the free pool immediately, so a disconnecting client
         // frees capacity for the next admission without disturbing the other
@@ -5377,6 +5711,16 @@ impl Builder for OvRuntimeBuilder {
             }
         };
 
+        // Structured output: built once on the stage that holds the tokenizer
+        // and takes tasks, from every EOS id generation stops on.
+        let grammar_factory = if spec.is_first_stage {
+            build_grammar_factory(self.tokenizer.as_deref(), &self.eos_token_ids).inspect_err(
+                |reason| warn!(%reason, "ov-runtime: structured output unavailable for this model"),
+            )
+        } else {
+            Err("not the first pipeline stage".to_string())
+        };
+
         Ok(Box::new(OvRuntimeEngine {
             packed,
             spec,
@@ -5385,6 +5729,7 @@ impl Builder for OvRuntimeBuilder {
             hidden_size: self.hidden_size,
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
+            grammar_factory,
             upstream: self.upstream,
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
@@ -6847,5 +7192,361 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tok, 8);
+    }
+
+    // ---- structured output: grammar-masked picks ----
+
+    /// EOS of the single-byte test vocab.
+    const TEST_EOS: u32 = 261;
+    /// A control byte JSON never allows: the raw argmax the mask must reject.
+    const BAD: u8 = 0x01;
+    const OK_ENUM: &str = r#"{"type":"string","enum":["ok"]}"#;
+    const INTEGER: &str = r#"{"type":"integer"}"#;
+
+    fn test_factory() -> GrammarFactory {
+        GrammarFactory::single_byte_for_tests()
+    }
+
+    fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
+        cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: body.to_string(),
+        }
+    }
+
+    fn test_mask(body: &str, seed: &str) -> GrammarMask {
+        let gf = test_factory();
+        let seed: Vec<i64> = seed.bytes().map(i64::from).collect();
+        start_grammar(&gf.compile(&json_spec(body)).unwrap(), &seed).unwrap()
+    }
+
+    /// A row of `width` zeros with the given `(token, logit)` peaks.
+    fn peaks(width: usize, peaks: &[(u32, f32)]) -> Vec<f32> {
+        let mut r = vec![0.0f32; width];
+        for &(t, l) in peaks {
+            r[t as usize] = l;
+        }
+        r
+    }
+
+    /// Raw argmax BAD, `ok` the best token the grammar may allow.
+    fn bad_then(width: usize, ok: u8) -> Vec<f32> {
+        peaks(width, &[(BAD as u32, 10.0), (ok as u32, 5.0)])
+    }
+
+    fn rows(rows: &[Vec<f32>]) -> (Vec<f32>, Vec<usize>) {
+        let w = rows[0].len();
+        (rows.concat(), vec![1, rows.len(), w])
+    }
+
+    #[test]
+    fn only_the_last_prompt_row_and_decode_rows_pick_the_next_token() {
+        assert!(!row_picks_next_token(0, 3));
+        assert!(!row_picks_next_token(1, 3));
+        assert!(row_picks_next_token(2, 3), "last prompt row");
+        assert!(row_picks_next_token(3, 3), "decode row");
+        assert!(row_picks_next_token(40, 3), "decode row");
+    }
+
+    #[test]
+    fn stateful_prefill_masks_the_last_prompt_position_only() {
+        let w = test_factory().mask_width();
+        let (out, shape) = rows(&[bad_then(w, b'x'), bad_then(w, b'y'), bad_then(w, b'"')]);
+        let mut mask = test_mask(OK_ENUM, "");
+        // Cold prefill of a 3-token prompt at position 0: last row is position 2.
+        let t = pick_next_token(&out, &shape, 2, 2, 3, Some(&mut mask)).unwrap();
+        assert_eq!(t, b'"' as i32);
+        // Warm resume: the same 3 rows are the suffix of a longer prompt, still
+        // its last position, so still masked.
+        let t = pick_next_token(&out, &shape, 2, 9, 10, Some(&mut mask)).unwrap();
+        assert_eq!(t, b'"' as i32);
+        // Not the last prompt row: plain argmax, the matcher is not touched.
+        let t = pick_next_token(&out, &shape, 2, 2, 5, Some(&mut mask)).unwrap();
+        assert_eq!(t, BAD as i32);
+        assert!(mask.allowed(b'"' as u32), "pick never advances the matcher");
+    }
+
+    #[test]
+    fn static_per_token_prefill_masks_only_the_last_prompt_token() {
+        let w = test_factory().mask_width();
+        let mut mask = test_mask(OK_ENUM, "");
+        let prompt_len = 4usize;
+        let mut picks = Vec::new();
+        for position in 0..prompt_len as i64 {
+            let (out, shape) = rows(&[bad_then(w, b'"')]);
+            picks.push(
+                pick_next_token(&out, &shape, 0, position, prompt_len, Some(&mut mask)).unwrap(),
+            );
+        }
+        let bad = BAD as i32;
+        assert_eq!(picks, vec![bad, bad, bad, b'"' as i32]);
+    }
+
+    /// Drives the single-stage chunked static prefill exactly as
+    /// `step_first_body` does (chunks via `chunk_take`, non-final chunks
+    /// unread, a `take < 2` step through the decode model) and records every
+    /// pick it makes as `(row position, token)`.
+    fn chunked_prefill_picks(
+        c: usize,
+        prompt_len: usize,
+        past_len: usize,
+        mask: &mut GrammarMask,
+    ) -> Vec<(i64, i32)> {
+        let w = test_factory().mask_width();
+        let mut picks = Vec::new();
+        let mut position = 0i64;
+        let mut idx = 0usize;
+        while idx < prompt_len {
+            let chunk_start = position;
+            let take = chunk_take(c, prompt_len - idx, chunk_start as usize, past_len);
+            if take >= 2 {
+                let is_final_chunk = idx + take == prompt_len;
+                position += take as i64;
+                idx += take;
+                if is_final_chunk {
+                    let (out, shape) = rows(&vec![bad_then(w, b'"'); take]);
+                    let t =
+                        pick_chunk_token(&out, &shape, take, chunk_start, prompt_len, Some(mask))
+                            .unwrap();
+                    picks.push((chunk_start + take as i64 - 1, t));
+                }
+            } else {
+                let (out, shape) = rows(&[bad_then(w, b'"')]);
+                position += 1;
+                idx += 1;
+                let t =
+                    pick_next_token(&out, &shape, 0, chunk_start, prompt_len, Some(mask)).unwrap();
+                picks.push((chunk_start, t));
+            }
+        }
+        picks
+    }
+
+    #[test]
+    fn chunked_prefill_of_c_times_n_plus_one_masks_the_one_token_remainder() {
+        let (c, n) = (4usize, 2usize);
+        let prompt_len = c * n + 1;
+        let mut mask = test_mask(OK_ENUM, "");
+        let picks = chunked_prefill_picks(c, prompt_len, 64, &mut mask);
+        // Both C-wide chunks are non-final (unread); the last prompt token goes
+        // through the `take < 2` path, and that row is the masked one.
+        assert_eq!(picks, vec![(prompt_len as i64 - 1, b'"' as i32)]);
+    }
+
+    #[test]
+    fn chunked_prefill_over_the_window_masks_only_the_last_one_token_step() {
+        // past_len 5: chunk 0..4, then a 2-row chunk, then every remaining row
+        // steps one token at a time; only the last of those may be masked.
+        let mut mask = test_mask(OK_ENUM, "");
+        let picks = chunked_prefill_picks(4, 9, 5, &mut mask);
+        let bad = BAD as i32;
+        assert_eq!(picks, vec![(6, bad), (7, bad), (8, b'"' as i32)]);
+    }
+
+    #[test]
+    fn chunked_prefill_whose_last_chunk_is_full_masks_its_last_row() {
+        let mut mask = test_mask(OK_ENUM, "");
+        let picks = chunked_prefill_picks(4, 8, 64, &mut mask);
+        assert_eq!(picks, vec![(7, b'"' as i32)]);
+    }
+
+    #[test]
+    fn padded_last_chunk_masks_the_last_real_row() {
+        let w = test_factory().mask_width();
+        let (c, take) = (4usize, 3usize);
+        let real = vec![
+            peaks(w, &[(b'1' as u32, 10.0)]),
+            peaks(w, &[(b'2' as u32, 10.0)]),
+            bad_then(w, b'7'),
+        ];
+        // `run_first_chunk` hands back only the real rows...
+        let (out, shape) = rows(&real);
+        let mut mask = test_mask(INTEGER, "");
+        let t = pick_chunk_token(&out, &shape, take, 4, 7, Some(&mut mask)).unwrap();
+        assert_eq!(t, b'7' as i32);
+        // ...and even a buffer still carrying the pad row picks row take-1.
+        let mut padded = real.clone();
+        padded.resize(c, peaks(w, &[(b'9' as u32, 20.0)]));
+        let (out, shape) = rows(&padded);
+        let t = pick_chunk_token(&out, &shape, take, 4, 7, Some(&mut mask)).unwrap();
+        assert_eq!(t, b'7' as i32);
+    }
+
+    #[test]
+    fn decode_rows_are_masked() {
+        let w = test_factory().mask_width();
+        let mut mask = test_mask(OK_ENUM, "\"o");
+        let (out, shape) = rows(&[bad_then(w, b'k')]);
+        let t = pick_next_token(&out, &shape, 0, 12, 10, Some(&mut mask)).unwrap();
+        assert_eq!(t, b'k' as i32);
+    }
+
+    #[test]
+    fn a_masked_dead_end_is_an_error_not_an_unmasked_pick() {
+        // Finished doc: only EOS (261) may follow, and the row is too narrow to hold it.
+        let mut mask = test_mask(OK_ENUM, "\"ok\"");
+        let (out, shape) = rows(&[peaks(256, &[(BAD as u32, 10.0)])]);
+        assert!(pick_next_token(&out, &shape, 0, 5, 5, Some(&mut mask)).is_err());
+    }
+
+    #[test]
+    fn requests_without_a_grammar_pick_the_plain_argmax_on_every_row() {
+        let w = test_factory().mask_width();
+        let (out, shape) = rows(&[bad_then(w, b'"'), bad_then(w, b'"')]);
+        for position in 0..4 {
+            assert_eq!(
+                pick_next_token(&out, &shape, 1, position, 2, None).unwrap(),
+                argmax_logits(&out, &shape).unwrap()
+            );
+        }
+        assert_eq!(
+            pick_chunk_token(&out, &shape, 2, 0, 2, None).unwrap(),
+            argmax_logits_row(&out, &shape, 1).unwrap()
+        );
+        assert!(!commit_grammar_token(None, BAD as i32).unwrap());
+    }
+
+    #[test]
+    fn commit_advances_the_matcher_and_reports_a_finish() {
+        let mut mask = test_mask(OK_ENUM, "");
+        for b in *b"\"ok" {
+            assert!(!commit_grammar_token(Some(&mut mask), b as i32).unwrap());
+        }
+        assert!(commit_grammar_token(Some(&mut mask), b'"' as i32).unwrap());
+        // EOS picked from the finished mask is accepted.
+        assert!(commit_grammar_token(Some(&mut mask), TEST_EOS as i32).unwrap());
+
+        let mut mask = test_mask(OK_ENUM, "");
+        assert!(commit_grammar_token(Some(&mut mask), BAD as i32).is_err());
+    }
+
+    #[test]
+    fn a_grammar_finish_on_the_last_allowed_token_is_stop() {
+        use cascadia_types::FinishReason;
+        // Exactly max_tokens and the JSON completes on that token.
+        assert_eq!(token_finish(4, 4, false, true), Some(FinishReason::Stop));
+        assert_eq!(token_finish(4, 4, false, false), Some(FinishReason::Length));
+        assert_eq!(token_finish(2, 4, true, false), Some(FinishReason::Stop));
+        assert_eq!(token_finish(2, 4, false, true), Some(FinishReason::Stop));
+        assert_eq!(token_finish(2, 4, false, false), None);
+    }
+
+    #[test]
+    fn multi_stage_pipelines_refuse_grammar_tasks() {
+        let gf: Result<GrammarFactory, String> = Ok(test_factory());
+        let json = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
+        match compile_task_grammar(&gf, &json, true) {
+            Err(EngineError::InvalidConfig(m)) => assert_eq!(
+                m,
+                "structured output (response_format) is not supported on multi-stage \
+                 ov-runtime pipelines yet"
+            ),
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, got Ok"),
+        }
+        assert!(compile_task_grammar(&gf, &json, false).unwrap().is_some());
+        let plain = GenerationTask::new("t", "p");
+        assert!(compile_task_grammar(&gf, &plain, true).unwrap().is_none());
+        assert!(compile_task_grammar(&gf, &plain, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn grammar_compile_errors_are_invalid_config() {
+        let gf: Result<GrammarFactory, String> = Ok(test_factory());
+        let bad = GenerationTask::new("t", "p").with_grammar(json_spec(r#"{"type":42}"#));
+        assert!(matches!(
+            compile_task_grammar(&gf, &bad, false),
+            Err(EngineError::InvalidConfig(_))
+        ));
+        let none: Result<GrammarFactory, String> = Err("no tokenizer".into());
+        let json = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
+        match compile_task_grammar(&none, &json, false) {
+            Err(EngineError::InvalidConfig(m)) => assert_eq!(
+                m,
+                "structured output is not available for this model: no tokenizer"
+            ),
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, got Ok"),
+        }
+    }
+
+    #[test]
+    fn a_resume_seed_the_grammar_rejects_is_a_backend_error() {
+        let gf = test_factory();
+        let cg = gf.compile(&json_spec(OK_ENUM)).unwrap();
+        assert!(matches!(
+            start_grammar(&cg, &[BAD as i64]),
+            Err(EngineError::Backend(_))
+        ));
+        let mut mask = start_grammar(&cg, &[b'"' as i64]).unwrap();
+        assert!(mask.allowed(b'o' as u32));
+    }
+
+    fn packed_slot(grammar: Option<GrammarMask>) -> crate::packed_exec::PackedSlot {
+        crate::packed_exec::PackedSlot {
+            task: GenerationTask::new("t", "p"),
+            prompt_ids: vec![1, 2, 3],
+            prompt_fed: 3,
+            generated: Vec::new(),
+            emitted: Vec::new(),
+            last_token: 0,
+            started: std::time::Instant::now(),
+            t_prefill: std::time::Duration::ZERO,
+            grammar,
+        }
+    }
+
+    #[test]
+    fn packed_batch_masks_grammar_slots_only() {
+        let w = test_factory().mask_width();
+        let mut slots = vec![
+            Some(packed_slot(Some(test_mask(OK_ENUM, "")))),
+            Some(packed_slot(None)),
+        ];
+        let (out, shape) = rows(&[bad_then(w, b'"'), bad_then(w, b'"')]);
+        let picks = pick_packed_rows(&out, &shape, &[(0, 0), (1, 1)], &mut slots).unwrap();
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].0, 0);
+        assert_eq!(*picks[0].1.as_ref().unwrap(), b'"' as i32);
+        assert_eq!(picks[1].0, 1);
+        assert_eq!(*picks[1].1.as_ref().unwrap(), BAD as i32);
+    }
+
+    #[test]
+    fn packed_dead_end_fails_only_its_own_slot() {
+        let mut slots = vec![
+            Some(packed_slot(None)),
+            Some(packed_slot(Some(test_mask(OK_ENUM, "\"ok\"")))),
+        ];
+        // Rows narrower than the EOS id: the finished slot has nothing allowed.
+        let (out, shape) = rows(&[
+            peaks(256, &[(BAD as u32, 10.0)]),
+            peaks(256, &[(BAD as u32, 10.0)]),
+        ]);
+        let picks = pick_packed_rows(&out, &shape, &[(0, 0), (1, 1)], &mut slots).unwrap();
+        assert_eq!(*picks[0].1.as_ref().unwrap(), BAD as i32);
+        assert!(picks[1].1.is_err(), "the grammar slot fails on its own");
+    }
+
+    #[test]
+    fn packed_prefill_row_of_a_grammar_slot_is_masked() {
+        let w = test_factory().mask_width();
+        let mut slots = vec![Some(packed_slot(Some(test_mask(INTEGER, ""))))];
+        let (out, shape) = rows(&[
+            peaks(w, &[(b'1' as u32, 10.0)]),
+            bad_then(w, b'4'),
+            peaks(w, &[(b'9' as u32, 20.0)]),
+        ]);
+        // A prefill chunk whose last real row is row 1 (row 2 is a pad).
+        let picks = pick_packed_rows(&out, &shape, &[(1, 0)], &mut slots).unwrap();
+        assert_eq!(*picks[0].1.as_ref().unwrap(), b'4' as i32);
+    }
+
+    #[test]
+    fn packed_row_out_of_range_is_a_batch_error() {
+        let w = test_factory().mask_width();
+        let mut slots = vec![Some(packed_slot(Some(test_mask(OK_ENUM, ""))))];
+        let (out, shape) = rows(&[bad_then(w, b'"')]);
+        assert!(pick_packed_rows(&out, &shape, &[(3, 0)], &mut slots).is_err());
     }
 }

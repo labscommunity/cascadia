@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use cascadia_engine::{EngineError, EngineResult};
+use cascadia_grammar::GrammarMask;
 use cascadia_ov_genai_shim::{DType as ShimDType, Runtime as OvRuntime};
 use cascadia_types::GenerationTask;
 
@@ -37,6 +38,9 @@ pub(crate) struct PackedSlot {
     pub(crate) last_token: i32,
     pub(crate) started: Instant,
     pub(crate) t_prefill: Duration,
+    /// The grammar matcher of a structured-output request, advanced over
+    /// `generated`. `None` for every other request (unmasked rows).
+    pub(crate) grammar: Option<GrammarMask>,
 }
 
 impl PackedSlot {
@@ -149,8 +153,15 @@ impl PackedState {
     }
 
     /// Place a task into `slot`, reusing `shared` cached prefix tokens and
-    /// clearing only that slot's own KV region.
-    pub(crate) fn admit(&mut self, slot: usize, task: GenerationTask, prompt_ids: Vec<i64>) {
+    /// clearing only that slot's own KV region. `grammar` is the request's
+    /// matcher (structured output only).
+    pub(crate) fn admit(
+        &mut self,
+        slot: usize,
+        task: GenerationTask,
+        prompt_ids: Vec<i64>,
+        grammar: Option<GrammarMask>,
+    ) {
         let shared = self.prefix_reuse(&prompt_ids);
         self.kv.reset_slot_reusing(slot, shared);
         // Nothing cached yet? This request populates the shared prefix.
@@ -171,6 +182,7 @@ impl PackedState {
             last_token: 0,
             started: Instant::now(),
             t_prefill: Duration::ZERO,
+            grammar,
         });
     }
 
