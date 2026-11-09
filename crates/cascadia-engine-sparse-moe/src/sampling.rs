@@ -3,7 +3,7 @@
 //! All sampling math runs on f32 logits. The deterministic argmax path
 //! is preserved for `temperature == 0`.
 
-use cascadia_engine::EngineResult;
+use cascadia_engine::{EngineError, EngineResult};
 use cascadia_grammar::GrammarMask;
 
 /// Sampling configuration for one decode call.
@@ -63,11 +63,39 @@ pub fn sample(
     rng_state: &mut u64,
     mask: Option<&mut GrammarMask>,
 ) -> EngineResult<i64> {
-    let mut work = logits.to_vec();
-    if let Some(mask) = mask {
-        mask.apply(&mut work)?;
+    let Some(mask) = mask else {
+        return Ok(sample_row(logits.to_vec(), history, cfg, rng_state));
+    };
+    let mut masked = logits.to_vec();
+    mask.apply(&mut masked)?;
+    let pick = sample_row(masked.clone(), history, cfg, rng_state);
+    if masked.get(pick as usize) != Some(&f32::NEG_INFINITY) {
+        return Ok(pick);
     }
-    Ok(sample_row(work, history, cfg, rng_state))
+    // No finite positive mass survived (a temperature so small that 1/t
+    // overflows, NaN logits): the row's fallback can land on a masked id.
+    // Take the best allowed logit instead.
+    masked_argmax(&masked).map(|i| i as i64).ok_or_else(|| {
+        EngineError::Backend("grammar: no token of the logits row is allowed".into())
+    })
+}
+
+/// The highest finite logit among the allowed (not `-inf`) entries of a
+/// masked row; the first allowed entry when none is finite (NaN logits).
+/// `None` when nothing is allowed.
+fn masked_argmax(masked: &[f32]) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    let mut first_allowed = None;
+    for (i, &v) in masked.iter().enumerate() {
+        if v == f32::NEG_INFINITY {
+            continue;
+        }
+        first_allowed.get_or_insert(i);
+        if v.is_finite() && best.is_none_or(|(_, b)| v > b) {
+            best = Some((i, v));
+        }
+    }
+    best.map(|(i, _)| i).or(first_allowed)
 }
 
 /// [`sample`] for a row no grammar constrains (normal requests, and the
@@ -530,5 +558,27 @@ mod tests {
     fn zero_mass_tokens_are_never_drawn_even_at_u_zero() {
         let probs = [0.0f32, 0.0, 1.0];
         assert_eq!(pick_categorical(&probs, 0.0), 2);
+    }
+
+    #[test]
+    fn masked_pick_with_no_finite_mass_falls_back_to_the_masked_argmax() {
+        // A temperature this small overflows 1/t to inf; the softmax is NaN.
+        let mut gm = mid_string_mask();
+        let (l, history) = adversarial_logits(4);
+        let cfg = task_cfg(1e-40);
+        let mut s = init_rng(Some(3));
+        let t = sample(&l, &history, &cfg, &mut s, Some(&mut gm)).unwrap();
+        assert!(gm.allowed(t as u32), "picked masked id {t}");
+    }
+
+    #[test]
+    fn masked_pick_over_nan_logits_stays_allowed() {
+        let mut gm = test_env::mask(test_env::WEATHER);
+        let l = vec![f32::NAN; test_env::VOCAB];
+        for temperature in [0.0, 1.0] {
+            let mut s = init_rng(Some(5));
+            let t = sample(&l, &[], &task_cfg(temperature), &mut s, Some(&mut gm)).unwrap();
+            assert_eq!(t, i64::from(b'{'), "temperature {temperature}");
+        }
     }
 }
