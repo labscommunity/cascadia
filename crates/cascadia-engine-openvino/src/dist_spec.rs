@@ -255,6 +255,62 @@ fn masked_accept(
     Ok(MaskedRound { tokens, kept, end })
 }
 
+/// What the draft model is fed after a round, ahead of the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftFeed {
+    /// The task ended: nothing more is fed.
+    Nothing,
+    /// The round's last token (the correction).
+    Correction,
+    /// Every draft was accepted: the last draft (which the draft model
+    /// proposed but never fed) goes in ahead of the bonus token.
+    LastDraftThenCorrection,
+}
+
+/// How a verify round leaves the target's and the draft's KV caches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RoundKv {
+    /// Positions to rewind off the end of the target's KV.
+    target_rewind: usize,
+    /// Positions to rewind off the end of the draft's KV.
+    draft_rewind: usize,
+    /// What to feed the draft model afterwards.
+    draft_feed: DraftFeed,
+}
+
+/// KV bookkeeping for one spec round, shared by the plain and the masked
+/// round. The target fed `[prev_correction, drafts...]`; the draft model fed
+/// `prev_correction` before the round and then `d_advanced` drafts (every
+/// draft but the last). `kept` leading drafts were emitted as-is and stay in
+/// both caches; `ended` is true when the task stops with this round.
+fn round_kv(drafts_len: usize, d_advanced: usize, kept: usize, ended: bool) -> RoundKv {
+    debug_assert!(kept <= drafts_len, "kept {kept} of {drafts_len} drafts");
+    debug_assert_eq!(d_advanced + 1, drafts_len, "the last draft is never fed");
+    let target_rewind = drafts_len - kept;
+    if ended {
+        // Keep both caches on the emitted tokens only. With every draft kept the
+        // draft model sits one behind the target, which a warm resume catches up.
+        return RoundKv {
+            target_rewind,
+            draft_rewind: d_advanced - kept.min(d_advanced),
+            draft_feed: DraftFeed::Nothing,
+        };
+    }
+    if kept == drafts_len {
+        RoundKv {
+            target_rewind,
+            draft_rewind: 0,
+            draft_feed: DraftFeed::LastDraftThenCorrection,
+        }
+    } else {
+        RoundKv {
+            target_rewind,
+            draft_rewind: d_advanced - kept,
+            draft_feed: DraftFeed::Correction,
+        }
+    }
+}
+
 /// Picks the first generated token from the last prompt row: plain argmax for
 /// a task without a grammar, else the masked argmax (accepted into the matcher
 /// unless it is EOS). `Some(end)` when the grammar task ends on this token.
@@ -2002,15 +2058,22 @@ impl OvDistSpecEngine {
         // per-round accepted-ids source for `Chunk::token_ids`.
         let token_ids_added: Vec<i64> = active.out[out_len_before..].to_vec();
 
-        // Rewind any rejected drafts from the target's KV cache.
-        self.target.rewind(drafts.len() - accepted);
-
-        // Reconcile the draft's KV cache to match what the target accepted,
-        // then re-prime with the correction so next round's drafts continue
-        // from the right state.
-        if !hit_eos && !hit_max {
-            self.draft.rewind(d_advanced - accepted);
-            let (l, sh) = self.draft.feed(&[correction])?;
+        // Drop the rejected drafts from both KV caches, then re-prime the draft
+        // with the correction so next round's drafts continue from the right
+        // state. On an end, only the drafts actually emitted are kept.
+        let ended = hit_eos || hit_max;
+        let kept = accepted.min(n_tokens_added as usize);
+        let plan = round_kv(drafts.len(), d_advanced, kept, ended);
+        self.target.rewind(plan.target_rewind);
+        self.draft.rewind(plan.draft_rewind);
+        let fed = match plan.draft_feed {
+            DraftFeed::Nothing => None,
+            DraftFeed::Correction => Some(self.draft.feed(&[correction])?),
+            DraftFeed::LastDraftThenCorrection => {
+                Some(self.draft.feed(&[drafts[d_advanced], correction])?)
+            }
+        };
+        if let Some((l, sh)) = fed {
             let dv = sh[2];
             active.d_last_logit = l[l.len() - dv..].to_vec();
             active.prev_correction = correction;
@@ -2075,25 +2138,19 @@ impl OvDistSpecEngine {
 
         // Only the drafts emitted as-is stay in the target's KV; the round's
         // last token (a correction or the bonus) is fed next round.
-        self.target.rewind(drafts.len() - round.kept);
-        match round.end {
-            None => {
-                let correction = *round.tokens.last().expect("an open round emits a token");
-                let l_sh = if round.kept == drafts.len() {
-                    // Every draft accepted: the draft model hasn't fed the last
-                    // one yet, so it goes in ahead of the bonus token.
-                    self.draft.feed(&[drafts[d_advanced], correction])?
-                } else {
-                    self.draft.rewind(d_advanced - round.kept);
-                    self.draft.feed(&[correction])?
-                };
-                let (l, sh) = l_sh;
-                let dv = sh[2];
-                active.d_last_logit = l[l.len() - dv..].to_vec();
-                active.prev_correction = correction;
-            }
-            // The task ends: keep both KV caches on the emitted tokens only.
-            Some(_) => self.draft.rewind(d_advanced - round.kept.min(d_advanced)),
+        let plan = round_kv(drafts.len(), d_advanced, round.kept, round.end.is_some());
+        self.target.rewind(plan.target_rewind);
+        self.draft.rewind(plan.draft_rewind);
+        if plan.draft_feed != DraftFeed::Nothing {
+            let correction = *round.tokens.last().expect("an open round emits a token");
+            let (l, sh) = if plan.draft_feed == DraftFeed::LastDraftThenCorrection {
+                self.draft.feed(&[drafts[d_advanced], correction])?
+            } else {
+                self.draft.feed(&[correction])?
+            };
+            let dv = sh[2];
+            active.d_last_logit = l[l.len() - dv..].to_vec();
+            active.prev_correction = correction;
         }
 
         let finished = round.end.is_some();
@@ -3805,14 +3862,96 @@ mod tests {
         assert!(masked_accept(&mut mask, &refs(&rows), &[BAD as i64], &[TEST_EOS], 16).is_err());
     }
 
+    fn kv(target_rewind: usize, draft_rewind: usize, draft_feed: DraftFeed) -> RoundKv {
+        RoundKv {
+            target_rewind,
+            draft_rewind,
+            draft_feed,
+        }
+    }
+
+    #[test]
+    fn round_kv_open_round() {
+        use DraftFeed::*;
+        // k = 4: the draft model fed 3 drafts past prev_correction.
+        assert_eq!(round_kv(4, 3, 0, false), kv(4, 3, Correction));
+        assert_eq!(round_kv(4, 3, 2, false), kv(2, 1, Correction));
+        assert_eq!(round_kv(4, 3, 3, false), kv(1, 0, Correction));
+        assert_eq!(round_kv(4, 3, 4, false), kv(0, 0, LastDraftThenCorrection));
+        // k = 1: one draft, never fed to the draft model.
+        assert_eq!(round_kv(1, 0, 0, false), kv(1, 0, Correction));
+        assert_eq!(round_kv(1, 0, 1, false), kv(0, 0, LastDraftThenCorrection));
+    }
+
+    #[test]
+    fn round_kv_ended_round() {
+        use DraftFeed::*;
+        assert_eq!(round_kv(4, 3, 0, true), kv(4, 3, Nothing));
+        assert_eq!(round_kv(4, 3, 2, true), kv(2, 1, Nothing));
+        assert_eq!(round_kv(4, 3, 4, true), kv(0, 0, Nothing));
+        assert_eq!(round_kv(1, 0, 0, true), kv(1, 0, Nothing));
+        assert_eq!(round_kv(1, 0, 1, true), kv(0, 0, Nothing));
+    }
+
+    /// Track both caches' depths through one round for every shape a round can
+    /// take. An open round must leave the target holding everything up to the
+    /// correction and the draft one past it (it has fed the correction); an
+    /// ended round must leave the draft at most one behind the target and never
+    /// ahead (what a warm resume accepts). No rewind may reach back past what
+    /// the round itself added.
+    #[test]
+    fn round_kv_keeps_draft_and_target_aligned() {
+        for k in 1..=5usize {
+            for drafts_len in 1..=k {
+                let d_advanced = drafts_len - 1;
+                for kept in 0..=drafts_len {
+                    for ended in [false, true] {
+                        let ctx = format!("len={drafts_len} kept={kept} ended={ended}");
+                        let r = round_kv(drafts_len, d_advanced, kept, ended);
+                        // Before the round: target at depth t0 (prev_correction not
+                        // yet in it), draft at t0 + 1 (prev_correction fed).
+                        let t0 = 100usize;
+                        assert!(r.target_rewind <= drafts_len, "{ctx}");
+                        assert!(r.draft_rewind <= d_advanced, "{ctx}");
+                        let t = t0 + 1 + drafts_len - r.target_rewind;
+                        let fed = match r.draft_feed {
+                            DraftFeed::Nothing => 0,
+                            DraftFeed::Correction => 1,
+                            DraftFeed::LastDraftThenCorrection => 2,
+                        };
+                        let d = t0 + 1 + d_advanced - r.draft_rewind + fed;
+                        assert_eq!(t, t0 + 1 + kept, "{ctx}");
+                        if ended {
+                            assert_eq!(r.draft_feed, DraftFeed::Nothing, "{ctx}");
+                            assert!(d <= t && t - d <= 1, "{ctx}: draft {d} target {t}");
+                        } else {
+                            assert_eq!(d, t + 1, "{ctx}: draft {d} target {t}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A deterministic fake target: logits as a function of the output so far.
     /// The raw argmax is always BAD (never allowed); the doc byte comes next;
-    /// `Z` competes and wins every fourth position where the grammar allows it.
-    fn fake_target(width: usize, doc: &[u8], perturb: bool, prefix: &[i64]) -> Vec<f32> {
+    /// `Z` competes and wins every fourth position where the grammar allows it;
+    /// at position `eos_at` EOS outranks the doc byte (and ends the output
+    /// where the grammar allows it there).
+    fn fake_target(
+        width: usize,
+        doc: &[u8],
+        perturb: bool,
+        eos_at: Option<usize>,
+        prefix: &[i64],
+    ) -> Vec<f32> {
         let n = prefix.len();
         let mut peaks = vec![(BAD as u32, 10.0)];
         if let Some(&b) = doc.get(n) {
             peaks.push((b as u32, 5.0));
+        }
+        if eos_at == Some(n) {
+            peaks.push((TEST_EOS, 7.0));
         }
         let z = if perturb && n.is_multiple_of(4) {
             6.0
@@ -3916,24 +4055,43 @@ mod tests {
     fn speculative_masked_output_equals_sequential_masked_greedy() {
         let gf = test_factory();
         let w = gf.mask_width();
-        let cg = compiled(&gf, WEATHER);
-        let doc = WEATHER_DOC.as_bytes();
-        for perturb in [false, true] {
-            let target = |p: &[i64]| fake_target(w, doc, perturb, p);
-            let draft = |p: &[i64]| fake_draft(doc, p);
-            for k in 1..=4 {
-                for max_tokens in [1, 2, 3, 7, 20, 200] {
-                    let seq = sequential_masked(&cg, max_tokens, &target);
-                    let spec = speculative_masked(&cg, k, max_tokens, &target, &draft);
-                    assert_eq!(spec, seq, "k={k} max_tokens={max_tokens} perturb={perturb}");
+        let weather = compiled(&gf, WEATHER);
+        let integer = compiled(&gf, INTEGER);
+        // EOS peaked mid-object (masked away) and mid-integer (where it ends the output).
+        let cases: [(&CompiledGrammar, &[u8], Option<usize>); 3] = [
+            (&weather, WEATHER_DOC.as_bytes(), None),
+            (&weather, WEATHER_DOC.as_bytes(), Some(5)),
+            (&integer, b"12345", Some(3)),
+        ];
+        for (cg, doc, eos_at) in cases {
+            for perturb in [false, true] {
+                let target = |p: &[i64]| fake_target(w, doc, perturb, eos_at, p);
+                let draft = |p: &[i64]| fake_draft(doc, p);
+                for k in 1..=4 {
+                    for max_tokens in [1, 2, 3, 7, 20, 200] {
+                        let seq = sequential_masked(cg, max_tokens, &target);
+                        let spec = speculative_masked(cg, k, max_tokens, &target, &draft);
+                        assert_eq!(
+                            spec, seq,
+                            "k={k} max_tokens={max_tokens} perturb={perturb} eos_at={eos_at:?}"
+                        );
+                    }
                 }
             }
         }
-        // Unperturbed, the grammar finishes on the document exactly.
-        let target = |p: &[i64]| fake_target(w, doc, false, p);
+        // Unperturbed, the grammar finishes on the document exactly, an EOS the
+        // grammar forbids changes nothing, and an allowed one ends the output.
+        for eos_at in [None, Some(5)] {
+            let target = |p: &[i64]| fake_target(w, WEATHER_DOC.as_bytes(), false, eos_at, p);
+            assert_eq!(
+                sequential_masked(&weather, 200, &target),
+                (ids(WEATHER_DOC), MaskedEnd::Finished)
+            );
+        }
+        let target = |p: &[i64]| fake_target(w, b"12345", false, Some(3), p);
         assert_eq!(
-            sequential_masked(&cg, 200, &target),
-            (ids(WEATHER_DOC), MaskedEnd::Finished)
+            sequential_masked(&integer, 200, &target),
+            (ids("123"), MaskedEnd::Eos)
         );
     }
 
