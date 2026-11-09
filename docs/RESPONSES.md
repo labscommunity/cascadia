@@ -54,7 +54,7 @@ a message, tool calls); they are gathered back into one assistant chat turn.
 |---|---|
 | `message`, role `user` / `system` | That chat message. `developer` is served as `system`. A `system` right after a `system`, or a `user` right after a `user`, is merged into it, the texts joined by a blank line (so `developer, developer, user, user` reaches the template as `system, user`). |
 | `message`, role `assistant` | The assistant turn's content. |
-| `reasoning` | Replayed as `<think>{text}</think>` at the front of the assistant turn's content. The text is the item's `content[].text`, else Cascadia's own `encrypted_content` decoded. A reasoning item with neither (another provider's blob, a summary-only item) is skipped. |
+| `reasoning` | Replayed as `<think>{text}</think>` at the front of the assistant turn's content (a literal `</think>` in the text is broken up with a zero-width space, so it cannot end the block early). The text is the item's `content[].text`, else Cascadia's own `encrypted_content` decoded. A reasoning item with neither (another provider's blob, a summary-only item) is skipped. |
 | `function_call`, `custom_tool_call` | A tool call on the assistant turn (`call_id` is the call's id; a `namespace` is flattened as the tool was served; a custom call's `input` becomes `{"input": ...}` arguments). |
 | `function_call_output`, `custom_tool_call_output` | A `tool` message. `output` is a string or text parts, joined. An image or file part is replaced by `[image omitted: tool output images are not supported]` / `[file omitted: tool output files are not supported]` and logged, so a Codex `view_image` result does not fail the request (and every later one that resends it). |
 | `item_reference` | Replaced by the cached item with that `id` (see [The item cache](#the-item-cache)), then read as above. An item with an `id` and no `type`, `role` or `content` is an `item_reference`. |
@@ -224,7 +224,7 @@ served tools (`tools.chat_tools`) and the checked `tool_choice`; `item_reference
 resolved through a closure, for example over the gateway's own `ItemCache`. A `Refusal`
 gives the status and the error body the server sends (`status()`, `to_error_json()`).
 Replayed reasoning arrives as a `<think>…</think>` prefix of the assistant turn's content;
-`strip_replayed_reasoning` removes it for a backend that cannot take it, and
+`strip_replayed_reasoning` removes it for a backend that cannot take it (the answer stays whole, even one that contains `</think>`), and
 `ChatMessage::to_openai_json` writes a message as a chat request's `messages[]` entry.
 `fold_system_turns` and `folds_to_try` retry a conversation whose template refuses a later
 `system` turn.
@@ -232,7 +232,7 @@ Replayed reasoning arrives as a `<think>…</think>` prefix of the assistant tur
 On the way back, `OutputBuilder` splits the streamed text, with reasoning folded in as
 `<think>…</think>`, into reasoning and message items, and `OutputBuilder::push_calls` takes
 the backend's already parsed tool calls (build the builder with `tools_active: false`, so
-text is not scanned for calls; text fed after the calls is ignored). `ResponseEvents`
+text is not scanned for calls; text fed after the calls is ignored, and once `finish` has closed the response nothing more is added). `ResponseEvents`
 renders the same SSE events, sequence numbers and terminal event as this server's stream,
 and returns the final items and response object. `End::from_finish_reason` reads the chat
 `finish_reason` (`stop`, `tool_calls`, `function_call`, `length`, `content_filter`) and

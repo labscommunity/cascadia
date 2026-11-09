@@ -27,6 +27,8 @@ pub(super) const ENCRYPTED_PREFIX: &str = "cascadia.v1.";
 /// A tool output's image part, which the chat path cannot take as a tool
 /// result. Codex's `view_image` sends one; a 400 would poison the history
 /// Codex resends on every later turn.
+/// The close tag of a `<think>` block.
+const CLOSE_THINK: &str = "</think>";
 const IMAGE_OMITTED: &str = "[image omitted: tool output images are not supported]";
 const FILE_OMITTED: &str = "[file omitted: tool output files are not supported]";
 
@@ -58,9 +60,13 @@ struct Turn {
 impl Turn {
     /// Push the turn, if any, as one assistant message: the held reasoning
     /// as a `<think>` prefix (no newline: templates split at `</think>`),
-    /// then the content, then the calls. A non-empty `parts` gets the prefix
-    /// as its first part too, as the image and part-trimming paths rebuild
-    /// `content` from `parts`.
+    /// then the content, then the calls. A literal `</think>` inside the
+    /// reasoning is broken up (`<\u{200B}/think>`, as the llama.cpp engine
+    /// does), so the prefix's own close tag is the turn's first one: a
+    /// template's split, and [`strip_replayed_reasoning`], end it there even
+    /// when the answer contains `</think>`. A non-empty `parts` gets the
+    /// prefix as its first part too, as the image and part-trimming paths
+    /// rebuild `content` from `parts`.
     fn flush(&mut self, out: &mut Vec<ChatMessage>) {
         let turn = std::mem::take(self);
         if turn.reasoning.is_empty() && turn.content.is_none() && turn.calls.is_empty() {
@@ -68,7 +74,12 @@ impl Turn {
         }
         let (mut content, mut parts) = turn.content.unwrap_or_default();
         if !turn.reasoning.is_empty() {
-            let think = format!("<think>{}</think>", turn.reasoning.join("\n"));
+            let think = format!(
+                "<think>{}</think>",
+                turn.reasoning
+                    .join("\n")
+                    .replace(CLOSE_THINK, "<\u{200B}/think>")
+            );
             content.insert_str(0, &think);
             if !parts.is_empty() {
                 parts.insert(0, ContentPart::Text(think));
@@ -276,14 +287,14 @@ fn merge(into: &mut ChatMessage, next: ChatMessage) {
 /// template cannot take replayed reasoning. Other turns, and an assistant
 /// turn without the prefix, are left as they are.
 ///
-/// A turn with parts carries the prefix as its first part exactly as it
-/// was written, so it strips whole even when the reasoning contains
-/// `</think>`, and `content` and `parts` still agree. A string-form turn
-/// has no such record: its prefix ends at the last `</think>`, which is
-/// exact unless the answer itself contains `</think>`.
+/// The prefix ends at the turn's first `</think>`: `input_messages` breaks
+/// up a literal one inside the reasoning, so that is exact, and the answer
+/// is kept whole even when it contains `</think>` itself. A turn with
+/// parts also loses its first part, the prefix as it was written, so
+/// `content` and `parts` still agree.
 pub fn strip_replayed_reasoning(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
+    const CLOSE: &str = CLOSE_THINK;
     messages
         .into_iter()
         .map(|mut m| {
@@ -291,10 +302,7 @@ pub fn strip_replayed_reasoning(messages: Vec<ChatMessage>) -> Vec<ChatMessage> 
                 return m;
             }
             let end = if m.parts.is_empty() {
-                // Calls-only turns (the common string case) have no answer,
-                // so the last close tag is the prefix's even when the
-                // reasoning holds one too.
-                m.content.rfind(CLOSE).map(|at| at + CLOSE.len())
+                m.content.find(CLOSE).map(|at| at + CLOSE.len())
             } else {
                 // `flush` wrote the prefix as the first part; without that
                 // part the content's `<think>` is the answer's own.
@@ -933,17 +941,34 @@ mod tests {
         let m = walk(json!([rs("a</think>b"), {"role": "assistant", "content": [
             {"type": "output_text", "text": "x", "annotations": []}]}]))
         .unwrap();
-        assert_eq!(m[0].content, "<think>a</think>b</think>x");
+        assert_eq!(m[0].content, "<think>a<\u{200B}/think>b</think>x");
         let m = strip_replayed_reasoning(m);
         assert_eq!(m[0].content, "x");
         assert_eq!(m[0].parts, [ContentPart::Text("x".into())]);
         assert_eq!(parts_text(&m[0]), m[0].content);
+
+        let m = walk(json!([rs("a</think>b"), {"role": "assistant", "content": "x"}])).unwrap();
+        assert!(m[0].parts.is_empty());
+        let m = strip_replayed_reasoning(m);
+        assert_eq!(m[0].content, "x");
 
         let m = walk(json!([rs("a</think>b"), fc("A")])).unwrap();
         assert!(m[0].parts.is_empty());
         let m = strip_replayed_reasoning(m);
         assert_eq!(m[0].content, "");
         assert_eq!(m[0].tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    /// A string-form answer that itself contains `</think>` keeps all of
+    /// it: only the replayed prefix goes.
+    #[test]
+    fn strip_keeps_an_answer_with_a_close_tag() {
+        let answer = "Close it with </think> then answer";
+        for reasoning in ["r", "a</think>b"] {
+            let m = walk(json!([rs(reasoning), {"role": "assistant", "content": answer}])).unwrap();
+            let m = strip_replayed_reasoning(m);
+            assert_eq!(m[0].content, answer, "reasoning {reasoning:?}");
+        }
     }
 
     /// An array-form turn whose first part is not a replayed prefix keeps

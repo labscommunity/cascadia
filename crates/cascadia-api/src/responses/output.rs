@@ -239,6 +239,9 @@ pub struct OutputBuilder {
     calls: usize,
     /// [`Self::push_calls`] ended the text: later feeds are ignored.
     text_ended: bool,
+    /// [`Self::finish`] ran: the response is closed, and later feeds,
+    /// pushed calls and finishes are ignored.
+    finished: bool,
     open: Option<Open>,
     /// The reasoning is over (its item, if any, closed).
     reasoning_done: bool,
@@ -286,6 +289,7 @@ impl OutputBuilder {
             items: Vec::new(),
             calls: 0,
             text_ended: false,
+            finished: false,
             open: None,
             reasoning_done: false,
             held: String::new(),
@@ -299,9 +303,13 @@ impl OutputBuilder {
     }
 
     /// One chunk of generated text and the tokens it carried. After
-    /// [`Self::push_calls`] the text is over, and a feed is ignored (no
-    /// events).
+    /// [`Self::push_calls`] or [`Self::finish`] the text is over, and a feed
+    /// is ignored (no events).
     pub fn feed(&mut self, text: &str, tokens: u32) -> Vec<OutputEvent> {
+        if self.finished {
+            tracing::debug!("responses: text after the response finished; ignored");
+            return Vec::new();
+        }
         if self.text_ended {
             tracing::debug!("responses: text after the tool calls; ignored");
             return Vec::new();
@@ -317,8 +325,13 @@ impl OutputBuilder {
     }
 
     /// The end of the generation. `item_status` (`completed` or
-    /// `incomplete`) closes the open item when no call was parsed.
+    /// `incomplete`) closes the open item when no call was parsed. Once only:
+    /// a second call returns no events.
     pub fn finish(&mut self, item_status: &str) -> Vec<OutputEvent> {
+        if std::mem::replace(&mut self.finished, true) {
+            tracing::debug!("responses: finish called twice; ignored");
+            return Vec::new();
+        }
         let segs = self.split.finish();
         self.count(0, &segs, 0);
         let mut ev = Vec::new();
@@ -369,7 +382,8 @@ impl OutputBuilder {
     /// `parallel: false` only the first call of the response is kept. A
     /// [`Self::feed`] after it is ignored; [`Self::finish`] still closes the
     /// response (and adds no item). No calls: no events, and the text goes
-    /// on.
+    /// on. After [`Self::finish`] the response is closed: no events, no
+    /// items (a call `finish` parsed from the text is not repeated).
     ///
     /// With `tools_active: true` the pushed calls stop the text scan for
     /// the rest of the turn: text the scan still holds is released as
@@ -377,6 +391,13 @@ impl OutputBuilder {
     /// calls are exactly the pushed ones.
     pub fn push_calls(&mut self, calls: Vec<ToolCall>) -> Vec<OutputEvent> {
         let mut ev = Vec::new();
+        if self.finished {
+            tracing::debug!(
+                dropped = calls.len(),
+                "responses: calls pushed after the response finished; ignored"
+            );
+            return ev;
+        }
         if calls.is_empty() {
             return ev;
         }
@@ -1357,6 +1378,33 @@ mod tests {
             assert_eq!(calls.len(), 1, "parallel {parallel}: {items:?}");
             assert_eq!(calls[0]["call_id"], "call_pushed");
             assert_eq!(calls[0]["arguments"], r#"{"city": "Pushed"}"#);
+            assert_eq!(items[0]["type"], "message", "{items:?}");
+            assert_eq!(items[0]["content"][0]["text"], "before ");
         }
+    }
+
+    /// Once `finish` closed the response, pushed calls, feeds and a second
+    /// `finish` add nothing: a call `finish` parsed from the text stays the
+    /// only one.
+    #[test]
+    fn nothing_lands_after_finish() {
+        let mut b = with_tools(false, weather(), true);
+        b.feed(&call("get_weather", r#"{"city": "Text"}"#), 1);
+        assert!(!b.finish("completed").is_empty());
+        let before = b.items();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|i| i["type"] == "function_call")
+                .count(),
+            1,
+            "{before:?}"
+        );
+        assert!(b
+            .push_calls(vec![structured("call_late", "get_weather", "{}")])
+            .is_empty());
+        assert!(b.feed("late text", 1).is_empty());
+        assert!(b.finish("completed").is_empty());
+        assert_eq!(b.items(), before);
     }
 }
