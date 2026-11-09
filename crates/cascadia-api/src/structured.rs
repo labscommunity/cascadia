@@ -229,16 +229,30 @@ impl SchemaCompileCheck {
             // Errors are the engine's to report; only the time counts here.
             let _ = GrammarFactory::byte_level().compile(&spec);
         });
-        match tokio::time::timeout(self.budget, build).await {
-            Ok(_) => {
-                self.passed
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(&body);
-                Ok(())
-            }
-            Err(_) => Err(SchemaCheckError::TooComplex),
+        let verdict = build_verdict(tokio::time::timeout(self.budget, build).await);
+        if verdict.is_ok() {
+            self.passed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(&body);
         }
+        verdict
+    }
+}
+
+/// The check's verdict on one timed build: a pass only when the build ran to
+/// its end within the budget. A build that panicked proved nothing about the
+/// schema, so it is refused like one that ran too long, and never remembered.
+fn build_verdict(
+    joined: Result<Result<(), tokio::task::JoinError>, tokio::time::error::Elapsed>,
+) -> Result<(), SchemaCheckError> {
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "response_format schema check: the grammar build failed");
+            Err(SchemaCheckError::TooComplex)
+        }
+        Err(_) => Err(SchemaCheckError::TooComplex),
     }
 }
 
@@ -2122,6 +2136,19 @@ mod tests {
             Err(SchemaCheckError::TooComplex)
         );
         assert!(!check.passed.lock().unwrap().contains(&schema.body));
+    }
+
+    /// A build that panicked proved nothing about the schema: it is neither
+    /// a pass nor remembered as one, so the engine never compiles it on the
+    /// strength of this check.
+    #[tokio::test]
+    async fn a_build_that_panicked_is_not_a_pass() {
+        let build = tokio::task::spawn_blocking(|| panic!("grammar build blew up"));
+        let joined = tokio::time::timeout(Duration::from_secs(5), build).await;
+        assert_eq!(build_verdict(joined), Err(SchemaCheckError::TooComplex));
+        let done =
+            tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| ())).await;
+        assert_eq!(build_verdict(done), Ok(()));
     }
 
     #[test]
