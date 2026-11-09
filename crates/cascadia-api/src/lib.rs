@@ -4177,7 +4177,16 @@ fn chat_turns(messages: &[ChatMessage], split_reasoning: bool) -> Vec<ChatTurn> 
                     (None, rest.to_owned())
                 }
                 Some((r, rest)) if split_reasoning && m.role == "assistant" => {
-                    (Some(r.to_owned()), rest.to_owned())
+                    // Jinja reads a whitespace-only string as true, so a
+                    // tool-call turn's blank content is sent empty, or
+                    // gpt-oss's template sees content and thinking both.
+                    let has_calls = m.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+                    let content = if has_calls && rest.trim().is_empty() {
+                        String::new()
+                    } else {
+                        rest.to_owned()
+                    };
+                    (Some(r.to_owned()), content)
                 }
                 _ => (None, m.content.clone()),
             };

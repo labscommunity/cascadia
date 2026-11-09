@@ -3179,7 +3179,7 @@ mod tests {
         };
         let cases = [
             ("Let me look.", true, None, "Let me look."),
-            ("  ", true, Some("use ls"), "  "),
+            ("  ", true, Some("use ls"), ""),
             ("", true, Some("use ls"), ""),
             ("Here.", false, Some("use ls"), "Here."),
         ];
