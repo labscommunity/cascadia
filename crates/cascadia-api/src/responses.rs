@@ -3408,6 +3408,31 @@ mod tests {
         assert_eq!(task.messages[1].reasoning_content, None);
     }
 
+    /// A replayed reasoning text holding a literal `</think>`, and an answer
+    /// holding one too, both reach sycl-llama whole: the reasoning's tag is
+    /// broken up, so the split ends at the prefix's own close tag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replayed_reasoning_with_a_close_tag_splits_at_the_prefix() {
+        let body = json!({"model": "script-model", "input": [
+            {"role": "user", "content": "q"},
+            {"type": "reasoning", "summary": [],
+                "content": [{"type": "reasoning_text", "text": "a</think>b"}]},
+            {"role": "assistant", "content": [
+                {"type": "output_text", "text": "x </think> y"}]},
+            {"role": "user", "content": "more"},
+        ]});
+        let cfg = sycl_llama_config(PERMISSIVE_TEMPLATE);
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, text) = post(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let turn = tasks.lock()[0].messages[1].clone();
+        assert_eq!(turn.content, "x </think> y");
+        assert_eq!(
+            turn.reasoning_content.as_deref(),
+            Some("a<\u{200B}/think>b")
+        );
+    }
+
     /// gpt-oss's template refuses an assistant turn with tool calls that
     /// has both content and thinking (llama.cpp's name for
     /// `reasoning_content`): under it, such a replayed turn keeps its content

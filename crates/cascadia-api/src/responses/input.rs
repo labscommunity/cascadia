@@ -24,11 +24,12 @@ use base64::Engine as _;
 /// the format change.
 pub(super) const ENCRYPTED_PREFIX: &str = "cascadia.v1.";
 
+/// The close tag of a `<think>` block.
+const CLOSE_THINK: &str = "</think>";
+
 /// A tool output's image part, which the chat path cannot take as a tool
 /// result. Codex's `view_image` sends one; a 400 would poison the history
 /// Codex resends on every later turn.
-/// The close tag of a `<think>` block.
-const CLOSE_THINK: &str = "</think>";
 const IMAGE_OMITTED: &str = "[image omitted: tool output images are not supported]";
 const FILE_OMITTED: &str = "[file omitted: tool output files are not supported]";
 
@@ -285,7 +286,12 @@ fn merge(into: &mut ChatMessage, next: ChatMessage) {
 /// `<think>…</think>` prefix it writes at the front of an assistant turn
 /// (and of its first part, when the turn has parts), for a backend whose
 /// template cannot take replayed reasoning. Other turns, and an assistant
-/// turn without the prefix, are left as they are.
+/// turn whose content does not open with `<think>`, are left as they are.
+/// A string-form assistant turn that opens with its own `<think>…</think>`
+/// block (a client replaying a reply whose reasoning stayed in the text)
+/// loses that block too: without parts there is no record of who wrote it,
+/// and a backend that cannot take replayed reasoning cannot take that block
+/// either.
 ///
 /// The prefix ends at the turn's first `</think>`: `input_messages` breaks
 /// up a literal one inside the reasoning, so that is exact, and the answer
@@ -946,11 +952,6 @@ mod tests {
         assert_eq!(m[0].content, "x");
         assert_eq!(m[0].parts, [ContentPart::Text("x".into())]);
         assert_eq!(parts_text(&m[0]), m[0].content);
-
-        let m = walk(json!([rs("a</think>b"), {"role": "assistant", "content": "x"}])).unwrap();
-        assert!(m[0].parts.is_empty());
-        let m = strip_replayed_reasoning(m);
-        assert_eq!(m[0].content, "x");
 
         let m = walk(json!([rs("a</think>b"), fc("A")])).unwrap();
         assert!(m[0].parts.is_empty());
