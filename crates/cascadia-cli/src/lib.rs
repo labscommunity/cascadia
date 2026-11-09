@@ -74,6 +74,20 @@ fn structured_output_for(kind: EngineKind) -> bool {
     }
 }
 
+/// Whether `kind` builds its grammars with llguidance (`cascadia-grammar`),
+/// so the API bounds each schema's build time before queuing it. The others
+/// build grammars with their own backend, or not at all.
+fn schema_build_check_for(kind: EngineKind) -> bool {
+    match kind {
+        EngineKind::OvRuntime
+        | EngineKind::OvDistSpec
+        | EngineKind::Gemma4
+        | EngineKind::Qwen36Moe
+        | EngineKind::SparseMoe => true,
+        EngineKind::OvGenai | EngineKind::SyclLlama | EngineKind::Mock => false,
+    }
+}
+
 /// Whether `kind` constrains output with OpenVINO GenAI's xgrammar backend,
 /// whose unenforced schema keywords the API logs per request.
 fn xgrammar_keyword_log_for(kind: EngineKind) -> bool {
@@ -2600,6 +2614,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         cfg.structured_output = structured_output_for(args.engine);
         cfg.engine_name = engine_name(args.engine).to_string();
         cfg.xgrammar_keyword_log = xgrammar_keyword_log_for(args.engine);
+        cfg.schema_build_check = schema_build_check_for(args.engine);
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
         // once, so a client that sends that many requests at once needs the
@@ -3838,6 +3853,22 @@ mod tests {
             EngineKind::OvRuntime,
         ] {
             assert!(structured_output_for(kind), "{}", engine_name(kind));
+        }
+    }
+
+    #[test]
+    fn schema_build_check_only_for_llguidance_engines() {
+        for kind in [
+            EngineKind::OvRuntime,
+            EngineKind::OvDistSpec,
+            EngineKind::Gemma4,
+            EngineKind::Qwen36Moe,
+            EngineKind::SparseMoe,
+        ] {
+            assert!(schema_build_check_for(kind), "{}", engine_name(kind));
+        }
+        for kind in [EngineKind::OvGenai, EngineKind::SyclLlama, EngineKind::Mock] {
+            assert!(!schema_build_check_for(kind), "{}", engine_name(kind));
         }
     }
 

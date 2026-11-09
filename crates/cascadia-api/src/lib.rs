@@ -161,8 +161,14 @@ pub struct AppState {
     /// log the schema keywords that backend does not enforce.
     pub xgrammar_keyword_log: bool,
     /// Builds every enforced `response_format` schema once, off the engine,
-    /// before the request is queued; see [`SchemaCompileCheck`].
+    /// before the request is queued; see [`SchemaCompileCheck`]. Runs only
+    /// when [`AppState::schema_build_check`] is set.
     pub schema_check: SchemaCompileCheck,
+    /// The engine builds its grammars with llguidance, whose build time
+    /// [`SchemaCompileCheck`] bounds: run that check before queuing. Off for
+    /// engines whose backend builds grammars another way (ov-genai's
+    /// xgrammar), where llguidance's time and verdict say nothing.
+    pub schema_build_check: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -192,6 +198,8 @@ pub struct Config {
     pub xgrammar_keyword_log: bool,
     /// See [`AppState::schema_check`].
     pub schema_check: SchemaCompileCheck,
+    /// See [`AppState::schema_build_check`]. Set by the CLI per engine.
+    pub schema_build_check: bool,
 }
 
 impl Default for Config {
@@ -208,6 +216,7 @@ impl Default for Config {
             engine_name: String::new(),
             xgrammar_keyword_log: false,
             schema_check: SchemaCompileCheck::default(),
+            schema_build_check: false,
         }
     }
 }
@@ -546,6 +555,7 @@ pub fn make_router_with_stats(
         engine_name: cfg.engine_name.clone(),
         xgrammar_keyword_log: cfg.xgrammar_keyword_log,
         schema_check: cfg.schema_check.clone(),
+        schema_build_check: cfg.schema_build_check,
     };
     let state = AppState {
         effort_words: state
@@ -2563,7 +2573,7 @@ async fn chat_completions(
     };
     // The engine builds the grammar inside its submit, under the engine
     // lock: a schema that takes too long to build is refused here first.
-    if let Some(spec) = &grammar {
+    if let Some(spec) = grammar.as_ref().filter(|_| state.schema_build_check) {
         if let Err(e) = state.schema_check.check(spec).await {
             let (status, reason, msg) = match e {
                 SchemaCheckError::Busy => (
@@ -7983,8 +7993,13 @@ level={{ effort_map[eff] }}";
         serde_json::json!([{"type":"function","function":{"name":"get_weather"}}])
     }
 
-    /// [`so_app`] with its own schema compile check.
+    /// [`so_app`] with its own schema compile check, run as for an engine
+    /// whose grammars are built with llguidance.
     async fn so_app_checked(check: SchemaCompileCheck) -> Router {
+        so_app_with_check(check, true).await
+    }
+
+    async fn so_app_with_check(check: SchemaCompileCheck, schema_build_check: bool) -> Router {
         let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
@@ -7998,6 +8013,7 @@ level={{ effort_map[eff] }}";
             engine_name: "mock".into(),
             chat_template: template(MINIMAL_TEMPLATE),
             schema_check: check,
+            schema_build_check,
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
@@ -8072,6 +8088,28 @@ level={{ effort_map[eff] }}";
             let (status, v) = post_chat(app.clone(), chat_with(format)).await;
             assert_eq!(status, StatusCode::OK, "{v}");
         }
+    }
+
+    /// An engine whose backend doesn't build grammars with llguidance
+    /// (ov-genai's xgrammar) never runs the check, whose budget and verdict
+    /// are llguidance's.
+    #[tokio::test]
+    async fn the_schema_build_check_runs_only_where_the_engine_uses_it() {
+        let check = SchemaCompileCheck::new(
+            0,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(2),
+        );
+        let (status, v) = post_chat(
+            so_app_with_check(check, false).await,
+            chat_with(Some(json_schema_format(nested_schema()))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(
+            !Config::default().schema_build_check,
+            "off unless an engine asks"
+        );
     }
 
     #[tokio::test]
