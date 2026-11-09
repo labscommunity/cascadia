@@ -577,19 +577,22 @@ fn minimax_m2_generate_with_cache_warm_matches_cold() {
     };
 
     // Cold: full prompt, no cache.
-    let (cold, _) = r
-        .generate_with_cache(&full, n, &cfg, None)
-        .expect("cold generate");
+    let cold = r
+        .generate_with_cache(&full, n, &cfg, None, None)
+        .expect("cold generate")
+        .tokens;
 
     // Warm: prime `base` (miss, caches it), then `full` (hit on base → warm-resume).
     let mut cache = cascadia_engine_sparse_moe::ov_kv_cache::OvMoeKvPrefixCache::new(4);
-    let (_prime, cached) = r
-        .generate_with_cache(&base, 1, &cfg, Some(&mut cache))
-        .expect("prime");
+    let cached = r
+        .generate_with_cache(&base, 1, &cfg, Some(&mut cache), None)
+        .expect("prime")
+        .cached;
     assert!(cached.is_some(), "prime should cache the base prompt");
-    let (warm, _) = r
-        .generate_with_cache(&full, n, &cfg, Some(&mut cache))
-        .expect("warm generate");
+    let warm = r
+        .generate_with_cache(&full, n, &cfg, Some(&mut cache), None)
+        .expect("warm generate")
+        .tokens;
 
     eprintln!("cold: {cold:?}");
     eprintln!("warm: {warm:?}");

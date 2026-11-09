@@ -7,7 +7,11 @@
 //! `generate` / `generate_argmax` are provided (default) methods built on the
 //! required primitives, so every backend shares one single-stage sampling loop.
 
-use crate::sampling::{init_rng, sample_unmasked, SamplingConfig};
+use cascadia_engine::EngineResult;
+use cascadia_grammar::GrammarMask;
+
+use crate::constrained::commit;
+use crate::sampling::{init_rng, sample, SamplingConfig};
 
 /// Wall-clock split of one generation: the prompt forward plus the first
 /// sample, then the decode steps (each a full forward + head + sample) after
@@ -238,77 +242,134 @@ pub trait StagedRunner: Send + 'static {
         max_new: usize,
         cfg: &SamplingConfig,
     ) -> (Vec<u32>, bool, GenTiming) {
-        let started = std::time::Instant::now();
-        self.reset();
-        if prompt.is_empty() {
-            return (Vec::new(), false, GenTiming::default());
+        match run_generation(self, prompt, max_new, cfg, None) {
+            Ok(g) => (g.tokens, g.hit_context_cap, g.timing),
+            // Only the grammar mask can fail, and there is none.
+            Err(e) => unreachable!("an unconstrained generation failed: {e}"),
         }
-        let max_seq = self.max_seq();
-        let mut rng = init_rng(cfg.seed);
-        let mut history: Vec<i64> = Vec::new();
-        let rows = prompt.len().min(max_seq);
-        let last_logits: Vec<f32> = if self.supports_batched_prefill() {
-            // Batch-union prefill: embed all rows, run the layers once as a batch,
-            // and take the head only at the final position. Bit-identical to the
-            // per-token loop; the batched MoE just loads overlapping experts once.
-            let hs = self.hidden_size();
-            let mut batch = vec![0.0f32; rows * hs];
-            for (r, &t) in prompt[..rows].iter().enumerate() {
-                batch[r * hs..(r + 1) * hs].copy_from_slice(&self.embed_token(t));
-            }
-            let h = self.forward_layers_batch(batch, 0, rows);
-            self.head_logits(&h[(rows - 1) * hs..rows * hs])
-        } else {
-            // Per-token prefill (backends whose layers need the position's token
-            // id, e.g. dsv4 hash gates).
-            let mut ll = Vec::new();
-            for (pos, &t) in prompt.iter().take(rows).enumerate() {
-                let h = self.embed_token(t);
-                let h = self.forward_layers(h, pos, Some(t));
-                ll = self.head_logits(&h);
-            }
-            ll
-        };
-        let mut next = sample_unmasked(&last_logits, &history, cfg, &mut rng);
-        let prefill_s = started.elapsed().as_secs_f64();
-        let decode_started = std::time::Instant::now();
-        let mut decode_steps = 0usize;
-        let mut out = Vec::with_capacity(max_new);
-        let mut pos = prompt.len().min(max_seq);
-        let mut hit_context_cap = false;
-        loop {
-            let tok = next as u32;
-            out.push(tok);
-            history.push(next);
-            if out.len() >= max_new || self.eos_token_ids().contains(&tok) {
-                break;
-            }
-            // Stop before forwarding at an absolute position the caches can't
-            // hold (== max_seq): that write would index past the cache rows.
-            // Checked after the push so the token sampled from the last in-range
-            // position is still emitted. This is a truncation, not a natural
-            // stop -> the caller reports `length`.
-            if pos >= max_seq {
-                hit_context_cap = true;
-                break;
-            }
-            let h = self.embed_token(tok);
-            let h = self.forward_layers(h, pos, Some(tok));
-            let logits = self.head_logits(&h);
-            next = sample_unmasked(&logits, &history, cfg, &mut rng);
-            pos += 1;
-            decode_steps += 1;
-        }
-        let timing = GenTiming {
-            prefill_s,
-            decode_s: decode_started.elapsed().as_secs_f64(),
-            decode_steps,
-        };
-        (out, hit_context_cap, timing)
+    }
+
+    /// [`Self::generate_reason_timed`] under a structured-output grammar:
+    /// every pick is masked, every emitted token advances `grammar`, and the
+    /// run ends as soon as the JSON is complete (`grammar_finished`). `Err`
+    /// on a grammar dead end or a token the grammar rejects; no unconstrained
+    /// token is ever returned.
+    fn generate_grammar_timed(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
+        grammar: &mut GrammarMask,
+    ) -> EngineResult<Generation> {
+        run_generation(self, prompt, max_new, cfg, Some(grammar))
     }
 
     /// Single-stage greedy convenience (warmup / tests).
     fn generate_argmax(&mut self, prompt: &[u32], max_new: usize) -> Vec<u32> {
         self.generate(prompt, max_new, &SamplingConfig::default())
     }
+}
+
+/// What one single-stage generation produced.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Generation {
+    /// Emitted tokens (an EOS that stopped the run included).
+    pub tokens: Vec<u32>,
+    /// Decode stopped because the context window filled (`length`).
+    pub hit_context_cap: bool,
+    /// The structured-output grammar completed (`stop`, even at the cap).
+    pub grammar_finished: bool,
+    pub timing: GenTiming,
+}
+
+/// The shared single-stage sampling loop. Prompt tokens drive the same
+/// per-token path as decode; sampling happens once after prefill (mirroring
+/// the pipeline). A prompt longer than the context budget is truncated to its
+/// first `max_seq` tokens. Without a grammar nothing here can fail.
+fn run_generation<R: StagedRunner + ?Sized>(
+    r: &mut R,
+    prompt: &[u32],
+    max_new: usize,
+    cfg: &SamplingConfig,
+    mut grammar: Option<&mut GrammarMask>,
+) -> EngineResult<Generation> {
+    let started = std::time::Instant::now();
+    r.reset();
+    if prompt.is_empty() {
+        return Ok(Generation::default());
+    }
+    let max_seq = r.max_seq();
+    let mut rng = init_rng(cfg.seed);
+    let mut history: Vec<i64> = Vec::new();
+    let rows = prompt.len().min(max_seq);
+    let last_logits: Vec<f32> = if r.supports_batched_prefill() {
+        // Batch-union prefill: embed all rows, run the layers once as a batch,
+        // and take the head only at the final position. Bit-identical to the
+        // per-token loop; the batched MoE just loads overlapping experts once.
+        let hs = r.hidden_size();
+        let mut batch = vec![0.0f32; rows * hs];
+        for (row, &t) in prompt[..rows].iter().enumerate() {
+            batch[row * hs..(row + 1) * hs].copy_from_slice(&r.embed_token(t));
+        }
+        let h = r.forward_layers_batch(batch, 0, rows);
+        r.head_logits(&h[(rows - 1) * hs..rows * hs])
+    } else {
+        // Per-token prefill (backends whose layers need the position's token
+        // id, e.g. dsv4 hash gates).
+        let mut ll = Vec::new();
+        for (pos, &t) in prompt.iter().take(rows).enumerate() {
+            let h = r.embed_token(t);
+            let h = r.forward_layers(h, pos, Some(t));
+            ll = r.head_logits(&h);
+        }
+        ll
+    };
+    let mut next = sample(
+        &last_logits,
+        &history,
+        cfg,
+        &mut rng,
+        grammar.as_deref_mut(),
+    )?;
+    let prefill_s = started.elapsed().as_secs_f64();
+    let decode_started = std::time::Instant::now();
+    let mut decode_steps = 0usize;
+    let mut out = Vec::with_capacity(max_new);
+    let mut pos = prompt.len().min(max_seq);
+    let mut hit_context_cap = false;
+    let grammar_finished = loop {
+        let tok = next as u32;
+        let grammar_finished = commit(grammar.as_deref_mut(), next)?;
+        out.push(tok);
+        history.push(next);
+        if grammar_finished || out.len() >= max_new || r.eos_token_ids().contains(&tok) {
+            break grammar_finished;
+        }
+        // Stop before forwarding at an absolute position the caches can't
+        // hold (== max_seq): that write would index past the cache rows.
+        // Checked after the push so the token sampled from the last in-range
+        // position is still emitted. This is a truncation, not a natural
+        // stop -> the caller reports `length`.
+        if pos >= max_seq {
+            hit_context_cap = true;
+            break false;
+        }
+        let h = r.embed_token(tok);
+        let h = r.forward_layers(h, pos, Some(tok));
+        let logits = r.head_logits(&h);
+        next = sample(&logits, &history, cfg, &mut rng, grammar.as_deref_mut())?;
+        pos += 1;
+        decode_steps += 1;
+    };
+    let timing = GenTiming {
+        prefill_s,
+        decode_s: decode_started.elapsed().as_secs_f64(),
+        decode_steps,
+    };
+    Ok(Generation {
+        tokens: out,
+        hit_context_cap,
+        grammar_finished,
+        timing,
+    })
 }

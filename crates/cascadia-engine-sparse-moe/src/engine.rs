@@ -29,6 +29,7 @@ use tokenizers::Tokenizer;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
+use crate::constrained::{activate, commit, refuse_multi_stage_grammar, GrammarSlot};
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
     recv_kind_client, recv_kind_server, recv_stream_close_body_server,
@@ -50,6 +51,7 @@ use crate::dist::{
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
 use crate::ov_moe::OvMoeRunner;
+use cascadia_grammar::{CompiledGrammar, GrammarMask};
 use std::num::NonZeroUsize;
 
 use crate::runner::{LayerRange, Runner, RunnerError, RunnerOptions};
@@ -341,6 +343,9 @@ pub struct SparseMoEBuilder {
     /// Expert-parallel worker: its expert shard, loaded in `load`.
     ep_bank: Option<crate::inkling::ep::ExpertBank>,
     tokenizer: Option<Tokenizer>,
+    /// Structured output: built next to rank 0's tokenizer from the EOS ids
+    /// the engine stops on.
+    grammar: GrammarSlot,
     listen_host: String,
     listen_port: Option<u16>,
     transport: StageTransport,
@@ -381,7 +386,9 @@ fn env_max_seq(var: &str, default: usize) -> usize {
 impl SparseMoEBuilder {
     /// Rank 0 (the API rank) needs the tokenizer; workers drive themselves from
     /// the hidden states on the wire. Shared by every Rust-shell family.
-    fn load_rank0_tokenizer(&mut self, rank: u32, family: &str) -> EngineResult<()> {
+    /// `eos` is every id the engine stops on, for the structured-output
+    /// grammar factory built next to the tokenizer.
+    fn load_rank0_tokenizer(&mut self, rank: u32, family: &str, eos: &[u32]) -> EngineResult<()> {
         if rank != 0 {
             return Ok(());
         }
@@ -391,6 +398,7 @@ impl SparseMoEBuilder {
                 Tokenizer::from_file(&tok_path)
                     .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?,
             );
+            self.build_grammar(eos);
         } else {
             warn!(
                 "no tokenizer.json at {} — {family} engine will only accept pre-tokenized inputs",
@@ -398,6 +406,14 @@ impl SparseMoEBuilder {
             );
         }
         Ok(())
+    }
+
+    /// Structured output: the grammar factory for the loaded tokenizer. A
+    /// failure is logged once; json tasks then get a 400 naming it.
+    fn build_grammar(&mut self, eos: &[u32]) {
+        if let Some(tok) = self.tokenizer.as_ref() {
+            self.grammar = GrammarSlot::build(tok, eos);
+        }
     }
 
     pub fn new(config: SparseMoEBuilderConfig) -> Self {
@@ -412,6 +428,7 @@ impl SparseMoEBuilder {
             ep_server: None,
             ep_bank: None,
             tokenizer: None,
+            grammar: GrammarSlot::default(),
             listen_host: "0.0.0.0".into(),
             listen_port: None,
             transport: StageTransport::default(),
@@ -581,7 +598,7 @@ impl Builder for SparseMoEBuilder {
                 shard.layer_end,
             )
             .map_err(|e| EngineError::Backend(format!("dsv4 load: {e}")))?;
-            self.load_rank0_tokenizer(rank, "dsv4")?;
+            self.load_rank0_tokenizer(rank, "dsv4", runner.eos_token_ids())?;
             self.dsv4_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded DeepSeek-V4 stage (dsv4 Rust shell)",
@@ -683,7 +700,7 @@ impl Builder for SparseMoEBuilder {
                 remote,
             )
             .map_err(|e| EngineError::Backend(format!("inkling load: {e}")))?;
-            self.load_rank0_tokenizer(rank, "inkling")?;
+            self.load_rank0_tokenizer(rank, "inkling", runner.eos_token_ids())?;
             self.inkling_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded inkling stage (Inkling Rust shell)",
@@ -721,7 +738,7 @@ impl Builder for SparseMoEBuilder {
                 ),
             )
             .map_err(|e| EngineError::Backend(format!("glm5 load: {e}")))?;
-            self.load_rank0_tokenizer(rank, "glm5")?;
+            self.load_rank0_tokenizer(rank, "glm5", runner.eos_token_ids())?;
             self.glm_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded glm5 stage (glm5 Rust shell)",
@@ -782,6 +799,7 @@ impl Builder for SparseMoEBuilder {
                         Some(Tokenizer::from_file(&tok_path).map_err(|e| {
                             EngineError::Backend(format!("load tokenizer.json: {e}"))
                         })?);
+                    self.build_grammar(ov_runner.eos_token_ids());
                 } else {
                     warn!(
                         "no tokenizer.json at {} — engine will only accept pre-tokenized inputs",
@@ -884,6 +902,8 @@ impl Builder for SparseMoEBuilder {
                 let t = Tokenizer::from_file(&tok_path)
                     .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?;
                 self.tokenizer = Some(t);
+                let eos = runner.manifest.eos_token_ids.clone();
+                self.build_grammar(&eos);
             } else {
                 warn!(
                     "no tokenizer.json at {} — engine will only accept pre-tokenized inputs",
@@ -923,7 +943,7 @@ impl Builder for SparseMoEBuilder {
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built DeepSeek-V4 dsv4 engine");
-            return Ok(Box::new(Dsv4Engine::new(
+            let mut engine = Dsv4Engine::new(
                 runner,
                 self.tokenizer,
                 self.transport,
@@ -933,7 +953,9 @@ impl Builder for SparseMoEBuilder {
                 // dsv4 has no config-threaded prefix cache; `None` keeps its
                 // existing env-only behaviour byte-for-byte.
                 None,
-            )));
+            );
+            engine.set_grammar_slot(self.grammar);
+            return Ok(Box::new(engine));
         }
         if let Some(runner) = self.inkling_runner {
             let total = self.config.total.max(1);
@@ -956,6 +978,7 @@ impl Builder for SparseMoEBuilder {
                 // No per-rank KV-prefix cache on this family yet (follow-up).
                 None,
             );
+            engine.set_grammar_slot(self.grammar);
             // `CASCADIA_STREAMS=N`: decode up to N requests together, on a
             // single stage or across the pipeline. Every rank must set the
             // same N. Off by default.
@@ -989,7 +1012,7 @@ impl Builder for SparseMoEBuilder {
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built glm5 engine");
-            return Ok(Box::new(PipelineEngine::new(
+            let mut engine = PipelineEngine::new(
                 runner,
                 self.tokenizer,
                 self.transport,
@@ -999,7 +1022,9 @@ impl Builder for SparseMoEBuilder {
                 // Same value the per-rank SliceKvCache got, so the rank-0 index
                 // and the per-rank caches stay in lockstep.
                 self.config.prefix_cache_depth.map(|d| d as usize),
-            )));
+            );
+            engine.set_grammar_slot(self.grammar);
+            return Ok(Box::new(engine));
         }
         if let Some(ov) = self.ov_runner {
             let total = self.config.total.max(1);
@@ -1045,7 +1070,7 @@ impl Builder for SparseMoEBuilder {
                     rank, total, "OvMoe kv-prefix-cache enabled (warm-resume)"
                 );
             }
-            return Ok(Box::new(OvMoeEngine::new(
+            let mut engine = OvMoeEngine::new(
                 ov,
                 self.tokenizer,
                 self.transport,
@@ -1053,7 +1078,9 @@ impl Builder for SparseMoEBuilder {
                 rank,
                 total,
                 ov_kv_cache,
-            )));
+            );
+            engine.grammar = self.grammar;
+            return Ok(Box::new(engine));
         }
         let runner = self.runner.ok_or(EngineError::NotLoaded)?;
         let total = self.config.total.max(1);
@@ -1181,6 +1208,8 @@ impl Builder for SparseMoEBuilder {
                 cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
             ),
             active: None,
+            grammar: self.grammar,
+            grammars: HashMap::new(),
         }))
     }
 }
@@ -1203,12 +1232,20 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// cap is `length`; stopping short of it (EOS / stop sequence) is `stop`. The
 /// runner returns the generated ids excluding EOS, so `n >= max_new` means the
 /// cap was the limiter. An EOS landing exactly at the cap reports `length`.
-fn finish_reason_for(n_tokens: usize, max_new: usize) -> FinishReason {
-    if n_tokens >= max_new {
+/// A completed structured-output grammar is a natural stop, also when its
+/// last token is the last one the cap allowed.
+fn finish_reason_for(n_tokens: usize, max_new: usize, grammar_finished: bool) -> FinishReason {
+    if n_tokens >= max_new && !grammar_finished {
         FinishReason::Length
     } else {
         FinishReason::Stop
     }
+}
+
+/// Whether a single-stage task runs n-gram speculative decoding: configured,
+/// greedy, and not a structured-output task (those decode plainly, masked).
+fn use_spec_decode(spec_decode_k: Option<u32>, temperature: f32, has_grammar: bool) -> bool {
+    spec_decode_k.is_some() && temperature <= 0.0 && !has_grammar
 }
 
 /// Incremental UTF-8-safe streaming delta. `full` is the whole output decoded so
@@ -1575,6 +1612,10 @@ pub struct SparseMoEEngine {
     pub(crate) kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
     /// In-flight multi-stage generation, streamed one token per `step()`.
     active: Option<SparseActive>,
+    /// Structured output: the grammar factory, and each queued json task's
+    /// grammar (compiled at `submit`, taken when the task starts).
+    grammar: GrammarSlot,
+    grammars: HashMap<TaskId, CompiledGrammar>,
 }
 
 impl SparseMoEEngine {
@@ -1682,6 +1723,12 @@ impl Engine for SparseMoEEngine {
                 cap: MAX_PENDING_TASKS,
             });
         }
+        if task.grammar.is_some() && self.total > 1 {
+            return Err(refuse_multi_stage_grammar());
+        }
+        if let Some(compiled) = self.grammar.compile(&task)? {
+            self.grammars.insert(task.task_id.clone(), compiled);
+        }
         self.pending.push_back(task);
         Ok(())
     }
@@ -1701,6 +1748,7 @@ impl Engine for SparseMoEEngine {
                                 // cancelled task-ids)
         }
         self.pending.retain(|t| &t.task_id != task_id);
+        self.grammars.remove(task_id);
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -1807,6 +1855,7 @@ impl SparseMoEEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        let compiled = self.grammars.remove(&task.task_id);
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
         let tokenizer = match self.tokenizer.as_ref() {
@@ -1849,6 +1898,21 @@ impl SparseMoEEngine {
             }
         }
         append_resume_ids(&mut prompt_ids, resume.as_deref());
+        // Structured output: the matcher starts past the resumed prefix.
+        let mut grammar = match compiled {
+            Some(c) => {
+                let seed: Vec<u32> = resume.iter().flatten().map(|&i| i as u32).collect();
+                match activate(&c, &seed) {
+                    Ok(gm) => Some(gm),
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "structured output failed; task aborted");
+                        let id = task.task_id.clone();
+                        return vec![(id.clone(), Chunk::error(id, e.to_string()))];
+                    }
+                }
+            }
+            None => None,
+        };
         // Non-resume keeps the base contract: max_tokens == 0 still yields one
         // token (`.max(1)`, matching gemma4/ov-runtime; qwen36 instead falls back
         // to its configured max_tokens_default). Only a RESUMED
@@ -1886,7 +1950,12 @@ impl SparseMoEEngine {
         // the plain generate path: the spec-decode helper consumes
         // KV-cache state internally, so wiring prefix-cache replay into
         // it would need extra plumbing — deferred.
-        let use_spec = self.spec_decode_k.is_some() && sampling_cfg.temperature <= 0.0;
+        let use_spec = use_spec_decode(
+            self.spec_decode_k,
+            sampling_cfg.temperature,
+            grammar.is_some(),
+        );
+        let mut grammar_finished = false;
         let generated = if use_spec {
             let k = self.spec_decode_k.unwrap();
             let mut draft = crate::ngram_draft::Draft::new().with_draft_k(k as usize);
@@ -1913,11 +1982,17 @@ impl SparseMoEEngine {
             } else {
                 None
             };
-            match self
-                .runner
-                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
-            {
-                Ok(g) => g,
+            match self.runner.generate_with_cache(
+                &prompt_ids,
+                max_new,
+                &sampling_cfg,
+                cache_opt,
+                grammar.as_mut(),
+            ) {
+                Ok((g, finished)) => {
+                    grammar_finished = finished;
+                    g
+                }
                 Err(e) => {
                     warn!(task = %task.task_id, "runner failed: {e}");
                     let final_chunk =
@@ -2006,7 +2081,11 @@ impl SparseMoEEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
         chunk.token_ids = generated;
-        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+        chunk.finish_reason = Some(finish_reason_for(
+            n_tokens as usize,
+            max_new,
+            grammar_finished,
+        ));
         vec![(task.task_id.clone(), chunk)]
     }
 
@@ -2273,7 +2352,7 @@ impl SparseMoEEngine {
             let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
             chunk.n_tokens = Some(n_tokens);
             chunk.token_ids = result_tokens;
-            chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+            chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new, false));
             return Some(vec![(task.task_id.clone(), chunk)]);
         }
 
@@ -2373,7 +2452,7 @@ impl SparseMoEEngine {
         if eos.contains(&token_back) {
             let mut chunk = Chunk::final_marker(task.task_id.clone(), "");
             chunk.n_tokens = Some(0);
-            chunk.finish_reason = Some(finish_reason_for(0, max_new));
+            chunk.finish_reason = Some(finish_reason_for(0, max_new, false));
             return Some(vec![(task.task_id, chunk)]);
         }
 
@@ -2642,7 +2721,7 @@ impl SparseMoEEngine {
             rank = self.rank, total = self.total, "task done (rank-0 driver, streamed)");
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
-        chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
+        chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new, false));
         vec![(a.id, chunk)]
     }
 
@@ -3896,6 +3975,10 @@ pub struct OvMoeEngine {
     kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
     /// In-flight multi-stage generation, streamed one token per `step()`.
     active_ov: Option<OvMoeActive>,
+    /// Structured output: the grammar factory, and each queued json task's
+    /// grammar (compiled at `submit`, taken when the task starts).
+    grammar: GrammarSlot,
+    grammars: HashMap<TaskId, CompiledGrammar>,
 }
 
 impl OvMoeEngine {
@@ -3947,6 +4030,8 @@ impl OvMoeEngine {
                 cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
             ),
             active_ov: None,
+            grammar: GrammarSlot::default(),
+            grammars: HashMap::new(),
         }
     }
 
@@ -4003,6 +4088,7 @@ impl OvMoeEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        let compiled = self.grammars.remove(&task.task_id);
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
         let Some(tok) = self.tokenizer.as_ref() else {
@@ -4047,20 +4133,37 @@ impl OvMoeEngine {
             } else {
                 None
             };
-        let (generated, _cached) =
-            match self
-                .runner
-                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
-            {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
-                    return vec![(
-                        task.task_id.clone(),
-                        Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
-                    )];
-                }
-            };
+        // Structured output: a fresh matcher (this path declines resumed turns above).
+        let mut grammar = match compiled.as_ref().map(|c| activate(c, &[])).transpose() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(task = %task.task_id, error = %e, "structured output failed; task aborted");
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, e.to_string()),
+                )];
+            }
+        };
+        let crate::ov_moe::OvMoeGeneration {
+            tokens: generated,
+            cached: _cached,
+            grammar_finished,
+        } = match self.runner.generate_with_cache(
+            &prompt_ids,
+            max_new,
+            &sampling_cfg,
+            cache_opt,
+            grammar.as_mut(),
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
+                )];
+            }
+        };
         #[cfg(feature = "kv_coord")]
         if let Some(snap) = _cached {
             let fp = self.runner.fingerprint();
@@ -4083,7 +4186,11 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
-        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+        chunk.finish_reason = Some(finish_reason_for(
+            n_tokens as usize,
+            max_new,
+            grammar_finished,
+        ));
         vec![(task.task_id.clone(), chunk)]
     }
 
@@ -4569,7 +4676,7 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
-        chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
+        chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new, false));
         vec![(a.id, chunk)]
     }
 
@@ -5051,6 +5158,12 @@ impl Engine for OvMoeEngine {
                 cap: OV_MAX_PENDING,
             });
         }
+        if task.grammar.is_some() && self.total > 1 {
+            return Err(refuse_multi_stage_grammar());
+        }
+        if let Some(compiled) = self.grammar.compile(&task)? {
+            self.grammars.insert(task.task_id.clone(), compiled);
+        }
         self.pending.push_back(task);
         Ok(())
     }
@@ -5063,6 +5176,7 @@ impl Engine for OvMoeEngine {
             self.active_ov = None;
         }
         self.pending.retain(|t| &t.task_id != task_id);
+        self.grammars.remove(task_id);
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -5383,6 +5497,10 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_log: (u64, Duration, u64),
     /// Per-window time account of this rank (`CASCADIA_STAGE_PROFILE_SECS`).
     stage_profile: Option<StageProfile>,
+    /// Structured output: the grammar factory, and each queued json task's
+    /// grammar (compiled at `submit`, taken when the task starts).
+    grammar: GrammarSlot,
+    grammars: HashMap<TaskId, CompiledGrammar>,
 }
 
 /// Per-slot sampling state on the last rank (the driver keeps the tokens).
@@ -5660,6 +5778,10 @@ struct StreamActive {
     emitted: usize,
     /// Pipeline, long prompts: the prompt tokens not sent yet (`Feeding`).
     feed: VecDeque<u32>,
+    /// Structured output: the stream's matcher (json tasks only), advanced
+    /// over `next` when it is sampled, and whether the JSON is complete.
+    grammar: Option<GrammarMask>,
+    grammar_finished: bool,
 }
 
 /// Rank-0 per-token streaming state: everything the decode loop threaded as
@@ -5739,7 +5861,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stream_admit_per_step: 1,
             stream_log: (0, Duration::ZERO, 0),
             stage_profile: None,
+            grammar: GrammarSlot::default(),
+            grammars: HashMap::new(),
         }
+    }
+
+    /// Structured output: the factory built from rank 0's tokenizer.
+    pub(crate) fn set_grammar_slot(&mut self, slot: GrammarSlot) {
+        self.grammar = slot;
     }
 
     /// Enable multi-stream decode with up to `n` concurrent tasks, on a single
@@ -6061,7 +6190,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 chunk.finish_reason = Some(if cap_stop {
                     FinishReason::Length
                 } else {
-                    finish_reason_for(n, st.max_new)
+                    finish_reason_for(n, st.max_new, false)
                 });
                 out.push((st.id.clone(), chunk));
                 let decode_s = st.decode_started.elapsed().as_secs_f64();
@@ -6353,6 +6482,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::new(),
             emitted: 0,
             feed,
+            // Multi-stage json tasks are refused at submit.
+            grammar: None,
+            grammar_finished: false,
         });
         Ok(rows)
     }
@@ -6637,7 +6769,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             c.token_ids = vec![st.next];
             out.push((st.id.clone(), c));
             let n = st.generated.len();
-            let natural_stop = n >= st.max_new || eos.contains(&t);
+            let natural_stop = n >= st.max_new || eos.contains(&t) || st.grammar_finished;
             // The cache cannot hold position `max_seq`: stop before forwarding
             // there (the token sampled at the last in-range position is still
             // emitted) and report `length`, as the one-task path does.
@@ -6649,7 +6781,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 chunk.finish_reason = Some(if cap_stop {
                     FinishReason::Length
                 } else {
-                    finish_reason_for(n, st.max_new)
+                    finish_reason_for(n, st.max_new, st.grammar_finished)
                 });
                 out.push((st.id.clone(), chunk));
                 let decode_s = st.decode_started.elapsed().as_secs_f64();
@@ -6708,10 +6840,32 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
         };
         let vocab = logits.len() / rows;
+        let mut failed: Vec<(usize, String)> = Vec::new();
         for (i, st) in self.streams.iter_mut().enumerate() {
             let l = &logits[i * vocab..(i + 1) * vocab];
-            st.next = crate::sampling::sample_unmasked(l, &st.history, &st.cfg, &mut st.rng);
+            if let Some(gm) = st.grammar.as_mut() {
+                // A json stream: masked pick, committed now (the next
+                // emission always sends it); a failure ends this stream only.
+                let picked =
+                    crate::sampling::sample(l, &st.history, &st.cfg, &mut st.rng, Some(gm))
+                        .and_then(|next| Ok((next, commit(Some(gm), next)?)));
+                match picked {
+                    Ok((next, finished)) => {
+                        st.next = next;
+                        st.grammar_finished = finished;
+                    }
+                    Err(e) => failed.push((i, e.to_string())),
+                }
+            } else {
+                st.next = crate::sampling::sample_unmasked(l, &st.history, &st.cfg, &mut st.rng);
+            }
             st.pos += 1;
+        }
+        for (i, msg) in failed.into_iter().rev() {
+            let st = self.streams.swap_remove(i);
+            warn!(task = %st.id, error = %msg, "structured output failed; stream aborted");
+            self.runner.close_stream(st.slot);
+            out.push((st.id.clone(), Chunk::error(st.id, msg)));
         }
         // ---- aggregate log every ~16 steps ----
         let (ref mut toks, ref mut wall, ref mut steps) = self.stream_log;
@@ -6793,7 +6947,33 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 return Err((task.task_id.clone(), Chunk::error(task.task_id, msg)));
             }
         };
-        let next = crate::sampling::sample_unmasked(&logits, &history, &cfg, &mut rng);
+        // Structured output: the first token is masked and committed here,
+        // every later one in `step_streams`.
+        let compiled = self.grammars.remove(&task.task_id);
+        let mut grammar = None;
+        let mut grammar_finished = false;
+        let next = if let Some(compiled) = compiled {
+            let picked = activate(&compiled, &[]).and_then(|mut gm| {
+                let next =
+                    crate::sampling::sample(&logits, &history, &cfg, &mut rng, Some(&mut gm))?;
+                grammar_finished = commit(Some(&mut gm), next)?;
+                grammar = Some(gm);
+                Ok(next)
+            });
+            match picked {
+                Ok(next) => next,
+                Err(e) => {
+                    warn!(task = %task.task_id, error = %e, "structured output failed; task aborted");
+                    self.runner.close_stream(slot);
+                    return Err((
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, e.to_string()),
+                    ));
+                }
+            }
+        } else {
+            crate::sampling::sample_unmasked(&logits, &history, &cfg, &mut rng)
+        };
         let prefill_s = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,
@@ -6822,6 +7002,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::new(),
             emitted: 0,
             feed: VecDeque::new(),
+            grammar,
+            grammar_finished,
         });
         Ok(())
     }
@@ -6921,12 +7103,37 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // has no error channel: catch it here, reset the sequence state the
         // half-finished turn left behind, and fail THIS task instead of the
         // process. The panic message carries the worker/layer diagnostics.
+        let compiled = self.grammars.remove(&task.task_id);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.runner
-                .generate_reason_timed(&prompt_ids, max_new, &sampling_cfg)
+            match compiled.as_ref() {
+                // Structured output: a masked run that ends when the JSON does.
+                Some(c) => activate(c, &[]).and_then(|mut gm| {
+                    self.runner
+                        .generate_grammar_timed(&prompt_ids, max_new, &sampling_cfg, &mut gm)
+                }),
+                None => {
+                    let (tokens, hit_context_cap, timing) =
+                        self.runner
+                            .generate_reason_timed(&prompt_ids, max_new, &sampling_cfg);
+                    Ok(crate::staged::Generation {
+                        tokens,
+                        hit_context_cap,
+                        grammar_finished: false,
+                        timing,
+                    })
+                }
+            }
         }));
-        let (generated, hit_context_cap, timing) = match outcome {
-            Ok(r) => r,
+        let (generated, hit_context_cap, grammar_finished, timing) = match outcome {
+            Ok(Ok(g)) => (g.tokens, g.hit_context_cap, g.grammar_finished, g.timing),
+            Ok(Err(e)) => {
+                warn!(task = %task.task_id, error = %e, "structured output failed; task aborted");
+                self.runner.reset();
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, e.to_string()),
+                )];
+            }
             Err(payload) => {
                 let msg = payload
                     .downcast_ref::<String>()
@@ -6978,7 +7185,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         chunk.finish_reason = Some(if hit_context_cap {
             FinishReason::Length
         } else {
-            finish_reason_for(n_tokens as usize, max_new)
+            finish_reason_for(n_tokens as usize, max_new, grammar_finished)
         });
         out.push((task.task_id.clone(), chunk));
         out
@@ -7444,7 +7651,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         chunk.finish_reason = Some(if a.hit_context_cap {
             FinishReason::Length
         } else {
-            finish_reason_for(n_tokens as usize, a.max_new)
+            finish_reason_for(n_tokens as usize, a.max_new, false)
         });
         vec![(a.id, chunk)]
     }
@@ -8278,6 +8485,12 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 cap: OV_MAX_PENDING,
             });
         }
+        if task.grammar.is_some() && self.total > 1 {
+            return Err(refuse_multi_stage_grammar());
+        }
+        if let Some(compiled) = self.grammar.compile(&task)? {
+            self.grammars.insert(task.task_id.clone(), compiled);
+        }
         self.pending.push_back(task);
         self.note_link_busy();
         Ok(())
@@ -8292,6 +8505,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
         // `begin_generation` issues a fresh reset + send_reset, so abandoning
         // mid-sequence leaves no stale KV state to clean up here.
         self.pending.retain(|t| &t.task_id != task_id);
+        self.grammars.remove(task_id);
         if self.active.as_ref().is_some_and(|a| &a.id == task_id) {
             self.active = None;
         }
@@ -8765,3 +8979,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod grammar_tests;

@@ -2221,7 +2221,8 @@ impl Runner {
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
     ) -> Result<Vec<i64>, RunnerError> {
-        self.generate_with_cache(prompt_ids, max_tokens, cfg, None)
+        self.generate_with_cache(prompt_ids, max_tokens, cfg, None, None)
+            .map(|(generated, _)| generated)
     }
 
     /// Generate with an optional KV-prefix cache. Behaviour is byte-
@@ -2237,13 +2238,19 @@ impl Runner {
     /// **full prompt token sequence**; common-prefix matching is
     /// O(entries) at lookup time, not at insert time. See the
     /// [`crate::kv_prefix_cache`] module docs for the cache semantics.
+    ///
+    /// `grammar` (structured output) masks every pick and is advanced over
+    /// every token; the run ends as soon as the JSON is complete, which the
+    /// returned flag reports (`finish_reason: "stop"`, also at the cap). A
+    /// grammar dead end or a rejected token is an error, never output.
     pub fn generate_with_cache(
         &mut self,
         prompt_ids: &[i64],
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
         mut cache: Option<&mut KvPrefixCache>,
-    ) -> Result<Vec<i64>, RunnerError> {
+        mut grammar: Option<&mut cascadia_grammar::GrammarMask>,
+    ) -> Result<(Vec<i64>, bool), RunnerError> {
         self.reset_kv();
         let eos: Vec<i64> = self
             .manifest
@@ -2375,21 +2382,37 @@ impl Runner {
             }
         }
 
+        // Masked pick + grammar commit (both no-ops without a grammar).
+        // Returns the token and whether the grammar finished on it.
+        let mut pick = |logits: &[f32], history: &[i64], rng: &mut u64| {
+            let next = crate::sampling::sample(logits, history, cfg, rng, grammar.as_deref_mut())
+                .map_err(|e| RunnerError::Internal(e.to_string()))?;
+            let finished = crate::constrained::commit(grammar.as_deref_mut(), next)
+                .map_err(|e| RunnerError::Internal(e.to_string()))?;
+            Ok::<_, RunnerError>((next, finished))
+        };
+        let mut grammar_finished = false;
+
         // First generated token from the LAST prefill step's logits.
         if let Some(l) = last_logits {
-            let next = crate::sampling::sample_unmasked(&l, &history, cfg, &mut rng);
+            let (next, finished) = pick(&l, &history, &mut rng)?;
             if eos.contains(&next) {
-                return Ok(generated);
+                return Ok((generated, finished));
             }
             history.push(next);
             generated.push(next);
+            grammar_finished = finished;
         }
 
         // Decode.
         for step_i in 1..max_tokens {
+            if grammar_finished {
+                break;
+            }
             let t_step = Instant::now();
             let logits = self.step(&history, 1)?;
-            let next = crate::sampling::sample_unmasked(&logits, &history, cfg, &mut rng);
+            let (next, finished) = pick(&logits, &history, &mut rng)?;
+            grammar_finished = finished;
             if eos.contains(&next) {
                 debug!(step = step_i, token = next, "EOS — stopping");
                 break;
@@ -2432,7 +2455,7 @@ impl Runner {
                 "FFN sparsity end-of-generation summary (routed experts only)"
             );
         }
-        Ok(generated)
+        Ok((generated, grammar_finished))
     }
 
     /// Back-compat: equivalent to `generate(..., &SamplingConfig::default())`.

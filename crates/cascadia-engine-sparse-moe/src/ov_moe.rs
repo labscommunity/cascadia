@@ -46,10 +46,12 @@ use tracing::info;
 
 use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 
+use crate::constrained::commit;
 use crate::kv_prefix_cache::ModelFingerprint;
 use crate::manifest::{Manifest, ManifestError};
 use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvPrefixCache, OvMoeKvSnapshot};
-use crate::sampling::{init_rng, sample_unmasked, SamplingConfig};
+use crate::sampling::{init_rng, sample, sample_unmasked, SamplingConfig};
+use cascadia_grammar::GrammarMask;
 
 /// Group size of the int4_bin quantization (cols per scale group).
 const INT4_GROUP: usize = 32;
@@ -877,15 +879,20 @@ impl OvMoeRunner {
     /// the snapshot inserted on a miss, so the engine can mirror it into its lock-free holder cache.
     /// `cache = None` is byte-identical to [`Self::generate`]. Prefill uses `step_logits` (no
     /// sampling), so the rep-penalty `history` covers generated tokens only — a warm run matches cold.
+    ///
+    /// `grammar` (structured output) masks every pick and is advanced over every token; the run
+    /// ends as soon as the JSON is complete, which [`OvMoeGeneration::grammar_finished`] reports. A
+    /// grammar dead end or a rejected token is an error, never output.
     pub fn generate_with_cache(
         &mut self,
         prompt_ids: &[u32],
         max_new: usize,
         cfg: &SamplingConfig,
         mut cache: Option<&mut OvMoeKvPrefixCache>,
-    ) -> Result<(Vec<u32>, Option<OvMoeKvSnapshot>), OvMoeError> {
+        mut grammar: Option<&mut GrammarMask>,
+    ) -> Result<OvMoeGeneration, OvMoeError> {
         if prompt_ids.is_empty() || max_new == 0 {
-            return Ok((Vec::new(), None));
+            return Ok(OvMoeGeneration::default());
         }
         self.reset();
         let mut rng = init_rng(cfg.seed);
@@ -941,20 +948,43 @@ impl OvMoeRunner {
         if logits.is_empty() {
             // No suffix token (cache_skip == prompt.len) — the lookup contract forbids this, but
             // return safely rather than sample from stale logits.
-            return Ok((out, cached_snap));
+            return Ok(OvMoeGeneration {
+                tokens: out,
+                cached: cached_snap,
+                grammar_finished: false,
+            });
         }
-        loop {
-            let next = sample_unmasked(&logits, &history, cfg, &mut rng) as u32;
+        let grammar_err = |e: cascadia_engine::EngineError| OvMoeError::Internal(e.to_string());
+        let grammar_finished = loop {
+            let next = sample(&logits, &history, cfg, &mut rng, grammar.as_deref_mut())
+                .map_err(grammar_err)?;
+            let finished = commit(grammar.as_deref_mut(), next).map_err(grammar_err)?;
+            let next = next as u32;
             out.push(next);
             history.push(next as i64);
-            if out.len() >= max_new || eos.contains(&next) {
-                break;
+            if finished || out.len() >= max_new || eos.contains(&next) {
+                break finished;
             }
             logits = self.step_logits(next, pos)?;
             pos += 1;
-        }
-        Ok((out, cached_snap))
+        };
+        Ok(OvMoeGeneration {
+            tokens: out,
+            cached: cached_snap,
+            grammar_finished,
+        })
     }
+}
+
+/// What [`OvMoeRunner::generate_with_cache`] produced.
+#[derive(Default)]
+pub struct OvMoeGeneration {
+    /// Generated tokens (an EOS that stopped the run included).
+    pub tokens: Vec<u32>,
+    /// The prompt's KV snapshot inserted on a cache miss.
+    pub cached: Option<OvMoeKvSnapshot>,
+    /// The structured-output grammar completed (`stop`, even at the cap).
+    pub grammar_finished: bool,
 }
 
 fn i64_as_bytes(v: &[i64]) -> &[u8] {
