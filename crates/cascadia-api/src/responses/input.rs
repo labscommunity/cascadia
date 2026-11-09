@@ -272,7 +272,7 @@ fn merge(into: &mut ChatMessage, next: ChatMessage) {
 
 /// Which `system` turns [`fold_system_turns`] folds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Fold {
+pub(crate) enum Fold {
     /// Those after the first non-`system` turn; a leading one stays.
     Later,
     /// Every one, leading ones too.
@@ -295,7 +295,7 @@ pub(super) enum Fold {
 /// user and assistant still alternate: `[user1, system, user2]` becomes one
 /// user turn `user1`, `system`, `user2`. Assistant and tool turns pass
 /// through.
-pub(super) fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<ChatMessage> {
+pub(crate) fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<ChatMessage> {
     // A folded turn joins a user turn just before it rather than standing
     // next to it, so user and assistant still alternate.
     fn push_user(out: &mut Vec<ChatMessage>, m: ChatMessage) {

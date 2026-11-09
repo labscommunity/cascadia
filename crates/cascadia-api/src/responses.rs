@@ -27,7 +27,8 @@ mod input;
 mod output;
 mod store;
 mod tools;
-use input::{fold_system_turns, input_messages, Fold};
+use input::input_messages;
+pub(crate) use input::{fold_system_turns, Fold};
 use output::{OutputBuilder, OutputEvent};
 pub(crate) use store::ItemCache;
 use tools::{check_include, check_tool_choice, ToolMap};
@@ -495,52 +496,6 @@ fn resolver(
     }
 }
 
-/// Fold `chat`'s system turns into user turns when the loaded chat template
-/// refuses them where they stand. Codex sends `developer` turns (read as
-/// `system`) mid-history; Gemma 3 and Mistral templates take only a leading
-/// system turn, Gemma 2 none at all, and refuse the rest with
-/// `raise_exception`. The messages are probed as `admit_chat` will render
-/// them: when the template takes them, or refuses for another reason (no
-/// fold renders), they are left as they are; otherwise the later system
-/// turns are folded, else every one. The folded messages are what reach the
-/// engine, so an engine that templates itself sees them too.
-fn fold_refused_system_turns(state: &AppState, chat: &mut ChatCompletionRequest) {
-    let Some(env) = state.chat_env.as_deref() else {
-        return;
-    };
-    if !chat.messages.iter().any(|m| m.role == "system") {
-        return;
-    }
-    let effort = EffortArgs {
-        mapped: Some(chat.effective_reasoning_effort()),
-        raw: chat.reasoning_effort.as_deref(),
-        explicit_thinking: chat.enable_thinking.is_some(),
-        template_words: state.effort_words,
-    };
-    let render = |messages: &[ChatMessage]| {
-        render_template(
-            Some(env),
-            &text_messages(state, messages),
-            &state.bos_token,
-            &state.eos_token,
-            chat.effective_enable_thinking(),
-            effort,
-            chat.tools.as_deref(),
-        )
-    };
-    if !matches!(render(&chat.messages), Err(PromptRenderError::Rejected(_))) {
-        return;
-    }
-    let folded = [Fold::Later, Fold::All]
-        .into_iter()
-        .map(|fold| fold_system_turns(chat.messages.clone(), fold))
-        .find(|messages| render(messages).is_ok());
-    if let Some(messages) = folded {
-        info!("responses: the chat template refuses system turns there; folded them into the next user turn");
-        chat.messages = messages;
-    }
-}
-
 /// `POST /v1/responses`.
 pub(crate) async fn create_response(
     State(state): State<AppState>,
@@ -563,8 +518,7 @@ pub(crate) async fn create_response(
     if !map.dropped.is_empty() {
         warn!(types = ?map.dropped, "responses: hosted tools are not served; dropped");
     }
-    let mut chat = chat_request(&req, messages, &map, choice);
-    fold_refused_system_turns(&state, &mut chat);
+    let chat = chat_request(&req, messages, &map, choice);
     // The response id doubles as the task id, so `/v1/cancel/<id>` works.
     let id = format!("resp_{}", Uuid::new_v4().simple());
     let shell = ResponseShell::new(&req, id, &map, choice);
@@ -575,6 +529,7 @@ pub(crate) async fn create_response(
         "`input` is empty or rendered to an empty prompt",
         AdmitOpts {
             api_render_on_thinking: true,
+            fold_refused_system_turns: true,
         },
     )
     .await
@@ -2784,6 +2739,119 @@ mod tests {
             "<sys>be brief</sys><user>list files</user><assistant></assistant>\
              <tool>a.txt</tool><user>now be terse</user><assistant></assistant>\
              <tool>b.txt</tool><user>and now?</user><assistant>"
+        );
+    }
+
+    /// The fold is judged with the request's tools in the render: a strict
+    /// template that prints them still folds the late system turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_system_turn_folds_with_tools() {
+        let template = format!(
+            "{{%- if tools -%}}<tools>{{{{ tools | tojson }}}}</tools>{{%- endif -%}}{STRICT_TEMPLATE}"
+        );
+        let mut body = developer_mid_history();
+        body["tools"] = json!([{"type": "function", "name": "get_weather",
+            "parameters": {"type": "object"}}]);
+        let (status, body, prompt) = prompt_under(&template, body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(prompt.starts_with("<tools>"), "{prompt}");
+        assert!(prompt.contains("get_weather"), "{prompt}");
+        assert_eq!(prompt.matches("<sys>").count(), 1, "{prompt}");
+        assert!(
+            prompt.ends_with("<user>now be terse\n\nand now?</user><assistant>"),
+            "{prompt}"
+        );
+    }
+
+    /// (role, content) of each turn forwarded to the engine.
+    fn forwarded(task: &GenerationTask) -> Vec<(String, String)> {
+        task.messages
+            .iter()
+            .map(|t| (t.role.clone(), t.content.clone()))
+            .collect()
+    }
+
+    /// The folded turns `developer_mid_history` reaches the engine as.
+    fn folded_turns() -> Vec<(String, String)> {
+        [
+            ("system", "be brief"),
+            ("user", "list files"),
+            ("assistant", ""),
+            ("tool", "a.txt"),
+            ("user", "now be terse\n\nand now?"),
+        ]
+        .map(|(r, c)| (r.to_owned(), c.to_owned()))
+        .to_vec()
+    }
+
+    /// An engine that renders the template itself from the forwarded turns
+    /// (sycl-llama) is sent the folded turns: the API never renders the
+    /// template there, so it probes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_engine_that_templates_itself_gets_the_folded_turns() {
+        let cfg = Config {
+            engine_applies_template: true,
+            ..template_config(STRICT_TEMPLATE)
+        };
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, body) = post(app, developer_mid_history()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(forwarded(&tasks.lock()[0]), folded_turns());
+    }
+
+    /// An ov-genai-style engine with thinking on (the API renders the
+    /// prompt) folds too, in the prompt and the forwarded turns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_thinking_request_on_a_deferring_engine_folds() {
+        let cfg = Config {
+            defer_template_on_thinking: true,
+            ..template_config(STRICT_TEMPLATE)
+        };
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, body) = post(app, developer_mid_history()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let task = tasks.lock()[0].clone();
+        assert!(task.enable_thinking && task.prompt_rendered);
+        assert!(
+            task.prompt
+                .ends_with("<user>now be terse\n\nand now?</user><assistant>"),
+            "{}",
+            task.prompt
+        );
+        assert_eq!(forwarded(&task), folded_turns());
+    }
+
+    /// An image request folds with its image where it was: the system text
+    /// leads the user turn, before the image's placeholder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_image_request_folds_with_its_image_in_place() {
+        let cfg = Config {
+            media: Some(MediaConfig::ov_genai(None)),
+            ..template_config(NO_SYSTEM_TEMPLATE)
+        };
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, body) = post(
+            app,
+            json!({"model": "script-model", "instructions": "be brief", "input": [
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_image", "image_url": png_url(8, 8)}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let task = tasks.lock()[0].clone();
+        assert_eq!(task.media.len(), 1);
+        assert!(!task.prompt.contains("<system>"), "{}", task.prompt);
+        let (sys, text, image) = (
+            task.prompt.find("be brief").expect("system text"),
+            task.prompt.find("describe").expect("user text"),
+            task.prompt.find("<ov_genai_image_0>").expect("placeholder"),
+        );
+        assert!(task.prompt.starts_with("<user>"), "{}", task.prompt);
+        assert!(sys < text && text < image, "{}", task.prompt);
+        assert_eq!(
+            forwarded(&task),
+            [("user".to_owned(), "be brief\n\ndescribe".to_owned())]
         );
     }
 

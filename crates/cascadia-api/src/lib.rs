@@ -4127,8 +4127,8 @@ pub fn render_chat_prompt(
 /// The engine-side structured turns from a chat request: tool fields travel
 /// as the OpenAI wire JSON a downstream chat server (llama-server's jinja)
 /// expects verbatim.
-fn chat_turns(req: &ChatCompletionRequest) -> Vec<ChatTurn> {
-    req.messages
+fn chat_turns(messages: &[ChatMessage]) -> Vec<ChatTurn> {
+    messages
         .iter()
         .map(|m| ChatTurn {
             role: m.role.clone(),
@@ -4150,6 +4150,100 @@ fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
         .and_then(|ts| serde_json::to_value(ts).ok())
 }
 
+/// A request's messages with refused system turns folded (see
+/// [`fold_refused_system_turns`]), and its media-prepared messages folded
+/// alike.
+struct FoldedTurns {
+    messages: Vec<ChatMessage>,
+    media: Option<Vec<ChatMessage>>,
+}
+
+/// `messages` with their system turns folded into user turns, when the chat
+/// template refuses them where they stand and a fold makes it take them;
+/// `None` leaves the request as it is (no system turn, the template takes
+/// it, or no fold helps and its 400 stands).
+///
+/// `rendered` is the request's own render. Where the API renders the
+/// template (`templated_here`) its rejection is read off that, so a request
+/// the template takes costs no extra render. Where the engine renders the
+/// same template from the forwarded turns instead (sycl-llama, or ov-genai
+/// thinking-on without an API render), the API probes it here, as the
+/// engine's rejection would otherwise surface as an engine error. Later
+/// system turns are folded first (skipped when there are none), then every
+/// one; the first fold the template renders wins. `media` (the
+/// placeholder-bearing messages, one per request message) is folded alike,
+/// so each image stays in its turn.
+#[allow(clippy::too_many_arguments)]
+fn fold_refused_system_turns(
+    state: &AppState,
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    media: Option<&[ChatMessage]>,
+    rendered: &Result<(String, bool), PromptRenderError>,
+    must_render: bool,
+    enable_thinking: bool,
+    effort: EffortArgs<'_>,
+    tools: Option<&[Tool]>,
+) -> Option<FoldedTurns> {
+    use responses::{fold_system_turns, Fold};
+    if !messages.iter().any(|m| m.role == "system") {
+        return None;
+    }
+    let probe = |messages: &[ChatMessage], media: Option<&[ChatMessage]>| {
+        let text;
+        let seen = match media {
+            Some(m) => m,
+            None => {
+                text = text_messages(state, messages);
+                &text[..]
+            }
+        };
+        render_template(
+            Some(env),
+            seen,
+            &state.bos_token,
+            &state.eos_token,
+            enable_thinking,
+            EffortArgs {
+                template_words: state.effort_words,
+                ..effort
+            },
+            tools,
+        )
+    };
+    let templated_here = media.is_some()
+        || !(state.engine_applies_template
+            || (state.defer_template_on_thinking && enable_thinking && !must_render));
+    let refused = if templated_here {
+        matches!(rendered, Err(PromptRenderError::Rejected(_)))
+    } else {
+        matches!(probe(messages, None), Err(PromptRenderError::Rejected(_)))
+    };
+    if !refused {
+        return None;
+    }
+    let later = messages
+        .iter()
+        .skip_while(|m| m.role == "system")
+        .any(|m| m.role == "system");
+    let folds = [Fold::Later, Fold::All]
+        .into_iter()
+        .filter(|f| later || *f == Fold::All);
+    for fold in folds {
+        let folded = FoldedTurns {
+            messages: fold_system_turns(messages.to_vec(), fold),
+            media: media.map(|m| fold_system_turns(m.to_vec(), fold)),
+        };
+        if probe(&folded.messages, folded.media.as_deref()).is_ok() {
+            info!(
+                "the chat template refuses system turns where they stand; folded them into user turns"
+            );
+            return Some(folded);
+        }
+    }
+    None
+}
+
 /// Per-endpoint knobs for [`admit_chat`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AdmitOpts {
@@ -4159,6 +4253,12 @@ pub(crate) struct AdmitOpts {
     /// user message, so `instructions`, developer messages and history would
     /// be lost. Set by `/v1/responses`; chat keeps the engine render.
     pub(crate) api_render_on_thinking: bool,
+    /// When the chat template refuses the request's system turns where they
+    /// stand, fold them into user turns and serve that (see
+    /// [`responses::fold_system_turns`]). Set by `/v1/responses`, whose
+    /// Codex histories carry `developer` turns mid-history; chat keeps the
+    /// template's 400.
+    pub(crate) fold_refused_system_turns: bool,
 }
 
 /// A chat request past every pre-engine check: the task to submit, and the
@@ -4255,7 +4355,7 @@ async fn admit_chat(
     ) {
         return Err(resp);
     }
-    let media = prepare_media(state, &req.messages).await?;
+    let mut media = prepare_media(state, &req.messages).await?;
     let effort = EffortArgs {
         mapped: Some(req.effective_reasoning_effort()),
         raw: req.reasoning_effort.as_deref(),
@@ -4279,32 +4379,62 @@ async fn admit_chat(
             || opts.api_render_on_thinking);
     // Set when the API rendered a thinking request for the deferring engine.
     let mut api_rendered = false;
-    let rendered = match &media {
+    // The prompt, and whether the API rendered a thinking request for the
+    // deferring engine, from the template's view of the messages (`media`'s
+    // when the request has media, the request's otherwise).
+    let render = |messages: &[ChatMessage], media: Option<&[ChatMessage]>| match media {
         // Image requests always render here, thinking or not, so each
         // placeholder sits inside its own message; the engine is told not to
         // template again (`prompt_rendered`).
         Some(m) => render_or_fallback(
             state.chat_env.as_deref(),
-            &m.messages,
+            m,
             &state.bos_token,
             &state.eos_token,
             enable_thinking,
             effort,
             req.tools.as_deref(),
-        ),
+        )
+        .map(|p| (p, false)),
         None => render_prompt(
             state,
-            &text_messages(state, &req.messages),
+            &text_messages(state, messages),
             enable_thinking,
             effort,
             req.tools.as_deref(),
             must_render,
-        )
-        .map(|(p, rendered)| {
-            api_rendered = rendered;
-            p
-        }),
+        ),
     };
+    let mut rendered = render(&req.messages, media.as_ref().map(|m| &m.messages[..]));
+    // The request's messages with refused system turns folded, when that
+    // made the template take them.
+    let mut folded: Option<Vec<ChatMessage>> = None;
+    if opts.fold_refused_system_turns {
+        if let Some(env) = state.chat_env.as_deref() {
+            if let Some(f) = fold_refused_system_turns(
+                state,
+                env,
+                &req.messages,
+                media.as_ref().map(|m| &m.messages[..]),
+                &rendered,
+                must_render,
+                enable_thinking,
+                effort,
+                req.tools.as_deref(),
+            ) {
+                rendered = render(&f.messages, f.media.as_deref());
+                if let (Some(m), Some(fm)) = (media.as_mut(), f.media) {
+                    m.messages = fm;
+                }
+                folded = Some(f.messages);
+            }
+        }
+    }
+    let messages: &[ChatMessage] = folded.as_deref().unwrap_or(&req.messages);
+    let rendered = rendered.map(|(p, api)| {
+        api_rendered = api;
+        p
+    });
     let prompt = match rendered {
         Ok(p) => p,
         // A tools request that cannot be templated must not return a 200: the
@@ -4351,8 +4481,7 @@ async fn admit_chat(
     // Same bound on the structured turns: tool-call results ride as
     // messages and never count toward prompt.len(), so a request could
     // pass the prompt check while shipping a megabyte of tool output.
-    let messages_bytes: usize = req
-        .messages
+    let messages_bytes: usize = messages
         .iter()
         .map(|m| {
             m.content.len()
@@ -4411,7 +4540,7 @@ async fn admit_chat(
         // downstream chat server applying its own template (sycl-llama:
         // llama-server renders the GGUF chat template). Other engines ignore
         // the field and keep consuming `prompt`.
-        messages: chat_turns(&req),
+        messages: chat_turns(messages),
         tools: chat_tools(&req),
         tool_choice: req.tool_choice.clone(),
         max_tokens: req.max_tokens,
@@ -9260,7 +9389,7 @@ mod tests {
                 {"role":"user","content":"thanks"}
             ]
         }));
-        let turns = chat_turns(&req);
+        let turns = chat_turns(&req.messages);
         assert_eq!(turns.len(), 3);
         let calls = turns[0].tool_calls.as_ref().expect("tool_calls forwarded");
         assert_eq!(calls[0]["id"], "call_1");
