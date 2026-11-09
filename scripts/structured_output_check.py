@@ -130,7 +130,7 @@ def verdict(case, ok, detail, info=False):
         RESULTS.append(ok)
 
 
-def run_json_case(base, case, schema, rf, messages, stream=False, **extra):
+def run_json_case(base, case, schema, rf, messages, stream=False, info=False, **extra):
     body = chat(messages, response_format=rf, stream=stream, **extra)
     status, raw, dt = post(base, body)
     if status != 200:
@@ -140,7 +140,7 @@ def run_json_case(base, case, schema, rf, messages, stream=False, **extra):
     ok, detail = check_json(text, schema)
     if ok and finish != "stop":
         ok, detail = False, f"finish_reason={finish} (want stop); {detail}"
-    verdict(case, ok, f"{dt:.2f}s finish={finish} {detail}")
+    verdict(case, ok, f"{dt:.2f}s finish={finish} {detail}", info=info)
     return text if ok else None
 
 
@@ -291,6 +291,8 @@ def case_zod_email(base):
         rf_schema(ZOD_EMAIL, "contact"),
         [{"role": "user", "content": "Ada's address is ada@example.com. Return it."}],
         max_tokens=128,
+        # The mock's minimal instance ignores `pattern` (an empty string).
+        info=MOCK,
     )
 
 
