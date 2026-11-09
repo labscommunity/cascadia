@@ -203,11 +203,11 @@ struct MaskedRound {
     end: Option<MaskedEnd>,
 }
 
-/// Masked greedy pick: the argmax of `row` among the tokens the grammar allows.
+/// Masked greedy pick: the argmax of `row` among the tokens the grammar
+/// allows, the lowest allowed one when every allowed logit is `-inf`/NaN.
+/// `Err` when nothing in the row is allowed.
 fn masked_pick(mask: &mut GrammarMask, row: &[f32]) -> EngineResult<i64> {
-    let mut masked = row.to_vec();
-    mask.apply(&mut masked)?;
-    Ok(argmax(&masked) as i64)
+    mask.pick_greedy(row).map(|t| t as i64)
 }
 
 /// Greedy acceptance for a grammar task. `rows[i]` is the target's logits
@@ -4079,6 +4079,29 @@ mod tests {
         // Accepted into the matcher: a key's quote may follow, `{` may not.
         assert!(mask.allowed(b'"' as u32));
         assert!(!mask.allowed(b'{' as u32));
+    }
+
+    /// An all `-inf` (or NaN) row whose last index is the disallowed EOS:
+    /// the first token and every verify row pick the lowest allowed token.
+    #[test]
+    fn an_all_neg_inf_row_never_picks_a_disallowed_eos() {
+        let gf = test_factory();
+        let w = gf.mask_width();
+        assert_eq!(w - 1, TEST_EOS as usize);
+        for fill in [f32::NEG_INFINITY, f32::NAN] {
+            let dead = vec![fill; w];
+            let mut mask = start_grammar(&compiled(&gf, OK_ENUM), &[]).unwrap();
+            assert!(!mask.allowed(TEST_EOS));
+            assert_eq!(
+                pick_first_token(&dead, Some(&mut mask), &[TEST_EOS]).unwrap(),
+                (b'"' as i64, None)
+            );
+            // Then `o`, `k`, `"`: each row's only allowed token.
+            let rows = vec![dead.clone(), dead.clone(), dead.clone()];
+            let r = masked_accept(&mut mask, &refs(&rows), &ids("ok"), &[TEST_EOS], 16).unwrap();
+            assert_eq!(r.tokens, ids("ok\""));
+            assert_eq!(r.end, Some(MaskedEnd::Finished));
+        }
     }
 
     #[test]
