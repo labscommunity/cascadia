@@ -4032,6 +4032,12 @@ impl OvRuntimeEngine {
             // loop exits for a supervisor rebuild rather than grinding on a
             // desynced stream. Those keep their `Backend` type on purpose:
             // the link really is dead, and that classification must survive.
+            //
+            // A masked plan's timeout takes the same path (the socket is
+            // dropped; there is no shorter masked budget or socket-keeping
+            // wait here, unlike the non-packed masked step). Mixed versions
+            // never get here on a masked plan: a stage that predates masks
+            // can't decode the taller plan and NACKs the batch at once.
             let (reply, _) = if prefill {
                 guard.recv_reply_prefill().await
             } else {
