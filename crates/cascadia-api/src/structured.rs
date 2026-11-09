@@ -6,7 +6,7 @@ use cascadia_types::{GrammarKind, GrammarSpec};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Grammar body used for `json_object` (and for `json_schema` whose schema is
 /// missing, `null`, `true` or `{}`): any JSON object.
@@ -165,6 +165,7 @@ fn parse_json_schema(js: Option<&Value>, raw: &str) -> Result<ResponseFormat, St
             let raw: Box<RawValue> =
                 serde_json::from_str(&text).map_err(|e| format!("{FIELD}: {e}"))?;
             check_converter_depth(&Node::parse(raw).map_err(|e| format!("{FIELD}: {e}"))?)?;
+            check_ref_depth_bound(&schema)?;
             Ok(ResponseFormat::JsonSchema {
                 name: js.get("name").and_then(Value::as_str).map(str::to_owned),
                 schema,
@@ -420,9 +421,97 @@ fn reject_duplicate_keys(text: &str) -> Result<(), String> {
 }
 
 /// Most work [`check_converter_depth`] does before it calls the schema too
-/// complex: each visit costs one plus the visited object's key count, so the
-/// budget bounds the walk's time. A real schema costs about its key count.
+/// complex: parsing the schema's scalars costs their length, each visit one
+/// plus the visited object's key count, and resolving a `$ref` its length
+/// plus the keys scanned, so the budget bounds the walk's time. A real
+/// schema costs about its size.
 const MAX_SCHEMA_VISITS: usize = 1_000_000;
+
+/// A scalar of the schema as [`check_converter_depth`] reads it.
+#[derive(Clone, Copy, PartialEq)]
+enum Scalar {
+    True,
+    False,
+    /// A string, by its index in [`Scalars::strings`].
+    Str(usize),
+    /// Anything else, or not a scalar.
+    Other,
+}
+
+/// Every scalar of a schema, parsed once before the walk, its strings
+/// interned: a visit reads `type`, `$ref` or `additionalProperties` in
+/// constant time whatever the value's size.
+struct Scalars {
+    by_node: HashMap<*const Node, Scalar>,
+    strings: Vec<String>,
+    /// The work of parsing them: their total text length.
+    cost: usize,
+}
+
+impl Scalars {
+    fn new(root: &Node) -> Scalars {
+        let mut ids: HashMap<String, usize> = HashMap::new();
+        let mut out = Scalars {
+            by_node: HashMap::new(),
+            strings: Vec::new(),
+            cost: 0,
+        };
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let raw = match node {
+                Node::Obj(entries) => {
+                    stack.extend(entries.iter().map(|(_, v)| v));
+                    continue;
+                }
+                Node::Arr(items) => {
+                    stack.extend(items.iter());
+                    continue;
+                }
+                Node::Scalar(raw) => raw,
+            };
+            out.cost += raw.get().len();
+            let parsed = match serde_json::from_str(raw.get()) {
+                Ok(Value::Bool(true)) => Scalar::True,
+                Ok(Value::Bool(false)) => Scalar::False,
+                Ok(Value::String(s)) => Scalar::Str(match ids.get(&s) {
+                    Some(&id) => id,
+                    None => {
+                        let id = out.strings.len();
+                        ids.insert(s.clone(), id);
+                        out.strings.push(s);
+                        id
+                    }
+                }),
+                _ => Scalar::Other,
+            };
+            out.by_node.insert(node as *const Node, parsed);
+        }
+        out
+    }
+
+    fn get(&self, node: &Node) -> Scalar {
+        self.by_node
+            .get(&(node as *const Node))
+            .copied()
+            .unwrap_or(Scalar::Other)
+    }
+
+    /// `node` as a `type` name: one of [`SCHEMA_TYPES`], `"unknown"` for any
+    /// other string (the converter rejects it), `None` when not a string.
+    /// Constant time: comparing strings checks their lengths first.
+    fn type_name(&self, node: &Node) -> Option<&'static str> {
+        let Scalar::Str(id) = self.get(node) else {
+            return None;
+        };
+        let t = self.strings[id].as_str();
+        Some(
+            SCHEMA_TYPES
+                .into_iter()
+                .find(|k| *k == t)
+                .unwrap_or("unknown"),
+        )
+    }
+}
 
 /// The value of `type` as the grammar converter sees a schema: its own, or
 /// replaced by one entry of a `type` list, or removed (an empty list).
@@ -458,24 +547,29 @@ struct Visit<'a> {
 /// depth-first visit in the converter's order with that same cache. It
 /// keeps its own stack, so it never recurses whatever the schema.
 fn check_converter_depth(root: &Node) -> Result<(), String> {
-    let mut entered: HashSet<String> = HashSet::new();
+    let scalars = Scalars::new(root);
+    let mut walk = Walk {
+        root,
+        cost: scalars.cost,
+        entered: vec![false; scalars.strings.len()],
+        scalars: &scalars,
+    };
     let mut stack = vec![Visit {
         node: root,
         ty: TypeView::Own,
         level: 1,
         via_create: true,
     }];
-    let mut cost = 0;
     let mut children = Vec::new();
     while let Some(v) = stack.pop() {
-        cost += 1 + match v.node {
+        walk.cost += 1 + match v.node {
             Node::Obj(entries) => entries.len(),
             _ => 0,
         };
-        if cost > MAX_SCHEMA_VISITS {
+        if walk.cost > MAX_SCHEMA_VISITS {
             return Err(format!("{FIELD} is too complex"));
         }
-        if v.via_create && is_basic_schema(v.node, v.ty) {
+        if v.via_create && walk.is_basic_schema(v.node, v.ty) {
             continue;
         }
         if v.level > MAX_SCHEMA_DEPTH {
@@ -483,7 +577,7 @@ fn check_converter_depth(root: &Node) -> Result<(), String> {
                 "{FIELD} nests deeper than {MAX_SCHEMA_DEPTH} levels through $ref"
             ));
         }
-        converter_children(root, v.node, v.ty, &mut entered, &mut children)?;
+        walk.children(v.node, v.ty, &mut children)?;
         // Last pushed is visited first: push in reverse to keep the order.
         stack.extend(
             children
@@ -507,122 +601,172 @@ type Child<'a> = (&'a Node, TypeView, bool);
 /// The fused schema the converter visits for an `allOf` of two or more.
 static EMPTY_SCHEMA: Node = Node::Obj(Vec::new());
 
-/// Append to `out` the subschemas the converter's `VisitSchema` visits for
-/// `node`, in its order, entering local `$ref`s on the way (`entered`).
-/// Mirrors `VisitSchema`'s dispatch: `$ref`, then `const`, `enum`,
-/// `anyOf`/`oneOf`, `allOf`, `type`, then object or array keywords.
-/// Keywords the converter would reject are walked anyway when they hold
-/// schemas (which may over-count, never under-count).
-fn converter_children<'a>(
+/// The state of [`check_converter_depth`]'s walk.
+struct Walk<'a, 's> {
+    /// The whole schema, which local refs point into.
     root: &'a Node,
-    node: &'a Node,
-    ty: TypeView,
-    entered: &mut HashSet<String>,
-    out: &mut Vec<Child<'a>>,
-) -> Result<(), String> {
-    let Node::Obj(_) = node else {
-        return Ok(());
-    };
-    if let TypeView::Own = ty {
-        if let Some(r) = node.get("$ref") {
-            let Some(r) = r.string() else {
-                return Ok(());
-            };
-            if let Some(target) = local_ref_target(root, &r)? {
-                if entered.insert(r) {
-                    out.push((target, TypeView::Own, false));
-                }
-            }
-            return Ok(());
-        }
-        if node.get("const").is_some() || node.get("enum").is_some() {
-            return Ok(());
-        }
-        if let Some(cases) = node.get("anyOf").or_else(|| node.get("oneOf")) {
-            if let Node::Arr(cases) = cases {
-                out.extend(cases.iter().map(|c| (c, TypeView::Own, true)));
-            }
-            return Ok(());
-        }
-        if let Some(members) = node.get("allOf") {
-            match members {
-                Node::Arr(m) if m.len() == 1 => out.push((&m[0], TypeView::Own, false)),
-                Node::Arr(_) => out.push((&EMPTY_SCHEMA, TypeView::Own, false)),
-                _ => {}
-            }
-            return Ok(());
-        }
-    }
-    let ty = match ty {
-        TypeView::Own => match node.get("type") {
-            Some(Node::Arr(types)) if types.is_empty() => {
-                out.push((node, TypeView::Removed, false));
-                return Ok(());
-            }
-            Some(Node::Arr(types)) => {
-                for t in types {
-                    let Some(t) = type_name(t) else { break };
-                    out.push((node, TypeView::Is(t), true));
-                }
-                return Ok(());
-            }
-            Some(t) => match type_name(t) {
-                Some(t) => Some(t),
-                None => return Ok(()),
-            },
-            None => None,
-        },
-        TypeView::Is(t) => Some(t),
-        TypeView::Removed => None,
-    };
-    let has = |k: &str| node.get(k).is_some();
-    let object = match ty {
-        Some(t) => match t {
-            "object" => true,
-            "array" => false,
-            _ => return Ok(()),
-        },
-        None if has("properties")
-            || has("additionalProperties")
-            || has("unevaluatedProperties") =>
-        {
-            true
-        }
-        None if has("items") || has("prefixItems") || has("unevaluatedItems") => false,
-        None => return Ok(()),
-    };
-    if object {
-        object_children(node, out);
-    } else {
-        array_children(node, out);
-    }
-    Ok(())
+    scalars: &'s Scalars,
+    /// By interned `$ref` text: entered, or seen needing no visit (`#`, a
+    /// remote ref). Each ref text is resolved once.
+    entered: Vec<bool>,
+    /// Work done so far, against [`MAX_SCHEMA_VISITS`].
+    cost: usize,
 }
 
-/// The subschemas `VisitObject` visits: with a non-empty `patternProperties`
-/// its values (else a `propertyNames`, seen as a string schema); otherwise
-/// the `properties` values in order, then the schema for other properties.
-fn object_children<'a>(node: &'a Node, out: &mut Vec<Child<'a>>) {
-    match (node.get("patternProperties"), node.get("propertyNames")) {
-        (Some(Node::Obj(patterns)), _) if !patterns.is_empty() => {
-            out.extend(patterns.iter().map(|(_, s)| (s, TypeView::Own, true)));
-            return;
+impl<'a> Walk<'a, '_> {
+    /// Append to `out` the subschemas the converter's `VisitSchema` visits
+    /// for `node`, in its order, entering local `$ref`s on the way. Mirrors
+    /// `VisitSchema`'s dispatch: `$ref`, then `const`, `enum`,
+    /// `anyOf`/`oneOf`, `allOf`, `type`, then object or array keywords.
+    /// Keywords the converter would reject are walked anyway when they hold
+    /// schemas (which may over-count, never under-count).
+    fn children(
+        &mut self,
+        node: &'a Node,
+        ty: TypeView,
+        out: &mut Vec<Child<'a>>,
+    ) -> Result<(), String> {
+        let Node::Obj(_) = node else {
+            return Ok(());
+        };
+        if let TypeView::Own = ty {
+            if let Some(r) = node.get("$ref") {
+                let Scalar::Str(id) = self.scalars.get(r) else {
+                    return Ok(());
+                };
+                if std::mem::replace(&mut self.entered[id], true) {
+                    return Ok(());
+                }
+                let (target, work) = local_ref_target(self.root, &self.scalars.strings[id])?;
+                self.cost += work;
+                if let Some(target) = target {
+                    out.push((target, TypeView::Own, false));
+                }
+                return Ok(());
+            }
+            if node.get("const").is_some() || node.get("enum").is_some() {
+                return Ok(());
+            }
+            if let Some(cases) = node.get("anyOf").or_else(|| node.get("oneOf")) {
+                if let Node::Arr(cases) = cases {
+                    out.extend(cases.iter().map(|c| (c, TypeView::Own, true)));
+                }
+                return Ok(());
+            }
+            if let Some(members) = node.get("allOf") {
+                match members {
+                    Node::Arr(m) if m.len() == 1 => out.push((&m[0], TypeView::Own, false)),
+                    Node::Arr(_) => out.push((&EMPTY_SCHEMA, TypeView::Own, false)),
+                    _ => {}
+                }
+                return Ok(());
+            }
         }
-        (_, Some(names @ Node::Obj(_))) => {
-            out.push((names, TypeView::Is("string"), true));
-            return;
+        let ty = match ty {
+            TypeView::Own => match node.get("type") {
+                Some(Node::Arr(types)) if types.is_empty() => {
+                    out.push((node, TypeView::Removed, false));
+                    return Ok(());
+                }
+                Some(Node::Arr(types)) => {
+                    for t in types {
+                        let Some(t) = self.scalars.type_name(t) else {
+                            break;
+                        };
+                        out.push((node, TypeView::Is(t), true));
+                    }
+                    return Ok(());
+                }
+                Some(t) => match self.scalars.type_name(t) {
+                    Some(t) => Some(t),
+                    None => return Ok(()),
+                },
+                None => None,
+            },
+            TypeView::Is(t) => Some(t),
+            TypeView::Removed => None,
+        };
+        let has = |k: &str| node.get(k).is_some();
+        let object = match ty {
+            Some("object") => true,
+            Some("array") => false,
+            Some(_) => return Ok(()),
+            None if has("properties")
+                || has("additionalProperties")
+                || has("unevaluatedProperties") =>
+            {
+                true
+            }
+            None if has("items") || has("prefixItems") || has("unevaluatedItems") => false,
+            None => return Ok(()),
+        };
+        if object {
+            self.object_children(node, out);
+        } else {
+            array_children(node, out);
         }
-        _ => {}
+        Ok(())
     }
-    if let Some(Node::Obj(props)) = node.get("properties") {
-        out.extend(props.iter().map(|(_, s)| (s, TypeView::Own, true)));
+
+    /// The subschemas `VisitObject` visits: with a non-empty
+    /// `patternProperties` its values (else a `propertyNames`, seen as a
+    /// string schema); otherwise the `properties` values in order, then the
+    /// schema for other properties.
+    fn object_children(&self, node: &'a Node, out: &mut Vec<Child<'a>>) {
+        match (node.get("patternProperties"), node.get("propertyNames")) {
+            (Some(Node::Obj(patterns)), _) if !patterns.is_empty() => {
+                out.extend(patterns.iter().map(|(_, s)| (s, TypeView::Own, true)));
+                return;
+            }
+            (_, Some(names @ Node::Obj(_))) => {
+                out.push((names, TypeView::Is("string"), true));
+                return;
+            }
+            _ => {}
+        }
+        if let Some(Node::Obj(props)) = node.get("properties") {
+            out.extend(props.iter().map(|(_, s)| (s, TypeView::Own, true)));
+        }
+        let other = match node.get("additionalProperties") {
+            Some(a) => Some(a),
+            None => node.get("unevaluatedProperties"),
+        };
+        if let Some(other) = other.filter(|o| self.scalars.get(o) != Scalar::False) {
+            out.push((other, TypeView::Own, true));
+        }
     }
-    let other = match node.get("additionalProperties") {
-        Some(a) => Some(a),
-        None => node.get("unevaluatedProperties"),
-    };
-    if let Some(other) = other.filter(|o| o.scalar() != Some(Value::Bool(false))) {
-        out.push((other, TypeView::Own, true));
+
+    /// True when the converter answers `node` (seen with `ty`) from its
+    /// built-in rules without visiting it: `true`, `{}` or `{"type": T}` for
+    /// a basic type `T`, once keys its cache ignores are dropped.
+    fn is_basic_schema(&self, node: &Node, ty: TypeView) -> bool {
+        let entries = match node {
+            Node::Obj(entries) => entries,
+            Node::Scalar(_) => return self.scalars.get(node) == Scalar::True,
+            Node::Arr(_) => return false,
+        };
+        let mut own = None;
+        for (k, v) in entries {
+            let k = k.as_str();
+            if CACHE_IGNORED_KEYS.contains(&k) {
+                continue;
+            }
+            if k != "type" {
+                return false;
+            }
+            if let TypeView::Own = ty {
+                match self.scalars.type_name(v) {
+                    Some(t) => own = Some(t),
+                    None => return false,
+                }
+            }
+        }
+        let ty = match ty {
+            TypeView::Own => own,
+            TypeView::Is(t) => Some(t),
+            TypeView::Removed => None,
+        };
+        ty.is_none_or(|t| t != "unknown")
     }
 }
 
@@ -660,54 +804,10 @@ const SCHEMA_TYPES: [&str; 7] = [
     "integer", "number", "string", "boolean", "null", "array", "object",
 ];
 
-/// `t` as a `type` name: one of [`SCHEMA_TYPES`], `"unknown"` for any other
-/// string (the converter rejects it), `None` when not a string.
-fn type_name(t: &Node) -> Option<&'static str> {
-    let t = t.string()?;
-    Some(
-        SCHEMA_TYPES
-            .into_iter()
-            .find(|k| *k == t)
-            .unwrap_or("unknown"),
-    )
-}
-
-/// True when the converter answers `node` (seen with `ty`) from its
-/// built-in rules without visiting it: `true`, `{}` or `{"type": T}` for a
-/// basic type `T`, once keys its cache ignores are dropped.
-fn is_basic_schema(node: &Node, ty: TypeView) -> bool {
-    let entries = match node {
-        Node::Obj(entries) => entries,
-        Node::Scalar(_) => return node.scalar() == Some(Value::Bool(true)),
-        Node::Arr(_) => return false,
-    };
-    let mut own = None;
-    for (k, v) in entries {
-        let k = k.as_str();
-        if CACHE_IGNORED_KEYS.contains(&k) {
-            continue;
-        }
-        if k != "type" {
-            return false;
-        }
-        if let TypeView::Own = ty {
-            match type_name(v) {
-                Some(t) => own = Some(t),
-                None => return false,
-            }
-        }
-    }
-    let ty = match ty {
-        TypeView::Own => own,
-        TypeView::Is(t) => Some(t),
-        TypeView::Removed => None,
-    };
-    ty.is_none_or(|t| t != "unknown")
-}
-
 /// The schema a `$ref` points to, `None` for a ref that is not local (it
 /// does not start with `#`; the converter accepts any value there) or is
-/// `#` itself (the converter refers back to the root without visiting it).
+/// `#` itself (the converter refers back to the root without visiting it),
+/// and the work resolving it took: the ref's length plus the keys scanned.
 ///
 /// A local ref must be a plain JSON pointer: `#/` and keys joined by `/`,
 /// with no empty key and no `~` or `%`. Where it is, it is read here the way
@@ -715,12 +815,12 @@ fn is_basic_schema(node: &Node, ty: TypeView) -> bool {
 /// unescape, and walks into objects only) read it, and must reach the same
 /// schema both ways. Any other local ref is an error, so a ref cannot point
 /// somewhere other than where it seems to.
-fn local_ref_target<'a>(root: &'a Node, r: &str) -> Result<Option<&'a Node>, String> {
+fn local_ref_target<'a>(root: &'a Node, r: &str) -> Result<(Option<&'a Node>, usize), String> {
     let Some(pointer) = r.strip_prefix('#') else {
-        return Ok(None);
+        return Ok((None, 1));
     };
     if pointer.is_empty() {
-        return Ok(None);
+        return Ok((None, 1));
     }
     let unsupported = || {
         let shown: String = r.chars().take(80).collect();
@@ -733,22 +833,32 @@ fn local_ref_target<'a>(root: &'a Node, r: &str) -> Result<Option<&'a Node>, Str
     if !plain {
         return Err(unsupported());
     }
-    match (
-        rfc6901_target(root, pointer),
-        converter_target(root, pointer),
-    ) {
-        (Some(a), Some(b)) if std::ptr::eq(a, b) => Ok(Some(a)),
+    let mut scanned = r.len();
+    let rfc = rfc6901_target(root, pointer, &mut scanned);
+    let converter = converter_target(root, pointer, &mut scanned);
+    match (rfc, converter) {
+        (Some(a), Some(b)) if std::ptr::eq(a, b) => Ok((Some(a), scanned)),
         _ => Err(unsupported()),
     }
 }
 
+/// The keys [`Node::get`] scans to look one up in `node`.
+fn keys_of(node: &Node) -> usize {
+    match node {
+        Node::Obj(entries) => entries.len(),
+        _ => 1,
+    }
+}
+
 /// The node the RFC 6901 JSON pointer `pointer` (`""` or `/...`) names.
-fn rfc6901_target<'a>(root: &'a Node, pointer: &str) -> Option<&'a Node> {
+/// Adds the keys it scans to `scanned`.
+fn rfc6901_target<'a>(root: &'a Node, pointer: &str, scanned: &mut usize) -> Option<&'a Node> {
     if pointer.is_empty() {
         return Some(root);
     }
     let mut current = root;
     for token in pointer.strip_prefix('/')?.split('/') {
+        *scanned += keys_of(current);
         let token = token.replace("~1", "/").replace("~0", "~");
         current = match current {
             Node::Obj(_) => current.get(&token)?,
@@ -767,15 +877,200 @@ fn rfc6901_target<'a>(root: &'a Node, pointer: &str) -> Option<&'a Node> {
 
 /// The node the converter's `URIToRule` reaches for `#` + `pointer`: split
 /// on `/`, empty parts skipped, no unescaping, each part a key of an object.
-fn converter_target<'a>(root: &'a Node, pointer: &str) -> Option<&'a Node> {
+/// Adds the keys it scans to `scanned`.
+fn converter_target<'a>(root: &'a Node, pointer: &str, scanned: &mut usize) -> Option<&'a Node> {
     let mut current = root;
     for part in pointer.split('/').filter(|p| !p.is_empty()) {
+        *scanned += keys_of(current);
         match current {
             Node::Obj(_) => current = current.get(part)?,
             _ => return None,
         }
     }
     Some(current)
+}
+
+/// Highest [`ref_depth_bound`] accepted. A coarse backstop to
+/// [`check_converter_depth`] in case that walk ever drifts from the real
+/// converter (another version, a visitor mirrored wrongly): far below the
+/// ~2000-link depth that crashed the converter, far above realistic
+/// recursive unions.
+const MAX_REF_DEPTH_BOUND: usize = 512;
+
+/// Reject `root` when [`ref_depth_bound`] is above [`MAX_REF_DEPTH_BOUND`].
+/// Linear in the schema's size and iterative.
+fn check_ref_depth_bound(root: &Value) -> Result<(), String> {
+    if ref_depth_bound(root) > MAX_REF_DEPTH_BOUND {
+        return Err(format!(
+            "{FIELD} may nest deeper than {MAX_REF_DEPTH_BOUND} levels through $ref"
+        ));
+    }
+    Ok(())
+}
+
+/// An upper bound on how deep `root` nests with its local refs followed,
+/// whatever order a backend walks it in.
+///
+/// The graph's nodes are the root and every ref target reached from it. A
+/// node's subtree stops at any other target inside it, and has an edge to
+/// it, as it has to the target of each `$ref` in it. Each node's height is
+/// its own structural nesting (objects and arrays, the node itself
+/// included). Entering a node from another puts it at most the other's
+/// height below the other's top, so a path's depth is at most the sum of
+/// its nodes' heights. A path visits a node once (a ref back to one on the
+/// path stops), so within one strongly connected set of nodes it is at most
+/// the sum of their heights. The bound is the heaviest path through the
+/// condensed graph from the root.
+fn ref_depth_bound(root: &Value) -> usize {
+    let targets = ref_targets(root);
+    let mut ids: HashMap<*const Value, usize> = HashMap::from([(root as *const Value, 0)]);
+    let mut nodes: Vec<&Value> = vec![root];
+    let mut heights: Vec<usize> = Vec::new();
+    let mut edges: Vec<Vec<usize>> = Vec::new();
+    let mut next = 0;
+    while next < nodes.len() {
+        let node = nodes[next];
+        let mut out = Vec::new();
+        let mut height = 0;
+        let mut stack = vec![(node, 1)];
+        while let Some((v, level)) = stack.pop() {
+            let children: Box<dyn Iterator<Item = &Value>> = match v {
+                Value::Object(o) => Box::new(o.values()),
+                Value::Array(a) => Box::new(a.iter()),
+                _ => continue,
+            };
+            height = height.max(level);
+            if let Some(r) = v.get("$ref").and_then(Value::as_str) {
+                for t in backstop_targets(root, r) {
+                    out.push(node_id(t, &mut ids, &mut nodes));
+                }
+            }
+            for c in children {
+                if targets.contains(&(c as *const Value)) {
+                    out.push(node_id(c, &mut ids, &mut nodes));
+                } else {
+                    stack.push((c, level + 1));
+                }
+            }
+        }
+        heights.push(height);
+        edges.push(out);
+        next += 1;
+    }
+    heaviest_path(&heights, &edges)
+}
+
+/// The graph node for `t`, added when new.
+fn node_id<'a>(
+    t: &'a Value,
+    ids: &mut HashMap<*const Value, usize>,
+    nodes: &mut Vec<&'a Value>,
+) -> usize {
+    *ids.entry(t as *const Value).or_insert_with(|| {
+        nodes.push(t);
+        nodes.len() - 1
+    })
+}
+
+/// Every value some local `$ref` in `root` points to, by address.
+fn ref_targets(root: &Value) -> HashSet<*const Value> {
+    let mut targets = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(o) => {
+                if let Some(r) = o.get("$ref").and_then(Value::as_str) {
+                    targets.extend(backstop_targets(root, r).map(|t| t as *const Value));
+                }
+                stack.extend(o.values());
+            }
+            Value::Array(a) => stack.extend(a.iter()),
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// The heaviest path from node 0 through the graph `edges` once each strongly
+/// connected set is condensed into one node weighing its members' `weights`
+/// summed. Iterative Tarjan: it emits a set only after every set reachable
+/// from it, so each set's heaviest path is final when it is emitted.
+fn heaviest_path(weights: &[usize], edges: &[Vec<usize>]) -> usize {
+    let n = weights.len();
+    let mut index: Vec<Option<usize>> = vec![None; n];
+    let mut low = vec![0; n];
+    let mut on_stack = vec![false; n];
+    let mut set_of: Vec<Option<usize>> = vec![None; n];
+    let mut best: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut counter = 0;
+    let mut calls: Vec<(usize, usize)> = vec![(0, 0)];
+    index[0] = Some(0);
+    low[0] = 0;
+    counter += 1;
+    stack.push(0);
+    on_stack[0] = true;
+    while let Some(&mut (v, ref mut e)) = calls.last_mut() {
+        if let Some(&w) = edges[v].get(*e) {
+            *e += 1;
+            match index[w] {
+                None => {
+                    index[w] = Some(counter);
+                    low[w] = counter;
+                    counter += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    calls.push((w, 0));
+                }
+                Some(iw) if on_stack[w] => low[v] = low[v].min(iw),
+                Some(_) => {}
+            }
+            continue;
+        }
+        calls.pop();
+        if let Some(&(parent, _)) = calls.last() {
+            low[parent] = low[parent].min(low[v]);
+        }
+        if Some(low[v]) != index[v] {
+            continue;
+        }
+        let set = best.len();
+        let mut members = Vec::new();
+        while let Some(w) = stack.pop() {
+            on_stack[w] = false;
+            set_of[w] = Some(set);
+            members.push(w);
+            if w == v {
+                break;
+            }
+        }
+        let weight: usize = members.iter().map(|&m| weights[m]).sum();
+        let after = members
+            .iter()
+            .flat_map(|&m| edges[m].iter())
+            .filter_map(|&w| set_of[w].filter(|&s| s != set))
+            .map(|s| best[s])
+            .max()
+            .unwrap_or(0);
+        best.push(weight.saturating_add(after));
+    }
+    set_of[0].map_or(0, |s| best[s])
+}
+
+/// Every value the `$ref` text `r` may point to in `root`, for
+/// [`ref_depth_bound`]: read as an RFC 6901 pointer and as the converter
+/// reads it (empty parts skipped, no unescaping, objects only). Remote refs
+/// point nowhere.
+fn backstop_targets<'a>(root: &'a Value, r: &str) -> impl Iterator<Item = &'a Value> {
+    let pointer = r.strip_prefix('#');
+    let rfc = pointer.and_then(|p| root.pointer(p));
+    let converter = pointer.and_then(|p| {
+        p.split('/')
+            .filter(|k| !k.is_empty())
+            .try_fold(root, |v, k| v.as_object()?.get(k))
+    });
+    let converter = converter.filter(|c| !rfc.is_some_and(|r| std::ptr::eq(r, *c)));
+    rfc.into_iter().chain(converter)
 }
 
 /// True when objects and arrays in `v` nest more than `levels` deep, counting
@@ -880,14 +1175,6 @@ impl Node {
     fn get(&self, key: &str) -> Option<&Node> {
         match self {
             Node::Obj(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    /// The value as a string, `None` for anything else.
-    fn string(&self) -> Option<String> {
-        match self.scalar()? {
-            Value::String(s) => Some(s),
             _ => None,
         }
     }
@@ -1830,7 +2117,13 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
-        assert_eq!(result, Err(REF_DEPTH_ERR.into()));
+        // So large that the walk's budget may run out before the depth
+        // limit is reached; refused either way.
+        let complex = "response_format.json_schema.schema is too complex".to_string();
+        assert!(
+            result == Err(REF_DEPTH_ERR.into()) || result == Err(complex),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1948,6 +2241,51 @@ mod tests {
         ));
     }
 
+    /// `levels` objects, each listing `object` ten times in `type` (so the
+    /// converter visits the next level ten times per visit of this one),
+    /// with `extra` added to each, around `inner`.
+    fn revisited(levels: usize, extra: &Value, inner: Value) -> Value {
+        let mut schema = inner;
+        for _ in 0..levels {
+            let mut level = json!({"type": vec!["object"; 10], "properties": {"a": schema}});
+            for (k, v) in extra.as_object().unwrap() {
+                level[k] = v.clone();
+            }
+            schema = level;
+        }
+        schema
+    }
+
+    #[test]
+    fn a_long_ref_visited_many_times_is_resolved_once() {
+        let name = "n".repeat(20_000);
+        let r = format!("#/$defs/{name}");
+        let mut schema = revisited(5, &json!({}), json!({"$ref": r}));
+        schema["$defs"] = json!({name: {"type": "string"}});
+        assert!(schema.to_string().len() <= MAX_SCHEMA_BYTES);
+        let start = std::time::Instant::now();
+        assert!(parse_schema(schema).is_ok());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn long_scalars_visited_many_times_are_read_once() {
+        let long = "x".repeat(9_000);
+        for extra in [
+            json!({"additionalProperties": long}),
+            json!({"unevaluatedProperties": long}),
+        ] {
+            let schema = revisited(5, &extra, json!({"type": long}));
+            assert!(schema.to_string().len() <= MAX_SCHEMA_BYTES);
+            let start = std::time::Instant::now();
+            let _ = parse_schema(schema);
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "{extra:.20}"
+            );
+        }
+    }
+
     #[test]
     fn the_converter_reads_some_pointers_differently_from_rfc_6901() {
         let root = Node::parse(
@@ -1957,9 +2295,10 @@ mod tests {
         .unwrap();
         let text = |n: Option<&Node>| n.map(node_text);
         let both = |p: &str| {
+            let mut scanned = 0;
             (
-                text(rfc6901_target(&root, p)),
-                text(converter_target(&root, p)),
+                text(rfc6901_target(&root, p, &mut scanned)),
+                text(converter_target(&root, p, &mut scanned)),
             )
         };
         let s = Some(r#"{"type":"string"}"#.to_string());
@@ -2102,6 +2441,29 @@ mod tests {
         for types in [12, 16, 20, 30] {
             assert!(parse_schema(ui_tree(types)).is_ok(), "{types} types");
         }
+    }
+
+    #[test]
+    fn recursive_unions_stay_far_below_the_backstop() {
+        for types in [16, 20, 30] {
+            let bound = ref_depth_bound(&ui_tree(types));
+            eprintln!("ui tree with {types} types: backstop bound {bound}");
+            assert!(bound <= MAX_REF_DEPTH_BOUND, "{types} types: {bound}");
+        }
+    }
+
+    #[test]
+    fn the_backstop_rejects_a_long_chain_in_either_spelling() {
+        let err = Err(format!(
+            "response_format.json_schema.schema may nest deeper than {MAX_REF_DEPTH_BOUND} levels through $ref"
+        ));
+        assert_eq!(check_ref_depth_bound(&alias_chain(600)), err);
+        assert_eq!(check_ref_depth_bound(&alias_chain(400)), Ok(()));
+        // Spellings only the converter resolves count as links too.
+        let empty_segment = spelled_chain(600, |i| format!("d{i}"), |i| format!("#/$defs//d{i}"));
+        assert_eq!(check_ref_depth_bound(&empty_segment), err);
+        let tilde = spelled_chain(600, |i| format!("d~1{i}"), |i| format!("#/$defs/d~1{i}"));
+        assert_eq!(check_ref_depth_bound(&tilde), err);
     }
 
     #[test]
