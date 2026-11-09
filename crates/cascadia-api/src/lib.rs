@@ -83,6 +83,7 @@ fn move_tokens_total(stats: &ApiStats, before: u32, after: u32) {
     }
 }
 
+pub mod gguf;
 mod media;
 pub use media::{
     check_request_pixels, image_url_bytes, is_remote, source_size, FetchPolicy, MediaConfig, Remote,
@@ -281,6 +282,13 @@ pub struct AppState {
     /// guard stays honest; tools flow through GenerationTask, so the
     /// no-template refusal does not apply.
     pub engine_applies_template: bool,
+    /// The template the engine renders itself, when the API has none
+    /// (`chat_env` is `None`): sycl-llama's GGUF `tokenizer.chat_template`.
+    /// Used only to decide whether `/v1/responses` folds system turns the
+    /// template refuses (see [`fold_refused_system_turns`]); nothing is
+    /// rendered with it for the engine, so chat, the reasoning and effort
+    /// probes and the tool refusal behave as with no template.
+    pub fold_probe_env: Option<Arc<minijinja::Environment<'static>>>,
     /// The chat template distinguishes OpenAI's `reasoning_effort` words
     /// (probed at load: "low" and "medium" render differently). When true the
     /// caller's own word reaches the template; when false the GLM high/max
@@ -337,6 +345,9 @@ pub struct Config {
     pub defer_template_on_thinking: bool,
     /// See [`AppState::engine_applies_template`]. Set by the CLI for sycl-llama.
     pub engine_applies_template: bool,
+    /// The source of [`AppState::fold_probe_env`]; the CLI reads it from a
+    /// sycl-llama GGUF (see [`gguf::chat_template`]).
+    pub fold_probe_template: Option<String>,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
     /// Image input settings; `None` (the default) when the served model takes
@@ -365,6 +376,7 @@ impl Default for Config {
             chat_template: ChatTemplateConfig::default(),
             defer_template_on_thinking: false,
             engine_applies_template: false,
+            fold_probe_template: None,
             marker_dialect: None,
             media: None,
             no_media_reason: None,
@@ -709,6 +721,16 @@ pub fn make_router_with_stats(
         eos_token: Arc::from(cfg.chat_template.eos_token.clone().unwrap_or_default()),
         defer_template_on_thinking: cfg.defer_template_on_thinking,
         engine_applies_template: cfg.engine_applies_template,
+        fold_probe_env: cfg
+            .fold_probe_template
+            .as_deref()
+            .and_then(|src| match build_chat_env(src) {
+                Ok(env) => Some(Arc::new(env)),
+                Err(e) => {
+                    warn!(error = %e, "the engine's chat template failed to parse; /v1/responses will not fold system turns it refuses");
+                    None
+                }
+            }),
         effort_words: false,
         template_opens_think: false,
         marker_dialect: cfg.marker_dialect.clone(),
@@ -4166,9 +4188,13 @@ struct FoldedTurns {
 /// `rendered` is the request's own render. Where the API renders the
 /// template (`templated_here`) its rejection is read off that, so a request
 /// the template takes costs no extra render. Where the engine renders the
-/// same template from the forwarded turns instead (sycl-llama, or ov-genai
-/// thinking-on without an API render), the API probes it here, as the
-/// engine's rejection would otherwise surface as an engine error. Later
+/// template from the forwarded turns instead (sycl-llama), the API has no
+/// template to render, and probes the one the engine will use
+/// ([`AppState::fold_probe_env`], the GGUF's) here, as the engine's
+/// rejection would otherwise surface as an engine error. (ov-genai with
+/// thinking on also renders itself, but not here: the fold's only caller,
+/// `/v1/responses`, sets `api_render_on_thinking`, so with a template the API
+/// renders those requests.) Later
 /// system turns are folded first (skipped when there are none), then every
 /// one; the first fold the template renders wins. `media` (the
 /// placeholder-bearing messages, one per request message) is folded alike,
@@ -4176,11 +4202,9 @@ struct FoldedTurns {
 #[allow(clippy::too_many_arguments)]
 fn fold_refused_system_turns(
     state: &AppState,
-    env: &minijinja::Environment<'static>,
     messages: &[ChatMessage],
     media: Option<&[ChatMessage]>,
     rendered: &Result<(String, bool), PromptRenderError>,
-    must_render: bool,
     enable_thinking: bool,
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
@@ -4189,6 +4213,13 @@ fn fold_refused_system_turns(
     if !messages.iter().any(|m| m.role == "system") {
         return None;
     }
+    let templated_here =
+        state.chat_env.is_some() && (media.is_some() || !state.engine_applies_template);
+    let env = match (state.chat_env.as_deref(), state.fold_probe_env.as_deref()) {
+        (Some(env), _) => env,
+        (None, Some(env)) if state.engine_applies_template => env,
+        _ => return None,
+    };
     let probe = |messages: &[ChatMessage], media: Option<&[ChatMessage]>| {
         let text;
         let seen = match media {
@@ -4211,9 +4242,6 @@ fn fold_refused_system_turns(
             tools,
         )
     };
-    let templated_here = media.is_some()
-        || !(state.engine_applies_template
-            || (state.defer_template_on_thinking && enable_thinking && !must_render));
     let refused = if templated_here {
         matches!(rendered, Err(PromptRenderError::Rejected(_)))
     } else {
@@ -4416,24 +4444,20 @@ async fn admit_chat(
     // made the template take them.
     let mut folded: Option<Vec<ChatMessage>> = None;
     if opts.fold_refused_system_turns {
-        if let Some(env) = state.chat_env.as_deref() {
-            if let Some(f) = fold_refused_system_turns(
-                state,
-                env,
-                &req.messages,
-                media.as_ref().map(|m| &m.messages[..]),
-                &rendered,
-                must_render,
-                enable_thinking,
-                effort,
-                req.tools.as_deref(),
-            ) {
-                rendered = render(&f.messages, f.media.as_deref());
-                if let (Some(m), Some(fm)) = (media.as_mut(), f.media) {
-                    m.messages = fm;
-                }
-                folded = Some(f.messages);
+        if let Some(f) = fold_refused_system_turns(
+            state,
+            &req.messages,
+            media.as_ref().map(|m| &m.messages[..]),
+            &rendered,
+            enable_thinking,
+            effort,
+            req.tools.as_deref(),
+        ) {
+            rendered = render(&f.messages, f.media.as_deref());
+            if let (Some(m), Some(fm)) = (media.as_mut(), f.media) {
+                m.messages = fm;
             }
+            folded = Some(f.messages);
         }
     }
     let messages: &[ChatMessage] = folded.as_deref().unwrap_or(&req.messages);

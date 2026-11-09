@@ -1792,6 +1792,25 @@ fn media_engine(engine: EngineKind) -> cascadia_api::MediaEngine {
     }
 }
 
+/// The GGUF's `tokenizer.chat_template`, for the `/v1/responses` fold's
+/// probe on sycl-llama; logged either way, without the template's text.
+fn gguf_fold_probe_template(model: &std::path::Path) -> Option<String> {
+    match cascadia_api::gguf::chat_template(model) {
+        Ok(Some(t)) => {
+            info!(model = %model.display(), "GGUF carries a chat template; /v1/responses folds system turns it refuses");
+            Some(t)
+        }
+        Ok(None) => {
+            info!(model = %model.display(), "GGUF carries no chat template; /v1/responses will not fold system turns");
+            None
+        }
+        Err(e) => {
+            warn!(model = %model.display(), error = %e, "could not read the GGUF chat template; /v1/responses will not fold system turns");
+            None
+        }
+    }
+}
+
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
 /// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
 /// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
@@ -2836,6 +2855,11 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
+        // The API renders nothing with the GGUF's own template, but
+        // /v1/responses probes it to fold system turns it refuses.
+        if matches!(args.engine, EngineKind::SyclLlama) {
+            cfg.fold_probe_template = gguf_fold_probe_template(std::path::Path::new(&args.model));
+        }
         // Image input: ov-genai on a VLM-layout export (vision encoder IRs
         // present). Every other engine answers `image_url` parts with a 400.
         // The body limit grows by the image allowance; the prompt cap does not.

@@ -2785,19 +2785,70 @@ mod tests {
         .to_vec()
     }
 
+    /// sycl-llama as the CLI configures it: no chat template for the API to
+    /// render, only the GGUF's template for the fold to probe with.
+    fn sycl_llama_config(probe: &str) -> Config {
+        Config {
+            engine_applies_template: true,
+            fold_probe_template: Some(probe.into()),
+            ..Config::default()
+        }
+    }
+
     /// An engine that renders the template itself from the forwarded turns
     /// (sycl-llama) is sent the folded turns: the API never renders the
-    /// template there, so it probes it.
+    /// template there, so it probes the GGUF's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_engine_that_templates_itself_gets_the_folded_turns() {
-        let cfg = Config {
-            engine_applies_template: true,
-            ..template_config(STRICT_TEMPLATE)
-        };
+        let cfg = sycl_llama_config(STRICT_TEMPLATE);
         let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
         let (status, body) = post(app, developer_mid_history()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(forwarded(&tasks.lock()[0]), folded_turns());
+    }
+
+    /// The probe template is the fold's only: chat on sycl-llama forwards a
+    /// late system turn as it was, and a template the probe accepts leaves
+    /// a `/v1/responses` request unfolded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_probe_template_changes_nothing_else() {
+        let late = || {
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "yes"},
+                {"role": "system", "content": "late"},
+                {"role": "user", "content": "again"},
+            ])
+        };
+        let cfg = sycl_llama_config(STRICT_TEMPLATE);
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, body) = post_to(
+            app,
+            "/v1/chat/completions",
+            json!({"model": "script-model", "messages": late(),
+                "tools": [{"type": "function", "function": {"name": "f",
+                    "parameters": {"type": "object"}}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let roles: Vec<_> = forwarded(&tasks.lock()[0])
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "system", "user"]);
+
+        let cfg = sycl_llama_config(PERMISSIVE_TEMPLATE);
+        let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+        let (status, body) = post(app, developer_mid_history()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let roles: Vec<_> = forwarded(&tasks.lock()[0])
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "tool", "system", "user"]
+        );
     }
 
     /// An ov-genai-style engine with thinking on (the API renders the
