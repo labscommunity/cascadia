@@ -973,6 +973,7 @@ fn build_gen_config(
         frequency_penalty: sampling.frequency_penalty,
         presence_penalty: sampling.presence_penalty,
         seed: sampling.seed,
+        json_schema: None,
     };
     if speculative_k > 0 {
         cfg.num_assistant_tokens = speculative_k;

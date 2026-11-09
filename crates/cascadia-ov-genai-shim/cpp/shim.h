@@ -110,6 +110,18 @@ void cascadia_genconfig_set_top_k(cascadia_genconfig_t* cfg, uint32_t v);
 void cascadia_genconfig_set_frequency_penalty(cascadia_genconfig_t* cfg, float v);
 void cascadia_genconfig_set_presence_penalty(cascadia_genconfig_t* cfg, float v);
 void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v);
+/// Constrain the output to `schema` (a JSON schema document) through
+/// ov::genai::StructuredOutputConfig. Returns 0 on success, 1 on failure with
+/// the last error set; the caller must not generate with `cfg` after a failure.
+int32_t cascadia_genconfig_set_json_schema(cascadia_genconfig_t* cfg, const char* schema);
+
+/// Check that `schema` can be compiled into an output constraint for this
+/// pipeline's tokenizer, without generating. Returns 0 when it can. On 1,
+/// `*err_out` (when `err_out` is non-NULL) receives the backend's message,
+/// freed via cascadia_free_string; it stays NULL for a null argument or a
+/// failed allocation, in which case the last error carries the reason.
+int32_t cascadia_pipeline_validate_json_schema(
+    cascadia_pipeline_t* handle, const char* schema, char** err_out);
 
 // ---- Generation -----------------------------------------------------------
 
@@ -214,6 +226,10 @@ void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle);
 /// Token count via the CB pipeline's tokenizer (usage reporting).
 int32_t cascadia_cb_count_tokens(
     cascadia_cb_pipeline_t* handle, const char* text, uint32_t* out_count);
+
+/// cascadia_pipeline_validate_json_schema for a continuous-batching pipeline.
+int32_t cascadia_cb_validate_json_schema(
+    cascadia_cb_pipeline_t* handle, const char* schema, char** err_out);
 
 // ---- Tokenizer (workaround for missing C API) -----------------------------
 

@@ -135,6 +135,16 @@ mod sys {
         pub fn cascadia_genconfig_set_frequency_penalty(cfg: *mut cascadia_genconfig_t, v: f32);
         pub fn cascadia_genconfig_set_presence_penalty(cfg: *mut cascadia_genconfig_t, v: f32);
         pub fn cascadia_genconfig_set_rng_seed(cfg: *mut cascadia_genconfig_t, v: u64);
+        pub fn cascadia_genconfig_set_json_schema(
+            cfg: *mut cascadia_genconfig_t,
+            schema: *const c_char,
+        ) -> c_int;
+
+        pub fn cascadia_pipeline_validate_json_schema(
+            handle: *mut cascadia_pipeline_t,
+            schema: *const c_char,
+            err_out: *mut *mut c_char,
+        ) -> c_int;
 
         pub fn cascadia_pipeline_generate(
             handle: *mut cascadia_pipeline_t,
@@ -182,6 +192,11 @@ mod sys {
             handle: *mut cascadia_cb_pipeline_t,
             text: *const c_char,
             out_count: *mut u32,
+        ) -> c_int;
+        pub fn cascadia_cb_validate_json_schema(
+            handle: *mut cascadia_cb_pipeline_t,
+            schema: *const c_char,
+            err_out: *mut *mut c_char,
         ) -> c_int;
 
         pub fn cascadia_pipeline_get_tokenizer(
@@ -361,6 +376,8 @@ mod sys {
 /// Caller must be on the `openvino` build (native shim linked).
 #[cfg(feature = "openvino")]
 unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconfig_t> {
+    // Convert before allocating so an interior NUL cannot leak the config.
+    let schema_c = cfg.json_schema.as_deref().map(cstr).transpose()?;
     let raw_cfg = sys::cascadia_genconfig_new();
     if raw_cfg.is_null() {
         return Err(Error::Native("genconfig allocation failed".into()));
@@ -391,6 +408,14 @@ unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconf
     if let Some(seed) = cfg.seed {
         sys::cascadia_genconfig_set_rng_seed(raw_cfg, seed);
     }
+    // A schema that fails to attach must fail the request: generating without
+    // the constraint would return output the caller did not ask for.
+    if let Some(c) = &schema_c {
+        if sys::cascadia_genconfig_set_json_schema(raw_cfg, c.as_ptr()) != 0 {
+            sys::cascadia_genconfig_destroy(raw_cfg);
+            return Err(Error::Native(last_native_error()));
+        }
+    }
     Ok(raw_cfg)
 }
 
@@ -404,6 +429,81 @@ fn last_native_error() -> String {
             CStr::from_ptr(p).to_string_lossy().into_owned()
         }
     }
+}
+
+/// Turn a failed validate call's result into an error. `p` is the message the
+/// shim allocated (freed here), or null when it could not allocate one.
+///
+/// # Safety
+/// `p` must be null or a string returned by the shim's validate functions.
+#[cfg(feature = "openvino")]
+unsafe fn validate_error(p: *mut c_char) -> Error {
+    let msg = if p.is_null() {
+        last_native_error()
+    } else {
+        let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+        sys::cascadia_free_string(p);
+        s
+    };
+    Error::Native(clean_backend_message(&msg))
+}
+
+/// Longest message [`clean_backend_message`] returns, in chars.
+const CLEAN_MESSAGE_MAX_CHARS: usize = 300;
+
+/// Reduce a raw OpenVINO / grammar-backend error to the one line a client can
+/// act on: drops `Exception from <file>:<line>:` frames, a leading
+/// `[hh:mm:ss] ` timestamp and a leading `<source file>:<line>: ` prefix, then
+/// trims and caps the result at 300 chars.
+pub fn clean_backend_message(raw: &str) -> String {
+    let lines = || raw.lines().map(str::trim).filter(|l| !l.is_empty());
+    let line = lines()
+        .rev()
+        .find(|l| !l.starts_with("Exception from"))
+        .or_else(|| lines().next_back())
+        .unwrap_or("");
+
+    let mut line = line;
+    if line.starts_with('[') {
+        if let Some(end) = line.find("] ") {
+            line = &line[end + 2..];
+        }
+    }
+    if let Some(cut) = source_location_end(line) {
+        line = &line[cut..];
+    }
+    let line = line.trim();
+    match line.char_indices().nth(CLEAN_MESSAGE_MAX_CHARS) {
+        Some((idx, _)) => line[..idx].to_string(),
+        None => line.to_string(),
+    }
+}
+
+/// Byte offset just past the first `<file>.{cc,cpp,hpp,h}:<digits>: ` in
+/// `line`, or `None` when there is no such source location.
+fn source_location_end(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut best: Option<(usize, usize)> = None;
+    for ext in [".cc:", ".cpp:", ".hpp:", ".h:"] {
+        let mut from = 0;
+        while let Some(pos) = line[from..].find(ext) {
+            let start = from + pos;
+            let digits_at = start + ext.len();
+            let digits = bytes[digits_at..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            let after = digits_at + digits;
+            if digits > 0 && line[after..].starts_with(": ") {
+                if !matches!(best, Some((s, _)) if s <= start) {
+                    best = Some((start, after + 2));
+                }
+                break;
+            }
+            from = start + 1;
+        }
+    }
+    best.map(|(_, end)| end)
 }
 
 /// Was the last shim error on this thread a resource-exhaustion class error
@@ -441,6 +541,9 @@ pub struct GenConfig {
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
     pub seed: Option<u64>,
+    /// JSON schema the output must match. `None` (the default) leaves
+    /// generation unconstrained.
+    pub json_schema: Option<String>,
 }
 
 /// Optional plugin-config knob (CACHE_DIR, KV_CACHE_PRECISION, etc.).
@@ -656,6 +759,32 @@ impl LlmPipeline {
                 return None;
             }
             Some(out)
+        }
+    }
+
+    /// Check that `schema` can be turned into an output constraint for this
+    /// pipeline's tokenizer. Always `Ok` in the stub build.
+    #[cfg(not(feature = "openvino"))]
+    pub fn validate_json_schema(&self, _schema: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check that `schema` can be turned into an output constraint for this
+    /// pipeline's tokenizer, without generating anything.
+    #[cfg(feature = "openvino")]
+    pub fn validate_json_schema(&self, schema: &str) -> Result<()> {
+        let schema_c = cstr(schema)?;
+        unsafe {
+            let mut err_p: *mut c_char = ptr::null_mut();
+            let rc = sys::cascadia_pipeline_validate_json_schema(
+                self.handle,
+                schema_c.as_ptr(),
+                &mut err_p,
+            );
+            if rc != 0 {
+                return Err(validate_error(err_p));
+            }
+            Ok(())
         }
     }
 }
@@ -982,6 +1111,32 @@ impl CbPipeline {
             None
         } else {
             Some(out)
+        }
+    }
+
+    /// Check that `schema` can be turned into an output constraint for this
+    /// pipeline's tokenizer. Always `Ok` in the stub build.
+    #[cfg(not(feature = "openvino"))]
+    pub fn validate_json_schema(&self, _schema: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check that `schema` can be turned into an output constraint for this
+    /// pipeline's tokenizer, without enrolling a request.
+    #[cfg(feature = "openvino")]
+    pub fn validate_json_schema(&self, schema: &str) -> Result<()> {
+        let schema_c = cstr(schema)?;
+        unsafe {
+            let mut err_p: *mut c_char = ptr::null_mut();
+            let rc = sys::cascadia_cb_validate_json_schema(
+                self.inner.ptr,
+                schema_c.as_ptr(),
+                &mut err_p,
+            );
+            if rc != 0 {
+                return Err(validate_error(err_p));
+            }
+            Ok(())
         }
     }
 }
@@ -1974,6 +2129,46 @@ mod holdback_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_backend_message_strips_timestamp_and_source_path() {
+        let raw = "[20:35:59] C:\\Jenkins\\workspace\\private-ci\\ie\\build-windows-vs2022\\b\\tmp\\genai_cpp\\python3.10\\_deps\\xgrammar-src\\cpp\\json_schema_converter.cc:881: Check failed: (schema_obj.at(\"type\").is<std::string>()) is false: Type should be a string";
+        assert_eq!(
+            clean_backend_message(raw),
+            "Check failed: (schema_obj.at(\"type\").is<std::string>()) is false: Type should be a string"
+        );
+    }
+
+    #[test]
+    fn clean_backend_message_skips_exception_from_lines() {
+        let raw = "Exception from src/inference/src/cpp/core.cpp:120:\nException from src/x.cpp:54:\nreal reason here\n";
+        assert_eq!(clean_backend_message(raw), "real reason here");
+    }
+
+    #[test]
+    fn clean_backend_message_caps_length() {
+        let raw = "é".repeat(1000);
+        let cleaned = clean_backend_message(&raw);
+        assert!(
+            cleaned.chars().count() <= 300,
+            "got {} chars",
+            cleaned.chars().count()
+        );
+        assert!(!cleaned.is_empty());
+    }
+
+    #[test]
+    fn clean_backend_message_keeps_a_plain_message() {
+        assert_eq!(
+            clean_backend_message("  unsupported keyword  "),
+            "unsupported keyword"
+        );
+    }
+
+    #[test]
+    fn gen_config_has_no_json_schema_by_default() {
+        assert_eq!(GenConfig::default().json_schema, None);
+    }
 
     #[cfg(not(feature = "openvino"))]
     #[test]

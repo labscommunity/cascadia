@@ -45,6 +45,7 @@ fn cfg(skip_chat_template: bool) -> GenConfig {
         frequency_penalty: 0.0,
         presence_penalty: 0.0,
         seed: None,
+        json_schema: None,
     }
 }
 

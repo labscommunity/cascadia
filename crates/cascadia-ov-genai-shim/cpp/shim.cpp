@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -182,6 +183,24 @@ std::string join_port_names(const Set& names) {
         out += n;
     }
     return out;
+}
+
+// malloc'd copy of `s` for a char** out-parameter; the caller frees it with
+// cascadia_free_string. Null when the allocation fails.
+char* dup_cstr(const std::string& s) {
+    char* p = static_cast<char*>(std::malloc(s.size() + 1));
+    if (p) { std::memcpy(p, s.c_str(), s.size() + 1); }
+    return p;
+}
+
+// Builds the grammar for `schema` against `tok` without compiling it; throws
+// when the schema cannot be turned into a constraint. validate() needs a
+// non-const lvalue tokenizer, hence the by-value parameter.
+int32_t validate_with(ov::genai::Tokenizer tok, const char* schema) {
+    ov::genai::StructuredOutputConfig soc;
+    soc.json_schema = std::string(schema);
+    soc.validate(tok);
+    return 0;
 }
 
 }  // namespace
@@ -385,6 +404,39 @@ void cascadia_genconfig_set_presence_penalty(cascadia_genconfig_t* cfg, float v)
 }
 void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v) {
     if (cfg) cfg->cfg.rng_seed = static_cast<size_t>(v);
+}
+int32_t cascadia_genconfig_set_json_schema(cascadia_genconfig_t* cfg, const char* schema) {
+    if (!cfg || !schema) { set_last_error("null arg in set_json_schema"); return 1; }
+    try {
+        ov::genai::StructuredOutputConfig soc;
+        soc.json_schema = std::string(schema);
+        cfg->cfg.structured_output_config = soc;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("set_json_schema failed"); return 1;
+    }
+}
+
+int32_t cascadia_pipeline_validate_json_schema(
+    cascadia_pipeline_t* h, const char* schema, char** err_out) {
+    if (err_out) *err_out = nullptr;
+    if (!h || !schema || (!h->pipe && !h->vlm)) {
+        set_last_error("null arg in validate_json_schema"); return 1;
+    }
+    try {
+        ov::genai::Tokenizer tok = h->pipe ? h->pipe->get_tokenizer() : h->vlm->get_tokenizer();
+        return validate_with(tok, schema);
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        if (err_out) *err_out = dup_cstr(e.what());
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in validate_json_schema");
+        if (err_out) *err_out = dup_cstr("unknown error");
+        return 1;
+    }
 }
 
 int32_t cascadia_pipeline_generate(
@@ -704,6 +756,28 @@ int32_t cascadia_cb_count_tokens(
         return 1;
     } catch (...) {
         set_last_error("unknown C++ exception in cb_count_tokens");
+        return 1;
+    }
+}
+
+int32_t cascadia_cb_validate_json_schema(
+    cascadia_cb_pipeline_t* h, const char* schema, char** err_out) {
+    if (err_out) *err_out = nullptr;
+    if (!h || !schema || (!h->pipe && !h->tok)) {
+        set_last_error("null arg in cb_validate_json_schema"); return 1;
+    }
+    try {
+        // The handle already holds the pipeline's tokenizer; fall back to
+        // asking the pipeline only if it was never set.
+        ov::genai::Tokenizer tok = h->tok ? *h->tok : h->pipe->get_tokenizer();
+        return validate_with(tok, schema);
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        if (err_out) *err_out = dup_cstr(e.what());
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_validate_json_schema");
+        if (err_out) *err_out = dup_cstr("unknown error");
         return 1;
     }
 }
