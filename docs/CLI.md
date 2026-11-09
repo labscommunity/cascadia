@@ -558,7 +558,7 @@ Engines:
 
 | Engine | `json_object` / `json_schema` |
 |---|---|
-| `ov-genai` | Enforced by OpenVINO GenAI's structured output, stateful and `--cb`. Needs OpenVINO GenAI 2026.4 or newer. At startup the engine runs one short structured-output check on the loaded model; if it fails, startup continues and JSON requests get 400 `invalid configuration: structured output is not available for this model: <reason>`. |
+| `ov-genai` | Enforced by OpenVINO GenAI's structured output, stateful and `--cb`. Needs OpenVINO GenAI 2026.4 or newer. At startup the engine runs one short structured-output check on the loaded model; if it fails, startup continues and JSON requests get 400 `invalid configuration: structured output is not available for this model: <reason>`. With `--draft-model` (speculative decoding) the check is skipped and JSON requests get that 400 with `not supported with a draft model (speculative decoding); run without --draft-model for response_format`: on OpenVINO GenAI 2026.4.1 the draft's proposals break the constraint. `--prompt-lookup` is fine. |
 | `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar. |
 | `mock` | Answers with a minimal instance of the schema, best effort: not every keyword is honoured. |
 | `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe` | 400: `response_format <type> is not supported by the <engine> engine; …`. |

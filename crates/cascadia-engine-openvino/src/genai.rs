@@ -341,6 +341,7 @@ impl Builder for OvGenaiBuilder {
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
             pipe,
+            draft_model: self.draft_model_path.is_some(),
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
@@ -485,6 +486,22 @@ fn runtime_older_than_2026_4(build: &str) -> Option<bool> {
     Some((major, minor) < (2026, 4))
 }
 
+/// Why structured output cannot run on a stateful pipeline with a draft
+/// model, without trying it. On GenAI 2026.4.1 a draft model's proposals
+/// reach the grammar with token ids outside the main model's vocabulary
+/// (xgrammar logs "token id ... is out of range") and the constrained output
+/// can loop on whitespace to the token cap, while the same request without
+/// the draft passes. A probe can pass by luck, so the pairing is refused
+/// outright. Prompt lookup proposes tokens from the prompt itself and keeps
+/// the probe. `None` (run the probe) without a draft model.
+fn draft_model_gate(draft_model: bool) -> Option<String> {
+    draft_model.then(|| {
+        "not supported with a draft model (speculative decoding); \
+         run without --draft-model for response_format"
+            .to_owned()
+    })
+}
+
 /// Why structured output cannot run on the loaded GenAI runtime, without
 /// trying it: an output constraint on GenAI older than 2026.4 crashes the
 /// process. `None` (run the probe) when the version is newer or unknown.
@@ -625,6 +642,9 @@ const QUARANTINE_STRIKES: u32 = 2;
 
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
+    /// Built with a draft model (speculative decoding), as opposed to prompt
+    /// lookup, which also sets `num_assistant_tokens`.
+    draft_model: bool,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -654,10 +674,13 @@ impl Engine for OvGenaiEngine {
         }
 
         // Structured-output probe: one real generation under the probe
-        // schema, through this engine's own config (speculative decoding /
-        // prompt lookup included), so a model or pipeline that cannot run
-        // with an output constraint is found here rather than per request.
-        if let Some(reason) = version_gate(cascadia_ov_genai_shim::ov_version()) {
+        // schema, through this engine's own config (prompt lookup included),
+        // so a model or pipeline that cannot run with an output constraint
+        // is found here rather than per request. A draft model skips it: see
+        // `draft_model_gate`.
+        if let Some(reason) = draft_model_gate(self.draft_model)
+            .or_else(|| version_gate(cascadia_ov_genai_shim::ov_version()))
+        {
             self.structured_unavailable = record_probe(Some(reason));
             return;
         }
@@ -2198,6 +2221,26 @@ mod tests {
             Ok(String::new())
         });
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_draft_model_turns_structured_output_off_without_a_probe() {
+        let draft = OvGenaiBuilder::new("m", "GPU").with_draft("d", "GPU", 3);
+        let lookup = OvGenaiBuilder::new("m", "GPU").with_prompt_lookup(3);
+        let plain = OvGenaiBuilder::new("m", "GPU");
+        assert_eq!(
+            draft_model_gate(draft.draft_model_path.is_some()).as_deref(),
+            Some(
+                "not supported with a draft model (speculative decoding); \
+                 run without --draft-model for response_format"
+            )
+        );
+        assert_eq!(
+            draft_model_gate(lookup.draft_model_path.is_some()),
+            None,
+            "prompt lookup keeps the probe"
+        );
+        assert_eq!(draft_model_gate(plain.draft_model_path.is_some()), None);
     }
 
     #[test]
