@@ -217,20 +217,34 @@ compact the conversation locally (the server refuses `compaction_trigger` items)
 ## Using the mapping from another crate
 
 `cascadia_api::responses_api` exposes this mapping without the engine, for a gateway that
-serves the Responses API over its own OpenAI chat-completion backends. It parses and
-validates a request as `/v1/responses` does (`ResponsesRequest`, `refuse_unsupported`,
-`ToolMap::from_request`, `check_tool_choice`, `is_empty_conversation`), maps `input` to chat
-messages (`input_messages`, resolving `item_reference` through a closure, for example over
-the gateway's own `ItemCache`), and turns the backend's answer back into Responses output:
-`OutputBuilder` splits streamed text, with reasoning folded in as `<think>…</think>`, into
-reasoning and message items, and `OutputBuilder::push_calls` takes the backend's already
-parsed tool calls (build the builder with `tools_active: false`, so text is not scanned for
-calls). `ResponseEvents` renders the same SSE events, sequence numbers and terminal event
-as this server's stream, and returns the final items and response object; `End::from_finish_reason`
-reads the chat `finish_reason`. A `Refusal`'s `to_error_json()` is the error body the server
-sends, with `status()`. `fold_system_turns` and `folds_to_try` retry a conversation whose
-template refuses a later `system` turn. The chat types (`ChatMessage`, `Tool`, `ToolCall`,
-`FunctionCall`) are re-exported too.
+serves the Responses API over its own OpenAI chat-completion backends. `validate_and_map`
+runs every check `/v1/responses` runs, in the same order (the refused fields, `tools`,
+`tool_choice`, `input`, then an empty conversation), and returns the chat messages, the
+served tools (`tools.chat_tools`) and the checked `tool_choice`; `item_reference` items are
+resolved through a closure, for example over the gateway's own `ItemCache`. A `Refusal`
+gives the status and the error body the server sends (`status()`, `to_error_json()`).
+Replayed reasoning arrives as a `<think>…</think>` prefix of the assistant turn's content;
+`strip_replayed_reasoning` removes it for a backend that cannot take it, and
+`ChatMessage::to_openai_json` writes a message as a chat request's `messages[]` entry.
+`fold_system_turns` and `folds_to_try` retry a conversation whose template refuses a later
+`system` turn.
+
+On the way back, `OutputBuilder` splits the streamed text, with reasoning folded in as
+`<think>…</think>`, into reasoning and message items, and `OutputBuilder::push_calls` takes
+the backend's already parsed tool calls (build the builder with `tools_active: false`, so
+text is not scanned for calls; text fed after the calls is ignored). `ResponseEvents`
+renders the same SSE events, sequence numbers and terminal event as this server's stream,
+and returns the final items and response object. `End::from_finish_reason` reads the chat
+`finish_reason` (`stop`, `tool_calls`, `function_call`, `length`, `content_filter`) and
+returns `None` for anything else; a backend error goes to `ResponseEvents::finish` as
+`Some(error)`, which ends the stream with `response.failed`.
+
+The gateway decides the chat request's sampling settings itself. The server maps them so:
+`max_output_tokens` is `max_tokens` (unset: 256, the chat endpoint's default, echoed on the
+response); `temperature` unset is `0.0`; `top_p` is passed through when set (echoed as `1.0`
+when unset); `reasoning.effort` is the chat request's `reasoning_effort`. `ResponseShell`
+echoes them by these rules, so a gateway that picks other defaults should send them to its
+backends and keep the echo in mind.
 
 ```rust
 use cascadia_api::responses_api::*;
@@ -238,40 +252,43 @@ use std::sync::Arc;
 
 let req: ResponsesRequest = serde_json::from_slice(&body)?;
 let cache = ItemCache::default();
-let mapped = refuse_unsupported(&req).and_then(|encrypted| {
-    let tools = ToolMap::from_request(req.tools.as_ref())?;
-    let choice = check_tool_choice(req.tool_choice.as_ref())?;
-    let resolve = |id: &str, budget: usize| {
-        cache.get_within(id, budget).map_err(|_| Refusal::too_large("input", MAX_BYTES))
-    };
-    let messages = input_messages(&req, &resolve, MAX_BYTES)?;
-    Ok((encrypted, tools, choice, messages))
-});
-let (encrypted, tools, choice, messages) = match mapped {
+let resolve = |id: &str, budget: usize| {
+    cache.get_within(id, budget).map_err(|_| Refusal::too_large("input", MAX_BYTES))
+};
+let mapped = match validate_and_map(&req, &resolve, MAX_BYTES) {
     Ok(m) => m,
     Err(refusal) => return reply(refusal.status(), refusal.to_error_json()),
 };
-// Send `messages`, `tools.chat_tools` and `choice` to a backend, then:
-let shell = ResponseShell::new(&req, new_response_id(), &tools, choice);
+let messages: Vec<_> = mapped.messages.iter().map(ChatMessage::to_openai_json).collect();
+// Send `messages`, `mapped.tools.chat_tools` and `mapped.tool_choice` to a backend, then:
+let shell = ResponseShell::new(&req, new_response_id(), &mapped.tools, mapped.tool_choice);
 let parallel = req.parallel_tool_calls.unwrap_or(true);
-let mut builder = OutputBuilder::new(true, false, false, Arc::new(tools), parallel, encrypted);
+let mut builder =
+    OutputBuilder::new(true, false, false, Arc::new(mapped.tools), parallel, mapped.wants_encrypted);
 let mut events = ResponseEvents::new(shell);
 send(events.start());
 for delta in content_deltas {
     send(events.push(builder.feed(&delta, 1)));
 }
 send(events.push(builder.push_calls(tool_calls)));
-let end = End::from_finish_reason(&finish_reason);
+let (end, error) = match End::from_finish_reason(&finish_reason) {
+    Some(end) => (end, None),
+    None => (End::Cancelled, Some(format!("backend finished with `{finish_reason}`"))),
+};
+let failed = error.is_some();
 let (closing, items, _response) =
-    events.finish(&mut builder, end, prompt_tokens, completion_tokens, None);
-if req.store != Some(false) {
-    cache.insert_all(&items); // before the terminal event is sent
+    events.finish(&mut builder, end, prompt_tokens, completion_tokens, error);
+if !failed && req.store != Some(false) {
+    cache.insert_all(&items); // before the terminal event is sent; a failed one is not kept
 }
 send(closing);
 ```
 
-A non-streaming reply is the same flow with the frames discarded: the returned response
-object is the body. `crates/cascadia-api/tests/responses_api.rs` drives it end to end.
+For a non-streaming reply, the returned response object is the body when the backend
+finished. A backend error is different there: the server answers a non-streaming request
+whose generation failed with an HTTP 5xx error body, not a `failed` response object, so a
+gateway that matches it should do the same rather than send `finish`'s object.
+`crates/cascadia-api/tests/responses_api.rs` drives the streaming flow end to end.
 
 ## Known limitations
 

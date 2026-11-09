@@ -39,21 +39,18 @@ fn turn2_by_reference(cache: &ItemCache) -> ResponsesRequest {
 
 /// `include` asks for encrypted reasoning, the tools, the checked
 /// `tool_choice`, and the chat messages.
-type Mapped = (bool, ToolMap, Option<&'static str>, Vec<ChatMessage>);
+type MappedParts = (bool, ToolMap, Option<&'static str>, Vec<ChatMessage>);
 
 /// Validate and map `req` as `create_response` does.
-fn map(req: &ResponsesRequest, cache: &ItemCache) -> Result<Mapped, Refusal> {
-    let encrypted = refuse_unsupported(req)?;
-    let tools = ToolMap::from_request(req.tools.as_ref())?;
-    let choice = check_tool_choice(req.tool_choice.as_ref())?;
+fn map(req: &ResponsesRequest, cache: &ItemCache) -> Result<MappedParts, Refusal> {
     let resolve = |id: &str, budget: usize| {
         cache
             .get_within(id, budget)
             .map_err(|_| Refusal::too_large("input", MAX_EXPAND))
     };
-    let messages = input_messages(req, &resolve, MAX_EXPAND)?;
-    assert!(!is_empty_conversation(&messages));
-    Ok((encrypted, tools, choice, messages))
+    let m = validate_and_map(req, &resolve, MAX_EXPAND)?;
+    assert!(!is_empty_conversation(&m.messages));
+    Ok((m.wants_encrypted, m.tools, m.tool_choice, m.messages))
 }
 
 #[test]
@@ -156,7 +153,7 @@ fn a_backend_turn_renders_as_the_spec_stream() {
         },
     };
     sse.push_str(&events.push(builder.push_calls(vec![call])));
-    let end = End::from_finish_reason("tool_calls");
+    let end = End::from_finish_reason("tool_calls").unwrap();
     let (closing, items, response) = events.finish(&mut builder, end, 120, 3, None);
     sse.push_str(&closing);
     cache.insert_all(&items);
@@ -212,7 +209,7 @@ fn a_backend_turn_renders_as_the_spec_stream() {
 }
 
 /// The other ends: `length` and `content_filter` are `incomplete` naming
-/// why, an unknown reason is a cancelled turn, and a backend failure is
+/// why, a cancelled turn is `cancelled`, and a backend failure is
 /// `response.failed`, each in the spec's shape.
 #[test]
 fn every_end_renders_in_the_spec_shape() {
@@ -232,17 +229,17 @@ fn every_end_renders_in_the_spec_shape() {
         assert_spec("Response", &response);
         (ev.last().unwrap().0.clone(), response)
     };
-    let (kind, r) = render(End::from_finish_reason("length"), None);
+    let (kind, r) = render(End::from_finish_reason("length").unwrap(), None);
     assert_eq!(
         (kind.as_str(), &r["status"]),
         ("response.incomplete", &json!("incomplete"))
     );
     assert_eq!(r["incomplete_details"]["reason"], "max_output_tokens");
-    let (kind, r) = render(End::from_finish_reason("content_filter"), None);
+    let (kind, r) = render(End::from_finish_reason("content_filter").unwrap(), None);
     assert_eq!(kind, "response.incomplete");
     assert_eq!(r["incomplete_details"]["reason"], "content_filter");
     assert_eq!(r["output"][0]["status"], "incomplete");
-    let (kind, r) = render(End::from_finish_reason("abort"), None);
+    let (kind, r) = render(End::Cancelled, None);
     assert_eq!(
         (kind.as_str(), &r["status"]),
         ("response.incomplete", &json!("cancelled"))
@@ -256,19 +253,165 @@ fn every_end_renders_in_the_spec_shape() {
     assert_eq!(r["output"][0]["status"], "incomplete");
 }
 
-/// `End::from_finish_reason` over OpenAI's finish reasons.
+/// `End::from_finish_reason` over OpenAI's finish reasons; anything else
+/// (a backend's `error`, an empty reason) is no end at all.
 #[test]
 fn finish_reasons_map_to_ends() {
     for (reason, end) in [
-        ("stop", End::Completed),
-        ("tool_calls", End::Completed),
-        ("function_call", End::Completed),
-        ("length", End::TokenCap),
-        ("content_filter", End::ContentFilter),
-        ("", End::Cancelled),
+        ("stop", Some(End::Completed)),
+        ("tool_calls", Some(End::Completed)),
+        ("function_call", Some(End::Completed)),
+        ("length", Some(End::TokenCap)),
+        ("content_filter", Some(End::ContentFilter)),
+        ("error", None),
+        ("abort", None),
+        ("", None),
     ] {
         assert_eq!(End::from_finish_reason(reason), end, "{reason}");
     }
+}
+
+fn request(v: Value) -> ResponsesRequest {
+    serde_json::from_value(v).unwrap()
+}
+
+fn no_refs(_: &str, _: usize) -> Result<Option<(Value, usize)>, Refusal> {
+    Ok(None)
+}
+
+/// `validate_and_map` checks in the server's order: the refused fields,
+/// then `tools`, then `tool_choice`, then `input`, then an empty
+/// conversation.
+#[test]
+fn validate_and_map_checks_in_the_server_order() {
+    let refused = |v: Value| {
+        validate_and_map(&request(v), &no_refs, MAX_EXPAND)
+            .map(|_| ())
+            .unwrap_err()
+    };
+    let bad_tools = json!([{"type": "function"}]);
+    let r = refused(json!({"model": "m", "input": 7, "metadata": 1,
+        "tools": bad_tools, "tool_choice": "required"}));
+    assert_eq!(r.param(), "metadata");
+    let r = refused(json!({"model": "m", "input": 7, "tools": bad_tools,
+        "tool_choice": "required"}));
+    assert_eq!(r.param(), "tools[0].name");
+    let r = refused(json!({"model": "m", "input": 7, "tool_choice": "required"}));
+    assert_eq!(r.param(), "tool_choice");
+    let r = refused(json!({"model": "m", "input": 7}));
+    assert_eq!(r.param(), "input");
+    let r = refused(json!({"model": "m", "input": "  ", "instructions": ""}));
+    assert_eq!(
+        (r.param(), r.message()),
+        (
+            "input",
+            "`input` and `instructions` hold nothing to respond to"
+        )
+    );
+    let m = validate_and_map(
+        &request(json!({"model": "m", "input": "hi", "tool_choice": "none",
+            "include": ["reasoning.encrypted_content"]})),
+        &no_refs,
+        MAX_EXPAND,
+    )
+    .unwrap();
+    assert!(m.wants_encrypted);
+    assert_eq!(m.tool_choice, Some("none"));
+    assert!(m.tools.chat_tools.is_empty());
+    assert_eq!(m.messages.len(), 1);
+}
+
+/// A mapped conversation as an OpenAI chat request's `messages`.
+#[test]
+fn chat_messages_render_as_openai_json() {
+    let cache = ItemCache::default();
+    let req = turn2_by_reference(&cache);
+    let (_, _, _, messages) = map(&req, &cache).unwrap();
+    let json: Vec<Value> = messages.iter().map(ChatMessage::to_openai_json).collect();
+    // Every message reads back as itself.
+    for (m, j) in messages.iter().zip(&json) {
+        let back: ChatMessage = serde_json::from_value(j.clone()).unwrap();
+        assert_eq!(
+            (
+                &back.role,
+                &back.content,
+                &back.parts,
+                &back.tool_calls,
+                &back.tool_call_id
+            ),
+            (
+                &m.role,
+                &m.content,
+                &m.parts,
+                &m.tool_calls,
+                &m.tool_call_id
+            ),
+            "{j}"
+        );
+    }
+    // The developer turns came as part arrays, and stay parts.
+    assert_eq!(json[0]["role"], "system");
+    assert_eq!(json[0]["content"][0]["type"], "text");
+    assert!(json[0].get("tool_calls").is_none());
+    let assistant = &json[2];
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(assistant["content"], "<think>I should list.</think>");
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+    assert_eq!(assistant["tool_calls"][0]["type"], "function");
+    assert_eq!(
+        assistant["tool_calls"][0]["function"]["name"],
+        "exec_command"
+    );
+    assert!(assistant["tool_calls"][0]["function"]["arguments"].is_string());
+    assert_eq!(json[3]["role"], "tool");
+    assert_eq!(json[3]["tool_call_id"], "call_1");
+
+    // Parts render as content parts, and read back as the same parts.
+    let with_parts: ChatMessage = serde_json::from_value(json!({"role": "user", "name": "u",
+        "content": [
+            {"type": "text", "text": "what is"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA", "detail": "low"}},
+            {"type": "video_url", "video_url": {"url": ["data:image/png;base64,AA"], "fps": 2.0}},
+            {"type": "text", "text": "this"}]}))
+    .unwrap();
+    let out = with_parts.to_openai_json();
+    assert_eq!(out["name"], "u");
+    assert_eq!(out["content"][1]["image_url"]["detail"], "low");
+    let back: ChatMessage = serde_json::from_value(out).unwrap();
+    assert_eq!(back.parts, with_parts.parts);
+    assert_eq!(back.content, with_parts.content);
+}
+
+/// Stripping replayed reasoning leaves an assistant turn's answer and
+/// calls, and every other turn as it was.
+#[test]
+fn replayed_reasoning_strips_from_assistant_turns() {
+    let cache = ItemCache::default();
+    let req = turn2_by_reference(&cache);
+    let (_, _, _, messages) = map(&req, &cache).unwrap();
+    let before: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+    let stripped = strip_replayed_reasoning(messages);
+    assert_eq!(stripped[2].content, "");
+    assert_eq!(stripped[2].tool_calls.as_ref().unwrap().len(), 1);
+    for i in [0, 1, 3] {
+        assert_eq!(stripped[i].content, before[i]);
+    }
+
+    let req = request(json!({"model": "m", "input": [
+        {"type": "message", "role": "user", "content": "<think>kept</think>q"},
+        {"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "r"}]},
+        {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "a"}]},
+    ]}));
+    let messages = input_messages(&req, &no_refs, MAX_EXPAND).unwrap();
+    assert_eq!(messages[1].content, "<think>r</think>a");
+    let stripped = strip_replayed_reasoning(messages);
+    assert_eq!(stripped[0].content, "<think>kept</think>q");
+    assert_eq!(stripped[1].content, "a");
+    assert!(stripped[1]
+        .parts
+        .iter()
+        .all(|p| !matches!(p, ContentPart::Text(t) if t.contains("<think>"))));
 }
 
 /// The system-turn fold retry a gateway runs when its backend's template

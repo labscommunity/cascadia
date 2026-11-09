@@ -1,6 +1,6 @@
 //! The Responses output path: splitting a generation into reasoning and answer.
 //!
-//! [`ReasoningSplit`] is stage 1 of the output builder: with thinking on it
+//! [`ReasoningSplit`] is the output builder's first step: with thinking on it
 //! routes the text inside `<think>…</think>` to reasoning and the rest to the
 //! answer. It starts inside reasoning when the generation prompt already
 //! opened `<think>` (see [`crate::opens_think`]); otherwise it holds leading
@@ -41,7 +41,7 @@ enum State {
     Answer,
 }
 
-/// Splits generated text into reasoning and answer (spec "Output", stage 1).
+/// Splits generated text into reasoning and answer.
 #[derive(Debug)]
 pub(super) struct ReasoningSplit {
     state: State,
@@ -219,8 +219,11 @@ struct Open {
     text: String,
 }
 
-/// Turns translated engine text into Responses output items (spec
-/// "Output"): reasoning, message, then the calls.
+/// Turns generated text into Responses output items, in order: reasoning,
+/// message, then the calls. With thinking on, the text inside
+/// `<think>…</think>` is the reasoning item; with `tools_active`, calls
+/// written in the text are parsed out of it, and a backend's already parsed
+/// calls come in through [`Self::push_calls`].
 pub struct OutputBuilder {
     split: ReasoningSplit,
     thinking: bool,
@@ -234,6 +237,8 @@ pub struct OutputBuilder {
     items: Vec<Value>,
     /// Call items emitted so far.
     calls: usize,
+    /// [`Self::push_calls`] ended the text: later feeds are ignored.
+    text_ended: bool,
     open: Option<Open>,
     /// The reasoning is over (its item, if any, closed).
     reasoning_done: bool,
@@ -254,9 +259,14 @@ pub struct OutputBuilder {
 }
 
 impl OutputBuilder {
-    /// `thinking`/`opened` as [`ReasoningSplit::new`]; `tools_active` as
-    /// [`ToolMap::tools_active`]; `parallel: false` keeps the first call;
-    /// `encrypted` fills reasoning items' `encrypted_content`.
+    /// `thinking`: the request has thinking on, so text inside
+    /// `<think>…</think>` is reasoning. `opened`: the prompt already opened
+    /// `<think>`, so the text starts inside reasoning (a backend that sends
+    /// its own `<think>` passes `false`). `tools_active`: calls written in
+    /// the text are parsed ([`ToolMap::tools_active`]; `false` when the
+    /// backend returns parsed calls, see [`Self::push_calls`]). `map`: the
+    /// served tools, to name call items. `parallel: false` keeps the first
+    /// call. `encrypted` fills reasoning items' `encrypted_content`.
     pub fn new(
         thinking: bool,
         opened: bool,
@@ -275,6 +285,7 @@ impl OutputBuilder {
             encrypted,
             items: Vec::new(),
             calls: 0,
+            text_ended: false,
             open: None,
             reasoning_done: false,
             held: String::new(),
@@ -287,8 +298,14 @@ impl OutputBuilder {
         }
     }
 
-    /// One chunk of translated text and the tokens it carried.
+    /// One chunk of generated text and the tokens it carried. After
+    /// [`Self::push_calls`] the text is over, and a feed is ignored (no
+    /// events).
     pub fn feed(&mut self, text: &str, tokens: u32) -> Vec<OutputEvent> {
+        if self.text_ended {
+            tracing::debug!("responses: text after the tool calls; ignored");
+            return Vec::new();
+        }
         let segs = self.split.feed(text);
         self.count(text.len(), &segs, tokens);
         let mut ev = Vec::new();
@@ -349,13 +366,22 @@ impl OutputBuilder {
     /// each call becomes a `function_call` (or `custom_tool_call`, or a
     /// namespaced `function_call`, by the [`ToolMap`]) item as [`Self::finish`]
     /// makes a parsed call; with `parallel: false` only the first call of the
-    /// response is kept. No [`Self::feed`] may follow; [`Self::finish`] still
-    /// closes the response (and adds no item). No calls: no events.
+    /// response is kept. A [`Self::feed`] after it is ignored;
+    /// [`Self::finish`] still closes the response (and adds no item). No
+    /// calls: no events, and the text goes on.
+    ///
+    /// Debug builds panic when the builder was made with `tools_active:
+    /// true`: its text would be scanned for calls as well.
     pub fn push_calls(&mut self, calls: Vec<ToolCall>) -> Vec<OutputEvent> {
+        debug_assert!(
+            !self.tools_active,
+            "push_calls needs a builder made with tools_active: false"
+        );
         let mut ev = Vec::new();
         if calls.is_empty() {
             return ev;
         }
+        self.text_ended = true;
         let segs = self.split.finish();
         self.count(0, &segs, 0);
         self.route(segs, &mut ev);
@@ -1278,5 +1304,27 @@ mod tests {
         assert_eq!(text_of(&items[0]), "still thinking</thi");
         assert!(matches!(&ev[0], OutputEvent::ReasoningDelta { delta, .. } if delta == "</thi"));
         assert_eq!(b.reasoning_tokens(2), 2);
+    }
+
+    /// Text fed after the calls is ignored: the calls ended the text.
+    #[test]
+    fn feed_after_pushed_calls_is_ignored() {
+        let mut b = OutputBuilder::new(false, false, false, weather(), true, false);
+        b.feed("before", 1);
+        b.push_calls(vec![structured("call_1", "get_weather", "{}")]);
+        assert!(b.feed("after", 1).is_empty());
+        assert!(b.finish("completed").is_empty());
+        let items = b.items();
+        assert_eq!(kinds(&items), ["message", "function_call"]);
+        assert_eq!(text_of(&items[0]), "before");
+    }
+
+    /// Structured calls are for a builder that does not parse calls.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "tools_active")]
+    fn pushed_calls_need_inactive_tools() {
+        let mut b = with_tools(false, weather(), true);
+        b.push_calls(vec![structured("call_1", "get_weather", "{}")]);
     }
 }

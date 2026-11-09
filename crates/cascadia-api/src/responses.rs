@@ -27,7 +27,9 @@ mod input;
 mod output;
 mod store;
 mod tools;
-pub use input::{fold_system_turns, folds_to_try, input_messages, Fold, Resolve};
+pub use input::{
+    fold_system_turns, folds_to_try, input_messages, strip_replayed_reasoning, Fold, Resolve,
+};
 pub use output::{OutputBuilder, OutputEvent};
 pub use store::{ItemCache, TooLarge};
 use tools::check_include;
@@ -72,14 +74,15 @@ pub struct ResponsesRequest {
     /// Only `"none"` or `"auto"` (see [`check_tool_choice`]).
     #[serde(default)]
     pub tool_choice: Option<Value>,
-    /// Echoed back on the response object; held to OpenAI's shape (see
-    /// [`check_metadata`]).
+    /// Echoed back on the response object; held to OpenAI's limits (an
+    /// object of at most 16 string pairs; see [`refuse_unsupported`]).
     #[serde(default)]
     pub metadata: Option<Value>,
     /// See [`ToolMap::from_request`].
     #[serde(default)]
     pub tools: Option<Value>,
-    /// Checked against OpenAI's values (see [`check_include`]).
+    /// Checked against OpenAI's `include` values (see
+    /// [`refuse_unsupported`]).
     #[serde(default)]
     pub include: Option<Value>,
     /// Echoed (absent = `true`).
@@ -519,15 +522,17 @@ pub enum End {
 
 impl End {
     /// From an OpenAI chat completion's `finish_reason`: `stop`,
-    /// `tool_calls` (and the legacy `function_call`) complete, `length` is
-    /// the token cap, `content_filter` the filter; any other reason (a
-    /// backend's `abort`, say) is a cancelled, partial turn.
-    pub fn from_finish_reason(reason: &str) -> Self {
+    /// `tool_calls` and the older `function_call` complete, `length` is the
+    /// token cap, `content_filter` the filter. Any other reason (`error`, an
+    /// empty one) is `None`: no end this maps. A backend that failed goes
+    /// through [`ResponseEvents::finish`] with `Some(error)` instead, and a
+    /// turn cut short is [`End::Cancelled`].
+    pub fn from_finish_reason(reason: &str) -> Option<Self> {
         match reason {
-            "stop" | "tool_calls" | "function_call" => End::Completed,
-            "length" => End::TokenCap,
-            "content_filter" => End::ContentFilter,
-            _ => End::Cancelled,
+            "stop" | "tool_calls" | "function_call" => Some(End::Completed),
+            "length" => Some(End::TokenCap),
+            "content_filter" => Some(End::ContentFilter),
+            _ => None,
         }
     }
 
@@ -614,25 +619,62 @@ pub fn is_empty_conversation(messages: &[ChatMessage]) -> bool {
     })
 }
 
+/// A request checked and mapped onto the chat path.
+#[derive(Debug)]
+pub struct Mapped {
+    /// `include` asks for reasoning items' `encrypted_content`.
+    pub wants_encrypted: bool,
+    /// The served tools: `chat_tools` go to the chat request.
+    pub tools: ToolMap,
+    /// The checked `tool_choice`: `Some("auto")`, `Some("none")`, or `None`
+    /// when absent (which means `auto`).
+    pub tool_choice: Option<&'static str>,
+    /// `instructions` and `input` as chat messages.
+    pub messages: Vec<ChatMessage>,
+}
+
+/// Every check `/v1/responses` makes before generating, in its order:
+/// the fields it refuses ([`refuse_unsupported`]), `tools`
+/// ([`ToolMap::from_request`]), `tool_choice` ([`check_tool_choice`]),
+/// `input` ([`input_messages`], `item_reference`s looked up through
+/// `resolve` within `max_expand_bytes`), and last a conversation with
+/// nothing to respond to ([`is_empty_conversation`]), refused on `input`.
+/// The first refusal is returned.
+pub fn validate_and_map(
+    req: &ResponsesRequest,
+    resolve: &Resolve,
+    max_expand_bytes: usize,
+) -> Result<Mapped, Refusal> {
+    let wants_encrypted = refuse_unsupported(req)?;
+    let tools = ToolMap::from_request(req.tools.as_ref())?;
+    let tool_choice = check_tool_choice(req.tool_choice.as_ref())?;
+    let messages = input_messages(req, resolve, max_expand_bytes)?;
+    if is_empty_conversation(&messages) {
+        return Err(Refusal::malformed(
+            "input",
+            "`input` and `instructions` hold nothing to respond to",
+        ));
+    }
+    Ok(Mapped {
+        wants_encrypted,
+        tools,
+        tool_choice,
+        messages,
+    })
+}
+
 /// `POST /v1/responses`.
 pub(crate) async fn create_response(
     State(state): State<AppState>,
     OpenAiJson(req): OpenAiJson<ResponsesRequest>,
 ) -> Response {
-    let checked = refuse_unsupported(&req).and_then(|encrypted| {
-        let map = ToolMap::from_request(req.tools.as_ref())?;
-        let choice = check_tool_choice(req.tool_choice.as_ref())?;
-        let messages = input_messages(&req, &resolver(&state), state.max_prompt_bytes)?;
-        if is_empty_conversation(&messages) {
-            return Err(Refusal::malformed(
-                "input",
-                "`input` and `instructions` hold nothing to respond to",
-            ));
-        }
-        Ok((encrypted, map, choice, messages))
-    });
-    let (wants_encrypted, map, choice, messages) = match checked {
-        Ok(c) => c,
+    let Mapped {
+        wants_encrypted,
+        tools: map,
+        tool_choice: choice,
+        messages,
+    } = match validate_and_map(&req, &resolver(&state), state.max_prompt_bytes) {
+        Ok(m) => m,
         Err(refusal) => return refusal.into_response(),
     };
     if !map.dropped.is_empty() {
@@ -802,7 +844,7 @@ impl ResponseEvents {
         v
     }
 
-    /// Render the builder's events as Responses stream events (spec D11).
+    /// Render the builder's events as Responses stream events.
     fn render(&mut self, out: &mut String, events: Vec<OutputEvent>) {
         for e in events {
             match e {
@@ -1096,7 +1138,7 @@ mod tests {
 
     /// `input` as a string is one user message; as items, each part maps to
     /// the chat part it names, `instructions` leads as `system`, and
-    /// `developer` reads as `system` (merged into the `instructions`, D22).
+    /// `developer` reads as `system` (merged into the `instructions`).
     #[test]
     fn input_maps_onto_chat_messages() {
         let m = walk_request(json!({"model": "m", "input": "hi there"})).unwrap();
@@ -3539,6 +3581,25 @@ mod tests {
             assert_eq!(response.status(), status);
             let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
             assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json);
+        }
+    }
+
+    /// The server refuses a request with the same body `validate_and_map`
+    /// refuses it with: they are one check.
+    #[tokio::test]
+    async fn server_refusals_are_validate_and_map_refusals() {
+        for body in [
+            json!({"model": "mock-model", "input": "  "}),
+            json!({"model": "mock-model", "input": 7, "tool_choice": "required"}),
+            json!({"model": "mock-model", "input": "x", "tools": [{"type": "function"}]}),
+            json!({"model": "mock-model", "input": "x", "stop": ["a"]}),
+        ] {
+            let refusal = validate_and_map(&request(body.clone()), &|_, _| Ok(None), 1 << 20)
+                .map(|_| ())
+                .unwrap_err();
+            let (status, sent) = post_json(make_app().await, body).await;
+            assert_eq!(status, refusal.status());
+            assert_eq!(sent, refusal.to_error_json());
         }
     }
 }

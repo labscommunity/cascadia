@@ -1161,6 +1161,64 @@ impl TryFrom<RawChatMessage> for ChatMessage {
 }
 
 impl ChatMessage {
+    /// The message as an OpenAI chat request's `messages[]` entry: `role`,
+    /// `content` (the string, or the content parts when the message came
+    /// with an array; `null` for an assistant turn with only tool calls),
+    /// and `name`, `tool_calls` and `tool_call_id` when set. It reads back
+    /// as the same message.
+    pub fn to_openai_json(&self) -> serde_json::Value {
+        use serde_json::{json, Map, Value};
+        let media = |url: Value, detail: &Option<String>| {
+            let mut obj = Map::new();
+            obj.insert("url".into(), url);
+            if let Some(d) = detail {
+                obj.insert("detail".into(), json!(d));
+            }
+            obj
+        };
+        let content = if !self.parts.is_empty() {
+            Value::Array(
+                self.parts
+                    .iter()
+                    .map(|p| match p {
+                        ContentPart::Text(t) => json!({"type": "text", "text": t}),
+                        ContentPart::ImageUrl { url, detail } => {
+                            json!({"type": "image_url", "image_url": media(json!(url), detail)})
+                        }
+                        ContentPart::VideoUrl { url, detail } => {
+                            json!({"type": "video_url", "video_url": media(json!(url), detail)})
+                        }
+                        ContentPart::VideoFrames { urls, detail, fps } => {
+                            let mut obj = media(json!(urls), detail);
+                            if let Some(fps) = fps {
+                                obj.insert("fps".into(), json!(fps));
+                            }
+                            json!({"type": "video_url", "video_url": obj})
+                        }
+                    })
+                    .collect(),
+            )
+        } else if self.content.is_empty() && self.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+        {
+            Value::Null
+        } else {
+            json!(self.content)
+        };
+        let mut out = Map::new();
+        out.insert("role".into(), json!(self.role));
+        out.insert("content".into(), content);
+        if let Some(name) = &self.name {
+            out.insert("name".into(), json!(name));
+        }
+        if let Some(calls) = &self.tool_calls {
+            out.insert("tool_calls".into(), json!(calls));
+        }
+        if let Some(id) = &self.tool_call_id {
+            out.insert("tool_call_id".into(), json!(id));
+        }
+        Value::Object(out)
+    }
+
     /// The image parts, in order.
     pub fn images(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
         self.parts.iter().filter_map(|p| match p {

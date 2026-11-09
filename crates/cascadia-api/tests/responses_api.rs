@@ -86,7 +86,7 @@ fn a_gateway_maps_and_renders_a_codex_turn() {
         },
     };
     sse.push_str(&events.push(builder.push_calls(vec![call])));
-    let end = End::from_finish_reason("tool_calls");
+    let end = End::from_finish_reason("tool_calls").unwrap();
     let (closing, items, response) = events.finish(&mut builder, end, 120, 3, None);
     sse.push_str(&closing);
     cache.insert_all(&items);

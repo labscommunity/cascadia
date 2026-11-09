@@ -1,4 +1,4 @@
-//! Responses `input` items, mapped onto chat messages (D9).
+//! Responses `input` items, mapped onto chat messages.
 //!
 //! The walk keeps one pending assistant turn: held reasoning text, the
 //! assistant message's content and the tool calls after it. A Responses
@@ -7,12 +7,12 @@
 //! output, or any non-assistant message, ends the turn.
 //!
 //! Reasoning is replayed as `<think>{text}</think>` at the front of the
-//! turn's content (D8): its `content[].text`, else our own
+//! turn's content: its `content[].text`, else our own
 //! `encrypted_content` decoded, else nothing (another provider's blob or a
 //! summary-only item cannot be rendered, so it is dropped).
 //!
 //! A `system` right after a `system`, or a `user` right after a `user`, is
-//! merged into it (D22). An `item_reference` is replaced by the stored item
+//! merged into it. An `item_reference` is replaced by the stored item
 //! it names, against a byte budget for everything expanded so.
 
 use super::*;
@@ -88,7 +88,7 @@ pub type Resolve<'a> = dyn Fn(&str, usize) -> Result<Option<(Value, usize)>, Ref
 
 /// `input` as chat messages, `instructions` first as a `system` message.
 /// Each item's content parts are rewritten into the chat endpoint's part
-/// types and parsed by its own [`parse_content`], so text joining and image
+/// types and parsed by its own content parser, so text joining and image
 /// placement match `/v1/chat/completions` exactly.
 ///
 /// An `item_reference` is looked up through `resolve`, which is given what is
@@ -232,7 +232,7 @@ fn item_kind(item: &Value) -> &str {
     }
 }
 
-/// `next` merged into `into`, a message of the same role (D22): the texts
+/// `next` merged into `into`, a message of the same role: the texts
 /// joined by a blank line. When either side has `parts` (a string-form side
 /// becoming one text part), the image and part-trimming paths rebuild
 /// `content` from them, so the blank line is never a part of its own (a
@@ -270,6 +270,31 @@ fn merge(into: &mut ChatMessage, next: ChatMessage) {
     into.content.push_str(&next.content);
 }
 
+/// `messages` without the reasoning [`input_messages`] replays: the
+/// `<think>…</think>` prefix it writes at the front of an assistant turn
+/// (and of its first part, when the turn has parts), for a backend whose
+/// template cannot take replayed reasoning. Other turns, and an assistant
+/// turn without the prefix, are left as they are.
+pub fn strip_replayed_reasoning(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .map(|mut m| {
+            if m.role != "assistant" || !m.content.starts_with("<think>") {
+                return m;
+            }
+            let Some(end) = m.content.find("</think>").map(|at| at + "</think>".len()) else {
+                return m;
+            };
+            let prefix = m.content[..end].to_owned();
+            m.content.replace_range(..end, "");
+            if matches!(m.parts.first(), Some(ContentPart::Text(t)) if *t == prefix) {
+                m.parts.remove(0);
+            }
+            m
+        })
+        .collect()
+}
+
 /// Which `system` turns [`fold_system_turns`] folds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fold {
@@ -283,7 +308,7 @@ pub enum Fold {
 /// for a chat template that refuses them where they stand (the system-role
 /// polyfill of llama.cpp's minja). A folded turn's text waits (several
 /// joined by a blank line) for the next non-tool turn, and lands as a user
-/// turn just before it, merged as [`merge`] does so image parts stay in
+/// turn just before it, merged so image parts stay in
 /// place:
 /// - a user turn next: the text leads it (`[system, user]` becomes one user
 ///   turn, the system text first);
@@ -440,8 +465,8 @@ fn str_field<'a>(
 }
 
 /// A `function_call` or `custom_tool_call` item as a chat tool call: `id`
-/// = `call_id`, the name flattened as the tool was served (D2), a custom
-/// call's `input` as `{"input": …}` arguments (D3).
+/// = `call_id`, the name flattened as the tool was served, a custom
+/// call's `input` as `{"input": …}` arguments.
 fn tool_call(item: &Value, kind: &str, at: &str) -> Result<ToolCall, Refusal> {
     let call_id = str_field(item, "call_id", at, true)?;
     let name = str_field(item, "name", at, true)?;
@@ -961,7 +986,7 @@ mod tests {
     }
 
     /// (l) A `system` after a `system`, or a `user` after a `user`, merges
-    /// into it (D22); `parts` are joined with a `\n\n` text part.
+    /// into it; `parts` are joined with a `\n\n` text part.
     #[test]
     fn same_role_turns_merge() {
         let m = walk(json!([

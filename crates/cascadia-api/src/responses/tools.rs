@@ -1,17 +1,17 @@
 //! Responses `tools`, `tool_choice` and `include`, mapped onto the chat path.
 //!
-//! - `function` tools become chat tools as they are (D1).
+//! - `function` tools become chat tools as they are.
 //! - A `namespace`'s function and custom tools are served flattened as
 //!   `<namespace>__<name>`, the shape Codex names its MCP tools in; a call is
 //!   mapped back by exact lookup in [`ToolMap::by_flat`], never by splitting
-//!   the name (D2).
+//!   the name.
 //! - `custom` (freeform) tools become a function taking one string
-//!   parameter `input`; a grammar is put in the description, not enforced
-//!   (D3).
+//!   parameter `input`; a grammar is put in the description, not
+//!   enforced.
 //! - Tool types this server cannot serve (OpenAI-hosted ones such as
 //!   `web_search`, `file_search`, `mcp`, and the client-side `shell`,
 //!   `local_shell`, `apply_patch`, `tool_search` types) are dropped with one
-//!   `warn!` per request and left out of the echoed `tools` (D4).
+//!   `warn!` per request and left out of the echoed `tools`.
 
 use super::Refusal;
 use serde_json::{json, Map, Value};
@@ -22,7 +22,8 @@ use std::collections::HashMap;
 pub enum Served {
     /// A `function_call` item.
     Function,
-    /// A `custom_tool_call` item, its `input` recovered by [`custom_input`].
+    /// A `custom_tool_call` item, its `input` the call's one string
+    /// argument.
     Custom,
 }
 
@@ -286,8 +287,8 @@ impl ToolMap {
 
 /// `tool_choice`: `"auto"` and `"none"` are served (`None` when absent).
 /// Forcing a call (`"required"`, a named function or custom tool,
-/// `allowed_tools`) is refused until it is enforced (D5); a hosted tool
-/// can never be called here (D4).
+/// `allowed_tools`) is refused until it is enforced; a hosted tool
+/// can never be called here.
 pub fn check_tool_choice(choice: Option<&Value>) -> Result<Option<&'static str>, Refusal> {
     let not_enforced = |what: &str| {
         Err(Refusal::new(
@@ -340,7 +341,7 @@ const INCLUDE_VALUES: [&str; 8] = [
     "message.output_text.logprobs",
 ];
 
-/// `include`, checked against [`INCLUDE_VALUES`] (D12). `true` when it asks
+/// `include`, checked against [`INCLUDE_VALUES`]. `true` when it asks
 /// for `reasoning.encrypted_content`; the other values have nothing to add
 /// on this server.
 pub(super) fn check_include(include: Option<&Value>) -> Result<bool, Refusal> {
@@ -375,7 +376,7 @@ pub(super) fn check_include(include: Option<&Value>) -> Result<bool, Refusal> {
 }
 
 /// A `custom` tool call's `input` from the arguments the model wrote for
-/// its one-parameter function (D3): `{"input": s}` → `s`; any other single
+/// its one-parameter function: `{"input": s}` → `s`; any other single
 /// string field → that string; otherwise the arguments text as is.
 pub(super) fn custom_input(arguments: &str) -> String {
     if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(arguments) {
