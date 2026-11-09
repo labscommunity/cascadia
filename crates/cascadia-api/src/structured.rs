@@ -23,8 +23,8 @@ pub enum ResponseFormat {
     JsonObject,
     JsonSchema {
         name: Option<String>,
-        /// The schema, parsed. Its object keys are sorted, so use it for
-        /// checks only.
+        /// The schema, parsed, object keys in the client's order. Use it for
+        /// checks; the decoder gets `raw`.
         schema: Value,
         /// The schema as the client sent it, whitespace removed, with each
         /// `allOf` of plain object schemas merged into one object (the
@@ -159,9 +159,9 @@ impl SchemaCompileCheck {
 const TYPE_ERR: &str = "response_format.type must be one of text, json_object, json_schema";
 
 /// Parse the `response_format` field of a chat request from its JSON text.
-/// Absent or `null` means plain text. The text is the field exactly as the
-/// client sent it, so a schema keeps its key order (see
-/// [`ResponseFormat::JsonSchema`]).
+/// Absent or `null` means plain text. `raw` is the field exactly as the
+/// client sent it; the schema keeps the client's key order, both parsed and
+/// as text (see [`ResponseFormat::JsonSchema`]).
 pub fn parse_response_format(raw: Option<&str>) -> Result<ResponseFormat, String> {
     let Some(raw) = raw else {
         return Ok(ResponseFormat::Text);
