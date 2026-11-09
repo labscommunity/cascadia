@@ -338,6 +338,7 @@ impl Builder for OvGenaiBuilder {
                 idle_steps: 0,
                 step_failures: 0,
                 suspect_failures: 0,
+                latched_at: None,
                 structured_unavailable: None,
                 quarantined: QuarantineSet::default(),
                 strikes: StrikeSet::default(),
@@ -966,13 +967,26 @@ const MAX_IDLE_STEPS: u32 = 2048;
 /// is gone, not that one request was unlucky.
 const MAX_STEP_FAILURES: u32 = 3;
 
-/// Step failures since the last successful step, with only new
-/// schema-constrained requests in flight, that are blamed on those schemas
-/// alone. A failing schema is refused after its first or second such failure,
-/// so each one needs a new schema; past this many in a row the device itself
-/// is the likelier cause, and from this one on each failure counts toward
-/// [`MAX_STEP_FAILURES`] so a dead device still latches.
-const MAX_SUSPECT_ONLY_FAILURES: u32 = 8;
+/// Step failures since the last successful step that are blamed on new
+/// schemas alone. A step that fails with a request whose schema has not yet
+/// produced output in flight is not counted toward [`MAX_STEP_FAILURES`],
+/// whatever else shares the step, and that schema is refused after its first
+/// or second such failure, so each failure needs a new schema; past this many
+/// in a row the device itself is the likelier cause, and from this one on
+/// each failure counts so a dead device still latches.
+const MAX_SUSPECT_FAILURES: u32 = 8;
+
+/// How long a latched CB pipeline refuses new work before it admits some
+/// again to see whether it recovered. The next step's outcome decides: a
+/// success clears the latch, a failure starts the wait over.
+const LATCH_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether a CB pipeline with `step_failures` consecutive failures, the last
+/// counted one at `latched_at`, refuses new work at `now`.
+fn latch_holds(step_failures: u32, latched_at: Option<Instant>, now: Instant) -> bool {
+    step_failures >= MAX_STEP_FAILURES
+        && !matches!(latched_at, Some(at) if now.saturating_duration_since(at) >= LATCH_RETRY)
+}
 
 /// The slice of [`CbPipeline`] the continuous-batching engine actually uses.
 ///
@@ -1076,11 +1090,13 @@ pub struct OvGenaiCbEngine {
     /// Consecutive `pipe.step()` failures. Past MAX_STEP_FAILURES the pipeline
     /// is treated as unusable and `submit()` stops admitting work.
     step_failures: u32,
-    /// Step failures since the last successful step in which every
-    /// in-flight request was a new schema-constrained one. They are not
-    /// counted in `step_failures` until there are
-    /// [`MAX_SUSPECT_ONLY_FAILURES`] of them.
+    /// Step failures since the last successful step blamed on new schemas.
+    /// They are not counted in `step_failures` until there are
+    /// [`MAX_SUSPECT_FAILURES`] of them.
     suspect_failures: u32,
+    /// When the last counted step failure happened; with `step_failures` at
+    /// the limit, work is refused until [`LATCH_RETRY`] after it.
+    latched_at: Option<Instant>,
     /// Set by the warmup probe when this model cannot do structured output.
     structured_unavailable: Option<String>,
     /// Schemas that recently took a scheduler iteration down with them.
@@ -1173,11 +1189,12 @@ impl Engine for OvGenaiCbEngine {
         // this request too. Admitting it means paying add_request and a step
         // before returning the same 503, forever, with nothing distinguishing a
         // transient hiccup from a dead device. Refuse up front instead; a
-        // single successful step clears this.
-        if self.step_failures >= MAX_STEP_FAILURES {
+        // single successful step clears this. After LATCH_RETRY work is
+        // admitted again, so a pipeline that recovered is not refused forever.
+        if latch_holds(self.step_failures, self.latched_at, Instant::now()) {
             return Err(EngineError::Backend(format!(
                 "cb pipeline unusable: {} consecutive scheduler iterations failed; \
-                 restart the worker",
+                 retry later or restart the worker",
                 self.step_failures
             )));
         }
@@ -1273,11 +1290,11 @@ impl Engine for OvGenaiCbEngine {
             // Resource exhaustion and json_object (the server's own schema)
             // are never blamed on one.
             //
-            // A step with only suspects in flight is not counted toward the
-            // failure latch, so one client cannot latch the worker with bad
-            // schemas, until MAX_SUSPECT_ONLY_FAILURES of them in a row. A
-            // step that also held a request that produced output or carried
-            // no client schema counts as any other failure.
+            // A step with a suspect in flight is not counted toward the
+            // failure latch, whatever shares the step, so one client cannot
+            // latch the worker with bad schemas (batched with plain requests
+            // or not) — until MAX_SUSPECT_FAILURES of them in a row. A step
+            // with no suspect counts as any other failure.
             let resource = cascadia_ov_genai_shim::last_error_resource_exhausted();
             let mut suspects: Vec<u64> = if resource {
                 Vec::new()
@@ -1304,26 +1321,20 @@ impl Engine for OvGenaiCbEngine {
                     }
                 }
             }
-            let suspect_only = !resource
-                && self
-                    .active
-                    .iter()
-                    .all(|t| !t.produced && t.grammar_hash.is_some());
-            let excused = if suspect_only {
+            let excused = !suspects.is_empty() && {
                 self.suspect_failures += 1;
-                self.suspect_failures < MAX_SUSPECT_ONLY_FAILURES
-            } else {
-                false
+                self.suspect_failures < MAX_SUSPECT_FAILURES
             };
             if !excused {
                 self.step_failures += 1;
+                self.latched_at = Some(now);
             }
             if !suspects.is_empty() {
                 warn!(
                     schemas = suspects.len(),
                     refused,
                     counted = !excused,
-                    suspect_only_failures = self.suspect_failures,
+                    suspect_failures = self.suspect_failures,
                     "cb step failed with new schema-constrained requests in the batch; \
                      schemas blamed for it are refused for 10 minutes"
                 );
@@ -1346,6 +1357,7 @@ impl Engine for OvGenaiCbEngine {
         }
         self.step_failures = 0;
         self.suspect_failures = 0;
+        self.latched_at = None;
 
         let mut out = Vec::new();
         let mut idx = 0;
@@ -1800,6 +1812,7 @@ mod tests {
             idle_steps: 0,
             step_failures: 0,
             suspect_failures: 0,
+            latched_at: None,
             structured_unavailable: None,
             quarantined: QuarantineSet::default(),
             strikes: StrikeSet::default(),
@@ -2228,24 +2241,25 @@ mod tests {
     }
 
     #[test]
-    fn cb_step_failure_with_a_plain_task_counts_and_still_quarantines_the_schema() {
+    fn cb_bad_schema_batched_with_plain_requests_cannot_latch() {
         let st = Arc::new(Mutex::new(MockState {
             step_fails: true,
             ..Default::default()
         }));
         let mut e = mock_engine(&st);
-        e.submit(schema_task("t1", SCHEMA_A)).unwrap();
-        e.submit(task("t2", 8)).unwrap();
-        let out = e.step().unwrap();
-        assert_eq!(out.len(), 2, "every in-flight request still fails");
-        assert_eq!(e.step_failures, 1, "a plain request in the step: it counts");
-        assert_eq!(e.suspect_failures, 0);
-
-        let err = e.submit(schema_task("t3", SCHEMA_A)).unwrap_err();
-        assert!(matches!(err, EngineError::InvalidConfig(_)), "{err:?}");
-        assert!(err.to_string().contains("failed to compile"), "{err}");
-        e.submit(schema_task("t4", SCHEMA_B)).unwrap();
-        e.submit(task("t5", 8)).unwrap();
+        for i in 0..=MAX_STEP_FAILURES {
+            let schema = numbered_schema(i);
+            e.submit(schema_task(&format!("s{i}"), &schema)).unwrap();
+            e.submit(task(&format!("p{i}"), 8)).unwrap();
+            let out = e.step().unwrap();
+            assert_eq!(out.len(), 2, "every in-flight request still fails");
+            assert_eq!(e.step_failures, 0, "a new schema in the step: not counted");
+            let err = e.submit(schema_task("again", &schema)).unwrap_err();
+            assert!(matches!(err, EngineError::InvalidConfig(_)), "{err:?}");
+            assert!(err.to_string().contains("failed to compile"), "{err}");
+        }
+        e.submit(task("plain", 8)).unwrap();
+        e.submit(schema_task("other", SCHEMA_B)).unwrap();
     }
 
     #[test]
@@ -2277,7 +2291,7 @@ mod tests {
     }
 
     #[test]
-    fn cb_consecutive_failures_with_only_new_schemas_do_not_latch() {
+    fn cb_consecutive_failures_with_new_schemas_do_not_latch() {
         let st = Arc::new(Mutex::new(MockState {
             step_fails: true,
             ..Default::default()
@@ -2303,20 +2317,78 @@ mod tests {
     }
 
     #[test]
-    fn cb_suspect_only_failures_count_once_the_backstop_is_reached() {
+    fn latch_holds_until_the_retry_cooldown_passes() {
+        let now = Instant::now();
+        let ago = |d: Duration| now.checked_sub(d).unwrap();
+        assert!(!latch_holds(MAX_STEP_FAILURES - 1, None, now));
+        assert!(latch_holds(MAX_STEP_FAILURES, Some(now), now));
+        assert!(latch_holds(
+            MAX_STEP_FAILURES,
+            Some(ago(LATCH_RETRY - Duration::from_secs(1))),
+            now
+        ));
+        assert!(!latch_holds(MAX_STEP_FAILURES, Some(ago(LATCH_RETRY)), now));
+        assert!(!latch_holds(
+            MAX_STEP_FAILURES + 5,
+            Some(ago(LATCH_RETRY * 2)),
+            now
+        ));
+    }
+
+    #[test]
+    fn cb_latched_worker_retries_after_the_cooldown() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_STEP_FAILURES {
+            e.submit(task(&format!("t{i}"), 8)).unwrap();
+            let _ = e.step().unwrap();
+        }
+        let err = e.submit(task("early", 8)).expect_err("latched");
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+
+        // The cooldown passes: work is admitted again, and a failure re-arms it.
+        let past = || Instant::now().checked_sub(LATCH_RETRY).unwrap();
+        e.latched_at = Some(past());
+        e.submit(task("retry1", 8)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, MAX_STEP_FAILURES + 1);
+        assert!(matches!(
+            e.submit(task("rearmed", 8)),
+            Err(EngineError::Backend(_))
+        ));
+
+        // A success after the next admission clears the latch.
+        e.latched_at = Some(past());
+        e.submit(task("retry2", 8)).unwrap();
+        st.lock().unwrap().step_fails = false;
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 0);
+        assert!(e.latched_at.is_none());
+        st.lock().unwrap().step_fails = true;
+        e.submit(task("after", 8)).unwrap();
+        let _ = e.step().unwrap();
+        e.submit(task("still open", 8)).unwrap();
+    }
+
+    #[test]
+    fn cb_suspect_failures_count_once_the_backstop_is_reached() {
         let st = Arc::new(Mutex::new(MockState {
             step_fails: true,
             ..Default::default()
         }));
         let mut e = mock_engine(&st);
-        for i in 0..MAX_SUSPECT_ONLY_FAILURES {
+        for i in 0..MAX_SUSPECT_FAILURES {
             e.submit(schema_task(&format!("t{i}"), &numbered_schema(i)))
                 .unwrap();
             let _ = e.step().unwrap();
-            let want = u32::from(i + 1 >= MAX_SUSPECT_ONLY_FAILURES);
+            let want = u32::from(i + 1 >= MAX_SUSPECT_FAILURES);
             assert_eq!(e.step_failures, want, "failure {}", i + 1);
         }
-        assert_eq!(e.suspect_failures, MAX_SUSPECT_ONLY_FAILURES);
+        assert_eq!(e.suspect_failures, MAX_SUSPECT_FAILURES);
 
         // A successful step resets both counters.
         st.lock().unwrap().step_fails = false;
