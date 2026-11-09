@@ -634,9 +634,11 @@ the 400s below and `engine_error` for anything else):
 
 On `ov-genai --cb`, a schema whose compile fails while a batch runs fails that
 batch step. Every request in a failed step gets 503 (on a stream, the error
-event): a request whose own schema is blamed for the failure (below) gets
-`cb step failed: <backend reason>`, every other request `cb step failed: the
-batch this request ran in failed; retry the request`. When the failed step held exactly one new schema-constrained
+event). When the step held one new schema (below), its requests get
+`cb step failed: <backend reason>`. When it held several, their requests get
+`cb step failed: a schema in this batch may have caused it; retry the
+request`, since the reason may come from any of them. Every other request gets
+`cb step failed: the batch this request ran in failed; retry the request`. When the failed step held exactly one new schema-constrained
 request (or several with the same schema), that schema is then refused for 10
 minutes with `invalid configuration: response_format json_schema: this schema
 failed to compile on this server; retry later or change the schema`. When it

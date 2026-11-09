@@ -457,8 +457,14 @@ fn client_message(err: OvError, what: &str) -> String {
 const CB_BATCH_FAILED: &str =
     "cb step failed: the batch this request ran in failed; retry the request";
 
-/// What a client of a failed CB step whose own schema is blamed for it is
-/// told: the backend's raw text (logged in full by the caller) can carry
+/// What a client of a failed CB step is told when its schema is one of
+/// several that may have caused it: the backend's reason may come from
+/// another of them, so it is not passed on.
+const CB_BATCH_SCHEMA_SUSPECT: &str =
+    "cb step failed: a schema in this batch may have caused it; retry the request";
+
+/// What the client of a failed CB step whose schema is the one blamed for
+/// it is told: the backend's raw text (logged in full by the caller) can carry
 /// build paths, so it is reduced by [`clean_backend_message`].
 fn step_failure_message(err: &OvError) -> String {
     let detail = match err {
@@ -1443,17 +1449,19 @@ impl Engine for OvGenaiCbEngine {
                     self.latched_at = Some(Instant::now());
                 }
             }
-            // Only a client whose own schema is blamed sees the backend's
-            // reason (cleaned); everyone else gets a fixed text, since that
-            // reason can name another client's schema.
+            // Only the client(s) of the one schema blamed for the step see
+            // the backend's reason (cleaned). With several suspects the
+            // reason may come from any of them, and anyone else's request
+            // did not cause it, so they get a fixed text: the reason can
+            // name another client's schema.
             let failed: Vec<(TaskId, Chunk)> = drained
                 .into_iter()
                 .map(|t| {
-                    let blamed = excused && t.grammar_hash.is_some_and(|h| suspects.contains(&h));
-                    let msg = if blamed {
-                        step_failure_message(&err)
-                    } else {
-                        CB_BATCH_FAILED.to_string()
+                    let suspect = excused && t.grammar_hash.is_some_and(|h| suspects.contains(&h));
+                    let msg = match (suspect, suspects.len()) {
+                        (true, 1) => step_failure_message(&err),
+                        (true, _) => CB_BATCH_SCHEMA_SUSPECT.to_string(),
+                        (false, _) => CB_BATCH_FAILED.to_string(),
                     };
                     (t.task_id.clone(), Chunk::error(t.task_id, msg))
                 })
@@ -3304,7 +3312,7 @@ mod tests {
     }
 
     #[test]
-    fn cb_struck_schemas_see_the_backend_reason() {
+    fn cb_two_suspects_do_not_see_the_backend_reason() {
         let st = Arc::new(Mutex::new(MockState {
             step_fails: true,
             step_err: Some(RAW_STEP_ERR.into()),
@@ -3316,13 +3324,16 @@ mod tests {
         e.submit(task("plain", 8)).unwrap();
         let errors = errors_by_task(&e.step().unwrap());
         assert_eq!(e.strikes.len(), 2);
+        // Either schema may have failed the step, so neither client is
+        // shown the backend's reason: it may come from the other's schema.
         for id in ["a", "b"] {
-            assert_eq!(
-                errors[id],
-                "cb step failed: bad grammar near {\"secret\":1}"
-            );
+            assert_eq!(errors[id], CB_BATCH_SCHEMA_SUSPECT, "{id}");
         }
         assert_eq!(errors["plain"], CB_BATCH_FAILED);
+        assert!(
+            errors.values().all(|m| !m.contains("grammar")),
+            "{errors:?}"
+        );
     }
 
     #[test]
