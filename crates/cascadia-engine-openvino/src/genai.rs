@@ -458,14 +458,16 @@ const CB_BATCH_FAILED: &str =
     "cb step failed: the batch this request ran in failed; retry the request";
 
 /// What a client of a failed CB step is told when its schema is one of
-/// several that may have caused it: the backend's reason may come from
-/// another of them, so it is not passed on.
+/// several that may have caused it (the backend's reason may come from
+/// another of them, so it is not passed on), or is the one suspect but the
+/// reason does not read as a grammar error.
 const CB_BATCH_SCHEMA_SUSPECT: &str =
     "cb step failed: a schema in this batch may have caused it; retry the request";
 
 /// What the client of a failed CB step whose schema is the one blamed for
-/// it is told: the backend's raw text (logged in full by the caller) can carry
-/// build paths, so it is reduced by [`clean_backend_message`].
+/// it is told when the reason reads as a grammar error: the backend's raw
+/// text (logged in full by the caller) can carry build paths, so it is
+/// reduced by [`clean_backend_message`].
 fn step_failure_message(err: &OvError) -> String {
     let detail = match err {
         OvError::Native(m) => clean_backend_message(m),
@@ -1450,16 +1452,20 @@ impl Engine for OvGenaiCbEngine {
                 }
             }
             // Only the client(s) of the one schema blamed for the step see
-            // the backend's reason (cleaned). With several suspects the
-            // reason may come from any of them, and anyone else's request
-            // did not cause it, so they get a fixed text: the reason can
-            // name another client's schema.
+            // the backend's reason (cleaned), and only when it reads as a
+            // grammar or schema error: any other reason (a device error) is
+            // not about their schema. With several suspects the reason may
+            // come from any of them, and anyone else's request did not cause
+            // it, so they get a fixed text: the reason can name another
+            // client's schema.
+            let grammar_error =
+                matches!(&err, OvError::Native(raw) if looks_like_grammar_error(raw));
             let failed: Vec<(TaskId, Chunk)> = drained
                 .into_iter()
                 .map(|t| {
                     let suspect = excused && t.grammar_hash.is_some_and(|h| suspects.contains(&h));
                     let msg = match (suspect, suspects.len()) {
-                        (true, 1) => step_failure_message(&err),
+                        (true, 1) if grammar_error => step_failure_message(&err),
                         (true, _) => CB_BATCH_SCHEMA_SUSPECT.to_string(),
                         (false, _) => CB_BATCH_FAILED.to_string(),
                     };
@@ -3308,6 +3314,27 @@ mod tests {
         for id in ["other", "plain", "json"] {
             assert_eq!(errors[id], CB_BATCH_FAILED, "{id}");
         }
+        assert_eq!(e.quarantined.len(), 1, "the suspect's schema was blamed");
+    }
+
+    #[test]
+    fn cb_the_blamed_schema_sees_the_reason_only_for_a_grammar_error() {
+        // A device error in the step that compiled the suspect's schema is
+        // not about that schema: its client gets the suspect text, not the
+        // backend's reason.
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            step_err: Some(
+                "Exception from src/plugin.cpp:7:\n/build/gpu/queue.cpp:3: device lost\n".into(),
+            ),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("suspect", SCHEMA_A)).unwrap();
+        e.submit(task("plain", 8)).unwrap();
+        let errors = errors_by_task(&e.step().unwrap());
+        assert_eq!(errors["suspect"], CB_BATCH_SCHEMA_SUSPECT);
+        assert_eq!(errors["plain"], CB_BATCH_FAILED);
         assert_eq!(e.quarantined.len(), 1, "the suspect's schema was blamed");
     }
 
