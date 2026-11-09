@@ -2833,7 +2833,12 @@ impl SparseMoEEngine {
                             send_capture(downstream, epoch, &captured, tenant)
                                 .await
                                 .map_err(|e| format!("send_capture: {e}"))?;
-                            match recv_kind_client(downstream).await {
+                            match crate::dist::recv_kind_client_noting(
+                                downstream,
+                                Some(&self.stage_masks.latch),
+                            )
+                            .await
+                            {
                                 Ok(Some(FrameKind::CaptureAck)) => {
                                     recv_capture_ack_body_client(downstream)
                                         .await
@@ -3416,7 +3421,12 @@ impl SparseMoEEngine {
             // same late-pairing hazard) — a parked bridge leg never errors
             // this recv on its own; see `decode_reply_deadline`.
             match tokio::time::timeout(decode_reply_deadline(), async {
-                match recv_kind_client(downstream).await {
+                match crate::dist::recv_kind_client_noting(
+                    downstream,
+                    Some(&self.stage_masks.latch),
+                )
+                .await
+                {
                     Ok(Some(FrameKind::TokenBatch)) => {
                         let tokens = recv_token_batch_body_client(downstream)
                             .await
@@ -3570,7 +3580,7 @@ impl SparseMoEEngine {
                     send_capture(down, epoch, tokens, tenant)
                         .await
                         .map_err(|e| format!("send_capture: {e}"))?;
-                    match recv_kind_client(down).await {
+                    match crate::dist::recv_kind_client_noting(down, Some(&self.mid_late)).await {
                         Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
                             .await
                             .map(|_| ())
@@ -3647,7 +3657,7 @@ impl SparseMoEEngine {
             }
             // Bounded + close-on-timeout: RESTORE runs at admission, so an unbounded wait
             // here stalls every warm-hit request behind a silent downstream.
-            recv_restore_verdict(&down).await
+            recv_restore_verdict(&down, Some(&self.stage_masks.latch)).await
         });
         match verdict {
             Ok(v) => v,
@@ -3941,7 +3951,7 @@ impl SparseMoEEngine {
                         send_restore(down, epoch)
                             .await
                             .map_err(|e| format!("send_restore: {e}"))?;
-                        recv_restore_verdict(down).await
+                        recv_restore_verdict(down, Some(&self.mid_late)).await
                     })
                     .unwrap_or_else(|e| {
                         warn!(
@@ -4010,7 +4020,7 @@ impl SparseMoEEngine {
                         send_restore(down, epoch)
                             .await
                             .map_err(|e| format!("send_restore: {e}"))?;
-                        recv_restore_verdict(down).await
+                        recv_restore_verdict(down, Some(&self.mid_late)).await
                     })
                     .unwrap_or_else(|e| {
                         // Verdict-0 cold fallback is the designed outcome, but the
@@ -4142,18 +4152,19 @@ impl SparseMoEEngine {
                 )
                 .await
                 .map_err(|e| format!("send_forward_batch: {e}"))?;
-                let tokens = match recv_kind_client(&down).await {
-                    Ok(Some(FrameKind::TokenBatch)) => recv_token_batch_body_client(&down)
-                        .await
-                        .map_err(|e| format!("recv_token_batch: {e}"))?,
-                    Ok(Some(other)) => {
-                        return Err(format!(
-                            "unexpected mid-rank frame after ForwardBatch: {other:?}"
-                        ));
-                    }
-                    Ok(None) => return Err("downstream closed mid-batch".into()),
-                    Err(e) => return Err(format!("recv_kind (batch): {e}")),
-                };
+                let tokens =
+                    match crate::dist::recv_kind_client_noting(&down, Some(&self.mid_late)).await {
+                        Ok(Some(FrameKind::TokenBatch)) => recv_token_batch_body_client(&down)
+                            .await
+                            .map_err(|e| format!("recv_token_batch: {e}"))?,
+                        Ok(Some(other)) => {
+                            return Err(format!(
+                                "unexpected mid-rank frame after ForwardBatch: {other:?}"
+                            ));
+                        }
+                        Ok(None) => return Err("downstream closed mid-batch".into()),
+                        Err(e) => return Err(format!("recv_kind (batch): {e}")),
+                    };
                 send_token_batch_upstream(upstream, &tokens)
                     .await
                     .map_err(|e| format!("send_token_batch (relay): {e}"))
@@ -4991,7 +5002,12 @@ impl OvMoeEngine {
                                 send_capture(&a.downstream, epoch, &captured, &a.tenant)
                                     .await
                                     .map_err(|e| format!("send_capture: {e}"))?;
-                                match recv_kind_client(&a.downstream).await {
+                                match crate::dist::recv_kind_client_noting(
+                                    &a.downstream,
+                                    Some(&self.stage_masks.latch),
+                                )
+                                .await
+                                {
                                     Ok(Some(FrameKind::CaptureAck)) => {
                                         recv_capture_ack_body_client(&a.downstream)
                                             .await
@@ -5165,7 +5181,7 @@ impl OvMoeEngine {
             }
             // Bounded + close-on-timeout: RESTORE runs at admission, so an unbounded wait
             // here stalls every warm-hit request behind a silent downstream.
-            recv_restore_verdict(&down).await
+            recv_restore_verdict(&down, Some(&self.stage_masks.latch)).await
         });
         match verdict {
             Ok(v) => v,
@@ -5206,7 +5222,7 @@ impl OvMoeEngine {
                     send_capture(down, epoch, &tokens, &tenant)
                         .await
                         .map_err(|e| format!("send_capture: {e}"))?;
-                    match recv_kind_client(down).await {
+                    match crate::dist::recv_kind_client_noting(down, Some(&self.mid_late)).await {
                         Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
                             .await
                             .map(|_| ())
@@ -5273,7 +5289,7 @@ impl OvMoeEngine {
                 send_restore(down, epoch)
                     .await
                     .map_err(|e| format!("send_restore: {e}"))?;
-                recv_restore_verdict(down).await
+                recv_restore_verdict(down, Some(&self.mid_late)).await
             })
             .unwrap_or_else(|e| {
                 warn!(
@@ -5327,7 +5343,7 @@ impl OvMoeEngine {
                 send_restore(down, epoch)
                     .await
                     .map_err(|e| format!("send_restore: {e}"))?;
-                recv_restore_verdict(down).await
+                recv_restore_verdict(down, Some(&self.mid_late)).await
             })
             .unwrap_or_else(|e| {
                 warn!(

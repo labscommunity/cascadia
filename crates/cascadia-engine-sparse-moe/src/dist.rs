@@ -263,15 +263,28 @@ pub async fn recv_kind_server(srv: &Mutex<ActivationServer>) -> TransportResult<
 /// `StreamTokensAck`): a masked step that timed out keeps its socket, and
 /// its reply may land in front of any later exchange (token waits, KV
 /// capture/restore acks, batched replies). The waits that own such replies
-/// use [`recv_kind_client_raw`].
+/// use [`recv_kind_client_raw`]. A stage that keeps a [`MaskLatch`] uses
+/// [`recv_kind_client_noting`], so a dropped acknowledged reply is noted.
 pub async fn recv_kind_client(cli: &Mutex<ActivationClient>) -> TransportResult<Option<FrameKind>> {
+    recv_kind_client_noting(cli, None).await
+}
+
+/// [`recv_kind_client`], noting each late acknowledged reply it drops in
+/// `latch` (see [`note_stale_ack`]): rank 0's latch clears, a middle stage
+/// owes the news upstream.
+pub async fn recv_kind_client_noting(
+    cli: &Mutex<ActivationClient>,
+    latch: Option<&MaskLatch>,
+) -> TransportResult<Option<FrameKind>> {
     loop {
         match recv_kind_client_raw(cli).await? {
             Some(FrameKind::TokenAck) => {
-                recv_token_ack_body_client(cli).await?;
+                let (_, _, status) = recv_token_ack_body_client(cli).await?;
+                note_stale_ack(latch, status);
             }
             Some(FrameKind::StreamTokensAck) => {
-                recv_stream_tokens_ack_body_client(cli).await?;
+                let (_, status, _) = recv_stream_tokens_ack_body_client(cli).await?;
+                note_stale_ack(latch, status);
             }
             other => return Ok(other),
         }
@@ -1054,10 +1067,15 @@ pub const RESTORE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// Await the RestoreAck verdict for a RESTORE/RESTORE_CARRY just sent on `down`, bounded by
 /// [`RESTORE_ACK_TIMEOUT`]. On timeout the connection is dropped — same hazard
 /// [`recv_token_reply`] documents: the late ack (13 raw bytes, no sequence number) would otherwise
-/// be read as the next exchange's reply on a reused connection.
-pub async fn recv_restore_verdict(down: &Mutex<ActivationClient>) -> Result<bool, String> {
+/// be read as the next exchange's reply on a reused connection. A late
+/// acknowledged reply read on the way is noted in `latch` (rank 0's latch
+/// or a middle's owed record; see [`recv_kind_client_noting`]).
+pub async fn recv_restore_verdict(
+    down: &Mutex<ActivationClient>,
+    latch: Option<&MaskLatch>,
+) -> Result<bool, String> {
     match tokio::time::timeout(RESTORE_ACK_TIMEOUT, async {
-        match recv_kind_client(down).await {
+        match recv_kind_client_noting(down, latch).await {
             Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
                 .await
                 .map(|(_, v)| v == 1)
@@ -3925,7 +3943,7 @@ mod mask_wire_tests {
         let (srv, cli) = pair().await;
         send_token_ack_upstream(&srv, 3, 1, MASK_ACK).await.unwrap();
         send_restore_ack_upstream(&srv, 9, 1).await.unwrap();
-        assert_eq!(recv_restore_verdict(&cli).await, Ok(true));
+        assert_eq!(recv_restore_verdict(&cli, None).await, Ok(true));
         send_stream_tokens_ack_upstream(&srv, 2, MASK_ACK, &[(0, 4)])
             .await
             .unwrap();
@@ -3950,6 +3968,44 @@ mod mask_wire_tests {
         );
         send_token_upstream(&srv, 42).await.unwrap();
         assert_eq!(recv_token_reply(&cli, SHORT).await, Ok(42));
+    }
+
+    /// A late acknowledged reply read in front of a control exchange (a KV
+    /// restore verdict, a capture ack) is noted like one read by a token
+    /// wait: rank 0's latch clears, and a middle owes it upstream.
+    #[tokio::test]
+    async fn a_late_ack_before_a_control_reply_clears_the_latch_and_is_owed() {
+        let (srv, cli) = pair().await;
+        let latch = MaskLatch::default();
+        latch.set();
+        send_token_ack_upstream(&srv, 3, 1, MASK_ACK).await.unwrap();
+        send_restore_ack_upstream(&srv, 9, 1).await.unwrap();
+        assert_eq!(recv_restore_verdict(&cli, Some(&latch)).await, Ok(true));
+        assert!(!latch.is_set(), "rank 0: latch cleared");
+        assert!(latch.take_owed(), "a middle: owed upstream");
+
+        latch.set();
+        send_stream_tokens_ack_upstream(&srv, 2, MASK_ACK, &[(0, 4)])
+            .await
+            .unwrap();
+        send_capture_ack_upstream(&srv, 77).await.unwrap();
+        assert_eq!(
+            recv_kind_client_noting(&cli, Some(&latch)).await.unwrap(),
+            Some(FrameKind::CaptureAck)
+        );
+        assert_eq!(recv_capture_ack_body_client(&cli).await.unwrap(), 77);
+        assert!(!latch.is_set());
+        assert!(latch.take_owed());
+
+        // An unconfirmed late reply proves nothing.
+        latch.set();
+        send_token_ack_upstream(&srv, -1, 4, MASK_UNCONFIRMED)
+            .await
+            .unwrap();
+        send_restore_ack_upstream(&srv, 9, 0).await.unwrap();
+        assert_eq!(recv_restore_verdict(&cli, Some(&latch)).await, Ok(false));
+        assert!(latch.is_set());
+        assert!(!latch.take_owed());
     }
 
     /// A middle that drops a slow tail's late acknowledged reply passes it on
