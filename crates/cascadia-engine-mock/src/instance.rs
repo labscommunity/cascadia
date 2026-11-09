@@ -122,7 +122,12 @@ impl<'a> Generator<'a> {
         let names = required.into_iter().flatten().filter_map(Value::as_str);
         let mut out = Map::new();
         for name in names {
-            self.spend(name.len())?;
+            // Every entry costs at least one unit, so a long `required` of
+            // empty or repeated names is not free.
+            self.spend(1 + name.len())?;
+            if out.contains_key(name) {
+                continue;
+            }
             let value = match props.and_then(|p| p.get(name)) {
                 Some(s) => self.instance(s, depth + 1)?,
                 None => Value::Object(Map::new()),
@@ -540,6 +545,38 @@ mod tests {
             took < Duration::from_millis(250),
             "merged allOf members are charged to the budget: {took:?}"
         );
+    }
+
+    #[test]
+    fn empty_required_names_are_charged_to_the_budget() {
+        let mut required = vec![json!("x"), json!("y")];
+        required.extend(std::iter::repeat_n(json!(""), 21_000));
+        let s = json!({
+            "$defs": {"N": {
+                "type": "object",
+                "properties": {"x": {"$ref": "#/$defs/N"}, "y": {"$ref": "#/$defs/N"}},
+                "required": required,
+            }},
+            "$ref": "#/$defs/N"
+        });
+        let start = Instant::now();
+        let v = minimal_instance(&s);
+        let took = start.elapsed();
+        assert_eq!(v, json!({}), "the budget runs out");
+        assert!(
+            took < Duration::from_millis(250),
+            "every required name costs budget: {took:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_required_names_are_emitted_once() {
+        let s = json!({
+            "type": "object",
+            "properties": {"a": {"type": "string", "minLength": 2}},
+            "required": ["a", "a", "a"],
+        });
+        assert_eq!(minimal_instance(&s), json!({"a": "aa"}));
     }
 
     #[test]
