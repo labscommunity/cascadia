@@ -45,9 +45,11 @@ R=$(post /v1/chat/completions '{"model":"m","messages":[{"role":"user","content"
 R=$(post /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":"a b"}],"max_tokens":4,"user":"u","safety_identifier":"s","prompt_cache_key":"k","prompt_cache_retention":"24h","metadata":{"k":"v"},"store":true,"service_tier":"auto","verbosity":"low","prediction":{"type":"content","content":"x"},"stream_options":{"include_obfuscation":false}}')
 [ "$(jq -r '.object' <<<"$R")" = chat.completion ] && verdict "harmless fields incl. store: true -> 200" ok || verdict "harmless fields" bad "$R"
 
-R=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$(words 400)\"}]}")
-[ "$(jq -r '.usage.completion_tokens' <<<"$R")" = 300 ] && [ "$(jq -r '.choices[0].finish_reason' <<<"$R")" = length ] \
-  && verdict "no limit: a 400-word answer runs past 256 to the 300-token window (length)" ok || verdict "no limit runs to the window" bad "$(jq -c '.usage,.choices[0].finish_reason' <<<"$R")"
+# The mock reports its prompt's words as prompt_tokens and echoes them: a 200-word prompt would
+# answer 200 tokens, but the prompt plus the answer reach the 300-token window after 100.
+R=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$(words 200)\"}]}")
+[ "$(jq -r '.usage.prompt_tokens + .usage.completion_tokens' <<<"$R")" = 300 ] && [ "$(jq -r '.usage.total_tokens' <<<"$R")" = 300 ] && [ "$(jq -r '.choices[0].finish_reason' <<<"$R")" = length ] \
+  && verdict "no limit: the answer runs until prompt + answer fill the 300-token window (length)" ok || verdict "no limit ends at the window" bad "$(jq -c '.usage,.choices[0].finish_reason' <<<"$R")"
 
 R=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$(words 50)\"}],\"max_tokens\":100000}")
 [ "$(jq -r '.usage.completion_tokens' <<<"$R")" = 50 ] && verdict "explicit max_tokens 100000 accepted (clamped to the window)" ok || verdict "explicit large limit" bad "$R"
@@ -69,10 +71,13 @@ U=$(grep '^data: {' <<<"$R" | sed 's/^data: //' | jq -c 'select(.usage != null) 
 { grep -q 'data: \[DONE\]' <<<"$R" && [ "$(jq -r '.prompt_tokens' <<<"$U")" -gt 0 ] && ! grep -q 'STOP' <<<"$R"; } \
   && verdict "streamed stop: no stop text sent, usage prompt_tokens > 0, [DONE]" ok || verdict "early stop (stream)" bad "$R"
 
-R=$(post /v1/completions "{\"model\":\"m\",\"prompt\":\"$(words 400)\"}")
-[ "$(jq -r '.usage.completion_tokens' <<<"$R")" = 300 ] && verdict "/v1/completions: same default (window 300)" ok || verdict "/v1/completions default" bad "$(jq -c .usage <<<"$R")"
+R=$(post /v1/completions "{\"model\":\"m\",\"prompt\":\"$(words 200)\"}")
+[ "$(jq -r '.usage.prompt_tokens + .usage.completion_tokens' <<<"$R")" = 300 ] && [ "$(jq -r '.choices[0].finish_reason' <<<"$R")" = length ] \
+  && verdict "/v1/completions: same default, ends when prompt + answer fill the window (length)" ok || verdict "/v1/completions default" bad "$(jq -c '.usage,.choices[0].finish_reason' <<<"$R")"
 stop
 
+# A 1000-token window here, so a 400-word prompt plus a 256-token answer fit and the 256 cap shows.
+echo '{"max_position_embeddings": 1000}' > "$M/config.json"
 start --default-max-tokens 256 --default-temperature 0 --default-top-p 1
 LINE=$(sed 's/\x1b\[[0-9;]*m//g' "$WORK/server.log" | grep -m1 'max_tokens=')
 echo "startup (restore flags): $LINE"
