@@ -617,15 +617,27 @@ fn stateful_finish(
     }
 }
 
-/// The final chunk for a stateful `generate` that failed. With a client's
-/// schema the failure is most likely that schema (the grammar is compiled
-/// inside `generate`, and one request is all a stateful pipeline runs), so
-/// it is refused as an invalid request with the backend's cleaned message.
-/// Resource exhaustion, the server's own `json_object` schema and requests
-/// without a schema keep the plain failure.
+/// Whether a backend error reads as a grammar or schema compile error.
+fn looks_like_grammar_error(raw: &str) -> bool {
+    let raw = raw.to_ascii_lowercase();
+    ["grammar", "json schema", "json_schema"]
+        .iter()
+        .any(|k| raw.contains(k))
+}
+
+/// The final chunk for a stateful `generate` that failed. When the request
+/// carries a client's schema and the backend's error reads as a grammar or
+/// schema error (the grammar is compiled inside `generate`), it is refused
+/// as an invalid request with the backend's cleaned message. Any other error
+/// (a device error, resource exhaustion), the server's own `json_object`
+/// schema and requests without a schema keep the plain failure.
 fn generate_failure_chunk(task: &GenerationTask, err: OvError, resource: bool) -> Chunk {
     let client_schema = grammar_json_schema(task).is_some_and(|s| s != JSON_OBJECT_PROBE);
-    if client_schema && !resource {
+    let grammar_error = match &err {
+        OvError::Native(raw) => looks_like_grammar_error(raw),
+        _ => false,
+    };
+    if client_schema && grammar_error && !resource {
         Chunk::rejected(
             task.task_id.clone(),
             format!(
@@ -2235,6 +2247,40 @@ mod tests {
     }
 
     const SCHEMA_A: &str = r#"{"type":"object","properties":{"a":{"type":"integer"}}}"#;
+
+    #[test]
+    fn stateful_generate_failure_is_a_client_error_only_when_it_names_the_grammar() {
+        for raw in [
+            "xgrammar: failed to compile the schema",
+            "Invalid JSON Schema: unsupported keyword",
+            "bad json_schema",
+            "Grammar construction failed",
+        ] {
+            let c = generate_failure_chunk(
+                &schema_task("s", SCHEMA_A),
+                OvError::Native(raw.into()),
+                false,
+            );
+            assert!(c.invalid_request, "{raw}");
+            assert_eq!(
+                c.error,
+                Some(format!("response_format json_schema: {raw}")),
+                "{raw}"
+            );
+        }
+        let raw = "Exception from src/plugins/intel_gpu/src/runtime/ocl/ocl_stream.cpp:1: \
+                   [GPU] CL_DEVICE_NOT_AVAILABLE: device lost";
+        let c = generate_failure_chunk(
+            &schema_task("s", SCHEMA_A),
+            OvError::Native(raw.into()),
+            false,
+        );
+        assert!(
+            !c.invalid_request,
+            "a device error with a schema stays a 503"
+        );
+        assert_eq!(c.error, Some(OvError::Native(raw.into()).to_string()));
+    }
 
     #[test]
     fn stateful_generate_failure_with_a_schema_is_a_client_error() {
