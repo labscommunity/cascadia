@@ -6,15 +6,17 @@
 //! [`CompiledGrammar`] per request schema, one [`GrammarMask`] per sequence.
 //!
 //! The grammar is compact JSON: no whitespace between tokens, so a model
-//! can't loop on spaces or newlines. Schema keywords llguidance does not
-//! implement are an error at [`GrammarFactory::compile`], not silently
-//! ignored.
+//! can't loop on spaces or newlines. Schema keywords llguidance accepts but
+//! does not enforce (`not`, `uniqueItems`, unknown `format`s, ...) compile and
+//! are listed by [`CompiledGrammar::warnings`]; a schema that can't be built
+//! at all (bad type, unresolvable `$ref`) is an error at
+//! [`GrammarFactory::compile`].
 
 use std::sync::Arc;
 
 use cascadia_engine::{EngineError, EngineResult};
 use cascadia_types::{GrammarKind, GrammarSpec};
-use llguidance::api::TopLevelGrammar;
+use llguidance::api::{StopReason, TopLevelGrammar};
 use llguidance::toktrie::{SimpleVob, TokEnv};
 use llguidance::{Matcher, ParserFactory};
 use toktrie_hf_tokenizers::ByteTokenizer;
@@ -72,8 +74,8 @@ impl GrammarFactory {
     fn from_tok_env(tok_env: TokEnv) -> EngineResult<Self> {
         let mask_width = tok_env.tok_trie().vocab_size();
         let mut factory = ParserFactory::new_simple(&tok_env).map_err(backend)?;
-        // A server: errors come back as values, nothing goes to stderr.
-        factory.quiet();
+        // A server: errors and warnings come back as values, nothing goes to stderr.
+        factory.quiet().set_stderr_log_level(0);
         Ok(Self {
             factory: Arc::new(factory),
             mask_width,
@@ -87,7 +89,7 @@ impl GrammarFactory {
     }
 
     /// Builds the grammar for `spec`, failing with `InvalidConfig` when the
-    /// schema can't be enforced (bad JSON, unsupported keyword, ...).
+    /// schema can't be built (bad JSON, bad type, unresolvable `$ref`, ...).
     pub fn compile(&self, spec: &GrammarSpec) -> EngineResult<CompiledGrammar> {
         let grammar = match spec.kind {
             GrammarKind::JsonSchema => {
@@ -98,9 +100,16 @@ impl GrammarFactory {
                 let obj = schema
                     .as_object_mut()
                     .ok_or_else(|| invalid_schema("must be a JSON object"))?;
+                // Ours replaces any the client sent. Compact JSON; oneOf is
+                // treated as anyOf (pydantic's discriminated unions); keywords
+                // llguidance can't enforce become warnings, not errors.
                 obj.insert(
                     "x-guidance".into(),
-                    serde_json::json!({"whitespace_flexible": false, "lenient": false}),
+                    serde_json::json!({
+                        "whitespace_flexible": false,
+                        "coerce_one_of": true,
+                        "lenient": true,
+                    }),
                 );
                 TopLevelGrammar::from_json_schema(schema)
             }
@@ -110,12 +119,14 @@ impl GrammarFactory {
             .factory
             .create_parser(grammar)
             .map_err(invalid_schema)?;
-        let matcher = Matcher::new(Ok(parser));
+        let mut matcher = Matcher::new(Ok(parser));
         if let Some(e) = matcher.get_error() {
             return Err(invalid_schema(e));
         }
+        let warnings = matcher.grammar_warnings().into();
         Ok(CompiledGrammar {
             pristine: Arc::new(matcher),
+            warnings,
             mask_width: self.mask_width,
         })
     }
@@ -126,10 +137,16 @@ impl GrammarFactory {
 #[derive(Clone)]
 pub struct CompiledGrammar {
     pristine: Arc<Matcher>,
+    warnings: Arc<[String]>,
     mask_width: usize,
 }
 
 impl CompiledGrammar {
+    /// What llguidance accepted but does not enforce, for the engine's log.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     /// A fresh mask at the start of the output.
     /// Clones the compiled parser (lexer caches stay shared), no recompile.
     pub fn matcher(&self) -> EngineResult<GrammarMask> {
@@ -203,17 +220,24 @@ impl GrammarMask {
         (token as usize) < width && self.current_mask().is_ok_and(|mask| mask.is_allowed(token))
     }
 
-    /// Advances past the token the engine picked.
+    /// Advances past the token the engine picked. A token the grammar rejects
+    /// is an error, and the mask stays in that error state: [`Self::apply`]
+    /// and later accepts fail, [`Self::finished`] stays false.
     pub fn accept(&mut self, token: u32) -> EngineResult<()> {
         self.current = None;
         self.matcher.consume_token(token).map_err(backend)
     }
 
-    /// The JSON is complete and nothing else may follow: the engine finishes
-    /// the sequence (`finish_reason: "stop"`) without generating EOS.
-    pub fn is_stopped(&self) -> bool {
-        // An error also stops llguidance's matcher; that is not a finished JSON.
-        !self.matcher.is_error() && self.matcher.is_stopped()
+    /// A clean finish: the JSON is complete and nothing else may follow, or
+    /// EOS was accepted. The engine ends the sequence with
+    /// `finish_reason: "stop"`. False in the error state (llguidance's own
+    /// `is_stopped` is true there too).
+    pub fn finished(&self) -> bool {
+        !self.matcher.is_error()
+            && matches!(
+                self.matcher.stop_reason(),
+                StopReason::NoExtension | StopReason::NoExtensionBias | StopReason::EndOfSentence
+            )
     }
 }
 

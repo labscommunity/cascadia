@@ -48,7 +48,7 @@ fn bytes(s: &str) -> Vec<u32> {
 /// Whole document accepted and the grammar says nothing may follow.
 fn accepts(gf: &GrammarFactory, body: &str, doc: &str) -> bool {
     let mut gm = mask_for(gf, body);
-    walk(gf, &mut gm, &bytes(doc)).is_ok() && gm.is_stopped()
+    walk(gf, &mut gm, &bytes(doc)).is_ok() && gm.finished()
 }
 
 fn masked_row(gf: &GrammarFactory, gm: &mut GrammarMask) -> Vec<f32> {
@@ -121,9 +121,9 @@ fn stopped_only_after_the_closing_brace() {
     let doc = bytes(WEATHER_OK);
     let (body, last) = doc.split_at(doc.len() - 1);
     walk(&gf, &mut gm, body).unwrap();
-    assert!(!gm.is_stopped());
+    assert!(!gm.finished());
     walk(&gf, &mut gm, last).unwrap();
-    assert!(gm.is_stopped());
+    assert!(gm.finished());
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn replay_of_a_valid_prefix_succeeds() {
         &bytes(r#"ris","temperature_celsius":18,"conditions":"sunny"}"#),
     )
     .unwrap();
-    assert!(gm.is_stopped());
+    assert!(gm.finished());
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn eos_is_allowed_where_the_value_may_end_or_continue() {
     let gf = single_byte();
     let mut gm = mask_for(&gf, r#"{"type":"integer"}"#);
     walk(&gf, &mut gm, &bytes("12")).unwrap();
-    assert!(!gm.is_stopped());
+    assert!(!gm.finished());
     let row = masked_row(&gf, &mut gm);
     assert!(row[SINGLE_BYTE_EOS].is_finite());
     assert!(row[b'3' as usize].is_finite());
@@ -199,30 +199,95 @@ fn apply_fails_when_no_index_of_the_row_is_allowed() {
 #[test]
 fn client_x_guidance_is_replaced() {
     let gf = single_byte();
-    let body = r#"{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false,"x-guidance":{"whitespace_flexible":true,"lenient":true}}"#;
+    let body = r#"{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false,"x-guidance":{"whitespace_flexible":true,"key_separator":": "}}"#;
     let mut gm = mask_for(&gf, body);
-    walk(&gf, &mut gm, &bytes(r#"{"city":"#)).unwrap();
+    walk(&gf, &mut gm, &bytes(r#"{"city""#)).unwrap();
     let row = masked_row(&gf, &mut gm);
     assert_eq!(row[b' ' as usize], f32::NEG_INFINITY);
-    // lenient from the client is dropped too: an unsupported keyword still fails.
-    let lenient_not = r#"{"type":"object","not":{"required":["a"]},"x-guidance":{"lenient":true}}"#;
-    assert!(matches!(
-        gf.compile(&spec(lenient_not)),
-        Err(EngineError::InvalidConfig(_))
+    assert!(row[b':' as usize].is_finite());
+    walk(&gf, &mut gm, &bytes(":")).unwrap();
+    let row = masked_row(&gf, &mut gm);
+    assert_eq!(row[b' ' as usize], f32::NEG_INFINITY);
+}
+
+#[test]
+fn not_keyword_compiles_with_a_warning() {
+    let gf = single_byte();
+    let compiled = gf
+        .compile(&spec(r#"{"type":"object","not":{"required":["a"]}}"#))
+        .unwrap();
+    assert!(
+        compiled.warnings().iter().any(|w| w.contains("\"not\"")),
+        "{:?}",
+        compiled.warnings()
+    );
+}
+
+#[test]
+fn unique_items_and_unknown_format_compile_with_warnings() {
+    let gf = single_byte();
+    let body = r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true},"blob":{"type":"string","format":"binary"}},"required":["tags","blob"],"additionalProperties":false}"#;
+    let compiled = gf.compile(&spec(body)).unwrap();
+    let w = compiled.warnings();
+    assert!(w.iter().any(|w| w.contains("uniqueItems")), "{w:?}");
+    assert!(w.iter().any(|w| w.contains("binary")), "{w:?}");
+    let mut gm = compiled.matcher().unwrap();
+    walk(&gf, &mut gm, &bytes(r#"{"tags":["a","a"],"blob":"x"}"#)).unwrap();
+    assert!(gm.finished());
+}
+
+#[test]
+fn clean_schema_has_no_warnings() {
+    let gf = single_byte();
+    assert!(gf.compile(&spec(WEATHER)).unwrap().warnings().is_empty());
+}
+
+#[test]
+fn pydantic_discriminated_union_compiles_and_accepts_each_branch() {
+    let gf = single_byte();
+    let body = r##"{"$defs":{"Cat":{"properties":{"pet_type":{"const":"cat","title":"Pet Type","type":"string"},"meows":{"title":"Meows","type":"integer"}},"required":["pet_type","meows"],"title":"Cat","type":"object"},"Dog":{"properties":{"pet_type":{"const":"dog","title":"Pet Type","type":"string"},"barks":{"title":"Barks","type":"number"}},"required":["pet_type","barks"],"title":"Dog","type":"object"}},"properties":{"pet":{"discriminator":{"mapping":{"cat":"#/$defs/Cat","dog":"#/$defs/Dog"},"propertyName":"pet_type"},"oneOf":[{"$ref":"#/$defs/Cat"},{"$ref":"#/$defs/Dog"}],"title":"Pet"}},"required":["pet"],"title":"Model","type":"object"}"##;
+    assert!(accepts(
+        &gf,
+        body,
+        r#"{"pet":{"pet_type":"cat","meows":3}}"#
+    ));
+    assert!(accepts(
+        &gf,
+        body,
+        r#"{"pet":{"pet_type":"dog","barks":1.5}}"#
+    ));
+    assert!(!accepts(
+        &gf,
+        body,
+        r#"{"pet":{"pet_type":"cow","meows":3}}"#
     ));
 }
 
 #[test]
-fn unsupported_keyword_is_invalid_config_naming_it() {
+fn broken_schemas_are_invalid_config() {
     let gf = single_byte();
-    let Err(EngineError::InvalidConfig(msg)) =
-        gf.compile(&spec(r#"{"type":"object","not":{"required":["a"]}}"#))
-    else {
-        panic!("expected InvalidConfig");
-    };
-    assert!(msg.contains("\"not\""), "{msg}");
-    assert!(!msg.contains('\n'), "{msg}");
-    assert!(msg.chars().count() <= MAX_ERROR_CHARS, "{msg}");
+    for body in [
+        r#"{"type":42}"#,
+        r##"{"type":"object","properties":{"a":{"$ref":"#/$defs/Missing"}},"required":["a"]}"##,
+    ] {
+        let err = gf.compile(&spec(body)).err();
+        let Some(EngineError::InvalidConfig(msg)) = err else {
+            panic!("{body}: {err:?}");
+        };
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(msg.chars().count() <= MAX_ERROR_CHARS, "{msg}");
+    }
+}
+
+#[test]
+fn rejected_token_is_an_error_and_not_a_finish() {
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, WEATHER);
+    assert!(gm.accept(u32::from(b'x')).is_err());
+    assert!(!gm.finished());
+    let mut row = vec![0.0f32; gf.mask_width()];
+    assert!(gm.apply(&mut row).is_err());
+    assert!(gm.accept(u32::from(b'{')).is_err());
 }
 
 #[test]
@@ -387,7 +452,7 @@ fn hf_tokenizer_masks_with_merged_tokens_and_every_eos() {
     assert_eq!(row[ENDOFTEXT as usize], f32::NEG_INFINITY);
     assert_eq!(row[IM_END as usize], f32::NEG_INFINITY);
     walk(&gf, &mut gm, &bytes("}")).unwrap();
-    assert!(gm.is_stopped());
+    assert!(gm.finished());
     let row = masked_row(&gf, &mut gm);
     assert!(row[ENDOFTEXT as usize].is_finite());
     assert!(row[IM_END as usize].is_finite());
