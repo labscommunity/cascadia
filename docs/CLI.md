@@ -260,8 +260,9 @@ context window still ends an answer where the prompt plus the answer fill it
     dist-spec, continuous batching) ends at or just past the window: the
     chunk that reaches it is the last.
   - An engine that reports no prompt count until the end (sycl-llama) is
-    measured on the answer alone; `llama-server` stops at `--llama-ctx`
-    itself anyway.
+    measured on the answer alone, so it ends when the answer reaches the
+    window; `llama-server` bounds the KV itself (it rounds `--llama-ctx` up,
+    e.g. 400 to a 512-token slot).
   - A prompt that alone reaches the window is not cut: the engine took it, so
     the window read is not its real limit, and the engine bounds the answer.
   - The window includes `rope_scaling` (above); with `--packed-slots` it is a
