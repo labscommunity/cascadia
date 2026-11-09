@@ -266,6 +266,34 @@ def case_bounded(base):
     )
 
 
+ZOD_EMAIL = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "email": {
+            "type": "string",
+            "format": "email",
+            # zod 4 (before 4.6) emits this look-ahead pattern for z.email().
+            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
+        }
+    },
+    "required": ["email"],
+    "additionalProperties": False,
+}
+
+
+def case_zod_email(base):
+    # A pattern the grammar backend can't enforce must be accepted (and logged), not refused.
+    run_json_case(
+        base,
+        "zod_email_pattern",
+        ZOD_EMAIL,
+        rf_schema(ZOD_EMAIL, "contact"),
+        [{"role": "user", "content": "Ada's address is ada@example.com. Return it."}],
+        max_tokens=128,
+    )
+
+
 def case_pydantic(base):
     schema = load_fixture("pydantic_output_schema.json")
     run_json_case(
@@ -399,6 +427,7 @@ CASES = {
     "browser_use_exact": case_browser_use_exact,
     "pydantic": case_pydantic,
     "bounded": case_bounded,
+    "zod_email": case_zod_email,
     "thinking": case_thinking_default,
     "malformed": case_malformed,
     "bad_schema": case_bad_schema,
