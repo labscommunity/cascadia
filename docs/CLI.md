@@ -540,7 +540,7 @@ Per-engine deep dives: [engines/](engines/). Per-family export notes:
 |---|---|
 | `text` (or no field) | Free text, as before. |
 | `json_object` | Any JSON object. |
-| `json_schema` | JSON matching `response_format.json_schema.schema`. A missing, `null` or `true` schema means any JSON object; `false` is rejected. |
+| `json_schema` | JSON matching `response_format.json_schema.schema`. A missing, `null`, `true` or `{}` schema means any JSON object; `false` is rejected. Object properties come out in the schema's order. |
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -552,24 +552,31 @@ curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/jso
 }'
 ```
 
+`/v1/completions` ignores `response_format` (OpenAI does not define it there).
+
 Engines:
 
 | Engine | `json_object` / `json_schema` |
 |---|---|
-| `ov-genai` | Enforced by OpenVINO GenAI's structured output, stateful and `--cb`. At startup the engine checks that structured output works for the loaded model. |
+| `ov-genai` | Enforced by OpenVINO GenAI's structured output, stateful and `--cb`. Needs OpenVINO GenAI 2026.4 or newer. At startup the engine runs one short structured-output check on the loaded model; if it fails, startup continues and JSON requests get 400 `invalid configuration: structured output is not available for this model: <reason>`. |
 | `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar. |
-| `mock` | Answers with a minimal instance that matches the schema. |
+| `mock` | Answers with a minimal instance of the schema, best effort: not every keyword is honoured. |
 | `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe` | 400: `response_format <type> is not supported by the <engine> engine; …`. |
+
+A malformed `response_format` is a 400 on every engine, including those
+without structured output (it used to be ignored).
 
 Behaviour:
 
-- Thinking is turned off for a JSON request: a JSON answer has no room for a
-  reasoning preamble.
+- Thinking is turned off for a JSON request on an engine that supports
+  structured output: a JSON answer has no room for a reasoning preamble.
 - The format is **not enforced** when the request offers tools the model may
   call (`tools` non-empty and `tool_choice` other than `"none"`): the model may
   answer with a tool call, which the format does not constrain. The server logs
   `response_format not enforced` for such a request, and engines without
-  structured output let it through instead of answering 400.
+  structured output let it through instead of answering 400. Thinking then
+  stays as requested, except on `ov-genai`, where it is turned off (thinking
+  with tools is otherwise refused there).
 - A token limit can cut the JSON short: the response then has
   `finish_reason: "length"` and the content does not parse. Leave room in
   `max_tokens`.
@@ -580,28 +587,40 @@ Behaviour:
   `uniqueItems`, `contains`, `minContains`, `maxContains`, `multipleOf`, an
   `allOf` with more than one member, and constraints placed beside
   `$ref`/`anyOf`/`oneOf`/`allOf`/`const`/`enum` (annotations such as
-  `description` are fine there). The server logs the keywords it found;
-  validate the answer client-side if they matter.
+  `description` are fine there). The server logs the keywords it found; the
+  list follows the gaps of the grammar backend `ov-genai` uses, and
+  llama-server's own schema converter may differ. Validate the answer
+  client-side if they matter.
 
 Schema limits (each is a 400 `invalid response_format: …`):
 
 | Limit | Value |
 |---|---|
-| Schema size (compact JSON) | 64 KiB (65 536 bytes) |
+| Schema size (JSON without whitespace) | 64 KiB (65 536 bytes) |
 | Nesting depth of objects and arrays | 64 |
-| Any one `minItems`, `maxItems`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, or number in a `pattern` / `patternProperties` repetition quantifier (`{n}`, `{n,m}`) | 10 000 |
-| Sum of all those counts in one schema | 100 000 |
+| Any one `minItems`, `maxItems`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, or number in a `pattern` / `patternProperties` repetition quantifier (`{n}`, `{n,}`, `{n,m}`, `{,m}`) | 10 000 |
+| Sum of all those counts in one schema; a `minX`/`maxX` pair on one object counts once, at the larger value | 200 000 |
 
-Errors (`{"error": "<message>"}`, status 400):
+Counts are taken everywhere in the schema, including inside `default` and
+`examples` (a `$ref` can point there). An object that repeats a key is
+rejected too.
 
-| Message | Cause |
-|---|---|
-| `invalid response_format: <reason>` | Malformed field (unknown `type`, non-object schema, `false` schema) or a schema over the limits above. |
-| `response_format <type> is not supported by the <engine> engine; …` | The engine has no structured output (table above). |
-| `invalid configuration: response_format json_schema: <reason>` | The backend could not build a constraint from the schema. |
-| `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai` only: the startup check found structured output does not work for the loaded model. |
+Errors (`{"error": "<message>"}`):
+
+| Status | Message | Cause |
+|---|---|---|
+| 400 | `invalid response_format: <reason>` | Malformed field (unknown `type`, non-object schema, `false` schema, a repeated key) or a schema over the limits above. Every engine. |
+| 400 | `response_format <type> is not supported by the <engine> engine; …` | The engine has no structured output (table above). |
+| 400 | `invalid configuration: response_format json_schema: <reason>` | `ov-genai`: the backend could not build a constraint from the schema. |
+| 400 | `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai`: the startup check found structured output does not work for the loaded model or runtime. |
+| 500 | llama-server's error | `sycl-llama`: llama-server refused the schema. |
 
 On `ov-genai --cb`, a schema whose compile fails while a batch runs fails that
-batch step, and the same schema is then refused for 10 minutes with
-`invalid configuration: response_format json_schema: this schema failed to
-compile on this server; retry later or change the schema`.
+batch step. When the failed step held exactly one new schema-constrained
+request (or several with the same schema), that schema is then refused for 10
+minutes with `invalid configuration: response_format json_schema: this schema
+failed to compile on this server; retry later or change the schema`. When it
+held several different new schemas, none is refused at once, but a schema in
+two such failed steps within 10 minutes is. Steps failed by resource
+exhaustion, and `json_object`, are never blamed on a schema. Such a failure
+is not counted toward the worker's failure limit, once per run of failures.
