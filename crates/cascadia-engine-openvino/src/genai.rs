@@ -12,7 +12,7 @@
 //! `perf_metrics` defaults to `max_new_tokens` when EOS fires early on
 //! short greedy decodes, which inflates reported tok/s).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -335,6 +335,7 @@ impl Builder for OvGenaiBuilder {
                 excused_since_success: false,
                 structured_unavailable: None,
                 quarantined: QuarantineSet::default(),
+                strikes: StrikeSet::default(),
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -576,6 +577,46 @@ impl QuarantineSet {
         self.order.len()
     }
 }
+
+/// Strikes against schemas (by body hash) that were among several new
+/// schemas in a failed CB step, so no single one could be blamed. Bounded
+/// like [`QuarantineSet`]: an entry lapses [`QUARANTINE_TTL`] after its last
+/// strike, and past [`QUARANTINE_CAPACITY`] the stalest one is dropped.
+#[derive(Default)]
+struct StrikeSet {
+    strikes: HashMap<u64, (u32, Instant)>,
+}
+
+impl StrikeSet {
+    /// Record a strike against `h`; returns its strikes within the window.
+    fn strike(&mut self, h: u64, now: Instant) -> u32 {
+        self.strikes
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < QUARANTINE_TTL);
+        if !self.strikes.contains_key(&h) && self.strikes.len() >= QUARANTINE_CAPACITY {
+            if let Some(oldest) = self
+                .strikes
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| *k)
+            {
+                self.strikes.remove(&oldest);
+            }
+        }
+        let entry = self.strikes.entry(h).or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+        entry.0
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.strikes.len()
+    }
+}
+
+/// Strikes at which a schema seen in several shared failed steps is
+/// quarantined.
+const QUARANTINE_STRIKES: u32 = 2;
 
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
@@ -889,6 +930,8 @@ pub struct OvGenaiCbEngine {
     structured_unavailable: Option<String>,
     /// Schemas that recently took a scheduler iteration down with them.
     quarantined: QuarantineSet,
+    /// Strikes against schemas that shared a failed step with others.
+    strikes: StrikeSet,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -1071,7 +1114,7 @@ impl Engine for OvGenaiCbEngine {
             // clients (the failure is still excused). Resource exhaustion and
             // json_object (the server's own schema) are never blamed on one.
             let resource = cascadia_ov_genai_shim::last_error_resource_exhausted();
-            let suspects: Vec<u64> = if resource || self.excused_since_success {
+            let mut suspects: Vec<u64> = if resource || self.excused_since_success {
                 Vec::new()
             } else {
                 self.active
@@ -1080,6 +1123,9 @@ impl Engine for OvGenaiCbEngine {
                     .filter_map(|t| t.grammar_hash)
                     .collect()
             };
+            // Several requests with one schema are one suspect.
+            suspects.sort_unstable();
+            suspects.dedup();
             if suspects.is_empty() {
                 self.step_failures += 1;
             } else if let [h] = suspects[..] {
@@ -1090,11 +1136,24 @@ impl Engine for OvGenaiCbEngine {
                      not counted toward the failure latch, schema refused for 10 minutes"
                 );
             } else {
+                // No telling which one failed: each gets a strike, and a schema
+                // that keeps turning up in failed steps is refused anyway, so
+                // pairing a failing schema with another does not dodge it.
                 self.excused_since_success = true;
+                let now = Instant::now();
+                let mut refused = 0;
+                for h in &suspects {
+                    if self.strikes.strike(*h, now) >= QUARANTINE_STRIKES {
+                        self.quarantined.insert(*h, now);
+                        refused += 1;
+                    }
+                }
                 warn!(
                     schemas = suspects.len(),
+                    refused,
                     "cb step failed with several new schema-constrained requests in the \
-                     batch; not counted toward the failure latch, none refused"
+                     batch; not counted toward the failure latch, schemas that failed \
+                     before are refused for 10 minutes"
                 );
             }
             warn!(
@@ -1565,6 +1624,7 @@ mod tests {
             excused_since_success: false,
             structured_unavailable: None,
             quarantined: QuarantineSet::default(),
+            strikes: StrikeSet::default(),
         }
     }
 
@@ -2196,6 +2256,72 @@ mod tests {
         st.lock().unwrap().step_fails = false;
         e.submit(schema_task("t3", SCHEMA_A)).unwrap();
         e.submit(schema_task("t4", SCHEMA_B)).unwrap();
+    }
+
+    const SCHEMA_C: &str = r#"{"type":"object","properties":{"c":{"type":"boolean"}}}"#;
+
+    #[test]
+    fn cb_step_failure_with_one_schema_twice_quarantines_it() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("t1", SCHEMA_A)).unwrap();
+        e.submit(schema_task("t2", SCHEMA_A)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 0);
+        st.lock().unwrap().step_fails = false;
+        assert!(e.submit(schema_task("t3", SCHEMA_A)).is_err());
+    }
+
+    #[test]
+    fn cb_schema_failing_in_two_shared_steps_is_quarantined() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("t1", SCHEMA_A)).unwrap();
+        e.submit(schema_task("t2", SCHEMA_B)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.quarantined.len(), 0);
+
+        // A successful step re-arms the excuse.
+        st.lock().unwrap().step_fails = false;
+        e.submit(task("plain", 8)).unwrap();
+        let _ = e.step().unwrap();
+        assert!(!e.excused_since_success);
+        e.cancel(&"plain".to_string());
+
+        st.lock().unwrap().step_fails = true;
+        e.submit(schema_task("t3", SCHEMA_A)).unwrap();
+        e.submit(schema_task("t4", SCHEMA_C)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 0);
+        st.lock().unwrap().step_fails = false;
+        let err = e.submit(schema_task("t5", SCHEMA_A)).unwrap_err();
+        assert!(err.to_string().contains("failed to compile"), "{err}");
+        e.submit(schema_task("t6", SCHEMA_C)).unwrap();
+        e.submit(schema_task("t7", SCHEMA_B)).unwrap();
+    }
+
+    #[test]
+    fn strike_set_counts_within_the_window_and_is_bounded() {
+        let now = Instant::now();
+        let mut s = StrikeSet::default();
+        assert_eq!(s.strike(1, now), 1);
+        assert_eq!(s.strike(1, now), 2);
+        let later = now + std::time::Duration::from_secs(11 * 60);
+        assert_eq!(s.strike(1, later), 1, "an old strike has expired");
+        let mut s = StrikeSet::default();
+        for h in 0..300u64 {
+            s.strike(h, now + std::time::Duration::from_millis(h));
+        }
+        assert_eq!(s.len(), 256);
+        assert_eq!(s.strike(0, now + std::time::Duration::from_secs(1)), 1);
+        assert_eq!(s.strike(299, now + std::time::Duration::from_secs(1)), 2);
     }
 
     /// A CB engine whose plain warmup request finishes at once, with
