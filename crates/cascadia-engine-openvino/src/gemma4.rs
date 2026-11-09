@@ -603,12 +603,88 @@ where
     loop {
         let end = prefill_span_end(i, chunk, seed_split);
         let last = end >= len;
-        let m = if last { mask.as_deref_mut() } else { None };
+        let m = step_mask(mask.as_deref_mut(), true, end, len);
         let token = span(i..end, m)?;
         if last {
             return Ok(token);
         }
         i = end;
+    }
+}
+
+/// The matcher for one span of a step, or `None`: a decode step's row is
+/// always the next generated token; a prefill span only when it ends the
+/// prompt (the earlier spans' picks are discarded).
+fn step_mask(
+    grammar: Option<&mut GrammarMask>,
+    prefill: bool,
+    span_end: usize,
+    len: usize,
+) -> Option<&mut GrammarMask> {
+    if !prefill || span_end >= len {
+        grammar
+    } else {
+        None
+    }
+}
+
+/// Advances the active task's matcher past `token`; `Ok(true)` when the JSON
+/// is complete. A token the grammar rejects ends the task: `active` is
+/// cleared and the error names it.
+fn advance_grammar(active: &mut Option<ActiveTask>, token: i32) -> EngineResult<bool> {
+    let Some(a) = active.as_mut() else {
+        return Ok(false);
+    };
+    let Some(mask) = a.grammar.as_mut() else {
+        return Ok(false);
+    };
+    match mask.accept(token as u32) {
+        Ok(()) => Ok(mask.finished()),
+        Err(e) => {
+            let id = a.task.task_id.clone();
+            *active = None;
+            Err(e.for_task(id))
+        }
+    }
+}
+
+/// A structured-output task failure: it ends that task, says nothing about
+/// the stage's health, and so stays out of the step-failure streak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrammarFailure {
+    /// The grammar allows no token of the row.
+    DeadEnd,
+    /// The picked token is not one the grammar allows.
+    Rejected,
+}
+
+impl GrammarFailure {
+    fn describe(self) -> &'static str {
+        match self {
+            GrammarFailure::DeadEnd => "the schema allows no token at this point",
+            GrammarFailure::Rejected => "the picked token is not one the schema allows",
+        }
+    }
+}
+
+/// Logs a failed step: a structured-output failure with its own message,
+/// anything else through the rate-limited step-failure WARN.
+fn report_step_error(
+    limiter: &mut StepWarnLimiter,
+    grammar: Option<GrammarFailure>,
+    e: &EngineError,
+    now: std::time::Instant,
+) {
+    if let Some(what) = grammar {
+        warn!(error = %e, "gemma4: structured-output task failed: {}", what.describe());
+        return;
+    }
+    match limiter.on_failure(now) {
+        Some(StepWarn::First) => warn!(error = %e, "gemma4 step failed"),
+        Some(StepWarn::StillFailing { suppressed }) => {
+            warn!(error = %e, suppressed, "gemma4 step still failing")
+        }
+        None => {}
     }
 }
 
@@ -664,6 +740,9 @@ pub struct Gemma4Engine {
     /// to feed into the `external_kv.*` inputs. Rebuilt each step.
     pending_external_kv: std::collections::HashMap<i64, (Vec<usize>, Vec<u8>)>,
     step_warn: StepWarnLimiter,
+    /// Why the current step failed when the failure is a structured-output
+    /// task's own (set where it happens, taken by `step`); `None` otherwise.
+    grammar_failure: Option<GrammarFailure>,
     /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
@@ -1376,7 +1455,7 @@ impl Gemma4Engine {
                 single_stage,
                 position,
                 prefill && tokens.len() > 1,
-                grammar.as_mut(),
+                step_mask(grammar.as_mut(), prefill, tokens.len(), tokens.len()),
             )?;
             wire = w;
             next_token = tok;
@@ -1408,10 +1487,13 @@ impl Gemma4Engine {
         mask: Option<&mut GrammarMask>,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
-            Ok((
-                pick_next_token(out, shape, mask)?,
-                std::time::Duration::ZERO,
-            ))
+            let masked = mask.is_some();
+            let token = pick_next_token(out, shape, mask).inspect_err(|_| {
+                if masked {
+                    self.grammar_failure = Some(GrammarFailure::DeadEnd);
+                }
+            })?;
+            Ok((token, std::time::Duration::ZERO))
         } else if mask.is_some() {
             Err(refuse_multi_stage_grammar())
         } else {
@@ -1426,19 +1508,19 @@ impl Gemma4Engine {
     /// Decode the delta text for `next_token`, append it to the active task,
     /// check stop conditions, and build the streamed chunk (first stage only).
     fn emit_token(&mut self, next_token: i32) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        if self.active.is_none() {
+            return Err(EngineError::Backend(
+                "emit_token with no active task".into(),
+            ));
+        }
+        // Structured output: advance the matcher past the picked token (a
+        // rejection ends the task); a complete JSON ends it with `stop`.
+        let grammar_finished = advance_grammar(&mut self.active, next_token)
+            .inspect_err(|_| self.grammar_failure = Some(GrammarFailure::Rejected))?;
         let active = self
             .active
             .as_mut()
             .ok_or_else(|| EngineError::Backend("emit_token with no active task".into()))?;
-        // Structured output: advance the matcher past the picked token (a
-        // rejection fails the task); a complete JSON ends it with `stop`.
-        let grammar_finished = match active.grammar.as_mut() {
-            Some(mask) => {
-                mask.accept(next_token as u32)?;
-                mask.finished()
-            }
-            None => false,
-        };
         active.last_token = next_token;
         active.generated.push(next_token);
 
@@ -1685,6 +1767,7 @@ impl Engine for Gemma4Engine {
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        self.grammar_failure = None;
         let result: EngineResult<Vec<(TaskId, Chunk)>> = if self.spec.is_first_stage {
             self.step_first()
         } else if self.spec.is_last_stage {
@@ -1708,13 +1791,12 @@ impl Engine for Gemma4Engine {
                     }
                 }
             }
-            Err(e) => match self.step_warn.on_failure(std::time::Instant::now()) {
-                Some(StepWarn::First) => warn!(error = %e, "gemma4 step failed"),
-                Some(StepWarn::StillFailing { suppressed }) => {
-                    warn!(error = %e, suppressed, "gemma4 step still failing")
-                }
-                None => {}
-            },
+            Err(e) => report_step_error(
+                &mut self.step_warn,
+                self.grammar_failure.take(),
+                e,
+                std::time::Instant::now(),
+            ),
         }
         result
     }
@@ -2489,6 +2571,7 @@ impl Builder for Gemma4Builder {
             external_kv_in,
             pending_external_kv: std::collections::HashMap::new(),
             step_warn: StepWarnLimiter::default(),
+            grammar_failure: None,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
@@ -2907,6 +2990,73 @@ mod tests {
     fn a_rejected_token_is_an_error() {
         let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
         assert!(mask.accept(BAD as u32).is_err());
+    }
+
+    fn active_task(grammar: Option<GrammarMask>) -> ActiveTask {
+        ActiveTask {
+            task: GenerationTask::new("t1", "p"),
+            prompt_ids: vec![1, 2],
+            generated: Vec::new(),
+            last_text: String::new(),
+            prefilled: true,
+            last_token: 0,
+            resume_seed_len: 0,
+            warm_prefix: 0,
+            started: std::time::Instant::now(),
+            t_alpha_compute: std::time::Duration::ZERO,
+            t_wire: std::time::Duration::ZERO,
+            grammar,
+        }
+    }
+
+    #[test]
+    fn a_decode_step_row_is_masked_and_only_the_last_prefill_span() {
+        let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
+        // Decode: one token, always the next generated one.
+        assert!(step_mask(Some(&mut mask), false, 1, 1).is_some());
+        // Prefill: only the span that ends the prompt.
+        assert!(step_mask(Some(&mut mask), true, 3, 7).is_none());
+        assert!(step_mask(Some(&mut mask), true, 7, 7).is_some());
+        // No grammar: never.
+        assert!(step_mask(None, false, 1, 1).is_none());
+        assert!(step_mask(None, true, 7, 7).is_none());
+    }
+
+    #[test]
+    fn a_rejected_token_clears_the_active_task_and_names_it() {
+        let mut active = Some(active_task(Some(
+            start_grammar(&ok_grammar(), &[]).unwrap(),
+        )));
+        let err = advance_grammar(&mut active, BAD as i32).unwrap_err();
+        assert!(active.is_none(), "a rejected token must end the task");
+        assert!(
+            matches!(&err, EngineError::Task { task_id, .. } if task_id == "t1"),
+            "{err:?}"
+        );
+        // An allowed token keeps it; a task without a grammar is untouched.
+        let mut active = Some(active_task(Some(
+            start_grammar(&ok_grammar(), &[]).unwrap(),
+        )));
+        assert!(!advance_grammar(&mut active, b'"' as i32).unwrap());
+        assert!(active.is_some());
+        let mut plain = Some(active_task(None));
+        assert!(!advance_grammar(&mut plain, BAD as i32).unwrap());
+        assert!(plain.is_some());
+    }
+
+    #[test]
+    fn a_structured_output_failure_does_not_start_a_step_failure_streak() {
+        let mut limiter = StepWarnLimiter::default();
+        let now = std::time::Instant::now();
+        let e = EngineError::Backend("grammar: no token of the logits row is allowed".into());
+        report_step_error(&mut limiter, Some(GrammarFailure::DeadEnd), &e, now);
+        report_step_error(&mut limiter, Some(GrammarFailure::Rejected), &e, now);
+        // The next real failure is still the first of a streak (logged in full).
+        assert!(matches!(limiter.on_failure(now), Some(StepWarn::First)));
+        // A real failure does count.
+        let mut limiter = StepWarnLimiter::default();
+        report_step_error(&mut limiter, None, &e, now);
+        assert!(limiter.on_failure(now).is_none());
     }
 
     #[test]
