@@ -123,9 +123,17 @@ impl GrammarFactory {
                 obj.insert("x-guidance".into(), guidance_options());
                 match self.compile_schema(schema.clone(), Vec::new()) {
                     Err(e) if is_regex_error(&e) => {
-                        // Only on a regex error: find each pattern that
-                        // fails alone, drop it, and build again.
-                        let dropped = self.drop_unparseable_patterns(&mut schema);
+                        // Only on a regex error: drop every pattern the regex
+                        // front end can't parse (a parse, no grammar build),
+                        // then build once more.
+                        let mut dropped = Vec::new();
+                        visit_patterns(&mut schema, &mut |p| {
+                            let ok = pattern_parses(p);
+                            if !ok && !dropped.iter().any(|d| d == p) {
+                                dropped.push(p.to_owned());
+                            }
+                            ok
+                        });
                         if dropped.is_empty() {
                             return Err(e);
                         }
@@ -150,6 +158,8 @@ impl GrammarFactory {
         schema: serde_json::Value,
         mut warnings: Vec<String>,
     ) -> EngineResult<CompiledGrammar> {
+        #[cfg(test)]
+        tests::SCHEMA_BUILDS.with(|c| c.set(c.get() + 1));
         let grammar = TopLevelGrammar::from_json_schema(schema);
         // Building the parser compiles the schema, so every error surfaces here.
         let parser = self
@@ -168,44 +178,15 @@ impl GrammarFactory {
             eos: self.eos.clone(),
         })
     }
-
-    /// Whether `pattern` builds on its own, as the only constraint of a string.
-    fn pattern_parses(&self, pattern: &str) -> bool {
-        let schema = serde_json::json!({
-            "type": "string",
-            "pattern": pattern,
-            "x-guidance": guidance_options(),
-        });
-        self.factory
-            .create_parser(TopLevelGrammar::from_json_schema(schema))
-            .is_ok()
-    }
-
-    /// Removes every `pattern` and `patternProperties` key in `schema` that
-    /// doesn't build alone; returns them. At most [`MAX_PATTERN_CHECKS`]
-    /// distinct patterns are tried (the schema size cap bounds them anyway).
-    fn drop_unparseable_patterns(&self, schema: &mut serde_json::Value) -> Vec<String> {
-        let mut verdicts = std::collections::HashMap::<String, bool>::new();
-        let mut dropped = Vec::new();
-        let mut parses = |p: &str| -> bool {
-            if let Some(&ok) = verdicts.get(p) {
-                return ok;
-            }
-            // Past the cap, keep the pattern: the rebuild then fails as before.
-            let ok = verdicts.len() >= MAX_PATTERN_CHECKS || self.pattern_parses(p);
-            verdicts.insert(p.to_owned(), ok);
-            if !ok {
-                dropped.push(p.to_owned());
-            }
-            ok
-        };
-        visit_patterns(schema, &mut parses);
-        dropped
-    }
 }
 
-/// Most distinct patterns tried one by one after a regex error.
-const MAX_PATTERN_CHECKS: usize = 256;
+/// Whether llguidance's regex front end parses `pattern`: the rewrite and the
+/// parser it applies to a JSON Schema `pattern`, without building a grammar.
+fn pattern_parses(pattern: &str) -> bool {
+    llguidance::derivre::RegexBuilder::new()
+        .mk_regex_for_serach(&llguidance::regex_to_lark(pattern, "dw"))
+        .is_ok()
+}
 
 /// Schema keywords whose values are data, not schemas: never searched for patterns.
 const DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples", "x-guidance"];

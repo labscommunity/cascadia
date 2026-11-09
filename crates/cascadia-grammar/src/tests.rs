@@ -1,6 +1,11 @@
 use super::*;
 use llguidance::toktrie::ApproximateTokEnv;
 
+thread_local! {
+    /// Schema builds (`create_parser` on a whole schema) on this thread.
+    pub(super) static SCHEMA_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The single-byte test vocab: token id `b` is byte `b`; 256..=261 are
 /// special tokens, 261 (`<|end|>`) is its EOS.
 const SINGLE_BYTE_EOS: usize = 261;
@@ -642,4 +647,37 @@ fn a_valid_pattern_is_still_enforced() {
     assert!(compiled.warnings().is_empty(), "{:?}", compiled.warnings());
     assert!(accepts(&gf, body, r#"{"code":"ABC"}"#));
     assert!(!accepts(&gf, body, r#"{"code":"abc"}"#));
+}
+
+#[test]
+fn many_unparseable_patterns_cost_two_builds() {
+    let gf = single_byte();
+    let props: serde_json::Map<String, serde_json::Value> = (0..200)
+        .map(|i| {
+            (
+                format!("p{i}"),
+                serde_json::json!({"type": "string", "pattern": format!("^(?!x{i})[a-z]+$")}),
+            )
+        })
+        .collect();
+    let body = serde_json::json!({"type": "object", "properties": props}).to_string();
+    let before = SCHEMA_BUILDS.with(|c| c.get());
+    let compiled = gf.compile(&spec(&body)).unwrap();
+    assert_eq!(SCHEMA_BUILDS.with(|c| c.get()) - before, 2);
+    assert_eq!(compiled.warnings().len(), 200);
+}
+
+#[test]
+fn backreference_and_look_behind_patterns_are_dropped() {
+    let gf = single_byte();
+    for p in [r"^(a)\\1$", r"(?<=a)b", r"(?<!a)b", r"(?=a)a"] {
+        let body = format!(r#"{{"type":"string","pattern":"{p}"}}"#);
+        let compiled = gf.compile(&spec(&body)).unwrap();
+        assert_eq!(
+            compiled.warnings().len(),
+            1,
+            "{p}: {:?}",
+            compiled.warnings()
+        );
+    }
 }
