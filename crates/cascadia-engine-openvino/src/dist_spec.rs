@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::structured::{self, compile_task_grammar, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
@@ -328,35 +329,6 @@ fn pick_first_token(
     }
     mask.accept(m as u32)?;
     Ok((m, mask.finished().then_some(MaskedEnd::Finished)))
-}
-
-/// Submit-time grammar build: `None` for a task without a grammar; an
-/// `InvalidConfig` (400) when the model can't do structured output or the
-/// schema doesn't compile.
-fn compile_task_grammar(
-    factory: &Result<GrammarFactory, String>,
-    task: &GenerationTask,
-) -> EngineResult<Option<CompiledGrammar>> {
-    let Some(spec) = task.grammar.as_ref() else {
-        return Ok(None);
-    };
-    let factory = factory.as_ref().map_err(|reason| {
-        EngineError::InvalidConfig(format!(
-            "structured output is not available for this model: {reason}"
-        ))
-    })?;
-    factory.compile(spec).map(Some)
-}
-
-/// Activation: a fresh matcher advanced over the resume seed. A seed the
-/// grammar rejects is a backend error.
-fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineResult<GrammarMask> {
-    let mut mask = compiled.matcher()?;
-    if !seed.is_empty() {
-        let seed: Vec<u32> = seed.iter().map(|&t| t as u32).collect();
-        mask.replay(&seed)?;
-    }
-    Ok(mask)
 }
 
 fn map_ov_err(err: OvError) -> EngineError {
@@ -1681,13 +1653,7 @@ impl Engine for OvDistSpecEngine {
             });
         }
         let grammar = compile_task_grammar(&self.grammar_factory, &task)?;
-        if let Some(g) = grammar.as_ref().filter(|g| !g.warnings().is_empty()) {
-            info!(
-                task = %task.task_id,
-                warnings = ?g.warnings(),
-                "ov-dist-spec: response_format keywords accepted but not enforced"
-            );
-        }
+        structured::log_grammar_warnings("ov-dist-spec", &task.task_id, grammar.as_ref());
         self.pending.push(PendingSpec { task, grammar });
         Ok(())
     }
@@ -2448,14 +2414,8 @@ impl Builder for OvDistSpecBuilder {
         let target =
             DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
         let masked_draft = MaskedReq::new(draft)?;
-        let grammar_factory = GrammarFactory::from_tokenizer(&tokenizer, &self.eos_token_ids)
-            .map_err(|e| match e {
-                EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
-                other => other.to_string(),
-            })
-            .inspect_err(|reason| {
-                warn!(%reason, "ov-dist-spec: structured output unavailable for this model");
-            });
+        let grammar_factory =
+            structured::build_grammar_factory("ov-dist-spec", &tokenizer, &self.eos_token_ids);
         Ok(Box::new(OvDistSpecEngine {
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
@@ -4136,47 +4096,6 @@ mod tests {
             pick_first_token(&peak(w, b'"'), Some(&mut mask), &[TEST_EOS]).unwrap(),
             (b'"' as i64, Some(MaskedEnd::Finished))
         );
-    }
-
-    #[test]
-    fn submit_compiles_the_grammar_or_refuses_with_invalid_config() {
-        let gf: Result<GrammarFactory, String> = Ok(test_factory());
-        let plain = GenerationTask::new("t", "p");
-        assert!(compile_task_grammar(&gf, &plain).unwrap().is_none());
-
-        let good = GenerationTask::new("t", "p").with_grammar(json_spec(WEATHER));
-        assert!(compile_task_grammar(&gf, &good).unwrap().is_some());
-
-        let bad = GenerationTask::new("t", "p").with_grammar(json_spec(r#"{"type":42}"#));
-        assert!(matches!(
-            compile_task_grammar(&gf, &bad),
-            Err(EngineError::InvalidConfig(_))
-        ));
-
-        let none: Result<GrammarFactory, String> = Err("no EOS in vocab".into());
-        assert!(compile_task_grammar(&none, &plain).unwrap().is_none());
-        match compile_task_grammar(&none, &good) {
-            Err(EngineError::InvalidConfig(m)) => assert_eq!(
-                m,
-                "structured output is not available for this model: no EOS in vocab"
-            ),
-            other => panic!(
-                "expected InvalidConfig, got {:?}",
-                other.map(|g| g.is_some())
-            ),
-        }
-    }
-
-    #[test]
-    fn activation_replays_the_resume_seed_and_fails_on_a_rejected_one() {
-        let gf = test_factory();
-        let cg = compiled(&gf, OK_ENUM);
-        let mut mask = start_grammar(&cg, &ids("\"o")).unwrap();
-        assert!(mask.allowed(b'k' as u32));
-        assert!(matches!(
-            start_grammar(&cg, &ids("\"x")),
-            Err(EngineError::Backend(_))
-        ));
     }
 
     #[test]

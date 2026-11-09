@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
@@ -470,41 +471,13 @@ fn compile_task_grammar(
     task: &GenerationTask,
     multi_stage: bool,
 ) -> EngineResult<Option<CompiledGrammar>> {
-    let Some(spec) = task.grammar.as_ref() else {
+    if task.grammar.is_none() {
         return Ok(None);
-    };
+    }
     if multi_stage {
         return Err(refuse_multi_stage_grammar());
     }
-    let factory = factory.as_ref().map_err(|reason| {
-        EngineError::InvalidConfig(format!(
-            "structured output is not available for this model: {reason}"
-        ))
-    })?;
-    factory.compile(spec).map(Some)
-}
-
-/// Activation: a fresh matcher advanced over the resume seed. A seed the
-/// grammar rejects is a backend error.
-fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineResult<GrammarMask> {
-    let mut mask = compiled.matcher()?;
-    if !seed.is_empty() {
-        let seed: Vec<u32> = seed.iter().map(|&t| t as u32).collect();
-        mask.replay(&seed)?;
-    }
-    Ok(mask)
-}
-
-/// The first stage's grammar factory, or why structured output is unavailable.
-fn build_grammar_factory(
-    tokenizer: Option<&Tokenizer>,
-    eos: &[u32],
-) -> Result<GrammarFactory, String> {
-    let tokenizer = tokenizer.ok_or_else(|| "no tokenizer loaded".to_string())?;
-    GrammarFactory::from_tokenizer(tokenizer, eos).map_err(|e| match e {
-        EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
-        other => other.to_string(),
-    })
+    structured::compile_task_grammar(factory, task)
 }
 
 /// Normalize an output shape to a 3D `[batch, seq, hidden]` for the wire.
@@ -4163,13 +4136,7 @@ impl Engine for OvRuntimeEngine {
             }
         }
         let grammar = compile_task_grammar(&self.grammar_factory, &task, !self.spec.is_last_stage)?;
-        if let Some(g) = grammar.as_ref().filter(|g| !g.warnings().is_empty()) {
-            info!(
-                task = %task.task_id,
-                warnings = ?g.warnings(),
-                "ov-runtime: response_format keywords accepted but not enforced"
-            );
-        }
+        structured::log_grammar_warnings("ov-runtime", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
     }
@@ -5713,12 +5680,16 @@ impl Builder for OvRuntimeBuilder {
 
         // Structured output: built once on the stage that holds the tokenizer
         // and takes tasks, from every EOS id generation stops on.
-        let grammar_factory = if spec.is_first_stage {
-            build_grammar_factory(self.tokenizer.as_deref(), &self.eos_token_ids).inspect_err(
-                |reason| warn!(%reason, "ov-runtime: structured output unavailable for this model"),
-            )
-        } else {
-            Err("not the first pipeline stage".to_string())
+        let grammar_factory = match self.tokenizer.as_deref() {
+            Some(tok) if spec.is_first_stage => {
+                structured::build_grammar_factory("ov-runtime", tok, &self.eos_token_ids)
+            }
+            None if spec.is_first_stage => {
+                let reason = "no tokenizer loaded".to_string();
+                structured::unavailable("ov-runtime", &reason);
+                Err(reason)
+            }
+            _ => Err("not the first pipeline stage".to_string()),
         };
 
         Ok(Box::new(OvRuntimeEngine {
@@ -7468,18 +7439,6 @@ mod tests {
             Err(other) => panic!("expected InvalidConfig, got {other:?}"),
             Ok(_) => panic!("expected InvalidConfig, got Ok"),
         }
-    }
-
-    #[test]
-    fn a_resume_seed_the_grammar_rejects_is_a_backend_error() {
-        let gf = test_factory();
-        let cg = gf.compile(&json_spec(OK_ENUM)).unwrap();
-        assert!(matches!(
-            start_grammar(&cg, &[BAD as i64]),
-            Err(EngineError::Backend(_))
-        ));
-        let mut mask = start_grammar(&cg, &[b'"' as i64]).unwrap();
-        assert!(mask.allowed(b'o' as u32));
     }
 
     fn packed_slot(grammar: Option<GrammarMask>) -> crate::packed_exec::PackedSlot {

@@ -21,6 +21,7 @@ pub mod prefix_cache;
 pub mod qwen36;
 pub mod rotary;
 pub mod runtime;
+mod structured;
 mod warn_limit;
 
 pub use dist_spec::{

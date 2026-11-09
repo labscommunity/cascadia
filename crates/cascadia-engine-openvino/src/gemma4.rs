@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
@@ -557,29 +558,13 @@ fn compile_task_grammar(
     single_stage: bool,
     task: &GenerationTask,
 ) -> EngineResult<Option<CompiledGrammar>> {
-    let Some(spec) = task.grammar.as_ref() else {
+    if task.grammar.is_none() {
         return Ok(None);
-    };
+    }
     if !single_stage {
         return Err(refuse_multi_stage_grammar());
     }
-    let factory = factory.as_ref().map_err(|reason| {
-        EngineError::InvalidConfig(format!(
-            "structured output is not available for this model: {reason}"
-        ))
-    })?;
-    factory.compile(spec).map(Some)
-}
-
-/// Activation: a fresh matcher advanced over the resume seed. A seed the
-/// grammar rejects is a backend error.
-fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineResult<GrammarMask> {
-    let mut mask = compiled.matcher()?;
-    if !seed.is_empty() {
-        let seed: Vec<u32> = seed.iter().map(|&t| t as u32).collect();
-        mask.replay(&seed)?;
-    }
-    Ok(mask)
+    structured::compile_task_grammar(factory, task)
 }
 
 /// Picks the token from the last row of a logits output. `mask` is passed
@@ -1681,13 +1666,7 @@ impl Engine for Gemma4Engine {
         }
         let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
         let grammar = compile_task_grammar(&self.grammar_factory, single_stage, &task)?;
-        if let Some(g) = grammar.as_ref().filter(|g| !g.warnings().is_empty()) {
-            info!(
-                task = %task.task_id,
-                warnings = ?g.warnings(),
-                "gemma4: response_format keywords accepted but not enforced"
-            );
-        }
+        structured::log_grammar_warnings("gemma4", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
     }
@@ -2485,14 +2464,7 @@ impl Builder for Gemma4Builder {
         // Structured output is built on the stage that receives tasks.
         let grammar_factory = match self.tokenizer.as_deref() {
             Some(tok) if spec.is_first_stage => {
-                GrammarFactory::from_tokenizer(tok, &self.eos_token_ids)
-                    .map_err(|e| match e {
-                        EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
-                        other => other.to_string(),
-                    })
-                    .inspect_err(|reason| {
-                        warn!(%reason, "gemma4: structured output unavailable for this model");
-                    })
+                structured::build_grammar_factory("gemma4", tok, &self.eos_token_ids)
             }
             _ => Err("this stage has no tokenizer".into()),
         };
@@ -2796,8 +2768,6 @@ mod tests {
 
     // ---- structured output (grammar-masked picks) ----
 
-    /// EOS of the single-byte test vocab.
-    const TEST_EOS: u32 = 261;
     /// A control byte JSON never allows: the raw argmax the mask must reject.
     const BAD: u8 = 0x01;
     const OK_ENUM: &str = r#"{"type":"string","enum":["ok"]}"#;
@@ -2937,18 +2907,6 @@ mod tests {
     fn a_rejected_token_is_an_error() {
         let mut mask = start_grammar(&ok_grammar(), &[]).unwrap();
         assert!(mask.accept(BAD as u32).is_err());
-    }
-
-    #[test]
-    fn the_resume_seed_is_replayed_and_a_rejected_seed_is_a_backend_error() {
-        let mut mask = start_grammar(&ok_grammar(), &seed("\"o")).unwrap();
-        assert!(mask.allowed(b'k' as u32));
-        assert!(!mask.allowed(b'o' as u32));
-        let err = start_grammar(&ok_grammar(), &seed("x")).err().unwrap();
-        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
-        // The EOS of a finished grammar is still allowed.
-        let mut done = start_grammar(&ok_grammar(), &seed("\"ok\"")).unwrap();
-        assert!(done.allowed(TEST_EOS));
     }
 
     #[test]

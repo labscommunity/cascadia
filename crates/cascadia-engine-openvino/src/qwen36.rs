@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
@@ -501,29 +502,13 @@ fn compile_task_grammar(
     single_box: bool,
     task: &GenerationTask,
 ) -> EngineResult<Option<CompiledGrammar>> {
-    let Some(spec) = task.grammar.as_ref() else {
+    if task.grammar.is_none() {
         return Ok(None);
-    };
+    }
     if !single_box {
         return Err(refuse_multi_stage_grammar());
     }
-    let factory = factory.as_ref().map_err(|reason| {
-        EngineError::InvalidConfig(format!(
-            "structured output is not available for this model: {reason}"
-        ))
-    })?;
-    factory.compile(spec).map(Some)
-}
-
-/// Activation: a fresh matcher advanced over the resume seed. A seed the
-/// grammar rejects is a backend error.
-fn start_grammar(compiled: &CompiledGrammar, seed: &[i64]) -> EngineResult<GrammarMask> {
-    let mut mask = compiled.matcher()?;
-    if !seed.is_empty() {
-        let seed: Vec<u32> = seed.iter().map(|&t| t as u32).collect();
-        mask.replay(&seed)?;
-    }
-    Ok(mask)
+    structured::compile_task_grammar(factory, task)
 }
 
 /// The decode pick from the last position's logits row: the argmax, or for a
@@ -744,14 +729,7 @@ impl Builder for Qwen36Builder {
         );
         // Structured output is built on the rank that receives tasks.
         let grammar_factory = match self.tokenizer.as_ref() {
-            Some(tok) => GrammarFactory::from_tokenizer(tok, &self.eos_ids)
-                .map_err(|e| match e {
-                    EngineError::InvalidConfig(m) | EngineError::Backend(m) => m,
-                    other => other.to_string(),
-                })
-                .inspect_err(|reason| {
-                    warn!(%reason, "qwen35: structured output unavailable for this model");
-                }),
+            Some(tok) => structured::build_grammar_factory("qwen35", tok, &self.eos_ids),
             None => Err("this rank has no tokenizer".into()),
         };
         Ok(Box::new(Qwen36Engine {
@@ -2792,13 +2770,7 @@ impl Engine for Qwen36Engine {
             }
         }
         let grammar = compile_task_grammar(&self.grammar_factory, self.total <= 1, &task)?;
-        if let Some(g) = grammar.as_ref().filter(|g| !g.warnings().is_empty()) {
-            info!(
-                task = %task.task_id,
-                warnings = ?g.warnings(),
-                "qwen35: response_format keywords accepted but not enforced"
-            );
-        }
+        structured::log_grammar_warnings("qwen35", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
     }
@@ -3993,15 +3965,6 @@ mod tests {
         );
         std::fs::write(&gc, r#"{"eos_token_id":7}"#).unwrap();
         assert_eq!(read_eos_ids(dir.path()), vec![7]);
-    }
-
-    #[test]
-    fn the_resume_seed_is_replayed_and_a_rejected_seed_is_a_backend_error() {
-        let mut mask = start_grammar(&compiled(OK_ENUM), &seed("\"o")).unwrap();
-        assert!(mask.allowed(b'k' as u32));
-        assert!(!mask.allowed(b'o' as u32));
-        let err = start_grammar(&compiled(OK_ENUM), &seed("x")).err().unwrap();
-        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
     }
 
     #[test]
