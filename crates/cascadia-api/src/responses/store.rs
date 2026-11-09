@@ -56,14 +56,22 @@ impl Inner {
         stamp
     }
 
-    /// Drop the stale `order` entries once they outnumber the live ones, so
-    /// the queue stays within a constant factor of the map and each use
-    /// costs amortized O(1).
-    fn compact(&mut self) {
-        if self.order.len() > 2 * self.map.len() + 64 {
-            let map = &self.map;
-            self.order
-                .retain(|(stamp, id)| map.get(id).is_some_and(|e| e.stamp == *stamp));
+    /// Remove the stale `order` entries once they outnumber the live ones,
+    /// so the queue stays within a constant factor of the map and each use
+    /// costs amortized O(1). Their ids are moved into `stale`, for the
+    /// caller to drop after the lock is released.
+    fn compact(&mut self, stale: &mut Vec<String>) {
+        if self.order.len() <= 2 * self.map.len() + 64 {
+            return;
+        }
+        let queued = std::mem::take(&mut self.order);
+        self.order.reserve(self.map.len());
+        for (stamp, id) in queued {
+            if self.map.get(&id).is_some_and(|e| e.stamp == stamp) {
+                self.order.push_back((stamp, id));
+            } else {
+                stale.push(id);
+            }
         }
     }
 }
@@ -110,8 +118,10 @@ impl ItemCache {
         if entries.is_empty() {
             return;
         }
-        // Replaced and evicted items are dropped after the lock is released.
+        // Replaced and evicted items, and stale queue ids, are dropped after
+        // the lock is released.
         let mut dropped: Vec<Arc<Value>> = Vec::new();
+        let mut stale: Vec<String> = Vec::new();
         {
             let mut inner = self.inner.lock();
             for (id, item, size) in entries {
@@ -132,10 +142,12 @@ impl ItemCache {
                     inner.bytes -= old.size;
                     dropped.push(old.item);
                 }
+                stale.push(id);
             }
-            inner.compact();
+            inner.compact(&mut stale);
         }
         drop(dropped);
+        drop(stale);
     }
 
     /// The item stored under `id` and its stored size, if that size fits
@@ -143,6 +155,10 @@ impl ItemCache {
     /// without cloning or refreshing the item. The item is copied after the
     /// lock is released.
     pub fn get_within(&self, id: &str, budget: usize) -> Result<Option<(Value, usize)>, TooLarge> {
+        // The queue's copy of the id is made, and stale ids are dropped,
+        // outside the lock.
+        let queued = id.to_owned();
+        let mut stale: Vec<String> = Vec::new();
         let found = {
             let mut inner = self.inner.lock();
             let (item, size) = match inner.map.get(id) {
@@ -150,13 +166,14 @@ impl ItemCache {
                 Some(e) if e.size > budget => return Err(TooLarge { size: e.size }),
                 Some(e) => (Arc::clone(&e.item), e.size),
             };
-            let stamp = inner.stamp(id.to_owned());
+            let stamp = inner.stamp(queued);
             if let Some(e) = inner.map.get_mut(id) {
                 e.stamp = stamp;
             }
-            inner.compact();
+            inner.compact(&mut stale);
             (item, size)
         };
+        drop(stale);
         let (item, size) = found;
         Ok(Some((Value::clone(&item), size)))
     }
