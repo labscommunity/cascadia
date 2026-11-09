@@ -650,6 +650,15 @@ fn a_valid_pattern_is_still_enforced() {
 }
 
 #[test]
+fn byte_level_factory_is_shared_and_compiles() {
+    let a = GrammarFactory::byte_level();
+    let b = GrammarFactory::byte_level();
+    assert!(Arc::ptr_eq(&a.factory, &b.factory));
+    assert_eq!(a.mask_width(), SINGLE_BYTE_EOS + 1);
+    assert!(accepts(&a, WEATHER, WEATHER_OK));
+}
+
+#[test]
 fn many_unparseable_patterns_cost_two_builds() {
     let gf = single_byte();
     let props: serde_json::Map<String, serde_json::Value> = (0..200)

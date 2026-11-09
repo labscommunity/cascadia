@@ -84,16 +84,29 @@ impl GrammarFactory {
         })
     }
 
-    /// A factory over a test vocab where token id `b` is byte `b` (0..=255)
-    /// and 256..=261 are special tokens; 261 is its EOS. For engine tests that
-    /// drive a mask over hand-built logits rows.
+    /// A factory over a tokenizer-free vocab where token id `b` is byte `b`
+    /// (0..=255) and 256..=261 are special tokens; 261 is its EOS. Built once
+    /// and shared. Building a schema's grammar costs about the same here as
+    /// with a real tokenizer, so a server can check that a schema compiles in
+    /// time before any engine sees it.
+    pub fn byte_level() -> Self {
+        static BYTE_LEVEL: std::sync::OnceLock<GrammarFactory> = std::sync::OnceLock::new();
+        BYTE_LEVEL
+            .get_or_init(|| {
+                Self::from_tok_env(
+                    llguidance::toktrie::ApproximateTokEnv::single_byte_env(),
+                    vec![261].into(),
+                )
+                .expect("byte-level vocab builds")
+            })
+            .clone()
+    }
+
+    /// [`Self::byte_level`], for engine tests that drive a mask over
+    /// hand-built logits rows.
     #[cfg(feature = "test-util")]
     pub fn single_byte_for_tests() -> Self {
-        Self::from_tok_env(
-            llguidance::toktrie::ApproximateTokEnv::single_byte_env(),
-            vec![261].into(),
-        )
-        .expect("single-byte test vocab builds")
+        Self::byte_level()
     }
 
     /// Number of real tokens the mask covers (the tokenizer vocab). A model's
