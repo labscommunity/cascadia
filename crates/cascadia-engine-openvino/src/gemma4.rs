@@ -1166,10 +1166,8 @@ async fn wait_plain_reply(g: &mut ActivationClient, prefill: bool) -> EngineResu
                     ?reply,
                     "discarding a late reply to an earlier structured-output step"
                 );
-                late_ack |= matches!(
-                    reply,
-                    StageReply::Token(_) | StageReply::Nack | StageReply::MaskMiss
-                );
+                // A late mask miss proves nothing about the chain.
+                late_ack |= matches!(reply, StageReply::Token(_) | StageReply::Nack);
             }
         }
     }
@@ -1200,10 +1198,8 @@ async fn drain_late_replies(g: &mut ActivationClient) -> EngineResult<bool> {
                     ?reply,
                     "discarding a late reply to an earlier structured-output step"
                 );
-                late_ack |= matches!(
-                    reply,
-                    Ok(StageReply::Token(_) | StageReply::Nack | StageReply::MaskMiss)
-                );
+                // A late mask miss proves nothing about the chain.
+                late_ack |= matches!(reply, Ok(StageReply::Token(_) | StageReply::Nack));
             }
         }
     }
@@ -2863,10 +2859,8 @@ async fn recv_control_ack_bounded(
                     ?reply,
                     "discarding a late reply to an earlier structured-output step"
                 );
-                late_ack |= matches!(
-                    reply,
-                    Ok(StageReply::Token(_) | StageReply::Nack | StageReply::MaskMiss)
-                );
+                // A late mask miss proves nothing about the chain.
+                late_ack |= matches!(reply, Ok(StageReply::Token(_) | StageReply::Nack));
                 continue;
             }
             return Ok((t, late_ack));
@@ -5724,8 +5718,9 @@ mod tests {
         assert_eq!(resolve_hidden(repeat, &mut recv), HiddenIn::MaskMiss);
     }
 
-    /// A late acknowledged mask-miss reply is discarded like any late masked
-    /// reply: by the plain wait, and by the drain before a masked step.
+    /// A late mask-miss reply is discarded like any late masked reply (by the
+    /// plain wait and by the drain before a masked step), but unlike the
+    /// others it is no evidence that the chain masks.
     #[tokio::test]
     async fn a_late_mask_miss_reply_is_discarded_as_stale() {
         let (mut server, mut client) = link().await;
@@ -5734,15 +5729,23 @@ mod tests {
             .await
             .unwrap();
         server.send(&encode_token_reply(7)).await.unwrap();
+        // Discarded, and no evidence that the chain masks.
         assert_eq!(
             wait_plain_reply(&mut client, false).await.unwrap(),
-            (7, true)
+            (7, false)
         );
         server
             .send(&encode_masked_reply(StageReply::MaskMiss))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(drain_late_replies(&mut client).await.unwrap());
+        // The reply is on the socket before the drain looks.
+        tokio::time::timeout(Duration::from_secs(5), client.wait_readable())
+            .await
+            .expect("the late reply arrives")
+            .unwrap();
+        assert!(!drain_late_replies(&mut client).await.unwrap());
+        // Drained: the link is empty again.
+        let empty = tokio::time::timeout(Duration::from_millis(200), client.wait_readable()).await;
+        assert!(empty.is_err());
     }
 }
