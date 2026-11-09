@@ -1825,6 +1825,86 @@ fn packed_step_masks(
     (masks.iter().any(Option::is_some).then_some(masks), failed)
 }
 
+/// How one packed pipeline step goes downstream.
+#[derive(Debug, PartialEq)]
+enum PackedExchange {
+    /// No row is masked: today's plan frame.
+    Plain,
+    /// One masked plan. `grammar_only`: every active row belongs to a grammar
+    /// slot, so a failed answer loses only those slots.
+    Masked {
+        masks: PlanMasks,
+        grammar_only: bool,
+    },
+    /// The link hasn't acknowledged a masked step yet, and plain slots share
+    /// the step: the grammar slots' rows go first in a masked plan of their
+    /// own (the probe), then the plain slots' rows in a plain plan. An older
+    /// stage refuses the probe before writing any KV and reads the plain plan
+    /// as today, so plain slots never lose a step to it.
+    Probe {
+        grammar_rows: PlanRows,
+        plain_rows: PlanRows,
+        masks: PlanMasks,
+    },
+}
+
+/// Chooses how a packed step with `rows` and `masks` goes downstream.
+/// `link_acked`: this link has acknowledged a masked step (positive
+/// evidence that every later stage masks).
+fn plan_packed_exchange(
+    rows: &PlanRows,
+    masks: Option<PlanMasks>,
+    link_acked: bool,
+) -> PackedExchange {
+    let Some(masks) = masks else {
+        return PackedExchange::Plain;
+    };
+    let grammar_slots: Vec<usize> = rows
+        .iter()
+        .zip(&masks)
+        .filter_map(|(row, m)| m.as_ref().and(row.map(|(slot, _, _)| slot)))
+        .collect();
+    let is_grammar = |row: &Option<(usize, i64, usize)>| {
+        row.is_some_and(|(slot, _, _)| grammar_slots.contains(&slot))
+    };
+    let grammar_only = rows.iter().all(|r| r.is_none() || is_grammar(r));
+    if grammar_only || link_acked {
+        return PackedExchange::Masked {
+            masks,
+            grammar_only,
+        };
+    }
+    let (grammar_rows, plain_rows) = rows
+        .iter()
+        .map(|r| {
+            if is_grammar(r) {
+                (*r, None)
+            } else {
+                (None, *r)
+            }
+        })
+        .unzip();
+    PackedExchange::Probe {
+        grammar_rows,
+        plain_rows,
+        masks,
+    }
+}
+
+/// One token per plan row from a probe's two replies: the probe's tokens on
+/// its grammar rows (when it succeeded), the plain plan's elsewhere.
+fn merge_probe_tokens(grammar_rows: &PlanRows, probe: Option<&[i32]>, plain: &[i32]) -> Vec<i32> {
+    let mut tokens = plain.to_vec();
+    if let Some(probe) = probe {
+        for (row, r) in grammar_rows.iter().enumerate() {
+            if let (Some(_), Some(&t), Some(slot)) = (r, probe.get(row), tokens.get_mut(row)) {
+                *slot = t;
+            }
+        }
+    }
+    tokens
+}
+
 /// Consecutive token-wait timeouts after which a RELAY rank gives up on its
 /// downstream and exits for a supervisor rebuild (see
 /// `escalate_if_downstream_is_gone`). Each timeout already burns a full token
@@ -3750,14 +3830,74 @@ impl OvRuntimeEngine {
         let hidden = bytes_to_f32(odt, obytes)?;
         let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
         let masks = self.packed_step_masks(&kind, plan_rows.len(), out);
-        let reply = self.exchange_packed_downstream(&hidden, oshape, &plan_rows, masks.as_deref());
-        let tokens = match masks {
-            None => reply.map_err(TokenWaitFailure::into_error)?,
-            // A masked plan answered without acknowledgement loses this batch
-            // (its plain slots too) and latches the link.
-            Some(_) => self.mask_link.verdict(std::time::Instant::now(), reply)?,
+        let tokens = match plan_packed_exchange(&plan_rows, masks, self.mask_link.acked) {
+            PackedExchange::Plain => self
+                .exchange_packed_downstream(&hidden, oshape, &plan_rows, None)
+                .map_err(TokenWaitFailure::into_error)?,
+            // A mixed masked plan answered without acknowledgement loses this
+            // batch (its plain slots too) and latches the link. It is sent only
+            // after the link acknowledged a masked step.
+            PackedExchange::Masked {
+                masks,
+                grammar_only: false,
+            } => {
+                let reply =
+                    self.exchange_packed_downstream(&hidden, oshape, &plan_rows, Some(&masks));
+                self.mask_link.verdict(std::time::Instant::now(), reply)?
+            }
+            PackedExchange::Masked {
+                masks,
+                grammar_only: true,
+            } => {
+                let reply =
+                    self.exchange_packed_downstream(&hidden, oshape, &plan_rows, Some(&masks));
+                match self.grammar_rows_verdict(&plan_rows, reply, out)? {
+                    Some(tokens) => tokens,
+                    None => return Ok(()),
+                }
+            }
+            PackedExchange::Probe {
+                grammar_rows,
+                plain_rows,
+                masks,
+            } => {
+                let reply =
+                    self.exchange_packed_downstream(&hidden, oshape, &grammar_rows, Some(&masks));
+                let probe = self.grammar_rows_verdict(&grammar_rows, reply, out)?;
+                let plain = self
+                    .exchange_packed_downstream(&hidden, oshape, &plain_rows, None)
+                    .map_err(TokenWaitFailure::into_error)?;
+                merge_probe_tokens(&grammar_rows, probe.as_deref(), &plain)
+            }
         };
         self.emit_packed_tokens(&tokens, kind, out)
+    }
+
+    /// The answer to a masked plan of grammar slots' rows only: the tokens,
+    /// or `None` after failing just those slots (an older stage, an
+    /// acknowledged NACK). A dead link still fails the whole batch.
+    fn grammar_rows_verdict(
+        &mut self,
+        rows: &PlanRows,
+        reply: Result<Vec<i32>, TokenWaitFailure>,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> EngineResult<Option<Vec<i32>>> {
+        if let Err(TokenWaitFailure::Other(_)) = &reply {
+            return reply.map(Some).map_err(TokenWaitFailure::into_error);
+        }
+        match self.mask_link.verdict(std::time::Instant::now(), reply) {
+            Ok(tokens) => Ok(Some(tokens)),
+            Err(e) => {
+                let mut slots: Vec<usize> = rows.iter().flatten().map(|&(s, _, _)| s).collect();
+                slots.sort_unstable();
+                slots.dedup();
+                let msg = e.to_string();
+                for slot in slots {
+                    out.extend(self.fail_packed_slot(slot, EngineError::Backend(msg.clone())));
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// The token masks of one packed pipeline step: one per sampled row of a
@@ -9785,6 +9925,80 @@ mod tests {
         let (hf, _) = server.recv_reply().await.unwrap();
         assert_eq!(decode_wire_plan(&pf, 2).unwrap(), plan);
         assert_eq!(hf, f16_hidden(2), "the stream stayed aligned");
+    }
+
+    /// Until this link has acknowledged a masked step, a masked plan carries
+    /// only grammar slots' rows: plain slots' rows go in a plain plan of their
+    /// own, which an old stage reads as today, so a json slot on an old tail
+    /// never costs a plain slot its step.
+    #[test]
+    fn a_fresh_link_never_gets_plain_rows_in_a_masked_plan() {
+        let plan = plan_rows_fixture();
+        let masks: PlanMasks = vec![Some(ok_enum_words()), None, None];
+        match plan_packed_exchange(&plan, Some(masks.clone()), false) {
+            PackedExchange::Probe {
+                grammar_rows,
+                plain_rows,
+                masks: m,
+            } => {
+                assert_eq!(grammar_rows, vec![Some((0, 5, 0)), None, None]);
+                assert_eq!(plain_rows, vec![None, Some((1, 3, 1)), None]);
+                assert_eq!(m, masks);
+                // The old stage: the plain plan decodes, the masked one is
+                // refused before any KV is written.
+                assert_eq!(
+                    decode_wire_plan(&encode_packed_plan(&plain_rows, None), 2).unwrap(),
+                    plain_rows
+                );
+                assert!(decode_wire_plan(&encode_packed_plan(&grammar_rows, Some(&m)), 2).is_err());
+            }
+            other => panic!("expected a probe, got {other:?}"),
+        }
+        // Once acknowledged, one masked plan carries every row.
+        assert_eq!(
+            plan_packed_exchange(&plan, Some(masks.clone()), true),
+            PackedExchange::Masked {
+                masks: masks.clone(),
+                grammar_only: false
+            }
+        );
+        assert_eq!(
+            plan_packed_exchange(&plan, None, false),
+            PackedExchange::Plain
+        );
+    }
+
+    /// A plan of grammar slots' rows only (a json slot's prefill, a batch of
+    /// json slots) goes as one masked plan: a failure there loses only those
+    /// slots. Unsampled rows of a grammar slot ride with it.
+    #[test]
+    fn a_plan_of_grammar_rows_only_is_one_masked_plan_failing_only_those_slots() {
+        let plan = vec![Some((0, 4, 0)), Some((0, 5, 0)), None];
+        let masks: PlanMasks = vec![None, Some(ok_enum_words()), None];
+        for acked in [false, true] {
+            assert_eq!(
+                plan_packed_exchange(&plan, Some(masks.clone()), acked),
+                PackedExchange::Masked {
+                    masks: masks.clone(),
+                    grammar_only: true
+                }
+            );
+        }
+    }
+
+    /// The probe's two replies make one token row per plan row.
+    #[test]
+    fn probe_tokens_merge_by_row() {
+        let grammar_rows = vec![Some((0, 5, 0)), None, None];
+        assert_eq!(
+            merge_probe_tokens(&grammar_rows, Some(&[34, 0, 0]), &[0, 9, 0]),
+            vec![34, 9, 0]
+        );
+        // A failed probe: the grammar rows' slots are failed, their tokens unused.
+        assert_eq!(
+            merge_probe_tokens(&grammar_rows, None, &[0, 9, 0]),
+            vec![0, 9, 0]
+        );
     }
 
     fn packed_slot(grammar: Option<GrammarMask>) -> crate::packed_exec::PackedSlot {
