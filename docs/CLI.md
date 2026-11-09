@@ -617,7 +617,10 @@ Schema limits (each is a 400 `invalid response_format: …`):
 | Sum of all those counts in one schema; a `minX`/`maxX` pair on one object counts once, at the larger value | 200 000 |
 
 Counts are taken everywhere in the schema, including inside `default` and
-`examples` (a `$ref` can point there). An object that repeats a key is
+`examples` (a `$ref` can point there). Each count keyword, and
+`minContains`/`maxContains`, must be written as a plain non-negative
+integer (`0`, `10`; not `0.0`, `0e0`, `-0`, `1.5` or `"0"`), or the request
+gets `… <keyword> must be a non-negative integer`. An object that repeats a key is
 rejected too. A local `$ref` must be `#` or a plain JSON pointer into
 objects, `#/key/key…`: no empty segment (`//`, a trailing `/`), no `~`
 escape, no `%` encoding, no array index, and it must name an existing
