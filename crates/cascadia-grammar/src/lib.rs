@@ -248,6 +248,39 @@ impl GrammarMask {
         }
     }
 
+    /// The current allowed set as `ceil(mask_width / 32)` words: bit `t % 32`
+    /// of word `t / 32` is set when token `t` may come next; no bit past the
+    /// tokenizer vocab is set. Read from the cached mask, no logits row. The
+    /// same errors as [`Self::apply`]: the error state, or nothing allowed.
+    pub fn mask_words(&mut self) -> EngineResult<Vec<u32>> {
+        let width = self.mask_width;
+        let mask = self.current_mask()?.as_slice();
+        let mut words: Vec<u32> = (0..width.div_ceil(32))
+            .map(|w| mask.get(w).copied().unwrap_or(0))
+            .collect();
+        if let (Some(last), tail @ 1..) = (words.last_mut(), width % 32) {
+            *last &= (1u32 << tail) - 1;
+        }
+        if words.iter().all(|&w| w == 0) {
+            return Err(EngineError::Backend(
+                "grammar: no token of the vocabulary is allowed".into(),
+            ));
+        }
+        Ok(words)
+    }
+
+    /// Greedy pick from `row` among the tokens that may come next (see
+    /// [`argmax_allowed`]); indices past the tokenizer vocab are never picked.
+    /// The matcher is not advanced. `Err` in the error state or when nothing
+    /// in `row` is allowed, as [`Self::apply`].
+    pub fn pick_greedy(&mut self, row: &[f32]) -> EngineResult<usize> {
+        let width = self.mask_width.min(row.len());
+        let mask = self.current_mask()?;
+        argmax_allowed(&row[..width], mask.as_slice()).ok_or_else(|| {
+            EngineError::Backend("grammar: no token of the logits row is allowed".into())
+        })
+    }
+
     /// Whether `token` may come next.
     pub fn allowed(&mut self, token: u32) -> bool {
         let width = self.mask_width;
@@ -278,6 +311,32 @@ impl GrammarMask {
                 StopReason::NoExtension | StopReason::EndOfSentence
             )
     }
+}
+
+/// Greedy pick among the indices `words` allows (bit `t % 32` of word
+/// `t / 32` set: index `t` allowed; indices past the words are not): the
+/// allowed index with the largest logit, the first on ties. NaN and `-inf`
+/// logits never win; when every allowed logit is one of them, the lowest
+/// allowed index. Never a disallowed index; `None` when no index of `row` is
+/// allowed.
+pub fn argmax_allowed(row: &[f32], words: &[u32]) -> Option<usize> {
+    let mut lowest = None;
+    let mut best: Option<(usize, f32)> = None;
+    'words: for (w, &word) in words.iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let t = w * 32 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let Some(&v) = row.get(t) else {
+                break 'words;
+            };
+            lowest.get_or_insert(t);
+            if v > f32::NEG_INFINITY && best.is_none_or(|(_, b)| v > b) {
+                best = Some((t, v));
+            }
+        }
+    }
+    best.map(|(t, _)| t).or(lowest)
 }
 
 #[cfg(test)]

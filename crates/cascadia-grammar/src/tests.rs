@@ -499,3 +499,104 @@ fn hf_tokenizer_masks_with_merged_tokens_and_every_eos() {
     assert!(row[ENDOFTEXT as usize].is_finite());
     assert!(row[IM_END as usize].is_finite());
 }
+
+/// The allowed set read back through `apply` on a zero row: what callers did
+/// before `mask_words`.
+fn words_via_apply(gm: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
+    let mut row = vec![0.0f32; width];
+    gm.apply(&mut row)?;
+    let mut words = vec![0u32; width.div_ceil(32)];
+    for (i, v) in row.iter().enumerate() {
+        if v.is_finite() {
+            words[i / 32] |= 1 << (i % 32);
+        }
+    }
+    Ok(words)
+}
+
+#[test]
+fn mask_words_are_the_allowed_set_bit_for_bit() {
+    let gf = single_byte();
+    let width = gf.mask_width();
+    let mut gm = mask_for(&gf, WEATHER);
+    // Start, inside a key, inside a string, after a number, finished.
+    let mut checked = 0;
+    for (i, &t) in bytes(WEATHER_OK).iter().enumerate() {
+        if [0, 3, 10, 40].contains(&i) {
+            let words = gm.mask_words().unwrap();
+            assert_eq!(words.len(), width.div_ceil(32));
+            for tok in 0..words.len() * 32 {
+                let bit = words[tok / 32] >> (tok % 32) & 1 == 1;
+                assert_eq!(bit, tok < width && gm.allowed(tok as u32), "token {tok}");
+            }
+            assert_eq!(words, words_via_apply(&mut gm, width).unwrap());
+            checked += 1;
+        }
+        gm.accept(t).unwrap();
+    }
+    assert_eq!(checked, 4);
+    assert!(gm.finished());
+    let done = gm.mask_words().unwrap();
+    assert_eq!(done, words_via_apply(&mut gm, width).unwrap());
+    let eos = SINGLE_BYTE_EOS;
+    assert_eq!(done[eos / 32] >> (eos % 32) & 1, 1);
+}
+
+#[test]
+fn mask_words_fail_in_the_error_state() {
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, WEATHER);
+    assert!(gm.accept(u32::from(b'x')).is_err());
+    let err = gm.mask_words().unwrap_err();
+    assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+}
+
+#[test]
+fn greedy_pick_takes_the_best_allowed_token() {
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, r#"{"type":"integer"}"#);
+    walk(&gf, &mut gm, &bytes("12")).unwrap();
+    // Digits and EOS are allowed; the best raw logit ('a') is not.
+    let mut row = vec![0.0f32; gf.mask_width()];
+    row[b'a' as usize] = 9.0;
+    row[b'7' as usize] = 3.0;
+    row[b'4' as usize] = 3.0;
+    assert_eq!(
+        gm.pick_greedy(&row).unwrap(),
+        b'4' as usize,
+        "first on ties"
+    );
+    let words = gm.mask_words().unwrap();
+    assert_eq!(argmax_allowed(&row, &words), Some(b'4' as usize));
+}
+
+#[test]
+fn an_all_non_finite_row_picks_the_lowest_allowed_token_never_a_disallowed_eos() {
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, WEATHER);
+    // Only '{' may come first; EOS (the last index) is disallowed.
+    for fill in [f32::NEG_INFINITY, f32::NAN] {
+        let row = vec![fill; gf.mask_width()];
+        assert_eq!(gm.pick_greedy(&row).unwrap(), b'{' as usize);
+        let words = gm.mask_words().unwrap();
+        assert_eq!(argmax_allowed(&row, &words), Some(b'{' as usize));
+    }
+    // NaN at an allowed index never beats a finite allowed logit.
+    let mut gm = mask_for(&gf, r#"{"type":"integer"}"#);
+    walk(&gf, &mut gm, &bytes("1")).unwrap();
+    let mut row = vec![f32::NEG_INFINITY; gf.mask_width()];
+    row[b'0' as usize] = f32::NAN;
+    row[b'5' as usize] = -1.0;
+    assert_eq!(gm.pick_greedy(&row).unwrap(), b'5' as usize);
+}
+
+#[test]
+fn a_pick_with_nothing_allowed_in_the_row_is_an_error() {
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, WEATHER);
+    // '{' (123) lies past this short row.
+    assert!(gm.pick_greedy(&[0.0; 100]).is_err());
+    let words = gm.mask_words().unwrap();
+    assert_eq!(argmax_allowed(&[0.0; 100], &words), None);
+    assert_eq!(argmax_allowed(&[0.0; 4], &[]), None);
+}
