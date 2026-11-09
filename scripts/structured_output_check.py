@@ -294,6 +294,20 @@ def case_zod_email(base):
     )
 
 
+def case_pattern_props(base):
+    # The largest patternProperties fan-out the server's caps allow (64 keys in each of two objects): the
+    # grammar compile must stay quick, whatever the answer.
+    def obj(prefix):
+        return {"type": "object", "additionalProperties": False,
+                "patternProperties": {f"^{prefix}{i}[a-z]*$": {"type": "integer"} for i in range(64)}}
+    schema = {"type": "object", "properties": {"a": obj("k"), "b": obj("m")}, "required": ["a", "b"],
+              "additionalProperties": False}
+    body = chat([{"role": "user", "content": "Return two empty objects a and b."}],
+                response_format=rf_schema(schema, "pp"), max_tokens=32)
+    status, raw, dt = post(base, body)
+    verdict("pattern_properties_compile_fast", status in (200, 400) and dt < 15, f"HTTP {status} {dt:.2f}s {raw[:120]}")
+
+
 def case_pydantic(base):
     schema = load_fixture("pydantic_output_schema.json")
     run_json_case(
@@ -428,6 +442,7 @@ CASES = {
     "pydantic": case_pydantic,
     "bounded": case_bounded,
     "zod_email": case_zod_email,
+    "pattern_props": case_pattern_props,
     "thinking": case_thinking_default,
     "malformed": case_malformed,
     "bad_schema": case_bad_schema,
