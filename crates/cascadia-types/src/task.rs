@@ -144,6 +144,24 @@ pub struct GenerationTask {
     /// also covers tasks constructed in-process).
     #[serde(default, deserialize_with = "de_resume_ids")]
     pub resume_token_ids: Option<Vec<i32>>,
+    /// Optional constraint on the shape of the output. `None` (the default)
+    /// leaves generation unconstrained and is not serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<GrammarSpec>,
+}
+
+/// Which grammar language a [`GrammarSpec`] body is written in.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GrammarKind {
+    JsonSchema,
+}
+
+/// Backend-neutral constraint on the output. `body` is a JSON Schema as compact JSON.
+/// Engines that cannot enforce it reject the task at submit or are never sent one (the API checks the server's capability).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrammarSpec {
+    pub kind: GrammarKind,
+    pub body: String,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -220,6 +238,7 @@ impl GenerationTask {
             trust_remote_code: false,
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
+            grammar: None,
         }
     }
 
@@ -244,11 +263,42 @@ impl GenerationTask {
         self.sampling = sampling;
         self
     }
+
+    /// Constrain the output to `g`.
+    #[must_use]
+    pub fn with_grammar(mut self, g: GrammarSpec) -> Self {
+        self.grammar = Some(g);
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grammar_defaults_none_and_round_trips() {
+        let t = GenerationTask::new("t1", "p");
+        assert_eq!(t.grammar, None);
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(
+            !json.contains("grammar"),
+            "absent grammar is not serialized: {json}"
+        );
+        let g = GrammarSpec {
+            kind: GrammarKind::JsonSchema,
+            body: r#"{"type":"object"}"#.into(),
+        };
+        let t2 = t.with_grammar(g.clone());
+        let back: GenerationTask =
+            serde_json::from_str(&serde_json::to_string(&t2).unwrap()).unwrap();
+        assert_eq!(back.grammar, Some(g));
+        // an older payload without the field still decodes
+        let mut v = serde_json::to_value(GenerationTask::new("t2", "p")).unwrap();
+        v.as_object_mut().unwrap().remove("grammar");
+        let old: GenerationTask = serde_json::from_value(v).unwrap();
+        assert_eq!(old.grammar, None);
+    }
 
     #[test]
     fn resume_token_ids_defaults_none_and_is_additive() {
@@ -266,6 +316,7 @@ mod tests {
             trust_remote_code: false,
             tenant: String::new(),
             resume_token_ids: None,
+            grammar: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();
