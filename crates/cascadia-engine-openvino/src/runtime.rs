@@ -1777,7 +1777,11 @@ async fn wait_token_reply(
         link.on_acked();
     }
     let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
-    *streak = next_timeout_streak(*streak, timed_out && !masked);
+    // A masked step's outcome leaves the streak as it was: its timeout doesn't
+    // count, and its success doesn't hide plain timeouts around it.
+    if !masked {
+        *streak = next_timeout_streak(*streak, timed_out);
+    }
     outcome
 }
 
@@ -8261,8 +8265,10 @@ mod tests {
             );
         }
 
+        // Masked steps between plain timeouts neither count nor reset the streak.
         let mut streak = 0;
         for _ in 0..n {
+            let _ = wait_token_reply(&down, 1, budget, true, &mut streak, &mut link).await;
             let reply = wait_token_reply(&down, 1, budget, false, &mut streak, &mut link).await;
             assert!(
                 matches!(reply, Err(TokenWaitFailure::TimedOut(_))),
