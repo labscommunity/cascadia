@@ -1235,14 +1235,11 @@ impl LlamaCppEngine {
             if let Some(tools) = &task.tools {
                 body["tools"] = tools.clone();
             }
-            // The API has already validated and capped the schema; the
-            // child compiles it to its own grammar.
+            // The schema is added after serialization (below), verbatim.
             if let Some(g) = &task.grammar {
-                if let Ok(schema) = serde_json::from_str::<serde_json::Value>(&g.body) {
-                    body["response_format"] = serde_json::json!({
-                        "type": "json_schema",
-                        "json_schema": {"name": "response", "schema": schema},
-                    });
+                if let Err(e) = check_grammar_body(&g.body) {
+                    let _ = tx.send(Err(e));
+                    return;
                 }
             }
             // tool_choice only means anything alongside tools, but it is
@@ -1258,7 +1255,10 @@ impl LlamaCppEngine {
             ("/v1/chat/completions", body)
         };
         apply_sampling(&mut body, &task.sampling);
-        let body = body.to_string();
+        let body = match (&task.grammar, task.messages.is_empty()) {
+            (Some(g), false) => with_response_format(body.to_string(), &g.body),
+            _ => body.to_string(),
+        };
         let mut s = match TcpStream::connect(("127.0.0.1", port)) {
             Ok(s) => s,
             Err(e) => {
@@ -1405,6 +1405,35 @@ fn apply_sampling(body: &mut serde_json::Value, sp: &SamplingParams) {
     if !sp.stop.is_empty() {
         o.insert("stop".into(), sp.stop.clone().into());
     }
+}
+
+/// Refuse a grammar body that is not JSON: it is spliced into the request
+/// text as is (see [`with_response_format`]).
+fn check_grammar_body(body: &str) -> EngineResult<()> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .map(|_| ())
+        .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))
+}
+
+/// The serialized request `body` (a JSON object without `response_format`)
+/// with a `json_schema` `response_format` whose schema is `schema`, inserted
+/// verbatim. Parsing the schema into a `serde_json::Value` would sort its
+/// keys, and llama-server's grammar emits object properties in schema
+/// order, so the client's order must survive. The API has already
+/// validated and capped the schema; the child compiles it to its own
+/// grammar.
+fn with_response_format(mut body: String, schema: &str) -> String {
+    debug_assert!(body.ends_with('}'), "{body}");
+    body.pop();
+    if !body.ends_with('{') {
+        body.push(',');
+    }
+    body.push_str(
+        r#""response_format":{"type":"json_schema","json_schema":{"name":"response","schema":"#,
+    );
+    body.push_str(schema);
+    body.push_str("}}}");
+    body
 }
 
 /// Translate an OpenAI `tool_choice` into the form llama-server parses.
@@ -1676,6 +1705,9 @@ impl Engine for LlamaCppEngine {
             || self.active.as_ref() == Some(&task.task_id)
         {
             return Ok(());
+        }
+        if let Some(g) = &task.grammar {
+            check_grammar_body(&g.body)?;
         }
         self.pending.push(task);
         Ok(())
@@ -2787,6 +2819,11 @@ mod unix_tests {
 
     /// Submit `task` to a mock child and return the JSON body it received.
     fn captured_chat_body(task: GenerationTask) -> serde_json::Value {
+        serde_json::from_str(&captured_chat_text(task)).unwrap()
+    }
+
+    /// Submit `task` to a mock child and return the body text it received.
+    fn captured_chat_text(task: GenerationTask) -> String {
         let (tx, rx) = std::sync::mpsc::channel();
         let (port, server) = mock_server(move |req, s| {
             let req = String::from_utf8_lossy(req).into_owned();
@@ -2806,7 +2843,47 @@ mod unix_tests {
         engine.submit(task).unwrap();
         drain(&mut engine);
         server.join().unwrap();
-        serde_json::from_str(&rx.recv().unwrap()).unwrap()
+        rx.recv().unwrap()
+    }
+
+    #[test]
+    fn chat_body_keeps_the_schema_key_order() {
+        let schema = r#"{"type":"object","properties":{"thinking":{"type":"string"},"action":{"type":"string"}},"required":["thinking","action"]}"#;
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: schema.into(),
+        });
+        let text = captured_chat_text(task);
+        assert!(text.contains(schema), "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["response_format"]["json_schema"]["name"], "response");
+    }
+
+    #[test]
+    fn grammar_that_is_not_json_is_refused_at_submit() {
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: "{not json".into(),
+        });
+        let mut engine = test_engine(1);
+        match engine.submit(task) {
+            Err(EngineError::InvalidConfig(m)) => {
+                assert!(m.starts_with("response_format json_schema: "), "{m}")
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_response_format_appends_the_field() {
+        assert_eq!(
+            with_response_format(r#"{"a":1}"#.into(), r#"{"z":1,"b":2}"#),
+            r#"{"a":1,"response_format":{"type":"json_schema","json_schema":{"name":"response","schema":{"z":1,"b":2}}}}"#
+        );
+        assert_eq!(
+            with_response_format("{}".into(), "{}"),
+            r#"{"response_format":{"type":"json_schema","json_schema":{"name":"response","schema":{}}}}"#
+        );
     }
 
     #[test]

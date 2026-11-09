@@ -3,10 +3,12 @@
 //! lists JSON Schema keywords the decoder cannot enforce.
 
 use cascadia_types::{GrammarKind, GrammarSpec};
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 /// Grammar body used for `json_object` (and for `json_schema` whose schema is
-/// missing, `null` or `true`): any JSON object.
+/// missing, `null`, `true` or `{}`): any JSON object.
 pub const JSON_OBJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":true}"#;
 
 /// The output format a chat request asked for.
@@ -16,7 +18,12 @@ pub enum ResponseFormat {
     JsonObject,
     JsonSchema {
         name: Option<String>,
+        /// The schema, parsed. Its object keys are sorted, so use it for
+        /// checks only.
         schema: Value,
+        /// The schema as the client sent it, whitespace removed. Key order
+        /// is kept: the decoder emits object properties in schema order.
+        raw: String,
         strict: bool,
     },
 }
@@ -42,7 +49,7 @@ impl ResponseFormat {
 // (measured on OpenVINO GenAI 2026.4.1); the limits sit far above any client
 // schema seen.
 
-/// Largest accepted schema, in bytes of its compact JSON serialization.
+/// Largest accepted schema, in bytes of its text with whitespace removed.
 pub const MAX_SCHEMA_BYTES: usize = 65536;
 /// Deepest accepted nesting of objects and arrays; the schema itself is level 1.
 pub const MAX_SCHEMA_DEPTH: usize = 64;
@@ -58,39 +65,96 @@ pub const MAX_SCHEMA_COUNT_TOTAL: u64 = 200_000;
 
 const TYPE_ERR: &str = "response_format.type must be one of text, json_object, json_schema";
 
-/// Parse the `response_format` field of a chat request. Absent or `null`
-/// means plain text.
-pub fn parse_response_format(v: Option<&Value>) -> Result<ResponseFormat, String> {
-    let obj = match v {
-        None | Some(Value::Null) => return Ok(ResponseFormat::Text),
-        Some(Value::Object(o)) => o,
-        Some(_) => return Err("response_format must be an object".into()),
+/// Parse the `response_format` field of a chat request from its JSON text.
+/// Absent or `null` means plain text. The text is the field exactly as the
+/// client sent it, so a schema keeps its key order (see
+/// [`ResponseFormat::JsonSchema`]).
+pub fn parse_response_format(raw: Option<&str>) -> Result<ResponseFormat, String> {
+    let Some(raw) = raw else {
+        return Ok(ResponseFormat::Text);
+    };
+    let v: Value =
+        serde_json::from_str(raw).map_err(|e| format!("response_format is not valid JSON: {e}"))?;
+    let obj = match &v {
+        Value::Null => return Ok(ResponseFormat::Text),
+        Value::Object(o) => o,
+        _ => return Err("response_format must be an object".into()),
     };
     match obj.get("type").and_then(Value::as_str) {
         None => Err(TYPE_ERR.into()),
         Some("text") => Ok(ResponseFormat::Text),
         Some("json_object") => Ok(ResponseFormat::JsonObject),
-        Some("json_schema") => parse_json_schema(obj.get("json_schema")),
+        Some("json_schema") => parse_json_schema(obj.get("json_schema"), raw),
         Some(other) => Err(format!("{TYPE_ERR}, got {}", Value::from(other))),
     }
 }
 
-/// Parse `response_format.json_schema`. A missing, `null` or `true` schema
-/// asks for any JSON object; `false` and non-object schemas are rejected.
-fn parse_json_schema(js: Option<&Value>) -> Result<ResponseFormat, String> {
+/// `response_format` with the schema left as text.
+#[derive(Deserialize)]
+struct RawFormat {
+    json_schema: Box<RawValue>,
+}
+
+/// `response_format.json_schema` with the schema left as text.
+#[derive(Deserialize)]
+struct RawJsonSchema {
+    schema: Box<RawValue>,
+}
+
+/// The text of `response_format.json_schema.schema` inside `raw`, which
+/// holds one.
+fn raw_schema_text(raw: &str) -> Result<String, String> {
+    let bad = |e: serde_json::Error| format!("response_format.json_schema: {e}");
+    let format: RawFormat = serde_json::from_str(raw).map_err(bad)?;
+    let js: RawJsonSchema = serde_json::from_str(format.json_schema.get()).map_err(bad)?;
+    Ok(minify_json(js.schema.get()))
+}
+
+/// `text`, valid JSON, with the whitespace between tokens removed. Strings
+/// and key order stay as they are.
+fn minify_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Parse `response_format.json_schema`. A missing, `null`, `true` or `{}`
+/// schema asks for any JSON object; `false` and non-object schemas are
+/// rejected. `raw` is the whole `response_format` text.
+fn parse_json_schema(js: Option<&Value>, raw: &str) -> Result<ResponseFormat, String> {
     let Some(Value::Object(js)) = js else {
         return Err("response_format.json_schema must be an object".into());
     };
     match js.get("schema") {
         None | Some(Value::Null) | Some(Value::Bool(true)) => Ok(ResponseFormat::JsonObject),
+        Some(Value::Object(o)) if o.is_empty() => Ok(ResponseFormat::JsonObject),
         Some(Value::Bool(false)) => {
             Err("response_format.json_schema.schema is false: no output can match it".into())
         }
         Some(schema @ Value::Object(_)) => {
-            check_limits(schema)?;
+            let text = raw_schema_text(raw)?;
+            check_limits(schema, &text)?;
             Ok(ResponseFormat::JsonSchema {
                 name: js.get("name").and_then(Value::as_str).map(str::to_owned),
                 schema: schema.clone(),
+                raw: text,
                 strict: js.get("strict") == Some(&Value::Bool(true)),
             })
         }
@@ -112,10 +176,9 @@ const FIELD: &str = "response_format.json_schema.schema";
 /// Reject a schema over [`MAX_SCHEMA_BYTES`], nested deeper than
 /// [`MAX_SCHEMA_DEPTH`], with a count keyword or pattern quantifier above
 /// [`MAX_SCHEMA_COUNT`], or whose counts sum above [`MAX_SCHEMA_COUNT_TOTAL`].
-fn check_limits(schema: &Value) -> Result<(), String> {
-    let n = serde_json::to_string(schema)
-        .expect("a serde_json::Value always serializes")
-        .len();
+/// `text` is the schema's compact text.
+fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
+    let n = text.len();
     if n > MAX_SCHEMA_BYTES {
         return Err(format!(
             "{FIELD} is {n} bytes; the limit is {MAX_SCHEMA_BYTES}"
@@ -259,9 +322,7 @@ pub fn grammar_for(rf: &ResponseFormat) -> Option<GrammarSpec> {
     let body = match rf {
         ResponseFormat::Text => return None,
         ResponseFormat::JsonObject => JSON_OBJECT_SCHEMA.to_owned(),
-        ResponseFormat::JsonSchema { schema, .. } => {
-            serde_json::to_string(schema).expect("a serde_json::Value always serializes")
-        }
+        ResponseFormat::JsonSchema { raw, .. } => raw.clone(),
     };
     Some(GrammarSpec {
         kind: GrammarKind::JsonSchema,
@@ -408,7 +469,58 @@ mod tests {
     use serde_json::json;
 
     fn parse(v: serde_json::Value) -> Result<ResponseFormat, String> {
-        parse_response_format(Some(&v))
+        parse_response_format(Some(&v.to_string()))
+    }
+
+    /// The `JsonSchema` variant [`parse`] gives for `schema`.
+    fn schema_variant(
+        name: Option<&str>,
+        schema: serde_json::Value,
+        strict: bool,
+    ) -> ResponseFormat {
+        ResponseFormat::JsonSchema {
+            name: name.map(str::to_owned),
+            raw: schema.to_string(),
+            schema,
+            strict,
+        }
+    }
+
+    #[test]
+    fn schema_keeps_its_property_order() {
+        let text =
+            include_str!("../../cascadia-engine-mock/tests/fixtures/browser_use_schema.json");
+        let format = format!(
+            r#"{{"type": "json_schema", "json_schema": {{"name": "AgentOutput", "schema": {text}}}}}"#
+        );
+        let g = grammar_for(&parse_response_format(Some(&format)).unwrap()).unwrap();
+        let thinking = g.body.find(r#""thinking":"#).unwrap();
+        let action = g.body.find(r#""action":"#).unwrap();
+        assert!(thinking < action, "{}", g.body);
+        assert_eq!(g.body, text.trim());
+    }
+
+    #[test]
+    fn schema_text_is_compacted_without_touching_strings() {
+        let format = r#"{"type":"json_schema","json_schema":{"schema":
+            { "type" : "object",
+              "properties" : { "z b" : { "const" : "a \" b\\" , "description":"x\ty  " },
+                               "a" : { "type" : [ "string" , "null" ] } } } }}"#;
+        let g = grammar_for(&parse_response_format(Some(format)).unwrap()).unwrap();
+        assert_eq!(
+            g.body,
+            r#"{"type":"object","properties":{"z b":{"const":"a \" b\\","description":"x\ty  "},"a":{"type":["string","null"]}}}"#
+        );
+        assert_eq!(minify_json(" [ 1 ,\n\t2 ] "), "[1,2]");
+        assert_eq!(minify_json(r#"" \\" , " x ""#), r#"" \\"," x ""#);
+    }
+
+    #[test]
+    fn empty_schema_is_json_object() {
+        assert_eq!(
+            parse(json!({"type": "json_schema", "json_schema": {"schema": {}}})),
+            Ok(ResponseFormat::JsonObject)
+        );
     }
 
     #[test]
@@ -436,14 +548,7 @@ mod tests {
             "json_schema": {"name": "thing", "schema": schema.clone(), "strict": true}
         }))
         .unwrap();
-        assert_eq!(
-            rf,
-            ResponseFormat::JsonSchema {
-                name: Some("thing".into()),
-                schema: schema.clone(),
-                strict: true
-            }
-        );
+        assert_eq!(rf, schema_variant(Some("thing"), schema.clone(), true));
         assert!(rf.is_json());
         assert_eq!(rf.type_name(), "json_schema");
 
@@ -453,14 +558,7 @@ mod tests {
             "json_schema": {"name": 7, "schema": schema.clone(), "strict": "yes"}
         }))
         .unwrap();
-        assert_eq!(
-            rf,
-            ResponseFormat::JsonSchema {
-                name: None,
-                schema,
-                strict: false
-            }
-        );
+        assert_eq!(rf, schema_variant(None, schema, false));
     }
 
     #[test]
@@ -534,12 +632,7 @@ mod tests {
         assert_eq!(g.body, JSON_OBJECT_SCHEMA);
 
         let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
-        let g = grammar_for(&ResponseFormat::JsonSchema {
-            name: None,
-            schema: schema.clone(),
-            strict: false,
-        })
-        .unwrap();
+        let g = grammar_for(&schema_variant(None, schema.clone(), false)).unwrap();
         assert_eq!(g.kind, GrammarKind::JsonSchema);
         assert!(
             !g.body.contains(' ') && !g.body.contains('\n'),
@@ -871,11 +964,7 @@ mod tests {
             let schema: serde_json::Value = serde_json::from_str(text).unwrap();
             assert_eq!(
                 parse_schema(schema.clone()),
-                Ok(ResponseFormat::JsonSchema {
-                    name: None,
-                    schema,
-                    strict: false
-                })
+                Ok(schema_variant(None, schema, false))
             );
         }
     }

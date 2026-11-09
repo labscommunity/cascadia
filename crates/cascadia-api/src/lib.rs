@@ -803,11 +803,12 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
-    /// OpenAI `response_format`, kept raw and parsed by
-    /// [`parse_response_format`] so a malformed value is a 400 naming the
-    /// field rather than a generic deserialization error.
+    /// OpenAI `response_format`, kept as the client's JSON text and parsed
+    /// by [`parse_response_format`]: a malformed value is a 400 naming the
+    /// field rather than a generic deserialization error, and a schema keeps
+    /// its key order (a `serde_json::Value` would sort it).
     #[serde(default)]
-    pub response_format: Option<serde_json::Value>,
+    pub response_format: Option<Box<serde_json::value::RawValue>>,
 }
 
 /// `chat_template_kwargs` as sent by vLLM/SGLang-shaped clients. Only
@@ -2484,17 +2485,18 @@ async fn chat_completions(
         )
             .into_response();
     }
-    let response_format = match parse_response_format(req.response_format.as_ref()) {
-        Ok(rf) => rf,
-        Err(msg) => {
-            count_rejected("invalid_request");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("invalid response_format: {msg}") })),
-            )
-                .into_response();
-        }
-    };
+    let response_format =
+        match parse_response_format(req.response_format.as_deref().map(|r| r.get())) {
+            Ok(rf) => rf,
+            Err(msg) => {
+                count_rejected("invalid_request");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid response_format: {msg}") })),
+                )
+                    .into_response();
+            }
+        };
     let tools_callable = req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && req.tool_choice.as_ref().and_then(|c| c.as_str()) != Some("none");
     let json = response_format.is_json();
@@ -7907,7 +7909,8 @@ level={{ effort_map[eff] }}";
         assert_eq!(
             task.grammar,
             grammar_for(
-                &parse_response_format(Some(&json_schema_format(nested_schema()))).unwrap()
+                &parse_response_format(Some(&json_schema_format(nested_schema()).to_string()))
+                    .unwrap()
             )
         );
         assert!(task.grammar.is_some());
@@ -8000,6 +8003,35 @@ level={{ effort_map[eff] }}";
         assert_eq!(status, StatusCode::OK, "{v}");
         let task = last_task(&seen);
         assert!(task.prompt.contains("EFFORT"), "{}", task.prompt);
+    }
+
+    #[tokio::test]
+    async fn grammar_keeps_the_schema_key_order_the_client_sent() {
+        let schema =
+            include_str!("../../cascadia-engine-mock/tests/fixtures/browser_use_schema.json")
+                .trim();
+        let body = format!(
+            r#"{{"model":"mock-model","messages":[{{"role":"user","content":"hi"}}],
+                "response_format":{{"type":"json_schema","json_schema":{{"name":"AgentOutput","schema":{schema}}}}}}}"#
+        );
+        let (app, seen) = capture_app(true, minimal_cfg()).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let grammar = last_task(&seen).grammar.expect("a grammar");
+        assert_eq!(grammar.body, schema);
+        let thinking = grammar.body.find(r#""thinking":"#).unwrap();
+        let action = grammar.body.find(r#""action":"#).unwrap();
+        assert!(thinking < action, "{}", grammar.body);
     }
 
     #[tokio::test]
