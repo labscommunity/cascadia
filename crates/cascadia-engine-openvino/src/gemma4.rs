@@ -4497,8 +4497,9 @@ mod tests {
 
     /// The engine's own context: `block_on` from a blocking thread, where the
     /// yield can't run the driver and the runtime's workers record the
-    /// bytes. A late reply lands while the stage still computes (here 2 ms
-    /// before the drain); the drain sees it and an empty link costs no wait.
+    /// bytes. A late reply lands while the stage still computes (here 20 ms
+    /// before the drain, enough for the driver to record it on a busy
+    /// machine); the drain sees it and an empty link costs no wait.
     #[test]
     fn the_drain_sees_a_reply_already_sent_from_a_blocking_thread() {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -4516,7 +4517,7 @@ mod tests {
                         .await
                         .unwrap();
                 });
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(20));
                 handle.block_on(async {
                     assert!(drain_late_replies(&mut client).await.unwrap());
                     assert_empty_drains_dont_wait(&mut client).await;
