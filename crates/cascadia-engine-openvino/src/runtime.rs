@@ -8282,6 +8282,68 @@ mod tests {
         );
     }
 
+    /// Any answer to a masked step proves the downstream is alive, so it
+    /// resets the escalation streak like a plain reply: N-1 plain timeouts
+    /// followed by an acknowledged token, an acknowledged NACK or an
+    /// unacknowledged reply leave the streak at 0. Only a masked step's
+    /// timeout leaves it where it was.
+    #[tokio::test]
+    async fn a_masked_reply_resets_the_streak_and_a_masked_timeout_keeps_it() {
+        let (client, mut server) = loopback().await;
+        let down = Arc::new(tokio::sync::Mutex::new(client));
+        let budget = std::time::Duration::from_millis(50);
+        let n = RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT;
+        let mut link = MaskLink::default();
+        let mut seq = 0;
+
+        let replies = [
+            (encode_token_reply(3, 0, true), "an acknowledged token"),
+            (
+                encode_token_reply(NACK_TOKEN, 0, true),
+                "an acknowledged NACK",
+            ),
+            (encode_token_reply(3, 0, false), "an unacknowledged token"),
+        ];
+        for (template, what) in replies {
+            let mut streak = 0;
+            for _ in 0..n - 1 {
+                seq += 1;
+                let reply =
+                    wait_token_reply(&down, seq, budget, false, &mut streak, &mut link).await;
+                assert!(
+                    matches!(reply, Err(TokenWaitFailure::TimedOut(_))),
+                    "{reply:?}"
+                );
+            }
+            assert_eq!(streak, n - 1);
+            seq += 1;
+            let (token, _, acked) = decode_token_reply(&template).unwrap();
+            server
+                .send(&encode_token_reply(token, seq, acked))
+                .await
+                .unwrap();
+            let reply = wait_token_reply(&down, seq, budget, true, &mut streak, &mut link).await;
+            assert!(
+                !matches!(reply, Err(TokenWaitFailure::TimedOut(_))),
+                "{what}: {reply:?}"
+            );
+            assert_eq!(streak, 0, "{what} resets the streak");
+        }
+
+        let mut streak = 0;
+        for _ in 0..n - 1 {
+            seq += 1;
+            let _ = wait_token_reply(&down, seq, budget, false, &mut streak, &mut link).await;
+        }
+        seq += 1;
+        let reply = wait_token_reply(&down, seq, budget, true, &mut streak, &mut link).await;
+        assert!(
+            matches!(reply, Err(TokenWaitFailure::TimedOut(_))),
+            "{reply:?}"
+        );
+        assert_eq!(streak, n - 1, "a masked timeout neither counts nor resets");
+    }
+
     /// The escalation error must be classifiable by TYPE. `Io(TimedOut)` is
     /// what makes the relay loop exit for a supervisor rebuild; a `Backend`
     /// string that merely happens to contain a fatal substring would be one
@@ -9449,6 +9511,56 @@ mod tests {
             (NACK_TOKEN, 9, false),
             "a plain NACK"
         );
+    }
+
+    /// The vouch a relay stage passes to [`own_failure_answer`], as the
+    /// middle's and the tail's call sites compute it (`is_last_stage ||
+    /// mask_link.acked`): the tail always vouches; a middle vouches only once
+    /// its downstream has acknowledged a masked step. Only a vouched masked
+    /// failure goes up as an acknowledged NACK.
+    #[test]
+    fn a_middle_vouches_for_its_own_failure_once_its_chain_has_masked() {
+        let e = || EngineError::Backend("x".into());
+        let vouch_at = |tail: bool, link: &MaskLink| tail || link.acked;
+        let fresh = MaskLink::default();
+        let mut masked_below = MaskLink::default();
+        masked_below.on_acked();
+        assert!(masked_below.acked);
+
+        // (stage is the tail, its link, expected acknowledgement)
+        let cases = [
+            (true, &fresh, true, "the tail"),
+            (
+                false,
+                &fresh,
+                false,
+                "a middle whose chain never acknowledged",
+            ),
+            (
+                false,
+                &masked_below,
+                true,
+                "a middle whose chain has acknowledged",
+            ),
+        ];
+        for (tail, link, want, who) in cases {
+            let (step, vouch) = own_failure_answer::<i32>(e(), vouch_at(tail, link));
+            assert!(step.is_err(), "{who}");
+            assert_eq!(vouch, want, "{who}");
+
+            let mut wire = MaskLink::default();
+            let frames = upstream_reply_frames(&mut wire, &step, 9, true, vouch);
+            assert_eq!(
+                frames,
+                vec![encode_token_reply(NACK_TOKEN, 9, want)],
+                "{who}: the NACK shape"
+            );
+            assert_eq!(
+                decode_token_reply(&frames[0]).unwrap(),
+                (NACK_TOKEN, 9, want),
+                "{who}"
+            );
+        }
     }
 
     /// A relay's answer to a masked step: only an acknowledged reply from
