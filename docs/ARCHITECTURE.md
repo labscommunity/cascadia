@@ -44,7 +44,7 @@ CPU-targeted sparse mixture-of-experts engine (Kimi K2.6-style models, MiniMax-M
 
 ## `cascadia-grammar`
 
-JSON Schema token masks for structured output (`response_format`) in the engines that decode in-process (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe`). Wraps llguidance: one grammar factory per engine, built from the tokenizer the engine already loads and its EOS ids; one compiled grammar per request schema; one matcher per sequence that masks each logits row and accepts the chosen token. Compact JSON (no whitespace), `oneOf` treated as `anyOf`, keywords llguidance does not enforce reported as warnings. Pure CPU with no OpenVINO dependency, so it unit-tests on every platform.
+JSON Schema token masks for structured output (`response_format`) in the engines that decode in-process (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe`). Wraps llguidance: one grammar factory per engine, built from the tokenizer the engine already loads and its EOS ids; one compiled grammar per request schema; one matcher per sequence that masks each logits row and accepts the chosen token. Compact JSON (no whitespace), `oneOf` treated as `anyOf`, keywords llguidance does not enforce reported as warnings. Also the two ends of a repeated mask on a pipeline stage link: the sender remembers the last full mask it wrote on a connection and sends a short marker when the next one is the same, and the receiver remembers the last mask it decoded to stand in for the marker; both forget it whenever a step on the link fails or the connection changes. Pure CPU with no OpenVINO dependency, so it unit-tests on every platform.
 
 ## `cascadia-int4-gemm`
 
