@@ -11200,7 +11200,7 @@ level={{ effort_map[eff] }}";
         let chat = "/v1/chat/completions";
         let cmpl = "/v1/completions";
         // (metrics label, endpoint, stream, tools, window, booked outcome)
-        let cases: [(&'static str, &str, bool, bool, Option<u32>, &str); 8] = [
+        let cases = [
             (
                 "api-early-window-chat",
                 chat,
