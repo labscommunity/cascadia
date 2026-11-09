@@ -450,9 +450,15 @@ fn client_message(err: OvError, what: &str) -> String {
     clean
 }
 
-/// What every in-flight client of a failed CB step is told.
+/// What every in-flight client of a failed CB step is told: the backend's
+/// raw text (logged in full by the caller) can carry build paths or another
+/// co-batched client's schema, so it is reduced by [`clean_backend_message`].
 fn step_failure_message(err: &OvError) -> String {
-    format!("cb step failed: {err}")
+    let detail = match err {
+        OvError::Native(m) => clean_backend_message(m),
+        other => other.to_string(),
+    };
+    format!("cb step failed: {detail}")
 }
 
 /// The probe schema's one answer, without whitespace.
@@ -3198,6 +3204,35 @@ mod tests {
         let _ = e.step().unwrap();
         assert_eq!(e.quarantined.len(), 0);
         e.submit(schema_task("b", SCHEMA_A)).unwrap();
+    }
+
+    #[test]
+    fn cb_step_failure_message_is_cleaned_for_clients() {
+        let err = OvError::Native(
+            "Exception from src/core.cpp:12:\n[09:00:01] /build/xgrammar-src/cpp/grammar.cc:88: \
+             bad grammar near {\"secret\":1}\n"
+                .into(),
+        );
+        assert_eq!(
+            step_failure_message(&err),
+            "cb step failed: bad grammar near {\"secret\":1}"
+        );
+        assert_eq!(
+            step_failure_message(&OvError::Native("mock step failure".into())),
+            "cb step failed: mock step failure"
+        );
+
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("plain", 8)).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(
+            out[0].1.error.as_deref(),
+            Some("cb step failed: mock step failure")
+        );
     }
 
     #[test]
