@@ -19,3 +19,4 @@ llguidance = "1.9.1"
 toktrie_hf_tokenizers = "1.9.1"
 tokenizers = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }

@@ -690,3 +690,20 @@ fn backreference_and_look_behind_patterns_are_dropped() {
         );
     }
 }
+
+#[test]
+fn runtime_grammar_errors_hide_the_parser_state() {
+    let gf = single_byte();
+    let generic = |e: EngineError| {
+        assert!(
+            matches!(&e, EngineError::Backend(m) if m == "structured output generation failed"),
+            "{e:?}"
+        )
+    };
+    let mut gm = mask_for(&gf, WEATHER);
+    generic(gm.accept(u32::from(b'x')).unwrap_err());
+    let mut row = vec![0.0f32; gf.mask_width()];
+    generic(gm.apply(&mut row).unwrap_err());
+    let mut gm = mask_for(&gf, WEATHER);
+    generic(gm.replay(&bytes(r#"{"x"#)).unwrap_err());
+}

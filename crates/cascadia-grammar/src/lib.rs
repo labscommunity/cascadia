@@ -41,6 +41,13 @@ fn backend(e: impl std::fmt::Display) -> EngineError {
     EngineError::Backend(clean_message(&format!("grammar: {e}")))
 }
 
+/// A grammar failure while generating. llguidance's text describes its
+/// parser state, which is for the log, not the client.
+fn generation_failed(e: impl std::fmt::Display) -> EngineError {
+    tracing::warn!(error = %clean_message(&e.to_string()), "structured output generation failed");
+    EngineError::Backend("structured output generation failed".into())
+}
+
 /// Builds grammars for one tokenizer. Cheap to share: clone it or keep it in an `Arc`.
 #[derive(Clone)]
 pub struct GrammarFactory {
@@ -265,7 +272,7 @@ impl CompiledGrammar {
     pub fn matcher(&self) -> EngineResult<GrammarMask> {
         let matcher = (*self.pristine).clone();
         if let Some(e) = matcher.get_error() {
-            return Err(backend(e));
+            return Err(generation_failed(e));
         }
         Ok(GrammarMask {
             matcher,
@@ -291,15 +298,18 @@ impl GrammarMask {
     /// failure (`Backend`), not the client's.
     pub fn replay(&mut self, tokens: &[u32]) -> EngineResult<()> {
         self.current = None;
-        self.matcher
-            .consume_tokens(tokens)
-            .map_err(|e| backend(format!("resumed output does not match the schema: {e}")))
+        self.matcher.consume_tokens(tokens).map_err(|e| {
+            generation_failed(format!("resumed output does not match the schema: {e}"))
+        })
     }
 
     fn current_mask(&mut self) -> EngineResult<&SimpleVob> {
         if self.current.is_none() {
             // Once stopped this is the EOS set: every EOS id the engine stops on.
-            let mask = self.matcher.compute_mask_or_eos().map_err(backend)?;
+            let mask = self
+                .matcher
+                .compute_mask_or_eos()
+                .map_err(generation_failed)?;
             self.current = Some(mask);
         }
         Ok(self.current.as_ref().expect("mask computed above"))
@@ -394,7 +404,7 @@ impl GrammarMask {
             return Ok(());
         }
         self.current = None;
-        self.matcher.consume_token(token).map_err(backend)
+        self.matcher.consume_token(token).map_err(generation_failed)
     }
 
     /// A clean finish: the JSON is complete and nothing else may follow, or

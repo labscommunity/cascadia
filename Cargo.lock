@@ -523,6 +523,7 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "toktrie_hf_tokenizers",
+ "tracing",
 ]
 
 [[package]]
