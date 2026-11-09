@@ -12,8 +12,10 @@
 //! `perf_metrics` defaults to `max_new_tokens` when EOS fires early on
 //! short greedy decodes, which inflates reported tok/s).
 
+use std::collections::{HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
@@ -22,8 +24,8 @@ use cascadia_ov_genai_shim::{
     GenConfig, LlmPipeline, PluginConfig,
 };
 use cascadia_types::{
-    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
-    TaskId,
+    Chunk, FinishReason, GenerationTask, GrammarKind, LoadProgress, PeerLayout, SamplingParams,
+    ShardSpec, TaskId,
 };
 use futures::stream;
 use tracing::{info, warn};
@@ -330,6 +332,9 @@ impl Builder for OvGenaiBuilder {
                 max_tokens_default: 256,
                 idle_steps: 0,
                 step_failures: 0,
+                excused_since_success: false,
+                structured_unavailable: None,
+                quarantined: QuarantineSet::default(),
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -340,6 +345,7 @@ impl Builder for OvGenaiBuilder {
             prompt_pretemplated: self.prompt_pretemplated,
             pending: Vec::new(),
             max_tokens_default: 256,
+            structured_unavailable: None,
         }))
     }
 }
@@ -354,6 +360,147 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+/// The JSON schema `response_format: {"type":"json_object"}` maps to. The
+/// warmup probe compiles this one, so it is also known to work on this server.
+const JSON_OBJECT_PROBE: &str = r#"{"type":"object","additionalProperties":true}"#;
+
+/// Prompt and token budget for the warmup structured-output probe.
+const PROBE_PROMPT: &str = "Reply with a JSON object.";
+const PROBE_MAX_TOKENS: u32 = 16;
+
+/// Request id of the CB structured-output probe (the plain warmup uses
+/// `u64::MAX`); neither can collide with the sequential request-id counter.
+const PROBE_REQUEST_ID: u64 = u64::MAX - 1;
+
+/// How many schemas the CB engine remembers as having failed to compile.
+const QUARANTINE_CAPACITY: usize = 256;
+/// How long a schema that failed to compile is refused.
+const QUARANTINE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// The JSON schema a task's output must follow, if it carries one.
+fn grammar_json_schema(task: &GenerationTask) -> Option<&str> {
+    match &task.grammar {
+        Some(g) => match g.kind {
+            GrammarKind::JsonSchema => Some(g.body.as_str()),
+        },
+        None => None,
+    }
+}
+
+/// The message inside a shim error, without the shim's own prefix.
+fn ov_message(err: OvError) -> String {
+    match err {
+        OvError::Native(m) => m,
+        other => other.to_string(),
+    }
+}
+
+/// Submit-time check of a task's output constraint: refuse it when this model
+/// cannot do structured output, or when the schema does not compile. Tasks
+/// without a grammar pass straight through.
+fn check_grammar(
+    task: &GenerationTask,
+    unavailable: Option<&str>,
+    validate: impl FnOnce(&str) -> Result<(), OvError>,
+) -> EngineResult<()> {
+    let Some(schema) = grammar_json_schema(task) else {
+        return Ok(());
+    };
+    if let Some(reason) = unavailable {
+        return Err(EngineError::InvalidConfig(format!(
+            "structured output is not available for this model: {reason}"
+        )));
+    }
+    validate(schema).map_err(|err| {
+        EngineError::InvalidConfig(format!("response_format json_schema: {}", ov_message(err)))
+    })
+}
+
+/// Decide the warmup structured-output probe. `None` means available: the
+/// output starts with `{`, or is empty or whitespace only (the grammar allows
+/// leading whitespace, so a short budget can end before the object starts —
+/// inconclusive, not a failure). `Some(reason)` means unavailable.
+fn probe_verdict(r: Result<String, OvError>) -> Option<String> {
+    match r {
+        Ok(text) => {
+            let t = text.trim_start();
+            if t.is_empty() || t.starts_with('{') {
+                None
+            } else {
+                let head: String = t.chars().take(40).collect();
+                Some(format!("probe output did not start with '{{': {head}"))
+            }
+        }
+        Err(err) => Some(ov_message(err)),
+    }
+}
+
+/// Log the probe's outcome and turn it into the engine's
+/// `structured_unavailable` value.
+fn record_probe(verdict: Option<String>) -> Option<String> {
+    match &verdict {
+        Some(reason) => warn!(
+            reason = %reason,
+            "structured output (response_format) unavailable for this model"
+        ),
+        None => info!("structured output available"),
+    }
+    verdict
+}
+
+fn schema_hash(body: &str) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    body.hash(&mut h);
+    h.finish()
+}
+
+/// Schemas (by body hash) that recently failed to compile on the CB pipeline.
+/// Bounded and time-limited: the oldest entry is dropped past capacity, and an
+/// entry stops counting after [`QUARANTINE_TTL`].
+#[derive(Default)]
+struct QuarantineSet {
+    order: VecDeque<(u64, Instant)>,
+    members: HashSet<u64>,
+}
+
+impl QuarantineSet {
+    fn prune(&mut self, now: Instant) {
+        // Entries are only ever appended with a non-decreasing time, so the
+        // expired ones are all at the front.
+        while let Some(&(h, at)) = self.order.front() {
+            if now.saturating_duration_since(at) < QUARANTINE_TTL {
+                break;
+            }
+            self.order.pop_front();
+            self.members.remove(&h);
+        }
+    }
+
+    fn contains(&mut self, h: u64, now: Instant) -> bool {
+        self.prune(now);
+        self.members.contains(&h)
+    }
+
+    fn insert(&mut self, h: u64, now: Instant) {
+        self.prune(now);
+        if self.members.contains(&h) {
+            return;
+        }
+        if self.order.len() >= QUARANTINE_CAPACITY {
+            if let Some((old, _)) = self.order.pop_front() {
+                self.members.remove(&old);
+            }
+        }
+        self.order.push_back((h, now));
+        self.members.insert(h);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
     speculative_k: u32,
@@ -361,6 +508,9 @@ pub struct OvGenaiEngine {
     prompt_pretemplated: bool,
     pending: Vec<GenerationTask>,
     max_tokens_default: u32,
+    /// Set by the warmup probe when this model cannot do structured output;
+    /// tasks with a grammar are then refused at submit with this reason.
+    structured_unavailable: Option<String>,
 }
 
 impl Engine for OvGenaiEngine {
@@ -370,6 +520,7 @@ impl Engine for OvGenaiEngine {
             /*temperature*/ 0.0,
             /*enable_thinking*/ false,
             &SamplingParams::default(),
+            None,
         );
         match self.pipe.generate("Hi", &cfg) {
             Ok(_) => info!(
@@ -379,6 +530,25 @@ impl Engine for OvGenaiEngine {
             ),
             Err(err) => warn!(error = %err, "ov-genai warmup failed"),
         }
+
+        // Structured-output probe: one real generation under the json_object
+        // schema, through this engine's own config (speculative decoding /
+        // prompt lookup included), so a model or pipeline that cannot run
+        // with an output constraint is found here rather than per request.
+        let cfg = self.gen_config(
+            PROBE_MAX_TOKENS,
+            0.0,
+            false,
+            &SamplingParams::default(),
+            Some(JSON_OBJECT_PROBE.to_owned()),
+        );
+        let result = self.pipe.generate(PROBE_PROMPT, &cfg).map(|r| {
+            match r.text.strip_prefix(PROBE_PROMPT) {
+                Some(rest) => rest.to_owned(),
+                None => r.text,
+            }
+        });
+        self.structured_unavailable = record_probe(probe_verdict(result));
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
@@ -406,6 +576,9 @@ impl Engine for OvGenaiEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
+            self.pipe.validate_json_schema(s)
+        })?;
         self.pending.push(task);
         Ok(())
     }
@@ -434,6 +607,7 @@ impl Engine for OvGenaiEngine {
             task.temperature,
             task.enable_thinking,
             &task.sampling,
+            grammar_json_schema(&task).map(str::to_owned),
         );
 
         let started = Instant::now();
@@ -545,6 +719,10 @@ trait CbPipe: Send {
     ) -> Result<Box<dyn CbReq>, OvError>;
     fn step(&self) -> Result<(), OvError>;
     fn count_tokens(&self, text: &str) -> Option<u32>;
+    /// Must only be called from the engine's own `&mut self` methods: the
+    /// tokenizer's structured-output state is not safe to touch while a step
+    /// or add_request runs on the same pipeline.
+    fn validate_json_schema(&self, schema: &str) -> Result<(), OvError>;
 }
 
 /// One enrolled request, as the engine sees it.
@@ -570,6 +748,9 @@ impl CbPipe for CbPipeline {
     fn count_tokens(&self, text: &str) -> Option<u32> {
         CbPipeline::count_tokens(self, text)
     }
+    fn validate_json_schema(&self, schema: &str) -> Result<(), OvError> {
+        CbPipeline::validate_json_schema(self, schema)
+    }
 }
 
 impl CbReq for CbHandle {
@@ -589,6 +770,11 @@ struct ActiveCbTask {
     max_tokens: u32,
     prompt_tokens: Option<u32>,
     started: Instant,
+    /// Hash of the task's JSON schema; `None` without one and for the
+    /// json_object schema (the warmup probe already compiled that).
+    grammar_hash: Option<u64>,
+    /// False until a read returned at least one new token.
+    produced: bool,
 }
 
 /// Continuous-batching ov-genai engine (#20). Unlike [`OvGenaiEngine`]'s
@@ -617,6 +803,14 @@ pub struct OvGenaiCbEngine {
     /// Consecutive `pipe.step()` failures. Past MAX_STEP_FAILURES the pipeline
     /// is treated as unusable and `submit()` stops admitting work.
     step_failures: u32,
+    /// A step failure was already blamed on a new schema since the last
+    /// successful step. Only one per run of failures is excused, so a dead
+    /// device still latches even when every request is schema-constrained.
+    excused_since_success: bool,
+    /// Set by the warmup probe when this model cannot do structured output.
+    structured_unavailable: Option<String>,
+    /// Schemas that recently took a scheduler iteration down with them.
+    quarantined: QuarantineSet,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -629,6 +823,7 @@ impl Engine for OvGenaiCbEngine {
             /*temperature*/ 0.0,
             /*enable_thinking*/ false,
             &SamplingParams::default(),
+            None,
         );
         // u64::MAX cannot collide with the sequential request-id counter.
         match self.pipe.add_request(u64::MAX, "Hi", &cfg) {
@@ -666,6 +861,9 @@ impl Engine for OvGenaiCbEngine {
             }
             Err(err) => warn!(error = %err, "ov-genai cb warmup failed"),
         }
+
+        let verdict = probe_verdict(self.run_structured_probe());
+        self.structured_unavailable = record_probe(verdict);
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
@@ -705,6 +903,20 @@ impl Engine for OvGenaiCbEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        let schema = grammar_json_schema(&task);
+        let grammar_hash = schema.filter(|s| *s != JSON_OBJECT_PROBE).map(schema_hash);
+        if let Some(h) = grammar_hash {
+            if self.quarantined.contains(h, Instant::now()) {
+                return Err(EngineError::InvalidConfig(
+                    "response_format json_schema: this schema failed to compile on this \
+                     server; retry later or change the schema"
+                        .to_string(),
+                ));
+            }
+        }
+        check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
+            self.pipe.validate_json_schema(s)
+        })?;
         let max_tokens = if task.max_tokens > 0 {
             task.max_tokens
         } else {
@@ -718,6 +930,7 @@ impl Engine for OvGenaiCbEngine {
             task.temperature,
             task.enable_thinking,
             &task.sampling,
+            schema.map(str::to_owned),
         );
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
@@ -732,6 +945,8 @@ impl Engine for OvGenaiCbEngine {
             total_tokens: 0,
             max_tokens,
             started: Instant::now(),
+            grammar_hash,
+            produced: false,
         });
         Ok(())
     }
@@ -758,7 +973,37 @@ impl Engine for OvGenaiCbEngine {
             // fail them all explicitly rather than spinning on a broken batch.
             // Each drained task still gets its own error chunk — that per-task
             // routing is why this returns Ok rather than an engine-level Err.
-            self.step_failures += 1;
+            //
+            // OV compiles a request's grammar on its first sampled step, so a
+            // step that fails while such a request is new may have failed on
+            // that compile. Counting it would let one client latch the worker
+            // with a bad schema; quarantining the schema stops it from failing
+            // the next batches too. Resource exhaustion and json_object (the
+            // warmup probe compiled it) are never blamed on a schema.
+            let resource = cascadia_ov_genai_shim::last_error_resource_exhausted();
+            let suspects: Vec<u64> = if resource || self.excused_since_success {
+                Vec::new()
+            } else {
+                self.active
+                    .iter()
+                    .filter(|t| !t.produced)
+                    .filter_map(|t| t.grammar_hash)
+                    .collect()
+            };
+            if suspects.is_empty() {
+                self.step_failures += 1;
+            } else {
+                self.excused_since_success = true;
+                let now = Instant::now();
+                for h in &suspects {
+                    self.quarantined.insert(*h, now);
+                }
+                warn!(
+                    schemas = suspects.len(),
+                    "cb step failed with a new schema-constrained request in the batch; \
+                     not counted toward the failure latch, schema refused for 10 minutes"
+                );
+            }
             warn!(
                 error = %err,
                 in_flight = self.active.len(),
@@ -776,6 +1021,7 @@ impl Engine for OvGenaiCbEngine {
             return Ok(failed);
         }
         self.step_failures = 0;
+        self.excused_since_success = false;
 
         let mut out = Vec::new();
         let mut idx = 0;
@@ -798,6 +1044,9 @@ impl Engine for OvGenaiCbEngine {
                 );
             }
             self.active[idx].total_tokens += read.new_tokens;
+            if read.new_tokens > 0 {
+                self.active[idx].produced = true;
+            }
             match read.status {
                 CbStatus::Running => {
                     // Every chunk carries ITS OWN token increment in n_tokens
@@ -933,8 +1182,52 @@ impl Engine for OvGenaiCbEngine {
     }
 }
 
+impl OvGenaiCbEngine {
+    /// Run the warmup structured-output probe: one request under the
+    /// json_object schema, driven to a terminal status within
+    /// [`WARMUP_MAX_STEPS`]. Returns the text it produced.
+    fn run_structured_probe(&mut self) -> Result<String, OvError> {
+        let cfg = build_gen_config(
+            0,
+            0,
+            self.prompt_pretemplated,
+            PROBE_MAX_TOKENS,
+            0.0,
+            false,
+            &SamplingParams::default(),
+            Some(JSON_OBJECT_PROBE.to_owned()),
+        );
+        let mut handle = self
+            .pipe
+            .add_request(PROBE_REQUEST_ID, PROBE_PROMPT, &cfg)?;
+        let mut text = String::new();
+        for _ in 0..WARMUP_MAX_STEPS {
+            if let Err(err) = self.pipe.step() {
+                let _ = handle.cancel();
+                return Err(err);
+            }
+            let r = match handle.read() {
+                Ok(r) => r,
+                Err(err) => {
+                    let _ = handle.cancel();
+                    return Err(err);
+                }
+            };
+            text.push_str(&r.text_delta);
+            if r.status != CbStatus::Running {
+                return Ok(text);
+            }
+        }
+        // Not finished in time: judge what it produced so far, and free it.
+        let _ = handle.cancel();
+        Ok(text)
+    }
+}
+
 /// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
 /// passes 0 for the speculative knobs — the CB scheduler owns batching).
+/// `json_schema` constrains the output to that schema; `None` leaves it free.
+#[allow(clippy::too_many_arguments)]
 fn build_gen_config(
     speculative_k: u32,
     prompt_lookup_ngram: u32,
@@ -943,6 +1236,7 @@ fn build_gen_config(
     temperature: f32,
     enable_thinking: bool,
     sampling: &SamplingParams,
+    json_schema: Option<String>,
 ) -> GenConfig {
     let do_sample = temperature > 0.0;
     let mut cfg = GenConfig {
@@ -973,7 +1267,7 @@ fn build_gen_config(
         frequency_penalty: sampling.frequency_penalty,
         presence_penalty: sampling.presence_penalty,
         seed: sampling.seed,
-        json_schema: None,
+        json_schema,
     };
     if speculative_k > 0 {
         cfg.num_assistant_tokens = speculative_k;
@@ -1007,8 +1301,9 @@ impl OvGenaiEngine {
         temperature: f32,
         enable_thinking: bool,
         sampling: &SamplingParams,
+        json_schema: Option<String>,
     ) -> GenConfig {
-        build_gen_config(
+        stateful_gen_config(
             self.speculative_k,
             self.prompt_lookup_ngram,
             self.prompt_pretemplated,
@@ -1016,8 +1311,34 @@ impl OvGenaiEngine {
             temperature,
             enable_thinking,
             sampling,
+            json_schema,
         )
     }
+}
+
+/// The stateful engine's `GenConfig` (see [`OvGenaiEngine::gen_config`]); a
+/// free function so it is testable without a pipeline.
+#[allow(clippy::too_many_arguments)]
+fn stateful_gen_config(
+    speculative_k: u32,
+    prompt_lookup_ngram: u32,
+    prompt_pretemplated: bool,
+    max_tokens: u32,
+    temperature: f32,
+    enable_thinking: bool,
+    sampling: &SamplingParams,
+    json_schema: Option<String>,
+) -> GenConfig {
+    build_gen_config(
+        speculative_k,
+        prompt_lookup_ngram,
+        prompt_pretemplated,
+        max_tokens,
+        temperature,
+        enable_thinking,
+        sampling,
+        json_schema,
+    )
 }
 
 #[cfg(test)]
@@ -1044,6 +1365,9 @@ mod tests {
         steps: usize,
         added: Vec<u64>,
         cancelled: Vec<u64>,
+        /// Returned by `validate_json_schema` when set.
+        validate_err: Option<String>,
+        validate_calls: usize,
     }
 
     struct MockPipe {
@@ -1085,6 +1409,14 @@ mod tests {
         }
         fn count_tokens(&self, _text: &str) -> Option<u32> {
             Some(7)
+        }
+        fn validate_json_schema(&self, _schema: &str) -> Result<(), OvError> {
+            let mut st = self.st.lock().unwrap();
+            st.validate_calls += 1;
+            match &st.validate_err {
+                Some(m) => Err(OvError::Native(m.clone())),
+                None => Ok(()),
+            }
         }
     }
 
@@ -1130,6 +1462,9 @@ mod tests {
             max_tokens_default: 256,
             idle_steps: 0,
             step_failures: 0,
+            excused_since_success: false,
+            structured_unavailable: None,
+            quarantined: QuarantineSet::default(),
         }
     }
 
@@ -1421,6 +1756,239 @@ mod tests {
     }
     use cascadia_engine::EngineError;
     use cascadia_types::{PeerEndpoint, PeerLayout, ShardSpec};
+
+    // ---- structured output (JSON schema) ------------------------------------
+
+    fn schema_task(id: &str, body: &str) -> GenerationTask {
+        task(id, 8).with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: body.to_string(),
+        })
+    }
+
+    const SCHEMA_A: &str = r#"{"type":"object","properties":{"a":{"type":"integer"}}}"#;
+    const SCHEMA_B: &str = r#"{"type":"object","properties":{"b":{"type":"string"}}}"#;
+
+    #[test]
+    fn build_gen_config_sets_json_schema() {
+        let sp = SamplingParams::default();
+        let cfg = build_gen_config(0, 0, false, 8, 0.0, false, &sp, Some(SCHEMA_A.to_owned()));
+        assert_eq!(cfg.json_schema.as_deref(), Some(SCHEMA_A));
+        let cfg = build_gen_config(0, 0, false, 8, 0.0, false, &sp, None);
+        assert_eq!(cfg.json_schema, None);
+    }
+
+    #[test]
+    fn stateful_gen_config_keeps_speculative_knobs_with_a_schema() {
+        let cfg = stateful_gen_config(
+            3,
+            2,
+            false,
+            16,
+            0.0,
+            false,
+            &SamplingParams::default(),
+            Some(SCHEMA_A.to_owned()),
+        );
+        assert_eq!(cfg.json_schema.as_deref(), Some(SCHEMA_A));
+        assert_eq!(cfg.num_assistant_tokens, 5);
+        assert_eq!(cfg.max_ngram_size, 2);
+        assert_eq!(cfg.max_new_tokens, 16);
+    }
+
+    #[test]
+    fn check_grammar_paths() {
+        // No grammar: validate must not run.
+        let plain = task("p", 8);
+        assert!(check_grammar(&plain, Some("x"), |_| panic!("validate called")).is_ok());
+
+        let t = schema_task("s", SCHEMA_A);
+        let err = check_grammar(&t, Some("no xgrammar"), |_| Ok(())).unwrap_err();
+        match err {
+            EngineError::InvalidConfig(m) => assert_eq!(
+                m,
+                "structured output is not available for this model: no xgrammar"
+            ),
+            other => panic!("{other:?}"),
+        }
+
+        let err =
+            check_grammar(&t, None, |_| Err(OvError::Native("bad schema".into()))).unwrap_err();
+        match err {
+            EngineError::InvalidConfig(m) => {
+                assert_eq!(m, "response_format json_schema: bad schema")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let mut seen = None;
+        assert!(check_grammar(&t, None, |s| {
+            seen = Some(s.to_owned());
+            Ok(())
+        })
+        .is_ok());
+        assert_eq!(seen.as_deref(), Some(SCHEMA_A));
+    }
+
+    #[test]
+    fn cb_submit_rejects_an_invalid_schema_before_enrolling() {
+        let st = Arc::new(Mutex::new(MockState {
+            validate_err: Some("unsupported keyword".into()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        let err = e.submit(schema_task("t1", SCHEMA_A)).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidConfig(_)), "{err:?}");
+        assert!(err.to_string().contains("unsupported keyword"), "{err}");
+        assert!(st.lock().unwrap().added.is_empty());
+        assert!(e.active.is_empty());
+        // A plain task never runs the validator.
+        e.submit(task("t2", 8)).unwrap();
+        assert_eq!(st.lock().unwrap().validate_calls, 1);
+    }
+
+    #[test]
+    fn cb_submit_validates_after_queue_cap() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..crate::dist_spec::MAX_PENDING_TASKS {
+            e.submit(task(&format!("f{i}"), 8)).unwrap();
+        }
+        let err = e.submit(schema_task("s", SCHEMA_A)).unwrap_err();
+        assert!(matches!(err, EngineError::QueueFull { .. }), "{err:?}");
+        assert_eq!(st.lock().unwrap().validate_calls, 0);
+    }
+
+    #[test]
+    fn cb_step_failure_with_a_new_grammar_task_does_not_latch_and_quarantines() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("t1", SCHEMA_A)).unwrap();
+        e.submit(task("t2", 8)).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 2, "every in-flight request still fails");
+        assert_eq!(e.step_failures, 0);
+
+        let err = e.submit(schema_task("t3", SCHEMA_A)).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidConfig(_)), "{err:?}");
+        assert!(err.to_string().contains("failed to compile"), "{err}");
+        e.submit(schema_task("t4", SCHEMA_B)).unwrap();
+        e.submit(task("t5", 8)).unwrap();
+    }
+
+    #[test]
+    fn cb_step_failure_after_the_grammar_task_produced_still_counts() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock()
+            .unwrap()
+            .reads
+            .push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Running,
+                1,
+                "{",
+                CbFinish::Unknown,
+            ))]));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("t1", SCHEMA_A)).unwrap();
+        let out = e.step().unwrap();
+        assert!(out[0].1.error.is_none());
+        st.lock().unwrap().step_fails = true;
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 1);
+        st.lock().unwrap().step_fails = false;
+        e.submit(schema_task("t2", SCHEMA_A)).unwrap();
+    }
+
+    #[test]
+    fn cb_second_consecutive_failure_with_grammar_counts() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("t1", SCHEMA_A)).unwrap();
+        let _ = e.step().unwrap();
+        e.submit(schema_task("t2", SCHEMA_B)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 1);
+        assert!(e.submit(schema_task("t3", SCHEMA_A)).is_err());
+        e.submit(schema_task("t4", SCHEMA_B)).unwrap();
+    }
+
+    #[test]
+    fn cb_step_failure_with_json_object_counts() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("t1", JSON_OBJECT_PROBE)).unwrap();
+        let _ = e.step().unwrap();
+        assert_eq!(e.step_failures, 1);
+        st.lock().unwrap().step_fails = false;
+        e.submit(schema_task("t2", JSON_OBJECT_PROBE)).unwrap();
+    }
+
+    #[test]
+    fn cb_step_failure_without_grammar_still_latches() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_STEP_FAILURES {
+            e.submit(task(&format!("t{i}"), 8)).unwrap();
+            let _ = e.step().unwrap();
+            assert_eq!(e.step_failures, i + 1);
+        }
+        assert!(matches!(
+            e.submit(task("late", 8)),
+            Err(EngineError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn quarantine_set_is_bounded_and_expires() {
+        let now = Instant::now();
+        let mut q = QuarantineSet::default();
+        for h in 0..300u64 {
+            q.insert(h, now);
+        }
+        assert_eq!(q.len(), 256);
+        for h in 0..44u64 {
+            assert!(!q.contains(h, now), "{h} should have been dropped");
+        }
+        for h in 44..300u64 {
+            assert!(q.contains(h, now), "{h} should be kept");
+        }
+
+        let mut q = QuarantineSet::default();
+        q.insert(7, now);
+        q.insert(7, now);
+        assert_eq!(q.len(), 1);
+        assert!(q.contains(7, now + std::time::Duration::from_secs(9 * 60)));
+        assert!(!q.contains(7, now + std::time::Duration::from_secs(11 * 60)));
+        assert_eq!(q.len(), 0, "expired entries are pruned");
+    }
+
+    #[test]
+    fn probe_verdict_cases() {
+        assert_eq!(probe_verdict(Ok("  {\"a\":1}".into())), None);
+        assert_eq!(probe_verdict(Ok("   \n".into())), None);
+        assert_eq!(probe_verdict(Ok(String::new())), None);
+        let r = probe_verdict(Ok("hello".into())).expect("must fail");
+        assert!(r.starts_with("probe output did not start with '{'"), "{r}");
+        assert!(r.contains("hello"), "{r}");
+        let r =
+            probe_verdict(Err(OvError::Native("no grammar backend".into()))).expect("must fail");
+        assert!(r.contains("no grammar backend"), "{r}");
+    }
 
     #[test]
     fn ov_properties_reach_plugin_config() {
