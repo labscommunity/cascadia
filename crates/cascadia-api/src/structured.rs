@@ -37,6 +37,19 @@ impl ResponseFormat {
     }
 }
 
+// Limits on a `json_schema` schema. Large repetition counts and deep nesting
+// make the backend's grammar compile take seconds inside the request
+// (measured on OpenVINO GenAI 2026.4.1); the limits sit far above any client
+// schema seen.
+
+/// Largest accepted schema, in bytes of its compact JSON serialization.
+pub const MAX_SCHEMA_BYTES: usize = 65536;
+/// Deepest accepted nesting of objects and arrays; the schema itself is level 1.
+pub const MAX_SCHEMA_DEPTH: usize = 64;
+/// Largest accepted value of `minItems`, `maxItems`, `minLength`,
+/// `maxLength`, `minProperties` and `maxProperties`.
+pub const MAX_SCHEMA_COUNT: u64 = 10_000;
+
 const TYPE_ERR: &str = "response_format.type must be one of text, json_object, json_schema";
 
 /// Parse the `response_format` field of a chat request. Absent or `null`
@@ -67,12 +80,65 @@ fn parse_json_schema(js: Option<&Value>) -> Result<ResponseFormat, String> {
         Some(Value::Bool(false)) => {
             Err("response_format.json_schema.schema is false: no output can match it".into())
         }
-        Some(schema @ Value::Object(_)) => Ok(ResponseFormat::JsonSchema {
-            name: js.get("name").and_then(Value::as_str).map(str::to_owned),
-            schema: schema.clone(),
-            strict: js.get("strict") == Some(&Value::Bool(true)),
-        }),
+        Some(schema @ Value::Object(_)) => {
+            check_limits(schema)?;
+            Ok(ResponseFormat::JsonSchema {
+                name: js.get("name").and_then(Value::as_str).map(str::to_owned),
+                schema: schema.clone(),
+                strict: js.get("strict") == Some(&Value::Bool(true)),
+            })
+        }
         Some(_) => Err("response_format.json_schema.schema must be a JSON Schema object".into()),
+    }
+}
+
+/// Keywords whose value is a repetition count, capped at [`MAX_SCHEMA_COUNT`].
+const COUNT_KEYWORDS: [&str; 6] = [
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "minProperties",
+    "maxProperties",
+];
+
+/// Reject a schema over [`MAX_SCHEMA_BYTES`], nested deeper than
+/// [`MAX_SCHEMA_DEPTH`], or with a count keyword above [`MAX_SCHEMA_COUNT`].
+fn check_limits(schema: &Value) -> Result<(), String> {
+    const FIELD: &str = "response_format.json_schema.schema";
+    let n = serde_json::to_string(schema)
+        .expect("a serde_json::Value always serializes")
+        .len();
+    if n > MAX_SCHEMA_BYTES {
+        return Err(format!(
+            "{FIELD} is {n} bytes; the limit is {MAX_SCHEMA_BYTES}"
+        ));
+    }
+    if nests_deeper_than(schema, MAX_SCHEMA_DEPTH) {
+        return Err(format!(
+            "{FIELD} nests deeper than {MAX_SCHEMA_DEPTH} levels"
+        ));
+    }
+    for_each_schema(schema, 0, &mut |obj| {
+        for k in COUNT_KEYWORDS {
+            if let Some(v) = obj.get(k) {
+                if v.as_f64().is_some_and(|c| c > MAX_SCHEMA_COUNT as f64) {
+                    return Err(format!("{FIELD}: {k} = {v} exceeds {MAX_SCHEMA_COUNT}"));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// True when objects and arrays in `v` nest more than `levels` deep, counting
+/// `v` itself as one level. Stops descending once past the limit.
+fn nests_deeper_than(v: &Value, levels: usize) -> bool {
+    let deeper = |c: &Value| nests_deeper_than(c, levels - 1);
+    match v {
+        Value::Object(o) => levels == 0 || o.values().any(deeper),
+        Value::Array(a) => levels == 0 || a.iter().any(deeper),
+        _ => false,
     }
 }
 
@@ -90,8 +156,6 @@ pub fn grammar_for(rf: &ResponseFormat) -> Option<GrammarSpec> {
         body,
     })
 }
-
-const MAX_DEPTH: usize = 64;
 
 const SIBLINGS: &str = "siblings of $ref/const/enum/anyOf/oneOf/allOf";
 
@@ -146,28 +210,56 @@ const DATA_KEYS: [&str; 4] = ["enum", "const", "default", "examples"];
 /// sorted and de-duplicated. Output may still be valid JSON that violates them.
 pub fn unenforced_keywords(schema: &Value) -> Vec<&'static str> {
     let mut found = Vec::new();
-    walk(schema, 0, &mut found);
+    let walked: Result<(), String> = for_each_schema(schema, 0, &mut |obj| {
+        flag_unenforced(obj, &mut found);
+        Ok(())
+    });
+    debug_assert!(walked.is_ok());
     found.sort_unstable();
     found.dedup();
     found
 }
 
-fn walk(v: &Value, depth: usize, found: &mut Vec<&'static str>) {
-    if depth > MAX_DEPTH {
-        return;
+/// Call `f` on every schema object reachable from `v`: values of schema maps
+/// (never their names) and every other key's value, except data keys. Stops
+/// at the first error, and below [`MAX_SCHEMA_DEPTH`].
+fn for_each_schema<E>(
+    v: &Value,
+    depth: usize,
+    f: &mut impl FnMut(&Map<String, Value>) -> Result<(), E>,
+) -> Result<(), E> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Ok(());
     }
     match v {
         Value::Array(items) => {
             for item in items {
-                walk(item, depth + 1, found);
+                for_each_schema(item, depth + 1, f)?;
             }
         }
-        Value::Object(obj) => walk_schema(obj, depth, found),
+        Value::Object(obj) => {
+            f(obj)?;
+            for (key, value) in obj {
+                let key = key.as_str();
+                if DATA_KEYS.contains(&key) {
+                    continue;
+                }
+                match value {
+                    Value::Object(map) if SCHEMA_MAPS.contains(&key) => {
+                        for sub in map.values() {
+                            for_each_schema(sub, depth + 1, f)?;
+                        }
+                    }
+                    _ => for_each_schema(value, depth + 1, f)?,
+                }
+            }
+        }
         _ => {}
     }
+    Ok(())
 }
 
-fn walk_schema(obj: &Map<String, Value>, depth: usize, found: &mut Vec<&'static str>) {
+fn flag_unenforced(obj: &Map<String, Value>, found: &mut Vec<&'static str>) {
     if has_constrained_siblings(obj) {
         found.push(SIBLINGS);
     }
@@ -181,18 +273,6 @@ fn walk_schema(obj: &Map<String, Value>, depth: usize, found: &mut Vec<&'static 
             "allOf" if value.as_array().is_some_and(|a| a.len() > 1) => found.push("allOf"),
             _ => {}
         }
-        if DATA_KEYS.contains(&key) {
-            continue;
-        }
-        if SCHEMA_MAPS.contains(&key) {
-            if let Value::Object(map) = value {
-                for sub in map.values() {
-                    walk(sub, depth + 1, found);
-                }
-                continue;
-            }
-        }
-        walk(value, depth + 1, found);
     }
 }
 
@@ -422,5 +502,128 @@ mod tests {
             unenforced_keywords(&json!({"enum": ["a"], "const": "a"})),
             vec![SIB]
         );
+    }
+
+    fn parse_schema(schema: serde_json::Value) -> Result<ResponseFormat, String> {
+        parse(json!({"type": "json_schema", "json_schema": {"schema": schema}}))
+    }
+
+    #[test]
+    fn schema_over_the_byte_limit_is_rejected() {
+        let big = json!({"type": "string", "description": "x".repeat(70_000)});
+        let n = serde_json::to_string(&big).unwrap().len();
+        assert!(n > MAX_SCHEMA_BYTES);
+        assert_eq!(
+            parse_schema(big),
+            Err(format!(
+                "response_format.json_schema.schema is {n} bytes; the limit is 65536"
+            ))
+        );
+
+        let fits = json!({"type": "string", "description": "x".repeat(60_000)});
+        assert!(matches!(
+            parse_schema(fits),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+    }
+
+    /// `levels` objects nested inside each other through `items`.
+    fn nested(levels: usize) -> serde_json::Value {
+        let mut v = json!({"type": "string"});
+        for _ in 1..levels {
+            v = json!({"type": "array", "items": v});
+        }
+        v
+    }
+
+    #[test]
+    fn schema_nested_too_deep_is_rejected() {
+        assert_eq!(
+            parse_schema(nested(65)),
+            Err("response_format.json_schema.schema nests deeper than 64 levels".into())
+        );
+        assert!(matches!(
+            parse_schema(nested(64)),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+        // Arrays count as levels too.
+        let mut v = json!([1]);
+        for _ in 1..64 {
+            v = json!([v]);
+        }
+        assert!(parse_schema(json!({"enum": v})).is_err());
+    }
+
+    #[test]
+    fn large_repetition_counts_are_rejected_at_any_depth() {
+        for k in [
+            "minItems",
+            "maxItems",
+            "minLength",
+            "maxLength",
+            "minProperties",
+            "maxProperties",
+        ] {
+            let mut top = json!({"type": "object"});
+            top[k] = json!(10_001);
+            assert_eq!(
+                parse_schema(top),
+                Err(format!(
+                    "response_format.json_schema.schema: {k} = 10001 exceeds 10000"
+                ))
+            );
+            let mut deep = json!({"type": "string"});
+            deep[k] = json!(100_000);
+            let deep = json!({
+                "type": "object",
+                "properties": {"a": {"$ref": "#/$defs/A"}},
+                "$defs": {"A": {"anyOf": [{"type": "null"}, deep]}}
+            });
+            let err = parse_schema(deep).unwrap_err();
+            assert!(err.contains(k) && err.contains("100000"), "{err}");
+        }
+        assert_eq!(
+            parse_schema(json!({"type": "string", "maxLength": 1e6})),
+            Err("response_format.json_schema.schema: maxLength = 1000000.0 exceeds 10000".into())
+        );
+        assert!(matches!(
+            parse_schema(json!({"type": "string", "maxLength": 10_000})),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn count_keyword_names_in_property_maps_and_data_are_not_counts() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"maxItems": {"type": "integer"}, "minLength": {"type": "string"}},
+            "required": ["maxItems"],
+            "default": {"maxItems": 99_999},
+            "examples": [{"minLength": 99_999}]
+        });
+        assert!(matches!(
+            parse_schema(schema),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+        assert!(parse_schema(json!({"const": {"maxLength": 99_999}})).is_ok());
+        assert!(parse_schema(json!({"enum": [{"maxItems": 99_999}]})).is_ok());
+    }
+
+    #[test]
+    fn real_client_schemas_fit_the_limits() {
+        for text in [
+            include_str!("../../cascadia-engine-mock/tests/fixtures/browser_use_schema.json"),
+            include_str!("../../cascadia-engine-mock/tests/fixtures/pydantic_output_schema.json"),
+        ] {
+            let schema: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                parse_schema(schema.clone()),
+                Ok(ResponseFormat::JsonSchema {
+                    name: None,
+                    schema,
+                    strict: false
+                })
+            );
+        }
     }
 }
