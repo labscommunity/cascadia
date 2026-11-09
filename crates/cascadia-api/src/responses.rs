@@ -226,20 +226,6 @@ fn check_metadata(metadata: Option<&Value>) -> Result<(), Refusal> {
 fn refuse_unsupported(req: &ResponsesRequest) -> Result<bool, Refusal> {
     check_metadata(req.metadata.as_ref())?;
     let encrypted = check_include(req.include.as_ref())?;
-    // An empty `input` with no instructions is an empty conversation: a
-    // template still renders its generation prompt, so the model would
-    // answer nothing in particular.
-    let empty = match &req.input {
-        Value::String(s) => s.is_empty(),
-        Value::Array(items) => items.is_empty(),
-        _ => false,
-    };
-    if empty && req.instructions.as_deref().is_none_or(str::is_empty) {
-        return Err(Refusal::malformed(
-            "input",
-            "`input` is empty and there are no `instructions`: nothing to respond to",
-        ));
-    }
     // A cap of 0 asks for no output; the engine would answer regardless.
     if req.max_output_tokens == Some(0) {
         return Err(Refusal::malformed(
@@ -517,6 +503,22 @@ fn resolver(
     }
 }
 
+/// A conversation with nothing in it: no text but whitespace (`instructions`
+/// included), no image or video, no tool call and no tool output. A template
+/// would still render its generation prompt, and the model answer nothing in
+/// particular.
+fn is_empty_conversation(messages: &[ChatMessage]) -> bool {
+    messages.iter().all(|m| {
+        m.role != "tool"
+            && m.tool_calls.as_ref().is_none_or(Vec::is_empty)
+            && m.content.trim().is_empty()
+            && m.parts.iter().all(|p| match p {
+                ContentPart::Text(t) => t.trim().is_empty(),
+                _ => false,
+            })
+    })
+}
+
 /// `POST /v1/responses`.
 pub(crate) async fn create_response(
     State(state): State<AppState>,
@@ -525,12 +527,14 @@ pub(crate) async fn create_response(
     let checked = refuse_unsupported(&req).and_then(|encrypted| {
         let map = ToolMap::from_request(req.tools.as_ref())?;
         let choice = check_tool_choice(req.tool_choice.as_ref())?;
-        Ok((
-            encrypted,
-            map,
-            choice,
-            input_messages(&req, &resolver(&state), state.max_prompt_bytes)?,
-        ))
+        let messages = input_messages(&req, &resolver(&state), state.max_prompt_bytes)?;
+        if is_empty_conversation(&messages) {
+            return Err(Refusal::malformed(
+                "input",
+                "`input` and `instructions` hold nothing to respond to",
+            ));
+        }
+        Ok((encrypted, map, choice, messages))
     });
     let (wants_encrypted, map, choice, messages) = match checked {
         Ok(c) => c,
@@ -1412,9 +1416,10 @@ mod tests {
         assert!(tasks.lock().is_empty());
     }
 
-    /// An empty `input` with no `instructions` is an empty conversation: a
-    /// 400 naming `input`, even where the template would still render a
-    /// prompt. With `instructions` there is something to answer.
+    /// A conversation with nothing in it (no text but whitespace, no image,
+    /// no call and no tool output, `instructions` included) is a 400 naming
+    /// `input`, even where the template would still render a prompt.
+    /// Anything real in `input`, or non-blank `instructions`, is served.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn empty_input_without_instructions_is_a_400() {
         let (app, tasks, _) = app_with(
@@ -1422,24 +1427,45 @@ mod tests {
             template_config(PERMISSIVE_TEMPLATE),
         )
         .await;
-        for input in [json!(""), json!([])] {
-            let (status, v) = post_json(
-                app.clone(),
-                json!({"model": "script-model", "input": input}),
-            )
-            .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{input}: {v}");
-            assert_eq!(v["error"]["param"], "input", "{v}");
+        let refused = [
+            json!({"input": ""}),
+            json!({"input": []}),
+            json!({"input": "   "}),
+            json!({"input": [{"role": "user", "content": ""}]}),
+            json!({"input": [{"role": "user", "content": []}]}),
+            json!({"input": [{"type": "reasoning", "summary": []}]}),
+            json!({"input": "", "instructions": "   "}),
+        ];
+        for mut body in refused {
+            body["model"] = json!("script-model");
+            let (status, v) = post_json(app.clone(), body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert_eq!(v["error"]["param"], "input", "{body}: {v}");
         }
         assert!(tasks.lock().is_empty());
-        for input in [json!(""), json!([])] {
-            let (status, v) = post_json(
-                app.clone(),
-                json!({"model": "script-model", "input": input, "instructions": "Say hi."}),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "{input}: {v}");
+        let served = [
+            json!({"input": "", "instructions": "Say hi."}),
+            json!({"input": [], "instructions": "Say hi."}),
+            json!({"input": "hi"}),
+            json!({"input": [{"type": "function_call_output", "call_id": "c1", "output": ""}]}),
+        ];
+        for mut body in served {
+            body["model"] = json!("script-model");
+            let (status, v) = post_json(app.clone(), body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {v}");
         }
+    }
+
+    /// A refused field keeps its own message, even with an empty `input`.
+    #[tokio::test]
+    async fn a_refused_field_beats_an_empty_input() {
+        let (status, v) = post_json(
+            make_app().await,
+            json!({"model": "mock-model", "input": [], "previous_response_id": "resp_1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["param"], "previous_response_id", "{v}");
     }
 
     /// What a [`RecordingEngine`] writes.
