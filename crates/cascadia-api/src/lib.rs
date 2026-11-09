@@ -4152,7 +4152,9 @@ pub fn render_chat_prompt(
 /// `split_reasoning`, an assistant turn whose content opens with
 /// `<think>…</think>` (a `/v1/responses` replayed reasoning item) carries
 /// that reasoning as `reasoning_content` and the rest as its content, for a
-/// downstream template that places reasoning itself.
+/// downstream template that places reasoning itself; a turn with tool calls
+/// and non-blank content drops the reasoning instead, as gpt-oss's template
+/// refuses content and thinking together on a tool-call turn.
 fn chat_turns(messages: &[ChatMessage], split_reasoning: bool) -> Vec<ChatTurn> {
     messages
         .iter()
@@ -4162,6 +4164,18 @@ fn chat_turns(messages: &[ChatMessage], split_reasoning: bool) -> Vec<ChatTurn> 
                 .strip_prefix("<think>")
                 .and_then(|rest| rest.split_once("</think>"))
             {
+                // gpt-oss's template refuses a tool-call turn with both
+                // content and thinking (llama.cpp's name for
+                // `reasoning_content`), so such a turn drops the reasoning
+                // and keeps its content and calls.
+                Some((_, rest))
+                    if split_reasoning
+                        && m.role == "assistant"
+                        && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+                        && !rest.trim().is_empty() =>
+                {
+                    (None, rest.to_owned())
+                }
                 Some((r, rest)) if split_reasoning && m.role == "assistant" => {
                     (Some(r.to_owned()), rest.to_owned())
                 }

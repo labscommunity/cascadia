@@ -3149,6 +3149,53 @@ mod tests {
         assert_eq!(task.messages[1].reasoning_content, None);
     }
 
+    /// gpt-oss's template refuses an assistant turn with tool calls that
+    /// has both content and thinking (llama.cpp's name for
+    /// `reasoning_content`): such a replayed turn keeps its content and
+    /// calls and drops the reasoning; with no content, or no calls, the
+    /// reasoning stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_turn_with_content_forwards_no_reasoning_content() {
+        let turn = |text: &str, call: bool| {
+            let mut input = vec![
+                json!({"role": "user", "content": "list files"}),
+                json!({"type": "reasoning", "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "use ls"}]}),
+            ];
+            if !text.is_empty() {
+                input.push(json!({"role": "assistant",
+                    "content": [{"type": "output_text", "text": text}]}));
+            }
+            if call {
+                input.push(
+                    json!({"type": "function_call", "call_id": "c1", "name": "ls",
+                    "arguments": "{}"}),
+                );
+                input.push(json!({"type": "function_call_output", "call_id": "c1",
+                    "output": "a.txt"}));
+            }
+            input.push(json!({"role": "user", "content": "and now?"}));
+            json!({"model": "script-model", "input": input})
+        };
+        let cases = [
+            ("Let me look.", true, None, "Let me look."),
+            ("  ", true, Some("use ls"), "  "),
+            ("", true, Some("use ls"), ""),
+            ("Here.", false, Some("use ls"), "Here."),
+        ];
+        for (text, call, reasoning, content) in cases {
+            let cfg = sycl_llama_config(PERMISSIVE_TEMPLATE);
+            let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+            let (status, body) = post(app, turn(text, call)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let sent = tasks.lock()[0].messages[1].clone();
+            assert_eq!(sent.role, "assistant");
+            assert_eq!(sent.tool_calls.is_some(), call, "{text:?}");
+            assert_eq!(sent.reasoning_content.as_deref(), reasoning, "{text:?}");
+            assert_eq!(sent.content, content, "{text:?}");
+        }
+    }
+
     /// A template that takes no system role gets every system turn folded,
     /// the instructions into the first user turn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
