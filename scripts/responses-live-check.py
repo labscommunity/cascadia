@@ -25,7 +25,9 @@ Usage:
           [--only text,tool_call] [--timeout 1800] [--mock] [--expect-reasoning]
 
 `--mock` adds the mock engine's `__mock_tool_call__` marker to the tool prompt,
-so `cascadia run tests/fixtures/mock-tools-model --engine mock` scripts a call.
+so `cascadia run tests/fixtures/mock-tools-model --engine mock` scripts a call,
+and skips the `<think>` marker checks: the mock echoes its rendered prompt, which
+holds the replayed reasoning of the Codex turn 2 body.
 
 Every response body and every streamed event is validated against the pinned
 OpenAI spec subset (`crates/cascadia-api/tests/fixtures/openai-spec-subset.json`:
@@ -49,6 +51,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "crates" / "cascadia-api" / "tests" / "fixtures"
 SCHEMAS = json.loads((FIXTURES / "openai-spec-subset.json").read_text())["components"]["schemas"]
 MARKERS = ("<think>", "</think>")
+# Off under --mock: the mock engine echoes its prompt (see the docstring).
+CHECK_MARKERS = True
 TYPES = {
     "string": lambda v: isinstance(v, str),
     "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
@@ -191,7 +195,7 @@ def stream(base, body, timeout):
         conform("ResponseStreamEvent", e, f"event {e.get('type')} #{e.get('sequence_number')}")
         if e.get("type") in ("response.output_text.delta", "response.output_text.done"):
             t = e.get("delta", e.get("text", ""))
-            if any(m in t for m in MARKERS):
+            if CHECK_MARKERS and any(m in t for m in MARKERS):
                 raise Fail(f"think marker in {e['type']}: {t[:120]!r}")
     if events and isinstance(events[-1].get("response"), dict):
         final = events[-1]["response"]
@@ -219,6 +223,8 @@ def check_finished(resp, allow_incomplete=True):
 
 
 def no_think_markers(resp):
+    if not CHECK_MARKERS:
+        return
     for t in texts(resp):
         if any(m in t for m in MARKERS):
             raise Fail(f"think marker in output_text: {t[:200]!r}")
@@ -251,9 +257,10 @@ def the_call(resp):
 
 
 def run(args):
-    global TOOL_PROMPT
+    global TOOL_PROMPT, CHECK_MARKERS
     if args.mock:
         TOOL_PROMPT += " __mock_tool_call__"
+        CHECK_MARKERS = False
     base, mot, to = args.url, args.max_output_tokens, args.timeout
     try:
         model = call(base, {"model": "x", "input": "hi", "max_output_tokens": 1}, to)["model"]
