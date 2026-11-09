@@ -279,12 +279,22 @@ pub(super) enum Fold {
     All,
 }
 
-/// `messages` with the `system` turns `fold` names folded into the next
-/// `user` turn, for a chat template that refuses them where they stand (the
-/// system-role polyfill of llama.cpp's minja). A folded turn's text waits
-/// (several joined by a blank line) and leads the next user turn, merged as
-/// [`merge`] does so image parts stay in place; with no user turn after it,
-/// it becomes the last user turn. Assistant and tool turns pass through.
+/// `messages` with the `system` turns `fold` names folded into user turns,
+/// for a chat template that refuses them where they stand (the system-role
+/// polyfill of llama.cpp's minja). A folded turn's text waits (several
+/// joined by a blank line) for the next non-tool turn, and lands as a user
+/// turn just before it, merged as [`merge`] does so image parts stay in
+/// place:
+/// - a user turn next: the text leads it (`[system, user]` becomes one user
+///   turn, the system text first);
+/// - an assistant turn next: the text is a user turn of its own before it
+///   (after any tool turns in between), so time order is kept;
+/// - nothing next: the text is a user turn at the end.
+///
+/// A landed user turn right after another user turn merges into it, so
+/// user and assistant still alternate: `[user1, system, user2]` becomes one
+/// user turn `user1`, `system`, `user2`. Assistant and tool turns pass
+/// through.
 pub(super) fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<ChatMessage> {
     // A folded turn joins a user turn just before it rather than standing
     // next to it, so user and assistant still alternate.
@@ -311,6 +321,11 @@ pub(super) fn fold_system_turns(messages: Vec<ChatMessage>, fold: Fold) -> Vec<C
             continue;
         }
         leading = false;
+        if m.role == "assistant" {
+            if let Some(p) = pending.take() {
+                push_user(&mut out, p);
+            }
+        }
         if m.role != "user" {
             out.push(m);
             continue;
@@ -1116,6 +1131,53 @@ mod tests {
                 ("user", "now terse\n\nagain", None, None),
             ]
         );
+    }
+
+    /// A folded turn followed by an assistant turn (tool turns aside) lands
+    /// in place, as a user turn before it, so time order is kept; between
+    /// two user turns, the three merge into one.
+    #[test]
+    fn a_folded_system_turn_before_an_assistant_turn_stays_in_place() {
+        let asked = |id: &str| ChatMessage {
+            tool_calls: Some(vec![call(id, "f", "{}")]),
+            ..msg("assistant", "")
+        };
+        let answer = |id: &str| ChatMessage {
+            tool_call_id: Some(id.into()),
+            ..msg("tool", id)
+        };
+        let m = fold_system_turns(
+            vec![
+                msg("system", "be brief"),
+                msg("user", "hi"),
+                asked("c1"),
+                answer("c1"),
+                msg("system", "now terse"),
+                asked("c2"),
+                answer("c2"),
+                msg("user", "again"),
+            ],
+            Fold::Later,
+        );
+        let (c1, c2) = (vec![call("c1", "f", "{}")], vec![call("c2", "f", "{}")]);
+        assert_eq!(
+            shape(&m),
+            [
+                ("system", "be brief", None, None),
+                ("user", "hi", None, None),
+                ("assistant", "", Some(&c1), None),
+                ("tool", "c1", None, Some("c1")),
+                ("user", "now terse", None, None),
+                ("assistant", "", Some(&c2), None),
+                ("tool", "c2", None, Some("c2")),
+                ("user", "again", None, None),
+            ]
+        );
+        let m = fold_system_turns(
+            vec![msg("user", "u1"), msg("system", "sys"), msg("user", "u2")],
+            Fold::Later,
+        );
+        assert_eq!(shape(&m), [("user", "u1\n\nsys\n\nu2", None, None)]);
     }
 
     /// Several folded turns accumulate; with no `user` turn after them they

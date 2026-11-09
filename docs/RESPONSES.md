@@ -209,9 +209,10 @@ compact the conversation locally (the server refuses `compaction_trigger` items)
 - Codex sends `developer` messages in the middle of a history; they become `system` turns
   after an assistant or tool turn. Templates that take a leading system turn only (Gemma 3,
   Mistral) or none at all (Gemma 2) refuse them, so when the loaded template refuses a
-  request's system turns, they are folded into the next user turn, their text first (or into
-  a user turn at the end when none follows): the later ones first, every one if that is not
-  enough. The model then reads them as user text, not as system instructions. Templates
+  request's system turns, they are folded into user turns where they stand: into the next
+  user turn, their text first, or as a user turn of their own before the next assistant turn,
+  or at the end when nothing follows. The later ones are folded first, every one if that is
+  not enough. The model then reads them as user text, not as system instructions. Templates
   that take them (Gemma 4, Qwen) see them unchanged. `/v1/chat/completions` does not fold.
 - `tool_choice` cannot force a call yet, and structured output (`text.format`) is not
   served.

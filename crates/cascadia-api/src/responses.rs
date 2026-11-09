@@ -2761,6 +2761,32 @@ mod tests {
         );
     }
 
+    /// A `developer` turn between a tool output and the next call stays
+    /// there, as a user turn, so the history keeps its order and alternates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_developer_turn_before_a_call_folds_in_place() {
+        let (status, body, prompt) = prompt_under(
+            STRICT_TEMPLATE,
+            json!({"model": "script-model", "instructions": "be brief", "input": [
+                {"role": "user", "content": "list files"},
+                {"type": "function_call", "call_id": "c1", "name": "ls", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
+                {"role": "developer", "content": "now be terse"},
+                {"type": "function_call", "call_id": "c2", "name": "ls", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c2", "output": "b.txt"},
+                {"role": "user", "content": "and now?"},
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            prompt,
+            "<sys>be brief</sys><user>list files</user><assistant></assistant>\
+             <tool>a.txt</tool><user>now be terse</user><assistant></assistant>\
+             <tool>b.txt</tool><user>and now?</user><assistant>"
+        );
+    }
+
     /// A template that takes no system role gets every system turn folded,
     /// the instructions into the first user turn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
