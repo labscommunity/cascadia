@@ -603,8 +603,13 @@ stage, which holds the tokenizer, computes each step's mask and sends it with
 the step to the stage that picks the token. Only steps of a JSON request
 carry a mask; every other request's stage traffic is unchanged. A mask that
 repeats the one sent just before on the same link (most steps inside a JSON
-string or number) is sent as a short marker instead of the full mask, so
-such a step usually costs no more bytes per hop than a plain one. Every stage
+string or number) is sent as a short marker instead of the full mask. Such a
+step costs, per hop, the plain step plus: 8 bytes on `ov-runtime`, 4 bytes per
+hidden row on `gemma4` (one row on a decode step), a 4-byte mask frame (24
+bytes with its header) on `qwen35`, and on `sparse-moe` 16 bytes on a decode
+step (up to 24 on a 2- or 3-row prompt window, 4 bytes per row from 4 rows
+up). A full mask costs about vocab/8 bytes
+(16 KB for a 128k vocabulary). Every stage
 must run a build with structured-output support. If a later stage runs an
 older build, a JSON request fails (5xx) with `a later pipeline stage runs a
 build without structured-output support; upgrade every stage`; normal
@@ -703,7 +708,7 @@ the 400s below and `engine_error` for anything else):
 | 400 | `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai`: the startup check found structured output does not work for the loaded model or runtime. The llguidance engines: the grammar could not be built from the model's tokenizer (logged at startup). |
 | 400 | `invalid configuration: response_format schema: <reason>` | The llguidance engines: llguidance could not build a grammar from the schema; The message is cut to one line of at most 300 characters. |
 | 5xx | `… a later pipeline stage runs a build without structured-output support; upgrade every stage` | Multi-stage `ov-runtime`, `gemma4`, `qwen35` or `sparse-moe`: a later stage runs an older build (see above). |
-| 5xx | `structured output: a pipeline stage lost its token-mask state; retry the request` | Multi-stage `ov-runtime`, `gemma4`, `qwen35` or `sparse-moe`: a stage got a repeated-mask marker without the mask it repeats. Not expected in normal operation; only that request fails, and the next one sends full masks again. Retry. |
+| 5xx | `structured output: a pipeline stage lost its token-mask state; retry the request` | Multi-stage `ov-runtime`, `gemma4`, `qwen35` or `sparse-moe`: a stage got a repeated-mask marker without the mask it repeats. Not expected in normal operation; only that request fails, and the next one sends full masks again. Retry. On a multi-stream `sparse-moe` pipeline, a miss at a middle stage instead closes that link and fails every stream on it (also not expected to happen). |
 | 400 | `invalid response_format: response_format schema is too complex to compile` | The llguidance engines: building the schema's grammar took longer than 2 seconds in the server's check before the request queues. |
 | 503 | `busy compiling response_format schemas; retry shortly` | The llguidance engines: the server's schema check had no free slot (2 builds at once) within half a second. Retry. |
 | 5xx | `… grammar: no token of the … is allowed` | The llguidance engines: decoding hit a state the grammar allows no token from. The request ends with this error, never with unconstrained output. |
