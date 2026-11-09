@@ -55,7 +55,9 @@ impl ResponseFormat {
 // Limits on a `json_schema` schema. Large repetition counts and deep nesting
 // make the backend's grammar compile take seconds inside the request
 // (measured on OpenVINO GenAI 2026.4.1); the limits sit far above any client
-// schema seen.
+// schema seen. They are fast 400s for the shapes known to be slow, not the
+// bound: [`SchemaCompileCheck`]'s time budget is the hard limit on how long
+// a schema may take to build.
 
 /// Largest accepted schema, in bytes of its text with whitespace removed.
 pub const MAX_SCHEMA_BYTES: usize = 65536;
@@ -73,8 +75,13 @@ pub const MAX_SCHEMA_COUNT_TOTAL: u64 = 200_000;
 /// Most `patternProperties` keys on one object. Building the grammar grows
 /// about with the cube of the key count (500 keys: 20 s; 100 keys: 0.1 s).
 pub const MAX_PATTERN_PROPERTIES: usize = 64;
-/// Most `patternProperties` keys in one schema, all objects together.
+/// Most `patternProperties` keys in one schema, all objects together, and
+/// counted again each time the grammar builder visits or merges an object
+/// anew (each entry of a `type` list, each `allOf` that merges it).
 pub const MAX_PATTERN_PROPERTIES_TOTAL: usize = 128;
+/// Largest accepted sum of the lengths, in bytes, of every `pattern` and
+/// `patternProperties` key in one schema.
+pub const MAX_PATTERN_BYTES: usize = 16384;
 
 /// Most schemas built at once by [`SchemaCompileCheck`].
 pub const SCHEMA_COMPILE_PERMITS: usize = 2;
@@ -291,11 +298,16 @@ fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
             "{FIELD} nests deeper than {MAX_SCHEMA_DEPTH} levels"
         ));
     }
-    let mut keys = 0;
-    count_pattern_properties(schema, &mut keys)?;
+    let (mut keys, mut bytes) = (0, 0);
+    count_patterns(schema, &mut keys, &mut bytes)?;
     if keys > MAX_PATTERN_PROPERTIES_TOTAL {
         return Err(format!(
             "{FIELD} has {keys} patternProperties keys; the limit is {MAX_PATTERN_PROPERTIES_TOTAL}"
+        ));
+    }
+    if bytes > MAX_PATTERN_BYTES {
+        return Err(format!(
+            "{FIELD}: its patterns add up to {bytes} bytes; the limit is {MAX_PATTERN_BYTES}"
         ));
     }
     let mut total = 0;
@@ -309,13 +321,14 @@ fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
 }
 
 /// Add the number of `patternProperties` keys of every object in `v` to
-/// `total` (data objects too, as [`sum_counts`]), failing on an object with
-/// more than [`MAX_PATTERN_PROPERTIES`].
-fn count_pattern_properties(v: &Value, total: &mut usize) -> Result<(), String> {
+/// `keys`, and the length of each of those keys and of every string
+/// `pattern` to `bytes` (data objects too, as [`sum_counts`]), failing on
+/// an object with more than [`MAX_PATTERN_PROPERTIES`] keys.
+fn count_patterns(v: &Value, keys: &mut usize, bytes: &mut usize) -> Result<(), String> {
     match v {
         Value::Array(items) => items
             .iter()
-            .try_for_each(|c| count_pattern_properties(c, total)),
+            .try_for_each(|c| count_patterns(c, keys, bytes)),
         Value::Object(obj) => {
             if let Some(Value::Object(map)) = obj.get("patternProperties") {
                 let n = map.len();
@@ -325,10 +338,14 @@ fn count_pattern_properties(v: &Value, total: &mut usize) -> Result<(), String> 
                          the limit is {MAX_PATTERN_PROPERTIES}"
                     ));
                 }
-                *total += n;
+                *keys += n;
+                *bytes += map.keys().map(String::len).sum::<usize>();
+            }
+            if let Some(Value::String(p)) = obj.get("pattern") {
+                *bytes += p.len();
             }
             obj.values()
-                .try_for_each(|c| count_pattern_properties(c, total))
+                .try_for_each(|c| count_patterns(c, keys, bytes))
         }
         _ => Ok(()),
     }
@@ -703,6 +720,7 @@ fn check_converter_depth(root: &Node) -> Result<(), String> {
         cost: scalars.cost,
         entered: vec![false; scalars.strings.len()],
         scalars: &scalars,
+        pattern_keys: 0,
     };
     let mut stack = vec![Visit {
         node: root,
@@ -728,6 +746,13 @@ fn check_converter_depth(root: &Node) -> Result<(), String> {
             ));
         }
         walk.children(v.node, v.ty, &mut children)?;
+        if walk.pattern_keys > MAX_PATTERN_PROPERTIES_TOTAL {
+            return Err(format!(
+                "{FIELD} has {} patternProperties keys counting each visit and merge; \
+                 the limit is {MAX_PATTERN_PROPERTIES_TOTAL}",
+                walk.pattern_keys
+            ));
+        }
         // Last pushed is visited first: push in reverse to keep the order.
         stack.extend(
             children
@@ -761,6 +786,11 @@ struct Walk<'a, 's> {
     entered: Vec<bool>,
     /// Work done so far, against [`MAX_SCHEMA_VISITS`].
     cost: usize,
+    /// `patternProperties` keys charged so far, against
+    /// [`MAX_PATTERN_PROPERTIES_TOTAL`]: once per visit of an object, and
+    /// once per `allOf` member, which llguidance merges anew for each
+    /// `allOf` (its ref cache doesn't cover merges).
+    pattern_keys: usize,
 }
 
 impl<'a> Walk<'a, '_> {
@@ -807,6 +837,11 @@ impl<'a> Walk<'a, '_> {
                 return Ok(());
             }
             if let Some(members) = node.get("allOf") {
+                if let Node::Arr(m) = members {
+                    for member in m {
+                        self.charge_merged_pattern_keys(member);
+                    }
+                }
                 match members {
                     Node::Arr(m) if m.len() == 1 => out.push((&m[0], TypeView::Own, false)),
                     Node::Arr(_) => out.push((&EMPTY_SCHEMA, TypeView::Own, false)),
@@ -867,7 +902,7 @@ impl<'a> Walk<'a, '_> {
     /// converter visits with `type: "string"` added to its other keys);
     /// otherwise the `properties` values in order, then the schema for
     /// other properties.
-    fn object_children(&self, node: &'a Node, out: &mut Vec<Child<'a>>) {
+    fn object_children(&mut self, node: &'a Node, out: &mut Vec<Child<'a>>) {
         // [`check_limits`] has made it a plain non-negative integer literal.
         if let Some(Node::Scalar(max)) = node.get("maxProperties") {
             if max.get().parse::<u64>() == Ok(0) {
@@ -876,6 +911,7 @@ impl<'a> Walk<'a, '_> {
         }
         match (node.get("patternProperties"), node.get("propertyNames")) {
             (Some(Node::Obj(patterns)), _) if !patterns.is_empty() => {
+                self.pattern_keys += patterns.len();
                 out.extend(patterns.iter().map(|(_, s)| (s, TypeView::Own, true)));
                 return;
             }
@@ -903,6 +939,31 @@ impl<'a> Walk<'a, '_> {
         };
         if let Some(other) = other.filter(|o| self.scalars.get(o) != Scalar::False) {
             out.push((other, TypeView::Own, true));
+        }
+    }
+
+    /// Charge the `patternProperties` keys an `allOf` member brings to a
+    /// merge: its own, and those of the schema its local `$ref` points to.
+    fn charge_merged_pattern_keys(&mut self, member: &'a Node) {
+        let keys = |n: &Node| match n.get("patternProperties") {
+            Some(Node::Obj(p)) => p.len(),
+            _ => 0,
+        };
+        if !matches!(member, Node::Obj(_)) {
+            return;
+        }
+        self.pattern_keys += keys(member);
+        if let Some(r) = member.get("$ref") {
+            if let Scalar::Str(id) = self.scalars.get(r) {
+                // A ref this walk can't read is left to the converter,
+                // as before; only the count is skipped.
+                if let Ok((target, work)) = local_ref_target(self.root, &self.scalars.strings[id]) {
+                    self.cost += work;
+                    if let Some(target @ Node::Obj(_)) = target {
+                        self.pattern_keys += keys(target);
+                    }
+                }
+            }
         }
     }
 
@@ -2970,6 +3031,80 @@ mod tests {
         });
         assert!(matches!(
             parse_schema(two),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn pattern_properties_merged_through_all_of_refs_count_each_time() {
+        // Each allOf of two refs is merged anew by the grammar builder:
+        // 40 merges of 64 + 64 keys took 2.6 s to build.
+        let props: serde_json::Map<String, serde_json::Value> = (0..40)
+            .map(|i| {
+                (
+                    format!("p{i}"),
+                    json!({"allOf": [{"$ref": "#/$defs/P"}, {"$ref": "#/$defs/Q"}]}),
+                )
+            })
+            .collect();
+        let schema = json!({
+            "type": "object",
+            "properties": props,
+            "$defs": {"P": pattern_props(64), "Q": pattern_props(64)}
+        });
+        let err = parse_schema(schema).unwrap_err();
+        assert!(
+            err.contains("patternProperties") && err.contains("128"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pattern_properties_visited_once_per_type_list_entry_count_each_time() {
+        let mut obj = pattern_props(64);
+        obj["type"] = json!(["object", "object", "object"]);
+        let err = parse_schema(json!({"type": "object", "properties": {"a": obj}})).unwrap_err();
+        assert!(
+            err.contains("patternProperties") && err.contains("128"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_ref_reused_many_times_counts_its_pattern_properties_once() {
+        // The builder caches a ref's grammar by its text: one build.
+        let props: serde_json::Map<String, serde_json::Value> = (0..40)
+            .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/P"})))
+            .collect();
+        let schema =
+            json!({"type": "object", "properties": props, "$defs": {"P": pattern_props(64)}});
+        assert!(matches!(
+            parse_schema(schema),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn pattern_text_is_capped_in_total() {
+        let long = "a|".repeat(4100) + "b";
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "x": {"type": "string", "pattern": long},
+                "y": {"type": "object", "patternProperties": {(long.clone()): {"type": "integer"}}}
+            }
+        });
+        assert_eq!(
+            parse_schema(schema),
+            Err(
+                "response_format.json_schema.schema: its patterns add up to 16402 bytes; \
+                 the limit is 16384"
+                    .into()
+            )
+        );
+        let fits = json!({"type": "string", "pattern": "a|".repeat(4000) + "b"});
+        assert!(matches!(
+            parse_schema(fits),
             Ok(ResponseFormat::JsonSchema { .. })
         ));
     }
