@@ -509,7 +509,7 @@ mod tests {
     /// control bytes, not the EOS, not a raw newline.
     fn mid_string_mask() -> GrammarMask {
         let mut gm = test_env::mask(test_env::WEATHER);
-        gm.replay(&br#"{"city":"Pa"#.map(u32::from)).unwrap();
+        gm.replay(&br#"{"city": "Pa"#.map(u32::from)).unwrap();
         gm
     }
 

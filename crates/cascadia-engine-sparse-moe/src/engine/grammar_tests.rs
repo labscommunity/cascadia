@@ -399,7 +399,7 @@ fn a_finished_grammar_at_the_cap_is_stop() {
 
 fn resumed_json_task(id: &str) -> GenerationTask {
     let mut t = json_task(id, 64);
-    t.resume_token_ids = Some(br#"{"city":"P"#.iter().map(|&b| i32::from(b)).collect());
+    t.resume_token_ids = Some(br#"{"city": "P"#.iter().map(|&b| i32::from(b)).collect());
     t
 }
 

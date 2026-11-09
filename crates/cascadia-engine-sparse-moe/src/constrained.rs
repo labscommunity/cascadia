@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn activation_replays_a_valid_seed_and_rejects_a_bad_one_as_backend() {
         let compiled = factory().compile(&spec(WEATHER)).unwrap();
-        let mut gm = activate(&compiled, b"{\"city\":\"P".map(u32::from).as_slice()).unwrap();
+        let mut gm = activate(&compiled, b"{\"city\": \"P".map(u32::from).as_slice()).unwrap();
         assert!(gm.allowed(u32::from(b'a')));
         let err = activate(&compiled, b"[1]".map(u32::from).as_slice()).err();
         assert!(matches!(err, Some(EngineError::Backend(_))), "{err:?}");
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn mask_words_are_the_matchers_allowed_set() {
         let mut gm = mask(WEATHER);
-        gm.replay(&br#"{"city":"P"#.map(u32::from)).unwrap();
+        gm.replay(&br#"{"city": "P"#.map(u32::from)).unwrap();
         let words = mask_words(&mut gm).unwrap();
         assert_eq!(words.len(), VOCAB.div_ceil(32));
         for t in 0..VOCAB as u32 {
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn commit_reports_the_finish_and_rejects_a_disallowed_token() {
         let mut gm = mask(WEATHER);
-        for &b in br#"{"city":"P","conditions":"sunny""# {
+        for &b in br#"{"city": "P", "conditions": "sunny""# {
             assert!(!commit(Some(&mut gm), i64::from(b)).unwrap());
         }
         assert!(commit(Some(&mut gm), i64::from(b'}')).unwrap());
