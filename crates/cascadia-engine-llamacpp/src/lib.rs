@@ -1518,18 +1518,19 @@ impl SseState {
         send(Ok((tid.clone(), c)));
     }
 
-    /// Close reasoning sent as text, if it is open: before the answer, a
-    /// tool call or the end of the stream.
+    /// Close reasoning sent as text, if it is open: before the answer or a
+    /// tool call.
     fn close_reasoning(&mut self, tid: &TaskId, send: &dyn Fn(EngineResult<(TaskId, Chunk)>)) {
         if std::mem::take(&mut self.in_reasoning) {
             self.send_text(tid, THINK_CLOSE.to_owned(), send);
         }
     }
 
-    /// The stream's end: close open reasoning, then send the assembled
-    /// tool calls, before the final chunk.
+    /// The stream's end: send the assembled tool calls, before the final
+    /// chunk. Reasoning still open stays open (no `</think>` is made up), so
+    /// a stream cut short mid-reasoning reads as unfinished reasoning; a
+    /// tool call already closed it when its first fragment came.
     fn end_text(&mut self, tid: &TaskId, send: &dyn Fn(EngineResult<(TaskId, Chunk)>)) {
-        self.close_reasoning(tid, send);
         for block in self.tool_call_blocks() {
             send(Ok((
                 tid.clone(),
@@ -2236,15 +2237,16 @@ mod tests {
         assert_eq!(texts[5..], ["|"]);
     }
 
-    /// A stream that ends while still reasoning is closed, at `[DONE]` or
-    /// at a clean EOF.
+    /// A stream that ends while still reasoning is left open, at `[DONE]`
+    /// or at a clean EOF: a length stop mid-reasoning is then an incomplete
+    /// reasoning item, as on other engines.
     #[test]
-    fn sse_reasoning_as_text_closes_at_the_end() {
+    fn sse_reasoning_as_text_stays_open_at_the_end() {
         for done in [true, false] {
             let chunks = stream(&mut as_text(), &[THINK_1, STOP], done);
             assert_eq!(
                 texts(&chunks),
-                ["<think>", "17 times 3", "</think>", "|"],
+                ["<think>", "17 times 3", "|"],
                 "done: {done}"
             );
         }

@@ -2961,6 +2961,29 @@ mod tests {
         assert!(!tasks.lock()[0].reasoning_as_text);
     }
 
+    /// Reasoning cut short by the token cap (sycl-llama sends no
+    /// `</think>` then) is an incomplete reasoning item in an incomplete
+    /// response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reasoning_cut_by_the_cap_is_incomplete() {
+        let cfg = Config {
+            engine_applies_template: true,
+            ..Config::default()
+        };
+        let script = ["<think>", "17 times 3", " is", " 51"];
+        let (app, _, _) = app_with(RecordingEngine::script(&script), cfg).await;
+        let (status, v) = post_json(
+            app,
+            json!({"model": "script-model", "input": "What is 17 times 3?",
+                "max_output_tokens": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["status"], "incomplete", "{v}");
+        assert_eq!(v["output"][0]["type"], "reasoning", "{v}");
+        assert_eq!(v["output"][0]["status"], "incomplete", "{v}");
+    }
+
     /// A template that takes no system role gets every system turn folded,
     /// the instructions into the first user turn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
