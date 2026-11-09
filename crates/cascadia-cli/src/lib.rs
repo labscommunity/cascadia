@@ -1792,6 +1792,13 @@ fn media_engine(engine: EngineKind) -> cascadia_api::MediaEngine {
     }
 }
 
+/// Do the operator's llama-server args set the child's chat template (any
+/// `--chat-template*` flag)? Then the GGUF's own template is not what the
+/// child renders, and the fold must not probe it.
+fn llama_args_set_chat_template(llama_args: &[String]) -> bool {
+    llama_args.iter().any(|a| a.starts_with("--chat-template"))
+}
+
 /// The GGUF's `tokenizer.chat_template`, for the `/v1/responses` fold's
 /// probe on sycl-llama; logged either way, without the template's text.
 fn gguf_fold_probe_template(model: &std::path::Path) -> Option<String> {
@@ -2858,7 +2865,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // The API renders nothing with the GGUF's own template, but
         // /v1/responses probes it to fold system turns it refuses.
         if matches!(args.engine, EngineKind::SyclLlama) {
-            cfg.fold_probe_template = gguf_fold_probe_template(std::path::Path::new(&args.model));
+            if llama_args_set_chat_template(&args.llama_args) {
+                info!("--llama-args set the chat template; /v1/responses will not fold system turns by the GGUF's");
+            } else {
+                cfg.fold_probe_template =
+                    gguf_fold_probe_template(std::path::Path::new(&args.model));
+            }
         }
         // Image input: ov-genai on a VLM-layout export (vision encoder IRs
         // present). Every other engine answers `image_url` parts with a 400.
@@ -5030,6 +5042,26 @@ mod sycl_llama_flag_tests {
         ]);
         assert_eq!(a.llama_args, ["-ctk", "q8_0", "-fa", "on"]);
         assert!(a.elastic);
+    }
+
+    /// Operator llama args that set the child's chat template (any
+    /// `--chat-template*` flag, both spellings) turn the GGUF fold probe off.
+    #[test]
+    fn llama_args_that_set_the_template_skip_the_fold_probe() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!llama_args_set_chat_template(&args(&[])));
+        assert!(!llama_args_set_chat_template(&args(&[
+            "-ctk", "q8_0", "--jinja"
+        ])));
+        for set in [
+            &["--chat-template", "chatml"][..],
+            &["--chat-template=chatml"],
+            &["--chat-template-file", "t.jinja"],
+            &["-fa", "on", "--chat-template-file=t.jinja"],
+            &["--chat-template-kwargs", "{}"],
+        ] {
+            assert!(llama_args_set_chat_template(&args(set)), "{set:?}");
+        }
     }
 
     #[test]

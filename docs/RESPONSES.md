@@ -217,7 +217,8 @@ compact the conversation locally (the server refuses `compaction_trigger` items)
   that take them (Gemma 4, Qwen) see them unchanged. `/v1/chat/completions` does not fold.
   On `sycl-llama`, which renders the GGUF's own template, the decision is made with the
   template the GGUF carries (`tokenizer.chat_template`, read at startup; the log says whether
-  one was found); a GGUF without one is not folded.
+  one was found); a GGUF without one, or a server whose `--llama-args` set the template
+  (`--chat-template*`), is not folded.
 - `tool_choice` cannot force a call yet, and structured output (`text.format`) is not
   served.
 - `reasoning.summary` produces no summary; reasoning is returned whole.
