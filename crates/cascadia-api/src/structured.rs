@@ -47,8 +47,12 @@ pub const MAX_SCHEMA_BYTES: usize = 65536;
 /// Deepest accepted nesting of objects and arrays; the schema itself is level 1.
 pub const MAX_SCHEMA_DEPTH: usize = 64;
 /// Largest accepted value of `minItems`, `maxItems`, `minLength`,
-/// `maxLength`, `minProperties` and `maxProperties`.
+/// `maxLength`, `minProperties` and `maxProperties`, and of any number in a
+/// `pattern` repetition quantifier such as `{n}` or `{n,m}`.
 pub const MAX_SCHEMA_COUNT: u64 = 10_000;
+/// Largest accepted sum of all those counts and quantifier numbers in one
+/// schema, since many counts under the per-value limit still add up.
+pub const MAX_SCHEMA_COUNT_TOTAL: u64 = 100_000;
 
 const TYPE_ERR: &str = "response_format.type must be one of text, json_object, json_schema";
 
@@ -102,10 +106,12 @@ const COUNT_KEYWORDS: [&str; 6] = [
     "maxProperties",
 ];
 
+const FIELD: &str = "response_format.json_schema.schema";
+
 /// Reject a schema over [`MAX_SCHEMA_BYTES`], nested deeper than
-/// [`MAX_SCHEMA_DEPTH`], or with a count keyword above [`MAX_SCHEMA_COUNT`].
+/// [`MAX_SCHEMA_DEPTH`], with a count keyword or pattern quantifier above
+/// [`MAX_SCHEMA_COUNT`], or whose counts sum above [`MAX_SCHEMA_COUNT_TOTAL`].
 fn check_limits(schema: &Value) -> Result<(), String> {
-    const FIELD: &str = "response_format.json_schema.schema";
     let n = serde_json::to_string(schema)
         .expect("a serde_json::Value always serializes")
         .len();
@@ -119,16 +125,112 @@ fn check_limits(schema: &Value) -> Result<(), String> {
             "{FIELD} nests deeper than {MAX_SCHEMA_DEPTH} levels"
         ));
     }
-    for_each_schema(schema, 0, &mut |obj| {
-        for k in COUNT_KEYWORDS {
-            if let Some(v) = obj.get(k) {
-                if v.as_f64().is_some_and(|c| c > MAX_SCHEMA_COUNT as f64) {
-                    return Err(format!("{FIELD}: {k} = {v} exceeds {MAX_SCHEMA_COUNT}"));
+    let mut total = 0;
+    sum_counts(schema, &mut total)?;
+    if total > MAX_SCHEMA_COUNT_TOTAL {
+        return Err(format!(
+            "{FIELD}: repetition counts add up to {total}; the limit is {MAX_SCHEMA_COUNT_TOTAL}"
+        ));
+    }
+    Ok(())
+}
+
+/// Add every count keyword value and pattern quantifier number in `v` to
+/// `total`, failing on the first one above [`MAX_SCHEMA_COUNT`]. This visits
+/// every object in the document, data keys included: a `$ref` may point
+/// anywhere, so any object may end up compiled as a schema. Counts inside
+/// data are therefore charged too.
+fn sum_counts(v: &Value, total: &mut u64) -> Result<(), String> {
+    match v {
+        Value::Array(items) => items.iter().try_for_each(|c| sum_counts(c, total)),
+        Value::Object(obj) => {
+            for (key, value) in obj {
+                let key = key.as_str();
+                if COUNT_KEYWORDS.contains(&key) {
+                    if let Some(c) = value.as_f64().filter(|c| *c >= 0.0) {
+                        if c > MAX_SCHEMA_COUNT as f64 {
+                            return Err(format!(
+                                "{FIELD}: {key} = {value} exceeds {MAX_SCHEMA_COUNT}"
+                            ));
+                        }
+                        *total += c as u64;
+                    }
                 }
+                match value {
+                    Value::String(re) if key == "pattern" => sum_quantifiers(re, total)?,
+                    Value::Object(map) if key == "patternProperties" => {
+                        for re in map.keys() {
+                            sum_quantifiers(re, total)?;
+                        }
+                    }
+                    _ => {}
+                }
+                sum_counts(value, total)?;
             }
+            Ok(())
         }
-        Ok(())
-    })
+        _ => Ok(()),
+    }
+}
+
+/// Add the numbers of every `{n}`, `{n,}` and `{n,m}` quantifier in the
+/// regex `re` to `total`, failing on one above [`MAX_SCHEMA_COUNT`]. Escaped
+/// characters such as `\{` are skipped. Braces inside a character class are
+/// read as quantifiers too, and nested quantifiers (`(a{100}){100}`) are
+/// summed, not multiplied: both are out of scope for this check.
+fn sum_quantifiers(re: &str, total: &mut u64) -> Result<(), String> {
+    let b = re.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'{' => {
+                let (numbers, end) = quantifier_at(b, i);
+                for digits in numbers {
+                    let n = digits.parse::<u64>().unwrap_or(u64::MAX);
+                    if n > MAX_SCHEMA_COUNT {
+                        return Err(format!(
+                            "{FIELD}: pattern repetition {{{digits}}} exceeds {MAX_SCHEMA_COUNT}"
+                        ));
+                    }
+                    *total += n;
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+/// The numbers of the quantifier opening at `b[start] == b'{'` (none when
+/// it is not one: digits, optional `,` and digits, then `}`), and the index
+/// to resume scanning at.
+fn quantifier_at(b: &[u8], start: usize) -> (Vec<&str>, usize) {
+    let digits_from = |from: usize| {
+        let len = b[from..].iter().take_while(|c| c.is_ascii_digit()).count();
+        (
+            from + len,
+            std::str::from_utf8(&b[from..from + len]).unwrap_or(""),
+        )
+    };
+    let not_one = (Vec::new(), start + 1);
+    let (mut i, n) = digits_from(start + 1);
+    if n.is_empty() {
+        return not_one;
+    }
+    let mut numbers = vec![n];
+    if b.get(i) == Some(&b',') {
+        let (j, m) = digits_from(i + 1);
+        if !m.is_empty() {
+            numbers.push(m);
+        }
+        i = j;
+    }
+    if b.get(i) != Some(&b'}') {
+        return not_one;
+    }
+    (numbers, i + 1)
 }
 
 /// True when objects and arrays in `v` nest more than `levels` deep, counting
@@ -195,12 +297,13 @@ const ALWAYS_UNENFORCED: [&str; 10] = [
 
 /// Keys whose value is a map from names to subschemas: walk the values,
 /// never treat the names as keywords.
-const SCHEMA_MAPS: [&str; 5] = [
+const SCHEMA_MAPS: [&str; 6] = [
     "properties",
     "patternProperties",
     "$defs",
     "definitions",
     "dependentSchemas",
+    "dependencies",
 ];
 
 /// Keys whose value is instance data, not a schema.
@@ -210,11 +313,7 @@ const DATA_KEYS: [&str; 4] = ["enum", "const", "default", "examples"];
 /// sorted and de-duplicated. Output may still be valid JSON that violates them.
 pub fn unenforced_keywords(schema: &Value) -> Vec<&'static str> {
     let mut found = Vec::new();
-    let walked: Result<(), String> = for_each_schema(schema, 0, &mut |obj| {
-        flag_unenforced(obj, &mut found);
-        Ok(())
-    });
-    debug_assert!(walked.is_ok());
+    for_each_schema(schema, 0, &mut |obj| flag_unenforced(obj, &mut found));
     found.sort_unstable();
     found.dedup();
     found
@@ -222,23 +321,19 @@ pub fn unenforced_keywords(schema: &Value) -> Vec<&'static str> {
 
 /// Call `f` on every schema object reachable from `v`: values of schema maps
 /// (never their names) and every other key's value, except data keys. Stops
-/// at the first error, and below [`MAX_SCHEMA_DEPTH`].
-fn for_each_schema<E>(
-    v: &Value,
-    depth: usize,
-    f: &mut impl FnMut(&Map<String, Value>) -> Result<(), E>,
-) -> Result<(), E> {
+/// below [`MAX_SCHEMA_DEPTH`].
+fn for_each_schema(v: &Value, depth: usize, f: &mut impl FnMut(&Map<String, Value>)) {
     if depth > MAX_SCHEMA_DEPTH {
-        return Ok(());
+        return;
     }
     match v {
         Value::Array(items) => {
             for item in items {
-                for_each_schema(item, depth + 1, f)?;
+                for_each_schema(item, depth + 1, f);
             }
         }
         Value::Object(obj) => {
-            f(obj)?;
+            f(obj);
             for (key, value) in obj {
                 let key = key.as_str();
                 if DATA_KEYS.contains(&key) {
@@ -247,16 +342,15 @@ fn for_each_schema<E>(
                 match value {
                     Value::Object(map) if SCHEMA_MAPS.contains(&key) => {
                         for sub in map.values() {
-                            for_each_schema(sub, depth + 1, f)?;
+                            for_each_schema(sub, depth + 1, f);
                         }
                     }
-                    _ => for_each_schema(value, depth + 1, f)?,
+                    _ => for_each_schema(value, depth + 1, f),
                 }
             }
         }
         _ => {}
     }
-    Ok(())
 }
 
 fn flag_unenforced(obj: &Map<String, Value>, found: &mut Vec<&'static str>) {
@@ -455,6 +549,13 @@ mod tests {
         });
         assert_eq!(unenforced_keywords(&schema), vec!["allOf"]);
 
+        // Draft-07 `dependencies` maps property names to schemas or name lists.
+        let schema = json!({
+            "type": "object",
+            "dependencies": {"not": {"required": ["x"]}, "if": ["y"]}
+        });
+        assert!(unenforced_keywords(&schema).is_empty());
+
         let schema = json!({"type": "array", "uniqueItems": false});
         assert!(unenforced_keywords(&schema).is_empty());
 
@@ -593,20 +694,130 @@ mod tests {
     }
 
     #[test]
-    fn count_keyword_names_in_property_maps_and_data_are_not_counts() {
+    fn count_keyword_names_in_property_maps_are_not_counts() {
         let schema = json!({
             "type": "object",
-            "properties": {"maxItems": {"type": "integer"}, "minLength": {"type": "string"}},
+            "properties": {
+                "maxItems": {"type": "integer"},
+                "minLength": {"type": "string"},
+                "pattern": {"type": "string"}
+            },
             "required": ["maxItems"],
-            "default": {"maxItems": 99_999},
-            "examples": [{"minLength": 99_999}]
+            "dependencies": {"maxItems": ["minLength"]}
         });
         assert!(matches!(
             parse_schema(schema),
             Ok(ResponseFormat::JsonSchema { .. })
         ));
-        assert!(parse_schema(json!({"const": {"maxLength": 99_999}})).is_ok());
-        assert!(parse_schema(json!({"enum": [{"maxItems": 99_999}]})).is_ok());
+    }
+
+    #[test]
+    fn counts_inside_data_are_checked_because_ref_can_reach_them() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"default": {"type": "array", "minItems": 1_000_000}},
+                "b": {"$ref": "#/properties/a/default"}
+            }
+        });
+        assert_eq!(
+            parse_schema(schema),
+            Err("response_format.json_schema.schema: minItems = 1000000 exceeds 10000".into())
+        );
+        for data in [
+            json!({"const": {"maxLength": 99_999}}),
+            json!({"enum": [{"maxItems": 99_999}]}),
+            json!({"examples": [{"minLength": 99_999}]}),
+        ] {
+            assert!(parse_schema(data).is_err());
+        }
+    }
+
+    #[test]
+    fn large_pattern_quantifiers_are_rejected() {
+        let err = |n: &str| {
+            Err(format!(
+                "response_format.json_schema.schema: pattern repetition {{{n}}} exceeds 10000"
+            ))
+        };
+        assert_eq!(
+            parse_schema(json!({"type": "string", "pattern": "^a{100000}$"})),
+            err("100000")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": "string", "pattern": "^a{3,20000}$"})),
+            err("20000")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": "string", "pattern": "^a{10001,}$"})),
+            err("10001")
+        );
+        assert_eq!(
+            parse_schema(json!({
+                "type": "object",
+                "patternProperties": {"^x{20000}$": {"type": "string"}}
+            })),
+            err("20000")
+        );
+        for ok in [
+            "^[a-z]{2,64}$",
+            "\\{99999\\}",
+            "a{,99999}",
+            "{x}",
+            "a{5",
+            "{",
+        ] {
+            assert!(
+                matches!(
+                    parse_schema(json!({"type": "string", "pattern": ok})),
+                    Ok(ResponseFormat::JsonSchema { .. })
+                ),
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn repetition_counts_are_capped_in_total() {
+        let props: serde_json::Map<String, serde_json::Value> = (0..11)
+            .map(|i| {
+                (
+                    format!("p{i}"),
+                    json!({"type": "string", "maxLength": 10_000}),
+                )
+            })
+            .collect();
+        assert_eq!(
+            parse_schema(json!({"type": "object", "properties": props})),
+            Err("response_format.json_schema.schema: repetition counts add up to 110000; the limit is 100000".into())
+        );
+        let props: serde_json::Map<String, serde_json::Value> = (0..10)
+            .map(|i| {
+                (
+                    format!("p{i}"),
+                    json!({"type": "string", "maxLength": 10_000}),
+                )
+            })
+            .collect();
+        assert!(parse_schema(json!({"type": "object", "properties": props})).is_ok());
+        // Pattern quantifiers count toward the total too.
+        // 20000 + 19001 + 3 * 20000 = 99001.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "maxLength": 10_000, "pattern": "^.{0,10000}$"},
+                "b": {"type": "array", "maxItems": 10_000, "items": {"pattern": "^(x{9000}){1}$"}},
+                "c": {"type": "string", "minLength": 10_000, "maxLength": 10_000},
+                "d": {"type": "string", "minLength": 10_000, "maxLength": 10_000},
+                "e": {"type": "string", "minLength": 10_000, "maxLength": 10_000}
+            }
+        });
+        assert!(parse_schema(schema.clone()).is_ok());
+        schema["properties"]["f"] = json!({"type": "string", "pattern": "^a{1000}$"});
+        assert_eq!(
+            parse_schema(schema),
+            Err("response_format.json_schema.schema: repetition counts add up to 100001; the limit is 100000".into())
+        );
     }
 
     #[test]
