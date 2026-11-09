@@ -841,28 +841,48 @@ impl ChunkStream {
             self.last_chunk_at = Some(now);
         }
         if chunk.is_final {
-            self.record_generated_tokens();
-            self.record_prompt_tokens();
-            // `Cancelled` is surfaced here (metrics-only per FinishReason's
-            // contract); the API maps it to "stop" on the wire. An engine
-            // that acknowledges a cancel with a Cancelled final marker must
-            // land in the SAME counter as the tombstone/Drop cancel paths,
-            // or the cancelled duration histogram and cancelled counter
-            // would diverge.
-            let reason = match chunk.finish_reason {
-                Some(FinishReason::Length) => "length",
-                Some(FinishReason::Cancelled) => {
-                    cascadia_metrics::TASKS_CANCELLED_TOTAL
-                        .with_label_values(&[&self.model])
-                        .inc();
-                    "cancelled"
-                }
-                Some(FinishReason::Stop) | None => "stop",
-            };
-            cascadia_metrics::GENERATION_DURATION_SECONDS
-                .with_label_values(&[&self.model, reason])
-                .observe((now - self.submitted_at).as_secs_f64());
-            self.metrics_finalized = true;
+            self.record_finish(chunk.finish_reason, now);
+        }
+    }
+
+    /// The terminal outcome of a generation that finished with `reason`.
+    /// Called only behind the terminal metrics guard, before it is set.
+    fn record_finish(&mut self, reason: Option<FinishReason>, now: Instant) {
+        self.record_generated_tokens();
+        self.record_prompt_tokens();
+        // `Cancelled` is surfaced here (metrics-only per FinishReason's
+        // contract); the API maps it to "stop" on the wire. An engine
+        // that acknowledges a cancel with a Cancelled final marker must
+        // land in the SAME counter as the tombstone/Drop cancel paths,
+        // or the cancelled duration histogram and cancelled counter
+        // would diverge.
+        let reason = match reason {
+            Some(FinishReason::Length) => "length",
+            Some(FinishReason::Cancelled) => {
+                cascadia_metrics::TASKS_CANCELLED_TOTAL
+                    .with_label_values(&[&self.model])
+                    .inc();
+                "cancelled"
+            }
+            Some(FinishReason::Stop) | None => "stop",
+        };
+        cascadia_metrics::GENERATION_DURATION_SECONDS
+            .with_label_values(&[&self.model, reason])
+            .observe((now - self.submitted_at).as_secs_f64());
+        self.metrics_finalized = true;
+    }
+
+    /// Ends the generation here because the consumer decided its answer is
+    /// complete (the API's context-window cut ends with `length`, a stop
+    /// match with `stop`). It books like an engine final with `reason`, on
+    /// the tokens and prompt count seen so far, instead of the client
+    /// cancel a plain drop books; then it cancels the engine task and
+    /// releases everything exactly as dropping the stream does. A stream
+    /// whose outcome is already booked (it ended, failed or was cancelled)
+    /// books nothing more.
+    pub fn finish_early(mut self, reason: FinishReason) {
+        if !self.metrics_finalized {
+            self.record_finish(Some(reason), Instant::now());
         }
     }
 
@@ -2901,6 +2921,88 @@ mod tests {
         ] {
             let needle = format!("{family}{{device=\"CPU\",model=\"{MODEL}\"}}");
             assert!(text.contains(&needle), "missing {needle} in:\n{text}");
+        }
+    }
+
+    /// The API ends a stream itself at the context window (`length`) or at
+    /// a stop match (`stop`). That is a finished answer, not a client
+    /// cancel: it books like an engine final with that reason, the observed
+    /// tokens and the prompt count once, and still cancels the engine task.
+    #[tokio::test]
+    async fn a_stream_finished_early_books_its_reason_not_a_cancel() {
+        for (model, reason, label) in [
+            ("runner-early-length", FinishReason::Length, "length"),
+            ("runner-early-stop", FinishReason::Stop, "stop"),
+        ] {
+            let runner = usage_sequence_runner(
+                model,
+                vec![
+                    Chunk::token("e", 0, "a").with_prompt_tokens(11),
+                    Chunk::token("e", 1, "bc").with_n_tokens(2),
+                    Chunk::token("e", 2, "never read"),
+                    Chunk::final_marker("e", "").with_prompt_tokens(12),
+                ],
+            );
+            let mut stream = runner.generate(GenerationTask::new("e", "x")).unwrap();
+            assert!(!stream.next().await.unwrap().is_final);
+            assert!(!stream.next().await.unwrap().is_final);
+            stream.finish_early(reason);
+            for (outcome, n) in [(label, 1), ("cancelled", 0)] {
+                assert_eq!(
+                    cascadia_metrics::GENERATION_DURATION_SECONDS
+                        .with_label_values(&[model, outcome])
+                        .get_sample_count(),
+                    n,
+                    "{model}: {outcome}"
+                );
+            }
+            assert_eq!(
+                cascadia_metrics::TASKS_CANCELLED_TOTAL
+                    .with_label_values(&[model])
+                    .get(),
+                0,
+                "{model}"
+            );
+            assert_eq!(
+                cascadia_metrics::TOKENS_GENERATED_TOTAL
+                    .with_label_values(&[model])
+                    .get(),
+                3,
+                "{model}"
+            );
+            assert_eq!(
+                cascadia_metrics::TOKENS_PROMPT_TOTAL
+                    .with_label_values(&[model])
+                    .get(),
+                11,
+                "{model}"
+            );
+            assert!(
+                runner.slot.buffers.lock().cancelled.contains("e"),
+                "{model}: the engine task was not cancelled"
+            );
+        }
+    }
+
+    /// A stream that already ended books nothing more when finished early.
+    #[tokio::test]
+    async fn finishing_a_completed_stream_early_books_nothing_more() {
+        const MODEL: &str = "runner-early-after-final";
+        let runner = usage_sequence_runner(
+            MODEL,
+            vec![Chunk::final_marker("f", "x").with_finish_reason(FinishReason::Stop)],
+        );
+        let mut stream = runner.generate(GenerationTask::new("f", "x")).unwrap();
+        while stream.next().await.is_some() {}
+        stream.finish_early(FinishReason::Length);
+        for (outcome, n) in [("stop", 1), ("length", 0), ("cancelled", 0)] {
+            assert_eq!(
+                cascadia_metrics::GENERATION_DURATION_SECONDS
+                    .with_label_values(&[MODEL, outcome])
+                    .get_sample_count(),
+                n,
+                "{outcome}"
+            );
         }
     }
 

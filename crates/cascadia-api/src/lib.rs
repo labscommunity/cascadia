@@ -3011,10 +3011,11 @@ async fn chat_completions(
                 finish_reason = fr.as_openai_str();
             }
         }
-        // Early stop: end at the match. Dropping the stream below
+        // Early stop: end at the match. Finishing the stream with `stop`
         // cancels the engine task; usage counts the tokens received so far.
         if stop.stopped() {
             finish_reason = "stop";
+            chunk_stream.finish_early(cascadia_types::FinishReason::Stop);
             break;
         }
     }
@@ -3241,10 +3242,11 @@ async fn completions(
                 finish_reason = fr.as_openai_str();
             }
         }
-        // Early stop: end at the match. Dropping the stream below
+        // Early stop: end at the match. Finishing the stream with `stop`
         // cancels the engine task; usage counts the tokens received so far.
         if stop.stopped() {
             finish_reason = "stop";
+            chunk_stream.finish_early(cascadia_types::FinishReason::Stop);
             break;
         }
     }
@@ -3479,6 +3481,14 @@ struct StreamWithPermit {
     _inflight: InFlightGuard,
 }
 
+impl StreamWithPermit {
+    /// Ends the engine stream with `reason` (see [`FinishEarly`]), then
+    /// releases the permit and the in-flight guard.
+    fn finish_early(mut self, reason: cascadia_types::FinishReason) {
+        self.inner.finish_early(reason);
+    }
+}
+
 impl Stream for StreamWithPermit {
     type Item = cascadia_types::Chunk;
     fn poll_next(
@@ -3493,13 +3503,13 @@ impl Stream for StreamWithPermit {
 /// stop there themselves, so a prompt of P tokens plus an answer of up to one
 /// window would run past it. When a token chunk makes the prompt plus the
 /// answer so far reach `window`, that chunk becomes the final one
-/// (`finish_reason: length`) and the engine stream is dropped, which cancels
-/// the task. The prompt count is the latest one any chunk carried
+/// (`finish_reason: length`) and the engine stream is finished early with
+/// `length`, which cancels the task. The prompt count is the latest one any chunk carried
 /// (token-streaming engines report it on their first chunk), 0 when none
 /// did. Errors, progress markers and the engine's own final chunk pass
 /// through unchanged; with no known window every chunk does.
 struct WindowGuard<S> {
-    /// `None` once the cut has dropped the engine stream.
+    /// `None` once the engine stream has been finished early.
     inner: Option<S>,
     window: Option<u32>,
     prompt: Option<u32>,
@@ -3518,7 +3528,7 @@ fn guard_window<S>(inner: S, window: Option<u32>) -> WindowGuard<S> {
 
 impl<S> Stream for WindowGuard<S>
 where
-    S: Stream<Item = cascadia_types::Chunk> + Unpin,
+    S: Stream<Item = cascadia_types::Chunk> + Unpin + FinishEarly,
 {
     type Item = cascadia_types::Chunk;
     fn poll_next(
@@ -3549,9 +3559,34 @@ where
             chunk.prompt_tokens = this.prompt;
             // The consumers add this chunk's own count to theirs.
             chunk.completion_tokens = None;
-            this.inner = None;
+            this.finish_early(cascadia_types::FinishReason::Length);
         }
         Poll::Ready(Some(chunk))
+    }
+}
+
+/// An engine stream the API can end itself once it has the whole answer: a
+/// context-window cut (`length`) or a stop match (`stop`). Unlike a plain
+/// drop, which is a client going away, this books the outcome like an
+/// engine final with `reason`; it still cancels the engine task and frees
+/// everything a drop frees.
+trait FinishEarly {
+    fn finish_early(self, reason: cascadia_types::FinishReason);
+}
+
+impl FinishEarly for cascadia_runner::ChunkStream {
+    fn finish_early(self, reason: cascadia_types::FinishReason) {
+        cascadia_runner::ChunkStream::finish_early(self, reason);
+    }
+}
+
+impl<S: FinishEarly> WindowGuard<S> {
+    /// Ends the engine stream with `reason` (see [`FinishEarly`]); nothing
+    /// once it has ended.
+    fn finish_early(&mut self, reason: cascadia_types::FinishReason) {
+        if let Some(inner) = self.inner.take() {
+            inner.finish_early(reason);
+        }
     }
 }
 
@@ -3767,7 +3802,26 @@ impl KeepAlive {
 }
 
 /// The receiving end of an engine stream run by [`spawn_engine_forwarder`].
-type EngineChunks = tokio::sync::mpsc::Receiver<cascadia_types::Chunk>;
+/// Dropping it ends the engine stream as a client cancel;
+/// [`EngineChunks::finish_early`] ends it with a reason instead.
+struct EngineChunks {
+    rx: tokio::sync::mpsc::Receiver<cascadia_types::Chunk>,
+    /// Set before `rx` drops when the body ended the answer itself; the
+    /// forwarder reads it once the channel closes.
+    early: Arc<std::sync::OnceLock<cascadia_types::FinishReason>>,
+}
+
+impl EngineChunks {
+    async fn recv(&mut self) -> Option<cascadia_types::Chunk> {
+        self.rx.recv().await
+    }
+
+    /// The body has the whole answer (a stop match): the forwarder ends the
+    /// engine stream with `reason` rather than as a client cancel.
+    fn finish_early(self, reason: cascadia_types::FinishReason) {
+        let _ = self.early.set(reason);
+    }
+}
 
 /// Chunks the forwarder may hold ahead of the SSE body. One keeps the
 /// engine paced by the body as before (it can be at most a chunk or two
@@ -3781,10 +3835,12 @@ const FORWARD_BUFFER: usize = 1;
 /// still sends keep-alive comments.
 ///
 /// Disconnect and cancel are unchanged: dropping the receiver (the body
-/// dropped on a client disconnect, or a stop match) ends the forwarder at
-/// its next poll, which drops the engine stream — that cancels the task and
-/// releases the permit and in-flight guard, as dropping the body did. A
-/// step already running cannot be interrupted either way.
+/// dropped on a client disconnect) ends the forwarder at its next poll,
+/// which drops the engine stream — that cancels the task and releases the
+/// permit and in-flight guard, as dropping the body did. A receiver ended
+/// with [`EngineChunks::finish_early`] (a stop match) finishes the engine
+/// stream with that reason instead, which cancels and releases the same
+/// way. A step already running cannot be interrupted either way.
 ///
 /// A panic inside `step()` is caught here and forwarded as an error chunk,
 /// so the client sees an SSE error event rather than a clean `[DONE]` after
@@ -3796,6 +3852,8 @@ fn spawn_engine_forwarder(
 ) -> EngineChunks {
     use futures::FutureExt;
     let (tx, rx) = tokio::sync::mpsc::channel(FORWARD_BUFFER);
+    let early = Arc::new(std::sync::OnceLock::new());
+    let finished = early.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3831,9 +3889,12 @@ fn spawn_engine_forwarder(
                 },
             }
         }
-        drop(chunks);
+        match finished.get() {
+            Some(&reason) => chunks.finish_early(reason),
+            None => drop(chunks),
+        }
     });
-    rx
+    EngineChunks { rx, early }
 }
 
 /// The OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
@@ -3881,8 +3942,8 @@ enum TextStreamKind {
 /// Body state of a plain (no tools) chat stream or a `/v1/completions`
 /// stream: one frame per engine chunk, `stop` applied as the text arrives,
 /// keep-alive comments while idle. Owns the permit + in-flight guard through
-/// `chunks`; dropping `chunks` (client disconnect, or a stop match) releases
-/// both and cancels the engine task.
+/// `chunks`; dropping `chunks` (client disconnect) or finishing it early (a
+/// stop match) releases both and cancels the engine task.
 struct TextStream {
     chunks: Option<EngineChunks>,
     keepalive: KeepAlive,
@@ -3973,10 +4034,12 @@ impl TextStream {
             let mut released = self.stop.push(&text);
             let n_tokens = std::mem::take(&mut self.held_tokens) + chunk.token_count();
             let finish = if self.stop.stopped() {
-                // Cut at the match: end the choice here and drop the engine
-                // stream, which cancels the task.
+                // Cut at the match: end the choice here and finish the
+                // engine stream with `stop`, which cancels the task.
                 self.finished = true;
-                self.chunks = None;
+                if let Some(chunks) = self.chunks.take() {
+                    chunks.finish_early(cascadia_types::FinishReason::Stop);
+                }
                 self.phase = ToolStreamPhase::Tail;
                 Some("stop")
             } else if chunk.is_final {
@@ -4166,9 +4229,12 @@ impl ToolStream {
             let mut text = self.stop.push(translated.as_deref().unwrap_or(&chunk.text));
             let frame = if self.stop.stopped() {
                 // Cut at the match: close the choice on what came before it
-                // and drop the engine stream, which cancels the task.
+                // and finish the engine stream with `stop`, which cancels
+                // the task.
                 self.finished = true;
-                self.chunks = None;
+                if let Some(chunks) = self.chunks.take() {
+                    chunks.finish_early(cascadia_types::FinishReason::Stop);
+                }
                 self.phase = ToolStreamPhase::Tail;
                 Some(self.close_choice(&text, None, "stop"))
             } else if chunk.is_final {
@@ -9554,6 +9620,8 @@ level={{ effort_map[eff] }}";
         max_concurrent: usize,
         /// The model's context window (`GenerationDefaults::context_window`).
         window: Option<u32>,
+        /// The runner's model label on the generation metrics.
+        metrics_model: &'static str,
     }
 
     impl Default for ScriptOpts<'_> {
@@ -9567,6 +9635,7 @@ level={{ effort_map[eff] }}";
                 end: ScriptEnd::Final,
                 max_concurrent: DEFAULT_MAX_CONCURRENT,
                 window: None,
+                metrics_model: "mock-model",
             }
         }
     }
@@ -9584,6 +9653,7 @@ level={{ effort_map[eff] }}";
             end,
             max_concurrent,
             window,
+            metrics_model,
         } = opts;
         let log = Arc::new(ScriptLog::default());
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -9600,7 +9670,7 @@ level={{ effort_map[eff] }}";
         runner
             .start(
                 PeerLayout::single_stage(),
-                ShardSpec::single_stage("mock-model", "CPU"),
+                ShardSpec::single_stage(metrics_model, "CPU"),
             )
             .await
             .unwrap();
@@ -10614,6 +10684,10 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    impl FinishEarly for DropFlagStream {
+        fn finish_early(self, _reason: cascadia_types::FinishReason) {}
+    }
+
     impl Drop for DropFlagStream {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::SeqCst);
@@ -11078,5 +11152,145 @@ level={{ effort_map[eff] }}";
                 );
             }
         }
+    }
+
+    // --- What an early end books in the runner's metrics --------------------
+
+    /// Duration samples booked for `model` with `outcome`, waited for: the
+    /// streamed paths book when their forwarder task ends.
+    async fn outcome_samples(model: &str, outcome: &str, want: u64) -> u64 {
+        let get = || {
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[model, outcome])
+                .get_sample_count()
+        };
+        for _ in 0..100 {
+            if get() >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        get()
+    }
+
+    /// A window cut and a stop match end the answer: they book `length` or
+    /// `stop`, never a client cancel, on every path.
+    #[tokio::test]
+    async fn an_early_end_books_its_reason_not_a_cancel() {
+        let chat = "/v1/chat/completions";
+        let cmpl = "/v1/completions";
+        // (metrics label, endpoint, stream, tools, window, booked outcome)
+        let cases: [(&'static str, &str, bool, bool, Option<u32>, &str); 8] = [
+            (
+                "api-early-window-chat",
+                chat,
+                false,
+                false,
+                Some(8),
+                "length",
+            ),
+            ("api-early-window-sse", chat, true, false, Some(8), "length"),
+            (
+                "api-early-window-tools",
+                chat,
+                true,
+                true,
+                Some(8),
+                "length",
+            ),
+            ("api-early-stop-chat", chat, false, false, None, "stop"),
+            ("api-early-stop-cmpl", cmpl, false, false, None, "stop"),
+            ("api-early-stop-sse", chat, true, false, None, "stop"),
+            ("api-early-stop-tools", chat, true, true, None, "stop"),
+            ("api-early-stop-cmpl-sse", cmpl, true, false, None, "stop"),
+        ];
+        for (model, uri, stream, tools, window, outcome) in cases {
+            let (app, log, _) = script_app_opts(
+                &script(&["alpha ", "bravo STOP ", "charlie "]),
+                ScriptOpts {
+                    window,
+                    metrics_model: model,
+                    ..ScriptOpts::default()
+                },
+            )
+            .await;
+            let mut body = if uri == cmpl {
+                serde_json::json!({"model": "mock-model", "prompt": "hi"})
+            } else {
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}]})
+            };
+            body["stream"] = serde_json::json!(stream);
+            if window.is_none() {
+                body["stop"] = serde_json::json!("STOP");
+            }
+            if tools {
+                body["tools"] =
+                    serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+            }
+            let (status, text) = post_text(app, uri, &body).await;
+            assert_eq!(status, StatusCode::OK, "{model}: {text}");
+            assert_cancelled(&log).await;
+            assert_eq!(
+                outcome_samples(model, outcome, 1).await,
+                1,
+                "{model}: {text}"
+            );
+            assert_eq!(outcome_samples(model, "cancelled", 0).await, 0, "{model}");
+            assert_eq!(
+                cascadia_metrics::TASKS_CANCELLED_TOTAL
+                    .with_label_values(&[model])
+                    .get(),
+                0,
+                "{model}"
+            );
+        }
+    }
+
+    /// A client that goes away mid-stream is still a cancel.
+    #[tokio::test]
+    async fn a_client_disconnect_still_books_a_cancel() {
+        const MODEL: &str = "api-early-disconnect";
+        let (app, log, _gate) = script_app_opts(
+            &script(&["alpha "]),
+            ScriptOpts {
+                gated: true,
+                metrics_model: MODEL,
+                ..ScriptOpts::default()
+            },
+        )
+        .await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model": "mock-model", "stream": true,
+                            "messages": [{"role": "user", "content": "hi"}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        // The first part arrives; the rest waits behind the closed gate.
+        let first = body.next().await.unwrap().unwrap();
+        assert!(
+            String::from_utf8_lossy(&first).contains("alpha"),
+            "{first:?}"
+        );
+        drop(body);
+        assert_cancelled(&log).await;
+        assert_eq!(outcome_samples(MODEL, "cancelled", 1).await, 1);
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            1
+        );
     }
 }
