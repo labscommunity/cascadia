@@ -29,8 +29,9 @@ use uuid::Uuid;
 
 mod structured;
 pub use structured::{
-    grammar_for, parse_response_format, unenforced_keywords, ResponseFormat, JSON_OBJECT_SCHEMA,
-    MAX_SCHEMA_BYTES, MAX_SCHEMA_COUNT, MAX_SCHEMA_COUNT_TOTAL, MAX_SCHEMA_DEPTH,
+    grammar_for, parse_response_format, unenforced_keywords, ResponseFormat, SchemaCheckError,
+    SchemaCompileCheck, JSON_OBJECT_SCHEMA, MAX_SCHEMA_BYTES, MAX_SCHEMA_COUNT,
+    MAX_SCHEMA_COUNT_TOTAL, MAX_SCHEMA_DEPTH,
 };
 
 /// Maximum HTTP request body the chat-completions endpoint accepts. 64
@@ -159,6 +160,9 @@ pub struct AppState {
     /// The engine constrains output with OpenVINO GenAI's xgrammar backend:
     /// log the schema keywords that backend does not enforce.
     pub xgrammar_keyword_log: bool,
+    /// Builds every enforced `response_format` schema once, off the engine,
+    /// before the request is queued; see [`SchemaCompileCheck`].
+    pub schema_check: SchemaCompileCheck,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -186,6 +190,8 @@ pub struct Config {
     pub engine_name: String,
     /// See [`AppState::xgrammar_keyword_log`]. Set by the CLI for ov-genai.
     pub xgrammar_keyword_log: bool,
+    /// See [`AppState::schema_check`].
+    pub schema_check: SchemaCompileCheck,
 }
 
 impl Default for Config {
@@ -201,6 +207,7 @@ impl Default for Config {
             structured_output: false,
             engine_name: String::new(),
             xgrammar_keyword_log: false,
+            schema_check: SchemaCompileCheck::default(),
         }
     }
 }
@@ -538,6 +545,7 @@ pub fn make_router_with_stats(
         structured_output: cfg.structured_output,
         engine_name: cfg.engine_name.clone(),
         xgrammar_keyword_log: cfg.xgrammar_keyword_log,
+        schema_check: cfg.schema_check.clone(),
     };
     let state = AppState {
         effort_words: state
@@ -2553,6 +2561,27 @@ async fn chat_completions(
     } else {
         None
     };
+    // The engine builds the grammar inside its submit, under the engine
+    // lock: a schema that takes too long to build is refused here first.
+    if let Some(spec) = &grammar {
+        if let Err(e) = state.schema_check.check(spec).await {
+            let (status, reason, msg) = match e {
+                SchemaCheckError::Busy => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "capacity",
+                    "busy compiling response_format schemas; retry shortly".to_owned(),
+                ),
+                SchemaCheckError::TooComplex => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "invalid response_format: response_format schema is too complex to compile"
+                        .to_owned(),
+                ),
+            };
+            count_rejected(reason);
+            return (status, Json(serde_json::json!({ "error": msg }))).into_response();
+        }
+    }
     // A JSON answer has no room for a reasoning preamble: thinking is off.
     // With callable tools the format is not enforced and the model may want
     // to reason before a tool call, so thinking stays as requested, except
@@ -7952,6 +7981,92 @@ level={{ effort_map[eff] }}";
 
     fn weather_tools() -> Value {
         serde_json::json!([{"type":"function","function":{"name":"get_weather"}}])
+    }
+
+    /// [`so_app`] with its own schema compile check.
+    async fn so_app_checked(check: SchemaCompileCheck) -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            structured_output: true,
+            engine_name: "mock".into(),
+            chat_template: template(MINIMAL_TEMPLATE),
+            schema_check: check,
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    fn chat_with(format: Option<Value>) -> Value {
+        let mut body = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "give me the answer"}],
+        });
+        if let Some(f) = format {
+            body["response_format"] = f;
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn schema_over_the_compile_budget_is_400() {
+        let check = SchemaCompileCheck::new(
+            2,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_nanos(1),
+        );
+        let (status, v) = post_chat(
+            so_app_checked(check).await,
+            chat_with(Some(json_schema_format(nested_schema()))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["error"],
+            "invalid response_format: response_format schema is too complex to compile"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_within_the_compile_budget_passes() {
+        let (status, v) = post_chat(
+            so_app_checked(SchemaCompileCheck::default()).await,
+            chat_with(Some(json_schema_format(nested_schema()))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn no_free_compile_slot_is_503_and_plain_requests_skip_the_check() {
+        // No permit ever frees up: any request that reaches the check waits
+        // out `wait` and is refused.
+        let check = SchemaCompileCheck::new(
+            0,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(2),
+        );
+        let app = so_app_checked(check).await;
+        let (status, v) = post_chat(
+            app.clone(),
+            chat_with(Some(serde_json::json!({"type": "json_object"}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(
+            v["error"],
+            "busy compiling response_format schemas; retry shortly"
+        );
+        for format in [None, Some(serde_json::json!({"type": "text"}))] {
+            let (status, v) = post_chat(app.clone(), chat_with(format)).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+        }
     }
 
     #[tokio::test]

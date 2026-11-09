@@ -308,6 +308,7 @@ dependencies = [
  "bytes",
  "cascadia-engine",
  "cascadia-engine-mock",
+ "cascadia-grammar",
  "cascadia-metrics",
  "cascadia-runner",
  "cascadia-types",

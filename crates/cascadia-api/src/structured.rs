@@ -2,11 +2,15 @@
 //! [`ResponseFormat`], maps it to a backend-neutral [`GrammarSpec`], and
 //! lists JSON Schema keywords the decoder cannot enforce.
 
+use cascadia_grammar::GrammarFactory;
 use cascadia_types::{GrammarKind, GrammarSpec};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// Grammar body used for `json_object` (and for `json_schema` whose schema is
 /// missing, `null`, `true` or `{}`): any JSON object.
@@ -71,6 +75,79 @@ pub const MAX_SCHEMA_COUNT_TOTAL: u64 = 200_000;
 pub const MAX_PATTERN_PROPERTIES: usize = 64;
 /// Most `patternProperties` keys in one schema, all objects together.
 pub const MAX_PATTERN_PROPERTIES_TOTAL: usize = 128;
+
+/// Most schemas built at once by [`SchemaCompileCheck`].
+pub const SCHEMA_COMPILE_PERMITS: usize = 2;
+/// How long a request waits for a free [`SchemaCompileCheck`] slot before a 503.
+pub const SCHEMA_COMPILE_WAIT: Duration = Duration::from_millis(500);
+/// Longest a schema may take to build in [`SchemaCompileCheck`].
+pub const SCHEMA_COMPILE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Why [`SchemaCompileCheck::check`] refused a schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaCheckError {
+    /// Every build slot stayed taken for the whole wait: a 503.
+    Busy,
+    /// The build ran past the budget: a 400.
+    TooComplex,
+}
+
+/// The hard bound on how long a schema's grammar takes to build. The caps
+/// above are fast 400s for the shapes known to be slow; this is what holds
+/// for everything else. Each enforced schema is built once with llguidance
+/// over a tokenizer-free byte vocab (the build cost of a schema doesn't
+/// depend on the tokenizer), on the blocking pool and never under the
+/// engine lock. A build past the budget is a 400; the request leaves, and
+/// the build keeps its slot until it ends, so abandoned builds hold at most
+/// `permits` cores. Whether the schema builds at all is left to the engine,
+/// whose backend may accept what llguidance doesn't.
+#[derive(Clone, Debug)]
+pub struct SchemaCompileCheck {
+    permits: Arc<Semaphore>,
+    wait: Duration,
+    budget: Duration,
+}
+
+impl Default for SchemaCompileCheck {
+    fn default() -> Self {
+        Self::new(
+            SCHEMA_COMPILE_PERMITS,
+            SCHEMA_COMPILE_WAIT,
+            SCHEMA_COMPILE_BUDGET,
+        )
+    }
+}
+
+impl SchemaCompileCheck {
+    /// At most `permits` builds at once; a request waits up to `wait` for
+    /// one; a build may take up to `budget`.
+    pub fn new(permits: usize, wait: Duration, budget: Duration) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+            wait,
+            budget,
+        }
+    }
+
+    /// Builds `spec` within the budget, or says why not.
+    pub async fn check(&self, spec: &GrammarSpec) -> Result<(), SchemaCheckError> {
+        let permit =
+            match tokio::time::timeout(self.wait, self.permits.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                _ => return Err(SchemaCheckError::Busy),
+            };
+        let spec = spec.clone();
+        let build = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            // Errors are the engine's to report; only the time counts here.
+            let _ = GrammarFactory::byte_level().compile(&spec);
+        });
+        match tokio::time::timeout(self.budget, build).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(SchemaCheckError::TooComplex),
+        }
+    }
+}
 
 const TYPE_ERR: &str = "response_format.type must be one of text, json_object, json_schema";
 
