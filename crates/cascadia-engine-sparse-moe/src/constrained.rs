@@ -122,7 +122,7 @@ impl GrammarSlot {
             info!(
                 task = %task.task_id,
                 warnings = ?compiled.warnings(),
-                "response_format schema uses keywords that are accepted but not enforced"
+                "sparse-moe: response_format keywords accepted but not enforced"
             );
         }
         Ok(Some(compiled))
