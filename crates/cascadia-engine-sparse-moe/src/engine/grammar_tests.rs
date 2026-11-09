@@ -1228,3 +1228,94 @@ fn a_stream_middle_drops_a_late_probe_ack_and_keeps_the_link() {
     assert_eq!(final_chunk(&out["p2"]).error, None);
     assert!(!log.died());
 }
+
+/// Steps until every task in `ids` has its final chunk, noting the step of
+/// each task's first token and of its final chunk.
+fn drive_timeline(
+    eng: &mut PipelineEngine<JsonStub>,
+    ids: &[&str],
+) -> (HashMap<String, Outcome>, HashMap<String, (usize, usize)>) {
+    let mut out: HashMap<String, Outcome> = HashMap::new();
+    let mut first: HashMap<String, usize> = HashMap::new();
+    let mut last: HashMap<String, usize> = HashMap::new();
+    for n in 0..10_000 {
+        if ids.iter().all(|id| last.contains_key(*id)) {
+            let at = ids
+                .iter()
+                .map(|id| {
+                    let id = id.to_string();
+                    let f = first.get(&id).copied().unwrap_or(usize::MAX);
+                    (id.clone(), (f, last[&id]))
+                })
+                .collect();
+            return (out, at);
+        }
+        for (id, c) in eng.step().unwrap() {
+            if !c.token_ids.is_empty() {
+                first.entry(id.clone()).or_insert(n);
+            }
+            let o = out.entry(id.clone()).or_default();
+            o.tokens.extend(c.token_ids.iter().map(|&t| t as u32));
+            o.text.push_str(&c.text);
+            if c.is_final {
+                last.insert(id, n);
+                o.last = Some(c);
+            }
+        }
+    }
+    panic!("tasks did not finish: {out:?}");
+}
+
+/// A stream head on a link with no mask evidence yet, one long plain stream
+/// running: a json request (which needs the idle link for its probe) and a
+/// short plain request queue behind it.
+fn json_waiting_for_the_probe() -> (
+    tokio::runtime::Runtime,
+    PipelineEngine<JsonStub>,
+    Arc<TailLog>,
+) {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), false);
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 3);
+    head.submit(plain_task("p1", 40)).unwrap();
+    for _ in 0..3 {
+        head.step().unwrap();
+    }
+    assert_eq!(head.streams.len(), 1, "the long stream is running");
+    // The fixture's sampler (lowest allowed token) never closes the JSON:
+    // the json request ends at its cap.
+    head.submit(json_task("j", 6)).unwrap();
+    head.submit(plain_task("p2", 3)).unwrap();
+    (rt, head, log)
+}
+
+#[test]
+fn plain_requests_behind_a_json_request_waiting_for_its_probe_are_admitted() {
+    let (_rt, mut head, log) = json_waiting_for_the_probe();
+    let (out, at) = drive_timeline(&mut head, &["p1", "j", "p2"]);
+    assert!(
+        at["p2"].1 < at["p1"].1,
+        "the short plain request waited for the long stream to drain: {at:?}"
+    );
+    assert_eq!(final_chunk(&out["p2"]).error, None);
+    assert_eq!(final_chunk(&out["p1"]).error, None);
+    assert_eq!(final_chunk(&out["j"]).error, None);
+    assert_eq!(out["j"].tokens.len(), 6);
+    assert_eq!(log.masked(FrameKind::Forward), 1, "probed once");
+}
+
+#[test]
+fn a_json_request_waiting_past_its_patience_stops_new_admissions() {
+    let (_rt, mut head, log) = json_waiting_for_the_probe();
+    head.probe_wait_since = Some(Instant::now() - JSON_PROBE_PATIENCE - Duration::from_secs(1));
+    let (out, at) = drive_timeline(&mut head, &["p1", "j", "p2"]);
+    assert!(
+        at["p1"].1 <= at["j"].0 && at["j"].0 <= at["p2"].0,
+        "the link idles, the json request is probed and runs first: {at:?}"
+    );
+    assert_eq!(final_chunk(&out["j"]).error, None);
+    assert_eq!(out["j"].tokens.len(), 6);
+    assert_eq!(final_chunk(&out["p2"]).error, None);
+    assert_eq!(log.masked(FrameKind::Forward), 1, "probed once");
+}

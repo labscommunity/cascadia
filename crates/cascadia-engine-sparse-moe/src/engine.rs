@@ -1628,6 +1628,11 @@ const WORKER_BACKOFF: Duration = Duration::from_millis(200);
 /// stall every step for the whole connect budget.
 const REDIAL_BUDGET: Duration = Duration::from_secs(2);
 const REDIAL_INTERVAL: Duration = Duration::from_secs(3);
+/// How long a json request may wait for an idle link to probe (streams
+/// mode, no mask evidence yet) while plain requests behind it keep being
+/// admitted. After that no new stream is admitted until the running ones
+/// drain, so the probe goes out.
+const JSON_PROBE_PATIENCE: Duration = Duration::from_secs(5);
 /// How often rank 0's link keeper looks at the downstream link while no
 /// request is in progress.
 const IDLE_LINK_CHECK: Duration = Duration::from_secs(2);
@@ -5938,6 +5943,10 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// it can't decode, but exits on a batched or stream frame it can't
     /// decode, and its stage reloads. Cleared on every re-dial.
     mask_evidence: bool,
+    /// Rank 0 with streams: since when the json request at the front of
+    /// `pending` has waited for an idle link to probe (see
+    /// [`JSON_PROBE_PATIENCE`]).
+    probe_wait_since: Option<Instant>,
 }
 
 /// Per-slot sampling state on the last rank (the driver keeps the tokens).
@@ -6309,6 +6318,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stage_masks: StageMasks::default(),
             mid_late: crate::dist::MaskLatch::default(),
             mask_evidence: false,
+            probe_wait_since: None,
         }
     }
 
@@ -6629,29 +6639,39 @@ impl<R: StagedRunner> PipelineEngine<R> {
         {
             // Structured output: a stream frame carries a mask only on a link
             // with evidence that every stage masks. Get it with the probe,
-            // which needs the link to itself: admission waits until no frame
-            // is in flight.
-            let needs_probe = self
-                .pending
-                .front()
-                .is_some_and(|t| self.grammars.contains_key(&t.task_id))
-                && !self.mask_evidence
-                && self.stage_masks.refusal().is_none();
-            if needs_probe {
+            // which needs the link to itself: a json request waits until no
+            // frame is in flight. Plain requests behind it keep being
+            // admitted for up to `JSON_PROBE_PATIENCE`; after that no new
+            // stream is admitted, so the running ones drain.
+            let probing = !self.mask_evidence && self.stage_masks.refusal().is_none();
+            let waits = |t: &GenerationTask| probing && self.grammars.contains_key(&t.task_id);
+            let mut at = 0;
+            if self.pending.front().is_some_and(waits) {
                 let idle =
                     self.streams.is_empty() && self.stream_inflight.iter().all(|q| q.is_empty());
-                if !idle {
-                    break;
+                if idle {
+                    self.probe_wait_since = None;
+                    if let Err(msg) = self.probe_link(&down) {
+                        let task = self.pending.pop_front().expect("non-empty");
+                        admitted += 1;
+                        self.grammars.remove(&task.task_id);
+                        out.push((task.task_id.clone(), Chunk::error(task.task_id, msg)));
+                        continue;
+                    }
+                } else {
+                    let since = *self.probe_wait_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= JSON_PROBE_PATIENCE {
+                        break;
+                    }
+                    match self.pending.iter().position(|t| !waits(t)) {
+                        Some(i) => at = i,
+                        None => break,
+                    }
                 }
-                if let Err(msg) = self.probe_link(&down) {
-                    let task = self.pending.pop_front().expect("non-empty");
-                    admitted += 1;
-                    self.grammars.remove(&task.task_id);
-                    out.push((task.task_id.clone(), Chunk::error(task.task_id, msg)));
-                    continue;
-                }
+            } else {
+                self.probe_wait_since = None;
             }
-            let task = self.pending.pop_front().expect("non-empty");
+            let task = self.pending.remove(at).expect("non-empty");
             admitted += 1;
             let admit_started = Instant::now();
             let compiled = self.grammars.remove(&task.task_id);
