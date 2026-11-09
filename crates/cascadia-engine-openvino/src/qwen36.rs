@@ -162,7 +162,11 @@ const MROPE_ROWS: usize = 4;
 
 // Pipeline wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
 // HELLO/HELLO_NAK: [len u32][json], FORWARD: one WireTensor f32
-// [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. An earlier design
+// [1,n,HIDDEN], TOKEN: [token i32 BE][downstream infer µs u32 BE]. ACKs are
+// header-only (HELLO_ACK's `pos` carries the chain's capabilities, see
+// `combine_hello_caps`). FORWARD_MASKED: FORWARD's tensor, then the grammar
+// mask tensor (`encode_wire_mask`); its reply is TOKEN_MASKED, TOKEN's body
+// under its own kind. An earlier design
 // draft framed the position as an i64 prefix tensor; the shipped header
 // carries the same information in the day-0 probe's framing
 // (kind+epoch+pos), which the probe validated end-to-end on the live
@@ -208,6 +212,110 @@ const PROTO_VERSION: u32 = 1;
 const CAPTURE_V2_CAP: u32 = 1;
 #[cfg(not(feature = "kv_coord"))]
 const CAPTURE_V2_CAP: u32 = 0;
+/// The capture level's bits in HELLO_ACK's `pos` (0 or [`CAPTURE_V2_CAP`]).
+const CAPTURE_LEVEL_BITS: u32 = 3;
+/// HELLO_ACK `pos` bit: every rank from this one down applies grammar masks
+/// ([`FRAME_FORWARD_MASKED`]). Older builds fold `pos` with `min()` against
+/// their capture level (0 or 1), so the bit never survives an older rank and
+/// an older head never reads it.
+const GRAMMAR_MASK_CAP: u32 = 4;
+/// A structured-output step: FORWARD's tensor followed by the grammar mask of
+/// the row the tail picks from. Sent only to a chain whose HELLO_ACK carried
+/// [`GRAMMAR_MASK_CAP`]; an older rank would treat the kind as a broken link.
+const FRAME_FORWARD_MASKED: u32 = 13;
+/// The reply to [`FRAME_FORWARD_MASKED`]: TOKEN's body, from a chain that
+/// applied the mask. Token -1 = the tail found no allowed token in its row
+/// (or a malformed mask). Only this kind accepts a masked step.
+const FRAME_TOKEN_MASKED: u32 = 14;
+/// Why a structured-output task can't run on this pipeline.
+const UPGRADE_EVERY_STAGE: &str =
+    "a later pipeline stage runs a build without structured-output support; upgrade every stage";
+
+/// A rank's own HELLO_ACK capabilities: its capture level, plus
+/// [`GRAMMAR_MASK_CAP`] when the head's HELLO asked for masks (an older head
+/// never asks, so it never sees the bit).
+fn own_hello_caps(capture_level: u32, payload_asks_mask: bool) -> u32 {
+    let mask = if payload_asks_mask {
+        GRAMMAR_MASK_CAP
+    } else {
+        0
+    };
+    (capture_level & CAPTURE_LEVEL_BITS) | mask
+}
+
+/// Folds a rank's own capabilities with the HELLO_ACK `pos` from below: the
+/// capture level is the lower of the two (what older ranks compute with
+/// `min()`), the mask bit needs both. Never `min()` or `>=` on the whole
+/// field: the bit would decide the capture level.
+fn combine_hello_caps(own: u32, down: u32) -> u32 {
+    let level = (own & CAPTURE_LEVEL_BITS).min(down & CAPTURE_LEVEL_BITS);
+    level | (own & down & GRAMMAR_MASK_CAP)
+}
+
+/// Whether a HELLO payload asks for grammar masks. Absent (an older head) or
+/// any other value reads as no; never a reason to refuse the handshake.
+fn hello_asks_mask(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| v["grammar_mask"].as_u64())
+        .is_some_and(|v| v >= 1)
+}
+
+/// The mask of the next pick as a wire tensor: I32 `[1, 1, 1 + ceil(W/32)]`
+/// = `[W, words...]`, bit `t % 32` of word `t / 32` set when token `t` is
+/// allowed, `W` the tokenizer vocab (indices at or past it are disallowed).
+/// A tensor, not raw bytes: raw reads are capped at 64 KiB. `Err` when the
+/// grammar allows nothing (a dead end; no frame is sent).
+fn encode_wire_mask(mask: &mut GrammarMask, width: usize) -> EngineResult<WireTensor> {
+    let mut probe = vec![0f32; width];
+    mask.apply(&mut probe)?;
+    let mut lanes = vec![0i32; 1 + width.div_ceil(32)];
+    lanes[0] = width as i32;
+    for (i, _) in probe.iter().enumerate().filter(|(_, v)| v.is_finite()) {
+        lanes[1 + i / 32] |= (1u32 << (i % 32)) as i32;
+    }
+    Ok(WireTensor::new(
+        WireDType::I32,
+        [1, 1, lanes.len() as u32],
+        le_bytes_i32(&lanes),
+    ))
+}
+
+/// The tail's read of [`encode_wire_mask`]: `(W, words)`, or `None` for a
+/// tensor of any other shape.
+fn decode_wire_mask(t: &WireTensor) -> Option<(usize, Vec<u32>)> {
+    let lanes = t.shape[2] as usize;
+    if !matches!(t.dtype, WireDType::I32)
+        || t.shape[0] != 1
+        || t.shape[1] != 1
+        || lanes == 0
+        || t.data.len() != lanes * 4
+    {
+        return None;
+    }
+    let mut vals = t
+        .data
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    let width = vals.next()? as usize;
+    let words: Vec<u32> = vals.collect();
+    (words.len() == width.div_ceil(32)).then_some((width, words))
+}
+
+/// The argmax of `row` with every index the mask disallows at `-inf` (the
+/// local path's masked pick), or `None` when no index of the row is allowed.
+fn masked_argmax(row: &[f32], width: usize, words: &[u32]) -> Option<u32> {
+    let allowed = |i: usize| i < width && words[i / 32] & (1 << (i % 32)) != 0;
+    if !(0..row.len()).any(allowed) {
+        return None;
+    }
+    let masked: Vec<f32> = row
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| if allowed(i) { l } else { f32::NEG_INFINITY })
+        .collect();
+    pick_decode_token(&masked, None).ok()
+}
 
 /// Read exactly `n` body bytes in ≤`MAX_RAW_BYTES` chunks, bounded by [`MAX_CARRY_BLOB_BYTES`].
 /// `recv_raw` refuses a single over-cap read BEFORE consuming a byte, so an unchunked body read
@@ -485,32 +593,6 @@ fn read_eos_ids(dir: &Path) -> Vec<u32> {
 
 // -------- structured output (grammar-masked decode) --------
 
-/// The submit-time answer to a structured-output task on a multi-rank
-/// pipeline: the last rank picks the token and has no grammar to mask with.
-fn refuse_multi_stage_grammar() -> EngineError {
-    EngineError::InvalidConfig(
-        "structured output (response_format) is not supported on multi-stage qwen35 pipelines yet"
-            .into(),
-    )
-}
-
-/// Submit-time grammar build: `None` for a task without a grammar; an
-/// `InvalidConfig` (400) on a multi-rank pipeline, when the model can't do
-/// structured output, or when the schema doesn't compile.
-fn compile_task_grammar(
-    factory: &Result<GrammarFactory, String>,
-    single_box: bool,
-    task: &GenerationTask,
-) -> EngineResult<Option<CompiledGrammar>> {
-    if task.grammar.is_none() {
-        return Ok(None);
-    }
-    if !single_box {
-        return Err(refuse_multi_stage_grammar());
-    }
-    structured::compile_task_grammar(factory, task)
-}
-
 /// The decode pick from the last position's logits row: the argmax, or for a
 /// structured-output task the best token the grammar allows (an error when it
 /// allows none).
@@ -752,6 +834,9 @@ impl Builder for Qwen36Builder {
             peer_epoch: 0,
             handshake_done: false,
             chain_capture_v2: 0,
+            chain_grammar_mask: false,
+            #[cfg(test)]
+            fake_embed: None,
             poisoned: None,
             pending: Vec::new(),
             active: None,
@@ -853,6 +938,11 @@ fn map_wire(err: TransportError) -> EngineError {
     EngineError::Backend(format!("qwen36 pipeline wire: {err}"))
 }
 
+/// Tests only: `(tokens, hidden) -> [1, n, hidden]` in place of the
+/// embeddings model.
+#[cfg(test)]
+type FakeEmbed = fn(&[u32], usize) -> Vec<f32>;
+
 pub struct Qwen36Engine {
     /// Rank 0 only in pipeline mode.
     emb: Option<Runtime>,
@@ -891,6 +981,14 @@ pub struct Qwen36Engine {
     /// the v1 frame — the workers then capture un-namespaced, which is cold-but-correct, instead of
     /// desyncing the stream on an unknown frame kind.
     chain_capture_v2: u32,
+    /// Every rank below this one applies grammar masks (HELLO_ACK carried
+    /// [`GRAMMAR_MASK_CAP`]). The head sends [`FRAME_FORWARD_MASKED`] only
+    /// when this is set and refuses structured-output tasks otherwise.
+    chain_grammar_mask: bool,
+    /// Tests only: stands in for the embeddings model, which the stub build
+    /// can't run. `(tokens, hidden) -> [1, n, hidden]`.
+    #[cfg(test)]
+    fake_embed: Option<FakeEmbed>,
     /// Set when the startup handshake found a config mismatch (handshake
     /// rule: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
@@ -991,8 +1089,10 @@ struct ActiveTask {
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
     /// decode frames (n=1), for the pipeline gate-4 wire histogram.
     wire_ms: Vec<f64>,
-    /// Single-box: the grammar matcher of a structured-output task, advanced
-    /// over every token in `gen_ids`. `None` for every other task.
+    /// The grammar matcher of a structured-output task. Single-box: advanced
+    /// over every token in `gen_ids`. Pipeline head: likewise; `next_token`
+    /// (the chain's latest pick) is accepted at the next decode step, before
+    /// that step's mask is computed. `None` for every other task.
     grammar: Option<GrammarMask>,
 }
 
@@ -1040,6 +1140,8 @@ enum InFrame {
         pos: u32,
         hidden: Vec<f32>,
         n: usize,
+        /// FORWARD_MASKED: the grammar mask tensor, relayed as received.
+        mask: Option<WireTensor>,
     },
     /// Issue-34 §8 CAPTURE: snapshot local KV under the head's content `kv_epoch` (body-carried).
     /// `partner` is `Some` only for `FRAME_CAPTURE_V2` (H.1b R2); `None` keeps the v1 frame's
@@ -1065,6 +1167,10 @@ enum InFrame {
 impl Qwen36Engine {
     /// Embed a token span: [1, n] ids -> flattened [1, n, hidden] f32.
     fn embed_seq(&mut self, toks: &[u32]) -> EngineResult<Vec<f32>> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_embed {
+            return Ok(fake(toks, self.hidden));
+        }
         let emb = self
             .emb
             .as_mut()
@@ -1325,6 +1431,9 @@ impl Qwen36Engine {
             "total": self.total,
             "wire": "f32",
             "manifest": self.manifest_json,
+            // Asks every rank to report whether it applies grammar masks
+            // (HELLO_ACK `pos` bit `GRAMMAR_MASK_CAP`). Older ranks ignore it.
+            "grammar_mask": 1,
         });
         // Advertised only by a build that can actually speak v2. A build without `kv_coord` has no
         // CAPTURE path at all, so it must read to its peers as a LEGACY rank (key absent ⇒ chain
@@ -1348,10 +1457,13 @@ impl Qwen36Engine {
                 "qwen36 pipeline handshake refused: {reason}"
             )));
         }
-        self.chain_capture_v2 = down_cap.min(CAPTURE_V2_CAP);
+        let caps = combine_hello_caps(own_hello_caps(CAPTURE_V2_CAP, true), down_cap);
+        self.chain_capture_v2 = caps & CAPTURE_LEVEL_BITS;
+        self.chain_grammar_mask = caps & GRAMMAR_MASK_CAP != 0;
         self.handshake_done = true;
         info!(
             capture_v2 = self.chain_capture_v2,
+            grammar_mask = self.chain_grammar_mask,
             "qwen36 pipeline handshake ok"
         );
         Ok(())
@@ -1383,15 +1495,21 @@ impl Qwen36Engine {
     }
 
     /// One lockstep FORWARD([1,n,hidden] f32 at pos t0) → TOKEN exchange
-    /// with the downstream peer. Returns the chain-end argmax token and
-    /// the accumulated downstream infer time (µs) the TOKEN carried.
+    /// with the downstream peer. Returns the chain-end argmax token, the
+    /// accumulated downstream infer time (µs) the TOKEN carried, and whether
+    /// the reply acknowledged a mask.
+    ///
+    /// With `mask` the step goes out as FORWARD_MASKED and either reply kind
+    /// is read whole (a plain TOKEN comes back with `false`); without it the
+    /// bytes and the checks are FORWARD's, unchanged.
     fn forward_downstream(
         &mut self,
         epoch: u32,
         hidden: &[f32],
         n: usize,
         t0: usize,
-    ) -> EngineResult<(i32, u32)> {
+        mask: Option<&WireTensor>,
+    ) -> EngineResult<(i32, u32, bool)> {
         let downstream = self
             .downstream
             .clone()
@@ -1402,22 +1520,32 @@ impl Qwen36Engine {
             [1, n as u32, self.hidden as u32],
             le_bytes_f32(hidden),
         );
+        let mask = mask.cloned();
         run_async(
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
-                    .await?;
+                let kind = if mask.is_some() {
+                    FRAME_FORWARD_MASKED
+                } else {
+                    FRAME_FORWARD
+                };
+                g.send_raw(&frame_header(kind, epoch, t0 as u32)).await?;
                 g.send(&tensor).await?;
+                if let Some(mask) = &mask {
+                    g.send(mask).await?;
+                }
                 let hb = g.recv_raw(12).await?;
                 let (kind, e, _) = parse_header(&hb);
-                if kind != FRAME_TOKEN || e != epoch {
+                let acked = mask.is_some() && kind == FRAME_TOKEN_MASKED;
+                if (kind != FRAME_TOKEN && !acked) || e != epoch {
                     return Err(TransportError::SocketClosed);
                 }
                 let tb = g.recv_raw(8).await?;
                 Ok((
                     i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]),
                     u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]),
+                    acked,
                 ))
             }),
         )
@@ -1426,16 +1554,31 @@ impl Qwen36Engine {
 
     /// Rank 0 wrapper: token + the round-trip's wire share in ms (RTT
     /// minus the chain's accumulated infer time) for the pipeline gate's
-    /// wire histogram.
+    /// wire histogram. A masked step (`mask`) needs the acknowledged reply:
+    /// without it the token was picked unmasked and is refused.
     fn send_forward_recv_token(
         &mut self,
         hidden: Vec<f32>,
         n: usize,
         t0: usize,
+        mask: Option<WireTensor>,
     ) -> EngineResult<(u32, f64)> {
         let epoch = self.epoch;
         let started = Instant::now();
-        let (token, infer_us) = self.forward_downstream(epoch, &hidden, n, t0)?;
+        let (token, infer_us, acked) =
+            self.forward_downstream(epoch, &hidden, n, t0, mask.as_ref())?;
+        if mask.is_some() {
+            if !acked {
+                return Err(EngineError::Backend(UPGRADE_EVERY_STAGE.into()));
+            }
+            if token < 0 {
+                return Err(EngineError::Backend(
+                    "structured output: the last pipeline stage found no allowed token in its \
+                     logits row"
+                        .into(),
+                ));
+            }
+        }
         let wire_ms =
             (started.elapsed().as_secs_f64() * 1000.0 - infer_us as f64 / 1000.0).max(0.0);
         Ok((token as u32, wire_ms))
@@ -1599,6 +1742,25 @@ impl Qwen36Engine {
         .map_err(|e| EngineError::Backend(format!("qwen36 RESTORE not acked: {e}")))
     }
 
+    /// Rank 0: the mask for a step whose reply is the next generated token
+    /// (`picks`: the final prefill chunk or a decode step) of a
+    /// structured-output task; `None` for every other step and task.
+    fn step_wire_mask(&mut self, picks: bool) -> EngineResult<Option<WireTensor>> {
+        let Some(grammar) = self.active.as_mut().and_then(|t| t.grammar.as_mut()) else {
+            return Ok(None);
+        };
+        if !picks {
+            return Ok(None);
+        }
+        let width = match &self.grammar_factory {
+            Ok(f) => f.mask_width(),
+            Err(reason) => return Err(EngineError::Backend(reason.clone())),
+        };
+        encode_wire_mask(grammar, width)
+            .map(Some)
+            .map_err(|e| EngineError::Backend(format!("structured output failed: {e}")))
+    }
+
     /// Rank 0 driver step: same task lifecycle as the single-box step,
     /// with the downstream stage + argmax behind the wire.
     fn step_pipe_first(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -1606,8 +1768,7 @@ impl Qwen36Engine {
             if self.pending.is_empty() {
                 return Vec::new();
             }
-            // Structured-output tasks never reach a pipeline (refused at submit).
-            let PendingTask { task, .. } = self.pending.remove(0);
+            let PendingTask { task, grammar } = self.pending.remove(0);
             if let Some(reason) = &self.poisoned {
                 warn!(task = %task.task_id, reason = %reason, "qwen36: refusing task (handshake mismatch)");
                 let reason = format!("qwen36 pipeline poisoned by handshake mismatch: {reason}");
@@ -1621,6 +1782,13 @@ impl Qwen36Engine {
                         Chunk::error(task.task_id, e.to_string()),
                     )];
                 }
+            }
+            // A structured-output task needs every later rank to apply its masks: refuse it
+            // before any frame of its own when the handshake said one can't.
+            if grammar.is_some() && !self.chain_grammar_mask {
+                warn!(task = %task.task_id, "qwen36: {UPGRADE_EVERY_STAGE}");
+                let reason = UPGRADE_EVERY_STAGE.to_string();
+                return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
             }
             // Admission (spec §3.2): bump the epoch (frames carry it), tokenize, then either
             // warm-resume (chain-wide RESTORE of the pulled KV) or cold-reset to position 0.
@@ -1661,6 +1829,21 @@ impl Qwen36Engine {
                 cascadia_types::append_resume_ids(&mut prompt_ids_i64, resume.as_deref());
                 prompt_ids = prompt_ids_i64.into_iter().map(|t| t as u32).collect();
             }
+            // Structured output: the matcher starts after the resume seed (if any), before any
+            // frame, so a seed the grammar rejects fails this task only.
+            let grammar = match grammar.as_ref().map(|g| {
+                start_grammar(g, &cascadia_types::resume_generated_seed(resume.as_deref()))
+            }) {
+                None => None,
+                Some(Ok(mask)) => Some(mask),
+                Some(Err(e)) => {
+                    warn!(task = %task.task_id, error = %e, "structured output start failed");
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, e.to_string()),
+                    )];
+                }
+            };
             // An empty prompt leaves next_token None through prefill and would
             // panic the decode branch (`expect`); reject at admission.
             if prompt_ids.is_empty() {
@@ -1785,7 +1968,7 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
-                grammar: None,
+                grammar,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -1806,10 +1989,13 @@ impl Qwen36Engine {
                 let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
                 let t0 = t.step;
                 let n = toks.len();
-                let res = self
-                    .embed_seq(&toks)
-                    .and_then(|e| self.chain_pass(&e, t0, t0 + n))
-                    .and_then(|h| self.send_forward_recv_token(h, n, t0));
+                // Only the final chunk's reply is the first generated token.
+                let last_chunk = end == t.prompt_ids.len();
+                let res = self.step_wire_mask(last_chunk).and_then(|mask| {
+                    let e = self.embed_seq(&toks)?;
+                    let h = self.chain_pass(&e, t0, t0 + n)?;
+                    self.send_forward_recv_token(h, n, t0, mask)
+                });
                 match res {
                     Ok((tok, _wire_ms)) => {
                         let t = self.active.as_mut().unwrap();
@@ -1875,18 +2061,29 @@ impl Qwen36Engine {
             }
             Vec::new()
         } else {
-            if t.gen_ids.len() >= t.max_tokens {
-                return self.finalize(FinishReason::Length);
+            // A structured-output task ends with `stop` once its JSON is complete, also on the
+            // token that reached the budget. Plain tasks: the budget check, as before.
+            let grammar_finished = t.grammar.as_ref().is_some_and(GrammarMask::finished);
+            if let Some(reason) = decode_end(t.gen_ids.len(), t.max_tokens, grammar_finished) {
+                return self.finalize(reason);
             }
             let next = t.next_token.expect("pipeline decode without pending token");
-            if Some(next) == self.eos {
+            if is_stop_token(next, self.eos, &self.eos_ids, t.grammar.is_some()) {
                 return self.finalize(FinishReason::Stop);
             }
+            // The chain picked `next` one step ago; it enters the matcher now, before the mask
+            // for the token after it.
+            let t = self.active.as_mut().unwrap();
+            if let Some(Err(e)) = t.grammar.as_mut().map(|m| m.accept(next)) {
+                warn!(task = %task_id, error = %e, "structured output decode failed");
+                return self.finalize_error(format!("structured output failed: {e}"));
+            }
             let step = t.step;
-            let res = self
-                .embed_seq(&[next])
-                .and_then(|e| self.chain_pass(&e, step, step + 1))
-                .and_then(|h| self.send_forward_recv_token(h, 1, step));
+            let res = self.step_wire_mask(true).and_then(|mask| {
+                let e = self.embed_seq(&[next])?;
+                let h = self.chain_pass(&e, step, step + 1)?;
+                self.send_forward_recv_token(h, 1, step, mask)
+            });
             match res {
                 Ok((tok, wire_ms)) => {
                     let t = self.active.as_mut().unwrap();
@@ -2039,6 +2236,24 @@ impl Qwen36Engine {
                         pos,
                         hidden: f32_from_le(&t.data),
                         n,
+                        mask: None,
+                    })
+                }
+                FRAME_FORWARD_MASKED => {
+                    // Both tensors are read before any check, so a bad one
+                    // still leaves the link on a frame boundary.
+                    let (t, _) = g.recv().await?;
+                    let (mask, _) = g.recv().await?;
+                    if !matches!(t.dtype, WireDType::F32) {
+                        return Err(TransportError::SocketClosed);
+                    }
+                    let n = t.shape[1] as usize;
+                    Ok(InFrame::Forward {
+                        epoch,
+                        pos,
+                        hidden: f32_from_le(&t.data),
+                        n,
+                        mask: Some(mask),
                     })
                 }
                 _ => Err(TransportError::SocketClosed),
@@ -2053,21 +2268,22 @@ impl Qwen36Engine {
                 // rank-0 payload downstream so every rank checks against
                 // the origin; reply upstream with the combined verdict.
                 let mut reason = self.validate_hello(&payload);
-                // Chain floor: this rank's own capability, lowered by everything below it. The last
-                // rank has nothing below, so it reports its own.
-                let mut cap = CAPTURE_V2_CAP;
+                // Chain floor: this rank's own capabilities, lowered by everything below it. The
+                // last rank has nothing below, so it reports its own.
+                let mut cap = own_hello_caps(CAPTURE_V2_CAP, hello_asks_mask(&payload));
                 if reason.is_none() && !is_last {
                     match self.forward_hello_downstream(&payload) {
                         Ok((r, down_cap)) => {
                             reason = r.map(|r| format!("downstream: {r}"));
-                            cap = cap.min(down_cap);
+                            cap = combine_hello_caps(cap, down_cap);
                         }
                         Err(e) => {
                             reason = Some(format!("downstream handshake forward failed: {e}"))
                         }
                     }
                 }
-                self.chain_capture_v2 = cap;
+                self.chain_capture_v2 = cap & CAPTURE_LEVEL_BITS;
+                self.chain_grammar_mask = cap & GRAMMAR_MASK_CAP != 0;
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 match reason {
@@ -2210,6 +2426,7 @@ impl Qwen36Engine {
                 pos,
                 hidden,
                 n,
+                mask,
             } => {
                 if self.poisoned.is_some() {
                     return Err(EngineError::Backend(
@@ -2258,31 +2475,61 @@ impl Qwen36Engine {
                 // infer; they report their own share, so rank 0's
                 // RTT-minus-infer stays the chain's true wire share.
                 let own_us = infer_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
-                let (next, downstream_us) = if is_last {
+                // `acked`: this reply may say "masked" (only ever on a masked step).
+                let (next, downstream_us, acked) = if is_last {
                     let logits = if self.last_logits_only {
                         out
                     } else {
                         let row = out.len() / n;
                         out[(n - 1) * row..].to_vec()
                     };
-                    let next = logits
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.total_cmp(b.1))
-                        .map(|(i, _)| i as i32)
-                        .unwrap_or(0);
-                    (next, 0u32)
+                    match &mask {
+                        None => {
+                            let next = logits
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| a.1.total_cmp(b.1))
+                                .map(|(i, _)| i as i32)
+                                .unwrap_or(0);
+                            (next, 0u32, false)
+                        }
+                        // The pick the head's grammar allows; -1 when the
+                        // mask is malformed or allows nothing in this row.
+                        Some(m) => {
+                            let next = decode_wire_mask(m)
+                                .and_then(|(w, words)| masked_argmax(&logits, w, &words))
+                                .map_or(-1, |t| t as i32);
+                            if next < 0 {
+                                warn!(pos, "qwen36: masked step has no allowed token");
+                            }
+                            (next, 0u32, true)
+                        }
+                    }
+                } else if mask.is_some() && !self.chain_grammar_mask {
+                    // Never sent by a head that read this chain's HELLO_ACK;
+                    // forwarding it would break an older rank's link. A plain
+                    // reply makes the head refuse the step.
+                    warn!(
+                        pos,
+                        "qwen36: masked step for a chain that can't mask; refusing"
+                    );
+                    (-1, 0u32, false)
                 } else {
-                    // Middle: pass the hidden span on; the chain end's
-                    // token comes back through us.
-                    self.forward_downstream(epoch, &out, n, t0)?
+                    // Middle: pass the hidden span (and any mask) on; the
+                    // chain end's token, and its ack, come back through us.
+                    self.forward_downstream(epoch, &out, n, t0, mask.as_ref())?
                 };
                 let infer_us = own_us.saturating_add(downstream_us);
+                let kind = if acked {
+                    FRAME_TOKEN_MASKED
+                } else {
+                    FRAME_TOKEN
+                };
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 run_async(&h, async move {
                     let mut g = upstream.lock().await;
-                    g.send_raw(&frame_header(FRAME_TOKEN, epoch, pos)).await?;
+                    g.send_raw(&frame_header(kind, epoch, pos)).await?;
                     g.send_raw(&next.to_be_bytes()).await?;
                     g.send_raw(&infer_us.to_be_bytes()).await
                 })
@@ -2329,6 +2576,8 @@ impl Qwen36Engine {
                 theirs["capture_v2"]
             ));
         }
+        // `grammar_mask` is not compared: it only asks for the HELLO_ACK capability bit, and an
+        // older head omits it (`hello_asks_mask`).
         None
     }
 
@@ -2769,7 +3018,9 @@ impl Engine for Qwen36Engine {
                 }
             }
         }
-        let grammar = compile_task_grammar(&self.grammar_factory, self.total <= 1, &task)?;
+        // A pipeline head compiles here too; whether its chain can mask is
+        // known at the first admission (the handshake), checked there.
+        let grammar = structured::compile_task_grammar(&self.grammar_factory, &task)?;
         structured::log_grammar_warnings("qwen35", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
@@ -3355,6 +3606,9 @@ mod tests {
             peer_epoch: 0,
             handshake_done: false,
             chain_capture_v2: 0,
+            chain_grammar_mask: false,
+            #[cfg(test)]
+            fake_embed: None,
             poisoned: None,
             pending: Vec::new(),
             active: None,
@@ -3968,22 +4222,18 @@ mod tests {
     }
 
     #[test]
-    fn multi_stage_pipelines_refuse_grammar_tasks_at_submit() {
+    fn a_pipeline_head_compiles_grammar_tasks_at_submit() {
         let mut e = bare_engine(2, "{}");
         e.rank = 0;
         e.grammar_factory = Ok(GrammarFactory::single_byte_for_tests());
         let task = GenerationTask::new("t", "p").with_grammar(json_spec(OK_ENUM));
-        match e.submit(task) {
-            Err(EngineError::InvalidConfig(m)) => assert_eq!(
-                m,
-                "structured output (response_format) is not supported on multi-stage qwen35 pipelines yet"
-            ),
-            other => panic!("{other:?}"),
-        }
-        assert!(e.pending.is_empty());
+        assert!(e.submit(task).is_ok());
+        assert!(e.pending[0].grammar.is_some());
+        let bad = GenerationTask::new("b", "p").with_grammar(json_spec(r#"{"type":42}"#));
+        assert!(matches!(e.submit(bad), Err(EngineError::InvalidConfig(_))));
         // Tasks without a grammar are unaffected.
         assert!(e.submit(GenerationTask::new("p", "p")).is_ok());
-        assert!(e.pending[0].grammar.is_none());
+        assert!(e.pending[1].grammar.is_none());
     }
 
     #[test]
@@ -4002,5 +4252,575 @@ mod tests {
         assert!(matches!(e.submit(bad), Err(EngineError::InvalidConfig(_))));
         assert!(e.submit(good).is_ok());
         assert!(e.pending[0].grammar.is_some());
+    }
+
+    // -------- structured output on a stage pipeline --------
+
+    /// The accept-Err path: every token the grammar allows has a `-inf` logit,
+    /// so the masked argmax lands on a disallowed index. The matcher refuses
+    /// it and the task fails instead of emitting it.
+    #[test]
+    fn a_pick_the_grammar_rejects_is_an_error_chunk() {
+        let mut e = bare_engine(1, "{}");
+        e.active = Some(grammar_task(OK_ENUM, "", 16, vec![f32::NEG_INFINITY; 300]));
+        let out = e.step_local();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].1.is_final);
+        let err = out[0].1.error.as_deref().unwrap_or_default();
+        assert!(err.contains("structured output failed"), "{err}");
+        assert!(e.active.is_none());
+    }
+
+    /// One rank of a test chain: an old build (from before masked frames) or
+    /// this build, with its capture level (0 without `kv_coord`, 1 with it).
+    #[derive(Clone, Copy, Debug)]
+    enum TestRank {
+        Old(u32),
+        New(u32),
+    }
+
+    /// The HELLO_ACK `pos` that `chain[0]` sends upstream. Old ranks fold
+    /// with `min()` (their code: `cap.min(down_cap)`); new ranks combine.
+    fn ack_from(chain: &[TestRank], payload_asks_mask: bool) -> u32 {
+        let below = (chain.len() > 1).then(|| ack_from(&chain[1..], payload_asks_mask));
+        match chain[0] {
+            TestRank::Old(level) => below.map_or(level, |down| level.min(down)),
+            TestRank::New(level) => {
+                let own = own_hello_caps(level, payload_asks_mask);
+                below.map_or(own, |down| combine_hello_caps(own, down))
+            }
+        }
+    }
+
+    /// Every 2- and 3-stage mix of old and new builds, with and without
+    /// `kv_coord` on each side: the mask bit survives only when every rank is
+    /// new, and the capture level is the chain floor. One exception, which
+    /// `min()` in older ranks can't avoid: an older `kv_coord` rank above a
+    /// newer rank without `kv_coord` reads that rank's mask bit as capture
+    /// level 1. Such a chain already breaks on its first CAPTURE frame (a
+    /// build without `kv_coord` has no CAPTURE kind at all).
+    #[test]
+    fn hello_caps_combine_keeps_the_capture_floor_and_needs_every_rank_new() {
+        let ranks = [
+            TestRank::Old(0),
+            TestRank::Old(1),
+            TestRank::New(0),
+            TestRank::New(1),
+        ];
+        let mut chains: Vec<Vec<TestRank>> = Vec::new();
+        for &a in &ranks {
+            for &b in &ranks {
+                chains.push(vec![a, b]);
+                for &c in &ranks {
+                    chains.push(vec![a, b, c]);
+                }
+            }
+        }
+        let level = |r: TestRank| match r {
+            TestRank::Old(l) | TestRank::New(l) => l,
+        };
+        for chain in chains {
+            let mut floor = chain.iter().map(|&r| level(r)).min().unwrap();
+            let all_new = chain.iter().all(|r| matches!(r, TestRank::New(_)));
+            // Only a new head asks for the bit, so only then can it be misread.
+            let old_kv_above_new_plain = matches!(chain[0], TestRank::New(_))
+                && chain.iter().enumerate().any(|(i, r)| {
+                    matches!(r, TestRank::Old(1))
+                        && chain[i + 1..].iter().any(|r| matches!(r, TestRank::New(0)))
+                });
+            if old_kv_above_new_plain {
+                assert!(!all_new);
+                floor = chain[..1]
+                    .iter()
+                    .chain(chain.iter().filter(|r| matches!(r, TestRank::Old(_))))
+                    .map(|&r| level(r))
+                    .min()
+                    .unwrap();
+            }
+            let (head, rest) = (chain[0], &chain[1..]);
+            match head {
+                TestRank::Old(own) => {
+                    // An old head never asks, and its own fold reads the floor.
+                    let down = ack_from(rest, false);
+                    assert_eq!(down.min(own), floor, "{chain:?}");
+                    assert_eq!(down & GRAMMAR_MASK_CAP, 0, "{chain:?}");
+                }
+                TestRank::New(own) => {
+                    let down = ack_from(rest, true);
+                    let caps = combine_hello_caps(own_hello_caps(own, true), down);
+                    assert_eq!(caps & CAPTURE_LEVEL_BITS, floor, "{chain:?}");
+                    assert_eq!(caps & GRAMMAR_MASK_CAP != 0, all_new, "{chain:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hello_accepts_a_payload_with_or_without_the_grammar_mask_key() {
+        let e = bare_engine(2, "{}");
+        let mut v: serde_json::Value = serde_json::from_slice(&e.hello_payload()).unwrap();
+        assert_eq!(v["grammar_mask"], serde_json::json!(1));
+        assert_eq!(e.validate_hello(v.to_string().as_bytes()), None);
+        v.as_object_mut().unwrap().remove("grammar_mask");
+        assert_eq!(e.validate_hello(v.to_string().as_bytes()), None);
+        v["grammar_mask"] = serde_json::json!("something else");
+        assert_eq!(e.validate_hello(v.to_string().as_bytes()), None);
+    }
+
+    #[test]
+    fn the_wire_mask_round_trips_the_allowed_set() {
+        let width = GrammarFactory::single_byte_for_tests().mask_width();
+        let mut mask = start_grammar(&compiled(OK_ENUM), &seed("\"o")).unwrap();
+        let t = encode_wire_mask(&mut mask, width).unwrap();
+        assert!(matches!(t.dtype, WireDType::I32));
+        assert_eq!(t.shape, [1, 1, 1 + width.div_ceil(32) as u32]);
+        let (w, words) = decode_wire_mask(&t).expect("well-formed mask");
+        assert_eq!(w, width);
+        for tok in 0..width as u32 {
+            let bit = words[tok as usize / 32] & (1 << (tok % 32)) != 0;
+            assert_eq!(bit, mask.allowed(tok), "token {tok}");
+        }
+        // The tail's pick: the best allowed token, never past the mask width.
+        let r = row(300, &[(BAD as u32, 10.0), (299, 20.0)]);
+        assert_eq!(masked_argmax(&r, w, &words), Some(b'k' as u32));
+        // Nothing allowed inside the row: a dead end, not an unmasked pick.
+        assert_eq!(masked_argmax(&r[..4], w, &words), None);
+        // A malformed mask is refused.
+        let mut short = t.clone();
+        short.shape[2] -= 1;
+        short.data.truncate(short.data.len() - 4);
+        assert!(decode_wire_mask(&short).is_none());
+    }
+
+    /// A dead end on the head (nothing allowed) fails before any frame.
+    #[test]
+    fn the_wire_mask_of_a_dead_end_is_an_error() {
+        let mut mask = start_grammar(&compiled(OK_ENUM), &[]).unwrap();
+        assert!(encode_wire_mask(&mut mask, 4).is_err());
+    }
+
+    const PIPE_HIDDEN: usize = 300;
+
+    /// The head's stand-in embedding (no model in the stub build): one row
+    /// per token peaked at a byte JSON never allows. Stage-less ranks pass
+    /// the row through, so the tail's logits row is this row, and the tail
+    /// picks an allowed token only when it applies the mask.
+    fn bad_peak_rows(toks: &[u32], hidden: usize) -> Vec<f32> {
+        toks.iter()
+            .flat_map(|_| row(hidden, &[(BAD as u32, 10.0)]))
+            .collect()
+    }
+
+    fn neg_inf_rows(toks: &[u32], hidden: usize) -> Vec<f32> {
+        vec![f32::NEG_INFINITY; toks.len() * hidden]
+    }
+
+    fn pipe_rank(rank: u32, total: u32, rt: &tokio::runtime::Runtime) -> Qwen36Engine {
+        let mut e = bare_engine(total, "{}");
+        e.rank = rank;
+        e.hidden = PIPE_HIDDEN;
+        e.runtime_handle = Some(rt.handle().clone());
+        e
+    }
+
+    fn pipe_head(total: u32, rt: &tokio::runtime::Runtime) -> Qwen36Engine {
+        let mut e = pipe_rank(0, total, rt);
+        e.tokenizer = Some(tiny_tokenizer());
+        e.eos_ids = vec![TEST_EOS];
+        e.grammar_factory = Ok(GrammarFactory::single_byte_for_tests());
+        e.fake_embed = Some(bad_peak_rows);
+        e
+    }
+
+    fn pipe_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Loopback links between consecutive entries of `ranks`.
+    fn loopback_links(
+        rt: &tokio::runtime::Runtime,
+        hops: usize,
+    ) -> Vec<(ActivationClient, ActivationServer)> {
+        rt.block_on(async {
+            let mut links = Vec::new();
+            for _ in 0..hops {
+                let mut s = ActivationServer::new("127.0.0.1", 0);
+                s.start().await.unwrap();
+                let mut c = ActivationClient::new("127.0.0.1", s.port());
+                c.connect().await.unwrap();
+                s.accept().await.unwrap();
+                links.push((c, s));
+            }
+            links
+        })
+    }
+
+    fn shared<T>(v: T) -> Option<Arc<tokio::sync::Mutex<T>>> {
+        Some(Arc::new(tokio::sync::Mutex::new(v)))
+    }
+
+    /// Wires `head` and `relays` (in rank order) over loopback and runs each
+    /// relay's step loop on its own thread until its upstream link closes.
+    fn wire_chain(
+        rt: &tokio::runtime::Runtime,
+        mut head: Qwen36Engine,
+        relays: Vec<Qwen36Engine>,
+    ) -> Qwen36Engine {
+        let (downs, ups): (Vec<_>, Vec<_>) = loopback_links(rt, relays.len()).into_iter().unzip();
+        let mut downs = downs.into_iter();
+        head.downstream = downs.next().and_then(shared);
+        for (mut r, up) in relays.into_iter().zip(ups) {
+            r.upstream = shared(up);
+            r.downstream = downs.next().and_then(shared);
+            std::thread::spawn(move || while r.step_pipe_relay().is_ok() {});
+        }
+        head
+    }
+
+    /// A stage on a build from before masked frames, at the raw frame level:
+    /// HELLO_ACK `pos` = `ack_caps`, RESET acked, FORWARD answered with the
+    /// last row's argmax. With `plain_reply_to_masked` it also consumes a
+    /// masked FORWARD and answers it with a plain TOKEN (a rank that claims
+    /// the bit but never masks). Any other kind ends it, as it would end an
+    /// old build's link. Returns every frame it read, raw.
+    fn fake_tail(
+        rt: &tokio::runtime::Runtime,
+        ack_caps: u32,
+        plain_reply_to_masked: bool,
+    ) -> (ActivationClient, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let (c, mut s) = loopback_links(rt, 1).pop().unwrap();
+        let h = rt.spawn(async move {
+            let mut frames = Vec::new();
+            loop {
+                let Ok(hb) = s.recv_raw(12).await else {
+                    return frames;
+                };
+                let (kind, epoch, pos) = parse_header(&hb);
+                let mut raw = hb.clone();
+                let tensor = |raw: &mut Vec<u8>, th: Vec<u8>, body: Vec<u8>| {
+                    raw.extend_from_slice(&th);
+                    raw.extend_from_slice(&body);
+                    f32_from_le(&body)
+                };
+                match kind {
+                    FRAME_HELLO => {
+                        let lb = s.recv_raw(4).await.unwrap();
+                        let n = u32::from_be_bytes(lb[..].try_into().unwrap()) as usize;
+                        raw.extend_from_slice(&lb);
+                        raw.extend_from_slice(&s.recv_raw(n).await.unwrap());
+                        s.send_raw(&frame_header(FRAME_HELLO_ACK, 0, ack_caps))
+                            .await
+                            .unwrap();
+                    }
+                    FRAME_RESET => {
+                        s.send_raw(&frame_header(FRAME_RESET_ACK, epoch, 0))
+                            .await
+                            .unwrap();
+                    }
+                    FRAME_FORWARD | FRAME_FORWARD_MASKED
+                        if kind == FRAME_FORWARD || plain_reply_to_masked =>
+                    {
+                        let mut tensors = if kind == FRAME_FORWARD { 1 } else { 2 };
+                        let mut hidden = Vec::new();
+                        while tensors > 0 {
+                            let th = s.recv_raw(20).await.unwrap();
+                            let len = u32::from_be_bytes(th[0..4].try_into().unwrap()) as usize;
+                            let body = s.recv_raw(len).await.unwrap();
+                            let vals = tensor(&mut raw, th, body);
+                            if hidden.is_empty() {
+                                hidden = vals;
+                            }
+                            tensors -= 1;
+                        }
+                        let last = &hidden[hidden.len() - PIPE_HIDDEN..];
+                        let tok = pick_decode_token(last, None).unwrap() as i32;
+                        s.send_raw(&frame_header(FRAME_TOKEN, epoch, pos))
+                            .await
+                            .unwrap();
+                        s.send_raw(&tok.to_be_bytes()).await.unwrap();
+                        s.send_raw(&0u32.to_be_bytes()).await.unwrap();
+                    }
+                    _ => {
+                        frames.push(raw);
+                        return frames;
+                    }
+                }
+                frames.push(raw);
+            }
+        });
+        (c, h)
+    }
+
+    fn pipe_task(id: &str, max_tokens: u32, grammar: Option<&str>) -> GenerationTask {
+        let mut t = windowed_task(id, "hi");
+        t.max_tokens = max_tokens;
+        if let Some(body) = grammar {
+            t = t.with_grammar(json_spec(body));
+        }
+        t
+    }
+
+    /// Submits `task` on the head and steps it to its final chunk; returns
+    /// the token chunks' ids and the final chunk.
+    fn run_pipe_task(head: &mut Qwen36Engine, task: GenerationTask) -> (Vec<i64>, Chunk) {
+        head.submit(task).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..64 {
+            for (_, c) in head.step_pipe_first() {
+                if c.is_final {
+                    return (ids, c);
+                }
+                ids.push(c.token_id);
+            }
+        }
+        panic!("task never finished; tokens so far {ids:?}");
+    }
+
+    fn kinds(frames: &[Vec<u8>]) -> Vec<u32> {
+        frames.iter().map(|f| parse_header(f).0).collect()
+    }
+
+    #[test]
+    fn a_new_head_and_tail_negotiate_the_mask_and_keep_the_capture_level() {
+        let rt = pipe_rt();
+        let tail = pipe_rank(1, 2, &rt);
+        let mut head = wire_chain(&rt, pipe_head(2, &rt), vec![tail]);
+        head.handshake_a().unwrap();
+        assert!(head.chain_grammar_mask);
+        assert_eq!(head.chain_capture_v2, CAPTURE_V2_CAP);
+    }
+
+    /// An old head's HELLO has no `grammar_mask` key: a new tail answers with
+    /// its capture level alone, exactly what an old tail sends.
+    #[test]
+    fn a_new_tail_answers_an_old_head_with_the_capture_level_alone() {
+        let rt = pipe_rt();
+        let (mut c, s) = loopback_links(&rt, 1).pop().unwrap();
+        let mut tail = pipe_rank(1, 2, &rt);
+        tail.upstream = shared(s);
+        let mut old: serde_json::Value = serde_json::from_slice(&tail.hello_payload()).unwrap();
+        old.as_object_mut().unwrap().remove("grammar_mask");
+        let old = old.to_string().into_bytes();
+        let relay = std::thread::spawn(move || {
+            tail.step_pipe_relay().unwrap();
+            tail
+        });
+        let ack = rt.block_on(async {
+            c.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await.unwrap();
+            c.send_raw(&(old.len() as u32).to_be_bytes()).await.unwrap();
+            c.send_raw(&old).await.unwrap();
+            c.recv_raw(12).await.unwrap()
+        });
+        assert_eq!(parse_header(&ack), (FRAME_HELLO_ACK, 0, CAPTURE_V2_CAP));
+        let tail = relay.join().unwrap();
+        assert_eq!(tail.chain_capture_v2, CAPTURE_V2_CAP);
+    }
+
+    /// A new head over a stage that predates masked frames: the json task
+    /// fails right after the handshake, before any frame of its own, and a
+    /// plain task on the same link still works.
+    #[test]
+    fn a_json_task_on_a_chain_without_the_mask_bit_fails_before_any_mask_frame() {
+        let rt = pipe_rt();
+        let (c, frames) = fake_tail(&rt, CAPTURE_V2_CAP, false);
+        let mut head = pipe_head(2, &rt);
+        head.downstream = shared(c);
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("j", 4, Some(OK_ENUM)));
+        assert!(ids.is_empty(), "{ids:?}");
+        assert_eq!(fin.error.as_deref(), Some(UPGRADE_EVERY_STAGE));
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("p", 3, None));
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(ids, vec![BAD as i64; 3]);
+        drop(head);
+        let kinds = kinds(&rt.block_on(frames).unwrap());
+        assert!(!kinds.contains(&FRAME_FORWARD_MASKED), "{kinds:?}");
+        // HELLO, then only the plain task's frames (a `kv_coord` build ends
+        // the turn with a CAPTURE, which this fake doesn't speak).
+        assert_eq!(
+            kinds[..6],
+            vec![
+                FRAME_HELLO,
+                FRAME_RESET,
+                FRAME_FORWARD,
+                FRAME_FORWARD,
+                FRAME_FORWARD,
+                FRAME_FORWARD
+            ]
+        );
+    }
+
+    /// The bytes of a plain task's FORWARD frames, fixed from the encoding
+    /// before masked frames existed, on a chain that negotiated the mask bit.
+    #[test]
+    fn plain_forward_frames_are_byte_identical_on_a_capable_chain() {
+        let rt = pipe_rt();
+        let (c, frames) = fake_tail(&rt, CAPTURE_V2_CAP | GRAMMAR_MASK_CAP, false);
+        let mut head = pipe_head(2, &rt);
+        head.downstream = shared(c);
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("p", 2, None));
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(ids, vec![BAD as i64; 2]);
+        drop(head);
+        let frames = rt.block_on(frames).unwrap();
+        // [kind 6][epoch 1][pos], then the f32 [1,1,300] tensor: [len 1200]
+        // [dtype 0][1][1][300] and the row with 10.0 at index 1.
+        let expected = |pos: u8| {
+            let mut b = vec![
+                0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0, pos, 0, 0, 4, 176, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+                0, 1, 0, 0, 1, 44,
+            ];
+            let mut data = vec![0u8; 1200];
+            data[4..8].copy_from_slice(&[0, 0, 0x20, 0x41]);
+            b.extend_from_slice(&data);
+            b
+        };
+        let forwards: Vec<&Vec<u8>> = frames
+            .iter()
+            .filter(|f| parse_header(f).0 == FRAME_FORWARD)
+            .collect();
+        assert_eq!(forwards.len(), 3);
+        for (i, f) in forwards.iter().enumerate() {
+            assert_eq!(**f, expected(i as u8), "frame {i}");
+        }
+        assert_eq!(parse_header(&frames[1]), (FRAME_RESET, 1, 0));
+    }
+
+    /// A new tail's TOKEN reply to a plain FORWARD is the 20 bytes it always
+    /// was: [kind 7][epoch][pos][token BE][infer µs], and nothing after it
+    /// (the next reply read is exactly the RESET_ACK).
+    #[test]
+    fn a_plain_token_reply_is_byte_identical() {
+        let rt = pipe_rt();
+        let (mut c, s) = loopback_links(&rt, 1).pop().unwrap();
+        let mut tail = pipe_rank(1, 2, &rt);
+        tail.upstream = shared(s);
+        std::thread::spawn(move || while tail.step_pipe_relay().is_ok() {});
+        let (reply, reset_ack) = rt.block_on(async {
+            c.send_raw(&frame_header(FRAME_FORWARD, 0, 9))
+                .await
+                .unwrap();
+            let r = row(PIPE_HIDDEN, &[(7, 3.0)]);
+            let t = WireTensor::new(WireDType::F32, [1, 1, PIPE_HIDDEN as u32], le_bytes_f32(&r));
+            c.send(&t).await.unwrap();
+            let reply = c.recv_raw(20).await.unwrap();
+            c.send_raw(&frame_header(FRAME_RESET, 1, 0)).await.unwrap();
+            (reply, c.recv_raw(12).await.unwrap())
+        });
+        assert_eq!(
+            reply[..16],
+            [0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 7]
+        );
+        assert_eq!(reset_ack, [0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0]);
+    }
+
+    /// A masked FORWARD sent by hand: the tail applies the mask and answers
+    /// with the acknowledged TOKEN; a malformed mask gets an acknowledged
+    /// refusal (token -1) and the link stays aligned.
+    #[test]
+    fn a_masked_forward_round_trips_and_the_tail_masks() {
+        let rt = pipe_rt();
+        let (mut c, s) = loopback_links(&rt, 1).pop().unwrap();
+        let mut tail = pipe_rank(1, 2, &rt);
+        tail.upstream = shared(s);
+        std::thread::spawn(move || while tail.step_pipe_relay().is_ok() {});
+        let width = GrammarFactory::single_byte_for_tests().mask_width();
+        let mut mask = start_grammar(&compiled(OK_ENUM), &[]).unwrap();
+        let good = encode_wire_mask(&mut mask, width).unwrap();
+        let mut bad = good.clone();
+        bad.data[0..4].copy_from_slice(&7i32.to_le_bytes());
+        let r = row(PIPE_HIDDEN, &[(BAD as u32, 10.0)]);
+        let hidden = WireTensor::new(WireDType::F32, [1, 1, PIPE_HIDDEN as u32], le_bytes_f32(&r));
+        let replies = rt.block_on(async {
+            let mut replies = Vec::new();
+            for m in [&good, &bad] {
+                c.send_raw(&frame_header(FRAME_FORWARD_MASKED, 0, 3))
+                    .await
+                    .unwrap();
+                c.send(&hidden).await.unwrap();
+                c.send(m).await.unwrap();
+                replies.push(c.recv_raw(20).await.unwrap());
+            }
+            replies
+        });
+        let token = |b: &[u8]| i32::from_be_bytes(b[12..16].try_into().unwrap());
+        assert_eq!(parse_header(&replies[0]), (FRAME_TOKEN_MASKED, 0, 3));
+        assert_eq!(token(&replies[0]), b'"' as i32);
+        assert_eq!(parse_header(&replies[1]), (FRAME_TOKEN_MASKED, 0, 3));
+        assert_eq!(token(&replies[1]), -1);
+    }
+
+    /// The pipeline commits each token one step later than the local loop
+    /// (the token a FORWARD returns is accepted at the next step, before that
+    /// step's mask). Every token is allowed, and a JSON that completes on the
+    /// budget's last token ends with `stop`.
+    #[test]
+    fn a_grammar_task_through_the_pipe_masks_every_step_and_stops_at_max_tokens() {
+        let rt = pipe_rt();
+        let tail = pipe_rank(1, 2, &rt);
+        let mut head = wire_chain(&rt, pipe_head(2, &rt), vec![tail]);
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("j", 4, Some(OK_ENUM)));
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(ids, b"\"ok\"".map(i64::from).to_vec());
+        assert_eq!(fin.finish_reason, Some(FinishReason::Stop));
+        // A plain task after it on the same link: unmasked, as before.
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("p", 2, None));
+        assert_eq!(ids, vec![BAD as i64; 2]);
+        assert_eq!(fin.finish_reason, Some(FinishReason::Length));
+    }
+
+    #[test]
+    fn a_three_stage_chain_relays_the_mask_and_the_ack() {
+        let rt = pipe_rt();
+        let middle = pipe_rank(1, 3, &rt);
+        let tail = pipe_rank(2, 3, &rt);
+        let mut head = wire_chain(&rt, pipe_head(3, &rt), vec![middle, tail]);
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("j", 8, Some(OK_ENUM)));
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(ids, b"\"ok\"".map(i64::from).to_vec());
+        assert_eq!(fin.finish_reason, Some(FinishReason::Stop));
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("p", 2, None));
+        assert_eq!(ids, vec![BAD as i64; 2]);
+        assert_eq!(fin.finish_reason, Some(FinishReason::Length));
+    }
+
+    /// A masked step answered without the acknowledgement fails the task
+    /// with the upgrade error; the reply was read whole, so the link stays
+    /// usable for the next task.
+    #[test]
+    fn a_masked_step_without_the_ack_is_the_upgrade_error() {
+        let rt = pipe_rt();
+        let (c, frames) = fake_tail(&rt, CAPTURE_V2_CAP | GRAMMAR_MASK_CAP, true);
+        let mut head = pipe_head(2, &rt);
+        head.downstream = shared(c);
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("j", 4, Some(OK_ENUM)));
+        assert!(ids.is_empty(), "{ids:?}");
+        let err = fin.error.as_deref().unwrap_or_default();
+        assert!(err.contains(UPGRADE_EVERY_STAGE), "{err}");
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("p", 2, None));
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(ids, vec![BAD as i64; 2]);
+        drop(head);
+        let kinds = kinds(&rt.block_on(frames).unwrap());
+        assert_eq!(kinds[2], FRAME_FORWARD_MASKED, "{kinds:?}");
+    }
+
+    /// The accept-Err path on the pipe: the tail's masked argmax over a row
+    /// whose allowed logits are all `-inf` lands on a disallowed index; the
+    /// head's matcher refuses it at the next step and the task fails.
+    #[test]
+    fn a_disallowed_token_back_from_the_tail_is_an_error_chunk() {
+        let rt = pipe_rt();
+        let tail = pipe_rank(1, 2, &rt);
+        let mut head = pipe_head(2, &rt);
+        head.fake_embed = Some(neg_inf_rows);
+        let mut head = wire_chain(&rt, head, vec![tail]);
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("j", 4, Some(OK_ENUM)));
+        assert!(ids.is_empty(), "{ids:?}");
+        let err = fin.error.as_deref().unwrap_or_default();
+        assert!(err.contains("structured output failed"), "{err}");
     }
 }
