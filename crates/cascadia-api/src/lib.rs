@@ -2531,7 +2531,12 @@ async fn chat_completions(
         None
     };
     // A JSON answer has no room for a reasoning preamble: thinking is off.
-    let enable_thinking = if structured {
+    // With callable tools the format is not enforced and the model may want
+    // to reason before a tool call, so thinking stays as requested, except
+    // where the engine refuses thinking with tools when it renders the
+    // template itself (ov-genai: `defer_template_on_thinking`).
+    let thinking_off = structured && (!tools_callable || state.defer_template_on_thinking);
+    let enable_thinking = if thinking_off {
         false
     } else {
         req.effective_enable_thinking()
@@ -2539,9 +2544,13 @@ async fn chat_completions(
     // Thinking off reaches the template the same way a bare
     // `reasoning_effort: "none"` does, so a template that switches thinking
     // through its effort words renders thinking off too.
-    let effort = if structured {
+    let effort = if thinking_off {
         EffortArgs {
             mapped: Some(map_reasoning_effort(Some("none"))),
+            // `None` on purpose: the caller never sent this word, so a
+            // template that rejects it must not become a 400 for them. The
+            // template then sees "none" first if it speaks the effort words,
+            // then the mapped "high", then undefined (its default).
             raw: None,
             explicit_thinking: false,
             template_words: state.effort_words,
@@ -7878,33 +7887,63 @@ level={{ effort_map[eff] }}";
         assert_eq!(last_task(&seen).grammar, None);
     }
 
+    fn json_with_tools(extra: Value) -> Value {
+        let mut v = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": json_schema_format(nested_schema()),
+            "tools": weather_tools(),
+        });
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    }
+
     #[tokio::test]
-    async fn tools_callable_skips_grammar_but_turns_thinking_off() {
-        let (app, seen) = capture_app(true, minimal_cfg()).await;
-        let (status, v) = post_chat(
-            app.clone(),
-            serde_json::json!({
-                "model": "mock-model",
-                "messages": [{"role": "user", "content": "hi"}],
-                "response_format": json_schema_format(nested_schema()),
-                "tools": weather_tools(),
-            }),
-        )
-        .await;
+    async fn tools_callable_skips_grammar_and_turns_thinking_off_on_ov_genai() {
+        let cfg = Config {
+            defer_template_on_thinking: true,
+            ..minimal_cfg()
+        };
+        let (app, seen) = capture_app(true, cfg).await;
+        let (status, v) = post_chat(app, json_with_tools(serde_json::json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         let task = last_task(&seen);
         assert_eq!(task.grammar, None);
         assert!(!task.enable_thinking);
+    }
+
+    #[tokio::test]
+    async fn tools_callable_keeps_thinking_as_requested_elsewhere() {
+        let (app, seen) = capture_app(true, minimal_cfg()).await;
+        let (status, v) = post_chat(app.clone(), json_with_tools(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let with_format = last_task(&seen);
+        assert_eq!(with_format.grammar, None);
+        assert!(with_format.enable_thinking);
+
+        let mut plain = json_with_tools(serde_json::json!({}));
+        plain.as_object_mut().unwrap().remove("response_format");
+        let (status, v) = post_chat(app.clone(), plain).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let without = last_task(&seen);
+        assert_eq!(with_format.prompt, without.prompt);
+        assert_eq!(with_format.enable_thinking, without.enable_thinking);
 
         let (status, v) = post_chat(
+            app.clone(),
+            json_with_tools(serde_json::json!({"enable_thinking": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(!last_task(&seen).enable_thinking);
+
+        // With tool_choice "none" no tool is callable: the grammar applies
+        // and thinking is off.
+        let (status, v) = post_chat(
             app,
-            serde_json::json!({
-                "model": "mock-model",
-                "messages": [{"role": "user", "content": "hi"}],
-                "response_format": json_schema_format(nested_schema()),
-                "tools": weather_tools(),
-                "tool_choice": "none",
-            }),
+            json_with_tools(serde_json::json!({"tool_choice": "none"})),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
