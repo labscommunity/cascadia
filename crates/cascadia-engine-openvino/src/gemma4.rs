@@ -4367,6 +4367,19 @@ mod tests {
         );
     }
 
+    /// Drains of an empty link find nothing and don't wait: the fastest of
+    /// 20 is far under a timer tick (a 1 ms wait measured about 2 ms each).
+    /// The fastest, so a busy test machine's preemption doesn't count.
+    async fn assert_empty_drains_dont_wait(client: &mut ActivationClient) {
+        let mut fastest = Duration::MAX;
+        for _ in 0..20 {
+            let t = std::time::Instant::now();
+            assert!(!drain_late_replies(client).await.unwrap());
+            fastest = fastest.min(t.elapsed());
+        }
+        assert!(fastest < Duration::from_micros(500), "{fastest:?}");
+    }
+
     /// The drain before a masked step doesn't wait: a reply that landed
     /// while the stage computed is drained, and an empty link returns at once.
     /// The thread sleeps instead of awaiting, so the I/O driver doesn't run
@@ -4380,13 +4393,7 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(2));
         assert!(drain_late_replies(&mut client).await.unwrap());
-        let t = std::time::Instant::now();
-        assert!(!drain_late_replies(&mut client).await.unwrap());
-        assert!(
-            t.elapsed() < Duration::from_micros(900),
-            "{:?}",
-            t.elapsed()
-        );
+        assert_empty_drains_dont_wait(&mut client).await;
         server.send(&encode_token_reply(19)).await.unwrap();
         assert_eq!(
             wait_plain_reply(&mut client, false).await.unwrap(),
@@ -4428,13 +4435,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
                 handle.block_on(async {
                     assert!(drain_late_replies(&mut client).await.unwrap());
-                    let t = std::time::Instant::now();
-                    assert!(!drain_late_replies(&mut client).await.unwrap());
-                    assert!(
-                        t.elapsed() < Duration::from_micros(900),
-                        "{:?}",
-                        t.elapsed()
-                    );
+                    assert_empty_drains_dont_wait(&mut client).await;
                 });
             }
         })
