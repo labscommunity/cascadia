@@ -1172,6 +1172,23 @@ impl MaskLatch {
     }
 }
 
+/// The structured-output gate of a task on this pipeline: `Err` (the
+/// upgrade message) while the latch is set, for a structured-output task on
+/// a multi-stage pipeline. Checked at activation, before any warm-resume
+/// exchange or frame, and again on every step of such a task.
+fn latched_refusal(
+    latch: &mut MaskLatch,
+    multi_stage: bool,
+    has_grammar: bool,
+    now: std::time::Instant,
+) -> EngineResult<()> {
+    if multi_stage && has_grammar {
+        latch.refusal(now)
+    } else {
+        Ok(())
+    }
+}
+
 /// The head's token from a masked step's wait, or the error that fails the
 /// task with how to log it.
 fn head_masked_token(
@@ -1658,6 +1675,18 @@ impl Gemma4Engine {
                     return Ok(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
                 }
             };
+            // A structured-output task on a pipeline that didn't acknowledge an
+            // earlier masked step fails here, before any warm-resume exchange.
+            let multi_stage = !(self.spec.is_first_stage && self.spec.is_last_stage);
+            if let Err(e) = latched_refusal(
+                &mut self.mask_latch,
+                multi_stage,
+                grammar.is_some(),
+                std::time::Instant::now(),
+            ) {
+                self.grammar_failure = Some(GrammarFailure::Latched);
+                return Err(e.for_task(task.task_id.clone()));
+            }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
             // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
@@ -1853,11 +1882,15 @@ impl Gemma4Engine {
 
         // A structured-output task on a pipeline that didn't acknowledge an
         // earlier masked step fails at once, before any frame is sent.
-        if !single_stage && self.active.as_ref().is_some_and(|a| a.grammar.is_some()) {
-            if let Err(e) = self.mask_latch.refusal(std::time::Instant::now()) {
-                self.grammar_failure = Some(GrammarFailure::Latched);
-                return Err(e);
-            }
+        let has_grammar = self.active.as_ref().is_some_and(|a| a.grammar.is_some());
+        if let Err(e) = latched_refusal(
+            &mut self.mask_latch,
+            !single_stage,
+            has_grammar,
+            std::time::Instant::now(),
+        ) {
+            self.grammar_failure = Some(GrammarFailure::Latched);
+            return Err(e);
         }
 
         // A generation request must carry at least one prompt token; an empty
@@ -2435,14 +2468,53 @@ const G_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// peer that dies without acking must surface as an error here — the caller
 /// holds the downstream lock, so an unbounded wait wedges the engine step (and
 /// with it the whole rank) forever.
+///
+/// Two-lane I32 `[1,1,2]` replies are late answers to an earlier
+/// structured-output step (they carry no sequence number): skipped, so they
+/// are never taken for the ack, which would shift every later reply by one.
+/// The bool says one of them was acknowledged. One bound covers the whole read.
 #[cfg(feature = "kv_coord")]
 async fn recv_control_ack_bounded(
     g: &mut cascadia_transport::ActivationClient,
-) -> Result<WireTensor, cascadia_transport::TransportError> {
-    let (ack, _) = tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, g.recv())
-        .await
-        .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
-    Ok(ack)
+) -> Result<(WireTensor, bool), cascadia_transport::TransportError> {
+    tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, async {
+        let mut late_ack = false;
+        loop {
+            let (t, _) = g.recv().await?;
+            if t.dtype == WireDType::I32 && t.shape == [1, 1, 2] {
+                let reply = decode_stage_reply(&t);
+                debug!(
+                    ?reply,
+                    "discarding a late reply to an earlier structured-output step"
+                );
+                late_ack |= matches!(reply, Ok(StageReply::Token(_) | StageReply::Nack));
+                continue;
+            }
+            return Ok((t, late_ack));
+        }
+    })
+    .await
+    .map_err(|_| cascadia_transport::TransportError::SocketClosed)?
+}
+
+/// One CAPTURE/RESTORE/ABORT exchange with downstream: send `frame`, read its
+/// ack (see [`recv_control_ack_bounded`]); the bool says a late acknowledged
+/// structured-output reply was discarded on the way.
+#[cfg(feature = "kv_coord")]
+async fn control_exchange(
+    g: &mut cascadia_transport::ActivationClient,
+    frame: &WireTensor,
+) -> Result<(WireTensor, bool), cascadia_transport::TransportError> {
+    g.send(frame).await?;
+    recv_control_ack_bounded(g).await
+}
+
+/// An I8 control frame: opcode then payload.
+#[cfg(feature = "kv_coord")]
+fn control_frame(opcode: u8, payload: &[u8]) -> WireTensor {
+    let mut data = vec![opcode];
+    data.extend_from_slice(payload);
+    WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data)
 }
 const G_OPCODE_CAPTURE_V2: u8 = 7;
 
@@ -2460,30 +2532,21 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let mut data = if tenant.is_empty() {
-            vec![G_OPCODE_CAPTURE]
+        let t = if tenant.is_empty() {
+            control_frame(
+                G_OPCODE_CAPTURE,
+                &crate::kv_coordination::capture_body_bytes(epoch, tokens),
+            )
         } else {
-            vec![G_OPCODE_CAPTURE_V2]
+            control_frame(
+                G_OPCODE_CAPTURE_V2,
+                &crate::kv_coordination::capture_body_bytes_v2(epoch, tokens, tenant),
+            )
         };
-        if tenant.is_empty() {
-            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
-        } else {
-            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes_v2(
-                epoch, tokens, tenant,
-            ));
-        }
-        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
-        let ack = self
-            .block_on(async move {
-                let mut g = downstream.lock().await;
-                g.send(&t).await?;
-                // Bounded, for the same reason ov-runtime bounds its CAPTURE ack: a peer on an
-                // older build that meets G_OPCODE_CAPTURE_V2 errors WITHOUT acking, and an
-                // unbounded wait here wedges this rank while it holds the downstream lock.
-                let ack = recv_control_ack_bounded(&mut g).await?;
-                Ok::<_, cascadia_transport::TransportError>(ack)
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        // Bounded, for the same reason ov-runtime bounds its CAPTURE ack: a peer on an
+        // older build that meets G_OPCODE_CAPTURE_V2 errors WITHOUT acking, and an
+        // unbounded wait here wedges this rank while it holds the downstream lock.
+        let ack = self.control_exchange_downstream(downstream, t)?;
         if ack.dtype == WireDType::I8 && ack.data.first() == Some(&G_OPCODE_CAPTURE_ACK) {
             Ok(())
         } else {
@@ -2496,19 +2559,10 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let mut data = vec![G_OPCODE_RESTORE];
-        data.extend_from_slice(&epoch.to_le_bytes());
-        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
-        let ack = self
-            .block_on(async move {
-                let mut g = downstream.lock().await;
-                g.send(&t).await?;
-                // Bounded like CAPTURE above: an unbounded wait on a dead peer
-                // wedges this rank while it holds the downstream lock.
-                let ack = recv_control_ack_bounded(&mut g).await?;
-                Ok::<_, cascadia_transport::TransportError>(ack)
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let t = control_frame(G_OPCODE_RESTORE, &epoch.to_le_bytes());
+        // Bounded like CAPTURE above: an unbounded wait on a dead peer
+        // wedges this rank while it holds the downstream lock.
+        let ack = self.control_exchange_downstream(downstream, t)?;
         if ack.dtype == WireDType::I8 && ack.data.first() == Some(&G_OPCODE_RESTORE_ACK) {
             Ok(ack.data.get(1) == Some(&1))
         } else {
@@ -2521,16 +2575,29 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![G_OPCODE_ABORT]);
-        self.block_on(async move {
-            let mut g = downstream.lock().await;
-            g.send(&t).await?;
-            // Bounded like CAPTURE above: an unbounded wait on a dead peer
-            // wedges this rank while it holds the downstream lock.
-            let _ = recv_control_ack_bounded(&mut g).await?;
-            Ok::<_, cascadia_transport::TransportError>(())
-        })
-        .map_err(|e| EngineError::Backend(e.to_string()))
+        // Bounded like CAPTURE above: an unbounded wait on a dead peer
+        // wedges this rank while it holds the downstream lock.
+        self.control_exchange_downstream(downstream, control_frame(G_OPCODE_ABORT, &[]))
+            .map(|_| ())
+    }
+
+    /// [`control_exchange`] on the downstream link; a late acknowledged
+    /// structured-output reply it skipped clears the latch.
+    fn control_exchange_downstream(
+        &mut self,
+        downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
+        frame: WireTensor,
+    ) -> EngineResult<WireTensor> {
+        let (ack, late_ack) = self
+            .block_on(async move {
+                let mut g = downstream.lock().await;
+                control_exchange(&mut g, &frame).await
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        if late_ack {
+            self.mask_latch.clear();
+        }
+        Ok(ack)
     }
 
     fn send_control_ack_upstream(&mut self, ack_opcode: u8, payload: &[u8]) -> EngineResult<()> {
@@ -2538,9 +2605,7 @@ impl Gemma4Engine {
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        let mut data = vec![ack_opcode];
-        data.extend_from_slice(payload);
-        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let t = control_frame(ack_opcode, payload);
         self.block_on(async move {
             let mut g = upstream.lock().await;
             g.send(&t).await
@@ -4225,5 +4290,105 @@ mod tests {
         assert!(compile_task_grammar(&factory, &task).unwrap().is_some());
         let plain = GenerationTask::new("t", "p");
         assert!(compile_task_grammar(&factory, &plain).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_latched_pipeline_refuses_structured_output_tasks_before_any_exchange() {
+        let now = std::time::Instant::now();
+        let mut latch = MaskLatch::default();
+        assert!(latched_refusal(&mut latch, true, true, now).is_ok());
+        latch.trip(now);
+        match latched_refusal(&mut latch, true, true, now) {
+            Err(EngineError::Backend(m)) => assert_eq!(m, UPGRADE_EVERY_STAGE),
+            other => panic!("{other:?}"),
+        }
+        // Plain tasks and single-stage pipelines are never refused.
+        assert!(latched_refusal(&mut latch, true, false, now).is_ok());
+        assert!(latched_refusal(&mut latch, false, true, now).is_ok());
+    }
+
+    /// A late two-lane reply still queued when a control exchange starts must
+    /// not be read as its ack: that would shift every later reply by one, and
+    /// every plain step would return the previous step's token.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_late_masked_reply_is_not_read_as_a_restore_ack() {
+        let (mut server, mut client) = link().await;
+        server
+            .send(&encode_masked_reply(StageReply::NotAcked))
+            .await
+            .unwrap();
+        server
+            .send(&encode_masked_reply(StageReply::Token(34)))
+            .await
+            .unwrap();
+        let peer = tokio::spawn(async move {
+            let (t, _) = server.recv().await.unwrap();
+            assert_eq!(t, control_frame(G_OPCODE_RESTORE, &7u64.to_le_bytes()));
+            server
+                .send(&control_frame(G_OPCODE_RESTORE_ACK, &[1]))
+                .await
+                .unwrap();
+            let _ = server.recv().await.unwrap();
+            server.send(&encode_token_reply(17)).await.unwrap();
+        });
+        let restore = control_frame(G_OPCODE_RESTORE, &7u64.to_le_bytes());
+        let (ack, late_ack) = control_exchange(&mut client, &restore).await.unwrap();
+        assert_eq!(ack, control_frame(G_OPCODE_RESTORE_ACK, &[1]));
+        assert!(late_ack, "the acknowledged late reply clears the latch");
+        client.send(&encode_wire_position(0)).await.unwrap();
+        assert_eq!(
+            wait_plain_reply(&mut client, false).await.unwrap(),
+            (17, false)
+        );
+        peer.await.unwrap();
+    }
+
+    /// Same through a middle: its RESTORE relay to the tail skips the late
+    /// reply, so its ack upstream and the next plain token line up.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_middle_restore_relay_skips_a_late_masked_reply() {
+        let (mut mid_up, mut head) = link().await;
+        let (mut tail_up, mut mid_down) = link().await;
+        tail_up
+            .send(&encode_masked_reply(StageReply::NotAcked))
+            .await
+            .unwrap();
+        let tail = tokio::spawn(async move {
+            let (t, _) = tail_up.recv().await.unwrap();
+            assert_eq!(t.data[0], G_OPCODE_RESTORE);
+            tail_up
+                .send(&control_frame(G_OPCODE_RESTORE_ACK, &[1]))
+                .await
+                .unwrap();
+            let _ = tail_up.recv().await.unwrap();
+            tail_up.send(&encode_token_reply(21)).await.unwrap();
+        });
+        let mid = tokio::spawn(async move {
+            // handle_inbound_control's RESTORE: relay down, ack up.
+            let (t, _) = mid_up.recv().await.unwrap();
+            let (ack, _) = control_exchange(&mut mid_down, &t).await.unwrap();
+            let ok = ack.data.first() == Some(&G_OPCODE_RESTORE_ACK) && ack.data.get(1) == Some(&1);
+            mid_up
+                .send(&control_frame(G_OPCODE_RESTORE_ACK, &[u8::from(ok)]))
+                .await
+                .unwrap();
+            // The next plain step.
+            let t = mid_up.recv().await.unwrap().0;
+            mid_down.send(&t).await.unwrap();
+            let (token, _) = wait_plain_reply(&mut mid_down, false).await.unwrap();
+            mid_up.send(&encode_token_reply(token)).await.unwrap();
+        });
+        let restore = control_frame(G_OPCODE_RESTORE, &9u64.to_le_bytes());
+        let (ack, _) = control_exchange(&mut head, &restore).await.unwrap();
+        assert_eq!(ack, control_frame(G_OPCODE_RESTORE_ACK, &[1]));
+        head.send(&encode_wire_position(0)).await.unwrap();
+        assert_eq!(
+            wait_plain_reply(&mut head, false).await.unwrap(),
+            (21, false)
+        );
+        mid.await.unwrap();
+        tail.await.unwrap();
     }
 }
