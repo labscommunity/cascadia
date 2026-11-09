@@ -585,12 +585,23 @@ Behaviour:
 - Some JSON Schema keywords are accepted but **not enforced**: `not`,
   `if`/`then`/`else`, `dependentRequired`, `dependentSchemas`,
   `uniqueItems`, `contains`, `minContains`, `maxContains`, `multipleOf`, an
-  `allOf` with more than one member, and constraints placed beside
+  `allOf` with more than one member other than the plain-object shape below,
+  and constraints placed beside
   `$ref`/`anyOf`/`oneOf`/`allOf`/`const`/`enum` (annotations such as
   `description` are fine there). The server logs the keywords it found; the
   list follows the gaps of the grammar backend `ov-genai` uses, and
   llama-server's own schema converter may differ. Validate the answer
   client-side if they matter.
+- An `allOf` of two or more plain object schemas (each member holds only
+  `type: "object"`, `properties`, `required`, a boolean
+  `additionalProperties`, `title` and `description`), as zod's `.and()`
+  emits, is merged into one object before the grammar is built: properties
+  in member order (the first definition of a name wins), `required` joined,
+  and `additionalProperties: false` if any member has it. A node that holds
+  such an `allOf` beside its own `properties`, `required`,
+  `additionalProperties`, `$ref`/`anyOf`/`oneOf`/`const`/`enum` or a
+  non-object `type` is left as is, and so is an `allOf` with any other
+  member (a `$ref`, other keywords).
 
 Schema limits (each is a 400 `invalid response_format: …`):
 

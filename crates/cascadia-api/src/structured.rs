@@ -21,8 +21,11 @@ pub enum ResponseFormat {
         /// The schema, parsed. Its object keys are sorted, so use it for
         /// checks only.
         schema: Value,
-        /// The schema as the client sent it, whitespace removed. Key order
-        /// is kept: the decoder emits object properties in schema order.
+        /// The schema as the client sent it, whitespace removed, with each
+        /// `allOf` of plain object schemas merged into one object (the
+        /// decoder does not enforce such an `allOf`; `schema` matches this
+        /// form). Key order is kept: the decoder emits object properties in
+        /// schema order.
         raw: String,
         strict: bool,
     },
@@ -151,9 +154,16 @@ fn parse_json_schema(js: Option<&Value>, raw: &str) -> Result<ResponseFormat, St
         Some(schema @ Value::Object(_)) => {
             let text = raw_schema_text(raw)?;
             check_limits(schema, &text)?;
+            let (schema, text) = match merge_object_all_of(&text) {
+                Some(merged) => (
+                    serde_json::from_str(&merged).map_err(|e| format!("{FIELD}: {e}"))?,
+                    merged,
+                ),
+                None => (schema.clone(), text),
+            };
             Ok(ResponseFormat::JsonSchema {
                 name: js.get("name").and_then(Value::as_str).map(str::to_owned),
-                schema: schema.clone(),
+                schema,
                 raw: text,
                 strict: js.get("strict") == Some(&Value::Bool(true)),
             })
@@ -413,6 +423,290 @@ fn nests_deeper_than(v: &Value, levels: usize) -> bool {
         Value::Array(a) => levels == 0 || a.iter().any(deeper),
         _ => false,
     }
+}
+
+/// A JSON value that keeps its object key order and the exact text of its
+/// scalars. The workspace's `serde_json::Value` sorts keys, and the grammar
+/// emits object properties in schema order.
+#[derive(Clone)]
+enum Node {
+    Obj(Vec<(String, Node)>),
+    Arr(Vec<Node>),
+    /// Any other value, as its JSON text.
+    Scalar(Box<RawValue>),
+}
+
+/// An object's entries in order, values left as text.
+struct RawEntries(Vec<(String, Box<RawValue>)>);
+
+impl<'de> Deserialize<'de> for RawEntries {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = RawEntries;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<RawEntries, A::Error> {
+                let mut out = Vec::new();
+                while let Some(entry) = map.next_entry::<String, Box<RawValue>>()? {
+                    out.push(entry);
+                }
+                Ok(RawEntries(out))
+            }
+        }
+        d.deserialize_map(V)
+    }
+}
+
+impl Node {
+    fn parse(raw: Box<RawValue>) -> serde_json::Result<Node> {
+        match raw.get().trim_start().as_bytes().first() {
+            Some(b'{') => {
+                let RawEntries(entries) = serde_json::from_str(raw.get())?;
+                let entries = entries
+                    .into_iter()
+                    .map(|(k, v)| Ok((k, Node::parse(v)?)))
+                    .collect::<serde_json::Result<_>>()?;
+                Ok(Node::Obj(entries))
+            }
+            Some(b'[') => {
+                let items: Vec<Box<RawValue>> = serde_json::from_str(raw.get())?;
+                let items = items
+                    .into_iter()
+                    .map(Node::parse)
+                    .collect::<serde_json::Result<_>>()?;
+                Ok(Node::Arr(items))
+            }
+            _ => Ok(Node::Scalar(raw)),
+        }
+    }
+
+    fn write(&self, out: &mut String) {
+        match self {
+            Node::Obj(entries) => {
+                out.push('{');
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String(k.clone()).to_string());
+                    out.push(':');
+                    v.write(out);
+                }
+                out.push('}');
+            }
+            Node::Arr(items) => {
+                out.push('[');
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write(out);
+                }
+                out.push(']');
+            }
+            Node::Scalar(raw) => out.push_str(raw.get()),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&Node> {
+        match self {
+            Node::Obj(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// The value as a parsed scalar, `None` for an object or array.
+    fn scalar(&self) -> Option<Value> {
+        match self {
+            Node::Scalar(raw) => serde_json::from_str(raw.get()).ok(),
+            _ => None,
+        }
+    }
+
+    fn scalar_node(v: &Value) -> Node {
+        Node::Scalar(RawValue::from_string(v.to_string()).expect("a serialized value is JSON"))
+    }
+}
+
+/// Keys an `allOf` member may have and still be merged.
+const MERGEABLE_MEMBER_KEYS: [&str; 6] = [
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "title",
+    "description",
+];
+
+/// `text`, a compact schema, with every `allOf` of two or more plain object
+/// schemas merged into one object schema, or `None` when it has none. The
+/// grammar backend `ov-genai` uses accepts any JSON value for such an
+/// `allOf`, and zod intersections (`.and()`) produce exactly that shape.
+///
+/// A member is plain when it holds only [`MERGEABLE_MEMBER_KEYS`], with
+/// `type` (if any) `"object"`, `properties` an object, `required` a list of
+/// names and `additionalProperties` a boolean. The merge keeps the
+/// properties in member order (the first definition of a name wins), the
+/// union of `required` in order, and `additionalProperties: false` when any
+/// member has it. The node holding the `allOf` keeps its other keys; it is
+/// left alone if it has its own `properties`, `required`,
+/// `additionalProperties`, another dispatch key or a `type` other than
+/// `"object"`.
+fn merge_object_all_of(text: &str) -> Option<String> {
+    let raw: Box<RawValue> = serde_json::from_str(text).ok()?;
+    let mut root = Node::parse(raw).ok()?;
+    let mut merged = false;
+    merge_in_schema(&mut root, 0, &mut merged);
+    if !merged {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    root.write(&mut out);
+    Some(out)
+}
+
+/// Merge mergeable `allOf`s in `node` and below, deepest first. Walks the
+/// same places as [`for_each_schema`]: never data keys, and schema maps by
+/// their values only.
+fn merge_in_schema(node: &mut Node, depth: usize, merged: &mut bool) {
+    if depth > MAX_SCHEMA_DEPTH {
+        return;
+    }
+    match node {
+        Node::Arr(items) => {
+            for item in items {
+                merge_in_schema(item, depth + 1, merged);
+            }
+        }
+        Node::Obj(entries) => {
+            for (key, value) in entries.iter_mut() {
+                let key = key.as_str();
+                if DATA_KEYS.contains(&key) {
+                    continue;
+                }
+                match value {
+                    Node::Obj(map) if SCHEMA_MAPS.contains(&key) => {
+                        for (_, sub) in map.iter_mut() {
+                            merge_in_schema(sub, depth + 1, merged);
+                        }
+                    }
+                    _ => merge_in_schema(value, depth + 1, merged),
+                }
+            }
+            if let Some(replacement) = merged_all_of(entries) {
+                *entries = replacement;
+                *merged = true;
+            }
+        }
+        Node::Scalar(_) => {}
+    }
+}
+
+/// The entries of an object schema with its `allOf` merged, or `None` when
+/// it has no mergeable `allOf` (see [`merge_object_all_of`]).
+fn merged_all_of(entries: &[(String, Node)]) -> Option<Vec<(String, Node)>> {
+    let object = Value::from("object");
+    let find = |key: &str| entries.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+    let Some(Node::Arr(members)) = find("allOf") else {
+        return None;
+    };
+    if members.len() < 2 {
+        return None;
+    }
+    let blocked = ["properties", "required", "additionalProperties"]
+        .iter()
+        .chain(DISPATCH_KEYS.iter().filter(|k| **k != "allOf"))
+        .any(|k| find(k).is_some());
+    let holder_type = find("type");
+    if blocked || holder_type.is_some_and(|t| t.scalar().as_ref() != Some(&object)) {
+        return None;
+    }
+    let mut properties: Vec<(String, Node)> = Vec::new();
+    let mut has_properties = false;
+    let mut required: Vec<String> = Vec::new();
+    let mut closed = false;
+    for member in members {
+        let Node::Obj(fields) = member else {
+            return None;
+        };
+        if fields
+            .iter()
+            .any(|(k, _)| !MERGEABLE_MEMBER_KEYS.contains(&k.as_str()))
+        {
+            return None;
+        }
+        if member
+            .get("type")
+            .is_some_and(|t| t.scalar().as_ref() != Some(&object))
+        {
+            return None;
+        }
+        match member.get("additionalProperties").map(Node::scalar) {
+            None => {}
+            Some(Some(Value::Bool(b))) => closed |= !b,
+            Some(_) => return None,
+        }
+        match member.get("required") {
+            None => {}
+            Some(Node::Arr(names)) => {
+                for name in names {
+                    let Some(Value::String(name)) = name.scalar() else {
+                        return None;
+                    };
+                    if !required.contains(&name) {
+                        required.push(name);
+                    }
+                }
+            }
+            Some(_) => return None,
+        }
+        match member.get("properties") {
+            None => {}
+            Some(Node::Obj(props)) => {
+                has_properties = true;
+                for (name, schema) in props {
+                    if !properties.iter().any(|(n, _)| n == name) {
+                        properties.push((name.clone(), schema.clone()));
+                    }
+                }
+            }
+            Some(_) => return None,
+        }
+    }
+    let mut out = Vec::with_capacity(entries.len() + 3);
+    for (key, value) in entries {
+        if key != "allOf" {
+            out.push((key.clone(), value.clone()));
+            continue;
+        }
+        if holder_type.is_none() {
+            out.push(("type".into(), Node::scalar_node(&object)));
+        }
+        if has_properties {
+            out.push((
+                "properties".into(),
+                Node::Obj(std::mem::take(&mut properties)),
+            ));
+        }
+        if !required.is_empty() {
+            let names = required
+                .iter()
+                .map(|n| Node::scalar_node(&Value::from(n.as_str())));
+            out.push(("required".into(), Node::Arr(names.collect())));
+        }
+        if closed {
+            out.push((
+                "additionalProperties".into(),
+                Node::scalar_node(&Value::Bool(false)),
+            ));
+        }
+    }
+    Some(out)
 }
 
 /// The grammar that enforces `rf`, or `None` for plain text.
@@ -1116,6 +1410,100 @@ mod tests {
                 parse_schema(schema.clone()),
                 Ok(schema_variant(None, schema, false))
             );
+        }
+    }
+
+    /// The grammar body and checked schema `parse_response_format` gives for
+    /// the schema text `schema`.
+    fn parsed_schema_text(schema: &str) -> (String, serde_json::Value) {
+        let format = format!(r#"{{"type":"json_schema","json_schema":{{"schema":{schema}}}}}"#);
+        match parse_response_format(Some(&format)).unwrap() {
+            ResponseFormat::JsonSchema { raw, schema, .. } => (raw, schema),
+            other => panic!("expected a json_schema format, got {other:?}"),
+        }
+    }
+
+    /// A zod-style intersection: `z.object({...}).and(z.object({...}))`.
+    const INTERSECTION: &str = r#"{"description":"agent","allOf":[{"type":"object","properties":{"thinking":{"type":"string"},"goal":{"type":"string"}},"required":["thinking","goal"],"additionalProperties":false},{"type":"object","properties":{"action":{"type":"string"},"goal":{"type":"integer"}},"required":["action","goal"]}]}"#;
+
+    #[test]
+    fn object_all_of_is_merged_into_one_object() {
+        let (raw, schema) = parsed_schema_text(INTERSECTION);
+        assert_eq!(
+            raw,
+            r#"{"description":"agent","type":"object","properties":{"thinking":{"type":"string"},"goal":{"type":"string"},"action":{"type":"string"}},"required":["thinking","goal","action"],"additionalProperties":false}"#
+        );
+        assert!(!raw.contains("allOf"));
+        assert!(unenforced_keywords(&schema).is_empty(), "{schema}");
+        let g = grammar_for(
+            &parse_response_format(Some(&format!(
+                r#"{{"type":"json_schema","json_schema":{{"schema":{INTERSECTION}}}}}"#
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(g.body, raw);
+    }
+
+    #[test]
+    fn merged_all_of_accepts_what_the_original_accepts() {
+        let original = r#"{"allOf":[{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]},{"properties":{"b":{"type":"integer"}},"required":["b"]}]}"#;
+        let (raw, _) = parsed_schema_text(original);
+        assert!(!raw.contains("allOf"), "{raw}");
+        let before = jsonschema::validator_for(&serde_json::from_str(original).unwrap()).unwrap();
+        let after = jsonschema::validator_for(&serde_json::from_str(&raw).unwrap()).unwrap();
+        for instance in [
+            json!({"a": "x", "b": 1}),
+            json!({"a": "x", "b": 1, "c": true}),
+            json!({"a": "x"}),
+            json!({"b": 1}),
+            json!({"a": 1, "b": 1}),
+            json!({"a": "x", "b": "y"}),
+            json!([]),
+            json!("a"),
+        ] {
+            assert_eq!(
+                before.is_valid(&instance),
+                after.is_valid(&instance),
+                "{instance}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_of_with_a_ref_or_other_keywords_is_left_and_flagged() {
+        for schema in [
+            r##"{"allOf":[{"$ref":"#/$defs/A"},{"type":"object","properties":{"b":{"type":"string"}}}],"$defs":{"A":{"type":"object"}}}"##,
+            r#"{"allOf":[{"type":"object","minProperties":1},{"type":"object"}]}"#,
+            r#"{"allOf":[{"type":"string"},{"type":"object"}]}"#,
+            r#"{"allOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"object"}]}"#,
+            r#"{"type":"object","properties":{"z":{"type":"string"}},"allOf":[{"type":"object"},{"type":"object"}]}"#,
+        ] {
+            let (raw, parsed) = parsed_schema_text(schema);
+            assert_eq!(raw, schema);
+            assert!(unenforced_keywords(&parsed).contains(&"allOf"), "{schema}");
+        }
+    }
+
+    #[test]
+    fn nested_all_of_in_properties_and_defs_is_merged() {
+        let schema = r##"{"type":"object","properties":{"p":{"allOf":[{"properties":{"x":{"type":"string"}}},{"properties":{"y":{"type":"string"}}}]},"q":{"$ref":"#/$defs/D"}},"$defs":{"D":{"allOf":[{"required":["m"]},{"type":"object","required":["n","m"]}]}}}"##;
+        let (raw, parsed) = parsed_schema_text(schema);
+        assert_eq!(
+            raw,
+            r##"{"type":"object","properties":{"p":{"type":"object","properties":{"x":{"type":"string"},"y":{"type":"string"}}},"q":{"$ref":"#/$defs/D"}},"$defs":{"D":{"type":"object","required":["m","n"]}}}"##
+        );
+        assert!(unenforced_keywords(&parsed).is_empty(), "{parsed}");
+    }
+
+    #[test]
+    fn schema_without_a_mergeable_all_of_keeps_its_exact_text() {
+        for schema in [
+            r#"{"type":"object","properties":{"z":{"type":"number","default":1.50},"a":{"type":"string","description":"café"}},"required":["z"]}"#,
+            r#"{"allOf":[{"type":"object","properties":{"z":{"type":"string"}}}]}"#,
+            r#"{"type":"object","properties":{"allOf":{"type":"string"}},"default":{"allOf":[{},{}]}}"#,
+        ] {
+            assert_eq!(parsed_schema_text(schema).0, schema);
         }
     }
 }
