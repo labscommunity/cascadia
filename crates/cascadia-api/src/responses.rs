@@ -2941,6 +2941,28 @@ mod tests {
         assert!(tasks.lock().is_empty());
     }
 
+    /// Gemma 2 style: no system role and no tool role. Folding deals with the
+    /// system turns, so the 400 names what the template still refuses (the
+    /// tool turn), not the system turns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refusal_no_fold_helps_names_what_is_still_refused() {
+        let template = concat!(
+            "{%- for m in messages -%}",
+            "{%- if m.role == 'system' -%}{{ raise_exception('System role not supported') }}{%- endif -%}",
+            "{%- if m.role == 'tool' -%}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{%- endif -%}",
+            "<{{ m.role }}>{{ m.content }}</{{ m.role }}>",
+            "{%- endfor -%}",
+        );
+        for cfg in [template_config(template), sycl_llama_config(template)] {
+            let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
+            let (status, text) = post(app, developer_mid_history()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+            assert!(text.contains("Conversation roles must alternate"), "{text}");
+            assert!(!text.contains("System role not supported"), "{text}");
+            assert!(tasks.lock().is_empty());
+        }
+    }
+
     /// A template that fails to render here (not a `raise_exception`) may
     /// still render in llama-server's own Jinja: the request is forwarded as
     /// it was.

@@ -4336,21 +4336,30 @@ fn fold_refused_system_turns(
     // thinking path.
     let api_rendered =
         media.is_none() && state.defer_template_on_thinking && enable_thinking && must_render;
+    // The last fold's own rejection, when every fold was refused: with the
+    // system turns out of the way it names what the template still refuses
+    // (a tool turn, say), where the request's first rejection would blame
+    // the system turns the folds dealt with.
+    let mut refused = None;
     for fold in folds {
         let messages = fold_system_turns(messages.to_vec(), fold);
         let media = media.map(|m| fold_system_turns(m.to_vec(), fold));
-        if let Ok(prompt) = probe(&messages, media.as_deref()) {
-            info!(
-                "the chat template refuses system turns where they stand; folded them into user turns"
-            );
-            return Ok(Some(FoldedTurns {
-                messages,
-                media,
-                prompt: templated_here.then_some((prompt, api_rendered)),
-            }));
+        match probe(&messages, media.as_deref()) {
+            Ok(prompt) => {
+                info!(
+                    "the chat template refuses system turns where they stand; folded them into user turns"
+                );
+                return Ok(Some(FoldedTurns {
+                    messages,
+                    media,
+                    prompt: templated_here.then_some((prompt, api_rendered)),
+                }));
+            }
+            Err(e @ PromptRenderError::Rejected(_)) => refused = Some(e),
+            Err(PromptRenderError::Failed(_)) => {}
         }
     }
-    rejection.map_or(Ok(None), Err)
+    refused.or(rejection).map_or(Ok(None), Err)
 }
 
 /// Per-endpoint knobs for [`admit_chat`].
