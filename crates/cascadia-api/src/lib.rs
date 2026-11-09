@@ -808,8 +808,8 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
     /// OpenAI `response_format`, kept as the client's JSON text and parsed
     /// by [`parse_response_format`]: a malformed value is a 400 naming the
-    /// field rather than a generic deserialization error, and a schema keeps
-    /// its key order (a `serde_json::Value` would sort it).
+    /// field rather than a generic deserialization error, and the schema text
+    /// reaches the engine exactly as the client wrote it.
     #[serde(default)]
     pub response_format: Option<Box<serde_json::value::RawValue>>,
 }
@@ -5728,10 +5728,9 @@ mod tests {
         // minijinja's builtin writes `{"a":1}` and escapes `'`/`<`/`&` into
         // \uXXXX for HTML safety. json.dumps does neither, so the builtin puts
         // tool schemas on the wire in bytes no model was trained on.
-        // Keys are written alphabetically here so the expectation isolates
-        // separators and escaping: `serde_json::Value` is a BTreeMap, which
-        // re-sorts client key order independently of this filter. See
-        // `tool_schema_key_order_is_alphabetical_not_client_order`.
+        // Client key order is kept independently of this filter (see
+        // `tool_schema_keeps_client_key_order`); this test isolates separators
+        // and escaping.
         let out = tojson_of(
             serde_json::json!([{
                 "function": {
@@ -5864,7 +5863,7 @@ mod tests {
             .expect("tojson(ensure_ascii=False) must render");
         assert_eq!(
             out,
-            r#"{"description": "user's city", "name": "get_weather"}"#
+            r#"{"name": "get_weather", "description": "user's city"}"#
         );
     }
 
@@ -6716,13 +6715,11 @@ level={{ effort_map[eff] }}";
     }
 
     #[test]
-    fn tool_schema_key_order_is_alphabetical_not_client_order() {
-        // Pins a known divergence rather than hiding it. `Tool.function` is a
-        // `serde_json::Value`, whose map is a BTreeMap without the
-        // `preserve_order` feature, so a client's `{name, description}` reaches
-        // the prompt as `{description, name}`. transformers and vLLM preserve
-        // client order. This test fails the day that feature is enabled, which
-        // is the point — the goldens above must be regenerated with it.
+    fn tool_schema_keeps_client_key_order() {
+        // A client's `{name, description}` reaches the prompt in that order,
+        // as transformers and vLLM render it. Both `serde_json` (the
+        // `Tool.function` value) and minijinja (the template's map) are built
+        // with `preserve_order`; without either one the keys come out sorted.
         let tools = vec![Tool {
             r#type: "function".into(),
             function: serde_json::json!({"name": "b", "description": "a"}),
@@ -6736,7 +6733,7 @@ level={{ effort_map[eff] }}";
             tool_call_id: None,
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools)).unwrap();
-        assert_eq!(out, r#"{"description": "a", "name": "b"}"#);
+        assert_eq!(out, r#"{"name": "b", "description": "a"}"#);
     }
 
     #[test]
