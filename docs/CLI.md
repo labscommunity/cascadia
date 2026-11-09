@@ -242,6 +242,13 @@ To restore the old behaviour:
   `max_completion_tokens` above it is sent as the window, so the answer ends
   with `finish_reason: "length"` there. `--default-max-tokens 256` does not cap
   a request that asks for 1000.
+- **A generation ends at a known window.** With the window known from one of
+  those real sources, the API ends a generation with `finish_reason: "length"`
+  once the prompt plus the answer fill it, on every engine that streams
+  tokens, whether or not the engine stops there itself; `usage` counts the
+  prompt and the answer up to that point. An ov-genai continuous-batching
+  request whose KV cache runs out after it produced output also ends with
+  `length`, keeping its text; it is an error only if nothing was produced.
 - **`temperature` / `top_p`**: `--default-temperature` / `--default-top-p`,
   else the model's `generation_config.json` (root, then `tokenizer/`;
   `do_sample` is not applied), else `1`. A file value outside the OpenAI range
