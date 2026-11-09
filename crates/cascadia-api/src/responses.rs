@@ -3151,9 +3151,9 @@ mod tests {
 
     /// gpt-oss's template refuses an assistant turn with tool calls that
     /// has both content and thinking (llama.cpp's name for
-    /// `reasoning_content`): such a replayed turn keeps its content and
-    /// calls and drops the reasoning; with no content, or no calls, the
-    /// reasoning stays.
+    /// `reasoning_content`): under it, such a replayed turn keeps its content
+    /// and calls and drops the reasoning; with no content, or no calls, the
+    /// reasoning stays. A template that takes both (Qwen) keeps it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_call_turn_with_content_forwards_no_reasoning_content() {
         let turn = |text: &str, call: bool| {
@@ -3177,14 +3177,28 @@ mod tests {
             input.push(json!({"role": "user", "content": "and now?"}));
             json!({"model": "script-model", "input": input})
         };
+        let gpt_oss = concat!(
+            "{%- for m in messages -%}",
+            "{%- if m.tool_calls and m.content and m.thinking -%}",
+            "{{ raise_exception('Cannot pass both content and thinking in an assistant message with tool calls! Put the analysis message in one or the other, but not both.') }}",
+            "{%- endif -%}<{{ m.role }}>{{ m.content }}",
+            "{%- endfor -%}",
+        );
         let cases = [
-            ("Let me look.", true, None, "Let me look."),
-            ("  ", true, Some("use ls"), ""),
-            ("", true, Some("use ls"), ""),
-            ("Here.", false, Some("use ls"), "Here."),
+            (gpt_oss, "Let me look.", true, None, "Let me look."),
+            (
+                PERMISSIVE_TEMPLATE,
+                "Let me look.",
+                true,
+                Some("use ls"),
+                "Let me look.",
+            ),
+            (gpt_oss, "  ", true, Some("use ls"), ""),
+            (gpt_oss, "", true, Some("use ls"), ""),
+            (gpt_oss, "Here.", false, Some("use ls"), "Here."),
         ];
-        for (text, call, reasoning, content) in cases {
-            let cfg = sycl_llama_config(PERMISSIVE_TEMPLATE);
+        for (template, text, call, reasoning, content) in cases {
+            let cfg = sycl_llama_config(template);
             let (app, tasks, _) = app_with(RecordingEngine::script(&["ok"]), cfg).await;
             let (status, body) = post(app, turn(text, call)).await;
             assert_eq!(status, StatusCode::OK, "{body}");

@@ -289,6 +289,11 @@ pub struct AppState {
     /// rendered with it for the engine, so chat, the reasoning and effort
     /// probes and the tool refusal behave as with no template.
     pub fold_probe_env: Option<Arc<minijinja::Environment<'static>>>,
+    /// The engine's template ([`Config::fold_probe_template`]) refuses an
+    /// assistant turn with tool calls, content and thinking all at once
+    /// (gpt-oss: "Cannot pass both content and thinking"), so a replayed
+    /// reasoning beside content is dropped there (see [`chat_turns`]).
+    pub probe_refuses_content_with_thinking: bool,
     /// The chat template distinguishes OpenAI's `reasoning_effort` words
     /// (probed at load: "low" and "medium" render differently). When true the
     /// caller's own word reaches the template; when false the GLM high/max
@@ -731,6 +736,10 @@ pub fn make_router_with_stats(
                     None
                 }
             }),
+        probe_refuses_content_with_thinking: cfg
+            .fold_probe_template
+            .as_deref()
+            .is_some_and(|src| src.contains("Cannot pass both content and thinking")),
         effort_words: false,
         template_opens_think: false,
         marker_dialect: cfg.marker_dialect.clone(),
@@ -4152,10 +4161,17 @@ pub fn render_chat_prompt(
 /// `split_reasoning`, an assistant turn whose content opens with
 /// `<think>…</think>` (a `/v1/responses` replayed reasoning item) carries
 /// that reasoning as `reasoning_content` and the rest as its content, for a
-/// downstream template that places reasoning itself; a turn with tool calls
-/// and non-blank content drops the reasoning instead, as gpt-oss's template
-/// refuses content and thinking together on a tool-call turn.
-fn chat_turns(messages: &[ChatMessage], split_reasoning: bool) -> Vec<ChatTurn> {
+/// downstream template that places reasoning itself. With
+/// `drop_beside_content` as well (the engine's template refuses content and
+/// thinking together on a tool-call turn, as gpt-oss's does), a turn with
+/// tool calls and non-blank content drops the reasoning instead; other
+/// templates (Qwen's render it for the turns after the last user query)
+/// keep it.
+fn chat_turns(
+    messages: &[ChatMessage],
+    split_reasoning: bool,
+    drop_beside_content: bool,
+) -> Vec<ChatTurn> {
     messages
         .iter()
         .map(|m| {
@@ -4166,10 +4182,11 @@ fn chat_turns(messages: &[ChatMessage], split_reasoning: bool) -> Vec<ChatTurn> 
             {
                 // gpt-oss's template refuses a tool-call turn with both
                 // content and thinking (llama.cpp's name for
-                // `reasoning_content`), so such a turn drops the reasoning
-                // and keeps its content and calls.
+                // `reasoning_content`), so under it such a turn drops the
+                // reasoning and keeps its content and calls.
                 Some((_, rest))
                     if split_reasoning
+                        && drop_beside_content
                         && m.role == "assistant"
                         && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
                         && !rest.trim().is_empty() =>
@@ -4644,6 +4661,7 @@ async fn admit_chat(
         messages: chat_turns(
             messages,
             opts.reasoning_content_turns && state.engine_applies_template,
+            state.probe_refuses_content_with_thinking,
         ),
         tools: chat_tools(&req),
         tool_choice: req.tool_choice.clone(),
@@ -9498,7 +9516,7 @@ mod tests {
                 {"role":"user","content":"thanks"}
             ]
         }));
-        let turns = chat_turns(&req.messages, false);
+        let turns = chat_turns(&req.messages, false, false);
         assert_eq!(turns.len(), 3);
         let calls = turns[0].tool_calls.as_ref().expect("tool_calls forwarded");
         assert_eq!(calls[0]["id"], "call_1");
