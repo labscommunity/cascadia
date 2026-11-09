@@ -451,9 +451,15 @@ fn client_message(err: OvError, what: &str) -> String {
     clean
 }
 
-/// What every in-flight client of a failed CB step is told: the backend's
-/// raw text (logged in full by the caller) can carry build paths or another
-/// co-batched client's schema, so it is reduced by [`clean_backend_message`].
+/// What a client of a failed CB step is told when its own schema is not
+/// blamed for it. Carries no backend text: that text can name another
+/// client's schema.
+const CB_BATCH_FAILED: &str =
+    "cb step failed: the batch this request ran in failed; retry the request";
+
+/// What a client of a failed CB step whose own schema is blamed for it is
+/// told: the backend's raw text (logged in full by the caller) can carry
+/// build paths, so it is reduced by [`clean_backend_message`].
 fn step_failure_message(err: &OvError) -> String {
     let detail = match err {
         OvError::Native(m) => clean_backend_message(m),
@@ -1396,16 +1402,11 @@ impl Engine for OvGenaiCbEngine {
             // Several requests with one schema are one suspect.
             suspects.sort_unstable();
             suspects.dedup();
-            let failed: Vec<(TaskId, Chunk)> = self
-                .active
-                .drain(..)
-                .map(|t| {
-                    // The canary below must run on its own.
-                    let _ = t.handle.cancel();
-                    let chunk = Chunk::error(t.task_id.clone(), step_failure_message(&err));
-                    (t.task_id, chunk)
-                })
-                .collect();
+            let drained: Vec<ActiveCbTask> = self.active.drain(..).collect();
+            for t in &drained {
+                // The canary below must run on its own.
+                let _ = t.handle.cancel();
+            }
             let excused = !suspects.is_empty() && {
                 self.suspect_failures += 1;
                 self.suspect_failures < MAX_SUSPECT_FAILURES || {
@@ -1442,6 +1443,21 @@ impl Engine for OvGenaiCbEngine {
                     self.latched_at = Some(Instant::now());
                 }
             }
+            // Only a client whose own schema is blamed sees the backend's
+            // reason (cleaned); everyone else gets a fixed text, since that
+            // reason can name another client's schema.
+            let failed: Vec<(TaskId, Chunk)> = drained
+                .into_iter()
+                .map(|t| {
+                    let blamed = excused && t.grammar_hash.is_some_and(|h| suspects.contains(&h));
+                    let msg = if blamed {
+                        step_failure_message(&err)
+                    } else {
+                        CB_BATCH_FAILED.to_string()
+                    };
+                    (t.task_id.clone(), Chunk::error(t.task_id, msg))
+                })
+                .collect();
             if !suspects.is_empty() {
                 warn!(
                     schemas = suspects.len(),
@@ -1894,6 +1910,8 @@ mod tests {
         /// Returned once a request's script runs out.
         default_read: Option<CbRead>,
         step_fails: bool,
+        /// The failed step's backend text, when not the default.
+        step_err: Option<String>,
         /// With `step_fails`, fail a step only when the request added last
         /// carries a schema: bad schemas on a healthy device.
         fail_only_with_grammar: bool,
@@ -1939,7 +1957,11 @@ mod tests {
             let mut st = self.st.lock().unwrap();
             st.steps += 1;
             if st.step_fails && (!st.fail_only_with_grammar || st.last_added_grammar) {
-                Err(OvError::Native("mock step failure".into()))
+                Err(OvError::Native(
+                    st.step_err
+                        .clone()
+                        .unwrap_or_else(|| "mock step failure".into()),
+                ))
             } else {
                 Ok(())
             }
@@ -3237,10 +3259,96 @@ mod tests {
         let mut e = mock_engine(&st);
         e.submit(task("plain", 8)).unwrap();
         let out = e.step().unwrap();
+        assert_eq!(out[0].1.error.as_deref(), Some(CB_BATCH_FAILED));
+    }
+
+    /// Backend text naming a build path and a schema fragment.
+    const RAW_STEP_ERR: &str = "Exception from src/core.cpp:12:\n[09:00:01] \
+        /build/xgrammar-src/cpp/grammar.cc:88: bad grammar near {\"secret\":1}\n";
+
+    /// Each task's error text in `out`, by task id.
+    fn errors_by_task(out: &[(TaskId, Chunk)]) -> HashMap<String, String> {
+        out.iter()
+            .map(|(id, c)| (id.to_string(), c.error.clone().expect("an error chunk")))
+            .collect()
+    }
+
+    #[test]
+    fn cb_only_the_blamed_schema_sees_the_backend_reason() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        // Schema B has compiled: its task is streaming.
+        script_output(&st, 0, CbStatus::Running);
+        e.submit(schema_task("other", SCHEMA_B)).unwrap();
+        let _ = e.step().unwrap();
+        e.submit(schema_task("suspect", SCHEMA_A)).unwrap();
+        e.submit(task("plain", 8)).unwrap();
+        e.submit(schema_task("json", JSON_OBJECT_PROBE)).unwrap();
+        {
+            let mut s = st.lock().unwrap();
+            s.step_fails = true;
+            s.step_err = Some(RAW_STEP_ERR.into());
+        }
+        let errors = errors_by_task(&e.step().unwrap());
         assert_eq!(
-            out[0].1.error.as_deref(),
-            Some("cb step failed: mock step failure")
+            errors["suspect"],
+            "cb step failed: bad grammar near {\"secret\":1}"
         );
+        for id in ["other", "plain", "json"] {
+            assert_eq!(errors[id], CB_BATCH_FAILED, "{id}");
+        }
+        assert_eq!(e.quarantined.len(), 1, "the suspect's schema was blamed");
+    }
+
+    #[test]
+    fn cb_struck_schemas_see_the_backend_reason() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            step_err: Some(RAW_STEP_ERR.into()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("a", SCHEMA_A)).unwrap();
+        e.submit(schema_task("b", SCHEMA_B)).unwrap();
+        e.submit(task("plain", 8)).unwrap();
+        let errors = errors_by_task(&e.step().unwrap());
+        assert_eq!(e.strikes.len(), 2);
+        for id in ["a", "b"] {
+            assert_eq!(
+                errors[id],
+                "cb step failed: bad grammar near {\"secret\":1}"
+            );
+        }
+        assert_eq!(errors["plain"], CB_BATCH_FAILED);
+    }
+
+    #[test]
+    fn cb_failure_with_no_suspect_gives_every_client_the_fixed_text() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        script_output(&st, 0, CbStatus::Running);
+        e.submit(schema_task("compiled", SCHEMA_A)).unwrap();
+        let _ = e.step().unwrap();
+        e.submit(task("plain", 8)).unwrap();
+        e.submit(schema_task("json", JSON_OBJECT_PROBE)).unwrap();
+        e.submit(schema_task("same", SCHEMA_A)).unwrap();
+        {
+            let mut s = st.lock().unwrap();
+            s.step_fails = true;
+            s.step_err = Some(RAW_STEP_ERR.into());
+        }
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 4);
+        for (id, msg) in errors_by_task(&out) {
+            assert_eq!(msg, CB_BATCH_FAILED, "{id}");
+        }
+        assert_eq!(e.step_failures, 1);
     }
 
     #[test]

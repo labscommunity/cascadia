@@ -633,7 +633,10 @@ the 400s below and `engine_error` for anything else):
 | 400 | `llama-server rejected the request: <reason>` | `sycl-llama`: llama-server answered 4xx (other than 408/429), for example a schema its grammar converter rejects; `<reason>` is llama-server's `error.message`, or the start of its reply. On a streamed request the SSE stream has already started, so this message arrives as the stream's error event instead, with `"type":"invalid_request_error"`. |
 
 On `ov-genai --cb`, a schema whose compile fails while a batch runs fails that
-batch step. When the failed step held exactly one new schema-constrained
+batch step. Every request in a failed step gets 503 (on a stream, the error
+event): a request whose own schema is blamed for the failure (below) gets
+`cb step failed: <backend reason>`, every other request `cb step failed: the
+batch this request ran in failed; retry the request`. When the failed step held exactly one new schema-constrained
 request (or several with the same schema), that schema is then refused for 10
 minutes with `invalid configuration: response_format json_schema: this schema
 failed to compile on this server; retry later or change the schema`. When it
