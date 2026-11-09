@@ -118,6 +118,12 @@ impl MaskRecvCache {
         }
     }
 
+    /// The last committed mask, borrowed: what a marker stands for. `None`
+    /// is a miss.
+    pub fn last(&self) -> Option<&[u32]> {
+        self.last.as_deref()
+    }
+
     /// The frame set carrying `words` decoded completely.
     pub fn commit(&mut self, words: &[u32]) {
         if self.last.as_deref() != Some(words) {

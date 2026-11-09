@@ -85,3 +85,13 @@ fn sender_and_receiver_agree_over_a_mask_sequence() {
     }
     assert_eq!(repeats, 3);
 }
+
+#[test]
+fn the_receiver_lends_its_last_mask_without_copying() {
+    let mut recv = MaskRecvCache::default();
+    assert_eq!(recv.last(), None);
+    recv.commit(A);
+    assert_eq!(recv.last(), Some(A));
+    recv.clear();
+    assert_eq!(recv.last(), None);
+}
