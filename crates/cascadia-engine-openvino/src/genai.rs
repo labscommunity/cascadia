@@ -856,13 +856,32 @@ impl Engine for OvGenaiCbEngine {
                     // OpenVINO ran out of KV cache and abandoned the request.
                     // Name the knobs that fix it either way.
                     let t = self.active.swap_remove(idx);
-                    warn!(
-                        task = %t.task_id,
-                        tokens = t.total_tokens,
-                        in_flight = self.active.len(),
-                        "cb scheduler dropped a request: KV cache exhausted. Raise \
-                         --cb-cache-size or lower --cb-max-num-seqs."
-                    );
+                    let outcome = if t.total_tokens > 0 {
+                        "length"
+                    } else {
+                        "error"
+                    };
+                    cascadia_metrics::KV_CACHE_EXHAUSTED_TOTAL
+                        .with_label_values(&[outcome])
+                        .inc();
+                    if t.total_tokens > 0 {
+                        warn!(
+                            task = %t.task_id,
+                            tokens = t.total_tokens,
+                            in_flight = self.active.len(),
+                            "cb scheduler ran out of KV cache: request ended with \
+                             finish_reason length after {} tokens. Raise --cb-cache-size \
+                             or lower --cb-max-num-seqs.",
+                            t.total_tokens
+                        );
+                    } else {
+                        warn!(
+                            task = %t.task_id,
+                            in_flight = self.active.len(),
+                            "cb scheduler dropped a request before it produced output: KV \
+                             cache exhausted. Raise --cb-cache-size or lower --cb-max-num-seqs."
+                        );
+                    }
                     if t.total_tokens > 0 {
                         // It already produced output: keep it and end like an
                         // answer that hit its limit (`length`), counted as the
@@ -882,12 +901,10 @@ impl Engine for OvGenaiCbEngine {
                     // fail it loudly.
                     let chunk = Chunk::error(
                         t.task_id.clone(),
-                        format!(
-                            "continuous-batching scheduler dropped this request after {} \
-                             tokens: KV cache exhausted. Raise --cb-cache-size or lower \
-                             --cb-max-num-seqs.",
-                            t.total_tokens
-                        ),
+                        "continuous-batching scheduler dropped this request before it \
+                         produced output: KV cache exhausted. Raise --cb-cache-size or \
+                         lower --cb-max-num-seqs."
+                            .to_string(),
                     );
                     out.push((t.task_id, chunk));
                 }
@@ -1313,10 +1330,16 @@ mod tests {
         }
     }
 
-    /// The B2 fix: a request OpenVINO abandoned for want of KV cache must not
-    /// be finalised like a normal completion.
+    /// A request OpenVINO abandoned for want of KV cache before it produced
+    /// anything must not be finalised like a normal (empty) completion.
     #[test]
     fn cb_ignored_status_is_reported_as_an_error() {
+        let exhausted = || {
+            cascadia_metrics::KV_CACHE_EXHAUSTED_TOTAL
+                .with_label_values(&["error"])
+                .get()
+        };
+        let before = exhausted();
         let st = Arc::new(Mutex::new(MockState::default()));
         st.lock()
             .unwrap()
@@ -1338,8 +1361,13 @@ mod tests {
             .as_deref()
             .expect("eviction must surface as an error");
         assert!(err.contains("KV cache exhausted"), "{err}");
+        assert!(
+            !err.contains("after"),
+            "nothing was produced, so no count: {err}"
+        );
         assert!(c.is_final);
         assert!(e.active.is_empty());
+        assert!(exhausted() > before, "not counted");
     }
 
     /// A request dropped for want of KV cache AFTER it produced output keeps
@@ -1347,6 +1375,12 @@ mod tests {
     /// answer that hit its limit, not as an error.
     #[test]
     fn cb_ignored_after_output_ends_with_length_and_keeps_the_text() {
+        let exhausted = || {
+            cascadia_metrics::KV_CACHE_EXHAUSTED_TOTAL
+                .with_label_values(&["length"])
+                .get()
+        };
+        let before = exhausted();
         let st = Arc::new(Mutex::new(MockState::default()));
         st.lock().unwrap().reads.push(VecDeque::from(vec![
             Ok(read_of(CbStatus::Running, 3, "abc", CbFinish::Unknown)),
@@ -1370,6 +1404,7 @@ mod tests {
         first[0].1.accumulate_tokens(&mut total);
         c.accumulate_tokens(&mut total);
         assert_eq!(total, 5);
+        assert!(exhausted() > before, "not counted");
     }
 
     /// Tokens produced by the very read that reports the drop count too.

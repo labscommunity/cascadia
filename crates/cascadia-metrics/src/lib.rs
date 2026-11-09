@@ -223,6 +223,21 @@ pub static TASKS_FAILED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cascadia_tasks_failed_total")
 });
 
+/// Continuous-batching requests (`ov-genai --cb`) the OpenVINO scheduler
+/// dropped because the KV cache ran out. `outcome`: `length` (it had
+/// produced output, so it ended with `finish_reason: length` and its text)
+/// or `error` (nothing produced; the request failed). Rising values mean
+/// `--cb-cache-size` is too small for `--cb-max-num-seqs` and the answers
+/// being asked for.
+pub static KV_CACHE_EXHAUSTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_kv_cache_exhausted_total",
+        "Continuous-batching requests dropped by the scheduler for want of KV cache.",
+        &["outcome"]
+    )
+    .expect("register cascadia_kv_cache_exhausted_total")
+});
+
 // --- Engine-level (bumped by cascadia-runner during start) ---------------
 
 /// Weight-load + engine-build duration at stage start (transport connect
@@ -324,6 +339,7 @@ pub fn init() {
     LazyLock::force(&TOKENS_PROMPT_TOTAL);
     LazyLock::force(&TASKS_CANCELLED_TOTAL);
     LazyLock::force(&TASKS_FAILED_TOTAL);
+    LazyLock::force(&KV_CACHE_EXHAUSTED_TOTAL);
     LazyLock::force(&ENGINE_LOAD_DURATION_SECONDS);
     LazyLock::force(&ENGINE_WARMUP_DURATION_SECONDS);
     LazyLock::force(&TRANSPORT_SENT_BYTES_TOTAL);

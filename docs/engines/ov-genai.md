@@ -103,6 +103,17 @@ of the batch. Tune with `--cb-cache-size`, `--cb-max-num-seqs`,
 `--cb-max-batched-tokens`, `--cb-dynamic-split-fuse`, `--cb-prefix-caching`
 (zeros/unset keep ov-genai defaults).
 
+When the batch needs more KV cache than `--cb-cache-size` holds, OpenVINO
+drops a request. A request that had already produced output keeps it: it ends
+with `finish_reason: length` and its text, like an answer that hit its limit
+(it used to be an HTTP 503 or an SSE error event, which clients retry; a
+`length` answer is not retried). A request dropped before it produced anything
+still fails. Both log a warning naming the knobs, and both count in
+`cascadia_kv_cache_exhausted_total{outcome="length"|"error"}` (see
+[METRICS.md](../METRICS.md)). A rising count means the cache is too small for
+`--cb-max-num-seqs` and the answers asked for: raise `--cb-cache-size` or
+lower `--cb-max-num-seqs`.
+
 Device note: paged attention is a CPU/GPU-plugin capability. On NPU,
 ov-genai serves the static NPUW pipeline — `--cb` will fail at compile
 there; run NPU workers without `--cb` (requests queue sequentially).

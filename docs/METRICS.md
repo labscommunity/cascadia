@@ -63,6 +63,7 @@ The `model` label is the shard's `model_id`.
 | `cascadia_tokens_prompt_total` | counter | `model` | Prompt tokens, for engines that report them on the final chunk. |
 | `cascadia_tasks_cancelled_total` | counter | `model` | Generations abandoned before completion: explicit `/v1/cancel` (including an engine acknowledging with a `Cancelled` final marker) or client disconnect mid-stream. Server teardown is never counted here — a restart is not a client cancellation, and the suppression is deterministic (`close()` flags the shutdown before emptying the engine slot, so poll-first and drop-first orderings agree). Those generations land on `finish_reason="teardown"` instead. |
 | `cascadia_tasks_failed_total` | counter | `model` | Generations that terminated with an engine error. |
+| `cascadia_kv_cache_exhausted_total` | counter | `outcome` | `ov-genai --cb` requests the OpenVINO scheduler dropped because the KV cache ran out. `outcome="length"`: the request had produced output, so it ended with `finish_reason: length` and its text (booked as `length` on the duration histogram, not as a failure). `outcome="error"`: nothing was produced and the request failed (also in `cascadia_tasks_failed_total`). Raise `--cb-cache-size` or lower `--cb-max-num-seqs` when it rises. |
 
 Modes that deliver the whole response on a single final chunk — `ov-genai`
 **without** `--cb`, which is the default worker configuration — produce one
