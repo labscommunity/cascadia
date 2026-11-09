@@ -886,10 +886,20 @@ fn word_level_char_tokenizer_with_a_fuse_decoder_builds_and_masks() {
 }
 
 #[test]
-fn word_level_without_a_decoder_builds() {
+fn word_level_without_a_decoder_is_unsupported() {
+    // `tokenizers` joins tokens with spaces when there is no decoder, so the
+    // engine's text would not be the concatenation the grammar masks.
     let tok = char_word_level(serde_json::Value::Null);
-    let gf = GrammarFactory::from_tokenizer(&tok, &[CHAR_EOS]).unwrap();
-    assert!(accepts(&gf, WEATHER, WEATHER_OK));
+    assert_eq!(
+        tok.decode(&[u32::from(b'{'), u32::from(b'}')], true)
+            .unwrap(),
+        "{ }"
+    );
+    let err = GrammarFactory::from_tokenizer(&tok, &[CHAR_EOS]).err();
+    assert!(
+        matches!(&err, Some(EngineError::InvalidConfig(m)) if m.contains("unsupported")),
+        "{err:?}"
+    );
 }
 
 #[test]

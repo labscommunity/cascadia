@@ -264,13 +264,11 @@ impl GrammarFactory {
 }
 
 /// Whether decoding `tokenizer` only joins its token strings: a word-level
-/// vocab with a `Fuse` decoder or none.
+/// vocab with a `Fuse` decoder. Without a decoder `tokenizers` joins tokens
+/// with spaces, so that case is not concatenation.
 fn decodes_by_concatenation(tokenizer: &tokenizers::Tokenizer) -> bool {
     matches!(tokenizer.get_model(), ModelWrapper::WordLevel(_))
-        && matches!(
-            tokenizer.get_decoder(),
-            None | Some(DecoderWrapper::Fuse(_))
-        )
+        && matches!(tokenizer.get_decoder(), Some(DecoderWrapper::Fuse(_)))
 }
 
 /// Token environment for a tokenizer that decodes by concatenation.
