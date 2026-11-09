@@ -610,13 +610,19 @@ Schema limits (each is a 400 `invalid response_format: …`):
 | Limit | Value |
 |---|---|
 | Schema size (JSON without whitespace) | 64 KiB (65 536 bytes) |
-| Nesting depth of objects and arrays, also counted through `$ref`: each local `$ref` (`#/…`) adds one level and continues in its target, and a `$ref` back to an object on the current path (a recursive schema) stops there. The count is an upper bound: definitions that refer to each other in a loop count together, as if one path ran through all of them | 64 |
+| Nesting depth of objects and arrays | 64 |
+| Nesting depth counted the way the grammar converter (`ov-genai`'s, xgrammar) walks the schema, through `$ref`: each subschema it descends into (a property, `items`, an `anyOf` case, a `$ref`'s target) is one level below its parent. It enters each `$ref` (by its text) once: a `$ref` already entered, such as one back into a recursive definition, stops there, but a schema reached by plain nesting is walked again each time it is reached | 64 |
 | Any one `minItems`, `maxItems`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, or number in a `pattern` / `patternProperties` repetition quantifier (`{n}`, `{n,}`, `{n,m}`, `{,m}`) | 10 000 |
 | Sum of all those counts in one schema; a `minX`/`maxX` pair on one object counts once, at the larger value | 200 000 |
 
 Counts are taken everywhere in the schema, including inside `default` and
 `examples` (a `$ref` can point there). An object that repeats a key is
-rejected too.
+rejected too. A local `$ref` must be `#` or a plain JSON pointer into
+objects, `#/key/key…`: no empty segment (`//`, a trailing `/`), no `~`
+escape, no `%` encoding, no array index, and it must name an existing
+schema; otherwise the request gets `unsupported $ref "<ref>"`. A `$ref`
+that does not start with `#` is left to the backend. A schema whose walk
+would take the converter too long gets `… schema is too complex`.
 
 Errors (`{"error": "<message>"}`; on a stream, after the SSE stream has
 started, a failure is an error event `{"object":"error","error":{"message":
