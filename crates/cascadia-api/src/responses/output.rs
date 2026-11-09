@@ -360,23 +360,22 @@ impl OutputBuilder {
     }
 
     /// Tool calls a backend returned already parsed (a chat completion's
-    /// `tool_calls`), for a builder made with `tools_active: false`, whose
-    /// text is never scanned for calls. Ends the text: what the reasoning
-    /// split still holds is released, the open item closes `completed`, and
-    /// each call becomes a `function_call` (or `custom_tool_call`, or a
-    /// namespaced `function_call`, by the [`ToolMap`]) item as [`Self::finish`]
-    /// makes a parsed call; with `parallel: false` only the first call of the
-    /// response is kept. A [`Self::feed`] after it is ignored;
-    /// [`Self::finish`] still closes the response (and adds no item). No
-    /// calls: no events, and the text goes on.
+    /// `tool_calls`), normally for a builder made with `tools_active:
+    /// false`, whose text is never scanned for calls. Ends the text: what
+    /// the reasoning split still holds is released, the open item closes
+    /// `completed`, and each call becomes a `function_call` (or
+    /// `custom_tool_call`, or a namespaced `function_call`, by the
+    /// [`ToolMap`]) item as [`Self::finish`] makes a parsed call; with
+    /// `parallel: false` only the first call of the response is kept. A
+    /// [`Self::feed`] after it is ignored; [`Self::finish`] still closes the
+    /// response (and adds no item). No calls: no events, and the text goes
+    /// on.
     ///
-    /// Debug builds panic when the builder was made with `tools_active:
-    /// true`: its text would be scanned for calls as well.
+    /// With `tools_active: true` the pushed calls stop the text scan for
+    /// the rest of the turn: text the scan still holds is released as
+    /// message text and a call written in it is dropped, so the response's
+    /// calls are exactly the pushed ones.
     pub fn push_calls(&mut self, calls: Vec<ToolCall>) -> Vec<OutputEvent> {
-        debug_assert!(
-            !self.tools_active,
-            "push_calls needs a builder made with tools_active: false"
-        );
         let mut ev = Vec::new();
         if calls.is_empty() {
             return ev;
@@ -385,6 +384,21 @@ impl OutputBuilder {
         let segs = self.split.finish();
         self.count(0, &segs, 0);
         self.route(segs, &mut ev);
+        // Taking the splitter is what keeps `finish` from parsing the text
+        // as well: one source of calls per turn, the backend's.
+        if let Some(mut t) = self.tools.take() {
+            let rest = match t.finish("") {
+                ToolStreamEnd::Content(c) => c.to_owned(),
+                ToolStreamEnd::ToolCalls { content, calls: c } => {
+                    tracing::debug!(
+                        dropped = c.len(),
+                        "responses: calls in the text beside pushed calls; dropped"
+                    );
+                    content.to_owned()
+                }
+            };
+            self.message_text(&rest, &mut ev);
+        }
         // Reasoning still open (`</think>` never came) closes with the text.
         self.held.clear();
         if self.open.is_some() {
@@ -1319,12 +1333,30 @@ mod tests {
         assert_eq!(text_of(&items[0]), "before");
     }
 
-    /// Structured calls are for a builder that does not parse calls.
+    /// Pushed calls on a builder that also parses text calls are the
+    /// response's calls: a call written in the text before them is not
+    /// parsed at `finish`, so it neither duplicates them (parallel on) nor
+    /// replaces them (parallel off).
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "tools_active")]
-    fn pushed_calls_need_inactive_tools() {
-        let mut b = with_tools(false, weather(), true);
-        b.push_calls(vec![structured("call_1", "get_weather", "{}")]);
+    fn pushed_calls_stop_the_text_scan() {
+        for parallel in [true, false] {
+            let mut b = with_tools(false, weather(), parallel);
+            b.feed("before ", 1);
+            b.feed(&call("get_weather", r#"{"city": "Text"}"#), 1);
+            b.push_calls(vec![structured(
+                "call_pushed",
+                "get_weather",
+                r#"{"city": "Pushed"}"#,
+            )]);
+            b.finish("completed");
+            let items = b.items();
+            let calls: Vec<_> = items
+                .iter()
+                .filter(|i| i["type"] == "function_call")
+                .collect();
+            assert_eq!(calls.len(), 1, "parallel {parallel}: {items:?}");
+            assert_eq!(calls[0]["call_id"], "call_pushed");
+            assert_eq!(calls[0]["arguments"], r#"{"city": "Pushed"}"#);
+        }
     }
 }

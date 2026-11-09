@@ -188,6 +188,7 @@ impl Refusal {
         &self.param
     }
 
+    /// The human-readable `message` of the error body.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -412,6 +413,7 @@ impl ResponseShell {
         }
     }
 
+    /// The response id (`resp_…`) the shell was made with.
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -620,6 +622,12 @@ pub fn is_empty_conversation(messages: &[ChatMessage]) -> bool {
 }
 
 /// A request checked and mapped onto the chat path.
+///
+/// Hosted tools the mapping cannot serve (`web_search`, `file_search` and
+/// the like) are not refused: they are dropped from the chat request and
+/// listed, each type once, in `tools.dropped`. The caller sees no error
+/// for them, so a server embedding the mapping should log that list, as
+/// `/v1/responses` warns about it.
 #[derive(Debug)]
 pub struct Mapped {
     /// `include` asks for reasoning items' `encrypted_content`.
@@ -757,10 +765,12 @@ pub struct ResponseEvents {
 }
 
 impl ResponseEvents {
+    /// A stream for the response `shell` describes, numbered from 0.
     pub fn new(shell: ResponseShell) -> Self {
         Self { shell, sequence: 0 }
     }
 
+    /// The response fields every rendered snapshot carries.
     pub fn shell(&self) -> &ResponseShell {
         &self.shell
     }

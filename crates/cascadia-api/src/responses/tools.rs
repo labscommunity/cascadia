@@ -30,6 +30,7 @@ pub enum Served {
 /// A tool the chat template sees, by its flattened name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedTool {
+    /// What a call to it becomes in the output.
     pub kind: Served,
     /// The name the caller gave it (inside its namespace, if any).
     pub name: String,

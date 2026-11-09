@@ -275,19 +275,45 @@ fn merge(into: &mut ChatMessage, next: ChatMessage) {
 /// (and of its first part, when the turn has parts), for a backend whose
 /// template cannot take replayed reasoning. Other turns, and an assistant
 /// turn without the prefix, are left as they are.
+///
+/// A turn with parts carries the prefix as its first part exactly as it
+/// was written, so it strips whole even when the reasoning contains
+/// `</think>`, and `content` and `parts` still agree. A string-form turn
+/// has no such record: its prefix ends at the last `</think>`, which is
+/// exact unless the answer itself contains `</think>`.
 pub fn strip_replayed_reasoning(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
     messages
         .into_iter()
         .map(|mut m| {
-            if m.role != "assistant" || !m.content.starts_with("<think>") {
+            if m.role != "assistant" || !m.content.starts_with(OPEN) {
                 return m;
             }
-            let Some(end) = m.content.find("</think>").map(|at| at + "</think>".len()) else {
+            let end = if m.parts.is_empty() {
+                // Calls-only turns (the common string case) have no answer,
+                // so the last close tag is the prefix's even when the
+                // reasoning holds one too.
+                m.content.rfind(CLOSE).map(|at| at + CLOSE.len())
+            } else {
+                // `flush` wrote the prefix as the first part; without that
+                // part the content's `<think>` is the answer's own.
+                match m.parts.first() {
+                    Some(ContentPart::Text(t))
+                        if t.starts_with(OPEN)
+                            && t.ends_with(CLOSE)
+                            && m.content.starts_with(t.as_str()) =>
+                    {
+                        Some(t.len())
+                    }
+                    _ => None,
+                }
+            };
+            let Some(end) = end else {
                 return m;
             };
-            let prefix = m.content[..end].to_owned();
             m.content.replace_range(..end, "");
-            if matches!(m.parts.first(), Some(ContentPart::Text(t)) if *t == prefix) {
+            if !m.parts.is_empty() {
                 m.parts.remove(0);
             }
             m
@@ -887,6 +913,49 @@ mod tests {
         assert_eq!(m[0].content, "<think>r</think>x");
         assert_eq!(m[0].parts[0], ContentPart::Text("<think>r</think>".into()));
         assert_eq!(m[0].parts[1], ContentPart::Text("x".into()));
+    }
+
+    /// The text parts of `m` back to back, as `content` is built from them.
+    fn parts_text(m: &ChatMessage) -> String {
+        m.parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Text(t) => t.as_str(),
+                _ => "",
+            })
+            .collect()
+    }
+
+    /// Reasoning that itself contains `</think>` strips whole, from the
+    /// content and the first part alike, so the two still agree.
+    #[test]
+    fn strip_takes_reasoning_with_a_close_tag_whole() {
+        let m = walk(json!([rs("a</think>b"), {"role": "assistant", "content": [
+            {"type": "output_text", "text": "x", "annotations": []}]}]))
+        .unwrap();
+        assert_eq!(m[0].content, "<think>a</think>b</think>x");
+        let m = strip_replayed_reasoning(m);
+        assert_eq!(m[0].content, "x");
+        assert_eq!(m[0].parts, [ContentPart::Text("x".into())]);
+        assert_eq!(parts_text(&m[0]), m[0].content);
+
+        let m = walk(json!([rs("a</think>b"), fc("A")])).unwrap();
+        assert!(m[0].parts.is_empty());
+        let m = strip_replayed_reasoning(m);
+        assert_eq!(m[0].content, "");
+        assert_eq!(m[0].tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    /// An array-form turn whose first part is not a replayed prefix keeps
+    /// its content and parts, even when its text opens with `<think>`.
+    #[test]
+    fn strip_leaves_an_unreplayed_array_turn() {
+        let m = walk(json!([{"role": "assistant", "content": [
+            {"type": "output_text", "text": "<think>own</think>x", "annotations": []}]}]))
+        .unwrap();
+        let before = (m[0].content.clone(), m[0].parts.clone());
+        let m = strip_replayed_reasoning(m);
+        assert_eq!((m[0].content.clone(), m[0].parts.clone()), before);
     }
 
     /// A reasoning item with no renderable text is skipped: it neither

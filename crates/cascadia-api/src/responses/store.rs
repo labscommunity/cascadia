@@ -1,4 +1,4 @@
-//! The item cache behind `store` and `item_reference` .
+//! The item cache behind `store` and `item_reference`.
 //!
 //! The output items of every response whose `store` is not `false` are kept
 //! here, in memory only, so a later request's `item_reference` resolves: the
