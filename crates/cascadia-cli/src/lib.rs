@@ -67,6 +67,12 @@ fn structured_output_for(kind: EngineKind) -> bool {
     )
 }
 
+/// Whether `kind` constrains output with OpenVINO GenAI's xgrammar backend,
+/// whose unenforced schema keywords the API logs per request.
+fn xgrammar_keyword_log_for(kind: EngineKind) -> bool {
+    matches!(kind, EngineKind::OvGenai)
+}
+
 /// Measure round-trip time to a peer via a 1 s-timeout TCP connect.
 /// Returns `None` if the peer is unreachable or the connect timed out.
 /// The connect handshake gives the best low-overhead RTT signal we can
@@ -2586,6 +2592,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
         cfg.structured_output = structured_output_for(args.engine);
         cfg.engine_name = engine_name(args.engine).to_string();
+        cfg.xgrammar_keyword_log = xgrammar_keyword_log_for(args.engine);
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
         // once, so a client that sends that many requests at once needs the
@@ -3828,6 +3835,22 @@ mod tests {
             EngineKind::SparseMoe,
         ] {
             assert!(!structured_output_for(kind), "{}", engine_name(kind));
+        }
+    }
+
+    #[test]
+    fn xgrammar_keyword_log_only_for_ov_genai() {
+        assert!(xgrammar_keyword_log_for(EngineKind::OvGenai));
+        for kind in [
+            EngineKind::Mock,
+            EngineKind::SyclLlama,
+            EngineKind::OvDistSpec,
+            EngineKind::Qwen36Moe,
+            EngineKind::Gemma4,
+            EngineKind::OvRuntime,
+            EngineKind::SparseMoe,
+        ] {
+            assert!(!xgrammar_keyword_log_for(kind), "{}", engine_name(kind));
         }
     }
 

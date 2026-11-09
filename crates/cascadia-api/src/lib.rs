@@ -156,6 +156,9 @@ pub struct AppState {
     pub structured_output: bool,
     /// The engine's name, for error messages. Empty when unknown.
     pub engine_name: String,
+    /// The engine constrains output with OpenVINO GenAI's xgrammar backend:
+    /// log the schema keywords that backend does not enforce.
+    pub xgrammar_keyword_log: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -181,6 +184,8 @@ pub struct Config {
     pub structured_output: bool,
     /// See [`AppState::engine_name`].
     pub engine_name: String,
+    /// See [`AppState::xgrammar_keyword_log`]. Set by the CLI for ov-genai.
+    pub xgrammar_keyword_log: bool,
 }
 
 impl Default for Config {
@@ -195,6 +200,7 @@ impl Default for Config {
             marker_dialect: None,
             structured_output: false,
             engine_name: String::new(),
+            xgrammar_keyword_log: false,
         }
     }
 }
@@ -531,6 +537,7 @@ pub fn make_router_with_stats(
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         structured_output: cfg.structured_output,
         engine_name: cfg.engine_name.clone(),
+        xgrammar_keyword_log: cfg.xgrammar_keyword_log,
     };
     let state = AppState {
         effort_words: state
@@ -2449,6 +2456,22 @@ pub fn render_chat_prompt(
     ChatPromptRenderer::new(cfg).render(messages)
 }
 
+/// The schema keywords to log as unenforced for a constrained task. Only
+/// OpenVINO GenAI's xgrammar backend leaves these keywords unenforced, so
+/// other engines log nothing.
+fn keywords_to_log(
+    xgrammar_keyword_log: bool,
+    constrained: bool,
+    rf: &ResponseFormat,
+) -> Vec<&'static str> {
+    match rf {
+        ResponseFormat::JsonSchema { schema, .. } if xgrammar_keyword_log && constrained => {
+            unenforced_keywords(schema)
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The engine-side structured turns from a chat request: tool fields travel
 /// as the OpenAI wire JSON a downstream chat server (llama-server's jinja)
 /// expects verbatim.
@@ -2687,16 +2710,17 @@ async fn chat_completions(
         resume_token_ids: None,
         grammar,
     };
-    if let (Some(_), ResponseFormat::JsonSchema { schema, .. }) = (&task.grammar, &response_format)
-    {
-        let keywords = unenforced_keywords(schema);
-        if !keywords.is_empty() {
-            info!(
-                task = %task_id,
-                keywords = ?keywords,
-                "response_format schema uses keywords the output constraint does not enforce"
-            );
-        }
+    let keywords = keywords_to_log(
+        state.xgrammar_keyword_log,
+        task.grammar.is_some(),
+        &response_format,
+    );
+    if !keywords.is_empty() {
+        info!(
+            task = %task_id,
+            keywords = ?keywords,
+            "response_format schema uses keywords the output constraint does not enforce"
+        );
     }
     if json && tools_callable {
         info!(
@@ -8073,6 +8097,29 @@ level={{ effort_map[eff] }}";
         assert_eq!(results[0].1, results[1].1, "captured tasks differ");
         assert_eq!(results[0].0, results[1].0, "response bodies differ");
         assert!(results[0].1.enable_thinking);
+    }
+
+    /// A schema with a keyword (`uniqueItems`) that xgrammar does not
+    /// enforce.
+    fn schema_with_unenforced_keyword() -> ResponseFormat {
+        parse_response_format(Some(
+            r#"{"type":"json_schema","json_schema":{"name":"t","schema":{"type":"array","uniqueItems":true}}}"#,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn unenforced_keywords_are_logged_only_for_xgrammar_engines() {
+        let rf = schema_with_unenforced_keyword();
+        assert_eq!(keywords_to_log(true, true, &rf), vec!["uniqueItems"]);
+        assert!(keywords_to_log(false, true, &rf).is_empty());
+        assert!(keywords_to_log(true, false, &rf).is_empty());
+        assert!(keywords_to_log(true, true, &ResponseFormat::JsonObject).is_empty());
+    }
+
+    #[test]
+    fn xgrammar_keyword_log_defaults_off() {
+        assert!(!Config::default().xgrammar_keyword_log);
     }
 
     #[tokio::test]
