@@ -497,6 +497,20 @@ fn version_gate(v: Result<cascadia_ov_genai_shim::OvVersion, OvError>) -> Option
     })
 }
 
+/// The stateful engine's finish reason. GenAI does not report one, so it is
+/// inferred: `length` when either the tokenizer's count of the decoded text
+/// or the generated-token count reaches the cap, else `stop`. Re-tokenising
+/// can undercount badly (a long run of newlines merges into a few tokens),
+/// so the generated count is consulted too; it is 0 when the backend's
+/// performance metrics are unavailable, which leaves the tokenizer to decide.
+fn stateful_finish(tokenizer_count: u32, generated: u32, max_new: u32) -> FinishReason {
+    if tokenizer_count >= max_new || generated >= max_new {
+        FinishReason::Length
+    } else {
+        FinishReason::Stop
+    }
+}
+
 /// Log the probe's outcome and turn it into the engine's
 /// `structured_unavailable` value.
 fn record_probe(verdict: Option<String>) -> Option<String> {
@@ -700,7 +714,7 @@ impl Engine for OvGenaiEngine {
         if let Some(stripped) = text.strip_prefix(&task.prompt) {
             text = stripped.trim_start().to_string();
         }
-        // Prefer tokenizer-based count; fall back to perf_metrics value.
+        // Prefer tokenizer-based count for usage; fall back to perf_metrics value.
         let tokens = self
             .pipe
             .count_tokens(&text)
@@ -730,11 +744,7 @@ impl Engine for OvGenaiEngine {
         // so infer — reaching the token cap is `length`, anything short of it
         // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
         // exactly at the cap reports `length` (OpenAI is also ambiguous here).
-        let finish = if tokens >= max_new {
-            FinishReason::Length
-        } else {
-            FinishReason::Stop
-        };
+        let finish = stateful_finish(tokens, result.generated_tokens, max_new);
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
             .with_n_tokens(tokens)
             .with_finish_reason(finish);
@@ -2252,6 +2262,18 @@ mod tests {
             ))],
         ]);
         assert_eq!(e.structured_unavailable.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn stateful_finish_reports_length_when_either_count_hits_the_cap() {
+        // A whitespace run re-tokenises into far fewer tokens than were
+        // generated: the generated count still says the cap was reached.
+        assert_eq!(stateful_finish(100, 4096, 4096), FinishReason::Length);
+        assert_eq!(stateful_finish(4096, 4096, 4096), FinishReason::Length);
+        assert_eq!(stateful_finish(50, 50, 4096), FinishReason::Stop);
+        // No generated count (perf metrics unavailable): the tokenizer decides.
+        assert_eq!(stateful_finish(4096, 0, 4096), FinishReason::Length);
+        assert_eq!(stateful_finish(50, 0, 4096), FinishReason::Stop);
     }
 
     #[test]
