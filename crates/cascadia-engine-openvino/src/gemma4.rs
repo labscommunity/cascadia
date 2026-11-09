@@ -558,8 +558,9 @@ fn compile_task_grammar(
 
 /// Picks the token from the last row of a logits output. `mask` is passed
 /// only when that row picks the next generated token of a structured-output
-/// task; then the pick is the best token the grammar allows (an error when it
-/// allows none). `None` is the plain argmax. The engine calls
+/// task; then the pick is the best token the grammar allows (the lowest
+/// allowed one when every allowed logit is `-inf`/NaN; an error when it allows
+/// none). `None` is the plain argmax. The engine calls
 /// [`pick_tagged`], which also says how a failure is logged.
 #[cfg(test)]
 fn pick_next_token(
@@ -582,10 +583,9 @@ fn pick_tagged(
         return argmax_logits(logits, shape).map_err(|e| (e, None));
     };
     let vocab = logits_vocab(logits, shape).map_err(|e| (e, None))?;
-    let mut row = logits[logits.len() - vocab..].to_vec();
-    mask.apply(&mut row)
-        .map_err(|e| (e, Some(GrammarFailure::DeadEnd)))?;
-    Ok(argmax_last_row(&row, vocab))
+    mask.pick_greedy(&logits[logits.len() - vocab..])
+        .map(|t| t as i32)
+        .map_err(|e| (e, Some(GrammarFailure::DeadEnd)))
 }
 
 /// Runs the prefill spans of a `len`-token prefill in order (see
@@ -883,49 +883,24 @@ fn mask_words(mask: &mut GrammarMask, width: usize) -> EngineResult<Vec<u32>> {
             "grammar: the tokenizer vocabulary is empty".into(),
         ));
     }
-    let mut row = vec![0.0f32; width];
-    mask.apply(&mut row)?;
-    let mut words = vec![0u32; width.div_ceil(32)];
-    for (i, v) in row.iter().enumerate() {
-        if v.is_finite() {
-            words[i / 32] |= 1 << (i % 32);
-        }
-    }
-    Ok(words)
+    crate::structured::mask_words_over(mask, width)
 }
 
-/// Sets every token of `row` the mask words don't allow to `-inf` (tokens
-/// past the words too). `Err` when the words are wider than the row or allow
-/// nothing in it.
-fn apply_mask_words(row: &mut [f32], words: &[u32]) -> Result<(), String> {
-    if words.len() > row.len().div_ceil(32) {
-        return Err(format!(
-            "the mask covers {} tokens but this stage's logits row has {}",
-            words.len() * 32,
-            row.len()
-        ));
-    }
-    let mut any = false;
-    for (i, v) in row.iter_mut().enumerate() {
-        if (words.get(i / 32).copied().unwrap_or(0) >> (i % 32)) & 1 == 1 {
-            any = true;
-        } else {
-            *v = f32::NEG_INFINITY;
-        }
-    }
-    if any {
-        Ok(())
-    } else {
-        Err("the mask allows no token of this stage's logits row".into())
-    }
-}
-
-/// The tail's pick on a masked step: the best allowed token of the last row.
+/// The tail's pick on a masked step: the best token of the last row the mask
+/// words allow (tokens past the words never), the lowest allowed one when
+/// every allowed logit is `-inf`/NaN. `Err` when the words are wider than the
+/// row or allow nothing in it.
 fn tail_masked_pick(logits: &[f32], shape: &[usize], words: &[u32]) -> Result<i32, String> {
     let vocab = logits_vocab(logits, shape).map_err(|e| e.to_string())?;
-    let mut row = logits[logits.len() - vocab..].to_vec();
-    apply_mask_words(&mut row, words)?;
-    Ok(argmax_last_row(&row, vocab))
+    if words.len() > vocab.div_ceil(32) {
+        return Err(format!(
+            "the mask covers {} tokens but this stage's logits row has {vocab}",
+            words.len() * 32,
+        ));
+    }
+    cascadia_grammar::argmax_allowed(&logits[logits.len() - vocab..], words)
+        .map(|t| t as i32)
+        .ok_or_else(|| "the mask allows no token of this stage's logits row".into())
 }
 
 /// A token reply from downstream.
@@ -4125,6 +4100,38 @@ mod tests {
         let mut m = start_grammar(&ok_grammar(), &[]).unwrap();
         let _ = m.accept(BAD as u32);
         assert!(mask_words(&mut m, width).is_err());
+    }
+
+    /// The head's encoder reads the allowed set from the matcher, not from
+    /// `apply` on a zero row; the words are unchanged.
+    #[test]
+    fn the_head_mask_equals_the_apply_readback() {
+        let width = GrammarFactory::single_byte_for_tests().mask_width();
+        for done in ["", "\"", "\"o", "\"ok\""] {
+            let mut m = start_grammar(&ok_grammar(), &seed(done)).unwrap();
+            let want = crate::structured::words_via_apply(&mut m, width).unwrap();
+            assert_eq!(mask_words(&mut m, width).unwrap(), want, "after {done:?}");
+        }
+    }
+
+    /// An all `-inf` (or NaN) row whose last index is the disallowed EOS:
+    /// the head's and the tail's picks are the lowest allowed token.
+    #[test]
+    fn an_all_neg_inf_row_never_picks_a_disallowed_eos() {
+        let width = GrammarFactory::single_byte_for_tests().mask_width();
+        let eos = width as u32 - 1;
+        let shape = [1, 1, width];
+        let mut m = start_grammar(&ok_grammar(), &[]).unwrap();
+        assert!(!m.allowed(eos));
+        let words = mask_words(&mut m, width).unwrap();
+        for fill in [f32::NEG_INFINITY, f32::NAN] {
+            let row = vec![fill; width];
+            assert_eq!(
+                pick_next_token(&row, &shape, Some(&mut m)).unwrap(),
+                b'"' as i32
+            );
+            assert_eq!(tail_masked_pick(&row, &shape, &words).unwrap(), b'"' as i32);
+        }
     }
 
     #[test]
