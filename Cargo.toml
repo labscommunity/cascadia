@@ -11,6 +11,7 @@ members = [
     "crates/cascadia-engine-openvino",
     "crates/cascadia-engine-sparse-moe",
     "crates/cascadia-engine-llamacpp",
+    "crates/cascadia-grammar",
     "crates/cascadia-int4-gemm",
     "crates/cascadia-metrics",
     "crates/cascadia-runner",
@@ -42,6 +43,7 @@ cascadia-ov-genai-shim = { path = "crates/cascadia-ov-genai-shim" }
 cascadia-engine-openvino = { path = "crates/cascadia-engine-openvino" }
 cascadia-engine-sparse-moe = { path = "crates/cascadia-engine-sparse-moe" }
 cascadia-engine-llamacpp = { path = "crates/cascadia-engine-llamacpp" }
+cascadia-grammar = { path = "crates/cascadia-grammar" }
 cascadia-int4-gemm = { path = "crates/cascadia-int4-gemm" }
 cascadia-metrics = { path = "crates/cascadia-metrics" }
 cascadia-runner = { path = "crates/cascadia-runner" }

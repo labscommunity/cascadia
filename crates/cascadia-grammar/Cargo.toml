@@ -1,0 +1,17 @@
+[package]
+name = "cascadia-grammar"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Token masks that keep a model's output inside a JSON Schema (llguidance)."
+
+[dependencies]
+cascadia-types = { workspace = true }
+cascadia-engine = { workspace = true }
+llguidance = "1.9.1"
+toktrie_hf_tokenizers = "1.9.1"
+tokenizers = { workspace = true }
+serde_json = { workspace = true }
