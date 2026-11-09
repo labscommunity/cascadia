@@ -18,8 +18,9 @@ use std::sync::Arc;
 use cascadia_engine::{EngineError, EngineResult};
 use cascadia_types::{GrammarKind, GrammarSpec};
 use llguidance::api::{StopReason, TopLevelGrammar};
-use llguidance::toktrie::{SimpleVob, TokEnv};
+use llguidance::toktrie::{SimpleVob, TokEnv, TokRxInfo, TokTrie, TokenizerEnv};
 use llguidance::{Matcher, ParserFactory};
+use tokenizers::{DecoderWrapper, ModelWrapper};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
 /// What a structured-output request fails with when a later pipeline stage
@@ -68,12 +69,22 @@ impl GrammarFactory {
     /// `eos` is every token id the engine stops on. Ids outside the tokenizer
     /// vocab are dropped; if none remains this fails, because a grammar that
     /// can't emit EOS can't end.
+    ///
+    /// Byte-level and byte-fallback BPE tokenizers are supported, and a
+    /// word-level vocab whose decoder only joins the token strings (`Fuse`
+    /// or none); any other tokenizer is `InvalidConfig`.
     pub fn from_tokenizer(tokenizer: &tokenizers::Tokenizer, eos: &[u32]) -> EngineResult<Self> {
-        let mut bt = ByteTokenizer::from_tokenizer(tokenizer.clone()).map_err(|e| {
-            EngineError::InvalidConfig(clean_message(&format!(
-                "tokenizer unsupported for structured output: {e}"
-            )))
-        })?;
+        let mut bt = match ByteTokenizer::from_tokenizer(tokenizer.clone()) {
+            Ok(bt) => bt,
+            Err(_) if decodes_by_concatenation(tokenizer) => {
+                return Self::from_concatenating_tokenizer(tokenizer, eos);
+            }
+            Err(e) => {
+                return Err(EngineError::InvalidConfig(clean_message(&format!(
+                    "tokenizer unsupported for structured output: {e}"
+                ))));
+            }
+        };
         let vocab = bt.tokrx_info().vocab_size;
         let eos: Vec<u32> = eos.iter().copied().filter(|&t| t < vocab).collect();
         if eos.is_empty() {
@@ -84,6 +95,50 @@ impl GrammarFactory {
         }
         bt.set_eos_tokens(&eos);
         let tok_env = bt.into_tok_env(None).map_err(backend)?;
+        Self::from_tok_env(tok_env, eos.into())
+    }
+
+    /// A tokenizer whose decoded text is its token strings joined: token
+    /// `t`'s bytes are the UTF-8 of its vocab string. Special added tokens
+    /// are marked special, so the grammar never puts them inside the JSON.
+    fn from_concatenating_tokenizer(
+        tokenizer: &tokenizers::Tokenizer,
+        eos: &[u32],
+    ) -> EngineResult<Self> {
+        let vocab = tokenizer.get_vocab_size(true) as u32;
+        let eos: Vec<u32> = eos.iter().copied().filter(|&t| t < vocab).collect();
+        let Some(&first_eos) = eos.first() else {
+            return Err(EngineError::InvalidConfig(
+                "structured output needs an end-of-sequence token inside the tokenizer vocab"
+                    .into(),
+            ));
+        };
+        let specials: std::collections::HashSet<u32> = tokenizer
+            .get_added_tokens_decoder()
+            .into_iter()
+            .filter(|(_, t)| t.special)
+            .map(|(id, _)| id)
+            .collect();
+        let words: Vec<Vec<u8>> = (0..vocab)
+            .map(|id| match tokenizer.id_to_token(id) {
+                Some(s) if specials.contains(&id) => {
+                    let mut b = vec![TokTrie::SPECIAL_TOKEN_MARKER];
+                    b.extend_from_slice(s.as_bytes());
+                    b
+                }
+                Some(s) => s.into_bytes(),
+                None => Vec::new(),
+            })
+            .collect();
+        let info = TokRxInfo::new(vocab, first_eos);
+        let mut trie = TokTrie::from(&info, &words);
+        if eos.len() > 1 {
+            trie = trie.with_eos_tokens(&eos);
+        }
+        let tok_env: TokEnv = Arc::new(ConcatenatingTokEnv {
+            tokenizer: tokenizer.clone(),
+            trie,
+        });
         Self::from_tok_env(tok_env, eos.into())
     }
 
@@ -204,6 +259,49 @@ impl GrammarFactory {
             warnings: warnings.into(),
             mask_width: self.mask_width,
             eos: self.eos.clone(),
+        })
+    }
+}
+
+/// Whether decoding `tokenizer` only joins its token strings: a word-level
+/// vocab with a `Fuse` decoder or none.
+fn decodes_by_concatenation(tokenizer: &tokenizers::Tokenizer) -> bool {
+    matches!(tokenizer.get_model(), ModelWrapper::WordLevel(_))
+        && matches!(
+            tokenizer.get_decoder(),
+            None | Some(DecoderWrapper::Fuse(_))
+        )
+}
+
+/// Token environment for a tokenizer that decodes by concatenation.
+struct ConcatenatingTokEnv {
+    tokenizer: tokenizers::Tokenizer,
+    trie: TokTrie,
+}
+
+impl ConcatenatingTokEnv {
+    fn encode(&self, s: &str) -> Vec<u32> {
+        match self.tokenizer.encode(s, false) {
+            Ok(enc) => enc.get_ids().to_vec(),
+            // Text the tokenizer can't encode: the trie's greedy split.
+            Err(_) => self.trie.greedy_tokenize(s.as_bytes()),
+        }
+    }
+}
+
+impl TokenizerEnv for ConcatenatingTokEnv {
+    fn tok_trie(&self) -> &TokTrie {
+        &self.trie
+    }
+
+    fn tokenize_bytes(&self, s: &[u8]) -> Vec<u32> {
+        self.trie
+            .tokenize_with_greedy_fallback(s, |s| self.encode(s))
+    }
+
+    fn tokenize_bytes_special(&self, s: &[u8]) -> Vec<u32> {
+        self.trie.tokenize_with_greedy_fallback(s, |s| {
+            self.trie.tokenize_with_special(s, |s| self.encode(s))
         })
     }
 }

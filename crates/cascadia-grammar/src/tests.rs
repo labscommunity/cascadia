@@ -826,3 +826,81 @@ fn word_wise_argmax_matches_bit_by_bit() {
         );
     }
 }
+
+// ---- a word-level tokenizer: one token per character, decoded by concatenation ----
+
+/// Token `b` is the character U+00`b` (0..=255); `</s>` is the added EOS.
+const CHAR_EOS: u32 = 256;
+
+/// A word-level character vocab split one character per token, with a
+/// `decoder` of `decoder` (`Fuse`: decoding concatenates the token strings).
+fn char_word_level(decoder: serde_json::Value) -> tokenizers::Tokenizer {
+    let mut vocab = serde_json::Map::new();
+    for b in 0..=255u8 {
+        vocab.insert(char::from(b).to_string(), u32::from(b).into());
+    }
+    let json = serde_json::json!({
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [{"id": CHAR_EOS, "content": "</s>", "single_word": false,
+            "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Split", "pattern": {"Regex": "."},
+            "behavior": "Isolated", "invert": false},
+        "post_processor": null,
+        "decoder": decoder,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "\u{0}"},
+    });
+    tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap()
+}
+
+#[test]
+fn word_level_char_tokenizer_with_a_fuse_decoder_builds_and_masks() {
+    let tok = char_word_level(serde_json::json!({"type": "Fuse"}));
+    let gf = GrammarFactory::from_tokenizer(&tok, &[CHAR_EOS]).unwrap();
+    assert_eq!(gf.mask_width(), CHAR_EOS as usize + 1);
+    assert!(accepts(&gf, WEATHER, WEATHER_OK));
+    // Without json.dumps separators, off the enum, or an extra key: rejected.
+    assert!(!accepts_raw(&gf, WEATHER, WEATHER_OK));
+    assert!(!accepts(
+        &gf,
+        WEATHER,
+        r#"{"city":"Paris","temperature_celsius":18,"conditions":"snowy"}"#
+    ));
+    assert!(!accepts(
+        &gf,
+        WEATHER,
+        r#"{"city":"Paris","temperature_celsius":"warm","conditions":"sunny"}"#
+    ));
+
+    // EOS only once the object is closed; the special token never inside it.
+    let mut gm = mask_for(&gf, WEATHER);
+    let doc = bytes(WEATHER_OK);
+    walk(&gf, &mut gm, &doc[..doc.len() - 1]).unwrap();
+    assert_eq!(
+        masked_row(&gf, &mut gm)[CHAR_EOS as usize],
+        f32::NEG_INFINITY
+    );
+    walk(&gf, &mut gm, &doc[doc.len() - 1..]).unwrap();
+    assert!(gm.finished());
+    assert!(masked_row(&gf, &mut gm)[CHAR_EOS as usize].is_finite());
+}
+
+#[test]
+fn word_level_without_a_decoder_builds() {
+    let tok = char_word_level(serde_json::Value::Null);
+    let gf = GrammarFactory::from_tokenizer(&tok, &[CHAR_EOS]).unwrap();
+    assert!(accepts(&gf, WEATHER, WEATHER_OK));
+}
+
+#[test]
+fn word_level_with_a_decoder_that_rewrites_tokens_is_still_unsupported() {
+    let tok = char_word_level(
+        serde_json::json!({"type": "Metaspace", "replacement": "\u{2581}",
+        "prepend_scheme": "always", "split": true}),
+    );
+    let err = GrammarFactory::from_tokenizer(&tok, &[CHAR_EOS]).err();
+    assert!(
+        matches!(&err, Some(EngineError::InvalidConfig(m)) if m.contains("unsupported")),
+        "{err:?}"
+    );
+}
