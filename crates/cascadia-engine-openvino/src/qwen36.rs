@@ -1333,6 +1333,34 @@ impl Qwen36Engine {
     /// it the API layer falls back to its `"stop"` default, so a turn cut off
     /// at `max_tokens` (or at the context window, which admission folds into
     /// `max_tokens`) was indistinguishable from a natural EOS.
+    /// `next` completed the JSON: emit it and end with `stop` now, without
+    /// the forward that would only compute a token nothing can follow.
+    /// `next` is counted for the text but not kept in `gen_ids`: the model
+    /// never ran on it, so a KV capture keyed by `gen_ids` must not
+    /// include it.
+    fn finish_on_last_token(&mut self, task_id: &TaskId, next: u32) -> Vec<(TaskId, Chunk)> {
+        let Some(t) = self.active.as_mut() else {
+            return Vec::new();
+        };
+        t.gen_ids.push(next);
+        let full = self
+            .tokenizer
+            .as_ref()
+            .map(|tok| tok.decode(t.gen_ids.as_slice(), true).unwrap_or_default())
+            .unwrap_or_default();
+        t.gen_ids.pop();
+        let (delta, reanchored) = advance_emitted(&mut t.emitted, full.as_bytes(), true);
+        if reanchored {
+            warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
+        }
+        let mut out = vec![(
+            task_id.clone(),
+            Chunk::token(task_id.clone(), next as i64, delta).with_token_ids(vec![next as i64]),
+        )];
+        out.extend(self.finalize(FinishReason::Stop));
+        out
+    }
+
     fn finalize(&mut self, reason: FinishReason) -> Vec<(TaskId, Chunk)> {
         let Some(t) = self.active.take() else {
             return Vec::new();
@@ -2094,6 +2122,9 @@ impl Qwen36Engine {
             if let Some(Err(e)) = t.grammar.as_mut().map(|m| m.accept(next)) {
                 warn!(task = %task_id, error = %e, "structured output decode failed");
                 return self.finalize_error(format!("structured output failed: {e}"));
+            }
+            if t.grammar.as_ref().is_some_and(GrammarMask::finished) {
+                return self.finish_on_last_token(&task_id, next);
             }
             let step = t.step;
             let res = self.step_wire_mask(true).and_then(|mask| {
@@ -2934,6 +2965,9 @@ impl Qwen36Engine {
             if let Some(Err(e)) = t.grammar.as_mut().map(|m| m.accept(next)) {
                 warn!(task = %task_id, error = %e, "structured output decode failed");
                 return self.finalize_error(format!("structured output failed: {e}"));
+            }
+            if t.grammar.as_ref().is_some_and(GrammarMask::finished) {
+                return self.finish_on_last_token(&task_id, next);
             }
             let step = t.step;
             match self.run_span(&[next], step) {
@@ -4202,6 +4236,40 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].1.is_final);
         assert!(out[0].1.error.is_some(), "{:?}", out[0].1);
+        assert!(e.active.is_none());
+    }
+
+    /// The token that completes the JSON ends the task with `stop` in the
+    /// same step: no forward runs for a token that can't be used. The bare
+    /// engine has no model, so a forward would fail the task.
+    fn assert_finished_without_a_forward(out: &[(TaskId, Chunk)]) {
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].1.token_ids, vec![b'"' as i64]);
+        assert!(!out[0].1.is_final);
+        assert!(out[1].1.is_final);
+        assert_eq!(out[1].1.finish_reason, Some(FinishReason::Stop));
+        assert!(out[1].1.error.is_none(), "{:?}", out[1].1);
+    }
+
+    #[test]
+    fn single_box_stops_on_the_token_that_completes_the_json() {
+        let mut e = bare_engine(1, "{}");
+        e.tokenizer = Some(tiny_tokenizer());
+        let logits = row(300, &[(BAD as u32, 10.0), (b'"' as u32, 5.0)]);
+        e.active = Some(grammar_task(OK_ENUM, "\"ok", 16, logits));
+        assert_finished_without_a_forward(&e.step_local());
+        assert!(e.active.is_none());
+    }
+
+    #[test]
+    fn pipeline_head_stops_on_the_token_that_completes_the_json() {
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.tokenizer = Some(tiny_tokenizer());
+        let mut t = grammar_task(OK_ENUM, "\"ok", 16, Vec::new());
+        t.next_token = Some(u32::from(b'"'));
+        e.active = Some(t);
+        assert_finished_without_a_forward(&e.step_pipe_first());
         assert!(e.active.is_none());
     }
 
