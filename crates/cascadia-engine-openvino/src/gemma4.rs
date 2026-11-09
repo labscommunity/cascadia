@@ -1043,12 +1043,22 @@ async fn wait_plain_reply(g: &mut ActivationClient, prefill: bool) -> EngineResu
 
 /// Reads and discards replies that already arrived (late answers to an
 /// earlier masked step) before a masked step is sent; true when one of them
-/// was acknowledged.
+/// was acknowledged. It doesn't wait for one: one yield lets the I/O driver
+/// record bytes already on the socket, then a reply is read only while the
+/// link shows a frame starting (a peek, which consumes nothing). A
+/// zero-time read instead would cost a timer tick (about a millisecond) on
+/// every masked step, and miss bytes the driver hasn't recorded yet.
 async fn drain_late_replies(g: &mut ActivationClient) -> EngineResult<bool> {
     let mut late_ack = false;
+    tokio::task::yield_now().await;
     loop {
-        match g.recv_token(Duration::from_millis(1)).await {
-            Err(cascadia_transport::TransportError::FrameStartTimeout(_)) => return Ok(late_ack),
+        match futures::FutureExt::now_or_never(g.wait_readable()) {
+            None => return Ok(late_ack),
+            Some(Err(e)) => return Err(EngineError::Backend(e.to_string())),
+            Some(Ok(())) => {}
+        }
+        // A frame has started: its bytes are there or on their way.
+        match g.recv_token(LATE_REPLY_FRAME_START).await {
             Err(e) => return Err(EngineError::Backend(e.to_string())),
             Ok((tensor, _)) => {
                 let reply = decode_stage_reply(&tensor);
@@ -1061,6 +1071,9 @@ async fn drain_late_replies(g: &mut ActivationClient) -> EngineResult<bool> {
         }
     }
 }
+
+/// Frame-start bound of a late reply whose first byte is already readable.
+const LATE_REPLY_FRAME_START: Duration = Duration::from_secs(1);
 
 /// How a masked step's wait ended.
 #[derive(Debug)]
@@ -4352,6 +4365,81 @@ mod tests {
             wait_plain_reply(&mut client, false).await.unwrap(),
             (17, false)
         );
+    }
+
+    /// The drain before a masked step doesn't wait: a reply that landed
+    /// while the stage computed is drained, and an empty link returns at once.
+    /// The thread sleeps instead of awaiting, so the I/O driver doesn't run
+    /// between send and drain (on the current-thread flavor only the drain's
+    /// own yield runs it).
+    async fn drain_sees_a_reply_sent_just_before() {
+        let (mut server, mut client) = link().await;
+        server
+            .send(&encode_masked_reply(StageReply::Token(34)))
+            .await
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(drain_late_replies(&mut client).await.unwrap());
+        let t = std::time::Instant::now();
+        assert!(!drain_late_replies(&mut client).await.unwrap());
+        assert!(
+            t.elapsed() < Duration::from_micros(900),
+            "{:?}",
+            t.elapsed()
+        );
+        server.send(&encode_token_reply(19)).await.unwrap();
+        assert_eq!(
+            wait_plain_reply(&mut client, false).await.unwrap(),
+            (19, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_drain_is_immediate_and_sees_a_reply_already_sent() {
+        drain_sees_a_reply_sent_just_before().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_drain_is_immediate_and_sees_a_reply_already_sent_multi_thread() {
+        drain_sees_a_reply_sent_just_before().await;
+    }
+
+    /// The engine's own context: `block_on` from a blocking thread, where the
+    /// yield can't run the driver and the runtime's workers record the
+    /// bytes. A late reply lands while the stage still computes (here 2 ms
+    /// before the drain); the drain sees it and an empty link costs no wait.
+    #[test]
+    fn the_drain_sees_a_reply_already_sent_from_a_blocking_thread() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut server, mut client) = rt.block_on(link());
+        let handle = rt.handle().clone();
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                handle.block_on(async {
+                    server
+                        .send(&encode_masked_reply(StageReply::Nack))
+                        .await
+                        .unwrap();
+                });
+                std::thread::sleep(Duration::from_millis(2));
+                handle.block_on(async {
+                    assert!(drain_late_replies(&mut client).await.unwrap());
+                    let t = std::time::Instant::now();
+                    assert!(!drain_late_replies(&mut client).await.unwrap());
+                    assert!(
+                        t.elapsed() < Duration::from_micros(900),
+                        "{:?}",
+                        t.elapsed()
+                    );
+                });
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     #[tokio::test]
