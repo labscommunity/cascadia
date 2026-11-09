@@ -1199,6 +1199,71 @@ fn the_masked_single_row_exchange_round_trips() {
     assert!(!masks.latch.is_set());
 }
 
+/// The SparseMoE / OvMoe head against a last stage on an older build (it
+/// skips a masked `Forward` it can't decode and never answers), driven step
+/// by step as those heads run it (their runners need model files): the
+/// json task's masked step times out with the upgrade error and latches,
+/// the socket stays, later json tasks are refused at once, and a later
+/// plain task on the same link (`Reset`, plain `Forward`) gets its token.
+#[test]
+fn a_masked_step_to_a_silent_old_tail_fails_then_a_plain_task_uses_the_link() {
+    use crate::dist::{recv_token_reply_with, send_forward, send_reset};
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let log = fixture_tail(&rt, srv, true);
+    let cfg = crate::sampling::SamplingConfig::default();
+    let mut masks = StageMasks::default();
+    let slot = GrammarSlot::from_factory(test_env::factory());
+
+    // The json task: Reset, then its first masked step.
+    assert_eq!(masks.refusal(), None);
+    rt.block_on(send_reset(&down)).unwrap();
+    let mut gm = test_env::mask(WEATHER);
+    let (cols, tag) = stage_mask_cols(&mut masks, &slot, &mut gm, 1).unwrap();
+    let err = rt
+        .block_on(masked_forward_exchange(
+            &down,
+            &masks,
+            0,
+            &cfg,
+            &[0.5; 4],
+            [1, 1, 4],
+            &cols,
+            tag,
+            Duration::from_millis(300),
+        ))
+        .unwrap_err();
+    assert!(err.contains("no reply within"), "{err}");
+    assert!(err.ends_with(UPGRADE_EVERY_STAGE), "{err}");
+    assert!(masks.latch.is_set());
+    assert_eq!(masks.refusal().as_deref(), Some(UPGRADE_EVERY_STAGE));
+
+    // A later plain task on the same link.
+    rt.block_on(send_reset(&down)).unwrap();
+    rt.block_on(send_forward(&down, 0, &cfg, &[0.5; 4], [1, 1, 4], true))
+        .unwrap();
+    let t = rt
+        .block_on(recv_token_reply_with(
+            &down,
+            Duration::from_secs(5),
+            Some(&masks.latch),
+        ))
+        .unwrap();
+    assert_eq!(t, i64::from(b'a'));
+    assert!(!log.died());
+    assert_eq!(
+        log.frames(),
+        vec![
+            (FrameKind::Reset, false),
+            (FrameKind::Forward, true),
+            (FrameKind::Reset, false),
+            (FrameKind::Forward, false),
+        ]
+    );
+    assert!(masks.latch.is_set(), "a plain reply proves nothing");
+}
+
 #[test]
 fn a_middle_takes_the_prefill_budget_only_for_the_first_sampled_step() {
     let mut sampled = false;
