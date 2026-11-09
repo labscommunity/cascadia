@@ -621,7 +621,8 @@ Counts are taken everywhere in the schema, including inside `default` and
 rejected too. A local `$ref` must be `#` or a plain JSON pointer into
 objects, `#/key/key…`: no empty segment (`//`, a trailing `/`), no `~`
 escape, no `%` encoding, no array index, and it must name an existing
-schema; otherwise the request gets `unsupported $ref "<ref>"`. A `$ref`
+schema (a JSON object or `true`/`false`, not a string, number or list such
+as `#/required`); otherwise the request gets `unsupported $ref "<ref>"`. A `$ref`
 that does not start with `#` is left to the backend. A schema whose walk
 would take the converter too long gets `… schema is too complex`.
 
