@@ -606,10 +606,10 @@ must run a build with structured-output support. If a later stage runs an
 older build, a JSON request fails (5xx) with `a later pipeline stage runs a
 build without structured-output support; upgrade every stage`; normal
 requests are unaffected. On `ov-runtime`, `gemma4` and `sparse-moe` the
-first such JSON request waits until its token deadline before failing, and
-a `--packed-slots` batch or a batch of `sparse-moe` streams that held it
-fails once; after that, JSON requests on that pipeline fail at once (the
-check runs again after 10 minutes). `qwen35` knows from its connection
+first such JSON request waits until its token deadline before failing
+(plain requests batched with it keep their tokens); after that, JSON
+requests on that pipeline fail at once (the check runs again after 10
+minutes). `qwen35` knows from its connection
 handshake and fails JSON requests at once. When deploying, upgrade every
 stage before relying on `response_format`.
 
