@@ -294,6 +294,19 @@ def case_cap(base):
     verdict("schema_cap_400", ok, f"HTTP {status}: {raw[:160]}")
 
 
+def case_ref_depth(base):
+    # A long $ref chain used to overflow the grammar converter's stack and kill the worker.
+    n = 2000
+    defs = {f"d{k}": {"$ref": f"#/$defs/d{k + 1}"} for k in range(n)}
+    defs[f"d{n}"] = {"type": "string"}
+    body = chat([{"role": "user", "content": "hi"}],
+                response_format=rf_schema({"$defs": defs, "$ref": "#/$defs/d0"}), max_tokens=8)
+    status, raw, _ = post(base, body)
+    verdict("ref_depth_400", status == 400 and "through $ref" in raw, f"HTTP {status}: {raw[:160]}")
+    status, raw, dt = post(base, chat([{"role": "user", "content": "Say hello."}], max_tokens=8))
+    verdict("server_alive_after_ref_depth", status == 200, f"HTTP {status} {dt:.2f}s")
+
+
 def case_text(base):
     body = chat(
         [{"role": "user", "content": "Say hello."}],
@@ -364,6 +377,7 @@ CASES = {
     "malformed": case_malformed,
     "bad_schema": case_bad_schema,
     "cap": case_cap,
+    "ref_depth": case_ref_depth,
     "text": case_text,
     "tools": case_tools,
 }
