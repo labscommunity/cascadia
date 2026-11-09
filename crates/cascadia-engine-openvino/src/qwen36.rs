@@ -834,9 +834,12 @@ pub struct Qwen36Engine {
 /// The streamed chunk for decoded token `next` of task `t` (already pushed
 /// onto `gen_ids`). The first NEW token (past any resume seed) carries the
 /// prompt count too, as the final chunk does, so a consumer that stops early
-/// still has it.
+/// still has it. `n_tokens` is this chunk's one token, set explicitly so a
+/// token whose text is held back (an incomplete UTF-8 glyph) still counts.
 fn decode_token_chunk(task_id: TaskId, next: u32, delta: String, t: &ActiveTask) -> Chunk {
-    let chunk = Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]);
+    let chunk = Chunk::token(task_id, next as i64, delta)
+        .with_n_tokens(1)
+        .with_token_ids(vec![next as i64]);
     if t.gen_ids.len() == t.resume_seed_len + 1 {
         chunk.with_prompt_tokens(t.prompt_ids.len() as u32)
     } else {
@@ -3483,6 +3486,12 @@ mod tests {
         let c = decode_token_chunk("t0".into(), 5, "x".into(), &t);
         assert_eq!(c.prompt_tokens, Some(3));
         assert_eq!(c.token_ids, vec![5]);
+        // A token whose text is held back (an incomplete UTF-8 glyph) still
+        // counts once.
+        assert_eq!(
+            decode_token_chunk("t0".into(), 5, String::new(), &t).token_count(),
+            1
+        );
         t.gen_ids.push(6);
         assert_eq!(
             decode_token_chunk("t0".into(), 6, "y".into(), &t).prompt_tokens,

@@ -3117,31 +3117,14 @@ impl OvRuntimeEngine {
             .len()
             .saturating_sub(active.resume_seed_len) as u32;
         let first_new = active.generated.len() == active.resume_seed_len + 1;
-        let chunk = if is_final {
-            Chunk {
-                task_id: task_id.clone(),
-                token_id: next_token as i64,
-                text: delta,
-                is_final: true,
-                logprobs: None,
-                n_tokens: None,
-                prompt_tokens: Some(prompt_tokens),
-                completion_tokens: None,
-                error: None,
-                token_ids: Vec::new(),
-                // ov-runtime doesn't yet distinguish length vs stop here; the
-                // API falls back to "stop" (unchanged behavior). #14 follow-up.
-                finish_reason: None,
-            }
-        } else {
-            let chunk = Chunk::token(task_id.clone(), next_token as i64, delta)
-                .with_token_ids(vec![next_token as i64]);
-            if first_new {
-                chunk.with_prompt_tokens(prompt_tokens)
-            } else {
-                chunk
-            }
-        };
+        let chunk = single_task_token_chunk(
+            task_id.clone(),
+            next_token,
+            delta,
+            is_final,
+            first_new,
+            prompt_tokens,
+        );
 
         if is_final {
             let elapsed = active.started.elapsed();
@@ -5435,10 +5418,74 @@ impl Builder for OvRuntimeBuilder {
     }
 }
 
+/// The chunk the single-task path streams for one decoded token: final at
+/// the stop conditions, carrying the prompt count on the first new token and
+/// on the final one. `n_tokens` is this chunk's one token, set explicitly so
+/// a token whose text is held back (an incomplete UTF-8 glyph) or an empty
+/// final delta (EOS) still counts, as the packed path does.
+fn single_task_token_chunk(
+    task_id: TaskId,
+    token: i32,
+    delta: String,
+    is_final: bool,
+    first_new: bool,
+    prompt_tokens: u32,
+) -> Chunk {
+    if is_final {
+        Chunk {
+            task_id,
+            token_id: token as i64,
+            text: delta,
+            is_final: true,
+            logprobs: None,
+            n_tokens: Some(1),
+            prompt_tokens: Some(prompt_tokens),
+            completion_tokens: None,
+            error: None,
+            token_ids: Vec::new(),
+            // ov-runtime doesn't yet distinguish length vs stop here; the
+            // API falls back to "stop" (unchanged behavior). #14 follow-up.
+            finish_reason: None,
+        }
+    } else {
+        let chunk = Chunk::token(task_id, token as i64, delta)
+            .with_n_tokens(1)
+            .with_token_ids(vec![token as i64]);
+        if first_new {
+            chunk.with_prompt_tokens(prompt_tokens)
+        } else {
+            chunk
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cascadia_types::PeerLayout;
+
+    /// Each decoded token counts once, also when its text is held back (an
+    /// incomplete UTF-8 glyph decodes to "") or the final delta is empty
+    /// (EOS), so usage and the API's context-window count match the tokens
+    /// generated.
+    #[test]
+    fn single_task_chunks_count_every_decoded_token() {
+        let chunks = [
+            single_task_token_chunk("t".into(), 1, String::new(), false, true, 7),
+            single_task_token_chunk("t".into(), 2, "é".into(), false, false, 7),
+            single_task_token_chunk("t".into(), 3, String::new(), true, false, 7),
+        ];
+        for c in &chunks {
+            assert_eq!(c.token_count(), 1, "{c:?}");
+        }
+        let mut total = 0;
+        chunks.iter().for_each(|c| c.accumulate_tokens(&mut total));
+        assert_eq!(total, 3);
+        assert_eq!(chunks[0].prompt_tokens, Some(7));
+        assert_eq!(chunks[1].prompt_tokens, None);
+        assert_eq!(chunks[2].prompt_tokens, Some(7));
+        assert!(chunks[2].is_final);
+    }
 
     #[tokio::test]
     async fn rejects_missing_pipeline_config() {
