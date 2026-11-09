@@ -1170,12 +1170,13 @@ fn masked_relay_answer<T>(downstream: Result<T, TokenWaitFailure>) -> (EngineRes
 }
 
 /// A relay stage's answer when the step failed on this stage, before any
-/// downstream exchange: the tail acknowledges it (it applies the mask itself,
-/// so the NACK proves the chain masks); a middle doesn't, since nothing from
-/// below vouched for the step. The acknowledgement flag is unused on a plain
-/// step.
-fn own_failure_answer<T>(e: EngineError, is_last_stage: bool) -> (EngineResult<T>, bool) {
-    (Err(e), is_last_stage)
+/// downstream exchange. `vouch` is whether this stage can say the chain below
+/// masks without this step's exchange: the tail always can (it applies the
+/// mask itself); a middle only once its downstream has acknowledged a masked
+/// step, otherwise its own transient failure would read as an older stage
+/// below. The acknowledgement flag is unused on a plain step.
+fn own_failure_answer<T>(e: EngineError, vouch: bool) -> (EngineResult<T>, bool) {
+    (Err(e), vouch)
 }
 
 /// A relay stage's answer from its downstream's reply: a plain step passes the
@@ -1776,9 +1777,10 @@ async fn wait_token_reply(
         link.on_acked();
     }
     let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
-    // A masked step's outcome leaves the streak as it was: its timeout doesn't
-    // count, and its success doesn't hide plain timeouts around it.
-    if !masked {
+    // A masked step's timeout leaves the streak as it was (below an older
+    // stage every masked step times out); any other masked outcome proves the
+    // downstream answers, so it resets the streak like a plain reply does.
+    if !(masked && timed_out) {
         *streak = next_timeout_streak(*streak, timed_out);
     }
     outcome
@@ -4165,11 +4167,11 @@ impl OvRuntimeEngine {
         let tail = self.spec.is_last_stage;
         let (plan_rows, masks) = match plan_res {
             Ok(p) => p,
-            Err(e) => return own_failure_answer(e, tail),
+            Err(e) => return own_failure_answer(e, tail || self.mask_link.acked),
         };
         let (odt, oshape, obytes) = match self.relay_packed_run(&plan_rows, hidden, hshape) {
             Ok(o) => o,
-            Err(e) => return own_failure_answer(e, tail),
+            Err(e) => return own_failure_answer(e, tail || self.mask_link.acked),
         };
         if tail {
             let picks = bytes_to_f32(odt, &obytes)
@@ -4178,7 +4180,7 @@ impl OvRuntimeEngine {
         }
         let hidden_out = match bytes_to_f32(odt, &obytes) {
             Ok(h) => h,
-            Err(e) => return own_failure_answer(e, false),
+            Err(e) => return own_failure_answer(e, self.mask_link.acked),
         };
         // A downstream failure (including its NACK) propagates as Err — the
         // caller NACKs our own upstream in turn, so the abort reaches rank 0
@@ -5232,7 +5234,7 @@ impl OvRuntimeEngine {
         );
         let prefill_reply = match forwarded {
             Ok(p) => p,
-            Err(e) => return own_failure_answer(e, false),
+            Err(e) => return own_failure_answer(e, self.mask_link.acked),
         };
         let downstream = match self.downstream.clone() {
             Some(d) => d,
