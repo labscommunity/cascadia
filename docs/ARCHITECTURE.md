@@ -42,6 +42,10 @@ Deterministic word-echo engine — splits the prompt and emits one word per `ste
 
 CPU-targeted sparse mixture-of-experts engine (Kimi K2.6-style models, MiniMax-M2). Runs attention/norm shells natively in Rust (default; OV IR shells are an optional backend) and dispatches only the top-k experts the router selects each step. Experts execute as per-(layer, expert) OV IRs by default, or through the `cascadia-int4-gemm` AVX-512 kernels against packed int4 weight binaries (`int4_bin` backend).
 
+## `cascadia-grammar`
+
+JSON Schema token masks for structured output (`response_format`) in the engines that decode in-process (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe`). Wraps llguidance: one grammar factory per engine, built from the tokenizer the engine already loads and its EOS ids; one compiled grammar per request schema; one matcher per sequence that masks each logits row and accepts the chosen token. Compact JSON (no whitespace), `oneOf` treated as `anyOf`, keywords llguidance does not enforce reported as warnings. Pure CPU with no OpenVINO dependency, so it unit-tests on every platform.
+
 ## `cascadia-int4-gemm`
 
 Hand-rolled AVX-512 INT4 GEMM kernels for the sparse-MoE expert path — group-32 symmetric quantization with bf16 scales, matching the compressed-tensors on-disk format.

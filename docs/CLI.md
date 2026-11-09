@@ -554,43 +554,83 @@ curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/jso
 
 `/v1/completions` ignores `response_format` (OpenAI does not define it there).
 
-Engines:
+Every engine enforces `json_object` and `json_schema`:
 
-| Engine | `json_object` / `json_schema` |
+| Engine | How |
 |---|---|
-| `ov-genai` | Enforced by OpenVINO GenAI's structured output, stateful and `--cb`. Needs OpenVINO GenAI 2026.4 or newer. At startup the engine runs one short structured-output check on the loaded model; if it fails, startup continues and JSON requests get 400 `invalid configuration: structured output is not available for this model: <reason>`. With `--draft-model` (speculative decoding) the check is skipped and JSON requests get that 400 with `not supported with a draft model (speculative decoding); run without --draft-model for response_format`: on OpenVINO GenAI 2026.4.1 the draft's proposals break the constraint. `--prompt-lookup` is fine. Not available on NPU either (`--device NPU`, `NPU.0`, or a `HETERO:`/`AUTO:` list that includes NPU): the check is skipped and JSON requests get that 400 with `not reliable on NPU with this OpenVINO GenAI version (the output constraint is not fully applied); use GPU or CPU for response_format`, because on GenAI 2026.4.1 the NPU pipeline does not fully apply the constraint. |
+| `ov-genai` | OpenVINO GenAI's structured output (xgrammar), stateful and `--cb`. Needs OpenVINO GenAI 2026.4 or newer. At startup the engine runs one short structured-output check on the loaded model; if it fails, startup continues and JSON requests get 400 `invalid configuration: structured output is not available for this model: <reason>`. With `--draft-model` (speculative decoding) the check is skipped and JSON requests get that 400 with `not supported with a draft model (speculative decoding); run without --draft-model for response_format`: on OpenVINO GenAI 2026.4.1 the draft's proposals break the constraint. `--prompt-lookup` is fine. Not available on NPU either (`--device NPU`, `NPU.0`, or a `HETERO:`/`AUTO:` list that includes NPU): the check is skipped and JSON requests get that 400 with `not reliable on NPU with this OpenVINO GenAI version (the output constraint is not fully applied); use GPU or CPU for response_format`, because on GenAI 2026.4.1 the NPU pipeline does not fully apply the constraint. |
+| `ov-runtime` | In-engine token mask (llguidance), on the stateful path, static NPU exports and `--packed-slots` (one mask per slot). |
+| `ov-dist-spec` | In-engine token mask (llguidance). Drafts are proposed unmasked; the target's verify rows are masked, so the output is the same as non-speculative masked decoding. |
+| `gemma4` | In-engine token mask (llguidance). |
+| `qwen35` | In-engine token mask (llguidance). |
+| `sparse-moe` | In-engine token mask (llguidance), applied before sampling (temperature, top-p). n-gram speculative decoding (`--prompt-lookup`) is skipped for a JSON request; it decodes plainly. |
 | `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar. |
 | `mock` | Answers with a minimal instance of the schema, best effort: not every keyword is honoured. |
-| `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe` | 400: `structured output (response_format <type>) is not supported by this server's engine (<engine>)`. |
 
-A malformed `response_format` is a 400 on every engine, including those
-without structured output (it used to be ignored).
+The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
+`sparse-moe`):
+
+- Emit compact JSON, with no whitespace between tokens.
+- Treat `oneOf` as `anyOf` (pydantic's discriminated unions compile).
+- Accept the schema keywords llguidance does not enforce (`not`,
+  `if`/`then`/`else`, `dependentRequired`, `dependentSchemas`,
+  `uniqueItems`, `contains`, `propertyNames`, unknown `format`s) and log
+  them per request (`response_format keywords accepted but not enforced`).
+- Compile the schema when the request is submitted: a schema llguidance
+  cannot build (for example `{"type": 42}` or an unresolvable `$ref`) is a
+  400 before the request queues. A client's own top-level `x-guidance`
+  object is replaced by the server's settings.
+- Need a tokenizer with an end-of-sequence token; when the engine cannot
+  build its grammar from the model's tokenizer, it logs why once at startup
+  and JSON requests get 400 `invalid configuration: structured output is not
+  available for this model: <reason>`.
+- Requests without `response_format` take the same decode path as before:
+  no mask, no grammar.
+
+Multi-stage pipelines (`--total >= 2`) enforce the format too: the first
+stage, which holds the tokenizer, computes each step's mask and sends it with
+the step to the stage that picks the token. Only steps of a JSON request
+carry a mask; every other request's stage traffic is unchanged. Every stage
+must run a build with structured-output support. If a later stage runs an
+older build, a JSON request fails (5xx) with `a later pipeline stage runs a
+build without structured-output support; upgrade every stage`; normal
+requests are unaffected. On `ov-runtime`, `gemma4` and `sparse-moe` the
+first such JSON request waits until its token deadline before failing, and
+a `--packed-slots` batch or a batch of `sparse-moe` streams that held it
+fails once; after that, JSON requests on that pipeline fail at once (the
+check runs again after 10 minutes). `qwen35` knows from its connection
+handshake and fails JSON requests at once. When deploying, upgrade every
+stage before relying on `response_format`.
+
+A malformed `response_format` is a 400 on every engine (it used to be
+ignored).
 
 Behaviour:
 
-- Thinking is turned off for a JSON request on an engine that supports
-  structured output: a JSON answer has no room for a reasoning preamble.
+- Thinking is turned off for a JSON request: a JSON answer has no room for
+  a reasoning preamble.
 - The format is **not enforced** when the request offers tools the model may
   call (`tools` non-empty and `tool_choice` other than `"none"`): the model may
   answer with a tool call, which the format does not constrain. The server logs
-  `response_format not enforced` for such a request, and engines without
-  structured output let it through instead of answering 400. Thinking then
+  `response_format not enforced` for such a request. Thinking then
   stays as requested, except on `ov-genai`, where it is turned off (thinking
   with tools is otherwise refused there).
 - A token limit can cut the JSON short: the response then has
   `finish_reason: "length"` and the content does not parse. Leave room in
   `max_tokens`.
-- Small models may emit long runs of whitespace inside the JSON: still valid,
-  but it spends tokens and can run into the token limit.
-- Some JSON Schema keywords are accepted but **not enforced**: `not`,
+- On `ov-genai`, small models may emit long runs of whitespace inside the
+  JSON: still valid, but it spends tokens and can run into the token limit.
+- On `ov-genai`, some JSON Schema keywords are accepted but **not
+  enforced**: `not`,
   `if`/`then`/`else`, `dependentRequired`, `dependentSchemas`,
   `uniqueItems`, `contains`, `minContains`, `maxContains`, `multipleOf`, an
   `allOf` with more than one member other than the plain-object shape below,
   and constraints placed beside
   `$ref`/`anyOf`/`oneOf`/`allOf`/`const`/`enum` (annotations such as
-  `description` are fine there). The server logs the keywords it found; the
-  list follows the gaps of the grammar backend `ov-genai` uses, and
-  llama-server's own schema converter may differ. Validate the answer
+  `description` are fine there). The server logs the keywords it found
+  (`response_format schema uses keywords the output constraint does not
+  enforce`). The llguidance engines log their own list (above), and
+  llama-server's schema converter may differ again. Validate the answer
   client-side if they matter.
 - An `allOf` of two or more plain object schemas (each member holds only
   `type: "object"`, `properties`, `required`, a boolean
@@ -604,6 +644,10 @@ Behaviour:
   `additionalProperties`, `$ref`/`anyOf`/`oneOf`/`const`/`enum` or a
   non-object `type` is left as is, and so is an `allOf` with any other
   member (a `$ref`, other keywords).
+- Tool schemas (`tools[].function.parameters`) reach the chat template with
+  their keys in the client's order, as transformers and vLLM render them.
+  Earlier builds sorted the keys alphabetically, so a tool prompt can differ
+  from an older node's render (and miss a prefix cache built by it).
 
 Schema limits (each is a 400 `invalid response_format: …`):
 
@@ -637,10 +681,12 @@ the 400s below and `engine_error` for anything else):
 | Status | Message | Cause |
 |---|---|---|
 | 400 | `invalid response_format: <reason>` | Malformed field (unknown `type`, non-object schema, `false` schema, a repeated key) or a schema over the limits above. Every engine. |
-| 400 | `structured output (response_format <type>) is not supported by this server's engine (<engine>)` | The engine has no structured output (table above). |
 | 400 | `invalid configuration: response_format json_schema: <reason>` | `ov-genai`: the backend could not build a constraint from the schema. |
 | 400 | `response_format json_schema: <reason>` | `ov-genai` without `--cb`: generation failed for a request with a schema, and the backend's message `<reason>` names the grammar or JSON schema. Other generation failures stay 503. On a streamed request this message arrives as the stream's error event, with `"type":"invalid_request_error"`. |
-| 400 | `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai`: the startup check found structured output does not work for the loaded model or runtime. |
+| 400 | `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai`: the startup check found structured output does not work for the loaded model or runtime. The llguidance engines: the grammar could not be built from the model's tokenizer (logged at startup). |
+| 400 | `invalid configuration: response_format schema: <reason>` | The llguidance engines: llguidance could not build a grammar from the schema; The message is cut to one line of at most 300 characters. |
+| 5xx | `… a later pipeline stage runs a build without structured-output support; upgrade every stage` | Multi-stage `ov-runtime`, `gemma4`, `qwen35` or `sparse-moe`: a later stage runs an older build (see above). |
+| 5xx | `… grammar: <reason>` | The llguidance engines: decoding hit a state the grammar allows no token from, or a resumed request's earlier output does not match the grammar. The request ends with this error, never with unconstrained output. |
 | 400 | `llama-server rejected the request: <reason>` | `sycl-llama`: llama-server answered 4xx (other than 408/429), for example a schema its grammar converter rejects; `<reason>` is llama-server's `error.message`, or the start of its reply. On a streamed request the SSE stream has already started, so this message arrives as the stream's error event instead, with `"type":"invalid_request_error"`. |
 
 On `ov-genai --cb`, a schema whose compile fails while a batch runs fails that
