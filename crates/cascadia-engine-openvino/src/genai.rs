@@ -339,7 +339,7 @@ impl Builder for OvGenaiBuilder {
                 step_failures: 0,
                 suspect_failures: 0,
                 latched_at: None,
-                blamed_in_run: HashSet::new(),
+                blamed_in_run: HashMap::new(),
                 canary_failed_in_run: false,
                 structured_unavailable: None,
                 quarantined: QuarantineSet::default(),
@@ -757,6 +757,17 @@ impl StrikeSet {
         self.strikes.remove(&h);
     }
 
+    /// Take back `n` of the strikes against `h`; the entry goes when none
+    /// are left.
+    fn take_back(&mut self, h: u64, n: u32) {
+        if let Some((count, _)) = self.strikes.get_mut(&h) {
+            *count = count.saturating_sub(n);
+            if *count == 0 {
+                self.strikes.remove(&h);
+            }
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.strikes.len()
@@ -997,8 +1008,9 @@ const MAX_STEP_FAILURES: u32 = 3;
 /// the step counts.
 const MAX_SUSPECT_FAILURES: u32 = 8;
 
-/// How often a latched CB pipeline runs a canary to see whether it recovered.
-/// Client requests are refused until one succeeds.
+/// How long a latched CB pipeline waits after its last canary before the next
+/// request runs another to see whether it recovered. Client requests are
+/// refused until one succeeds.
 const LATCH_RETRY: Duration = Duration::from_secs(30);
 
 /// Token budget of the canary request.
@@ -1119,9 +1131,10 @@ pub struct OvGenaiCbEngine {
     /// With `step_failures` at the limit: when the latch was set or its last
     /// canary ran. The next canary runs [`LATCH_RETRY`] after it.
     latched_at: Option<Instant>,
-    /// Schemas quarantined or struck during the current run of failures. They
-    /// are released if the run turns out to have been the device's fault.
-    blamed_in_run: HashSet<u64>,
+    /// Schemas quarantined or struck during the current run of failures, with
+    /// the strikes each got in it. They are released (and only those strikes
+    /// taken back) if the run turns out to have been the device's fault.
+    blamed_in_run: HashMap<u64, u32>,
     /// A canary failed during the current run of failures.
     canary_failed_in_run: bool,
     /// Set by the warmup probe when this model cannot do structured output.
@@ -1216,8 +1229,9 @@ impl Engine for OvGenaiCbEngine {
         // this request too. Admitting it means paying add_request and a step
         // before returning the same 503, forever, with nothing distinguishing a
         // transient hiccup from a dead device. Refuse up front instead. No
-        // client request is admitted while latched: every LATCH_RETRY an
-        // internal canary checks the device, and only its success clears this.
+        // client request is admitted while latched: a request arriving
+        // LATCH_RETRY or more after the last check runs an internal canary
+        // first, and only its success clears this.
         if self.step_failures >= MAX_STEP_FAILURES {
             let now = Instant::now();
             let recovered = canary_due(self.latched_at, now) && {
@@ -1227,7 +1241,8 @@ impl Engine for OvGenaiCbEngine {
             if !recovered {
                 return Err(EngineError::Backend(format!(
                     "cb pipeline unusable: {} counted scheduler failures since the last \
-                     successful step; it is checked again every {} s",
+                     successful step; it is checked again on a request {} s or more after \
+                     the last check",
                     self.step_failures,
                     LATCH_RETRY.as_secs()
                 )));
@@ -1375,7 +1390,7 @@ impl Engine for OvGenaiCbEngine {
                 let now = Instant::now();
                 if let [h] = suspects[..] {
                     self.quarantined.insert(h, now);
-                    self.blamed_in_run.insert(h);
+                    self.blamed_in_run.entry(h).or_insert(0);
                     refused = 1;
                 } else {
                     for h in &suspects {
@@ -1383,7 +1398,7 @@ impl Engine for OvGenaiCbEngine {
                             self.quarantined.insert(*h, now);
                             refused += 1;
                         }
-                        self.blamed_in_run.insert(*h);
+                        *self.blamed_in_run.entry(*h).or_insert(0) += 1;
                     }
                 }
             } else {
@@ -1409,7 +1424,9 @@ impl Engine for OvGenaiCbEngine {
             );
             return Ok(failed);
         }
-        self.end_failure_run(false);
+        // A canary that failed in this run means the device, not the schemas,
+        // failed those steps.
+        self.end_failure_run(self.canary_failed_in_run);
 
         let mut out = Vec::new();
         let mut idx = 0;
@@ -1576,10 +1593,6 @@ impl Engine for OvGenaiCbEngine {
 }
 
 impl OvGenaiCbEngine {
-    /// Run the warmup structured-output probe: one request under the probe
-    /// schema, driven to a terminal status within [`WARMUP_MAX_STEPS`].
-    /// Returns the text it produced, or nothing when the scheduler dropped
-    /// or cancelled it (an incomplete probe proves nothing).
     /// Check the device with an internal canary: a short plain request (no
     /// schema), run on its own, as the warmup does. True when it finishes.
     /// Only ever called with nothing else in flight.
@@ -1638,9 +1651,9 @@ impl OvGenaiCbEngine {
     /// in it are released; otherwise they stay refused.
     fn end_failure_run(&mut self, release: bool) {
         if release {
-            for h in self.blamed_in_run.drain() {
+            for (h, strikes) in self.blamed_in_run.drain() {
                 self.quarantined.remove(h);
-                self.strikes.clear(h);
+                self.strikes.take_back(h, strikes);
             }
         }
         self.blamed_in_run.clear();
@@ -1650,6 +1663,10 @@ impl OvGenaiCbEngine {
         self.latched_at = None;
     }
 
+    /// Run the warmup structured-output probe: one request under the probe
+    /// schema, driven to a terminal status within [`WARMUP_MAX_STEPS`].
+    /// Returns the text it produced, or nothing when the scheduler dropped
+    /// or cancelled it (an incomplete probe proves nothing).
     fn run_structured_probe(&mut self, request_id: u64) -> Result<String, OvError> {
         let cfg = build_gen_config(
             0,
@@ -1940,7 +1957,7 @@ mod tests {
             step_failures: 0,
             suspect_failures: 0,
             latched_at: None,
-            blamed_in_run: HashSet::new(),
+            blamed_in_run: HashMap::new(),
             canary_failed_in_run: false,
             structured_unavailable: None,
             quarantined: QuarantineSet::default(),
@@ -2639,7 +2656,7 @@ mod tests {
     }
 
     #[test]
-    fn cb_ordinary_success_after_a_failed_canary_keeps_the_blame() {
+    fn cb_ordinary_success_after_a_failed_canary_releases_the_blame() {
         let st = Arc::new(Mutex::new(MockState {
             step_fails: true,
             default_read: Some(finished_read()),
@@ -2652,13 +2669,60 @@ mod tests {
             let _ = e.step().unwrap();
         }
         assert!(e.canary_failed_in_run);
+        assert!(e.submit(schema_task("x", &numbered_schema(0))).is_err());
         st.lock().unwrap().step_fails = false;
         st.lock().unwrap().default_read = Some(idle_read());
         e.submit(task("p", 8)).unwrap();
         let _ = e.step().unwrap();
-        assert!(e.submit(schema_task("x", &numbered_schema(0))).is_err());
+        e.submit(schema_task("x", &numbered_schema(0)))
+            .expect("released: the device failed during that run");
         assert!(e.blamed_in_run.is_empty());
         assert!(!e.canary_failed_in_run);
+    }
+
+    #[test]
+    fn cb_release_keeps_strikes_from_earlier_runs() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            default_read: Some(finished_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        let a = schema_hash(SCHEMA_A);
+        // Earlier run, ended by an ordinary success: A keeps one strike.
+        e.submit(schema_task("a1", SCHEMA_A)).unwrap();
+        e.submit(schema_task("b1", SCHEMA_B)).unwrap();
+        let _ = e.step().unwrap();
+        st.lock().unwrap().step_fails = false;
+        e.submit(task("p", 8)).unwrap();
+        let _ = e.step().unwrap();
+        e.cancel(&"p".to_string());
+        assert_eq!(e.strikes.strikes.get(&a).map(|s| s.0), Some(1));
+
+        // A run on a failing device: A is struck again (and refused), then a
+        // failed and a successful canary release what this run added.
+        st.lock().unwrap().step_fails = true;
+        e.submit(schema_task("a2", SCHEMA_A)).unwrap();
+        e.submit(schema_task("c2", SCHEMA_C)).unwrap();
+        let _ = e.step().unwrap();
+        assert!(e.submit(schema_task("a3", SCHEMA_A)).is_err());
+        for i in 1..MAX_SUSPECT_FAILURES {
+            e.submit(schema_task(&format!("s{i}"), &numbered_schema(i)))
+                .unwrap();
+            let _ = e.step().unwrap();
+        }
+        assert!(e.canary_failed_in_run);
+        st.lock().unwrap().fail_only_with_grammar = true;
+        e.submit(schema_task("n", &numbered_schema(100))).unwrap();
+        let _ = e.step().unwrap();
+        assert!(!e.canary_failed_in_run);
+        assert_eq!(
+            e.strikes.strikes.get(&a).map(|s| s.0),
+            Some(1),
+            "the earlier run's strike stays"
+        );
+        assert_eq!(e.strikes.strikes.get(&schema_hash(SCHEMA_C)), None);
+        e.submit(schema_task("a4", SCHEMA_A)).expect("released");
     }
 
     #[test]

@@ -646,9 +646,9 @@ runs a short internal health check (a plain request of a few tokens, alone
 on the pipeline). If it succeeds, the schemas keep the blame and the count
 starts over; if it fails, the step counts. A failed step with no such
 request counts as usual. After 3 counted failures since the last successful
-step the worker refuses every new request (`cb pipeline unusable: …`) and
-runs the health check every 30 seconds; the first success clears the limit
-and requests are admitted again. Schemas refused during a run of failures
+step the worker refuses every new request (`cb pipeline unusable: …`). The
+health check runs again when a request arrives at least 30 seconds after the
+last one; its first success clears the limit and that request is admitted.
+Schemas refused during a run of failures (since the last successful step)
 in which the health check failed, or that ended with the limit clearing, are
-released then; schemas refused before an ordinary successful step stay
-refused.
+released when the run ends; in any other run they stay refused.
