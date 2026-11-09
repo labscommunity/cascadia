@@ -742,8 +742,10 @@ fn report_step_error(
 // before it sends.
 //
 // Repeated masks: a masked step whose mask equals the last one sent on the
-// link carries the marker instead, I32 `[1, n+1, H]`: the hidden rows, then
-// one row of zeros whose last element is `REPEAT` (no mask words). The
+// link carries the marker instead, I32 `[1, n, H+1]`: each hidden row's f32
+// bits followed by `REPEAT` (no mask words, one extra word per row). Its last
+// element is `REPEAT` where a full masked frame has `W`, which tells the two
+// apart before any width or row check. The
 // receiver uses the last mask it decoded (`MaskSendCache` / `MaskRecvCache`).
 // A receiver with nothing to repeat runs nothing and answers
 // `[MASK_MISS_TOKEN, MASK_ACK]`; middles pass that up unchanged and the head
@@ -814,18 +816,22 @@ fn encode_hidden_frame(
 }
 
 /// Turns a full masked hidden frame (see [`encode_hidden_frame`]) into the
-/// repeat marker in place: the hidden rows stay, the mask rows become one
-/// row of zeros whose last element is [`REPEAT`].
+/// repeat marker in place: I32 `[1, n, H+1]`, each hidden row followed by
+/// [`REPEAT`]. The mask rows are dropped.
 fn into_repeat_frame(hid: &mut WireTensor) {
     let h = hid.shape[2] as usize;
     let rows = hid.shape[1] as usize;
     let len = hid.data.len();
     let w = u32::from_le_bytes(hid.data[len - 4..].try_into().unwrap()) as usize;
     let n = rows - (w + 1).div_ceil(h);
-    hid.data.truncate(n * h * 4);
-    hid.data.resize((n + 1) * h * 4 - 4, 0);
-    hid.data.extend_from_slice(&REPEAT.to_le_bytes());
-    hid.shape[1] = (n + 1) as u32;
+    let mut data = Vec::with_capacity(n * (h + 1) * 4);
+    for row in hid.data[..n * h * 4].chunks_exact(h * 4) {
+        data.extend_from_slice(row);
+        data.extend_from_slice(&REPEAT.to_le_bytes());
+    }
+    hid.data = data;
+    hid.shape[1] = n as u32;
+    hid.shape[2] = (h + 1) as u32;
 }
 
 /// A received hidden frame.
@@ -927,18 +933,19 @@ fn decode_masked_hidden(t: &WireTensor, shape: [usize; 3]) -> HiddenIn {
     if batch != 1 || h == 0 || elems.len() != rows * h {
         return HiddenIn::BadMask(format!("masked hidden frame of shape {shape:?}"));
     }
-    // The marker is checked first: its `W` is no word count.
+    // The marker is checked first: its last element is no word count.
+    // `[1, n, H+1]`, every row ending in REPEAT.
     if elems.last() == Some(&REPEAT) {
-        if rows < 2 {
+        let width = h;
+        if rows == 0 || width < 2 || elems.chunks_exact(width).any(|r| r[width - 1] != REPEAT) {
             return HiddenIn::BadMask(format!("repeat-mask hidden frame of shape {shape:?}"));
         }
-        let n = rows - 1;
-        if elems[n * h..rows * h - 1].iter().any(|&x| x != 0) {
-            return HiddenIn::BadMask("repeat-mask hidden frame has a non-zero padding".into());
-        }
         return HiddenIn::Repeat {
-            floats: elems[..n * h].iter().map(|&b| f32::from_bits(b)).collect(),
-            shape: [1, n, h],
+            floats: elems
+                .chunks_exact(width)
+                .flat_map(|r| r[..width - 1].iter().map(|&b| f32::from_bits(b)))
+                .collect(),
+            shape: [1, rows, width - 1],
         };
     }
     let w = elems.last().copied().unwrap_or(0) as usize;
@@ -1741,7 +1748,7 @@ impl Gemma4Engine {
         hidden: &[f32],
         shape: [usize; 3],
         position: i64,
-        mask: Option<&[u32]>,
+        mask: Option<Vec<u32>>,
     ) -> EngineResult<()> {
         let downstream = self
             .downstream
@@ -1757,18 +1764,19 @@ impl Gemma4Engine {
         Ok(())
     }
 
-    /// The frames of one step from this stage's last inference.
+    /// The frames of one step from this stage's last inference. `mask` moves
+    /// into the frames: the send compares and records it there.
     fn step_frames(
         &mut self,
         hidden: &[f32],
         shape: [usize; 3],
         position: i64,
-        mask: Option<&[u32]>,
+        mask: Option<Vec<u32>>,
     ) -> EngineResult<StepFrames> {
         // Gemma 4 activations are f32 (the IR's hidden_states input/output are
         // f32). Send raw f32 so the downstream stage feeds it without a lossy
         // f16 round-trip — matches the f32 Core reference.
-        let hid = encode_hidden_frame(hidden, shape, mask)?;
+        let hid = encode_hidden_frame(hidden, shape, mask.as_deref())?;
         // The absolute start-position rides as its own frame (sent first): relay
         // stages use it directly as their position_ids base and reset their KV
         // when it is 0. MAX_RANK=3 + the strict payload==shape*dtype check leave
@@ -1813,7 +1821,7 @@ impl Gemma4Engine {
             hid,
             header: encode_cross_kv_header(&tags),
             cross: cross_frames,
-            mask: mask.map(<[u32]>::to_vec),
+            mask,
         })
     }
 
@@ -2358,7 +2366,7 @@ impl Gemma4Engine {
             let words = mask_words(mask, width).inspect_err(|_| {
                 self.grammar_failure = (width > 0).then_some(GrammarFailure::DeadEnd)
             })?;
-            let mut frames = self.step_frames(out, s3, position, Some(&words))?;
+            let mut frames = self.step_frames(out, s3, position, Some(words))?;
             let downstream = self
                 .downstream
                 .clone()
@@ -2633,7 +2641,7 @@ impl Gemma4Engine {
         let prepared = self
             .relay(&hidden, shape, position)
             .and_then(|(out, out_shape)| {
-                self.step_frames(&out, to_shape3(&out_shape), position, Some(&words))
+                self.step_frames(&out, to_shape3(&out_shape), position, Some(words))
             });
         let budget = masked_wait_budget(prefill_reply, self.stages_below);
         let cache = &mut self.mask_send;
@@ -5201,17 +5209,49 @@ mod tests {
         }
     }
 
-    /// The marker's exact hidden frame for the sample hidden: I32
-    /// `[1, n+1, H]`, the hidden's f32 bits, then one row of zeros whose last
-    /// element is `REPEAT`.
-    fn sample_repeat_frame() -> WireTensor {
-        let (hidden, [_, n, h]) = sample_hidden();
-        let mut data = f32_to_bytes(&hidden);
-        for _ in 0..h - 1 {
-            data.extend_from_slice(&0u32.to_le_bytes());
+    /// The marker's exact hidden frame for `hidden` of `[1, n, H]`: I32
+    /// `[1, n, H+1]`, each row's H f32 bits followed by `REPEAT`.
+    fn repeat_frame_of(hidden: &[f32], [_, n, h]: [usize; 3]) -> WireTensor {
+        let mut data = Vec::new();
+        for row in hidden.chunks(h) {
+            data.extend_from_slice(&f32_to_bytes(row));
+            data.extend_from_slice(&REPEAT.to_le_bytes());
         }
-        data.extend_from_slice(&REPEAT.to_le_bytes());
-        WireTensor::new(WireDType::I32, [1, n as u32 + 1, h as u32], data)
+        WireTensor::new(WireDType::I32, [1, n as u32, h as u32 + 1], data)
+    }
+
+    fn sample_repeat_frame() -> WireTensor {
+        let (hidden, shape) = sample_hidden();
+        repeat_frame_of(&hidden, shape)
+    }
+
+    /// The marker costs the plain frame plus one word per row, whatever the
+    /// vocab: n=1, H=4096 with a 128k-token mask (4096 words, which a full
+    /// masked frame needs a second row for).
+    #[test]
+    fn a_marker_costs_one_word_per_row_over_the_plain_frame() {
+        for (n, h) in [(1usize, 4096usize), (3, 4096), (2, 4)] {
+            let hidden: Vec<f32> = (0..n * h).map(|i| i as f32 * 0.5).collect();
+            let words = vec![0x5555_5555u32; 131_072 / 32];
+            let plain = encode_hidden_frame(&hidden, [1, n, h], None).unwrap();
+            let mut hid = encode_hidden_frame(&hidden, [1, n, h], Some(&words)).unwrap();
+            into_repeat_frame(&mut hid);
+            assert_eq!(hid, repeat_frame_of(&hidden, [1, n, h]));
+            assert_eq!(hid.data.len(), plain.data.len() + 4 * n, "n={n} H={h}");
+            let mut recv = MaskRecvCache::default();
+            recv.commit(&words);
+            match resolve_hidden(decode_hidden_frame(&hid).unwrap(), &mut recv) {
+                HiddenIn::Masked {
+                    floats,
+                    shape,
+                    words: got,
+                } => {
+                    assert_eq!((floats, shape), (hidden.clone(), [1, n, h]));
+                    assert_eq!(got, words);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     /// A relay stage's step read the way the engine reads it, with the link's
@@ -5280,8 +5320,8 @@ mod tests {
                 assert_eq!(hid, sample_repeat_frame(), "step {step}");
                 assert_eq!(
                     hid.data.len(),
-                    (shape[1] + 1) * shape[2] * 4,
-                    "no mask words"
+                    shape[1] * (shape[2] + 1) * 4,
+                    "one marker word per row, no mask words"
                 );
             }
             assert_eq!(
@@ -5600,7 +5640,12 @@ mod tests {
                 masked_round(
                     &mut client,
                     &mut frames,
-                    Duration::from_millis(100),
+                    // Short only where no reply comes.
+                    if reply.is_some() {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_millis(100)
+                    },
                     &mut send
                 ),
                 tail
@@ -5666,9 +5711,9 @@ mod tests {
         let words = ok_words();
         let mut recv = MaskRecvCache::default();
         recv.commit(&words);
+        // A row whose last element isn't the marker.
         let mut bad = sample_repeat_frame();
-        let at = bad.data.len() - 8;
-        bad.data[at] = 1;
+        bad.data[16..20].copy_from_slice(&7u32.to_le_bytes());
         let decoded = decode_hidden_frame(&bad).unwrap();
         assert!(matches!(decoded, HiddenIn::BadMask(_)), "{decoded:?}");
         assert!(matches!(
