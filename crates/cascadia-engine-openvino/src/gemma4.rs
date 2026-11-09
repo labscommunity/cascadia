@@ -42,6 +42,7 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 #[cfg(test)]
 use cascadia_grammar::GrammarFactory;
 use cascadia_grammar::{CompiledGrammar, GrammarMask};
+use cascadia_grammar::{MaskRecvCache, MaskSendCache, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT};
 use cascadia_ov_genai_shim::{
     DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -739,6 +740,14 @@ fn report_step_error(
 // sequence number, so a plain wait discards any two-lane reply as a late
 // answer to an earlier masked step, and a masked step drains such replies
 // before it sends.
+//
+// Repeated masks: a masked step whose mask equals the last one sent on the
+// link carries the marker instead, I32 `[1, n+1, H]`: the hidden rows, then
+// one row of zeros whose last element is `REPEAT` (no mask words). The
+// receiver uses the last mask it decoded (`MaskSendCache` / `MaskRecvCache`).
+// A receiver with nothing to repeat runs nothing and answers
+// `[MASK_MISS_TOKEN, MASK_ACK]`; middles pass that up unchanged and the head
+// fails the task without latching.
 
 /// Second lane of a masked step's reply from a stage that acknowledged it.
 const MASK_ACK: i32 = 0x4d41_534b;
@@ -804,6 +813,21 @@ fn encode_hidden_frame(
     ))
 }
 
+/// Turns a full masked hidden frame (see [`encode_hidden_frame`]) into the
+/// repeat marker in place: the hidden rows stay, the mask rows become one
+/// row of zeros whose last element is [`REPEAT`].
+fn into_repeat_frame(hid: &mut WireTensor) {
+    let h = hid.shape[2] as usize;
+    let rows = hid.shape[1] as usize;
+    let len = hid.data.len();
+    let w = u32::from_le_bytes(hid.data[len - 4..].try_into().unwrap()) as usize;
+    let n = rows - (w + 1).div_ceil(h);
+    hid.data.truncate(n * h * 4);
+    hid.data.resize((n + 1) * h * 4 - 4, 0);
+    hid.data.extend_from_slice(&REPEAT.to_le_bytes());
+    hid.shape[1] = (n + 1) as u32;
+}
+
 /// A received hidden frame.
 #[derive(Debug, PartialEq)]
 enum HiddenIn {
@@ -818,6 +842,51 @@ enum HiddenIn {
     },
     /// A masked frame this stage can't read; it answers with an acknowledged NACK.
     BadMask(String),
+    /// The repeat marker, as decoded: the link's last mask applies (see
+    /// [`resolve_hidden`]).
+    Repeat {
+        floats: Vec<f32>,
+        shape: [usize; 3],
+    },
+    /// A repeat marker with no mask to repeat on this link: the stage runs
+    /// nothing and answers [`StageReply::MaskMiss`].
+    MaskMiss,
+}
+
+/// Resolves a decoded hidden frame against the link's receive cache, once
+/// every frame of the step is read: a marker becomes the last mask decoded
+/// (or [`HiddenIn::MaskMiss`]), a full mask is committed, and a bad masked
+/// frame clears the cache.
+fn resolve_hidden(h: HiddenIn, cache: &mut MaskRecvCache) -> HiddenIn {
+    match h {
+        HiddenIn::Repeat { floats, shape } => {
+            match cache.resolve(cascadia_grammar::WireMask::Repeat) {
+                Ok(words) => HiddenIn::Masked {
+                    floats,
+                    shape,
+                    words,
+                },
+                Err(_) => HiddenIn::MaskMiss,
+            }
+        }
+        HiddenIn::Masked {
+            floats,
+            shape,
+            words,
+        } => {
+            cache.commit(&words);
+            HiddenIn::Masked {
+                floats,
+                shape,
+                words,
+            }
+        }
+        HiddenIn::BadMask(why) => {
+            cache.clear();
+            HiddenIn::BadMask(why)
+        }
+        other => other,
+    }
 }
 
 /// Decodes a hidden frame (F32/F16 plain, I32 masked).
@@ -857,6 +926,20 @@ fn decode_masked_hidden(t: &WireTensor, shape: [usize; 3]) -> HiddenIn {
         .collect();
     if batch != 1 || h == 0 || elems.len() != rows * h {
         return HiddenIn::BadMask(format!("masked hidden frame of shape {shape:?}"));
+    }
+    // The marker is checked first: its `W` is no word count.
+    if elems.last() == Some(&REPEAT) {
+        if rows < 2 {
+            return HiddenIn::BadMask(format!("repeat-mask hidden frame of shape {shape:?}"));
+        }
+        let n = rows - 1;
+        if elems[n * h..rows * h - 1].iter().any(|&x| x != 0) {
+            return HiddenIn::BadMask("repeat-mask hidden frame has a non-zero padding".into());
+        }
+        return HiddenIn::Repeat {
+            floats: elems[..n * h].iter().map(|&b| f32::from_bits(b)).collect(),
+            shape: [1, n, h],
+        };
     }
     let w = elems.last().copied().unwrap_or(0) as usize;
     let r = (w + 1).div_ceil(h);
@@ -911,6 +994,9 @@ enum StageReply {
     Nack,
     /// `[-1, MASK_NOT_ACKED]`.
     NotAcked,
+    /// `[MASK_MISS_TOKEN, MASK_ACK]`: a stage got a repeat marker with no
+    /// mask to repeat.
+    MaskMiss,
 }
 
 /// The plain token reply, `[1,1,1]` I32.
@@ -925,6 +1011,7 @@ fn encode_masked_reply(reply: StageReply) -> WireTensor {
         StageReply::Token(t) => (t, MASK_ACK),
         StageReply::Nack => (MASK_NACK_TOKEN, MASK_ACK),
         StageReply::NotAcked => (MASK_NACK_TOKEN, MASK_NOT_ACKED),
+        StageReply::MaskMiss => (MASK_MISS_TOKEN, MASK_ACK),
     };
     let mut data = token.to_le_bytes().to_vec();
     data.extend_from_slice(&lane.to_le_bytes());
@@ -939,6 +1026,7 @@ fn decode_stage_reply(t: &WireTensor) -> EngineResult<StageReply> {
         return match (lane(0), lane(1)) {
             (MASK_NACK_TOKEN, MASK_ACK) => Ok(StageReply::Nack),
             (MASK_NACK_TOKEN, MASK_NOT_ACKED) => Ok(StageReply::NotAcked),
+            (MASK_MISS_TOKEN, MASK_ACK) => Ok(StageReply::MaskMiss),
             (token, MASK_ACK) if token >= 0 => Ok(StageReply::Token(token)),
             (a, b) => Err(EngineError::Backend(format!(
                 "downstream sent an unrecognised two-lane token reply [{a}, {b}]"
@@ -969,6 +1057,43 @@ async fn send_step(
         g.send(f).await?;
     }
     Ok(())
+}
+
+/// Sends one step with the link's send cache: a masked step whose mask
+/// equals the last one sent on the link goes as the repeat marker (its
+/// hidden frame rewritten in place). The cache is checked and updated under
+/// the caller's lock on the link, around the write; a write error clears it.
+async fn send_step_cached(
+    g: &mut ActivationClient,
+    frames: &mut StepFrames,
+    cache: &mut MaskSendCache,
+) -> Result<(), cascadia_transport::TransportError> {
+    // The links of this engine never re-dial, so one connection generation.
+    const GENERATION: u64 = 0;
+    if let Some(words) = &frames.mask {
+        if cache.repeats(GENERATION, words) {
+            into_repeat_frame(&mut frames.hid);
+        }
+    }
+    let sent = send_step(g, &frames.pos, &frames.hid, &frames.header, &frames.cross).await;
+    match (&sent, &frames.mask) {
+        (Err(_), _) => cache.clear(),
+        (Ok(()), Some(words)) => cache.record(GENERATION, words),
+        (Ok(()), None) => {}
+    }
+    sent
+}
+
+/// [`wait_plain_reply`] on a link with a send cache: a failed wait clears
+/// it, so the next masked step goes full.
+async fn plain_reply_settled(
+    g: &mut ActivationClient,
+    prefill: bool,
+    cache: &mut MaskSendCache,
+) -> EngineResult<(i32, bool)> {
+    wait_plain_reply(g, prefill)
+        .await
+        .inspect_err(|_| cache.clear())
 }
 
 /// Reads the rest of a step after its position frame: the hidden frame, the
@@ -1034,7 +1159,10 @@ async fn wait_plain_reply(g: &mut ActivationClient, prefill: bool) -> EngineResu
                     ?reply,
                     "discarding a late reply to an earlier structured-output step"
                 );
-                late_ack |= matches!(reply, StageReply::Token(_) | StageReply::Nack);
+                late_ack |= matches!(
+                    reply,
+                    StageReply::Token(_) | StageReply::Nack | StageReply::MaskMiss
+                );
             }
         }
     }
@@ -1065,7 +1193,10 @@ async fn drain_late_replies(g: &mut ActivationClient) -> EngineResult<bool> {
                     ?reply,
                     "discarding a late reply to an earlier structured-output step"
                 );
-                late_ack |= matches!(reply, Ok(StageReply::Token(_) | StageReply::Nack));
+                late_ack |= matches!(
+                    reply,
+                    Ok(StageReply::Token(_) | StageReply::Nack | StageReply::MaskMiss)
+                );
             }
         }
     }
@@ -1083,6 +1214,8 @@ enum MaskedWait {
     /// No acknowledgement (no reply in time, a plain reply, or a middle's
     /// not-acknowledged reply): the chain can't mask.
     Unacked(String),
+    /// A stage below got a repeat marker with no mask to repeat.
+    MaskMiss,
     /// The link failed.
     Failed(EngineError),
 }
@@ -1127,6 +1260,7 @@ async fn wait_masked_reply(g: &mut ActivationClient, budget: Duration) -> Masked
     match decode_stage_reply(&tensor) {
         Ok(StageReply::Token(t)) => MaskedWait::Token(t),
         Ok(StageReply::Nack) => MaskedWait::Nack,
+        Ok(StageReply::MaskMiss) => MaskedWait::MaskMiss,
         Ok(StageReply::NotAcked) => MaskedWait::Unacked(
             "a later stage relayed a structured-output step to a stage that did not \
              acknowledge it"
@@ -1145,6 +1279,8 @@ fn middle_reply(w: MaskedWait) -> (StageReply, Option<EngineError>) {
     match w {
         MaskedWait::Token(t) => (StageReply::Token(t), None),
         MaskedWait::Nack => (StageReply::Nack, None),
+        // Passed up unchanged: the head fails the task without latching.
+        MaskedWait::MaskMiss => (StageReply::MaskMiss, None),
         MaskedWait::Unacked(why) => {
             warn!(%why, "gemma4: downstream did not acknowledge a structured-output step");
             (StageReply::NotAcked, None)
@@ -1161,27 +1297,38 @@ struct StepFrames {
     hid: WireTensor,
     header: WireTensor,
     cross: Vec<WireTensor>,
+    /// The mask `hid` carries, on a masked step.
+    mask: Option<Vec<u32>>,
 }
 
 /// A masked step on the downstream link, as the head and every middle run
-/// it: discard late replies, send the step, wait for its reply. The bool
-/// says a discarded late reply was acknowledged.
+/// it: discard late replies, send the step (a repeated mask as the marker,
+/// see [`send_step_cached`]), wait for its reply. The bool says a discarded
+/// late reply was acknowledged. Any outcome but a token clears `cache`.
 async fn masked_round(
     g: &mut ActivationClient,
-    frames: &StepFrames,
+    frames: &mut StepFrames,
     budget: Duration,
+    cache: &mut MaskSendCache,
 ) -> (MaskedWait, bool) {
     let late_ack = match drain_late_replies(g).await {
         Ok(late_ack) => late_ack,
-        Err(e) => return (MaskedWait::Failed(e), false),
+        Err(e) => {
+            cache.clear();
+            return (MaskedWait::Failed(e), false);
+        }
     };
-    if let Err(e) = send_step(g, &frames.pos, &frames.hid, &frames.header, &frames.cross).await {
+    if let Err(e) = send_step_cached(g, frames, cache).await {
         return (
             MaskedWait::Failed(EngineError::Backend(e.to_string())),
             late_ack,
         );
     }
-    (wait_masked_reply(g, budget).await, late_ack)
+    let wait = wait_masked_reply(g, budget).await;
+    if !matches!(wait, MaskedWait::Token(_)) {
+        cache.clear();
+    }
+    (wait, late_ack)
 }
 
 /// A middle stage's masked step after it has read the step from upstream:
@@ -1194,11 +1341,12 @@ async fn middle_masked_step(
     down: &mut ActivationClient,
     prepared: EngineResult<StepFrames>,
     budget: Duration,
+    cache: &mut MaskSendCache,
 ) -> (StageReply, Option<EngineError>, bool) {
     match prepared {
         Err(e) => (StageReply::Nack, Some(e), false),
-        Ok(frames) => {
-            let (wait, late_ack) = masked_round(down, &frames, budget).await;
+        Ok(mut frames) => {
+            let (wait, late_ack) = masked_round(down, &mut frames, budget, cache).await;
             let (reply, err) = middle_reply(wait);
             (reply, err, late_ack)
         }
@@ -1359,6 +1507,9 @@ fn head_masked_token(
             ),
             Some(GrammarFailure::Nack),
         )),
+        // A stage below lost its mask state: fail the task (the client may
+        // retry), never latch.
+        MaskedWait::MaskMiss => Err((EngineError::Backend(MASK_MISS_MESSAGE.into()), None)),
         MaskedWait::Unacked(why) => {
             latch.trip(now);
             Err((
@@ -1429,6 +1580,12 @@ pub struct Gemma4Engine {
     grammar_failure: Option<GrammarFailure>,
     /// Head: set when a later stage didn't acknowledge a masked step.
     mask_latch: MaskLatch,
+    /// The last token mask sent downstream, so a repeat goes as the short
+    /// marker. Cleared on every failed step, an ABORT and a latch.
+    mask_send: MaskSendCache,
+    /// Relay stages: the last token mask decoded from the upstream, which a
+    /// repeat marker stands for. The upstream link never re-dials.
+    mask_recv: MaskRecvCache,
     /// Middles: see [`OwedLateAck`].
     owed_late_ack: OwedLateAck,
     /// Pipeline stages after this one (0 on the tail); sizes masked waits.
@@ -1590,10 +1747,11 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let f = self.step_frames(hidden, shape, position, mask)?;
-        self.block_on(async move {
+        let mut f = self.step_frames(hidden, shape, position, mask)?;
+        let cache = &mut self.mask_send;
+        crate::dist_spec::run_async_pub(&self.runtime_handle, async move {
             let mut guard = downstream.lock().await;
-            send_step(&mut guard, &f.pos, &f.hid, &f.header, &f.cross).await
+            send_step_cached(&mut guard, &mut f, cache).await
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
         Ok(())
@@ -1655,6 +1813,7 @@ impl Gemma4Engine {
             hid,
             header: encode_cross_kv_header(&tags),
             cross: cross_frames,
+            mask: mask.map(<[u32]>::to_vec),
         })
     }
 
@@ -1665,10 +1824,12 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let (token, late_ack) = self.block_on(async move {
-            let mut guard = downstream.lock().await;
-            wait_plain_reply(&mut guard, prefill).await
-        })?;
+        let cache = &mut self.mask_send;
+        let (token, late_ack) =
+            crate::dist_spec::run_async_pub(&self.runtime_handle, async move {
+                let mut guard = downstream.lock().await;
+                plain_reply_settled(&mut guard, prefill, cache).await
+            })?;
         if late_ack {
             self.mask_latch.clear();
             self.owed_late_ack.on_ack_from_below();
@@ -1676,7 +1837,23 @@ impl Gemma4Engine {
         Ok(token)
     }
 
+    /// The upstream's next step: its hidden frame, resolved against this
+    /// link's receive cache once every frame of the step is read (a repeat
+    /// marker becomes the last mask decoded, or [`HiddenIn::MaskMiss`]), and
+    /// its position. A read or decode error clears the cache.
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(HiddenIn, i64)> {
+        match self.recv_step_from_upstream() {
+            Ok((hidden_in, position)) => {
+                Ok((resolve_hidden(hidden_in, &mut self.mask_recv), position))
+            }
+            Err(e) => {
+                self.mask_recv.clear();
+                Err(e)
+            }
+        }
+    }
+
+    fn recv_step_from_upstream(&mut self) -> EngineResult<(HiddenIn, i64)> {
         // Wire order per step: position frame, hidden frame, cross-KV header, then `count` cross-KV
         // frames. The position read transparently absorbs any I8 control frame (CAPTURE/RESTORE)
         // that arrives between turns (stateful workers only).
@@ -2181,16 +2358,18 @@ impl Gemma4Engine {
             let words = mask_words(mask, width).inspect_err(|_| {
                 self.grammar_failure = (width > 0).then_some(GrammarFailure::DeadEnd)
             })?;
-            let frames = self.step_frames(out, s3, position, Some(&words))?;
+            let mut frames = self.step_frames(out, s3, position, Some(&words))?;
             let downstream = self
                 .downstream
                 .clone()
                 .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
             let budget = masked_wait_budget(prefill, self.stages_below);
-            let (wait, late_ack) = self.block_on(async move {
-                let mut guard = downstream.lock().await;
-                masked_round(&mut guard, &frames, budget).await
-            });
+            let cache = &mut self.mask_send;
+            let (wait, late_ack) =
+                crate::dist_spec::run_async_pub(&self.runtime_handle, async move {
+                    let mut guard = downstream.lock().await;
+                    masked_round(&mut guard, &mut frames, budget, cache).await
+                });
             if late_ack {
                 self.mask_latch.clear();
             }
@@ -2404,7 +2583,17 @@ impl Gemma4Engine {
                 warn!(%why, "gemma4: can't read a structured-output step; answering NACK");
                 self.send_masked_reply_upstream(StageReply::Nack, false)
             }
+            HiddenIn::MaskMiss => self.answer_mask_miss(),
+            // `recv_hidden_from_upstream` resolves every marker.
+            HiddenIn::Repeat { .. } => self.send_masked_reply_upstream(StageReply::Nack, false),
         }
+    }
+
+    /// Answers a repeat marker this stage has no mask for: the mask-miss
+    /// reply, with no layer run and nothing forwarded.
+    fn answer_mask_miss(&mut self) -> EngineResult<()> {
+        warn!("gemma4: a repeat token mask arrived with no mask to repeat; answering a mask miss");
+        self.send_masked_reply_upstream(StageReply::MaskMiss, false)
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
@@ -2419,6 +2608,11 @@ impl Gemma4Engine {
             HiddenIn::BadMask(why) => {
                 warn!(%why, "gemma4: can't read a structured-output step; answering NACK");
                 return self.send_masked_reply_upstream(StageReply::Nack, false);
+            }
+            HiddenIn::MaskMiss => return self.answer_mask_miss(),
+            // `recv_hidden_from_upstream` resolves every marker.
+            HiddenIn::Repeat { .. } => {
+                return self.send_masked_reply_upstream(StageReply::Nack, false)
             }
         };
         // Multi-token hidden = prefill: the token reply waits on every
@@ -2442,10 +2636,11 @@ impl Gemma4Engine {
                 self.step_frames(&out, to_shape3(&out_shape), position, Some(&words))
             });
         let budget = masked_wait_budget(prefill_reply, self.stages_below);
+        let cache = &mut self.mask_send;
         let (reply, err, late_ack) = match self.downstream.clone() {
-            Some(downstream) => self.block_on(async move {
+            Some(downstream) => crate::dist_spec::run_async_pub(&self.runtime_handle, async move {
                 let mut guard = downstream.lock().await;
-                middle_masked_step(&mut guard, prepared, budget).await
+                middle_masked_step(&mut guard, prepared, budget, cache).await
             }),
             None => (
                 StageReply::Nack,
@@ -2660,7 +2855,10 @@ async fn recv_control_ack_bounded(
                     ?reply,
                     "discarding a late reply to an earlier structured-output step"
                 );
-                late_ack |= matches!(reply, Ok(StageReply::Token(_) | StageReply::Nack));
+                late_ack |= matches!(
+                    reply,
+                    Ok(StageReply::Token(_) | StageReply::Nack | StageReply::MaskMiss)
+                );
                 continue;
             }
             return Ok((t, late_ack));
@@ -2750,6 +2948,8 @@ impl Gemma4Engine {
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
         // Bounded like CAPTURE above: an unbounded wait on a dead peer
         // wedges this rank while it holds the downstream lock.
+        // The chain resets: the next masked step goes full.
+        self.mask_send.clear();
         self.control_exchange_downstream(downstream, control_frame(G_OPCODE_ABORT, &[]))
             .map(|_| ())
     }
@@ -3387,6 +3587,8 @@ impl Builder for Gemma4Builder {
             grammar_warn: StepWarnLimiter::default(),
             grammar_failure: None,
             mask_latch: MaskLatch::default(),
+            mask_send: MaskSendCache::default(),
+            mask_recv: MaskRecvCache::default(),
             owed_late_ack: OwedLateAck::default(),
             stages_below: self.total.saturating_sub(self.rank + 1),
             #[cfg(feature = "kv_coord")]
@@ -4078,7 +4280,7 @@ mod tests {
                 reply
             }
             HiddenIn::BadMask(_) => StageReply::Nack,
-            HiddenIn::Plain { .. } => panic!("expected a masked step"),
+            other => panic!("expected a masked step, got {other:?}"),
         };
         up.send(&encode_masked_reply(reply)).await.unwrap();
     }
@@ -4104,8 +4306,10 @@ mod tests {
             hid,
             header: encode_cross_kv_header(&tags),
             cross: frames,
+            mask: Some(words),
         });
-        let (reply, err, _) = middle_masked_step(down, prepared, budget).await;
+        let (reply, err, _) =
+            middle_masked_step(down, prepared, budget, &mut MaskSendCache::default()).await;
         up.send(&encode_masked_reply(reply)).await.unwrap();
         assert!(err.is_none());
     }
@@ -4854,6 +5058,7 @@ mod tests {
             &mut down,
             Err(EngineError::Backend("infer failed".into())),
             Duration::from_secs(5),
+            &mut MaskSendCache::default(),
         )
         .await;
         assert_eq!(reply, StageReply::Nack);
@@ -4875,9 +5080,15 @@ mod tests {
             hid: encode_hidden_frame(&hidden, shape, Some(&words)).unwrap(),
             header: encode_cross_kv_header(&tags),
             cross,
+            mask: Some(words.clone()),
         };
-        let (reply, err, _) =
-            middle_masked_step(&mut down, Ok(frames), Duration::from_secs(5)).await;
+        let (reply, err, _) = middle_masked_step(
+            &mut down,
+            Ok(frames),
+            Duration::from_secs(5),
+            &mut MaskSendCache::default(),
+        )
+        .await;
         assert_eq!(reply, StageReply::Nack);
         assert!(err.is_some());
     }
@@ -4901,10 +5112,16 @@ mod tests {
             hid: encode_hidden_frame(&hidden, shape, Some(&words)).unwrap(),
             header: encode_cross_kv_header(&tags),
             cross,
+            mask: Some(words.clone()),
         };
         // The tail reads nothing and never answers: the wait times out.
-        let (reply, err, late_ack) =
-            middle_masked_step(&mut down, Ok(frames), Duration::from_millis(100)).await;
+        let (reply, err, late_ack) = middle_masked_step(
+            &mut down,
+            Ok(frames),
+            Duration::from_millis(100),
+            &mut MaskSendCache::default(),
+        )
+        .await;
         assert_eq!(reply, StageReply::NotAcked);
         assert!(err.is_none());
         assert!(late_ack, "the drained reply was acknowledged");
@@ -4946,13 +5163,541 @@ mod tests {
             hid: encode_hidden_frame(&hidden, shape, Some(&words)).unwrap(),
             header: encode_cross_kv_header(&tags),
             cross,
+            mask: Some(words.clone()),
         };
-        let (w, late_ack) = masked_round(&mut client, &frames, Duration::from_secs(5)).await;
+        let mut frames = frames;
+        let (w, late_ack) = masked_round(
+            &mut client,
+            &mut frames,
+            Duration::from_secs(5),
+            &mut MaskSendCache::default(),
+        )
+        .await;
         assert!(late_ack);
         assert!(
             matches!(w, MaskedWait::Token(t) if t == b'"' as i32),
             "{w:?}"
         );
         tail.await.unwrap();
+    }
+
+    // ---- repeated masks on the stage wire ----
+
+    /// A different mask of the same width as [`ok_words`].
+    fn other_words() -> Vec<u32> {
+        vec![u32::MAX; ok_words().len()]
+    }
+
+    /// The sample step's frames, carrying `mask`.
+    fn sample_frames(mask: Option<&[u32]>) -> StepFrames {
+        let (hidden, shape) = sample_hidden();
+        let (tags, cross) = sample_cross();
+        StepFrames {
+            pos: encode_wire_position(0),
+            hid: encode_hidden_frame(&hidden, shape, mask).unwrap(),
+            header: encode_cross_kv_header(&tags),
+            cross,
+            mask: mask.map(<[u32]>::to_vec),
+        }
+    }
+
+    /// The marker's exact hidden frame for the sample hidden: I32
+    /// `[1, n+1, H]`, the hidden's f32 bits, then one row of zeros whose last
+    /// element is `REPEAT`.
+    fn sample_repeat_frame() -> WireTensor {
+        let (hidden, [_, n, h]) = sample_hidden();
+        let mut data = f32_to_bytes(&hidden);
+        for _ in 0..h - 1 {
+            data.extend_from_slice(&0u32.to_le_bytes());
+        }
+        data.extend_from_slice(&REPEAT.to_le_bytes());
+        WireTensor::new(WireDType::I32, [1, n as u32 + 1, h as u32], data)
+    }
+
+    /// A relay stage's step read the way the engine reads it, with the link's
+    /// receive cache.
+    async fn cached_stage_read(
+        g: &mut ActivationServer,
+        recv: &mut MaskRecvCache,
+    ) -> (WireTensor, HiddenIn) {
+        let _pos = g.recv().await.unwrap().0;
+        let (hid, _tags, _frames) = recv_step_frames(g, 2).await.unwrap();
+        let decoded = resolve_hidden(decode_hidden_frame(&hid).unwrap(), recv);
+        (hid, decoded)
+    }
+
+    /// The tail's step as `step_last` runs it on the cached wire: a miss runs
+    /// nothing and answers the mask-miss reply.
+    async fn cached_tail_step(up: &mut ActivationServer, recv: &mut MaskRecvCache) -> HiddenIn {
+        let (_, hidden_in) = cached_stage_read(up, recv).await;
+        let reply = match &hidden_in {
+            HiddenIn::Masked { words, .. } => {
+                let (row, shape) = tail_row();
+                tail_masked_reply(Ok((row, shape)), words).0
+            }
+            HiddenIn::MaskMiss => StageReply::MaskMiss,
+            other => panic!("expected a masked step, got {other:?}"),
+        };
+        up.send(&encode_masked_reply(reply)).await.unwrap();
+        hidden_in
+    }
+
+    /// A repeated mask goes as the marker, a frame of the hidden plus one
+    /// row whatever the vocab; the tail resolves it and picks the same token.
+    #[tokio::test]
+    async fn a_repeated_mask_goes_as_a_short_marker_and_the_tail_picks_the_same_token() {
+        let (mut server, mut client) = link().await;
+        let words = ok_words();
+        let mut send = MaskSendCache::default();
+        let mut recv = MaskRecvCache::default();
+        let (hidden, shape) = sample_hidden();
+        for step in 0..3 {
+            let mut frames = sample_frames(Some(&words));
+            let tail = async {
+                let (hid, decoded) = cached_stage_read(&mut server, &mut recv).await;
+                let (row, rshape) = tail_row();
+                let HiddenIn::Masked { words: got, .. } = &decoded else {
+                    panic!("{decoded:?}")
+                };
+                let reply = tail_masked_reply(Ok((row, rshape)), got).0;
+                server.send(&encode_masked_reply(reply)).await.unwrap();
+                (hid, decoded)
+            };
+            let ((w, _), (hid, decoded)) = tokio::join!(
+                masked_round(&mut client, &mut frames, Duration::from_secs(5), &mut send),
+                tail
+            );
+            assert!(
+                matches!(w, MaskedWait::Token(t) if t == b'"' as i32),
+                "{w:?}"
+            );
+            if step == 0 {
+                assert_eq!(
+                    hid,
+                    encode_hidden_frame(&hidden, shape, Some(&words)).unwrap()
+                );
+            } else {
+                assert_eq!(hid, sample_repeat_frame(), "step {step}");
+                assert_eq!(
+                    hid.data.len(),
+                    (shape[1] + 1) * shape[2] * 4,
+                    "no mask words"
+                );
+            }
+            assert_eq!(
+                decoded,
+                HiddenIn::Masked {
+                    floats: hidden.clone(),
+                    shape,
+                    words: words.clone()
+                }
+            );
+        }
+    }
+
+    /// The first masked step and every changed mask go full; a plain step in
+    /// between is the base byte stream and doesn't reset the link.
+    #[tokio::test]
+    async fn the_first_mask_and_every_changed_mask_go_full() {
+        let (mut server, mut client) = link().await;
+        let (a, b) = (ok_words(), other_words());
+        let mut send = MaskSendCache::default();
+        let mut recv = MaskRecvCache::default();
+        let (hidden, shape) = sample_hidden();
+        let steps: [(Option<&[u32]>, bool); 6] = [
+            (Some(&a), false),
+            (Some(&a), true),
+            (None, false),
+            (Some(&a), true),
+            (Some(&b), false),
+            (Some(&a), false),
+        ];
+        for (mask, repeat) in steps {
+            let mut frames = sample_frames(mask);
+            send_step_cached(&mut client, &mut frames, &mut send)
+                .await
+                .unwrap();
+            let (hid, decoded) = cached_stage_read(&mut server, &mut recv).await;
+            match mask {
+                None => assert_eq!(hid, encode_hidden_frame(&hidden, shape, None).unwrap()),
+                Some(_) if repeat => assert_eq!(hid, sample_repeat_frame()),
+                Some(words) => {
+                    assert_eq!(
+                        hid,
+                        encode_hidden_frame(&hidden, shape, Some(words)).unwrap()
+                    )
+                }
+            }
+            match (mask, decoded) {
+                (None, HiddenIn::Plain { .. }) => {}
+                (Some(want), HiddenIn::Masked { words, .. }) => assert_eq!(words, want),
+                (m, d) => panic!("{m:?} {d:?}"),
+            }
+        }
+    }
+
+    /// A marker on a fresh receiver is a miss: the tail runs nothing and
+    /// answers `[-2, MASK_ACK]`. The head fails the task with the retry
+    /// message, clears its send cache, and doesn't latch; the next masked
+    /// step goes full.
+    #[tokio::test]
+    async fn a_repeat_on_a_fresh_receiver_fails_the_task_without_latching() {
+        let (mut server, mut client) = link().await;
+        let words = ok_words();
+        let mut send = MaskSendCache::default();
+        send.record(0, &words);
+        let mut recv = MaskRecvCache::default();
+        let mut frames = sample_frames(Some(&words));
+        let ((w, late), got) = tokio::join!(
+            masked_round(&mut client, &mut frames, Duration::from_secs(5), &mut send),
+            cached_tail_step(&mut server, &mut recv)
+        );
+        assert_eq!(got, HiddenIn::MaskMiss);
+        assert!(!late);
+        assert!(matches!(w, MaskedWait::MaskMiss), "{w:?}");
+        assert!(send.is_empty(), "the head forgets the mask");
+        let mut latch = MaskLatch::default();
+        let now = std::time::Instant::now();
+        let (err, kind) = head_masked_token(w, &mut latch, now).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("backend error: {MASK_MISS_MESSAGE}")
+        );
+        assert_eq!(kind, None);
+        assert!(latch.refusal(now).is_ok(), "no latch");
+
+        // The miss reply's exact bytes.
+        let miss = encode_masked_reply(StageReply::MaskMiss);
+        assert_eq!(miss.shape, [1, 1, 2]);
+        let mut want = MASK_MISS_TOKEN.to_le_bytes().to_vec();
+        want.extend_from_slice(&MASK_ACK.to_le_bytes());
+        assert_eq!(miss.data, want);
+        assert_eq!(decode_stage_reply(&miss).unwrap(), StageReply::MaskMiss);
+
+        // The next step goes full and succeeds.
+        let mut frames = sample_frames(Some(&words));
+        let ((w, _), got) = tokio::join!(
+            masked_round(&mut client, &mut frames, Duration::from_secs(5), &mut send),
+            cached_tail_step(&mut server, &mut recv)
+        );
+        assert!(matches!(got, HiddenIn::Masked { .. }), "{got:?}");
+        assert!(
+            matches!(w, MaskedWait::Token(t) if t == b'"' as i32),
+            "{w:?}"
+        );
+    }
+
+    /// The middle's step as `step_middle` runs it on the cached wire (the
+    /// model an identity): a miss from upstream answers the mask-miss reply
+    /// and sends nothing down; else it re-encodes with its own send cache.
+    /// `fail_own_step` fails its own work before it forwards.
+    async fn cached_middle_step(
+        up: &mut ActivationServer,
+        down: &mut ActivationClient,
+        recv: &mut MaskRecvCache,
+        send: &mut MaskSendCache,
+        fail_own_step: bool,
+    ) -> StageReply {
+        let pos_t = up.recv().await.unwrap().0;
+        let (hid, tags, frames) = recv_step_frames(up, 2).await.unwrap();
+        let reply = match resolve_hidden(decode_hidden_frame(&hid).unwrap(), recv) {
+            HiddenIn::MaskMiss => StageReply::MaskMiss,
+            HiddenIn::Masked {
+                floats,
+                shape,
+                words,
+            } => {
+                let prepared = if fail_own_step {
+                    Err(EngineError::Backend("own".into()))
+                } else {
+                    encode_hidden_frame(&floats, shape, Some(&words)).map(|hid| StepFrames {
+                        pos: pos_t,
+                        hid,
+                        header: encode_cross_kv_header(&tags),
+                        cross: frames,
+                        mask: Some(words),
+                    })
+                };
+                middle_masked_step(down, prepared, Duration::from_secs(5), send)
+                    .await
+                    .0
+            }
+            other => panic!("expected a masked step, got {other:?}"),
+        };
+        up.send(&encode_masked_reply(reply)).await.unwrap();
+        reply
+    }
+
+    /// Head → middle → tail, miss at the tail: the middle passes the
+    /// mask-miss reply up unchanged; the head fails the task without
+    /// latching, and the middle forgets its downstream mask.
+    #[tokio::test]
+    async fn a_miss_at_the_tail_reaches_the_head_through_a_middle() {
+        let (mut mid_up, mut head) = link().await;
+        let (mut tail_up, mut mid_down) = link().await;
+        let words = ok_words();
+        let mut head_send = MaskSendCache::default();
+        let mut mid_recv = MaskRecvCache::default();
+        let mut mid_send = MaskSendCache::default();
+        // The middle believes the tail holds `words`; the tail is fresh.
+        mid_send.record(0, &words);
+        let mut tail_recv = MaskRecvCache::default();
+        let mut frames = sample_frames(Some(&words));
+        let ((w, _), mid_reply, tail_got) = tokio::join!(
+            masked_round(
+                &mut head,
+                &mut frames,
+                Duration::from_secs(10),
+                &mut head_send
+            ),
+            cached_middle_step(
+                &mut mid_up,
+                &mut mid_down,
+                &mut mid_recv,
+                &mut mid_send,
+                false
+            ),
+            cached_tail_step(&mut tail_up, &mut tail_recv)
+        );
+        assert_eq!(tail_got, HiddenIn::MaskMiss);
+        assert_eq!(
+            mid_reply,
+            StageReply::MaskMiss,
+            "relayed, not turned into a NACK"
+        );
+        assert!(mid_send.is_empty());
+        let mut latch = MaskLatch::default();
+        let now = std::time::Instant::now();
+        let (err, _) = head_masked_token(w, &mut latch, now).unwrap_err();
+        assert!(err.to_string().contains(MASK_MISS_MESSAGE), "{err}");
+        assert!(latch.refusal(now).is_ok(), "no latch");
+        assert!(head_send.is_empty());
+
+        // The next step goes full on both hops and succeeds.
+        let mut frames = sample_frames(Some(&words));
+        let ((w, _), mid_reply, tail_got) = tokio::join!(
+            masked_round(
+                &mut head,
+                &mut frames,
+                Duration::from_secs(10),
+                &mut head_send
+            ),
+            cached_middle_step(
+                &mut mid_up,
+                &mut mid_down,
+                &mut mid_recv,
+                &mut mid_send,
+                false
+            ),
+            cached_tail_step(&mut tail_up, &mut tail_recv)
+        );
+        assert!(matches!(tail_got, HiddenIn::Masked { .. }), "{tail_got:?}");
+        assert_eq!(mid_reply, StageReply::Token(b'"' as i32));
+        assert!(
+            matches!(w, MaskedWait::Token(t) if t == b'"' as i32),
+            "{w:?}"
+        );
+    }
+
+    /// A middle resolves the upstream's marker and re-encodes it with its own
+    /// cache. When it fails a step it decoded without forwarding it, the
+    /// upstream's next marker goes downstream full.
+    #[tokio::test]
+    async fn a_marker_from_upstream_goes_down_full_after_the_middle_dropped_a_step() {
+        let (mut mid_up, mut head) = link().await;
+        let (mut tail_up, mut mid_down) = link().await;
+        let (a, b) = (ok_words(), other_words());
+        let mut head_send = MaskSendCache::default();
+        let mut mid_recv = MaskRecvCache::default();
+        let mut mid_send = MaskSendCache::default();
+        let mut tail_recv = MaskRecvCache::default();
+        let (hidden, shape) = sample_hidden();
+        let mut tail_hids = Vec::new();
+        // (mask the head sends, the middle fails its own step)
+        let steps: [(&[u32], bool); 4] = [(&a, false), (&a, false), (&b, true), (&b, false)];
+        for (words, fail) in steps {
+            let mut frames = sample_frames(Some(words));
+            // The head keeps its cache across the middle's failure: the
+            // middle decoded every frame it was sent.
+            send_step_cached(&mut head, &mut frames, &mut head_send)
+                .await
+                .unwrap();
+            let tail = async {
+                if fail {
+                    return;
+                }
+                let (hid, decoded) = cached_stage_read(&mut tail_up, &mut tail_recv).await;
+                tail_hids.push(hid);
+                let HiddenIn::Masked { words: got, .. } = decoded else {
+                    panic!("{decoded:?}")
+                };
+                assert_eq!(got, words);
+                tail_up
+                    .send(&encode_masked_reply(StageReply::Token(1)))
+                    .await
+                    .unwrap();
+            };
+            let (reply, ()) = tokio::join!(
+                cached_middle_step(
+                    &mut mid_up,
+                    &mut mid_down,
+                    &mut mid_recv,
+                    &mut mid_send,
+                    fail
+                ),
+                tail
+            );
+            let w = wait_masked_reply(&mut head, Duration::from_secs(5)).await;
+            if fail {
+                assert_eq!(reply, StageReply::Nack);
+                assert!(matches!(w, MaskedWait::Nack), "{w:?}");
+            } else {
+                assert!(matches!(w, MaskedWait::Token(1)), "{w:?}");
+            }
+        }
+        assert_eq!(tail_hids.len(), 3);
+        assert_eq!(
+            tail_hids[0],
+            encode_hidden_frame(&hidden, shape, Some(&a)).unwrap()
+        );
+        assert_eq!(
+            tail_hids[1],
+            sample_repeat_frame(),
+            "the middle re-encodes as a marker"
+        );
+        assert_eq!(
+            tail_hids[2],
+            encode_hidden_frame(&hidden, shape, Some(&b)).unwrap(),
+            "the tail never saw b: it goes full"
+        );
+    }
+
+    /// Every failed step on a link clears its send cache: an acknowledged
+    /// NACK, an unacknowledged reply, silence, a failed plain wait, a write
+    /// error. A good reply keeps it.
+    #[tokio::test]
+    async fn the_sender_forgets_the_mask_on_every_failed_step() {
+        let words = ok_words();
+        let replies = [
+            (Some(StageReply::Nack), false),
+            (Some(StageReply::NotAcked), false),
+            (Some(StageReply::Plain(3)), false),
+            (None, false),
+            (Some(StageReply::Token(3)), true),
+        ];
+        for (reply, kept) in replies {
+            let (mut server, mut client) = link().await;
+            let mut send = MaskSendCache::default();
+            send.record(0, &words);
+            let mut frames = sample_frames(Some(&words));
+            let tail = async {
+                let _ = cached_stage_read(&mut server, &mut MaskRecvCache::default()).await;
+                if let Some(r) = reply {
+                    server.send(&encode_masked_reply(r)).await.unwrap();
+                }
+            };
+            let ((w, _), ()) = tokio::join!(
+                masked_round(
+                    &mut client,
+                    &mut frames,
+                    Duration::from_millis(100),
+                    &mut send
+                ),
+                tail
+            );
+            assert_eq!(!send.is_empty(), kept, "{reply:?} {w:?}");
+        }
+
+        // A failed plain wait (the downstream went away).
+        let (server, mut client) = link().await;
+        drop(server);
+        let mut send = MaskSendCache::default();
+        send.record(0, &words);
+        assert!(plain_reply_settled(&mut client, false, &mut send)
+            .await
+            .is_err());
+        assert!(send.is_empty());
+
+        // A write error.
+        let (server, mut client) = link().await;
+        drop(server);
+        client.close().await;
+        let mut send = MaskSendCache::default();
+        send.record(0, &words);
+        let mut frames = sample_frames(Some(&words));
+        assert!(send_step_cached(&mut client, &mut frames, &mut send)
+            .await
+            .is_err());
+        assert!(send.is_empty());
+    }
+
+    /// A stage that predates the marker reads every frame of a marker step,
+    /// then fails on the I32 hidden exactly as for a full mask, and stays
+    /// aligned.
+    #[tokio::test]
+    async fn an_old_stage_reads_every_frame_of_a_marker_step_then_fails() {
+        let (mut server, mut client) = link().await;
+        let words = ok_words();
+        let mut send = MaskSendCache::default();
+        send.record(0, &words);
+        let mut frames = sample_frames(Some(&words));
+        frames.pos = encode_wire_position(4);
+        send_step_cached(&mut client, &mut frames, &mut send)
+            .await
+            .unwrap();
+        assert_eq!(frames.hid, sample_repeat_frame());
+        send_sample_step(&mut client, 6, None).await;
+        let err = old_stage_read(&mut server, 2).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unexpected upstream hidden dtype I32"),
+            "{err}"
+        );
+        let (floats, shape, pos) = old_stage_read(&mut server, 2).await.unwrap();
+        let (hidden, hshape) = sample_hidden();
+        assert_eq!((floats, shape, pos), (hidden, hshape, 6));
+    }
+
+    /// A malformed marker (non-zero padding, or more than one trailing row)
+    /// is a bad mask, and a bad masked frame clears the receive cache: a
+    /// marker after it misses.
+    #[test]
+    fn a_bad_masked_frame_clears_the_receive_cache() {
+        let words = ok_words();
+        let mut recv = MaskRecvCache::default();
+        recv.commit(&words);
+        let mut bad = sample_repeat_frame();
+        let at = bad.data.len() - 8;
+        bad.data[at] = 1;
+        let decoded = decode_hidden_frame(&bad).unwrap();
+        assert!(matches!(decoded, HiddenIn::BadMask(_)), "{decoded:?}");
+        assert!(matches!(
+            resolve_hidden(decoded, &mut recv),
+            HiddenIn::BadMask(_)
+        ));
+        let repeat = decode_hidden_frame(&sample_repeat_frame()).unwrap();
+        assert_eq!(resolve_hidden(repeat, &mut recv), HiddenIn::MaskMiss);
+    }
+
+    /// A late acknowledged mask-miss reply is discarded like any late masked
+    /// reply: by the plain wait, and by the drain before a masked step.
+    #[tokio::test]
+    async fn a_late_mask_miss_reply_is_discarded_as_stale() {
+        let (mut server, mut client) = link().await;
+        server
+            .send(&encode_masked_reply(StageReply::MaskMiss))
+            .await
+            .unwrap();
+        server.send(&encode_token_reply(7)).await.unwrap();
+        assert_eq!(
+            wait_plain_reply(&mut client, false).await.unwrap(),
+            (7, true)
+        );
+        server
+            .send(&encode_masked_reply(StageReply::MaskMiss))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(drain_late_replies(&mut client).await.unwrap());
     }
 }
