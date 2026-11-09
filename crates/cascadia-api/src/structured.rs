@@ -66,6 +66,11 @@ pub const MAX_SCHEMA_COUNT: u64 = 10_000;
 /// `minX`/`maxX` pair on one object counts once, at the larger value. Sized
 /// so an extraction schema with 21 text fields of `maxLength: 5000` passes.
 pub const MAX_SCHEMA_COUNT_TOTAL: u64 = 200_000;
+/// Most `patternProperties` keys on one object. Building the grammar grows
+/// about with the cube of the key count (500 keys: 20 s; 100 keys: 0.1 s).
+pub const MAX_PATTERN_PROPERTIES: usize = 64;
+/// Most `patternProperties` keys in one schema, all objects together.
+pub const MAX_PATTERN_PROPERTIES_TOTAL: usize = 128;
 
 const TYPE_ERR: &str = "response_format.type must be one of text, json_object, json_schema";
 
@@ -189,7 +194,9 @@ const COUNT_KEYWORDS: [[&str; 2]; 3] = [
 const FIELD: &str = "response_format.json_schema.schema";
 
 /// Reject a schema over [`MAX_SCHEMA_BYTES`], with a repeated key in any
-/// object, nested deeper than [`MAX_SCHEMA_DEPTH`], with a count keyword or
+/// object, nested deeper than [`MAX_SCHEMA_DEPTH`], with more
+/// `patternProperties` keys than [`MAX_PATTERN_PROPERTIES`] on one object or
+/// [`MAX_PATTERN_PROPERTIES_TOTAL`] in all, with a count keyword or
 /// pattern quantifier above [`MAX_SCHEMA_COUNT`], or whose counts sum above
 /// [`MAX_SCHEMA_COUNT_TOTAL`]. `text` is the schema's compact text. Depth
 /// through `$ref` is checked later, on the text the backend receives
@@ -207,6 +214,13 @@ fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
             "{FIELD} nests deeper than {MAX_SCHEMA_DEPTH} levels"
         ));
     }
+    let mut keys = 0;
+    count_pattern_properties(schema, &mut keys)?;
+    if keys > MAX_PATTERN_PROPERTIES_TOTAL {
+        return Err(format!(
+            "{FIELD} has {keys} patternProperties keys; the limit is {MAX_PATTERN_PROPERTIES_TOTAL}"
+        ));
+    }
     let mut total = 0;
     sum_counts(schema, &mut total)?;
     if total > MAX_SCHEMA_COUNT_TOTAL {
@@ -215,6 +229,32 @@ fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Add the number of `patternProperties` keys of every object in `v` to
+/// `total` (data objects too, as [`sum_counts`]), failing on an object with
+/// more than [`MAX_PATTERN_PROPERTIES`].
+fn count_pattern_properties(v: &Value, total: &mut usize) -> Result<(), String> {
+    match v {
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|c| count_pattern_properties(c, total)),
+        Value::Object(obj) => {
+            if let Some(Value::Object(map)) = obj.get("patternProperties") {
+                let n = map.len();
+                if n > MAX_PATTERN_PROPERTIES {
+                    return Err(format!(
+                        "{FIELD}: an object has {n} patternProperties keys; \
+                         the limit is {MAX_PATTERN_PROPERTIES}"
+                    ));
+                }
+                *total += n;
+            }
+            obj.values()
+                .try_for_each(|c| count_pattern_properties(c, total))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Add every count keyword value and pattern quantifier number in `v` to
@@ -2807,5 +2847,53 @@ mod tests {
         ] {
             assert_eq!(parsed_schema_text(schema).0, schema);
         }
+    }
+
+    /// An object schema with `n` literal `patternProperties` keys.
+    fn pattern_props(n: usize) -> serde_json::Value {
+        let map: serde_json::Map<String, serde_json::Value> = (0..n)
+            .map(|i| (format!("^k{i}$"), json!({"type": "integer"})))
+            .collect();
+        json!({"type": "object", "patternProperties": map})
+    }
+
+    #[test]
+    fn many_pattern_properties_keys_are_rejected() {
+        assert_eq!(
+            parse_schema(pattern_props(500)),
+            Err(
+                "response_format.json_schema.schema: an object has 500 patternProperties keys; \
+                 the limit is 64"
+                    .into()
+            )
+        );
+        assert!(matches!(
+            parse_schema(pattern_props(64)),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn pattern_properties_keys_are_capped_in_total() {
+        let three = json!({
+            "type": "object",
+            "properties": {"a": pattern_props(60), "b": pattern_props(60), "c": pattern_props(60)}
+        });
+        assert_eq!(
+            parse_schema(three),
+            Err(
+                "response_format.json_schema.schema has 180 patternProperties keys; \
+                 the limit is 128"
+                    .into()
+            )
+        );
+        let two = json!({
+            "type": "object",
+            "properties": {"a": pattern_props(64), "b": pattern_props(64)}
+        });
+        assert!(matches!(
+            parse_schema(two),
+            Ok(ResponseFormat::JsonSchema { .. })
+        ));
     }
 }
