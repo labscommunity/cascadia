@@ -531,3 +531,77 @@ OpenVINO GPU plugin can see.
 
 Per-engine deep dives: [engines/](engines/). Per-family export notes:
 [architectures/](architectures/).
+
+## Structured output (`response_format`)
+
+`/v1/chat/completions` accepts OpenAI's `response_format` field:
+
+| `type` | Output |
+|---|---|
+| `text` (or no field) | Free text, as before. |
+| `json_object` | Any JSON object. |
+| `json_schema` | JSON matching `response_format.json_schema.schema`. A missing, `null` or `true` schema means any JSON object; `false` is rejected. |
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Name a city and its country."}],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "city", "schema": {
+    "type": "object",
+    "properties": {"city": {"type": "string"}, "country": {"type": "string"}},
+    "required": ["city", "country"]}}}
+}'
+```
+
+Engines:
+
+| Engine | `json_object` / `json_schema` |
+|---|---|
+| `ov-genai` | Enforced by OpenVINO GenAI's structured output, stateful and `--cb`. At startup the engine checks that structured output works for the loaded model. |
+| `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar. |
+| `mock` | Answers with a minimal instance that matches the schema. |
+| `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe` | 400: `response_format <type> is not supported by the <engine> engine; …`. |
+
+Behaviour:
+
+- Thinking is turned off for a JSON request: a JSON answer has no room for a
+  reasoning preamble.
+- The format is **not enforced** when the request offers tools the model may
+  call (`tools` non-empty and `tool_choice` other than `"none"`): the model may
+  answer with a tool call, which the format does not constrain. The server logs
+  `response_format not enforced` for such a request, and engines without
+  structured output let it through instead of answering 400.
+- A token limit can cut the JSON short: the response then has
+  `finish_reason: "length"` and the content does not parse. Leave room in
+  `max_tokens`.
+- Small models may emit long runs of whitespace inside the JSON: still valid,
+  but it spends tokens and can run into the token limit.
+- Some JSON Schema keywords are accepted but **not enforced**: `not`,
+  `if`/`then`/`else`, `dependentRequired`, `dependentSchemas`,
+  `uniqueItems`, `contains`, `minContains`, `maxContains`, `multipleOf`, an
+  `allOf` with more than one member, and constraints placed beside
+  `$ref`/`anyOf`/`oneOf`/`allOf`/`const`/`enum` (annotations such as
+  `description` are fine there). The server logs the keywords it found;
+  validate the answer client-side if they matter.
+
+Schema limits (each is a 400 `invalid response_format: …`):
+
+| Limit | Value |
+|---|---|
+| Schema size (compact JSON) | 64 KiB (65 536 bytes) |
+| Nesting depth of objects and arrays | 64 |
+| Any one `minItems`, `maxItems`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, or number in a `pattern` / `patternProperties` repetition quantifier (`{n}`, `{n,m}`) | 10 000 |
+| Sum of all those counts in one schema | 100 000 |
+
+Errors (`{"error": "<message>"}`, status 400):
+
+| Message | Cause |
+|---|---|
+| `invalid response_format: <reason>` | Malformed field (unknown `type`, non-object schema, `false` schema) or a schema over the limits above. |
+| `response_format <type> is not supported by the <engine> engine; …` | The engine has no structured output (table above). |
+| `invalid configuration: response_format json_schema: <reason>` | The backend could not build a constraint from the schema. |
+| `invalid configuration: structured output is not available for this model: <reason>` | `ov-genai` only: the startup check found structured output does not work for the loaded model. |
+
+On `ov-genai --cb`, a schema whose compile fails while a batch runs fails that
+batch step, and the same schema is then refused for 10 minutes with
+`invalid configuration: response_format json_schema: this schema failed to
+compile on this server; retry later or change the schema`.
