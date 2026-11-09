@@ -15,6 +15,10 @@ Sends what Codex and the agent SDKs send and checks the answers' shape:
   codex_turn2     Codex's replay (reasoning, function_call, its output), streamed
   codex_late_dev  turn 2 plus a later `developer` message and a new user
                   message, as Codex sends after a permission change
+  late_dev        instructions, a user and an assistant turn, then a
+                  `developer` message and a user message, with no tools (the
+                  turns a template that only takes a leading system turn
+                  refuses unless the server folds them)
 
 Usage:
   python3 scripts/responses-live-check.py http://127.0.0.1:18100 [--max-output-tokens 1024]
@@ -336,6 +340,18 @@ def run(args):
         {"type": "message", "role": "user",
          "content": [{"type": "input_text", "text": "Now say done."}]},
     ]
+    def late_dev_plain():
+        r = call(base, {"model": model, "instructions": "You are terse.", "input": [
+            {"role": "user", "content": "Say hello."},
+            {"role": "assistant", "content": "Hello."},
+            {"role": "developer", "content": "From now on answer in one word."},
+            {"role": "user", "content": "Say done."},
+        ], "max_output_tokens": mot, "store": False}, to)
+        check_finished(r)
+        if not "".join(texts(r)).strip() and r.get("status") == "completed":
+            raise Fail(f"empty answer: {summary(r)}")
+        return summary(r) + f" answer={''.join(texts(r))[:60]!r}"
+
     checks = [
         ("text", text),
         ("tool_call", tool_call),
@@ -344,6 +360,7 @@ def run(args):
         ("codex_turn1", lambda: codex("codex-0.166.0-turn1.json")),
         ("codex_turn2", lambda: codex("codex-0.166.0-turn2.json")),
         ("codex_late_dev", lambda: codex("codex-0.166.0-turn2.json", late_dev)),
+        ("late_dev", late_dev_plain),
     ]
     only = set(args.only.split(",")) if args.only else None
     unknown = (only or set()) - {name for name, _ in checks}
