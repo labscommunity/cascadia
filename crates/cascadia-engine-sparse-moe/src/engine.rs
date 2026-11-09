@@ -6531,10 +6531,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 Err(e) => {
                     // A masked frame's link is dropped like any other on a
                     // failed reply (other groups' frames share the reply
-                    // order), and json requests are refused for a while.
+                    // order); without mask evidence on the link, json
+                    // requests are refused for a while.
                     let msg = if f.masked {
-                        self.stage_masks.latch.set();
-                        unconfirmed_step(&e)
+                        self.stage_masks.stream_failure(e, self.mask_evidence)
                     } else {
                         e
                     };
@@ -7391,9 +7391,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     return false;
                 }
                 Err(e) => {
-                    if f.masked {
-                        self.stage_masks.latch.set();
-                    }
+                    let e = if f.masked {
+                        self.stage_masks.stream_failure(e, self.mask_evidence)
+                    } else {
+                        e
+                    };
                     warn!(error = %e, "stale stream reply not read");
                     return false;
                 }

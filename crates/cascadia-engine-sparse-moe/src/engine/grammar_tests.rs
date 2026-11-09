@@ -1098,6 +1098,52 @@ fn draining_a_masked_frame_without_ack_sets_the_latch() {
     assert!(head.stage_masks.latch.is_set());
 }
 
+/// A masked stream frame whose reply fails (here the next stage goes away
+/// before it answers; a timeout takes the same branch): on a link whose
+/// stages acknowledged a mask it is a slow or dead stage, so json stays on;
+/// without that evidence it latches.
+#[test]
+fn a_failed_masked_stream_reply_latches_only_without_evidence() {
+    for evidence in [false, true] {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let (srv, down) = l.remove(0);
+        let mut head = head_engine(&rt, JsonStub::new(), down, 2, 2);
+        head.link_busy.store(1, std::sync::atomic::Ordering::SeqCst);
+        head.mask_evidence = evidence;
+        head.stream_inflight[0].push_back(StreamInFlight {
+            batch_id: 7,
+            slots: vec![0],
+            open: false,
+            sent_at: Instant::now(),
+            masked: true,
+        });
+        rt.block_on(async { srv.lock().await.close().await });
+        let mut out = Vec::new();
+        assert!(!head.step_stream_group(0, &mut out));
+        assert_eq!(
+            head.stage_masks.latch.is_set(),
+            !evidence,
+            "evidence {evidence}"
+        );
+        // The drain after a local failure takes the same rule.
+        head.stage_masks.latch.clear();
+        head.stream_inflight[0].push_back(StreamInFlight {
+            batch_id: 8,
+            slots: vec![0],
+            open: false,
+            sent_at: Instant::now(),
+            masked: true,
+        });
+        assert!(!head.drain_stream_link());
+        assert_eq!(
+            head.stage_masks.latch.is_set(),
+            !evidence,
+            "drain, evidence {evidence}"
+        );
+    }
+}
+
 /// The head and tail pieces SparseMoE and OvMoe run on a masked step
 /// (their runners need model files, so the exchange is driven directly):
 /// rank 0's masked `Forward` and acknowledged wait, the last stage's

@@ -187,6 +187,20 @@ impl StageMasks {
         Ok((cols, tag))
     }
 
+    /// A masked stream frame whose reply failed (a timeout, a closed link, a
+    /// frame out of step): the streams' error. On a link without evidence
+    /// that every stage masks, a stage on an older build that never answers
+    /// is the likely cause, so json requests are refused for a while. On a
+    /// link whose stages acknowledged a mask, a slow or dead stage is: the
+    /// plain error, and no latch.
+    pub(crate) fn stream_failure(&self, reason: String, evidence: bool) -> String {
+        if evidence {
+            return reason;
+        }
+        self.latch.set();
+        unconfirmed_step(&reason)
+    }
+
     /// The token of a masked step's reply, or the task's error; latches on
     /// a reply without acknowledgement.
     pub(crate) fn outcome(&self, reply: MaskedReply) -> Result<i64, String> {
@@ -418,6 +432,25 @@ mod tests {
         // A rejected token leaves the matcher in its error state: an error.
         let _ = gm.accept(0x01);
         assert!(mask_words(&mut gm).is_err());
+    }
+
+    #[test]
+    fn a_failed_masked_stream_reply_latches_only_on_a_link_without_evidence() {
+        let reason = "stream reply timeout after 1s".to_string();
+        // No evidence yet: an older stage that never answers is the likely cause.
+        let masks = StageMasks::default();
+        let e = masks.stream_failure(reason.clone(), false);
+        assert!(masks.latch.is_set());
+        assert!(
+            e.contains(&reason) && e.ends_with(UPGRADE_EVERY_STAGE),
+            "{e}"
+        );
+        // Every stage on the link acknowledged a mask: a slow or dead stage,
+        // the plain stream error, json stays on.
+        let masks = StageMasks::default();
+        let e = masks.stream_failure(reason.clone(), true);
+        assert!(!masks.latch.is_set());
+        assert_eq!(e, reason);
     }
 
     #[test]
