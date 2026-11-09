@@ -7,8 +7,8 @@
 #   aisdk   @ai-sdk/openai 4.0.111 multi-step loop + item_reference     AISDK_TOOL_LOOP_AND_ITEM_REFERENCE
 #   n8n     n8n 2.46.6 AI Agent + OpenAI Chat Model, Responses API on   N8N_RESPONSES_AGENT_TOOL_LOOP
 #   codex   Codex CLI 0.166.0 (codex on PATH) exec_command round trip   CODEX_MOCK_TOOL_LOOP (SKIP if not 0.166.0)
-# Prints one verdict line per check, then RESPONSES_CLIENTS: ALL PASS (exit 0) or RESPONSES_CLIENTS: FAIL <names>
-# (exit 1).
+# Prints one verdict line per check, then RESPONSES_CLIENTS: ALL PASS (every check ran and passed, exit 0),
+# RESPONSES_CLIENTS: PASS (skipped: <names>) (exit 0) or RESPONSES_CLIENTS: FAIL <names> (exit 1).
 #
 # Everything installed or written lives under WORK (default: a new temp dir; set WORK=... to reuse one and skip
 # reinstalls): the Python venv, node_modules, the n8n home (N8N_USER_FOLDER, so ~/.n8n is never touched) and
@@ -70,7 +70,7 @@ start_server() {
   note "start Cascadia mock on 127.0.0.1:$PORT (log: $WORK/cascadia.log)"
   printf '+ %s run tests/fixtures/mock-tools-model --engine mock --api 127.0.0.1:%s\n' "$BIN" "$PORT"
   [[ $DRY_RUN == 1 ]] && { echo "+ wait for $BASE/models"; return 0; }
-  [[ -x "$BIN" ]] || { echo "cascadia binary not found: $BIN (build it: mbx build -p cascadia)" >&2; exit 1; }
+  [[ -x "$BIN" ]] || { echo "cascadia binary not found: $BIN (build it: cargo build -p cascadia)" >&2; exit 1; }
   if curl -fsS -o /dev/null "$BASE/models" 2>/dev/null; then
     echo "port $PORT already serves $BASE/models; stop that server or pass --port" >&2; exit 1
   fi
@@ -163,7 +163,7 @@ note "WORK=$WORK"
 [[ $DRY_RUN == 1 ]] || mkdir -p "$WORK/logs"
 start_server
 
-VERDICTS=(); FAILED=()
+VERDICTS=(); FAILED=(); SKIPPED=()
 for c in ${ONLY//,/ }; do
   note "check: $c"
   name="$(verdict_name "$c")"
@@ -173,15 +173,17 @@ for c in ${ONLY//,/ }; do
   line="$(grep -E "^$name: (PASS|FAIL|SKIP)" "$log" | tail -1 || true)"
   [[ -n "$line" ]] || line="$name: FAIL (no verdict; see $log)"
   VERDICTS+=("$line")
-  case "$line" in *": PASS"*|*": SKIP"*) ;; *) FAILED+=("$c") ;; esac
+  case "$line" in *": PASS"*) ;; *": SKIP"*) SKIPPED+=("$c") ;; *) FAILED+=("$c") ;; esac
 done
 
 [[ $DRY_RUN == 1 ]] && { note "dry run: nothing was run"; exit 0; }
 echo
 note "verdicts (logs in $WORK/logs)"
 for v in "${VERDICTS[@]}"; do echo "$v"; done
-if [[ ${#FAILED[@]} -eq 0 ]]; then
+if [[ ${#FAILED[@]} -eq 0 && ${#SKIPPED[@]} -eq 0 ]]; then
   echo "RESPONSES_CLIENTS: ALL PASS"
+elif [[ ${#FAILED[@]} -eq 0 ]]; then
+  echo "RESPONSES_CLIENTS: PASS (skipped: ${SKIPPED[*]})"
 else
   echo "RESPONSES_CLIENTS: FAIL ${FAILED[*]}"; exit 1
 fi
