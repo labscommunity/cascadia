@@ -1689,13 +1689,17 @@ fn handle_sse_line(
                 st.in_reasoning = true;
                 st.send_text(tid, THINK_OPEN.to_owned(), send);
             }
-            st.send_text(tid, r.to_owned(), send);
+            // A literal `</think>` in the reasoning would end it early in
+            // the API's split; a zero-width space after the `<` keeps it
+            // readable but no longer a tag.
+            st.send_text(tid, r.replace(THINK_CLOSE, "<\u{200B}/think>"), send);
         } else {
             active = true;
         }
     }
-    // The answer or a tool call ends reasoning sent as text.
-    if !text.is_empty() || v["choices"][0]["delta"]["tool_calls"].is_array() {
+    // The answer or a tool call ends reasoning sent as text; whitespace
+    // alone (a newline before the reasoning) does not start the answer.
+    if !text.trim().is_empty() || v["choices"][0]["delta"]["tool_calls"].is_array() {
         st.close_reasoning(tid, send);
         st.answer_started = true;
     }
@@ -2277,6 +2281,30 @@ mod tests {
         // Nor does reasoning after an answer that started without any.
         let chunks = stream(&mut as_text(), &[ANSWER, THINK_1, STOP], true);
         assert_eq!(texts(&chunks), ["51", ".", "|"]);
+    }
+
+    /// A literal `</think>` inside the reasoning is broken up, so it cannot
+    /// end the reasoning early in the API's split.
+    #[test]
+    fn sse_reasoning_as_text_neutralises_a_closing_tag() {
+        let think = r#"data: {"choices":[{"delta":{"reasoning_content":"a </think> b"}}]}"#;
+        let chunks = stream(&mut as_text(), &[think, ANSWER, STOP], true);
+        assert_eq!(
+            texts(&chunks),
+            ["<think>", "a <\u{200B}/think> b", "</think>", "51", "|"]
+        );
+    }
+
+    /// Whitespace before the reasoning does not start the answer: it is
+    /// passed through and the reasoning is still framed.
+    #[test]
+    fn sse_reasoning_as_text_ignores_leading_whitespace() {
+        let blank = r#"data: {"choices":[{"delta":{"content":"\n"}}]}"#;
+        let chunks = stream(&mut as_text(), &[blank, THINK_1, ANSWER, STOP], true);
+        assert_eq!(
+            texts(&chunks),
+            ["\n", "<think>", "17 times 3", "</think>", "51", "|"]
+        );
     }
 
     /// Without the flag, reasoning is only a liveness ping, as before.
