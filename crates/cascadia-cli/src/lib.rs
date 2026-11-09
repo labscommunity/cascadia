@@ -63,7 +63,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
 fn structured_output_for(kind: EngineKind) -> bool {
     matches!(
         kind,
-        EngineKind::OvGenai | EngineKind::Mock | EngineKind::SyclLlama
+        EngineKind::OvGenai | EngineKind::Mock | EngineKind::SyclLlama | EngineKind::OvDistSpec
     )
 }
 
@@ -3813,14 +3813,18 @@ mod tests {
 
     #[test]
     fn structured_output_support_per_engine() {
-        for kind in [EngineKind::OvGenai, EngineKind::Mock, EngineKind::SyclLlama] {
+        for kind in [
+            EngineKind::OvGenai,
+            EngineKind::Mock,
+            EngineKind::SyclLlama,
+            EngineKind::OvDistSpec,
+        ] {
             assert!(structured_output_for(kind), "{}", engine_name(kind));
         }
         for kind in [
             EngineKind::Qwen36Moe,
             EngineKind::Gemma4,
             EngineKind::OvRuntime,
-            EngineKind::OvDistSpec,
             EngineKind::SparseMoe,
         ] {
             assert!(!structured_output_for(kind), "{}", engine_name(kind));
