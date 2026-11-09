@@ -71,8 +71,9 @@ impl GrammarFactory {
     /// can't emit EOS can't end.
     ///
     /// Byte-level and byte-fallback BPE tokenizers are supported, and a
-    /// word-level vocab whose decoder only joins the token strings (`Fuse`
-    /// or none); any other tokenizer is `InvalidConfig`.
+    /// word-level vocab with a `Fuse` decoder, which only joins the token
+    /// strings; any other tokenizer (a word-level vocab without a decoder
+    /// joins tokens with spaces) is `InvalidConfig`.
     pub fn from_tokenizer(tokenizer: &tokenizers::Tokenizer, eos: &[u32]) -> EngineResult<Self> {
         let mut bt = match ByteTokenizer::from_tokenizer(tokenizer.clone()) {
             Ok(bt) => bt,
