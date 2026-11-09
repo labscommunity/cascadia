@@ -1,5 +1,7 @@
 //! Deterministic minimal instance of a JSON Schema.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Map, Number, Value};
 
 /// Nesting beyond this many levels (each `$ref` hop counts as one) yields `null`.
@@ -151,17 +153,22 @@ impl<'a> Generator<'a> {
     }
 
     /// Multi-member `allOf`: merge the object members' `properties` and `required`.
+    ///
+    /// Members are borrowed, never copied, and every property entry and
+    /// `required` entry a visit merges is charged to the budget, so a wide
+    /// `allOf` reached many times through a recursive `$ref` runs out of
+    /// budget instead of re-walking all its properties on every visit.
     fn merged_object(&mut self, members: &[Value], depth: usize) -> Result<Value, OutOfBudget> {
-        let mut props: Map<String, Value> = Map::new();
-        let mut required: Vec<String> = Vec::new();
+        let mut objects: Vec<&Map<String, Value>> = Vec::with_capacity(members.len());
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut required: Vec<&str> = Vec::new();
         for member in members {
+            self.spend(1)?;
             let Some(m) = self.follow_refs(member).as_object() else {
                 continue;
             };
             if let Some(p) = m.get("properties").and_then(Value::as_object) {
-                for (k, v) in p {
-                    props.entry(k.clone()).or_insert_with(|| v.clone());
-                }
+                self.spend(p.len())?;
             }
             for name in m
                 .get("required")
@@ -169,21 +176,29 @@ impl<'a> Generator<'a> {
                 .into_iter()
                 .flatten()
             {
+                self.spend(1)?;
                 if let Some(name) = name.as_str() {
-                    if !required.iter().any(|r| r == name) {
-                        required.push(name.to_string());
+                    if seen.insert(name) {
+                        required.push(name);
                     }
                 }
             }
+            objects.push(m);
         }
         let mut out = Map::new();
         for name in required {
             self.spend(name.len())?;
-            let value = match props.get(&name) {
+            // The first member that defines the property wins.
+            let schema = objects.iter().find_map(|m| {
+                m.get("properties")
+                    .and_then(Value::as_object)
+                    .and_then(|p| p.get(name))
+            });
+            let value = match schema {
                 Some(s) => self.instance(s, depth + 1)?,
                 None => Value::Object(Map::new()),
             };
-            out.insert(name, value);
+            out.insert(name.to_string(), value);
         }
         Ok(Value::Object(out))
     }
@@ -494,6 +509,36 @@ mod tests {
         assert!(
             took < Duration::from_millis(100),
             "budget is checked while generating: {took:?}"
+        );
+    }
+
+    #[test]
+    fn wide_all_of_inside_a_recursive_array_exhausts_the_budget_quickly() {
+        // A multi-member allOf with many properties, reached through a
+        // self-referencing array: each visit must pay for the properties it
+        // merges, or the walk crawls through every visit before giving up.
+        let mut props = serde_json::Map::new();
+        props.insert(
+            "x".into(),
+            json!({"type": "array", "minItems": 64, "items": {"$ref": "#/$defs/A"}}),
+        );
+        for i in 0..2500 {
+            props.insert(format!("p{i}"), json!({"type": "string"}));
+        }
+        let s = json!({
+            "$defs": {"A": {"allOf": [
+                {"properties": props, "required": ["x"]},
+                {}
+            ]}},
+            "$ref": "#/$defs/A"
+        });
+        let start = Instant::now();
+        let v = minimal_instance(&s);
+        let took = start.elapsed();
+        assert_eq!(v, json!({}));
+        assert!(
+            took < Duration::from_millis(250),
+            "merged allOf members are charged to the budget: {took:?}"
         );
     }
 
