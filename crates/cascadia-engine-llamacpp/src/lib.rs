@@ -1487,6 +1487,9 @@ struct SseState {
     reasoning_as_text: bool,
     /// A `<think>` was sent and its `</think>` not yet.
     in_reasoning: bool,
+    /// The answer (text or a tool call) has started: later reasoning is
+    /// only a liveness ping, as a `<think>` block would land in the answer.
+    answer_started: bool,
 }
 
 /// One streaming tool call assembled from `delta.tool_calls` fragments.
@@ -1680,7 +1683,7 @@ fn handle_sse_line(
     .into_iter()
     .find_map(|r| r.as_str().filter(|s| !s.is_empty()));
     if let Some(r) = reasoning {
-        if st.reasoning_as_text {
+        if st.reasoning_as_text && !st.answer_started {
             if !st.in_reasoning {
                 st.in_reasoning = true;
                 st.send_text(tid, THINK_OPEN.to_owned(), send);
@@ -1693,6 +1696,7 @@ fn handle_sse_line(
     // The answer or a tool call ends reasoning sent as text.
     if !text.is_empty() || v["choices"][0]["delta"]["tool_calls"].is_array() {
         st.close_reasoning(tid, send);
+        st.answer_started = true;
     }
     let stop_str = v["choices"][0]["finish_reason"].as_str();
     if let Some(r) = stop_str {
@@ -2244,6 +2248,33 @@ mod tests {
                 "done: {done}"
             );
         }
+    }
+
+    /// Reasoning after the answer has started is only a liveness ping: a
+    /// second `<think>` would land in the answer.
+    #[test]
+    fn sse_reasoning_as_text_frames_one_block() {
+        let more = r#"data: {"choices":[{"delta":{"content":" exactly"}}]}"#;
+        let chunks = stream(
+            &mut as_text(),
+            &[THINK_1, ANSWER, THINK_2, more, STOP],
+            true,
+        );
+        assert_eq!(
+            texts(&chunks),
+            [
+                "<think>",
+                "17 times 3",
+                "</think>",
+                "51",
+                ".",
+                " exactly",
+                "|"
+            ]
+        );
+        // Nor does reasoning after an answer that started without any.
+        let chunks = stream(&mut as_text(), &[ANSWER, THINK_1, STOP], true);
+        assert_eq!(texts(&chunks), ["51", ".", "|"]);
     }
 
     /// Without the flag, reasoning is only a liveness ping, as before.
