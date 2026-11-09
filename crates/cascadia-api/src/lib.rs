@@ -2777,12 +2777,7 @@ async fn chat_completions(
         // loud with a 5xx instead (e.g. a sharded chain poisoned by a
         // handshake/manifest mismatch).
         if let Some(reason) = &chunk.error {
-            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": reason })),
-            )
-                .into_response();
+            return failed_task_response(&task_id, reason, chunk.invalid_request);
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
@@ -2983,12 +2978,7 @@ async fn completions(
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
     while let Some(chunk) = chunk_stream.next().await {
         if let Some(reason) = &chunk.error {
-            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": reason })),
-            )
-                .into_response();
+            return failed_task_response(&task_id, reason, chunk.invalid_request);
         }
         match marker.as_mut() {
             Some(f) => {
@@ -3656,6 +3646,24 @@ fn content_frame(
     format!("data: {payload}\n\n")
 }
 
+/// The reply to a non-streaming request whose task failed: 400 when the
+/// backend refused the request as invalid (resending it fails the same way),
+/// else 503.
+fn failed_task_response(
+    task_id: &str,
+    reason: &str,
+    invalid_request: bool,
+) -> axum::response::Response {
+    let status = if invalid_request {
+        warn!(task = %task_id, reason = %reason, "backend refused the request; returning 400");
+        StatusCode::BAD_REQUEST
+    } else {
+        warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(serde_json::json!({ "error": reason }))).into_response()
+}
+
 fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
     use cascadia_engine::EngineError;
     // An engine-queue-full 503 is the same "at capacity" experience as the
@@ -4152,6 +4160,122 @@ mod tests {
             make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats.clone()),
             stats,
         )
+    }
+
+    /// Fails every task as a request its backend refused.
+    struct RejectingEngine {
+        pending: Option<cascadia_types::TaskId>,
+    }
+
+    impl cascadia_engine::Engine for RejectingEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some(task.task_id);
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            Ok(self
+                .pending
+                .take()
+                .map(|id| {
+                    let c = Chunk::rejected(&id, "llama-server rejected the request: bad grammar");
+                    vec![(id, c)]
+                })
+                .unwrap_or_default())
+        }
+    }
+
+    struct RejectingBuilder;
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for RejectingBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(RejectingEngine { pending: None }))
+        }
+    }
+
+    async fn rejecting_app() -> Router {
+        let runner = Runner::new(Box::new(RejectingBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    #[tokio::test]
+    async fn a_request_the_backend_refused_is_a_400_with_its_reason() {
+        let want = serde_json::json!({"error": "llama-server rejected the request: bad grammar"});
+        let (status, v) = post_chat(
+            rejecting_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v, want);
+        let (status, v) = post_completions(
+            rejecting_app().await,
+            serde_json::json!({"model": "mock-model", "prompt": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v, want);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_request_the_backend_refused_carries_its_reason() {
+        // The SSE headers are sent before the engine answers, so the refusal
+        // arrives as the stream's error event.
+        let response = rejecting_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "mock-model", "stream": true,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#""message":"llama-server rejected the request: bad grammar""#),
+            "{body}"
+        );
     }
 
     #[tokio::test]

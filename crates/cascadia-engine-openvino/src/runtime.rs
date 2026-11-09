@@ -3117,6 +3117,7 @@ impl OvRuntimeEngine {
                 prompt_tokens: None,
                 completion_tokens: None,
                 error: None,
+                invalid_request: false,
                 token_ids: Vec::new(),
                 // ov-runtime doesn't yet distinguish length vs stop here; the
                 // API falls back to "stop" (unchanged behavior). #14 follow-up.

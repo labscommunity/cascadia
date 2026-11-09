@@ -84,6 +84,13 @@ pub struct Chunk {
     /// loud (5xx). `None` on every normal token/final chunk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set with `error` when the backend refused the request itself as
+    /// invalid (an HTTP 4xx from a child server, for example a JSON schema
+    /// it cannot turn into a grammar): retrying the same request fails the
+    /// same way, so the API answers 400 with `error` instead of a 5xx.
+    /// `false` on every other chunk, and left off the wire then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invalid_request: bool,
     /// Why generation ended. Set on the FINAL chunk by engines that can tell
     /// `length` (hit max_tokens) from `stop` (EOS / stop sequence). `None` on
     /// non-final chunks and on engines that don't distinguish — the API then
@@ -113,6 +120,7 @@ impl Chunk {
             prompt_tokens: None,
             completion_tokens: None,
             error: None,
+            invalid_request: false,
             finish_reason: None,
             token_ids: Vec::new(),
         }
@@ -135,6 +143,7 @@ impl Chunk {
             prompt_tokens: None,
             completion_tokens: None,
             error: None,
+            invalid_request: false,
             finish_reason: None,
         }
     }
@@ -155,6 +164,7 @@ impl Chunk {
             prompt_tokens: None,
             completion_tokens: None,
             error: None,
+            invalid_request: false,
             finish_reason: None,
             token_ids: Vec::new(),
         }
@@ -174,8 +184,18 @@ impl Chunk {
             prompt_tokens: None,
             completion_tokens: None,
             error: Some(reason.into()),
+            invalid_request: false,
             finish_reason: None,
             token_ids: Vec::new(),
+        }
+    }
+
+    /// A final chunk that marks the task FAILED because the backend refused
+    /// the request as invalid (see the `invalid_request` field).
+    pub fn rejected(task_id: impl Into<TaskId>, reason: impl Into<String>) -> Self {
+        Self {
+            invalid_request: true,
+            ..Self::error(task_id, reason)
         }
     }
 
@@ -268,6 +288,7 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             error: None,
+            invalid_request: false,
             finish_reason: None,
             token_ids: Vec::new(),
         };

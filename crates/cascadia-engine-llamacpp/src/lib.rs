@@ -1286,6 +1286,7 @@ impl LlamaCppEngine {
             let mut reader = BufReader::new(s);
             // Skip response headers.
             let mut chunked = false;
+            let mut content_length = None;
             let mut status = String::new();
             loop {
                 let mut line = String::new();
@@ -1301,11 +1302,28 @@ impl LlamaCppEngine {
                 {
                     chunked = true;
                 }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse::<usize>().ok();
+                }
                 if line == "\r\n" {
                     break;
                 }
             }
             if !status.contains(" 200") {
+                // A 4xx means the child refused this request itself (e.g. a
+                // schema its grammar converter rejects): resending it fails
+                // the same way, so it reaches the client as a 400 with the
+                // child's reason. Timeouts and rate limits are not the
+                // request's fault and stay backend errors like a 5xx.
+                if status_code(&status).is_some_and(is_request_rejection) {
+                    let body = read_error_body(&mut reader, chunked, content_length);
+                    let reason = format!(
+                        "llama-server rejected the request: {}",
+                        child_error_message(&body)
+                    );
+                    send(Ok((tid.clone(), Chunk::rejected(tid.clone(), reason))));
+                    return;
+                }
                 send(Err(EngineError::Backend(format!("server {status}"))));
                 return;
             }
@@ -1405,6 +1423,70 @@ fn apply_sampling(body: &mut serde_json::Value, sp: &SamplingParams) {
     if !sp.stop.is_empty() {
         o.insert("stop".into(), sp.stop.clone().into());
     }
+}
+
+/// The most of a child's error body read for its message.
+const ERROR_BODY_CAP: usize = 64 * 1024;
+/// The most characters of a non-JSON error body quoted to the client.
+const ERROR_TEXT_CHARS: usize = 300;
+
+/// The numeric code of an HTTP status line (`HTTP/1.1 400 Bad Request`).
+fn status_code(status_line: &str) -> Option<u16> {
+    status_line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// A 4xx other than 408 (timeout) and 429 (rate limit): the child refused
+/// the request as such.
+fn is_request_rejection(code: u16) -> bool {
+    (400..500).contains(&code) && code != 408 && code != 429
+}
+
+/// Up to [`ERROR_BODY_CAP`] bytes of a response body whose headers have
+/// been read. A body with neither a length nor chunked framing is not read
+/// (it would only end when the child closes the connection).
+fn read_error_body(r: &mut impl BufRead, chunked: bool, content_length: Option<usize>) -> Vec<u8> {
+    let mut out = Vec::new();
+    if chunked {
+        while out.len() < ERROR_BODY_CAP {
+            let mut sz = String::new();
+            if r.read_line(&mut sz).unwrap_or(0) == 0 {
+                break;
+            }
+            let n = usize::from_str_radix(sz.trim(), 16).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            let take = n.min(ERROR_BODY_CAP - out.len());
+            let mut buf = vec![0u8; take];
+            if r.read_exact(&mut buf).is_err() {
+                break;
+            }
+            out.extend_from_slice(&buf);
+            if take < n {
+                break;
+            }
+            let mut crlf = [0u8; 2];
+            let _ = r.read_exact(&mut crlf);
+        }
+    } else if let Some(n) = content_length {
+        let _ = r.take(n.min(ERROR_BODY_CAP) as u64).read_to_end(&mut out);
+    }
+    out
+}
+
+/// The reason in a child's error body: `error.message` when the body is
+/// llama-server's JSON error, else the start of the body as text.
+fn child_error_message(body: &[u8]) -> String {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(m) = v.pointer("/error/message").and_then(|m| m.as_str()) {
+            return m.to_string();
+        }
+    }
+    String::from_utf8_lossy(body)
+        .trim()
+        .chars()
+        .take(ERROR_TEXT_CHARS)
+        .collect()
 }
 
 /// Refuse a grammar body that is not JSON: it is spliced into the request
@@ -2857,6 +2939,83 @@ mod unix_tests {
         assert!(text.contains(schema), "{text}");
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["response_format"]["json_schema"]["name"], "response");
+    }
+
+    /// The final chunk of a task whose child answers `head` + `body`.
+    fn final_chunk_for_reply(head: &'static str, body: &'static str) -> Chunk {
+        let (port, server) = mock_server(move |_, s| {
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(body.as_bytes()).unwrap();
+        });
+        let mut engine = test_engine(port);
+        engine.submit(chat_task()).unwrap();
+        let chunks = drain(&mut engine);
+        server.join().unwrap();
+        chunks.last().unwrap().1.clone()
+    }
+
+    #[test]
+    fn child_400_is_a_rejected_request_with_its_message() {
+        let body = r#"{"error":{"code":400,"message":"failed to parse grammar","type":"invalid_request_error"}}"#;
+        let head: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let c = final_chunk_for_reply(head, body);
+        assert!(c.is_final);
+        assert!(c.invalid_request, "{c:?}");
+        assert_eq!(
+            c.error.as_deref(),
+            Some("llama-server rejected the request: failed to parse grammar")
+        );
+    }
+
+    #[test]
+    fn child_4xx_without_a_json_error_quotes_the_body() {
+        let c = final_chunk_for_reply(
+            "HTTP/1.1 422 Unprocessable Entity\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "a\r\nbad schema\r\n0\r\n\r\n",
+        );
+        assert!(c.invalid_request, "{c:?}");
+        assert_eq!(
+            c.error.as_deref(),
+            Some("llama-server rejected the request: bad schema")
+        );
+    }
+
+    #[test]
+    fn child_5xx_408_and_429_stay_backend_errors() {
+        for head in [
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\n\r\n",
+            "HTTP/1.1 408 Request Timeout\r\nContent-Length: 2\r\n\r\n",
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\n\r\n",
+        ] {
+            let c = final_chunk_for_reply(head, "{}");
+            assert!(!c.invalid_request, "{head}: {c:?}");
+            let status = head.split("\r\n").next().unwrap();
+            assert_eq!(
+                c.error.as_deref(),
+                Some(format!("backend error: server {status}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn child_error_message_prefers_error_message_and_caps_raw_text() {
+        assert_eq!(
+            child_error_message(br#"{"error":{"message":"nope"}}"#),
+            "nope"
+        );
+        assert_eq!(
+            child_error_message(br#"{"error":"flat"}"#),
+            r#"{"error":"flat"}"#
+        );
+        let long = "x".repeat(1000);
+        assert_eq!(child_error_message(long.as_bytes()).chars().count(), 300);
+        assert_eq!(child_error_message(b"  \n"), "");
     }
 
     #[test]

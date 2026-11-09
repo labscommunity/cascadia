@@ -502,6 +502,7 @@ fn final_chunk(
         prompt_tokens: Some(prompt_len as u32),
         completion_tokens: None,
         error: None,
+        invalid_request: false,
         token_ids: Vec::new(),
         finish_reason: Some(if is_eos {
             FinishReason::Stop
