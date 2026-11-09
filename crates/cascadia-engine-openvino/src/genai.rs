@@ -327,6 +327,7 @@ impl Builder for OvGenaiBuilder {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
                 pipe: Box::new(pipe),
+                device: self.device,
                 prompt_pretemplated: self.prompt_pretemplated,
                 next_request_id: 0,
                 max_tokens_default: 256,
@@ -341,6 +342,7 @@ impl Builder for OvGenaiBuilder {
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
             pipe,
+            device: self.device,
             draft_model: self.draft_model_path.is_some(),
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
@@ -484,6 +486,41 @@ fn runtime_older_than_2026_4(build: &str) -> Option<bool> {
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
     Some((major, minor) < (2026, 4))
+}
+
+/// Why structured output cannot run on this engine, decided without running
+/// the warmup probe: a GenAI runtime older than 2026.4 (see
+/// [`version_gate`]), an NPU device (see [`npu_gate`]) or a draft model (see
+/// [`draft_model_gate`]). `None` means run the probe.
+fn structured_gate(
+    device: &str,
+    draft_model: bool,
+    version: Result<cascadia_ov_genai_shim::OvVersion, OvError>,
+) -> Option<String> {
+    version_gate(version)
+        .or_else(|| npu_gate(device))
+        .or_else(|| draft_model_gate(draft_model))
+}
+
+/// True when `device` is an NPU or lists one: `NPU`, `NPU.0`, or a
+/// `HETERO:`/`AUTO:`/`MULTI:` list such as `HETERO:GPU,NPU`. Case-insensitive.
+fn uses_npu(device: &str) -> bool {
+    let list = device.split_once(':').map_or(device, |(_, list)| list);
+    list.split(',')
+        .any(|d| d.trim().to_ascii_uppercase().starts_with("NPU"))
+}
+
+/// Why structured output cannot run on an NPU device. On GenAI 2026.4.1 the
+/// NPU pipeline lets tokens the grammar forbids through: a `json_object`
+/// request returned raw newlines inside strings (invalid JSON, finish
+/// `stop`) where the same model on GPU returned valid JSON. A probe can pass
+/// by luck, so the device is refused outright.
+fn npu_gate(device: &str) -> Option<String> {
+    uses_npu(device).then(|| {
+        "not reliable on NPU with this OpenVINO GenAI version (the output \
+         constraint is not fully applied); use GPU or CPU for response_format"
+            .to_owned()
+    })
 }
 
 /// Why structured output cannot run on a stateful pipeline with a draft
@@ -642,6 +679,8 @@ const QUARANTINE_STRIKES: u32 = 2;
 
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
+    /// The OpenVINO device string the pipeline was compiled for.
+    device: String,
     /// Built with a draft model (speculative decoding), as opposed to prompt
     /// lookup, which also sets `num_assistant_tokens`.
     draft_model: bool,
@@ -678,9 +717,11 @@ impl Engine for OvGenaiEngine {
         // so a model or pipeline that cannot run with an output constraint
         // is found here rather than per request. A draft model skips it: see
         // `draft_model_gate`.
-        if let Some(reason) = draft_model_gate(self.draft_model)
-            .or_else(|| version_gate(cascadia_ov_genai_shim::ov_version()))
-        {
+        if let Some(reason) = structured_gate(
+            &self.device,
+            self.draft_model,
+            cascadia_ov_genai_shim::ov_version(),
+        ) {
             self.structured_unavailable = record_probe(Some(reason));
             return;
         }
@@ -942,6 +983,8 @@ struct ActiveCbTask {
 pub struct OvGenaiCbEngine {
     active: Vec<ActiveCbTask>,
     pipe: Box<dyn CbPipe>,
+    /// The OpenVINO device string the pipeline was compiled for.
+    device: String,
     prompt_pretemplated: bool,
     next_request_id: u64,
     max_tokens_default: u32,
@@ -1011,7 +1054,11 @@ impl Engine for OvGenaiCbEngine {
             Err(err) => warn!(error = %err, "ov-genai cb warmup failed"),
         }
 
-        if let Some(reason) = version_gate(cascadia_ov_genai_shim::ov_version()) {
+        // `--cb` refuses a draft model at load, so only the device and the
+        // runtime decide here.
+        if let Some(reason) =
+            structured_gate(&self.device, false, cascadia_ov_genai_shim::ov_version())
+        {
             self.structured_unavailable = record_probe(Some(reason));
             return;
         }
@@ -1649,6 +1696,7 @@ mod tests {
         OvGenaiCbEngine {
             active: Vec::new(),
             pipe: Box::new(MockPipe { st: st.clone() }),
+            device: "CPU".into(),
             prompt_pretemplated: false,
             next_request_id: 0,
             max_tokens_default: 256,
@@ -2224,23 +2272,40 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_model_turns_structured_output_off_without_a_probe() {
-        let draft = OvGenaiBuilder::new("m", "GPU").with_draft("d", "GPU", 3);
-        let lookup = OvGenaiBuilder::new("m", "GPU").with_prompt_lookup(3);
-        let plain = OvGenaiBuilder::new("m", "GPU");
+    fn structured_gate_skips_the_probe_on_npu_and_with_a_draft_model() {
+        const NPU: &str = "not reliable on NPU with this OpenVINO GenAI version (the output \
+                           constraint is not fully applied); use GPU or CPU for response_format";
+        const DRAFT: &str = "not supported with a draft model (speculative decoding); \
+                             run without --draft-model for response_format";
+        let gate = |b: &OvGenaiBuilder| {
+            structured_gate(&b.device, b.draft_model_path.is_some(), Err(OvError::Stub))
+        };
+        let builder = |device: &str| OvGenaiBuilder::new("m", device);
+        for device in ["NPU", "npu", "NPU.0", "HETERO:GPU,NPU", "AUTO:NPU.1,CPU"] {
+            assert_eq!(gate(&builder(device)).as_deref(), Some(NPU), "{device}");
+        }
+        for device in ["GPU", "GPU.1", "CPU", "HETERO:GPU,CPU", "AUTO"] {
+            assert_eq!(gate(&builder(device)), None, "{device}: the probe runs");
+        }
         assert_eq!(
-            draft_model_gate(draft.draft_model_path.is_some()).as_deref(),
-            Some(
-                "not supported with a draft model (speculative decoding); \
-                 run without --draft-model for response_format"
-            )
+            gate(&builder("GPU").with_draft("d", "GPU", 3)).as_deref(),
+            Some(DRAFT)
         );
         assert_eq!(
-            draft_model_gate(lookup.draft_model_path.is_some()),
+            gate(&builder("CPU").with_prompt_lookup(3)),
             None,
             "prompt lookup keeps the probe"
         );
-        assert_eq!(draft_model_gate(plain.draft_model_path.is_some()), None);
+        let old = cascadia_ov_genai_shim::OvVersion {
+            built_genai: "2026.4.1".into(),
+            built_core: "2026.4.1".into(),
+            runtime_genai: "2026.2.0".into(),
+            runtime_core: "2026.2.0".into(),
+        };
+        assert_eq!(
+            structured_gate("GPU", false, Ok(old)).as_deref(),
+            Some("needs OpenVINO GenAI 2026.4 or newer; this runtime is 2026.2.0")
+        );
     }
 
     #[test]
