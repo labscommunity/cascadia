@@ -3784,6 +3784,12 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         | EngineError::PeerRejected(_)
         | EngineError::ShardRejected(_) => StatusCode::BAD_REQUEST,
         EngineError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+        // A pipeline whose later stage can't apply a grammar mask: this node
+        // can't serve the request now, another may (the same 503 a client gets
+        // when the refusal arrives mid-task).
+        EngineError::Backend(msg) if msg.contains(cascadia_grammar::STAGE_UPGRADE_MESSAGE) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         EngineError::Backend(_) | EngineError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // A task-attributed step failure: the engine abandoned a task; the
         // underlying cause is a backend/transport failure.
@@ -6775,6 +6781,17 @@ level={{ effort_map[eff] }}";
                 .unwrap();
             assert_eq!(resp.status(), want, "{choice}");
         }
+    }
+
+    #[test]
+    fn a_pipeline_that_cannot_mask_is_a_503() {
+        let resp = engine_error_response(cascadia_engine::EngineError::Backend(format!(
+            "task t1: {}",
+            cascadia_grammar::STAGE_UPGRADE_MESSAGE
+        )));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = engine_error_response(cascadia_engine::EngineError::Backend("boom".into()));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
