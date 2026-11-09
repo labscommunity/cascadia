@@ -54,9 +54,21 @@ pub fn read_model_generation_info(model_dir: &Path) -> ModelGenerationInfo {
         // the wrapper, not the language model (qwen35 `read_max_ctx`, vLLM).
         // Each takes the `rope_scaling` of the object it came from.
         context_window: first(&dirs, "config.json", |v| {
-            v.get("text_config")
-                .and_then(scaled_window_of)
-                .or_else(|| scaled_window_of(v))
+            // Gemma 3's window already counts its RoPE scaling (vLLM skips
+            // it for that family).
+            let is_gemma3 = [Some(v), v.get("text_config")]
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o.get("model_type").and_then(|t| t.as_str()))
+                .any(|t| t.contains("gemma3"));
+            let window = |o: &serde_json::Value| {
+                if is_gemma3 {
+                    window_of(o)
+                } else {
+                    scaled_window_of(o)
+                }
+            };
+            v.get("text_config").and_then(window).or_else(|| window(v))
         }),
         static_context: static_context(model_dir),
         temperature: sampling("temperature"),
@@ -90,15 +102,19 @@ fn window_of(v: &serde_json::Value) -> Option<u32> {
     })
 }
 
-/// [`window_of`] with `v`'s `rope_scaling` applied, by vLLM's rule: an
-/// object with a numeric `factor` whose `rope_type` (or `type`) is not one
-/// that already counts the scaling in the window (`su`, `longrope`,
-/// `llama3`, `mrope`, `default`) makes the window `factor` times its base.
-/// The base is `original_max_position_embeddings` for `yarn` when given,
-/// else the window read.
+/// [`window_of`] with `v`'s RoPE scaling applied, by vLLM's rule: a
+/// `rope_scaling` (or `rope_parameters`) object with a numeric `factor`
+/// multiplies the window, unless its `rope_type` (or `type`) is one whose
+/// window already counts the scaling: `su`, `longrope`, `llama3`, the YaRN
+/// variants (`yarn`, `deepseek_yarn`, `deepseek_llama_scaling`), and `mrope`
+/// or `default`, which scale nothing.
 fn scaled_window_of(v: &serde_json::Value) -> Option<u32> {
     let window = window_of(v)?;
-    let Some(scaling) = v.get("rope_scaling").and_then(|r| r.as_object()) else {
+    let Some(scaling) = v
+        .get("rope_scaling")
+        .or_else(|| v.get("rope_parameters"))
+        .and_then(|r| r.as_object())
+    else {
         return Some(window);
     };
     let kind = scaling
@@ -107,7 +123,15 @@ fn scaled_window_of(v: &serde_json::Value) -> Option<u32> {
         .and_then(|t| t.as_str());
     if matches!(
         kind,
-        Some("su" | "longrope" | "llama3" | "mrope" | "default")
+        Some(
+            "su" | "longrope"
+                | "llama3"
+                | "yarn"
+                | "deepseek_yarn"
+                | "deepseek_llama_scaling"
+                | "mrope"
+                | "default"
+        )
     ) {
         return Some(window);
     }
@@ -118,16 +142,8 @@ fn scaled_window_of(v: &serde_json::Value) -> Option<u32> {
     else {
         return Some(window);
     };
-    let base = match kind {
-        Some("yarn") => scaling
-            .get("original_max_position_embeddings")
-            .and_then(|o| o.as_u64())
-            .filter(|&o| o > 0)
-            .unwrap_or(u64::from(window)),
-        _ => u64::from(window),
-    };
     // Truncated as vLLM's `int()`; a result past `u32` saturates.
-    let scaled = (base as f64 * factor) as u64;
+    let scaled = (f64::from(window) * factor) as u64;
     Some(u32::try_from(scaled).unwrap_or(u32::MAX).max(1))
 }
 
@@ -406,18 +422,33 @@ mod tests {
     #[test]
     fn rope_scaling_multiplies_the_window_as_vllm_does() {
         for (config, want) in [
-            // yarn: factor x original_max_position_embeddings.
+            // YaRN variants already count the scaling in the window.
             (
                 r#"{"max_position_embeddings": 40960, "rope_scaling":
                     {"rope_type": "yarn", "factor": 4.0,
                      "original_max_position_embeddings": 32768}}"#,
-                131072,
+                40960,
             ),
-            // yarn without the original: factor x the read window.
             (
                 r#"{"max_position_embeddings": 32768, "rope_scaling":
                     {"type": "yarn", "factor": 4.0}}"#,
-                131072,
+                32768,
+            ),
+            (
+                r#"{"max_position_embeddings": 163840, "rope_scaling":
+                    {"type": "deepseek_yarn", "factor": 40.0}}"#,
+                163840,
+            ),
+            (
+                r#"{"max_position_embeddings": 16384, "rope_scaling":
+                    {"rope_type": "deepseek_llama_scaling", "factor": 4.0}}"#,
+                16384,
+            ),
+            // Newer configs name it rope_parameters.
+            (
+                r#"{"max_position_embeddings": 4096, "rope_parameters":
+                    {"rope_type": "linear", "factor": 2.0}}"#,
+                8192,
             ),
             (
                 r#"{"max_position_embeddings": 4096, "rope_scaling":
@@ -499,5 +530,20 @@ mod tests {
             ),
             Some(8192)
         );
+    }
+
+    /// Gemma 3's window already counts its linear scaling (vLLM skips it),
+    /// whether the model type sits at the root or in text_config.
+    #[test]
+    fn gemma3_window_is_not_scaled_again() {
+        for config in [
+            r#"{"model_type": "gemma3", "text_config": {"model_type": "gemma3_text",
+                 "max_position_embeddings": 131072,
+                 "rope_scaling": {"rope_type": "linear", "factor": 8.0}}}"#,
+            r#"{"model_type": "gemma3_text", "max_position_embeddings": 131072,
+                 "rope_scaling": {"rope_type": "linear", "factor": 8.0}}"#,
+        ] {
+            assert_eq!(window_with(config), Some(131072), "{config}");
+        }
     }
 }

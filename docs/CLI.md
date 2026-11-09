@@ -235,10 +235,10 @@ context window still ends an answer where the prompt plus the answer fill it
   export's `static_context` (`stage_<r>/stage_config.json`); the model's
   `config.json` window (`max_position_embeddings` and similar, `text_config`
   first, then the top level; model root, then `tokenizer/`; with that
-  object's `rope_scaling` applied as vLLM does: a numeric `factor` of a type
-  other than `su`, `longrope`, `llama3`, `mrope` or `default` multiplies the
-  window, or `original_max_position_embeddings` for `yarn` when given); else
-  4096. With `--packed-slots N` the ov-runtime limit is one slot's region,
+  object's `rope_scaling` (or `rope_parameters`) applied as vLLM does: a
+  numeric `factor` multiplies the window, except for the types whose window
+  already counts the scaling (`su`, `longrope`, `llama3`, `yarn`,
+  `deepseek_yarn`, `deepseek_llama_scaling`) and for Gemma 3); else 4096. With `--packed-slots N` the ov-runtime limit is one slot's region,
   `(static_context - 1 - packed_prefix) / N`, and its context window is that
   region plus the shared prefix (`packed_prefix`, clamped as the engine
   clamps it), since a slot that reuses the prefix holds both and the prompt
@@ -268,7 +268,10 @@ context window still ends an answer where the prompt plus the answer fill it
     slot's region plus the shared prefix.
   - ov-genai without `--cb` makes the whole answer in one call, so the engine
     itself cuts that call's limit to what the prompt leaves of the window and
-    reports `length` there.
+    reports `length` there. When ov-genai applies the chat template itself
+    (no template found for the API to apply), the prompt is counted without
+    the template's wrapping, so the answer can end a few tokens past the
+    window.
   - An ov-genai continuous-batching request whose KV cache runs out after it
     produced output ends with `length`, keeping its text; it is an error only
     if nothing was produced. It used to be an HTTP 503 (or an SSE error
@@ -276,7 +279,8 @@ context window still ends an answer where the prompt plus the answer fill it
     `cascadia_kv_cache_exhausted_total` ([METRICS.md](METRICS.md)).
   - In the metrics, an answer the API ends at the window books
     `finish_reason="length"` and one it ends at a `stop` match books `stop`;
-    neither counts as a cancel.
+    neither counts as a cancel. A `stop` match inside the very chunk that
+    fills the window answers `stop` but books `length`.
 - **`temperature` / `top_p`**: `--default-temperature` / `--default-top-p`,
   else the model's `generation_config.json` (root, then `tokenizer/`;
   `do_sample` is not applied), else `1`. A file value outside the OpenAI range
