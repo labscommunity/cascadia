@@ -8055,7 +8055,7 @@ level={{ effort_map[eff] }}";
         let app = so_app_checked(check).await;
         let (status, v) = post_chat(
             app.clone(),
-            chat_with(Some(serde_json::json!({"type": "json_object"}))),
+            chat_with(Some(json_schema_format(nested_schema()))),
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
@@ -8063,7 +8063,12 @@ level={{ effort_map[eff] }}";
             v["error"],
             "busy compiling response_format schemas; retry shortly"
         );
-        for format in [None, Some(serde_json::json!({"type": "text"}))] {
+        // Plain requests, and json_object (a constant grammar), never build.
+        for format in [
+            None,
+            Some(serde_json::json!({"type": "text"})),
+            Some(serde_json::json!({"type": "json_object"})),
+        ] {
             let (status, v) = post_chat(app.clone(), chat_with(format)).await;
             assert_eq!(status, StatusCode::OK, "{v}");
         }

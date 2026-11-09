@@ -99,6 +99,67 @@ pub enum SchemaCheckError {
     TooComplex,
 }
 
+/// Most passed schemas [`SchemaCompileCheck`] remembers.
+pub const SCHEMA_PASS_CACHE: usize = 256;
+
+/// The schemas that built within the budget, by a keyed hash of the schema
+/// text, at most `cap` of them; the least recently used leaves first. Only
+/// passes are kept: a build that ran long on a busy machine may pass when
+/// tried again.
+#[derive(Debug)]
+struct PassedSchemas {
+    cap: usize,
+    hasher: std::hash::RandomState,
+    tick: u64,
+    entries: HashMap<u64, u64>,
+}
+
+impl PassedSchemas {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            hasher: std::hash::RandomState::new(),
+            tick: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn key(&self, text: &str) -> u64 {
+        use std::hash::BuildHasher;
+        self.hasher.hash_one(text)
+    }
+
+    /// Whether `text` passed before; marks it used.
+    fn contains(&mut self, text: &str) -> bool {
+        let key = self.key(text);
+        self.tick += 1;
+        let tick = self.tick;
+        self.entries
+            .get_mut(&key)
+            .map(|used| *used = tick)
+            .is_some()
+    }
+
+    fn insert(&mut self, text: &str) {
+        if self.cap == 0 {
+            return;
+        }
+        let key = self.key(text);
+        if self.entries.len() >= self.cap && !self.entries.contains_key(&key) {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, used)| **used)
+                .map(|(k, _)| *k);
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.tick += 1;
+        self.entries.insert(key, self.tick);
+    }
+}
+
 /// The hard bound on how long a schema's grammar takes to build. The caps
 /// above are fast 400s for the shapes known to be slow; this is what holds
 /// for everything else. Each enforced schema is built once with llguidance
@@ -108,11 +169,17 @@ pub enum SchemaCheckError {
 /// the build keeps its slot until it ends, so abandoned builds hold at most
 /// `permits` cores. Whether the schema builds at all is left to the engine,
 /// whose backend may accept what llguidance doesn't.
+///
+/// `json_object`'s constant grammar is never built here, and a schema that
+/// passed is remembered ([`SCHEMA_PASS_CACHE`] of them, by schema text):
+/// agents resend the same schema every step, and it never waits for a slot
+/// again.
 #[derive(Clone, Debug)]
 pub struct SchemaCompileCheck {
     permits: Arc<Semaphore>,
     wait: Duration,
     budget: Duration,
+    passed: Arc<std::sync::Mutex<PassedSchemas>>,
 }
 
 impl Default for SchemaCompileCheck {
@@ -133,24 +200,43 @@ impl SchemaCompileCheck {
             permits: Arc::new(Semaphore::new(permits)),
             wait,
             budget,
+            passed: Arc::new(std::sync::Mutex::new(PassedSchemas::new(SCHEMA_PASS_CACHE))),
         }
     }
 
     /// Builds `spec` within the budget, or says why not.
     pub async fn check(&self, spec: &GrammarSpec) -> Result<(), SchemaCheckError> {
+        if spec.body == JSON_OBJECT_SCHEMA {
+            return Ok(());
+        }
+        let passed = self
+            .passed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&spec.body);
+        if passed {
+            return Ok(());
+        }
         let permit =
             match tokio::time::timeout(self.wait, self.permits.clone().acquire_owned()).await {
                 Ok(Ok(permit)) => permit,
                 _ => return Err(SchemaCheckError::Busy),
             };
         let spec = spec.clone();
+        let body = spec.body.clone();
         let build = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             // Errors are the engine's to report; only the time counts here.
             let _ = GrammarFactory::byte_level().compile(&spec);
         });
         match tokio::time::timeout(self.budget, build).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.passed
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(&body);
+                Ok(())
+            }
             Err(_) => Err(SchemaCheckError::TooComplex),
         }
     }
@@ -1977,6 +2063,65 @@ mod tests {
                 Err(msg.into())
             );
         }
+    }
+
+    fn spec_of(body: &str) -> GrammarSpec {
+        GrammarSpec {
+            kind: GrammarKind::JsonSchema,
+            body: body.to_owned(),
+        }
+    }
+
+    /// `json_object`'s grammar is the same constant every time: no build, no
+    /// permit, even when none is free.
+    #[tokio::test]
+    async fn json_object_never_takes_a_compile_permit() {
+        let check = SchemaCompileCheck::new(0, Duration::from_millis(10), Duration::from_secs(2));
+        assert_eq!(check.check(&spec_of(JSON_OBJECT_SCHEMA)).await, Ok(()));
+    }
+
+    /// Agents resend the same schema every step: it is built once, and a
+    /// passed schema never waits for a permit again. A schema not seen
+    /// before still does.
+    #[tokio::test]
+    async fn a_repeated_schema_is_built_once() {
+        let check = SchemaCompileCheck::new(1, Duration::from_millis(10), Duration::from_secs(2));
+        let schema = spec_of(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#);
+        assert_eq!(check.check(&schema).await, Ok(()));
+        let _all = check.permits.clone().acquire_owned().await.unwrap();
+        assert_eq!(check.check(&schema).await, Ok(()), "cached verdict");
+        let other = spec_of(r#"{"type":"object","properties":{"b":{"type":"integer"}}}"#);
+        assert_eq!(
+            check.check(&other).await,
+            Err(SchemaCheckError::Busy),
+            "a new schema still needs a permit"
+        );
+    }
+
+    /// The pass cache is bounded: the least recently used schema leaves
+    /// first.
+    #[test]
+    fn the_pass_cache_evicts_the_least_recently_used() {
+        let mut cache = PassedSchemas::new(2);
+        cache.insert("a");
+        cache.insert("b");
+        assert!(cache.contains("a"));
+        cache.insert("c");
+        assert!(!cache.contains("b"), "b was the least recently used");
+        assert!(cache.contains("a") && cache.contains("c"));
+    }
+
+    /// A schema that ran past the budget is tried again next time (the
+    /// machine may just have been busy), not refused from memory.
+    #[tokio::test]
+    async fn a_schema_over_the_budget_is_not_remembered() {
+        let check = SchemaCompileCheck::new(2, Duration::from_millis(500), Duration::from_nanos(1));
+        let schema = spec_of(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#);
+        assert_eq!(
+            check.check(&schema).await,
+            Err(SchemaCheckError::TooComplex)
+        );
+        assert!(!check.passed.lock().unwrap().contains(&schema.body));
     }
 
     #[test]
