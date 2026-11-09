@@ -12,9 +12,9 @@ Usage:
 minimal instance and has no chat template, so the two cases only a real backend can pass
 (a schema the backend can't build → 400; tools rendered by the model's template) report INFO.
 
-Answers are validated with the `jsonschema` package when it is installed
-(`pip install jsonschema`); without it the check only parses the JSON and says so.
-Uses only the standard library otherwise. Schemas come from
+Answers are validated with the `jsonschema` package (`pip install jsonschema`). Without it
+the run fails (`VERDICT jsonschema_installed FAIL`), except with `--mock`, where answers are
+only parsed. Uses only the standard library otherwise. Schemas come from
 `crates/cascadia-engine-mock/tests/fixtures/` (browser-use and pydantic-ai shapes).
 """
 
@@ -129,12 +129,14 @@ def run_json_case(base, case, schema, rf, messages, stream=False, **extra):
     body = chat(messages, response_format=rf, stream=stream, **extra)
     status, raw, dt = post(base, body)
     if status != 200:
-        return verdict(case, False, f"HTTP {status}: {raw[:200]}")
+        verdict(case, False, f"HTTP {status}: {raw[:200]}")
+        return None
     text, finish = stream_content(raw) if stream else content_of(raw)
     ok, detail = check_json(text, schema)
     if ok and finish != "stop":
         ok, detail = False, f"finish_reason={finish} (want stop); {detail}"
     verdict(case, ok, f"{dt:.2f}s finish={finish} {detail}")
+    return text if ok else None
 
 
 def case_json_object(base):
@@ -191,7 +193,7 @@ def case_person_stream(base):
 
 def case_browser_use(base):
     schema = load_fixture("browser_use_schema.json")
-    run_json_case(
+    text = run_json_case(
         base,
         "browser_use_schema",
         schema,
@@ -202,6 +204,13 @@ def case_browser_use(base):
         ],
         max_tokens=4096,
     )
+    if text is None:
+        return
+    # The answer's keys must come in the schema's order (thinking first, action last): an agent
+    # reads its fields in that order. The mock emits sorted keys, so this is INFO there.
+    keys = list(json.loads(text))
+    want = [k for k in schema["properties"] if k in keys]
+    verdict("browser_use_key_order", keys == want, f"keys={keys}", info=MOCK)
 
 
 def case_browser_use_exact(base):
@@ -354,7 +363,11 @@ def main():
     global MOCK
     MOCK = args.mock
     if jsonschema is None:
-        print("WARN jsonschema not installed: answers are parsed but not checked against their schema", flush=True)
+        if MOCK:
+            print("WARN jsonschema not installed: answers are parsed but not checked against their schema",
+                  flush=True)
+        else:
+            verdict("jsonschema_installed", False, "install it with pip install jsonschema")
     for name in args.cases.split(","):
         CASES[name](args.base)
     if args.concurrency:
