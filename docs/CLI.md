@@ -612,6 +612,7 @@ Schema limits (each is a 400 `invalid response_format: …`):
 | Schema size (JSON without whitespace) | 64 KiB (65 536 bytes) |
 | Nesting depth of objects and arrays | 64 |
 | Nesting depth counted the way the grammar converter (`ov-genai`'s, xgrammar) walks the schema, through `$ref`: each subschema it descends into (a property, `items`, an `anyOf` case, a `$ref`'s target) is one level below its parent. It enters each `$ref` (by its text) once: a `$ref` already entered, such as one back into a recursive definition, stops there, but a schema reached by plain nesting is walked again each time it is reached | 64 |
+| A coarse bound on the same depth whatever order a backend walks the schema in: each definition a `$ref` points to counts its own nesting, and definitions that refer to each other in a loop count together. A backstop to the limit above (a UI tree whose node is a union of 30 component types bounds at 126); over it the request gets `… may nest deeper than 512 levels through $ref` | 512 |
 | Any one `minItems`, `maxItems`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, or number in a `pattern` / `patternProperties` repetition quantifier (`{n}`, `{n,}`, `{n,m}`, `{,m}`) | 10 000 |
 | Sum of all those counts in one schema; a `minX`/`maxX` pair on one object counts once, at the larger value | 200 000 |
 
