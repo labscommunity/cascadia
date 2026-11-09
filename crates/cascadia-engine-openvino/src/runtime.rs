@@ -453,6 +453,46 @@ fn token_finish(
     }
 }
 
+/// The `finish_reason` of a single-task final chunk. ov-runtime doesn't yet
+/// distinguish length vs stop for plain tasks; the API falls back to "stop"
+/// (unchanged behaviour). Structured-output tasks say why: stop on a grammar
+/// finish or EOS, length on the budget.
+fn final_chunk_finish_reason(
+    has_grammar: bool,
+    finish: Option<cascadia_types::FinishReason>,
+) -> Option<cascadia_types::FinishReason> {
+    finish.filter(|_| has_grammar)
+}
+
+/// Commits `token` to a packed slot: advances its matcher, appends the token
+/// and decides whether the slot ends. `Err` when the grammar rejects the
+/// token, which fails that slot alone.
+fn commit_packed_token(
+    t: &mut crate::packed_exec::PackedSlot,
+    token: i32,
+    eos: &[u32],
+) -> EngineResult<Option<cascadia_types::FinishReason>> {
+    let grammar_finished = commit_grammar_token(t.grammar.as_mut(), token)?;
+    t.last_token = token;
+    t.generated.push(token);
+    let max_tokens = t.task.max_tokens.max(1) as usize;
+    let is_eos = eos.contains(&(token as u32));
+    Ok(token_finish(
+        t.generated.len(),
+        max_tokens,
+        is_eos,
+        grammar_finished,
+    ))
+}
+
+/// The error chunk that ends one packed slot's request.
+fn packed_slot_error_chunk(ps: crate::packed_exec::PackedSlot, e: &EngineError) -> (TaskId, Chunk) {
+    (
+        ps.task.task_id.clone(),
+        Chunk::error(ps.task.task_id, e.to_string()),
+    )
+}
+
 /// The refusal for grammar tasks on a pipeline of more than one stage: the
 /// last stage picks the token and has no grammar.
 fn refuse_multi_stage_grammar() -> EngineError {
@@ -1450,6 +1490,48 @@ fn fill_static_mask(buf: &mut Vec<u8>, ctx: usize, past_len: usize, valid: usize
 fn chunk_take(c: usize, remaining: usize, position: usize, past_len: usize) -> usize {
     let window = (past_len + 1).saturating_sub(position);
     c.min(remaining).min(window)
+}
+
+/// One inference of the static chunked prefill: `take` prompt tokens fed from
+/// absolute position `start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillStep {
+    start: i64,
+    take: usize,
+}
+
+impl PrefillStep {
+    /// Two or more rows run through the chunked-prefill model; a single row
+    /// steps through the seq=1 decode model.
+    fn chunked(self) -> bool {
+        self.take >= 2
+    }
+}
+
+/// The inferences that consume `n_tokens` prompt tokens from absolute
+/// position `start` on the static path: chunks of up to `c` rows capped at the
+/// KV window ([`chunk_take`]), and a seq=1 step wherever fewer than two rows
+/// fit (a one-token remainder, or every row past the window).
+fn chunked_prefill_steps(
+    c: usize,
+    n_tokens: usize,
+    start: i64,
+    past_len: usize,
+) -> Vec<PrefillStep> {
+    let mut steps = Vec::new();
+    let mut position = start;
+    let mut fed = 0usize;
+    while fed < n_tokens {
+        let take = chunk_take(c, n_tokens - fed, position as usize, past_len);
+        let take = if take >= 2 { take } else { 1 };
+        steps.push(PrefillStep {
+            start: position,
+            take,
+        });
+        position += take as i64;
+        fed += take;
+    }
+    steps
 }
 
 /// Primary input of one prefill chunk: prompt ids on the embed stage, hidden
@@ -2784,21 +2866,7 @@ impl OvRuntimeEngine {
         kind: crate::packed_exec::PackedStepKind,
         out: &mut Vec<(TaskId, Chunk)>,
     ) -> EngineResult<()> {
-        let sampled: Vec<(usize, usize)> = match kind {
-            crate::packed_exec::PackedStepKind::Prefill {
-                slot,
-                last_row,
-                finished_prompt,
-            } => {
-                if finished_prompt {
-                    vec![(last_row, slot)]
-                } else {
-                    Vec::new()
-                }
-            }
-            crate::packed_exec::PackedStepKind::Decode { rows } => rows,
-        };
-        for (row, slot) in sampled {
+        for (row, slot) in kind.sampled_rows() {
             let token = tokens.get(row).copied().ok_or_else(|| {
                 EngineError::Backend(format!(
                     "packed tail returned {} tokens, need row {row}",
@@ -2956,22 +3024,9 @@ impl OvRuntimeEngine {
         kind: crate::packed_exec::PackedStepKind,
         out: &mut Vec<(TaskId, Chunk)>,
     ) -> EngineResult<()> {
-        let sampled: Vec<(usize, usize)> = match kind {
-            crate::packed_exec::PackedStepKind::Prefill {
-                slot,
-                last_row,
-                finished_prompt,
-            } => {
-                // Only the chunk that consumed the final prompt token yields a
-                // real token; earlier chunks just fill the slot's KV.
-                if finished_prompt {
-                    vec![(last_row, slot)]
-                } else {
-                    Vec::new()
-                }
-            }
-            crate::packed_exec::PackedStepKind::Decode { rows } => rows,
-        };
+        // Only the chunk that consumed the final prompt token yields a real
+        // token; earlier chunks just fill the slot's KV.
+        let sampled = kind.sampled_rows();
         if sampled.is_empty() {
             return Ok(());
         }
@@ -3003,10 +3058,7 @@ impl OvRuntimeEngine {
         let packed = self.packed.as_mut().unwrap();
         let ps = packed.retire(slot)?;
         warn!(task = %ps.task.task_id, slot, error = %e, "packed slot failed");
-        Some((
-            ps.task.task_id.clone(),
-            Chunk::error(ps.task.task_id, e.to_string()),
-        ))
+        Some(packed_slot_error_chunk(ps, &e))
     }
 
     /// Append `token` to `slot`'s sequence, decode its text delta, and build the
@@ -3027,19 +3079,14 @@ impl OvRuntimeEngine {
         let Some(t) = packed.slots[slot].as_mut() else {
             return Ok(None);
         };
-        // Structured output: a token the grammar rejects fails this slot only.
-        let grammar_finished = match commit_grammar_token(t.grammar.as_mut(), token) {
+        // Stop conditions first: they decide `running`, which tells
+        // `advance_emitted` whether it may hold back an unresolved
+        // replacement-char run or must flush it. Structured output: a token
+        // the grammar rejects fails this slot only.
+        let finish = match commit_packed_token(t, token, &eos) {
             Ok(f) => f,
             Err(e) => return Ok(self.fail_packed_slot(slot, e)),
         };
-        t.last_token = token;
-        t.generated.push(token);
-        // Stop conditions first: they decide `running`, which tells
-        // `advance_emitted` whether it may hold back an unresolved
-        // replacement-char run or must flush it.
-        let max_tokens = t.task.max_tokens.max(1) as usize;
-        let is_eos = eos.contains(&(token as u32));
-        let finish = token_finish(t.generated.len(), max_tokens, is_eos, grammar_finished);
         let is_final = finish.is_some();
         let task_id = t.task.task_id.clone();
 
@@ -3150,11 +3197,11 @@ impl OvRuntimeEngine {
                 let past_len = self.static_kv.as_ref().map(|sk| sk.past_len).unwrap_or(0);
                 let mut nt = 0i32;
                 let mut idx = 0usize;
-                while idx < tokens.len() {
-                    let chunk_start = self.position;
-                    let take = chunk_take(c, tokens.len() - idx, chunk_start as usize, past_len);
+                for step in chunked_prefill_steps(c, tokens.len(), self.position, past_len) {
+                    let chunk_start = step.start;
+                    let take = step.take;
                     let ts = std::time::Instant::now();
-                    let (token, wire) = if take >= 2 {
+                    let (token, wire) = if step.chunked() {
                         // Lazy so a prompt that never chunks (1-token, or
                         // fully over-window) skips a parked model's reload.
                         self.ensure_prefill_loaded()?;
@@ -3416,11 +3463,7 @@ impl OvRuntimeEngine {
                 error: None,
                 invalid_request: false,
                 token_ids: Vec::new(),
-                // ov-runtime doesn't yet distinguish length vs stop here; the
-                // API falls back to "stop" (unchanged behavior). #14 follow-up.
-                // Structured-output tasks say why: stop on a grammar finish or
-                // EOS, length on the budget.
-                finish_reason: active.grammar.as_ref().and(finish),
+                finish_reason: final_chunk_finish_reason(active.grammar.is_some(), finish),
             }
         } else {
             Chunk::token(task_id.clone(), next_token as i64, delta)
@@ -7253,10 +7296,10 @@ mod tests {
         assert_eq!(picks, vec![bad, bad, bad, b'"' as i32]);
     }
 
-    /// Drives the single-stage chunked static prefill exactly as
-    /// `step_first_body` does (chunks via `chunk_take`, non-final chunks
-    /// unread, a `take < 2` step through the decode model) and records every
-    /// pick it makes as `(row position, token)`.
+    /// Drives the single-stage chunked static prefill over the same
+    /// [`chunked_prefill_steps`] `step_first_body` iterates (non-final chunks
+    /// unread, a one-row step through the decode model) and records every pick
+    /// it makes as `(row position, token)`.
     fn chunked_prefill_picks(
         c: usize,
         prompt_len: usize,
@@ -7265,32 +7308,45 @@ mod tests {
     ) -> Vec<(i64, i32)> {
         let w = test_factory().mask_width();
         let mut picks = Vec::new();
-        let mut position = 0i64;
-        let mut idx = 0usize;
-        while idx < prompt_len {
-            let chunk_start = position;
-            let take = chunk_take(c, prompt_len - idx, chunk_start as usize, past_len);
-            if take >= 2 {
-                let is_final_chunk = idx + take == prompt_len;
-                position += take as i64;
-                idx += take;
-                if is_final_chunk {
+        let mut fed = 0usize;
+        for step in chunked_prefill_steps(c, prompt_len, 0, past_len) {
+            let take = step.take;
+            fed += take;
+            if step.chunked() {
+                if fed == prompt_len {
                     let (out, shape) = rows(&vec![bad_then(w, b'"'); take]);
                     let t =
-                        pick_chunk_token(&out, &shape, take, chunk_start, prompt_len, Some(mask))
+                        pick_chunk_token(&out, &shape, take, step.start, prompt_len, Some(mask))
                             .unwrap();
-                    picks.push((chunk_start + take as i64 - 1, t));
+                    picks.push((step.start + take as i64 - 1, t));
                 }
             } else {
                 let (out, shape) = rows(&[bad_then(w, b'"')]);
-                position += 1;
-                idx += 1;
                 let t =
-                    pick_next_token(&out, &shape, 0, chunk_start, prompt_len, Some(mask)).unwrap();
-                picks.push((chunk_start, t));
+                    pick_next_token(&out, &shape, 0, step.start, prompt_len, Some(mask)).unwrap();
+                picks.push((step.start, t));
             }
         }
         picks
+    }
+
+    #[test]
+    fn chunked_prefill_steps_cover_the_prompt_in_window_capped_chunks() {
+        let s = |start, take| PrefillStep { start, take };
+        // C·n+1: two full chunks, then a one-row step.
+        assert_eq!(
+            chunked_prefill_steps(4, 9, 0, 64),
+            vec![s(0, 4), s(4, 4), s(8, 1)]
+        );
+        // Window 5 (past_len 5 ⇒ positions 0..=5 fit): 4, then 2, then one row at a time.
+        assert_eq!(
+            chunked_prefill_steps(4, 9, 0, 5),
+            vec![s(0, 4), s(4, 2), s(6, 1), s(7, 1), s(8, 1)]
+        );
+        // Already past the window: every row steps alone.
+        assert_eq!(chunked_prefill_steps(4, 2, 10, 5), vec![s(10, 1), s(11, 1)]);
+        assert!(chunked_prefill_steps(4, 0, 0, 64).is_empty());
+        assert!(s(4, 2).chunked() && !s(4, 1).chunked());
     }
 
     #[test]
@@ -7499,6 +7555,63 @@ mod tests {
         // A prefill chunk whose last real row is row 1 (row 2 is a pad).
         let picks = pick_packed_rows(&out, &shape, &[(1, 0)], &mut slots).unwrap();
         assert_eq!(*picks[0].1.as_ref().unwrap(), b'4' as i32);
+    }
+
+    #[test]
+    fn plain_single_task_final_chunks_keep_no_finish_reason() {
+        use cascadia_types::FinishReason;
+        for finish in [Some(FinishReason::Stop), Some(FinishReason::Length), None] {
+            assert_eq!(final_chunk_finish_reason(false, finish), None);
+            assert_eq!(final_chunk_finish_reason(true, finish), finish);
+        }
+    }
+
+    #[test]
+    fn a_packed_token_the_grammar_rejects_fails_the_slot_without_committing_it() {
+        let mut slot = packed_slot(Some(test_mask(OK_ENUM, "")));
+        assert!(commit_packed_token(&mut slot, BAD as i32, &[TEST_EOS]).is_err());
+        assert!(
+            slot.generated.is_empty(),
+            "a rejected token is never committed"
+        );
+        // The slot's own error chunk carries the grammar's reason, final.
+        let err = commit_packed_token(&mut slot, BAD as i32, &[TEST_EOS]).unwrap_err();
+        let (id, chunk) = packed_slot_error_chunk(slot, &err);
+        assert_eq!(id, chunk.task_id);
+        assert!(chunk.is_final);
+        assert_eq!(chunk.error.as_deref(), Some(err.to_string().as_str()));
+    }
+
+    #[test]
+    fn packed_commits_finish_on_the_grammar_eos_or_budget() {
+        use cascadia_types::FinishReason;
+        let mut slot = packed_slot(Some(test_mask(OK_ENUM, "")));
+        for b in *b"\"ok" {
+            assert_eq!(
+                commit_packed_token(&mut slot, b as i32, &[TEST_EOS]).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            commit_packed_token(&mut slot, b'"' as i32, &[TEST_EOS]).unwrap(),
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(slot.generated, b"\"ok\"".map(i32::from).to_vec());
+
+        let mut plain = packed_slot(None);
+        plain.task.max_tokens = 2;
+        assert_eq!(
+            commit_packed_token(&mut plain, BAD as i32, &[TEST_EOS]).unwrap(),
+            None
+        );
+        assert_eq!(
+            commit_packed_token(&mut plain, BAD as i32, &[TEST_EOS]).unwrap(),
+            Some(FinishReason::Length)
+        );
+        assert_eq!(
+            commit_packed_token(&mut packed_slot(None), TEST_EOS as i32, &[TEST_EOS]).unwrap(),
+            Some(FinishReason::Stop)
+        );
     }
 
     #[test]

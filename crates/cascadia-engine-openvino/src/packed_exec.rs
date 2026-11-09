@@ -72,6 +72,23 @@ pub(crate) enum PackedStepKind {
     Decode { rows: Vec<(usize, usize)> },
 }
 
+impl PackedStepKind {
+    /// The `(row, slot)` pairs whose logits pick a slot's next token: the
+    /// final real row of the chunk that consumed the last prompt token, or
+    /// every decode row. Earlier prefill chunks pick nothing.
+    pub(crate) fn sampled_rows(&self) -> Vec<(usize, usize)> {
+        match self {
+            PackedStepKind::Prefill {
+                slot,
+                last_row,
+                finished_prompt: true,
+            } => vec![(*last_row, *slot)],
+            PackedStepKind::Prefill { .. } => Vec::new(),
+            PackedStepKind::Decode { rows } => rows.clone(),
+        }
+    }
+}
+
 pub(crate) struct PackedState {
     pub(crate) runtime: OvRuntime,
     pub(crate) kv: PackedKv,
@@ -455,5 +472,30 @@ impl PackedState {
             }
         }
         Ok((odt, oshape, obytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_finishing_prefill_chunk_and_decode_rows_are_sampled() {
+        let unfinished = PackedStepKind::Prefill {
+            slot: 1,
+            last_row: 3,
+            finished_prompt: false,
+        };
+        assert!(unfinished.sampled_rows().is_empty());
+        let finished = PackedStepKind::Prefill {
+            slot: 1,
+            last_row: 2,
+            finished_prompt: true,
+        };
+        assert_eq!(finished.sampled_rows(), vec![(2, 1)]);
+        let decode = PackedStepKind::Decode {
+            rows: vec![(0, 2), (1, 0)],
+        };
+        assert_eq!(decode.sampled_rows(), vec![(0, 2), (1, 0)]);
     }
 }
