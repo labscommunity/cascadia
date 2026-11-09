@@ -581,3 +581,8 @@ pub fn argmax_allowed(row: &[f32], words: &[u32]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests;
+
+mod stage_mask;
+pub use stage_mask::{
+    MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT,
+};
