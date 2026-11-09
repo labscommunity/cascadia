@@ -23,6 +23,10 @@ Sends what Codex and the agent SDKs send and checks the answers' shape:
 Usage:
   python3 scripts/responses-live-check.py http://127.0.0.1:18100 [--max-output-tokens 1024]
           [--only text,tool_call] [--timeout 1800] [--mock] [--expect-reasoning]
+          [--bearer-env NAME]
+
+`--bearer-env NAME` sends `Authorization: Bearer <value of $NAME>` (a server behind an
+API key or a gateway); the value is never printed.
 
 `--mock` adds the mock engine's `__mock_tool_call__` marker to the tool prompt,
 so `cascadia run tests/fixtures/mock-tools-model --engine mock` scripts a call,
@@ -42,6 +46,7 @@ Every check prints `<NAME>: PASS` or `<NAME>: FAIL <why>`; the last line is
 
 import argparse
 import json
+import os
 import pathlib
 import sys
 import urllib.error
@@ -158,11 +163,14 @@ class Fail(Exception):
     pass
 
 
+HEADERS = {"Content-Type": "application/json"}
+
+
 def post(base, body, timeout):
     req = urllib.request.Request(
         base.rstrip("/") + "/v1/responses",
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=HEADERS,
     )
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
@@ -258,6 +266,12 @@ def the_call(resp):
 
 def run(args):
     global TOOL_PROMPT, CHECK_MARKERS
+    if args.bearer_env:
+        token = os.environ.get(args.bearer_env, "")
+        if not token:
+            print(f"RESPONSES_LIVE: FAIL (${args.bearer_env} is empty or unset)")
+            return 2
+        HEADERS["Authorization"] = "Bearer " + token
     if args.mock:
         TOOL_PROMPT += " __mock_tool_call__"
         CHECK_MARKERS = False
@@ -402,6 +416,7 @@ def main():
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--mock", action="store_true")
     p.add_argument("--expect-reasoning", action="store_true")
+    p.add_argument("--bearer-env", default="")
     sys.exit(run(p.parse_args()))
 
 
