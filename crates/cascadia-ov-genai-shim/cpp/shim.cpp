@@ -186,10 +186,13 @@ std::string join_port_names(const Set& names) {
 }
 
 // malloc'd copy of `s` for a char** out-parameter; the caller frees it with
-// cascadia_free_string. Null when the allocation fails.
-char* dup_cstr(const std::string& s) {
-    char* p = static_cast<char*>(std::malloc(s.size() + 1));
-    if (p) { std::memcpy(p, s.c_str(), s.size() + 1); }
+// cascadia_free_string. Null when the allocation fails. Takes a C string so
+// a catch handler can pass e.what() without building a std::string: a
+// bad_alloc thrown there would escape the extern "C" boundary.
+char* dup_cstr(const char* s) {
+    const size_t n = std::strlen(s);
+    char* p = static_cast<char*>(std::malloc(n + 1));
+    if (p) { std::memcpy(p, s, n + 1); }
     return p;
 }
 
