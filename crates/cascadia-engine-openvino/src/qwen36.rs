@@ -38,6 +38,9 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 #[cfg(test)]
 use cascadia_grammar::GrammarFactory;
 use cascadia_grammar::{CompiledGrammar, GrammarMask};
+use cascadia_grammar::{
+    MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT,
+};
 use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, Runtime};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
@@ -168,7 +171,10 @@ const MROPE_ROWS: usize = 4;
 // header-only (HELLO_ACK's `pos` carries the chain's capabilities, see
 // `combine_hello_caps`). FORWARD_MASKED: FORWARD's tensor, then the grammar
 // mask tensor (`encode_wire_mask`); its reply is TOKEN_MASKED, TOKEN's body
-// under its own kind. An earlier design
+// under its own kind. A mask equal to the last one the head sent goes as the
+// marker `[REPEAT]` (I32 `[1,1,1]`): middles relay it untouched, the tail
+// uses the last mask it decoded, and a tail with none answers
+// TOKEN_MASKED with MASK_MISS_TOKEN without running a layer. An earlier design
 // draft framed the position as an i64 prefix tensor; the shipped header
 // carries the same information in the day-0 probe's framing
 // (kind+epoch+pos), which the probe validated end-to-end on the live
@@ -298,6 +304,51 @@ fn decode_wire_mask(t: &WireTensor) -> Option<(usize, Vec<u32>)> {
     let width = vals.next()? as usize;
     let words: Vec<u32> = vals.collect();
     (words.len() == width.div_ceil(32)).then_some((width, words))
+}
+
+/// The mask tensor's lanes, `[W, words...]`: the key both ends of a link
+/// cache a mask under.
+fn mask_lanes(t: &WireTensor) -> Vec<u32> {
+    t.data
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// The repeat marker: I32 `[1, 1, 1]` = `[REPEAT]`.
+fn encode_repeat_mask() -> WireTensor {
+    WireTensor::new(WireDType::I32, [1, 1, 1], REPEAT.to_le_bytes().to_vec())
+}
+
+/// The tail's read of a mask tensor against the link's receive cache: the
+/// marker (checked before anything else: the `[0]` mask decodes today)
+/// becomes the last mask decoded, or [`MaskMiss`]; a full mask is committed;
+/// `Ok(None)` for a malformed tensor, which also clears the cache.
+fn resolve_wire_mask(
+    t: &WireTensor,
+    cache: &mut MaskRecvCache,
+) -> Result<Option<(usize, Vec<u32>)>, MaskMiss> {
+    if *t == encode_repeat_mask() {
+        let lanes = cache.resolve(WireMask::Repeat)?;
+        return Ok(decode_mask_lanes(&lanes));
+    }
+    match decode_wire_mask(t) {
+        Some(mask) => {
+            cache.commit(&mask_lanes(t));
+            Ok(Some(mask))
+        }
+        None => {
+            cache.clear();
+            Ok(None)
+        }
+    }
+}
+
+/// `(W, words)` of committed mask lanes `[W, words...]`.
+fn decode_mask_lanes(lanes: &[u32]) -> Option<(usize, Vec<u32>)> {
+    let (&width, words) = lanes.split_first()?;
+    let width = width as usize;
+    (words.len() == width.div_ceil(32)).then(|| (width, words.to_vec()))
 }
 
 /// The tail's masked pick: the best token of `row` the mask allows (indices
@@ -845,6 +896,8 @@ impl Builder for Qwen36Builder {
             handshake_done: false,
             chain_capture_v2: 0,
             chain_grammar_mask: false,
+            mask_send: MaskSendCache::default(),
+            mask_recv: MaskRecvCache::default(),
             #[cfg(test)]
             fake_embed: None,
             poisoned: None,
@@ -995,6 +1048,12 @@ pub struct Qwen36Engine {
     /// [`GRAMMAR_MASK_CAP`]). The head sends [`FRAME_FORWARD_MASKED`] only
     /// when this is set and refuses structured-output tasks otherwise.
     chain_grammar_mask: bool,
+    /// Rank 0: the last mask sent downstream, so a repeat goes as the short
+    /// marker. Cleared on every failed step.
+    mask_send: MaskSendCache,
+    /// The tail: the last mask decoded from upstream, which a marker stands
+    /// for. Middles relay masks without decoding them, so theirs stays empty.
+    mask_recv: MaskRecvCache,
     /// Tests only: stands in for the embeddings model, which the stub build
     /// can't run. `(tokens, hidden) -> [1, n, hidden]`.
     #[cfg(test)]
@@ -1540,6 +1599,10 @@ impl Qwen36Engine {
     /// With `mask` the step goes out as FORWARD_MASKED and either reply kind
     /// is read whole (a plain TOKEN comes back with `false`); without it the
     /// bytes and the checks are FORWARD's, unchanged.
+    ///
+    /// `cache` (rank 0): a mask equal to the last one sent goes as the marker,
+    /// and a failed exchange clears it. Middles pass `None` and relay the
+    /// mask tensor as received.
     fn forward_downstream(
         &mut self,
         epoch: u32,
@@ -1547,6 +1610,7 @@ impl Qwen36Engine {
         n: usize,
         t0: usize,
         mask: Option<&WireTensor>,
+        mut cache: Option<&mut MaskSendCache>,
     ) -> EngineResult<(i32, u32, bool)> {
         let downstream = self
             .downstream
@@ -1558,8 +1622,12 @@ impl Qwen36Engine {
             [1, n as u32, self.hidden as u32],
             le_bytes_f32(hidden),
         );
+        // The links of this engine never re-dial, so one connection generation.
+        const GENERATION: u64 = 0;
+        let lanes = mask.map(mask_lanes);
         let mask = mask.cloned();
-        run_async(
+        let cache_ref = &mut cache;
+        let res = run_async(
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
@@ -1568,10 +1636,21 @@ impl Qwen36Engine {
                 } else {
                     FRAME_FORWARD
                 };
+                let repeat = matches!(
+                    (cache_ref.as_deref(), &lanes),
+                    (Some(c), Some(l)) if c.repeats(GENERATION, l)
+                );
                 g.send_raw(&frame_header(kind, epoch, t0 as u32)).await?;
                 g.send(&tensor).await?;
                 if let Some(mask) = &mask {
-                    g.send(mask).await?;
+                    if repeat {
+                        g.send(&encode_repeat_mask()).await?;
+                    } else {
+                        g.send(mask).await?;
+                    }
+                }
+                if let (Some(c), Some(l)) = (cache_ref.as_deref_mut(), &lanes) {
+                    c.record(GENERATION, l);
                 }
                 let hb = g.recv_raw(12).await?;
                 let (kind, e, _) = parse_header(&hb);
@@ -1587,7 +1666,13 @@ impl Qwen36Engine {
                 ))
             }),
         )
-        .map_err(map_wire)
+        .map_err(map_wire);
+        if res.is_err() {
+            if let Some(c) = cache {
+                c.clear();
+            }
+        }
+        res
     }
 
     /// Rank 0 wrapper: token + the round-trip's wire share in ms (RTT
@@ -1603,11 +1688,22 @@ impl Qwen36Engine {
     ) -> EngineResult<(u32, f64)> {
         let epoch = self.epoch;
         let started = Instant::now();
-        let (token, infer_us, acked) =
-            self.forward_downstream(epoch, &hidden, n, t0, mask.as_ref())?;
+        let mut cache = std::mem::take(&mut self.mask_send);
+        let reply = self.forward_downstream(epoch, &hidden, n, t0, mask.as_ref(), Some(&mut cache));
+        self.mask_send = cache;
+        let (token, infer_us, acked) = reply?;
+        if mask.is_some() && (!acked || token < 0) {
+            // The step failed: the tail may not hold this mask.
+            self.mask_send.clear();
+        }
         if mask.is_some() {
             if !acked {
                 return Err(EngineError::Backend(UPGRADE_EVERY_STAGE.into()));
+            }
+            // A stage lost its mask state: fail the task, keep structured
+            // output on.
+            if token == MASK_MISS_TOKEN {
+                return Err(EngineError::Backend(MASK_MISS_MESSAGE.into()));
             }
             if token < 0 {
                 return Err(EngineError::Backend(
@@ -2497,6 +2593,28 @@ impl Qwen36Engine {
                         self.hidden
                     )));
                 }
+                // The tail resolves a repeat marker before any layer runs; with
+                // no mask to repeat it answers the mask-miss token at once.
+                let tail_mask = match (&mask, is_last) {
+                    (Some(m), true) => Some(resolve_wire_mask(m, &mut self.mask_recv)),
+                    _ => None,
+                };
+                if let Some(Err(MaskMiss)) = tail_mask {
+                    warn!(
+                        pos,
+                        "qwen36: a repeat token mask arrived with no mask to repeat"
+                    );
+                    let h = self.handle()?;
+                    let upstream = self.upstream.clone().unwrap();
+                    return run_async(&h, async move {
+                        let mut g = upstream.lock().await;
+                        g.send_raw(&frame_header(FRAME_TOKEN_MASKED, epoch, pos))
+                            .await?;
+                        g.send_raw(&MASK_MISS_TOKEN.to_be_bytes()).await?;
+                        g.send_raw(&0u32.to_be_bytes()).await
+                    })
+                    .map_err(map_wire);
+                }
                 let infer_started = Instant::now();
                 let t0 = pos as usize;
                 let out = self.chain_pass(&hidden, t0, t0 + n)?;
@@ -2530,7 +2648,7 @@ impl Qwen36Engine {
                         let row = out.len() / n;
                         out[(n - 1) * row..].to_vec()
                     };
-                    match &mask {
+                    match tail_mask {
                         None => {
                             let next = logits
                                 .iter()
@@ -2542,8 +2660,10 @@ impl Qwen36Engine {
                         }
                         // The pick the head's grammar allows; -1 when the
                         // mask is malformed or allows nothing in this row.
-                        Some(m) => {
-                            let next = decode_wire_mask(m)
+                        Some(resolved) => {
+                            let next = resolved
+                                .ok()
+                                .flatten()
                                 .and_then(|(w, words)| masked_argmax(&logits, w, &words))
                                 .map_or(-1, |t| t as i32);
                             if next < 0 {
@@ -2564,7 +2684,7 @@ impl Qwen36Engine {
                 } else {
                     // Middle: pass the hidden span (and any mask) on; the
                     // chain end's token, and its ack, come back through us.
-                    self.forward_downstream(epoch, &out, n, t0, mask.as_ref())?
+                    self.forward_downstream(epoch, &out, n, t0, mask.as_ref(), None)?
                 };
                 let infer_us = own_us.saturating_add(downstream_us);
                 let kind = if acked {
@@ -3664,6 +3784,8 @@ mod tests {
             handshake_done: false,
             chain_capture_v2: 0,
             chain_grammar_mask: false,
+            mask_send: MaskSendCache::default(),
+            mask_recv: MaskRecvCache::default(),
             #[cfg(test)]
             fake_embed: None,
             poisoned: None,
@@ -4978,5 +5100,249 @@ mod tests {
         assert_eq!(ids, seed("\"ok\""));
         assert!(fin.error.is_none(), "{fin:?}");
         assert_eq!(fin.finish_reason, Some(FinishReason::Stop));
+    }
+
+    // ---- repeated masks on the stage wire ----
+
+    /// A JSON string: every step inside it allows the same tokens, so its
+    /// masks repeat.
+    const STRING: &str = r#"{"type":"string"}"#;
+
+    /// The marker's exact tensor: I32 `[1, 1, 1]` holding `REPEAT`.
+    fn repeat_tensor() -> WireTensor {
+        WireTensor::new(WireDType::I32, [1, 1, 1], REPEAT.to_le_bytes().to_vec())
+    }
+
+    /// A tail at the raw frame level that masks (its HELLO_ACK carries the
+    /// mask bit) and records every mask tensor it reads. It resolves markers
+    /// with its own receive cache; with `forget` it answers every marker with
+    /// the mask-miss token instead (a tail that lost its mask state).
+    fn masking_fake_tail(
+        rt: &tokio::runtime::Runtime,
+        forget: bool,
+    ) -> (ActivationClient, tokio::task::JoinHandle<Vec<WireTensor>>) {
+        let (c, mut s) = loopback_links(rt, 1).pop().unwrap();
+        let h = rt.spawn(async move {
+            let mut masks = Vec::new();
+            let mut recv = MaskRecvCache::default();
+            loop {
+                let Ok(hb) = s.recv_raw(12).await else {
+                    return masks;
+                };
+                let (kind, epoch, pos) = parse_header(&hb);
+                match kind {
+                    FRAME_HELLO => {
+                        let lb = s.recv_raw(4).await.unwrap();
+                        let n = u32::from_be_bytes(lb[..].try_into().unwrap()) as usize;
+                        s.recv_raw(n).await.unwrap();
+                        let caps = CAPTURE_V2_CAP | GRAMMAR_MASK_CAP;
+                        s.send_raw(&frame_header(FRAME_HELLO_ACK, 0, caps))
+                            .await
+                            .unwrap();
+                    }
+                    FRAME_RESET => {
+                        s.send_raw(&frame_header(FRAME_RESET_ACK, epoch, 0))
+                            .await
+                            .unwrap();
+                    }
+                    FRAME_FORWARD | FRAME_FORWARD_MASKED => {
+                        let (hidden, _) = s.recv().await.unwrap();
+                        let hidden = f32_from_le(&hidden.data);
+                        let last = &hidden[hidden.len() - PIPE_HIDDEN..];
+                        let (reply_kind, tok) = if kind == FRAME_FORWARD {
+                            (FRAME_TOKEN, pick_decode_token(last, None).unwrap() as i32)
+                        } else {
+                            let (mask, _) = s.recv().await.unwrap();
+                            let resolved = if forget && mask == repeat_tensor() {
+                                Err(MaskMiss)
+                            } else {
+                                resolve_wire_mask(&mask, &mut recv)
+                            };
+                            masks.push(mask);
+                            let tok = match resolved {
+                                Err(MaskMiss) => MASK_MISS_TOKEN,
+                                Ok(Some((w, words))) => {
+                                    masked_argmax(last, w, &words).map_or(-1, |t| t as i32)
+                                }
+                                Ok(None) => -1,
+                            };
+                            (FRAME_TOKEN_MASKED, tok)
+                        };
+                        s.send_raw(&frame_header(reply_kind, epoch, pos))
+                            .await
+                            .unwrap();
+                        s.send_raw(&tok.to_be_bytes()).await.unwrap();
+                        s.send_raw(&0u32.to_be_bytes()).await.unwrap();
+                    }
+                    _ => return masks,
+                }
+            }
+        });
+        (c, h)
+    }
+
+    fn is_full_mask(t: &WireTensor) -> bool {
+        decode_wire_mask(t).is_some_and(|(w, _)| w > 0)
+    }
+
+    /// A repeated mask goes as the marker, `[1,1,1]` = `[REPEAT]` whatever
+    /// the vocab; the tail resolves it and the task picks the same tokens as
+    /// on a chain of real stages.
+    #[test]
+    fn a_repeated_mask_goes_as_a_short_marker_and_the_tail_picks_the_same_tokens() {
+        let rt = pipe_rt();
+        let tail = pipe_rank(1, 2, &rt);
+        let mut head = wire_chain(&rt, pipe_head(2, &rt), vec![tail]);
+        let (want, fin) = run_pipe_task(&mut head, pipe_task("j", 6, Some(STRING)));
+        assert!(fin.error.is_none(), "{fin:?}");
+
+        let (c, masks) = masking_fake_tail(&rt, false);
+        let mut head = pipe_head(2, &rt);
+        head.downstream = shared(c);
+        let (ids, fin) = run_pipe_task(&mut head, pipe_task("j", 6, Some(STRING)));
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(ids, want);
+        drop(head);
+        let masks = rt.block_on(masks).unwrap();
+        assert!(masks.len() >= 4, "{}", masks.len());
+        // The opening quote's mask, then the first in-string mask, full.
+        assert!(is_full_mask(&masks[0]) && is_full_mask(&masks[1]));
+        assert_ne!(masks[0], masks[1]);
+        for m in &masks[2..] {
+            assert_eq!(*m, repeat_tensor());
+            assert_eq!(m.data, vec![0xff, 0xff, 0xff, 0xff], "no mask words");
+        }
+    }
+
+    /// A marker on a fresh tail is a miss: it runs no layer and answers the
+    /// acknowledged TOKEN_MASKED with the mask-miss token. After a full mask
+    /// the same marker resolves and picks what the full mask picks. The
+    /// decoder checks for the marker before the `[0]` mask it accepts today.
+    #[test]
+    fn a_fresh_tail_answers_a_marker_with_a_mask_miss_and_runs_nothing() {
+        let rt = pipe_rt();
+        let (mut c, s) = loopback_links(&rt, 1).pop().unwrap();
+        let mut tail = pipe_rank(1, 2, &rt);
+        tail.upstream = shared(s);
+        let width = GrammarFactory::single_byte_for_tests().mask_width();
+        let mut mask = start_grammar(&compiled(OK_ENUM), &[]).unwrap();
+        let full = encode_wire_mask(&mut mask, width).unwrap();
+        let r = row(PIPE_HIDDEN, &[(BAD as u32, 10.0)]);
+        let hidden = WireTensor::new(WireDType::F32, [1, 1, PIPE_HIDDEN as u32], le_bytes_f32(&r));
+        let send = |c: &mut ActivationClient, m: &WireTensor| {
+            rt.block_on(async {
+                c.send_raw(&frame_header(FRAME_FORWARD_MASKED, 0, 3))
+                    .await
+                    .unwrap();
+                c.send(&hidden).await.unwrap();
+                c.send(m).await.unwrap();
+            })
+        };
+        let token = |b: &[u8]| i32::from_be_bytes(b[12..16].try_into().unwrap());
+
+        send(&mut c, &repeat_tensor());
+        let mut tail = std::thread::spawn(move || {
+            tail.step_pipe_relay().unwrap();
+            tail
+        })
+        .join()
+        .unwrap();
+        let reply = rt.block_on(c.recv_raw(20)).unwrap();
+        assert_eq!(parse_header(&reply), (FRAME_TOKEN_MASKED, 0, 3));
+        assert_eq!(token(&reply), MASK_MISS_TOKEN);
+        assert!(!tail.primed, "no layer ran");
+
+        for m in [&full, &repeat_tensor()] {
+            send(&mut c, m);
+            tail = std::thread::spawn(move || {
+                tail.step_pipe_relay().unwrap();
+                tail
+            })
+            .join()
+            .unwrap();
+            let reply = rt.block_on(c.recv_raw(20)).unwrap();
+            assert_eq!(parse_header(&reply), (FRAME_TOKEN_MASKED, 0, 3));
+            assert_eq!(token(&reply), b'"' as i32);
+        }
+
+        let zero = WireTensor::new(WireDType::I32, [1, 1, 1], 0u32.to_le_bytes().to_vec());
+        assert_eq!(decode_wire_mask(&zero), Some((0, Vec::new())));
+        let mut fresh = MaskRecvCache::default();
+        assert_eq!(
+            resolve_wire_mask(&repeat_tensor(), &mut fresh),
+            Err(MaskMiss)
+        );
+        assert_eq!(
+            resolve_wire_mask(&zero, &mut fresh),
+            Ok(Some((0, Vec::new())))
+        );
+    }
+
+    /// A mask miss fails the task with the retry message; the head forgets
+    /// its mask and keeps structured output on (no latch, the chain still
+    /// masks).
+    #[test]
+    fn a_mask_miss_fails_the_task_without_disabling_structured_output() {
+        let rt = pipe_rt();
+        let (c, masks) = masking_fake_tail(&rt, true);
+        let mut head = pipe_head(2, &rt);
+        head.downstream = shared(c);
+        let (_, fin) = run_pipe_task(&mut head, pipe_task("j", 6, Some(STRING)));
+        let err = fin.error.as_deref().unwrap_or_default();
+        assert!(err.contains(MASK_MISS_MESSAGE), "{err}");
+        assert!(head.mask_send.is_empty(), "the head forgets the mask");
+        assert!(head.chain_grammar_mask, "no latch");
+        // The next json task's first mask goes full.
+        let (_, fin) = run_pipe_task(&mut head, pipe_task("k", 2, Some(OK_ENUM)));
+        assert!(fin.error.is_none(), "{fin:?}");
+        drop(head);
+        let masks = rt.block_on(masks).unwrap();
+        assert_eq!(masks[2], repeat_tensor(), "the missed marker");
+        assert!(masks[3..].iter().all(is_full_mask), "{masks:?}");
+    }
+
+    /// Head → middle → tail: the middle relays the marker verbatim (it never
+    /// decodes a mask), and a miss at the tail comes back to the head
+    /// through the middle as the mask-miss token.
+    #[test]
+    fn a_middle_relays_the_marker_and_the_mask_miss_verbatim() {
+        for forget in [false, true] {
+            let rt = pipe_rt();
+            let (c, masks) = masking_fake_tail(&rt, forget);
+            let (mut downs, ups): (Vec<_>, Vec<_>) = loopback_links(&rt, 1).into_iter().unzip();
+            let mut middle = pipe_rank(1, 3, &rt);
+            middle.upstream = ups.into_iter().next().and_then(shared);
+            middle.downstream = shared(c);
+            std::thread::spawn(move || while middle.step_pipe_relay().is_ok() {});
+            let mut head = pipe_head(3, &rt);
+            head.downstream = downs.pop().and_then(shared);
+            let (ids, fin) = run_pipe_task(&mut head, pipe_task("j", 6, Some(STRING)));
+            drop(head);
+            let masks = rt.block_on(masks).unwrap();
+            assert_eq!(masks[2], repeat_tensor(), "relayed verbatim");
+            if forget {
+                let err = fin.error.as_deref().unwrap_or_default();
+                assert!(err.contains(MASK_MISS_MESSAGE), "{err}");
+            } else {
+                assert!(fin.error.is_none(), "{fin:?}");
+                assert_eq!(ids.len(), 6);
+                assert!(masks[2..].iter().all(|m| *m == repeat_tensor()));
+            }
+        }
+    }
+
+    /// A failed plain step clears the head's send cache too.
+    #[test]
+    fn a_failed_plain_step_clears_the_send_cache() {
+        let rt = pipe_rt();
+        let (c, s) = loopback_links(&rt, 1).pop().unwrap();
+        drop(s);
+        let mut head = pipe_head(2, &rt);
+        head.downstream = shared(c);
+        let mut cache = MaskSendCache::default();
+        cache.record(0, &[1, 2]);
+        let res = head.forward_downstream(1, &[0.0; PIPE_HIDDEN], 1, 0, None, Some(&mut cache));
+        assert!(res.is_err());
+        assert!(cache.is_empty());
     }
 }
