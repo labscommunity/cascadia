@@ -1564,12 +1564,19 @@ struct GenerationDefaultSources {
 /// and the key matched without regard to case; else ov-genai's default, so
 /// 1024 + 128 when neither is set); an ov-runtime NPU export has a fixed
 /// `static_context` KV.
+///
+/// Returns the default answer limit, the context window and its source. They
+/// are the same number except with `--packed-slots`, where the limit is one
+/// slot's region and the window adds the shared prefix (see below).
 fn engine_window(
     args: &WorkerArgs,
     info: &cascadia_api::ModelGenerationInfo,
-) -> Option<(u32, &'static str)> {
+) -> Option<(u32, u32, &'static str)> {
+    let same = |(w, src): (u32, &'static str)| (w, w, src);
     match args.engine {
-        EngineKind::SyclLlama => (args.llama_ctx > 0).then_some((args.llama_ctx, "--llama-ctx")),
+        EngineKind::SyclLlama => {
+            (args.llama_ctx > 0).then_some(same((args.llama_ctx, "--llama-ctx")))
+        }
         EngineKind::OvGenai if device_is_npu(&args.device) => {
             let props = ov_perf_properties(args);
             let prop = |key: &str| {
@@ -1587,20 +1594,25 @@ fn engine_window(
                 .unwrap_or(OVGENAI_NPU_MIN_RESPONSE_LEN);
             // A computed 0 is no window: fall through (and clamp nothing).
             let window = prompt.saturating_add(response);
-            (window > 0).then_some((window, NPU_WINDOW_SOURCE))
+            (window > 0).then_some(same((window, NPU_WINDOW_SOURCE)))
         }
         // A 0 is no window. With --packed-slots each request gets one slot's
         // region of the static KV, by the engine's own formula
         // (`PackedKv::new`): the prefix is clamped to leave a row per slot.
+        // The region is the default answer limit. The packed engine does not
+        // end a request when its region fills (it slides the region,
+        // `PackedKv::absorb_row`), and a slot reusing the shared prefix holds
+        // those tokens plus its region while the prompt count includes them,
+        // so the window is the region plus the prefix.
         EngineKind::OvRuntime => info.static_context.filter(|&c| c > 0).and_then(|c| {
             if args.packed_slots == 0 {
-                return Some((c, "stage_config.json static_context"));
+                return Some(same((c, "stage_config.json static_context")));
             }
             let slots = args.packed_slots;
             let past_len = c - 1;
             let prefix = args.packed_prefix.min(past_len.saturating_sub(slots));
             let region = (past_len - prefix) / slots;
-            (region > 0).then_some((region, PACKED_WINDOW_SOURCE))
+            (region > 0).then_some((region, region + prefix, PACKED_WINDOW_SOURCE))
         }),
         _ => None,
     }
@@ -1617,12 +1629,15 @@ fn resolve_generation_defaults(
     info: &cascadia_api::ModelGenerationInfo,
 ) -> (cascadia_api::GenerationDefaults, GenerationDefaultSources) {
     let window = engine_window(args, info)
-        .map(|(w, src)| (w, DefaultSource::EngineWindow(src)))
-        .or_else(|| info.context_window.map(|w| (w, DefaultSource::ConfigJson)));
+        .map(|(limit, w, src)| (limit, w, DefaultSource::EngineWindow(src)))
+        .or_else(|| {
+            info.context_window
+                .map(|w| (w, w, DefaultSource::ConfigJson))
+        });
     let (max_tokens, max_tokens_src) = args
         .default_max_tokens
         .map(|n| (n, DefaultSource::Flag("--default-max-tokens")))
-        .or(window)
+        .or(window.map(|(limit, _, src)| (limit, src)))
         .unwrap_or((cascadia_api::DEFAULT_MAX_TOKENS, DefaultSource::Fallback));
     let (temperature, temperature_src) = args
         .default_temperature
@@ -1647,7 +1662,7 @@ fn resolve_generation_defaults(
             max_tokens,
             temperature,
             top_p,
-            context_window: window.map(|(w, _)| w),
+            context_window: window.map(|(_, w, _)| w),
         },
         GenerationDefaultSources {
             max_tokens: max_tokens_src,
@@ -5205,11 +5220,25 @@ mod generation_defaults_tests {
             s.max_tokens,
             DefaultSource::EngineWindow(PACKED_WINDOW_SOURCE)
         );
+        // A slot that reuses the shared prefix holds it plus its region, and
+        // the prompt count includes the prefix, so the window is both; the
+        // default answer limit stays one region.
         w.packed_prefix = 512;
-        assert_eq!(resolve(&w, info).0.max_tokens, (1024 - 512) / 8);
+        let d = resolve(&w, info).0;
+        assert_eq!(
+            (d.max_tokens, d.context_window),
+            ((1024 - 512) / 8, Some((1024 - 512) / 8 + 512))
+        );
         // A prefix larger than the window is clamped as the engine clamps it.
         w.packed_prefix = 5000;
-        assert_eq!(resolve(&w, info).0.max_tokens, (1024 - (1024 - 8)) / 8);
+        let d = resolve(&w, info).0;
+        assert_eq!(
+            (d.max_tokens, d.context_window),
+            (
+                (1024 - (1024 - 8)) / 8,
+                Some((1024 - (1024 - 8)) / 8 + 1016)
+            )
+        );
         // Without --packed-slots the whole static context is the window.
         w.packed_slots = 0;
         w.packed_prefix = 0;
