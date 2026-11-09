@@ -241,6 +241,31 @@ def case_browser_use_exact(base):
     verdict("browser_use_exact_body", ok, f"{dt:.2f}s finish={finish} {detail}", info=True)
 
 
+BOUNDED = {
+    "type": "object",
+    "properties": {
+        "ok": {"type": "boolean"},
+        "n": {"type": "integer", "minimum": 0, "maximum": 9},
+        "color": {"enum": ["red", "green", "blue"]},
+    },
+    "required": ["ok", "n", "color"],
+    "additionalProperties": False,
+}
+
+
+def case_bounded(base):
+    # Only finite choices: any model, even one with random weights, must close this object within
+    # a few dozen tokens, so a pass shows the grammar alone forces the shape.
+    run_json_case(
+        base,
+        "json_schema_bounded",
+        BOUNDED,
+        rf_schema(BOUNDED, "choice"),
+        [{"role": "user", "content": "Pick a color and a digit."}],
+        max_tokens=64,
+    )
+
+
 def case_pydantic(base):
     schema = load_fixture("pydantic_output_schema.json")
     run_json_case(
@@ -373,6 +398,7 @@ CASES = {
     "browser_use": case_browser_use,
     "browser_use_exact": case_browser_use_exact,
     "pydantic": case_pydantic,
+    "bounded": case_bounded,
     "thinking": case_thinking_default,
     "malformed": case_malformed,
     "bad_schema": case_bad_schema,
