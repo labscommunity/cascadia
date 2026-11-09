@@ -319,6 +319,9 @@ impl StageMasks {
         match reply {
             MaskedReply::Token(t) => Ok(t),
             MaskedReply::Refused => Err(REFUSED_STEP.to_string()),
+            // A stage lost its mask state: fail the task (the client may
+            // retry); nothing is latched and no evidence is recorded.
+            MaskedReply::MaskMiss => Err(cascadia_grammar::MASK_MISS_MESSAGE.to_string()),
             MaskedReply::Unconfirmed(reason) => {
                 self.latch.set();
                 warn!(%reason, "masked step not acknowledged; json requests refused until a stage acknowledges or the re-probe interval passes");

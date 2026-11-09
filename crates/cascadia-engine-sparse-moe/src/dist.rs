@@ -52,6 +52,7 @@
 
 use std::sync::Arc;
 
+use cascadia_grammar::{MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_TOKEN, REPEAT};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult,
     MAX_RAW_BYTES,
@@ -2282,6 +2283,16 @@ mod expert_frame_tests {
 // step; a masked step is only answered by `TokenAck` / `StreamTokensAck`, kinds only
 // stages on this build send. Requests without a grammar send exactly the old bytes: the
 // `*_step` encoders hand an unmasked frame to the original encoder.
+//
+// Repeated masks: a frame with exactly one masked row whose mask equals the
+// last one sent on the link (on the same connection) carries the marker
+// section `[REPEAT, 1, row, tag]` instead, with no words (the W field is the
+// marker, so it is never read as a word count or as the probe's W = 0). The
+// receiver resolves it from the last single-row mask it decoded on the link
+// ([`MaskSendLink`] / [`MaskRecvLink`]); a receiver with none answers that
+// row with the acknowledged mask-miss token. Frames with several masked
+// rows, batched frames and the probe always go full and leave both caches
+// alone.
 
 /// Acknowledgement status: every stage down the chain applied the mask.
 pub const MASK_ACK: u32 = 0x4D41_534B; // "MASK"
@@ -2302,6 +2313,9 @@ pub struct MaskCols {
     /// are at the same index of `data`, `words` per entry.
     masked: Vec<(usize, u32)>,
     data: Vec<u32>,
+    /// The repeat marker: one masked row, no words; the link's last mask
+    /// applies (see [`MaskRecvLink::resolve`]).
+    repeat: bool,
 }
 
 impl MaskCols {
@@ -2312,6 +2326,32 @@ impl MaskCols {
             words,
             masked: Vec::new(),
             data: Vec::new(),
+            repeat: false,
+        }
+    }
+
+    /// The repeat marker, unresolved. After [`MaskRecvLink::resolve`] only a
+    /// marker with no mask to repeat (a miss) is still one.
+    pub fn is_repeat(&self) -> bool {
+        self.repeat
+    }
+
+    /// The words of a frame the repeat caches cover: exactly one masked row,
+    /// carrying words. `None` for any other frame (several masked rows, the
+    /// probe, a marker).
+    fn single_words(&self) -> Option<&[u32]> {
+        (!self.repeat && self.masked.len() == 1 && self.words > 0).then_some(&self.data[..])
+    }
+
+    /// The marker standing for this frame's single masked row: same row and
+    /// tag, no words.
+    pub fn to_repeat(&self) -> MaskCols {
+        MaskCols {
+            rows: self.rows,
+            words: 0,
+            masked: self.masked.clone(),
+            data: Vec::new(),
+            repeat: true,
         }
     }
 
@@ -2366,8 +2406,13 @@ impl MaskCols {
         !self.masked.is_empty()
     }
 
-    /// The mask section on the wire: `[W, n, n × (row, tag, W words)]`.
+    /// The mask section on the wire: `[W, n, n × (row, tag, W words)]`, or
+    /// for the marker `[REPEAT, 1, row, tag]`.
     fn section(&self) -> Vec<u32> {
+        if self.repeat {
+            let (row, tag) = self.masked[0];
+            return vec![REPEAT, 1, row as u32, tag];
+        }
         let mut out = Vec::with_capacity(2 + self.masked.len() * (2 + self.words));
         out.push(self.words as u32);
         out.push(self.masked.len() as u32);
@@ -2386,6 +2431,20 @@ impl MaskCols {
             [w, n, ..] => (w, n),
             _ => return Err(bad("too short")),
         };
+        // The marker first: its W is no word count.
+        if w == REPEAT {
+            let (row, tag) = match sec {
+                [_, 1, row, tag, ..] => (*row as usize, *tag),
+                _ => return Err(bad("a repeat marker lists exactly one row")),
+            };
+            if row >= rows || tag == 0 {
+                return Err(bad("row out of range or tag 0"));
+            }
+            let mut cols = Self::new(rows, 0);
+            cols.masked.push((row, tag));
+            cols.repeat = true;
+            return Ok(cols);
+        }
         let (w, n) = (w as usize, n as usize);
         let need = w
             .checked_add(2)
@@ -2545,6 +2604,51 @@ async fn send_header_and_tensor(
     Ok(())
 }
 
+/// Writes `header` and the masked tensor of `hidden` + `cols` under the
+/// link's lock. With `link`, a frame with one masked row whose mask equals the
+/// last one written on this connection goes as the marker, and the link
+/// records what went; a failed write clears it.
+async fn send_header_and_masked(
+    cli: &Mutex<ActivationClient>,
+    header: &[u8],
+    hidden: &[f32],
+    shape: [u32; 3],
+    cols: &MaskCols,
+    link: Option<&MaskSendLink>,
+) -> TransportResult<()> {
+    let mut guard = cli.lock().await;
+    let generation = link.map_or(0, MaskSendLink::generation);
+    let single = link.and(cols.single_words());
+    let repeat = match (link, single) {
+        (Some(l), Some(words)) => l.cache().repeats(generation, words),
+        _ => false,
+    };
+    let sent = async {
+        let tensor = if repeat {
+            masked_tensor(hidden, shape, &cols.to_repeat())?
+        } else {
+            masked_tensor(hidden, shape, cols)?
+        };
+        guard.send_raw(header).await?;
+        guard.send(&tensor).await?;
+        Ok(())
+    }
+    .await;
+    if let Some(l) = link {
+        match (&sent, single) {
+            (Err(_), _) => l.clear(),
+            (Ok(()), Some(words)) => {
+                l.cache().record(generation, words);
+                if repeat {
+                    l.markers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            (Ok(()), None) => {}
+        }
+    }
+    sent
+}
+
 /// A single-row Forward-family frame (`Forward`, `ForwardNoSample`,
 /// `ForwardPrefill`); `cols: None` sends exactly what [`send_forward`] and
 /// its siblings send.
@@ -2558,6 +2662,7 @@ pub async fn send_forward_step(
     hidden_shape: [u32; 3],
     push_history: bool,
     cols: Option<&MaskCols>,
+    link: Option<&MaskSendLink>,
 ) -> TransportResult<()> {
     let Some(cols) = cols else {
         return send_forward_kind(
@@ -2571,9 +2676,8 @@ pub async fn send_forward_step(
         )
         .await;
     };
-    let tensor = masked_tensor(hidden_f32, hidden_shape, cols)?;
     let header = forward_header(kind, past_seq_len, sampling, push_history);
-    send_header_and_tensor(cli, &header, &tensor).await
+    send_header_and_masked(cli, &header, hidden_f32, hidden_shape, cols, link).await
 }
 
 /// Body of a Forward-family frame (kind consumed), masked or not:
@@ -2675,18 +2779,6 @@ pub async fn recv_forward_batch_step_body_server(
     ))
 }
 
-fn stream_rows_tensor(
-    hidden_f32: &[f32],
-    rows: u32,
-    h: u32,
-    cols: Option<&MaskCols>,
-) -> TransportResult<Tensor> {
-    match cols {
-        None => Ok(hidden_to_tensor(hidden_f32, [1, rows, h])),
-        Some(c) => masked_tensor(hidden_f32, [1, rows, h], c),
-    }
-}
-
 /// [`send_stream_open`] with optional mask columns (`None`: the same bytes).
 #[allow(clippy::too_many_arguments)]
 pub async fn send_stream_open_step(
@@ -2698,11 +2790,11 @@ pub async fn send_stream_open_step(
     rows: u32,
     h: u32,
     cols: Option<&MaskCols>,
+    link: Option<&MaskSendLink>,
 ) -> TransportResult<()> {
-    if cols.is_none() {
+    let Some(cols) = cols else {
         return send_stream_open(cli, batch_id, slot, sampling, hidden_f32, rows, h).await;
-    }
-    let tensor = stream_rows_tensor(hidden_f32, rows, h, cols)?;
+    };
     let mut header = [0u8; 16 + SAMPLING_WIRE_BYTES];
     header[0..4].copy_from_slice(&(FrameKind::StreamOpen as u32).to_be_bytes());
     header[4..8].copy_from_slice(&batch_id.to_be_bytes());
@@ -2711,7 +2803,7 @@ pub async fn send_stream_open_step(
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
     encode_sampling(sampling, &mut sbytes);
     header[16..].copy_from_slice(&sbytes);
-    send_header_and_tensor(cli, &header, &tensor).await
+    send_header_and_masked(cli, &header, hidden_f32, [1, rows, h], cols, link).await
 }
 
 /// Body of a `StreamOpen` (kind consumed), masked or not:
@@ -2756,11 +2848,11 @@ pub async fn send_stream_feed_step(
     rows: u32,
     h: u32,
     cols: Option<&MaskCols>,
+    link: Option<&MaskSendLink>,
 ) -> TransportResult<()> {
-    if cols.is_none() {
+    let Some(cols) = cols else {
         return send_stream_feed(cli, batch_id, slot, flags, sampling, hidden_f32, rows, h).await;
-    }
-    let tensor = stream_rows_tensor(hidden_f32, rows, h, cols)?;
+    };
     let mut header = [0u8; 20 + SAMPLING_WIRE_BYTES];
     header[0..4].copy_from_slice(&(FrameKind::StreamFeed as u32).to_be_bytes());
     header[4..8].copy_from_slice(&batch_id.to_be_bytes());
@@ -2770,7 +2862,7 @@ pub async fn send_stream_feed_step(
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
     encode_sampling(sampling, &mut sbytes);
     header[20..].copy_from_slice(&sbytes);
-    send_header_and_tensor(cli, &header, &tensor).await
+    send_header_and_masked(cli, &header, hidden_f32, [1, rows, h], cols, link).await
 }
 
 /// Body of a `StreamFeed` (kind consumed), masked or not:
@@ -2816,17 +2908,17 @@ pub async fn send_stream_decode_step(
     hidden_f32: &[f32],
     h: u32,
     cols: Option<&MaskCols>,
+    link: Option<&MaskSendLink>,
 ) -> TransportResult<()> {
-    if cols.is_none() {
+    let Some(cols) = cols else {
         return send_stream_decode(cli, batch_id, rows, hidden_f32, h).await;
-    }
+    };
     let n = rows.len() as u32;
     if n == 0 || n > MAX_STREAM_ROWS {
         return Err(TransportError::Io(std::io::Error::other(format!(
             "stream decode: rows {n} out of range 1..={MAX_STREAM_ROWS}"
         ))));
     }
-    let tensor = stream_rows_tensor(hidden_f32, n, h, cols)?;
     let mut header = Vec::with_capacity(12 + rows.len() * 8);
     header.extend_from_slice(&(FrameKind::StreamDecode as u32).to_be_bytes());
     header.extend_from_slice(&batch_id.to_be_bytes());
@@ -2835,7 +2927,7 @@ pub async fn send_stream_decode_step(
         header.extend_from_slice(&slot.to_be_bytes());
         header.extend_from_slice(&pos.to_be_bytes());
     }
-    send_header_and_tensor(cli, &header, &tensor).await
+    send_header_and_masked(cli, &header, hidden_f32, [1, n, h], cols, link).await
 }
 
 /// Body of a `StreamDecode` (kind consumed), masked or not:
@@ -2893,6 +2985,20 @@ pub async fn send_token_ack_upstream(
     let mut guard = srv.lock().await;
     guard.send_raw(&bytes).await?;
     Ok(())
+}
+
+/// A worker's answer to a single-row masked frame whose repeat marker it
+/// can't resolve: the acknowledged mask-miss token for `tag`, with no layer
+/// run and nothing forwarded.
+pub async fn send_mask_miss_upstream(
+    srv: &Mutex<ActivationServer>,
+    tag: u32,
+) -> TransportResult<()> {
+    tracing::warn!(
+        tag,
+        "a repeat token mask arrived with no mask to repeat; answering a mask miss"
+    );
+    send_token_ack_upstream(srv, MASK_MISS_TOKEN.into(), tag, MASK_ACK).await
 }
 
 /// Body of a `TokenAck` (kind consumed): `(token, tag, status)`.
@@ -3056,7 +3162,107 @@ pub async fn send_owed_late_ack(
 /// words. A stage on this build answers it without running its layers or
 /// touching any state (middles pass it on); see [`probe_mask_support`].
 pub fn is_mask_probe(cols: &MaskCols) -> bool {
-    cols.rows() == 1 && cols.width() == 1 && cols.tag(0) != 0
+    // The marker is checked first: it too has one masked row and no words.
+    !cols.is_repeat() && cols.rows() == 1 && cols.width() == 1 && cols.tag(0) != 0
+}
+
+/// The sending end of one link's repeat state: the last single-row mask
+/// written on it and the connection it went on. Shared by everything that
+/// writes to the link; checked and updated under the link's lock, around
+/// the write.
+#[derive(Debug, Default)]
+pub struct MaskSendLink {
+    cache: std::sync::Mutex<MaskSendCache>,
+    /// The link's connection generation, bumped on every re-dial while the
+    /// client's lock is held. `None`: the link never re-dials.
+    generation: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Frames sent as the marker (for logs and tests).
+    markers: std::sync::atomic::AtomicU64,
+}
+
+impl MaskSendLink {
+    /// A link whose connection is re-dialed in place: `generation` counts the
+    /// connections.
+    pub fn on_link(generation: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            generation: Some(generation),
+            ..Self::default()
+        }
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, MaskSendCache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+            .as_ref()
+            .map_or(0, |g| g.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Forget the last mask: the next single-row masked frame goes full.
+    /// On any failed step on the link, an abort, a latch.
+    pub fn clear(&self) {
+        self.cache().clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache().is_empty()
+    }
+
+    /// Frames sent as the marker so far.
+    pub fn markers_sent(&self) -> u64 {
+        self.markers.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_for_tests(&self, words: &[u32]) {
+        let g = self.generation();
+        self.cache().record(g, words);
+    }
+}
+
+/// The receiving end of one link's repeat state: the last single-row mask
+/// decoded on it. A worker's upstream link is accepted once, so it lives as
+/// long as the worker.
+#[derive(Debug, Default)]
+pub struct MaskRecvLink {
+    cache: std::sync::Mutex<MaskRecvCache>,
+}
+
+impl MaskRecvLink {
+    fn cache(&self) -> std::sync::MutexGuard<'_, MaskRecvCache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A decoded frame's mask columns, with a marker resolved to the last
+    /// single-row mask decoded on the link (same row and tag). A marker with
+    /// no mask to repeat comes back as it went in: still
+    /// [`MaskCols::is_repeat`], which is a miss. A full single-row frame is
+    /// committed; every other frame passes through untouched. Call it once
+    /// every frame of the step is read, before any layer runs.
+    pub fn resolve(&self, cols: MaskCols) -> MaskCols {
+        let mut cache = self.cache();
+        if cols.is_repeat() {
+            let Ok(words) = cache.resolve(WireMask::Repeat) else {
+                return cols;
+            };
+            let (row, tag) = cols.masked[0];
+            let mut full = MaskCols::new(cols.rows, words.len());
+            full.set(row, tag, &words);
+            return full;
+        }
+        if let Some(words) = cols.single_words() {
+            cache.commit(words);
+        }
+        cols
+    }
+
+    /// Forget the last mask: a marker now misses. On a decode error of a
+    /// masked frame.
+    pub fn clear(&self) {
+        self.cache().clear();
+    }
 }
 
 /// Rank 0: ask every stage whether it applies masks, with a masked
@@ -3083,6 +3289,7 @@ pub async fn probe_mask_support(
         [1, 1, h as u32],
         false,
         Some(&cols),
+        None,
     )
     .await
     .map_err(|e| format!("send mask probe: {e}"))?;
@@ -3108,6 +3315,9 @@ pub enum MaskedReply {
     /// or a middle stage whose downstream did not acknowledge. The likely
     /// cause is a stage on an older build.
     Unconfirmed(String),
+    /// A stage got a repeat marker with no mask to repeat (the mask-miss
+    /// token, acknowledged).
+    MaskMiss,
 }
 
 enum AckWait {
@@ -3180,6 +3390,9 @@ pub async fn recv_token_reply_masked(
 ) -> MaskedReply {
     match wait_token_ack(down, deadline, tag, Some(latch)).await {
         AckWait::Acked(token, MASK_ACK) if token >= 0 => MaskedReply::Token(token),
+        AckWait::Acked(token, MASK_ACK) if token == i64::from(MASK_MISS_TOKEN) => {
+            MaskedReply::MaskMiss
+        }
         AckWait::Acked(_, MASK_ACK) => MaskedReply::Refused,
         AckWait::Acked(_, MASK_UNCONFIRMED) => {
             MaskedReply::Unconfirmed("a later stage did not acknowledge the mask".into())
@@ -3195,13 +3408,16 @@ pub async fn recv_token_reply_masked(
 /// up as it came, or `TokenAck(-1, tag, MASK_UNCONFIRMED)` when the
 /// downstream did not acknowledge within `deadline` (socket kept, as on
 /// rank 0). The answer upstream is always a `TokenAck`, so a late one is
-/// recognised as stale there too.
+/// recognised as stale there too. A mask-miss token goes up unchanged.
+/// Anything but a token clears `link`, this stage's send state for the link
+/// below.
 pub async fn relay_masked_token_reply(
     up: &Mutex<ActivationServer>,
     down: &Mutex<ActivationClient>,
     deadline: std::time::Duration,
     tag: u32,
     late: &MaskLatch,
+    link: Option<&MaskSendLink>,
 ) -> Result<(), String> {
     let (token, status) = match wait_token_ack(down, deadline, tag, Some(late)).await {
         AckWait::Acked(token, status) => (token, status),
@@ -3210,6 +3426,11 @@ pub async fn relay_masked_token_reply(
             (-1, MASK_UNCONFIRMED)
         }
     };
+    if token < 0 || status != MASK_ACK {
+        if let Some(l) = link {
+            l.clear();
+        }
+    }
     send_owed_late_ack(up, late)
         .await
         .map_err(|e| format!("relay late ack: {e}"))?;
@@ -3416,6 +3637,7 @@ mod mask_wire_tests {
             [1, 1, 3],
             true,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3465,7 +3687,7 @@ mod mask_wire_tests {
 
         send_stream_open(&cli, 5, 1, &c, &h, 3, 2).await.unwrap();
         let old = raw_bytes(&srv).await;
-        send_stream_open_step(&cli, 5, 1, &c, &h, 3, 2, None)
+        send_stream_open_step(&cli, 5, 1, &c, &h, 3, 2, None, None)
             .await
             .unwrap();
         assert_eq!(raw_bytes(&srv).await, old, "StreamOpen");
@@ -3474,7 +3696,7 @@ mod mask_wire_tests {
             .await
             .unwrap();
         let old = raw_bytes(&srv).await;
-        send_stream_feed_step(&cli, 6, 1, STREAM_FEED_FINAL, &c, &h, 3, 2, None)
+        send_stream_feed_step(&cli, 6, 1, STREAM_FEED_FINAL, &c, &h, 3, 2, None, None)
             .await
             .unwrap();
         assert_eq!(raw_bytes(&srv).await, old, "StreamFeed");
@@ -3482,7 +3704,7 @@ mod mask_wire_tests {
         let rows = [(0u32, 7u32), (2, 9), (1, 4)];
         send_stream_decode(&cli, 8, &rows, &h, 2).await.unwrap();
         let old = raw_bytes(&srv).await;
-        send_stream_decode_step(&cli, 8, &rows, &h, 2, None)
+        send_stream_decode_step(&cli, 8, &rows, &h, 2, None, None)
             .await
             .unwrap();
         assert_eq!(raw_bytes(&srv).await, old, "StreamDecode");
@@ -3502,6 +3724,7 @@ mod mask_wire_tests {
             [1, 1, 4],
             true,
             Some(&cols),
+            None,
         )
         .await
         .unwrap();
@@ -3571,7 +3794,7 @@ mod mask_wire_tests {
         let mut dec = MaskCols::new(2, 2);
         dec.set(0, 9, &[1, 2]);
         let rows = [(1u32, 4u32), (0, 6)];
-        send_stream_decode_step(&cli, 3, &rows, &h[..4], 2, Some(&dec))
+        send_stream_decode_step(&cli, 3, &rows, &h[..4], 2, Some(&dec), None)
             .await
             .unwrap();
         recv_kind_server(&srv).await.unwrap();
@@ -3656,8 +3879,11 @@ mod mask_wire_tests {
         assert!(tensor(&[0, 1, 1, 0]).split(1).is_err());
         // More rows listed than the section holds.
         assert!(tensor(&[0, 3, 1, 5]).split(1).is_err());
-        // A word count that overflows.
-        assert!(tensor(&[u32::MAX, 1, 1, 5]).split(1).is_err());
+        // A word count past the tensor (u32::MAX itself is the repeat
+        // marker, read before any word count).
+        assert!(tensor(&[u32::MAX - 1, 1, 1, 5]).split(1).is_err());
+        let (_, _, marker) = tensor(&[u32::MAX, 1, 1, 5]).split(1).unwrap();
+        assert!(marker.unwrap().is_repeat());
         // The same row twice.
         assert!(tensor(&[0, 2, 1, 5, 1, 6, 0, 0]).split(1).is_err());
     }
@@ -3699,6 +3925,7 @@ mod mask_wire_tests {
             [1, 1, 4],
             true,
             Some(&one_mask(1, 1)),
+            None,
         )
         .await
         .unwrap();
@@ -3731,7 +3958,7 @@ mod mask_wire_tests {
         assert_eq!(next_plain_forward(srv.clone()).await, h1);
 
         // StreamOpen.
-        send_stream_open_step(&cli, 1, 0, &c, &h3, 3, 4, Some(&one_mask(3, 3)))
+        send_stream_open_step(&cli, 1, 0, &c, &h3, 3, 4, Some(&one_mask(3, 3)), None)
             .await
             .unwrap();
         send_forward(&cli, 77, &c, &h1, [1, 1, 4], true)
@@ -3752,6 +3979,7 @@ mod mask_wire_tests {
             3,
             4,
             Some(&one_mask(3, 4)),
+            None,
         )
         .await
         .unwrap();
@@ -3763,7 +3991,7 @@ mod mask_wire_tests {
         assert_eq!(next_plain_forward(srv.clone()).await, h1);
 
         // StreamDecode.
-        send_stream_decode_step(&cli, 3, &[(0, 5)], &h1, 4, Some(&one_mask(1, 5)))
+        send_stream_decode_step(&cli, 3, &[(0, 5)], &h1, 4, Some(&one_mask(1, 5)), None)
             .await
             .unwrap();
         send_forward(&cli, 77, &c, &h1, [1, 1, 4], true)
@@ -3906,7 +4134,7 @@ mod mask_wire_tests {
         send_token_ack_upstream(&srv_dn, 12, 5, MASK_ACK)
             .await
             .unwrap();
-        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 5, &MaskLatch::default())
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 5, &MaskLatch::default(), None)
             .await
             .unwrap();
         recv_kind_client_raw(&cli_up).await.unwrap();
@@ -3915,7 +4143,7 @@ mod mask_wire_tests {
             (12, 5, MASK_ACK)
         );
         // Downstream silent (an older tail): unconfirmed, socket kept.
-        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 6, &MaskLatch::default())
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 6, &MaskLatch::default(), None)
             .await
             .unwrap();
         recv_kind_client_raw(&cli_up).await.unwrap();
@@ -3925,7 +4153,7 @@ mod mask_wire_tests {
         );
         // Downstream replied plain: unconfirmed.
         send_token_upstream(&srv_dn, 4).await.unwrap();
-        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 7, &MaskLatch::default())
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 7, &MaskLatch::default(), None)
             .await
             .unwrap();
         recv_kind_client_raw(&cli_up).await.unwrap();
@@ -4038,7 +4266,7 @@ mod mask_wire_tests {
         send_token_ack_upstream(&srv_dn, 7, 4, MASK_ACK)
             .await
             .unwrap();
-        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 4, &late)
+        relay_masked_token_reply(&srv_up, &cli_dn, SHORT, 4, &late, None)
             .await
             .unwrap();
         head.set();
@@ -4110,5 +4338,337 @@ mod mask_wire_tests {
         let section = 2 + rows * (2 + 262_144 / 32);
         let bytes = rows * (7168 + section.div_ceil(rows)) * 4;
         assert!(bytes <= cascadia_transport::MAX_TENSOR_BYTES, "{bytes}");
+    }
+}
+
+#[cfg(test)]
+mod repeat_mask_tests {
+    use super::*;
+    use cascadia_grammar::{MASK_MISS_TOKEN, REPEAT};
+    use std::time::Duration;
+
+    const SHORT: Duration = Duration::from_secs(5);
+    const A: [u32; 3] = [0b1010, 1 << 31, 7];
+    const B: [u32; 3] = [0b0110, 1, 7];
+
+    async fn pair() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let server = Arc::new(Mutex::new(server));
+        let s = server.clone();
+        let accept = tokio::spawn(async move { s.lock().await.accept().await.unwrap() });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect_with_timeout(SHORT).await.unwrap();
+        accept.await.unwrap();
+        (server, Arc::new(Mutex::new(client)))
+    }
+
+    fn hidden(rows: usize) -> Vec<f32> {
+        (0..rows * 4).map(|i| i as f32 * 0.5).collect()
+    }
+
+    /// `rows` rows, the last masked with `words` under `tag`.
+    fn last_row(rows: usize, tag: u32, words: &[u32]) -> MaskCols {
+        let mut c = MaskCols::new(rows, words.len());
+        c.set(rows - 1, tag, words);
+        c
+    }
+
+    async fn send_one(cli: &Mutex<ActivationClient>, cols: &MaskCols, link: &MaskSendLink) {
+        send_forward_step(
+            cli,
+            FrameKind::Forward,
+            3,
+            &SamplingConfig::default(),
+            &hidden(1),
+            [1, 1, 4],
+            true,
+            Some(cols),
+            Some(link),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The step tensor of the next `Forward` and its mask columns.
+    async fn recv_one(srv: &Mutex<ActivationServer>) -> (Tensor, MaskCols) {
+        assert_eq!(
+            recv_kind_server(srv).await.unwrap(),
+            Some(FrameKind::Forward)
+        );
+        let (_, _, _, step) = recv_forward_step_body_server(srv).await.unwrap();
+        let StepTensor::Masked(t) = step else {
+            panic!("expected a masked frame")
+        };
+        let (_, _, cols) = StepTensor::Masked(t.clone()).split(4).unwrap();
+        (t, cols.unwrap())
+    }
+
+    /// The marker's exact tensor for one row of the sample hidden under
+    /// `tag`: the hidden's bits, then `[REPEAT, 1, row 0, tag]`.
+    fn marker_tensor(tag: u32) -> Tensor {
+        let mut data = Vec::new();
+        for v in hidden(1) {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        for w in [REPEAT, 1, 0, tag] {
+            data.extend_from_slice(&w.to_le_bytes());
+        }
+        Tensor::new(DType::I32, [1, 1, 8], data)
+    }
+
+    /// A repeated single-row mask goes as the marker section `[REPEAT, 1,
+    /// row, tag]` with no words, whatever the vocab; the receiver resolves it
+    /// to the mask it last decoded, under the frame's own tag.
+    #[tokio::test]
+    async fn a_repeated_single_row_mask_goes_as_a_marker() {
+        let (srv, cli) = pair().await;
+        let send = MaskSendLink::default();
+        let recv = MaskRecvLink::default();
+        let wide: Vec<u32> = (0..4096u32).map(|i| i | 1).collect();
+        for (i, words) in [&wide, &wide, &wide].into_iter().enumerate() {
+            let tag = 10 + i as u32;
+            send_one(&cli, &last_row(1, tag, words), &send).await;
+            let (t, cols) = recv_one(&srv).await;
+            if i == 0 {
+                assert!(!cols.is_repeat());
+                assert!(t.data.len() > words.len() * 4);
+            } else {
+                assert!(cols.is_repeat());
+                assert_eq!(t, marker_tensor(tag), "exact marker bytes");
+                assert_eq!(t.data.len(), 32, "no mask words");
+            }
+            let got = recv.resolve(cols);
+            assert!(!got.is_repeat());
+            assert_eq!(got.words(0), Some(words.as_slice()));
+            assert_eq!(got.tag(0), tag);
+        }
+    }
+
+    /// The first frame and every changed mask go full; a frame on a new
+    /// connection generation goes full too.
+    #[tokio::test]
+    async fn changed_masks_and_a_new_connection_go_full() {
+        let (srv, cli) = pair().await;
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let send = MaskSendLink::on_link(generation.clone());
+        let steps: [(&[u32], bool, bool); 5] = [
+            (&A, false, false),
+            (&A, true, false),
+            (&B, false, false),
+            (&B, true, false),
+            (&B, false, true),
+        ];
+        for (i, (words, repeat, redial)) in steps.into_iter().enumerate() {
+            if redial {
+                generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            send_one(&cli, &last_row(1, 1 + i as u32, words), &send).await;
+            let (_, cols) = recv_one(&srv).await;
+            assert_eq!(cols.is_repeat(), repeat, "step {i}");
+        }
+    }
+
+    /// The probe (one masked row, no words) is never the marker and never
+    /// touches either cache; the marker is never read as the probe.
+    #[tokio::test]
+    async fn the_marker_is_not_the_probe_and_the_probe_skips_the_caches() {
+        let (srv, cli) = pair().await;
+        let send = MaskSendLink::default();
+        let recv = MaskRecvLink::default();
+        let mut probe = MaskCols::new(1, 0);
+        probe.set(0, 5, &[]);
+        assert!(is_mask_probe(&probe));
+        send_one(&cli, &probe, &send).await;
+        send_one(&cli, &probe, &send).await;
+        assert!(send.is_empty());
+        for _ in 0..2 {
+            let (_, cols) = recv_one(&srv).await;
+            assert!(is_mask_probe(&cols), "the probe goes as it always did");
+            let cols = recv.resolve(cols);
+            assert!(is_mask_probe(&cols));
+        }
+        // The receiver committed nothing: a marker now misses.
+        let marker = last_row(1, 6, &A).to_repeat();
+        assert!(!is_mask_probe(&marker), "the marker is not the probe");
+        assert!(recv.resolve(marker).is_repeat());
+    }
+
+    /// Frames with more than one masked row, and batched frames, always go
+    /// full and leave both caches alone.
+    #[tokio::test]
+    async fn multi_row_and_batch_frames_never_carry_the_marker() {
+        let (srv, cli) = pair().await;
+        let send = MaskSendLink::default();
+        let recv = MaskRecvLink::default();
+        let mut two = MaskCols::new(2, A.len());
+        two.set(0, 1, &A);
+        two.set(1, 2, &A);
+        for _ in 0..2 {
+            send_stream_decode_step(
+                &cli,
+                9,
+                &[(0, 1), (1, 1)],
+                &hidden(2),
+                4,
+                Some(&two),
+                Some(&send),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                recv_kind_server(&srv).await.unwrap(),
+                Some(FrameKind::StreamDecode)
+            );
+            let (_, _, step) = recv_stream_decode_step_body_server(&srv).await.unwrap();
+            let (_, _, cols) = step.split(4).unwrap();
+            let cols = cols.unwrap();
+            assert!(!cols.is_repeat());
+            assert_eq!(recv.resolve(cols), two);
+        }
+        assert!(send.is_empty());
+        // A batched frame has no send link at all: always full.
+        let one = last_row(2, 3, &A);
+        for _ in 0..2 {
+            send_forward_batch_step(
+                FrameKind::ForwardBatchPrefill,
+                &cli,
+                0,
+                2,
+                &SamplingConfig::default(),
+                &hidden(2),
+                [1, 2, 4],
+                Some(&one),
+            )
+            .await
+            .unwrap();
+            recv_kind_server(&srv).await.unwrap();
+            let (_, _, _, step) = recv_forward_batch_step_body_server(&srv).await.unwrap();
+            let (_, _, cols) = step.split(4).unwrap();
+            assert!(!cols.unwrap().is_repeat());
+        }
+        // Nothing was committed: a marker misses.
+        assert!(recv.resolve(last_row(1, 4, &A).to_repeat()).is_repeat());
+    }
+
+    /// A malformed marker section is a decode error: more than one entry, a
+    /// row out of range, tag 0.
+    #[test]
+    fn malformed_marker_sections_are_refused() {
+        for sec in [
+            vec![REPEAT, 2, 0, 1, 1, 2],
+            vec![REPEAT, 1, 3, 1],
+            vec![REPEAT, 1, 0, 0],
+            vec![REPEAT, 1],
+        ] {
+            assert!(MaskCols::from_section(2, &sec).is_err(), "{sec:?}");
+        }
+        let ok = MaskCols::from_section(2, &[REPEAT, 1, 1, 9, 0, 0]).unwrap();
+        assert!(ok.is_repeat());
+        assert_eq!((ok.tag(1), ok.words(1)), (9, None));
+    }
+
+    /// A write error clears the send link: the next frame on a link goes
+    /// full.
+    #[tokio::test]
+    async fn a_write_error_clears_the_send_link() {
+        let (srv, cli) = pair().await;
+        let send = MaskSendLink::default();
+        send_one(&cli, &last_row(1, 1, &A), &send).await;
+        assert!(!send.is_empty());
+        drop(srv);
+        cli.lock().await.close().await;
+        let res = send_forward_step(
+            &cli,
+            FrameKind::Forward,
+            3,
+            &SamplingConfig::default(),
+            &hidden(1),
+            [1, 1, 4],
+            true,
+            Some(&last_row(1, 2, &A)),
+            Some(&send),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(send.is_empty());
+    }
+
+    /// The mask-miss reply: rank 0 reads it as its own outcome (not a
+    /// refusal, no latch); a middle passes it up unchanged and forgets its
+    /// downstream mask; a late one is dropped by tag like any stale reply.
+    #[tokio::test]
+    async fn a_mask_miss_reply_is_relayed_unchanged_and_never_latches() {
+        let (srv_up, cli_up) = pair().await;
+        let (srv_dn, cli_dn) = pair().await;
+        let latch = MaskLatch::default();
+        let mid_send = MaskSendLink::default();
+        mid_send.record_for_tests(&A);
+        send_token_ack_upstream(&srv_dn, MASK_MISS_TOKEN.into(), 4, MASK_ACK)
+            .await
+            .unwrap();
+        relay_masked_token_reply(
+            &srv_up,
+            &cli_dn,
+            SHORT,
+            4,
+            &MaskLatch::default(),
+            Some(&mid_send),
+        )
+        .await
+        .unwrap();
+        assert!(
+            mid_send.is_empty(),
+            "the middle forgets its downstream mask"
+        );
+        assert_eq!(
+            recv_token_reply_masked(&cli_up, SHORT, 4, &latch).await,
+            MaskedReply::MaskMiss
+        );
+        assert!(!latch.is_set());
+
+        // A late mask-miss reply for an older tag is dropped.
+        send_token_ack_upstream(&srv_up, MASK_MISS_TOKEN.into(), 4, MASK_ACK)
+            .await
+            .unwrap();
+        send_token_ack_upstream(&srv_up, 9, 5, MASK_ACK)
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_token_reply_masked(&cli_up, SHORT, 5, &latch).await,
+            MaskedReply::Token(9)
+        );
+    }
+
+    /// Head → middle → tail at the wire level: the middle resolves the head's
+    /// marker with its receive cache and re-encodes with its own send cache.
+    /// When it fails a step it decoded without forwarding it, the head's next
+    /// marker for that mask goes down full: the tail never saw it.
+    #[tokio::test]
+    async fn a_middle_re_encodes_and_a_dropped_step_goes_down_full() {
+        let (mid_srv, head_cli) = pair().await;
+        let (tail_srv, mid_cli) = pair().await;
+        let head_send = MaskSendLink::default();
+        let (mid_recv, mid_send) = (MaskRecvLink::default(), MaskSendLink::default());
+        let tail_recv = MaskRecvLink::default();
+        // (mask, the middle fails the step after decoding it)
+        let steps: [(&[u32], bool); 4] = [(&A, false), (&A, false), (&B, true), (&B, false)];
+        let mut at_tail = Vec::new();
+        for (i, (words, fail)) in steps.into_iter().enumerate() {
+            let tag = 1 + i as u32;
+            send_one(&head_cli, &last_row(1, tag, words), &head_send).await;
+            let (_, cols) = recv_one(&mid_srv).await;
+            let cols = mid_recv.resolve(cols);
+            assert_eq!(cols.words(0), Some(words));
+            if fail {
+                continue;
+            }
+            send_one(&mid_cli, &cols, &mid_send).await;
+            let (_, got) = recv_one(&tail_srv).await;
+            at_tail.push(got.is_repeat());
+            assert_eq!(tail_recv.resolve(got).words(0), Some(words));
+        }
+        assert_eq!(at_tail, vec![false, true, false], "b goes down full");
     }
 }

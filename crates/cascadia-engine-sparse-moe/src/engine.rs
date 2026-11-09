@@ -1207,6 +1207,8 @@ impl Builder for SparseMoEBuilder {
             grammars: HashMap::new(),
             stage_masks: StageMasks::default(),
             mid_late: crate::dist::MaskLatch::default(),
+            mask_send: crate::dist::MaskSendLink::default(),
+            mask_recv: crate::dist::MaskRecvLink::default(),
         }))
     }
 }
@@ -1283,6 +1285,16 @@ fn sample_wire_masked(
     }
 }
 
+/// The token a last stage answers for a masked row it could not sample: the
+/// mask-miss token for a repeat marker with no mask to repeat, else `-1`.
+fn miss_or_nack(cols: Option<&MaskCols>) -> i64 {
+    if cols.is_some_and(MaskCols::is_repeat) {
+        i64::from(cascadia_grammar::MASK_MISS_TOKEN)
+    } else {
+        -1
+    }
+}
+
 /// Rank 0: the mask columns of a `rows`-row frame whose last row picks the
 /// next token of `gm`'s task, and that row's tag. A dead end is the task's
 /// error.
@@ -1312,6 +1324,7 @@ async fn masked_forward_exchange(
     cols: &MaskCols,
     tag: u32,
     deadline: std::time::Duration,
+    link: &crate::dist::MaskSendLink,
 ) -> Result<i64, String> {
     crate::dist::send_forward_step(
         down,
@@ -1322,11 +1335,13 @@ async fn masked_forward_exchange(
         shape,
         true,
         Some(cols),
+        Some(link),
     )
     .await
     .map_err(|e| format!("send_forward: {e}"))?;
     let reply = crate::dist::recv_token_reply_masked(down, deadline, tag, &masks.latch).await;
-    masks.outcome(reply)
+    // Any failed step: the stage below may not hold this mask.
+    masks.outcome(reply).inspect_err(|_| link.clear())
 }
 
 /// Last stage, a masked sampling row: the token to answer with (`-1` when
@@ -1756,6 +1771,12 @@ pub struct SparseMoEEngine {
     stage_masks: StageMasks,
     /// Middle rank: a late acknowledged reply it dropped, owed upstream.
     mid_late: crate::dist::MaskLatch,
+    /// Rank 0 and middles: the last single-row mask sent downstream, so a
+    /// repeat goes as the short marker.
+    mask_send: crate::dist::MaskSendLink,
+    /// Workers: the last single-row mask decoded from upstream, which a
+    /// marker stands for.
+    mask_recv: crate::dist::MaskRecvLink,
 }
 
 impl SparseMoEEngine {
@@ -3067,6 +3088,7 @@ impl SparseMoEEngine {
                 &cols,
                 tag,
                 reply_deadline,
+                &self.mask_send,
             ));
         }
         let result = self.block_on(async {
@@ -3117,7 +3139,11 @@ impl SparseMoEEngine {
                 );
                 Ok(token)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // A failed step: the next masked frame goes full.
+                self.mask_send.clear();
+                Err(e)
+            }
         }
     }
 
@@ -3502,6 +3528,8 @@ impl SparseMoEEngine {
             Ok(_) => Vec::new(),
             Err(e) => {
                 warn!(rank = self.rank, "worker frame failed: {e}");
+                // A failed step: the next masked frame downstream goes full.
+                self.mask_send.clear();
                 // Don't hot-spin on a misbehaving peer. dist_spec uses
                 // the same 200 ms cool-off; same logic applies here.
                 std::thread::sleep(WORKER_BACKOFF);
@@ -3725,9 +3753,19 @@ impl SparseMoEEngine {
                 let hidden = self.runner.manifest.hidden_size as usize;
                 // Structured output: a masked step carries mask columns after
                 // the hidden (sampling frames only).
-                let (hidden_f32, in_shape, cols) = step.split(hidden)?;
+                let (hidden_f32, in_shape, cols) =
+                    step.split(hidden).inspect_err(|_| self.mask_recv.clear())?;
                 if cols.is_some() && !sample {
+                    self.mask_recv.clear();
                     return Err(format!("{k:?} frame carries a mask; only sampling frames may"));
+                }
+                // A repeat marker resolves here, before any layer runs; one
+                // with no mask to repeat is answered at once.
+                let cols = cols.map(|c| self.mask_recv.resolve(c));
+                if let Some(c) = cols.as_ref().filter(|c| c.is_repeat()) {
+                    return self
+                        .block_on(crate::dist::send_mask_miss_upstream(upstream, c.tag(0)))
+                        .map_err(|e| format!("send_token_ack (mask miss): {e}"));
                 }
                 if in_shape[0] != 1 || in_shape[1] != 1 || in_shape[2] as usize != hidden {
                     return Err(format!(
@@ -3817,6 +3855,7 @@ impl SparseMoEEngine {
                                 [1, 1, hidden as u32],
                                 push_history,
                                 Some(&cols),
+                                Some(&self.mask_send),
                             )
                             .await
                             .map_err(|e| format!("send_forward: {e}"))?;
@@ -3826,6 +3865,7 @@ impl SparseMoEEngine {
                                 mid_budget,
                                 cols.tag(0),
                                 &self.mid_late,
+                                Some(&self.mask_send),
                             )
                             .await
                         });
@@ -4286,6 +4326,12 @@ pub struct OvMoeEngine {
     stage_masks: StageMasks,
     /// Middle rank: a late acknowledged reply it dropped, owed upstream.
     mid_late: crate::dist::MaskLatch,
+    /// Rank 0 and middles: the last single-row mask sent downstream, so a
+    /// repeat goes as the short marker.
+    mask_send: crate::dist::MaskSendLink,
+    /// Workers: the last single-row mask decoded from upstream, which a
+    /// marker stands for.
+    mask_recv: crate::dist::MaskRecvLink,
 }
 
 impl OvMoeEngine {
@@ -4342,6 +4388,8 @@ impl OvMoeEngine {
             grammars: HashMap::new(),
             stage_masks: StageMasks::default(),
             mid_late: crate::dist::MaskLatch::default(),
+            mask_send: crate::dist::MaskSendLink::default(),
+            mask_recv: crate::dist::MaskRecvLink::default(),
         }
     }
 
@@ -4550,9 +4598,10 @@ impl OvMoeEngine {
                 &cols,
                 tag,
                 reply_deadline,
+                &self.mask_send,
             ));
         }
-        self.block_on(async {
+        let plain = self.block_on(async {
             if sample_back {
                 send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h], true)
                     .await
@@ -4570,7 +4619,9 @@ impl OvMoeEngine {
                 Some(&self.stage_masks.latch),
             )
             .await
-        })
+        });
+        // A failed step: the next masked frame goes full.
+        plain.inspect_err(|_| self.mask_send.clear())
     }
 
     /// Rank 0 driver: token-streaming state machine (mirrors
@@ -5422,6 +5473,8 @@ impl OvMoeEngine {
         };
         if let Err(e) = res {
             warn!("worker frame failed: {e}");
+            // A failed step: the next masked frame downstream goes full.
+            self.mask_send.clear();
             std::thread::sleep(WORKER_BACKOFF);
         }
         Vec::new()
@@ -5444,9 +5497,20 @@ impl OvMoeEngine {
             .map_err(|e| format!("recv_forward_body: {e}"))?;
         // Structured output: a masked step carries mask columns after the
         // hidden (sampling frames only).
-        let (hidden_f32, _shape, cols) = step.split(self.runner.hidden_size())?;
+        let (hidden_f32, _shape, cols) = step
+            .split(self.runner.hidden_size())
+            .inspect_err(|_| self.mask_recv.clear())?;
         if cols.is_some() && !sample {
+            self.mask_recv.clear();
             return Err("a ForwardNoSample frame carries a mask; only sampling frames may".into());
+        }
+        // A repeat marker resolves here, before any layer runs; one with no
+        // mask to repeat is answered at once.
+        let cols = cols.map(|c| self.mask_recv.resolve(c));
+        if let Some(c) = cols.as_ref().filter(|c| c.is_repeat()) {
+            return self
+                .block_on(crate::dist::send_mask_miss_upstream(upstream, c.tag(0)))
+                .map_err(|e| format!("send_token_ack (mask miss): {e}"));
         }
         let pos = past_seq_len as usize;
         let hidden = self
@@ -5536,6 +5600,7 @@ impl OvMoeEngine {
                         [1, 1, h],
                         push_history,
                         Some(&cols),
+                        Some(&self.mask_send),
                     )
                     .await
                     .map_err(|e| format!("send_forward: {e}"))?;
@@ -5545,6 +5610,7 @@ impl OvMoeEngine {
                         mid_budget,
                         cols.tag(0),
                         &self.mid_late,
+                        Some(&self.mask_send),
                     )
                     .await
                 });
@@ -5953,6 +6019,12 @@ pub struct PipelineEngine<R: StagedRunner> {
     stage_masks: StageMasks,
     /// Middle rank: a late acknowledged reply it dropped, owed upstream.
     mid_late: crate::dist::MaskLatch,
+    /// Rank 0 and middles: the last single-row mask sent downstream, so a
+    /// repeat goes as the short marker.
+    mask_send: crate::dist::MaskSendLink,
+    /// Workers: the last single-row mask decoded from upstream, which a
+    /// marker stands for.
+    mask_recv: crate::dist::MaskRecvLink,
     /// Rank 0: the current downstream link acknowledged a masked single-row
     /// `Forward`, so every stage on it masks. Until then only that frame
     /// carries a mask: a stage on an older build survives a masked `Forward`
@@ -6291,6 +6363,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         total: u32,
         prefix_cap: Option<usize>,
     ) -> Self {
+        // The link keeper and `redial_downstream` bump this under the
+        // client's lock on every new connection.
+        let link_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         Self {
             runner,
             tokenizer,
@@ -6303,7 +6378,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             upstream_seen: false,
             redial_next: None,
             link_busy: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            link_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            link_epoch: link_epoch.clone(),
             seen_link_epoch: 0,
             link_keeper: None,
             disconnect_reported: false,
@@ -6333,6 +6408,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             grammars: HashMap::new(),
             stage_masks: StageMasks::default(),
             mid_late: crate::dist::MaskLatch::default(),
+            mask_send: crate::dist::MaskSendLink::on_link(link_epoch.clone()),
+            mask_recv: crate::dist::MaskRecvLink::default(),
             mask_evidence: false,
             probe_wait_since: None,
         }
@@ -6600,6 +6677,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     return false;
                 }
                 if let Some(st) = self.streams.iter_mut().find(|s| s.slot == slot) {
+                    if token == i64::from(cascadia_grammar::MASK_MISS_TOKEN) {
+                        // A stage lost its mask state: this stream fails, no
+                        // latch (the others keep going).
+                        failed.push((slot, cascadia_grammar::MASK_MISS_MESSAGE.to_string()));
+                        continue;
+                    }
                     if token < 0 {
                         // An acknowledged row the last stage could not serve.
                         failed.push((slot, crate::constrained::REFUSED_STEP.to_string()));
@@ -6866,6 +6949,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             &h,
             hs as u32,
             cols.as_ref(),
+            Some(&self.mask_send),
         )) {
             self.fail_streams_into(out, format!("send_stream_decode: {e}"), true);
             return false;
@@ -6946,6 +7030,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         let st = self.streams.swap_remove(i);
         warn!(task = %st.id, error = %msg, "stream aborted");
+        // A failed step on the link: the next masked frame goes full.
+        self.mask_send.clear();
         self.runner.close_stream(st.slot);
         if let Err(e) = self.block_on(send_stream_close(down, st.slot as u32)) {
             warn!(slot = st.slot, "stream close not relayed: {e}");
@@ -7110,6 +7196,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 rows as u32,
                 hs as u32,
                 cols.as_ref(),
+                Some(&self.mask_send),
             ))
         };
         if let Err(e) = sent {
@@ -7252,6 +7339,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             rows as u32,
             hs as u32,
             cols.as_ref(),
+            Some(&self.mask_send),
         )) {
             warn!(task = %id, "send_stream_feed failed: {e}");
             self.peer_disconnected = true;
@@ -7312,10 +7400,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
         if !self.streams.is_empty() || self.stream_inflight.iter().any(|q| !q.is_empty()) {
             self.fail_streams_into(out, "downstream link lost; stream aborted".into(), true);
         }
+        let epoch = self.link_epoch.clone();
         let res = self.block_on(async {
             let mut c = down.lock().await;
             c.close().await;
-            c.connect_with_timeout(REDIAL_BUDGET).await
+            let res = c.connect_with_timeout(REDIAL_BUDGET).await;
+            // A new connection, counted under the lock like the keeper's:
+            // the next masked frame on it goes full.
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            res
         });
         match res {
             Ok(()) => {
@@ -7348,6 +7441,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// link for the idle check or the next request to find. If one of these
     /// reads or sends fails, the failure is a wire failure.
     fn fail_streams_into(&mut self, out: &mut Vec<(TaskId, Chunk)>, msg: String, wire: bool) {
+        // Failed steps on the link: the next masked frame goes full.
+        self.mask_send.clear();
         let wire = wire || !self.drain_stream_link();
         if wire {
             self.peer_disconnected = true;
@@ -7953,13 +8048,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 &cols,
                 tag,
                 reply_deadline,
+                &self.mask_send,
             ))?;
             // An acknowledged single-row step: every stage of this link
             // masks, so batched and stream frames may carry masks too.
             self.mask_evidence = true;
             return Ok(token);
         }
-        self.block_on(async {
+        let plain = self.block_on(async {
             if sample_back {
                 send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h], true)
                     .await
@@ -7979,7 +8075,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 Some(&self.stage_masks.latch),
             )
             .await
-        })
+        });
+        // A failed step: the next masked frame goes full.
+        plain.inspect_err(|_| self.mask_send.clear())
     }
 
     /// Strict deadline for the Token reply owed to one forwarded token.
@@ -8544,6 +8642,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         let relay_started = Instant::now();
                         let down = relay.as_ref().expect("Ready::Down only with a downstream");
                         let mid_late = &self.mid_late;
+                        let mid_send = &self.mask_send;
                         let res = self.block_on(async {
                             match crate::dist::recv_kind_client_raw(down).await {
                                 Ok(Some(FrameKind::StreamTokens)) => {
@@ -8564,6 +8663,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
                                         crate::dist::recv_stream_tokens_ack_body_client(down)
                                             .await
                                             .map_err(|e| format!("recv_stream_tokens_ack: {e}"))?;
+                                    // A row below failed (a mask miss included):
+                                    // the next masked frame goes full.
+                                    if status != MASK_ACK || toks.iter().any(|&(_, t)| t < 0) {
+                                        mid_send.clear();
+                                    }
                                     crate::dist::send_owed_late_ack(&upstream, mid_late)
                                         .await
                                         .map_err(|e| format!("relay late ack: {e}"))?;
@@ -8729,6 +8833,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         if let Err(e) = res {
             warn!("worker frame failed: {e}");
+            // A failed step: the next masked frame downstream goes full.
+            self.mask_send.clear();
             if matches!(
                 kind,
                 FrameKind::StreamOpen
@@ -8773,6 +8879,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
             upstream, token, tag, MASK_ACK,
         ))
         .map_err(|e| format!("send_token_ack: {e}"))
+    }
+
+    /// A stream frame whose repeat marker this rank can't resolve. The last
+    /// rank answers that row with the mask-miss token (the others in the
+    /// frame are served as usual). A middle can't pass the row on without a
+    /// mask, nor serve the rows next to it without running them, so the frame
+    /// fails like a malformed one: the link closes and rank 0 fails the
+    /// streams on it. Neither can happen while the two ends of the link stay
+    /// in step.
+    fn stream_mask_miss(&mut self, cols: Option<&MaskCols>) -> Result<(), String> {
+        if self.is_last() || !cols.is_some_and(MaskCols::is_repeat) {
+            return Ok(());
+        }
+        self.peer_disconnected = true;
+        Err(cascadia_grammar::MASK_MISS_MESSAGE.to_string())
     }
 
     /// A stream frame that names a slot this rank cannot hold is a protocol
@@ -8861,10 +8982,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let (hidden_f32, _, cols) = match step.split(hs) {
             Ok(parts) => parts,
             Err(e) => {
+                self.mask_recv.clear();
                 self.peer_disconnected = true;
                 return Err(format!("stream prefill: {e}"));
             }
         };
+        // A repeat marker resolves here, before any layer runs (see
+        // `stream_mask_miss`).
+        let cols = cols.map(|c| self.mask_recv.resolve(c));
+        self.stream_mask_miss(cols.as_ref())?;
         let have = if open {
             Some(0)
         } else {
@@ -8910,6 +9036,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 rng,
             };
             let token = match cols.as_ref() {
+                // A marker with no mask to repeat: the mask-miss token.
+                Some(c) if c.is_repeat() => None,
                 Some(c) => sample_wire_masked(
                     &logits,
                     &sampler.history,
@@ -8930,7 +9058,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
             self.stream_samplers.insert(s, sampler);
             let send_started = Instant::now();
-            let row = [(slot, token.unwrap_or(-1))];
+            let row = [(slot, token.unwrap_or(miss_or_nack(cols.as_ref())))];
             let sent = match cols {
                 Some(_) => self
                     .block_on(crate::dist::send_stream_tokens_ack_upstream(
@@ -8961,6 +9089,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         rows,
                         hs as u32,
                         cols.as_ref(),
+                        Some(&self.mask_send),
                     ))
                     .map_err(|e| format!("send_stream_open: {e}")),
                 Some(f) => self
@@ -8974,6 +9103,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         rows,
                         hs as u32,
                         cols.as_ref(),
+                        Some(&self.mask_send),
                     ))
                     .map_err(|e| format!("send_stream_feed: {e}")),
             };
@@ -9001,10 +9131,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let (hidden_f32, _, cols) = match step.split(hs) {
             Ok(parts) => parts,
             Err(e) => {
+                self.mask_recv.clear();
                 self.peer_disconnected = true;
                 return Err(format!("stream decode: {e}"));
             }
         };
+        // A repeat marker resolves here, before any layer runs (see
+        // `stream_mask_miss`).
+        let cols = cols.map(|c| self.mask_recv.resolve(c));
+        self.stream_mask_miss(cols.as_ref())?;
         if hidden_f32.len() != rows.len() * hs {
             self.peer_disconnected = true;
             return Err(format!(
@@ -9048,6 +9183,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 })?;
                 let l = &logits[i * vocab..(i + 1) * vocab];
                 let token = match cols.as_ref().filter(|c| c.tag(i) != 0) {
+                    // A marker with no mask to repeat: the mask-miss token
+                    // for this row only.
+                    Some(c) if c.is_repeat() => None,
                     Some(c) => sample_wire_masked(
                         l,
                         &sampler.history,
@@ -9066,7 +9204,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 if let Some(t) = token {
                     sampler.history.push(t);
                 }
-                toks.push((s as u32, token.unwrap_or(-1)));
+                let miss = cols.as_ref().filter(|c| c.tag(i) != 0);
+                toks.push((s as u32, token.unwrap_or(miss_or_nack(miss))));
             }
             let send_started = Instant::now();
             let sent = match cols {
@@ -9094,6 +9233,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     &hidden,
                     hs as u32,
                     cols.as_ref(),
+                    Some(&self.mask_send),
                 ))
                 .map_err(|e| format!("send_stream_decode: {e}"));
             if let Some(p) = self.stage_profile.as_mut() {
@@ -9144,13 +9284,23 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let (hidden_f32, _shape, cols) = match step.split(self.runner.hidden_size()) {
             Ok(parts) => parts,
             Err(e) => {
+                self.mask_recv.clear();
                 self.peer_disconnected = true;
                 return Err(format!("forward frame: {e}"));
             }
         };
         if cols.is_some() && !sample {
+            self.mask_recv.clear();
             self.peer_disconnected = true;
             return Err("a ForwardNoSample frame carries a mask; only sampling frames may".into());
+        }
+        // A repeat marker resolves here, before any layer runs; one with no
+        // mask to repeat is answered at once. The probe passes untouched.
+        let cols = cols.map(|c| self.mask_recv.resolve(c));
+        if let Some(c) = cols.as_ref().filter(|c| c.is_repeat()) {
+            return self
+                .block_on(crate::dist::send_mask_miss_upstream(upstream, c.tag(0)))
+                .map_err(|e| format!("send_token_ack (mask miss): {e}"));
         }
         // The mask-support probe: acknowledged without running any layer or
         // touching any state; a middle passes it on unchanged.
@@ -9177,11 +9327,20 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     [1, 1, h],
                     push_history,
                     Some(c),
+                    // The probe never touches the repeat caches.
+                    None,
                 )
                 .await
                 .map_err(|e| format!("relay mask probe: {e}"))?;
-                crate::dist::relay_masked_token_reply(upstream, down, budget, tag, &self.mid_late)
-                    .await
+                crate::dist::relay_masked_token_reply(
+                    upstream,
+                    down,
+                    budget,
+                    tag,
+                    &self.mid_late,
+                    None,
+                )
+                .await
             });
         }
         // A malformed or over-range frame is a protocol violation we cannot
@@ -9247,6 +9406,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         [1, 1, h],
                         push_history,
                         Some(&cols),
+                        Some(&self.mask_send),
                     )
                     .await
                     .map_err(|e| format!("send_forward: {e}"))?;
@@ -9256,6 +9416,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         crate::dist::mid_mask_budget(Self::reply_deadline(), self.rank, self.total),
                         cols.tag(0),
                         &self.mid_late,
+                        Some(&self.mask_send),
                     )
                     .await
                 });
@@ -9409,6 +9570,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         ),
                         cols.tag(rows - 1),
                         &self.mid_late,
+                        // Batched frames never record a mask; a failed one
+                        // still clears this link's.
+                        Some(&self.mask_send),
                     )
                     .await
                 });

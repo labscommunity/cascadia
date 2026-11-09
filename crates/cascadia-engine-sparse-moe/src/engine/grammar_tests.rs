@@ -758,6 +758,8 @@ fn middle_masked_budgets_end_before_the_heads_with_the_real_budgets() {
 struct TailLog {
     frames: std::sync::Mutex<Vec<(FrameKind, bool)>>,
     died: std::sync::atomic::AtomicBool,
+    /// Masked frames that carried the repeat marker.
+    repeats: std::sync::atomic::AtomicUsize,
 }
 
 impl TailLog {
@@ -769,6 +771,9 @@ impl TailLog {
     }
     fn died(&self) -> bool {
         self.died.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn repeats(&self) -> usize {
+        self.repeats.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn masked(&self, kind: FrameKind) -> usize {
         self.frames()
@@ -798,10 +803,41 @@ fn fixture_tail(
     srv: Arc<TokioMutex<ActivationServer>>,
     old: bool,
 ) -> Arc<TailLog> {
+    fixture_tail_with(rt, srv, old, false)
+}
+
+/// [`fixture_tail`]; with `forget` a new stage that answers every repeat
+/// marker with the mask-miss token (a stage that lost its mask state).
+fn fixture_tail_with(
+    rt: &tokio::runtime::Runtime,
+    srv: Arc<TokioMutex<ActivationServer>>,
+    old: bool,
+    forget: bool,
+) -> Arc<TailLog> {
     use crate::dist::*;
     let log = Arc::new(TailLog::default());
     let l = log.clone();
     let handle = rt.handle().clone();
+    let recv = MaskRecvLink::default();
+    // A new stage resolves markers with its receive cache, unless it forgot.
+    let resolve = move |l: &TailLog, c: MaskCols| {
+        if c.is_repeat() {
+            l.repeats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if forget {
+                return c;
+            }
+        }
+        recv.resolve(c)
+    };
+    // The lowest allowed token of row `r`, the mask-miss token for a
+    // marker that did not resolve.
+    let pick = |c: &MaskCols, r: usize| {
+        if c.is_repeat() {
+            i64::from(cascadia_grammar::MASK_MISS_TOKEN)
+        } else {
+            c.words(r).map_or(-1, first_allowed)
+        }
+    };
     std::thread::spawn(move || {
         handle.block_on(async move {
             let die = |l: &TailLog| l.died.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -891,9 +927,13 @@ fn fixture_tail(
                             };
                         let (_, _, cols) = step.split(4).unwrap();
                         l.saw(kind, cols.is_some());
+                        let cols = cols.map(|c| match kind {
+                            FrameKind::Forward => resolve(&l, c),
+                            _ => c,
+                        });
                         match cols {
                             Some(c) => {
-                                let t = c.words(rows - 1).map_or(-1, first_allowed);
+                                let t = pick(&c, rows - 1);
                                 send_token_ack_upstream(&srv, t, c.tag(rows - 1), MASK_ACK)
                                     .await
                                     .unwrap();
@@ -924,6 +964,7 @@ fn fixture_tail(
                         };
                         let (_, shape, cols) = step.split(4).unwrap();
                         l.saw(kind, cols.is_some());
+                        let cols = cols.map(|c| resolve(&l, c));
                         if !last {
                             continue;
                         }
@@ -939,7 +980,7 @@ fn fixture_tail(
                                     rows - 1
                                 };
                                 let t = match cols.as_ref().filter(|c| c.tag(r) != 0) {
-                                    Some(c) => c.words(r).map_or(-1, first_allowed),
+                                    Some(c) => pick(c, r),
                                     None => i64::from(b'a'),
                                 };
                                 (s, t)
@@ -1191,6 +1232,7 @@ fn the_masked_single_row_exchange_round_trips() {
             &cols,
             tag,
             Duration::from_secs(5),
+            &crate::dist::MaskSendLink::default(),
         ))
         .unwrap();
     // The stub favours a control byte, EOS and `}`; the mask allows `{` only.
@@ -1232,6 +1274,7 @@ fn a_masked_step_to_a_silent_old_tail_fails_then_a_plain_task_uses_the_link() {
             &cols,
             tag,
             Duration::from_millis(300),
+            &crate::dist::MaskSendLink::default(),
         ))
         .unwrap_err();
     assert!(err.contains("no reply within"), "{err}");
@@ -1429,4 +1472,142 @@ fn a_json_request_waiting_past_its_patience_stops_new_admissions() {
     assert_eq!(out["j"].tokens.len(), 6);
     assert_eq!(final_chunk(&out["p2"]).error, None);
     assert_eq!(log.masked(FrameKind::Forward), 1, "probed once");
+}
+
+// ---- repeated masks on the stage wire ----------------------------------------
+
+/// A JSON string the fixture tail fills with the lowest allowed byte: every
+/// step inside it has the same mask.
+const STRING: &str = r#"{"type":"string"}"#;
+/// Strings of one letter each: two streams with these never share a mask.
+const XS: &str = r#"{"type":"string","enum":["xxxxxxxx"]}"#;
+const YS: &str = r#"{"type":"string","enum":["yyyyyyyy"]}"#;
+
+fn schema_task(id: &str, schema: &str, max_tokens: u32) -> GenerationTask {
+    let mut t = GenerationTask::new(id, "hi").with_max_tokens(max_tokens);
+    t.grammar = Some(test_env::spec(schema));
+    t
+}
+
+/// Every token of `o` was allowed by `schema` when it was picked.
+fn assert_allowed(o: &Outcome, schema: &str) {
+    let mut gm = test_env::mask(schema);
+    for &t in &o.tokens {
+        assert!(
+            gm.allowed(t),
+            "token {t} not allowed by {schema}: {:?}",
+            o.text
+        );
+        gm.accept(t).unwrap();
+    }
+}
+
+/// The one-task path: a mask equal to the last one sent goes as the
+/// marker, and the tail, resolving it, picks the same tokens.
+#[test]
+fn repeated_masks_go_as_markers_on_the_one_task_path() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), false);
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 0);
+    head.submit(schema_task("j", STRING, 8)).unwrap();
+    let out = drive(&mut head, &["j"]);
+    assert_eq!(final_chunk(&out["j"]).error, None);
+    assert_eq!(out["j"].tokens.len(), 8);
+    assert_allowed(&out["j"], STRING);
+    assert!(log.repeats() >= 5, "{} markers", log.repeats());
+    assert!(!head.stage_masks.latch.is_set());
+    let _ = &rt;
+}
+
+/// Two json streams with the same mask, each in its own group so their
+/// frames are in flight together: markers flow through a middle, and both
+/// come out right.
+#[test]
+fn pipelined_json_streams_share_markers_through_a_middle() {
+    let mut c = chain(3, 2, JsonStub::new);
+    c.head.submit(schema_task("a", XS, 12)).unwrap();
+    c.head.submit(schema_task("b", XS, 12)).unwrap();
+    let out = drive(&mut c.head, &["a", "b"]);
+    for id in ["a", "b"] {
+        assert_eq!(final_chunk(&out[id]).error, None, "{id}");
+        assert_eq!(out[id].text, "\"xxxxxxxx\"", "{id}");
+    }
+    assert!(c.head.mask_send.markers_sent() > 0);
+    assert!(!c.head.stage_masks.latch.is_set());
+}
+
+/// Two pipelined json streams with different masks through a middle never
+/// get each other's mask.
+#[test]
+fn pipelined_json_streams_with_different_masks_never_swap_them() {
+    let mut c = chain(3, 2, JsonStub::new);
+    c.head.submit(schema_task("x", XS, 12)).unwrap();
+    c.head.submit(schema_task("y", YS, 12)).unwrap();
+    let out = drive(&mut c.head, &["x", "y"]);
+    assert_eq!(final_chunk(&out["x"]).error, None);
+    assert_eq!(final_chunk(&out["y"]).error, None);
+    assert_eq!(out["x"].text, "\"xxxxxxxx\"");
+    assert_eq!(out["y"].text, "\"yyyyyyyy\"");
+}
+
+/// A marker the tail can't resolve fails that task with the retry message:
+/// no latch, rank 0 forgets its mask, and a plain stream next to it keeps
+/// going.
+#[test]
+fn a_mask_miss_fails_only_that_task_and_never_latches() {
+    // The one-task path.
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let _log = fixture_tail_with(&rt, l[0].0.clone(), false, true);
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 0);
+    head.submit(schema_task("j", STRING, 8)).unwrap();
+    let out = drive(&mut head, &["j"]);
+    let err = final_chunk(&out["j"]).error.clone().unwrap_or_default();
+    assert!(err.contains(cascadia_grammar::MASK_MISS_MESSAGE), "{err}");
+    assert!(!head.stage_masks.latch.is_set());
+    assert!(head.mask_send.is_empty());
+
+    // Streams: the json one fails, the plain one in the same pipeline does not.
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let _log = fixture_tail_with(&rt, l[0].0.clone(), false, true);
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 2);
+    head.submit(schema_task("j", XS, 12)).unwrap();
+    head.submit(plain_task("p", 12)).unwrap();
+    let out = drive(&mut head, &["j", "p"]);
+    let err = final_chunk(&out["j"]).error.clone().unwrap_or_default();
+    assert!(err.contains(cascadia_grammar::MASK_MISS_MESSAGE), "{err}");
+    assert_eq!(final_chunk(&out["p"]).error, None);
+    assert_eq!(out["p"].tokens.len(), 12);
+    assert!(!head.stage_masks.latch.is_set());
+    assert!(head.mask_send.is_empty());
+}
+
+/// A re-dial is a new connection: the next json frame goes full, even when
+/// it repeats the last mask sent on the old one.
+#[test]
+fn a_redial_starts_the_link_with_full_masks() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), false);
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 0);
+    // One masked step each, all with the opening quote's mask.
+    let one = |head: &mut PipelineEngine<JsonStub>, id: &str| {
+        head.submit(schema_task(id, XS, 1)).unwrap();
+        let out = drive(head, &[id]);
+        assert_eq!(final_chunk(&out[id]).error, None);
+    };
+    one(&mut head, "j1");
+    assert_eq!(log.repeats(), 0);
+    one(&mut head, "j2");
+    assert_eq!(log.repeats(), 1, "the same mask again: a marker");
+    // The link keeper re-dialed between two requests.
+    head.link_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    one(&mut head, "j3");
+    assert_eq!(log.repeats(), 1, "full on the new connection");
+    one(&mut head, "j4");
+    assert_eq!(log.repeats(), 2);
+    let _ = &rt;
 }
