@@ -189,6 +189,15 @@ mod sys {
             n_keep: usize,
             out_text: *mut *mut c_char,
         ) -> c_int;
+        pub fn cascadia_debug_decode_keeping_reads(
+            ids: *const i64,
+            n_ids: usize,
+            keep_ids: *const i64,
+            keep_texts: *const *const c_char,
+            n_keep: usize,
+            out_text: *mut *mut c_char,
+            out_decode_calls: *mut usize,
+        ) -> c_int;
         pub fn cascadia_cb_add_request(
             handle: *mut cascadia_cb_pipeline_t,
             request_id: u64,
@@ -2441,5 +2450,68 @@ mod tests {
         assert_eq!(decode(&[1, 48, 2], &[]), "(1,48,2)");
         assert_eq!(decode(&[], &keep), "");
         assert_eq!(decode(&[], &[]), "()");
+    }
+
+    /// The continuous-batching read decodes the ids one more at a time, as
+    /// reads do: each read's text equals the keep-list decode of the ids so
+    /// far, while only the trailing open run is decoded again (finished
+    /// runs come from the handle's cache), so a reply with many markers
+    /// costs about one decode per read. An empty keep list is one plain
+    /// decode per read.
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn cb_reads_decode_only_the_open_run() {
+        use std::ffi::{CStr, CString};
+        use std::os::raw::c_char;
+
+        let reads = |ids: &[i64], keep: &[(i64, &str)]| -> (Vec<String>, usize) {
+            let texts: Vec<CString> = keep
+                .iter()
+                .map(|(_, t)| CString::new(*t).unwrap())
+                .collect();
+            let ptrs: Vec<*const c_char> = texts.iter().map(|t| t.as_ptr()).collect();
+            let keep_ids: Vec<i64> = keep.iter().map(|(id, _)| *id).collect();
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let mut calls = 0usize;
+            let rc = unsafe {
+                super::sys::cascadia_debug_decode_keeping_reads(
+                    ids.as_ptr(),
+                    ids.len(),
+                    keep_ids.as_ptr(),
+                    ptrs.as_ptr(),
+                    keep.len(),
+                    &mut out,
+                    &mut calls,
+                )
+            };
+            assert_eq!(rc, 0);
+            let s = unsafe { CStr::from_ptr(out) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { super::sys::cascadia_free_string(out) };
+            (s.split('\n').map(str::to_owned).collect(), calls)
+        };
+        let keep = [(48, "<|tool_call>"), (49, "<tool_call|>"), (52, "<|\"|>")];
+        let (texts, calls) = reads(&[48, 1, 2, 52, 3, 52, 4, 49, 106], &keep);
+        assert_eq!(
+            texts,
+            [
+                "<|tool_call>",
+                "<|tool_call>(1)",
+                "<|tool_call>(1,2)",
+                "<|tool_call>(1,2)<|\"|>",
+                "<|tool_call>(1,2)<|\"|>(3)",
+                "<|tool_call>(1,2)<|\"|>(3)<|\"|>",
+                "<|tool_call>(1,2)<|\"|>(3)<|\"|>(4)",
+                "<|tool_call>(1,2)<|\"|>(3)<|\"|>(4)<tool_call|>",
+                "<|tool_call>(1,2)<|\"|>(3)<|\"|>(4)<tool_call|>(106)",
+            ]
+        );
+        // One decode per read that ends in an open run, plus one per
+        // finished run when it closes: 5 + 3 here, not 1+1+2+2+3+3+3+3.
+        assert_eq!(calls, 8);
+        let (texts, calls) = reads(&[1, 48, 2], &[]);
+        assert_eq!(texts, ["(1)", "(1,48)", "(1,48,2)"]);
+        assert_eq!(calls, 3);
     }
 }

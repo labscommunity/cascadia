@@ -60,6 +60,19 @@ int32_t cascadia_debug_decode_keeping(
     size_t n_keep,
     char** out_text);
 
+/// Test-only: the continuous-batching read's cached keep-list decode, read
+/// once per id as the ids grow, over the same stand-in decoder. `*out_text`
+/// holds each read's text, one per line (freed via cascadia_free_string);
+/// `*out_decode_calls` counts the decoder calls.
+int32_t cascadia_debug_decode_keeping_reads(
+    const int64_t* ids,
+    size_t n_ids,
+    const int64_t* keep_ids,
+    const char* const* keep_texts,
+    size_t n_keep,
+    char** out_text,
+    size_t* out_decode_calls);
+
 // ---- Pipeline (LLMPipeline) construction ---------------------------------
 
 int32_t cascadia_pipeline_create(

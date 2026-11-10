@@ -114,6 +114,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DNNL_DIR");
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
     println!("cargo:rerun-if-changed=cpp/shim.h");
+    println!("cargo:rerun-if-changed=cpp/decode_keep.hpp");
     println!("cargo:rerun-if-changed=cpp/gemv_offload.cpp");
     println!("cargo:rerun-if-changed=cpp/gemv_offload.hpp");
     println!("cargo:rerun-if-env-changed=INTEL_OPENVINO_DIR");

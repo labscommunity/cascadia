@@ -4,6 +4,7 @@
 // recent message is stashed in a thread-local static buffer.
 
 #include "shim.h"
+#include "decode_keep.hpp"
 
 #include "gemv_offload.hpp"
 
@@ -206,54 +207,6 @@ int32_t validate_with(ov::genai::Tokenizer tok, const char* schema) {
     soc.json_schema = std::string(schema);
     soc.validate(tok);
     return 0;
-}
-
-// Token ids written out as literal text when decoding, instead of being
-// skipped with the other special tokens: a model's tool-call markers (Gemma 4
-// builds its calls out of special tokens, so a plain decode erases them).
-using KeepList = std::vector<std::pair<int64_t, std::string>>;
-
-// A keep list is a handful of markers; this only bounds a poisoned count.
-static constexpr size_t MAX_KEEP_TOKENS = 64;
-
-KeepList read_keep_list(const int64_t* ids, const char* const* texts, size_t n) {
-    if (n > MAX_KEEP_TOKENS) {
-        throw std::invalid_argument("keep token count exceeds MAX_KEEP_TOKENS=64");
-    }
-    KeepList keep;
-    keep.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        if (!texts[i]) throw std::invalid_argument("null keep token text");
-        keep.emplace_back(ids[i], std::string(texts[i]));
-    }
-    return keep;
-}
-
-// `decode(ids)`, except kept ids come out as their literal text: the ids are
-// split at the kept ids, each run between them is decoded on its own, and the
-// kept texts go between the runs. An empty keep list is exactly one
-// `decode(ids)`.
-template <typename Decode>
-std::string decode_keeping(const std::vector<int64_t>& ids, const KeepList& keep,
-                           Decode&& decode) {
-    if (keep.empty()) return decode(ids);
-    std::string text;
-    std::vector<int64_t> run;
-    for (const int64_t id : ids) {
-        const auto kept = std::find_if(keep.begin(), keep.end(),
-                                       [id](const auto& k) { return k.first == id; });
-        if (kept == keep.end()) {
-            run.push_back(id);
-            continue;
-        }
-        if (!run.empty()) {
-            text += decode(run);
-            run.clear();
-        }
-        text += kept->second;
-    }
-    if (!run.empty()) text += decode(run);
-    return text;
 }
 
 // Collects the generated token ids of one generate() call, so its text can be
@@ -637,6 +590,49 @@ int32_t cascadia_pipeline_generate(
 
 void cascadia_free_string(char* s) { std::free(s); }
 
+// Test-only: the continuous-batching read's cached decode over
+// cascadia_debug_decode_keeping's stand-in decoder, read once per id as the
+// ids grow. *out_text holds each read's text, one per line;
+// *out_decode_calls counts the decoder calls.
+int32_t cascadia_debug_decode_keeping_reads(
+    const int64_t* ids, size_t n_ids, const int64_t* keep_ids,
+    const char* const* keep_texts, size_t n_keep, char** out_text,
+    size_t* out_decode_calls) {
+    if ((n_ids && !ids) || (n_keep && (!keep_ids || !keep_texts)) || !out_text ||
+        !out_decode_calls) {
+        set_last_error("null arg in debug_decode_keeping_reads"); return 1;
+    }
+    try {
+        const KeepList keep = read_keep_list(keep_ids, keep_texts, n_keep);
+        size_t calls = 0;
+        auto decode = [&calls](const std::vector<int64_t>& run) {
+            ++calls;
+            std::string s = "(";
+            for (size_t i = 0; i < run.size(); ++i) {
+                if (i) s += ",";
+                s += std::to_string(run[i]);
+            }
+            return s + ")";
+        };
+        KeepingDecodeCache cache;
+        std::vector<int64_t> acc;
+        std::string text;
+        for (size_t i = 0; i < n_ids; ++i) {
+            acc.push_back(ids[i]);
+            if (i) text += "\n";
+            text += decode_keeping_cached(acc, keep, cache, decode);
+        }
+        *out_text = dup_cstr(text.c_str());
+        if (!*out_text) { set_last_error("malloc failure in debug_decode_keeping_reads"); return 1; }
+        *out_decode_calls = calls;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in debug_decode_keeping_reads"); return 1;
+    }
+}
+
 // ---- Continuous batching (issue #20) ---------------------------------------
 
 struct cascadia_cb_pipeline_t {
@@ -655,6 +651,11 @@ struct cascadia_cb_handle_t {
     // count that was never checked against the decode meant a re-decode that
     // shrank desynced the stream permanently and silently.
     std::vector<int64_t> acc_ids;
+    // The decoded text of acc_ids' finished runs (up to and including the
+    // last kept id) and how many ids it covers, so a read decodes only the
+    // trailing open run instead of one run per marker. Unused with an empty
+    // keep list. Lives and dies with acc_ids.
+    KeepingDecodeCache decoded;
     // Latched from GenerationOutput. The terminal read can return no new
     // output at all (the last tokens were consumed by an earlier read, and an
     // evicted request produces none), so the reason has to be remembered when
@@ -844,10 +845,11 @@ int32_t cascadia_cb_handle_read(
         // Return the whole decode, not a delta. The caller diffs it against
         // what it has already emitted, which lets it notice a non-monotonic
         // re-decode instead of silently slicing at a stale offset. Kept ids
-        // (tool-call markers) come out as their text; with no keep list this
-        // is one plain decode of the whole sequence.
-        std::string full = decode_keeping(
-            handle->acc_ids, pipeline->keep,
+        // (tool-call markers) come out as their text, and runs a kept id has
+        // closed come from the handle's cache; with no keep list this is one
+        // plain decode of the whole sequence.
+        std::string full = decode_keeping_cached(
+            handle->acc_ids, pipeline->keep, handle->decoded,
             [pipeline](const std::vector<int64_t>& run) { return pipeline->tok->decode(run); });
         if (full.size() > MAX_GENERATED_TEXT_BYTES) {
             set_last_error("cb decoded text exceeds MAX_GENERATED_TEXT_BYTES");
