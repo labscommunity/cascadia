@@ -11480,6 +11480,60 @@ level={{ effort_map[eff] }}";
         assert_eq!(health_status(app).await, StatusCode::OK);
     }
 
+    /// A streamed `/v1/responses` failure keeps the spec's `{code, message}`
+    /// error, classified as chat's error frame is: an over-window refusal is
+    /// `context_length_exceeded` with OpenAI's sentence, another client fault
+    /// `invalid_prompt`, anything else `server_error`.
+    #[tokio::test]
+    async fn streamed_responses_failure_carries_the_classified_code() {
+        let cases = [
+            (
+                "prompt too long: prompt is 900 tokens; the model's window is 512",
+                "context_length_exceeded",
+                "This model's maximum context length is 512 tokens. However, your input \
+                 resulted in 900 tokens.",
+            ),
+            (
+                "unsupported input: a resumed turn cannot carry images",
+                "invalid_prompt",
+                "unsupported input: a resumed turn cannot carry images",
+            ),
+            ("peer link dropped", "server_error", "peer link dropped"),
+        ];
+        for (reason, code, message_start) in cases {
+            let (app, release) = gated_app_failing(&["Hi "], Some(reason)).await;
+            release.store(true, Ordering::SeqCst);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"model": "mock-model", "input": "hi",
+                                "stream": true})
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec())
+                .unwrap();
+            let data = body
+                .split("\n\n")
+                .find_map(|f| f.strip_prefix("event: response.failed\ndata: "))
+                .unwrap_or_else(|| panic!("no response.failed: {body}"));
+            let v: Value = serde_json::from_str(data).unwrap();
+            let err = v["response"]["error"].as_object().unwrap();
+            assert_eq!(err.len(), 2, "{reason}: {err:?}");
+            assert_eq!(err["code"], code, "{reason}");
+            let msg = err["message"].as_str().unwrap();
+            assert!(msg.starts_with(message_start), "{reason}: {msg}");
+        }
+    }
+
     #[tokio::test]
     async fn streamed_engine_failure_frame_is_server_error() {
         let resp = make_app()

@@ -544,7 +544,7 @@ impl ResponseShell {
             "status": status,
             "completed_at": outcome.filter(|_| status == "completed").map(|_| now_unix()),
             "error": outcome.and_then(|o| o.error.as_ref()).map(|e| json!({
-                "code": "server_error", "message": e})),
+                "code": e.code, "message": e.message})),
             "incomplete_details": (status == "incomplete")
                 .then(|| json!({"reason": "max_output_tokens"})),
             "instructions": self.instructions,
@@ -594,7 +594,30 @@ struct Outcome {
     prompt_tokens: u32,
     completion_tokens: u32,
     /// The engine's failure, for a `failed` response.
-    error: Option<String>,
+    error: Option<Failure>,
+}
+
+/// A `failed` response's `error`: the spec's `ResponseError`, `{code,
+/// message}`.
+struct Failure {
+    code: &'static str,
+    message: String,
+}
+
+impl Failure {
+    /// The engine's failure `reason`, classified as chat's error frame is
+    /// ([`crate::classify_chunk_error`]): an over-window refusal is
+    /// `context_length_exceeded` with OpenAI's sentence, another client fault
+    /// `invalid_prompt`, anything else `server_error`.
+    fn classify(reason: &str) -> Self {
+        let (status, message, _, code) = crate::classify_chunk_error(reason, "input");
+        let code = match code {
+            Some(code) => code,
+            None if status.is_client_error() => "invalid_prompt",
+            None => "server_error",
+        };
+        Self { code, message }
+    }
 }
 
 /// How the generation ended, in Responses terms.
@@ -770,7 +793,7 @@ impl ResponseStream {
             let outcome = Outcome {
                 prompt_tokens: self.prompt_tokens,
                 completion_tokens: self.completion_tokens,
-                error: Some(reason.clone()),
+                error: Some(Failure::classify(reason)),
             };
             let failed = self.shell.object("failed", json!([]), Some(&outcome));
             self.emit(&mut out, "response.failed", json!({"response": failed}));
@@ -1584,6 +1607,12 @@ mod tests {
         assert_eq!(response["status"], "failed", "{response}");
         assert_eq!(response["error"]["code"], "server_error");
         assert_eq!(response["error"]["message"], "peer link dropped");
+        // The spec's `ResponseError`: `code` and `message`, nothing else.
+        assert_eq!(
+            response["error"].as_object().unwrap().len(),
+            2,
+            "{response}"
+        );
         assert!(response["completed_at"].is_null());
         assert_eq!(response["usage"]["output_tokens"], 2);
     }
