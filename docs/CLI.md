@@ -311,12 +311,28 @@ context window still ends an answer where the prompt plus the answer fill it
   single-stage sparse-moe) put everything on one final chunk. sycl-llama
   learns the count only at the end, so a cut there reports a prompt of 0; that
   is rare, because `llama-server` applies `stop` itself.
-- **What still runs to the window.** Two engines run a generation as one call
-  that cannot be cancelled: the default (non-`--cb`) ov-genai path and
-  single-stage sparse-moe. There an answer that never reaches end-of-sequence
-  (or a `stop` match, which can only be applied once the call returns) holds
-  the engine for up to one context window instead of 256 tokens, and a client
-  disconnect does not stop it. ov-runtime (CPU/GPU and NPU), dist-spec,
+- **One-shot engines end early too.** Two engines make a whole answer in one
+  call: the default (non-`--cb`) ov-genai path and single-stage sparse-moe.
+  That call now ends early when the client disconnects (streaming or not),
+  on `/v1/cancel/{task_id}`, or when a `stop` sequence matches. It ends within one token,
+  or within one decode round with `--draft-model`, `--prompt-lookup` or
+  sparse-moe's speculative decode. Then the engine is free for the next request.
+  - The engine checks at most 4 `stop` sequences of up to 256 bytes each.
+    Longer ones, and any past the fourth, are still cut by the API, but only
+    once the answer is complete.
+  - The engine's own stop check is off for models whose chat template frames
+    output with special tokens (Inkling's `<|content_thinking|>` style), since
+    there the engine's text is not the text the API matches. The API still
+    cuts at the stop, and a disconnect or `/v1/cancel/{task_id}` still ends the call.
+  - A cancel during the prompt prefill of the glm and inkling sparse-moe
+    models waits for the prefill to finish, because those models prefill the
+    prompt as one batch.
+  - On these paths every generated token now costs one extra check, plus a
+    short decode of the newest tokens while a `stop` is set.
+- **What still runs to the window.** On the two one-shot engines above, an
+  answer that never reaches end-of-sequence or a `stop` match holds the engine
+  for up to one context window instead of 256 tokens, unless the client
+  disconnects or cancels. ov-runtime (CPU/GPU and NPU), dist-spec,
   `gemma4` and multi-stage `qwen35` have no window stop of their own; with a
   known window such an answer now runs until the prompt plus the answer fill
   it (above), not to the full limit, unless `stop` matches or the client

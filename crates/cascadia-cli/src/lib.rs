@@ -1870,6 +1870,48 @@ fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The chat template the API renders for `engine` serving `model` (each
+/// engine's export layout keeps it in a different place).
+fn api_chat_template(engine: EngineKind, model: &str) -> cascadia_api::ChatTemplateConfig {
+    match engine {
+        // ov-genai: render the template API-side so enable_thinking is
+        // honored; the engine sets apply_chat_template=false so ov-genai
+        // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
+        EngineKind::OvGenai => ovgenai_chat_template(model),
+        // qwen36 surgery trees keep chat_template.jinja at the model
+        // root with no tokenizer_config.json.
+        EngineKind::Qwen36Moe => {
+            cascadia_api::load_chat_template_config_at(std::path::Path::new(model))
+        }
+        EngineKind::SyclLlama => cascadia_api::ChatTemplateConfig::default(),
+        // sparse-moe exports (dsv4) keep the tokenizer files and
+        // chat_template.jinja at the model root, not in a tokenizer/
+        // subdir. Read the root first; fall back to the subdir layout so
+        // other sparse-moe models (MiniMax-M2) that ship a tokenizer/
+        // subdir still resolve their template.
+        EngineKind::SparseMoe => {
+            let root = cascadia_api::load_chat_template_config_at(std::path::Path::new(model));
+            if root.template.is_some() {
+                root
+            } else {
+                cascadia_api::load_chat_template_config(std::path::Path::new(model))
+            }
+        }
+        _ => cascadia_api::load_chat_template_config(std::path::Path::new(model)),
+    }
+}
+
+/// Whether the engine may end a running one-shot generation at a `stop` match
+/// it finds itself. Off when the API translates the model's special-token
+/// message framing (a marker dialect): there the engine's text isn't the text
+/// the API matches stops against, so an engine stop could end an answer the
+/// API never cuts. Decided from the same template and tokenizer_config.json
+/// the API reads. A cancel ends the generation either way.
+fn engine_stop_check(engine: EngineKind, model: &str) -> bool {
+    let template = api_chat_template(engine, model).template;
+    cascadia_api::MarkerDialect::load(std::path::Path::new(model), template.as_deref()).is_none()
+}
+
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
 /// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
 /// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
@@ -2094,6 +2136,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             // enable_thinking) and the engine tells ov-genai to skip its own
             // internal apply. No template → leave ov-genai's apply on.
             b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
+            b = b.with_engine_stop_check(engine_stop_check(args.engine, &args.model));
             // Without --cb one generate() call makes the whole answer, so the
             // engine cuts its limit to what the prompt leaves of the window.
             let info = cascadia_api::read_model_generation_info(std::path::Path::new(&args.model));
@@ -2177,7 +2220,8 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
                 .with_rank(args.rank, args.total)
-                .with_kv_prefix_cache_size(args.kv_prefix_cache_size);
+                .with_kv_prefix_cache_size(args.kv_prefix_cache_size)
+                .with_engine_stop_check(engine_stop_check(args.engine, &args.model));
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 cfg.cache_dir = Some(dir);
             }
@@ -2859,33 +2903,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // exact format the model was trained on. Falls back gracefully
         // to the legacy "role: content" join if the file or fields are
         // missing.
-        let chat_template = match args.engine {
-            // ov-genai: render the template API-side so enable_thinking is
-            // honored; the engine sets apply_chat_template=false so ov-genai
-            // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
-            EngineKind::OvGenai => ovgenai_chat_template(&args.model),
-            // qwen36 surgery trees keep chat_template.jinja at the model
-            // root with no tokenizer_config.json.
-            EngineKind::Qwen36Moe => {
-                cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model))
-            }
-            EngineKind::SyclLlama => cascadia_api::ChatTemplateConfig::default(),
-            // sparse-moe exports (dsv4) keep the tokenizer files and
-            // chat_template.jinja at the model root, not in a tokenizer/
-            // subdir. Read the root first; fall back to the subdir layout so
-            // other sparse-moe models (MiniMax-M2) that ship a tokenizer/
-            // subdir still resolve their template.
-            EngineKind::SparseMoe => {
-                let root =
-                    cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model));
-                if root.template.is_some() {
-                    root
-                } else {
-                    cascadia_api::load_chat_template_config(std::path::Path::new(&args.model))
-                }
-            }
-            _ => cascadia_api::load_chat_template_config(std::path::Path::new(&args.model)),
-        };
+        let chat_template = api_chat_template(args.engine, &args.model);
         if chat_template.template.is_some() {
             info!(
                 model = %args.model,
@@ -4156,6 +4174,68 @@ mod cli_version_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model dir whose tokenizer_config.json carries `template` and the
+    /// five marker tokens a marker dialect needs.
+    fn model_with_template(template: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let markers = [
+            "<|message_model|>",
+            "<|content_text|>",
+            "<|content_thinking|>",
+            "<|end_message|>",
+            "<|content_invoke_tool_json|>",
+        ];
+        let decoder: serde_json::Map<String, serde_json::Value> = markers
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                (
+                    (100 + i).to_string(),
+                    serde_json::json!({ "content": m, "special": true }),
+                )
+            })
+            .collect();
+        let cfg = serde_json::json!({
+            "chat_template": template,
+            "added_tokens_decoder": decoder,
+        });
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::to_vec(&cfg).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The engine stop check is off exactly when the API gets a marker
+    /// dialect, for both engines that run one-shot generations.
+    #[test]
+    fn engine_stop_check_is_off_for_a_marker_dialect_model() {
+        let marker = model_with_template(
+            "{% for m in messages %}<|message_model|><|content_thinking|>{{ m.content }}<|end_message|>{% endfor %}",
+        );
+        let plain = model_with_template("{% for m in messages %}{{ m.content }}{% endfor %}");
+        let none = tempfile::tempdir().unwrap();
+        for engine in [EngineKind::OvGenai, EngineKind::SparseMoe] {
+            let m = marker.path().to_str().unwrap();
+            let tpl = api_chat_template(engine, m);
+            assert!(
+                cascadia_api::MarkerDialect::load(std::path::Path::new(m), tpl.template.as_deref())
+                    .is_some(),
+                "{engine:?}: the fixture must give the API a marker dialect"
+            );
+            assert!(!engine_stop_check(engine, m), "{engine:?}: marker model");
+            assert!(
+                engine_stop_check(engine, plain.path().to_str().unwrap()),
+                "{engine:?}: plain template"
+            );
+            assert!(
+                engine_stop_check(engine, none.path().to_str().unwrap()),
+                "{engine:?}: no template"
+            );
+        }
+    }
 
     #[test]
     fn api_max_concurrent_rejects_bad_values() {

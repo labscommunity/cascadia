@@ -955,8 +955,8 @@ impl Engine for OvGenaiCbEngine {
     fn cancel(&mut self, task_id: &TaskId) {
         // Per-request abort — the CB scheduler frees the request's KV blocks
         // on the next iteration; every other in-flight request is untouched.
-        // (The monolithic engine can only drop queued tasks; see
-        // OvGenaiEngine::cancel.)
+        // (The stateful engine drops queued tasks here and ends its running
+        // one through the in-flight handle; see OvGenaiEngine::cancel.)
         if let Some(idx) = self.active.iter().position(|t| &t.task_id == task_id) {
             let t = self.active.swap_remove(idx);
             if let Err(err) = t.handle.cancel() {

@@ -141,8 +141,9 @@ struct Buffers {
     /// worker thread (#122). Applied by the next holder to ACQUIRE the
     /// engine lock — `submit`, `poll_next`, another `cancel`, or a relay
     /// round — before it does anything else with the engine. That is the
-    /// same effective timing a blocking cancel had, since a running step
-    /// can't be interrupted anyway.
+    /// same effective timing a blocking cancel had: a running step can't be
+    /// reached through `Engine::cancel` (an engine that ends a running step
+    /// early does it through its in-flight handle, signalled without the lock).
     ///
     /// Draining only from `poll_next` was not enough: cancelling the one
     /// in-flight request leaves nobody polling, so its engine-side slot and

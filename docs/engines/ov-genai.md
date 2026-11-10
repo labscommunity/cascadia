@@ -165,6 +165,7 @@ concurrent) because it stops splitting the prefill; it does nothing on CPU.
 
 - **Single-stage only.** No pipeline parallelism (`--total 1` enforced).
 - **Streaming**: the default path yields one chunk per task with `is_final=True`; `--cb` streams per-iteration text deltas.
+- **Cancel and `stop` on the default path.** The default (non-`--cb`) path makes the whole answer in one `generate()` call, and that call now ends early on a client disconnect, on `/v1/cancel/{task_id}`, or at a `stop` match. It ends within one token, or within one decode round with `--draft-model` / `--prompt-lookup`, which deliver several tokens at a time. The engine checks at most 4 `stop` sequences of up to 256 bytes each; longer ones are still cut by the API once the answer is complete. For models whose chat template frames output with special tokens, the engine's stop check is off (the API still cuts), and cancel still works. The cost is one callback per generated token, plus a short decode of the newest tokens while a `stop` is set. `--cb` already cancels per request.
 - **Draft / target tokeniser must match.** FastDraft companions are trained per target family; mixing across families won't work.
 - **`--draft-model` and `--prompt-lookup` are mutually exclusive.** Both set `GenerationConfig.num_assistant_tokens`; the validator rejects the combination.
 - **`--cb` is incompatible with `--draft-model` / `--prompt-lookup` and with VLM-layout exports.** The CB scheduler owns batch composition; speculative CB is a follow-up.
