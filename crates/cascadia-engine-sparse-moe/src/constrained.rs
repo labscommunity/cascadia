@@ -8,12 +8,12 @@
 
 use cascadia_engine::{EngineError, EngineResult};
 use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
-use cascadia_metrics::{count_constraint_unenforced, UnenforcedReason};
+use cascadia_metrics::{count_constraint_unenforced, unenforced_warns, UnenforcedReason};
 
 use crate::dist::{MaskCols, MaskLatch, MaskedReply};
 use cascadia_types::GenerationTask;
 use tokenizers::Tokenizer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Builds the factory. Run again only after a [`BuildFailure::transient`]
 /// failure.
@@ -283,11 +283,20 @@ pub(crate) fn drop_best_effort_grammar(
     if !task.drop_best_effort_grammar() {
         return false;
     }
-    warn!(
-        task = %task.task_id,
-        reason = reason.as_str(),
-        "output constraint not enforced; answering unconstrained"
-    );
+    // A per-server reason would warn on every request: once, then debug.
+    if unenforced_warns(reason) {
+        warn!(
+            task = %task.task_id,
+            reason = reason.as_str(),
+            "output constraint not enforced; answering unconstrained"
+        );
+    } else {
+        debug!(
+            task = %task.task_id,
+            reason = reason.as_str(),
+            "output constraint not enforced; answering unconstrained"
+        );
+    }
     count_constraint_unenforced(reason);
     true
 }

@@ -9,6 +9,7 @@
 //! tools render them unchanged.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 
 use cascadia_metrics::UnenforcedReason;
 use cascadia_types::GrammarSpec;
@@ -555,15 +556,44 @@ fn relax_parameters(tool: &mut Tool) -> bool {
     let Some(first) = dropped.first() else {
         return false;
     };
-    let name = tool.function.get("name").and_then(Value::as_str);
-    // One line per tool, however many pairs it held.
-    tracing::warn!(
-        tool = name.unwrap_or(""),
-        pairs = dropped.len(),
-        first = %first.detail,
-        "tool parameters hold bound pairs no value can meet; dropping them"
-    );
+    let name = tool
+        .function
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // One line per tool, however many pairs it held, at warn the first time
+    // the tool is seen: agents resend the same tools every turn.
+    static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+    if first_sighting(&WARNED, name, RELAX_WARN_NAMES) {
+        tracing::warn!(
+            tool = name,
+            pairs = dropped.len(),
+            first = %first.detail,
+            "tool parameters hold bound pairs no value can meet; dropping them"
+        );
+    } else {
+        tracing::debug!(
+            tool = name,
+            pairs = dropped.len(),
+            first = %first.detail,
+            "tool parameters hold bound pairs no value can meet; dropping them"
+        );
+    }
     true
+}
+
+/// How many tool names [`relax_parameters`] remembers for its warn-once
+/// rule; a name past these is logged at debug.
+const RELAX_WARN_NAMES: usize = 256;
+
+/// True the first time `name` is offered to `seen`, while `seen` holds
+/// fewer than `cap` names; false for a name seen before or past the cap.
+fn first_sighting(seen: &Mutex<HashSet<String>>, name: &str, cap: usize) -> bool {
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(name) || seen.len() >= cap {
+        return false;
+    }
+    seen.insert(name.to_owned())
 }
 
 /// The parameters schema of a tool that declares none: any object.
@@ -2108,6 +2138,18 @@ mod tests {
                 arguments: arguments.into(),
             },
         }
+    }
+
+    /// A tool's relax warning goes out the first time its name is seen,
+    /// for at most `cap` names; later ones go to debug.
+    #[test]
+    fn a_relaxed_tool_warns_once_per_name_up_to_a_cap() {
+        let seen = std::sync::Mutex::new(HashSet::new());
+        assert!(first_sighting(&seen, "get_city", 2));
+        assert!(!first_sighting(&seen, "get_city", 2));
+        assert!(first_sighting(&seen, "get_time", 2));
+        assert!(!first_sighting(&seen, "get_date", 2), "past the cap");
+        assert!(!first_sighting(&seen, "get_date", 2));
     }
 
     #[test]

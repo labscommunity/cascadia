@@ -193,6 +193,38 @@ impl UnenforcedReason {
     }
 }
 
+impl UnenforcedReason {
+    /// The reason holds for every request this server gets (its device,
+    /// draft model, runtime version, probe result, tokenizer, or a later
+    /// stage latched as unable to mask), as opposed to one about the
+    /// request's own schema or the moment's load.
+    pub fn is_per_server(self) -> bool {
+        matches!(
+            self,
+            Self::Npu
+                | Self::DraftModel
+                | Self::GenaiVersion
+                | Self::ProbeFailed
+                | Self::NoTokenizer
+                | Self::StageUnsupported
+        )
+    }
+}
+
+/// Whether a constraint dropped for `reason` is logged at warn: always for
+/// a reason about the request, and the first time in this process for a
+/// per-server one ([`UnenforcedReason::is_per_server`]), which would
+/// otherwise warn on every request. Later ones go to debug; the counter
+/// counts every one.
+pub fn unenforced_warns(reason: UnenforcedReason) -> bool {
+    static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !reason.is_per_server() {
+        return true;
+    }
+    let bit = 1u32 << (reason as u32);
+    WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
+}
+
 /// Count one best-effort output constraint dropped for `reason`.
 pub fn count_constraint_unenforced(reason: UnenforcedReason) {
     CONSTRAINT_UNENFORCED_TOTAL
@@ -463,6 +495,18 @@ mod tests {
             text.contains("cascadia_tokens_generated_total{model=\"test-model\"} 3"),
             "got:\n{text}"
         );
+    }
+
+    /// A reason that is the same for every request on this server warns
+    /// once per process; one about the request's own schema every time.
+    #[test]
+    fn a_per_server_reason_warns_once() {
+        assert!(UnenforcedReason::DraftModel.is_per_server());
+        assert!(unenforced_warns(UnenforcedReason::DraftModel));
+        assert!(!unenforced_warns(UnenforcedReason::DraftModel));
+        assert!(!UnenforcedReason::TooComplex.is_per_server());
+        assert!(unenforced_warns(UnenforcedReason::TooComplex));
+        assert!(unenforced_warns(UnenforcedReason::TooComplex));
     }
 
     #[test]
