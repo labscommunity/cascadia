@@ -563,7 +563,7 @@ fn relax_parameters(tool: &mut Tool) -> bool {
         .unwrap_or("");
     // One line per tool, however many pairs it held, at warn the first time
     // the tool is seen: agents resend the same tools every turn.
-    static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+    static WARNED: LazyLock<Mutex<SeenNames>> = LazyLock::new(Default::default);
     if first_sighting(&WARNED, name, RELAX_WARN_NAMES) {
         tracing::warn!(
             tool = ?log_text(name),
@@ -600,14 +600,24 @@ fn log_text(text: &str) -> std::borrow::Cow<'_, str> {
 /// rule; a name past these is logged at debug.
 const RELAX_WARN_NAMES: usize = 256;
 
+/// The names [`first_sighting`] has seen, each by a keyed hash: a client's
+/// name can be any length, and only whether it was seen is needed.
+#[derive(Default)]
+struct SeenNames {
+    hasher: std::hash::RandomState,
+    keys: HashSet<u64>,
+}
+
 /// True the first time `name` is offered to `seen`, while `seen` holds
 /// fewer than `cap` names; false for a name seen before or past the cap.
-fn first_sighting(seen: &Mutex<HashSet<String>>, name: &str, cap: usize) -> bool {
+fn first_sighting(seen: &Mutex<SeenNames>, name: &str, cap: usize) -> bool {
+    use std::hash::BuildHasher;
     let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.contains(name) || seen.len() >= cap {
+    let key = seen.hasher.hash_one(name);
+    if seen.keys.contains(&key) || seen.keys.len() >= cap {
         return false;
     }
-    seen.insert(name.to_owned())
+    seen.keys.insert(key)
 }
 
 /// The parameters schema of a tool that declares none: any object.
@@ -2177,12 +2187,24 @@ mod tests {
     /// for at most `cap` names; later ones go to debug.
     #[test]
     fn a_relaxed_tool_warns_once_per_name_up_to_a_cap() {
-        let seen = std::sync::Mutex::new(HashSet::new());
+        let seen = Mutex::new(SeenNames::default());
         assert!(first_sighting(&seen, "get_city", 2));
         assert!(!first_sighting(&seen, "get_city", 2));
         assert!(first_sighting(&seen, "get_time", 2));
         assert!(!first_sighting(&seen, "get_date", 2), "past the cap");
         assert!(!first_sighting(&seen, "get_date", 2));
+    }
+
+    /// A client's tool name can be any length: the warn-once set keeps a
+    /// fixed-size key per name, never the name.
+    #[test]
+    fn the_warn_once_set_keeps_a_key_not_the_name() {
+        let seen = Mutex::new(SeenNames::default());
+        let long = "n".repeat(1 << 20);
+        assert!(first_sighting(&seen, &long, 2));
+        assert!(!first_sighting(&seen, &long, 2));
+        let keys: &HashSet<u64> = &seen.lock().unwrap().keys;
+        assert_eq!(keys.len(), 1);
     }
 
     #[test]
