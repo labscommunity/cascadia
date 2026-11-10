@@ -103,6 +103,11 @@ impl InflightCancel {
         }
     }
 
+    /// Whether [`shutdown`](Self::shutdown) is in effect.
+    pub fn is_shut(&self) -> bool {
+        self.lock().closed
+    }
+
     /// Undo [`shutdown`](Self::shutdown): the engine is in service again.
     pub fn reopen(&self) {
         self.lock().closed = false;
@@ -158,7 +163,9 @@ mod tests {
         assert!(ic.cancelled());
         ic.end();
         assert_eq!(ic.early_len(), 0, "nothing is parked in the early set");
+        assert!(ic.is_shut());
         ic.reopen();
+        assert!(!ic.is_shut());
         assert!(!ic.begin(&id("c")), "reopened: tasks run again");
         assert!(!ic.cancelled());
         ic.end();

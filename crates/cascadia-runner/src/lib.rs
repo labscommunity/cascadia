@@ -983,6 +983,31 @@ impl ChunkStream {
         Poll::Ready(Some(chunk))
     }
 
+    /// `close()` ended this one-shot task through the engine's in-flight handle, and the engine
+    /// answered with its `Cancelled` final. Ends the stream with the same teardown error as
+    /// [`Self::fail_teardown`] and books teardown, plus the prompt the final reported.
+    fn end_by_shutdown(&mut self, chunk: &Chunk) -> Poll<Option<Chunk>> {
+        self.done = true;
+        self.ended = true;
+        self.slot.buffers.lock().chunks.remove(&self.task_id);
+        warn!(
+            task = %self.task_id,
+            "one-shot generation ended by the server shutdown; failing the request rather \
+             than returning a truncated success"
+        );
+        if !self.metrics_finalized {
+            if chunk.prompt_tokens.is_some() {
+                self.prompt_tokens = chunk.prompt_tokens;
+            }
+            self.record_prompt_tokens();
+        }
+        self.record_teardown_metrics();
+        Poll::Ready(Some(Chunk::error(
+            self.task_id.clone(),
+            "server is shutting down".to_string(),
+        )))
+    }
+
     /// The engine slot emptied under us: the server is shutting down.
     ///
     /// Ends the stream with an ERROR chunk, not a bare `None`. A bare
@@ -1097,7 +1122,7 @@ impl Stream for ChunkStream {
                         {
                             // `close()` ended this task through the in-flight handle: a
                             // shutdown, not a client cancel (see `record_cancelled_metrics`).
-                            return this.fail_teardown();
+                            return this.end_by_shutdown(&chunk);
                         }
                         this.record_chunk_metrics(&chunk);
                         return Poll::Ready(Some(chunk));
@@ -2256,13 +2281,20 @@ mod tests {
                 return Ok(vec![]);
             }
             let id = task.task_id.clone();
+            // A one-shot engine's cancelled final reports the prompt it counted (3 here).
             let cancelled_chunk = |id: &TaskId| {
-                Chunk::final_marker(id.clone(), "").with_finish_reason(FinishReason::Cancelled)
+                Chunk::final_marker(id.clone(), "")
+                    .with_finish_reason(FinishReason::Cancelled)
+                    .with_prompt_tokens(3)
             };
             if task.prompt == "slow-begin" {
-                // Popped, then a pause before `begin`: the pop->begin window, held open.
+                // Popped, then held before `begin` until close() has shut the handle (bounded):
+                // the pop->begin window, made deterministic.
                 self.log.lock().push((id.clone(), "popped", Instant::now()));
-                std::thread::sleep(Duration::from_millis(150));
+                let start = Instant::now();
+                while !self.ic.is_shut() && start.elapsed() < Duration::from_secs(2) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
             if self.ic.begin(&id) {
                 self.ic.end();
@@ -2439,7 +2471,9 @@ mod tests {
             .await
             .unwrap();
         // Queued behind it, and polled: it must not win the engine after the cancel and run a
-        // whole generation while close() waits for the lock.
+        // whole generation while close() waits for the lock. Best-effort: whether it reaches the
+        // lock before close() is a race; `close_between_pop_and_begin_runs_no_generation` covers
+        // that window deterministically.
         let b = rig
             .runner
             .generate_async(GenerationTask::new("spin-queued", "spin"))
@@ -2465,6 +2499,9 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        let prompt_before = cascadia_metrics::TOKENS_PROMPT_TOTAL
+            .with_label_values(&["runner-inflight-close-model"])
+            .get();
         let runner = rig.runner.clone();
         let closed_at = Instant::now();
         tokio::task::spawn_blocking(move || runner.close())
@@ -2494,6 +2531,16 @@ mod tests {
         assert!(
             logged_at(&rig.log, "spin-queued", "start").is_none(),
             "the queued task ran a generation during the shutdown"
+        );
+        // The cancelled final's prompt is booked (teardown, not a client cancel), at least for
+        // the running task.
+        let prompt = cascadia_metrics::TOKENS_PROMPT_TOTAL
+            .with_label_values(&["runner-inflight-close-model"])
+            .get();
+        assert!(
+            prompt - prompt_before >= 3,
+            "prompt not booked: {}",
+            prompt - prompt_before
         );
     }
 
