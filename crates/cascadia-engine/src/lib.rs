@@ -18,6 +18,9 @@ use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
 use futures::Stream;
 use thiserror::Error;
 
+pub mod inflight_cancel;
+pub use inflight_cancel::{InflightCancel, MAX_EARLY_CANCELS};
+
 #[cfg(feature = "kv_coord")]
 pub mod kv_handoff;
 #[cfg(feature = "kv_coord")]
@@ -377,6 +380,17 @@ pub trait Engine: Send {
     /// applies one itself. Default `None`. Grabbed once at engine load, like [`Self::kv_holder`].
     #[cfg(feature = "kv_coord")]
     fn kv_handoff(&self) -> Option<std::sync::Arc<dyn KvWarmHandoff>> {
+        None
+    }
+
+    /// M18: a lock-free cancel handle for the task this engine is running, if it can end one early.
+    /// Default `None`. Grabbed once at engine load (cheap `Arc` clone), before the engine is
+    /// installed, like [`Self::kv_holder`]: a cancel can then reach an engine parked in `step()`
+    /// holding the engine mutex, which [`Self::cancel`] never can. The runner signals it on every
+    /// cancel and client disconnect; the engine brackets each task with
+    /// [`InflightCancel::begin`] / [`InflightCancel::end`] and polls [`InflightCancel::cancelled`]
+    /// in between. `&self` because the handle is shared, not engine state.
+    fn inflight_cancel(&self) -> Option<std::sync::Arc<InflightCancel>> {
         None
     }
 

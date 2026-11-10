@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use cascadia_engine::{Builder, Engine, EngineError};
+use cascadia_engine::{Builder, Engine, EngineError, InflightCancel};
 use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
 use futures::Stream;
 use parking_lot::Mutex;
@@ -179,6 +179,11 @@ struct EngineSlot {
     /// failed `try_lock` rather than block a tokio worker here (#122).
     engine: Mutex<Option<Box<dyn Engine>>>,
     buffers: Mutex<Buffers>,
+    /// The engine's [`InflightCancel`] handle (M18), if it hands one out. Taken from the engine
+    /// before the engine is installed, and kept outside the engine lock so a cancel can reach an
+    /// engine parked in `step()` with that lock held. Its own short lock is a leaf: nothing else is
+    /// taken while it is held.
+    inflight: Mutex<Option<Arc<InflightCancel>>>,
 }
 
 /// An engine lock that cannot be released without paying what the release
@@ -218,8 +223,12 @@ impl EngineGuard<'_> {
     /// Fill the slot (`start`) or empty it (`close`). An emptied slot makes
     /// every later lock holder fail cleanly with [`EngineError::NotLoaded`];
     /// the outgoing engine is dropped under the lock.
+    ///
+    /// The engine's [`InflightCancel`] handle is stored first, so a cancel that arrives the moment
+    /// the engine is in place already finds it.
     fn set(&mut self, engine: Option<Box<dyn Engine>>) {
         if let Some(g) = self.guard.as_mut() {
+            *self.slot.inflight.lock() = engine.as_ref().and_then(|e| e.inflight_cancel());
             **g = engine;
         }
     }
@@ -256,8 +265,18 @@ impl Drop for EngineGuard<'_> {
 impl EngineSlot {
     fn new(engine: Option<Box<dyn Engine>>) -> Self {
         Self {
+            inflight: Mutex::new(engine.as_ref().and_then(|e| e.inflight_cancel())),
             engine: Mutex::new(engine),
             buffers: Mutex::new(Buffers::default()),
+        }
+    }
+
+    /// Signal the engine's [`InflightCancel`] handle, if it has one. Never touches the engine lock.
+    fn signal_inflight(&self, task_id: &TaskId) {
+        // Clone out, then signal: the handle's own lock is never taken under this one.
+        let handle = self.inflight.lock().clone();
+        if let Some(handle) = handle {
+            handle.cancel(task_id);
         }
     }
 
@@ -305,10 +324,17 @@ impl EngineSlot {
     /// the same constraint: both run on whatever (often tokio worker)
     /// thread calls them, and a hard `lock()` during another stream's step
     /// counts toward the worker starvation that wedges the pipeline (#122).
-    /// Deferring costs nothing — a running step can't be interrupted
-    /// anyway, so the next holder applies it at the same effective time a
-    /// blocking cancel would have.
+    /// Deferring costs nothing: the engine's [`InflightCancel`] handle is
+    /// signalled first, in both arms, so an engine that polls it ends a
+    /// running step early, and the next holder still applies the engine
+    /// cancel at the same effective time a blocking cancel would have.
     fn cancel_or_defer(&self, task_id: &TaskId) {
+        self.signal_inflight(task_id);
+        self.engine_cancel_or_defer(task_id);
+    }
+
+    /// [`cancel_or_defer`](Self::cancel_or_defer) without the handle signal.
+    fn engine_cancel_or_defer(&self, task_id: &TaskId) {
         match self.try_lock_applying_cancels() {
             Some(mut guard) => {
                 if let Some(engine) = guard.engine() {
@@ -680,6 +706,19 @@ impl Runner {
                 std::thread::yield_now();
             }
         }
+    }
+
+    /// Ask the engine to end `task_id` now, through its [`InflightCancel`]
+    /// handle, and do nothing else: no tombstone, no metrics, no engine
+    /// lock. A no-op for engines that hand out no handle.
+    ///
+    /// For a caller that can't use [`Runner::cancel`] or a stream drop: the
+    /// API's forwarder owns the task's [`ChunkStream`] and is itself blocked
+    /// inside that stream's `step()`, so the stream can't be dropped until
+    /// the step returns. The step then ends and the forwarder's stream
+    /// winds down and books the outcome as it always does.
+    pub fn interrupt(&self, task_id: &TaskId) {
+        self.slot.signal_inflight(task_id);
     }
 
     pub fn close(&self) {
@@ -1265,7 +1304,16 @@ impl Drop for ChunkStream {
         // engine-lock holder applies it before stepping. Same helper
         // `Runner::cancel` uses, and the guard inside it handles the
         // release-then-wake ordering for both.
-        self.slot.cancel_or_defer(&self.task_id);
+        //
+        // A done stream (final chunk seen, or already ended on a cancel,
+        // failure or teardown) skips the in-flight handle signal: its task
+        // isn't running, so the signal would only park its id in the
+        // handle's bounded early-cancel set (M18).
+        if self.done {
+            self.slot.engine_cancel_or_defer(&self.task_id);
+        } else {
+            self.slot.cancel_or_defer(&self.task_id);
+        }
         let mut bufs = self.slot.buffers.lock();
         bufs.chunks.remove(&self.task_id);
         // Tombstone rather than remove: an engine that defers its final
@@ -2127,6 +2175,277 @@ mod tests {
 
         let _ = hold_tx.send(());
         assert!(poll.await.unwrap(), "the gated poll should have produced");
+    }
+
+    /// One task per `step()`, run to the end inside that step the way stateful ov-genai and
+    /// single-stage sparse-moe run theirs. A task whose prompt is `spin` keeps going until its
+    /// [`InflightCancel`] says stop (2 s safety cap, so a broken test fails instead of hanging); any
+    /// other prompt finishes at once with `done`. Logs each step's start and end per task.
+    /// `(task, "start" | "end", when)` per step, shared with the test.
+    type StepLog = Arc<Mutex<Vec<(TaskId, &'static str, Instant)>>>;
+
+    struct PollingCancelEngine {
+        ic: Arc<cascadia_engine::InflightCancel>,
+        queue: VecDeque<GenerationTask>,
+        log: StepLog,
+        cancels: Arc<Mutex<Vec<TaskId>>>,
+    }
+
+    impl Engine for PollingCancelEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            self.queue.push_back(task);
+            Ok(())
+        }
+        fn cancel(&mut self, task_id: &TaskId) {
+            self.cancels.lock().push(task_id.clone());
+            self.queue.retain(|t| &t.task_id != task_id);
+        }
+        fn inflight_cancel(&self) -> Option<Arc<cascadia_engine::InflightCancel>> {
+            Some(self.ic.clone())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            let Some(task) = self.queue.pop_front() else {
+                return Ok(vec![]);
+            };
+            let id = task.task_id.clone();
+            let cancelled_chunk = |id: &TaskId| {
+                Chunk::final_marker(id.clone(), "").with_finish_reason(FinishReason::Cancelled)
+            };
+            if self.ic.begin(&id) {
+                self.ic.end();
+                return Ok(vec![(id.clone(), cancelled_chunk(&id))]);
+            }
+            self.log.lock().push((id.clone(), "start", Instant::now()));
+            let mut cancelled = false;
+            if task.prompt == "spin" {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(2) {
+                    if self.ic.cancelled() {
+                        cancelled = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            self.ic.end();
+            self.log.lock().push((id.clone(), "end", Instant::now()));
+            let chunk = if cancelled {
+                cancelled_chunk(&id)
+            } else if task.prompt == "spin" {
+                Chunk::final_marker(id.clone(), "timeout")
+            } else {
+                Chunk::final_marker(id.clone(), "done")
+            };
+            Ok(vec![(id, chunk)])
+        }
+    }
+
+    struct PollingCancelBuilder {
+        ic: Arc<cascadia_engine::InflightCancel>,
+        log: StepLog,
+        cancels: Arc<Mutex<Vec<TaskId>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for PollingCancelBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(PollingCancelEngine {
+                ic: self.ic,
+                queue: VecDeque::new(),
+                log: self.log,
+                cancels: self.cancels,
+            }))
+        }
+    }
+
+    struct PollingCancelRig {
+        runner: Arc<Runner>,
+        ic: Arc<cascadia_engine::InflightCancel>,
+        log: StepLog,
+        cancels: Arc<Mutex<Vec<TaskId>>>,
+    }
+
+    async fn polling_cancel_rig(model: &str) -> PollingCancelRig {
+        let ic = Arc::new(cascadia_engine::InflightCancel::new());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        let runner = Arc::new(Runner::new(Box::new(PollingCancelBuilder {
+            ic: ic.clone(),
+            log: log.clone(),
+            cancels: cancels.clone(),
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(model, "CPU"),
+            )
+            .await
+            .unwrap();
+        PollingCancelRig {
+            runner,
+            ic,
+            log,
+            cancels,
+        }
+    }
+
+    fn logged_at(
+        log: &Mutex<Vec<(TaskId, &'static str, Instant)>>,
+        task: &str,
+        what: &str,
+    ) -> Option<Instant> {
+        log.lock()
+            .iter()
+            .find(|(t, w, _)| t == task && *w == what)
+            .map(|(_, _, at)| *at)
+    }
+
+    /// M18: `Runner::cancel` reaches a task running inside one long `step()` through the engine's
+    /// `InflightCancel` handle. The deferred engine cancel alone waits for the step to return,
+    /// which for a one-shot engine is the whole generation. The step ends within 50 ms and the
+    /// next queued task's step starts right after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancel_ends_a_running_step_through_the_inflight_handle() {
+        let rig = polling_cancel_rig("runner-inflight-cancel-model").await;
+        let a = rig
+            .runner
+            .generate_async(GenerationTask::new("spin-a", "spin"))
+            .await
+            .unwrap();
+        let b = rig
+            .runner
+            .generate_async(GenerationTask::new("next-b", "quick"))
+            .await
+            .unwrap();
+        let a_task = tokio::spawn(async move {
+            let mut a = a;
+            while a.next().await.is_some() {}
+        });
+        let start = Instant::now();
+        while logged_at(&rig.log, "spin-a", "start").is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "A's step never started"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let b_task = tokio::spawn(async move {
+            let mut b = b;
+            let mut last = None;
+            while let Some(c) = b.next().await {
+                last = Some(c);
+            }
+            last
+        });
+
+        let cancelled_at = Instant::now();
+        rig.runner.cancel(&"spin-a".to_string());
+        tokio::time::timeout(Duration::from_secs(5), a_task)
+            .await
+            .expect("A's stream never ended")
+            .unwrap();
+        let b_last = tokio::time::timeout(Duration::from_secs(5), b_task)
+            .await
+            .expect("B's stream never ended")
+            .unwrap()
+            .expect("B's stream yielded nothing");
+
+        let a_end = logged_at(&rig.log, "spin-a", "end").expect("A's step never ended");
+        let b_start = logged_at(&rig.log, "next-b", "start").expect("B's step never started");
+        assert!(
+            a_end.duration_since(cancelled_at) < Duration::from_millis(50),
+            "A's step ran {:?} past its cancel",
+            a_end.duration_since(cancelled_at)
+        );
+        assert!(
+            b_start.duration_since(a_end) < Duration::from_millis(50),
+            "B's step started {:?} after A's ended",
+            b_start.duration_since(a_end)
+        );
+        assert!(b_last.is_final && b_last.error.is_none(), "{b_last:?}");
+        assert_eq!(b_last.text, "done");
+    }
+
+    /// M18: `Runner::interrupt` only signals the handle. It books no metric, writes no tombstone,
+    /// defers no engine cancel and never touches the engine lock: the API calls it from a stream
+    /// owner's drop while that owner is itself blocked in `step()` holding the lock.
+    #[tokio::test]
+    async fn interrupt_only_signals_the_inflight_handle() {
+        const MODEL: &str = "runner-inflight-interrupt-model";
+        let rig = polling_cancel_rig(MODEL).await;
+        let id = "intr-1".to_string();
+        let cancelled_before = cascadia_metrics::TASKS_CANCELLED_TOTAL
+            .with_label_values(&[MODEL])
+            .get();
+        {
+            // Hold the engine lock across the call: parking_lot isn't reentrant, so an interrupt
+            // that took it would hang here, and one that try-locked would defer a cancel.
+            let _held = rig.runner.slot.lock();
+            rig.runner.interrupt(&id);
+        }
+        let bufs = rig.runner.slot.buffers.lock();
+        assert!(!bufs.cancelled.contains(&id), "interrupt wrote a tombstone");
+        assert!(
+            bufs.deferred_cancels.is_empty(),
+            "interrupt deferred an engine cancel"
+        );
+        drop(bufs);
+        assert!(
+            rig.cancels.lock().is_empty(),
+            "interrupt reached Engine::cancel"
+        );
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            cancelled_before,
+            "interrupt booked a cancel"
+        );
+        assert!(rig.ic.begin(&id), "interrupt never signalled the handle");
+        rig.ic.end();
+    }
+
+    /// M18: a stream that saw its final chunk doesn't signal the handle on drop, so finished ids
+    /// don't fill its bounded early-cancel set. A stream dropped before its end still does.
+    #[tokio::test]
+    async fn a_done_streams_drop_does_not_signal_the_inflight_handle() {
+        let rig = polling_cancel_rig("runner-inflight-done-drop-model").await;
+        let mut done = rig
+            .runner
+            .generate(GenerationTask::new("done-1", "quick"))
+            .unwrap();
+        let mut last = None;
+        while let Some(c) = done.next().await {
+            last = Some(c);
+        }
+        assert!(last.is_some_and(|c| c.is_final));
+        drop(done);
+        assert!(
+            !rig.ic.begin(&"done-1".to_string()),
+            "a finished stream's drop signalled the handle"
+        );
+        rig.ic.end();
+
+        let open = rig
+            .runner
+            .generate(GenerationTask::new("open-2", "quick"))
+            .unwrap();
+        drop(open);
+        assert!(
+            rig.ic.begin(&"open-2".to_string()),
+            "an unfinished stream's drop must signal the handle"
+        );
+        rig.ic.end();
     }
 
     /// The deferred-cancel queue is a bounded to-do list. A runner whose
