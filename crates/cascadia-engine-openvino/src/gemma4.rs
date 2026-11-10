@@ -1638,7 +1638,8 @@ fn probe_wait_budget(probe_timeout: Duration, stages_below: u32) -> Duration {
 
 /// A probe's wait: bounded, never closes the socket. Its answer is
 /// [`StageReply::ProbeOk`]; a middle's not-acknowledged answer means a stage
-/// below can't mask. Every other reply is a late one to an earlier step
+/// below can't mask; an acknowledged NACK means a stage that masks failed it
+/// (a lost link below a middle). Every other reply is a late one to an earlier step
 /// (gemma4 replies carry no sequence number): skipped, the wait goes on. The
 /// bool says a skipped reply was acknowledged (a late mask miss proves
 /// nothing).
@@ -1666,6 +1667,10 @@ async fn wait_probe_reply(g: &mut ActivationClient, budget: Duration) -> (Masked
         };
         match decode_stage_reply(&tensor) {
             Ok(StageReply::ProbeOk) => return (MaskedWait::ProbeOk, late_ack),
+            // A stage that masks failed the probe (a middle lost its link
+            // below): a failed step, not an older stage. The late replies
+            // before the probe were drained, so this is its answer.
+            Ok(StageReply::Nack) => return (MaskedWait::Nack, late_ack),
             Ok(StageReply::NotAcked) => {
                 return (
                     MaskedWait::Unacked(
@@ -1681,7 +1686,7 @@ async fn wait_probe_reply(g: &mut ActivationClient, budget: Duration) -> (Masked
                     ?reply,
                     "discarding a late reply in a mask-support probe's wait"
                 );
-                late_ack |= matches!(reply, StageReply::Token(_) | StageReply::Nack);
+                late_ack |= matches!(reply, StageReply::Token(_));
             }
             Err(e) => return (MaskedWait::Failed(e), late_ack),
         }
@@ -1723,6 +1728,14 @@ async fn middle_probe_step(
     let (wait, late_ack) = probe_round(down, frames, budget).await;
     let reply = match wait {
         MaskedWait::ProbeOk => StageReply::ProbeOk,
+        // This stage's link below failed, or a stage below that masks failed
+        // the probe: an acknowledged NACK, so the head fails the task without
+        // taking it for an older stage.
+        MaskedWait::Failed(e) => {
+            warn!(error = %e, "gemma4: the link below failed a mask-support probe");
+            StageReply::Nack
+        }
+        MaskedWait::Nack => StageReply::Nack,
         other => {
             warn!(
                 ?other,
@@ -1756,6 +1769,18 @@ fn head_probe_verdict(
             ))
         }
         MaskedWait::Failed(e) => Err((e, None)),
+        // A stage that masks failed the probe: the chain masks; the task
+        // fails as a lost step, nothing is latched.
+        MaskedWait::Nack => {
+            latch.on_evidence();
+            Err((
+                EngineError::Backend(
+                    "a later pipeline stage failed the mask-support probe; retry the request"
+                        .into(),
+                ),
+                Some(GrammarFailure::Nack),
+            ))
+        }
         other => Err((
             EngineError::Backend(format!(
                 "unexpected answer to a mask-support probe: {other:?}"
@@ -2876,7 +2901,7 @@ impl Gemma4Engine {
                 let mut guard = downstream.lock().await;
                 middle_probe_step(&mut guard, probe_frames(&tags), budget).await
             }),
-            None => (StageReply::NotAcked, false),
+            None => (StageReply::Nack, false),
         };
         self.send_masked_reply_upstream(reply, late_ack)
     }
@@ -6368,16 +6393,16 @@ mod tests {
         }
     }
 
-    /// In a probe's wait every reply but its own answer is a late one:
-    /// skipped (acknowledged ones counted as evidence) while the wait goes
-    /// on. A plain wait and the drain skip a late probe answer the same way.
+    /// In a probe's wait every reply but its own answer (or an acknowledged
+    /// NACK) is a late one: skipped (acknowledged ones counted as evidence)
+    /// while the wait goes on. A plain wait and the drain skip a late probe
+    /// answer the same way.
     #[tokio::test]
     async fn the_probe_wait_skips_late_replies() {
         let (mut up, mut head) = link().await;
         for r in [
             encode_token_reply(4),
             encode_masked_reply(StageReply::Token(5)),
-            encode_masked_reply(StageReply::Nack),
             encode_masked_reply(StageReply::MaskMiss),
             encode_masked_reply(StageReply::ProbeOk),
         ] {
@@ -6386,6 +6411,12 @@ mod tests {
         let (wait, late_ack) = wait_probe_reply(&mut head, TEST_PROBE).await;
         assert!(matches!(wait, MaskedWait::ProbeOk), "{wait:?}");
         assert!(late_ack);
+        // An acknowledged NACK answers the probe: a stage that masks failed it.
+        up.send(&encode_masked_reply(StageReply::Nack))
+            .await
+            .unwrap();
+        let (wait, _) = wait_probe_reply(&mut head, TEST_PROBE).await;
+        assert!(matches!(wait, MaskedWait::Nack), "{wait:?}");
         // Only a mask miss before it: no evidence, and the wait runs out.
         up.send(&encode_masked_reply(StageReply::MaskMiss))
             .await
@@ -6449,5 +6480,42 @@ mod tests {
         let mut latch = MaskLatch::default();
         let _ = head_masked_token(MaskedWait::Nack, &mut latch, t0);
         assert!(!needs_mask_probe(&latch, true, true));
+    }
+
+    /// A middle whose own downstream is gone can't forward the probe: it
+    /// answers the acknowledged NACK (a stage that masks failed the step),
+    /// and the head fails the task at once without latching or naming an
+    /// upgrade.
+    #[tokio::test]
+    async fn a_middle_that_loses_its_downstream_fails_the_probe_without_a_latch() {
+        for i in 0..20 {
+            let (mut mid_up, mut head) = link().await;
+            let (mut tail_up, mut mid_down) = link().await;
+            tail_up.close().await;
+            drop(tail_up);
+            let mut latch = MaskLatch::default();
+            let t0 = std::time::Instant::now();
+            let ((wait, _), _) = tokio::join!(
+                probe_round(&mut head, probe_frames(&[10, 11]), MASK_PROBE_TIMEOUT),
+                new_middle_probe(
+                    &mut mid_up,
+                    &mut mid_down,
+                    probe_wait_budget(MASK_PROBE_TIMEOUT, 1)
+                )
+            );
+            assert!(
+                t0.elapsed() < MASK_PROBE_TIMEOUT / 4,
+                "{i}: {:?}",
+                t0.elapsed()
+            );
+            let (e, kind) =
+                head_probe_verdict(wait, &mut latch, std::time::Instant::now()).unwrap_err();
+            assert!(!e.to_string().contains(UPGRADE_EVERY_STAGE), "{i}: {e}");
+            assert_eq!(kind, Some(GrammarFailure::Nack), "{i}");
+            assert!(
+                latch.refusal(std::time::Instant::now()).is_ok(),
+                "{i}: no latch"
+            );
+        }
     }
 }
