@@ -570,11 +570,8 @@ Every engine enforces `json_object` and `json_schema`:
 The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
 `sparse-moe`):
 
-- Emit `json_schema` output with Python `json.dumps` separators: `": "`
-  after each key and `", "` between items, and no other whitespace between
-  tokens. `json_object` (here and on `ov-genai`) allows short runs of
-  whitespace or newlines (up to 20 characters) between tokens, so a model
-  that pretty-prints its JSON can.
+- Emit JSON with Python `json.dumps` separators: `": "` after each key and
+  `", "` between items, and no other whitespace between tokens.
 - Treat `oneOf` as `anyOf` (pydantic's discriminated unions compile).
 - Accept the schema keywords llguidance does not enforce (`not`,
   `if`/`then`/`else`, `dependentRequired`, `dependentSchemas`,
