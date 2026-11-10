@@ -1,0 +1,435 @@
+[
+  [
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 11,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "CALL",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\"}"
+                }
+              }
+            ]
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "tool_calls": null
+          },
+          "finish_reason": "tool_calls"
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 12,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "[{\"function\": {\"name\": \"get_weather\"}, \"type\": \"function\"}, {\"function\": {\"name\": \"get_time\"}, \"type\": \"function\"}]user: hello there ",
+            "tool_calls": null
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "choices": [],
+      "usage": {
+        "prompt_tokens": 0,
+        "completion_tokens": 12,
+        "total_tokens": 12
+      }
+    }
+  ],
+  [
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "[{\"function\": ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "{\"name\": ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "\"get_weather\"}, ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "\"type\": ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "\"function\"}, ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "{\"function\": ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "{\"name\": ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "\"get_time\"}, ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "\"type\": ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "\"function\"}]user: ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call> ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 0,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": null
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  ],
+  [
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 12,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "CALL",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\"}"
+                }
+              },
+              {
+                "index": 1,
+                "id": "CALL",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": "{\"tz\":\"CET\"}"
+                }
+              }
+            ]
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "tool_calls": null
+          },
+          "finish_reason": "tool_calls"
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "choices": [],
+      "usage": {
+        "prompt_tokens": 0,
+        "completion_tokens": 12,
+        "total_tokens": 12
+      }
+    }
+  ],
+  [
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "user: ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 1,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call> ",
+            "tool_calls": null
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "ID",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "mock-model",
+      "n_tokens": 0,
+      "completion_tokens": null,
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": null
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  ]
+]

@@ -1959,7 +1959,7 @@ fn build_choice(
     union_sent: bool,
 ) -> (ChatChoiceMessage, Option<&'static str>) {
     if policy.callable() {
-        if let Some(calls) = resolve_calls(
+        if let Some((calls, finish_reason)) = answer_calls(
             tool_call_scan_text(&buf, enable_thinking),
             policy,
             grammar_sent,
@@ -1969,12 +1969,9 @@ fn build_choice(
                 ChatChoiceMessage {
                     role: "assistant",
                     content: None,
-                    tool_calls: Some(output_calls(calls, policy)),
+                    tool_calls: Some(calls),
                 },
-                Some(match policy.mode {
-                    ToolMode::Named(_) => "stop",
-                    _ => "tool_calls",
-                }),
+                Some(finish_reason),
             );
         }
     }
@@ -1986,6 +1983,25 @@ fn build_choice(
         },
         None,
     )
+}
+
+/// The tool calls in an answer's scan text (see [`resolve_calls`]) in their
+/// output shape, and the `finish_reason` they report: `"stop"` for the call
+/// a named `tool_choice` forced (as OpenAI reports it), else
+/// `"tool_calls"`. `None` when no call is left: the answer is content.
+/// Streamed and non-streamed answers are decided here alike.
+fn answer_calls(
+    scan_text: &str,
+    policy: &ToolPolicy,
+    grammar_sent: bool,
+    union_sent: bool,
+) -> Option<(Vec<OutputToolCall>, &'static str)> {
+    let calls = resolve_calls(scan_text, policy, grammar_sent, union_sent)?;
+    let finish_reason = match policy.mode {
+        ToolMode::Named(_) => "stop",
+        _ => "tool_calls",
+    };
+    Some((output_calls(calls, policy), finish_reason))
 }
 
 /// Closing delimiter every hybrid-reasoning template this stack serves uses
@@ -2061,17 +2077,15 @@ struct ToolStreamSplitter {
     lead: usize,
 }
 
-/// The decision at the end of a tools-active stream.
-enum ToolStreamEnd<'a> {
+/// The decision at the end of a tools-active stream; `T` is what the
+/// caller's reader made of the calls.
+enum ToolStreamEnd<'a, T> {
     /// No call: the text not yet released, so the content deltas add up to
     /// the whole reply.
     Content(&'a str),
     /// Calls parsed: `content` is the text still releasable before the hold
     /// point; everything from the hold point on is dropped.
-    ToolCalls {
-        content: &'a str,
-        calls: Vec<ToolCall>,
-    },
+    ToolCalls { content: &'a str, calls: T },
 }
 
 impl ToolStreamSplitter {
@@ -2094,11 +2108,16 @@ impl ToolStreamSplitter {
         &self.buf[start..self.emitted]
     }
 
-    /// Append the final `text` and decide: calls, or the rest as content.
-    fn finish(&mut self, text: &str) -> ToolStreamEnd<'_> {
+    /// Append the final `text` and decide: the calls `read` finds in the
+    /// scan text (see `tool_call_scan_text`), or the rest as content.
+    fn finish<T>(
+        &mut self,
+        text: &str,
+        read: impl FnOnce(&str) -> Option<T>,
+    ) -> ToolStreamEnd<'_, T> {
         self.push(text);
         let start = self.emitted;
-        let calls = parse_tool_calls(tool_call_scan_text(&self.buf, self.enable_thinking));
+        let calls = read(tool_call_scan_text(&self.buf, self.enable_thinking));
         let end = if calls.is_some() {
             self.hold_point().max(start)
         } else {
@@ -2717,10 +2736,8 @@ async fn chat_completions(
     // can't be built or applied the turn runs unconstrained and the answer
     // is read as the model wrote it. Engines that apply their own chat
     // template get it too: their server's own tool_choice handling doesn't
-    // force a call. Streamed answers are not read this way yet, so a
-    // streamed request is constrained as before.
-    let tool_constrained =
-        !req.stream && state.structured_output && (policy.forced() || (json && tools_callable));
+    // force a call. Streamed and non-streamed answers are read alike.
+    let tool_constrained = state.structured_output && (policy.forced() || (json && tools_callable));
     let grammar = if tool_constrained {
         let format = json
             .then(|| grammar_for(&response_format))
@@ -2752,8 +2769,11 @@ async fn chat_completions(
     // constrained leaves thinking as requested (the model may reason before
     // a call), except where the engine refuses thinking with tools when it
     // renders the template itself (ov-genai: `defer_template_on_thinking`).
-    let thinking_off =
-        tool_grammar_sent || (structured && (!tools_callable || state.defer_template_on_thinking));
+    // There a forced choice turns thinking off even without a grammar: the
+    // turn must answer with a call, and the engine would refuse it.
+    let thinking_off = tool_grammar_sent
+        || (policy.forced() && state.defer_template_on_thinking)
+        || (structured && (!tools_callable || state.defer_template_on_thinking));
     let enable_thinking = if thinking_off {
         false
     } else {
@@ -2957,8 +2977,6 @@ async fn chat_completions(
             .as_ref()
             .map(|o| o.include_usage)
             .unwrap_or(false);
-        let tool_choice = req.tool_choice.clone();
-        let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
         return stream_completion(
             state,
             req.model,
@@ -2966,8 +2984,11 @@ async fn chat_completions(
             permit,
             inflight,
             include_usage,
-            tool_choice,
-            tools_present,
+            ToolReading {
+                policy,
+                grammar_sent: tool_grammar_sent,
+                union_sent,
+            },
         )
         .await
         .into_response();
@@ -3396,9 +3417,16 @@ async fn stream_text_completion(
         .into_response()
 }
 
+/// How a chat answer's tool calls are read: the request's tool policy and
+/// which tool grammar was sent (see [`resolve_calls`]).
+struct ToolReading {
+    policy: ToolPolicy,
+    grammar_sent: bool,
+    union_sent: bool,
+}
+
 // Streaming carries the usage handles (inflight/include_usage) and the tool
-// gate (tool_choice/tools_present) alongside the task plumbing.
-#[allow(clippy::too_many_arguments)]
+// reading alongside the task plumbing.
 async fn stream_completion(
     state: AppState,
     model: String,
@@ -3406,8 +3434,7 @@ async fn stream_completion(
     permit: tokio::sync::OwnedSemaphorePermit,
     inflight: InFlightGuard,
     include_usage: bool,
-    tool_choice: Option<serde_json::Value>,
-    tools_present: bool,
+    tools: ToolReading,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     // Captured before `task` moves into `generate` below — arms the tool-call
@@ -3422,12 +3449,10 @@ async fn stream_completion(
             return engine_error_response(err);
         }
     };
-    // Tools present and not disabled: content streams as the splitter
-    // releases it; whether the reply is a tool call is decided at the final
-    // chunk, on the same text and parse as the non-streaming path.
-    let tools_active =
-        tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
-    if tools_active {
+    // Callable tools: content streams as the splitter releases it; whether
+    // the reply is a tool call is decided at the final chunk, on the same
+    // text and reading as the non-streaming path.
+    if tools.policy.callable() {
         let tool_stream = ToolStream {
             chunks: StreamWithPermit {
                 inner: chunk_stream,
@@ -3445,6 +3470,7 @@ async fn stream_completion(
             task_id,
             model,
             include_usage,
+            tools,
         };
         let body = stream::unfold(tool_stream, |mut s| async move {
             let frame = s.next_frame().await?;
@@ -3669,6 +3695,7 @@ struct ToolStream {
     task_id: String,
     model: String,
     include_usage: bool,
+    tools: ToolReading,
 }
 
 enum ToolStreamPhase {
@@ -3760,7 +3787,9 @@ impl ToolStream {
 
     /// Close the choice: the rest as content with the engine's
     /// finish_reason, or the still-releasable content, one indexed
-    /// tool_calls delta, and a `tool_calls` finish.
+    /// tool_calls delta, and the calls' finish (`tool_calls`, or `stop` for
+    /// a named choice). Calls are numbered from 0 after filtering; a custom
+    /// call is `{index, id, type: "custom", custom: {name, input}}`.
     fn close_choice(
         &mut self,
         text: &str,
@@ -3769,7 +3798,10 @@ impl ToolStream {
     ) -> Bytes {
         let n_tokens = std::mem::take(&mut self.held_tokens);
         let (task_id, model) = (&self.task_id, &self.model);
-        let out = match self.splitter.finish(text) {
+        let tools = &self.tools;
+        let read =
+            |scan: &str| answer_calls(scan, &tools.policy, tools.grammar_sent, tools.union_sent);
+        let out = match self.splitter.finish(text, read) {
             ToolStreamEnd::Content(content) => content_frame(
                 task_id,
                 model,
@@ -3778,7 +3810,10 @@ impl ToolStream {
                 completion_tokens,
                 Some(finish_reason),
             ),
-            ToolStreamEnd::ToolCalls { content, calls } => {
+            ToolStreamEnd::ToolCalls {
+                content,
+                calls: (calls, call_finish),
+            } => {
                 // The held tokens are the call's: they ride the tool_calls
                 // delta, so each model token is counted in exactly one frame.
                 let mut out = String::new();
@@ -3788,11 +3823,15 @@ impl ToolStream {
                 let tool_calls: Vec<serde_json::Value> = calls
                     .into_iter()
                     .enumerate()
-                    .map(|(i, c)| {
-                        serde_json::json!({
+                    .map(|(i, c)| match c {
+                        OutputToolCall::Function(c) => serde_json::json!({
                             "index": i, "id": c.id, "type": c.r#type,
                             "function": { "name": c.function.name, "arguments": c.function.arguments },
-                        })
+                        }),
+                        OutputToolCall::Custom { id, r#type, custom } => serde_json::json!({
+                            "index": i, "id": id, "type": r#type,
+                            "custom": { "name": custom.name, "input": custom.input },
+                        }),
                     })
                     .collect();
                 let delta = serde_json::json!({
@@ -3806,7 +3845,7 @@ impl ToolStream {
                 let finish = serde_json::json!({
                     "id": task_id, "object": "chat.completion.chunk",
                     "created": now_unix(), "model": model,
-                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": call_finish }],
                 });
                 out.push_str(&format!("data: {delta}\n\ndata: {finish}\n\n"));
                 out
@@ -7484,7 +7523,7 @@ level={{ effort_map[eff] }}";
         let mut s = ToolStreamSplitter::new(thinking);
         let (last, body) = pieces.split_last().unwrap();
         let mut out: Vec<String> = body.iter().map(|p| s.feed(p).to_owned()).collect();
-        match s.finish(last) {
+        match s.finish(last, parse_tool_calls) {
             ToolStreamEnd::Content(c) => {
                 out.push(c.to_owned());
                 (out, None)
@@ -10512,5 +10551,337 @@ level={{ effort_map[eff] }}";
             assert!(task.enable_thinking, "{}", reason.as_str());
             assert!(unenforced(reason) > before, "{}", reason.as_str());
         }
+    }
+
+    /// SSE events of a streamed chat body with the per-response values
+    /// (`id`, `created`, call ids) replaced by fixed ones.
+    fn normalised_events(body: &str) -> Vec<Value> {
+        let mut events = sse_events(body);
+        for e in &mut events {
+            if e.get("id").is_some() {
+                e["id"] = Value::from("ID");
+            }
+            if e.get("created").is_some() {
+                e["created"] = Value::from(0);
+            }
+            let calls = e["choices"]
+                .as_array_mut()
+                .and_then(|cs| cs.first_mut())
+                .and_then(|c| c["delta"]["tool_calls"].as_array_mut());
+            for c in calls.into_iter().flatten() {
+                if c.get("id").is_some() {
+                    c["id"] = Value::from("CALL");
+                }
+            }
+        }
+        events
+    }
+
+    /// Streamed plain tool requests (no forcing, no JSON format, parallel
+    /// calls allowed) and their normalised SSE events.
+    async fn plain_tool_stream_frames() -> Value {
+        let call = r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
+        let second = r#"<tool_call>{"name":"get_time","arguments":{"tz":"CET"}}</tool_call>"#;
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "get_weather"}},
+            {"type": "function", "function": {"name": "get_time"}}
+        ]);
+        let cases = [
+            serde_json::json!({"messages": [{"role": "user", "content": call}], "tools": tools}),
+            serde_json::json!({"messages": [{"role": "user", "content": "hello there"}],
+                "tools": tools, "tool_choice": "auto",
+                "stream_options": {"include_usage": true}}),
+            serde_json::json!({"messages": [{"role": "user", "content": call}],
+                "tools": tools, "tool_choice": "none"}),
+            serde_json::json!({"messages": [{"role": "user", "content": format!("{call} {second}")}],
+                "tools": tools, "tool_choice": "auto", "parallel_tool_calls": true,
+                "stream_options": {"include_usage": true}}),
+            serde_json::json!({"messages": [{"role": "user", "content": call}], "tools": []}),
+        ];
+        let mut out = Vec::new();
+        for mut case in cases {
+            case["model"] = Value::from("mock-model");
+            case["stream"] = Value::from(true);
+            let body = post_stream(make_tool_app().await, "/v1/chat/completions", case).await;
+            out.push(Value::from(normalised_events(&body)));
+        }
+        Value::from(out)
+    }
+
+    /// SSE events of a streamed chat request.
+    async fn stream_events(app: Router, mut body: Value) -> Vec<Value> {
+        body["stream"] = Value::from(true);
+        sse_events(&post_stream(app, "/v1/chat/completions", body).await)
+    }
+
+    /// Every streamed `tool_calls` entry, in order.
+    fn streamed_calls(events: &[Value]) -> Vec<Value> {
+        events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["tool_calls"].as_array())
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    fn streamed_finishes(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| e["choices"][0]["finish_reason"].as_str())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streamed_required_sends_the_call_grammar_and_streams_the_call() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather"), city_tool("get_time")]),
+            serde_json::json!({"tool_choice": "required", "enable_thinking": true}),
+        );
+        let events = stream_events(app, body.clone()).await;
+        let task = last_task(&seen);
+        let grammar = task.grammar.expect("the call grammar is sent");
+        assert!(grammar.best_effort);
+        assert_eq!(
+            Some(grammar),
+            tool_grammar(&policy_of(&body), None),
+            "the same grammar as a non-streamed request"
+        );
+        assert!(!task.enable_thinking);
+        let calls = streamed_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[0]["type"], "function");
+        assert!(calls[0]["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(streamed_finishes(&events), ["tool_calls"]);
+        assert_eq!(streamed_content(&events), "", "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn streamed_named_function_finishes_with_stop() {
+        let (app, _seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather"), city_tool("get_time")]),
+            serde_json::json!({"tool_choice": named("get_time")}),
+        );
+        let events = stream_events(app, body).await;
+        let calls = streamed_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0]["function"]["name"], "get_time");
+        assert_eq!(streamed_finishes(&events), ["stop"]);
+    }
+
+    #[tokio::test]
+    async fn streamed_named_custom_is_one_custom_delta() {
+        let (app, _seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather"), custom_tool("apply_patch")]),
+            serde_json::json!({"tool_choice": {"type": "custom", "custom": {"name": "apply_patch"}}}),
+        );
+        let events = stream_events(app, body).await;
+        let calls = streamed_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        let id = calls[0]["id"].as_str().expect("an id");
+        assert!(id.starts_with("call_"), "{events:?}");
+        assert_eq!(
+            calls[0],
+            serde_json::json!({"index": 0, "id": id, "type": "custom",
+                "custom": {"name": "apply_patch", "input": ""}})
+        );
+        assert_eq!(streamed_finishes(&events), ["stop"]);
+    }
+
+    #[tokio::test]
+    async fn streamed_parallel_false_keeps_the_first_call() {
+        let text = format!(
+            "{WEATHER_CALL}\n{}",
+            r#"<tool_call>{"name":"get_time","arguments":{"tz":"CET"}}</tool_call>"#
+        );
+        let tools = serde_json::json!([city_tool("get_weather"), city_tool("get_time")]);
+        for (parallel, names) in [
+            (false, vec!["get_weather"]),
+            (true, vec!["get_weather", "get_time"]),
+        ] {
+            let app = scripted_app(&text, cascadia_types::FinishReason::Stop).await;
+            let body = tool_body(
+                tools.clone(),
+                serde_json::json!({"parallel_tool_calls": parallel}),
+            );
+            let events = stream_events(app, body).await;
+            let calls = streamed_calls(&events);
+            let got: Vec<_> = calls
+                .iter()
+                .map(|c| {
+                    (
+                        c["index"].as_u64().unwrap(),
+                        c["function"]["name"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            let want: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (i as u64, *n))
+                .collect();
+            assert_eq!(got, want, "parallel={parallel}: {events:?}");
+            assert_eq!(streamed_finishes(&events), ["tool_calls"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_json_format_with_tools_sends_the_union_and_streams_a_call() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather")]),
+            serde_json::json!({"response_format": {"type": "json_object"}}),
+        );
+        let events = stream_events(app, body).await;
+        let task = last_task(&seen);
+        assert!(task.grammar.is_some_and(|g| g.best_effort));
+        assert!(!task.enable_thinking);
+        let calls = streamed_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(streamed_finishes(&events), ["tool_calls"]);
+    }
+
+    #[tokio::test]
+    async fn streamed_dropped_grammar_still_reads_the_dialect_call() {
+        // The scripted engine ignores the grammar, as an engine that
+        // dropped it would: the model's own call markup is still a call.
+        for extra in [
+            serde_json::json!({"tool_choice": "required"}),
+            serde_json::json!({"response_format": {"type": "json_object"}}),
+        ] {
+            let app = scripted_app(WEATHER_CALL, cascadia_types::FinishReason::Stop).await;
+            let body = tool_body(serde_json::json!([city_tool("get_weather")]), extra.clone());
+            let events = stream_events(app, body).await;
+            let calls = streamed_calls(&events);
+            assert_eq!(calls.len(), 1, "{extra}: {events:?}");
+            assert_eq!(calls[0]["function"]["name"], "get_weather");
+            assert_eq!(streamed_finishes(&events), ["tool_calls"], "{extra}");
+            assert_eq!(streamed_content(&events), "", "{extra}");
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_all_filtered_calls_release_the_text_as_content() {
+        let text = r#"<tool_call>{"name":"get_time","arguments":{"tz":"CET"}}</tool_call>"#;
+        for (finish, want) in [
+            (cascadia_types::FinishReason::Stop, "stop"),
+            (cascadia_types::FinishReason::Length, "length"),
+        ] {
+            let app = scripted_app(text, finish).await;
+            let body = tool_body(
+                serde_json::json!([city_tool("get_weather"), city_tool("get_time")]),
+                serde_json::json!({"tool_choice": named("get_weather")}),
+            );
+            let events = stream_events(app, body).await;
+            assert!(streamed_calls(&events).is_empty(), "{events:?}");
+            assert_eq!(streamed_content(&events), text);
+            assert_eq!(streamed_finishes(&events), [want]);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_forced_call_reports_usage_last() {
+        let (app, _seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather")]),
+            serde_json::json!({"tool_choice": "required",
+                "stream_options": {"include_usage": true}}),
+        );
+        let events = stream_events(app, body).await;
+        assert_eq!(streamed_calls(&events).len(), 1, "{events:?}");
+        let usage = events.last().unwrap();
+        assert_eq!(usage["choices"], serde_json::json!([]), "{events:?}");
+        let u = &usage["usage"];
+        assert!(u["completion_tokens"].as_u64().unwrap() > 0, "{usage}");
+        assert_eq!(
+            u["total_tokens"].as_u64(),
+            Some(u["prompt_tokens"].as_u64().unwrap() + u["completion_tokens"].as_u64().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_forced_engine_error_is_an_error_event() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let mut body = tool_body(
+            serde_json::json!([city_tool("get_weather")]),
+            serde_json::json!({"tool_choice": "required"}),
+        );
+        body["messages"] = serde_json::json!([{"role": "user", "content": "__engine_error__"}]);
+        body["stream"] = Value::from(true);
+        let raw = post_stream(app, "/v1/chat/completions", body).await;
+        assert!(last_task(&seen).grammar.is_some());
+        assert!(raw.trim_end().ends_with("data: [DONE]"), "{raw}");
+        let events = sse_events(&raw);
+        assert_eq!(events.last().unwrap()["object"], "error", "{raw}");
+        assert!(!raw.contains("tool_calls"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn forced_choice_on_ov_genai_turns_thinking_off_without_a_grammar() {
+        // No compile slot frees up, so no tool grammar is sent; ov-genai
+        // refuses tools with thinking on, so a forced choice still turns
+        // thinking off rather than failing the request.
+        for stream in [false, true] {
+            let cfg = Config {
+                defer_template_on_thinking: true,
+                schema_check: SchemaCompileCheck::new(
+                    0,
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_secs(2),
+                ),
+                schema_build_check: true,
+                ..Config::default()
+            };
+            let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+            let body = tool_body(
+                serde_json::json!([city_tool("get_weather")]),
+                serde_json::json!({"tool_choice": "required", "enable_thinking": true,
+                    "stream": stream}),
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+            let task = last_task(&seen);
+            assert_eq!(task.grammar, None, "stream={stream}");
+            assert!(!task.enable_thinking, "stream={stream}");
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_plain_tool_request_is_unchanged() {
+        let want: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/plain_tool_stream_frames.json"
+        ))
+        .unwrap();
+        assert_eq!(plain_tool_stream_frames().await, want);
+    }
+
+    #[tokio::test]
+    async fn streamed_fenced_json_without_a_grammar_stays_content() {
+        let text = "```json\n[{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Paris\"}}]\n```";
+        let app = scripted_app(text, cascadia_types::FinishReason::Stop).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather")]),
+            serde_json::json!({}),
+        );
+        let events = stream_events(app, body).await;
+        assert!(streamed_calls(&events).is_empty(), "{events:?}");
+        assert_eq!(streamed_content(&events), text);
+        assert_eq!(streamed_finishes(&events), ["stop"]);
     }
 }
