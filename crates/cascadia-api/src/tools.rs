@@ -566,20 +566,34 @@ fn relax_parameters(tool: &mut Tool) -> bool {
     static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
     if first_sighting(&WARNED, name, RELAX_WARN_NAMES) {
         tracing::warn!(
-            tool = name,
+            tool = ?log_text(name),
             pairs = dropped.len(),
-            first = %first.detail,
+            first = ?log_text(&first.detail),
             "tool parameters hold bound pairs no value can meet; dropping them"
         );
     } else {
         tracing::debug!(
-            tool = name,
+            tool = ?log_text(name),
             pairs = dropped.len(),
-            first = %first.detail,
+            first = ?log_text(&first.detail),
             "tool parameters hold bound pairs no value can meet; dropping them"
         );
     }
     true
+}
+
+/// How many characters of a client's text (a tool name, a JSON pointer
+/// built from its property names) a log line carries.
+const LOG_TEXT_CHARS: usize = 200;
+
+/// `text` cut to [`LOG_TEXT_CHARS`] characters (`…` marks a cut), for a log
+/// field written with `?`: Debug-escaped, so a newline or quote in a
+/// client's property name can't forge a log line.
+fn log_text(text: &str) -> std::borrow::Cow<'_, str> {
+    match text.char_indices().nth(LOG_TEXT_CHARS) {
+        None => text.into(),
+        Some((cut, _)) => format!("{}…", &text[..cut]).into(),
+    }
 }
 
 /// How many tool names [`relax_parameters`] remembers for its warn-once
@@ -675,8 +689,8 @@ fn tool_schema(
                 // nothing, so the turn gets none.
                 if let Some(detail) = unsatisfiable_bound(p) {
                     tracing::warn!(
-                        tool = name,
-                        detail = %detail,
+                        tool = ?log_text(name),
+                        detail = ?log_text(&detail),
                         "tool parameters still hold a bound pair no value can meet; \
                          no call grammar"
                     );
@@ -2138,6 +2152,21 @@ mod tests {
                 arguments: arguments.into(),
             },
         }
+    }
+
+    /// Client text in a log line is cut to a bound, and logged Debug-
+    /// escaped, so a newline in a property name can't forge a log line.
+    #[test]
+    fn client_text_is_capped_for_the_log() {
+        assert_eq!(format!("{:?}", log_text("a\nb")), r#""a\nb""#);
+        let long = "x".repeat(10_000);
+        assert_eq!(log_text(&long).chars().count(), LOG_TEXT_CHARS + 1);
+        assert!(log_text(&long).ends_with('…'));
+        assert_eq!(log_text("short"), "short");
+        assert_eq!(
+            log_text(&"é".repeat(LOG_TEXT_CHARS)),
+            "é".repeat(LOG_TEXT_CHARS)
+        );
     }
 
     /// A tool's relax warning goes out the first time its name is seen,
