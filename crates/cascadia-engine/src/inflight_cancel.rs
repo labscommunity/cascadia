@@ -20,6 +20,8 @@ pub const MAX_EARLY_CANCELS: usize = 4096;
 struct State {
     current: Option<TaskId>,
     early: VecDeque<TaskId>,
+    /// Set by [`InflightCancel::shutdown`]: every `begin` reports a cancel until `reopen`.
+    closed: bool,
 }
 
 /// Lock-free-to-poll cancel state for the one task an engine is running.
@@ -65,7 +67,7 @@ impl InflightCancel {
                 true
             }
             None => false,
-        };
+        } || s.closed;
         s.current = Some(task_id.clone());
         // Under the lock, so a `cancel` for the previous task can't land between the reset and the
         // new `current`.
@@ -90,12 +92,20 @@ impl InflightCancel {
         s.early.push_back(task_id.clone());
     }
 
-    /// Ask whatever task is running now to stop (a shutdown). Nothing is remembered when none is.
-    pub fn cancel_current(&self) {
-        let s = self.lock();
+    /// The engine is shutting down: stop the running task, and make every later
+    /// [`begin`](Self::begin) report a cancel, until [`reopen`](Self::reopen). A queued task
+    /// that wins the engine after this, or one popped but not yet begun, then never runs.
+    pub fn shutdown(&self) {
+        let mut s = self.lock();
+        s.closed = true;
         if s.current.is_some() {
             self.flag.store(true, Ordering::Release);
         }
+    }
+
+    /// Undo [`shutdown`](Self::shutdown): the engine is in service again.
+    pub fn reopen(&self) {
+        self.lock().closed = false;
     }
 
     /// The running task is over: clear it and reset the flag.
@@ -135,20 +145,22 @@ mod tests {
     }
 
     #[test]
-    fn cancel_current_cancels_only_the_running_task() {
+    fn shutdown_cancels_the_running_task_and_every_later_begin() {
         let ic = InflightCancel::new();
-        // Nothing running: nothing to do, and nothing is remembered.
-        ic.cancel_current();
-        assert!(!ic.cancelled());
-        assert_eq!(ic.early_len(), 0);
         assert!(!ic.begin(&id("a")));
-        ic.cancel_current();
-        assert!(ic.cancelled());
+        ic.shutdown();
+        assert!(ic.cancelled(), "the running task is cancelled");
         ic.end();
         assert!(
-            !ic.begin(&id("b")),
-            "it doesn't carry over to the next task"
+            ic.begin(&id("b")),
+            "a task begun after the shutdown is cancelled"
         );
+        assert!(ic.cancelled());
+        ic.end();
+        assert_eq!(ic.early_len(), 0, "nothing is parked in the early set");
+        ic.reopen();
+        assert!(!ic.begin(&id("c")), "reopened: tasks run again");
+        assert!(!ic.cancelled());
         ic.end();
     }
 

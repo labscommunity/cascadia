@@ -2957,7 +2957,11 @@ async fn chat_completions(
     // interrupts a running step) even while a step blocks. The handler holds
     // the permit + in-flight guard itself: they are released when it returns
     // (or is dropped), not when the forwarder ends, so a stop match answers
-    // without waiting for the step the forwarder may be in.
+    // without waiting for the step the forwarder may be in. The cost: after a
+    // stop the engine may still hold that stopped task for up to one step
+    // while the freed permit already admits the next request, so the engine
+    // can briefly carry one step's worth of stopped tasks beyond the permit
+    // count.
     let _slot = RequestSlot {
         _permit: permit,
         _inflight: inflight,
@@ -3500,6 +3504,8 @@ struct RequestSlot {
 /// when it ends (the stream finished, or the SSE body went away). A
 /// non-streaming handler keeps its slot itself, so the slot is free when the
 /// handler returns, without waiting for a forwarder still blocked in a step.
+/// So after a non-streaming stop the engine can hold up to one step's worth of
+/// stopped tasks beyond the permit count, until their forwarders' steps return.
 struct StreamWithPermit {
     inner: WindowGuard<cascadia_runner::ChunkStream>,
     _slot: Option<RequestSlot>,

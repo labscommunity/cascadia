@@ -9004,33 +9004,51 @@ mod tests {
         t
     }
 
-    /// Run `f` with an INFO fmt subscriber writing to a buffer.
+    std::thread_local! {
+        /// Where the test subscriber writes this thread's log lines, if anywhere.
+        static LOG_BUF: std::cell::RefCell<Option<Arc<std::sync::Mutex<Vec<u8>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writes into the current thread's [`LOG_BUF`], else nowhere.
+    struct ThreadLogBuf;
+
+    impl std::io::Write for ThreadLogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            LOG_BUF.with(|cell| {
+                if let Some(buf) = cell.borrow().as_ref() {
+                    buf.lock().unwrap().extend_from_slice(b);
+                }
+            });
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` and return the INFO log lines it wrote on this thread.
+    ///
+    /// One global INFO subscriber for the whole test binary, writing per
+    /// thread. A scoped subscriber (`with_default`) per test raced with
+    /// parallel tests that hit the same log callsites with no subscriber:
+    /// tracing could cache such a callsite as never enabled and drop the
+    /// line the test reads.
     fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
-        #[derive(Clone, Default)]
-        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-            type Writer = Buf;
-            fn make_writer(&'a self) -> Buf {
-                self.clone()
-            }
-        }
-        let buf = Buf::default();
-        let sub = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let r = tracing::subscriber::with_default(sub, f);
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let sub = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLogBuf)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::set_global_default(sub).expect("one test subscriber");
+        });
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        LOG_BUF.with(|cell| *cell.borrow_mut() = Some(buf.clone()));
+        let r = f();
+        LOG_BUF.with(|cell| *cell.borrow_mut() = None);
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         (r, out)
     }
 

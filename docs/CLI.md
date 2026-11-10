@@ -336,10 +336,12 @@ context window still ends an answer where the prompt plus the answer fill it
     continuous-batching backend a plain pipeline can pick, or the speculative
     pipelines; the node logs `ov-genai streamer thread threaded_streamer=true`
     once), a cancel or stop lands one step later.
-  - When the answer starts with text the server strips (a repeat of the
-    prompt, leading whitespace), the engine checks for a `stop` only after
-    it. A stop there is still cut by the API at the end, so the answer is the
-    same as without the engine check.
+  - When the answer starts with text the server strips (an echoed prompt,
+    leading whitespace), the engine's stop check starts one short window after
+    that text: about the longest stop's length + 16 tokens, plus one
+    speculative round with draft / prompt-lookup. If the stripped text runs
+    past that window, the check is skipped for the request. The API still
+    cuts at the stop, so the answer is the same either way.
   - A non-streaming client that half-closes its socket after the request
     (`shutdown(SHUT_WR)`: raw sockets, `nc -N`, some proxies) counts as a
     disconnect, and the request is cancelled. curl and the OpenAI SDKs don't

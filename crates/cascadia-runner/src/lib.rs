@@ -229,7 +229,12 @@ impl EngineGuard<'_> {
     /// the engine is in place already finds it.
     fn set(&mut self, engine: Option<Box<dyn Engine>>) {
         if let Some(g) = self.guard.as_mut() {
-            *self.slot.inflight.lock() = engine.as_ref().and_then(|e| e.inflight_cancel());
+            let handle = engine.as_ref().and_then(|e| e.inflight_cancel());
+            // An engine going into service: a handle shut by an earlier close() runs tasks again.
+            if let Some(h) = &handle {
+                h.reopen();
+            }
+            *self.slot.inflight.lock() = handle;
             **g = engine;
         }
     }
@@ -281,12 +286,13 @@ impl EngineSlot {
         }
     }
 
-    /// Ask the engine to end whatever task it is running inside `step()` (a shutdown), through
-    /// its [`InflightCancel`] handle. Never touches the engine lock.
-    fn cancel_inflight_current(&self) {
+    /// Shut the engine's [`InflightCancel`] handle (a server shutdown): the task running inside
+    /// `step()` ends, and any task that begins later is cancelled at once. Never touches the
+    /// engine lock.
+    fn shutdown_inflight(&self) {
         let handle = self.inflight.lock().clone();
         if let Some(handle) = handle {
-            handle.cancel_current();
+            handle.shutdown();
         }
     }
 
@@ -739,8 +745,10 @@ impl Runner {
         // a client cancellation for a server restart.
         self.closing.store(true, Ordering::SeqCst);
         // A one-shot engine runs a whole generation in one step with the engine lock held: end
-        // that generation first, or the lock below waits it out (M18).
-        self.slot.cancel_inflight_current();
+        // that generation first, or the lock below waits it out. Latched, so a queued task that
+        // wins the lock before this call does, or one popped but not yet begun, doesn't run its
+        // whole generation either (M18).
+        self.slot.shutdown_inflight();
         {
             // Tear down and empty the slot under ONE guard, where this used
             // to take the lock twice. Releasing in between now means waking,
@@ -2251,13 +2259,18 @@ mod tests {
             let cancelled_chunk = |id: &TaskId| {
                 Chunk::final_marker(id.clone(), "").with_finish_reason(FinishReason::Cancelled)
             };
+            if task.prompt == "slow-begin" {
+                // Popped, then a pause before `begin`: the pop->begin window, held open.
+                self.log.lock().push((id.clone(), "popped", Instant::now()));
+                std::thread::sleep(Duration::from_millis(150));
+            }
             if self.ic.begin(&id) {
                 self.ic.end();
                 return Ok(vec![(id.clone(), cancelled_chunk(&id))]);
             }
             self.log.lock().push((id.clone(), "start", Instant::now()));
             let mut cancelled = false;
-            if task.prompt == "spin" {
+            if task.prompt == "spin" || task.prompt == "slow-begin" {
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(2) {
                     if self.ic.cancelled() {
@@ -2271,7 +2284,7 @@ mod tests {
             self.log.lock().push((id.clone(), "end", Instant::now()));
             let chunk = if cancelled {
                 cancelled_chunk(&id)
-            } else if task.prompt == "spin" {
+            } else if task.prompt == "spin" || task.prompt == "slow-begin" {
                 Chunk::final_marker(id.clone(), "timeout")
             } else {
                 Chunk::final_marker(id.clone(), "done")
@@ -2425,6 +2438,13 @@ mod tests {
             .generate_async(GenerationTask::new("spin-close", "spin"))
             .await
             .unwrap();
+        // Queued behind it, and polled: it must not win the engine after the cancel and run a
+        // whole generation while close() waits for the lock.
+        let b = rig
+            .runner
+            .generate_async(GenerationTask::new("spin-queued", "spin"))
+            .await
+            .unwrap();
         let a_task = tokio::spawn(async move {
             let mut a = a;
             let mut last = None;
@@ -2432,6 +2452,10 @@ mod tests {
                 last = Some(c);
             }
             last
+        });
+        let b_task = tokio::spawn(async move {
+            let mut b = b;
+            while b.next().await.is_some() {}
         });
         let start = Instant::now();
         while logged_at(&rig.log, "spin-close", "start").is_none() {
@@ -2462,6 +2486,57 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("shutting down")),
             "{last:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), b_task)
+            .await
+            .expect("the queued stream never ended")
+            .unwrap();
+        assert!(
+            logged_at(&rig.log, "spin-queued", "start").is_none(),
+            "the queued task ran a generation during the shutdown"
+        );
+    }
+
+    /// M18: a `close()` that lands after a task was popped but before it began still ends it:
+    /// the shutdown is latched in the in-flight handle, so the late `begin` reports a cancel and
+    /// the task never runs its generation while `close()` waits for the engine lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_between_pop_and_begin_runs_no_generation() {
+        let rig = polling_cancel_rig("runner-inflight-close-popped-model").await;
+        let a = rig
+            .runner
+            .generate_async(GenerationTask::new("slow-a", "slow-begin"))
+            .await
+            .unwrap();
+        let a_task = tokio::spawn(async move {
+            let mut a = a;
+            while a.next().await.is_some() {}
+        });
+        let start = Instant::now();
+        while logged_at(&rig.log, "slow-a", "popped").is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the task was never popped"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let runner = rig.runner.clone();
+        let closed_at = Instant::now();
+        tokio::task::spawn_blocking(move || runner.close())
+            .await
+            .unwrap();
+        let took = closed_at.elapsed();
+        tokio::time::timeout(Duration::from_secs(5), a_task)
+            .await
+            .expect("the stream never ended")
+            .unwrap();
+        assert!(
+            logged_at(&rig.log, "slow-a", "start").is_none(),
+            "the task popped before close() ran its generation"
+        );
+        assert!(
+            took < Duration::from_millis(500),
+            "close() waited {took:?} for a generation"
         );
     }
 
