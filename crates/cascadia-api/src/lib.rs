@@ -271,6 +271,8 @@ pub struct AppState {
     /// with a 5xx (e.g. the distributed pipeline dropped a peer link) flips it
     /// `false`, a success flips it back `true` — so `/health` reflects the real
     /// state of the chain instead of always returning 200 while requests 503.
+    /// It publishes the `readiness` cause and is written only while that
+    /// cause's lock is held.
     pub ready: Arc<std::sync::atomic::AtomicBool>,
     /// See [`Config::media`].
     pub media: Option<Arc<MediaConfig>>,
@@ -288,17 +290,9 @@ pub struct AppState {
     pub decode_permits: Arc<Semaphore>,
     /// See [`Config::stall_after`].
     pub stall_after: std::time::Duration,
-    /// The stall that last marked the server unready (not a failed
-    /// request): its evidence time ([`cascadia_runner::monotonic_ms`]) in
-    /// the low 40 bits, and the low bits of [`AppState::pipeline_failures`]
-    /// when it was stamped above them; `0` when readiness was not lost that
-    /// way. `/health` clears such a mark, if no pipeline 5xx came after it,
-    /// once the engine has produced real output after it or once no request
-    /// is in flight.
-    pub stall_marked_ms: Arc<std::sync::atomic::AtomicU64>,
-    /// Completions that failed with a 5xx pointing at the pipeline: the
-    /// failure epoch a stall mark must match to be healed.
-    pub pipeline_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Why the server is unready, if it is; `ready` publishes it. See
+    /// [`ReadinessState`].
+    pub(crate) readiness: Arc<std::sync::Mutex<ReadinessState>>,
 }
 
 /// See [`AppState::decode_permits`].
@@ -707,8 +701,7 @@ pub fn make_router_with_stats(
         max_text_bytes: cfg.media.as_ref().map(|_| cfg.max_body_bytes),
         decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
         stall_after: cfg.stall_after,
-        stall_marked_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        pipeline_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        readiness: Arc::new(std::sync::Mutex::new(ReadinessState::Ready)),
     };
     let state = AppState {
         effort_words: state
@@ -996,122 +989,101 @@ fn pipeline_stalled(state: &AppState) -> Option<u64> {
     )
 }
 
-/// The readiness words of [`AppState`], borrowed together: `ready`, the
-/// stall mark ([`AppState::stall_marked_ms`]) and the pipeline-failure
-/// epoch ([`AppState::pipeline_failures`]).
+/// Why the server is unready, if it is. Every change to it, and to
+/// [`AppState::ready`] which publishes it, happens under one lock
+/// ([`Health`]), so readiness changes form a sequence: no interleaving of a
+/// pipeline 5xx, a success, a stall and a `/health` heal can leave `ready`
+/// disagreeing with the cause, or let a heal undo a 5xx.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ReadinessState {
+    /// Ready.
+    #[default]
+    Ready,
+    /// A completion failed with a 5xx that points at the pipeline; only a
+    /// success clears it.
+    Pipeline,
+    /// A capacity 503 met a stalled pipeline ([`pipeline_stalled`]);
+    /// `evidence_ms` is the time the stall is measured from
+    /// ([`cascadia_runner::monotonic_ms`]). `/health` clears it once the
+    /// engine has produced real output after it or no request is in flight,
+    /// and a success clears it too.
+    Stall { evidence_ms: u64 },
+}
+
+/// The readiness of [`AppState`], borrowed together: the cause
+/// ([`AppState::readiness`]) and the published `ready` flag, written only
+/// while the cause's lock is held.
 struct Health<'a> {
     ready: &'a std::sync::atomic::AtomicBool,
-    marked: &'a std::sync::atomic::AtomicU64,
-    failures: &'a std::sync::atomic::AtomicU64,
+    cause: &'a std::sync::Mutex<ReadinessState>,
 }
 
 impl<'a> Health<'a> {
     fn of(state: &'a AppState) -> Self {
         Self {
             ready: &state.ready,
-            marked: &state.stall_marked_ms,
-            failures: &state.pipeline_failures,
+            cause: &state.readiness,
         }
+    }
+
+    /// Runs `change` on the cause under its lock and publishes the result
+    /// to `ready` before the lock is released. A lock poisoned by a panic
+    /// elsewhere still holds a valid cause, so it is used as it is.
+    fn transition(&self, change: impl FnOnce(ReadinessState) -> ReadinessState) {
+        let mut cause = self
+            .cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cause = change(*cause);
+        self.ready
+            .store(*cause == ReadinessState::Ready, Ordering::SeqCst);
     }
 }
 
-/// Bits of a stall mark that hold its evidence time; the bits above hold
-/// the low bits of the failure epoch it was stamped in. 2^40 ms is about
-/// 35 years of uptime.
-const MARK_EVIDENCE_BITS: u32 = 40;
-const MARK_EVIDENCE_MASK: u64 = (1 << MARK_EVIDENCE_BITS) - 1;
-
-/// A stall mark: `evidence` (never `0`, see
-/// [`cascadia_runner::monotonic_ms`]) stamped in failure epoch `epoch`.
-fn stall_mark(epoch: u64, evidence: u64) -> u64 {
-    (epoch << MARK_EVIDENCE_BITS) | (evidence & MARK_EVIDENCE_MASK)
-}
-
-/// Whether `mark` was stamped in failure epoch `epoch`.
-fn mark_in_epoch(mark: u64, epoch: u64) -> bool {
-    mark >> MARK_EVIDENCE_BITS == (epoch << MARK_EVIDENCE_BITS) >> MARK_EVIDENCE_BITS
-}
-
-/// A capacity 503 met a stalled pipeline: unready, and the mark stamped with
-/// the stall's evidence time and the current failure epoch. A failed
-/// request's unready state (unready with no stall mark) stays that kind:
-/// only the 2xx it has always waited for clears it. The mark is set with a
-/// compare-exchange, so it never lands on top of a 5xx's clear.
+/// A capacity 503 met a stalled pipeline: unready from a stall measured
+/// from `evidence`. A pipeline 5xx's unready state stays that kind: only the
+/// success it has always waited for clears it.
 fn note_stall(h: &Health, evidence: u64) {
-    let epoch = h.failures.load(Ordering::SeqCst);
-    let was_ready = h.ready.swap(false, Ordering::SeqCst);
-    let _ = h
-        .marked
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |m| {
-            (was_ready || m != 0).then_some(stall_mark(epoch, evidence))
-        });
+    h.transition(|cause| match cause {
+        ReadinessState::Pipeline => ReadinessState::Pipeline,
+        ReadinessState::Ready | ReadinessState::Stall { .. } => ReadinessState::Stall {
+            evidence_ms: evidence,
+        },
+    });
 }
 
-/// A completion returned 2xx: ready, and no stall mark.
+/// A completion returned 2xx: ready, whatever the cause was.
 fn note_success(h: &Health) {
-    note_success_with(h, || ());
+    h.transition(|_| ReadinessState::Ready);
 }
 
-/// [`note_success`], with `between` run between its two stores so a test
-/// can land a concurrent [`note_stall`] there. The mark is cleared BEFORE
-/// `ready` is stored: the other order lets a stall between them read
-/// "was ready", stamp a mark that this then wipes, and leave the server
-/// unready with no mark for `/health` to heal.
-fn note_success_with(h: &Health, between: impl FnOnce()) {
-    h.marked.store(0, Ordering::SeqCst);
-    between();
-    h.ready.store(true, Ordering::SeqCst);
-}
-
-/// A completion failed with a 5xx that points at the pipeline: a new
-/// failure epoch, unready, and no stall mark, so only a 2xx clears it.
+/// A completion failed with a 5xx that points at the pipeline: unready
+/// until a success, whatever the cause was.
 fn note_failure(h: &Health) {
-    note_failure_with(h, || ());
+    h.transition(|_| ReadinessState::Pipeline);
 }
 
-/// [`note_failure`], with `between` run between storing `ready` and
-/// clearing the mark so a test can land a concurrent [`note_stall`] there.
-/// The epoch is bumped FIRST: a stall mark stamped in an earlier epoch never
-/// heals ([`heal_stall_mark`]), and a heal that stored `ready` while the
-/// epoch moved backs out, so no interleaving turns this 5xx's unready state
-/// into one `/health` would clear.
-fn note_failure_with(h: &Health, between: impl FnOnce()) {
-    h.failures.fetch_add(1, Ordering::SeqCst);
-    h.ready.store(false, Ordering::SeqCst);
-    between();
-    h.marked.store(0, Ordering::SeqCst);
-}
-
-/// `/health`'s heal: unready from a stall stamped in the current failure
-/// epoch, and either the engine has produced real output after the stall's
-/// evidence time (the pipeline is moving again) or nothing is `in_flight`
-/// (the stall rule needs work in flight to see a stall; if the pipeline is
-/// still broken, the next capacity 503 under load marks it again). A drained
-/// server whose failed streams have all ended would otherwise stay unready
-/// with nothing left to step. A pipeline 5xx after the epoch was read makes
-/// the heal back out once it has stored `ready`.
-fn heal_stall_mark(h: &Health, last_output_ms: u64, in_flight: u64) {
-    heal_stall_mark_with(h, last_output_ms, in_flight, || ());
-}
-
-/// [`heal_stall_mark`], with `between` run after the mark is cleared and
-/// before `ready` is stored, so a test can land a concurrent 5xx there.
-fn heal_stall_mark_with(h: &Health, last_output_ms: u64, in_flight: u64, between: impl FnOnce()) {
-    let epoch = h.failures.load(Ordering::SeqCst);
-    let mark = h.marked.load(Ordering::SeqCst);
-    if mark != 0
-        && mark_in_epoch(mark, epoch)
-        && (last_output_ms > (mark & MARK_EVIDENCE_MASK) || in_flight == 0)
-        && h.marked
-            .compare_exchange(mark, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    {
-        between();
-        h.ready.store(true, Ordering::SeqCst);
-        if h.failures.load(Ordering::SeqCst) != epoch {
-            h.ready.store(false, Ordering::SeqCst);
+/// `/health`'s heal: unready from a stall, and either the engine has
+/// produced real output after the stall's evidence time (the pipeline is
+/// moving again) or nothing is in flight (the stall rule needs work in
+/// flight to see a stall; if the pipeline is still broken, the next capacity
+/// 503 under load marks it again). A drained server whose failed streams
+/// have all ended would otherwise stay unready with nothing left to step.
+/// `observe` reads the last real output time and the requests in flight; it
+/// runs under the lock, so both are read after any stall it could clear was
+/// noted. Any other cause is left as it is.
+fn heal_stall_mark(h: &Health, observe: impl FnOnce() -> (u64, u64)) {
+    h.transition(|cause| match cause {
+        ReadinessState::Stall { evidence_ms } => {
+            let (last_output_ms, in_flight) = observe();
+            if last_output_ms > evidence_ms || in_flight == 0 {
+                ReadinessState::Ready
+            } else {
+                cause
+            }
         }
-    }
+        ReadinessState::Ready | ReadinessState::Pipeline => cause,
+    });
 }
 
 /// Response middleware: for completion routes, flip `AppState.ready` from the
@@ -1121,7 +1093,7 @@ fn heal_stall_mark_with(h: &Health, last_output_ms: u64, in_flight: u64, between
 /// about the pipeline — except a [`CapacityRefusal`] while the pipeline is
 /// stalled ([`pipeline_stalled`]): a wedged step holds every slot, so every
 /// new request is a capacity 503 and nothing else would ever mark it unready.
-/// Such a mark is noted in [`AppState::stall_marked_ms`] so `/health` can
+/// Such a mark is noted as [`ReadinessState::Stall`] so `/health` can
 /// clear it when the engine moves again or nothing is left in flight, with
 /// no completion to send a 2xx.
 async fn track_pipeline_health(
@@ -1161,11 +1133,12 @@ async fn health(
     use std::sync::atomic::Ordering;
     // Unready from a stall, and the engine has produced output since or
     // nothing is in flight any more.
-    heal_stall_mark(
-        &Health::of(&state),
-        state.runner.last_output_ms(),
-        state.stats.requests_in_flight.load(Ordering::Relaxed),
-    );
+    heal_stall_mark(&Health::of(&state), || {
+        (
+            state.runner.last_output_ms(),
+            state.stats.requests_in_flight.load(Ordering::Relaxed),
+        )
+    });
     if state.ready.load(Ordering::Relaxed) {
         (StatusCode::OK, Json(HealthResponse { status: "ok" }))
     } else {
@@ -8633,130 +8606,254 @@ mod tests {
         );
     }
 
+    /// A fresh, ready pair of readiness words for the transition tests.
+    fn readiness_words() -> (
+        std::sync::atomic::AtomicBool,
+        std::sync::Mutex<ReadinessState>,
+    ) {
+        (
+            std::sync::atomic::AtomicBool::new(true),
+            std::sync::Mutex::new(ReadinessState::Ready),
+        )
+    }
+
+    /// The cause behind `h`, read under its lock, after checking that the
+    /// published `ready` agrees with it.
+    fn cause_of(h: &Health) -> ReadinessState {
+        let cause = *h.cause.lock().unwrap();
+        assert_eq!(
+            h.ready.load(Ordering::SeqCst),
+            cause == ReadinessState::Ready,
+            "`ready` disagrees with {cause:?}"
+        );
+        cause
+    }
+
+    /// One readiness change, as the middleware and `/health` make them.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Change {
+        Failure,
+        Stall,
+        Success,
+        /// `/health` with output long after any stall and nothing in flight:
+        /// it clears any stall.
+        Heal,
+    }
+
+    fn apply(h: &Health, change: Change) {
+        match change {
+            Change::Failure => note_failure(h),
+            Change::Stall => note_stall(h, 1000),
+            Change::Success => note_success(h),
+            Change::Heal => heal_stall_mark(h, || (u64::MAX, 0)),
+        }
+    }
+
+    /// Every ordering of `changes` (repeats included).
+    fn orderings(changes: &[Change]) -> Vec<Vec<Change>> {
+        if changes.is_empty() {
+            return vec![Vec::new()];
+        }
+        let mut all = Vec::new();
+        for i in 0..changes.len() {
+            let mut rest = changes.to_vec();
+            let first = rest.remove(i);
+            for mut tail in orderings(&rest) {
+                tail.insert(0, first);
+                all.push(tail);
+            }
+        }
+        all
+    }
+
     /// The mark is stamped with the evidence, not "now", so output in the
     /// very millisecond the mark was made still clears it.
     #[test]
     fn output_in_the_marking_millisecond_clears_the_mark() {
-        let ready = std::sync::atomic::AtomicBool::new(true);
-        let marked = std::sync::atomic::AtomicU64::new(0);
-        let failures = std::sync::atomic::AtomicU64::new(0);
+        let (ready, cause) = readiness_words();
         let h = Health {
             ready: &ready,
-            marked: &marked,
-            failures: &failures,
+            cause: &cause,
         };
         let now = 5000;
         let evidence = stall_evidence(&activity(None, now - 1, 100, 1000), now, 1000).unwrap();
         note_stall(&h, evidence);
-        assert!(!ready.load(Ordering::SeqCst));
-        heal_stall_mark(&h, now, 1);
-        assert!(
-            ready.load(Ordering::SeqCst),
+        assert_eq!(cause_of(&h), ReadinessState::Stall { evidence_ms: 1000 });
+        heal_stall_mark(&h, || (now, 1));
+        assert_eq!(
+            cause_of(&h),
+            ReadinessState::Ready,
             "output at {now} must clear the mark"
         );
-        assert_eq!(marked.load(Ordering::SeqCst), 0);
     }
 
-    /// A stall 503 landing in the middle of a 2xx's update must not leave
-    /// the server unready with no stall mark (which only a later 2xx could
-    /// clear): the 2xx clears the mark before it stores `ready`.
+    /// Pipeline 5xxs and stall marks in every order: after the first 5xx,
+    /// `/health` is 503 at every step, however often it tries to heal,
+    /// until a success.
+    #[test]
+    fn a_stall_never_turns_a_5xx_into_one_health_heals() {
+        use Change::{Failure, Heal, Stall, Success};
+        for changes in [
+            &[Failure, Stall][..],
+            &[Failure, Stall, Stall],
+            &[Failure, Failure, Stall],
+            &[Failure, Stall, Heal],
+            &[Failure, Stall, Stall, Heal],
+        ] {
+            for order in orderings(changes) {
+                let (ready, cause) = readiness_words();
+                let h = Health {
+                    ready: &ready,
+                    cause: &cause,
+                };
+                let mut failed = false;
+                for &change in &order {
+                    apply(&h, change);
+                    failed |= change == Failure;
+                    heal_stall_mark(&h, || (u64::MAX, 0));
+                    if failed {
+                        assert_eq!(cause_of(&h), ReadinessState::Pipeline, "{order:?}");
+                    }
+                }
+                apply(&h, Success);
+                assert_eq!(cause_of(&h), ReadinessState::Ready, "{order:?}");
+            }
+        }
+    }
+
+    /// A heal, a pipeline 5xx and a success in every order, from a stall:
+    /// the server ends ready exactly when the success came after the 5xx,
+    /// and is never ready between the 5xx and the success.
+    #[test]
+    fn a_heal_racing_a_5xx_and_a_success_ends_on_the_last_completion() {
+        use Change::{Failure, Heal, Success};
+        for order in orderings(&[Heal, Failure, Success]) {
+            let (ready, cause) = readiness_words();
+            let h = Health {
+                ready: &ready,
+                cause: &cause,
+            };
+            note_stall(&h, 1000);
+            let mut failed = false;
+            for &change in &order {
+                apply(&h, change);
+                match change {
+                    Failure => failed = true,
+                    Success => failed = false,
+                    Heal | Change::Stall => {}
+                }
+                if failed {
+                    assert_eq!(cause_of(&h), ReadinessState::Pipeline, "{order:?}");
+                }
+            }
+            let success_last = order.iter().rposition(|&c| c == Success)
+                > order.iter().rposition(|&c| c == Failure);
+            assert_eq!(
+                cause_of(&h) == ReadinessState::Ready,
+                success_last,
+                "{order:?}"
+            );
+        }
+    }
+
+    /// A success clears a stall mark, and a stall after a success marks the
+    /// server unready in a way `/health` can heal: neither order strands it
+    /// unready with nothing to clear it.
     #[test]
     fn a_stall_mark_racing_a_2xx_is_not_stranded() {
-        let ready = std::sync::atomic::AtomicBool::new(true);
-        let marked = std::sync::atomic::AtomicU64::new(0);
-        let failures = std::sync::atomic::AtomicU64::new(0);
-        let h = Health {
-            ready: &ready,
-            marked: &marked,
-            failures: &failures,
-        };
-        note_success_with(&h, || note_stall(&h, 1234));
-        let stranded = !ready.load(Ordering::SeqCst) && marked.load(Ordering::SeqCst) == 0;
-        assert!(!stranded, "unready with no stall mark");
+        use Change::{Stall, Success};
+        for order in orderings(&[Stall, Success]) {
+            let (ready, cause) = readiness_words();
+            let h = Health {
+                ready: &ready,
+                cause: &cause,
+            };
+            for &change in &order {
+                apply(&h, change);
+            }
+            heal_stall_mark(&h, || (u64::MAX, 0));
+            assert_eq!(cause_of(&h), ReadinessState::Ready, "{order:?}");
+        }
     }
 
-    /// A stall 503 landing in the middle of a pipeline 5xx's update must not
-    /// turn that 5xx's unready state into a stall mark `/health` would heal:
-    /// after both, the server is unready with no mark.
+    /// Transitions racing on real threads: whatever the interleaving, a
+    /// round of 5xxs and stalls with no success ends unready for good, and
+    /// `ready` always agrees with the cause once the threads are done.
     #[test]
-    fn a_stall_racing_a_5xx_does_not_make_it_self_healing() {
-        let ready = std::sync::atomic::AtomicBool::new(true);
-        let marked = std::sync::atomic::AtomicU64::new(0);
-        let failures = std::sync::atomic::AtomicU64::new(0);
+    fn racing_readiness_changes_stay_consistent() {
+        let (ready, cause) = readiness_words();
         let h = Health {
             ready: &ready,
-            marked: &marked,
-            failures: &failures,
+            cause: &cause,
         };
-        note_failure_with(&h, || note_stall(&h, 1234));
-        assert!(!ready.load(Ordering::SeqCst));
-        heal_stall_mark(&h, u64::MAX, 0);
-        assert!(!ready.load(Ordering::SeqCst), "the 5xx must not heal");
+        for round in 0..500 {
+            note_success(&h);
+            let go = std::sync::Barrier::new(3);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    go.wait();
+                    note_failure(&h);
+                });
+                s.spawn(|| {
+                    go.wait();
+                    note_stall(&h, 1000);
+                });
+                s.spawn(|| {
+                    go.wait();
+                    heal_stall_mark(&h, || (u64::MAX, 0));
+                });
+            });
+            heal_stall_mark(&h, || (u64::MAX, 0));
+            assert_eq!(cause_of(&h), ReadinessState::Pipeline, "round {round}");
+        }
     }
 
-    /// A pipeline 5xx landing between the heal's mark-clear and its
-    /// ready-store is not overwritten: `/health` stays 503 until a 2xx.
+    /// A panic while the readiness lock is held does not take readiness
+    /// down with it: the next transitions use the cause as it was left.
     #[test]
-    fn a_stall_heal_never_hides_a_pipeline_failure() {
-        let ready = std::sync::atomic::AtomicBool::new(true);
-        let marked = std::sync::atomic::AtomicU64::new(0);
-        let failures = std::sync::atomic::AtomicU64::new(0);
+    fn a_poisoned_readiness_lock_still_changes_state() {
+        let (ready, cause) = readiness_words();
         let h = Health {
             ready: &ready,
-            marked: &marked,
-            failures: &failures,
+            cause: &cause,
         };
-        note_stall(&h, 1000);
-        heal_stall_mark_with(&h, 2000, 1, || note_failure(&h));
-        assert!(!ready.load(Ordering::SeqCst), "the 5xx must stand");
-        heal_stall_mark(&h, 9000, 0);
-        assert!(!ready.load(Ordering::SeqCst), "a 5xx waits for a 2xx");
+        note_failure(&h);
+        let _ = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _held = cause.lock().unwrap();
+                panic!("poison the readiness lock");
+            })
+            .join()
+        });
+        assert!(cause.is_poisoned());
+        heal_stall_mark(&h, || (u64::MAX, 0));
+        assert!(!ready.load(Ordering::SeqCst), "a 5xx waits for a success");
         note_success(&h);
-        assert!(ready.load(Ordering::SeqCst));
-    }
-
-    /// A stall mark stamped before a pipeline 5xx (an earlier failure
-    /// epoch) never heals, however it got past the 5xx's clear.
-    #[test]
-    fn a_stall_mark_from_an_earlier_epoch_never_heals() {
-        let ready = std::sync::atomic::AtomicBool::new(false);
-        let marked = std::sync::atomic::AtomicU64::new(stall_mark(0, 1000));
-        let failures = std::sync::atomic::AtomicU64::new(1);
-        let h = Health {
-            ready: &ready,
-            marked: &marked,
-            failures: &failures,
-        };
-        heal_stall_mark(&h, 9000, 0);
-        assert!(!ready.load(Ordering::SeqCst));
-        // Stamped in the current epoch, the same mark heals.
-        marked.store(stall_mark(1, 1000), Ordering::SeqCst);
-        heal_stall_mark(&h, 9000, 0);
         assert!(ready.load(Ordering::SeqCst));
     }
 
     /// A stall mark with requests still in flight and no output since waits
     /// for output; with nothing left in flight it clears, as no stall can be
-    /// observed then. An unready state from a 5xx (no mark) does not.
+    /// observed then. An unready state from a 5xx does not.
     #[test]
     fn a_stall_mark_clears_once_nothing_is_in_flight() {
-        let ready = std::sync::atomic::AtomicBool::new(true);
-        let marked = std::sync::atomic::AtomicU64::new(0);
-        let failures = std::sync::atomic::AtomicU64::new(0);
+        let (ready, cause) = readiness_words();
         let h = Health {
             ready: &ready,
-            marked: &marked,
-            failures: &failures,
+            cause: &cause,
         };
         note_stall(&h, 1000);
-        heal_stall_mark(&h, 500, 1);
+        heal_stall_mark(&h, || (500, 1));
         assert!(!ready.load(Ordering::SeqCst), "in flight, no output since");
-        heal_stall_mark(&h, 500, 0);
-        assert!(ready.load(Ordering::SeqCst), "nothing in flight");
-        assert_eq!(marked.load(Ordering::SeqCst), 0);
+        heal_stall_mark(&h, || (500, 0));
+        assert_eq!(cause_of(&h), ReadinessState::Ready, "nothing in flight");
         note_failure(&h);
-        heal_stall_mark(&h, 500, 0);
-        assert!(!ready.load(Ordering::SeqCst), "a 5xx waits for a 2xx");
+        heal_stall_mark(&h, || (500, 0));
+        assert_eq!(
+            cause_of(&h),
+            ReadinessState::Pipeline,
+            "a 5xx waits for a 2xx"
+        );
     }
 
     /// A peer that times out makes every stream fail without output; once
