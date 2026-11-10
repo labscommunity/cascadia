@@ -2487,3 +2487,110 @@ fn a_dead_downstream_fails_json_admission_without_a_latch() {
         assert!(!evidence);
     }
 }
+
+/// A json request at the front of the stream queue finds the downstream link
+/// dead: on the read of a late answer still owed (a latched link), or on the
+/// probe (a link without evidence). The request fails with the link message,
+/// the head marks the link down so the next step re-dials, and the plain
+/// request behind it is not sent onto the dead socket, by this group or the
+/// next. The one-task path (no streams, no re-dial) answers the json request
+/// with the link message too, not with the upgrade message.
+#[test]
+fn a_dead_link_found_at_a_json_admission_is_redialed_not_reused() {
+    for latched in [true, false] {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let (srv, down) = l.remove(0);
+        let mut head = head_engine_with(
+            &rt,
+            JsonStub::new(),
+            down,
+            2,
+            0,
+            TEST_PROBE,
+            Duration::from_secs(3600),
+        );
+        if latched {
+            head.stage_masks.latch.set_probe();
+            head.owed_late
+                .owe_until(Instant::now() + Duration::from_secs(60));
+        }
+        rt.block_on(async { srv.lock().await.close().await });
+        drop(srv);
+        head.submit(json_task("j", 6)).unwrap();
+        let out = head.begin_generation().expect("j answered at its start");
+        let e = out[0].1.error.clone().expect("an error chunk");
+        assert!(e.starts_with(PROBE_LINK_FAILED), "one-task {latched}: {e}");
+    }
+    for latched in [true, false] {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let (srv, down) = l.remove(0);
+        let mut head = head_engine_with(
+            &rt,
+            JsonStub::new(),
+            down,
+            2,
+            2,
+            TEST_PROBE,
+            Duration::from_secs(3600),
+        );
+        if latched {
+            head.stage_masks.latch.set_probe();
+            head.owed_late
+                .owe_until(Instant::now() + Duration::from_secs(60));
+        }
+        // The link dies after the step's own idle check, inside the turn.
+        rt.block_on(async { srv.lock().await.close().await });
+        drop(srv);
+        head.submit(json_task("j", 6)).unwrap();
+        head.submit(plain_task("p", 8)).unwrap();
+        // Every group's turn (two here), as `step` runs them after its idle
+        // check.
+        let out = head.step_streams_pipeline();
+        let j = out
+            .iter()
+            .find(|(id, c)| id == "j" && c.is_final)
+            .unwrap_or_else(|| panic!("{latched}: j not answered: {out:?}"));
+        let e = j.1.error.clone().expect("an error chunk");
+        assert!(e.starts_with(PROBE_LINK_FAILED), "{latched}: {e}");
+        assert!(head.peer_disconnected, "{latched}: marked for a re-dial");
+        assert!(head.streams.is_empty(), "{latched}: p was not admitted");
+        assert!(
+            head.pending.iter().any(|t| t.task_id == "p"),
+            "{latched}: p waits for the re-dial"
+        );
+    }
+}
+
+/// A new downstream connection (the keeper re-dialed): a late probe answer
+/// owed on the old one never comes, so the head drops it and the latch it
+/// would have cleared, and the next json request probes the new link.
+#[test]
+fn a_new_connection_drops_the_owed_answer_and_the_latch() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), false);
+    let mut head = head_engine_with(
+        &rt,
+        JsonStub::new(),
+        l.remove(0).1,
+        2,
+        2,
+        ANSWERED_PROBE,
+        Duration::from_secs(3600),
+    );
+    head.stage_masks.latch.set_probe();
+    head.owed_late
+        .owe_until(Instant::now() + Duration::from_secs(60));
+    head.link_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    head.step().unwrap();
+    assert!(!head.stage_masks.latch.is_set());
+    assert!(!head.owed_late.is_owed());
+    assert!(!head.mask_evidence);
+    head.submit(json_task("j", 6)).unwrap();
+    let out = drive(&mut head, &["j"]);
+    assert_eq!(final_chunk(&out["j"]).error, None);
+    assert_eq!(log.probes(), 1, "the new link was probed");
+}

@@ -6797,10 +6797,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // every group's frame is in flight at once, which is the overlap.
         let mut out: Vec<(TaskId, Chunk)> = Vec::new();
         let groups = self.stream_groups.max(1);
+        let was_down = self.peer_disconnected;
         loop {
             for g in 0..groups {
                 let done = self.step_stream_group(g, &mut out);
                 if !done {
+                    return out;
+                }
+                // A link a json admission found dead in this turn takes
+                // nothing more: the next step re-dials it first. (While a
+                // re-dial is still failing, requests fail fast as before.)
+                if self.peer_disconnected && !was_down {
                     return out;
                 }
             }
@@ -6987,11 +6994,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     self.probe_wait_since = None;
                     if owed && !self.read_idle_replies() {
                         let task = self.pending.pop_front().expect("non-empty");
-                        admitted += 1;
                         self.grammars.remove(&task.task_id);
                         let msg = PROBE_LINK_FAILED.to_string();
                         out.push((task.task_id.clone(), Chunk::error(task.task_id, msg)));
-                        continue;
+                        // Dead: the next step re-dials before anything
+                        // else goes down it.
+                        warn!(
+                            rank = self.rank,
+                            "downstream link found dead at a json admission; re-dialing"
+                        );
+                        self.peer_disconnected = true;
+                        self.redial_next = None;
+                        break;
                     }
                     // Still latched: refused at its admission below.
                     let probe = !self.mask_evidence && self.stage_masks.refusal().is_none();
@@ -7005,6 +7019,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         admitted += 1;
                         self.grammars.remove(&task.task_id);
                         out.push((task.task_id.clone(), Chunk::error(task.task_id, msg)));
+                        if self.peer_disconnected {
+                            break;
+                        }
                         continue;
                     }
                 } else {
@@ -7265,7 +7282,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 Ok(())
             }
             Err(crate::dist::ProbeFailure::Link(reason)) => {
-                warn!(%reason, "the downstream link failed the mask-support probe");
+                warn!(%reason, "the downstream link failed the mask-support probe; re-dialing");
+                // The next step re-dials before anything else goes down it.
+                self.peer_disconnected = true;
+                self.redial_next = None;
                 Err(format!("{PROBE_LINK_FAILED} ({reason})"))
             }
             Err(crate::dist::ProbeFailure::Unanswered(reason)) => {
@@ -7660,6 +7680,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
         alive
     }
 
+    /// A new downstream connection: what the old one proved does not carry
+    /// over, and a late probe answer owed on the old one never arrives on
+    /// it, so the latch that answer would have cleared goes too (the next
+    /// json request probes the new connection).
+    fn forget_old_connection(&mut self) {
+        self.mask_evidence = false;
+        self.owed_late.settle();
+        self.stage_masks.latch.clear();
+    }
+
     /// Rank 0 only. The downstream link dropped: a neighbour restarted, or the
     /// connect raced a rank that was exiting. Workers rebuild by exiting for
     /// their supervisor because their listener accepts exactly once; the
@@ -7696,7 +7726,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         match res {
             Ok(()) => {
                 info!(rank = self.rank, "downstream link re-dialed; resuming");
-                self.mask_evidence = false;
+                self.forget_old_connection();
                 self.peer_disconnected = false;
                 self.disconnect_reported = false;
                 self.redial_next = None;
@@ -8483,8 +8513,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // that); probed first on a link without evidence that it masks; else
         // a fresh matcher (this path declines resumed turns).
         if compiled.is_some() {
-            if self.owed_late.is_owed() {
-                let _ = self.read_idle_replies();
+            if self.owed_late.is_owed() && !self.read_idle_replies() {
+                // A dead link, not an older stage: say so. (This path has no
+                // re-dial; the next request finds the link dead too.)
+                return Some(vec![(
+                    id.clone(),
+                    Chunk::error(id, PROBE_LINK_FAILED.to_string()),
+                )]);
             }
             if let Some(msg) = self.stage_masks.refusal() {
                 return Some(vec![(id.clone(), Chunk::error(id, msg))]);
@@ -10133,8 +10168,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                     self.redial_next = None;
                 }
                 if epoch != self.seen_link_epoch {
-                    // A new connection: what the old one proved does not carry over.
-                    self.mask_evidence = false;
+                    self.forget_old_connection();
                 }
                 self.seen_link_epoch = epoch;
                 let idle =
