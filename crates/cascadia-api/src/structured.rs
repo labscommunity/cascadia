@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 
 /// Grammar body used for `json_object` (and for `json_schema` whose schema is
 /// missing, `null`, `true` or `{}`): any JSON object.
-pub use cascadia_types::JSON_OBJECT_SCHEMA;
+pub const JSON_OBJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":true}"#;
 
 /// The output format a chat request asked for.
 #[derive(Clone, Debug, PartialEq)]

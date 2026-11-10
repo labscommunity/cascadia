@@ -204,12 +204,7 @@ impl GrammarFactory {
                 // Ours replaces any the client sent. json.dumps separators; oneOf is
                 // treated as anyOf (pydantic's discriminated unions); keywords
                 // llguidance can't enforce become warnings, not errors.
-                let options = if spec.is_json_object() {
-                    json_object_options()
-                } else {
-                    guidance_options()
-                };
-                obj.insert("x-guidance".into(), options);
+                obj.insert("x-guidance".into(), guidance_options());
                 match self.compile_schema(schema.clone(), Vec::new()) {
                     Err(e) if is_regex_error(&e) => {
                         // Only on a regex error: drop every pattern the regex
@@ -329,25 +324,6 @@ fn guidance_options() -> serde_json::Value {
         // other whitespace, so a model can't loop on spaces or newlines.
         "key_separator": ": ",
         "item_separator": ", ",
-        "coerce_one_of": true,
-        "lenient": true,
-    })
-}
-
-/// The longest run of whitespace `json_object` allows between two tokens.
-pub const JSON_OBJECT_WHITESPACE_MAX: usize = 20;
-
-/// `json_object`: any JSON object, and models that pretty-print it (a
-/// newline after `{`, indented keys) may: up to
-/// [`JSON_OBJECT_WHITESPACE_MAX`] spaces, tabs or newlines between tokens.
-/// The bound keeps a model from looping on whitespace. A schema keeps
-/// [`guidance_options`].
-fn json_object_options() -> serde_json::Value {
-    serde_json::json!({
-        "whitespace_flexible": true,
-        "whitespace_pattern": format!("[\\x20\\x0A\\x0D\\x09]{{1,{JSON_OBJECT_WHITESPACE_MAX}}}"),
-        "key_separator": ":",
-        "item_separator": ",",
         "coerce_one_of": true,
         "lenient": true,
     })
