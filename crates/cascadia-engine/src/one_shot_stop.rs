@@ -142,6 +142,94 @@ impl OneShotStop {
     }
 }
 
+/// When an engine whose answer is `strip_prefix(prompt)` + `trim_start` of its decode (else the
+/// decode as is) may start its in-engine stop check (M18 D9).
+///
+/// The engine must never stop on a match inside text that the visible answer strips (a prompt
+/// echo, leading whitespace): the API would then cut a different answer than a run with the check
+/// off. So the check is armed only once every window it looks at lies wholly inside the visible
+/// text. A stop that starts before that point is missed by the engine; that costs latency only,
+/// because the API still cuts the final text.
+///
+/// Feed [`armed`](Self::armed) the cumulative generated token count and the window decode of the
+/// last `window` ids, at every poll. While the count is at most `window`, that decode is the whole
+/// generated text F:
+/// - F still a prefix of the prompt: not decided yet;
+/// - F does not start with the prompt (no strip; nearly every chat request): armed from now on;
+/// - F starts with the prompt (the strip and trim apply; always so for an empty prompt): armed
+///   once the count reaches k0 + `window`, where k0 is the count at which the trimmed visible text
+///   first became non-empty. From then on the window holds only visible text.
+///
+/// If the count passes `window` while still undecided (a long echo), it never arms.
+#[derive(Debug, Clone)]
+pub struct VisibleArm {
+    prompt: String,
+    window: usize,
+    state: ArmState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmState {
+    Undecided,
+    Armed,
+    /// Armed once the generated count reaches this.
+    From(usize),
+    Never,
+}
+
+impl VisibleArm {
+    /// For an engine that strips `prompt` and trims (see the type docs); `window` is the number of
+    /// ids its window decode covers.
+    pub fn new(prompt: &str, window: usize) -> Self {
+        Self {
+            prompt: prompt.to_string(),
+            window,
+            state: ArmState::Undecided,
+        }
+    }
+
+    /// For text that is returned as decoded (no strip, no trim): armed at once.
+    pub fn always() -> Self {
+        Self {
+            prompt: String::new(),
+            window: 0,
+            state: ArmState::Armed,
+        }
+    }
+
+    /// Whether the stop check may run on this poll. `generated` is the cumulative generated token
+    /// count and `window_text` the decode of the last `min(window, generated)` ids.
+    pub fn armed(&mut self, generated: usize, window_text: &str) -> bool {
+        if self.state == ArmState::Undecided {
+            self.decide(generated, window_text);
+        }
+        match self.state {
+            ArmState::Armed => true,
+            ArmState::From(at) => generated >= at,
+            ArmState::Undecided | ArmState::Never => false,
+        }
+    }
+
+    fn decide(&mut self, generated: usize, full: &str) {
+        if generated > self.window {
+            // The window decode is no longer the whole text: k0 can't be found.
+            self.state = ArmState::Never;
+            return;
+        }
+        // A character split at the end: the next id may still complete a prompt character.
+        if full.ends_with('\u{FFFD}') || self.prompt.starts_with(full) {
+            return;
+        }
+        match full.strip_prefix(self.prompt.as_str()) {
+            None => self.state = ArmState::Armed,
+            Some(rest) if !rest.trim_start().is_empty() => {
+                self.state = ArmState::From(generated + self.window);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 /// Among the stops found in `text`, the one whose first occurrence starts earliest, then ends
 /// earliest, then is listed first.
 fn earliest_match(stops: &[String], text: &str) -> Option<usize> {
@@ -399,5 +487,59 @@ mod tests {
         assert!(s.matches_tail("是的你"));
         // A U+FFFD earlier in the window (a split char at its start) doesn't block a match.
         assert!(s.matches_tail("\u{FFFD}是的"));
+    }
+
+    /// Feeds `tokens` one per poll, the window decode being the last `window` of them; returns the
+    /// poll counts at which the gate was armed.
+    fn armed_at(prompt: &str, window: usize, tokens: &[&str]) -> Vec<usize> {
+        let mut arm = VisibleArm::new(prompt, window);
+        (1..=tokens.len())
+            .filter(|&n| arm.armed(n, &tokens[n.saturating_sub(window)..n].concat()))
+            .collect()
+    }
+
+    #[test]
+    fn visible_arm_a_chat_answer_arms_at_once() {
+        assert_eq!(
+            armed_at("<|user|>hi<|assistant|>", 5, &["Hello", " there"]),
+            [1, 2]
+        );
+        assert!(VisibleArm::always().armed(1, "x"));
+    }
+
+    /// An empty prompt: the strip always applies. k0 = 3 ("Hi"), so the gate arms at 3 + window.
+    #[test]
+    fn visible_arm_empty_prompt_waits_past_the_leading_whitespace() {
+        let toks = ["\n", "\n", "Hi", "\n", "a", "b", "c", "d"];
+        assert_eq!(armed_at("", 4, &toks), [7, 8]);
+    }
+
+    /// A prompt echo: undecided while the output is a prefix of the prompt, then k0 at the first
+    /// visible token.
+    #[test]
+    fn visible_arm_a_prompt_echo_waits_for_the_visible_text() {
+        let toks = ["Hel", "lo", "\n", "There", "x", "y", "z", "w", "v"];
+        // k0 = 4 ("There"), window 5: armed from 9.
+        assert_eq!(armed_at("Hello", 5, &toks), [9]);
+    }
+
+    /// An echo longer than the window: the window decode stops being the whole text before the
+    /// visible text starts, so it never arms.
+    #[test]
+    fn visible_arm_a_long_echo_never_arms() {
+        let prompt = "a b c d e f";
+        let toks = ["a", " b", " c", " d", " e", " f", " X", " Y", " Z", " W"];
+        assert!(armed_at(prompt, 4, &toks).is_empty());
+    }
+
+    /// A trailing split character might still complete a prompt character: no decision yet.
+    #[test]
+    fn visible_arm_waits_on_a_trailing_partial_char() {
+        let mut arm = VisibleArm::new("是的", 8);
+        assert!(!arm.armed(1, "\u{FFFD}"));
+        assert!(!arm.armed(2, "是"));
+        assert!(!arm.armed(3, "是的"));
+        assert!(!arm.armed(4, "是的 ok"));
+        assert!(arm.armed(12, "ok"));
     }
 }

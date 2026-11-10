@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use cascadia_engine::{
-    Builder, Engine, EngineError, EngineResult, InflightCancel, LoadStream, OneShotStop,
+    Builder, Engine, EngineError, EngineResult, InflightCancel, LoadStream, OneShotStop, VisibleArm,
 };
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
@@ -575,6 +575,10 @@ impl Engine for OvGenaiEngine {
         } else {
             0
         };
+        // Arm the check only on text the visible answer keeps (M18 D9): an
+        // engine stop inside a stripped prompt echo or leading whitespace
+        // would give a different answer than a run with the check off.
+        let mut arm = VisibleArm::new(&task.prompt, tail_tokens);
         let mut polled_tokens: u64 = 0;
         let mut stopped_on_match = false;
         // Which thread ov-genai calls the streamer on, probed on the first
@@ -602,7 +606,11 @@ impl Engine for OvGenaiEngine {
                     ended = Some(PollAction::Cancel);
                     return PollAction::Cancel;
                 }
-                if tail_tokens > 0 && n_tokens > 0 && stop.matches_tail(tail) {
+                if tail_tokens > 0
+                    && n_tokens > 0
+                    && arm.armed(polled_tokens as usize, tail)
+                    && stop.matches_tail(tail)
+                {
                     stopped_on_match = true;
                     ended = Some(PollAction::Stop);
                     return PollAction::Stop;
@@ -649,35 +657,21 @@ impl Engine for OvGenaiEngine {
         let elapsed = started.elapsed().as_secs_f64();
 
         let raw = result.text;
-        let mut text = match raw.strip_prefix(&task.prompt) {
+        let text = match raw.strip_prefix(&task.prompt) {
             Some(stripped) => stripped.trim_start().to_string(),
-            None => raw.clone(),
+            None => raw,
         };
-        // The generation stopped on a match in the raw text, but the strip
-        // (a prompt echo) or the trim (leading whitespace) can remove the text
-        // it matched in. The API would then find no stop, and the client would
-        // get an answer cut short with nothing to show why. Return the raw
-        // text instead, so the API's cut is the one generation stopped on
-        // (OpenAI: stop applies to the generated output) (M18 D8).
-        //
-        // If raw lacks the stop too, the D8 invariant (a window decode is a
-        // substring of the final decode) broke. That can rarely happen when a
-        // detokenizer cleanup rule (`clean_up_tokenization_spaces`) rewrites
-        // text based on later tokens, so a window matched what the final
-        // decode no longer has. Keep the visible text and warn: the hardware
-        // check fails on that line.
-        if stopped_on_match {
-            let has_stop = |t: &str| OneShotStop::new(&task.sampling.stop).push(t);
-            if !has_stop(&text) {
-                if has_stop(&raw) {
-                    text = raw;
-                } else {
-                    warn!(
-                        task = %task.task_id,
-                        "engine stopped on a stop the returned text lacks (D8 invariant)"
-                    );
-                }
-            }
+        // The check armed only on text this visible answer keeps (M18 D9),
+        // so it holds the stop. If it doesn't, the D8 invariant (a window
+        // decode is a substring of the final decode) broke. That can rarely
+        // happen when a detokenizer cleanup rule (`clean_up_tokenization_spaces`)
+        // rewrites text based on later tokens. Keep the text and warn: the
+        // hardware check fails on that line.
+        if stopped_on_match && !OneShotStop::new(&task.sampling.stop).push(&text) {
+            warn!(
+                task = %task.task_id,
+                "engine stopped on a stop the returned text lacks (D8 invariant)"
+            );
         }
         // Prefer tokenizer-based count; fall back to perf_metrics value.
         let tokens = self
@@ -2455,38 +2449,81 @@ mod tests {
         }
     }
 
-    /// The model repeats the prompt. step's strip_prefix + trim_start would
-    /// remove the "\n" the generation stopped on and leave "": the raw text
-    /// goes out instead, so the API's cut gives "Hi".
-    #[test]
-    fn stateful_stop_in_a_prompt_echo_returns_the_raw_text() {
+    /// One stateful step over `toks` (one token per write) with `stops`, with the
+    /// engine stop check on or off: (final chunk, writes consumed).
+    fn run_stateful(prompt: &str, toks: &[&str], stops: &[&str], check: bool) -> (Chunk, usize) {
         let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["Hi", "\n", "There", "\n"]);
-        let mut e = stateful_engine(&st);
-        let mut t = stop_task("t1", 64, &["\n"]);
-        t.prompt = "Hi".into();
+        st.lock().unwrap().pieces = pieces(toks);
+        let mut e = stateful_engine_with(&st, |b| b.with_engine_stop_check(check));
+        let mut t = stop_task("t1", 64, stops);
+        t.prompt = prompt.into();
         e.submit(t).unwrap();
         let out = e.step().unwrap();
-        assert_eq!(st.lock().unwrap().consumed, 2);
-        assert_eq!(out[0].1.text, "Hi\n");
-        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+        let consumed = st.lock().unwrap().consumed;
+        (out[0].1.clone(), consumed)
     }
 
-    /// The answer starts with the stop: the engine stops on the first token
-    /// and returns it as is, so the API cut gives "".
+    /// An empty prompt: step's strip_prefix + trim_start apply, and the
+    /// leading "\n"s are not part of the answer. The engine must not stop on
+    /// them (M18 D9): it returns the visible text, so the API cut gives "Hi",
+    /// the same as with the check off.
     #[test]
-    fn stateful_stop_in_leading_whitespace_returns_the_raw_text() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["\n", "\n", "Hi", "\n"]);
-        let mut e = stateful_engine(&st);
-        let mut t = stop_task("t1", 64, &["\n"]);
-        // An empty prompt makes step's strip_prefix + trim_start apply.
-        t.prompt = String::new();
-        e.submit(t).unwrap();
-        let out = e.step().unwrap();
-        assert_eq!(st.lock().unwrap().consumed, 1);
-        assert_eq!(out[0].1.text, "\n");
-        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+    fn stateful_empty_prompt_does_not_stop_in_leading_whitespace() {
+        let toks = ["\n", "\n", "Hi", "\n", "There"];
+        let (on, consumed) = run_stateful("", &toks, &["\n"], true);
+        let (off, _) = run_stateful("", &toks, &["\n"], false);
+        assert_eq!(on.text, "Hi\nThere");
+        assert_eq!(on.text, off.text);
+        assert_eq!(on.finish_reason, off.finish_reason);
+        assert_eq!(
+            consumed,
+            toks.len(),
+            "not armed inside the window: no engine stop"
+        );
+    }
+
+    /// The model repeats the prompt: the strip removes it, so a stop inside
+    /// the echo must not end the generation (M18 D9). The answer is built on
+    /// "There", the same as with the check off.
+    #[test]
+    fn stateful_stop_in_a_prompt_echo_keeps_the_visible_answer() {
+        let toks = ["Hi", "\n", "There", "\n"];
+        let (on, _) = run_stateful("Hi", &toks, &["\n"], true);
+        let (off, _) = run_stateful("Hi", &toks, &["\n"], false);
+        assert_eq!(on.text, "There\n");
+        assert_eq!(on.text, off.text);
+    }
+
+    /// A chat-style prompt the output doesn't start with: no strip, so the
+    /// check is armed from the first token.
+    #[test]
+    fn stateful_chat_prompt_arms_the_stop_at_once() {
+        let (c, consumed) = run_stateful(
+            "<|user|>count<|assistant|>",
+            &["one", "\n", "two", "\n"],
+            &["\n"],
+            true,
+        );
+        assert_eq!(consumed, 2);
+        assert_eq!(c.text, "one\n");
+        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// An echo longer than the window: the visible text starts after the
+    /// window decode stopped being the whole text, so the check never arms
+    /// (latency only; the answer equals the check-off run).
+    #[test]
+    fn stateful_a_long_echo_never_arms() {
+        // Stop "x": window 1 + 16 = 17 tokens; the echo is 20.
+        let echo: Vec<String> = (0..20).map(|i| format!("w{i} ")).collect();
+        let prompt = echo.concat();
+        let mut toks: Vec<&str> = echo.iter().map(String::as_str).collect();
+        toks.extend(["x", " y", " x", " z"]);
+        let (on, consumed) = run_stateful(&prompt, &toks, &["x"], true);
+        let (off, _) = run_stateful(&prompt, &toks, &["x"], false);
+        assert_eq!(consumed, toks.len());
+        assert_eq!(on.text, "x y x z");
+        assert_eq!(on.text, off.text);
     }
 
     /// The window is the last `tail_tokens` tokens, not the whole history:
@@ -2510,8 +2547,8 @@ mod tests {
         assert_eq!(s.polls[30], (String::new(), 0, PollAction::Running));
     }
 
-    /// D8 invariant broken (a window decode that matched while neither the
-    /// returned nor the visible text holds the stop): keep the visible text,
+    /// D8 invariant broken (a window decode that matched while the visible
+    /// text doesn't hold the stop): keep the visible text,
     /// and say so in a warn the hardware check fails on.
     #[test]
     fn stateful_stop_missing_from_both_texts_keeps_visible_and_warns() {
@@ -2522,13 +2559,11 @@ mod tests {
             s.tail_override = Some((1, "STOP".into()));
         }
         let mut e = stateful_engine(&st);
-        let mut t = stop_task("t1", 64, &["STOP"]);
-        // An empty prompt: the visible text is the raw text trimmed.
-        t.prompt = String::new();
-        e.submit(t).unwrap();
+        // The default chat-style prompt: armed at once, no strip.
+        e.submit(stop_task("t1", 64, &["STOP"])).unwrap();
         let (out, logs) = capture_logs(|| e.step().unwrap());
         assert_eq!(st.lock().unwrap().consumed, 2);
-        assert_eq!(out[0].1.text, "alpha beta");
+        assert_eq!(out[0].1.text, "  alpha beta");
         assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
         assert!(
             logs.contains("engine stopped on a stop the returned text lacks (D8 invariant)"),

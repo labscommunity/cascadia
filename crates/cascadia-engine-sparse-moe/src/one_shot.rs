@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use cascadia_engine::{InflightCancel, OneShotStop};
+use cascadia_engine::{InflightCancel, OneShotStop, VisibleArm};
 use cascadia_types::{Chunk, FinishReason, TaskId};
 use tracing::warn;
 
@@ -60,6 +60,9 @@ pub(crate) struct OneShotPoll<'a, T> {
     stop: OneShotStop,
     window: usize,
     decode: TailDecode<'a, T>,
+    /// When the check may run (M18 D9); armed at once unless
+    /// [`Self::with_visible_arm`] says the answer strips text.
+    arm: VisibleArm,
     ended: Option<PollEnd>,
 }
 
@@ -86,8 +89,18 @@ impl<'a, T> OneShotPoll<'a, T> {
             stop,
             window,
             decode: Box::new(decode),
+            arm: VisibleArm::always(),
             ended: None,
         }
+    }
+
+    /// For an engine whose answer is `strip_prefix(prompt)` + `trim_start`
+    /// of its decode: arm the stop check only on text that answer keeps, so
+    /// an engine stop never lands in a stripped prompt echo or leading
+    /// whitespace (M18 D9; see [`VisibleArm`]).
+    pub(crate) fn with_visible_arm(mut self, prompt: &str) -> Self {
+        self.arm = VisibleArm::new(prompt, self.window);
+        self
     }
 
     /// Whether the runner should end the generation now. Latches: once true,
@@ -103,7 +116,7 @@ impl<'a, T> OneShotPoll<'a, T> {
         if self.window > 0 && !generated.is_empty() {
             let tail = &generated[generated.len().saturating_sub(self.window)..];
             if let Some(text) = (self.decode)(tail) {
-                if self.stop.matches_tail(&text) {
+                if self.arm.armed(generated.len(), &text) && self.stop.matches_tail(&text) {
                     self.ended = Some(PollEnd::Stopped);
                     return true;
                 }
@@ -118,33 +131,10 @@ impl<'a, T> OneShotPoll<'a, T> {
     }
 }
 
-/// The text to return after an engine stop, for an engine that post-processes
-/// its decode (`raw`) into `visible` (a prompt-echo strip, a leading trim).
-///
-/// That processing can remove the text the stop matched in; the API would then
-/// find no stop and the client would get an answer cut short with nothing to
-/// show why. So `raw` is returned when only it holds a stop (OpenAI: stop applies
-/// to the generated output). When neither does, the D8 invariant broke (a
-/// detokenizer cleanup rule rewrote text based on later tokens): keep `visible`
-/// and warn; the hardware check fails on that line (M18 D8).
-pub(crate) fn text_after_stop(
-    task_id: &TaskId,
-    stops: &[String],
-    visible: String,
-    raw: String,
-) -> String {
-    if has_stop(stops, &visible) {
-        return visible;
-    }
-    if has_stop(stops, &raw) {
-        return raw;
-    }
-    warn_d8_invariant(task_id);
-    visible
-}
-
-/// After an engine stop, for text that has no raw form to fall back to (a
-/// resumed turn's tail): warns when it holds no stop (the D8 invariant broke).
+/// After an engine stop: warns when the returned text holds no stop. The check
+/// armed only on text that text keeps (M18 D9), so this means the D8 invariant
+/// broke (a detokenizer cleanup rule rewrote text based on later tokens); the
+/// hardware check fails on that line.
 pub(crate) fn check_text_after_stop(task_id: &TaskId, stops: &[String], text: &str) {
     if !has_stop(stops, text) {
         warn_d8_invariant(task_id);
@@ -301,20 +291,65 @@ mod tests {
         assert!(!p.should_stop(&[1]));
     }
 
+    /// The K2.6 single-stage flow over a token table: poll after every
+    /// generated id (as the runner does), stop when told, then the visible
+    /// text `step_single_stage` returns (strip the prompt, trim).
+    fn k26_answer(prompt: &str, toks: &[&str], stops_: &[&str], check: bool) -> (String, usize) {
+        let h = InflightCancel::new();
+        let decode = |ids: &[u32]| Some(ids.iter().map(|&i| toks[i as usize]).collect::<String>());
+        let mut p = OneShotPoll::new(&h, &stops(stops_), check, 0, decode).with_visible_arm(prompt);
+        let mut ids: Vec<u32> = Vec::new();
+        for i in 0..toks.len() as u32 {
+            ids.push(i);
+            if p.should_stop(&ids) {
+                break;
+            }
+        }
+        let raw = decode(&ids).unwrap();
+        let visible = match raw.strip_prefix(prompt) {
+            Some(s) => s.trim_start().to_string(),
+            None => raw,
+        };
+        (visible, ids.len())
+    }
+
+    /// An empty prompt: the strip always applies. The leading "\n"s are not
+    /// in the answer, so no engine stop there (M18 D9): the visible text is
+    /// the check-off text, and the API cut gives "Hi".
     #[test]
-    fn text_after_stop_prefers_visible_then_raw_then_warns() {
-        let id = TaskId::from("t");
-        let s = stops(&["END"]);
-        assert_eq!(
-            text_after_stop(&id, &s, "a END".into(), "p a END".into()),
-            "a END"
-        );
-        // The strip removed the match: the raw text goes out.
-        assert_eq!(
-            text_after_stop(&id, &s, "a".into(), "END a".into()),
-            "END a"
-        );
-        // Neither holds it: keep the visible text.
-        assert_eq!(text_after_stop(&id, &s, "a".into(), "b".into()), "a");
+    fn an_empty_prompt_does_not_stop_in_leading_whitespace() {
+        let toks = ["\n", "\n", "Hi", "\n", "There"];
+        let (on, n) = k26_answer("", &toks, &["\n"], true);
+        assert_eq!(on, "Hi\nThere");
+        assert_eq!(n, toks.len());
+        assert_eq!(on, k26_answer("", &toks, &["\n"], false).0);
+    }
+
+    #[test]
+    fn a_prompt_echo_keeps_the_visible_answer() {
+        let toks = ["Hi", "\n", "There", "\n"];
+        let (on, _) = k26_answer("Hi", &toks, &["\n"], true);
+        assert_eq!(on, "There\n");
+        assert_eq!(on, k26_answer("Hi", &toks, &["\n"], false).0);
+    }
+
+    #[test]
+    fn a_chat_prompt_arms_at_once() {
+        let (on, n) = k26_answer("<|user|>count", &["one", "\n", "two", "\n"], &["\n"], true);
+        assert_eq!((on.as_str(), n), ("one\n", 2));
+    }
+
+    /// An echo longer than the window: never armed, latency only.
+    #[test]
+    fn a_long_echo_never_arms() {
+        let echo: Vec<String> = (0..20).map(|i| format!("w{i} ")).collect();
+        let prompt = echo.concat();
+        let mut toks: Vec<&str> = echo.iter().map(String::as_str).collect();
+        toks.extend(["x", " y", " x", " z"]);
+        // Stop "x": window 1 + TAIL_SLACK_IDS = 17 ids; the echo is 20.
+        let (on, n) = k26_answer(&prompt, &toks, &["x"], true);
+        assert_eq!(n, toks.len());
+        assert_eq!(on, "x y x z");
+        assert_eq!(on, k26_answer(&prompt, &toks, &["x"], false).0);
     }
 }

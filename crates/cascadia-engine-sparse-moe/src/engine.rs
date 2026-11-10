@@ -1945,7 +1945,7 @@ impl SparseMoEEngine {
         } else {
             0
         };
-        let mut poll = crate::one_shot::OneShotPoll::new(
+        let poll = crate::one_shot::OneShotPoll::new(
             &inflight,
             &task.sampling.stop,
             self.engine_stop_check,
@@ -1955,6 +1955,14 @@ impl SparseMoEEngine {
                 tokenizer.decode(&ids, true).ok()
             },
         );
+        // A fresh turn returns the decode with the prompt echo stripped and
+        // leading whitespace trimmed: arm the stop only on what it keeps
+        // (M18 D9). A resumed turn returns its tail as decoded.
+        let mut poll = if resume.is_none() {
+            poll.with_visible_arm(&task.prompt)
+        } else {
+            poll
+        };
         // Err = (log line, error-chunk text).
         let generated: Result<Vec<i64>, (String, String)> = if use_spec {
             let k = self.spec_decode_k.unwrap();
@@ -2076,8 +2084,6 @@ impl SparseMoEEngine {
                 String::new()
             };
             if stopped_on_match {
-                // No raw form to fall back to here: the prefix's text is the
-                // client's already (M18 D8).
                 crate::one_shot::check_text_after_stop(&task.task_id, &task.sampling.stop, &tail);
             }
             tail
@@ -2088,15 +2094,16 @@ impl SparseMoEEngine {
                 .unwrap_or_else(|_| String::new());
             let visible = match raw.strip_prefix(&task.prompt) {
                 Some(stripped) => stripped.trim_start().to_string(),
-                None => raw.clone(),
+                None => raw,
             };
             if stopped_on_match {
-                // The strip / trim can remove the text the stop matched in
-                // (M18 D8): return the raw decode then.
-                crate::one_shot::text_after_stop(&task.task_id, &task.sampling.stop, visible, raw)
-            } else {
-                visible
+                crate::one_shot::check_text_after_stop(
+                    &task.task_id,
+                    &task.sampling.stop,
+                    &visible,
+                );
             }
+            visible
         };
         let elapsed = started.elapsed().as_secs_f64();
         if stopped_on_match {
