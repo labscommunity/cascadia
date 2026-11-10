@@ -5789,7 +5789,7 @@ mod tests {
         // engine's own text after it.
         assert_eq!(
             v["error"]["message"],
-            "This model's maximum context length is exceeded: your messages exceeds the \
+            "This model's maximum context length is exceeded: your messages exceeded the \
              available context size. Please reduce the length of the messages. (x)"
         );
     }
@@ -12506,7 +12506,9 @@ level={{ effort_map[eff] }}";
             (StatusCode::BAD_REQUEST, Some("context_length_exceeded"))
         );
         assert!(
-            m.starts_with("This model's maximum context length is exceeded: your messages exceeds"),
+            m.starts_with(
+                "This model's maximum context length is exceeded: your messages exceeded"
+            ),
             "{m}"
         );
     }

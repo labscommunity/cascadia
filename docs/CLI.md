@@ -536,9 +536,9 @@ Its forms, by what the engine reported (`messages` is the route's prompt field):
 |---|---|
 | window N, prompt M > N | `This model's maximum context length is N tokens. However, your messages resulted in M tokens. Please reduce the length of the messages.` |
 | window N, prompt M ≤ N | `This model's maximum context length is N tokens. However, your messages resulted in M tokens, which leaves no room for the completion. Please reduce the length of the messages.` |
-| window N only | `This model's maximum context length is N tokens. However, your messages is longer than that. Please reduce the length of the messages.` |
+| window N only | `This model's maximum context length is N tokens. However, your messages exceeded this limit. Please reduce the length of the messages.` |
 | prompt M only | `This model's maximum context length is exceeded: your messages resulted in M tokens, which exceeds the available context size. Please reduce the length of the messages.` |
-| neither | `This model's maximum context length is exceeded: your messages exceeds the available context size. Please reduce the length of the messages.` |
+| neither | `This model's maximum context length is exceeded: your messages exceeded the available context size. Please reduce the length of the messages.` |
 
 `sparse-moe` truncates an over-window prompt instead. `sycl-llama` sends this
 code when `llama-server` refuses the prompt as over its window (with the counts

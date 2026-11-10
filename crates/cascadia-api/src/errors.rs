@@ -119,8 +119,8 @@ pub fn context_length_message(
              of the {noun}."
         ),
         (Some(n), None) => format!(
-            "This model's maximum context length is {n} tokens. However, your {noun} is longer \
-             than that. Please reduce the length of the {noun}."
+            "This model's maximum context length is {n} tokens. However, your {noun} exceeded \
+             this limit. Please reduce the length of the {noun}."
         ),
         (None, Some(m)) => format!(
             "This model's maximum context length is exceeded: your {noun} resulted in {m} \
@@ -128,7 +128,7 @@ pub fn context_length_message(
              {noun}."
         ),
         (None, None) => format!(
-            "This model's maximum context length is exceeded: your {noun} exceeds the \
+            "This model's maximum context length is exceeded: your {noun} exceeded the \
              available context size. Please reduce the length of the {noun}."
         ),
     };
@@ -523,8 +523,8 @@ mod tests {
             (
                 Some(8192),
                 None,
-                "This model's maximum context length is 8192 tokens. However, your messages is \
-                 longer than that. Please reduce the length of the messages.",
+                "This model's maximum context length is 8192 tokens. However, your messages \
+                 exceeded this limit. Please reduce the length of the messages.",
             ),
             (
                 None,
@@ -536,7 +536,7 @@ mod tests {
             (
                 None,
                 None,
-                "This model's maximum context length is exceeded: your messages exceeds the \
+                "This model's maximum context length is exceeded: your messages exceeded the \
                  available context size. Please reduce the length of the messages.",
             ),
         ];
@@ -549,7 +549,7 @@ mod tests {
         }
         assert_eq!(
             context_length_message("input", None, None, ""),
-            "This model's maximum context length is exceeded: your input exceeds the \
+            "This model's maximum context length is exceeded: your input exceeded the \
              available context size. Please reduce the length of the input."
         );
     }
