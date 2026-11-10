@@ -461,39 +461,80 @@ pub fn unsatisfiable_bound(schema: &Value) -> Option<String> {
     let mut path = Vec::new();
     find_unsatisfiable_bound(schema, &mut path, 0).or_else(|| {
         // A local `$ref` makes whatever it points to a schema, inside a data
-        // keyword too, which the walk above skips. Only such targets need a
-        // walk of their own, and each one once, however many refs name it.
-        let mut walked: HashSet<*const Value> = HashSet::new();
-        let mut stack = vec![schema];
-        while let Some(v) = stack.pop() {
-            match v {
-                Value::Object(o) => {
-                    if let Some(r) = o.get("$ref").and_then(Value::as_str) {
-                        let mut path: Vec<String> = r
-                            .trim_start_matches('#')
-                            .split('/')
-                            .filter(|k| !k.is_empty())
-                            .map(|k| k.replace("~1", "/").replace("~0", "~"))
-                            .collect();
-                        let in_data = path.iter().any(|k| DATA_KEYS.contains(&k.as_str()));
-                        for target in backstop_targets(schema, r) {
-                            if !in_data || !walked.insert(target as *const Value) {
-                                continue;
-                            }
-                            let found = find_unsatisfiable_bound(target, &mut path, 0);
-                            if found.is_some() {
-                                return found;
-                            }
-                        }
+        // keyword too, which the walk above skips. Each such target gets a
+        // walk of its own, once, and a target inside another one only when
+        // that one's walk skips it: refs to every level of one subtree cost
+        // one walk of it.
+        uncovered_ref_targets(schema)
+            .into_iter()
+            .find_map(|(target, mut path)| find_unsatisfiable_bound(target, &mut path, 0))
+    })
+}
+
+/// The targets of the local `$ref`s in `root` that no walk from the root
+/// visits (it skips data keywords), outermost first, each with the decoded
+/// path of a ref naming it. A target is left out when the walk from the root
+/// or from another target returned here visits it, the way
+/// [`find_unsatisfiable_bound`] walks: data keywords skipped, the entries of a
+/// map of named schemas walked whatever their names.
+fn uncovered_ref_targets(root: &Value) -> Vec<(&Value, Vec<String>)> {
+    let mut targets: HashMap<*const Value, Vec<String>> = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(o) => {
+                if let Some(r) = o.get("$ref").and_then(Value::as_str) {
+                    for target in backstop_targets(root, r) {
+                        targets
+                            .entry(target as *const Value)
+                            .or_insert_with(|| decode_pointer(r));
                     }
-                    stack.extend(o.values());
                 }
-                Value::Array(a) => stack.extend(a.iter()),
-                _ => {}
+                stack.extend(o.values());
+            }
+            Value::Array(a) => stack.extend(a.iter()),
+            _ => {}
+        }
+    }
+    let mut uncovered = Vec::new();
+    // Each value with whether a walk visits it as a schema, and whether it is
+    // a map of named schemas.
+    let mut stack = vec![(root, true, false)];
+    while let Some((v, mut walked, schema_map)) = stack.pop() {
+        if targets.is_empty() {
+            break;
+        }
+        if !walked {
+            if let Some(path) = targets.remove(&(v as *const Value)) {
+                uncovered.push((v, path));
+                walked = true;
             }
         }
-        None
-    })
+        match v {
+            Value::Object(o) => stack.extend(o.iter().map(|(key, child)| {
+                if schema_map {
+                    (child, walked, false)
+                } else if DATA_KEYS.contains(&key.as_str()) {
+                    (child, false, false)
+                } else {
+                    let map = SCHEMA_MAPS.contains(&key.as_str()) && child.is_object();
+                    (child, walked, map)
+                }
+            })),
+            Value::Array(a) => stack.extend(a.iter().map(|child| (child, walked, false))),
+            _ => {}
+        }
+    }
+    uncovered
+}
+
+/// The keys of a local `$ref` such as `#/$defs/a~1b`, decoded: `["$defs", "a/b"]`.
+fn decode_pointer(r: &str) -> Vec<String> {
+    r.trim_start_matches('#')
+        .split('/')
+        .filter(|k| !k.is_empty())
+        .map(|k| k.replace("~1", "/").replace("~0", "~"))
+        .collect()
 }
 
 fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> Option<String> {
@@ -514,7 +555,7 @@ fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> 
             .find_map(|(i, c)| descend(path, i.to_string(), c)),
         Value::Object(obj) => {
             if let Some(found) = bound_violation(obj) {
-                return Some(locate(found, "", path));
+                return Some(locate(found, path));
             }
             for (key, child) in obj {
                 if DATA_KEYS.contains(&key.as_str()) {
@@ -539,11 +580,10 @@ fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> 
             }
             // The members of an `allOf` all apply to the same value: bounds
             // from different members (and the holder) can leave nothing.
-            if let Some(Value::Array(members)) = obj.get("allOf") {
-                let sources: Vec<&Map<String, Value>> = std::iter::once(obj)
-                    .chain(members.iter().filter_map(Value::as_object))
-                    .collect();
-                return all_of_violation(&sources, path, depth);
+            if let Some(Value::Array(_)) = obj.get("allOf") {
+                let (mut arena, mut sources) = (Vec::new(), Vec::new());
+                add_source(&mut arena, &mut sources, obj, None, Step::Holder, depth);
+                return all_of_violation(&mut arena, &sources, path, depth);
             }
             None
         }
@@ -554,6 +594,37 @@ fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> 
 /// A bound pair in `obj` no value meets, or an integer-only range with no
 /// integer: its description and whether it is a pair.
 fn bound_violation(obj: &Map<String, Value>) -> Option<(String, bool)> {
+    Some(match violated_pair(obj)? {
+        (lower, upper, Some(strict)) => (
+            format!(
+                "{lower} ({}) {} {upper} ({})",
+                obj[lower],
+                relation(strict),
+                obj[upper]
+            ),
+            true,
+        ),
+        (lower, upper, None) => (
+            format!(
+                "no integer meets {lower} ({}) and {upper} ({})",
+                obj[lower], obj[upper]
+            ),
+            false,
+        ),
+    })
+}
+
+fn relation(strict: bool) -> &'static str {
+    if strict {
+        "is not less than"
+    } else {
+        "is greater than"
+    }
+}
+
+/// The lower and upper keywords of a bound pair in `obj` no value meets, with
+/// `Some(strict)`, or of an integer-only range with no integer, with `None`.
+fn violated_pair(obj: &Map<String, Value>) -> Option<(&'static str, &'static str, Option<bool>)> {
     for (lower, upper, strict) in BOUND_PAIRS {
         let (Some(Value::Number(lo)), Some(Value::Number(hi))) = (obj.get(lower), obj.get(upper))
         else {
@@ -564,79 +635,153 @@ fn bound_violation(obj: &Map<String, Value>) -> Option<(String, bool)> {
         };
         let empty = if strict { order.is_ge() } else { order.is_gt() };
         if empty {
-            let relation = if strict {
-                "is not less than"
-            } else {
-                "is greater than"
-            };
-            return Some((format!("{lower} ({lo}) {relation} {upper} ({hi})"), true));
+            return Some((lower, upper, Some(strict)));
         }
     }
     let (lower, upper) = empty_integer_range(obj)?;
-    Some((
-        format!(
-            "no integer meets {lower} ({}) and {upper} ({})",
-            obj[lower], obj[upper]
-        ),
-        false,
-    ))
+    Some((lower, upper, None))
 }
 
 /// The 400 detail for `found` at `path`.
-fn locate((detail, pair): (String, bool), across: &str, path: &[String]) -> String {
+fn locate((detail, pair): (String, bool), path: &[String]) -> String {
     let at = json_pointer(path);
     if pair {
-        format!("{detail}{across} at {at}; no value can satisfy both")
+        format!("{detail} at {at}; no value can satisfy both")
     } else {
-        format!("{detail}{across} at {at}")
+        format!("{detail} at {at}")
     }
 }
 
+/// One schema of those that apply to the value an `allOf` holder describes:
+/// the holder, a member, a member's member, and so on; or, one level down, a
+/// property or `items` schema several of those define. `parent` and `step`
+/// give its pointer.
+struct Source<'a> {
+    map: &'a Map<String, Value>,
+    parent: Option<usize>,
+    step: Step<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Holder,
+    Member(usize),
+    Property(&'a str),
+    Items,
+}
+
+/// Add `map` to `arena` and its index to `out`, then the members of its
+/// `allOf`, and theirs. A `$ref` schema is left out with its members: draft 7
+/// ignores what sits beside a `$ref`, and the target is not followed here.
+fn add_source<'a>(
+    arena: &mut Vec<Source<'a>>,
+    out: &mut Vec<usize>,
+    map: &'a Map<String, Value>,
+    parent: Option<usize>,
+    step: Step<'a>,
+    depth: usize,
+) {
+    if depth > MAX_SCHEMA_DEPTH || map.contains_key("$ref") {
+        return;
+    }
+    let index = arena.len();
+    arena.push(Source { map, parent, step });
+    out.push(index);
+    if let Some(Value::Array(members)) = map.get("allOf") {
+        for (i, member) in members.iter().enumerate() {
+            if let Some(member) = member.as_object() {
+                add_source(arena, out, member, Some(index), Step::Member(i), depth + 1);
+            }
+        }
+    }
+}
+
+/// Schemas several sources define for one value (a property, or `items`),
+/// each with the index of the source defining it.
+type Defs<'a> = Vec<(usize, &'a Map<String, Value>)>;
+
+/// The pointer of `arena[index]`, under `base` (the holder's).
+fn source_path(arena: &[Source], mut index: usize, base: &[String]) -> Vec<String> {
+    let mut keys = Vec::new();
+    loop {
+        let source = &arena[index];
+        match source.step {
+            Step::Holder => {}
+            Step::Member(i) => keys.extend([i.to_string(), "allOf".into()]),
+            Step::Property(name) => keys.extend([name.to_string(), "properties".into()]),
+            Step::Items => keys.push("items".into()),
+        }
+        match source.parent {
+            Some(parent) => index = parent,
+            None => break,
+        }
+    }
+    base.iter().cloned().chain(keys.into_iter().rev()).collect()
+}
+
 /// A bound pair no value meets across `sources`, schemas that all apply to
-/// one value (an `allOf` holder and its object members), reported at `path`;
-/// then the same for each property more than one of them defines.
-fn all_of_violation(
-    sources: &[&Map<String, Value>],
-    path: &mut Vec<String>,
+/// one value, each bound named with the pointer of the schema holding it;
+/// then the same for each property, and for `items`, that more than one of
+/// them defines. One pass over their property maps groups the definitions,
+/// so the cost stays linear in the schema.
+fn all_of_violation<'a>(
+    arena: &mut Vec<Source<'a>>,
+    sources: &[usize],
+    base: &[String],
     depth: usize,
 ) -> Option<String> {
     if depth > MAX_SCHEMA_DEPTH {
         return None;
     }
-    if let Some(found) = bound_violation(&merged_bounds(sources)) {
-        return Some(locate(found, " across the allOf", path));
+    if let Some(found) = merged_violation(arena, sources, base) {
+        return Some(found);
     }
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut names: Vec<&String> = Vec::new();
-    for source in sources {
-        if let Some(Value::Object(props)) = source.get("properties") {
-            names.extend(props.keys().filter(|k| seen.insert(k.as_str())));
+    let mut names: Vec<&'a str> = Vec::new();
+    let mut defs: HashMap<&'a str, Defs<'a>> = HashMap::new();
+    let mut items = Vec::new();
+    for &index in sources {
+        let map = arena[index].map;
+        if let Some(Value::Object(props)) = map.get("properties") {
+            for (name, def) in props {
+                if let Some(def) = def.as_object() {
+                    let entry = defs.entry(name.as_str()).or_default();
+                    if entry.is_empty() {
+                        names.push(name.as_str());
+                    }
+                    entry.push((index, def));
+                }
+            }
+        }
+        if let Some(Value::Object(def)) = map.get("items") {
+            items.push((index, def));
         }
     }
-    for name in names {
-        let defs: Vec<&Map<String, Value>> = sources
-            .iter()
-            .filter_map(|s| s.get("properties")?.get(name.as_str())?.as_object())
-            .collect();
-        if defs.len() < 2 {
-            continue;
+    let mut groups: Vec<(Step<'a>, Defs<'a>)> = names
+        .into_iter()
+        .filter_map(|name| {
+            let group = defs.remove(name)?;
+            (group.len() > 1).then_some((Step::Property(name), group))
+        })
+        .collect();
+    if items.len() > 1 {
+        groups.push((Step::Items, items));
+    }
+    for (step, group) in groups {
+        let mut next = Vec::new();
+        for (parent, def) in group {
+            add_source(arena, &mut next, def, Some(parent), step, depth + 1);
         }
-        path.push("properties".into());
-        path.push(name.clone());
-        let found = all_of_violation(&defs, path, depth + 1);
-        path.pop();
-        path.pop();
-        if found.is_some() {
-            return found;
+        if let Some(found) = all_of_violation(arena, &next, base, depth + 1) {
+            return Some(found);
         }
     }
     None
 }
 
-/// The bounds `sources` together put on one value: the tightest lower and
+/// The bounds `sources` put on one value together (the tightest lower and
 /// upper of each keyword, and `type: "integer"` when one of them allows only
-/// integers. A source that is a `$ref` is left out.
-fn merged_bounds(sources: &[&Map<String, Value>]) -> Map<String, Value> {
+/// integers), checked like one schema's.
+fn merged_violation(arena: &[Source], sources: &[usize], base: &[String]) -> Option<String> {
     const LOWER: [&str; 5] = [
         "minLength",
         "minItems",
@@ -651,19 +796,15 @@ fn merged_bounds(sources: &[&Map<String, Value>]) -> Map<String, Value> {
         "maximum",
         "exclusiveMaximum",
     ];
-    let sources: Vec<&Map<String, Value>> = sources
-        .iter()
-        .copied()
-        .filter(|m| !m.contains_key("$ref"))
-        .collect();
     let mut merged = Map::new();
+    let mut origin: HashMap<&str, usize> = HashMap::new();
     for (keys, keep) in [
         (LOWER, std::cmp::Ordering::Greater),
         (UPPER, std::cmp::Ordering::Less),
     ] {
         for key in keys {
-            for source in &sources {
-                let Some(Value::Number(n)) = source.get(key) else {
+            for &index in sources {
+                let Some(Value::Number(n)) = arena[index].map.get(key) else {
                     continue;
                 };
                 let tighter = match merged.get(key) {
@@ -672,20 +813,31 @@ fn merged_bounds(sources: &[&Map<String, Value>]) -> Map<String, Value> {
                 };
                 if tighter {
                     merged.insert(key.to_string(), Value::Number(n.clone()));
+                    origin.insert(key, index);
                 }
             }
         }
     }
     let integer = |t: &Value| t.as_str() == Some("integer");
-    let only_integer = |m: &&Map<String, Value>| match m.get("type") {
+    let only_integer = |m: &Map<String, Value>| match m.get("type") {
         Some(Value::Array(types)) => !types.is_empty() && types.iter().all(integer),
         Some(t) => integer(t),
         None => false,
     };
-    if sources.iter().any(only_integer) {
+    if sources.iter().any(|&index| only_integer(arena[index].map)) {
         merged.insert("type".into(), Value::String("integer".into()));
     }
-    merged
+    let (lower, upper, pair) = violated_pair(&merged)?;
+    let at = |key: &str| json_pointer(&source_path(arena, origin[key], base));
+    let (lo, hi) = (&merged[lower], &merged[upper]);
+    let (lo_at, hi_at) = (at(lower), at(upper));
+    Some(match pair {
+        Some(strict) => format!(
+            "{lower} ({lo}) at {lo_at} {} {upper} ({hi}) at {hi_at}; no value can satisfy both",
+            relation(strict)
+        ),
+        None => format!("no integer meets {lower} ({lo}) at {lo_at} and {upper} ({hi}) at {hi_at}"),
+    })
 }
 
 /// The RFC 6901 pointer of `path`, as a URI fragment: `#`, `#/items`, ...
@@ -3837,18 +3989,22 @@ mod tests {
     fn a_pair_split_across_all_of_members_is_refused() {
         assert_eq!(
             parse_schema(json!({"allOf": [{"type": "string", "minLength": 5}, {"maxLength": 2}]})),
-            unsat("minLength (5) is greater than maxLength (2) across the allOf at #; no value can satisfy both")
+            unsat("minLength (5) at #/allOf/0 is greater than maxLength (2) at #/allOf/1; no value can satisfy both")
         );
         assert_eq!(
-            parse_schema(json!({"type": "integer", "exclusiveMinimum": 2, "allOf": [{"exclusiveMaximum": 3}]})),
-            unsat("no integer meets exclusiveMinimum (2) and exclusiveMaximum (3) across the allOf at #")
+            parse_schema(
+                json!({"type": "integer", "exclusiveMinimum": 2, "allOf": [{"exclusiveMaximum": 3}]})
+            ),
+            unsat(
+                "no integer meets exclusiveMinimum (2) at # and exclusiveMaximum (3) at #/allOf/0"
+            )
         );
         assert_eq!(
             parse_schema(json!({"type": "object", "allOf": [
                 {"properties": {"a": {"type": "string", "minLength": 5}}},
                 {"properties": {"a": {"maxLength": 2}}}
             ]})),
-            unsat("minLength (5) is greater than maxLength (2) across the allOf at #/properties/a; no value can satisfy both")
+            unsat("minLength (5) at #/allOf/0/properties/a is greater than maxLength (2) at #/allOf/1/properties/a; no value can satisfy both")
         );
         assert_eq!(
             parse_schema(json!({"allOf": [{"minItems": 1}, {"minItems": 4, "maxItems": 3}]})),
@@ -3861,9 +4017,126 @@ mod tests {
         for schema in [
             json!({"allOf": [{"minLength": 2}, {"maxLength": 5}]}),
             json!({"$defs": {"N": {"maxLength": 2}}, "allOf": [{"minLength": 5}, {"$ref": "#/$defs/N"}]}),
+            // Beside a `$ref`, draft 7 ignores the siblings: its properties
+            // are left out as well as its bounds.
+            json!({"$defs": {"A": {}}, "allOf": [
+                {"$ref": "#/$defs/A", "properties": {"a": {"minLength": 5}}},
+                {"properties": {"a": {"maxLength": 2}}}
+            ]}),
         ] {
             assert_eq!(unsatisfiable_bound(&schema), None, "{schema}");
         }
+    }
+
+    /// The members of a member's `allOf` apply to the value too, and so does
+    /// `items` when several members define it.
+    #[test]
+    fn a_split_in_a_nested_all_of_or_in_shared_items_is_refused() {
+        assert_eq!(
+            parse_schema(json!({"allOf": [{"allOf": [{"minLength": 5}]}, {"maxLength": 2}]})),
+            unsat("minLength (5) at #/allOf/0/allOf/0 is greater than maxLength (2) at #/allOf/1; no value can satisfy both")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": "array", "allOf": [
+                {"items": {"type": "string", "minLength": 5}},
+                {"items": {"maxLength": 2}}
+            ]})),
+            unsat("minLength (5) at #/allOf/0/items is greater than maxLength (2) at #/allOf/1/items; no value can satisfy both")
+        );
+        assert_eq!(
+            parse_schema(json!({"allOf": [
+                {"properties": {"n": {"type": "integer", "exclusiveMinimum": 2}}},
+                {"properties": {"n": {"allOf": [{"exclusiveMaximum": 3}]}}}
+            ]})),
+            unsat("no integer meets exclusiveMinimum (2) at #/allOf/0/properties/n and exclusiveMaximum (3) at #/allOf/1/properties/n/allOf/0")
+        );
+    }
+
+    /// Each `$ref` target the main walk skips is walked once, and a target
+    /// inside another one is left to that one's walk, unless it sits under a
+    /// data keyword there (which that walk skips too).
+    #[test]
+    fn ref_targets_are_walked_once_each_and_none_is_missed() {
+        // Two refs to one target, and a ref to a target the main walk visits.
+        let schema = json!({
+            "properties": {
+                "a": {"$ref": "#/default/x"},
+                "b": {"$ref": "#/default/x"},
+                "c": {"$ref": "#/properties/a"}
+            },
+            "default": {"x": {"minLength": 5, "maxLength": 2}}
+        });
+        assert_eq!(uncovered_ref_targets(&schema).len(), 1);
+        assert_eq!(
+            unsatisfiable_bound(&schema).as_deref(),
+            Some("minLength (5) is greater than maxLength (2) at #/default/x; no value can satisfy both")
+        );
+        // A ref to each ancestor of one subtree: only the outermost is walked.
+        let schema = json!({
+            "properties": {
+                "a": {"$ref": "#/default"},
+                "b": {"$ref": "#/default/0"},
+                "c": {"$ref": "#/default/0/0"}
+            },
+            "default": [[{"minItems": 4, "maxItems": 3}]]
+        });
+        let targets = uncovered_ref_targets(&schema);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].1, ["default"]);
+        assert_eq!(
+            unsatisfiable_bound(&schema).as_deref(),
+            Some("minItems (4) is greater than maxItems (3) at #/default/0/0; no value can satisfy both")
+        );
+        // Under a data keyword inside another target: walked on its own.
+        let schema = json!({
+            "properties": {
+                "a": {"$ref": "#/default"},
+                "b": {"$ref": "#/default/enum/0"}
+            },
+            "default": {"enum": [{"minLength": 5, "maxLength": 2}]}
+        });
+        assert_eq!(uncovered_ref_targets(&schema).len(), 2);
+        assert_eq!(
+            unsatisfiable_bound(&schema).as_deref(),
+            Some("minLength (5) is greater than maxLength (2) at #/default/enum/0; no value can satisfy both")
+        );
+    }
+
+    /// The largest schema the limits let through, built to make the bounds
+    /// check slow: an `allOf` of thousands of members, one of them defining
+    /// thousands of properties, inside a `default` nested 50 arrays deep, with
+    /// a `$ref` to every level of it. Each level's walk used to merge the
+    /// whole `allOf` again, at a cost of names times members (seconds per
+    /// request); it is now linear and walks the subtree once.
+    #[test]
+    fn a_wide_all_of_under_a_ref_chain_is_checked_in_linear_time() {
+        const LEVELS: usize = 50;
+        let names: Map<String, Value> = (0..3400).map(|i| (format!("p{i}"), json!(0))).collect();
+        let mut members = vec![json!({"properties": names})];
+        members.extend((0..8000).map(|_| json!({})));
+        let mut nested = json!({"allOf": members});
+        for _ in 0..LEVELS {
+            nested = json!([nested]);
+        }
+        let refs: Map<String, Value> = (0..=LEVELS)
+            .map(|level| {
+                let pointer = std::iter::once("#/default")
+                    .chain(std::iter::repeat_n("0", level))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                (format!("r{level}"), json!({"$ref": pointer}))
+            })
+            .collect();
+        let schema = json!({"type": "object", "properties": refs, "default": nested});
+        let text = schema.to_string();
+        assert!(text.len() <= MAX_SCHEMA_BYTES, "{} bytes", text.len());
+        check_limits(&schema, &text).expect("the limits let this schema through");
+        let start = std::time::Instant::now();
+        assert_eq!(unsatisfiable_bound(&schema), None);
+        let took = start.elapsed();
+        // Linear: a few milliseconds in release and well under this bound in
+        // a debug build under load; the old cost was billions of steps.
+        assert!(took < Duration::from_secs(2), "took {took:?}");
     }
 
     /// A local `$ref` into a data keyword makes that value a schema: its
