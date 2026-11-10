@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, RandomState};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -34,6 +34,8 @@ use cascadia_types::{
 };
 use futures::stream;
 use tracing::{info, warn};
+
+use crate::decode_keep::tool_marker_ids;
 
 #[derive(Default)]
 pub struct OvGenaiBuilder {
@@ -169,6 +171,9 @@ struct PipelineRecipe {
     device: String,
     plugin: PluginConfig,
     kind: PipelineKind,
+    /// Gemma 4's tool-call marker ids, handed to every pipeline built from
+    /// this recipe, a rebuilt one included (see [`install_keep_tokens`]).
+    keep: Vec<(u32, String)>,
 }
 
 impl PipelineRecipe {
@@ -189,6 +194,13 @@ impl PipelineRecipe {
                 "a continuous-batching recipe builds no stateful pipeline".into(),
             )),
         }
+        .map(|pipe| self.with_keep_tokens(pipe))
+    }
+
+    /// `pipe`, just built from this recipe, told which tokens to keep.
+    fn with_keep_tokens<P: KeepTokenSink>(&self, mut pipe: P) -> P {
+        install_keep_tokens(&mut pipe, &self.keep);
+        pipe
     }
 
     /// The continuous-batching pipeline. Only for [`PipelineKind::Cb`].
@@ -201,6 +213,7 @@ impl PipelineRecipe {
                 "a stateful recipe builds no continuous-batching pipeline".into(),
             )),
         }
+        .map(|pipe| self.with_keep_tokens(pipe))
     }
 }
 
@@ -380,6 +393,7 @@ impl Builder for OvGenaiBuilder {
             device: self.device.clone(),
             plugin,
             kind,
+            keep: tool_marker_keep_list(&model_dir),
         };
         if matches!(recipe.kind, PipelineKind::Cb(_)) {
             self.cb_pipe = Some(recipe.build_cb().map_err(map_ov_err)?);
@@ -441,6 +455,59 @@ impl Builder for OvGenaiBuilder {
             }),
             rebuild,
         }))
+    }
+}
+
+/// Gemma 4's tool-call markers in the model's `tokenizer.json`, as
+/// `(id, text)`. Empty when the file is missing or unreadable, or the
+/// vocabulary has no such markers, which leaves decoding exactly as before.
+///
+/// OpenVINO GenAI decodes with special tokens skipped, which erases these
+/// markers and with them the call; the shim keeps the listed ids as text.
+fn tool_marker_keep_list(model_dir: &Path) -> Vec<(u32, String)> {
+    let path = model_dir.join("tokenizer.json");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    match tokenizers::Tokenizer::from_file(&path) {
+        Ok(tok) => tool_marker_ids(&tok),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "tokenizer.json unreadable; tool-call markers are not kept");
+            Vec::new()
+        }
+    }
+}
+
+/// A pipeline that can be told which token ids to keep as text when decoding.
+trait KeepTokenSink {
+    fn set_keep_tokens(&mut self, keep: &[(u32, String)]) -> Result<(), OvError>;
+}
+
+impl KeepTokenSink for LlmPipeline {
+    fn set_keep_tokens(&mut self, keep: &[(u32, String)]) -> Result<(), OvError> {
+        LlmPipeline::set_keep_tokens(self, keep)
+    }
+}
+
+impl KeepTokenSink for CbPipeline {
+    fn set_keep_tokens(&mut self, keep: &[(u32, String)]) -> Result<(), OvError> {
+        CbPipeline::set_keep_tokens(self, keep)
+    }
+}
+
+/// Hands a non-empty keep list to a freshly created pipeline, once. An empty
+/// list never reaches the shim, so a model without the markers runs the
+/// shim's unchanged decode. A refusal only costs the markers: the load goes on.
+fn install_keep_tokens(pipe: &mut impl KeepTokenSink, keep: &[(u32, String)]) {
+    if keep.is_empty() {
+        return;
+    }
+    match pipe.set_keep_tokens(keep) {
+        Ok(()) => info!(
+            count = keep.len(),
+            "keeping tool-call marker tokens when decoding"
+        ),
+        Err(e) => warn!(error = %e, "could not keep tool-call marker tokens; calls will not parse"),
     }
 }
 
@@ -5717,5 +5784,92 @@ mod tests {
         let events = st.lock().unwrap().events.clone();
         assert_eq!(events.last().map(String::as_str), Some("p1: second"));
         assert!(!events.iter().any(|e| e == "p1: hello"), "{events:?}");
+    }
+
+    // ---- Gemma 4 tool-call markers -----------------------------------------
+
+    /// Records every keep list handed to it, standing in for the shim.
+    #[derive(Default)]
+    struct KeepSpy {
+        calls: Vec<Vec<(u32, String)>>,
+        fail: bool,
+    }
+
+    impl KeepTokenSink for KeepSpy {
+        fn set_keep_tokens(&mut self, keep: &[(u32, String)]) -> Result<(), OvError> {
+            self.calls.push(keep.to_vec());
+            if self.fail {
+                return Err(OvError::Native("refused".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn model_dir_with_tokenizer(tok: Option<&tokenizers::Tokenizer>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(tok) = tok {
+            tok.save(dir.path().join("tokenizer.json"), false).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn keep_list_comes_from_the_models_tokenizer_json() {
+        let dir = model_dir_with_tokenizer(Some(&crate::decode_keep::tests::marker_tokenizer()));
+        assert_eq!(
+            tool_marker_keep_list(dir.path()),
+            vec![
+                (4, "<|tool_call>".to_string()),
+                (5, "<tool_call|>".to_string()),
+                (6, "<|\"|>".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn keep_list_is_empty_without_markers_or_without_a_tokenizer_json() {
+        let none = model_dir_with_tokenizer(None);
+        assert!(tool_marker_keep_list(none.path()).is_empty());
+
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::write(unreadable.path().join("tokenizer.json"), "not json").unwrap();
+        assert!(tool_marker_keep_list(unreadable.path()).is_empty());
+
+        let plain: tokenizers::Tokenizer = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[
+              {"id":2,"content":"<turn|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+            "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":{"type":"Fuse"},
+            "model":{"type":"WordLevel","vocab":{"a":0,"b":1,"<turn|>":2},"unk_token":"a"}}"#
+            .parse()
+            .unwrap();
+        let dir = model_dir_with_tokenizer(Some(&plain));
+        assert!(tool_marker_keep_list(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn keep_tokens_are_passed_once_at_creation() {
+        let keep = tool_marker_ids(&crate::decode_keep::tests::marker_tokenizer());
+        let mut spy = KeepSpy::default();
+        install_keep_tokens(&mut spy, &keep);
+        assert_eq!(spy.calls, vec![keep]);
+    }
+
+    #[test]
+    fn an_empty_keep_list_never_reaches_the_shim() {
+        let mut spy = KeepSpy::default();
+        install_keep_tokens(&mut spy, &[]);
+        assert!(spy.calls.is_empty());
+    }
+
+    #[test]
+    fn a_refused_keep_list_does_not_fail_the_load() {
+        let keep = tool_marker_ids(&crate::decode_keep::tests::marker_tokenizer());
+        let mut spy = KeepSpy {
+            fail: true,
+            ..Default::default()
+        };
+        install_keep_tokens(&mut spy, &keep);
+        assert_eq!(spy.calls.len(), 1);
     }
 }

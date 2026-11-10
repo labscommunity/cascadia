@@ -20,6 +20,7 @@
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <openvino/openvino.hpp>
@@ -27,6 +28,7 @@
 #include <openvino/runtime/variable_state.hpp>
 #include <openvino/genai/llm_pipeline.hpp>
 #include <openvino/genai/generation_config.hpp>
+#include <openvino/genai/streamer_base.hpp>
 #include <openvino/genai/tokenizer.hpp>
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include <openvino/genai/continuous_batching_pipeline.hpp>
@@ -206,6 +208,67 @@ int32_t validate_with(ov::genai::Tokenizer tok, const char* schema) {
     return 0;
 }
 
+// Token ids written out as literal text when decoding, instead of being
+// skipped with the other special tokens: a model's tool-call markers (Gemma 4
+// builds its calls out of special tokens, so a plain decode erases them).
+using KeepList = std::vector<std::pair<int64_t, std::string>>;
+
+// A keep list is a handful of markers; this only bounds a poisoned count.
+static constexpr size_t MAX_KEEP_TOKENS = 64;
+
+KeepList read_keep_list(const int64_t* ids, const char* const* texts, size_t n) {
+    if (n > MAX_KEEP_TOKENS) {
+        throw std::invalid_argument("keep token count exceeds MAX_KEEP_TOKENS=64");
+    }
+    KeepList keep;
+    keep.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!texts[i]) throw std::invalid_argument("null keep token text");
+        keep.emplace_back(ids[i], std::string(texts[i]));
+    }
+    return keep;
+}
+
+// `decode(ids)`, except kept ids come out as their literal text: the ids are
+// split at the kept ids, each run between them is decoded on its own, and the
+// kept texts go between the runs. An empty keep list is exactly one
+// `decode(ids)`.
+template <typename Decode>
+std::string decode_keeping(const std::vector<int64_t>& ids, const KeepList& keep,
+                           Decode&& decode) {
+    if (keep.empty()) return decode(ids);
+    std::string text;
+    std::vector<int64_t> run;
+    for (const int64_t id : ids) {
+        const auto kept = std::find_if(keep.begin(), keep.end(),
+                                       [id](const auto& k) { return k.first == id; });
+        if (kept == keep.end()) {
+            run.push_back(id);
+            continue;
+        }
+        if (!run.empty()) {
+            text += decode(run);
+            run.clear();
+        }
+        text += kept->second;
+    }
+    if (!run.empty()) text += decode(run);
+    return text;
+}
+
+// Collects the generated token ids of one generate() call, so its text can be
+// rebuilt with decode_keeping. Never stops the generation.
+class TokenCollector : public ov::genai::StreamerBase {
+public:
+    using ov::genai::StreamerBase::write;
+    ov::genai::StreamingStatus write(int64_t token) override {
+        ids.push_back(token);
+        return ov::genai::StreamingStatus::RUNNING;
+    }
+    void end() override {}
+    std::vector<int64_t> ids;
+};
+
 }  // namespace
 
 struct cascadia_pipeline_t {
@@ -214,6 +277,8 @@ struct cascadia_pipeline_t {
     // through this ABI).
     std::unique_ptr<ov::genai::LLMPipeline> pipe;
     std::unique_ptr<ov::genai::VLMPipeline> vlm;
+    // Set once after creation; empty = generate's text is GenAI's own decode.
+    KeepList keep;
 };
 struct cascadia_genconfig_t {
     ov::genai::GenerationConfig cfg;
@@ -266,6 +331,36 @@ int32_t cascadia_debug_property_int64_kind(
         return 1;
     }
     return 0;
+}
+
+// Test-only: decode_keeping() over a stand-in decoder that writes each run of
+// ids as "(a,b,...)", so the Rust test can pin the run splitting without a
+// real tokenizer. *out_text is freed via cascadia_free_string.
+int32_t cascadia_debug_decode_keeping(
+    const int64_t* ids, size_t n_ids, const int64_t* keep_ids,
+    const char* const* keep_texts, size_t n_keep, char** out_text) {
+    if ((n_ids && !ids) || (n_keep && (!keep_ids || !keep_texts)) || !out_text) {
+        set_last_error("null arg in debug_decode_keeping"); return 1;
+    }
+    try {
+        const KeepList keep = read_keep_list(keep_ids, keep_texts, n_keep);
+        const std::vector<int64_t> all(ids, ids + n_ids);
+        const std::string text = decode_keeping(all, keep, [](const std::vector<int64_t>& run) {
+            std::string s = "(";
+            for (size_t i = 0; i < run.size(); ++i) {
+                if (i) s += ",";
+                s += std::to_string(run[i]);
+            }
+            return s + ")";
+        });
+        *out_text = dup_cstr(text.c_str());
+        if (!*out_text) { set_last_error("malloc failure in debug_decode_keeping"); return 1; }
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in debug_decode_keeping"); return 1;
+    }
 }
 
 // ===================== LLMPipeline (genai) =====================
@@ -368,6 +463,21 @@ int32_t cascadia_pipeline_create_vlm(
 
 void cascadia_pipeline_destroy(cascadia_pipeline_t* handle) { delete handle; }
 
+int32_t cascadia_pipeline_set_keep_tokens(
+    cascadia_pipeline_t* handle, const int64_t* ids, const char* const* texts, size_t n) {
+    if (!handle || (n && (!ids || !texts))) {
+        set_last_error("null arg in pipeline_set_keep_tokens"); return 1;
+    }
+    try {
+        handle->keep = read_keep_list(ids, texts, n);
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in pipeline_set_keep_tokens"); return 1;
+    }
+}
+
 cascadia_genconfig_t* cascadia_genconfig_new() {
     try { return new cascadia_genconfig_t{ov::genai::GenerationConfig{}}; }
     catch (...) { return nullptr; }
@@ -451,6 +561,15 @@ int32_t cascadia_pipeline_generate(
     try {
         std::string text;
         uint32_t generated = 0;
+        // With a keep list, GenAI's own decode (special tokens skipped) would
+        // erase the kept markers, so collect the generated ids and decode them
+        // here instead. Without one, no streamer: the call is unchanged.
+        std::shared_ptr<TokenCollector> collector;
+        ov::genai::StreamerVariant streamer{std::monostate{}};
+        if (!handle->keep.empty()) {
+            collector = std::make_shared<TokenCollector>();
+            streamer = std::static_pointer_cast<ov::genai::StreamerBase>(collector);
+        }
         if (handle->vlm) {
             // Text-only generate on a VLM-layout export; no image tensors.
             ov::genai::GenerationConfig gen_cfg =
@@ -459,18 +578,36 @@ int32_t cascadia_pipeline_generate(
             // an empty std::function — which fast-fails (0xc0000409) when
             // invoked. Pass monostate explicitly: "no streamer".
             ov::genai::VLMDecodedResults results = handle->vlm->generate(
-                std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg,
-                ov::genai::StreamerVariant{std::monostate{}});
+                std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg, streamer);
             text = results.texts.empty() ? std::string{} : results.texts[0];
+            if (collector) {
+                ov::genai::Tokenizer tok = handle->vlm->get_tokenizer();
+                text = decode_keeping(collector->ids, handle->keep,
+                                      [&tok](const std::vector<int64_t>& run) {
+                                          return tok.decode(run);
+                                      });
+            }
             try {
                 generated = static_cast<uint32_t>(
                     results.perf_metrics.get_num_generated_tokens());
             } catch (...) { generated = 0; }
         } else {
-            ov::genai::DecodedResults results = cfg
+            ov::genai::DecodedResults results = collector
+                ? handle->pipe->generate(
+                      std::string(prompt),
+                      cfg ? ov::genai::OptionalGenerationConfig{cfg->cfg} : std::nullopt,
+                      streamer)
+                : cfg
                 ? handle->pipe->generate(std::string(prompt), cfg->cfg)
                 : handle->pipe->generate(std::string(prompt));
             text = results;
+            if (collector) {
+                ov::genai::Tokenizer tok = handle->pipe->get_tokenizer();
+                text = decode_keeping(collector->ids, handle->keep,
+                                      [&tok](const std::vector<int64_t>& run) {
+                                          return tok.decode(run);
+                                      });
+            }
             try {
                 generated = static_cast<uint32_t>(
                     results.perf_metrics.get_num_generated_tokens());
@@ -505,6 +642,8 @@ void cascadia_free_string(char* s) { std::free(s); }
 struct cascadia_cb_pipeline_t {
     std::unique_ptr<ov::genai::ContinuousBatchingPipeline> pipe;
     std::unique_ptr<ov::genai::Tokenizer> tok;
+    // Set once after creation; empty = every read is one plain decode.
+    KeepList keep;
 };
 
 struct cascadia_cb_handle_t {
@@ -561,6 +700,21 @@ int32_t cascadia_cb_pipeline_create(
 }
 
 void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle) { delete handle; }
+
+int32_t cascadia_cb_set_keep_tokens(
+    cascadia_cb_pipeline_t* handle, const int64_t* ids, const char* const* texts, size_t n) {
+    if (!handle || (n && (!ids || !texts))) {
+        set_last_error("null arg in cb_set_keep_tokens"); return 1;
+    }
+    try {
+        handle->keep = read_keep_list(ids, texts, n);
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_set_keep_tokens"); return 1;
+    }
+}
 
 int32_t cascadia_cb_add_request(
     cascadia_cb_pipeline_t* handle, uint64_t request_id, const char* prompt,
@@ -689,8 +843,12 @@ int32_t cascadia_cb_handle_read(
 
         // Return the whole decode, not a delta. The caller diffs it against
         // what it has already emitted, which lets it notice a non-monotonic
-        // re-decode instead of silently slicing at a stale offset.
-        std::string full = pipeline->tok->decode(handle->acc_ids);
+        // re-decode instead of silently slicing at a stale offset. Kept ids
+        // (tool-call markers) come out as their text; with no keep list this
+        // is one plain decode of the whole sequence.
+        std::string full = decode_keeping(
+            handle->acc_ids, pipeline->keep,
+            [pipeline](const std::vector<int64_t>& run) { return pipeline->tok->decode(run); });
         if (full.size() > MAX_GENERATED_TEXT_BYTES) {
             set_last_error("cb decoded text exceeds MAX_GENERATED_TEXT_BYTES");
             return 1;

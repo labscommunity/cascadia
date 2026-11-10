@@ -118,6 +118,12 @@ mod sys {
         ) -> c_int;
 
         pub fn cascadia_pipeline_destroy(handle: *mut cascadia_pipeline_t);
+        pub fn cascadia_pipeline_set_keep_tokens(
+            handle: *mut cascadia_pipeline_t,
+            ids: *const i64,
+            texts: *const *const c_char,
+            n: usize,
+        ) -> c_int;
 
         pub fn cascadia_genconfig_new() -> *mut cascadia_genconfig_t;
         pub fn cascadia_genconfig_destroy(cfg: *mut cascadia_genconfig_t);
@@ -169,6 +175,20 @@ mod sys {
             out_handle: *mut *mut cascadia_cb_pipeline_t,
         ) -> c_int;
         pub fn cascadia_cb_pipeline_destroy(handle: *mut cascadia_cb_pipeline_t);
+        pub fn cascadia_cb_set_keep_tokens(
+            handle: *mut cascadia_cb_pipeline_t,
+            ids: *const i64,
+            texts: *const *const c_char,
+            n: usize,
+        ) -> c_int;
+        pub fn cascadia_debug_decode_keeping(
+            ids: *const i64,
+            n_ids: usize,
+            keep_ids: *const i64,
+            keep_texts: *const *const c_char,
+            n_keep: usize,
+            out_text: *mut *mut c_char,
+        ) -> c_int;
         pub fn cascadia_cb_add_request(
             handle: *mut cascadia_cb_pipeline_t,
             request_id: u64,
@@ -417,6 +437,19 @@ unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconf
         }
     }
     Ok(raw_cfg)
+}
+
+/// A keep list as the C ABI takes it: ids, and NUL-terminated texts that the
+/// pointers in `.2` borrow from `.1`.
+#[cfg(feature = "openvino")]
+fn keep_arrays(keep: &[(u32, String)]) -> Result<(Vec<i64>, Vec<CString>, Vec<*const c_char>)> {
+    let ids: Vec<i64> = keep.iter().map(|(id, _)| i64::from(*id)).collect();
+    let texts = keep
+        .iter()
+        .map(|(_, t)| cstr(t))
+        .collect::<Result<Vec<CString>>>()?;
+    let ptrs = texts.iter().map(|t| t.as_ptr()).collect();
+    Ok((ids, texts, ptrs))
 }
 
 #[cfg(feature = "openvino")]
@@ -702,6 +735,32 @@ impl LlmPipeline {
             return Err(Error::Native(last_native_error()));
         }
         Ok(Self { handle })
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn set_keep_tokens(&mut self, _keep: &[(u32, String)]) -> Result<()> {
+        Err(Error::Stub)
+    }
+
+    /// Token ids that every later `generate` writes out as the given literal
+    /// text instead of skipping them as special tokens (a model's tool-call
+    /// markers). Call once, right after creation; never calling it keeps
+    /// `generate` exactly as it was.
+    #[cfg(feature = "openvino")]
+    pub fn set_keep_tokens(&mut self, keep: &[(u32, String)]) -> Result<()> {
+        let (ids, _texts, ptrs) = keep_arrays(keep)?;
+        let rc = unsafe {
+            sys::cascadia_pipeline_set_keep_tokens(
+                self.handle,
+                ids.as_ptr(),
+                ptrs.as_ptr(),
+                keep.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(())
     }
 
     #[cfg(not(feature = "openvino"))]
@@ -1041,6 +1100,32 @@ impl CbPipeline {
         Ok(Self {
             inner: std::sync::Arc::new(CbInner { ptr: handle }),
         })
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn set_keep_tokens(&mut self, _keep: &[(u32, String)]) -> Result<()> {
+        Err(Error::Stub)
+    }
+
+    /// Token ids that every request's text keeps as the given literal text
+    /// instead of skipping them as special tokens (a model's tool-call
+    /// markers). Call once, right after creation and before any request;
+    /// never calling it keeps the decode exactly as it was.
+    #[cfg(feature = "openvino")]
+    pub fn set_keep_tokens(&mut self, keep: &[(u32, String)]) -> Result<()> {
+        let (ids, _texts, ptrs) = keep_arrays(keep)?;
+        let rc = unsafe {
+            sys::cascadia_cb_set_keep_tokens(
+                self.inner.ptr,
+                ids.as_ptr(),
+                ptrs.as_ptr(),
+                keep.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(())
     }
 
     #[cfg(not(feature = "openvino"))]
@@ -2308,5 +2393,53 @@ mod tests {
             )
         };
         assert_eq!(kind, 0, "partial-numeric value must fall back to string");
+    }
+
+    /// The shim's keep-list decode over a stand-in decoder that writes each
+    /// run of ids as `(a,b)`: runs are split at kept ids, which come out as
+    /// their literal text, and an empty keep list is one plain decode.
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn decode_keeping_splits_runs_at_kept_ids() {
+        use std::ffi::{CStr, CString};
+        use std::os::raw::c_char;
+
+        let decode = |ids: &[i64], keep: &[(i64, &str)]| -> String {
+            let texts: Vec<CString> = keep
+                .iter()
+                .map(|(_, t)| CString::new(*t).unwrap())
+                .collect();
+            let ptrs: Vec<*const c_char> = texts.iter().map(|t| t.as_ptr()).collect();
+            let keep_ids: Vec<i64> = keep.iter().map(|(id, _)| *id).collect();
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = unsafe {
+                super::sys::cascadia_debug_decode_keeping(
+                    ids.as_ptr(),
+                    ids.len(),
+                    keep_ids.as_ptr(),
+                    ptrs.as_ptr(),
+                    keep.len(),
+                    &mut out,
+                )
+            };
+            assert_eq!(rc, 0);
+            let s = unsafe { CStr::from_ptr(out) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { super::sys::cascadia_free_string(out) };
+            s
+        };
+        let keep = [(48, "<|tool_call>"), (49, "<tool_call|>"), (52, "<|\"|>")];
+        assert_eq!(
+            decode(&[48, 1, 2, 52, 3, 52, 4, 49, 106], &keep),
+            "<|tool_call>(1,2)<|\"|>(3)<|\"|>(4)<tool_call|>(106)"
+        );
+        assert_eq!(
+            decode(&[1, 48, 49, 2], &keep),
+            "(1)<|tool_call><tool_call|>(2)"
+        );
+        assert_eq!(decode(&[1, 48, 2], &[]), "(1,48,2)");
+        assert_eq!(decode(&[], &keep), "");
+        assert_eq!(decode(&[], &[]), "()");
     }
 }

@@ -50,6 +50,16 @@ int32_t cascadia_debug_property_int64_kind(
     const char* key,
     int64_t* out_i64);
 
+/// Test-only: the keep-list decode over a stand-in decoder that writes each
+/// run of ids as "(a,b,...)". `*out_text` is freed via cascadia_free_string.
+int32_t cascadia_debug_decode_keeping(
+    const int64_t* ids,
+    size_t n_ids,
+    const int64_t* keep_ids,
+    const char* const* keep_texts,
+    size_t n_keep,
+    char** out_text);
+
 // ---- Pipeline (LLMPipeline) construction ---------------------------------
 
 int32_t cascadia_pipeline_create(
@@ -90,6 +100,16 @@ int32_t cascadia_pipeline_create_vlm(
     cascadia_pipeline_t** out_handle);
 
 void cascadia_pipeline_destroy(cascadia_pipeline_t* handle);
+
+/// Token ids that every later generate writes out as the given literal text
+/// (`texts[i]` for `ids[i]`, copied) instead of skipping them as special
+/// tokens: a model's tool-call markers. Call once after creation. Never
+/// calling it, or n == 0, leaves generate exactly as without this call.
+int32_t cascadia_pipeline_set_keep_tokens(
+    cascadia_pipeline_t* handle,
+    const int64_t* ids,
+    const char* const* texts,
+    size_t n);
 
 // ---- GenerationConfig -----------------------------------------------------
 
@@ -173,6 +193,15 @@ int32_t cascadia_cb_pipeline_create(
     cascadia_cb_pipeline_t** out_handle);
 
 void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle);
+
+/// cascadia_pipeline_set_keep_tokens for a continuous-batching pipeline: the
+/// text every cascadia_cb_handle_read returns keeps these ids as their text.
+/// Call once after creation, before any request.
+int32_t cascadia_cb_set_keep_tokens(
+    cascadia_cb_pipeline_t* handle,
+    const int64_t* ids,
+    const char* const* texts,
+    size_t n);
 
 /// Enroll a prompt. `request_id` is caller-chosen; upstream requires it be
 /// unique for EVERY add_request() call, not merely among live requests. The
