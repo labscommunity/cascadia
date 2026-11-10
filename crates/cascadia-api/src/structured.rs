@@ -104,25 +104,40 @@ pub enum SchemaCheckError {
 /// Most passed schemas [`SchemaCompileCheck`] remembers.
 pub const SCHEMA_PASS_CACHE: usize = 256;
 
-/// The schemas that built within the budget, by a keyed hash of the schema
-/// text, at most `cap` of them; the least recently used leaves first. Only
-/// passes are kept: a build that ran long on a busy machine may pass when
-/// tried again.
+/// How long [`SchemaCompileCheck`] refuses a best-effort schema from memory
+/// after its build ran past the budget; it is built again after that.
+pub const SLOW_SCHEMA_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Schemas by a keyed hash of the schema text, at most `cap` of them; the
+/// least recently used leaves first, and with a `ttl` an entry is forgotten
+/// that long after it was added. [`SchemaCompileCheck`] keeps its passes
+/// here for good, and its slow best-effort builds for [`SLOW_SCHEMA_TTL`].
 #[derive(Debug)]
 struct PassedSchemas {
     cap: usize,
+    ttl: Option<Duration>,
     hasher: std::hash::RandomState,
     tick: u64,
-    entries: HashMap<u64, u64>,
+    /// Last use and when added, by key.
+    entries: HashMap<u64, (u64, std::time::Instant)>,
 }
 
 impl PassedSchemas {
     fn new(cap: usize) -> Self {
         Self {
             cap,
+            ttl: None,
             hasher: std::hash::RandomState::new(),
             tick: 0,
             entries: HashMap::new(),
+        }
+    }
+
+    /// Entries forgotten `ttl` after they were added.
+    fn expiring(cap: usize, ttl: Duration) -> Self {
+        Self {
+            ttl: Some(ttl),
+            ..Self::new(cap)
         }
     }
 
@@ -131,18 +146,28 @@ impl PassedSchemas {
         self.hasher.hash_one(text)
     }
 
-    /// Whether `text` passed before; marks it used.
-    fn contains(&mut self, text: &str) -> bool {
+    /// Whether `text` is held at `now`; marks it used. An entry past its
+    /// `ttl` is forgotten.
+    fn contains(&mut self, text: &str, now: std::time::Instant) -> bool {
         let key = self.key(text);
         self.tick += 1;
         let tick = self.tick;
-        self.entries
-            .get_mut(&key)
-            .map(|used| *used = tick)
-            .is_some()
+        let Some((used, added)) = self.entries.get_mut(&key) else {
+            return false;
+        };
+        if self
+            .ttl
+            .is_some_and(|ttl| now.saturating_duration_since(*added) >= ttl)
+        {
+            self.entries.remove(&key);
+            return false;
+        }
+        *used = tick;
+        true
     }
 
-    fn insert(&mut self, text: &str) {
+    /// Holds `text` from `now` on.
+    fn insert(&mut self, text: &str, now: std::time::Instant) {
         if self.cap == 0 {
             return;
         }
@@ -151,14 +176,14 @@ impl PassedSchemas {
             let oldest = self
                 .entries
                 .iter()
-                .min_by_key(|(_, used)| **used)
+                .min_by_key(|(_, (used, _))| *used)
                 .map(|(k, _)| *k);
             if let Some(oldest) = oldest {
                 self.entries.remove(&oldest);
             }
         }
         self.tick += 1;
-        self.entries.insert(key, self.tick);
+        self.entries.insert(key, (self.tick, now));
     }
 }
 
@@ -187,9 +212,29 @@ pub struct SchemaCompileCheck {
     passed: Arc<std::sync::Mutex<PassedSchemas>>,
     factory: GrammarFactory,
     /// Best-effort schemas that ran past the budget, at most
-    /// [`SCHEMA_PASS_CACHE`] of them: a tool-call grammar is resent every
-    /// turn, and would otherwise cost each turn the whole budget and a slot.
+    /// [`SCHEMA_PASS_CACHE`] of them, each for [`SLOW_SCHEMA_TTL`]: a
+    /// tool-call grammar is resent every turn, and would otherwise cost each
+    /// turn the whole budget and a slot; it may have been slow only because
+    /// the machine was busy, so it is built again after a while.
     slow: Arc<std::sync::Mutex<PassedSchemas>>,
+    clock: Clock,
+}
+
+/// Where [`SchemaCompileCheck`] reads the time: `Instant::now`, or a test's
+/// own clock.
+#[derive(Clone)]
+struct Clock(Arc<dyn Fn() -> std::time::Instant + Send + Sync>);
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self(Arc::new(std::time::Instant::now))
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Clock")
+    }
 }
 
 impl std::fmt::Debug for SchemaCompileCheck {
@@ -222,7 +267,11 @@ impl SchemaCompileCheck {
             budget,
             passed: Arc::new(std::sync::Mutex::new(PassedSchemas::new(SCHEMA_PASS_CACHE))),
             factory: GrammarFactory::byte_level(),
-            slow: Arc::new(std::sync::Mutex::new(PassedSchemas::new(SCHEMA_PASS_CACHE))),
+            slow: Arc::new(std::sync::Mutex::new(PassedSchemas::expiring(
+                SCHEMA_PASS_CACHE,
+                SLOW_SCHEMA_TTL,
+            ))),
+            clock: Clock::default(),
         }
     }
 
@@ -237,17 +286,19 @@ impl SchemaCompileCheck {
     /// A best-effort `spec` (answered unconstrained on any refusal) never
     /// waits for a slot: none free is `Busy` at once, so it never delays a
     /// strict request waiting for one. One that ran past the budget is
-    /// remembered and refused `TooComplex` at once after that. A strict
+    /// remembered and refused `TooComplex` at once for [`SLOW_SCHEMA_TTL`]
+    /// after that, then built again. A strict
     /// `spec` waits for a slot and is built every time it hasn't passed.
     pub async fn check(&self, spec: &GrammarSpec) -> Result<(), SchemaCheckError> {
         if spec.body == JSON_OBJECT_SCHEMA {
             return Ok(());
         }
+        let now = (self.clock.0)();
         let passed = self
             .passed
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .contains(&spec.body);
+            .contains(&spec.body, now);
         if passed {
             return Ok(());
         }
@@ -257,7 +308,7 @@ impl SchemaCompileCheck {
                 .slow
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .contains(&spec.body)
+                .contains(&spec.body, now)
         {
             return Err(SchemaCheckError::TooComplex);
         }
@@ -302,12 +353,12 @@ impl SchemaCompileCheck {
             self.passed
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(&body);
+                .insert(&body, (self.clock.0)());
         } else if best_effort && timed_out {
             self.slow
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(&body);
+                .insert(&body, (self.clock.0)());
         }
         verdict
     }
@@ -3171,13 +3222,14 @@ mod tests {
     /// first.
     #[test]
     fn the_pass_cache_evicts_the_least_recently_used() {
+        let now = std::time::Instant::now();
         let mut cache = PassedSchemas::new(2);
-        cache.insert("a");
-        cache.insert("b");
-        assert!(cache.contains("a"));
-        cache.insert("c");
-        assert!(!cache.contains("b"), "b was the least recently used");
-        assert!(cache.contains("a") && cache.contains("c"));
+        cache.insert("a", now);
+        cache.insert("b", now);
+        assert!(cache.contains("a", now));
+        cache.insert("c", now);
+        assert!(!cache.contains("b", now), "b was the least recently used");
+        assert!(cache.contains("a", now) && cache.contains("c", now));
     }
 
     /// A schema that ran past the budget is tried again next time (the
@@ -3190,7 +3242,11 @@ mod tests {
             check.check(&schema).await,
             Err(SchemaCheckError::TooComplex)
         );
-        assert!(!check.passed.lock().unwrap().contains(&schema.body));
+        assert!(!check
+            .passed
+            .lock()
+            .unwrap()
+            .contains(&schema.body, std::time::Instant::now()));
     }
 
     /// 600 optional properties: past a row cap of 2000 (llguidance's
@@ -3215,7 +3271,11 @@ mod tests {
             check.check(&schema).await,
             Err(SchemaCheckError::TooComplex)
         );
-        assert!(!check.passed.lock().unwrap().contains(&schema.body));
+        assert!(!check
+            .passed
+            .lock()
+            .unwrap()
+            .contains(&schema.body, std::time::Instant::now()));
         // Under the limits engines use, it passes.
         assert_eq!(SchemaCompileCheck::default().check(&schema).await, Ok(()));
     }
@@ -3278,6 +3338,33 @@ mod tests {
             check.check(&spec_of(body)).await,
             Err(SchemaCheckError::Busy)
         );
+    }
+
+    /// A best-effort schema remembered as slow is tried again once
+    /// [`SLOW_SCHEMA_TTL`] has passed: one overloaded turn doesn't leave a
+    /// normally fast tool grammar unenforced for the life of the process.
+    #[tokio::test]
+    async fn a_slow_best_effort_schema_is_tried_again_after_a_while() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut check =
+            SchemaCompileCheck::new(1, Duration::from_millis(500), Duration::from_nanos(1));
+        let base = std::time::Instant::now();
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let clock = Arc::clone(&elapsed);
+        check.clock = Clock(Arc::new(move || {
+            base + Duration::from_secs(clock.load(Ordering::Relaxed))
+        }));
+        let soft = GrammarSpec::best_effort_json_schema(
+            r#"{"type":"object","properties":{"a":{"type":"string"}}}"#,
+        );
+        assert_eq!(check.check(&soft).await, Err(SchemaCheckError::TooComplex));
+        // With the only permit taken, a remembered schema is `TooComplex`
+        // and one tried again is `Busy`.
+        let _all = check.permits.clone().acquire_owned().await.unwrap();
+        elapsed.store(SLOW_SCHEMA_TTL.as_secs() - 1, Ordering::Relaxed);
+        assert_eq!(check.check(&soft).await, Err(SchemaCheckError::TooComplex));
+        elapsed.store(SLOW_SCHEMA_TTL.as_secs(), Ordering::Relaxed);
+        assert_eq!(check.check(&soft).await, Err(SchemaCheckError::Busy));
     }
 
     /// A best-effort check never waits for a permit: with every one taken it
