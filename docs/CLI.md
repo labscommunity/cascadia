@@ -592,7 +592,10 @@ Errors that are the client's fault never mark it unready. Neither do capacity
 call (a step, or a request's submit) for 60 s (a peer that stopped answering holds every slot, so every new
 request is a capacity 503); the server is then ready again as soon as the
 engine produces output. Clients that open streams and leave them unread do
-not count as a stall: the engine only steps while a stream is read.
+not count as a stall: the engine only steps while a stream is read. On engines
+that run a whole answer as one call (`ov-genai` without `--cb`, single-stage
+`sparse-moe`), an answer that takes longer than 60 s while further requests are
+refused for capacity also marks the server unready until that answer ends.
 
 ---
 
