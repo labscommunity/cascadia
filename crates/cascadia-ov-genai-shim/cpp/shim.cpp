@@ -424,6 +424,9 @@ int32_t cascadia_genconfig_set_json_schema(cascadia_genconfig_t* cfg, const char
     }
 }
 
+// The definitions below sit inside the file's extern "C" block; templates need
+// C++ linkage, which MSVC enforces (C2894).
+extern "C++" {
 namespace {
 // Whether this GenAI's StructuredOutputConfig has an EBNF `grammar` field.
 // Detected at compile time so the shim builds against GenAI headers with or
@@ -447,6 +450,7 @@ bool set_grammar_field(T& soc, const char* grammar) {
     }
 }
 }  // namespace
+}  // extern "C++"
 
 int32_t cascadia_genconfig_set_grammar(cascadia_genconfig_t* cfg, const char* grammar) {
     if (!cfg || !grammar) { set_last_error("null arg in set_grammar"); return 1; }
