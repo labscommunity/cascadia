@@ -2952,19 +2952,21 @@ async fn chat_completions(
         .into_response();
     }
 
-    // Non-streaming: collect full output. The engine stream, with the permit
-    // + in-flight guard, runs on a forwarder task, so a client that goes away
-    // drops this handler (and interrupts a running step) even while a step
-    // blocks; `close` frees the slot before the answer is built.
+    // Non-streaming: collect full output. The engine stream runs on a
+    // forwarder task, so a client that goes away drops this handler (and
+    // interrupts a running step) even while a step blocks. The handler holds
+    // the permit + in-flight guard itself: they are released when it returns
+    // (or is dropped), not when the forwarder ends, so a stop match answers
+    // without waiting for the step the forwarder may be in.
+    let _slot = RequestSlot {
+        _permit: permit,
+        _inflight: inflight,
+    };
     let mut chunks = match generate_in_window(&state, task.clone()).await {
         Ok(s) => spawn_engine_forwarder(
             task_id.clone(),
             state.runner.clone(),
-            StreamWithPermit {
-                inner: s,
-                _permit: permit,
-                _inflight: inflight,
-            },
+            StreamWithPermit::without_slot(s),
         ),
         Err(err) => return engine_error_response(err),
     };
@@ -3204,16 +3206,16 @@ async fn completions(
         .into_response();
     }
 
-    // On a forwarder task, as the chat path (see there).
+    // On a forwarder task, the slot held here, as the chat path (see there).
+    let _slot = RequestSlot {
+        _permit: permit,
+        _inflight: inflight,
+    };
     let mut chunks = match generate_in_window(&state, task).await {
         Ok(s) => spawn_engine_forwarder(
             task_id.clone(),
             state.runner.clone(),
-            StreamWithPermit {
-                inner: s,
-                _permit: permit,
-                _inflight: inflight,
-            },
+            StreamWithPermit::without_slot(s),
         ),
         Err(err) => return engine_error_response(err),
     };
@@ -3347,11 +3349,7 @@ async fn stream_text_completion(
         chunks: Some(spawn_engine_forwarder(
             task_id.clone(),
             state.runner.clone(),
-            StreamWithPermit {
-                inner: chunk_stream,
-                _permit: permit,
-                _inflight: inflight,
-            },
+            StreamWithPermit::with_slot(chunk_stream, permit, inflight),
         )),
         keepalive: KeepAlive::new(state.sse_keepalive),
         kind: TextStreamKind::Completion { echo: echo_prefix },
@@ -3409,11 +3407,7 @@ async fn stream_completion(
     let chunks = Some(spawn_engine_forwarder(
         task_id.clone(),
         state.runner.clone(),
-        StreamWithPermit {
-            inner: chunk_stream,
-            _permit: permit,
-            _inflight: inflight,
-        },
+        StreamWithPermit::with_slot(chunk_stream, permit, inflight),
     ));
     // Tools present and not disabled: content streams as the splitter
     // releases it; whether the reply is a tool call is decided at the final
@@ -3492,19 +3486,48 @@ async fn stream_completion(
     }))
 }
 
-/// Wraps a [`cascadia_runner::ChunkStream`] so it carries its concurrency
-/// permit and the permit is released when the stream is dropped (which
-/// happens on client disconnect — axum drops the SSE response).
-struct StreamWithPermit {
-    inner: WindowGuard<cascadia_runner::ChunkStream>,
+/// A request's concurrency permit and its `requests_in_flight` entry, both
+/// released on drop.
+struct RequestSlot {
     _permit: tokio::sync::OwnedSemaphorePermit,
-    /// Decrements `requests_in_flight` when the stream body is dropped.
+    /// Decrements `requests_in_flight` when dropped.
     _inflight: InFlightGuard,
 }
 
+/// Wraps a [`cascadia_runner::ChunkStream`], optionally with the request's
+/// [`RequestSlot`], released when the stream is dropped. A streamed request
+/// moves its slot in here, so the forwarder that owns the stream frees it
+/// when it ends (the stream finished, or the SSE body went away). A
+/// non-streaming handler keeps its slot itself, so the slot is free when the
+/// handler returns, without waiting for a forwarder still blocked in a step.
+struct StreamWithPermit {
+    inner: WindowGuard<cascadia_runner::ChunkStream>,
+    _slot: Option<RequestSlot>,
+}
+
 impl StreamWithPermit {
+    /// A streamed request's stream: it owns the slot.
+    fn with_slot(
+        inner: WindowGuard<cascadia_runner::ChunkStream>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        inflight: InFlightGuard,
+    ) -> Self {
+        Self {
+            inner,
+            _slot: Some(RequestSlot {
+                _permit: permit,
+                _inflight: inflight,
+            }),
+        }
+    }
+
+    /// A non-streaming request's stream: the handler holds the slot.
+    fn without_slot(inner: WindowGuard<cascadia_runner::ChunkStream>) -> Self {
+        Self { inner, _slot: None }
+    }
+
     /// Ends the engine stream with `reason` (see [`FinishEarly`]), then
-    /// releases the permit and the in-flight guard.
+    /// releases the slot, if it holds one.
     fn finish_early(mut self, reason: cascadia_types::FinishReason) {
         self.inner.finish_early(reason);
     }
@@ -3859,16 +3882,25 @@ impl EngineChunks {
         let _ = self.early.set(reason);
     }
 
-    /// Ends the engine stream, with `reason` when the answer ended early
-    /// (as [`EngineChunks::finish_early`]), and waits for the forwarder to
-    /// release it: the task's permit and in-flight guard are back once this
-    /// returns. For the non-streaming handlers, which answer only after it.
+    /// Ends the engine stream. For the non-streaming handlers, which hold
+    /// the request's slot themselves.
+    ///
+    /// With `reason` (the answer ended early, a stop match) it returns at
+    /// once: the forwarder may be blocked in the engine's next step, and the
+    /// answer is whole already. The forwarder finishes the engine stream with
+    /// that reason (as [`EngineChunks::finish_early`]) once the step returns.
+    /// With `None` (a final chunk or an error came in) the forwarder is about
+    /// to end, and this waits for it, so the runner has booked the task
+    /// before the answer goes out.
     async fn close(mut self, reason: Option<cascadia_types::FinishReason>) {
+        // The reason first: the forwarder reads it once it sees the close.
         if let Some(reason) = reason {
             let _ = self.early.set(reason);
         }
         self.rx.close();
-        let _ = (&mut self.forwarder).await;
+        if reason.is_none() {
+            let _ = (&mut self.forwarder).await;
+        }
     }
 }
 
@@ -10021,6 +10053,45 @@ level={{ effort_map[eff] }}";
         assert_cancelled(&log).await;
     }
 
+    /// A non-streaming stop match answers at once: it doesn't wait for the
+    /// engine step the forwarder has already started (one token time on a
+    /// per-token engine whose step blocks).
+    #[tokio::test]
+    async fn a_non_streaming_stop_answers_without_waiting_for_the_next_step() {
+        const STEP: Duration = Duration::from_millis(300);
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            let (app, log, _) = script_app_full(
+                &["alpha ", "STOP x", "more", "more"],
+                "",
+                true,
+                false,
+                SSE_KEEPALIVE_INTERVAL,
+                STEP,
+            )
+            .await;
+            let body = if path == "/v1/completions" {
+                serde_json::json!({"model": "mock-model", "prompt": "hi", "stop": "STOP"})
+            } else {
+                serde_json::json!({"model": "mock-model", "stop": "STOP",
+                    "messages": [{"role": "user", "content": "hi"}]})
+            };
+            let started = std::time::Instant::now();
+            let (status, text) = post_text(app.clone(), path, &body).await;
+            let took = started.elapsed();
+            assert_eq!(status, StatusCode::OK, "{path}: {text}");
+            assert!(text.contains("alpha"), "{path}: {text}");
+            // The matching chunk is the second step's: 2 * STEP. The next
+            // step would end at 3 * STEP.
+            assert!(
+                took < STEP * 2 + STEP * 3 / 4,
+                "{path}: answered {took:?} after the start, past the next step"
+            );
+            assert_released(&log).await;
+            let (status, _) = post_text(app, path, &body).await;
+            assert_eq!(status, StatusCode::OK, "{path}: the slot is free again");
+        }
+    }
+
     #[tokio::test]
     async fn streaming_chat_cuts_at_the_match_and_cancels_the_engine() {
         let (app, log, _) = script_app(
@@ -11694,6 +11765,59 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// A stop match closes the channel with a reason and returns at once,
+    /// while the forwarder is still blocked in the engine's next step: the
+    /// non-streaming answer doesn't wait one step for it. The forwarder then
+    /// finishes the stream with that reason (a stop, not a cancel).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_close_returns_while_the_forwarder_is_in_a_step() {
+        const STEP: Duration = Duration::from_millis(300);
+        let log = Arc::new(ScriptLog::default());
+        let runner = Arc::new(Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
+            parts: vec!["a ".into(), "b ".into(), "c ".into()],
+            final_text: String::new(),
+            prompt_first: true,
+            step_delay: STEP,
+            end: ScriptEnd::Final,
+            gate: None,
+            log: log.clone(),
+            pending: None,
+            inflight: None,
+            slices: 0,
+        })))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("api-stop-close", "CPU"),
+            )
+            .await
+            .unwrap();
+        let task = GenerationTask::new("t-stop-close", "hi").with_max_tokens(8);
+        let id = task.task_id.clone();
+        let stream = runner.generate_async(task).await.unwrap();
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut chunks = spawn_engine_forwarder(
+            id.clone(),
+            runner.clone(),
+            StreamWithPermit::with_slot(
+                guard_window(stream, None),
+                permit,
+                InFlightGuard::new(log.stats.clone()),
+            ),
+        );
+        let first = chunks.recv().await.expect("the first part");
+        assert_eq!(first.text, "a ");
+        // The forwarder is now inside the second step.
+        tokio::time::sleep(STEP / 4).await;
+        let started = std::time::Instant::now();
+        chunks.close(Some(cascadia_types::FinishReason::Stop)).await;
+        let took = started.elapsed();
+        assert!(
+            took < STEP / 4,
+            "close waited {took:?} for the forwarder's step"
+        );
+    }
+
     /// A receiver dropped once its forwarder has ended (the final chunk still
     /// unread in the channel) interrupts nothing: the finished task's id is
     /// not parked in the engine's early-cancel set.
@@ -11727,11 +11851,11 @@ level={{ effort_map[eff] }}";
         let chunks = spawn_engine_forwarder(
             id.clone(),
             runner.clone(),
-            StreamWithPermit {
-                inner: guard_window(stream, None),
-                _permit: permit,
-                _inflight: InFlightGuard::new(log.stats.clone()),
-            },
+            StreamWithPermit::with_slot(
+                guard_window(stream, None),
+                permit,
+                InFlightGuard::new(log.stats.clone()),
+            ),
         );
         for _ in 0..1000 {
             if chunks.forwarder.is_finished() {
