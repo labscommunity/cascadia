@@ -1276,6 +1276,7 @@ impl LlamaCppEngine {
             let mut reader = BufReader::new(s);
             // Skip response headers.
             let mut chunked = false;
+            let mut content_length = None;
             let mut status = String::new();
             loop {
                 let mut line = String::new();
@@ -1286,17 +1287,29 @@ impl LlamaCppEngine {
                 if status.is_empty() {
                     status = line.trim().to_string();
                 }
-                if line.to_lowercase().contains("transfer-encoding:")
-                    && line.to_lowercase().contains("chunked")
-                {
+                let lower = line.to_lowercase();
+                if lower.contains("transfer-encoding:") && lower.contains("chunked") {
                     chunked = true;
+                }
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse::<usize>().ok();
                 }
                 if line == "\r\n" {
                     break;
                 }
             }
             if !status.contains(" 200") {
-                send(Err(EngineError::Backend(format!("server {status}"))));
+                let is_4xx = status
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|code| code.len() == 3 && code.starts_with('4'));
+                let err = if is_4xx {
+                    let body = read_error_body(&mut reader, chunked, content_length);
+                    child_refusal(&status, &body)
+                } else {
+                    EngineError::Backend(format!("server {status}"))
+                };
+                send(Err(err));
                 return;
             }
             // Body is one byte stream of SSE `data: ...` lines, possibly
@@ -1366,6 +1379,75 @@ impl LlamaCppEngine {
             }
         });
     }
+}
+
+/// Most of a child's error body that is read; llama-server's are one short
+/// JSON object.
+const MAX_CHILD_ERROR_BODY: usize = 64 * 1024;
+
+/// Read a (non-SSE) error reply's body, framed by `Content-Length` or
+/// chunked encoding, up to [`MAX_CHILD_ERROR_BODY`]. Best effort: a short or
+/// broken body yields what arrived.
+fn read_error_body(
+    reader: &mut impl BufRead,
+    chunked: bool,
+    content_length: Option<usize>,
+) -> String {
+    let mut body = Vec::new();
+    if chunked {
+        loop {
+            let mut sz = String::new();
+            if reader.read_line(&mut sz).unwrap_or(0) == 0 {
+                break;
+            }
+            let n = usize::from_str_radix(sz.trim(), 16).unwrap_or(0);
+            if n == 0 || body.len() + n > MAX_CHILD_ERROR_BODY {
+                break;
+            }
+            let mut buf = vec![0u8; n];
+            if reader.read_exact(&mut buf).is_err() {
+                break;
+            }
+            body.extend_from_slice(&buf);
+            let mut crlf = [0u8; 2];
+            let _ = reader.read_exact(&mut crlf);
+        }
+    } else if let Some(n) = content_length {
+        let mut buf = vec![0u8; n.min(MAX_CHILD_ERROR_BODY)];
+        if reader.read_exact(&mut buf).is_ok() {
+            body = buf;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// The engine error for a 4xx from llama-server, from its JSON error body
+/// (`{"error": {"type", "message", ...}}`). Its over-window refusal
+/// (`exceed_context_size_error`) is the prompt's fault, worded so the API
+/// reads the counts ("prompt is M tokens; the model's window is N"); any
+/// other refusal is a request the child rejected, with its own message.
+/// Both become 400s at the API rather than a 5xx that marks the server
+/// unready.
+fn child_refusal(status: &str, body: &str) -> EngineError {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let err = v.get("error").filter(|e| e.is_object()).unwrap_or(&v);
+    if err.get("type").and_then(|t| t.as_str()) == Some("exceed_context_size_error") {
+        let count = |k: &str| err.get(k).and_then(|n| n.as_u64());
+        return EngineError::PromptTooLong(match (count("n_prompt_tokens"), count("n_ctx")) {
+            (Some(m), Some(n)) => format!("prompt is {m} tokens; the model's window is {n}"),
+            (Some(m), None) => format!("prompt is {m} tokens; it exceeds the model's window"),
+            (None, Some(n)) => {
+                format!("the prompt exceeds the model's window; the model's window is {n}")
+            }
+            (None, None) => "the prompt exceeds the model's window".to_string(),
+        });
+    }
+    let message = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("llama-server refused the request: {status}"));
+    EngineError::InvalidConfig(message)
 }
 
 /// Forward the non-default sampling knobs into a request body. Omitted
@@ -2791,6 +2873,66 @@ mod unix_tests {
             "{last:?}"
         );
         server.join().unwrap();
+    }
+
+    /// The child's error, as the final error chunk's text, for a reply of
+    /// `status_line` with JSON `body`.
+    fn child_error_text(status_line: &'static str, body: &'static str) -> String {
+        let (port, server) = mock_server(move |_, s| {
+            let reply = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(reply.as_bytes()).unwrap();
+        });
+        let mut engine = test_engine(port);
+        engine.submit(chat_task()).unwrap();
+        let chunks = drain(&mut engine);
+        server.join().unwrap();
+        let last = &chunks.last().unwrap().1;
+        assert!(last.is_final, "{last:?}");
+        last.error.clone().expect("an error chunk")
+    }
+
+    /// llama-server's over-window refusal is the client's fault: the prompt
+    /// is too long, with the child's counts in the canonical wording the API
+    /// reads them from.
+    #[test]
+    fn child_over_window_400_is_prompt_too_long() {
+        let e = child_error_text(
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":4100,"n_ctx":4096}}"#,
+        );
+        assert_eq!(
+            e,
+            "prompt too long: prompt is 4100 tokens; the model's window is 4096"
+        );
+        let e = child_error_text(
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size","type":"exceed_context_size_error"}}"#,
+        );
+        assert_eq!(e, "prompt too long: the prompt exceeds the model's window");
+    }
+
+    /// Any other 4xx from the child is a request it refused: invalid
+    /// configuration, with the child's own message.
+    #[test]
+    fn child_other_400_is_invalid_config() {
+        let e = child_error_text(
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":{"code":400,"message":"Unable to parse tool_choice","type":"invalid_request_error"}}"#,
+        );
+        assert_eq!(e, "invalid configuration: Unable to parse tool_choice");
+    }
+
+    /// A 5xx is still the child's failure.
+    #[test]
+    fn child_500_stays_a_backend_error() {
+        let e = child_error_text(
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"error":{"code":500,"message":"boom","type":"server_error"}}"#,
+        );
+        assert!(e.starts_with("backend error: server HTTP/1.1 500"), "{e}");
     }
 
     /// A quiet child (prefill, a long inter-token gap) must not hold the

@@ -11994,6 +11994,34 @@ level={{ effort_map[eff] }}";
         );
     }
 
+    /// The wording the llama.cpp engine gives a child's over-window refusal
+    /// reaches the client as `context_length_exceeded`, with the counts when
+    /// the child sent them and the no-window form when it did not.
+    #[test]
+    fn llama_server_over_window_wording_is_a_context_length_400() {
+        let (s, m, p, c) = classify_chunk_error(
+            "prompt too long: prompt is 4100 tokens; the model's window is 4096",
+            "messages",
+        );
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!((p, c), (Some("messages"), Some("context_length_exceeded")));
+        assert!(
+            m.starts_with("This model's maximum context length is 4096 tokens. However, your messages resulted in 4100 tokens."),
+            "{m}"
+        );
+        let detail = "the prompt exceeds the model's window";
+        assert_eq!(errors::prompt_counts(detail), (None, None));
+        let (s, m, _, c) = classify_chunk_error(&format!("prompt too long: {detail}"), "messages");
+        assert_eq!(
+            (s, c),
+            (StatusCode::BAD_REQUEST, Some("context_length_exceeded"))
+        );
+        assert!(
+            m.starts_with("This model's maximum context length is exceeded: your messages exceeds"),
+            "{m}"
+        );
+    }
+
     #[test]
     fn classify_chunk_error_splits_client_and_server_faults() {
         let (s, m, p, c) = classify_chunk_error(MID_GENERATION_TOO_LONG, "input");
