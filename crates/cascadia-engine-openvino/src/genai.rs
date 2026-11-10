@@ -33,7 +33,7 @@ use cascadia_types::{
     ShardSpec, TaskId,
 };
 use futures::stream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::decode_keep::tool_marker_ids;
 
@@ -467,6 +467,10 @@ impl Builder for OvGenaiBuilder {
 fn tool_marker_keep_list(model_dir: &Path) -> Vec<(u32, String)> {
     let path = model_dir.join("tokenizer.json");
     if !path.is_file() {
+        debug!(
+            path = %path.display(),
+            "no tokenizer.json next to the model; a Gemma 4 model's tool-call markers are not kept"
+        );
         return Vec::new();
     }
     match tokenizers::Tokenizer::from_file(&path) {
