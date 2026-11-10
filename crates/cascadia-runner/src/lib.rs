@@ -630,6 +630,7 @@ impl Runner {
             last_errored_task: None,
             consecutive_foreign_err: 0,
             done: false,
+            ended: false,
             model: self.model_label(),
             submitted_at: Instant::now(),
             last_chunk_at: None,
@@ -805,6 +806,13 @@ pub struct ChunkStream {
     last_errored_task: Option<TaskId>,
     consecutive_foreign_err: usize,
     done: bool,
+    /// This stream's task is over on the engine side: its final chunk was
+    /// delivered, its tombstone was seen, or the engine slot emptied. Narrower
+    /// than `done`, which `fail_stream` also sets for endings about the stream
+    /// alone (a foreign-task wedge, a task-less engine error, no progress),
+    /// where the task may still be queued. Drop skips the in-flight handle
+    /// signal only when this is set (M18).
+    ended: bool,
     /// `model` label for the generation metrics below (#16).
     model: Arc<str>,
     /// When the task was submitted — the zero point for TTFT and duration.
@@ -967,6 +975,7 @@ impl ChunkStream {
     /// a planned restart must not land on the primary failure SLO.
     fn fail_teardown(&mut self) -> Poll<Option<Chunk>> {
         self.done = true;
+        self.ended = true;
         self.slot.buffers.lock().chunks.remove(&self.task_id);
         warn!(
             task = %self.task_id,
@@ -1045,6 +1054,7 @@ impl Stream for ChunkStream {
                 let mut bufs = this.slot.buffers.lock();
                 if bufs.cancelled.contains(&this.task_id) {
                     this.done = true;
+                    this.ended = true;
                     bufs.chunks.remove(&this.task_id);
                     bufs.cancelled.remove(&this.task_id);
                     drop(bufs);
@@ -1056,6 +1066,7 @@ impl Stream for ChunkStream {
                         let is_final = chunk.is_final;
                         if is_final {
                             this.done = true;
+                            this.ended = true;
                             bufs.chunks.remove(&this.task_id);
                         }
                         drop(bufs);
@@ -1305,11 +1316,13 @@ impl Drop for ChunkStream {
         // `Runner::cancel` uses, and the guard inside it handles the
         // release-then-wake ordering for both.
         //
-        // A done stream (final chunk seen, or already ended on a cancel,
-        // failure or teardown) skips the in-flight handle signal: its task
-        // isn't running, so the signal would only park its id in the
-        // handle's bounded early-cancel set (M18).
-        if self.done {
+        // An ended stream (its final chunk was delivered, its cancel
+        // tombstone was seen, or the server tore down) skips the in-flight
+        // handle signal: its task isn't running, so the signal would only
+        // park its id in the handle's bounded early-cancel set (M18). A
+        // stream `fail_stream` ended still signals: that ending is about the
+        // stream, and its task may still be queued.
+        if self.ended {
             self.slot.engine_cancel_or_defer(&self.task_id);
         } else {
             self.slot.cancel_or_defer(&self.task_id);
@@ -2208,6 +2221,11 @@ mod tests {
             let Some(task) = self.queue.pop_front() else {
                 return Ok(vec![]);
             };
+            if task.prompt == "stall" {
+                // Never starts: stays queued, and the step makes no progress.
+                self.queue.push_front(task);
+                return Ok(vec![]);
+            }
             let id = task.task_id.clone();
             let cancelled_chunk = |id: &TaskId| {
                 Chunk::final_marker(id.clone(), "").with_finish_reason(FinishReason::Cancelled)
@@ -2388,10 +2406,20 @@ mod tests {
             .with_label_values(&[MODEL])
             .get();
         {
-            // Hold the engine lock across the call: parking_lot isn't reentrant, so an interrupt
-            // that took it would hang here, and one that try-locked would defer a cancel.
+            // Hold the engine lock across the call, made from another thread: an interrupt that
+            // took the lock would block there (and fail the timeout below), and one that
+            // try-locked would defer a cancel.
             let _held = rig.runner.slot.lock();
-            rig.runner.interrupt(&id);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let runner = rig.runner.clone();
+            let caller = id.clone();
+            std::thread::spawn(move || {
+                runner.interrupt(&caller);
+                let _ = done_tx.send(());
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("interrupt blocked on the engine lock");
         }
         let bufs = rig.runner.slot.buffers.lock();
         assert!(!bufs.cancelled.contains(&id), "interrupt wrote a tombstone");
@@ -2413,6 +2441,50 @@ mod tests {
         );
         assert!(rig.ic.begin(&id), "interrupt never signalled the handle");
         rig.ic.end();
+    }
+
+    /// M18: a stream that `fail_stream` ended (here: no progress) while its task is still queued
+    /// signals the handle on drop. That ending is about the stream, not the task: the task can
+    /// still be begun later, with no consumer left.
+    #[tokio::test]
+    async fn a_failed_streams_drop_still_signals_the_inflight_handle() {
+        let rig = polling_cancel_rig("runner-inflight-failed-drop-model").await;
+        let mut s = rig
+            .runner
+            .generate(GenerationTask::new("stall-1", "stall"))
+            .unwrap();
+        let mut last = None;
+        while let Some(c) = s.next().await {
+            last = Some(c);
+        }
+        let last = last.expect("the stalled stream yielded nothing");
+        assert!(
+            last.is_final && last.error.is_some(),
+            "expected the no-progress failure: {last:?}"
+        );
+        drop(s);
+        assert!(
+            rig.ic.begin(&"stall-1".to_string()),
+            "a stream ended by fail_stream didn't signal the handle for its still-queued task"
+        );
+        rig.ic.end();
+    }
+
+    /// M18: the slot holds the engine's handle once the runner has started, and lets it go on
+    /// close.
+    #[tokio::test]
+    async fn the_slots_inflight_handle_is_set_on_start_and_cleared_on_close() {
+        let rig = polling_cancel_rig("runner-inflight-slot-model").await;
+        let held = rig.runner.slot.inflight.lock().clone();
+        assert!(
+            held.is_some_and(|h| Arc::ptr_eq(&h, &rig.ic)),
+            "start didn't store the engine's handle"
+        );
+        rig.runner.close();
+        assert!(
+            rig.runner.slot.inflight.lock().is_none(),
+            "close kept the handle"
+        );
     }
 
     /// M18: a stream that saw its final chunk doesn't signal the handle on drop, so finished ids

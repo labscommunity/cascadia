@@ -32,6 +32,10 @@ struct State {
 /// bounded FIFO set, so [`begin`](Self::begin) can report it. That closes the race between the
 /// engine popping a task and starting it.
 ///
+/// An engine that drops a queued task in its `Engine::cancel` should call [`forget`](Self::forget)
+/// for it, so the task's early entry (the runner signals this handle on every cancel) doesn't sit in
+/// the set until it is evicted.
+///
 /// Invariant: a cancel for task A never sets the flag while task B is current. `cancel` and `begin`
 /// both decide under the same mutex, and `begin` resets the flag for the incoming task.
 #[derive(Default)]
@@ -91,6 +95,15 @@ impl InflightCancel {
         let mut s = self.lock();
         s.current = None;
         self.flag.store(false, Ordering::Release);
+    }
+
+    /// Drop `task_id` from the early-cancel set, if it is there. For an engine's `Engine::cancel` of a
+    /// task that is queued and will now never begin. Leaves the running task and the flag alone.
+    pub fn forget(&self, task_id: &TaskId) {
+        let mut s = self.lock();
+        if let Some(i) = s.early.iter().position(|t| t == task_id) {
+            s.early.remove(i);
+        }
     }
 
     /// Whether the running task has been cancelled. One `Acquire` load; cheap enough per token.
@@ -192,6 +205,32 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(b_cancelled, 0, "B was cancelled by cancels meant for A");
+    }
+
+    #[test]
+    fn forget_drops_an_early_cancel_and_nothing_else() {
+        let ic = InflightCancel::new();
+        ic.cancel(&id("queued"));
+        ic.cancel(&id("other"));
+        ic.forget(&id("queued"));
+        assert_eq!(ic.early_len(), 1, "forget left the id in the early set");
+        assert!(
+            !ic.begin(&id("queued")),
+            "a forgotten cancel was still reported"
+        );
+        ic.end();
+        assert!(
+            ic.begin(&id("other")),
+            "forget removed another task's cancel"
+        );
+        ic.end();
+        // An id that isn't there is a no-op, and the running task's flag is untouched.
+        assert!(!ic.begin(&id("run")));
+        ic.cancel(&id("run"));
+        ic.forget(&id("run"));
+        ic.forget(&id("never"));
+        assert!(ic.cancelled(), "forget cleared the running task's flag");
+        ic.end();
     }
 
     #[test]
