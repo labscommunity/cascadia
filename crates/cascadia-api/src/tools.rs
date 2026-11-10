@@ -969,21 +969,24 @@ pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<T
 /// stays, as before. A named `tool_choice` keeps only calls to that tool
 /// (another is possible when the engine dropped the grammar).
 /// `parallel_tool_calls: false` keeps the first call.
+/// `gemma`: the model writes Gemma 4 calls, which are read only then (see
+/// [`crate::parse_tool_calls_for`]).
 /// `None` when no call is left.
 pub fn resolve_calls(
     text: &str,
     policy: &ToolPolicy,
     grammar_sent: bool,
     union_sent: bool,
+    gemma: bool,
 ) -> Option<Vec<ToolCall>> {
     let forced = grammar_sent
         .then(|| calls_from_forced_output(text, policy))
         .flatten();
     let mut calls = forced.or_else(|| {
         if union_sent {
-            crate::parse_tool_calls_marked(text)
+            crate::parse_tool_calls_marked(text, gemma)
         } else {
-            crate::parse_tool_calls(text)
+            crate::parse_tool_calls_for(text, gemma)
         }
     })?;
     if policy.narrowed || grammar_sent {
@@ -2120,11 +2123,11 @@ mod tests {
             assert!(forced.is_some_and(|c| c.is_empty()), "{text}");
             // Not handed to the dialect parser either, which would make
             // `arguments` of the non-object value.
-            assert_eq!(resolve_calls(&text, &p, true, false), None, "{text}");
+            assert_eq!(resolve_calls(&text, &p, true, false, false), None, "{text}");
         }
         // A malformed item is skipped; a good one beside it is the call.
         let text = r#"[{"name":"f","parameters":"hello"},{"name":"f","parameters":{"a":1}}]"#;
-        let calls = resolve_calls(text, &p, true, false).expect("the good call");
+        let calls = resolve_calls(text, &p, true, false, false).expect("the good call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
     }
@@ -2260,8 +2263,14 @@ mod tests {
     #[test]
     fn resolve_calls_reads_the_forced_shape_first() {
         let p = policy(&json!([func("a"), func("b")]), Some(json!("required"))).unwrap();
-        let calls = resolve_calls(r#"[{"name":"b","parameters":{"x":1}}]"#, &p, true, false)
-            .expect("a call");
+        let calls = resolve_calls(
+            r#"[{"name":"b","parameters":{"x":1}}]"#,
+            &p,
+            true,
+            false,
+            false,
+        )
+        .expect("a call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "b");
         assert_eq!(calls[0].function.arguments, r#"{"x":1}"#);
@@ -2270,6 +2279,7 @@ mod tests {
             "```json\n[{\"name\":\"a\",\"parameters\":{}}]\n```",
             &p,
             true,
+            false,
             false,
         )
         .expect("a fenced call");
@@ -2280,7 +2290,7 @@ mod tests {
     fn resolve_calls_under_a_union_ignores_bare_json() {
         let p = policy(&json!([func("a")]), None).unwrap();
         assert_eq!(
-            resolve_calls(r#"{"name":"a","parameters":{}}"#, &p, true, true),
+            resolve_calls(r#"{"name":"a","parameters":{}}"#, &p, true, true, false),
             None
         );
         let calls = resolve_calls(
@@ -2288,6 +2298,7 @@ mod tests {
             &p,
             true,
             true,
+            false,
         )
         .expect("a marked call");
         assert_eq!(calls[0].function.name, "a");
@@ -2297,10 +2308,10 @@ mod tests {
     fn resolve_calls_filters_to_the_tools_once_a_grammar_applied() {
         let p = policy(&json!([func("a")]), Some(json!("required"))).unwrap();
         let text = r#"<tool_call>{"name":"zzz","arguments":{}}</tool_call>"#;
-        assert_eq!(resolve_calls(text, &p, true, false), None);
+        assert_eq!(resolve_calls(text, &p, true, false, false), None);
         // Without a grammar (and without narrowing) the call stays, as today.
         assert_eq!(
-            resolve_calls(text, &p, false, false).unwrap()[0]
+            resolve_calls(text, &p, false, false, false).unwrap()[0]
                 .function
                 .name,
             "zzz"
@@ -2312,7 +2323,7 @@ mod tests {
         let t = tools(json!([func("a"), func("b")]));
         let p = ToolPolicy::from_request(Some(&t), None, Some(false)).unwrap();
         let text = r#"<tool_call>{"name":"a","arguments":{}}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call>"#;
-        let calls = resolve_calls(text, &p, false, false).unwrap();
+        let calls = resolve_calls(text, &p, false, false, false).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "a");
     }

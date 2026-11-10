@@ -1961,13 +1961,14 @@ fn render_prompt(
 /// answer is tool calls, `"stop"` when it is the call a named `tool_choice`
 /// forced (as OpenAI reports it). `None` when the answer is content, which
 /// keeps the engine's reason (`"length"` for a cut-off call, say).
-/// `grammar_sent` / `union_sent`: see [`resolve_calls`].
+/// `grammar_sent` / `union_sent` / `gemma`: see [`resolve_calls`].
 fn build_choice(
     buf: String,
     policy: &ToolPolicy,
     enable_thinking: bool,
     grammar_sent: bool,
     union_sent: bool,
+    gemma: bool,
 ) -> (ChatChoiceMessage, Option<&'static str>) {
     if policy.callable() {
         if let Some((calls, finish_reason)) = answer_calls(
@@ -1975,6 +1976,7 @@ fn build_choice(
             policy,
             grammar_sent,
             union_sent,
+            gemma,
         ) {
             return (
                 ChatChoiceMessage {
@@ -2006,8 +2008,9 @@ fn answer_calls(
     policy: &ToolPolicy,
     grammar_sent: bool,
     union_sent: bool,
+    gemma: bool,
 ) -> Option<(Vec<OutputToolCall>, &'static str)> {
-    let calls = resolve_calls(scan_text, policy, grammar_sent, union_sent)?;
+    let calls = resolve_calls(scan_text, policy, grammar_sent, union_sent, gemma)?;
     let finish_reason = match policy.mode {
         ToolMode::Named(_) => "stop",
         _ => "tool_calls",
@@ -2305,28 +2308,40 @@ impl ToolStreamSplitter {
 /// Parse model tool-call output into structured calls; None when none found.
 /// Shape-based + engine-agnostic; never panics (each block parsed independently,
 /// malformed blocks skipped).
+///
+/// Reads every dialect but Gemma 4's: see [`parse_tool_calls_for`].
 pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
-    parse_tool_calls_with(text, true)
+    parse_tool_calls_for(text, false)
 }
 
-/// [`parse_tool_calls`] without its bare-JSON branch: only calls behind a
-/// tool-call marker (`<tool_call>`, `<|python_tag|>`, Gemma 4's
-/// `<|tool_call>`) count. A whole-output
+/// [`parse_tool_calls`], also reading Gemma 4 calls
+/// (`<|tool_call>call:NAME{…}<tool_call|>`) when `gemma` is set: the model
+/// writes them (see [`AppState::gemma_tool_markers`]). For any other model
+/// that marker is only text, so a Gemma 4 call quoted inside another
+/// dialect's call or in a plain answer is never read as a call.
+pub fn parse_tool_calls_for(text: &str, gemma: bool) -> Option<Vec<ToolCall>> {
+    parse_tool_calls_with(text, true, gemma)
+}
+
+/// [`parse_tool_calls_for`] without its bare-JSON branch: only calls behind
+/// a tool-call marker (`<tool_call>`, `<|python_tag|>`, and with `gemma`
+/// Gemma 4's `<|tool_call>`) count. A whole-output
 /// JSON object or array with `name` and `arguments`/`parameters` keys stays
 /// text, for answers where such JSON may be the client's own data.
-pub fn parse_tool_calls_marked(text: &str) -> Option<Vec<ToolCall>> {
-    parse_tool_calls_with(text, false)
+pub fn parse_tool_calls_marked(text: &str, gemma: bool) -> Option<Vec<ToolCall>> {
+    parse_tool_calls_with(text, false, gemma)
 }
 
-fn parse_tool_calls_with(text: &str, bare_json: bool) -> Option<Vec<ToolCall>> {
+fn parse_tool_calls_with(text: &str, bare_json: bool, gemma: bool) -> Option<Vec<ToolCall>> {
     // The dialect whose open marker comes first: the other's marker may be
     // text inside its arguments. A Gemma 4 marker that opens no Gemma 4
     // call is only text, so the other dialects are still tried after it.
-    let gemma_first = match (text.find(GEMMA_CALL_OPEN), text.find(TOOL_CALL_OPEN)) {
-        (Some(g), Some(h)) => g < h,
-        (Some(_), None) => true,
-        (None, _) => false,
-    };
+    let gemma_first = gemma
+        && match (text.find(GEMMA_CALL_OPEN), text.find(TOOL_CALL_OPEN)) {
+            (Some(g), Some(h)) => g < h,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
     if gemma_first {
         let calls = gemma_calls(text);
         if !calls.is_empty() {
@@ -3311,6 +3326,7 @@ async fn chat_completions(
             .as_ref()
             .map(|o| o.include_usage)
             .unwrap_or(false);
+        let gemma = state.gemma_tool_markers;
         return stream_completion(
             state,
             req.model,
@@ -3322,6 +3338,7 @@ async fn chat_completions(
                 policy,
                 grammar_sent: tool_grammar_sent,
                 union_sent,
+                gemma,
             },
         )
         .await
@@ -3408,6 +3425,7 @@ async fn chat_completions(
         enable_thinking,
         tool_grammar_sent && !grammar_dropped,
         union_sent && !grammar_dropped,
+        state.gemma_tool_markers,
     );
     // Gemma 4's markers stay in the text so calls can be read; content never
     // carries them.
@@ -3795,6 +3813,8 @@ struct ToolReading {
     policy: ToolPolicy,
     grammar_sent: bool,
     union_sent: bool,
+    /// The model writes Gemma 4 calls (see [`AppState::gemma_tool_markers`]).
+    gemma: bool,
 }
 
 // Streaming carries the usage handles (inflight/include_usage) and the tool
@@ -4204,8 +4224,15 @@ impl ToolStream {
             Some(g) => g.feed_last(content),
             None => content.to_owned(),
         };
-        let read =
-            |scan: &str| answer_calls(scan, &tools.policy, tools.grammar_sent, tools.union_sent);
+        let read = |scan: &str| {
+            answer_calls(
+                scan,
+                &tools.policy,
+                tools.grammar_sent,
+                tools.union_sent,
+                tools.gemma,
+            )
+        };
         let out = match self.splitter.finish(text, read) {
             ToolStreamEnd::Content(content) => content_frame(
                 task_id,
@@ -7735,6 +7762,7 @@ level={{ effort_map[eff] }}";
             true,
             false,
             false,
+            false,
         );
         assert_eq!(fr, Some("tool_calls"));
         assert!(m.content.is_none());
@@ -7747,6 +7775,7 @@ level={{ effort_map[eff] }}";
             "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
             &tool_policy(&["x"], Some(serde_json::json!("none"))),
             true,
+            false,
             false,
             false,
         );
@@ -7762,6 +7791,7 @@ level={{ effort_map[eff] }}";
             "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
             &ToolPolicy::from_request(None, Some(&serde_json::json!("auto")), None).unwrap(),
             true,
+            false,
             false,
             false,
         );
@@ -7781,6 +7811,7 @@ level={{ effort_map[eff] }}";
             false,
             false,
             false,
+            false,
         );
         assert_eq!(fr, Some("tool_calls"));
         assert_eq!(m.tool_calls.unwrap()[0].name(), "echo");
@@ -7792,6 +7823,7 @@ level={{ effort_map[eff] }}";
             "hello".into(),
             &tool_policy(&["x"], None),
             true,
+            false,
             false,
             false,
         );
@@ -7939,7 +7971,7 @@ level={{ effort_map[eff] }}";
         let mut s = ToolStreamSplitter::new(thinking, false, gemma);
         let (last, body) = pieces.split_last().unwrap();
         let mut out: Vec<String> = body.iter().map(|p| s.feed(p).to_owned()).collect();
-        match s.finish(last, parse_tool_calls) {
+        match s.finish(last, |t| parse_tool_calls_for(t, gemma)) {
             ToolStreamEnd::Content(c) => {
                 out.push(c.to_owned());
                 (out, None)
@@ -10474,7 +10506,7 @@ level={{ effort_map[eff] }}";
             r#"{"name":"Alice","parameters":{"age":30}}"#,
             r#"[{"name":"Alice","parameters":{}}]"#,
         ] {
-            let (m, fr) = build_choice(text.into(), &policy, false, true, true);
+            let (m, fr) = build_choice(text.into(), &policy, false, true, true, false);
             assert_eq!(fr, None, "{text}");
             assert!(m.tool_calls.is_none(), "{text}");
             assert_eq!(m.content.as_deref(), Some(text));
@@ -10483,6 +10515,7 @@ level={{ effort_map[eff] }}";
         let (m, _) = build_choice(
             r#"{"name":"Alice","parameters":{"age":30}}"#.into(),
             &policy,
+            false,
             false,
             false,
             false,
@@ -10495,13 +10528,13 @@ level={{ effort_map[eff] }}";
         let text = r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
         let required = tool_policy(&["get_weather"], Some(serde_json::json!("required")));
         for grammar_sent in [false, true] {
-            let calls = resolve_calls(text, &required, grammar_sent, false).expect("a call");
+            let calls = resolve_calls(text, &required, grammar_sent, false, false).expect("a call");
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].function.name, "get_weather");
             assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
         }
         let auto = tool_policy(&["get_weather"], None);
-        let calls = resolve_calls(text, &auto, true, true).expect("a call under the union");
+        let calls = resolve_calls(text, &auto, true, true, false).expect("a call under the union");
         assert_eq!(calls[0].function.name, "get_weather");
     }
 
@@ -10608,13 +10641,13 @@ level={{ effort_map[eff] }}";
     fn undeclared_call_dropped_only_when_narrowed() {
         let text = r#"<tool_call>{"name":"other","arguments":{}}</tool_call>"#;
         let narrowed = tool_policy(&["a", "b"], Some(allowed("auto", &["a"])));
-        let (m, fr) = build_choice(text.into(), &narrowed, false, false, false);
+        let (m, fr) = build_choice(text.into(), &narrowed, false, false, false, false);
         assert_eq!(fr, None);
         assert!(m.tool_calls.is_none());
         assert_eq!(m.content.as_deref(), Some(text));
 
         let plain = tool_policy(&["a"], None);
-        let (m, fr) = build_choice(text.into(), &plain, false, false, false);
+        let (m, fr) = build_choice(text.into(), &plain, false, false, false, false);
         assert_eq!(fr, Some("tool_calls"));
         assert_eq!(m.tool_calls.unwrap()[0].name(), "other");
     }
@@ -10908,6 +10941,7 @@ level={{ effort_map[eff] }}";
             false,
             false,
             false,
+            false,
         );
         assert_eq!((m.content.as_deref(), fr), (Some(text), None));
     }
@@ -10917,14 +10951,14 @@ level={{ effort_map[eff] }}";
         let text = r#"<tool_call>{"name":"get_time","arguments":{"city":"Paris"}}</tool_call>"#;
         let policy = tool_policy(&["get_weather", "get_time"], Some(named("get_weather")));
         for grammar_sent in [true, false] {
-            let (m, fr) = build_choice(text.into(), &policy, false, grammar_sent, false);
+            let (m, fr) = build_choice(text.into(), &policy, false, grammar_sent, false, false);
             assert_eq!(fr, None, "grammar_sent={grammar_sent}");
             assert!(m.tool_calls.is_none());
             assert_eq!(m.content.as_deref(), Some(text));
         }
         // The named tool's own call is kept.
         let own = r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
-        let (m, fr) = build_choice(own.into(), &policy, false, false, false);
+        let (m, fr) = build_choice(own.into(), &policy, false, false, false, false);
         assert_eq!(fr, Some("stop"));
         assert_eq!(m.tool_calls.unwrap()[0].name(), "get_weather");
     }
@@ -11649,12 +11683,22 @@ level={{ effort_map[eff] }}";
         serde_json::from_str(&c.function.arguments).unwrap()
     }
 
+    /// [`parse_tool_calls_for`] for a model that writes Gemma 4 calls.
+    fn gemma_parse(text: &str) -> Option<Vec<ToolCall>> {
+        parse_tool_calls_for(text, true)
+    }
+
+    /// [`parse_tool_calls_marked`] for a model that writes Gemma 4 calls.
+    fn gemma_marked(text: &str) -> Option<Vec<ToolCall>> {
+        parse_tool_calls_marked(text, true)
+    }
+
     const GEMMA_WEATHER_CALL: &str =
         "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>";
 
     #[test]
     fn parse_tool_calls_gemma4_basic() {
-        for parse in [parse_tool_calls, parse_tool_calls_marked] {
+        for parse in [gemma_parse, gemma_marked] {
             let calls = parse(GEMMA_WEATHER_CALL).expect("a Gemma 4 call");
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].function.name, "get_weather");
@@ -11663,7 +11707,7 @@ level={{ effort_map[eff] }}";
             assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
         }
         // Text around the call does not stop it from being read.
-        let calls = parse_tool_calls(&format!("Let me check.\n{GEMMA_WEATHER_CALL}\n"))
+        let calls = gemma_parse(&format!("Let me check.\n{GEMMA_WEATHER_CALL}\n"))
             .expect("a call after prose");
         assert_eq!(calls[0].function.name, "get_weather");
     }
@@ -11676,7 +11720,7 @@ level={{ effort_map[eff] }}";
              opts:{{seat:{q}aisle{q},bags:{{count:2}}}},tags:[{q}a{q},1,[true,null],{{k:{q}v{q}}}],\
              note:{q}a, b: {{c}} [d]{q}, empty:{q}{q}, list:[]}}<tool_call|>"
         );
-        let calls = parse_tool_calls(&text).expect("a typed Gemma 4 call");
+        let calls = gemma_parse(&text).expect("a typed Gemma 4 call");
         assert_eq!(calls[0].function.name, "book");
         assert_eq!(
             call_args(&calls[0]),
@@ -11699,7 +11743,7 @@ level={{ effort_map[eff] }}";
         let text = format!(
             "{GEMMA_WEATHER_CALL}<|tool_call>call:get_time{{tz:<|\"|>CET<|\"|>}}<tool_call|>"
         );
-        let calls = parse_tool_calls(&text).expect("two calls");
+        let calls = gemma_parse(&text).expect("two calls");
         let names: Vec<_> = calls.iter().map(|c| c.function.name.as_str()).collect();
         assert_eq!(names, ["get_weather", "get_time"]);
         assert_eq!(call_args(&calls[1]), serde_json::json!({"tz": "CET"}));
@@ -11708,7 +11752,7 @@ level={{ effort_map[eff] }}";
 
     #[test]
     fn parse_tool_calls_gemma4_zero_args() {
-        let calls = parse_tool_calls("<|tool_call>call:now{}<tool_call|>").expect("a call");
+        let calls = gemma_parse("<|tool_call>call:now{}<tool_call|>").expect("a call");
         assert_eq!(calls[0].function.name, "now");
         assert_eq!(calls[0].function.arguments, "{}");
     }
@@ -11727,9 +11771,9 @@ level={{ effort_map[eff] }}";
             "<|tool_call>f{}<tool_call|>".to_string(),
             "<|tool_call>call:{}<tool_call|>".to_string(),
         ] {
-            assert_eq!(parse_tool_calls(&bad), None, "{bad}");
+            assert_eq!(gemma_parse(&bad), None, "{bad}");
             // A good call after a malformed one is still read.
-            let calls = parse_tool_calls(&format!("{bad}{GEMMA_WEATHER_CALL}"))
+            let calls = gemma_parse(&format!("{bad}{GEMMA_WEATHER_CALL}"))
                 .unwrap_or_else(|| panic!("the good call after {bad}"));
             assert_eq!(calls.len(), 1, "{bad}");
             assert_eq!(calls[0].function.name, "get_weather", "{bad}");
@@ -11738,7 +11782,7 @@ level={{ effort_map[eff] }}";
         // it is read as a call (see
         // `an_unterminated_gemma4_string_makes_no_call_from_the_markers_inside_it`).
         assert_eq!(
-            parse_tool_calls(&format!("<|tool_call>call:f{{a:{q}x}}<tool_call|>")),
+            gemma_parse(&format!("<|tool_call>call:f{{a:{q}x}}<tool_call|>")),
             None
         );
     }
@@ -11775,14 +11819,18 @@ level={{ effort_map[eff] }}";
             let app = scripted_app_with(&text, cascadia_types::FinishReason::Stop, gemma).await;
             let (status, v) = post_chat(app, body.clone()).await;
             assert_eq!(status, StatusCode::OK, "{v}");
-            assert_eq!(call_names(&v), ["get_weather"], "{v}");
-            assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
-            // Streamed, the call is held only for a Gemma 4 model.
-            if !gemma {
-                continue;
-            }
             let app = scripted_app_with(&text, cascadia_types::FinishReason::Stop, gemma).await;
             let events = stream_events(app, body.clone()).await;
+            if !gemma {
+                // Another model's text: content, streamed and not.
+                assert!(call_names(&v).is_empty(), "{v}");
+                assert_eq!(v["choices"][0]["message"]["content"], text.as_str(), "{v}");
+                assert!(streamed_calls(&events).is_empty(), "{events:?}");
+                assert_eq!(streamed_content(&events), text, "{events:?}");
+                continue;
+            }
+            assert_eq!(call_names(&v), ["get_weather"], "{v}");
+            assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
             let calls = streamed_calls(&events);
             assert_eq!(calls.len(), 1, "{events:?}");
             assert_eq!(calls[0]["function"]["arguments"], r#"{"city":"Paris"}"#);
@@ -11900,7 +11948,7 @@ level={{ effort_map[eff] }}";
     #[test]
     fn gemma4_call_wins_when_its_marker_comes_first() {
         let text = "<|tool_call>call:f{code:<|\"|>see <tool_call><|\"|>}<tool_call|>";
-        let calls = parse_tool_calls(text).expect("the Gemma 4 call");
+        let calls = gemma_parse(text).expect("the Gemma 4 call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "f");
         assert_eq!(
@@ -11910,7 +11958,7 @@ level={{ effort_map[eff] }}";
         // And the other way round: a Hermes call whose argument mentions
         // the Gemma 4 marker is still the Hermes call.
         let text = r#"<tool_call>{"name":"g","arguments":{"s":"<|tool_call>"}}</tool_call>"#;
-        let calls = parse_tool_calls(text).expect("the Hermes call");
+        let calls = gemma_parse(text).expect("the Hermes call");
         assert_eq!(calls[0].function.name, "g");
         assert_eq!(
             call_args(&calls[0]),
@@ -11920,13 +11968,12 @@ level={{ effort_map[eff] }}";
 
     #[test]
     fn gemma4_call_name_may_start_with_a_digit() {
-        let calls = parse_tool_calls("<|tool_call>call:3d_render{}<tool_call|>").expect("a call");
+        let calls = gemma_parse("<|tool_call>call:3d_render{}<tool_call|>").expect("a call");
         assert_eq!(calls[0].function.name, "3d_render");
-        let calls =
-            parse_tool_calls("<|tool_call>call:ns.get-item_2{}<tool_call|>").expect("a call");
+        let calls = gemma_parse("<|tool_call>call:ns.get-item_2{}<tool_call|>").expect("a call");
         assert_eq!(calls[0].function.name, "ns.get-item_2");
         // The other dialects keep their own name rule.
-        assert_eq!(parse_tool_calls("<tool_call>3d_render\n</tool_call>"), None);
+        assert_eq!(gemma_parse("<tool_call>3d_render\n</tool_call>"), None);
     }
 
     #[test]
@@ -11987,21 +12034,21 @@ level={{ effort_map[eff] }}";
             serde_json::json!({"content": "x"}),
         ];
         for (text, want) in GEMMA_MARKER_AS_DATA.iter().zip(want) {
-            let calls = parse_tool_calls(text).unwrap_or_else(|| panic!("a call in {text}"));
+            let calls = gemma_parse(text).unwrap_or_else(|| panic!("a call in {text}"));
             assert_eq!(calls.len(), 1, "{text}");
             assert_eq!(calls[0].function.name, "write_file", "{text}");
             assert_eq!(call_args(&calls[0]), want, "{text}");
         }
         // The marked reader keeps its own rule: a marked call counts, a bare
         // whole-output JSON object does not.
-        assert_eq!(parse_tool_calls_marked(GEMMA_MARKER_AS_DATA[0]), None);
+        assert_eq!(gemma_marked(GEMMA_MARKER_AS_DATA[0]), None);
         for text in &GEMMA_MARKER_AS_DATA[1..] {
-            let calls = parse_tool_calls_marked(text).expect("a marked call");
+            let calls = gemma_marked(text).expect("a marked call");
             assert_eq!(calls[0].function.name, "write_file", "{text}");
         }
         // A real Gemma 4 call still wins over a later Hermes block.
         let text = format!("{GEMMA_WEATHER_CALL}{WEATHER_CALL}");
-        let calls = parse_tool_calls(&text).expect("calls");
+        let calls = gemma_parse(&text).expect("calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(call_args(&calls[0]), serde_json::json!({"city": "Paris"}));
     }
@@ -12014,10 +12061,74 @@ level={{ effort_map[eff] }}";
             false,
             false,
             false,
+            true,
         );
         assert_eq!(fr, Some("tool_calls"));
         assert!(m.content.is_none());
         let calls = m.tool_calls.expect("tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name(), "write_file");
+    }
+
+    /// Gemma 4 calls quoted as data inside another dialect's call (tools
+    /// `write_file` and `delete_file`, `auto`): the call is `write_file`.
+    const GEMMA_CALL_AS_DATA: [&str; 3] = [
+        r#"<|python_tag|>{"name":"write_file","parameters":{"path":"notes.md","content":"Gemma emits <|tool_call>call:delete_file{id:42,recursive:true}<tool_call|>"}}"#,
+        r#"{"name":"write_file","arguments":{"path":"notes.md","content":"Gemma emits <|tool_call>call:delete_file{id:42,recursive:true}<tool_call|>"}}"#,
+        r#"The marker <|tool_call> is Gemma's. <tool_call>{"name":"write_file","arguments":{"content":"<|tool_call>call:delete_file{id:42,recursive:true}<tool_call|>"}}</tool_call>"#,
+    ];
+
+    #[test]
+    fn a_quoted_gemma4_call_is_a_call_only_for_a_gemma4_model() {
+        let auto = tool_policy(
+            &["write_file", "delete_file"],
+            Some(serde_json::json!("auto")),
+        );
+        for text in GEMMA_CALL_AS_DATA {
+            let (m, fr) = build_choice(text.into(), &auto, false, false, false, false);
+            assert_eq!(fr, Some("tool_calls"), "{text}");
+            let calls = m.tool_calls.unwrap_or_else(|| panic!("calls in {text}"));
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!(calls[0].name(), "write_file", "{text}");
+            // The same reading as the public reader, which has no Gemma 4.
+            let plain = parse_tool_calls(text).expect("a call");
+            assert_eq!(plain[0].function.name, "write_file", "{text}");
+            // A Gemma 4 model's marker comes first, so its call is read.
+            let (m, _) = build_choice(text.into(), &auto, false, false, false, true);
+            assert_eq!(m.tool_calls.expect("a call")[0].name(), "delete_file");
+        }
+        // Under the json + tools union, a JSON answer is the client's data.
+        let answer = r#"{"summary":"Gemma writes <|tool_call>call:delete_file{id:42,recursive:true}<tool_call|> for calls"}"#;
+        let (m, fr) = build_choice(answer.into(), &auto, false, true, true, false);
+        assert_eq!((m.content.as_deref(), fr), (Some(answer), None));
+        assert!(m.tool_calls.is_none());
+        let (m, _) = build_choice(answer.into(), &auto, false, true, true, true);
+        assert_eq!(m.tool_calls.expect("a call")[0].name(), "delete_file");
+    }
+
+    #[test]
+    fn another_models_gemma4_text_is_content_streamed_and_not() {
+        let text = "Sure. <|tool_call>call:write_file{path:<|\"|>a.md<|\"|>}<tool_call|> done";
+        let auto = tool_policy(&["write_file"], Some(serde_json::json!("auto")));
+        let (m, fr) = build_choice(text.into(), &auto, false, false, false, false);
+        assert_eq!((m.content.as_deref(), fr), (Some(text), None));
+        for i in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
+            let (out, calls) = run_splitter_with(&[&text[..i], &text[i..], ""], false, false);
+            assert!(calls.is_none(), "split at {i}");
+            assert_eq!(out.concat(), text, "split at {i}");
+        }
+    }
+
+    #[test]
+    fn an_undeclared_gemma4_call_cancels_no_call_for_another_model() {
+        let text = r#"<|tool_call>call:delete_file{id:42}<tool_call|><tool_call>{"name":"write_file","arguments":{"path":"a.md"}}</tool_call>"#;
+        let narrowed = tool_policy(
+            &["write_file", "delete_file"],
+            Some(allowed("auto", &["write_file"])),
+        );
+        let (m, fr) = build_choice(text.into(), &narrowed, false, false, false, false);
+        assert_eq!(fr, Some("tool_calls"));
+        let calls = m.tool_calls.expect("the Hermes call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name(), "write_file");
     }
@@ -12039,7 +12150,7 @@ level={{ effort_map[eff] }}";
                 pieces.push("");
                 let (out, calls) = run_splitter_with(&pieces, false, gemma);
                 let calls = calls.unwrap_or_else(|| panic!("streamed calls in {text}"));
-                let whole = parse_tool_calls(text).expect("non-streamed calls");
+                let whole = parse_tool_calls_for(text, gemma).expect("non-streamed calls");
                 assert_eq!(calls.len(), whole.len(), "{text}");
                 assert_eq!(calls[0].function.name, whole[0].function.name);
                 assert_eq!(call_args(&calls[0]), call_args(&whole[0]), "{text}");
@@ -12061,7 +12172,7 @@ level={{ effort_map[eff] }}";
             let junk = unit.repeat(32_000);
             let text = format!("{GEMMA_WEATHER_CALL}{junk}{GEMMA_WEATHER_CALL}");
             let t = std::time::Instant::now();
-            let calls = parse_tool_calls(&text).expect("the two valid calls");
+            let calls = gemma_parse(&text).expect("the two valid calls");
             let took = t.elapsed();
             assert!(
                 took < std::time::Duration::from_secs(1),
@@ -12086,12 +12197,12 @@ level={{ effort_map[eff] }}";
             "x<|tool_call>y".to_string(),
         ] {
             let text = format!("<|tool_call>call:write_file{{content:{q}{inner}{q}}}<tool_call|>");
-            let calls = parse_tool_calls(&text).unwrap_or_else(|| panic!("a call in {text}"));
+            let calls = gemma_parse(&text).unwrap_or_else(|| panic!("a call in {text}"));
             assert_eq!(calls.len(), 1, "{text}");
             assert_eq!(calls[0].function.name, "write_file");
             assert_eq!(call_args(&calls[0]), serde_json::json!({"content": inner}));
             // And after a good call, the next one is still read.
-            let calls = parse_tool_calls(&format!("{text}{GEMMA_WEATHER_CALL}")).expect("calls");
+            let calls = gemma_parse(&format!("{text}{GEMMA_WEATHER_CALL}")).expect("calls");
             assert_eq!(calls.len(), 2, "{text}");
             assert_eq!(calls[1].function.name, "get_weather");
         }
@@ -12101,7 +12212,7 @@ level={{ effort_map[eff] }}";
             "<|tool_call>call:write_file{{content:{q}a<tool_call|>\
              <|tool_call>call:evil{{cmd:{q}rm{q}}}<tool_call|>b{q}}}<tool_call|>"
         );
-        assert_eq!(parse_tool_calls(&text), None, "{text}");
+        assert_eq!(gemma_parse(&text), None, "{text}");
     }
 
     #[test]
@@ -12112,7 +12223,7 @@ level={{ effort_map[eff] }}";
             format!("<|tool_call>call:f{{a:{q}<|tool_call>call:evil{{}}<tool_call|>"),
             format!("<|tool_call>call:f{{a:{q}x}}<tool_call|>{GEMMA_WEATHER_CALL}"),
         ] {
-            assert_eq!(parse_tool_calls(&text), None, "{text}");
+            assert_eq!(gemma_parse(&text), None, "{text}");
         }
     }
 }
