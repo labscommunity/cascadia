@@ -523,6 +523,7 @@ fn final_chunk(task_id: TaskId, token: i64, delta: String, prompt_len: usize, st
         error: None,
         invalid_request: false,
         token_ids: Vec::new(),
+        grammar_dropped: false,
         finish_reason: Some(if stop {
             FinishReason::Stop
         } else {

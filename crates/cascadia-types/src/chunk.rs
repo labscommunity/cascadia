@@ -106,6 +106,12 @@ pub struct Chunk {
     /// not resume sources. `#[serde(default)]` keeps the wire additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub token_ids: Vec<i64>,
+    /// Set on the FINAL chunk when the engine dropped the task's best-effort
+    /// grammar and answered unconstrained, so the answer is read as one
+    /// generated without it. `false` on every other chunk, and left off the
+    /// wire then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grammar_dropped: bool,
 }
 
 impl Chunk {
@@ -123,6 +129,7 @@ impl Chunk {
             invalid_request: false,
             finish_reason: None,
             token_ids: Vec::new(),
+            grammar_dropped: false,
         }
     }
 
@@ -145,6 +152,7 @@ impl Chunk {
             error: None,
             invalid_request: false,
             finish_reason: None,
+            grammar_dropped: false,
         }
     }
 
@@ -167,6 +175,7 @@ impl Chunk {
             invalid_request: false,
             finish_reason: None,
             token_ids: Vec::new(),
+            grammar_dropped: false,
         }
     }
 
@@ -187,6 +196,7 @@ impl Chunk {
             invalid_request: false,
             finish_reason: None,
             token_ids: Vec::new(),
+            grammar_dropped: false,
         }
     }
 
@@ -291,6 +301,7 @@ mod tests {
             invalid_request: false,
             finish_reason: None,
             token_ids: Vec::new(),
+            grammar_dropped: false,
         };
         let json = serde_json::to_string(&c).unwrap();
         let back: Chunk = serde_json::from_str(&json).unwrap();

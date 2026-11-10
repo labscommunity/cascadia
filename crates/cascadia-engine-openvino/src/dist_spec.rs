@@ -1790,6 +1790,7 @@ impl Engine for OvDistSpecEngine {
                         error: None,
                         invalid_request: false,
                         token_ids: Vec::new(),
+                        grammar_dropped: false,
                         finish_reason: None,
                     },
                 )]
@@ -1836,6 +1837,7 @@ impl Engine for OvDistSpecEngine {
                                 error: None,
                                 invalid_request: false,
                                 token_ids,
+                                grammar_dropped: false,
                                 finish_reason: None,
                             },
                         )]
@@ -2213,6 +2215,7 @@ impl OvDistSpecEngine {
                 error: None,
                 invalid_request: false,
                 token_ids,
+                grammar_dropped: false,
                 finish_reason,
             },
         )]

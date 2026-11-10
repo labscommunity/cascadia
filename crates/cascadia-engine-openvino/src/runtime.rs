@@ -5417,6 +5417,7 @@ impl OvRuntimeEngine {
                 error: None,
                 invalid_request: false,
                 token_ids: Vec::new(),
+                grammar_dropped: false,
                 finish_reason: final_chunk_finish_reason(active.grammar.is_some(), finish),
             }
         } else {

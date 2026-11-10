@@ -1301,6 +1301,7 @@ impl LlamaCppEngine {
         };
         let live = Arc::new(RequestSocket::new(s.try_clone().ok()));
         self.socket = Some(live.clone());
+        let grammar_dropped = task.grammar_dropped.clone();
 
         std::thread::spawn(move || {
             let send = |r: EngineResult<(TaskId, Chunk)>| {
@@ -1365,6 +1366,7 @@ impl LlamaCppEngine {
                         "output constraint not enforced (llama-server refused the schema); answering unconstrained"
                     );
                     count_constraint_unenforced(UnenforcedReason::SchemaRejected);
+                    grammar_dropped.set();
                     (s, body) = (next, plain);
                     continue;
                 }
@@ -3399,11 +3401,13 @@ mod unix_tests {
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
             TOOL_SCHEMA,
         ));
+        let dropped = task.grammar_dropped.clone();
         let Run {
             chunks,
             bodies,
             counted,
         } = run_against(task, vec![ok_reply("[]")]);
+        assert!(!dropped.get());
         assert_eq!(bodies.len(), 1, "{bodies:?}");
         assert!(bodies[0].contains(TOOL_SCHEMA), "{}", bodies[0]);
         let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
@@ -3422,6 +3426,7 @@ mod unix_tests {
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
             TOOL_SCHEMA,
         ));
+        let dropped = task.grammar_dropped.clone();
         let Run {
             chunks,
             bodies,
@@ -3433,6 +3438,8 @@ mod unix_tests {
                 ok_reply("Sunny."),
             ],
         );
+        // Recorded on the task, for its final chunk.
+        assert!(dropped.get());
         assert_eq!(bodies.len(), 2, "{bodies:?}");
         let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
         assert!(first.get("response_format").is_some(), "{}", bodies[0]);

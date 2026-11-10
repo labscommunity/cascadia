@@ -148,6 +148,37 @@ pub struct GenerationTask {
     /// leaves generation unconstrained and is not serialized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grammar: Option<GrammarSpec>,
+    /// Raised by the engine when it drops this task's best-effort
+    /// `grammar` ([`GenerationTask::drop_best_effort_grammar`]); the runner
+    /// copies it onto the task's final chunk ([`crate::Chunk::grammar_dropped`]).
+    /// Shared by every clone of the task, and never on the wire.
+    #[serde(skip)]
+    pub grammar_dropped: GrammarDropped,
+}
+
+/// Whether an engine dropped a task's best-effort grammar: one flag shared
+/// by the task and its clones, so the caller that submitted the task can
+/// read what the engine decided. Always equal to another flag: it is not
+/// part of what a task asks for.
+#[derive(Clone, Debug, Default)]
+pub struct GrammarDropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl GrammarDropped {
+    /// Record that the grammar was dropped.
+    pub fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the grammar was dropped.
+    pub fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl PartialEq for GrammarDropped {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// Which grammar language a [`GrammarSpec`] body is written in.
@@ -266,7 +297,20 @@ impl GenerationTask {
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
             grammar: None,
+            grammar_dropped: GrammarDropped::default(),
         }
+    }
+
+    /// Removes a best-effort grammar the engine can't apply, and records
+    /// that on the task (see [`Self::grammar_dropped`]). `false`, the task
+    /// untouched, when it has no grammar or a strict one.
+    pub fn drop_best_effort_grammar(&mut self) -> bool {
+        if !self.grammar.as_ref().is_some_and(|g| g.best_effort) {
+            return false;
+        }
+        self.grammar = None;
+        self.grammar_dropped.set();
+        true
     }
 
     /// Issue-34 H.1b: set the tenant this turn's KV is namespaced under (both capture and resume).
@@ -347,6 +391,26 @@ mod tests {
         assert!(!old.best_effort);
     }
 
+    /// Dropping a best-effort grammar raises the flag every clone of the
+    /// task shares; a strict grammar is kept. The flag never goes on the
+    /// wire.
+    #[test]
+    fn dropping_a_best_effort_grammar_is_seen_by_every_clone() {
+        let mut soft =
+            GenerationTask::new("t", "p").with_grammar(GrammarSpec::best_effort_json_schema("{}"));
+        let seen = soft.clone();
+        assert!(soft.drop_best_effort_grammar());
+        assert_eq!(soft.grammar, None);
+        assert!(seen.grammar_dropped.get());
+        assert!(!serde_json::to_string(&soft)
+            .unwrap()
+            .contains("grammar_dropped"));
+        let mut strict = GenerationTask::new("t", "p").with_grammar(GrammarSpec::json_schema("{}"));
+        assert!(!strict.drop_best_effort_grammar());
+        assert!(strict.grammar.is_some() && !strict.grammar_dropped.get());
+        assert!(!GenerationTask::new("t", "p").drop_best_effort_grammar());
+    }
+
     #[test]
     fn resume_token_ids_defaults_none_and_is_additive() {
         let t = GenerationTask {
@@ -364,6 +428,7 @@ mod tests {
             tenant: String::new(),
             resume_token_ids: None,
             grammar: None,
+            grammar_dropped: GrammarDropped::default(),
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();

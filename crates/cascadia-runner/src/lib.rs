@@ -20,7 +20,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use cascadia_engine::{Builder, Engine, EngineError};
-use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{
+    Chunk, FinishReason, GenerationTask, GrammarDropped, PeerLayout, ShardSpec, TaskId,
+};
 use futures::Stream;
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -529,8 +531,9 @@ impl Runner {
     /// runs inline via [`Runner::submit`], and only the returned stream is
     /// async. Async contexts must use [`Runner::generate_async`] instead.
     pub fn generate(&self, task: GenerationTask) -> Result<ChunkStream, EngineError> {
+        let grammar_dropped = task.grammar_dropped.clone();
         self.submit(task.clone())?;
-        Ok(self.stream_for(task.task_id))
+        Ok(self.stream_for(task.task_id, grammar_dropped))
     }
 
     /// Async [`Runner::generate`]: submits off the runtime via
@@ -563,6 +566,7 @@ impl Runner {
         task: GenerationTask,
     ) -> Result<ChunkStream, EngineError> {
         let task_id = task.task_id.clone();
+        let grammar_dropped = task.grammar_dropped.clone();
         // Armed BEFORE the dispatch below: from here until `disarm()`, every
         // exit path — `?`, a panic, or the caller's future being dropped at
         // the await — cancels the task.
@@ -591,13 +595,14 @@ impl Runner {
             Ok(Ok(())) => {}
         }
         // The task now has an owner: from here its `Drop` handles cancellation.
-        let stream = self.stream_for(task_id);
+        let stream = self.stream_for(task_id, grammar_dropped);
         guard.disarm();
         Ok(stream)
     }
 
-    fn stream_for(&self, task_id: TaskId) -> ChunkStream {
+    fn stream_for(&self, task_id: TaskId, grammar_dropped: GrammarDropped) -> ChunkStream {
         ChunkStream {
+            grammar_dropped,
             task_id,
             slot: self.slot.clone(),
             consecutive_empty: 0,
@@ -791,6 +796,9 @@ pub struct ChunkStream {
     /// Tokio worker then services timers and I/O only every few dozen polls
     /// (each poll may block in `step()`), so unrelated timers starve.
     foreign_yield: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// The task's flag the engine raises when it drops a best-effort
+    /// grammar; copied onto the final chunk.
+    grammar_dropped: GrammarDropped,
 }
 
 impl ChunkStream {
@@ -977,11 +985,14 @@ impl Stream for ChunkStream {
                     return Poll::Ready(None);
                 }
                 if let Some(buf) = bufs.chunks.get_mut(&this.task_id) {
-                    if let Some(chunk) = buf.pop_front() {
+                    if let Some(mut chunk) = buf.pop_front() {
                         let is_final = chunk.is_final;
                         if is_final {
                             this.done = true;
                             bufs.chunks.remove(&this.task_id);
+                            // The engine answered without the best-effort
+                            // grammar it was given.
+                            chunk.grammar_dropped |= this.grammar_dropped.get();
                         }
                         drop(bufs);
                         this.record_chunk_metrics(&chunk);
@@ -1248,6 +1259,7 @@ impl Drop for ChunkStream {
 mod tests {
     use super::*;
     use cascadia_engine_mock::MockBuilder;
+    use cascadia_types::GrammarSpec;
     use futures::StreamExt;
 
     #[test]
@@ -1341,6 +1353,81 @@ mod tests {
     async fn close_without_start_does_not_panic() {
         let runner = Runner::new(Box::new(MockBuilder::new()));
         runner.close();
+    }
+
+    /// An engine that drops every best-effort grammar at submit (as one
+    /// that can't apply it does) and answers each task with one final chunk.
+    #[derive(Default)]
+    struct GrammarDroppingEngine {
+        queued: Vec<TaskId>,
+    }
+
+    impl Engine for GrammarDroppingEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, mut task: GenerationTask) -> Result<(), EngineError> {
+            task.drop_best_effort_grammar();
+            self.queued.push(task.task_id);
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(self
+                .queued
+                .drain(..)
+                .map(|id| {
+                    let mut c = Chunk::token(id.clone(), 1, "{}");
+                    c.is_final = true;
+                    (id, c)
+                })
+                .collect())
+        }
+    }
+
+    struct GrammarDroppingBuilder;
+
+    #[async_trait::async_trait]
+    impl Builder for GrammarDroppingBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(GrammarDroppingEngine::default()))
+        }
+    }
+
+    /// A best-effort grammar the engine dropped is reported on the task's
+    /// final chunk; a strict one it kept, or no grammar, is not.
+    #[tokio::test]
+    async fn the_final_chunk_reports_a_dropped_grammar() {
+        let runner = Arc::new(Runner::new(Box::new(GrammarDroppingBuilder)));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        for (id, grammar, dropped) in [
+            (
+                "soft",
+                Some(GrammarSpec::best_effort_json_schema("{}")),
+                true,
+            ),
+            ("strict", Some(GrammarSpec::json_schema("{}")), false),
+            ("none", None, false),
+        ] {
+            let mut task = GenerationTask::new(id, "p");
+            task.grammar = grammar;
+            let mut stream = runner.generate_async(task).await.unwrap();
+            let last = stream.next().await.expect("a final chunk");
+            assert!(last.is_final, "{id}");
+            assert_eq!(last.grammar_dropped, dropped, "{id}");
+        }
     }
 
     /// An engine whose every step fails (e.g. dead transport).

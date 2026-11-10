@@ -21,5 +21,5 @@ pub use shard::{ShardPlan, ShardSpec};
 pub use stats::ApiStats;
 pub use task::{
     append_resume_ids, resume_generated_seed, validate_resume_ids, ChatTurn, GenerationTask,
-    GrammarKind, GrammarSpec, SamplingParams, TaskId,
+    GrammarDropped, GrammarKind, GrammarSpec, SamplingParams, TaskId,
 };

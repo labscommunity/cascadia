@@ -3222,6 +3222,7 @@ async fn chat_completions(
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
         grammar,
+        grammar_dropped: Default::default(),
     };
     let keywords = keywords_to_log(
         state.xgrammar_keyword_log,
@@ -3308,6 +3309,9 @@ async fn chat_completions(
     // `stop`. Engines that don't distinguish leave it None → "stop".
     let mut finish_reason: &'static str = "stop";
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    // The engine dropped the tool grammar: the answer is read as one
+    // generated without it.
+    let mut grammar_dropped = false;
     while let Some(chunk) = chunk_stream.next().await {
         // A failed task carries `error` on its final chunk. Without this
         // branch the empty text below would build a normal 200 with empty
@@ -3337,6 +3341,7 @@ async fn chat_completions(
             if let Some(fr) = chunk.finish_reason {
                 finish_reason = fr.as_openai_str();
             }
+            grammar_dropped = chunk.grammar_dropped;
         }
     }
     state
@@ -3361,8 +3366,13 @@ async fn chat_completions(
         }
     }
 
-    let (mut message, choice_finish) =
-        build_choice(buf, &policy, enable_thinking, tool_grammar_sent, union_sent);
+    let (mut message, choice_finish) = build_choice(
+        buf,
+        &policy,
+        enable_thinking,
+        tool_grammar_sent && !grammar_dropped,
+        union_sent && !grammar_dropped,
+    );
     // Gemma 4's markers stay in the text so calls can be read; content never
     // carries them.
     if state.gemma_tool_markers {
@@ -3467,6 +3477,7 @@ async fn completions(
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
         grammar: None,
+        grammar_dropped: Default::default(),
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
@@ -4077,6 +4088,14 @@ impl ToolStream {
                 self.finished =
                     chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
                 self.phase = ToolStreamPhase::Tail;
+                // The engine dropped the tool grammar: read the answer as
+                // one generated without it. The splitter held a leading
+                // `{`/`[` whatever was sent, so a bare JSON call is still
+                // undecided here.
+                if chunk.grammar_dropped {
+                    self.tools.grammar_sent = false;
+                    self.tools.union_sent = false;
+                }
                 let reason = chunk
                     .finish_reason
                     .map(|f| f.as_openai_str())
@@ -10707,11 +10726,17 @@ level={{ effort_map[eff] }}";
         text: String,
         finish: cascadia_types::FinishReason,
         pending: Option<(cascadia_types::TaskId, bool)>,
+        /// Drop a best-effort grammar at submit, as an engine that can't
+        /// apply it does.
+        drop_grammar: bool,
     }
 
     impl cascadia_engine::Engine for ScriptedEngine {
         fn warmup(&mut self) {}
-        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+        fn submit(&mut self, mut task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            if self.drop_grammar {
+                task.drop_best_effort_grammar();
+            }
             self.pending = Some((task.task_id, false));
             Ok(())
         }
@@ -10762,10 +10787,25 @@ level={{ effort_map[eff] }}";
         finish: cascadia_types::FinishReason,
         gemma_tool_markers: bool,
     ) -> Router {
+        scripted_router(text, finish, gemma_tool_markers, false).await
+    }
+
+    /// [`scripted_app`] whose engine drops every best-effort grammar.
+    async fn grammar_dropping_app(text: &str) -> Router {
+        scripted_router(text, cascadia_types::FinishReason::Stop, false, true).await
+    }
+
+    async fn scripted_router(
+        text: &str,
+        finish: cascadia_types::FinishReason,
+        gemma_tool_markers: bool,
+        drop_grammar: bool,
+    ) -> Router {
         let runner = Runner::new(Box::new(ScriptedBuilder(ScriptedEngine {
             text: text.into(),
             finish,
             pending: None,
+            drop_grammar,
         })));
         runner
             .start(
@@ -11296,6 +11336,66 @@ level={{ effort_map[eff] }}";
             assert_eq!(streamed_finishes(&events), ["tool_calls"], "{extra}");
             assert_eq!(streamed_content(&events), "", "{extra}");
         }
+    }
+
+    /// With `response_format` json beside callable tools the union grammar
+    /// is sent, and only marked calls are read from its answer. An engine
+    /// that drops it answers as without a grammar, so the model's own bare
+    /// JSON call is a call again, streamed or not, as it was before the
+    /// union existed. Kept, the same text is the client's JSON.
+    #[tokio::test]
+    async fn a_union_the_engine_dropped_reads_a_bare_json_call() {
+        let text = r#"{"name":"get_weather","parameters":{"city":"Paris"}}"#;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather")]),
+            serde_json::json!({"response_format": {"type": "json_object"}}),
+        );
+        let (status, v) = post_chat(grammar_dropping_app(text).await, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let calls = v["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a call: {v}"));
+        assert_eq!(calls.len(), 1, "{v}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
+
+        let events = stream_events(grammar_dropping_app(text).await, body.clone()).await;
+        let calls = streamed_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(streamed_finishes(&events), ["tool_calls"]);
+        assert_eq!(streamed_content(&events), "", "{events:?}");
+
+        // The grammar applied: the object is the client's JSON answer.
+        let app = scripted_app(text, cascadia_types::FinishReason::Stop).await;
+        let (status, v) = post_chat(app, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["message"]["content"], text, "{v}");
+        let app = scripted_app(text, cascadia_types::FinishReason::Stop).await;
+        let events = stream_events(app, body).await;
+        assert!(streamed_calls(&events).is_empty(), "{events:?}");
+        assert_eq!(streamed_content(&events), text, "{events:?}");
+    }
+
+    /// A forced call grammar the engine dropped: calls are filtered as
+    /// without a grammar (any name stays under plain `required`).
+    #[tokio::test]
+    async fn a_forced_grammar_the_engine_dropped_reads_as_without_one() {
+        let text = r#"<tool_call>{"name":"get_time","arguments":{"tz":"CET"}}</tool_call>"#;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather")]),
+            serde_json::json!({"tool_choice": "required"}),
+        );
+        let (status, v) = post_chat(grammar_dropping_app(text).await, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_time",
+            "{v}"
+        );
+        let events = stream_events(grammar_dropping_app(text).await, body).await;
+        let calls = streamed_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0]["function"]["name"], "get_time");
     }
 
     #[tokio::test]

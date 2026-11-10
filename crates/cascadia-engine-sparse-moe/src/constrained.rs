@@ -278,10 +278,11 @@ pub(crate) fn drop_best_effort_grammar(
     task: &mut GenerationTask,
     reason: UnenforcedReason,
 ) -> bool {
-    if !is_best_effort(task) {
+    // Recorded on the task: its final chunk then says the answer was
+    // generated unconstrained.
+    if !task.drop_best_effort_grammar() {
         return false;
     }
-    task.grammar = None;
     warn!(
         task = %task.task_id,
         reason = reason.as_str(),
@@ -701,11 +702,14 @@ mod tests {
         let mut t = soft_task(r#"{"type":42}"#);
         assert!(slot.admit(&mut t).unwrap().is_none());
         assert_eq!(t.grammar, None);
+        // Recorded on the task, for its final chunk.
+        assert!(t.grammar_dropped.get());
         assert!(unenforced(UnenforcedReason::SchemaRejected) > before);
         // One that compiles is kept.
         let mut t = soft_task(WEATHER);
         assert!(slot.admit(&mut t).unwrap().is_some());
         assert!(t.grammar.is_some());
+        assert!(!t.grammar_dropped.get());
         // A strict one is refused as before.
         let mut t = task_with(Some(r#"{"type":42}"#));
         assert!(matches!(

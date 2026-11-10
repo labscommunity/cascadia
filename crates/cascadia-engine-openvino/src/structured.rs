@@ -150,10 +150,11 @@ pub(crate) fn drop_best_effort_grammar(
     task: &mut GenerationTask,
     reason: UnenforcedReason,
 ) -> bool {
-    if !task.grammar.as_ref().is_some_and(|g| g.best_effort) {
+    // Recorded on the task: its final chunk then says the answer was
+    // generated unconstrained.
+    if !task.drop_best_effort_grammar() {
         return false;
     }
-    task.grammar = None;
     warn!(
         task = %task.task_id,
         reason = reason.as_str(),
@@ -463,6 +464,7 @@ mod tests {
             UnenforcedReason::StageUnsupported
         ));
         assert!(strict.grammar.is_some());
+        assert!(!strict.grammar_dropped.get());
         let mut plain = GenerationTask::new("t", "p");
         assert!(!drop_best_effort_grammar(
             &mut plain,
@@ -475,6 +477,8 @@ mod tests {
             UnenforcedReason::StageUnsupported
         ));
         assert_eq!(soft.grammar, None);
+        // Recorded on the task, for its final chunk.
+        assert!(soft.grammar_dropped.get());
         assert!(unenforced(UnenforcedReason::StageUnsupported) > before);
     }
 
