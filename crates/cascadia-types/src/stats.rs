@@ -18,9 +18,4 @@ pub struct ApiStats {
     pub requests_in_flight: AtomicU64,
     /// Cumulative model tokens emitted across all requests.
     pub tokens_total: AtomicU64,
-    /// Unix milliseconds of the server's last sign of progress: a generated
-    /// chunk delivered to a request, or the moment the server went from idle
-    /// to busy. `0` before the first request. Tells a busy server from a
-    /// stalled one.
-    pub last_progress_ms: AtomicU64,
 }

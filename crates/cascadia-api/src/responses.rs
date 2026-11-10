@@ -870,7 +870,7 @@ async fn stream_response(
         inflight,
     }: AdmittedChat,
 ) -> Response {
-    let chunks = match crate::generate(&state, task).await {
+    let chunks = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "responses-stream: generate failed");

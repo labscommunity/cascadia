@@ -105,13 +105,7 @@ struct InFlightGuard(Arc<ApiStats>);
 
 impl InFlightGuard {
     fn new(stats: Arc<ApiStats>) -> Self {
-        // Going from idle to busy starts the stall clock afresh: a server
-        // that sat idle has not stalled, it has had nothing to deliver.
-        if stats.requests_in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
-            stats
-                .last_progress_ms
-                .store(unix_millis(), Ordering::Relaxed);
-        }
+        stats.requests_in_flight.fetch_add(1, Ordering::Relaxed);
         cascadia_metrics::INFLIGHT_TASKS.inc();
         InFlightGuard(stats)
     }
@@ -122,44 +116,6 @@ fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
-/// An admitted task's chunk stream that records each delivered chunk in
-/// [`ApiStats::last_progress_ms`], so [`track_pipeline_health`] can tell a
-/// busy server from a stalled one. Every completion route reads its chunks
-/// through one of these (see [`generate`]).
-struct Delivering {
-    inner: cascadia_runner::ChunkStream,
-    stats: Arc<ApiStats>,
-}
-
-impl Stream for Delivering {
-    type Item = cascadia_types::Chunk;
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
-        if let std::task::Poll::Ready(Some(_)) = &polled {
-            self.stats
-                .last_progress_ms
-                .store(unix_millis(), Ordering::Relaxed);
-        }
-        polled
-    }
-}
-
-/// Submit `task` to the engine ([`Runner::generate_async`]) and read its
-/// chunks through [`Delivering`].
-async fn generate(
-    state: &AppState,
-    task: GenerationTask,
-) -> Result<Delivering, cascadia_engine::EngineError> {
-    let inner = state.runner.generate_async(task).await?;
-    Ok(Delivering {
-        inner,
-        stats: state.stats.clone(),
-    })
 }
 
 impl Drop for InFlightGuard {
@@ -337,6 +293,12 @@ pub struct AppState {
     /// full-size source image, so this bounds the API's decode memory to
     /// about this many times the largest accepted image.
     pub decode_permits: Arc<Semaphore>,
+    /// See [`Config::stall_after`].
+    pub stall_after: std::time::Duration,
+    /// Unix milliseconds at which a stall (not a failed request) last marked
+    /// the server unready; `0` when readiness was not lost that way. `/health`
+    /// clears such a mark once the engine has produced output since.
+    pub stall_marked_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// See [`AppState::decode_permits`].
@@ -376,6 +338,10 @@ pub struct Config {
     /// the request answered `408`. 30 s carries the largest allowed body
     /// (about 69 MB) at under 20 Mbit/s.
     pub media_body_timeout: std::time::Duration,
+    /// How long one engine call may run, with requests in flight, before a
+    /// capacity 503 marks the server unready (see [`track_pipeline_health`]).
+    /// [`STALL_SECS`] by default.
+    pub stall_after: std::time::Duration,
 }
 
 impl Default for Config {
@@ -391,6 +357,7 @@ impl Default for Config {
             media: None,
             no_media_reason: None,
             media_body_timeout: std::time::Duration::from_secs(30),
+            stall_after: std::time::Duration::from_secs(STALL_SECS),
         }
     }
 }
@@ -738,6 +705,8 @@ pub fn make_router_with_stats(
         no_media_reason: cfg.no_media_reason.as_deref().map(Arc::from),
         max_text_bytes: cfg.media.as_ref().map(|_| cfg.max_body_bytes),
         decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+        stall_after: cfg.stall_after,
+        stall_marked_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let state = AppState {
         effort_words: state
@@ -954,10 +923,13 @@ struct PreEngineFailure;
 #[derive(Clone, Copy)]
 struct CapacityRefusal;
 
-/// How long a server with requests in flight may go without delivering a
-/// generated chunk before a capacity 503 marks it unready: a busy server keeps
-/// producing, a wedged pipeline holds every slot and produces nothing.
-const STALL_SECS: u64 = 60;
+/// Default [`Config::stall_after`]: how long one engine call (a step, or a
+/// task's submit) may run, with requests in flight, before a capacity 503
+/// marks the server unready. A busy server returns from its steps; a wedged
+/// pipeline (a peer that stopped answering) sits in one while it holds every
+/// slot. The engine steps only while a stream is read, so clients that open
+/// streams and never read them leave it idle, never stalled.
+pub const STALL_SECS: u64 = 60;
 
 /// The 503 for a request past the in-flight cap: `Retry-After` tells the
 /// client when to come back, and [`PreEngineFailure`] keeps it out of
@@ -975,13 +947,15 @@ fn capacity_refusal() -> Response {
     errors::with_retry_after(resp, errors::RETRY_AFTER_SECS)
 }
 
-/// Requests are in flight and none has been delivered a chunk for longer than
-/// [`STALL_SECS`] (or the server went busy that long ago and has delivered
-/// nothing since).
-fn pipeline_stalled(stats: &ApiStats) -> bool {
-    stats.requests_in_flight.load(Ordering::Relaxed) > 0
-        && unix_millis().saturating_sub(stats.last_progress_ms.load(Ordering::Relaxed))
-            > STALL_SECS * 1000
+/// Requests are in flight and the engine has been inside one call for longer
+/// than [`Config::stall_after`].
+fn pipeline_stalled(state: &AppState) -> bool {
+    let bound = u64::try_from(state.stall_after.as_millis()).unwrap_or(u64::MAX);
+    state.stats.requests_in_flight.load(Ordering::Relaxed) > 0
+        && state
+            .runner
+            .engine_busy_since_ms()
+            .is_some_and(|since| unix_millis().saturating_sub(since) > bound)
 }
 
 /// Response middleware: for completion routes, flip `AppState.ready` from the
@@ -991,6 +965,8 @@ fn pipeline_stalled(stats: &ApiStats) -> bool {
 /// about the pipeline — except a [`CapacityRefusal`] while the pipeline is
 /// stalled ([`pipeline_stalled`]): a wedged step holds every slot, so every
 /// new request is a capacity 503 and nothing else would ever mark it unready.
+/// Such a mark is noted in [`AppState::stall_marked_ms`] so `/health` can
+/// clear it when the engine moves again, with no completion to send a 2xx.
 async fn track_pipeline_health(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
@@ -1005,12 +981,24 @@ async fn track_pipeline_health(
     if is_completion {
         let s = resp.status();
         let ext = resp.extensions();
-        let pipeline_failed = ext.get::<PreEngineFailure>().is_none()
-            || (ext.get::<CapacityRefusal>().is_some() && pipeline_stalled(&state.stats));
-        if s.is_server_error() && pipeline_failed {
+        if s.is_server_error() && ext.get::<PreEngineFailure>().is_none() {
+            state.stall_marked_ms.store(0, Ordering::Relaxed);
             state.ready.store(false, Ordering::Relaxed);
+        } else if s.is_server_error()
+            && ext.get::<CapacityRefusal>().is_some()
+            && pipeline_stalled(&state)
+        {
+            // A mark from a failed request stays that kind: only the 2xx it
+            // has always waited for clears it.
+            let was_ready = state.ready.swap(false, Ordering::Relaxed);
+            if was_ready || state.stall_marked_ms.load(Ordering::Relaxed) != 0 {
+                state
+                    .stall_marked_ms
+                    .store(unix_millis(), Ordering::Relaxed);
+            }
         } else if s.is_success() {
             state.ready.store(true, Ordering::Relaxed);
+            state.stall_marked_ms.store(0, Ordering::Relaxed);
         }
     }
     resp
@@ -1025,6 +1013,18 @@ async fn health(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> (StatusCode, Json<HealthResponse>) {
     use std::sync::atomic::Ordering;
+    // Unready from a stall, and the engine has produced output since: the
+    // pipeline is moving again.
+    let marked = state.stall_marked_ms.load(Ordering::Relaxed);
+    if marked != 0
+        && state.runner.last_output_ms() > marked
+        && state
+            .stall_marked_ms
+            .compare_exchange(marked, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        state.ready.store(true, Ordering::Relaxed);
+    }
     if state.ready.load(Ordering::Relaxed) {
         (StatusCode::OK, Json(HealthResponse { status: "ok" }))
     } else {
@@ -4469,7 +4469,7 @@ async fn collect_generation(
     let _permit = permit;
     let _inflight = inflight;
     let task_id = task.task_id.clone();
-    let mut chunk_stream = match generate(&state, task).await {
+    let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => return Err(engine_error_response(err, prompt_param)),
     };
@@ -4752,7 +4752,7 @@ async fn completions(
 
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match generate(&state, task).await {
+    let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err, "prompt"),
     };
@@ -4853,7 +4853,7 @@ async fn stream_text_completion(
     include_usage: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
-    let chunk_stream = match generate(&state, task).await {
+    let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "completions-stream: generate failed");
@@ -4984,7 +4984,7 @@ async fn stream_completion(
     let enable_thinking = task.enable_thinking;
     let _ = SystemTime::now();
 
-    let chunk_stream = match generate(&state, task).await {
+    let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "ov-stream: generate failed");
@@ -5199,7 +5199,7 @@ async fn stream_completion(
 /// permit and the permit is released when the stream is dropped (which
 /// happens on client disconnect — axum drops the SSE response).
 struct StreamWithPermit {
-    inner: Delivering,
+    inner: cascadia_runner::ChunkStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
     /// Decrements `requests_in_flight` when the stream body is dropped.
     _inflight: InFlightGuard,
@@ -7948,13 +7948,65 @@ mod tests {
         }
     }
 
-    /// A capacity 503 marks the server unready only when it is stalled:
-    /// requests are in flight and nothing has been delivered for longer than
-    /// [`STALL_SECS`]. A busy server that is still producing stays ready, so
-    /// does one with nothing in flight, and the next 2xx heals a stalled one.
-    #[tokio::test]
-    async fn stalled_capacity_503s_mark_the_server_unready() {
-        let runner = Runner::new(Box::new(MockBuilder::new()));
+    /// Emits a token per step, except that while `stuck` is set its `step`
+    /// blocks, as one waiting on a peer that stopped answering does.
+    struct StuckEngine {
+        stuck: Arc<std::sync::atomic::AtomicBool>,
+        pending: Option<(cascadia_types::TaskId, usize)>,
+    }
+
+    impl cascadia_engine::Engine for StuckEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some((task.task_id, 0));
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            while self.stuck.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let Some((id, i)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            if i < 3 {
+                self.pending = Some((id.clone(), i + 1));
+                return Ok(vec![(id.clone(), Chunk::token(&id, i as i64, "tok "))]);
+            }
+            Ok(vec![(
+                id.clone(),
+                Chunk::final_marker(&id, "").with_finish_reason(cascadia_types::FinishReason::Stop),
+            )])
+        }
+    }
+
+    struct StuckBuilder(Option<StuckEngine>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for StuckBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            mut self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0.take().unwrap()))
+        }
+    }
+
+    /// A one-slot router over a [`StuckEngine`] whose stall bound is short
+    /// enough to pass in a test. Returns the `stuck` switch (initially off).
+    async fn stall_app() -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        let stuck = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Runner::new(Box::new(StuckBuilder(Some(StuckEngine {
+            stuck: stuck.clone(),
+            pending: None,
+        }))));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -7962,46 +8014,62 @@ mod tests {
             )
             .await
             .unwrap();
-        let stats = Arc::new(ApiStats::default());
         let cfg = Config {
             max_concurrent_requests: 1,
+            stall_after: STALL_TEST_BOUND,
             ..Config::default()
         };
-        let app = make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats.clone());
-        let post = |stream: bool| {
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"model": "mock-model", "max_tokens": 2,
-                        "stream": stream,
-                        "messages": [{"role": "user", "content": "alpha bravo"}]})
-                    .to_string(),
-                ))
-                .unwrap()
-        };
-        let health = || async {
-            app.clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/health")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .status()
-        };
-        let now_ms = || {
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64
-        };
+        (
+            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            stuck,
+        )
+    }
 
-        // Nothing in flight: a capacity 503 never flips, however old the
-        // last delivery.
+    const STALL_TEST_BOUND: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn stall_chat(stream: bool) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model": "mock-model", "max_tokens": 8, "stream": stream,
+                    "messages": [{"role": "user", "content": "hi"}]})
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn stall_health(app: &Router) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A client that opens a stream and never reads it holds the only slot
+    /// for as long as it likes, but the engine only steps while a stream is
+    /// read, so it is idle, not stalled: capacity 503s past the stall bound
+    /// leave the server ready. With nothing in flight they never flip it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unread_streams_do_not_look_stalled() {
+        let (app, _stuck) = stall_app().await;
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "nothing in flight");
+        let held = app.clone().oneshot(stall_chat(true)).await.unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stall_health(&app).await, StatusCode::OK, "unread stream");
+        drop(held);
+
         let empty = make_router_with_config(
             Arc::new({
                 let r = Runner::new(Box::new(MockBuilder::new()));
@@ -8016,125 +8084,78 @@ mod tests {
             "mock-model",
             Config {
                 max_concurrent_requests: 0,
+                stall_after: std::time::Duration::ZERO,
                 ..Config::default()
             },
         );
-        let resp = empty.clone().oneshot(post(false)).await.unwrap();
+        let resp = empty.clone().oneshot(stall_chat(false)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let resp = empty
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "nothing in flight");
-
-        // A streamed request holds the only slot while its body is unread.
-        let held = app.clone().oneshot(post(true)).await.unwrap();
-        assert_eq!(held.status(), StatusCode::OK);
-        assert_eq!(stats.requests_in_flight.load(Ordering::Relaxed), 1);
-
-        // Busy but moving: delivered just now.
-        stats.last_progress_ms.store(now_ms(), Ordering::Relaxed);
-        let resp = app.clone().oneshot(post(false)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(health().await, StatusCode::OK, "busy but moving");
-
-        // Stalled: in flight, nothing delivered for longer than the bound.
-        stats
-            .last_progress_ms
-            .store(now_ms() - (STALL_SECS + 1) * 1000, Ordering::Relaxed);
-        let resp = app.clone().oneshot(post(false)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(health().await, StatusCode::SERVICE_UNAVAILABLE, "stalled");
-
-        // The slot frees and the next 2xx heals it.
-        drop(held);
-        let resp = app.clone().oneshot(post(false)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(health().await, StatusCode::OK, "healed");
+        assert_eq!(
+            stall_health(&empty).await,
+            StatusCode::OK,
+            "nothing in flight"
+        );
     }
 
-    /// Every delivered chunk records progress, on every completion route,
-    /// streamed or not; so does a server going from idle to busy.
-    #[tokio::test]
-    async fn delivered_chunks_record_progress() {
-        let cases = [
-            (
-                "/v1/chat/completions",
-                serde_json::json!({"model": "mock-model", "max_tokens": 2,
-                    "messages": [{"role": "user", "content": "alpha bravo"}]}),
-            ),
-            (
-                "/v1/completions",
-                serde_json::json!({"model": "mock-model", "max_tokens": 2,
-                    "prompt": "alpha bravo"}),
-            ),
-            (
-                "/v1/responses",
-                serde_json::json!({"model": "mock-model", "input": "alpha bravo"}),
-            ),
-        ];
-        for (uri, payload) in cases {
-            for stream in [false, true] {
-                let runner = Runner::new(Box::new(MockBuilder::new()));
-                runner
-                    .start(
-                        PeerLayout::single_stage(),
-                        ShardSpec::single_stage("mock-model", "CPU"),
-                    )
-                    .await
-                    .unwrap();
-                let stats = Arc::new(ApiStats::default());
-                // Another request already in flight: this one is no idle-to-
-                // busy edge, so only a delivered chunk can move the stamp.
-                stats.requests_in_flight.store(1, Ordering::Relaxed);
-                let app = make_router_with_stats(
-                    Arc::new(runner),
-                    "mock-model",
-                    Config::default(),
-                    stats.clone(),
-                );
-                let mut body = payload.clone();
-                body["stream"] = stream.into();
-                let resp = app
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri(uri)
-                            .header("content-type", "application/json")
-                            .body(Body::from(body.to_string()))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::OK, "{uri} stream={stream}");
-                // Reading the body drives the generation to its end.
-                let _ = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-                assert!(
-                    stats.last_progress_ms.load(Ordering::Relaxed) > 0,
-                    "{uri} stream={stream}: no progress recorded"
-                );
-            }
-        }
-
-        let stats = Arc::new(ApiStats::default());
-        let first = InFlightGuard::new(stats.clone());
-        assert!(
-            stats.last_progress_ms.load(Ordering::Relaxed) > 0,
-            "idle to busy"
-        );
-        stats.last_progress_ms.store(0, Ordering::Relaxed);
-        let second = InFlightGuard::new(stats.clone());
+    /// An engine stuck inside a step past the stall bound, holding the only
+    /// slot: the next capacity 503 marks the server unready. Once the engine
+    /// produces again `/health` is ready with no new request; and a stall
+    /// mark is also healed by the next 2xx.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stuck_engine_marks_the_server_unready_until_it_moves() {
+        let (app, stuck) = stall_app().await;
+        let read_tokens = || {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+            })
+        };
+        // The reader's stream drives a step that blocks.
+        stuck.store(true, Ordering::SeqCst);
+        let reader = read_tokens();
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            stats.last_progress_ms.load(Ordering::Relaxed),
-            0,
-            "already busy"
+            stall_health(&app).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stuck in a step past the bound"
         );
-        drop((first, second));
+        // The engine moves again: ready, though no completion has returned.
+        stuck.store(false, Ordering::SeqCst);
+        let body = reader.await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("tok"));
+        assert_eq!(stall_health(&app).await, StatusCode::OK, "engine moved");
+
+        // Stuck again; this time a 2xx heals the mark.
+        stuck.store(true, Ordering::SeqCst);
+        let reader = read_tokens();
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stall_health(&app).await, StatusCode::SERVICE_UNAVAILABLE);
+        stuck.store(false, Ordering::SeqCst);
+        reader.await.unwrap();
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stall_health(&app).await, StatusCode::OK, "healed by a 2xx");
+    }
+
+    /// A short step that returns keeps a busy server ready: the 503 that
+    /// meets a slot held by a stream being read, its steps returning, does
+    /// not flip `/health`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_busy_server_whose_steps_return_stays_ready() {
+        let (app, _stuck) = stall_app().await;
+        let held = app.clone().oneshot(stall_chat(true)).await.unwrap();
+        let mut body = held.into_body().into_data_stream();
+        // Read one frame: the engine stepped and returned.
+        assert!(body.next().await.is_some());
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stall_health(&app).await, StatusCode::OK, "busy but moving");
     }
 
     /// On a server that takes images, the request past the in-flight cap

@@ -14,7 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -179,6 +179,37 @@ struct EngineSlot {
     /// failed `try_lock` rather than block a tokio worker here (#122).
     engine: Mutex<Option<Box<dyn Engine>>>,
     buffers: Mutex<Buffers>,
+    /// Unix milliseconds at which the engine call now running (a `step` or a
+    /// `submit` for a stream) began; `0` while none is. See
+    /// [`Runner::engine_busy_since_ms`].
+    busy_since_ms: AtomicU64,
+    /// Unix milliseconds of the last `step` that produced output; `0` before
+    /// the first. See [`Runner::last_output_ms`].
+    last_output_ms: AtomicU64,
+}
+
+/// Milliseconds since the Unix epoch (`0` if the clock is before it).
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Holds [`EngineSlot::busy_since_ms`] at the time an engine call began, and
+/// clears it when the call returns (or unwinds).
+struct BusyStamp<'a>(&'a AtomicU64);
+
+impl<'a> BusyStamp<'a> {
+    fn start(since: &'a AtomicU64) -> Self {
+        since.store(unix_millis(), Ordering::Relaxed);
+        Self(since)
+    }
+}
+
+impl Drop for BusyStamp<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
 }
 
 /// An engine lock that cannot be released without paying what the release
@@ -258,6 +289,8 @@ impl EngineSlot {
         Self {
             engine: Mutex::new(engine),
             buffers: Mutex::new(Buffers::default()),
+            busy_since_ms: AtomicU64::new(0),
+            last_output_ms: AtomicU64::new(0),
         }
     }
 
@@ -498,10 +531,32 @@ impl Runner {
         } else {
             // ==== END; the branch below is the original submit path ====
             match guard.engine() {
-                Some(engine) => engine.submit(task),
+                Some(engine) => {
+                    let _busy = BusyStamp::start(&self.slot.busy_since_ms);
+                    engine.submit(task)
+                }
                 None => Err(EngineError::NotLoaded),
             }
         }
+    }
+
+    /// Unix milliseconds at which the engine call now running for a stream
+    /// (a `step`, or a task's `submit`) began; `None` while the engine is not
+    /// inside one. The engine steps only while some stream is read, so an
+    /// idle server, or one whose clients are not reading, is never inside a
+    /// call: a call that has been running for long is a stuck pipeline (a
+    /// peer that stopped answering), not a slow client.
+    pub fn engine_busy_since_ms(&self) -> Option<u64> {
+        match self.slot.busy_since_ms.load(Ordering::Relaxed) {
+            0 => None,
+            t => Some(t),
+        }
+    }
+
+    /// Unix milliseconds of the last engine `step` that produced output for
+    /// any task; `0` before the first.
+    pub fn last_output_ms(&self) -> u64 {
+        self.slot.last_output_ms.load(Ordering::Relaxed)
     }
 
     /// Cooperatively cancel a task.
@@ -1063,19 +1118,30 @@ impl Stream for ChunkStream {
                     // `fail_teardown` needs `&mut *this` and this guard still
                     // borrows `this.slot`.
                     None => None,
-                    Some(engine) => Some(match engine.step() {
-                        Ok(produced) => {
-                            let empty = produced.is_empty();
-                            let mut bufs = this.slot.buffers.lock();
-                            for (tid, chunk) in produced {
-                                if bufs.cancelled.contains(&tid) {
-                                    continue;
+                    Some(engine) => Some({
+                        let out = {
+                            let _busy = BusyStamp::start(&this.slot.busy_since_ms);
+                            engine.step()
+                        };
+                        match out {
+                            Ok(produced) => {
+                                let empty = produced.is_empty();
+                                if !empty {
+                                    this.slot
+                                        .last_output_ms
+                                        .store(unix_millis(), Ordering::Relaxed);
                                 }
-                                bufs.chunks.entry(tid).or_default().push_back(chunk);
+                                let mut bufs = this.slot.buffers.lock();
+                                for (tid, chunk) in produced {
+                                    if bufs.cancelled.contains(&tid) {
+                                        continue;
+                                    }
+                                    bufs.chunks.entry(tid).or_default().push_back(chunk);
+                                }
+                                Ok(empty)
                             }
-                            Ok(empty)
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
                     }),
                 };
                 // Releasing the guard is what drains + wakes every stream
