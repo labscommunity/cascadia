@@ -291,7 +291,8 @@ pub struct AppState {
     /// The evidence time ([`cascadia_runner::monotonic_ms`]) of the stall
     /// that last marked the server unready (not a failed request); `0` when
     /// readiness was not lost that way. `/health` clears such a mark once the
-    /// engine has produced real output after it.
+    /// engine has produced real output after it, or once no request is in
+    /// flight.
     pub stall_marked_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -1024,16 +1025,42 @@ fn note_success_with(
     ready.store(true, Ordering::Relaxed);
 }
 
-/// `/health`'s heal: unready from a stall, and the engine has produced real
-/// output after the stall's evidence time, so the pipeline is moving again.
+/// A completion failed with a 5xx that points at the pipeline: unready, and
+/// no stall mark, so only a 2xx clears it.
+fn note_failure(ready: &std::sync::atomic::AtomicBool, marked: &std::sync::atomic::AtomicU64) {
+    note_failure_with(ready, marked, || ());
+}
+
+/// [`note_failure`], with `between` run between its two stores so a test
+/// can land a concurrent [`note_stall`] there. `ready` is stored BEFORE the
+/// mark is cleared: the other order lets a stall between them read "was
+/// ready" and stamp a mark that `/health` would then heal, turning this
+/// 5xx's unready state into a self-healing one.
+fn note_failure_with(
+    ready: &std::sync::atomic::AtomicBool,
+    marked: &std::sync::atomic::AtomicU64,
+    between: impl FnOnce(),
+) {
+    ready.store(false, Ordering::Relaxed);
+    between();
+    marked.store(0, Ordering::Relaxed);
+}
+
+/// `/health`'s heal: unready from a stall, and either the engine has
+/// produced real output after the stall's evidence time (the pipeline is
+/// moving again) or nothing is `in_flight` (the stall rule needs work in
+/// flight to see a stall; if the pipeline is still broken, the next capacity
+/// 503 under load marks it again). A drained server whose failed streams
+/// have all ended would otherwise stay unready with nothing left to step.
 fn heal_stall_mark(
     ready: &std::sync::atomic::AtomicBool,
     marked: &std::sync::atomic::AtomicU64,
     last_output_ms: u64,
+    in_flight: u64,
 ) {
     let mark = marked.load(Ordering::Relaxed);
     if mark != 0
-        && last_output_ms > mark
+        && (last_output_ms > mark || in_flight == 0)
         && marked
             .compare_exchange(mark, 0, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
@@ -1050,13 +1077,13 @@ fn heal_stall_mark(
 /// stalled ([`pipeline_stalled`]): a wedged step holds every slot, so every
 /// new request is a capacity 503 and nothing else would ever mark it unready.
 /// Such a mark is noted in [`AppState::stall_marked_ms`] so `/health` can
-/// clear it when the engine moves again, with no completion to send a 2xx.
+/// clear it when the engine moves again or nothing is left in flight, with
+/// no completion to send a 2xx.
 async fn track_pipeline_health(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use std::sync::atomic::Ordering;
     let is_completion = matches!(
         req.uri().path(),
         "/v1/chat/completions" | "/v1/completions" | "/v1/responses"
@@ -1066,8 +1093,7 @@ async fn track_pipeline_health(
         let s = resp.status();
         let ext = resp.extensions();
         if s.is_server_error() && ext.get::<PreEngineFailure>().is_none() {
-            state.stall_marked_ms.store(0, Ordering::Relaxed);
-            state.ready.store(false, Ordering::Relaxed);
+            note_failure(&state.ready, &state.stall_marked_ms);
         } else if s.is_server_error() && ext.get::<CapacityRefusal>().is_some() {
             if let Some(evidence) = pipeline_stalled(&state) {
                 note_stall(&state.ready, &state.stall_marked_ms, evidence);
@@ -1088,12 +1114,13 @@ async fn health(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> (StatusCode, Json<HealthResponse>) {
     use std::sync::atomic::Ordering;
-    // Unready from a stall, and the engine has produced output since: the
-    // pipeline is moving again.
+    // Unready from a stall, and the engine has produced output since or
+    // nothing is in flight any more.
     heal_stall_mark(
         &state.ready,
         &state.stall_marked_ms,
         state.runner.last_output_ms(),
+        state.stats.requests_in_flight.load(Ordering::Relaxed),
     );
     if state.ready.load(Ordering::Relaxed) {
         (StatusCode::OK, Json(HealthResponse { status: "ok" }))
@@ -8294,6 +8321,8 @@ mod tests {
     const PHASE_NPU_CAP_CHUNKS: u8 = 5;
     /// Every step ends a task nobody reads with a server-fault error chunk.
     const PHASE_SERVER_CHUNKS: u8 = 6;
+    /// The next step fails the stream's own task for the server's fault.
+    const PHASE_FAIL_OWN: u8 = 7;
 
     /// Emits three tokens and a final for its task, except that in the
     /// error or progress phase every step (a few ms long) returns no real
@@ -8331,6 +8360,11 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                     self.pending = Some((id.clone(), i));
                     return Ok(vec![(id.clone(), Chunk::progress(id))]);
+                }
+                PHASE_FAIL_OWN => {
+                    return Err(
+                        cascadia_engine::EngineError::Backend("peer timeout".into()).for_task(id)
+                    );
                 }
                 PHASE_REFUSALS => {
                     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -8565,7 +8599,7 @@ mod tests {
         let evidence = stall_evidence(&activity(None, now - 1, 100, 1000), now, 1000).unwrap();
         note_stall(&ready, &marked, evidence);
         assert!(!ready.load(Ordering::SeqCst));
-        heal_stall_mark(&ready, &marked, now);
+        heal_stall_mark(&ready, &marked, now, 1);
         assert!(
             ready.load(Ordering::SeqCst),
             "output at {now} must clear the mark"
@@ -8583,6 +8617,74 @@ mod tests {
         note_success_with(&ready, &marked, || note_stall(&ready, &marked, 1234));
         let stranded = !ready.load(Ordering::SeqCst) && marked.load(Ordering::SeqCst) == 0;
         assert!(!stranded, "unready with no stall mark");
+    }
+
+    /// A stall 503 landing in the middle of a pipeline 5xx's update must not
+    /// turn that 5xx's unready state into a stall mark `/health` would heal:
+    /// after both, the server is unready with no mark.
+    #[test]
+    fn a_stall_racing_a_5xx_does_not_make_it_self_healing() {
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let marked = std::sync::atomic::AtomicU64::new(0);
+        note_failure_with(&ready, &marked, || note_stall(&ready, &marked, 1234));
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(marked.load(Ordering::SeqCst), 0, "the 5xx's mark must stay");
+    }
+
+    /// A stall mark with requests still in flight and no output since waits
+    /// for output; with nothing left in flight it clears, as no stall can be
+    /// observed then. An unready state from a 5xx (no mark) does not.
+    #[test]
+    fn a_stall_mark_clears_once_nothing_is_in_flight() {
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let marked = std::sync::atomic::AtomicU64::new(0);
+        note_stall(&ready, &marked, 1000);
+        heal_stall_mark(&ready, &marked, 500, 1);
+        assert!(!ready.load(Ordering::SeqCst), "in flight, no output since");
+        heal_stall_mark(&ready, &marked, 500, 0);
+        assert!(ready.load(Ordering::SeqCst), "nothing in flight");
+        assert_eq!(marked.load(Ordering::SeqCst), 0);
+        note_failure(&ready, &marked);
+        heal_stall_mark(&ready, &marked, 500, 0);
+        assert!(!ready.load(Ordering::SeqCst), "a 5xx waits for a 2xx");
+    }
+
+    /// A peer that times out makes every stream fail without output; once
+    /// the failed streams have ended and nothing is in flight, `/health` is
+    /// ready again with no new request (the next capacity 503 under load
+    /// marks it again if the pipeline is still broken).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stall_mark_clears_when_the_failed_streams_end() {
+        let (app, phase_switch) = phase_app(PHASE_ERRORS).await;
+        let reader = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+            })
+        };
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let refused = app
+            .clone()
+            .oneshot(stall_chat(false))
+            .await
+            .unwrap()
+            .status();
+        let health = stall_health(&app).await;
+        // The reader's own task now fails too, with no output.
+        phase_switch.store(PHASE_FAIL_OWN, Ordering::SeqCst);
+        let body = reader.await.unwrap();
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health, StatusCode::SERVICE_UNAVAILABLE, "stalled");
+        assert!(
+            String::from_utf8_lossy(&body).contains("peer timeout"),
+            "{body:?}"
+        );
+        assert_eq!(
+            stall_health(&app).await,
+            StatusCode::OK,
+            "nothing in flight"
+        );
     }
 
     /// A short step that returns keeps a busy server ready: the 503 that

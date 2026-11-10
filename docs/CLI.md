@@ -599,7 +599,10 @@ more than 60 s. A peer
 that stops answering does either: the step waiting on it hangs, or times out
 and fails, while its requests hold every slot, so every new request is a
 capacity 503. The server is then ready again as soon as the engine produces
-real output, with no new request needed. Clients that open streams and leave
+real output, or once no request is left in flight (a load balancer that
+drained the node lets its failed streams end), with no new request needed; if
+the pipeline is still broken, the next capacity 503 under load marks it
+unready again. Clients that open streams and leave
 them unread never count as a stall: the engine only steps while a stream is
 read, and time it spent idle before a burst of requests is not counted. Any
 engine call longer than 60 s counts while every slot is full, whatever the
