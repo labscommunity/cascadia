@@ -106,11 +106,13 @@ The engine is then free for the next request.
 - For models whose chat template frames output with special tokens (Inkling),
   the engine's stop check is off, because there its text is not what the API
   matches. The API still cuts at the stop, and cancel still works.
-- Kimi-K2.6 strips an echoed prompt and leading whitespace from its answer.
-  Its stop check starts one short window after that text (about the longest
+- Kimi-K2.6 strips an echoed prompt and the whitespace after it from its
+  answer (an empty prompt counts as echoed). Its stop check starts one short
+  window after that text (about the longest
   stop's length + 16 tokens, plus one round with `--prompt-lookup`), and is
   skipped if the stripped text runs past that window. The API still cuts at
-  the stop, so the answer is the same either way.
+  the stop, so the answer is the same either way. An answer that merely
+  starts with whitespace, after a prompt it doesn't echo, is checked at once.
 - Multi-stage pipelines and `CASCADIA_STREAMS` already stream per token and
   stop at the next token; they are unchanged.
 
