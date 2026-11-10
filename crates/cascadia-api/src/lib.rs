@@ -802,13 +802,7 @@ async fn gate_media_body(
     };
     let Ok(permit) = gate.slots.try_acquire_owned() else {
         count_rejected("capacity");
-        let mut resp = api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "engine at capacity; retry after current requests complete",
-            None,
-        );
-        resp.extensions_mut().insert(PreEngineFailure);
-        return errors::with_retry_after(resp, errors::RETRY_AFTER_SECS);
+        return capacity_refusal();
     };
     let (parts, body) = req.into_parts();
     let read = async {
@@ -896,6 +890,21 @@ async fn metrics() -> impl IntoResponse {
 /// permanently on a single request.
 #[derive(Clone, Copy)]
 struct PreEngineFailure;
+
+/// The 503 for a request past the in-flight cap: `Retry-After` tells the
+/// client when to come back, and [`PreEngineFailure`] keeps it out of
+/// readiness. A busy node is not a broken one, and since a streamed request's
+/// 200 goes out when its stream starts, a capacity 503 that latched `/health`
+/// might never see the 2xx that clears it.
+fn capacity_refusal() -> Response {
+    let mut resp = api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "engine at capacity; retry after current requests complete",
+        None,
+    );
+    resp.extensions_mut().insert(PreEngineFailure);
+    errors::with_retry_after(resp, errors::RETRY_AFTER_SECS)
+}
 
 /// Response middleware: for completion routes, flip `AppState.ready` from the
 /// response status (5xx → not ready, 2xx → ready) so `/health` reflects whether
@@ -4077,14 +4086,7 @@ async fn admit_chat(
             Ok(p) => Some(p),
             Err(_) => {
                 count_rejected("capacity");
-                return Err(errors::with_retry_after(
-                    api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "engine at capacity; retry after current requests complete",
-                        None,
-                    ),
-                    errors::RETRY_AFTER_SECS,
-                ));
+                return Err(capacity_refusal());
             }
         }
     } else {
@@ -4281,14 +4283,7 @@ async fn admit_chat(
             Ok(p) => p,
             Err(_) => {
                 count_rejected("capacity");
-                return Err(errors::with_retry_after(
-                    api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "engine at capacity; retry after current requests complete",
-                        None,
-                    ),
-                    errors::RETRY_AFTER_SECS,
-                ));
+                return Err(capacity_refusal());
             }
         },
     };
@@ -4588,14 +4583,7 @@ async fn completions(
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return errors::with_retry_after(
-                api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "engine at capacity; retry after current requests complete",
-                    None,
-                ),
-                errors::RETRY_AFTER_SECS,
-            );
+            return capacity_refusal();
         }
     };
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -5342,12 +5330,16 @@ fn engine_error_response(
             Some("context_length_exceeded"),
         );
     }
+    let mut resp = api_error(status, err.to_string(), None);
+    // A full queue is the engine at capacity, like the in-flight gate: keep it
+    // out of readiness. Not loaded or not connected means the pipeline really
+    // is down, so those 503s still flip `/health`.
+    if matches!(err, EngineError::QueueFull { .. }) {
+        resp.extensions_mut().insert(PreEngineFailure);
+    }
     // The 503s here (queue full, engine not loaded or not connected) are all
     // "come back shortly"; `with_retry_after` leaves every other status bare.
-    errors::with_retry_after(
-        api_error(status, err.to_string(), None),
-        errors::RETRY_AFTER_SECS,
-    )
+    errors::with_retry_after(resp, errors::RETRY_AFTER_SECS)
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -5427,6 +5419,8 @@ mod tests {
             let r = engine_error_response(err, "messages");
             assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(r.headers()[header::RETRY_AFTER], "1");
+            // The pipeline really is down: readiness must flip.
+            assert!(r.extensions().get::<PreEngineFailure>().is_none());
         }
         for (err, status) in [
             (
@@ -7479,6 +7473,68 @@ mod tests {
                 "1",
                 "{uri} media={media}"
             );
+        }
+    }
+
+    /// A capacity 503 says nothing about the pipeline, so it must not mark
+    /// the server unready: a streamed request's 200 goes out when its stream
+    /// starts, so a busy node would never see the 2xx that heals the flag,
+    /// and a load balancer gating on `/health` would drain it for good.
+    #[tokio::test]
+    async fn capacity_503s_keep_the_server_ready() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_concurrent_requests: 0,
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let cases = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "hi"}),
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "mock-model", "input": "hi"}),
+            ),
+        ];
+        for (uri, payload) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let health = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK, "{uri}");
         }
     }
 
@@ -10862,6 +10918,7 @@ level={{ effort_map[eff] }}";
             .unwrap();
         let app = make_router(Arc::new(runner), "queuefull-model");
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -10880,6 +10937,18 @@ level={{ effort_map[eff] }}";
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
+        // A full queue is the engine at capacity, not down: `/health` stays
+        // ready.
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
         let capacity_after = cascadia_metrics::API_REJECTED_TOTAL
             .with_label_values(&["capacity"])
             .get();
