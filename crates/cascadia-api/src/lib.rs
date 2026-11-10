@@ -1042,12 +1042,18 @@ impl<'a> Health<'a> {
 
 /// A capacity 503 met a stalled pipeline: unready from a stall measured
 /// from `evidence`. A pipeline 5xx's unready state stays that kind: only the
-/// success it has always waited for clears it.
+/// success it has always waited for clears it. An existing stall keeps the
+/// newer evidence: requests measure it before taking the lock, so an older
+/// reading can arrive last, and output older than the newer reading must
+/// not clear the mark.
 fn note_stall(h: &Health, evidence: u64) {
     h.transition(|cause| match cause {
         ReadinessState::Pipeline => ReadinessState::Pipeline,
-        ReadinessState::Ready | ReadinessState::Stall { .. } => ReadinessState::Stall {
+        ReadinessState::Ready => ReadinessState::Stall {
             evidence_ms: evidence,
+        },
+        ReadinessState::Stall { evidence_ms } => ReadinessState::Stall {
+            evidence_ms: evidence_ms.max(evidence),
         },
     });
 }
@@ -8685,6 +8691,29 @@ mod tests {
             ReadinessState::Ready,
             "output at {now} must clear the mark"
         );
+    }
+
+    /// Two capacity 503s that measured the stall at different times can note
+    /// it out of order; the mark keeps the newer evidence, so output that
+    /// predates it doesn't clear the mark.
+    #[test]
+    fn an_older_stall_reading_never_lowers_the_mark() {
+        let (ready, cause) = readiness_words();
+        let h = Health {
+            ready: &ready,
+            cause: &cause,
+        };
+        note_stall(&h, 2000);
+        note_stall(&h, 1000);
+        assert_eq!(cause_of(&h), ReadinessState::Stall { evidence_ms: 2000 });
+        heal_stall_mark(&h, || (1500, 1));
+        assert_eq!(
+            cause_of(&h),
+            ReadinessState::Stall { evidence_ms: 2000 },
+            "output at 1500 predates the newer stall evidence at 2000"
+        );
+        heal_stall_mark(&h, || (2001, 1));
+        assert_eq!(cause_of(&h), ReadinessState::Ready);
     }
 
     /// Pipeline 5xxs and stall marks in every order: after the first 5xx,
