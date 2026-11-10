@@ -28,11 +28,13 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod structured;
+mod tools;
 pub use structured::{
     check_pointer_refs_only, grammar_for, parse_response_format, unenforced_keywords,
     unsatisfiable_bound, ResponseFormat, SchemaCheckError, SchemaCompileCheck, JSON_OBJECT_SCHEMA,
     MAX_SCHEMA_BYTES, MAX_SCHEMA_COUNT, MAX_SCHEMA_COUNT_TOTAL, MAX_SCHEMA_DEPTH,
 };
+pub use tools::*;
 
 /// Maximum HTTP request body the chat-completions endpoint accepts. 64
 /// KiB is plenty for any legitimate chat completion (prompt + system +
@@ -800,7 +802,9 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
+    /// Function calls as sent; a replayed custom call arrives here in the
+    /// function form with arguments `{"input": ...}`.
+    #[serde(default, deserialize_with = "tools::de_tool_calls")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
@@ -832,6 +836,12 @@ pub struct FunctionCall {
 /// null/missing content -> "" (assistant tool-call turns send content: null).
 fn de_null_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A boolean, or nothing: any other JSON value (null, a string, a number) is
+/// ignored rather than rejected, as it was before the field was read.
+fn lenient_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    Ok(Option::<serde_json::Value>::deserialize(d)?.and_then(|v| v.as_bool()))
 }
 
 /// OpenAI `stop` is either a single string or an array of strings.
@@ -907,10 +917,16 @@ pub struct ChatCompletionRequest {
     /// the template.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Function and custom tools; see [`ToolPolicy`] for how they combine
+    /// with `tool_choice` and `parallel_tool_calls`.
     #[serde(default)]
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<Vec<RequestTool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI `parallel_tool_calls`; only an explicit `false` limits the
+    /// answer to one call. A non-boolean value is ignored.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub parallel_tool_calls: Option<bool>,
     /// OpenAI `response_format`, kept as the client's JSON text and parsed
     /// by [`parse_response_format`]: a malformed value is a 400 naming the
     /// field rather than a generic deserialization error, and the schema text
@@ -958,43 +974,12 @@ impl ChatCompletionRequest {
         }
     }
 
-    /// `tool_choice` must be one of the OpenAI shapes: `"auto"`, `"none"`,
-    /// `"required"`, or `{"type":"function","function":{"name":N}}` naming a
-    /// function present in `tools`. Anything else is the caller's mistake
-    /// (a 400), not something an engine should guess at.
-    fn validate_tool_choice(&self) -> Result<(), String> {
-        let Some(choice) = &self.tool_choice else {
-            return Ok(());
-        };
-        if let Some(s) = choice.as_str() {
-            return match s {
-                "auto" | "none" | "required" => Ok(()),
-                other => Err(format!(
-                    "tool_choice '{other}' is not one of \"auto\", \"none\", \"required\""
-                )),
-            };
-        }
-        let name = choice
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
-            .filter(|n| choice.get("type").and_then(|t| t.as_str()) == Some("function") && !n.is_empty())
-            .ok_or_else(|| {
-                "tool_choice must be a string or {\"type\":\"function\",\"function\":{\"name\":...}}"
-                    .to_string()
-            })?;
-        let declared = self
-            .tools
-            .iter()
-            .flatten()
-            .any(|t| t.function.get("name").and_then(|n| n.as_str()) == Some(name));
-        if declared {
-            Ok(())
-        } else {
-            Err(format!(
-                "tool_choice names function '{name}', which is not in tools"
-            ))
-        }
+    /// The request's tools as the chat template and the engine see them:
+    /// function tools unchanged, custom tools as their function shims.
+    fn request_tools(&self) -> Option<Vec<Tool>> {
+        self.tools
+            .as_ref()
+            .map(|ts| ts.iter().map(RequestTool::to_tool).collect())
     }
 
     /// Resolves `enable_thinking`, highest precedence first:
@@ -2591,8 +2576,7 @@ fn chat_turns(req: &ChatCompletionRequest) -> Vec<ChatTurn> {
 
 /// The request's tool definitions as wire JSON for the engine.
 fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
-    req.tools
-        .as_ref()
+    req.request_tools()
         .and_then(|ts| serde_json::to_value(ts).ok())
 }
 
@@ -2601,7 +2585,11 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    if let Err(e) = req.validate_tool_choice() {
+    if let Err(e) = ToolPolicy::from_request(
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        req.parallel_tool_calls,
+    ) {
         count_rejected("invalid_request");
         return (
             StatusCode::BAD_REQUEST,
@@ -2769,12 +2757,13 @@ async fn chat_completions(
     // client's "low" reaches such a template unescalated — or, when the caller
     // sent nothing of their own, with the effort undefined (the template's
     // default). A caller word the template also rejects is a 400.
+    let request_tools = req.request_tools();
     let prompt = match render_prompt(
         &state,
         &req.messages,
         enable_thinking,
         effort,
-        req.tools.as_deref(),
+        request_tools.as_deref(),
     ) {
         Ok(p) => p,
         // A tools request that cannot be templated must not return a 200: the
@@ -5535,7 +5524,7 @@ mod tests {
             "description":"Get weather","parameters":{"type":"object",
             "properties":{"city":{"type":"string"}}}}}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
-        let tools = req.tools.expect("tools parse");
+        let tools = req.request_tools().expect("tools parse");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].r#type, "function");
         assert_eq!(tools[0].function["name"], "get_weather");
@@ -5553,6 +5542,81 @@ mod tests {
         assert_eq!(calls[0].id, "call_abc");
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(calls[0].function.arguments, "{\"city\":\"Paris\"}");
+    }
+
+    #[test]
+    fn chat_message_accepts_a_replayed_custom_call() {
+        let raw = r#"{"role":"assistant","content":null,"tool_calls":[
+            {"id":"call_1","type":"custom","custom":{"name":"apply_patch","input":"*** Begin"}},
+            {"id":"call_2","type":"function","function":{"name":"f","arguments":"{}"}}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        let calls = m.tool_calls.expect("tool_calls parse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].r#type, "function");
+        assert_eq!(calls[0].function.name, "apply_patch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap(),
+            serde_json::json!({"input": "*** Begin"})
+        );
+        assert_eq!(calls[1].function.arguments, "{}");
+        // Absent and null stay absent; a malformed entry is still an error.
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"x"}"#).unwrap();
+        assert!(m.tool_calls.is_none());
+        let m: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"x","tool_calls":null}"#).unwrap();
+        assert!(m.tool_calls.is_none());
+        assert!(serde_json::from_str::<ChatMessage>(
+            r#"{"role":"assistant","tool_calls":[{"id":"c","type":"custom","custom":{"name":"x"}}]}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ChatMessage>(
+            r#"{"role":"assistant","tool_calls":[{"id":"c","type":"other","custom":{"name":"x","input":""}}]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parallel_tool_calls_non_bool_is_ignored() {
+        let req = |extra: &str| -> ChatCompletionRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}]{extra}}}"#
+            ))
+            .unwrap()
+        };
+        assert_eq!(req("").parallel_tool_calls, None);
+        assert_eq!(
+            req(r#","parallel_tool_calls":false"#).parallel_tool_calls,
+            Some(false)
+        );
+        assert_eq!(
+            req(r#","parallel_tool_calls":true"#).parallel_tool_calls,
+            Some(true)
+        );
+        for v in ["null", "\"false\"", "0", "{}"] {
+            assert_eq!(
+                req(&format!(r#","parallel_tool_calls":{v}"#)).parallel_tool_calls,
+                None,
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_request_accepts_custom_tools() {
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f"}},
+                     {"type":"custom","custom":{"name":"apply_patch","description":"Patch."}}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+        let tools = req.request_tools().expect("tools parse");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function, serde_json::json!({"name": "f"}));
+        assert_eq!(tools[1].r#type, "function");
+        assert_eq!(tools[1].function["name"], "apply_patch");
+        assert_eq!(
+            tools[1].function["parameters"]["required"],
+            serde_json::json!(["input"])
+        );
     }
 
     #[test]
@@ -6991,6 +7055,20 @@ level={{ effort_map[eff] }}";
                 StatusCode::OK,
             ),
             (serde_json::json!("required"), StatusCode::OK),
+            (
+                serde_json::json!({"type": "allowed_tools", "allowed_tools": {
+                    "mode": "auto", "tools": [{"type": "function", "function": {"name": "get_weather"}}]}}),
+                StatusCode::OK,
+            ),
+            (
+                serde_json::json!({"type": "allowed_tools", "allowed_tools": {
+                    "mode": "auto", "tools": [{"type": "function", "function": {"name": "get_time"}}]}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"type": "custom", "custom": {"name": "get_weather"}}),
+                StatusCode::BAD_REQUEST,
+            ),
         ] {
             let payload = serde_json::json!({
                 "model": "mock-model",
