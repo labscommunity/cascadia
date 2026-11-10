@@ -615,11 +615,15 @@ must run a build with structured-output support. If a later stage runs an
 older build, a JSON request fails (5xx) with `a later pipeline stage runs a
 build without structured-output support; upgrade every stage`; normal
 requests are unaffected. On `ov-runtime`, `gemma4` and `sparse-moe` the
-first such JSON request waits until its token deadline before failing
-(plain requests batched with it keep their tokens); after that, JSON
-requests on that pipeline fail at once (the check runs again after 10
-minutes). `qwen35` knows from its connection
-handshake and fails JSON requests at once. When deploying, upgrade every
+first stage checks the pipeline with a short probe before the first JSON
+request on it (an older stage reads the probe, ignores it and stays in
+step), so that request fails within about 10 s (a few seconds more on a
+`gemma4` pipeline of more than two stages), not at its token deadline.
+After that, JSON requests on that pipeline fail at once; the check runs
+again after 1 minute, or after 10 minutes when a JSON request's own step
+went unanswered. A stage that was only slow and answers the probe late
+clears the check on the next JSON request. `qwen35` knows from its
+connection handshake and fails JSON requests at once. When deploying, upgrade every
 stage before relying on `response_format`.
 
 A malformed `response_format` is a 400 on every engine (it used to be
