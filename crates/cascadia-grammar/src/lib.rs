@@ -584,5 +584,6 @@ mod tests;
 
 mod stage_mask;
 pub use stage_mask::{
-    MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT,
+    MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN,
+    MASK_PROBE, MASK_PROBE_OK_TOKEN, MASK_PROBE_REPROBE_AFTER, MASK_PROBE_TIMEOUT, REPEAT,
 };

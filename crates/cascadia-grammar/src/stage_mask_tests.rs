@@ -12,6 +12,22 @@ fn repeat_is_the_largest_width_and_never_zero() {
 }
 
 #[test]
+fn the_probe_width_is_distinct_from_repeat_and_any_real_width() {
+    assert_eq!(MASK_PROBE, u32::MAX - 1);
+    assert_ne!(MASK_PROBE, REPEAT);
+    assert_ne!(
+        MASK_PROBE, 0,
+        "W = 0 is the sparse-moe probe, a separate encoding"
+    );
+    assert_eq!(MASK_PROBE_OK_TOKEN, -3);
+    assert_ne!(MASK_PROBE_OK_TOKEN, MASK_MISS_TOKEN);
+    assert_ne!(MASK_PROBE_OK_TOKEN, -1, "-1 is the plain failure token");
+    assert!(MASK_PROBE_TIMEOUT >= std::time::Duration::from_secs(5));
+    assert!(MASK_PROBE_TIMEOUT <= std::time::Duration::from_secs(30));
+    assert_eq!(MASK_PROBE_REPROBE_AFTER, std::time::Duration::from_secs(60));
+}
+
+#[test]
 fn a_fresh_sender_sends_full_then_repeats_the_same_mask() {
     let mut send = MaskSendCache::default();
     assert!(!send.repeats(0, A), "nothing sent yet");

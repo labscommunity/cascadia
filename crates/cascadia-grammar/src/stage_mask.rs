@@ -30,6 +30,32 @@ pub const REPEAT: u32 = u32::MAX;
 /// sampled token.
 pub const MASK_MISS_TOKEN: i32 = -2;
 
+/// The mask-width value that marks a mask-support probe: a frame set shaped
+/// like a masked step that asks "can every later stage apply a mask?" and
+/// carries no mask. An older build reads its frames as an unsupported masked
+/// step, fails it and answers nothing, so the link stays aligned; a newer
+/// stage answers [`MASK_PROBE_OK_TOKEN`] at once without touching any state.
+/// Distinct from [`REPEAT`] and from any real width. Decoders check it before
+/// [`REPEAT`] and before validating any width or mask word.
+pub const MASK_PROBE: u32 = u32::MAX - 1;
+
+/// The token a pipeline's last stage answers a mask-support probe with (an
+/// acknowledged reply). Never a sampled token, and distinct from the plain
+/// failure token (-1) and [`MASK_MISS_TOKEN`].
+pub const MASK_PROBE_OK_TOKEN: i32 = -3;
+
+/// How long a head waits for the answer to a mask-support probe before it
+/// takes the silence for an older stage. It covers the round trip over every
+/// hop of a relayed link; a probe runs no layer, so it does not scale with
+/// the prompt the way a masked step's token deadline does.
+pub const MASK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a "can't mask" latch set by an unanswered probe holds before the
+/// next structured-output request probes again. Shorter than the re-probe
+/// time after a real masked step went unanswered: a probe is cheap, and a
+/// stage that was only slow should not wait long to be trusted again.
+pub const MASK_PROBE_REPROBE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// What a structured-output task fails with when a later stage couldn't
 /// resolve a repeat marker. Nothing is latched: the next request starts with
 /// a full mask.
