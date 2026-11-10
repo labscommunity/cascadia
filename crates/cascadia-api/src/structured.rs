@@ -972,104 +972,105 @@ fn path_to_target(root: &Value, r: &str, target: &Value) -> Option<Vec<String>> 
     })
 }
 
-/// The first bound pair one object of `schema` holds that no value can
-/// meet, with its location: the schemas [`unsatisfiable_bound`] visits, then
-/// whatever a local `$ref` points to.
-fn first_unsatisfiable_pair(schema: &Value) -> Option<UnsatisfiableBound> {
-    fn search(v: &Value, path: &mut Vec<String>, depth: usize) -> Option<UnsatisfiableBound> {
-        if depth > MAX_SCHEMA_DEPTH {
-            return None;
-        }
-        let descend = |path: &mut Vec<String>, key: String, child: &Value| {
-            path.push(key);
-            let found = search(child, path, depth + 1);
-            path.pop();
-            found
-        };
-        match v {
-            Value::Array(items) => items
-                .iter()
-                .enumerate()
-                .find_map(|(i, c)| descend(path, i.to_string(), c)),
-            Value::Object(obj) => {
-                if let Some(found) = bound_pair_here(obj, path) {
-                    return Some(found);
-                }
-                for (key, child) in obj {
-                    if DATA_KEYS.contains(&key.as_str()) {
-                        continue;
-                    }
-                    let hit = match child {
-                        Value::Object(map) if SCHEMA_MAPS.contains(&key.as_str()) => {
-                            path.push(key.clone());
-                            let hit = map
-                                .iter()
-                                .find_map(|(name, sub)| descend(path, name.clone(), sub));
-                            path.pop();
-                            hit
-                        }
-                        _ => descend(path, key.clone(), child),
-                    };
-                    if hit.is_some() {
-                        return hit;
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-    search(schema, &mut Vec::new(), 0).or_else(|| {
-        let mut stack = vec![schema];
-        while let Some(v) = stack.pop() {
-            match v {
-                Value::Object(o) => {
-                    if let Some(r) = o.get("$ref").and_then(Value::as_str) {
-                        for target in backstop_targets(schema, r) {
-                            let Some(mut path) = path_to_target(schema, r, target) else {
-                                continue;
-                            };
-                            let found = search(target, &mut path, 0);
-                            if found.is_some() {
-                                return found;
-                            }
-                        }
-                    }
-                    stack.extend(o.values());
-                }
-                Value::Array(a) => stack.extend(a.iter()),
-                _ => {}
-            }
-        }
-        None
-    })
-}
-
-/// `schema` with every bound pair no value can meet removed: while
-/// [`first_unsatisfiable_pair`] finds one, exactly that pair's two keywords
-/// are dropped from the object holding it, everything else kept in order.
-/// Returns what was dropped, in the order found; empty (and `schema`
-/// untouched) when there was nothing to drop.
+/// `schema` with every bound pair no value can meet removed, for a schema
+/// the server must accept anyway (a tool's parameters) and that a
+/// downstream server may build its own grammar from. Exactly each pair's
+/// two keywords are dropped from the object holding it, everything else
+/// kept in order. Returns what was dropped, in the order found; empty (and
+/// `schema` untouched) when there was nothing to drop.
+///
+/// One pass, visiting only the places a grammar builder reads a schema
+/// from: the root, `properties`/`patternProperties`/`$defs`/`definitions`
+/// entries, `additionalProperties`, `items`, `contains`, `propertyNames`,
+/// `unevaluatedItems`, `unevaluatedProperties`, and the members of
+/// `prefixItems`, `allOf`, `anyOf`, `oneOf` (and of an array `items`).
+/// Data (`enum`, `const`, `default`, `examples`) is never edited, nor are
+/// `not`, `if`, `then`, `else` and `dependentSchemas`: grammar builders
+/// skip those, and dropping a pair under `not` would flip its meaning.
+/// Whatever a local `$ref` met on the way points to is a schema and is
+/// relaxed too, each target once.
+///
+/// There is no depth cap: the server builds its grammar at any depth, and
+/// the request parser (serde_json, 128 levels) already bounds the nesting,
+/// so the recursion stays shallow.
 pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound> {
     let mut dropped = Vec::new();
-    while let Some(found) = first_unsatisfiable_pair(schema) {
-        let mut node = &mut *schema;
-        for key in &found.path {
-            node = match node {
-                Value::Object(obj) => obj.get_mut(key),
-                Value::Array(items) => key.parse::<usize>().ok().and_then(|i| items.get_mut(i)),
-                _ => None,
+    let mut refs = Vec::new();
+    relax_in_place(schema, &mut Vec::new(), &mut dropped, &mut refs);
+    let mut walked: HashSet<Vec<String>> = HashSet::new();
+    while let Some(r) = refs.pop() {
+        let paths: Vec<Vec<String>> = backstop_targets(schema, &r)
+            .filter_map(|target| path_to_target(schema, &r, target))
+            .collect();
+        for mut path in paths {
+            if !walked.insert(path.clone()) {
+                continue;
             }
-            .expect("the path a search just found leads to an object");
+            let mut node = &mut *schema;
+            for key in &path {
+                node = match node {
+                    Value::Object(obj) => obj.get_mut(key),
+                    Value::Array(items) => key.parse::<usize>().ok().and_then(|i| items.get_mut(i)),
+                    _ => None,
+                }
+                .expect("path_to_target only returns a path that leads somewhere");
+            }
+            relax_in_place(node, &mut path, &mut dropped, &mut refs);
         }
-        let obj = node
-            .as_object_mut()
-            .expect("a bound pair sits in an object");
+    }
+    dropped
+}
+
+/// [`relax_unsatisfiable_bounds`] on `v`, at `path`, and the schemas
+/// below it; the local `$ref`s met are added to `refs`.
+fn relax_in_place(
+    v: &mut Value,
+    path: &mut Vec<String>,
+    dropped: &mut Vec<UnsatisfiableBound>,
+    refs: &mut Vec<String>,
+) {
+    let Value::Object(obj) = v else {
+        return;
+    };
+    // An object can hold more than one such pair.
+    while let Some(found) = bound_pair_here(obj, path) {
         obj.shift_remove(found.lower);
         obj.shift_remove(found.upper);
         dropped.push(found);
     }
-    dropped
+    if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
+        refs.push(r.to_owned());
+    }
+    for (key, child) in obj.iter_mut() {
+        path.push(key.clone());
+        match (key.as_str(), child) {
+            ("properties" | "patternProperties" | "$defs" | "definitions", Value::Object(map)) => {
+                for (name, sub) in map.iter_mut() {
+                    path.push(name.clone());
+                    relax_in_place(sub, path, dropped, refs);
+                    path.pop();
+                }
+            }
+            ("prefixItems" | "allOf" | "anyOf" | "oneOf" | "items", Value::Array(subs)) => {
+                for (i, sub) in subs.iter_mut().enumerate() {
+                    path.push(i.to_string());
+                    relax_in_place(sub, path, dropped, refs);
+                    path.pop();
+                }
+            }
+            (
+                "additionalProperties"
+                | "items"
+                | "contains"
+                | "propertyNames"
+                | "unevaluatedItems"
+                | "unevaluatedProperties",
+                sub,
+            ) => relax_in_place(sub, path, dropped, refs),
+            _ => {}
+        }
+        path.pop();
+    }
 }
 
 /// The RFC 6901 pointer of `path`, as a URI fragment: `#`, `#/items`, ...
@@ -4850,6 +4851,119 @@ mod tests {
             ["minLength (5) is greater than maxLength (2) at #/default/x; no value can satisfy both"]
         );
         assert_eq!(unsatisfiable_bound(&schema), None);
+    }
+
+    /// `leaf` under `levels` nested `properties` maps, each holding `a`.
+    fn nested_properties(levels: usize, leaf: Value) -> Value {
+        (0..levels).fold(
+            leaf,
+            |inner, _| json!({"type": "object", "properties": {"a": inner}}),
+        )
+    }
+
+    /// A downstream server builds its grammar from the forwarded tool at any
+    /// depth, so a pair far below the response_format nesting cap is dropped
+    /// too.
+    #[test]
+    fn relax_drops_a_pair_past_the_nesting_cap() {
+        let (schema, dropped) = relaxed(nested_properties(
+            40,
+            json!({"type": "string", "minLength": 5, "maxLength": 2}),
+        ));
+        assert_eq!(schema, nested_properties(40, json!({"type": "string"})));
+        let pointer = format!("#{}", "/properties/a".repeat(40));
+        assert_eq!(
+            dropped,
+            [format!(
+                "minLength (5) is greater than maxLength (2) at {pointer}; no value can satisfy both"
+            )]
+        );
+    }
+
+    /// `items` nests one JSON level per schema level: 100 of them fit a
+    /// request body (serde_json parses 128 levels), well past the cap.
+    #[test]
+    fn relax_drops_a_pair_100_items_levels_deep() {
+        let nested =
+            |leaf: Value| (0..100).fold(leaf, |inner, _| json!({"type": "array", "items": inner}));
+        let (schema, dropped) = relaxed(nested(json!({"type": "string", "minLength": 5,
+            "maxLength": 2})));
+        assert_eq!(schema, nested(json!({"type": "string"})));
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+    }
+
+    #[test]
+    fn relax_drops_every_pair_one_object_holds() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "array", "items": {"type": "string"},
+            "minItems": 4, "maxItems": 3, "minLength": 5, "maxLength": 2
+        }));
+        assert_eq!(
+            schema,
+            json!({"type": "array", "items": {"type": "string"}})
+        );
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+    }
+
+    /// `enum`, `const`, `default` and `examples` hold data: a bound-named
+    /// key there is not a bound.
+    #[test]
+    fn relax_leaves_data_literals_alone() {
+        let pair = json!({"minLength": 5, "maxLength": 2, "minimum": 3, "maximum": 1});
+        let schema = json!({
+            "type": "object",
+            "properties": {"a": {"type": "object", "enum": [pair.clone()],
+                "const": pair.clone(), "default": pair.clone(), "examples": [pair.clone()]}},
+            "default": pair.clone(),
+            "examples": [pair]
+        });
+        let (out, dropped) = relaxed(schema.clone());
+        assert_eq!(out, schema);
+        assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
+    /// Dropping a pair under `not` would flip its meaning (an empty `not`
+    /// rejects every value), and a grammar builder skips `not` and the
+    /// conditional keywords anyway: they are left as sent.
+    #[test]
+    fn relax_leaves_not_and_conditionals_alone() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"n": {"type": "number", "not": {"minimum": 3, "maximum": 1}}},
+            "if": {"properties": {"s": {"minLength": 5, "maxLength": 2}}},
+            "then": {"minProperties": 3, "maxProperties": 1},
+            "else": {"properties": {"s": {"minItems": 4, "maxItems": 3}}},
+            "dependentSchemas": {"s": {"minimum": 3, "maximum": 1}}
+        });
+        let (out, dropped) = relaxed(schema.clone());
+        assert_eq!(out, schema);
+        assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
+    /// One pass over the schema however many pairs it holds: a request's
+    /// tools are relaxed before any size limit applies.
+    #[test]
+    fn relax_drops_thousands_of_pairs_in_one_pass() {
+        let properties: Map<String, Value> = (0..5000)
+            .map(|i| {
+                (
+                    format!("p{i}"),
+                    json!({"type": "string", "minLength": 5, "maxLength": 2}),
+                )
+            })
+            .collect();
+        let mut schema = json!({"type": "object", "properties": properties});
+        let start = std::time::Instant::now();
+        let dropped = relax_unsatisfiable_bounds(&mut schema);
+        let elapsed = start.elapsed();
+        eprintln!("relaxed {} pairs in {elapsed:?}", dropped.len());
+        assert_eq!(dropped.len(), 5000);
+        assert!(schema["properties"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|p| *p == json!({"type": "string"})));
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
 
     #[test]

@@ -538,7 +538,8 @@ pub(crate) fn de_tool_calls<'de, D: serde::Deserializer<'de>>(
 
 /// Drop from `tool`'s `parameters` every bound pair no value can meet
 /// ([`relax_unsatisfiable_bounds`]), such as `minLength` above `maxLength`,
-/// logging each pair with the tool's name; `true` when one was dropped.
+/// logging once per tool (its name, how many pairs, the first); `true`
+/// when one was dropped.
 ///
 /// The server must accept such a tool (the client chose it, and a 400
 /// would refuse a request the model may never call it in), but no call
@@ -551,17 +552,18 @@ fn relax_parameters(tool: &mut Tool) -> bool {
         return false;
     };
     let dropped = relax_unsatisfiable_bounds(parameters);
+    let Some(first) = dropped.first() else {
+        return false;
+    };
     let name = tool.function.get("name").and_then(Value::as_str);
-    for found in &dropped {
-        tracing::warn!(
-            tool = name.unwrap_or(""),
-            detail = %found.detail,
-            "tool parameters hold a bound pair no value can meet; dropping {} and {}",
-            found.lower,
-            found.upper
-        );
-    }
-    !dropped.is_empty()
+    // One line per tool, however many pairs it held.
+    tracing::warn!(
+        tool = name.unwrap_or(""),
+        pairs = dropped.len(),
+        first = %first.detail,
+        "tool parameters hold bound pairs no value can meet; dropping them"
+    );
+    true
 }
 
 /// The parameters schema of a tool that declares none: any object.
@@ -1699,6 +1701,52 @@ mod tests {
             None,
         );
         assert_eq!(p.tools[0].function["parameters"], fine);
+        assert!(p.relaxed.is_empty() && !p.grammar_relaxed());
+    }
+
+    #[test]
+    fn a_pair_in_defs_is_dropped_before_the_defs_are_hoisted() {
+        let params = json!({"type": "object", "properties": {"a": {"$ref": "#/$defs/A"}},
+            "$defs": {"A": {"type": "string", "minLength": 5, "maxLength": 2}}});
+        let p = pol(
+            json!([with_params("f", params)]),
+            Some(json!("required")),
+            None,
+        );
+        assert_eq!(
+            p.tools[0].function["parameters"]["$defs"]["A"],
+            json!({"type": "string"})
+        );
+        let g = tool_grammar(&p, None).expect("a call grammar");
+        let b: Value = serde_json::from_str(&g.body).unwrap();
+        assert!(b["$defs"].is_object(), "{}", g.body);
+        assert!(!g.body.contains("minLength"), "{}", g.body);
+        assert!(!g.body.contains("maxLength"), "{}", g.body);
+        assert_eq!(p.relaxed, BTreeSet::from([0]));
+        assert!(p.grammar_relaxed());
+    }
+
+    #[test]
+    fn allowed_tools_counts_a_relaxed_tool_only_when_it_is_kept() {
+        let bad = json!({"type": "object", "properties": {
+            "city": {"type": "string", "minLength": 5, "maxLength": 2}}});
+        let t = json!([weather(), with_params("f", bad), func("g")]);
+        // The relaxed tool is among the allowed ones: the grammar covers it.
+        let p = pol(
+            t.clone(),
+            Some(allowed("required", json!([func("g"), func("f")]))),
+            None,
+        );
+        assert_eq!(names(&p), ["f", "g"]);
+        assert_eq!(p.relaxed, BTreeSet::from([0]));
+        assert!(p.grammar_relaxed());
+        // Narrowing leaves it out: nothing sent lost a pair.
+        let p = pol(
+            t,
+            Some(allowed("required", json!([func("g"), func("get_weather")]))),
+            None,
+        );
+        assert_eq!(names(&p), ["get_weather", "g"]);
         assert!(p.relaxed.is_empty() && !p.grammar_relaxed());
     }
 

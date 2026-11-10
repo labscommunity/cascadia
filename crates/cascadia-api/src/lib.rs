@@ -10969,6 +10969,48 @@ level={{ effort_map[eff] }}";
         assert!(!task.prompt.contains("minLength"), "{}", task.prompt);
         assert_eq!(task.grammar, None);
         assert_eq!(rejected(), before);
+
+        // Auto beside a JSON format: the union covers the relaxed tool,
+        // counted once.
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let before = rejected();
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([tool]),
+                serde_json::json!({"tool_choice": "auto",
+                    "response_format": {"type": "json_object"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        let grammar = task.grammar.expect("the union is sent");
+        assert!(!grammar.body.contains("minLength"), "{}", grammar.body);
+        assert_eq!(rejected(), before + 1);
+
+        // allowed_tools: counted when the relaxed tool is kept, not when
+        // narrowing leaves it out.
+        let allowed = |name: &str| {
+            serde_json::json!({"tool_choice": {"type": "allowed_tools", "allowed_tools": {
+                "mode": "required",
+                "tools": [{"type": "function", "function": {"name": name}}]}}})
+        };
+        for (name, counted) in [("get_city", 1), ("get_weather", 0)] {
+            let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+            let before = rejected();
+            let (status, v) = post_chat(
+                app,
+                tool_body(
+                    serde_json::json!([tool, city_tool("get_weather")]),
+                    allowed(name),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert!(last_task(&seen).grammar.is_some(), "{name}");
+            assert_eq!(rejected(), before + counted, "{name}");
+        }
     }
 
     #[tokio::test]
