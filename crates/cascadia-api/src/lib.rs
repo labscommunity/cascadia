@@ -6534,7 +6534,6 @@ mod tests {
     #[tokio::test]
     async fn out_of_range_and_unsupported_fields_name_their_param() {
         let app = make_tool_app().await;
-        let five: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
         let refused = [
             (serde_json::json!({"temperature": -0.1}), "temperature"),
             (serde_json::json!({"temperature": 2.5}), "temperature"),
@@ -6553,7 +6552,6 @@ mod tests {
                 serde_json::json!({"logprobs": true, "top_logprobs": 21}),
                 "top_logprobs",
             ),
-            (serde_json::json!({"stop": five}), "stop"),
             (
                 serde_json::json!({"reasoning_effort": "turbo"}),
                 "reasoning_effort",
@@ -6603,7 +6601,7 @@ mod tests {
             }
         }
 
-        let four: Vec<String> = (0..4).map(|i| format!("s{i}")).collect();
+        let nine: Vec<String> = (0..9).map(|i| format!("s{i}")).collect();
         let mut accepted = vec![
             serde_json::json!({"temperature": 0}),
             serde_json::json!({"temperature": 2}),
@@ -6615,7 +6613,7 @@ mod tests {
             serde_json::json!({"n": null}),
             serde_json::json!({"logprobs": true, "top_logprobs": 20}),
             serde_json::json!({"top_logprobs": null}),
-            serde_json::json!({"stop": four}),
+            serde_json::json!({"stop": nine}),
             serde_json::json!({"stop": []}),
             serde_json::json!({"logit_bias": {}}),
             serde_json::json!({"logit_bias": null}),
@@ -6644,7 +6642,6 @@ mod tests {
     /// `/v1/completions` holds its sampling fields to the same ranges.
     #[tokio::test]
     async fn completions_out_of_range_fields_name_their_param() {
-        let five: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
         let cases = [
             (serde_json::json!({"temperature": 3}), "temperature"),
             (serde_json::json!({"n": 2}), "n"),
@@ -6652,7 +6649,6 @@ mod tests {
                 serde_json::json!({"logit_bias": {"50256": -100}}),
                 "logit_bias",
             ),
-            (serde_json::json!({"stop": five}), "stop"),
         ];
         for (extra, param) in cases {
             for stream in [false, true] {
@@ -6677,6 +6673,42 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// Nine stop strings, more than OpenAI documents, are served: clients
+    /// such as editor autocompletes send that many. Every one reaches the
+    /// stop list the API trims at, so the ninth still cuts the output.
+    #[tokio::test]
+    async fn any_number_of_stop_sequences_all_trim_the_output() {
+        let mut nine: Vec<String> = (0..8).map(|i| format!("zz{i}")).collect();
+        nine.push("charlie".to_owned());
+
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "max_tokens": 64, "stop": nine,
+                "messages": [{"role": "user", "content": "alpha bravo charlie delta"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(content.trim(), "alpha bravo", "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "max_tokens": 64, "stop": nine,
+                "prompt": "alpha bravo charlie delta"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let text = v["choices"][0]["text"].as_str().unwrap();
+        assert_eq!(text.trim(), "alpha bravo", "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [], "stop": nine}))
+        .unwrap();
+        assert_eq!(req.sampling_params().stop, nine);
     }
 
     /// End to end: an array-content request is served like the string form.

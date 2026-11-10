@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::{ChatCompletionRequest, CompletionRequest, StopSpec};
+use crate::{ChatCompletionRequest, CompletionRequest};
 
 /// A request field whose value OpenAI's API would refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,8 +31,6 @@ impl FieldError {
 pub const REASONING_EFFORTS: [&str; 7] =
     ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// The most `stop` sequences OpenAI takes.
-const MAX_STOP: usize = 4;
 /// The most `top_logprobs` OpenAI returns per position.
 const MAX_TOP_LOGPROBS: u32 = 20;
 
@@ -73,18 +71,6 @@ pub fn check_reasoning_effort(v: &str, param: &str) -> Result<(), FieldError> {
                 "{param} `{v}` is not one of {}",
                 REASONING_EFFORTS.join(", ")
             ),
-        ))
-    }
-}
-
-/// `stop`: at most four sequences.
-pub fn check_stop_count(n: usize) -> Result<(), FieldError> {
-    if n <= MAX_STOP {
-        Ok(())
-    } else {
-        Err(FieldError::new(
-            "stop",
-            format!("stop has {n} sequences; at most {MAX_STOP} are allowed"),
         ))
     }
 }
@@ -171,14 +157,6 @@ fn check_logit_bias(logit_bias: Option<&Value>) -> Result<(), FieldError> {
     }
 }
 
-fn stop_count(stop: Option<&StopSpec>) -> usize {
-    match stop {
-        None => 0,
-        Some(StopSpec::Single(_)) => 1,
-        Some(StopSpec::Multiple(v)) => v.len(),
-    }
-}
-
 /// Every check above that applies to a `/v1/chat/completions` request.
 pub fn check_chat(req: &ChatCompletionRequest) -> Result<(), FieldError> {
     check_temperature(req.temperature, "temperature")?;
@@ -195,7 +173,6 @@ pub fn check_chat(req: &ChatCompletionRequest) -> Result<(), FieldError> {
     if let Some(v) = req.top_logprobs {
         check_top_logprobs(v)?;
     }
-    check_stop_count(stop_count(req.stop.as_ref()))?;
     if let Some(e) = req.reasoning_effort.as_deref() {
         check_reasoning_effort(e, "reasoning_effort")?;
     }
@@ -220,7 +197,6 @@ pub fn check_completion(req: &CompletionRequest) -> Result<(), FieldError> {
         check_penalty(v, "presence_penalty")?;
     }
     check_n(req.n)?;
-    check_stop_count(stop_count(req.stop.as_ref()))?;
     check_logit_bias(req.logit_bias.as_ref())
 }
 
@@ -244,8 +220,6 @@ mod tests {
         assert!(check_penalty(2.1, "presence_penalty").is_err());
         assert!(check_top_logprobs(20).is_ok());
         assert!(check_top_logprobs(21).is_err());
-        assert!(check_stop_count(4).is_ok());
-        assert_eq!(check_stop_count(5).unwrap_err().param, "stop");
     }
 
     #[test]
