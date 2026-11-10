@@ -443,9 +443,14 @@ impl Drop for EndInflight {
     }
 }
 
-/// The final chunk for a cancelled task: empty, `Cancelled` (M18 D4).
-fn cancelled_chunk(task_id: &TaskId) -> Chunk {
-    Chunk::final_marker(task_id.clone(), "").with_finish_reason(FinishReason::Cancelled)
+/// The final chunk for a cancelled task: empty, `Cancelled` (M18 D4), with
+/// the prompt's token count when it is known, so the runner books the prompt.
+/// No text and no `n_tokens`: no TTFT sample, 0 generated tokens.
+fn cancelled_chunk(task_id: &TaskId, prompt_tokens: Option<u32>) -> Chunk {
+    let mut chunk =
+        Chunk::final_marker(task_id.clone(), "").with_finish_reason(FinishReason::Cancelled);
+    chunk.prompt_tokens = prompt_tokens;
+    chunk
 }
 
 pub struct OvGenaiEngine {
@@ -537,7 +542,7 @@ impl Engine for OvGenaiEngine {
         let _end = EndInflight(self.inflight.clone());
         if self.inflight.begin(&task.task_id) {
             info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
-            let chunk = cancelled_chunk(&task.task_id);
+            let chunk = cancelled_chunk(&task.task_id, None);
             return Ok(vec![(task.task_id, chunk)]);
         }
         let max_new = if task.max_tokens > 0 {
@@ -641,7 +646,7 @@ impl Engine for OvGenaiEngine {
                 elapsed_s = started.elapsed().as_secs_f64(),
                 "task cancelled"
             );
-            let chunk = cancelled_chunk(&task.task_id);
+            let chunk = cancelled_chunk(&task.task_id, prompt_tokens);
             return Ok(vec![(task.task_id, chunk)]);
         }
         let result = match generated {
@@ -2210,34 +2215,51 @@ mod tests {
         })
     }
 
-    /// Run `f` with an INFO fmt subscriber writing to a buffer; returns the
-    /// buffer.
+    std::thread_local! {
+        /// Where the test subscriber writes this thread's log lines, if anywhere.
+        static LOG_BUF: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writes into the current thread's [`LOG_BUF`], else nowhere.
+    struct ThreadLogBuf;
+
+    impl std::io::Write for ThreadLogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            LOG_BUF.with(|cell| {
+                if let Some(buf) = cell.borrow().as_ref() {
+                    buf.lock().unwrap().extend_from_slice(b);
+                }
+            });
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` and return the INFO log lines it wrote on this thread.
+    ///
+    /// One global INFO subscriber for the whole test binary, writing per
+    /// thread. A scoped subscriber (`with_default`) per test raced with
+    /// parallel tests that hit the same log callsites with no subscriber:
+    /// tracing could cache such a callsite as never enabled and drop the
+    /// line the test reads.
     fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-            type Writer = Buf;
-            fn make_writer(&'a self) -> Buf {
-                self.clone()
-            }
-        }
-        let buf = Buf::default();
-        let sub = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let r = tracing::subscriber::with_default(sub, f);
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let sub = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLogBuf)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::set_global_default(sub).expect("one test subscriber");
+        });
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        LOG_BUF.with(|cell| *cell.borrow_mut() = Some(buf.clone()));
+        let r = f();
+        LOG_BUF.with(|cell| *cell.borrow_mut() = None);
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         (r, out)
     }
 
@@ -2315,6 +2337,76 @@ mod tests {
         assert!(logs.contains("tokens=3"), "{logs}");
         // end() ran: the handle is free for the next task.
         assert!(!h.cancelled());
+    }
+
+    /// An interrupted generation still books its prompt: the cancelled final
+    /// carries `prompt_tokens` (counted before generate), with no text and no
+    /// `n_tokens`, so no TTFT sample and 0 generated tokens.
+    #[tokio::test]
+    async fn stateful_interrupt_books_the_prompt_tokens() {
+        use cascadia_types::{PeerLayout, ShardSpec};
+        use futures::StreamExt;
+        const MODEL: &str = "ov-genai-interrupt-prompt-model";
+
+        struct Prebuilt(Option<Box<dyn Engine>>);
+        #[async_trait::async_trait]
+        impl Builder for Prebuilt {
+            async fn connect(&mut self, _peers: PeerLayout) -> EngineResult<()> {
+                Ok(())
+            }
+            async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+            fn build(mut self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+                Ok(self.0.take().unwrap())
+            }
+        }
+
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let e = stateful_engine(&st);
+        let h = e.inflight_cancel().unwrap();
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["one", " two", " three"]);
+            // What Runner::interrupt does: signal the handle, nothing else.
+            s.cancel_before = Some((1, h, TaskId::from("t-intr")));
+        }
+        let runner = Arc::new(cascadia_runner::Runner::new(Box::new(Prebuilt(Some(e)))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+        let prompt = || {
+            cascadia_metrics::TOKENS_PROMPT_TOTAL
+                .with_label_values(&[MODEL])
+                .get()
+        };
+        let generated = || {
+            cascadia_metrics::TOKENS_GENERATED_TOTAL
+                .with_label_values(&[MODEL])
+                .get()
+        };
+        let ttft = || {
+            cascadia_metrics::GENERATION_TTFT_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count()
+        };
+        let (p0, g0, t0) = (prompt(), generated(), ttft());
+        let mut stream = runner.generate_async(task("t-intr", 64)).await.unwrap();
+        let mut last = None;
+        while let Some(c) = stream.next().await {
+            last = Some(c);
+        }
+        let last = last.expect("a final chunk");
+        assert!(is_empty_cancelled(&last), "{last:?}");
+        assert_eq!(last.n_tokens, None);
+        // The mock counts the prompt "hello" as 1 token.
+        assert_eq!(prompt() - p0, 1, "the prompt is booked");
+        assert_eq!(generated() - g0, 0);
+        assert_eq!(ttft() - t0, 0, "no TTFT sample");
     }
 
     #[test]

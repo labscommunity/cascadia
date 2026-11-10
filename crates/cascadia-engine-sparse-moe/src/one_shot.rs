@@ -29,9 +29,14 @@ impl Drop for EndInflight {
     }
 }
 
-/// The final chunk for a cancelled task: empty, `Cancelled` (M18 D4).
-pub(crate) fn cancelled_chunk(task_id: &TaskId) -> Chunk {
-    Chunk::final_marker(task_id.clone(), "").with_finish_reason(FinishReason::Cancelled)
+/// The final chunk for a cancelled task: empty, `Cancelled` (M18 D4), with
+/// the prompt's token count when it is known, so the runner books the prompt.
+/// No text and no `n_tokens`: no TTFT sample, 0 generated tokens.
+pub(crate) fn cancelled_chunk(task_id: &TaskId, prompt_tokens: Option<u32>) -> Chunk {
+    let mut chunk =
+        Chunk::final_marker(task_id.clone(), "").with_finish_reason(FinishReason::Cancelled);
+    chunk.prompt_tokens = prompt_tokens;
+    chunk
 }
 
 /// Decodes a window of generated ids with the engine's final-decode options.

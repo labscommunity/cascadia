@@ -1852,7 +1852,7 @@ impl SparseMoEEngine {
         let _end = crate::one_shot::EndInflight(Arc::clone(&inflight));
         if inflight.begin(&task.task_id) {
             info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
-            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id, None);
             return vec![(task.task_id, chunk)];
         }
         #[cfg(feature = "kv_coord")]
@@ -2013,7 +2013,8 @@ impl SparseMoEEngine {
                 elapsed_s = started.elapsed().as_secs_f64(),
                 "task cancelled"
             );
-            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            let chunk =
+                crate::one_shot::cancelled_chunk(&task.task_id, Some(prompt_ids.len() as u32));
             return vec![(task.task_id, chunk)];
         }
         let generated = match generated {
@@ -4149,7 +4150,7 @@ impl OvMoeEngine {
         let _end = crate::one_shot::EndInflight(Arc::clone(&inflight));
         if inflight.begin(&task.task_id) {
             info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
-            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id, None);
             return vec![(task.task_id, chunk)];
         }
         #[cfg(feature = "kv_coord")]
@@ -4241,7 +4242,8 @@ impl OvMoeEngine {
                 elapsed_s = started.elapsed().as_secs_f64(),
                 "task cancelled"
             );
-            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            let chunk =
+                crate::one_shot::cancelled_chunk(&task.task_id, Some(prompt_ids.len() as u32));
             return vec![(task.task_id, chunk)];
         }
         let generated = match generated {
@@ -7130,7 +7132,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let _end = crate::one_shot::EndInflight(Arc::clone(&inflight));
         if inflight.begin(&task.task_id) {
             info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
-            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id, None);
             return vec![(task.task_id, chunk)];
         }
         let Some(tok) = self.tokenizer.as_ref() else {
@@ -7206,7 +7208,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 elapsed_s = started.elapsed().as_secs_f64(),
                 "task cancelled"
             );
-            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            let chunk =
+                crate::one_shot::cancelled_chunk(&task.task_id, Some(prompt_ids.len() as u32));
             return vec![(task.task_id, chunk)];
         }
         let (generated, hit_context_cap, timing) = match outcome {
@@ -9075,6 +9078,10 @@ mod tests {
         assert!(logs.contains("task cancelled"), "{logs}");
         assert!(logs.contains("tokens=3"), "{logs}");
         assert!(!h.cancelled(), "end() freed the handle");
+        // The prompt length is known: the runner books it (no text, no
+        // n_tokens, so no TTFT and 0 generated).
+        assert_eq!(out[0].1.prompt_tokens, Some(4));
+        assert_eq!(out[0].1.n_tokens, None);
     }
 
     #[test]
