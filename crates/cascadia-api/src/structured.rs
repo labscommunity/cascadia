@@ -344,6 +344,7 @@ fn parse_json_schema(js: Option<&Value>, raw: &str) -> Result<ResponseFormat, St
         Some(schema @ Value::Object(_)) => {
             let text = raw_schema_text(raw)?;
             check_limits(schema, &text)?;
+            check_bounds(schema)?;
             let (schema, text) = match merge_object_all_of(&text) {
                 Some(merged) => (
                     serde_json::from_str(&merged).map_err(|e| format!("{FIELD}: {e}"))?,
@@ -418,6 +419,110 @@ fn check_limits(schema: &Value, text: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Bound pairs no value can satisfy when `lower` is above `upper`
+/// (`strict`: not below it), as `(lower, upper, strict)`.
+const BOUND_PAIRS: [(&str, &str, bool); 7] = [
+    ("minLength", "maxLength", false),
+    ("minItems", "maxItems", false),
+    ("minProperties", "maxProperties", false),
+    ("minimum", "maximum", false),
+    ("exclusiveMinimum", "exclusiveMaximum", true),
+    ("minimum", "exclusiveMaximum", true),
+    ("exclusiveMinimum", "maximum", true),
+];
+
+/// The first bound pair in `schema` that no value can satisfy, such as
+/// `minLength` above `maxLength` or `exclusiveMinimum` not below
+/// `exclusiveMaximum`, described with the JSON pointer (`#`, `#/items`, ...)
+/// of the object holding it; `None` when there is none.
+///
+/// Such a schema has no valid output at all. Some grammar backends refuse
+/// it, others build a grammar no output can finish and decode until the
+/// request is killed, so [`parse_response_format`] refuses it up front.
+/// This only reports, for callers that would rather drop the constraint.
+///
+/// Like [`sum_counts`], it visits every object in the document, data keys
+/// included: a `$ref` may point anywhere. Only numeric values are compared,
+/// so a property map whose names are keywords is never read as bounds.
+/// `minContains`/`maxContains` are left alone: no backend enforces
+/// `contains`, so they never empty the grammar. The boolean (draft 4) form
+/// of `exclusiveMinimum`/`exclusiveMaximum` is not a number and is skipped.
+pub fn unsatisfiable_bound(schema: &Value) -> Option<String> {
+    let mut path = Vec::new();
+    find_unsatisfiable_bound(schema, &mut path, 0)
+}
+
+fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> Option<String> {
+    // Past the nesting cap [`check_limits`] enforces; a bare call may get here.
+    if depth > MAX_SCHEMA_DEPTH {
+        return None;
+    }
+    let descend = |path: &mut Vec<String>, key: String, child: &Value| {
+        path.push(key);
+        let found = find_unsatisfiable_bound(child, path, depth + 1);
+        path.pop();
+        found
+    };
+    match v {
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| descend(path, i.to_string(), c)),
+        Value::Object(obj) => {
+            for (lower, upper, strict) in BOUND_PAIRS {
+                let (Some(Value::Number(lo)), Some(Value::Number(hi))) =
+                    (obj.get(lower), obj.get(upper))
+                else {
+                    continue;
+                };
+                let Some(order) = compare_numbers(lo, hi) else {
+                    continue;
+                };
+                let empty = if strict { order.is_ge() } else { order.is_gt() };
+                if empty {
+                    let relation = if strict {
+                        "is not less than"
+                    } else {
+                        "is greater than"
+                    };
+                    let mut pointer = String::from("#");
+                    for key in path.iter() {
+                        pointer.push('/');
+                        pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                    }
+                    return Some(format!(
+                        "{lower} ({lo}) {relation} {upper} ({hi}) at {pointer}"
+                    ));
+                }
+            }
+            obj.iter().find_map(|(k, c)| descend(path, k.clone(), c))
+        }
+        _ => None,
+    }
+}
+
+/// `a` against `b`: exactly when both are integers, else as doubles.
+fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    let int = |n: &serde_json::Number| {
+        n.as_i64()
+            .map(i128::from)
+            .or_else(|| n.as_u64().map(i128::from))
+    };
+    match (int(a), int(b)) {
+        (Some(a), Some(b)) => Some(a.cmp(&b)),
+        _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
+    }
+}
+
+/// Reject a schema holding a bound pair no value can satisfy
+/// ([`unsatisfiable_bound`]).
+fn check_bounds(schema: &Value) -> Result<(), String> {
+    match unsatisfiable_bound(schema) {
+        Some(found) => Err(format!("{FIELD}: {found}; no output can match it")),
+        None => Ok(()),
+    }
 }
 
 /// Add the number of `patternProperties` keys of every object in `v` to
@@ -3279,5 +3384,180 @@ mod tests {
             parse_schema(fits),
             Ok(ResponseFormat::JsonSchema { .. })
         ));
+    }
+
+    /// The 400 message for an unsatisfiable bound pair.
+    fn unsat(detail: &str) -> Result<ResponseFormat, String> {
+        Err(format!(
+            "response_format.json_schema.schema: {detail}; no output can match it"
+        ))
+    }
+
+    #[test]
+    fn min_length_above_max_length_is_rejected() {
+        assert_eq!(
+            parse_schema(json!({"type": "string", "minLength": 5, "maxLength": 2})),
+            unsat("minLength (5) is greater than maxLength (2) at #")
+        );
+    }
+
+    #[test]
+    fn min_items_above_max_items_is_rejected() {
+        assert_eq!(
+            parse_schema(json!({"type": "array", "minItems": 5, "maxItems": 2})),
+            unsat("minItems (5) is greater than maxItems (2) at #")
+        );
+    }
+
+    #[test]
+    fn min_properties_above_max_properties_is_rejected() {
+        assert_eq!(
+            parse_schema(json!({"type": "object", "minProperties": 3, "maxProperties": 1})),
+            unsat("minProperties (3) is greater than maxProperties (1) at #")
+        );
+    }
+
+    #[test]
+    fn minimum_above_maximum_is_rejected() {
+        assert_eq!(
+            parse_schema(json!({"type": "number", "minimum": 5, "maximum": 2.5})),
+            unsat("minimum (5) is greater than maximum (2.5) at #")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": "integer", "minimum": -1, "maximum": -2})),
+            unsat("minimum (-1) is greater than maximum (-2) at #")
+        );
+    }
+
+    #[test]
+    fn exclusive_minimum_not_below_exclusive_maximum_is_rejected() {
+        assert_eq!(
+            parse_schema(json!({"type": "number", "exclusiveMinimum": 2, "exclusiveMaximum": 2})),
+            unsat("exclusiveMinimum (2) is not less than exclusiveMaximum (2) at #")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": "number", "exclusiveMinimum": 3, "exclusiveMaximum": 2})),
+            unsat("exclusiveMinimum (3) is not less than exclusiveMaximum (2) at #")
+        );
+    }
+
+    #[test]
+    fn minimum_not_below_exclusive_maximum_is_rejected() {
+        assert_eq!(
+            parse_schema(json!({"type": "number", "minimum": 2, "exclusiveMaximum": 2})),
+            unsat("minimum (2) is not less than exclusiveMaximum (2) at #")
+        );
+    }
+
+    #[test]
+    fn exclusive_minimum_not_below_maximum_is_rejected() {
+        assert_eq!(
+            parse_schema(json!({"type": "number", "exclusiveMinimum": 2, "maximum": 2})),
+            unsat("exclusiveMinimum (2) is not less than maximum (2) at #")
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_bounds_are_found_nested() {
+        // Inside `properties`, and the pointer escapes `/` and `~` per RFC 6901.
+        assert_eq!(
+            parse_schema(json!({
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "string"},
+                    "a/b~c": {"type": "string", "minLength": 5, "maxLength": 2}
+                }
+            })),
+            unsat("minLength (5) is greater than maxLength (2) at #/properties/a~1b~0c")
+        );
+        // Inside `items`.
+        assert_eq!(
+            parse_schema(json!({
+                "type": "array",
+                "items": {"type": "array", "minItems": 4, "maxItems": 3}
+            })),
+            unsat("minItems (4) is greater than maxItems (3) at #/items")
+        );
+        // Inside an `anyOf` branch and `prefixItems`.
+        assert_eq!(
+            parse_schema(json!({
+                "anyOf": [
+                    {"type": "null"},
+                    {"type": "array", "prefixItems": [{"type": "number", "minimum": 1, "maximum": 0}]}
+                ]
+            })),
+            unsat("minimum (1) is greater than maximum (0) at #/anyOf/1/prefixItems/0")
+        );
+        // An `additionalProperties` schema.
+        assert_eq!(
+            parse_schema(json!({
+                "type": "object",
+                "additionalProperties": {"type": "object", "minProperties": 2, "maxProperties": 1}
+            })),
+            unsat("minProperties (2) is greater than maxProperties (1) at #/additionalProperties")
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_bounds_reached_through_ref_are_rejected() {
+        assert_eq!(
+            parse_schema(json!({
+                "type": "object",
+                "properties": {"name": {"$ref": "#/$defs/Name"}},
+                "required": ["name"],
+                "$defs": {"Name": {"type": "string", "minLength": 5, "maxLength": 2}}
+            })),
+            unsat("minLength (5) is greater than maxLength (2) at #/$defs/Name")
+        );
+        assert_eq!(
+            parse_schema(json!({
+                "$ref": "#/definitions/N",
+                "definitions": {"N": {"type": "number", "exclusiveMinimum": 1, "maximum": 1}}
+            })),
+            unsat("exclusiveMinimum (1) is not less than maximum (1) at #/definitions/N")
+        );
+    }
+
+    #[test]
+    fn equal_and_open_bounds_are_accepted() {
+        for schema in [
+            json!({"type": "string", "minLength": 3, "maxLength": 3}),
+            json!({"type": "array", "minItems": 2, "maxItems": 2}),
+            json!({"type": "object", "minProperties": 1, "maxProperties": 1}),
+            json!({"type": "number", "minimum": 2, "maximum": 2}),
+            json!({"type": "number", "minimum": 1.5, "exclusiveMaximum": 2}),
+            json!({"type": "number", "exclusiveMinimum": 1, "maximum": 1.5}),
+            json!({"type": "number", "exclusiveMinimum": 1, "exclusiveMaximum": 1.5}),
+            json!({"type": "string", "minLength": 5}),
+            json!({"type": "array", "maxItems": 0}),
+            json!({"type": "number", "minimum": 100}),
+            json!({"type": "number", "exclusiveMaximum": -100}),
+            // A property map whose names are keywords holds schemas, not bounds.
+            json!({
+                "type": "object",
+                "properties": {"minLength": {"type": "integer"}, "maxLength": {"type": "integer"}}
+            }),
+        ] {
+            assert!(
+                matches!(
+                    parse_schema(schema.clone()),
+                    Ok(ResponseFormat::JsonSchema { .. })
+                ),
+                "{schema}"
+            );
+            assert_eq!(unsatisfiable_bound(&schema), None, "{schema}");
+        }
+    }
+
+    #[test]
+    fn unsatisfiable_bound_reports_without_failing() {
+        assert_eq!(
+            unsatisfiable_bound(&json!({
+                "type": "object",
+                "properties": {"a": {"type": "string", "minLength": 5, "maxLength": 2}}
+            }))
+            .as_deref(),
+            Some("minLength (5) is greater than maxLength (2) at #/properties/a")
+        );
     }
 }

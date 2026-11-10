@@ -29,8 +29,8 @@ use uuid::Uuid;
 
 mod structured;
 pub use structured::{
-    grammar_for, parse_response_format, unenforced_keywords, ResponseFormat, SchemaCheckError,
-    SchemaCompileCheck, JSON_OBJECT_SCHEMA, MAX_SCHEMA_BYTES, MAX_SCHEMA_COUNT,
+    grammar_for, parse_response_format, unenforced_keywords, unsatisfiable_bound, ResponseFormat,
+    SchemaCheckError, SchemaCompileCheck, JSON_OBJECT_SCHEMA, MAX_SCHEMA_BYTES, MAX_SCHEMA_COUNT,
     MAX_SCHEMA_COUNT_TOTAL, MAX_SCHEMA_DEPTH,
 };
 

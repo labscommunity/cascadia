@@ -914,3 +914,69 @@ fn word_level_with_a_decoder_that_rewrites_tokens_is_still_unsupported() {
         "{err:?}"
     );
 }
+
+/// What llguidance does with a schema whose bounds no value meets: it
+/// refuses each one at build time, naming the pair, rather than building a
+/// grammar no output can finish. `contains` is not enforced, so
+/// `minContains > maxContains` builds with a warning. The API refuses all
+/// of them but the last before any engine sees them: llama-server builds
+/// a grammar for such a schema and then decodes until killed.
+#[test]
+fn unsatisfiable_bounds_are_refused_at_build() {
+    let gf = single_byte();
+    for (body, says) in [
+        (
+            r#"{"type":"string","minLength":5,"maxLength":2}"#,
+            "minLength (5) is greater than maxLength (2)",
+        ),
+        (
+            r#"{"type":"array","minItems":5,"maxItems":2}"#,
+            "minItems (5) is greater than maxItems (2)",
+        ),
+        (
+            r#"{"type":"object","minProperties":5,"maxProperties":2}"#,
+            "minProperties > maxProperties",
+        ),
+        (
+            r#"{"type":"number","minimum":5,"maximum":2}"#,
+            "minimum (5) is greater than maximum (2)",
+        ),
+        (
+            r#"{"type":"number","exclusiveMinimum":2,"exclusiveMaximum":2}"#,
+            "exclusiveMinimum (2) is equal to exclusiveMaximum (2)",
+        ),
+        (
+            r#"{"type":"number","minimum":2,"exclusiveMaximum":2}"#,
+            "minimum (2) is equal to exclusiveMaximum (2)",
+        ),
+        (
+            r#"{"type":"number","exclusiveMinimum":2,"maximum":2}"#,
+            "exclusiveMinimum (2) is equal to maximum (2)",
+        ),
+        (
+            r#"{"type":"object","properties":{"a":{"type":"string","minLength":5,"maxLength":2}},"required":["a"]}"#,
+            "required property 'a' is unsatisfiable",
+        ),
+    ] {
+        let err = gf
+            .compile(&spec(body))
+            .err()
+            .unwrap_or_else(|| panic!("{body} built"));
+        let msg = err.to_string();
+        assert!(msg.contains("Unsatisfiable schema"), "{body}: {msg}");
+        assert!(msg.contains(says), "{body}: {msg}");
+    }
+    let contains = gf
+        .compile(&spec(
+            r#"{"type":"array","contains":{"type":"string"},"minContains":5,"maxContains":2}"#,
+        ))
+        .unwrap();
+    assert!(
+        contains
+            .warnings()
+            .iter()
+            .any(|w| w.contains("minContains")),
+        "{:?}",
+        contains.warnings()
+    );
+}

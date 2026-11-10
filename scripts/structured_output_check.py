@@ -376,6 +376,21 @@ def case_ref_depth(base):
     verdict("server_alive_after_ref_depth", status == 200, f"HTTP {status} {dt:.2f}s")
 
 
+
+def case_unsatisfiable_bounds(base):
+    # Bounds no value meets: a grammar built from them can never finish, and a backend that
+    # builds it anyway decodes until killed. The server must refuse it fast.
+    for kind, schema in (
+        ("string", {"type": "string", "minLength": 5, "maxLength": 2}),
+        ("array", {"type": "array", "minItems": 5, "maxItems": 2}),
+    ):
+        body = chat([{"role": "user", "content": "hi"}], response_format=rf_schema(schema), max_tokens=8)
+        status, raw, dt = post(base, body, timeout=30)
+        ok = status == 400 and "invalid response_format" in raw and "no output can match it" in raw and dt < 5
+        verdict(f"unsatisfiable_bounds_400_{kind}", ok, f"HTTP {status} {dt:.2f}s: {raw[:200]}")
+    status, raw, dt = post(base, chat([{"role": "user", "content": "Say hello."}], max_tokens=8))
+    verdict("server_alive_after_unsatisfiable_bounds", status == 200, f"HTTP {status} {dt:.2f}s")
+
 def case_text(base):
     body = chat(
         [{"role": "user", "content": "Say hello."}],
@@ -450,6 +465,7 @@ CASES = {
     "bad_schema": case_bad_schema,
     "cap": case_cap,
     "ref_depth": case_ref_depth,
+    "unsatisfiable_bounds": case_unsatisfiable_bounds,
     "text": case_text,
     "tools": case_tools,
 }
