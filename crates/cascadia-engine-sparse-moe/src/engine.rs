@@ -937,17 +937,20 @@ impl Builder for SparseMoEBuilder {
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built DeepSeek-V4 dsv4 engine");
-            return Ok(Box::new(Dsv4Engine::new(
-                runner,
-                self.tokenizer,
-                self.transport,
-                runtime_handle,
-                rank,
-                total,
-                // dsv4 has no config-threaded prefix cache; `None` keeps its
-                // existing env-only behaviour byte-for-byte.
-                None,
-            )));
+            return Ok(Box::new(
+                Dsv4Engine::new(
+                    runner,
+                    self.tokenizer,
+                    self.transport,
+                    runtime_handle,
+                    rank,
+                    total,
+                    // dsv4 has no config-threaded prefix cache; `None` keeps its
+                    // existing env-only behaviour byte-for-byte.
+                    None,
+                )
+                .with_engine_stop_check(self.config.engine_stop_check),
+            ));
         }
         if let Some(runner) = self.inkling_runner {
             let total = self.config.total.max(1);
@@ -969,7 +972,8 @@ impl Builder for SparseMoEBuilder {
                 total,
                 // No per-rank KV-prefix cache on this family yet (follow-up).
                 None,
-            );
+            )
+            .with_engine_stop_check(self.config.engine_stop_check);
             // `CASCADIA_STREAMS=N`: decode up to N requests together, on a
             // single stage or across the pipeline. Every rank must set the
             // same N. Off by default.
@@ -1003,17 +1007,20 @@ impl Builder for SparseMoEBuilder {
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built glm5 engine");
-            return Ok(Box::new(PipelineEngine::new(
-                runner,
-                self.tokenizer,
-                self.transport,
-                runtime_handle,
-                rank,
-                total,
-                // Same value the per-rank SliceKvCache got, so the rank-0 index
-                // and the per-rank caches stay in lockstep.
-                self.config.prefix_cache_depth.map(|d| d as usize),
-            )));
+            return Ok(Box::new(
+                PipelineEngine::new(
+                    runner,
+                    self.tokenizer,
+                    self.transport,
+                    runtime_handle,
+                    rank,
+                    total,
+                    // Same value the per-rank SliceKvCache got, so the rank-0 index
+                    // and the per-rank caches stay in lockstep.
+                    self.config.prefix_cache_depth.map(|d| d as usize),
+                )
+                .with_engine_stop_check(self.config.engine_stop_check),
+            ));
         }
         if let Some(ov) = self.ov_runner {
             let total = self.config.total.max(1);
@@ -5569,6 +5576,13 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_log: (u64, Duration, u64),
     /// Per-window time account of this rank (`CASCADIA_STAGE_PROFILE_SECS`).
     stage_profile: Option<StageProfile>,
+    /// M18: the runner signals a cancel here while the single-stage one-shot
+    /// `step()` holds the engine lock; the runner's `should_stop` reads it per
+    /// token.
+    inflight: Arc<cascadia_engine::InflightCancel>,
+    /// End a running single-stage one-shot generation at a `stop` match (M18
+    /// D6). Default `true`; see [`Self::with_engine_stop_check`].
+    engine_stop_check: bool,
 }
 
 /// Per-slot sampling state on the last rank (the driver keeps the tokens).
@@ -5925,7 +5939,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stream_admit_per_step: 1,
             stream_log: (0, Duration::ZERO, 0),
             stage_profile: None,
+            inflight: Arc::new(cascadia_engine::InflightCancel::new()),
+            engine_stop_check: true,
         }
+    }
+
+    /// M18 D6: whether a single-stage one-shot generation ends at a `stop`
+    /// match (checked in-engine on a suffix decode of the generated ids).
+    /// Off when the server has a marker dialect. A cancel ends it either way.
+    pub fn with_engine_stop_check(mut self, on: bool) -> Self {
+        self.engine_stop_check = on;
+        self
     }
 
     /// Enable multi-stream decode with up to `n` concurrent tasks, on a single
@@ -7078,6 +7102,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
             Some(t) => t,
             None => return Vec::new(),
         };
+        let inflight = Arc::clone(&self.inflight);
+        let _end = crate::one_shot::EndInflight(Arc::clone(&inflight));
+        if inflight.begin(&task.task_id) {
+            info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            return vec![(task.task_id, chunk)];
+        }
         let Some(tok) = self.tokenizer.as_ref() else {
             warn!(task = %task.task_id, "dsv4 engine has no tokenizer");
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -7117,10 +7148,42 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // has no error channel: catch it here, reset the sequence state the
         // half-finished turn left behind, and fail THIS task instead of the
         // process. The panic message carries the worker/layer diagnostics.
+        // M18: polled before each prefill token (or around a batched prefill)
+        // and each decode token. The stop check decodes the newest ids with
+        // the tokenizer and options of the per-token decode below, so its text
+        // is a substring of the streamed text (D8).
+        let mut poll = crate::one_shot::OneShotPoll::new(
+            &inflight,
+            &task.sampling.stop,
+            self.engine_stop_check,
+            |ids: &[u32]| tok.decode(ids, true).ok(),
+        );
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.runner
-                .generate_reason_timed(&prompt_ids, max_new, &sampling_cfg)
+            self.runner.generate_reason_timed_polled(
+                &prompt_ids,
+                max_new,
+                &sampling_cfg,
+                &mut |ids| poll.should_stop(ids),
+            )
         }));
+        let stopped_on_match = poll.stopped_on_match();
+        drop(poll);
+        if outcome.is_err() {
+            // Reset the sequence state the half-finished turn left behind.
+            self.runner.reset();
+        }
+        if inflight.cancelled() {
+            // Also when the forward failed after the cancel: the task ends as
+            // cancelled, never as an error or a partial success (M18 D4).
+            info!(
+                task = %task.task_id,
+                tokens = outcome.as_ref().map_or(0, |(g, _, _)| g.len()),
+                elapsed_s = started.elapsed().as_secs_f64(),
+                "task cancelled"
+            );
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            return vec![(task.task_id, chunk)];
+        }
         let (generated, hit_context_cap, timing) = match outcome {
             Ok(r) => r,
             Err(payload) => {
@@ -7130,24 +7193,34 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_else(|| "forward panicked".to_string());
                 warn!(task = %task.task_id, error = %msg, "single-stage forward failed; task aborted");
-                self.runner.reset();
                 return vec![(task.task_id.clone(), Chunk::error(task.task_id, msg))];
             }
         };
         let n_tokens = generated.len() as u32;
         let elapsed = started.elapsed().as_secs_f64();
-        info!(
-            task = %task.task_id,
-            tokens = n_tokens,
-            elapsed_s = elapsed,
-            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
-            prefill_s = timing.prefill_s,
-            decode_s = timing.decode_s,
-            decode_steps = timing.decode_steps,
-            decode_tok_s = timing.decode_tok_s(),
-            "task done ({} single-stage)",
-            self.runner.arch_name()
-        );
+        if stopped_on_match {
+            info!(
+                task = %task.task_id,
+                tokens = n_tokens,
+                elapsed_s = elapsed,
+                prefill_s = timing.prefill_s,
+                decode_s = timing.decode_s,
+                "task stopped at stop string"
+            );
+        } else {
+            info!(
+                task = %task.task_id,
+                tokens = n_tokens,
+                elapsed_s = elapsed,
+                tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+                prefill_s = timing.prefill_s,
+                decode_s = timing.decode_s,
+                decode_steps = timing.decode_steps,
+                decode_tok_s = timing.decode_tok_s(),
+                "task done ({} single-stage)",
+                self.runner.arch_name()
+            );
+        }
         // One chunk per token (id + UTF-8-safe text delta), exactly what the
         // pipeline path streams, then an empty final marker — not one
         // whole-turn text: the API's marker translation (Inkling's
@@ -7175,7 +7248,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // `prompt_ids` is already truncated to the context budget above, so its
         // length is the count actually processed.
         chunk.prompt_tokens = Some(prompt_ids.len() as u32);
-        chunk.finish_reason = Some(if hit_context_cap {
+        chunk.finish_reason = Some(if stopped_on_match {
+            FinishReason::Stop
+        } else if hit_context_cap {
             FinishReason::Length
         } else {
             finish_reason_for(n_tokens as usize, max_new)
@@ -8505,7 +8580,19 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 self.runner.close_stream(st.slot);
             }
         }
+        // A running single-stage one-shot task is ended through `inflight`
+        // (signalled by the runner for this id too); a queued one will now
+        // never begin, so drop that early entry.
+        self.inflight.forget(task_id);
         self.note_link_busy();
+    }
+
+    /// Only for the single-stage one-shot path (M18), where one blocking
+    /// runner call makes the whole answer. The multi-stage driver and the
+    /// multi-stream path (`CASCADIA_STREAMS`) already end at the next token
+    /// through [`Engine::cancel`], so they keep no handle (unchanged).
+    fn inflight_cancel(&self) -> Option<Arc<cascadia_engine::InflightCancel>> {
+        (self.total <= 1 && self.stream_cap == 0).then(|| Arc::clone(&self.inflight))
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -8740,6 +8827,346 @@ mod tests {
             reason.starts_with("resume_unsupported:"),
             "sentinel must PREFIX the reason (callers match with starts_with): {reason}"
         );
+    }
+
+    // -------- M18 task 6c: PipelineEngine single-stage in-flight cancel/stop --------
+
+    /// A `StagedRunner` that "generates" a fixed script of ids: the head's
+    /// logits are one-hot at `script[n]` for the n-th generated token. It
+    /// records the positions it forwarded, and can cancel a task (or panic)
+    /// from inside the forward at a given position, the way a cancel lands
+    /// while the engine holds its lock in `step()`.
+    struct ScriptRunner {
+        prompt_len: usize,
+        script: Vec<u32>,
+        last_pos: usize,
+        forwarded: Vec<usize>,
+        batches: usize,
+        batched: bool,
+        cancel_at: Option<(usize, Arc<cascadia_engine::InflightCancel>, TaskId)>,
+        panic_at: Option<usize>,
+    }
+
+    /// Vocabulary of the script tokenizer: `w0`..`w9` are ids 0..9, `stop` 10.
+    const SCRIPT_VOCAB: usize = 11;
+    const STOP_ID: u32 = 10;
+
+    impl ScriptRunner {
+        fn new(prompt_len: usize, script: Vec<u32>) -> Self {
+            Self {
+                prompt_len,
+                script,
+                last_pos: 0,
+                forwarded: Vec::new(),
+                batches: 0,
+                batched: false,
+                cancel_at: None,
+                panic_at: None,
+            }
+        }
+
+        fn at(&mut self, pos: usize) {
+            self.last_pos = pos;
+            if let Some((p, h, id)) = &self.cancel_at {
+                if *p == pos {
+                    h.cancel(id);
+                }
+            }
+            if self.panic_at == Some(pos) {
+                panic!("script forward failed at {pos}");
+            }
+        }
+    }
+
+    impl StagedRunner for ScriptRunner {
+        fn arch_name(&self) -> &'static str {
+            "script"
+        }
+        fn hidden_size(&self) -> usize {
+            1
+        }
+        fn max_seq(&self) -> usize {
+            64
+        }
+        fn eos_token_ids(&self) -> &[u32] {
+            &[]
+        }
+        fn reset(&mut self) {
+            self.last_pos = 0;
+        }
+        fn embed_token(&self, _token: u32) -> Vec<f32> {
+            vec![0.0]
+        }
+        fn forward_layers(
+            &mut self,
+            hidden: Vec<f32>,
+            pos: usize,
+            _token: Option<u32>,
+        ) -> Vec<f32> {
+            self.forwarded.push(pos);
+            self.at(pos);
+            hidden
+        }
+        fn forward_layers_batch(&mut self, hidden: Vec<f32>, base: usize, rows: usize) -> Vec<f32> {
+            self.batches += 1;
+            for pos in base..base + rows {
+                self.at(pos);
+            }
+            hidden
+        }
+        fn supports_batched_prefill(&self) -> bool {
+            self.batched
+        }
+        fn head_logits(&self, _hidden: &[f32]) -> Vec<f32> {
+            let n = (self.last_pos + 1).saturating_sub(self.prompt_len);
+            let id = self.script[n.min(self.script.len() - 1)] as usize;
+            let mut l = vec![0.0; SCRIPT_VOCAB];
+            l[id] = 1.0;
+            l
+        }
+    }
+
+    fn script_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel",
+                "vocab":{"w0":0,"w1":1,"w2":2,"w3":3,"w4":4,"w5":5,"w6":6,"w7":7,
+                    "w8":8,"w9":9,"stop":10},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("script tokenizer")
+    }
+
+    /// Four prompt ids.
+    const SCRIPT_PROMPT: &str = "w0 w1 w2 w3";
+
+    fn script_engine(
+        runner: ScriptRunner,
+        total: u32,
+    ) -> (PipelineEngine<ScriptRunner>, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let eng = PipelineEngine::new(
+            runner,
+            Some(script_tokenizer()),
+            StageTransport {
+                upstream: None,
+                downstream: None,
+            },
+            rt.handle().clone(),
+            0,
+            total,
+            None,
+        );
+        (eng, rt)
+    }
+
+    fn script_task(id: &str, max_tokens: u32, stop: &[&str]) -> GenerationTask {
+        let mut t = GenerationTask::new(id, SCRIPT_PROMPT).with_max_tokens(max_tokens);
+        t.sampling.stop = stop.iter().map(|s| s.to_string()).collect();
+        t
+    }
+
+    /// Run `f` with an INFO fmt subscriber writing to a buffer.
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let r = tracing::subscriber::with_default(sub, f);
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, out)
+    }
+
+    fn is_empty_cancelled(c: &Chunk) -> bool {
+        c.is_final
+            && c.error.is_none()
+            && c.text.is_empty()
+            && c.finish_reason == Some(FinishReason::Cancelled)
+    }
+
+    /// The streamed text of a run's token chunks.
+    fn streamed_text(out: &[(TaskId, Chunk)]) -> String {
+        out.iter()
+            .filter(|(_, c)| !c.is_final)
+            .map(|(_, c)| c.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn pipeline_single_stage_exposes_its_inflight_handle() {
+        let (e, _rt) = script_engine(ScriptRunner::new(4, vec![0]), 1);
+        let a = e
+            .inflight_cancel()
+            .expect("single-stage engine has a handle");
+        let b = e.inflight_cancel().expect("same handle again");
+        assert!(Arc::ptr_eq(&a, &b));
+        // Multi-stage already cancels at the next token: no handle (unchanged).
+        let (e, _rt) = script_engine(ScriptRunner::new(4, vec![0]), 2);
+        assert!(e.inflight_cancel().is_none());
+    }
+
+    #[test]
+    fn pipeline_single_stage_cancel_at_decode_token_k_ends_with_k_tokens() {
+        let (mut e, _rt) = script_engine(ScriptRunner::new(4, (0..10).collect()), 1);
+        let h = e.inflight_cancel().unwrap();
+        // The forward at pos P+k-2 makes token k; the cancel lands inside it.
+        let k = 3;
+        e.runner.cancel_at = Some((4 + k - 2, h.clone(), "t1".into()));
+        e.submit(script_task("t1", 8, &[])).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        assert_eq!(out.len(), 1, "only the cancelled final: {out:?}");
+        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+        // Prefill 0..4, then the decode forwards for tokens 2..=k only.
+        assert_eq!(e.runner.forwarded, (0..4 + k - 1).collect::<Vec<_>>());
+        assert!(logs.contains("task cancelled"), "{logs}");
+        assert!(logs.contains("tokens=3"), "{logs}");
+        assert!(!h.cancelled(), "end() freed the handle");
+    }
+
+    #[test]
+    fn pipeline_single_stage_cancel_before_begin_runs_no_generate() {
+        let (mut e, _rt) = script_engine(ScriptRunner::new(4, (0..10).collect()), 1);
+        let h = e.inflight_cancel().unwrap();
+        h.cancel(&"t1".to_string());
+        e.submit(script_task("t1", 8, &[])).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        assert_eq!(out.len(), 1);
+        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+        assert!(e.runner.forwarded.is_empty(), "no forward ran");
+        assert!(logs.contains("tokens=0"), "{logs}");
+        // The next task runs normally.
+        e.submit(script_task("t2", 2, &[])).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2].1.finish_reason, Some(FinishReason::Length));
+    }
+
+    #[test]
+    fn pipeline_single_stage_cancel_during_prefill_stops_before_the_next_token() {
+        let (mut e, _rt) = script_engine(ScriptRunner::new(4, (0..10).collect()), 1);
+        let h = e.inflight_cancel().unwrap();
+        e.runner.cancel_at = Some((1, h.clone(), "t1".into()));
+        e.submit(script_task("t1", 8, &[])).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        assert_eq!(out.len(), 1);
+        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+        assert_eq!(
+            e.runner.forwarded,
+            vec![0, 1],
+            "stopped before prefill pos 2"
+        );
+        assert!(logs.contains("tokens=0"), "{logs}");
+    }
+
+    /// Batched prefill (glm, inkling) is polled before and after the batch
+    /// only: a cancel inside it ends the task right after the batch.
+    #[test]
+    fn pipeline_single_stage_cancel_in_a_batched_prefill_ends_after_the_batch() {
+        let mut r = ScriptRunner::new(4, (0..10).collect());
+        r.batched = true;
+        let (mut e, _rt) = script_engine(r, 1);
+        let h = e.inflight_cancel().unwrap();
+        e.runner.cancel_at = Some((2, h.clone(), "t1".into()));
+        e.submit(script_task("t1", 8, &[])).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+        assert_eq!(e.runner.batches, 1);
+        assert!(e.runner.forwarded.is_empty(), "no decode forward ran");
+    }
+
+    #[test]
+    fn pipeline_single_stage_error_after_a_cancel_is_cancelled() {
+        let (mut e, _rt) = script_engine(ScriptRunner::new(4, (0..10).collect()), 1);
+        let h = e.inflight_cancel().unwrap();
+        e.runner.cancel_at = Some((5, h.clone(), "t1".into()));
+        e.runner.panic_at = Some(5);
+        e.submit(script_task("t1", 8, &[])).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+        // Without a cancel the same failure is still an error chunk.
+        e.runner.cancel_at = None;
+        e.submit(script_task("t2", 8, &[])).unwrap();
+        let out = e.step().unwrap();
+        assert!(out[0].1.error.is_some(), "{:?}", out[0].1);
+    }
+
+    #[test]
+    fn pipeline_single_stage_stops_at_a_stop_string() {
+        let script = vec![0, 1, STOP_ID, 2, 3, 4, 5, 6, 7, 8];
+        let (mut e, _rt) = script_engine(ScriptRunner::new(4, script), 1);
+        e.submit(script_task("t1", 8, &["stop"])).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        assert_eq!(out.len(), 4, "three tokens, then the final: {out:?}");
+        assert_eq!(streamed_text(&out), "w0 w1 stop", "the text keeps the stop");
+        let fin = &out[3].1;
+        assert!(fin.is_final && fin.error.is_none());
+        assert_eq!(fin.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(
+            e.runner.forwarded.len(),
+            4 + 2,
+            "no forward after the match"
+        );
+        assert!(logs.contains("task stopped at stop string"), "{logs}");
+        assert!(logs.contains("tokens=3"), "{logs}");
+    }
+
+    #[test]
+    fn pipeline_single_stage_stop_check_off_runs_to_the_end() {
+        let script = vec![0, 1, STOP_ID, 2, 3, 4, 5, 6, 7, 8];
+        let (e, _rt) = script_engine(ScriptRunner::new(4, script), 1);
+        let mut e = e.with_engine_stop_check(false);
+        e.submit(script_task("t1", 8, &["stop"])).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        assert_eq!(out.len(), 9);
+        assert_eq!(out[8].1.finish_reason, Some(FinishReason::Length));
+        assert!(!logs.contains("task stopped at stop string"), "{logs}");
+        // A cancel still works with the check off.
+        let h = e.inflight_cancel().unwrap();
+        h.cancel(&"t2".to_string());
+        e.submit(script_task("t2", 8, &["stop"])).unwrap();
+        assert!(is_empty_cancelled(&e.step().unwrap()[0].1));
+    }
+
+    /// No stop match, no cancel: the same chunks as before M18.
+    #[test]
+    fn pipeline_single_stage_without_a_match_is_unchanged() {
+        let (mut e, _rt) = script_engine(ScriptRunner::new(4, (0..10).collect()), 1);
+        // "stop" in the prompt is not generated text: the window never sees it.
+        let mut t = script_task("t1", 5, &["zzz", "stop"]);
+        t.prompt = "w0 stop w1 w2".into();
+        e.submit(t).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        assert_eq!(out.len(), 6);
+        assert_eq!(streamed_text(&out), "w0 w1 w2 w3 w4");
+        assert!(out[..5].iter().all(|(_, c)| c.n_tokens == Some(1)));
+        assert_eq!(out[0].1.prompt_tokens, Some(4));
+        let fin = &out[5].1;
+        assert_eq!(fin.n_tokens, Some(0));
+        assert_eq!(fin.finish_reason, Some(FinishReason::Length));
+        assert!(logs.contains("task done (script single-stage)"), "{logs}");
     }
 
     #[test]

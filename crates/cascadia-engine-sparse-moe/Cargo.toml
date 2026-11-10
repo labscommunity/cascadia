@@ -40,4 +40,5 @@ num_cpus = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

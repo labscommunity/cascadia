@@ -238,11 +238,38 @@ pub trait StagedRunner: Send + 'static {
         max_new: usize,
         cfg: &SamplingConfig,
     ) -> (Vec<u32>, bool, GenTiming) {
+        self.generate_reason_timed_polled(prompt, max_new, cfg, &mut |_| false)
+    }
+
+    /// [`Self::generate_reason_timed`] that can end early (M18 D3).
+    /// `should_stop` gets the tokens generated so far and returns `true` to
+    /// stop; the tokens so far are then returned (the `bool` is `false`).
+    ///
+    /// Polling points: before each per-token prefill forward (with no tokens
+    /// yet) and before each decode forward. A runner that prefills as one
+    /// batch ([`Self::supports_batched_prefill`]: glm, inkling) is polled only
+    /// before and after the batch, so a cancel during its prefill waits for
+    /// the whole batch. A stop during prefill returns no tokens. The
+    /// single-stage path keeps no prefix cache, so there is none to protect.
+    fn generate_reason_timed_polled(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
+        should_stop: &mut dyn FnMut(&[u32]) -> bool,
+    ) -> (Vec<u32>, bool, GenTiming) {
         let started = std::time::Instant::now();
         self.reset();
         if prompt.is_empty() {
             return (Vec::new(), false, GenTiming::default());
         }
+        let prefill_stopped = |started: std::time::Instant| {
+            let timing = GenTiming {
+                prefill_s: started.elapsed().as_secs_f64(),
+                ..GenTiming::default()
+            };
+            (Vec::new(), false, timing)
+        };
         let max_seq = self.max_seq();
         let mut rng = init_rng(cfg.seed);
         let mut history: Vec<i64> = Vec::new();
@@ -252,17 +279,26 @@ pub trait StagedRunner: Send + 'static {
             // and take the head only at the final position. Bit-identical to the
             // per-token loop; the batched MoE just loads overlapping experts once.
             let hs = self.hidden_size();
+            if should_stop(&[]) {
+                return prefill_stopped(started);
+            }
             let mut batch = vec![0.0f32; rows * hs];
             for (r, &t) in prompt[..rows].iter().enumerate() {
                 batch[r * hs..(r + 1) * hs].copy_from_slice(&self.embed_token(t));
             }
             let h = self.forward_layers_batch(batch, 0, rows);
+            if should_stop(&[]) {
+                return prefill_stopped(started);
+            }
             self.head_logits(&h[(rows - 1) * hs..rows * hs])
         } else {
             // Per-token prefill (backends whose layers need the position's token
             // id, e.g. dsv4 hash gates).
             let mut ll = Vec::new();
             for (pos, &t) in prompt.iter().take(rows).enumerate() {
+                if should_stop(&[]) {
+                    return prefill_stopped(started);
+                }
                 let h = self.embed_token(t);
                 let h = self.forward_layers(h, pos, Some(t));
                 ll = self.head_logits(&h);
@@ -290,6 +326,9 @@ pub trait StagedRunner: Send + 'static {
             // stop -> the caller reports `length`.
             if pos >= max_seq {
                 hit_context_cap = true;
+                break;
+            }
+            if should_stop(&out) {
                 break;
             }
             let h = self.embed_token(tok);
