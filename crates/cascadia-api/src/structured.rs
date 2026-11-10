@@ -951,16 +951,21 @@ fn bound_pair_here(obj: &Map<String, Value>, path: &[String]) -> Option<Unsatisf
 /// keys for the converter's reading. `None` when neither leads there, so
 /// [`relax_unsatisfiable_bounds`] never gets a path it cannot follow.
 fn path_to_target(root: &Value, r: &str, target: &Value) -> Option<Vec<String>> {
-    let raw: Vec<String> = r
-        .trim_start_matches('#')
+    let pointer = r.trim_start_matches('#');
+    let raw: Vec<String> = pointer
         .split('/')
         .filter(|k| !k.is_empty())
         .map(str::to_string)
         .collect();
-    let unescaped: Vec<String> = raw
-        .iter()
-        .map(|k| k.replace("~1", "/").replace("~0", "~"))
-        .collect();
+    // RFC 6901 keeps empty segments: `#/x/` names `x[""]`, as
+    // [`backstop_targets`] reads it.
+    let unescaped: Vec<String> = match pointer.strip_prefix('/') {
+        Some(tokens) => tokens
+            .split('/')
+            .map(|k| k.replace("~1", "/").replace("~0", "~"))
+            .collect(),
+        None => Vec::new(),
+    };
     [unescaped, raw].into_iter().find(|path| {
         path.iter()
             .try_fold(root, |v, k| match v {
@@ -1003,7 +1008,7 @@ pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound>
             .filter_map(|target| path_to_target(schema, &r, target))
             .collect();
         for mut path in paths {
-            if !walked.insert(path.clone()) {
+            if !schema_position(schema, &path) || !walked.insert(path.clone()) {
                 continue;
             }
             let mut node = &mut *schema;
@@ -1019,6 +1024,44 @@ pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound>
         }
     }
     dropped
+}
+
+/// False when `path` from `root` passes through a data keyword (`enum`,
+/// `const`, `default`, `examples`) or through `not`, `if`, `then`, `else`
+/// or `dependentSchemas` where a keyword stands, so a `$ref` target is
+/// relaxed by the same rules as [`relax_in_place`]. A key inside a map of
+/// named schemas or an array of member schemas is a name or an index, not
+/// a keyword: `#/properties/default` is a schema position.
+fn schema_position(root: &Value, path: &[String]) -> bool {
+    let mut node = root;
+    let mut at_keyword = true;
+    for key in path {
+        let child = match node {
+            Value::Object(obj) => obj.get(key),
+            Value::Array(items) => key.parse::<usize>().ok().and_then(|i| items.get(i)),
+            _ => None,
+        };
+        let Some(child) = child else {
+            return false;
+        };
+        if at_keyword {
+            if DATA_KEYS.contains(&key.as_str())
+                || matches!(
+                    key.as_str(),
+                    "not" | "if" | "then" | "else" | "dependentSchemas"
+                )
+            {
+                return false;
+            }
+            // The next key names an entry of a schema map or an array.
+            at_keyword = !(matches!(child, Value::Array(_))
+                || (matches!(child, Value::Object(_)) && SCHEMA_MAPS.contains(&key.as_str())));
+        } else {
+            at_keyword = true;
+        }
+        node = child;
+    }
+    true
 }
 
 /// [`relax_unsatisfiable_bounds`] on `v`, at `path`, and the schemas
@@ -4829,27 +4872,132 @@ mod tests {
         assert_eq!(unsatisfiable_bound(&schema), None);
     }
 
-    /// A pair reached only through a local `$ref` into a data keyword is
-    /// dropped where it sits, so the relaxed schema passes the check.
+    /// A `$ref` into a data keyword makes the literal a schema, but relaxing
+    /// it would rewrite data: it stays as sent, and [`unsatisfiable_bound`]
+    /// (which the call grammar checks on each tool) still reports the pair.
     #[test]
-    fn relax_drops_a_pair_a_ref_reaches_inside_a_data_keyword() {
+    fn relax_leaves_a_ref_target_inside_a_data_keyword() {
+        for schema in [
+            json!({
+                "type": "object",
+                "properties": {"a": {"$ref": "#/default/x"}},
+                "default": {"x": {"type": "string", "minLength": 5, "maxLength": 2}}
+            }),
+            json!({
+                "type": "object",
+                "properties": {"a": {"$ref": "#/default/"}},
+                "default": {"": {"type": "string", "minLength": 5, "maxLength": 2}}
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "a": {"$ref": "#/properties/b/enum/0"},
+                    "b": {"enum": [{"type": "string", "minLength": 5, "maxLength": 2}]}
+                }
+            }),
+        ] {
+            let (out, dropped) = relaxed(schema.clone());
+            assert_eq!(out, schema);
+            assert!(dropped.is_empty(), "{dropped:?}");
+            assert!(unsatisfiable_bound(&out).is_some(), "{out}");
+        }
+    }
+
+    /// A `$ref` to a subschema under `not` must not relax it: dropping the
+    /// pair would flip what `not` rejects.
+    #[test]
+    fn relax_leaves_a_ref_target_under_not() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/properties/b/not"},
+                "b": {"type": "number", "not": {"minimum": 3, "maximum": 1}}
+            }
+        });
+        let (out, dropped) = relaxed(schema.clone());
+        assert_eq!(out, schema);
+        assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
+    /// An empty pointer segment names the `""` key, as in
+    /// [`backstop_targets`]: `#/x/` reaches `x[""]`, not `x`.
+    #[test]
+    fn relax_follows_an_empty_pointer_segment() {
         let (schema, dropped) = relaxed(json!({
             "type": "object",
-            "properties": {"a": {"$ref": "#/default/x"}},
-            "default": {"x": {"type": "string", "minLength": 5, "maxLength": 2}}
+            "properties": {"a": {"$ref": "#/x/"}},
+            "x": {"": {"type": "string", "minLength": 5, "maxLength": 2}}
         }));
         assert_eq!(
             schema,
             json!({
                 "type": "object",
-                "properties": {"a": {"$ref": "#/default/x"}},
-                "default": {"x": {"type": "string"}}
+                "properties": {"a": {"$ref": "#/x/"}},
+                "x": {"": {"type": "string"}}
             })
         );
         assert_eq!(
             dropped,
-            ["minLength (5) is greater than maxLength (2) at #/default/x; no value can satisfy both"]
+            ["minLength (5) is greater than maxLength (2) at #/x/; no value can satisfy both"]
         );
+        assert_eq!(unsatisfiable_bound(&schema), None);
+    }
+
+    /// Two refs naming each other: each target is relaxed once and the
+    /// walk ends.
+    #[test]
+    fn relax_ends_on_a_ref_cycle() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "object",
+            "properties": {"p": {"$ref": "#/x/a"}},
+            "x": {
+                "a": {"type": "object", "properties": {"q": {"$ref": "#/x/b"}},
+                    "minProperties": 3, "maxProperties": 1},
+                "b": {"type": "object", "properties": {"r": {"$ref": "#/x/a"}},
+                    "minLength": 5, "maxLength": 2}
+            }
+        }));
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {"p": {"$ref": "#/x/a"}},
+                "x": {
+                    "a": {"type": "object", "properties": {"q": {"$ref": "#/x/b"}}},
+                    "b": {"type": "object", "properties": {"r": {"$ref": "#/x/a"}}}
+                }
+            })
+        );
+        assert_eq!(
+            dropped,
+            [
+                "minProperties (3) is greater than maxProperties (1) at #/x/a; no value can satisfy both",
+                "minLength (5) is greater than maxLength (2) at #/x/b; no value can satisfy both",
+            ]
+        );
+        assert_eq!(unsatisfiable_bound(&schema), None);
+    }
+
+    /// A `"#"` self-ref names the root, already relaxed: the walk ends and
+    /// each pair is dropped once.
+    #[test]
+    fn relax_ends_on_a_root_self_ref() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "object",
+            "properties": {
+                "self": {"$ref": "#"},
+                "s": {"type": "string", "minLength": 5, "maxLength": 2}
+            },
+            "minProperties": 3, "maxProperties": 1
+        }));
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {"self": {"$ref": "#"}, "s": {"type": "string"}}
+            })
+        );
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
         assert_eq!(unsatisfiable_bound(&schema), None);
     }
 
@@ -4963,7 +5111,11 @@ mod tests {
             .unwrap()
             .values()
             .all(|p| *p == json!({"type": "string"})));
-        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+        // Linear work takes milliseconds here; a quadratic walk (25M steps
+        // with a clone each) takes far longer. A fixed 5 s ceiling keeps
+        // that signal without failing on a loaded CI runner, where a
+        // ratio against a smaller run would be timer noise.
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     }
 
     #[test]
