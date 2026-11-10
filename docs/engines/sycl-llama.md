@@ -108,8 +108,30 @@ export CASCADIA_LLAMA_BIN="$PWD/cascadia-llama-sycl/llama-server"
 
 Packaging includes dependencies of the selected SYCL runtime and its plugins,
 then checks the staged executable without `LD_LIBRARY_PATH`. Missing runtime
-dependencies or failed relocation stop packaging. The host still provides the
-Intel GPU driver, Level Zero/OpenCL loaders and standard OS libraries.
+dependencies or failed relocation stop packaging; host libraries (OpenCL/Level
+Zero loaders, glibc, libstdc++) are expected on the destination and may be
+absent on the builder. The host still provides the Intel GPU driver, Level
+Zero/OpenCL loaders and standard OS libraries. A builder with no Intel GPU
+must pass `--no-run-check`: the staged server aborts on startup without a
+device, even for `--version`. The release job does exactly that.
+
+Windows equivalent, from a Developer Command Prompt (`vcvars64.bat`, for
+`dumpbin`) with oneAPI `setvars.bat` called:
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package-llama-stream-windows.ps1 C:\llama-stream llama-sycl.zip
+REM unzip, then:
+set CASCADIA_LLAMA_BIN=%CD%\cascadia-llama-sycl\llama-server.exe
+```
+
+The zip holds `llama-server.exe` with the SYCL, oneMKL and Unified Runtime
+DLLs beside it. Packaging on a GPU box runs the staged server with only
+`System32` on `PATH` (`--version`, `--list-devices`) and fails if a DLL is
+missing or a patch marker is gone; release zips are built on a GPU-less CI
+runner, which passes `-NoRunCheck` and checks the import closure statically
+only, so they carry no `VERSION.txt` or `DEVICES.txt`. The target box needs
+the Intel GPU driver and the VC++ redistributable; `HOST-DEPENDENCIES.txt` in
+the zip lists every DLL taken from the host.
 
 
 `--device` defaults to `GPU`, which maps to `SYCL0` — no flag needed on a
