@@ -288,17 +288,60 @@ def cgroup_file(pid, name):
         return None
 
 
-def escape_target(edir, pool_mb=8192):
+SHIM_POOL_MB_DEFAULT = 8192
+
+
+def shim_pool_mb(env):
+    """The pool cap (MB) elastic_unix.c derives from ELASTIC_POOL_MB.
+
+    Mirrors the shim: unset keeps the default; otherwise atol() semantics
+    (leading digits, garbage = 0), a negative value keeps the default, and the
+    result is clamped at 1 TiB.
+    """
+    v = env.get("ELASTIC_POOL_MB")
+    if v is None:
+        return SHIM_POOL_MB_DEFAULT
+    m = re.match(r"\s*([+-]?\d+)", v)
+    n = int(m.group(1)) if m else 0
+    if n < 0:
+        return SHIM_POOL_MB_DEFAULT
+    return min(n, 1 << 20)
+
+
+def dir_usable(path):
+    """elastic_unix.c's dir_usable(): O_TMPFILE + a 1 MiB ftruncate must work.
+
+    Write permission alone is not enough: NFS/FUSE or a read-only mount can
+    pass os.access() and still reject the temp files both allocation paths use.
+    """
+    tmpfile = getattr(os, "O_TMPFILE", None)
+    if tmpfile is None:
+        return False
+    try:
+        fd = os.open(path, tmpfile | os.O_RDWR | os.O_EXCL, 0o600)
+    except OSError:
+        return False
+    try:
+        os.ftruncate(fd, 1 << 20)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def escape_target(edir, pool_mb=SHIM_POOL_MB_DEFAULT):
     """Where elastic_unix.c's resolve_backing_dir() will move a tmpfs/ramfs dir.
 
     Mirrors the shim so the guard checks the directory the posture will really
     use, not the one the user asked for. None = the shim will refuse to escape.
+    Pass the pool cap the shim will see (shim_pool_mb()), not the default.
     """
     need = (min(pool_mb, 1 << 20) << 20) + (1 << 30)
     for cand in ("/var/tmp", os.path.expanduser("~/.cache")):
         if not cand or os.path.abspath(cand) == os.path.abspath(edir):
             continue
-        if not os.path.isdir(cand) or not os.access(cand, os.W_OK):
+        if not os.path.isdir(cand) or not dir_usable(cand):
             continue
         if fstype(cand) in ("tmpfs", "ramfs"):
             continue
@@ -493,7 +536,13 @@ def main():
         # The shim escapes a memory-backed dir; that is the supported config now.
         # It only stays fatal when no disk-backed alternative exists, because then
         # the posture really is a no-op under a cap.
-        esc = escape_target(edir)
+        # Legs that force the interposer see the ambient ELASTIC_POOL_MB; legs
+        # that go through the CLI re-exec get its default. Check the larger.
+        pool_mb = SHIM_POOL_MB_DEFAULT
+        if so_path:
+            pool_mb = max(pool_mb, shim_pool_mb(base_env))
+        results["elastic_pool_mb"] = pool_mb
+        esc = escape_target(edir, pool_mb)
         if not esc:
             record("guard: backing dir disk-backed", False,
                    f"{edir} is on {ft} and no disk-backed alternative was found "
