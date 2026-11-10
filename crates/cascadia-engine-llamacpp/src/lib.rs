@@ -1423,15 +1423,23 @@ fn read_error_body(
 
 /// The engine error for a 4xx from llama-server, from its JSON error body
 /// (`{"error": {"type", "message", ...}}`). Its over-window refusal
-/// (`exceed_context_size_error`) is the prompt's fault, worded so the API
-/// reads the counts ("prompt is M tokens; the model's window is N"); any
-/// other refusal is a request the child rejected, with its own message.
+/// (`exceed_context_size_error`, or, from older builds that send it untyped,
+/// any message saying the request "exceeds the available context size") is
+/// the prompt's fault, worded so the API reads the counts ("prompt is M
+/// tokens; the model's window is N"); any other refusal is a request the
+/// child rejected, with its own message.
 /// Both become 400s at the API rather than a 5xx that marks the server
 /// unready.
 fn child_refusal(status: &str, body: &str) -> EngineError {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let err = v.get("error").filter(|e| e.is_object()).unwrap_or(&v);
-    if err.get("type").and_then(|t| t.as_str()) == Some("exceed_context_size_error") {
+    let message = err.get("message").and_then(|m| m.as_str());
+    let over_window = err.get("type").and_then(|t| t.as_str()) == Some("exceed_context_size_error")
+        || message.is_some_and(|m| {
+            m.to_ascii_lowercase()
+                .contains("exceeds the available context size")
+        });
+    if over_window {
         let count = |k: &str| err.get(k).and_then(|n| n.as_u64());
         return EngineError::PromptTooLong(match (count("n_prompt_tokens"), count("n_ctx")) {
             (Some(m), Some(n)) => format!("prompt is {m} tokens; the model's window is {n}"),
@@ -1442,9 +1450,7 @@ fn child_refusal(status: &str, body: &str) -> EngineError {
             (None, None) => "the prompt exceeds the model's window".to_string(),
         });
     }
-    let message = err
-        .get("message")
-        .and_then(|m| m.as_str())
+    let message = message
         .map(str::to_owned)
         .unwrap_or_else(|| format!("llama-server refused the request: {status}"));
     EngineError::InvalidConfig(message)
@@ -2912,6 +2918,29 @@ mod unix_tests {
             r#"{"error":{"code":400,"message":"the request exceeds the available context size","type":"exceed_context_size_error"}}"#,
         );
         assert_eq!(e, "prompt too long: the prompt exceeds the model's window");
+    }
+
+    /// Older llama-server builds send the over-window refusal untyped
+    /// (`invalid_request_error`): any 4xx whose message says it exceeds the
+    /// available context size (in any case) is the prompt being too long,
+    /// with the counts when the body carries them. The API answers that text
+    /// with a 400 `context_length_exceeded`.
+    #[test]
+    fn child_untyped_over_window_400_is_prompt_too_long() {
+        let e = child_error_text(
+            "HTTP/1.1 400 Bad Request",
+            r#"{"type":"invalid_request_error","message":"the request exceeds the available context size, try increasing it"}"#,
+        );
+        assert_eq!(e, "prompt too long: the prompt exceeds the model's window");
+        assert!(cascadia_engine::is_client_error_reason(&e), "{e}");
+        let e = child_error_text(
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":{"code":400,"message":"The request Exceeds The Available Context Size","type":"invalid_request_error","n_prompt_tokens":4100,"n_ctx":4096}}"#,
+        );
+        assert_eq!(
+            e,
+            "prompt too long: prompt is 4100 tokens; the model's window is 4096"
+        );
     }
 
     /// Any other 4xx from the child is a request it refused: invalid
