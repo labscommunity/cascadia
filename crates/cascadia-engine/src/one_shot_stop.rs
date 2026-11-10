@@ -8,6 +8,13 @@
 //! The per-token cost is bounded. At most [`MAX_STOPS`] stops of at most [`MAX_STOP_BYTES`] bytes
 //! each are checked, against a rolling tail of the last [`TAIL_BYTES`] bytes. Longer stops, and any
 //! past the first [`MAX_STOPS`], are left to the API's linear cut at the end.
+//!
+//! Input contract: the text fed in must be exactly text the engine returns. That is the
+//! concatenation of the pieces it emits ([`OneShotStop::push`]), or a decode whose text is a
+//! substring of the final decode ([`OneShotStop::matches_tail`]). A match on anything else can end
+//! the answer with `finish_reason: "stop"` where the API finds no stop to cut at. For the same
+//! reason a stop that contains U+FFFD is never checked: a lossy decode makes that character out of a
+//! character split across pieces or ids, so it can appear in the fed text and not in the answer.
 
 /// How many stops are checked (OpenAI's maximum).
 pub const MAX_STOPS: usize = 4;
@@ -27,12 +34,13 @@ pub struct OneShotStop {
 }
 
 impl OneShotStop {
-    /// Keeps the first [`MAX_STOPS`] stops that are non-empty and at most [`MAX_STOP_BYTES`] bytes
-    /// long, in the order given; the rest are ignored here.
+    /// Keeps the first [`MAX_STOPS`] stops that are non-empty, at most [`MAX_STOP_BYTES`] bytes long
+    /// and free of U+FFFD (see the module's input contract), in the order given; the rest are
+    /// ignored here.
     pub fn new(stops: &[String]) -> Self {
         let stops: Vec<String> = stops
             .iter()
-            .filter(|s| !s.is_empty() && s.len() <= MAX_STOP_BYTES)
+            .filter(|s| !s.is_empty() && s.len() <= MAX_STOP_BYTES && !s.contains('\u{FFFD}'))
             .take(MAX_STOPS)
             .cloned()
             .collect();
@@ -62,6 +70,9 @@ impl OneShotStop {
     /// far, and keeps returning `true` after that. Only the last [`TAIL_BYTES`] bytes are kept; the
     /// work per call is bounded by that tail plus the piece, not by the stop lengths or the total
     /// text.
+    ///
+    /// The pieces must concatenate to exactly the text the engine returns (the module's input
+    /// contract).
     pub fn push(&mut self, piece: &str) -> bool {
         if self.matched.is_some() {
             return true;
@@ -81,20 +92,31 @@ impl OneShotStop {
         self.matched = earliest_match(&self.stops, &self.tail[from..]);
         let cut = ceil_char_boundary(&self.tail, self.tail.len().saturating_sub(TAIL_BYTES));
         self.tail.drain(..cut);
+        // One huge piece would otherwise leave its whole allocation behind for the rest of the run.
+        if self.tail.capacity() > 4 * TAIL_BYTES {
+            self.tail.shrink_to(2 * TAIL_BYTES);
+        }
         self.matched.is_some()
     }
 
-    /// The stop that matched first (the one whose occurrence ends earliest in the text; on a tie,
-    /// the one given first), once [`push`](Self::push) has returned `true`.
+    /// The stop that matched, once [`push`](Self::push) has returned `true`. `push` latches on the
+    /// first piece in which any stop completes; among the stops that complete in that piece, this
+    /// names the one that starts earliest, then ends earliest, then was given first. That is the
+    /// API `StopMatcher`'s choice (earliest start).
     pub fn matched(&self) -> Option<&str> {
         self.matched.map(|i| self.stops[i].as_str())
     }
 
     /// Stateless check of a freshly decoded tail of the output, for a caller that re-decodes its
-    /// newest ids each time instead of feeding pieces. A match counts only if the whole stop lies
-    /// inside `tail`, so the caller must pass a tail that holds every stop ending in its newest text:
-    /// at least [`max_stop_bytes`](Self::max_stop_bytes) bytes back from that text, and more if a
-    /// token can decode to zero bytes. Nothing is remembered between calls.
+    /// newest ids each time instead of feeding pieces. Nothing is remembered between calls, so a
+    /// match counts only if the whole stop lies inside one `tail`.
+    ///
+    /// Sizing: decode the last `max_stop_bytes() + K` ids, where K bounds consecutive 0-byte tokens
+    /// (skipped special tokens); K = 16 is recommended. A stop that never lies inside one window is
+    /// missed permanently, not found late: generation runs on and the API still cuts at the end, so
+    /// the cost is latency only.
+    ///
+    /// The decoded text must be a substring of the final decode (the module's input contract).
     pub fn matches_tail(&self, tail: &str) -> bool {
         self.stops.iter().any(|stop| tail.contains(stop.as_str()))
     }
@@ -103,16 +125,22 @@ impl OneShotStop {
     fn tail_len(&self) -> usize {
         self.tail.len()
     }
+
+    #[cfg(test)]
+    fn tail_capacity(&self) -> usize {
+        self.tail.capacity()
+    }
 }
 
-/// The stop whose first occurrence in `text` ends earliest; on a tie, the one listed first.
+/// Among the stops found in `text`, the one whose first occurrence starts earliest, then ends
+/// earliest, then is listed first.
 fn earliest_match(stops: &[String], text: &str) -> Option<usize> {
     stops
         .iter()
         .enumerate()
-        .filter_map(|(i, stop)| text.find(stop.as_str()).map(|at| (at + stop.len(), i)))
+        .filter_map(|(i, stop)| text.find(stop.as_str()).map(|at| (at, at + stop.len(), i)))
         .min()
-        .map(|(_, i)| i)
+        .map(|(_, _, i)| i)
 }
 
 /// The largest char boundary of `s` at or below `i`.
@@ -177,10 +205,21 @@ mod tests {
         let mut s = OneShotStop::new(&stops(&["world", "lo"]));
         assert!(s.push("hello world"));
         assert_eq!(s.matched(), Some("lo"));
-        // Same end: the stop given first wins.
+        // Same end: the one that starts first wins, as the API's StopMatcher picks it.
         let mut s = OneShotStop::new(&stops(&["b", "ab"]));
         assert!(s.push("xab"));
-        assert_eq!(s.matched(), Some("b"));
+        assert_eq!(s.matched(), Some("ab"));
+        // Same start: the one that ends first wins.
+        let mut s = OneShotStop::new(&stops(&["abc", "ab"]));
+        assert!(s.push("xabc"));
+        assert_eq!(s.matched(), Some("ab"));
+        // Same start and end can't differ; list order is the last word.
+        // The latch fires on the first piece any stop completes in, even when a stop that
+        // starts earlier would complete only later.
+        let mut s = OneShotStop::new(&stops(&["abcdef", "cd"]));
+        assert!(!s.push("ab"));
+        assert!(s.push("cd"));
+        assert_eq!(s.matched(), Some("cd"));
         // The second stop can match alone.
         let mut s = OneShotStop::new(&stops(&["never", "end"]));
         assert!(!s.push("the e"));
@@ -267,6 +306,66 @@ mod tests {
         let mut big = "n".repeat(TAIL_BYTES * 3);
         big.insert_str(10, "needle");
         assert!(s.push(&big), "a match early in a long piece was missed");
+    }
+
+    #[test]
+    fn a_stop_with_a_replacement_char_is_ignored() {
+        // A lossy decode turns a split character into U+FFFD, so a stop holding one could match
+        // text the final answer doesn't contain.
+        let mut s = OneShotStop::new(&stops(&["\u{FFFD}", "a\u{FFFD}b", "ok"]));
+        assert_eq!(s.max_stop_bytes(), 2);
+        assert!(!s.push("x \u{FFFD} a\u{FFFD}b"));
+        assert!(!s.matches_tail("a\u{FFFD}b"));
+        assert!(s.push("ok"));
+        assert!(!OneShotStop::new(&stops(&["\u{FFFD}"])).is_active());
+    }
+
+    #[test]
+    fn the_tail_gives_back_memory_after_a_huge_piece() {
+        let mut s = OneShotStop::new(&stops(&["never-there"]));
+        assert!(!s.push(&"m".repeat(10 * 1024 * 1024)));
+        assert!(s.tail_len() <= TAIL_BYTES);
+        assert!(
+            s.tail_capacity() <= 4 * TAIL_BYTES,
+            "the tail kept {} bytes of capacity",
+            s.tail_capacity()
+        );
+    }
+
+    /// A 256-byte stop, split 255|1 and 1|255 after the tail has rolled. The 255|1 split starts
+    /// the match exactly at the window's first byte (`len - (max_len - 1)`).
+    #[test]
+    fn a_256_byte_stop_at_the_window_edge() {
+        let stop = format!("Z{}", "q".repeat(MAX_STOP_BYTES - 1));
+        for split in [MAX_STOP_BYTES - 1, 1] {
+            let mut s = OneShotStop::new(std::slice::from_ref(&stop));
+            for _ in 0..(TAIL_BYTES * 3 / 4) {
+                assert!(!s.push("ab c"));
+            }
+            assert_eq!(s.tail_len(), TAIL_BYTES);
+            assert!(!s.push(&stop[..split]), "split {split}: matched early");
+            assert!(s.push(&stop[split..]), "split {split}: missed at the edge");
+        }
+    }
+
+    /// The window start (`len - 255`) lands inside a multibyte character; slicing there must not
+    /// panic, and a stop ending in the new piece is still found.
+    #[test]
+    fn a_window_start_inside_a_multibyte_char() {
+        let long = "L".repeat(MAX_STOP_BYTES);
+        for ch in ["é", "😀"] {
+            let mut s = OneShotStop::new(&[long.clone(), format!("{ch}x")]);
+            for _ in 0..TAIL_BYTES {
+                assert!(!s.push(ch));
+            }
+            let from = s.tail_len() - (MAX_STOP_BYTES - 1);
+            assert!(
+                !s.tail.is_char_boundary(from),
+                "{ch}: the test must put the window start mid-char (tail {})",
+                s.tail_len()
+            );
+            assert!(s.push("x"), "{ch}: missed the stop");
+        }
     }
 
     #[test]
