@@ -1898,11 +1898,13 @@ impl MaskLink {
             Err(TokenWaitFailure::NoAck(e) | TokenWaitFailure::TimedOut(e)) => {
                 Err(self.on_probe_unanswered(now, &e))
             }
-            Err(
-                TokenWaitFailure::Other(e)
-                | TokenWaitFailure::AckedNack(e)
-                | TokenWaitFailure::MaskMiss(e),
-            ) => Err(e),
+            // A stage that masks failed the probe: the chain masks, the task
+            // fails as a lost step, nothing is latched.
+            Err(TokenWaitFailure::AckedNack(e)) => {
+                self.on_acked();
+                Err(e)
+            }
+            Err(TokenWaitFailure::Other(e) | TokenWaitFailure::MaskMiss(e)) => Err(e),
         }
     }
 
@@ -2767,6 +2769,16 @@ async fn recv_reply_of(
         if kind == ReplyWait::Probe {
             if token == MASK_PROBE_OK_TOKEN {
                 return Ok(token);
+            }
+            // An acknowledged NACK for the probe's own seq: a stage that
+            // masks failed it (a middle whose link below is proven lost its
+            // downstream). A failed step, not an older stage.
+            if token < 0 {
+                return Err(TokenWaitFailure::AckedNack(EngineError::BatchAborted(
+                    "a later stage that masks failed the mask-support probe and NACKed it; the \
+                     pipeline link stays aligned"
+                        .into(),
+                )));
             }
             // Acknowledged, but no answer to a probe: skipped, as stale.
             *stale_ack |= token != MASK_MISS_TOKEN;
@@ -12123,6 +12135,20 @@ mod tests {
         seq_down: u32,
         probe_budget: Duration,
     ) -> (LoopStage, EngineResult<()>) {
+        relay_stage_step_with(up, down, recv, want_pos, seq_down, probe_budget, |_| {}).await
+    }
+
+    /// [`relay_stage_step`] with the stage set up by `setup` before its step
+    /// (its link's evidence, a failure of its own).
+    async fn relay_stage_step_with(
+        up: &Arc<tokio::sync::Mutex<ActivationServer>>,
+        down: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+        recv: &mut MaskRecvCache,
+        want_pos: bool,
+        seq_down: u32,
+        probe_budget: Duration,
+        setup: impl FnOnce(&mut LoopStage) + Send + 'static,
+    ) -> (LoopStage, EngineResult<()>) {
         let (up, mut cache) = (up.clone(), std::mem::take(recv));
         let handle = tokio::runtime::Handle::current();
         let w = test_factory().mask_width();
@@ -12144,6 +12170,7 @@ mod tests {
                 ran: false,
                 probe_budget,
             };
+            setup(&mut stage);
             let res = relay_upstream_step(&mut stage, step, tail);
             (cache, (stage, res))
         })
@@ -12378,7 +12405,7 @@ mod tests {
             let tail_up = Arc::new(tokio::sync::Mutex::new(tail_s));
             let mut link = MaskLink::default();
             let mut mid_recv = MaskRecvCache::default();
-            let head_budget = Duration::from_millis(300);
+            let head_budget = Duration::from_secs(2);
             let mid_budget = probe_wait_budget(head_budget, &spec(false, false, (8, 16), 32));
             let t0 = std::time::Instant::now();
             let (head, (mid, mid_res), answered) = tokio::join!(
@@ -12582,5 +12609,54 @@ mod tests {
             .unwrap();
         assert_eq!(tok, 42);
         assert!(stale_ack, "an acknowledged probe answer is evidence");
+    }
+
+    /// A middle whose own link below has proved it masks, and which can't
+    /// forward the probe (its downstream is gone), answers an acknowledged
+    /// NACK for the probe's seq. The head, whose link has no evidence yet
+    /// (it restarted), fails the task at once as a lost step: no latch, no
+    /// upgrade message, no wait for the probe's deadline.
+    #[tokio::test]
+    async fn an_acknowledged_nack_to_the_probe_fails_the_task_without_latching() {
+        for i in 0..20 {
+            let (head_c, mid_s) = loopback().await;
+            let (mid_c, _tail_s) = loopback().await;
+            let head_down = Arc::new(tokio::sync::Mutex::new(head_c));
+            let mid_up = Arc::new(tokio::sync::Mutex::new(mid_s));
+            let mid_down = Arc::new(tokio::sync::Mutex::new(mid_c));
+            let mut link = MaskLink::default();
+            let mut mid_recv = MaskRecvCache::default();
+            let t0 = std::time::Instant::now();
+            let (head, (mid, mid_res)) = tokio::join!(
+                probe_exchange(&head_down, 1, None, 2, MASK_PROBE_TIMEOUT, &mut link),
+                relay_stage_step_with(
+                    &mid_up,
+                    Some(mid_down.clone()),
+                    &mut mid_recv,
+                    false,
+                    9,
+                    TEST_PROBE,
+                    |s| {
+                        s.link.acked = true;
+                        s.fail_own = true;
+                    }
+                )
+            );
+            let took = t0.elapsed();
+            assert!(mid_res.is_err(), "{i}: the middle's own failure");
+            assert!(!mid.forwarded);
+            let err = head.unwrap_err();
+            assert!(matches!(err, EngineError::BatchAborted(_)), "{i}: {err:?}");
+            assert!(!err.to_string().contains(MASK_UPGRADE_ERROR), "{i}: {err}");
+            assert!(took < MASK_PROBE_TIMEOUT / 4, "{i}: {took:?}");
+            assert!(
+                link.refusal(std::time::Instant::now()).is_none(),
+                "{i}: no latch"
+            );
+            assert!(
+                link.acked,
+                "{i}: an acknowledged answer shows the chain masks"
+            );
+        }
     }
 }
