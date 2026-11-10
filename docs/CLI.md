@@ -592,8 +592,10 @@ the engine not loaded), and 200 again after the next successful completion.
 Errors that are the client's fault never mark it unready. Neither do capacity
 503s, unless requests are in flight and the pipeline is stalled: the engine has
 been inside one call (a step, or a request's submit) for more than 60 s, or it
-keeps stepping but has produced no real output (a token or a final answer; a
-progress marker or a failed step does not count) for more than 60 s. A peer
+keeps stepping but has produced no real output (a token, a final answer, or a
+refusal of a request for its own fault, such as a prompt over the window; a
+progress marker or a step that fails for the server's fault does not count) for
+more than 60 s. A peer
 that stops answering does either: the step waiting on it hangs, or times out
 and fails, while its requests hold every slot, so every new request is a
 capacity 503. The server is then ready again as soon as the engine produces

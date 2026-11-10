@@ -282,7 +282,8 @@ pub const CLIENT_ERROR_PREFIX: &str = "invalid_request: ";
 /// [`EngineError`]'s own `Display` prefix for a client variant (`prompt too
 /// long:`, `unsupported input:`, ...), [`CLIENT_ERROR_PREFIX`], or
 /// `resume_unsupported:`, optionally behind a `task <id>: ` attribution and a
-/// `backend error: ` wrapper.
+/// `backend error: ` wrapper. OpenVINO GenAI's NPU prompt cap
+/// ([`genai_npu_prompt_cap`]) is one too, wherever it appears in the text.
 pub fn is_client_error_reason(reason: &str) -> bool {
     const PREFIXES: [&str; 8] = [
         CLIENT_ERROR_PREFIX,
@@ -302,7 +303,38 @@ pub fn is_client_error_reason(reason: &str) -> bool {
     if let Some(rest) = r.strip_prefix("backend error: ") {
         r = rest;
     }
-    PREFIXES.iter().any(|p| r.starts_with(p))
+    PREFIXES.iter().any(|p| r.starts_with(p)) || genai_npu_prompt_cap(r).is_some()
+}
+
+/// The leading decimal digits of `s` as a count; `None` when `s` does not
+/// start with a digit or the number does not fit.
+fn leading_count(s: &str) -> Option<u32> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s[..end].parse().ok()
+}
+
+/// OpenVINO GenAI's own NPU prompt cap, which fires inside generation rather
+/// than as a typed over-window error: "Stateful LLM pipeline on NPU may only
+/// process prompts or generated texts up to N tokens. M is passed. ...".
+/// `Some((prompt tokens, window))` when `detail` carries that wording (matched
+/// case-insensitively on "may only process prompts", anywhere in the text, as
+/// the native exception may put its own preamble first), with the window
+/// read after "up to " and the tokens before " is passed"; `None` otherwise.
+pub fn genai_npu_prompt_cap(detail: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let lower = detail.to_ascii_lowercase();
+    let at = lower.find("may only process prompts")?;
+    let rest = &lower[at..];
+    let window = rest
+        .find("up to ")
+        .and_then(|i| leading_count(&rest[i + "up to ".len()..]));
+    let tokens = rest.find(" is passed").and_then(|i| {
+        let before = &rest[..i];
+        let start = before
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map_or(0, |j| j + 1);
+        before[start..].parse().ok()
+    });
+    Some((tokens, window))
 }
 
 /// Why GenAI cannot serve this VLM export's images correctly, if it cannot.
@@ -839,6 +871,9 @@ mod client_error_tests {
             "unsupported input: resume_unsupported: a resumed turn cannot carry images".into(),
             "resume_unsupported: ov-genai has no forced-prefix path".into(),
             "task t-2: prompt too long: prompt is at least 5875 tokens".into(),
+            "task t-9: backend error: Stateful LLM pipeline on NPU may only process prompts \
+             or generated texts up to 1024 tokens. 6393 is passed."
+                .into(),
         ] {
             assert!(is_client_error_reason(&r), "{r}");
         }

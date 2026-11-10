@@ -189,8 +189,9 @@ struct EngineSlot {
     /// [`monotonic_ms`] at which the current run of engine calls began. See
     /// [`EngineActivity::stepping_since_ms`].
     stepping_since_ms: AtomicU64,
-    /// [`monotonic_ms`] of the last `step` that produced real output; `0`
-    /// before the first. See [`EngineActivity::last_output_ms`].
+    /// [`monotonic_ms`] of the last engine call that produced real output
+    /// or refused a request for its own fault; `0` before the first. See
+    /// [`EngineActivity::last_output_ms`].
     last_output_ms: AtomicU64,
     /// An engine call that starts more than this many milliseconds after the
     /// last one returned starts a new run ([`STEP_GAP`]; a field so tests can
@@ -228,9 +229,20 @@ pub struct EngineActivity {
     /// When the current run of engine calls began: the start of the first
     /// call that followed an idle gap longer than [`STEP_GAP`].
     pub stepping_since_ms: u64,
-    /// When a `step` last produced real output for any task: a chunk that is
-    /// neither a progress marker ([`Chunk::is_progress`]) nor an error.
+    /// When the engine last answered a task: a `step` produced real output
+    /// (a chunk that is neither a progress marker ([`Chunk::is_progress`])
+    /// nor a server-fault error), or a `step` or `submit` refused a request
+    /// for its own fault (a client-fault error or error chunk, as
+    /// [`cascadia_engine::is_client_error_reason`] reads it).
     pub last_output_ms: u64,
+}
+
+/// Whether an engine call's error refuses the request for its own fault (a
+/// 4xx [`EngineError::http_status`], or a text that
+/// [`cascadia_engine::is_client_error_reason`] reads as one): the engine
+/// answering, which the stall rule counts as output.
+fn is_client_refusal(e: &EngineError) -> bool {
+    e.is_client_error() || cascadia_engine::is_client_error_reason(&e.to_string())
 }
 
 /// Marks an engine call: stamps [`EngineSlot::busy_since_ms`] (and, after an
@@ -334,6 +346,11 @@ impl Drop for EngineGuard<'_> {
 }
 
 impl EngineSlot {
+    /// Stamps [`EngineSlot::last_output_ms`] with now.
+    fn note_output(&self) {
+        self.last_output_ms.store(monotonic_ms(), Ordering::Relaxed);
+    }
+
     fn new(engine: Option<Box<dyn Engine>>) -> Self {
         Self {
             engine: Mutex::new(engine),
@@ -585,7 +602,11 @@ impl Runner {
             match guard.engine() {
                 Some(engine) => {
                     let _busy = BusyStamp::start(&self.slot);
-                    engine.submit(task)
+                    let out = engine.submit(task);
+                    if out.as_ref().is_err_and(is_client_refusal) {
+                        self.slot.note_output();
+                    }
+                    out
                 }
                 None => Err(EngineError::NotLoaded),
             }
@@ -1178,16 +1199,19 @@ impl Stream for ChunkStream {
                         match out {
                             Ok(produced) => {
                                 let empty = produced.is_empty();
-                                // Progress markers and error chunks are not
-                                // output: an engine stepping through them is
-                                // not serving anyone.
-                                if produced
-                                    .iter()
-                                    .any(|(_, c)| !c.is_progress() && c.error.is_none())
-                                {
-                                    this.slot
-                                        .last_output_ms
-                                        .store(monotonic_ms(), Ordering::Relaxed);
+                                // Progress markers and server-fault error
+                                // chunks are not output: an engine stepping
+                                // through them is not serving anyone. A
+                                // refusal for the request's own fault is the
+                                // engine answering, so it counts.
+                                if produced.iter().any(|(_, c)| {
+                                    !c.is_progress()
+                                        && match &c.error {
+                                            None => true,
+                                            Some(r) => cascadia_engine::is_client_error_reason(r),
+                                        }
+                                }) {
+                                    this.slot.note_output();
                                 }
                                 let mut bufs = this.slot.buffers.lock();
                                 for (tid, chunk) in produced {
@@ -1198,7 +1222,12 @@ impl Stream for ChunkStream {
                                 }
                                 Ok(empty)
                             }
-                            Err(e) => Err(e),
+                            Err(e) => {
+                                if is_client_refusal(&e) {
+                                    this.slot.note_output();
+                                }
+                                Err(e)
+                            }
                         }
                     }),
                 };
@@ -3791,6 +3820,45 @@ mod tests {
         let a = runner.activity();
         assert_ne!(a.last_step_end_ms, 0);
         assert_eq!(a.last_output_ms, 0, "an error is not output");
+    }
+
+    /// An engine that refuses every submit with the error its function makes.
+    struct RefusingEngine(fn() -> EngineError);
+
+    impl Engine for RefusingEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Err((self.0)())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A submit refused for the request's own fault is the engine
+    /// answering, so it stamps `last_output_ms`; a server-fault refusal
+    /// does not.
+    #[test]
+    fn a_client_fault_submit_refusal_counts_as_output() {
+        let runner = |refusal: fn() -> EngineError| {
+            let engine: Box<dyn Engine> = Box::new(RefusingEngine(refusal));
+            Runner {
+                builder: Mutex::new(None),
+                slot: Arc::new(EngineSlot::new(Some(engine))),
+                model: Mutex::new(None),
+                closing: Arc::new(AtomicBool::new(false)),
+            }
+        };
+        let client = runner(|| EngineError::PromptTooLong("prompt is 9 tokens".into()));
+        assert!(client.submit(GenerationTask::new("t1", "x")).is_err());
+        assert_ne!(
+            client.activity().last_output_ms,
+            0,
+            "a refusal is an answer"
+        );
+        let server = runner(|| EngineError::Backend("peer timeout".into()));
+        assert!(server.submit(GenerationTask::new("t1", "x")).is_err());
+        assert_eq!(server.activity().last_output_ms, 0, "a failure is not");
     }
 
     /// `stepping_since_ms` marks the start of the current run of engine

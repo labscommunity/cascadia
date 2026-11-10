@@ -8283,6 +8283,17 @@ mod tests {
     const PHASE_ERRORS: u8 = 1;
     /// Every step returns only a progress marker.
     const PHASE_PROGRESS: u8 = 2;
+    /// Every step refuses a task nobody reads for its own fault (a typed
+    /// `PromptTooLong`), as an engine refusing a stream of over-window
+    /// requests does.
+    const PHASE_REFUSALS: u8 = 3;
+    /// Every step ends a task nobody reads with an over-window error chunk.
+    const PHASE_REFUSAL_CHUNKS: u8 = 4;
+    /// Every step ends a task nobody reads with OpenVINO GenAI's NPU prompt
+    /// cap, raised mid-generation.
+    const PHASE_NPU_CAP_CHUNKS: u8 = 5;
+    /// Every step ends a task nobody reads with a server-fault error chunk.
+    const PHASE_SERVER_CHUNKS: u8 = 6;
 
     /// Emits three tokens and a final for its task, except that in the
     /// error or progress phase every step (a few ms long) returns no real
@@ -8320,6 +8331,36 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                     self.pending = Some((id.clone(), i));
                     return Ok(vec![(id.clone(), Chunk::progress(id))]);
+                }
+                PHASE_REFUSALS => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    self.pending = Some((id, i));
+                    self.failures += 1;
+                    return Err(cascadia_engine::EngineError::PromptTooLong(
+                        "prompt is 9000 tokens; the model's window is 4096".into(),
+                    )
+                    .for_task(cascadia_types::TaskId::from(format!(
+                        "gone-{}",
+                        self.failures
+                    ))));
+                }
+                PHASE_REFUSAL_CHUNKS | PHASE_NPU_CAP_CHUNKS | PHASE_SERVER_CHUNKS => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let phase = self.phase.load(Ordering::SeqCst);
+                    self.pending = Some((id, i));
+                    self.failures += 1;
+                    let gone = cascadia_types::TaskId::from(format!("gone-{}", self.failures));
+                    let reason = match phase {
+                        PHASE_REFUSAL_CHUNKS => {
+                            "prompt too long: prompt is 9000 tokens; the model's window is 4096"
+                        }
+                        PHASE_NPU_CAP_CHUNKS => {
+                            "backend error: Stateful LLM pipeline on NPU may only process \
+                             prompts or generated texts up to 1024 tokens. 6393 is passed."
+                        }
+                        _ => "backend error: peer timeout",
+                    };
+                    return Ok(vec![(gone.clone(), Chunk::error(gone, reason))]);
                 }
                 _ => {}
             }
@@ -8381,10 +8422,10 @@ mod tests {
         )
     }
 
-    /// The engine keeps stepping, each step short, but none produces real
-    /// output: past the bound a capacity 503 marks the server unready, and
-    /// once real output resumes `/health` is ready with no new request.
-    async fn stepping_without_output_marks_unready(phase: u8) {
+    /// The engine keeps stepping in `phase` past the stall bound while a
+    /// stream is read; returns the capacity 503's status and `/health` then
+    /// (after which real output resumes and the reader's body is returned).
+    async fn step_in_phase_past_the_bound(phase: u8) -> (Router, StatusCode, StatusCode, Bytes) {
         let (app, phase_switch) = phase_app(phase).await;
         let reader = {
             let app = app.clone();
@@ -8405,6 +8446,14 @@ mod tests {
         // pins a worker, and a failed assertion would hang, not fail.
         phase_switch.store(PHASE_TOKENS, Ordering::SeqCst);
         let body = reader.await.unwrap();
+        (app, refused, health, body)
+    }
+
+    /// The engine keeps stepping, each step short, but none produces real
+    /// output: past the bound a capacity 503 marks the server unready, and
+    /// once real output resumes `/health` is ready with no new request.
+    async fn stepping_without_output_marks_unready(phase: u8) {
+        let (app, refused, health, body) = step_in_phase_past_the_bound(phase).await;
         assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             health,
@@ -8423,6 +8472,28 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_progress_only_engine_counts_as_no_output() {
         stepping_without_output_marks_unready(PHASE_PROGRESS).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pipeline_whose_steps_end_in_server_error_chunks_marks_unready() {
+        stepping_without_output_marks_unready(PHASE_SERVER_CHUNKS).await;
+    }
+
+    /// An engine refusing every request for the client's own fault is
+    /// answering, not stalled: a capacity 503 past the bound leaves the
+    /// server ready, whether the refusal is a step's typed error or an
+    /// error chunk (an over-window text, or GenAI's NPU prompt cap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_engine_refusing_client_faults_is_not_stalled() {
+        for phase in [PHASE_REFUSALS, PHASE_REFUSAL_CHUNKS, PHASE_NPU_CAP_CHUNKS] {
+            let (_app, refused, health, _body) = step_in_phase_past_the_bound(phase).await;
+            assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE, "phase {phase}");
+            assert_eq!(
+                health,
+                StatusCode::OK,
+                "phase {phase}: refusals are answers"
+            );
+        }
     }
 
     fn activity(

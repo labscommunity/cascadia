@@ -87,29 +87,10 @@ pub fn prompt_counts(detail: &str) -> (Option<u32>, Option<u32>) {
     (tokens, window)
 }
 
-/// OpenVINO GenAI's own NPU prompt cap, which fires inside generation rather
-/// than as a typed over-window error: "Stateful LLM pipeline on NPU may only
-/// process prompts or generated texts up to N tokens. M is passed. ...".
-/// `Some((prompt tokens, window))` when `detail` carries that wording (matched
-/// case-insensitively on "may only process prompts", anywhere in the text, as
-/// the native exception may put its own preamble first), with the window
-/// read after "up to " and the tokens before " is passed"; `None` otherwise.
-pub fn genai_npu_prompt_cap(detail: &str) -> Option<(Option<u32>, Option<u32>)> {
-    let lower = detail.to_ascii_lowercase();
-    let at = lower.find("may only process prompts")?;
-    let rest = &lower[at..];
-    let window = rest
-        .find("up to ")
-        .and_then(|i| leading_count(&rest[i + "up to ".len()..]));
-    let tokens = rest.find(" is passed").and_then(|i| {
-        let before = &rest[..i];
-        let start = before
-            .rfind(|c: char| !c.is_ascii_digit())
-            .map_or(0, |j| j + 1);
-        before[start..].parse().ok()
-    });
-    Some((tokens, window))
-}
+/// OpenVINO GenAI's own NPU prompt cap, raised inside generation: see
+/// [`cascadia_engine::genai_npu_prompt_cap`], which also makes
+/// [`cascadia_engine::is_client_error_reason`] count it as the request's fault.
+pub use cascadia_engine::genai_npu_prompt_cap;
 
 /// OpenAI's wording for a prompt over the context window, which client
 /// libraries match to recognise context overflow: every form starts with
