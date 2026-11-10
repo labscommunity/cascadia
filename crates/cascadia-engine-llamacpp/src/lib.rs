@@ -1235,6 +1235,14 @@ impl LlamaCppEngine {
             if let Some(tools) = &task.tools {
                 body["tools"] = tools.clone();
             }
+            // A json request with thinking off: llama-server's own grammar
+            // for some templates (Gemma 4) allows a thought block before the
+            // JSON whatever enable_thinking says, and a thought can run to
+            // the token cap. A reasoning budget of 0 makes its sampler close
+            // a thought block the moment one opens.
+            if task.grammar.is_some() && !task.enable_thinking {
+                body["reasoning_budget_tokens"] = serde_json::json!(0);
+            }
             // The schema is added after serialization (below), verbatim.
             if let Some(g) = &task.grammar {
                 if let Err(e) = check_grammar_body(&g.body) {
@@ -3134,6 +3142,36 @@ mod unix_tests {
         // Whitespace and key order intact: no pattern, nothing re-serialized.
         let schema = r#"{ "type": "object", "properties": {"b": {"type": "string"}, "a": {"type": "integer"}} }"#;
         assert_eq!(forwarded_schema(schema), schema);
+    }
+
+    /// A json request with thinking off also caps llama-server's reasoning
+    /// at 0 tokens: its own grammar for some templates (Gemma 4) allows a
+    /// thought block before the JSON whatever `enable_thinking` says, and
+    /// with a budget of 0 the sampler closes one the moment it opens. Other
+    /// requests are left as they were.
+    #[test]
+    fn a_json_request_with_thinking_off_caps_reasoning_at_zero() {
+        let json = || {
+            chat_task().with_grammar(cascadia_types::GrammarSpec {
+                kind: cascadia_types::GrammarKind::JsonSchema,
+                body: r#"{"type":"object"}"#.into(),
+            })
+        };
+        let mut task = json();
+        task.enable_thinking = false;
+        let body = captured_chat_body(task);
+        assert_eq!(body["reasoning_budget_tokens"], 0, "{body}");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+
+        let mut task = json();
+        task.enable_thinking = true;
+        let body = captured_chat_body(task);
+        assert!(body.get("reasoning_budget_tokens").is_none(), "{body}");
+
+        let mut task = chat_task();
+        task.enable_thinking = false;
+        let body = captured_chat_body(task);
+        assert!(body.get("reasoning_budget_tokens").is_none(), "{body}");
     }
 
     #[test]

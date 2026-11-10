@@ -564,7 +564,7 @@ Every engine enforces `json_object` and `json_schema`:
 | `gemma4` | In-engine token mask (llguidance). |
 | `qwen35` | In-engine token mask (llguidance). |
 | `sparse-moe` | In-engine token mask (llguidance), applied before sampling (temperature, top-p). n-gram speculative decoding (`--prompt-lookup`) is skipped for a JSON request; it decodes plainly. |
-| `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar. A `pattern` (or `patternProperties` key) the llguidance regex engine can't parse, such as zod's email regex with its look-aheads, is dropped first and logged (`response_format pattern not enforced`), as on the llguidance engines; llama-server would reject it with a 400. |
+| `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar. A `pattern` (or `patternProperties` key) the llguidance regex engine can't parse, such as zod's email regex with its look-aheads, is dropped first and logged (`response_format pattern not enforced`), as on the llguidance engines; llama-server would reject it with a 400. With thinking off (every JSON request without callable tools) the request also sets `reasoning_budget_tokens: 0`: llama-server's grammar for some chat templates (Gemma 4) allows a thought block before the JSON, and the budget closes one as soon as it opens. |
 | `mock` | Answers with a minimal instance of the schema, best effort: not every keyword is honoured. |
 
 The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
