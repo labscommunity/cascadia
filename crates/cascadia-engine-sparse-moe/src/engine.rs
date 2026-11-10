@@ -6035,6 +6035,15 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// `pending` has waited for an idle link to probe (see
     /// [`JSON_PROBE_PATIENCE`]).
     probe_wait_since: Option<Instant>,
+    /// How long rank 0 waits for the answer to a mask-support probe; a
+    /// middle waits its share of it ([`crate::dist::mid_mask_budget`]).
+    mask_probe_timeout: Duration,
+    /// Rank 0: a late answer its downstream link still owes after a probe
+    /// went unanswered, which the idle checks read instead of taking the
+    /// link for dead. Shared with the link keeper.
+    owed_late: Arc<crate::dist::OwedLateReply>,
+    /// How often the link keeper looks at an idle downstream link.
+    link_check_every: Duration,
 }
 
 /// Per-slot sampling state on the last rank (the driver keeps the tokens).
@@ -6412,6 +6421,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             mask_recv: crate::dist::MaskRecvLink::default(),
             mask_evidence: false,
             probe_wait_since: None,
+            mask_probe_timeout: cascadia_grammar::MASK_PROBE_TIMEOUT,
+            owed_late: Arc::default(),
+            link_check_every: IDLE_LINK_CHECK,
         }
     }
 
@@ -6498,9 +6510,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
         self.link_keeper = Some(token);
         let busy = self.link_busy.clone();
         let epoch = self.link_epoch.clone();
+        let owed = self.owed_late.clone();
+        let every = self.link_check_every;
         self.runtime_handle.spawn(async move {
             use std::sync::atomic::Ordering::SeqCst;
-            let mut tick = tokio::time::interval(IDLE_LINK_CHECK);
+            let mut tick = tokio::time::interval(every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut down_since: Option<Instant> = None;
             // Last time a failed re-dial was logged (rate limit).
@@ -6518,10 +6532,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 if busy.load(SeqCst) != 0 {
                     continue;
                 }
-                let dead = tokio::time::timeout(Duration::from_millis(1), client.wait_readable())
-                    .await
-                    .is_ok();
-                if !dead {
+                // A late reply still owed is read, not taken for a dead link.
+                if crate::dist::drain_idle_link(&mut client, &owed).await {
                     continue;
                 }
                 if down_since.is_none() {
@@ -6996,20 +7008,30 @@ impl<R: StagedRunner> PipelineEngine<R> {
     fn probe_link(&mut self, down: &Arc<TokioMutex<ActivationClient>>) -> Result<(), String> {
         let tag = self.stage_masks.next_tag();
         let h = self.runner.hidden_size();
+        let t0 = Instant::now();
         let probed = self.block_on(crate::dist::probe_mask_support(
             down,
             h,
-            Self::reply_deadline(),
+            self.mask_probe_timeout,
             tag,
             &self.stage_masks.latch,
         ));
+        info!(
+            ok = probed.is_ok(),
+            took_ms = t0.elapsed().as_millis() as u64,
+            "mask-support probe answered"
+        );
         match probed {
             Ok(()) => {
                 self.mask_evidence = true;
                 Ok(())
             }
             Err(reason) => {
-                self.stage_masks.latch.set();
+                self.stage_masks.latch.set_probe();
+                // A slow but new stage may still answer: read that answer
+                // as a late reply, not as a dead link.
+                self.owed_late
+                    .owe_until(Instant::now() + cascadia_grammar::MASK_PROBE_REPROBE_AFTER);
                 warn!(%reason, "mask-support probe not acknowledged; json requests refused for a while");
                 Err(unconfirmed_step(&reason))
             }
@@ -7368,17 +7390,32 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// would have hit the dead socket is served on a fresh one instead of
     /// failing; on Linux a send to a peer that closed even succeeds, and the
     /// failure would only surface on the reply.
-    fn downstream_idle_dead(&self) -> bool {
+    ///
+    /// A late reply still owed after an unanswered probe is read instead
+    /// (see [`crate::dist::drain_idle_link`]); an acknowledged one clears
+    /// the latch.
+    fn downstream_idle_dead(&mut self) -> bool {
+        !self.read_idle_replies()
+    }
+
+    /// Rank 0, the link idle: read the late replies already on it (see
+    /// [`crate::dist::drain_idle_link`]), clearing the latch when one was
+    /// acknowledged, a slow but new stage's. Returns whether the link is
+    /// alive.
+    fn read_idle_replies(&mut self) -> bool {
         let Some(down) = self.transport.downstream.clone() else {
-            return false;
+            return true;
         };
-        self.block_on(async {
-            let c = down.lock().await;
-            // Timing out means nothing to read: idle and alive.
-            tokio::time::timeout(Duration::from_millis(1), c.wait_readable())
-                .await
-                .is_ok()
-        })
+        let owed = self.owed_late.clone();
+        let alive = self.block_on(async {
+            let mut c = down.lock().await;
+            crate::dist::drain_idle_link(&mut c, &owed).await
+        });
+        if owed.take_acked() && self.stage_masks.latch.is_set() {
+            info!("a late acknowledged answer to the mask-support probe arrived; json requests accepted again");
+            self.stage_masks.latch.clear();
+        }
+        alive
     }
 
     /// Rank 0 only. The downstream link dropped: a neighbour restarted, or the
@@ -8200,10 +8237,20 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return Some(vec![(id.clone(), Chunk::final_marker(id, ""))]);
         }
         // Structured output: refused at once while the pipeline is known not
-        // to mask; else a fresh matcher (this path declines resumed turns).
+        // to mask (after reading a slow stage's late answer, which clears
+        // that); probed first on a link without evidence that it masks; else
+        // a fresh matcher (this path declines resumed turns).
         if compiled.is_some() {
+            if self.owed_late.is_owed() {
+                let _ = self.read_idle_replies();
+            }
             if let Some(msg) = self.stage_masks.refusal() {
                 return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+            }
+            if !self.mask_evidence {
+                if let Err(msg) = self.probe_link(&downstream) {
+                    return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+                }
             }
         }
         let mut grammar = match compiled.as_ref().map(|c| activate(c, &[])).transpose() {
@@ -9339,7 +9386,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let h = hidden_f32.len() as u32;
             let budget =
-                crate::dist::mid_mask_budget(Self::reply_deadline(), self.rank, self.total);
+                crate::dist::mid_mask_budget(self.mask_probe_timeout, self.rank, self.total);
             return self.block_on(async {
                 crate::dist::send_forward_step(
                     down,

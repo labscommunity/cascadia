@@ -760,6 +760,8 @@ struct TailLog {
     died: std::sync::atomic::AtomicBool,
     /// Masked frames that carried the repeat marker.
     repeats: std::sync::atomic::AtomicUsize,
+    /// Mask-support probes a new stage answered.
+    probes: std::sync::atomic::AtomicUsize,
 }
 
 impl TailLog {
@@ -774,6 +776,9 @@ impl TailLog {
     }
     fn repeats(&self) -> usize {
         self.repeats.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn probes(&self) -> usize {
+        self.probes.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn masked(&self, kind: FrameKind) -> usize {
         self.frames()
@@ -813,6 +818,18 @@ fn fixture_tail_with(
     srv: Arc<TokioMutex<ActivationServer>>,
     old: bool,
     forget: bool,
+) -> Arc<TailLog> {
+    fixture_tail_full(rt, srv, old, forget, Duration::ZERO)
+}
+
+/// [`fixture_tail_with`]; a new stage answers its first mask-support probe
+/// only after `probe_delay` (a slow but new stage).
+fn fixture_tail_full(
+    rt: &tokio::runtime::Runtime,
+    srv: Arc<TokioMutex<ActivationServer>>,
+    old: bool,
+    forget: bool,
+    probe_delay: Duration,
 ) -> Arc<TailLog> {
     use crate::dist::*;
     let log = Arc::new(TailLog::default());
@@ -927,6 +944,12 @@ fn fixture_tail_with(
                             };
                         let (_, _, cols) = step.split(4).unwrap();
                         l.saw(kind, cols.is_some());
+                        if cols.as_ref().is_some_and(is_mask_probe) {
+                            let n = l.probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if n == 0 && !probe_delay.is_zero() {
+                                tokio::time::sleep(probe_delay).await;
+                            }
+                        }
                         let cols = cols.map(|c| match kind {
                             FrameKind::Forward => resolve(&l, c),
                             _ => c,
@@ -1038,14 +1061,7 @@ fn an_old_worker_never_gets_a_masked_batch_frame_on_a_fresh_link() {
     std::thread::sleep(Duration::from_millis(100));
     assert!(!log.died(), "the old worker exited: {:?}", log.frames());
     let frames = log.frames();
-    assert!(
-        frames.contains(&(FrameKind::ForwardBatchPrefillNoSample, false)),
-        "{frames:?}"
-    );
-    assert!(
-        !frames.iter().any(|&(k, m)| m && k != FrameKind::Forward),
-        "{frames:?}"
-    );
+    assert_eq!(frames, vec![(FrameKind::Forward, true)], "only the probe");
 }
 
 #[test]
@@ -1073,13 +1089,15 @@ fn a_new_link_gets_evidence_from_the_first_json_request_then_masks_batches() {
     let out = drive(&mut head, &["j1"]);
     assert_eq!(final_chunk(&out["j1"]).error, None);
     assert!(head.mask_evidence);
-    assert_eq!(log.masked(FrameKind::ForwardBatchPrefill), 0);
+    // The probe gave the evidence, so the request's own windows mask.
+    assert_eq!(log.frames()[0], (FrameKind::Forward, true));
+    assert_eq!(log.masked(FrameKind::ForwardBatchPrefill), 1);
     head.submit(long_json_task("j2", 6)).unwrap();
     let out = drive(&mut head, &["j2"]);
     assert_eq!(final_chunk(&out["j2"]).error, None);
     assert_eq!(
         log.masked(FrameKind::ForwardBatchPrefill),
-        1,
+        2,
         "{:?}",
         log.frames()
     );
@@ -1698,4 +1716,227 @@ fn a_stream_window_miss_at_the_last_rank_runs_no_layer() {
         )
     );
     assert_eq!(tail.runner.stream_pos(1), None, "the slot was never opened");
+}
+
+// ---- the mask-support probe's own short wait -------------------------------
+
+/// A short probe wait for tests; the real one is `MASK_PROBE_TIMEOUT`.
+const TEST_PROBE: Duration = Duration::from_millis(80);
+
+/// [`head_engine`] with its probe wait and its link keeper's interval set.
+fn head_engine_with(
+    rt: &tokio::runtime::Runtime,
+    runner: JsonStub,
+    down: Arc<TokioMutex<ActivationClient>>,
+    ranks: u32,
+    streams: usize,
+    probe: Duration,
+    keeper_every: Duration,
+) -> PipelineEngine<JsonStub> {
+    let mut head = head_engine(rt, runner, down, ranks, 0);
+    head.mask_probe_timeout = probe;
+    head.link_check_every = keeper_every;
+    if streams > 0 {
+        assert_eq!(head.enable_streams(streams), streams);
+    }
+    head
+}
+
+/// Submits `task` and drives it to its final chunk; returns the outcome and
+/// how long it took.
+fn timed(eng: &mut PipelineEngine<JsonStub>, task: GenerationTask) -> (Outcome, Duration) {
+    let id = task.task_id.to_string();
+    let t0 = Instant::now();
+    eng.submit(task).unwrap();
+    let mut out = drive(eng, &[id.as_str()]);
+    (out.remove(&id).unwrap(), t0.elapsed())
+}
+
+/// A last stage on an older build (the base Pipeline worker) reads the
+/// probe, can't decode it, skips it and never answers. The first json
+/// request fails with the upgrade message after the probe's short wait,
+/// far under a reply deadline, on the one-task path and with streams; the
+/// link stays aligned, so a plain request after it gets its tokens.
+#[test]
+fn an_old_tail_fails_the_first_json_request_at_the_probe_wait() {
+    for streams in [0, 2] {
+        for i in 0..20 {
+            let rt = runtime();
+            let mut l = links(&rt, 1);
+            let log = fixture_tail(&rt, l[0].0.clone(), true);
+            let mut head = head_engine_with(
+                &rt,
+                JsonStub::new(),
+                l.remove(0).1,
+                2,
+                streams,
+                TEST_PROBE,
+                IDLE_LINK_CHECK,
+            );
+            let (j, took) = timed(&mut head, json_task("j", 8));
+            let e = final_chunk(&j).error.clone().expect("error chunk");
+            assert!(e.ends_with(UPGRADE_EVERY_STAGE), "{streams}/{i}: {e}");
+            assert!(j.tokens.is_empty());
+            assert!(took >= TEST_PROBE, "{streams}/{i}: {took:?}");
+            assert!(
+                took < PipelineEngine::<JsonStub>::reply_deadline() / 4,
+                "{streams}/{i}: {took:?}"
+            );
+            assert!(head.stage_masks.latch.is_set());
+            assert_eq!(
+                log.frames(),
+                vec![(FrameKind::Forward, true)],
+                "only the probe"
+            );
+            let (p, _) = timed(&mut head, plain_task("p", 4));
+            assert_eq!(final_chunk(&p).error, None, "{streams}/{i}");
+            assert_eq!(p.tokens, vec![u32::from(b'a'); 4], "{streams}/{i}: aligned");
+            assert!(!log.died());
+        }
+    }
+}
+
+/// The one-task path probes a link before its first json request, then
+/// masks batched prefill windows from that request on; a link with
+/// evidence is never probed again.
+#[test]
+fn the_one_task_path_probes_a_fresh_link_once() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), false);
+    let mut head = head_engine(&rt, JsonStub::batched(), l.remove(0).1, 2, 0);
+    let (j1, took) = timed(&mut head, long_json_task("j1", 6));
+    assert_eq!(final_chunk(&j1).error, None);
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert!(head.mask_evidence);
+    assert_eq!(
+        log.frames()[0],
+        (FrameKind::Forward, true),
+        "the probe first"
+    );
+    assert_eq!(log.probes(), 1);
+    assert_eq!(
+        log.masked(FrameKind::ForwardBatchPrefill),
+        1,
+        "{:?}",
+        log.frames()
+    );
+    let (j2, _) = timed(&mut head, long_json_task("j2", 6));
+    assert_eq!(final_chunk(&j2).error, None);
+    assert_eq!(log.probes(), 1, "evidence: no second probe");
+}
+
+/// Head → middle → older tail: the middle's shorter probe wait runs out
+/// first and its unconfirmed answer reaches the head inside the head's own
+/// wait.
+#[test]
+fn a_middle_above_an_old_tail_answers_the_probe_inside_the_heads_wait() {
+    for i in 0..20 {
+        let rt = runtime();
+        let l = links(&rt, 2);
+        let log = fixture_tail(&rt, l[1].0.clone(), true);
+        let mut mid = PipelineEngine::new(
+            JsonStub::new(),
+            None,
+            StageTransport {
+                upstream: Some(l[0].0.clone()),
+                downstream: Some(l[1].1.clone()),
+            },
+            rt.handle().clone(),
+            1,
+            3,
+            None,
+        );
+        let head_wait = Duration::from_millis(300);
+        mid.mask_probe_timeout = head_wait;
+        std::thread::spawn(move || while mid.step().is_ok() {});
+        let mut head = head_engine_with(
+            &rt,
+            JsonStub::new(),
+            l[0].1.clone(),
+            3,
+            0,
+            head_wait,
+            IDLE_LINK_CHECK,
+        );
+        let (j, took) = timed(&mut head, json_task("j", 8));
+        let e = final_chunk(&j).error.clone().expect("error chunk");
+        assert!(
+            e.contains("did not acknowledge"),
+            "{i}: the middle's answer: {e}"
+        );
+        assert!(took < head_wait, "{i}: {took:?}");
+        assert!(head.stage_masks.latch.is_set());
+        assert_eq!(log.frames(), vec![(FrameKind::Forward, true)]);
+    }
+}
+
+/// A slow but new tail answers the probe after the head gave up. On the
+/// one-task path the next json request reads that late answer before its
+/// refusal: the latch clears and the request runs. With streams, the idle
+/// link keeper reads it as a late reply rather than a dead link (no
+/// re-dial), and the next json request runs too.
+#[test]
+fn a_late_probe_answer_clears_the_latch_and_keeps_the_link() {
+    for streams in [0, 2] {
+        for i in 0..20 {
+            let rt = runtime();
+            let mut l = links(&rt, 1);
+            let late = Duration::from_millis(150);
+            let log = fixture_tail_full(&rt, l[0].0.clone(), false, false, late);
+            let mut head = head_engine_with(
+                &rt,
+                JsonStub::new(),
+                l.remove(0).1,
+                2,
+                streams,
+                TEST_PROBE,
+                Duration::from_millis(20),
+            );
+            let epoch = head.link_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            let (j1, _) = timed(&mut head, json_task("j1", 6));
+            let e = final_chunk(&j1).error.clone().expect("error chunk");
+            assert!(e.ends_with(UPGRADE_EVERY_STAGE), "{streams}/{i}: {e}");
+            assert!(head.stage_masks.latch.is_set());
+            // The late answer lands; with streams the keeper looks at the
+            // idle link several times meanwhile.
+            std::thread::sleep(late + Duration::from_millis(150));
+            assert_eq!(
+                head.link_epoch.load(std::sync::atomic::Ordering::SeqCst),
+                epoch,
+                "{streams}/{i}: no re-dial"
+            );
+            let (j2, _) = timed(&mut head, json_task("j2", 6));
+            assert_eq!(final_chunk(&j2).error, None, "{streams}/{i}");
+            assert!(!head.stage_masks.latch.is_set());
+            assert!(!head.peer_disconnected);
+            assert_eq!(
+                log.probes(),
+                2,
+                "{streams}/{i}: probed again, answered at once"
+            );
+            assert!(!log.died());
+        }
+    }
+}
+
+/// A latch set by an unanswered probe lasts a minute: the next json request
+/// after it probes again.
+#[test]
+fn a_probe_latch_re_probes_after_a_minute() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), false);
+    let mut head = head_engine(&rt, JsonStub::new(), l.remove(0).1, 2, 0);
+    let past = Instant::now() - cascadia_grammar::MASK_PROBE_REPROBE_AFTER;
+    head.stage_masks
+        .latch
+        .set_probe_at(past + Duration::from_secs(1));
+    let (j, _) = timed(&mut head, json_task("j1", 4));
+    assert_eq!(final_chunk(&j).error.as_deref(), Some(UPGRADE_EVERY_STAGE));
+    assert_eq!(log.probes(), 0, "refused at once");
+    head.stage_masks.latch.set_probe_at(past);
+    let (j, _) = timed(&mut head, json_task("j2", 4));
+    assert_eq!(final_chunk(&j).error, None);
+    assert_eq!(log.probes(), 1);
 }

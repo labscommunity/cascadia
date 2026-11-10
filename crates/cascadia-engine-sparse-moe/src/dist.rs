@@ -3087,14 +3087,19 @@ pub async fn recv_stream_tokens_ack_body_client(
 /// On a middle stage the same record notes a late acknowledged reply it
 /// dropped ([`MaskLatch::take_owed`]), so it can tell the stages above with
 /// its next reply (see [`send_owed_late_ack`]).
+///
+/// A latch set by an unanswered mask-support probe refuses for
+/// [`cascadia_grammar::MASK_PROBE_REPROBE_AFTER`] instead: a probe costs a
+/// json request only a short wait.
 #[derive(Debug, Default)]
 pub struct MaskLatch {
-    at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// When it was set, and for how long it refuses.
+    at: std::sync::Mutex<Option<(std::time::Instant, std::time::Duration)>>,
     owed: std::sync::atomic::AtomicBool,
 }
 
 impl MaskLatch {
-    fn slot(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<(std::time::Instant, std::time::Duration)>> {
         self.at.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -3108,7 +3113,16 @@ impl MaskLatch {
     }
 
     pub fn set_at(&self, at: std::time::Instant) {
-        *self.slot() = Some(at);
+        *self.slot() = Some((at, MASK_REPROBE));
+    }
+
+    /// Set by an unanswered mask-support probe.
+    pub fn set_probe(&self) {
+        self.set_probe_at(std::time::Instant::now());
+    }
+
+    pub fn set_probe_at(&self, at: std::time::Instant) {
+        *self.slot() = Some((at, cascadia_grammar::MASK_PROBE_REPROBE_AFTER));
     }
 
     pub fn clear(&self) {
@@ -3126,7 +3140,7 @@ impl MaskLatch {
 
     pub fn refuses_at(&self, now: std::time::Instant) -> bool {
         self.slot()
-            .is_some_and(|t| now.saturating_duration_since(t) < MASK_REPROBE)
+            .is_some_and(|(t, window)| now.saturating_duration_since(t) < window)
     }
 }
 
@@ -3166,6 +3180,123 @@ pub async fn send_owed_late_ack(
         send_token_ack_upstream(up, -1, LATE_ACK_TAG, MASK_ACK).await?;
     }
     Ok(())
+}
+
+/// Rank 0: a reply its downstream link still owes after a wait that gave up
+/// (a mask-support probe left unanswered: a slow but new stage answers it
+/// late), expected until a grace time. While one is owed, bytes on the idle
+/// link are that reply, read through the stale-discard path, not a dead
+/// link (see [`drain_idle_link`]). Shared by the engine and its link keeper.
+#[derive(Debug, Default)]
+pub struct OwedLateReply {
+    until: std::sync::Mutex<Option<std::time::Instant>>,
+    acked: std::sync::atomic::AtomicBool,
+}
+
+impl OwedLateReply {
+    /// A late reply is expected until `until`.
+    pub fn owe_until(&self, until: std::time::Instant) {
+        *self.until.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
+    }
+
+    /// Whether a late reply is still expected now.
+    pub fn is_owed(&self) -> bool {
+        self.until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|t| std::time::Instant::now() < t)
+    }
+
+    /// A late reply was read: `status` and its tokens. An acknowledged one
+    /// that isn't a mask miss is evidence that the stages mask.
+    fn note(&self, status: u32, tokens: &[i64]) {
+        if status == MASK_ACK && !tokens.contains(&i64::from(MASK_MISS_TOKEN)) {
+            self.acked.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether an acknowledged late reply was read since the last call.
+    pub fn take_acked(&self) -> bool {
+        self.acked.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// One reply frame off an idle link, under the caller's lock: its status
+/// (0 for a plain `Token`) and tokens. `Err` for anything that isn't a
+/// reply, EOF included.
+async fn read_idle_reply(c: &mut ActivationClient) -> Result<(u32, Vec<i64>), String> {
+    let kind = c.recv_raw(4).await.map_err(|e| e.to_string())?;
+    let kind = parse_kind(&kind).map_err(|e| e.to_string())?;
+    let body = |n: usize, raw: &[u8]| {
+        if raw.len() == n {
+            Ok(())
+        } else {
+            Err("short reply body".to_string())
+        }
+    };
+    match kind {
+        FrameKind::Token => {
+            let raw = c.recv_raw(8).await.map_err(|e| e.to_string())?;
+            body(8, &raw)?;
+            Ok((0, vec![i64::from_be_bytes(raw[..8].try_into().unwrap())]))
+        }
+        FrameKind::TokenAck => {
+            let raw = c.recv_raw(16).await.map_err(|e| e.to_string())?;
+            body(16, &raw)?;
+            let token = i64::from_be_bytes(raw[0..8].try_into().unwrap());
+            Ok((be_u32(&raw[12..16]), vec![token]))
+        }
+        FrameKind::StreamTokensAck => {
+            let raw = c.recv_raw(12).await.map_err(|e| e.to_string())?;
+            body(12, &raw)?;
+            let (status, n) = (be_u32(&raw[4..8]), be_u32(&raw[8..12]));
+            if n == 0 || n > MAX_STREAM_ROWS {
+                return Err(format!("stream tokens: rows {n} out of range"));
+            }
+            let rows = c
+                .recv_raw(n as usize * 12)
+                .await
+                .map_err(|e| e.to_string())?;
+            body(n as usize * 12, &rows)?;
+            let tokens = rows
+                .chunks_exact(12)
+                .map(|r| i64::from_be_bytes(r[4..12].try_into().unwrap()))
+                .collect();
+            Ok((status, tokens))
+        }
+        other => Err(format!("unexpected {other:?} on an idle link")),
+    }
+}
+
+/// Rank 0, on an idle link (no frame in flight), under the caller's lock:
+/// whether the link is alive. Nothing to read: alive. Bytes while a late
+/// reply is owed ([`OwedLateReply`]): each waiting reply is read and noted,
+/// and the link is alive unless one of them is not a reply (or EOF). Bytes
+/// with nothing owed: the downstream never sends unsolicited bytes, so the
+/// link is dead or out of step.
+pub async fn drain_idle_link(c: &mut ActivationClient, owed: &OwedLateReply) -> bool {
+    loop {
+        // Timing out means nothing to read: idle and alive.
+        let readable = tokio::time::timeout(std::time::Duration::from_millis(1), c.wait_readable())
+            .await
+            .is_ok();
+        if !readable {
+            return true;
+        }
+        if !owed.is_owed() {
+            return false;
+        }
+        match read_idle_reply(c).await {
+            Ok((status, tokens)) => {
+                tracing::debug!(status, ?tokens, "late reply read on an idle link");
+                owed.note(status, &tokens);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "idle link carried something other than a late reply");
+                return false;
+            }
+        }
+    }
 }
 
 /// Whether `cols` is the mask-support probe: one masked row with no mask
@@ -4724,5 +4855,122 @@ mod repeat_mask_tests {
             MaskedReply::Token(8)
         );
         assert!(!latch.is_set());
+    }
+}
+
+#[cfg(test)]
+mod mask_probe_tests {
+    use super::*;
+    use cascadia_grammar::{MASK_MISS_TOKEN, MASK_PROBE_REPROBE_AFTER, MASK_PROBE_TIMEOUT};
+    use std::time::Duration;
+
+    async fn pair() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) {
+        let mut srv = ActivationServer::new("127.0.0.1", 0);
+        srv.start().await.unwrap();
+        let port = srv.port();
+        let srv = Arc::new(Mutex::new(srv));
+        let s = srv.clone();
+        let accept = tokio::spawn(async move { s.lock().await.accept().await.unwrap() });
+        let mut cli = ActivationClient::new("127.0.0.1", port);
+        cli.connect_with_timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
+        accept.await.unwrap();
+        (srv, Arc::new(Mutex::new(cli)))
+    }
+
+    /// Lets bytes just written on loopback reach the reader's socket.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    /// A latch set by an unanswered probe refuses for a minute; one set by
+    /// a masked step keeps ten.
+    #[test]
+    fn a_probe_latch_re_probes_after_a_minute() {
+        let sec = Duration::from_secs(1);
+        let t0 = std::time::Instant::now();
+        let latch = MaskLatch::default();
+        latch.set_probe_at(t0);
+        assert!(latch.refuses_at(t0 + MASK_PROBE_REPROBE_AFTER - sec));
+        assert!(!latch.refuses_at(t0 + MASK_PROBE_REPROBE_AFTER));
+        latch.set_at(t0);
+        assert!(latch.refuses_at(t0 + MASK_PROBE_REPROBE_AFTER));
+        assert!(latch.refuses_at(t0 + MASK_REPROBE - sec));
+        assert!(!latch.refuses_at(t0 + MASK_REPROBE));
+    }
+
+    /// Every middle waits less for a probe's answer than the stage above.
+    #[test]
+    fn a_middle_waits_less_for_a_probe_than_the_head() {
+        for total in 2..=12u32 {
+            let mut upstream = MASK_PROBE_TIMEOUT;
+            for rank in 1..total {
+                let b = mid_mask_budget(MASK_PROBE_TIMEOUT, rank, total);
+                assert!(b < upstream && b > Duration::ZERO, "{rank}/{total}");
+                upstream = b;
+            }
+        }
+    }
+
+    /// An idle link with a late reply owed: the reply waiting on it is read
+    /// through the stale-discard path (an acknowledged one noted, a late
+    /// mask miss not), and the link is alive. Without a reply owed, bytes on
+    /// an idle link mean it is dead or out of step, as before; so does EOF
+    /// either way.
+    #[tokio::test]
+    async fn an_owed_late_reply_on_an_idle_link_is_read_not_taken_for_a_dead_link() {
+        let (srv, cli) = pair().await;
+        let owed = OwedLateReply::default();
+        assert!(
+            drain_idle_link(&mut *cli.lock().await, &owed).await,
+            "nothing to read"
+        );
+
+        owed.owe_until(std::time::Instant::now() + Duration::from_secs(60));
+        send_token_ack_upstream(&srv, MASK_MISS_TOKEN.into(), 3, MASK_ACK)
+            .await
+            .unwrap();
+        settle().await;
+        assert!(drain_idle_link(&mut *cli.lock().await, &owed).await);
+        assert!(!owed.take_acked(), "a late mask miss proves nothing");
+
+        send_token_ack_upstream(&srv, -1, 4, MASK_ACK)
+            .await
+            .unwrap();
+        send_token_upstream(&srv, 9).await.unwrap();
+        settle().await;
+        assert!(drain_idle_link(&mut *cli.lock().await, &owed).await);
+        assert!(owed.take_acked(), "the late probe answer");
+        assert!(!owed.take_acked(), "taken once");
+
+        // The link still carries the next exchange.
+        send_token_upstream(&srv, 8).await.unwrap();
+        assert_eq!(recv_token_reply(&cli, Duration::from_secs(5)).await, Ok(8));
+
+        // Nothing owed: data on an idle link is a dead link.
+        let idle = OwedLateReply::default();
+        send_token_ack_upstream(&srv, -1, 5, MASK_ACK)
+            .await
+            .unwrap();
+        settle().await;
+        assert!(!drain_idle_link(&mut *cli.lock().await, &idle).await);
+
+        // An owed reply that has expired is no longer expected.
+        let (srv, cli) = pair().await;
+        let expired = OwedLateReply::default();
+        expired.owe_until(std::time::Instant::now());
+        send_token_ack_upstream(&srv, -1, 5, MASK_ACK)
+            .await
+            .unwrap();
+        settle().await;
+        assert!(!drain_idle_link(&mut *cli.lock().await, &expired).await);
+
+        // EOF while owed is still a dead link.
+        let (srv, cli) = pair().await;
+        owed.owe_until(std::time::Instant::now() + Duration::from_secs(60));
+        srv.lock().await.close().await;
+        settle().await;
+        assert!(!drain_idle_link(&mut *cli.lock().await, &owed).await);
     }
 }
