@@ -508,7 +508,9 @@ jobs:
       # 40230737422.
       ONEAPI_INSTALLER: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/a51104eb-6f4a-4a0e-9dae-1b81b0c81ae1/intel-deep-learning-essentials-2026.1.4.16_offline.exe
       ONEAPI_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.tbb.devel
+      ONEAPI_INSTALLER_SHA256: 937e36408726a5535c31e14dc44543bdad9cdc24f7a61dc8b0b0b7cf3cb009b5
       LEVEL_ZERO_SDK_URL: https://github.com/oneapi-src/level-zero/releases/download/v1.33.1/level-zero-win-sdk-1.33.1.zip
+      LEVEL_ZERO_SDK_SHA256: ff845844b1a57a22abf646ebffb32cd07839249e0e2b962d0d5684a7a70689c1
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -519,6 +521,8 @@ jobs:
         shell: cmd
         run: |
           curl.exe --fail --output "%RUNNER_TEMP%\oneapi.exe" --url "%ONEAPI_INSTALLER%" --retry 5 --retry-delay 5 || exit /b 1
+          rem Pinned digest: a replaced file at the same URL must not run.
+          powershell -NoProfile -Command "if ((Get-FileHash -Algorithm SHA256 '%RUNNER_TEMP%\oneapi.exe').Hash -ne '%ONEAPI_INSTALLER_SHA256%') { Write-Error 'oneAPI installer sha256 mismatch'; exit 1 }" || exit /b 1
           start /b /wait "" "%RUNNER_TEMP%\oneapi.exe" -s -x -f "%RUNNER_TEMP%\oneapi" --log "%RUNNER_TEMP%\oneapi-extract.log"
           del "%RUNNER_TEMP%\oneapi.exe"
           "%RUNNER_TEMP%\oneapi\bootstrapper.exe" -s --action install --components=%ONEAPI_COMPONENTS% --eula=accept -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 --log-dir="%RUNNER_TEMP%\oneapi-logs" || exit /b 1
@@ -533,6 +537,7 @@ jobs:
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "$env:LEVEL_ZERO_SDK_URL" -OutFile "$env:RUNNER_TEMP\level-zero.zip"
+          if ((Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP\level-zero.zip").Hash -ne $env:LEVEL_ZERO_SDK_SHA256) { throw "Level Zero SDK sha256 mismatch" }
           Expand-Archive -Path "$env:RUNNER_TEMP\level-zero.zip" -DestinationPath "C:\level-zero-sdk" -Force
           if (-not (Test-Path "C:\level-zero-sdk\include\level_zero\ze_api.h")) { throw "Level Zero SDK headers missing" }
           "LEVEL_ZERO_V1_SDK_PATH=C:\level-zero-sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -612,6 +617,10 @@ jobs:
           cd "$RUNNER_TEMP"
           wget -q "https://github.com/oneapi-src/level-zero/releases/download/v1.33.1/libze1_1.33.1%2Bu22.04_amd64.deb" -O libze1.deb
           wget -q "https://github.com/oneapi-src/level-zero/releases/download/v1.33.1/libze-dev_1.33.1%2Bu22.04_amd64.deb" -O libze-dev.deb
+          sha256sum -c - <<'SUMS'
+          85d3ed193bb6a3b3185fe987b91bff8b6d5bdaadbb21aed42f5b6b8042146aaa  libze1.deb
+          c2a3ea5cade9f2db012b4e7b6289e3432c0080c31d4a599d1df763187788533f  libze-dev.deb
+          SUMS
           sudo apt-get install -y ./libze1.deb ./libze-dev.deb
           test -f /usr/include/level_zero/ze_api.h || { echo "::error::Level Zero headers missing"; exit 1; }
 
@@ -665,7 +674,9 @@ jobs:
   #    pre-release badge when its binaries are verifiably present.
   promote:
     name: promote release
-    needs: [plan, build-linux, build-windows, build-sycl-llama]
+    # build-sycl-llama-windows is listed so promote waits for its upload; its
+    # success is not required (non-blocking until it has shipped once).
+    needs: [plan, build-linux, build-windows, build-sycl-llama, build-sycl-llama-windows]
     if: ${{ !cancelled() && needs.plan.outputs.dry_run != 'true' && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' && needs.build-sycl-llama.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -722,16 +733,21 @@ jobs:
               done
             done
           fi
-          # The sycl-llama legs ship extra assets and stay non-blocking until
-          # each has produced a release once; name what they didn't ship.
-          for a in "cascadia-llama-sycl-$VER-linux-x86_64.tar.gz" "cascadia-llama-sycl-$VER-windows-x86_64.zip"; do
-            case " $assets " in
-              *" $a "*) ;;
-              *)
-                echo "::warning::sycl-llama bundle $a is missing on $TAG"
-                echo "- sycl-llama bundle \`$a\` is missing on $TAG" >> "$GITHUB_STEP_SUMMARY"
-                ;;
-            esac
-          done
+          # The Linux sycl-llama bundle is required (its leg gates promote).
+          a="cascadia-llama-sycl-$VER-linux-x86_64.tar.gz"
+          case " $assets " in
+            *" $a "*) ;;
+            *) echo "::error::expected sycl-llama bundle $a on $TAG, found: $assets"; exit 1 ;;
+          esac
+          # The Windows sycl-llama leg stays non-blocking until it has shipped
+          # once; name it when it didn't.
+          a="cascadia-llama-sycl-$VER-windows-x86_64.zip"
+          case " $assets " in
+            *" $a "*) ;;
+            *)
+              echo "::warning::sycl-llama bundle $a is missing on $TAG"
+              echo "- sycl-llama bundle \`$a\` is missing on $TAG" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
           gh release edit "$TAG" --prerelease=false --latest
           echo "release $TAG promoted"
