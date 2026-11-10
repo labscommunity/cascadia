@@ -438,14 +438,20 @@ const BOUND_PAIRS: [(&str, &str, bool); 7] = [
 /// `exclusiveMaximum`, described with the JSON pointer (`#`, `#/items`, ...)
 /// of the object holding it; `None` when there is none.
 ///
-/// Such a schema has no valid output at all. Some grammar backends refuse
-/// it, others build a grammar no output can finish and decode until the
-/// request is killed, so [`parse_response_format`] refuses it up front.
-/// This only reports, for callers that would rather drop the constraint.
+/// No value meets such a pair, and a grammar backend given it may build a
+/// grammar no output can finish (llama-server then decodes until the
+/// request is killed), so [`parse_response_format`] refuses it up front,
+/// wherever it sits: a pair no value meets is a mistake in the schema even
+/// in a branch a value need not take. This only reports, for callers that
+/// would rather drop the constraint.
 ///
-/// Like [`sum_counts`], it visits every object in the document, data keys
-/// included: a `$ref` may point anywhere. Only numeric values are compared,
-/// so a property map whose names are keywords is never read as bounds.
+/// It visits every schema in the document, `$defs` included, and skips
+/// `enum`, `const`, `default` and `examples`, whose values are data: a
+/// bound-named key in a default object is not a bound. Whatever a local
+/// `$ref` points to is a schema and is checked, inside a data keyword too. A property map's
+/// entries are schemas whatever they are called. Only numeric values are
+/// compared, so a property map whose names are keywords is never read as
+/// bounds.
 /// For a schema whose every `type` is `integer`, a range holding no integer
 /// (`exclusiveMinimum` 2 with `exclusiveMaximum` 3) is reported too.
 /// `minContains`/`maxContains` are left alone: no backend enforces
@@ -453,7 +459,35 @@ const BOUND_PAIRS: [(&str, &str, bool); 7] = [
 /// of `exclusiveMinimum`/`exclusiveMaximum` is not a number and is skipped.
 pub fn unsatisfiable_bound(schema: &Value) -> Option<String> {
     let mut path = Vec::new();
-    find_unsatisfiable_bound(schema, &mut path, 0)
+    find_unsatisfiable_bound(schema, &mut path, 0).or_else(|| {
+        // A local `$ref` makes whatever it points to a schema, inside a data
+        // keyword too, which the walk above skips.
+        let mut stack = vec![schema];
+        while let Some(v) = stack.pop() {
+            match v {
+                Value::Object(o) => {
+                    if let Some(r) = o.get("$ref").and_then(Value::as_str) {
+                        for target in backstop_targets(schema, r) {
+                            let mut path: Vec<String> = r
+                                .trim_start_matches('#')
+                                .split('/')
+                                .filter(|k| !k.is_empty())
+                                .map(|k| k.replace("~1", "/").replace("~0", "~"))
+                                .collect();
+                            let found = find_unsatisfiable_bound(target, &mut path, 0);
+                            if found.is_some() {
+                                return found;
+                            }
+                        }
+                    }
+                    stack.extend(o.values());
+                }
+                Value::Array(a) => stack.extend(a.iter()),
+                _ => {}
+            }
+        }
+        None
+    })
 }
 
 fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> Option<String> {
@@ -490,7 +524,7 @@ fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> 
                         "is greater than"
                     };
                     return Some(format!(
-                        "{lower} ({lo}) {relation} {upper} ({hi}) at {}",
+                        "{lower} ({lo}) {relation} {upper} ({hi}) at {}; no value can satisfy both",
                         json_pointer(path)
                     ));
                 }
@@ -503,7 +537,28 @@ fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> 
                     json_pointer(path)
                 ));
             }
-            obj.iter().find_map(|(k, c)| descend(path, k.clone(), c))
+            for (key, child) in obj {
+                if DATA_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
+                let found = match child {
+                    // A map of named schemas: each entry is a schema, a
+                    // `default` property too.
+                    Value::Object(map) if SCHEMA_MAPS.contains(&key.as_str()) => {
+                        path.push(key.clone());
+                        let found = map
+                            .iter()
+                            .find_map(|(name, sub)| descend(path, name.clone(), sub));
+                        path.pop();
+                        found
+                    }
+                    _ => descend(path, key.clone(), child),
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
         }
         _ => None,
     }
@@ -536,14 +591,18 @@ fn empty_integer_range(obj: &Map<String, Value>) -> Option<(&'static str, &'stat
     if !only_integer {
         return None;
     }
-    // An integer bound as is; a fraction rounded the given way. Saturates
-    // far outside any count a schema can hold.
+    // An integer bound as is; a fraction rounded the given way. A float
+    // past what an i128 holds is no bound here (a cast would saturate and
+    // make a wide range look empty).
     let bound = |key: &str, round: fn(f64) -> f64| -> Option<i128> {
         let n = obj.get(key)?.as_number()?;
         match (n.as_i64(), n.as_u64()) {
             (Some(i), _) => Some(i128::from(i)),
             (_, Some(u)) => Some(i128::from(u)),
-            _ => Some(round(n.as_f64()?) as i128),
+            _ => {
+                let r = round(n.as_f64()?);
+                (r.is_finite() && r.abs() < 1e37).then_some(r as i128)
+            }
         }
     };
     let lowers = [
@@ -588,7 +647,7 @@ fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<std
 /// ([`unsatisfiable_bound`]).
 fn check_bounds(schema: &Value) -> Result<(), String> {
     match unsatisfiable_bound(schema) {
-        Some(found) => Err(format!("{FIELD}: {found}; no output can match it")),
+        Some(found) => Err(format!("{FIELD}: {found}")),
         None => Ok(()),
     }
 }
@@ -3456,16 +3515,14 @@ mod tests {
 
     /// The 400 message for an unsatisfiable bound pair.
     fn unsat(detail: &str) -> Result<ResponseFormat, String> {
-        Err(format!(
-            "response_format.json_schema.schema: {detail}; no output can match it"
-        ))
+        Err(format!("response_format.json_schema.schema: {detail}"))
     }
 
     #[test]
     fn min_length_above_max_length_is_rejected() {
         assert_eq!(
             parse_schema(json!({"type": "string", "minLength": 5, "maxLength": 2})),
-            unsat("minLength (5) is greater than maxLength (2) at #")
+            unsat("minLength (5) is greater than maxLength (2) at #; no value can satisfy both")
         );
     }
 
@@ -3473,7 +3530,7 @@ mod tests {
     fn min_items_above_max_items_is_rejected() {
         assert_eq!(
             parse_schema(json!({"type": "array", "minItems": 5, "maxItems": 2})),
-            unsat("minItems (5) is greater than maxItems (2) at #")
+            unsat("minItems (5) is greater than maxItems (2) at #; no value can satisfy both")
         );
     }
 
@@ -3481,7 +3538,7 @@ mod tests {
     fn min_properties_above_max_properties_is_rejected() {
         assert_eq!(
             parse_schema(json!({"type": "object", "minProperties": 3, "maxProperties": 1})),
-            unsat("minProperties (3) is greater than maxProperties (1) at #")
+            unsat("minProperties (3) is greater than maxProperties (1) at #; no value can satisfy both")
         );
     }
 
@@ -3489,11 +3546,11 @@ mod tests {
     fn minimum_above_maximum_is_rejected() {
         assert_eq!(
             parse_schema(json!({"type": "number", "minimum": 5, "maximum": 2.5})),
-            unsat("minimum (5) is greater than maximum (2.5) at #")
+            unsat("minimum (5) is greater than maximum (2.5) at #; no value can satisfy both")
         );
         assert_eq!(
             parse_schema(json!({"type": "integer", "minimum": -1, "maximum": -2})),
-            unsat("minimum (-1) is greater than maximum (-2) at #")
+            unsat("minimum (-1) is greater than maximum (-2) at #; no value can satisfy both")
         );
     }
 
@@ -3501,11 +3558,11 @@ mod tests {
     fn exclusive_minimum_not_below_exclusive_maximum_is_rejected() {
         assert_eq!(
             parse_schema(json!({"type": "number", "exclusiveMinimum": 2, "exclusiveMaximum": 2})),
-            unsat("exclusiveMinimum (2) is not less than exclusiveMaximum (2) at #")
+            unsat("exclusiveMinimum (2) is not less than exclusiveMaximum (2) at #; no value can satisfy both")
         );
         assert_eq!(
             parse_schema(json!({"type": "number", "exclusiveMinimum": 3, "exclusiveMaximum": 2})),
-            unsat("exclusiveMinimum (3) is not less than exclusiveMaximum (2) at #")
+            unsat("exclusiveMinimum (3) is not less than exclusiveMaximum (2) at #; no value can satisfy both")
         );
     }
 
@@ -3513,7 +3570,9 @@ mod tests {
     fn minimum_not_below_exclusive_maximum_is_rejected() {
         assert_eq!(
             parse_schema(json!({"type": "number", "minimum": 2, "exclusiveMaximum": 2})),
-            unsat("minimum (2) is not less than exclusiveMaximum (2) at #")
+            unsat(
+                "minimum (2) is not less than exclusiveMaximum (2) at #; no value can satisfy both"
+            )
         );
     }
 
@@ -3521,7 +3580,9 @@ mod tests {
     fn exclusive_minimum_not_below_maximum_is_rejected() {
         assert_eq!(
             parse_schema(json!({"type": "number", "exclusiveMinimum": 2, "maximum": 2})),
-            unsat("exclusiveMinimum (2) is not less than maximum (2) at #")
+            unsat(
+                "exclusiveMinimum (2) is not less than maximum (2) at #; no value can satisfy both"
+            )
         );
     }
 
@@ -3536,7 +3597,7 @@ mod tests {
                     "a/b~c": {"type": "string", "minLength": 5, "maxLength": 2}
                 }
             })),
-            unsat("minLength (5) is greater than maxLength (2) at #/properties/a~1b~0c")
+            unsat("minLength (5) is greater than maxLength (2) at #/properties/a~1b~0c; no value can satisfy both")
         );
         // Inside `items`.
         assert_eq!(
@@ -3544,7 +3605,9 @@ mod tests {
                 "type": "array",
                 "items": {"type": "array", "minItems": 4, "maxItems": 3}
             })),
-            unsat("minItems (4) is greater than maxItems (3) at #/items")
+            unsat(
+                "minItems (4) is greater than maxItems (3) at #/items; no value can satisfy both"
+            )
         );
         // Inside an `anyOf` branch and `prefixItems`.
         assert_eq!(
@@ -3554,7 +3617,7 @@ mod tests {
                     {"type": "array", "prefixItems": [{"type": "number", "minimum": 1, "maximum": 0}]}
                 ]
             })),
-            unsat("minimum (1) is greater than maximum (0) at #/anyOf/1/prefixItems/0")
+            unsat("minimum (1) is greater than maximum (0) at #/anyOf/1/prefixItems/0; no value can satisfy both")
         );
         // An `additionalProperties` schema.
         assert_eq!(
@@ -3562,7 +3625,7 @@ mod tests {
                 "type": "object",
                 "additionalProperties": {"type": "object", "minProperties": 2, "maxProperties": 1}
             })),
-            unsat("minProperties (2) is greater than maxProperties (1) at #/additionalProperties")
+            unsat("minProperties (2) is greater than maxProperties (1) at #/additionalProperties; no value can satisfy both")
         );
     }
 
@@ -3575,14 +3638,14 @@ mod tests {
                 "required": ["name"],
                 "$defs": {"Name": {"type": "string", "minLength": 5, "maxLength": 2}}
             })),
-            unsat("minLength (5) is greater than maxLength (2) at #/$defs/Name")
+            unsat("minLength (5) is greater than maxLength (2) at #/$defs/Name; no value can satisfy both")
         );
         assert_eq!(
             parse_schema(json!({
                 "$ref": "#/definitions/N",
                 "definitions": {"N": {"type": "number", "exclusiveMinimum": 1, "maximum": 1}}
             })),
-            unsat("exclusiveMinimum (1) is not less than maximum (1) at #/definitions/N")
+            unsat("exclusiveMinimum (1) is not less than maximum (1) at #/definitions/N; no value can satisfy both")
         );
     }
 
@@ -3617,6 +3680,73 @@ mod tests {
         }
     }
 
+    /// `enum`, `const`, `default` and `examples` hold values, not schemas:
+    /// bound-named keys inside them are data. A property map's entries are
+    /// schemas whatever they are called, `default` included.
+    #[test]
+    fn bounds_inside_data_keywords_are_data() {
+        for schema in [
+            json!({"type": "object", "properties": {"range": {
+                "type": "object",
+                "properties": {"minimum": {"type": "integer"}, "maximum": {"type": "integer"}},
+                "default": {"minimum": 10, "maximum": 0}
+            }}}),
+            json!({"enum": [{"minLength": 5, "maxLength": 2}]}),
+            json!({"properties": {"s": {"const": {"type": "integer", "minimum": 2.5, "maximum": 2.9}}}}),
+            json!({"type": "string", "examples": [{"minItems": 3, "maxItems": 1}]}),
+        ] {
+            assert_eq!(unsatisfiable_bound(&schema), None, "{schema}");
+            assert!(parse_schema(schema.clone()).is_ok(), "{schema}");
+        }
+        assert_eq!(
+            parse_schema(json!({"type": "object", "properties": {
+                "default": {"type": "string", "minLength": 5, "maxLength": 2}
+            }})),
+            unsat("minLength (5) is greater than maxLength (2) at #/properties/default; no value can satisfy both")
+        );
+    }
+
+    /// A local `$ref` into a data keyword makes that value a schema: its
+    /// bounds are checked like any other.
+    #[test]
+    fn a_ref_into_a_data_keyword_is_checked() {
+        assert_eq!(
+            parse_schema(json!({
+                "type": "object",
+                "properties": {"a": {"$ref": "#/default/x"}},
+                "default": {"x": {"type": "string", "minLength": 5, "maxLength": 2}}
+            })),
+            unsat("minLength (5) is greater than maxLength (2) at #/default/x; no value can satisfy both")
+        );
+    }
+
+    /// The pair is refused wherever it sits, also in a branch a value need not
+    /// take; the message says what is true of the pair itself.
+    #[test]
+    fn a_pair_in_an_optional_branch_is_named_for_what_it_is() {
+        assert_eq!(
+            parse_schema(json!({"anyOf": [
+                {"type": "integer", "minimum": 5, "maximum": 2},
+                {"type": "null"}
+            ]})),
+            unsat(
+                "minimum (5) is greater than maximum (2) at #/anyOf/0; no value can satisfy both"
+            )
+        );
+    }
+
+    /// Float bounds past the range an integer comparison can hold are not
+    /// read as an empty integer range.
+    #[test]
+    fn huge_float_bounds_on_an_integer_are_not_refused() {
+        for schema in [
+            json!({"type": "integer", "minimum": 1e39, "exclusiveMaximum": 1e40}),
+            json!({"type": "integer", "exclusiveMinimum": -1e40, "maximum": -1e39}),
+        ] {
+            assert_eq!(unsatisfiable_bound(&schema), None, "{schema}");
+        }
+    }
+
     #[test]
     fn unsatisfiable_bound_reports_without_failing() {
         assert_eq!(
@@ -3625,7 +3755,7 @@ mod tests {
                 "properties": {"a": {"type": "string", "minLength": 5, "maxLength": 2}}
             }))
             .as_deref(),
-            Some("minLength (5) is greater than maxLength (2) at #/properties/a")
+            Some("minLength (5) is greater than maxLength (2) at #/properties/a; no value can satisfy both")
         );
     }
 

@@ -386,7 +386,7 @@ def case_unsatisfiable_bounds(base):
     ):
         body = chat([{"role": "user", "content": "hi"}], response_format=rf_schema(schema), max_tokens=8)
         status, raw, dt = post(base, body, timeout=30)
-        ok = status == 400 and "invalid response_format" in raw and "no output can match it" in raw and dt < 5
+        ok = status == 400 and "invalid response_format" in raw and "no value can satisfy both" in raw and dt < 5
         verdict(f"unsatisfiable_bounds_400_{kind}", ok, f"HTTP {status} {dt:.2f}s: {raw[:200]}")
     status, raw, dt = post(base, chat([{"role": "user", "content": "Say hello."}], max_tokens=8))
     verdict("server_alive_after_unsatisfiable_bounds", status == 200, f"HTTP {status} {dt:.2f}s")
