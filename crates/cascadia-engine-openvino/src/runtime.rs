@@ -47,7 +47,8 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_grammar::GrammarFactory;
 use cascadia_grammar::{CompiledGrammar, GrammarMask};
 use cascadia_grammar::{
-    MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT,
+    MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN,
+    MASK_PROBE, MASK_PROBE_OK_TOKEN, MASK_PROBE_REPROBE_AFTER, MASK_PROBE_TIMEOUT, REPEAT,
 };
 use cascadia_ov_genai_shim::{
     advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
@@ -985,6 +986,16 @@ const NACK_TOKEN: i32 = -1;
 // nothing and answers the acknowledged `[MASK_MISS_TOKEN, seq, MASK_ACK]`;
 // middles pass that up unchanged and the head fails the task with
 // `MASK_MISS_MESSAGE`, without latching. Packed plans always carry full masks.
+//
+// Mask-support probe (non-packed only): before a structured-output task's
+// first masked step on a link with no evidence that every later stage masks,
+// the head sends the lead `[seq, (0,) W]` with `W` = `MASK_PROBE` and no mask
+// lanes, then a one-row F32 hidden of zeros. A stage that predates masks
+// reads both frames and rejects the lead, as for any masked step, so it stays
+// aligned and silent; the head stops waiting after `MASK_PROBE_TIMEOUT` and
+// latches. A newer middle forwards its own probe and passes the answer up; the
+// tail answers `[MASK_PROBE_OK_TOKEN, seq, MASK_ACK]` at once. No stage runs
+// a layer or touches its KV, position, warm resume or mask caches for it.
 
 /// The acknowledgement lane of a reply to a masked step.
 const MASK_ACK: i32 = 0x4d41_534b;
@@ -1084,13 +1095,64 @@ fn encode_wire_lead_repeat(seq: u32, position: Option<i64>) -> WireTensor {
     t
 }
 
+/// The lead of a mask-support probe: today's lanes, then the tagged `W` lane
+/// with `W` = [`MASK_PROBE`] and no mask lanes (see the stage-wire notes
+/// above `MASK_ACK`).
+fn encode_wire_lead_probe(seq: u32, position: Option<i64>) -> WireTensor {
+    let mut t = encode_wire_lead(seq, position);
+    let base = t.data.len() / 8;
+    t.data
+        .extend_from_slice(&mask_count_lane(base, MASK_PROBE as usize).to_le_bytes());
+    t.shape[2] = (t.data.len() / 8) as u32;
+    t
+}
+
+/// The hidden of a mask-support probe: one F32 row of `width` zeros (at
+/// least one), a frame any stage's hidden decoder accepts.
+fn probe_hidden(width: usize) -> WireTensor {
+    let width = width.max(1);
+    WireTensor::new(WireDType::F32, [1, 1, width as u32], vec![0u8; width * 4])
+}
+
+/// Send a mask-support probe downstream: [`encode_wire_lead_probe`] then
+/// [`probe_hidden`], in wire order and under one lock. The link's send cache
+/// is not touched.
+async fn send_probe_frames(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    seq: u32,
+    position: Option<i64>,
+    width: usize,
+) -> Result<(), cascadia_transport::TransportError> {
+    let lead = encode_wire_lead_probe(seq, position);
+    let hid = probe_hidden(width);
+    let mut guard = downstream.lock().await;
+    guard.send(&lead).await?;
+    guard.send(&hid).await?;
+    Ok(())
+}
+
+/// What a lead beyond today's lanes carries: a mask (its words or the repeat
+/// marker), or a mask-support probe.
+#[derive(Debug)]
+enum LeadMask {
+    Wire(WireMask),
+    Probe,
+}
+
 /// [`decode_wire_lead_masks`] for a receiver with no mask to repeat.
 #[cfg(test)]
 fn decode_wire_lead_any(
     t: &WireTensor,
     want_pos: bool,
 ) -> EngineResult<(u32, Option<i64>, Option<Vec<u32>>)> {
-    let (seq, pos, wire) = decode_wire_lead_masks(t, want_pos)?;
+    let (seq, pos, lead) = decode_wire_lead_masks(t, want_pos)?;
+    let wire = match lead {
+        Some(LeadMask::Probe) => {
+            return Err(EngineError::Backend("a mask-support probe lead".into()))
+        }
+        Some(LeadMask::Wire(w)) => Some(w),
+        None => None,
+    };
     let mask = wire
         .map(|w| MaskRecvCache::default().resolve(w))
         .transpose()
@@ -1101,11 +1163,11 @@ fn decode_wire_lead_any(
 /// Decode a lead that may carry a mask: `(seq, position, mask)`. A lead with
 /// exactly the lanes this stage expects is [`decode_wire_lead`]'s; one with
 /// more must carry a consistent `W` and either its mask lanes or, with `W` =
-/// [`REPEAT`], none.
+/// [`MASK_PROBE`] or [`REPEAT`], none.
 fn decode_wire_lead_masks(
     t: &WireTensor,
     want_pos: bool,
-) -> EngineResult<(u32, Option<i64>, Option<WireMask>)> {
+) -> EngineResult<(u32, Option<i64>, Option<LeadMask>)> {
     let base = if want_pos { 2usize } else { 1 };
     let lanes = t.shape[2] as usize;
     if t.dtype != WireDType::I64 || t.shape[..2] != [1, 1] || lanes <= base {
@@ -1124,10 +1186,12 @@ fn decode_wire_lead_masks(
         return Ok((seq, pos, None));
     }
     let words = (count & 0xffff_ffff) as usize;
-    // The marker is checked first: its `W` is no word count.
+    // The probe, then the marker, are checked first: their `W` is no word
+    // count.
+    let probe = words == MASK_PROBE as usize;
     let repeat = words == REPEAT as usize;
     let consistent = t.data.len() == lanes * 8
-        && if repeat {
+        && if probe || repeat {
             lanes == base + 1
         } else {
             words > 0 && lanes == base + 1 + words.div_ceil(2)
@@ -1147,16 +1211,20 @@ fn decode_wire_lead_masks(
         t.data[..base * 8].to_vec(),
     );
     let (seq, pos) = decode_wire_lead(&plain, want_pos)?;
+    if probe {
+        return Ok((seq, pos, Some(LeadMask::Probe)));
+    }
     if repeat {
-        return Ok((seq, pos, Some(WireMask::Repeat)));
+        return Ok((seq, pos, Some(LeadMask::Wire(WireMask::Repeat))));
     }
     let mask = read_mask_words(&t.data[(base + 1) * 8..], words);
-    Ok((seq, pos, Some(WireMask::Full(mask))))
+    Ok((seq, pos, Some(LeadMask::Wire(WireMask::Full(mask)))))
 }
 
 /// One decoded upstream activation: the seq to echo, the static position,
 /// the hidden rows and their shape, and on a masked step its mask — or
-/// [`MaskMiss`] for a repeat marker this link has no mask for.
+/// [`MaskMiss`] for a repeat marker this link has no mask for. `probe`: a
+/// mask-support probe, which carries no mask and runs nothing.
 #[derive(Debug)]
 struct UpstreamStep {
     seq: u32,
@@ -1164,13 +1232,14 @@ struct UpstreamStep {
     hidden: Vec<f32>,
     shape: [usize; 3],
     mask: Option<Result<Vec<u32>, MaskMiss>>,
+    probe: bool,
 }
 
 /// Decode an upstream `[lead] [hidden]` pair against the link's receive
 /// cache. A repeat marker resolves to the last mask decoded on the link; the
 /// mask is committed only once the hidden decoded too. Any decode error
 /// clears the cache, so a marker after it misses instead of applying a mask
-/// the sender didn't mean.
+/// the sender didn't mean. A probe leaves the cache as it was.
 fn decode_upstream_step(
     lead: &WireTensor,
     hidden: &WireTensor,
@@ -1181,7 +1250,12 @@ fn decode_upstream_step(
         let floats = decode_hidden_floats(hidden)?;
         Ok((seq, position, wire, floats))
     });
-    let (seq, position, wire, floats) = decoded.inspect_err(|_| cache.clear())?;
+    let (seq, position, lead, floats) = decoded.inspect_err(|_| cache.clear())?;
+    let (wire, probe) = match lead {
+        Some(LeadMask::Probe) => (None, true),
+        Some(LeadMask::Wire(w)) => (Some(w), false),
+        None => (None, false),
+    };
     let mask = wire.map(|w| cache.resolve(w));
     if let Some(Ok(words)) = &mask {
         cache.commit(words);
@@ -1196,6 +1270,7 @@ fn decode_upstream_step(
             hidden.shape[2] as usize,
         ],
         mask,
+        probe,
     })
 }
 
@@ -1353,6 +1428,46 @@ trait RelayStage {
     fn link_acked(&self) -> bool;
     /// Drop a warm resume armed for a step that won't run.
     fn drop_warm_resume(&mut self);
+    /// A middle: send its own mask-support probe downstream (a fresh seq,
+    /// nothing run). `Err`: the send failed.
+    fn forward_probe(&mut self) -> EngineResult<()>;
+    /// A middle: the downstream's answer to the probe just forwarded, on the
+    /// probe's short budget.
+    fn wait_probe(&mut self) -> Result<i32, TokenWaitFailure>;
+}
+
+/// A relay stage's step once its upstream pair is read and decoded: a
+/// mask-support probe ([`relay_probe_step`]), else the tail's or a middle's
+/// step.
+fn relay_upstream_step<S: RelayStage>(
+    stage: &mut S,
+    step: UpstreamStep,
+    tail: bool,
+) -> EngineResult<()> {
+    if step.probe {
+        return relay_probe_step(stage, tail);
+    }
+    if tail {
+        relay_last_step(stage, step.hidden, step.shape, step.position, step.mask)
+    } else {
+        relay_middle_step(stage, step.hidden, step.shape, step.position, step.mask)
+    }
+}
+
+/// Answer a mask-support probe. The tail answers [`MASK_PROBE_OK_TOKEN`],
+/// acknowledged, at once; a middle forwards its own probe and passes the
+/// answer up (`-3` acknowledged when the stage below acknowledged it, else a
+/// plain NACK, as for a masked step). Nothing runs and no state changes: no
+/// layer, KV, position, warm resume or mask cache.
+fn relay_probe_step<S: RelayStage>(stage: &mut S, tail: bool) -> EngineResult<()> {
+    if tail {
+        return stage.reply_upstream(Ok(MASK_PROBE_OK_TOKEN), true, true);
+    }
+    let (step, vouch) = match stage.forward_probe() {
+        Err(e) => own_failure_answer(e, stage.link_acked()),
+        Ok(()) => masked_relay_answer(stage.wait_probe()),
+    };
+    stage.reply_upstream(step, true, vouch)
 }
 
 /// The tail's step once its upstream pair is read and decoded.
@@ -1672,15 +1787,19 @@ fn pick_plan_rows(
 /// [`MASK_UPGRADE_ERROR`] instead of each stalling a full token deadline. The
 /// latch is the engine's, so it survives a re-dial; an acknowledged reply —
 /// even a late one discarded as stale, i.e. a slow but capable tail — clears
-/// it, and after [`MASK_REPROBE_AFTER`] the next structured-output task
-/// probes the link again.
+/// it, and after [`MASK_REPROBE_AFTER`] (or [`MASK_PROBE_REPROBE_AFTER`] for
+/// a latch set by an unanswered mask-support probe) the next
+/// structured-output task probes the link again.
 #[derive(Debug, Default)]
 struct MaskLink {
-    /// A masked step on this link has been acknowledged since the last
-    /// failure. Until then, structured-output tasks skip the warm-resume path.
+    /// A masked step or a mask-support probe on this link has been
+    /// acknowledged since the last failure. Until then, a structured-output
+    /// task probes the link first and skips the warm-resume path.
     acked: bool,
-    /// When the link last failed a masked step.
+    /// When the link last failed a masked step or a probe.
     latched_at: Option<std::time::Instant>,
+    /// How long the latch set at `latched_at` refuses structured-output tasks.
+    reprobe_after: Duration,
     /// Middles: the upstream seq of the last masked step this stage answered
     /// unacknowledged. Once a stage below acknowledges anything after it, the
     /// upstream is told (see [`upstream_reply_frames`]).
@@ -1713,7 +1832,7 @@ impl MaskLink {
     /// The error a structured-output task gets now, while latched.
     fn refusal(&self, now: std::time::Instant) -> Option<EngineError> {
         self.latched_at
-            .filter(|at| now.saturating_duration_since(*at) < MASK_REPROBE_AFTER)
+            .filter(|at| now.saturating_duration_since(*at) < self.reprobe_after)
             .map(|_| EngineError::Backend(MASK_UPGRADE_ERROR.into()))
     }
 
@@ -1734,12 +1853,57 @@ impl MaskLink {
                   refusing structured-output tasks on this pipeline (likely a later stage on \
                   an older build)");
         }
-        self.acked = false;
-        self.latched_at = Some(now);
-        self.send.clear();
+        self.latch(now, MASK_REPROBE_AFTER);
         EngineError::Backend(format!(
             "{MASK_UPGRADE_ERROR} (a masked step got no acknowledged reply: {cause})"
         ))
+    }
+
+    /// A mask-support probe got no acknowledged answer in time. Latches like
+    /// [`Self::on_unacked`], for [`MASK_PROBE_REPROBE_AFTER`]: an acknowledged
+    /// late answer clears it sooner.
+    fn on_probe_unanswered(&mut self, now: std::time::Instant, cause: &EngineError) -> EngineError {
+        if self.latched_at.is_none() {
+            warn!(cause = %cause, "structured output: the mask-support probe got no acknowledged \
+                  answer; refusing structured-output tasks on this pipeline (likely a later \
+                  stage on an older build)");
+        }
+        self.latch(now, MASK_PROBE_REPROBE_AFTER);
+        EngineError::Backend(format!(
+            "{MASK_UPGRADE_ERROR} (the mask-support probe got no acknowledged answer: {cause})"
+        ))
+    }
+
+    fn latch(&mut self, now: std::time::Instant, reprobe_after: Duration) {
+        self.acked = false;
+        self.latched_at = Some(now);
+        self.reprobe_after = reprobe_after;
+        self.send.clear();
+    }
+
+    /// The head's verdict on its downstream's answer to a mask-support probe:
+    /// an acknowledged answer is the evidence that every later stage masks;
+    /// silence or an unacknowledged answer latches; anything else (a dead or
+    /// desynced link) fails the task without latching.
+    fn probe_verdict(
+        &mut self,
+        now: std::time::Instant,
+        reply: Result<i32, TokenWaitFailure>,
+    ) -> EngineResult<()> {
+        match reply {
+            Ok(_) => {
+                self.on_acked();
+                Ok(())
+            }
+            Err(TokenWaitFailure::NoAck(e) | TokenWaitFailure::TimedOut(e)) => {
+                Err(self.on_probe_unanswered(now, &e))
+            }
+            Err(
+                TokenWaitFailure::Other(e)
+                | TokenWaitFailure::AckedNack(e)
+                | TokenWaitFailure::MaskMiss(e),
+            ) => Err(e),
+        }
     }
 
     /// The head's verdict on its downstream's reply to a masked step.
@@ -1774,6 +1938,14 @@ impl MaskLink {
 #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
 fn warm_resume_allowed(has_grammar: bool, multi_stage: bool, link_acked: bool) -> bool {
     !(has_grammar && multi_stage) || link_acked
+}
+
+/// Whether a structured-output task admitted now must probe the link first:
+/// it runs on more than one stage and the link has no evidence that every
+/// later stage masks (never acknowledged, or latched and past its re-probe
+/// time).
+fn needs_mask_probe(has_grammar: bool, multi_stage: bool, link: &MaskLink) -> bool {
+    has_grammar && multi_stage && !link.acked
 }
 
 /// Send the downstream activation frames in wire order: `[lead] [hidden]`,
@@ -2061,6 +2233,99 @@ async fn masked_exchange(
         .map_err(|e| EngineError::Backend(e.to_string()))?;
     let reply = wait_token_reply(downstream, seq, budget, true, streak, link).await;
     link.verdict(std::time::Instant::now(), reply)
+}
+
+/// The wait for a mask-support probe's answer: [`MASK_PROBE_TIMEOUT`] (or the
+/// configured `probe_timeout`) at the head, a middle's shorter share of it
+/// below ([`masked_relay_budget`]), so a middle above a silent stage answers
+/// inside its upstream's wait.
+fn probe_wait_budget(probe_timeout: std::time::Duration, spec: &ShardSpec) -> std::time::Duration {
+    if spec.is_first_stage {
+        probe_timeout
+    } else {
+        masked_relay_budget(
+            probe_timeout,
+            spec.layer_start,
+            spec.layer_end,
+            spec.total_layers,
+        )
+    }
+}
+
+/// One wait for a probe's answer on the socket-keeping path. An
+/// acknowledged late reply skipped on the way is evidence that the chain
+/// masks ([`MaskLink::on_acked`]). Neither the send cache nor the escalation
+/// streak changes: a probe is no step.
+async fn probe_wait_reply(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    awaiting: u32,
+    budget: std::time::Duration,
+    link: &mut MaskLink,
+) -> Result<i32, TokenWaitFailure> {
+    let mut stale_ack = false;
+    let outcome = recv_reply_of(
+        downstream,
+        awaiting,
+        budget,
+        ReplyWait::Probe,
+        &mut stale_ack,
+    )
+    .await;
+    if stale_ack {
+        link.on_acked();
+    }
+    outcome
+}
+
+/// Head: probe the link for mask support (see the stage-wire notes above
+/// `MASK_ACK`) and judge the answer ([`MaskLink::probe_verdict`]). `Ok`: every
+/// later stage masks. `Err`: the task's error, the upgrade message when the
+/// probe went unanswered (the link is then latched).
+async fn probe_exchange(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    seq: u32,
+    position: Option<i64>,
+    width: usize,
+    budget: std::time::Duration,
+    link: &mut MaskLink,
+) -> EngineResult<()> {
+    send_probe_frames(downstream, seq, position, width)
+        .await
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+    let reply = probe_wait_reply(downstream, seq, budget, link).await;
+    link.probe_verdict(std::time::Instant::now(), reply)
+}
+
+/// Head: read, without waiting, every reply already in the socket and skip
+/// each as stale (no step is awaited). An acknowledged one (a slow but new
+/// tail's late answer) clears the latch; a late mask miss proves nothing.
+/// Stops at the first frame that isn't a token reply or a control ack.
+async fn drain_late_replies(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    link: &mut MaskLink,
+) {
+    let mut guard = downstream.lock().await;
+    loop {
+        // A zero frame-start budget still reads a frame already buffered.
+        let Ok((frame, _)) = guard.recv_token(Duration::ZERO).await else {
+            return;
+        };
+        if frame.dtype == WireDType::I8 {
+            continue;
+        }
+        match decode_token_reply(&frame) {
+            Ok((token, seq, acked)) => {
+                debug!(seq, acked, token, "late token reply drained");
+                if acked && token != MASK_MISS_TOKEN {
+                    link.on_acked();
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "an unexpected frame was drained from the downstream link");
+                return;
+            }
+        }
+    }
 }
 
 /// Head: the token mask to send with a step whose last row is at
@@ -2363,6 +2628,38 @@ async fn recv_token_reply(
     masked: bool,
     stale_ack: &mut bool,
 ) -> Result<i32, TokenWaitFailure> {
+    let kind = if masked {
+        ReplyWait::Masked
+    } else {
+        ReplyWait::Plain
+    };
+    recv_reply_of(downstream, awaiting_seq, budget, kind, stale_ack).await
+}
+
+/// What a token wait is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyWait {
+    /// A plain step's token.
+    Plain,
+    /// A masked step's acknowledged reply.
+    Masked,
+    /// A mask-support probe's acknowledged [`MASK_PROBE_OK_TOKEN`].
+    Probe,
+}
+
+/// [`recv_token_reply`] for any [`ReplyWait`]. A probe is answered only by
+/// the acknowledged [`MASK_PROBE_OK_TOKEN`] for its seq; an unacknowledged
+/// reply for its seq is [`TokenWaitFailure::NoAck`], and an acknowledged one
+/// that isn't the probe's answer is skipped like a stale reply. A late probe
+/// answer (an older seq) read by any wait is stale, and acknowledged.
+async fn recv_reply_of(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    awaiting_seq: u32,
+    budget: std::time::Duration,
+    kind: ReplyWait,
+    stale_ack: &mut bool,
+) -> Result<i32, TokenWaitFailure> {
+    let masked = kind != ReplyWait::Plain;
     let deadline_at = std::time::Instant::now() + budget;
     // Discards are summarised into the terminal error rather than logged per
     // frame. A peer echoing the wrong seq every time — a version skew, or a
@@ -2457,10 +2754,32 @@ async fn recv_token_reply(
         // was discarded above, by seq, before reaching here.
         if masked && !acked {
             return Err(TokenWaitFailure::NoAck(EngineError::Backend(format!(
-                "the downstream answered a masked step with a {} without the structured-output \
+                "the downstream answered a {} with a {} without the structured-output \
                  acknowledgement",
+                if kind == ReplyWait::Probe {
+                    "mask-support probe"
+                } else {
+                    "masked step"
+                },
                 if token < 0 { "NACK" } else { "token" }
             ))));
+        }
+        if kind == ReplyWait::Probe {
+            if token == MASK_PROBE_OK_TOKEN {
+                return Ok(token);
+            }
+            // Acknowledged, but no answer to a probe: skipped, as stale.
+            *stale_ack |= token != MASK_MISS_TOKEN;
+            discarded += 1;
+            last_echo = Some(echo_seq);
+            continue;
+        }
+        if token == MASK_PROBE_OK_TOKEN {
+            // A probe answer never answers a step: skipped, as stale.
+            *stale_ack |= acked;
+            discarded += 1;
+            last_echo = Some(echo_seq);
+            continue;
         }
         if !masked && acked {
             return Err(TokenWaitFailure::Other(EngineError::Backend(
@@ -2997,6 +3316,9 @@ pub struct OvRuntimeEngine {
     /// repeat marker stands for. The upstream link never re-dials, so it
     /// lives as long as the engine.
     mask_recv: MaskRecvCache,
+    /// How long the head waits for the answer to a mask-support probe;
+    /// middles wait their share of it ([`probe_wait_budget`]).
+    mask_probe_timeout: Duration,
     /// Issue-34 Option C: opaque KV blob cache + NEGOTIATE/GET offers for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
@@ -3442,6 +3764,70 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
+    /// Send a mask-support probe downstream with the next seq: position 0
+    /// on a static link, a one-row hidden of zeros. Nothing runs.
+    fn send_probe_downstream(&mut self) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        self.awaiting_token_seq = self.awaiting_token_seq.wrapping_add(1);
+        let seq = self.awaiting_token_seq;
+        let pos = self.static_kv.is_some().then_some(0);
+        let handle = self.runtime_handle.clone();
+        crate::dist_spec::run_async_pub(
+            &handle,
+            send_probe_frames(&downstream, seq, pos, self.hidden_size),
+        )
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
+    /// Head: probe the link for mask support before a structured-output
+    /// task's first masked step on a link without evidence (see
+    /// [`probe_exchange`]). `Err` is the task's error.
+    fn probe_downstream(&mut self) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        self.awaiting_token_seq = self.awaiting_token_seq.wrapping_add(1);
+        let seq = self.awaiting_token_seq;
+        let pos = self.static_kv.is_some().then_some(0);
+        let budget = probe_wait_budget(self.mask_probe_timeout, &self.spec);
+        let t0 = std::time::Instant::now();
+        let handle = self.runtime_handle.clone();
+        let verdict = crate::dist_spec::run_async_pub(
+            &handle,
+            probe_exchange(
+                &downstream,
+                seq,
+                pos,
+                self.hidden_size,
+                budget,
+                &mut self.mask_link,
+            ),
+        );
+        info!(
+            ok = verdict.is_ok(),
+            took_ms = t0.elapsed().as_millis() as u64,
+            "structured output: mask-support probe answered"
+        );
+        verdict
+    }
+
+    /// Head: skip, without waiting, any late replies already in the
+    /// downstream socket (see [`drain_late_replies`]).
+    fn drain_late_downstream_replies(&mut self) {
+        let Some(downstream) = self.downstream.clone() else {
+            return;
+        };
+        let handle = self.runtime_handle.clone();
+        crate::dist_spec::run_async_pub(
+            &handle,
+            drain_late_replies(&downstream, &mut self.mask_link),
+        );
+    }
+
     /// The next activation's seq, static position and hidden frame.
     fn stamp_hidden(
         &mut self,
@@ -3607,18 +3993,11 @@ impl OvRuntimeEngine {
         let _ = abort;
     }
 
-    /// The upstream's next activation: hidden rows, their shape, the static
-    /// position, and the token mask of a masked step ([`MaskMiss`] for a
-    /// repeat marker this stage has no mask for).
-    #[allow(clippy::type_complexity)]
-    fn recv_hidden_from_upstream(
-        &mut self,
-    ) -> EngineResult<(
-        Vec<f32>,
-        [usize; 3],
-        Option<i64>,
-        Option<Result<Vec<u32>, MaskMiss>>,
-    )> {
+    /// The upstream's next activation, decoded: hidden rows, their shape,
+    /// the static position, and the token mask of a masked step
+    /// ([`MaskMiss`] for a repeat marker this stage has no mask for), or a
+    /// mask-support probe.
+    fn recv_hidden_from_upstream(&mut self) -> EngineResult<UpstreamStep> {
         // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
         // [seq] or [seq, position]. The LEAD frame's wait is lenient
         // (idle-between-requests); the hidden that must follow it is deadlined,
@@ -3662,7 +4041,7 @@ impl OvRuntimeEngine {
             // resolves here, before any layer runs.
             let step = decode_upstream_step(&lead, &tensor, want_pos, &mut self.mask_recv)?;
             self.inbound_seq = Some(step.seq);
-            return Ok((step.hidden, step.shape, step.position, step.mask));
+            return Ok(step);
         }
     }
 
@@ -3762,10 +4141,25 @@ impl OvRuntimeEngine {
             // A later stage that can't mask latched this pipeline: refuse the
             // structured-output task now, before any warm-resume exchange or
             // model work.
-            if grammar.is_some() && !self.spec.is_last_stage {
+            let multi_stage = self.downstream.is_some() && !self.spec.is_last_stage;
+            if grammar.is_some() && multi_stage {
+                // A slow but new tail's late acknowledged answer, already in
+                // the socket, clears the latch before it refuses.
+                if self.mask_link.latched_at.is_some() {
+                    self.drain_late_downstream_replies();
+                }
                 if let Some(refused) = self.mask_link.refusal(std::time::Instant::now()) {
                     let id = task.task_id.clone();
                     return Ok(vec![(id.clone(), Chunk::error(id, refused.to_string()))]);
+                }
+            }
+            // No evidence yet that every later stage masks: probe the link
+            // now, before any warm-resume exchange or prefill, so an older
+            // stage costs this task a short probe wait, not a token deadline.
+            if needs_mask_probe(grammar.is_some(), multi_stage, &self.mask_link) {
+                if let Err(e) = self.probe_downstream() {
+                    let id = task.task_id.clone();
+                    return Ok(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
@@ -5373,8 +5767,8 @@ impl OvRuntimeEngine {
         // at all, or lost frame alignment, in which case the socket is gone and
         // there is nothing to answer on. After it, `inbound_seq` is set and
         // every failure must answer.
-        let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
-        relay_last_step(self, hidden, shape, pos_opt, mask)
+        let step = self.recv_hidden_from_upstream()?;
+        relay_upstream_step(self, step, true)
     }
 
     /// Everything `step_last` does between consuming the activation group and
@@ -5417,8 +5811,8 @@ impl OvRuntimeEngine {
             return self.step_relay_packed();
         }
         // See `step_last`: nothing is owed until the group is consumed.
-        let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
-        let answered = relay_middle_step(self, hidden, shape, pos_opt, mask);
+        let step = self.recv_hidden_from_upstream()?;
+        let answered = relay_upstream_step(self, step, false);
         self.escalate_if_downstream_is_gone(answered)
     }
 
@@ -5562,6 +5956,25 @@ impl RelayStage for OvRuntimeEngine {
 
     fn drop_warm_resume(&mut self) {
         let _ = self.kv_consume_warm_pending();
+    }
+
+    fn forward_probe(&mut self) -> EngineResult<()> {
+        self.send_probe_downstream()
+    }
+
+    fn wait_probe(&mut self) -> Result<i32, TokenWaitFailure> {
+        let Some(downstream) = self.downstream.clone() else {
+            return Err(TokenWaitFailure::Other(EngineError::Backend(
+                "no downstream".into(),
+            )));
+        };
+        let awaiting = self.awaiting_token_seq;
+        let budget = probe_wait_budget(self.mask_probe_timeout, &self.spec);
+        let handle = self.runtime_handle.clone();
+        crate::dist_spec::run_async_pub(
+            &handle,
+            probe_wait_reply(&downstream, awaiting, budget, &mut self.mask_link),
+        )
     }
 }
 
@@ -7298,6 +7711,7 @@ impl Builder for OvRuntimeBuilder {
             consecutive_token_timeouts: 0,
             mask_link: MaskLink::default(),
             mask_recv: MaskRecvCache::default(),
+            mask_probe_timeout: MASK_PROBE_TIMEOUT,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
@@ -10819,6 +11233,10 @@ mod tests {
         fail_own: bool,
         forwarded: bool,
         dropped_warm: bool,
+        /// A layer ran: the tail's `run_last` or a middle's `run_and_forward`.
+        ran: bool,
+        /// A middle's wait for its downstream's answer to a probe.
+        probe_budget: Duration,
     }
 
     impl RelayStage for LoopStage {
@@ -10829,6 +11247,7 @@ mod tests {
             _pos: Option<i64>,
             mask: Option<&[u32]>,
         ) -> EngineResult<i32> {
+            self.ran = true;
             tail_pick(&self.logits.0, &self.logits.1, mask)
         }
         fn run_and_forward(
@@ -10838,6 +11257,7 @@ mod tests {
             _pos: Option<i64>,
             mask: Option<&[u32]>,
         ) -> EngineResult<bool> {
+            self.ran = true;
             if self.fail_own {
                 return Err(EngineError::Backend("own".into()));
             }
@@ -10893,6 +11313,26 @@ mod tests {
         fn drop_warm_resume(&mut self) {
             self.dropped_warm = true;
         }
+        fn forward_probe(&mut self) -> EngineResult<()> {
+            if self.fail_own {
+                return Err(EngineError::Backend("own".into()));
+            }
+            let down = self.down.clone().expect("a middle has a downstream");
+            self.handle
+                .block_on(send_probe_frames(&down, self.seq_down, None, 2))
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            self.forwarded = true;
+            Ok(())
+        }
+        fn wait_probe(&mut self) -> Result<i32, TokenWaitFailure> {
+            let down = self.down.clone().expect("a middle has a downstream");
+            self.handle.block_on(probe_wait_reply(
+                &down,
+                self.seq_down,
+                self.probe_budget,
+                &mut self.link,
+            ))
+        }
     }
 
     /// The tail's step as `step_last` runs it: read and decode the pair
@@ -10918,6 +11358,8 @@ mod tests {
                 fail_own: false,
                 forwarded: false,
                 dropped_warm: false,
+                ran: false,
+                probe_budget: decode_budget(),
             };
             let mask = step.mask.clone();
             let _ = relay_last_step(
@@ -11126,6 +11568,8 @@ mod tests {
                 fail_own: fail_own_step,
                 forwarded: false,
                 dropped_warm: false,
+                ran: false,
+                probe_budget: decode_budget(),
             };
             let _ = relay_middle_step(
                 &mut stage,
@@ -11605,6 +12049,8 @@ mod tests {
                 fail_own: false,
                 forwarded: false,
                 dropped_warm: false,
+                ran: false,
+                probe_budget: decode_budget(),
             };
             relay_last_step(
                 &mut stage,
@@ -11637,5 +12083,504 @@ mod tests {
         let (got, stale_ack) = recv_control_ack(&mut client, Duration::from_secs(5), "ABORT").await;
         assert_eq!(got.unwrap(), ack);
         assert!(!stale_ack);
+    }
+
+    // ---- the mask-support probe ----
+
+    /// A short probe wait for tests; the real one is `MASK_PROBE_TIMEOUT`.
+    const TEST_PROBE: Duration = Duration::from_millis(60);
+
+    /// What a stage of the main build (the stage wire before masks) does
+    /// with one step: read the lead and the hidden, decode the lead with
+    /// today's decoder and, when that fails, return without answering, as
+    /// its `step_last` does on a `?`. A plain step it answers `[42, seq]`.
+    /// Returns whether it answered.
+    async fn old_stage_step(
+        up: &Arc<tokio::sync::Mutex<ActivationServer>>,
+        want_pos: bool,
+    ) -> bool {
+        let (lead, hid) = recv_hidden_frames(up, want_pos).await.unwrap();
+        assert!(hid.is_some(), "both frames of the step are consumed");
+        let Ok((seq, _)) = decode_wire_lead(&lead, want_pos) else {
+            return false;
+        };
+        up.lock()
+            .await
+            .send(&encode_token_with_seq(42, seq))
+            .await
+            .unwrap();
+        true
+    }
+
+    /// A relay stage on `up` (and `down` for a middle) whose next step is
+    /// decoded and dispatched exactly as `step_last` / `step_middle` do.
+    /// Returns the stage after the step, for its flags and link.
+    async fn relay_stage_step(
+        up: &Arc<tokio::sync::Mutex<ActivationServer>>,
+        down: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+        recv: &mut MaskRecvCache,
+        want_pos: bool,
+        seq_down: u32,
+        probe_budget: Duration,
+    ) -> (LoopStage, EngineResult<()>) {
+        let (up, mut cache) = (up.clone(), std::mem::take(recv));
+        let handle = tokio::runtime::Handle::current();
+        let w = test_factory().mask_width();
+        let (cache, out) = tokio::task::spawn_blocking(move || {
+            let (lead, hid) = handle.block_on(recv_hidden_frames(&up, want_pos)).unwrap();
+            let step = decode_upstream_step(&lead, &hid.unwrap(), want_pos, &mut cache).unwrap();
+            let tail = down.is_none();
+            let mut stage = LoopStage {
+                handle,
+                up,
+                down,
+                link: MaskLink::default(),
+                seq_up: step.seq,
+                seq_down,
+                logits: rows(&[bad_then(w, b'"')]),
+                fail_own: false,
+                forwarded: false,
+                dropped_warm: false,
+                ran: false,
+                probe_budget,
+            };
+            let res = relay_upstream_step(&mut stage, step, tail);
+            (cache, (stage, res))
+        })
+        .await
+        .unwrap();
+        *recv = cache;
+        out
+    }
+
+    /// The probe's exact bytes: today's lead lanes (position 0 when static),
+    /// then the tagged `W` lane holding `MASK_PROBE`, no mask lanes; and a
+    /// one-row F32 hidden of zeros. The answer is `[-3, seq, MASK_ACK]`.
+    #[test]
+    fn the_probe_frames_and_their_answer_have_exact_bytes() {
+        for (pos, base) in [(None, 1u32), (Some(0), 2)] {
+            let lead = encode_wire_lead_probe(7, pos);
+            let mut want = encode_wire_lead(7, pos).data;
+            want.extend_from_slice(
+                &((((MASK_LEAD_TAG | base) as u64) << 32) | MASK_PROBE as u64).to_le_bytes(),
+            );
+            assert_eq!(lead.dtype, WireDType::I64);
+            assert_eq!(lead.shape, [1, 1, base + 1]);
+            assert_eq!(lead.data, want);
+        }
+        let hid = probe_hidden(3);
+        assert_eq!(hid, WireTensor::new(WireDType::F32, [1, 1, 3], vec![0; 12]));
+        assert_eq!(MASK_PROBE_OK_TOKEN, -3);
+        let ok = encode_token_reply(MASK_PROBE_OK_TOKEN, 9, true);
+        let mut want = (-3i32).to_le_bytes().to_vec();
+        want.extend_from_slice(&9i32.to_le_bytes());
+        want.extend_from_slice(&MASK_ACK.to_le_bytes());
+        assert_eq!(ok, WireTensor::new(WireDType::I32, [1, 1, 3], want));
+    }
+
+    /// New decoders tell a probe from a repeat marker and from a mask; the
+    /// main build's decoder rejects it as it rejects any masked lead.
+    #[test]
+    fn a_probe_lead_decodes_as_a_probe_and_an_old_decoder_rejects_it() {
+        for want_pos in [false, true] {
+            let pos = want_pos.then_some(0);
+            let lead = encode_wire_lead_probe(5, pos);
+            let (seq, p, mask) = decode_wire_lead_masks(&lead, want_pos).unwrap();
+            assert_eq!((seq, p), (5, pos));
+            assert!(matches!(mask, Some(LeadMask::Probe)), "{mask:?}");
+            assert!(decode_wire_lead(&lead, want_pos).is_err(), "old decoder");
+            let repeat = encode_wire_lead_repeat(5, pos);
+            assert!(matches!(
+                decode_wire_lead_masks(&repeat, want_pos).unwrap().2,
+                Some(LeadMask::Wire(WireMask::Repeat))
+            ));
+            // A probe lead with mask lanes after it is malformed.
+            let mut bad = lead.clone();
+            bad.data.extend_from_slice(&0u64.to_le_bytes());
+            bad.shape[2] += 1;
+            assert!(decode_wire_lead_masks(&bad, want_pos).is_err());
+        }
+    }
+
+    /// A chain that masks answers the probe at once; the head records the
+    /// evidence and its first masked step goes full and gets its token.
+    #[tokio::test]
+    async fn a_new_tail_acknowledges_the_probe_at_once_then_the_masked_step_runs() {
+        let words = ok_enum_words();
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let mut link = MaskLink::default();
+        let mut recv = MaskRecvCache::default();
+        assert!(needs_mask_probe(true, true, &link));
+        let t0 = std::time::Instant::now();
+        let (head, (stage, tail)) = tokio::join!(
+            probe_exchange(&downstream, 1, None, 2, MASK_PROBE_TIMEOUT, &mut link),
+            relay_stage_step(&upstream, None, &mut recv, false, 0, TEST_PROBE)
+        );
+        let took = t0.elapsed();
+        head.unwrap();
+        tail.unwrap();
+        assert!(took < Duration::from_secs(2), "answered at once: {took:?}");
+        assert!(!stage.ran, "the probe runs no layer");
+        assert!(link.acked, "evidence that the chain masks");
+        assert!(
+            !needs_mask_probe(true, true, &link),
+            "evidence: no more probes"
+        );
+        assert!(link.send.is_empty(), "the probe sends no mask");
+
+        let mut streak = 0;
+        let (head, (_, tail)) = tokio::join!(
+            masked_exchange(
+                &downstream,
+                2,
+                None,
+                &words,
+                f16_hidden(2),
+                decode_budget(),
+                &mut streak,
+                &mut link,
+            ),
+            relay_stage_step(&upstream, None, &mut recv, false, 0, TEST_PROBE)
+        );
+        tail.unwrap();
+        assert_eq!(head.unwrap(), b'"' as i32);
+    }
+
+    /// An older tail reads both probe frames, fails the lead and answers
+    /// nothing. The head gives up at its short probe wait, far under a token
+    /// deadline, latches with the upgrade message, and the link stays
+    /// aligned: the plain request after it gets its own token.
+    #[tokio::test]
+    async fn an_old_tail_leaves_the_probe_unanswered_and_the_head_latches_quickly() {
+        for i in 0..25u32 {
+            for want_pos in [false, true] {
+                let pos = want_pos.then_some(0);
+                let (client, server) = loopback().await;
+                let downstream = Arc::new(tokio::sync::Mutex::new(client));
+                let upstream = Arc::new(tokio::sync::Mutex::new(server));
+                let mut link = MaskLink::default();
+                let t0 = std::time::Instant::now();
+                let (head, answered) = tokio::join!(
+                    probe_exchange(&downstream, 1, pos, 2, TEST_PROBE, &mut link),
+                    old_stage_step(&upstream, want_pos)
+                );
+                let took = t0.elapsed();
+                assert!(!answered, "an old stage never answers a probe");
+                let err = head.unwrap_err();
+                assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+                assert!(!err.is_connection_fatal(), "{err}");
+                assert!(took >= TEST_PROBE, "{i}: {took:?}");
+                assert!(took < decode_budget() / 4, "{i}: {took:?}");
+                assert!(link.refusal(std::time::Instant::now()).is_some(), "latched");
+                assert!(!link.acked);
+                // A plain step on the same link: its own token.
+                send_hidden_frames(&downstream, 2, pos.map(|_| 3), None, f16_hidden(2))
+                    .await
+                    .unwrap();
+                assert!(old_stage_step(&upstream, want_pos).await);
+                let tok = recv_token_reply(&downstream, 2, decode_budget(), false, &mut false)
+                    .await
+                    .unwrap();
+                assert_eq!(tok, 42, "{i}: the link stayed aligned");
+            }
+        }
+    }
+
+    /// A probe changes nothing at a new stage: the tail's receive cache
+    /// keeps its last mask (a repeat after the probe still resolves), no
+    /// layer runs, an armed warm resume stays armed, and the head's send
+    /// cache keeps its last mask too. On a static (NPU) link the probe's
+    /// position 0 neither runs the ring nor parks the prefill model.
+    #[tokio::test]
+    async fn a_probe_touches_no_cache_kv_or_position() {
+        let words = ok_enum_words();
+        for want_pos in [false, true] {
+            let pos = want_pos.then_some(0);
+            let (client, server) = loopback().await;
+            let downstream = Arc::new(tokio::sync::Mutex::new(client));
+            let upstream = Arc::new(tokio::sync::Mutex::new(server));
+            let mut link = MaskLink {
+                acked: true,
+                ..MaskLink::default()
+            };
+            let mut recv = MaskRecvCache::default();
+            recv.commit(&words);
+            link.send.record(0, &words);
+            let (head, (stage, tail)) = tokio::join!(
+                probe_exchange(&downstream, 1, pos, 2, TEST_PROBE, &mut link),
+                relay_stage_step(&upstream, None, &mut recv, want_pos, 0, TEST_PROBE)
+            );
+            head.unwrap();
+            tail.unwrap();
+            assert!(!stage.ran, "no layer, no ring, no prefill park");
+            assert!(!stage.dropped_warm, "a warm resume stays armed");
+            assert_eq!(recv.last(), Some(words.as_slice()), "receive cache kept");
+            assert!(link.send.repeats(0, &words), "send cache kept");
+        }
+    }
+
+    /// Head → middle → tail: the middle forwards its own probe with its own
+    /// seq and passes the tail's acknowledged answer up as `-3`,
+    /// acknowledged, without running a layer.
+    #[tokio::test]
+    async fn a_middle_relays_the_probe_and_its_answer() {
+        let (head_c, mid_s) = loopback().await;
+        let (mid_c, tail_s) = loopback().await;
+        let head_down = Arc::new(tokio::sync::Mutex::new(head_c));
+        let mid_up = Arc::new(tokio::sync::Mutex::new(mid_s));
+        let mid_down = Arc::new(tokio::sync::Mutex::new(mid_c));
+        let tail_up = Arc::new(tokio::sync::Mutex::new(tail_s));
+        let mut link = MaskLink::default();
+        let (mut mid_recv, mut tail_recv) = (MaskRecvCache::default(), MaskRecvCache::default());
+        let mid_budget = TEST_PROBE.mul_f64(0.75);
+        let (head, (mid, mid_res), (tail, tail_res)) = tokio::join!(
+            probe_exchange(&head_down, 1, None, 2, MASK_PROBE_TIMEOUT, &mut link),
+            relay_stage_step(
+                &mid_up,
+                Some(mid_down.clone()),
+                &mut mid_recv,
+                false,
+                77,
+                mid_budget
+            ),
+            relay_stage_step(&tail_up, None, &mut tail_recv, false, 0, TEST_PROBE)
+        );
+        head.unwrap();
+        mid_res.unwrap();
+        tail_res.unwrap();
+        assert!(mid.forwarded && !mid.ran, "forwarded, no layer run");
+        assert!(!tail.ran);
+        assert_eq!(tail.seq_up, 77, "the middle's own seq");
+        assert!(link.acked);
+    }
+
+    /// Head → middle → old tail: the middle's shorter probe wait runs out
+    /// first and its plain NACK reaches the head inside the head's own wait,
+    /// which latches. A middle's probe wait is always shorter than the
+    /// head's.
+    #[tokio::test]
+    async fn a_middle_above_an_old_tail_nacks_the_probe_inside_the_heads_wait() {
+        for layers in [(8, 16), (16, 24), (8, 31)] {
+            let mid = probe_wait_budget(MASK_PROBE_TIMEOUT, &spec(false, false, layers, 32));
+            let head = probe_wait_budget(MASK_PROBE_TIMEOUT, &spec(true, false, (0, 8), 32));
+            assert_eq!(head, MASK_PROBE_TIMEOUT);
+            assert!(mid < head, "{layers:?}: {mid:?} {head:?}");
+            assert!(mid >= head / 2, "{layers:?}: {mid:?}");
+        }
+        for i in 0..20u32 {
+            let (head_c, mid_s) = loopback().await;
+            let (mid_c, tail_s) = loopback().await;
+            let head_down = Arc::new(tokio::sync::Mutex::new(head_c));
+            let mid_up = Arc::new(tokio::sync::Mutex::new(mid_s));
+            let mid_down = Arc::new(tokio::sync::Mutex::new(mid_c));
+            let tail_up = Arc::new(tokio::sync::Mutex::new(tail_s));
+            let mut link = MaskLink::default();
+            let mut mid_recv = MaskRecvCache::default();
+            let head_budget = Duration::from_millis(300);
+            let mid_budget = probe_wait_budget(head_budget, &spec(false, false, (8, 16), 32));
+            let t0 = std::time::Instant::now();
+            let (head, (mid, mid_res), answered) = tokio::join!(
+                probe_exchange(&head_down, 1, None, 2, head_budget, &mut link),
+                relay_stage_step(
+                    &mid_up,
+                    Some(mid_down.clone()),
+                    &mut mid_recv,
+                    false,
+                    5,
+                    mid_budget
+                ),
+                old_stage_step(&tail_up, false)
+            );
+            let took = t0.elapsed();
+            assert!(!answered);
+            assert!(mid_res.is_err(), "the middle's step failed");
+            assert_eq!(
+                mid.link.owed_late_ack,
+                Some(1),
+                "{i}: a late answer is owed upstream"
+            );
+            let err = head.unwrap_err();
+            assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+            assert!(
+                err.to_string().contains("acknowledgement"),
+                "{i}: the middle's NACK, not the head's own timeout: {err}"
+            );
+            assert!(took < head_budget, "{i}: {took:?}");
+            assert!(link.refusal(std::time::Instant::now()).is_some());
+        }
+    }
+
+    /// A slow but new tail whose probe answer arrives after the head gave
+    /// up: the next structured-output request drains it before refusing,
+    /// and the acknowledged late answer clears the latch.
+    #[tokio::test]
+    async fn a_late_probe_answer_clears_the_latch_on_the_next_request() {
+        for i in 0..20u32 {
+            let (client, server) = loopback().await;
+            let downstream = Arc::new(tokio::sync::Mutex::new(client));
+            let upstream = Arc::new(tokio::sync::Mutex::new(server));
+            let mut link = MaskLink::default();
+            let (head, seq) = tokio::join!(
+                probe_exchange(&downstream, 1, None, 2, TEST_PROBE, &mut link),
+                async {
+                    let (lead, _) = recv_hidden_frames(&upstream, false).await.unwrap();
+                    decode_wire_lead_masks(&lead, false).unwrap().0
+                }
+            );
+            assert!(head.is_err());
+            assert!(link.refusal(std::time::Instant::now()).is_some());
+            // Nothing in the socket yet: the drain leaves the latch.
+            drain_late_replies(&downstream, &mut link).await;
+            assert!(link.refusal(std::time::Instant::now()).is_some(), "{i}");
+            upstream
+                .lock()
+                .await
+                .send(&encode_token_reply(MASK_PROBE_OK_TOKEN, seq, true))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drain_late_replies(&downstream, &mut link).await;
+            assert!(
+                link.refusal(std::time::Instant::now()).is_none(),
+                "{i}: unlatched"
+            );
+            assert!(link.acked, "{i}");
+            assert!(!needs_mask_probe(true, true, &link));
+        }
+        // A late mask miss drained the same way is no evidence.
+        let (client, mut server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut link = MaskLink::default();
+        let now = std::time::Instant::now();
+        let _ = link.on_probe_unanswered(now, &EngineError::Backend("silence".into()));
+        server
+            .send(&encode_token_reply(MASK_MISS_TOKEN, 1, true))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drain_late_replies(&downstream, &mut link).await;
+        assert!(link.refusal(std::time::Instant::now()).is_some());
+    }
+
+    /// A probe's own replies: an unacknowledged answer for its seq latches;
+    /// stale replies for other seqs are skipped (an acknowledged one counts
+    /// as evidence); a mismatched-shape frame is a link error that fails the
+    /// task without latching.
+    #[tokio::test]
+    async fn the_probe_wait_reads_late_replies_and_judges_only_its_own() {
+        // A stale acknowledged token, then the probe's answer.
+        let (client, mut server) = loopback().await;
+        server.send(&encode_token_reply(7, 4, true)).await.unwrap();
+        server
+            .send(&encode_token_reply(MASK_PROBE_OK_TOKEN, 5, true))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut link = MaskLink::default();
+        let got = probe_wait_reply(&downstream, 5, TEST_PROBE, &mut link).await;
+        assert_eq!(got.unwrap(), MASK_PROBE_OK_TOKEN);
+        assert!(link.acked);
+
+        // A plain NACK for the probe's seq (a new middle whose tail is old).
+        let (client, mut server) = loopback().await;
+        server
+            .send(&encode_token_with_seq(NACK_TOKEN, 5))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut link = MaskLink::default();
+        let got = probe_wait_reply(&downstream, 5, TEST_PROBE, &mut link).await;
+        assert!(matches!(got, Err(TokenWaitFailure::NoAck(_))), "{got:?}");
+        let err = link
+            .probe_verdict(std::time::Instant::now(), got)
+            .unwrap_err();
+        assert!(err.to_string().contains(MASK_UPGRADE_ERROR));
+
+        // A foreign frame: fail without latching.
+        let (client, mut server) = loopback().await;
+        server
+            .send(&WireTensor::new(WireDType::I64, [1, 1, 1], vec![0; 8]))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut link = MaskLink::default();
+        let got = probe_wait_reply(&downstream, 5, TEST_PROBE, &mut link).await;
+        assert!(matches!(got, Err(TokenWaitFailure::Other(_))), "{got:?}");
+        assert!(link.probe_verdict(std::time::Instant::now(), got).is_err());
+        assert!(
+            link.refusal(std::time::Instant::now()).is_none(),
+            "no latch"
+        );
+
+        // An acknowledged answer to the probe's seq that isn't the probe's is
+        // no answer: the wait goes on to its end.
+        let (client, mut server) = loopback().await;
+        server.send(&encode_token_reply(7, 5, true)).await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut link = MaskLink::default();
+        let got = probe_wait_reply(&downstream, 5, TEST_PROBE, &mut link).await;
+        assert!(matches!(got, Err(TokenWaitFailure::TimedOut(_))), "{got:?}");
+    }
+
+    /// A latch set by an unanswered probe refuses for a minute, then the next
+    /// structured-output request probes again; a latch from a real masked
+    /// step keeps the ten-minute window. Only a structured-output task on a
+    /// multi-stage link without evidence probes.
+    #[test]
+    fn a_probe_latch_re_probes_after_a_minute() {
+        let now = std::time::Instant::now();
+        let sec = Duration::from_secs(1);
+        let cause = EngineError::Backend("silence".into());
+        let mut link = MaskLink::default();
+        let err = link.on_probe_unanswered(now, &cause);
+        assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+        assert!(link.refusal(now + MASK_PROBE_REPROBE_AFTER - sec).is_some());
+        assert!(link.refusal(now + MASK_PROBE_REPROBE_AFTER).is_none());
+        assert!(needs_mask_probe(true, true, &link), "probes again");
+
+        let mut link = MaskLink {
+            acked: true,
+            ..MaskLink::default()
+        };
+        let _ = link.on_unacked(now, &cause);
+        assert!(link.refusal(now + MASK_PROBE_REPROBE_AFTER).is_some());
+        assert!(link.refusal(now + MASK_REPROBE_AFTER - sec).is_some());
+        assert!(link.refusal(now + MASK_REPROBE_AFTER).is_none());
+        assert!(needs_mask_probe(true, true, &link));
+
+        assert!(
+            !needs_mask_probe(false, true, &MaskLink::default()),
+            "plain task"
+        );
+        assert!(
+            !needs_mask_probe(true, false, &MaskLink::default()),
+            "one stage"
+        );
+        let acked = MaskLink {
+            acked: true,
+            ..MaskLink::default()
+        };
+        assert!(!needs_mask_probe(true, true, &acked), "evidence");
+    }
+
+    /// Plain frames stay byte-identical with the probe in the build, and a
+    /// late probe answer read by a plain step's wait is skipped by seq.
+    #[tokio::test]
+    async fn a_late_probe_answer_in_a_plain_wait_is_stale() {
+        let (client, mut server) = loopback().await;
+        server
+            .send(&encode_token_reply(MASK_PROBE_OK_TOKEN, 1, true))
+            .await
+            .unwrap();
+        server.send(&encode_token_with_seq(42, 2)).await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let mut stale_ack = false;
+        let tok = recv_token_reply(&downstream, 2, decode_budget(), false, &mut stale_ack)
+            .await
+            .unwrap();
+        assert_eq!(tok, 42);
+        assert!(stale_ack, "an acknowledged probe answer is evidence");
     }
 }
