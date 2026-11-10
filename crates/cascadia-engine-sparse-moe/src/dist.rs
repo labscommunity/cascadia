@@ -3207,6 +3207,13 @@ impl OwedLateReply {
             .is_some_and(|t| std::time::Instant::now() < t)
     }
 
+    /// A reply to a frame sent after the wait that gave up was read: the
+    /// late reply, which the link carries in front of it, is past (read by
+    /// that reply's wait, or never coming).
+    pub fn settle(&self) {
+        *self.until.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// A late reply was read: `status` and its tokens. An acknowledged one
     /// that isn't a mask miss is evidence that the stages mask.
     fn note(&self, status: u32, tokens: &[i64]) {

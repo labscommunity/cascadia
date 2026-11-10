@@ -6857,6 +6857,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     return false;
                 }
             };
+            // Every frame in flight went down after the last probe (it needs
+            // the idle link), so its late answer was in front of this reply:
+            // read and dropped by the wait (an acknowledged one cleared the
+            // latch), or never coming.
+            self.owed_late.settle();
             if let Some(p) = self.stage_profile.as_mut() {
                 p.wait += wait_started.elapsed();
                 p.replied(f.sent_at.elapsed());
@@ -6964,15 +6969,38 @@ impl<R: StagedRunner> PipelineEngine<R> {
             // frame is in flight. Plain requests behind it keep being
             // admitted for up to `JSON_PROBE_PATIENCE`; after that no new
             // stream is admitted, so the running ones drain.
-            let probing = !self.mask_evidence && self.stage_masks.refusal().is_none();
-            let waits = |t: &GenerationTask| probing && self.grammars.contains_key(&t.task_id);
+            //
+            // A latch an unanswered probe set, its late answer still owed,
+            // waits the same way: that answer is read off the idle link
+            // here, or by the first stream reply's wait (it is in front of
+            // that reply), and an acknowledged one clears the latch.
+            let latched = self.stage_masks.refusal().is_some();
+            let owed = latched && self.owed_late.is_owed();
+            let probing = !self.mask_evidence && !latched;
+            let waits =
+                |t: &GenerationTask| (probing || owed) && self.grammars.contains_key(&t.task_id);
             let mut at = 0;
             if self.pending.front().is_some_and(waits) {
                 let idle =
                     self.streams.is_empty() && self.stream_inflight.iter().all(|q| q.is_empty());
                 if idle {
                     self.probe_wait_since = None;
-                    if let Err(msg) = self.probe_link(&down) {
+                    if owed && !self.read_idle_replies() {
+                        let task = self.pending.pop_front().expect("non-empty");
+                        admitted += 1;
+                        self.grammars.remove(&task.task_id);
+                        let msg = PROBE_LINK_FAILED.to_string();
+                        out.push((task.task_id.clone(), Chunk::error(task.task_id, msg)));
+                        continue;
+                    }
+                    // Still latched: refused at its admission below.
+                    let probe = !self.mask_evidence && self.stage_masks.refusal().is_none();
+                    let probed = if probe {
+                        self.probe_link(&down)
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(msg) = probed {
                         let task = self.pending.pop_front().expect("non-empty");
                         admitted += 1;
                         self.grammars.remove(&task.task_id);

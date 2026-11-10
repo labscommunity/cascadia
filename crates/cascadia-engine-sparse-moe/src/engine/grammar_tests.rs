@@ -1927,6 +1927,95 @@ fn a_late_probe_answer_clears_the_latch_and_keeps_the_link() {
     }
 }
 
+/// A slow but new tail answers the probe after the head gave up, and a plain
+/// stream went down the link behind the probe. The late answer reaches the
+/// head in front of that stream's reply, so a json request that arrives
+/// meanwhile is not refused on the latch the answer clears: it waits for
+/// the idle link like any json request without evidence, is probed (answered
+/// at once) and runs.
+#[test]
+fn a_late_probe_answer_behind_a_running_stream_does_not_refuse_json() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let late = Duration::from_millis(150);
+    let log = fixture_tail_full(&rt, l[0].0.clone(), false, false, late);
+    let mut head = head_engine_with(
+        &rt,
+        JsonStub::new(),
+        l.remove(0).1,
+        2,
+        3,
+        TEST_PROBE,
+        Duration::from_secs(3600),
+    );
+    head.submit(json_task("j1", 6)).unwrap();
+    head.submit(plain_task("p1", 40)).unwrap();
+    // Until the probe gave up and p1's first frame is on the link, its
+    // reply not read yet.
+    let mut j1: Option<Chunk> = None;
+    for _ in 0..100 {
+        if j1.is_some() && !head.streams.is_empty() {
+            break;
+        }
+        for (id, c) in head.step().unwrap() {
+            if id == "j1" && c.is_final {
+                j1 = Some(c);
+            }
+        }
+    }
+    let e = j1.expect("j1 final").error.expect("error chunk");
+    assert!(e.ends_with(UPGRADE_EVERY_STAGE), "{e}");
+    assert!(head.stage_masks.latch.is_set());
+    assert_eq!(head.streams.len(), 1, "p1 is running");
+    // The late answer is on the link, in front of p1's reply.
+    std::thread::sleep(late + Duration::from_millis(150));
+    head.submit(json_task("j2", 6)).unwrap();
+    let (out, _) = drive_timeline(&mut head, &["p1", "j2"]);
+    assert_eq!(final_chunk(&out["j2"]).error, None);
+    assert_eq!(out["j2"].tokens.len(), 6);
+    assert_eq!(final_chunk(&out["p1"]).error, None);
+    assert!(!head.stage_masks.latch.is_set());
+    assert_eq!(log.probes(), 2, "probed again, answered at once");
+    assert!(!log.died());
+}
+
+/// The same, above an old tail that never answers the probe: the first
+/// stream reply shows no late answer is coming, so the json request is
+/// refused then, not held until the running stream drains.
+#[test]
+fn an_unanswered_probe_behind_a_running_stream_refuses_json_at_the_first_reply() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let log = fixture_tail(&rt, l[0].0.clone(), true);
+    let mut head = head_engine_with(
+        &rt,
+        JsonStub::new(),
+        l.remove(0).1,
+        2,
+        3,
+        TEST_PROBE,
+        Duration::from_secs(3600),
+    );
+    head.submit(json_task("j1", 6)).unwrap();
+    head.submit(plain_task("p1", 40)).unwrap();
+    head.submit(json_task("j2", 6)).unwrap();
+    let (out, at) = drive_timeline(&mut head, &["j1", "p1", "j2"]);
+    for j in ["j1", "j2"] {
+        let e = final_chunk(&out[j]).error.clone().expect("error chunk");
+        assert!(e.ends_with(UPGRADE_EVERY_STAGE), "{j}: {e}");
+    }
+    assert!(
+        at["j2"].1 < at["p1"].1,
+        "j2 refused before p1 drained: {at:?}"
+    );
+    assert_eq!(final_chunk(&out["p1"]).error, None);
+    assert!(
+        !head.owed_late.is_owed(),
+        "settled by the first stream reply"
+    );
+    assert!(!log.died());
+}
+
 /// A latch set by an unanswered probe lasts a minute: the next json request
 /// after it probes again.
 #[test]
