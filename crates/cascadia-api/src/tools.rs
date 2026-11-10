@@ -805,16 +805,20 @@ pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<T
 
 /// The tool calls in an answer, read the way the turn was constrained.
 ///
-/// The call array a tool grammar produces is read first
-/// ([`calls_from_forced_output`]); the engine may have dropped the grammar,
-/// so the model's own tool-call dialect is read next. Under a union grammar
+/// When a tool grammar was sent (`grammar_sent`), the call array it
+/// produces is read first ([`calls_from_forced_output`]); the engine may
+/// have dropped the grammar, so the model's own tool-call dialect is read
+/// next. Without a grammar the answer is read by the dialect parser alone,
+/// as before tool grammars existed. Under a union grammar
 /// (`union_sent`: a call or the client's JSON) only marked calls count
 /// ([`crate::parse_tool_calls_marked`]): a bare JSON object with `name` and
 /// `parameters` keys is the client's data there, not a call.
 ///
 /// Calls are kept only for the effective tools when `allowed_tools`
 /// narrowed them or a grammar was sent (`grammar_sent`); otherwise any name
-/// stays, as before. `parallel_tool_calls: false` keeps the first call.
+/// stays, as before. A named `tool_choice` keeps only calls to that tool
+/// (another is possible when the engine dropped the grammar).
+/// `parallel_tool_calls: false` keeps the first call.
 /// `None` when no call is left.
 pub fn resolve_calls(
     text: &str,
@@ -822,7 +826,10 @@ pub fn resolve_calls(
     grammar_sent: bool,
     union_sent: bool,
 ) -> Option<Vec<ToolCall>> {
-    let mut calls = calls_from_forced_output(text, policy).or_else(|| {
+    let forced = grammar_sent
+        .then(|| calls_from_forced_output(text, policy))
+        .flatten();
+    let mut calls = forced.or_else(|| {
         if union_sent {
             crate::parse_tool_calls_marked(text)
         } else {
@@ -836,6 +843,9 @@ pub fn resolve_calls(
             .filter_map(|t| t.function.get("name").and_then(Value::as_str))
             .collect();
         calls.retain(|c| names.contains(c.function.name.as_str()));
+    }
+    if let ToolMode::Named(name) = &policy.mode {
+        calls.retain(|c| &c.function.name == name);
     }
     if policy.single_call {
         calls.truncate(1);

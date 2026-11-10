@@ -10320,4 +10320,197 @@ level={{ effort_map[eff] }}";
         assert_eq!(task.prompt, "TOOLS[]|user: weather in Paris?\n");
         assert_eq!(task.tools, Some(serde_json::json!([])));
     }
+
+    /// Answers every task with `text` in one chunk, finishing with `finish`.
+    struct ScriptedEngine {
+        text: String,
+        finish: cascadia_types::FinishReason,
+        pending: Option<(cascadia_types::TaskId, bool)>,
+    }
+
+    impl cascadia_engine::Engine for ScriptedEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some((task.task_id, false));
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some((id, sent)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            if !sent {
+                let chunk = Chunk::token(&id, 0, self.text.clone());
+                self.pending = Some((id.clone(), true));
+                return Ok(vec![(id, chunk)]);
+            }
+            let last = Chunk::final_marker(&id, "").with_finish_reason(self.finish);
+            Ok(vec![(id, last)])
+        }
+    }
+
+    struct ScriptedBuilder(ScriptedEngine);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ScriptedBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0))
+        }
+    }
+
+    /// A router (structured output on, tools-rendering template) whose
+    /// engine always answers `text` and stops with `finish`.
+    async fn scripted_app(text: &str, finish: cascadia_types::FinishReason) -> Router {
+        let runner = Runner::new(Box::new(ScriptedBuilder(ScriptedEngine {
+            text: text.into(),
+            finish,
+            pending: None,
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            structured_output: true,
+            engine_name: "mock".into(),
+            chat_template: template(TOOLS_TEMPLATE),
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    #[tokio::test]
+    async fn fenced_json_without_a_grammar_stays_content() {
+        // A fenced call array is read as calls only when the call grammar
+        // was sent; a plain `auto` answer is read as before: content.
+        let text = "```json\n[{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Paris\"}}]\n```";
+        let app = scripted_app(text, cascadia_types::FinishReason::Stop).await;
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([city_tool("get_weather")]),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["choices"][0]["message"]["content"], text, "{v}");
+        assert!(
+            v["choices"][0]["message"].get("tool_calls").is_none(),
+            "{v}"
+        );
+        assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+        // The same text, unit-level: content, as the old parser reads it.
+        assert_eq!(parse_tool_calls(text), None);
+        let (m, fr) = build_choice(
+            text.into(),
+            &tool_policy(&["get_weather"], None),
+            false,
+            false,
+            false,
+        );
+        assert_eq!((m.content.as_deref(), fr), (Some(text), None));
+    }
+
+    #[test]
+    fn named_choice_drops_a_call_to_another_tool() {
+        let text = r#"<tool_call>{"name":"get_time","arguments":{"city":"Paris"}}</tool_call>"#;
+        let policy = tool_policy(&["get_weather", "get_time"], Some(named("get_weather")));
+        for grammar_sent in [true, false] {
+            let (m, fr) = build_choice(text.into(), &policy, false, grammar_sent, false);
+            assert_eq!(fr, None, "grammar_sent={grammar_sent}");
+            assert!(m.tool_calls.is_none());
+            assert_eq!(m.content.as_deref(), Some(text));
+        }
+        // The named tool's own call is kept.
+        let own = r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
+        let (m, fr) = build_choice(own.into(), &policy, false, false, false);
+        assert_eq!(fr, Some("stop"));
+        assert_eq!(m.tool_calls.unwrap()[0].name(), "get_weather");
+    }
+
+    #[tokio::test]
+    async fn named_call_reports_stop_even_when_the_engine_hit_length() {
+        let app = scripted_app(
+            r#"[{"name":"get_weather","parameters":{"city":"Paris"}}]"#,
+            cascadia_types::FinishReason::Length,
+        )
+        .await;
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([city_tool("get_weather"), city_tool("get_time")]),
+                serde_json::json!({"tool_choice": named("get_weather")}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(call_names(&v), ["get_weather"], "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_forced_grammar_the_compile_check_refuses_runs_unconstrained() {
+        let unenforced = |r: cascadia_metrics::UnenforcedReason| {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[r.as_str()])
+                .get()
+        };
+        let cases = [
+            // No compile slot ever frees up.
+            (
+                SchemaCompileCheck::new(
+                    0,
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_secs(2),
+                ),
+                cascadia_metrics::UnenforcedReason::Busy,
+            ),
+            // No build fits the budget.
+            (
+                SchemaCompileCheck::new(
+                    2,
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_nanos(1),
+                ),
+                cascadia_metrics::UnenforcedReason::TooComplex,
+            ),
+        ];
+        for (check, reason) in cases {
+            let cfg = Config {
+                schema_check: check,
+                schema_build_check: true,
+                ..Config::default()
+            };
+            let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+            let before = unenforced(reason);
+            let (status, v) = post_chat(
+                app,
+                tool_body(
+                    serde_json::json!([city_tool("get_weather")]),
+                    serde_json::json!({"tool_choice": "required", "enable_thinking": true}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let task = last_task(&seen);
+            assert_eq!(task.grammar, None, "{}", reason.as_str());
+            // Forced without a JSON format: thinking as requested.
+            assert!(task.enable_thinking, "{}", reason.as_str());
+            assert!(unenforced(reason) > before, "{}", reason.as_str());
+        }
+    }
 }
