@@ -1940,3 +1940,306 @@ fn a_probe_latch_re_probes_after_a_minute() {
     assert_eq!(final_chunk(&j).error, None);
     assert_eq!(log.probes(), 1);
 }
+
+// ---- the MiniMax engine's probe, driven step by step -----------------------
+//
+// The SparseMoE head and its workers need model files, so the probe is
+// driven through the functions they run: `admit_json_task` at the head's
+// json admission, `answer_mask_probe` at a worker that read a probe.
+
+/// The SparseMoE head's json admission, as `begin_generation_sparse` runs
+/// it, with a 4-wide hidden.
+fn admit(
+    rt: &tokio::runtime::Runtime,
+    down: &Arc<TokioMutex<ActivationClient>>,
+    probe: Duration,
+    masks: &mut StageMasks,
+    evidence: &mut bool,
+    owed: &crate::dist::OwedLateReply,
+) -> (Result<(), String>, Duration) {
+    let t0 = Instant::now();
+    let r = rt.block_on(admit_json_task(down, 4, probe, masks, evidence, owed));
+    (r, t0.elapsed())
+}
+
+/// A plain task on the link afterwards, as the SparseMoE head runs one:
+/// `Reset`, a plain `Forward`, its token.
+fn plain_round(
+    rt: &tokio::runtime::Runtime,
+    down: &Arc<TokioMutex<ActivationClient>>,
+    masks: &StageMasks,
+) -> i64 {
+    use crate::dist::{recv_token_reply_with, send_forward, send_reset};
+    let cfg = crate::sampling::SamplingConfig::default();
+    rt.block_on(send_reset(down)).unwrap();
+    rt.block_on(send_forward(down, 0, &cfg, &[0.5; 4], [1, 1, 4], true))
+        .unwrap();
+    rt.block_on(recv_token_reply_with(
+        down,
+        Duration::from_secs(5),
+        Some(&masks.latch),
+    ))
+    .unwrap()
+}
+
+/// A last stage on the main build (the SparseMoE worker reads a `Forward`
+/// with the original body decoder, logs the failure and goes on) gets the
+/// probe: the head's json admission fails with the upgrade message after
+/// the probe's short wait, the probe latch is set, and a plain task on the
+/// same link gets its token.
+#[test]
+fn the_sparse_moe_head_fails_json_at_the_probe_wait_on_an_old_tail() {
+    for i in 0..20 {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let (srv, down) = l.remove(0);
+        let log = fixture_tail(&rt, srv, true);
+        let (mut masks, mut evidence) = (StageMasks::default(), false);
+        let owed = crate::dist::OwedLateReply::default();
+        let (r, took) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        let e = r.unwrap_err();
+        assert!(e.ends_with(UPGRADE_EVERY_STAGE), "{i}: {e}");
+        assert!(took >= TEST_PROBE, "{i}: {took:?}");
+        assert!(took < decode_reply_deadline() / 4, "{i}: {took:?}");
+        assert!(!evidence);
+        assert!(masks.latch.refuses());
+        assert!(!masks
+            .latch
+            .refuses_at(Instant::now() + cascadia_grammar::MASK_PROBE_REPROBE_AFTER));
+        assert!(owed.is_owed(), "a late answer is owed");
+        // Refused at once now, no second probe.
+        let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        assert_eq!(r.unwrap_err(), UPGRADE_EVERY_STAGE);
+        assert_eq!(
+            plain_round(&rt, &down, &masks),
+            i64::from(b'a'),
+            "{i}: aligned"
+        );
+        assert_eq!(
+            log.frames(),
+            vec![
+                (FrameKind::Forward, true),
+                (FrameKind::Reset, false),
+                (FrameKind::Forward, false)
+            ]
+        );
+        assert!(!log.died());
+    }
+}
+
+/// A chain that masks answers at once; with that evidence the next json
+/// admission sends no probe.
+#[test]
+fn the_sparse_moe_head_probes_a_new_link_once() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let log = fixture_tail(&rt, srv, false);
+    let (mut masks, mut evidence) = (StageMasks::default(), false);
+    let owed = crate::dist::OwedLateReply::default();
+    let (r, took) = admit(
+        &rt,
+        &down,
+        cascadia_grammar::MASK_PROBE_TIMEOUT,
+        &mut masks,
+        &mut evidence,
+        &owed,
+    );
+    r.unwrap();
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert!(evidence);
+    let (r, _) = admit(
+        &rt,
+        &down,
+        cascadia_grammar::MASK_PROBE_TIMEOUT,
+        &mut masks,
+        &mut evidence,
+        &owed,
+    );
+    r.unwrap();
+    assert_eq!(log.probes(), 1, "evidence: no second probe");
+    assert!(!owed.is_owed());
+}
+
+/// A slow but new tail answers after the head gave up: the next json
+/// admission reads the late answer before its refusal, the latch clears,
+/// and the probe that follows is answered at once.
+#[test]
+fn the_sparse_moe_head_clears_its_latch_on_a_late_probe_answer() {
+    for i in 0..20 {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let (srv, down) = l.remove(0);
+        let late = Duration::from_millis(150);
+        let log = fixture_tail_full(&rt, srv, false, false, late);
+        let (mut masks, mut evidence) = (StageMasks::default(), false);
+        let owed = crate::dist::OwedLateReply::default();
+        let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        assert!(r.is_err(), "{i}");
+        std::thread::sleep(late + Duration::from_millis(100));
+        let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        assert_eq!(r, Ok(()), "{i}");
+        assert!(!masks.latch.is_set());
+        assert!(evidence);
+        assert_eq!(log.probes(), 2, "{i}");
+        assert_eq!(
+            plain_round(&rt, &down, &masks),
+            i64::from(b'a'),
+            "{i}: aligned"
+        );
+    }
+}
+
+/// A probe latch past its minute: the next json admission probes again.
+#[test]
+fn the_sparse_moe_head_re_probes_after_a_minute() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let log = fixture_tail(&rt, srv, false);
+    let (mut masks, mut evidence) = (StageMasks::default(), false);
+    let owed = crate::dist::OwedLateReply::default();
+    let past = Instant::now() - cascadia_grammar::MASK_PROBE_REPROBE_AFTER;
+    masks.latch.set_probe_at(past + Duration::from_secs(1));
+    let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+    assert_eq!(r.unwrap_err(), UPGRADE_EVERY_STAGE);
+    assert_eq!(log.probes(), 0);
+    masks.latch.set_probe_at(past);
+    let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+    r.unwrap();
+    assert_eq!(log.probes(), 1);
+}
+
+/// A SparseMoE worker that read a probe, as its frame loop runs it: read
+/// and split the `Forward`, then `answer_mask_probe` (no layer runs).
+fn sparse_worker_probe(
+    rt: &tokio::runtime::Runtime,
+    up: Arc<TokioMutex<ActivationServer>>,
+    down: Option<Arc<TokioMutex<ActivationClient>>>,
+    budget: Duration,
+) -> std::thread::JoinHandle<()> {
+    let handle = rt.handle().clone();
+    std::thread::spawn(move || {
+        handle.block_on(async move {
+            use crate::dist::*;
+            assert_eq!(
+                recv_kind_server(&up).await.unwrap(),
+                Some(FrameKind::Forward)
+            );
+            let (past, cfg, push, step) = recv_forward_step_body_server(&up).await.unwrap();
+            let (hidden, _, cols) = step.split(4).unwrap();
+            let cols = cols.unwrap();
+            assert!(is_mask_probe(&cols));
+            answer_mask_probe(
+                &up,
+                down.as_deref(),
+                &cols,
+                past,
+                &cfg,
+                &hidden,
+                push,
+                budget,
+                &MaskLatch::default(),
+            )
+            .await
+            .unwrap();
+        })
+    })
+}
+
+/// Head → SparseMoE middle → tail: a new tail's answer comes up through the
+/// middle; above a main-build tail the middle's shorter wait runs out first
+/// and its unconfirmed answer reaches the head inside the head's own wait.
+#[test]
+fn a_sparse_moe_middle_relays_the_probe_and_answers_inside_the_heads_wait() {
+    for old in [false, true] {
+        for i in 0..20 {
+            let rt = runtime();
+            let l = links(&rt, 2);
+            let log = fixture_tail(&rt, l[1].0.clone(), old);
+            let head_wait = Duration::from_millis(300);
+            let mid = sparse_worker_probe(
+                &rt,
+                l[0].0.clone(),
+                Some(l[1].1.clone()),
+                crate::dist::mid_mask_budget(head_wait, 1, 3),
+            );
+            let (mut masks, mut evidence) = (StageMasks::default(), false);
+            let owed = crate::dist::OwedLateReply::default();
+            let (r, took) = admit(&rt, &l[0].1, head_wait, &mut masks, &mut evidence, &owed);
+            mid.join().unwrap();
+            assert_eq!(log.frames(), vec![(FrameKind::Forward, true)], "{old}/{i}");
+            if old {
+                let e = r.unwrap_err();
+                assert!(
+                    e.contains("did not acknowledge"),
+                    "{i}: the middle's answer: {e}"
+                );
+                assert!(took < head_wait, "{i}: {took:?}");
+            } else {
+                r.unwrap();
+                assert!(evidence);
+            }
+        }
+    }
+}
+
+/// A SparseMoE last stage answers the probe at once with
+/// `TokenAck(-1, tag, MASK_ACK)`.
+#[test]
+fn a_sparse_moe_tail_answers_the_probe_at_once() {
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let tail = sparse_worker_probe(&rt, srv, None, Duration::ZERO);
+    let (mut masks, mut evidence) = (StageMasks::default(), false);
+    let owed = crate::dist::OwedLateReply::default();
+    let (r, took) = admit(
+        &rt,
+        &down,
+        cascadia_grammar::MASK_PROBE_TIMEOUT,
+        &mut masks,
+        &mut evidence,
+        &owed,
+    );
+    tail.join().unwrap();
+    r.unwrap();
+    assert!(took < Duration::from_secs(2), "{took:?}");
+}
+
+/// The SparseMoE worker's body decoder on the main build (kept verbatim as
+/// `recv_forward_body_server`) reads the whole probe, fails on its tensor,
+/// and the next plain `Forward` decodes: the link stays aligned.
+#[test]
+fn a_main_build_sparse_moe_worker_reads_the_probe_and_stays_aligned() {
+    use crate::dist::*;
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let cfg = crate::sampling::SamplingConfig::default();
+    let latch = MaskLatch::default();
+    rt.block_on(async {
+        let probe = probe_mask_support(&down, 4, TEST_PROBE, 9, &latch);
+        let old = async {
+            assert_eq!(
+                recv_kind_server(&srv).await.unwrap(),
+                Some(FrameKind::Forward)
+            );
+            assert!(
+                recv_forward_body_server(&srv).await.is_err(),
+                "fails on the tensor"
+            );
+        };
+        let (r, ()) = tokio::join!(probe, old);
+        assert!(r.is_err(), "never answered");
+        send_forward(&down, 3, &cfg, &[0.5; 4], [1, 1, 4], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_kind_server(&srv).await.unwrap(),
+            Some(FrameKind::Forward)
+        );
+        let (past, _, _, h, shape) = recv_forward_body_server(&srv).await.unwrap();
+        assert_eq!((past, shape, h), (3, [1, 1, 4], vec![0.5; 4]));
+    });
+}

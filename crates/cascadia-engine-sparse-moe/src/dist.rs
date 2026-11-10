@@ -3444,6 +3444,47 @@ pub async fn probe_mask_support(
     }
 }
 
+/// A worker that read a mask-support probe (see [`is_mask_probe`]): the
+/// last stage answers `TokenAck(-1, tag, MASK_ACK)` at once; a middle
+/// passes the probe on unchanged and relays the answer within `budget`
+/// (its share of rank 0's probe wait, [`mid_mask_budget`]). No layer runs
+/// and no state changes: the caller hands it the frame as read, before any
+/// KV, position or repeat cache is touched.
+#[allow(clippy::too_many_arguments)]
+pub async fn answer_mask_probe(
+    up: &Mutex<ActivationServer>,
+    down: Option<&Mutex<ActivationClient>>,
+    cols: &MaskCols,
+    past_seq_len: u32,
+    cfg: &SamplingConfig,
+    hidden: &[f32],
+    push_history: bool,
+    budget: std::time::Duration,
+    mid_late: &MaskLatch,
+) -> Result<(), String> {
+    let tag = cols.tag(0);
+    let Some(down) = down else {
+        return send_token_ack_upstream(up, -1, tag, MASK_ACK)
+            .await
+            .map_err(|e| format!("send_token_ack (probe): {e}"));
+    };
+    send_forward_step(
+        down,
+        FrameKind::Forward,
+        past_seq_len,
+        cfg,
+        hidden,
+        [1, 1, hidden.len() as u32],
+        push_history,
+        Some(cols),
+        // The probe never touches the repeat caches.
+        None,
+    )
+    .await
+    .map_err(|e| format!("relay mask probe: {e}"))?;
+    relay_masked_token_reply(up, down, budget, tag, mid_late, None).await
+}
+
 /// How a masked step's reply wait ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MaskedReply {

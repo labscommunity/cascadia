@@ -1209,6 +1209,9 @@ impl Builder for SparseMoEBuilder {
             mid_late: crate::dist::MaskLatch::default(),
             mask_send: crate::dist::MaskSendLink::default(),
             mask_recv: crate::dist::MaskRecvLink::default(),
+            mask_evidence: false,
+            mask_probe_timeout: cascadia_grammar::MASK_PROBE_TIMEOUT,
+            owed_late: crate::dist::OwedLateReply::default(),
         }))
     }
 }
@@ -1342,6 +1345,59 @@ async fn masked_forward_exchange(
     let reply = crate::dist::recv_token_reply_masked(down, deadline, tag, &masks.latch).await;
     // Any failed step: the stage below may not hold this mask.
     masks.outcome(reply).inspect_err(|_| link.clear())
+}
+
+/// Rank 0, a json task's admission on a multi-stage link: read a slow
+/// stage's late probe answer already on the idle link (it clears the
+/// latch), refuse while the latch holds, and probe a link without
+/// `evidence` that every stage masks (see
+/// [`crate::dist::probe_mask_support`]), waiting `probe_timeout`. An
+/// unanswered probe latches for a minute and leaves a late answer owed.
+/// `Err` is the task's error. The link must be idle.
+pub(crate) async fn admit_json_task(
+    down: &TokioMutex<ActivationClient>,
+    hidden: usize,
+    probe_timeout: Duration,
+    masks: &mut StageMasks,
+    evidence: &mut bool,
+    owed: &crate::dist::OwedLateReply,
+) -> Result<(), String> {
+    if owed.is_owed() {
+        let _ = crate::dist::drain_idle_link(&mut *down.lock().await, owed).await;
+        if owed.take_acked() && masks.latch.is_set() {
+            info!("a late acknowledged answer to the mask-support probe arrived; json requests accepted again");
+            masks.latch.clear();
+        }
+    }
+    if let Some(msg) = masks.refusal() {
+        return Err(msg);
+    }
+    if *evidence {
+        return Ok(());
+    }
+    let tag = masks.next_tag();
+    let t0 = Instant::now();
+    let probed =
+        crate::dist::probe_mask_support(down, hidden, probe_timeout, tag, &masks.latch).await;
+    info!(
+        ok = probed.is_ok(),
+        took_ms = t0.elapsed().as_millis() as u64,
+        "mask-support probe answered"
+    );
+    match probed {
+        Ok(()) => {
+            *evidence = true;
+            Ok(())
+        }
+        Err(reason) => {
+            masks.latch.set_probe();
+            // A slow but new stage may still answer: read that answer as a
+            // late reply, not as a dead link.
+            owed.owe_until(Instant::now() + cascadia_grammar::MASK_PROBE_REPROBE_AFTER);
+            warn!(%reason, "mask-support probe not acknowledged; json requests refused for a while");
+            Err(unconfirmed_step(&reason))
+        }
+    }
 }
 
 /// Last stage, a masked sampling row: the token to answer with (`-1` when
@@ -1777,6 +1833,14 @@ pub struct SparseMoEEngine {
     /// Workers: the last single-row mask decoded from upstream, which a
     /// marker stands for.
     mask_recv: crate::dist::MaskRecvLink,
+    /// Rank 0: the downstream link acknowledged a mask-support probe or a
+    /// masked step, so every stage on it masks.
+    mask_evidence: bool,
+    /// How long rank 0 waits for the answer to a mask-support probe; a
+    /// middle waits its share of it ([`crate::dist::mid_mask_budget`]).
+    mask_probe_timeout: Duration,
+    /// Rank 0: a late probe answer the downstream link still owes.
+    owed_late: crate::dist::OwedLateReply,
 }
 
 impl SparseMoEEngine {
@@ -2394,6 +2458,29 @@ impl SparseMoEEngine {
                 )]);
             }
         };
+
+        // Structured output: probe a link without evidence that every stage
+        // masks before the task's first frame (see `admit_json_task`).
+        if grammar.is_some() {
+            let hidden = self.runner.manifest.hidden_size as usize;
+            let admitted = cascadia_runner::run_async(
+                &self.runtime_handle.clone(),
+                admit_json_task(
+                    &downstream,
+                    hidden,
+                    self.mask_probe_timeout,
+                    &mut self.stage_masks,
+                    &mut self.mask_evidence,
+                    &self.owed_late,
+                ),
+            );
+            if let Err(msg) = admitted {
+                return Some(vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, msg),
+                )]);
+            }
+        }
 
         // RESET downstream so workers clear their KV caches.
         self.runner.reset_kv();
@@ -3767,6 +3854,28 @@ impl SparseMoEEngine {
                         .block_on(crate::dist::send_mask_miss_upstream(upstream, c.tag(0)))
                         .map_err(|e| format!("send_token_ack (mask miss): {e}"));
                 }
+                // The mask-support probe: answered (the last rank) or passed
+                // on (a middle) before any layer runs or any state moves.
+                if let Some(c) = cols.as_ref().filter(|c| crate::dist::is_mask_probe(c)) {
+                    let down = if self.is_last() {
+                        None
+                    } else {
+                        Some(downstream.ok_or("mid rank missing downstream")?)
+                    };
+                    let budget =
+                        crate::dist::mid_mask_budget(self.mask_probe_timeout, self.rank, self.total);
+                    return self.block_on(crate::dist::answer_mask_probe(
+                        upstream,
+                        down.as_deref(),
+                        c,
+                        past_seq_len,
+                        &sampling_cfg,
+                        &hidden_f32,
+                        push_history,
+                        budget,
+                        &self.mid_late,
+                    ));
+                }
                 if in_shape[0] != 1 || in_shape[1] != 1 || in_shape[2] as usize != hidden {
                     return Err(format!(
                         "forward shape unexpected {:?} vs hidden {}",
@@ -4332,6 +4441,14 @@ pub struct OvMoeEngine {
     /// Workers: the last single-row mask decoded from upstream, which a
     /// marker stands for.
     mask_recv: crate::dist::MaskRecvLink,
+    /// Rank 0: the downstream link acknowledged a mask-support probe, so
+    /// every stage on it masks.
+    mask_evidence: bool,
+    /// How long rank 0 waits for the answer to a mask-support probe; a
+    /// middle waits its share of it ([`crate::dist::mid_mask_budget`]).
+    mask_probe_timeout: Duration,
+    /// Rank 0: a late probe answer the downstream link still owes.
+    owed_late: crate::dist::OwedLateReply,
 }
 
 impl OvMoeEngine {
@@ -4390,6 +4507,9 @@ impl OvMoeEngine {
             mid_late: crate::dist::MaskLatch::default(),
             mask_send: crate::dist::MaskSendLink::default(),
             mask_recv: crate::dist::MaskRecvLink::default(),
+            mask_evidence: false,
+            mask_probe_timeout: cascadia_grammar::MASK_PROBE_TIMEOUT,
+            owed_late: crate::dist::OwedLateReply::default(),
         }
     }
 
@@ -4759,6 +4879,26 @@ impl OvMoeEngine {
             return Some(vec![(id, chunk)]);
         }
         let eos = self.runner.eos_token_ids().to_vec();
+
+        // Structured output: probe a link without evidence that every stage
+        // masks before the task's first frame (see `admit_json_task`).
+        if grammar.is_some() {
+            let hidden = self.runner.hidden_size();
+            let admitted = cascadia_runner::run_async(
+                &self.runtime_handle.clone(),
+                admit_json_task(
+                    &downstream,
+                    hidden,
+                    self.mask_probe_timeout,
+                    &mut self.stage_masks,
+                    &mut self.mask_evidence,
+                    &self.owed_late,
+                ),
+            );
+            if let Err(msg) = admitted {
+                return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+            }
+        }
 
         // Reset KV across the whole pipeline before the new generation.
         self.runner.reset();
@@ -5511,6 +5651,28 @@ impl OvMoeEngine {
             return self
                 .block_on(crate::dist::send_mask_miss_upstream(upstream, c.tag(0)))
                 .map_err(|e| format!("send_token_ack (mask miss): {e}"));
+        }
+        // The mask-support probe: answered (the last rank) or passed on (a
+        // middle) before any layer runs or any state moves.
+        if let Some(c) = cols.as_ref().filter(|c| crate::dist::is_mask_probe(c)) {
+            let down = if self.is_last() {
+                None
+            } else {
+                Some(downstream.ok_or("mid rank missing downstream")?)
+            };
+            let budget =
+                crate::dist::mid_mask_budget(self.mask_probe_timeout, self.rank, self.total);
+            return self.block_on(crate::dist::answer_mask_probe(
+                upstream,
+                down.map(|d| &**d),
+                c,
+                past_seq_len,
+                &sampling_cfg,
+                &hidden_f32,
+                push_history,
+                budget,
+                &self.mid_late,
+            ));
         }
         let pos = past_seq_len as usize;
         let hidden = self
@@ -9375,43 +9537,24 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // The mask-support probe: acknowledged without running any layer or
         // touching any state; a middle passes it on unchanged.
         if let Some(c) = cols.as_ref().filter(|c| crate::dist::is_mask_probe(c)) {
-            let tag = c.tag(0);
-            if self.is_last() {
-                return self
-                    .block_on(crate::dist::send_token_ack_upstream(
-                        upstream, -1, tag, MASK_ACK,
-                    ))
-                    .map_err(|e| format!("send_token_ack (probe): {e}"));
-            }
-            let down = downstream.ok_or("mid rank missing downstream")?;
-            let h = hidden_f32.len() as u32;
+            let down = if self.is_last() {
+                None
+            } else {
+                Some(downstream.ok_or("mid rank missing downstream")?)
+            };
             let budget =
                 crate::dist::mid_mask_budget(self.mask_probe_timeout, self.rank, self.total);
-            return self.block_on(async {
-                crate::dist::send_forward_step(
-                    down,
-                    FrameKind::Forward,
-                    past_seq_len,
-                    &sampling_cfg,
-                    &hidden_f32,
-                    [1, 1, h],
-                    push_history,
-                    Some(c),
-                    // The probe never touches the repeat caches.
-                    None,
-                )
-                .await
-                .map_err(|e| format!("relay mask probe: {e}"))?;
-                crate::dist::relay_masked_token_reply(
-                    upstream,
-                    down,
-                    budget,
-                    tag,
-                    &self.mid_late,
-                    None,
-                )
-                .await
-            });
+            return self.block_on(crate::dist::answer_mask_probe(
+                upstream,
+                down.map(|d| &**d),
+                c,
+                past_seq_len,
+                &sampling_cfg,
+                &hidden_f32,
+                push_history,
+                budget,
+                &self.mid_late,
+            ));
         }
         // A malformed or over-range frame is a protocol violation we cannot
         // serve: forwarding a wrong-width hidden, or one at a position the
