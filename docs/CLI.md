@@ -529,11 +529,18 @@ detect context overflow, followed by the engine's own text in parentheses:
 This model's maximum context length is 4096 tokens. However, your messages resulted in 5000 tokens. Please reduce the length of the messages. (prompt is 5000 tokens but the model's context is 4096; send a shorter prompt)
 ```
 
-Without a token count it reads `However, your messages is longer than that.`;
-without a known window, `This model's maximum context length was exceeded: the
-prompt exceeds the available context size. Please reduce the length of the
-messages.` `sparse-moe` truncates an over-window prompt instead, and
-`sycl-llama` never sends this code.
+Its forms, by what the engine reported (`messages` is the route's prompt field):
+
+| Engine reported | Message |
+|---|---|
+| window N, prompt M > N | `This model's maximum context length is N tokens. However, your messages resulted in M tokens. Please reduce the length of the messages.` |
+| window N, prompt M ≤ N | `This model's maximum context length is N tokens. However, your messages resulted in M tokens, which leaves no room for the completion. Please reduce the length of the messages.` |
+| window N only | `This model's maximum context length is N tokens. However, your messages is longer than that. Please reduce the length of the messages.` |
+| prompt M only | `This model's maximum context length is exceeded: your messages resulted in M tokens, which exceeds the available context size. Please reduce the length of the messages.` |
+| neither | `This model's maximum context length is exceeded: your messages exceeds the available context size. Please reduce the length of the messages.` |
+
+`sparse-moe` truncates an over-window prompt instead, and `sycl-llama` never
+sends this code.
 
 **Validated fields.** Ranges are inclusive; a value outside them, or a refused
 field in any form but its no-op one, is a 400 naming the field in `param`.

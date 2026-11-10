@@ -5658,7 +5658,7 @@ mod tests {
         // engine's own text after it.
         assert_eq!(
             v["error"]["message"],
-            "This model's maximum context length was exceeded: the prompt exceeds the \
+            "This model's maximum context length is exceeded: your messages exceeds the \
              available context size. Please reduce the length of the messages. (x)"
         );
     }
@@ -5668,19 +5668,27 @@ mod tests {
     /// "maximum context length", Cline a 400 with `context_length_exceeded`.
     #[tokio::test]
     async fn over_window_message_matches_client_detectors() {
-        let r = engine_error_response(
-            cascadia_engine::EngineError::PromptTooLong(
-                "prompt is 9000 tokens; the model's window is 8192".into(),
-            ),
-            "messages",
-        );
-        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(r.into_body(), 4096).await.unwrap();
-        let v: Value = serde_json::from_slice(&body).unwrap();
-        let m = v["error"]["message"].as_str().unwrap().to_lowercase();
-        assert!(m.contains("this model's maximum context length is"), "{m}");
-        assert!(m.contains("maximum context length"), "{m}");
-        assert_eq!(v["error"]["code"], "context_length_exceeded");
+        // One engine text per message form: over the window, at it, no
+        // count, no window, neither.
+        for detail in [
+            "prompt is 9000 tokens; the model's window is 8192",
+            "prompt is 8192 tokens; the model's window is 8192",
+            "the model's window is 8192",
+            "prompt is at least 5875 tokens",
+            "3 images do not fit the context",
+        ] {
+            let r = engine_error_response(
+                cascadia_engine::EngineError::PromptTooLong(detail.into()),
+                "messages",
+            );
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(r.into_body(), 4096).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            let m = v["error"]["message"].as_str().unwrap().to_lowercase();
+            assert!(m.contains("this model's maximum context length is"), "{m}");
+            assert!(m.contains("maximum context length"), "{m}");
+            assert_eq!(v["error"]["code"], "context_length_exceeded");
+        }
     }
 
     /// Only the window refusal carries `param` and a code; every other

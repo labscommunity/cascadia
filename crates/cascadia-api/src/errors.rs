@@ -84,11 +84,15 @@ pub fn prompt_counts(detail: &str) -> (Option<u32>, Option<u32>) {
 }
 
 /// OpenAI's wording for a prompt over the context window, which client
-/// libraries match to recognise context overflow. `noun` is the request field
+/// libraries match to recognise context overflow: every form starts with
+/// "This model's maximum context length is". `noun` is the request field
 /// that carries the prompt (`messages`, `prompt` or `input`). With a known
-/// `window` the message states it, and the prompt's `tokens` when known;
-/// without one it says only that the context was exceeded. A non-empty
-/// `detail` (the engine's own text) follows in parentheses.
+/// `window` the message states it, and the prompt's `tokens` when known (a
+/// prompt at or under the window, which engines refuse when it leaves no room
+/// to generate, says so); without one it says the context is exceeded, with
+/// the tokens when known, and no number right after "is" for a client to
+/// read as the limit. A non-empty `detail` (the engine's own text) follows in
+/// parentheses.
 pub fn context_length_message(
     noun: &str,
     window: Option<u32>,
@@ -96,16 +100,26 @@ pub fn context_length_message(
     detail: &str,
 ) -> String {
     let mut msg = match (window, tokens) {
-        (Some(n), Some(m)) => format!(
+        (Some(n), Some(m)) if m > n => format!(
             "This model's maximum context length is {n} tokens. However, your {noun} resulted \
              in {m} tokens. Please reduce the length of the {noun}."
+        ),
+        (Some(n), Some(m)) => format!(
+            "This model's maximum context length is {n} tokens. However, your {noun} resulted \
+             in {m} tokens, which leaves no room for the completion. Please reduce the length \
+             of the {noun}."
         ),
         (Some(n), None) => format!(
             "This model's maximum context length is {n} tokens. However, your {noun} is longer \
              than that. Please reduce the length of the {noun}."
         ),
-        (None, _) => format!(
-            "This model's maximum context length was exceeded: the prompt exceeds the \
+        (None, Some(m)) => format!(
+            "This model's maximum context length is exceeded: your {noun} resulted in {m} \
+             tokens, which exceeds the available context size. Please reduce the length of the \
+             {noun}."
+        ),
+        (None, None) => format!(
+            "This model's maximum context length is exceeded: your {noun} exceeds the \
              available context size. Please reduce the length of the {noun}."
         ),
     };
@@ -350,6 +364,11 @@ mod tests {
             ),
             // a count without a window
             ("prompt is at least 5875 tokens", (Some(5875), None)),
+            // a count too large to be one
+            (
+                "prompt is 99999999999 tokens; the model's window is 512",
+                (None, Some(512)),
+            ),
             // neither
             ("3 images do not fit the context", (None, None)),
             ("stage 1 hung up", (None, None)),
@@ -367,25 +386,63 @@ mod tests {
         );
     }
 
+    /// Every form, exact. All of them start with "This model's maximum
+    /// context length is", the text released client libraries match.
     #[test]
-    fn context_length_message_has_openais_three_forms() {
-        assert_eq!(
-            context_length_message("messages", Some(8192), Some(9000), ""),
-            "This model's maximum context length is 8192 tokens. However, your messages \
-             resulted in 9000 tokens. Please reduce the length of the messages."
-        );
-        assert_eq!(
-            context_length_message("prompt", Some(8192), None, ""),
-            "This model's maximum context length is 8192 tokens. However, your prompt is \
-             longer than that. Please reduce the length of the prompt."
-        );
-        for tokens in [None, Some(5875)] {
+    fn context_length_message_forms() {
+        let rows = [
+            (
+                Some(8192),
+                Some(9000),
+                "This model's maximum context length is 8192 tokens. However, your messages \
+                 resulted in 9000 tokens. Please reduce the length of the messages.",
+            ),
+            (
+                Some(8192),
+                Some(8192),
+                "This model's maximum context length is 8192 tokens. However, your messages \
+                 resulted in 8192 tokens, which leaves no room for the completion. Please \
+                 reduce the length of the messages.",
+            ),
+            (
+                Some(8192),
+                Some(100),
+                "This model's maximum context length is 8192 tokens. However, your messages \
+                 resulted in 100 tokens, which leaves no room for the completion. Please \
+                 reduce the length of the messages.",
+            ),
+            (
+                Some(8192),
+                None,
+                "This model's maximum context length is 8192 tokens. However, your messages is \
+                 longer than that. Please reduce the length of the messages.",
+            ),
+            (
+                None,
+                Some(5875),
+                "This model's maximum context length is exceeded: your messages resulted in \
+                 5875 tokens, which exceeds the available context size. Please reduce the \
+                 length of the messages.",
+            ),
+            (
+                None,
+                None,
+                "This model's maximum context length is exceeded: your messages exceeds the \
+                 available context size. Please reduce the length of the messages.",
+            ),
+        ];
+        for (window, tokens, want) in rows {
             assert_eq!(
-                context_length_message("input", None, tokens, ""),
-                "This model's maximum context length was exceeded: the prompt exceeds the \
-                 available context size. Please reduce the length of the input."
+                context_length_message("messages", window, tokens, ""),
+                want,
+                "{window:?} {tokens:?}"
             );
         }
+        assert_eq!(
+            context_length_message("input", None, None, ""),
+            "This model's maximum context length is exceeded: your input exceeds the \
+             available context size. Please reduce the length of the input."
+        );
     }
 
     #[test]
