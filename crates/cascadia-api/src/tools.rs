@@ -15,7 +15,9 @@ use cascadia_types::GrammarSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::structured::{check_schema, DATA_KEYS, MAX_SCHEMA_DEPTH, SCHEMA_MAPS};
+use crate::structured::{
+    check_schema, relax_unsatisfiable_bounds, DATA_KEYS, MAX_SCHEMA_DEPTH, SCHEMA_MAPS,
+};
 use crate::{FunctionCall, Tool, ToolCall};
 
 /// One entry of a request's `tools` list.
@@ -168,6 +170,9 @@ pub struct ToolPolicy {
     pub choice_given: bool,
     /// The request had a `tools` field (absent and `[]` render differently).
     pub tools_given: bool,
+    /// Indices into `tools` whose `parameters` lost a bound pair no value
+    /// can meet (see [`relax_parameters`]).
+    pub relaxed: BTreeSet<usize>,
 }
 
 /// Which kind of tool a name belongs to.
@@ -257,6 +262,7 @@ impl ToolPolicy {
 
         let mut effective = Vec::with_capacity(tools.len());
         let mut custom_names = BTreeSet::new();
+        let mut relaxed = BTreeSet::new();
         for tool in tools {
             if let Some(allowed) = &allowed {
                 if !tool.name().is_some_and(|n| allowed.contains(n)) {
@@ -266,7 +272,11 @@ impl ToolPolicy {
             if let (RequestTool::Custom { .. }, Some(name)) = (tool, tool.name()) {
                 custom_names.insert(name.to_string());
             }
-            effective.push(tool.to_tool());
+            let mut tool = tool.to_tool();
+            if relax_parameters(&mut tool) {
+                relaxed.insert(effective.len());
+            }
+            effective.push(tool);
         }
         Ok(ToolPolicy {
             tools: effective,
@@ -276,7 +286,32 @@ impl ToolPolicy {
             narrowed: allowed.is_some(),
             choice_given: tool_choice.is_some(),
             tools_given,
+            relaxed,
         })
+    }
+
+    /// The call grammar of a forced or union turn ([`tool_grammar`]) covers
+    /// a tool whose parameters lost a bound pair: part of the client's
+    /// schema is not enforced.
+    pub fn grammar_relaxed(&self) -> bool {
+        let named = match &self.mode {
+            ToolMode::Named(name) => Some(name.as_str()),
+            _ => None,
+        };
+        // The tools `tool_schema` puts in the grammar: every one with a
+        // name, or the first one a named choice names.
+        let mut in_grammar = self.tools.iter().enumerate().filter(|(_, t)| {
+            t.function
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| named.is_none_or(|want| want == n))
+        });
+        match named {
+            Some(_) => in_grammar
+                .next()
+                .is_some_and(|(i, _)| self.relaxed.contains(&i)),
+            None => in_grammar.any(|(i, _)| self.relaxed.contains(&i)),
+        }
     }
 
     /// The model may call a tool: there is one and `tool_choice` isn't
@@ -501,6 +536,34 @@ pub(crate) fn de_tool_calls<'de, D: serde::Deserializer<'de>>(
         .map(Some)
 }
 
+/// Drop from `tool`'s `parameters` every bound pair no value can meet
+/// ([`relax_unsatisfiable_bounds`]), such as `minLength` above `maxLength`,
+/// logging each pair with the tool's name; `true` when one was dropped.
+///
+/// The server must accept such a tool (the client chose it, and a 400
+/// would refuse a request the model may never call it in), but no call
+/// could match it: a grammar built from it, here or by a downstream server
+/// building its own from the forwarded tools (llama-server), decodes until
+/// the request is killed. Dropping just that pair keeps the rest of the
+/// call shape enforced. A tool with no such pair is left exactly as sent.
+fn relax_parameters(tool: &mut Tool) -> bool {
+    let Some(parameters) = tool.function.get_mut("parameters") else {
+        return false;
+    };
+    let dropped = relax_unsatisfiable_bounds(parameters);
+    let name = tool.function.get("name").and_then(Value::as_str);
+    for found in &dropped {
+        tracing::warn!(
+            tool = name.unwrap_or(""),
+            detail = %found.detail,
+            "tool parameters hold a bound pair no value can meet; dropping {} and {}",
+            found.lower,
+            found.upper
+        );
+    }
+    !dropped.is_empty()
+}
+
 /// The parameters schema of a tool that declares none: any object.
 fn empty_parameters() -> Value {
     json!({"type": "object", "properties": {}})
@@ -526,11 +589,9 @@ fn empty_parameters() -> Value {
 /// `response_format` schema. A `$ref` of any other form, a `$ref` in a
 /// schema that also has a nested `$id` (which would change what the ref
 /// resolves against), or a result over those limits, gives `None`, logged and counted: the turn then runs
-/// unconstrained. So does a tool's parameters (or the format) schema holding
-/// a bound pair no value can meet ([`crate::unsatisfiable_bound`]), such as
-/// `minLength` above `maxLength`: no call could match it, and some backends
-/// would decode until the request is killed. The log names the tool and the
-/// pointer to the pair. The grammar is best-effort for the same reason.
+/// unconstrained. The grammar is best-effort for the same reason. A bound
+/// pair no value can meet never gets here: [`ToolPolicy::from_request`]
+/// drops it from the tools, and `response_format` refuses it with a 400.
 pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<GrammarSpec> {
     // Under a forced choice the format is moot: the answer is the call.
     let format_schema = match (policy.forced(), format_schema) {
@@ -540,48 +601,14 @@ pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<
     };
     match tool_schema(policy, format_schema) {
         Ok(body) => body.map(GrammarSpec::best_effort_json_schema),
-        Err(Unenforced { reason, detail }) => {
-            match detail {
-                Some(detail) => tracing::warn!(
-                    reason = reason.as_str(),
-                    %detail,
-                    "tool-call output constraint not enforced; answering unconstrained"
-                ),
-                None => tracing::warn!(
-                    reason = reason.as_str(),
-                    "tool-call output constraint not enforced; answering unconstrained"
-                ),
-            }
+        Err(reason) => {
+            tracing::warn!(
+                reason = reason.as_str(),
+                "tool-call output constraint not enforced; answering unconstrained"
+            );
             cascadia_metrics::count_constraint_unenforced(reason);
             None
         }
-    }
-}
-
-/// Why [`tool_schema`] built nothing, and where when it can tell.
-struct Unenforced {
-    reason: UnenforcedReason,
-    detail: Option<String>,
-}
-
-impl From<UnenforcedReason> for Unenforced {
-    fn from(reason: UnenforcedReason) -> Self {
-        Unenforced {
-            reason,
-            detail: None,
-        }
-    }
-}
-
-/// `Err` naming the first bound pair in `schema` no value can meet, found
-/// by [`crate::unsatisfiable_bound`]; `what` says whose schema it is.
-fn check_meetable(schema: &Value, what: &str) -> Result<(), Unenforced> {
-    match crate::unsatisfiable_bound(schema) {
-        Some(found) => Err(Unenforced {
-            reason: UnenforcedReason::SchemaRejected,
-            detail: Some(format!("{what}: {found}; no call can match it")),
-        }),
-        None => Ok(()),
     }
 }
 
@@ -590,7 +617,7 @@ fn check_meetable(schema: &Value, what: &str) -> Result<(), Unenforced> {
 fn tool_schema(
     policy: &ToolPolicy,
     format_schema: Option<&str>,
-) -> Result<Option<String>, Unenforced> {
+) -> Result<Option<String>, UnenforcedReason> {
     let named = match &policy.mode {
         ToolMode::Named(name) => Some(name.as_str()),
         _ => None,
@@ -606,10 +633,7 @@ fn tool_schema(
         }
         let parameters = match tool.function.get("parameters") {
             None | Some(Value::Null) => empty_parameters(),
-            Some(p) => {
-                check_meetable(p, &format!("tool `{name}` parameters"))?;
-                hoisted.take(p.clone(), &format!("t{i}_"))?
-            }
+            Some(p) => hoisted.take(p.clone(), &format!("t{i}_"))?,
         };
         items.push(json!({
             "type": "object",
@@ -640,7 +664,6 @@ fn tool_schema(
             // The format schema was parsed once already; it can't fail here.
             let format: Value =
                 serde_json::from_str(text).map_err(|_| UnenforcedReason::SchemaRejected)?;
-            check_meetable(&format, "response_format schema")?;
             let format = hoisted.take(format, "rf_")?;
             let mut root = Map::new();
             root.insert("anyOf".into(), json!([Value::Object(calls), format]));
@@ -659,7 +682,7 @@ fn tool_schema(
     let text = serde_json::to_string(&root).map_err(|_| UnenforcedReason::TooComplex)?;
     check_schema(&root, &text)
         .map(Some)
-        .map_err(|_| UnenforcedReason::TooComplex.into())
+        .map_err(|_| UnenforcedReason::TooComplex)
 }
 
 /// The definitions moved to the root of a tool grammar, by keyword.
@@ -1619,45 +1642,64 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_no_value_can_meet_gives_no_grammar() {
-        let unmeetable = [
-            json!({"type": "object", "properties": {
-                "city": {"type": "string", "minLength": 5, "maxLength": 2}}}),
+    fn a_bound_pair_no_value_can_meet_is_dropped_from_the_tools() {
+        let cases = [
+            (
+                json!({"type": "object", "properties": {
+                    "city": {"type": "string", "minLength": 5, "maxLength": 2, "pattern": "^A"}}}),
+                json!({"type": "object", "properties": {
+                    "city": {"type": "string", "pattern": "^A"}}}),
+            ),
             // An integer range that holds numbers but no integer.
-            json!({"type": "object", "properties": {
-                "n": {"type": "integer", "exclusiveMinimum": 2, "exclusiveMaximum": 3}}}),
+            (
+                json!({"type": "object", "properties": {
+                    "n": {"type": "integer", "exclusiveMinimum": 2, "exclusiveMaximum": 3}}}),
+                json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
+            ),
         ];
-        for params in unmeetable {
-            let before = unenforced(UnenforcedReason::SchemaRejected);
+        for (params, want) in cases {
             let p = pol(
                 json!([weather(), with_params("f", params.clone())]),
                 Some(json!("required")),
                 None,
             );
-            assert!(tool_grammar(&p, None).is_none(), "{params}");
-            assert!(
-                unenforced(UnenforcedReason::SchemaRejected) > before,
-                "{params}"
+            // Every path out of the policy carries the relaxed copy.
+            assert_eq!(p.tools[0].function, weather()["function"], "{params}");
+            assert_eq!(p.tools[1].function["parameters"], want, "{params}");
+            assert_eq!(p.engine_tools().unwrap()[1]["function"]["parameters"], want);
+            assert_eq!(p.prompt_tools().unwrap()[1].function["parameters"], want);
+            // The call stays forced, over the relaxed schema.
+            let g = tool_grammar(&p, None).expect("a call grammar");
+            let b: Value = serde_json::from_str(&g.body).unwrap();
+            assert_eq!(b["items"]["anyOf"][1]["properties"]["parameters"], want);
+            assert_eq!(p.relaxed, BTreeSet::from([1]));
+            assert!(p.grammar_relaxed());
+            // A named choice leaving the relaxed tool out enforces all it sends.
+            let named = json!({"type": "function", "function": {"name": "get_weather"}});
+            let p = pol(
+                json!([weather(), with_params("f", params.clone())]),
+                Some(named),
+                None,
             );
+            assert!(!p.grammar_relaxed());
+            let p = pol(
+                json!([weather(), with_params("f", params)]),
+                Some(json!({"type": "function", "function": {"name": "f"}})),
+                None,
+            );
+            assert!(p.grammar_relaxed());
         }
-        // A tool a named choice leaves out doesn't count.
-        let bad = json!({"type": "string", "minLength": 5, "maxLength": 2});
-        let p = pol(
-            json!([weather(), with_params("f", bad)]),
-            Some(json!({"type": "function", "function": {"name": "get_weather"}})),
-            None,
-        );
-        assert!(tool_grammar(&p, None).is_some());
-        // Bounds that some value meets: the grammar as before.
+        // Bounds that some value meets: the tool exactly as sent.
         let fine = json!({"type": "object", "properties": {
             "city": {"type": "string", "minLength": 2, "maxLength": 5},
             "n": {"type": "integer", "exclusiveMinimum": 2, "exclusiveMaximum": 4}}});
         let p = pol(
-            json!([with_params("f", fine)]),
+            json!([with_params("f", fine.clone())]),
             Some(json!("required")),
             None,
         );
-        assert!(tool_grammar(&p, None).is_some());
+        assert_eq!(p.tools[0].function["parameters"], fine);
+        assert!(p.relaxed.is_empty() && !p.grammar_relaxed());
     }
 
     #[test]

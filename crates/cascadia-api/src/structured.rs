@@ -511,8 +511,9 @@ const BOUND_PAIRS: [(&str, &str, bool); 7] = [
 /// grammar no output can finish (llama-server then decodes until the
 /// request is killed), so [`parse_response_format`] refuses it up front,
 /// wherever it sits: a pair no value meets is a mistake in the schema even
-/// in a branch a value need not take. This only reports, for callers that
-/// would rather drop the constraint.
+/// in a branch a value need not take. This only reports;
+/// [`relax_unsatisfiable_bounds`] drops such pairs from a schema the server
+/// must accept anyway (a tool's parameters).
 ///
 /// It visits every schema in the document, `$defs` included, and skips
 /// `enum`, `const`, `default` and `examples`, whose values are data: a
@@ -711,6 +712,13 @@ fn violated_pair(obj: &Map<String, Value>) -> Option<(&'static str, &'static str
     Some((lower, upper, None))
 }
 
+/// [`bound_violation`] with the two keywords that leave nothing.
+fn violated_bound(obj: &Map<String, Value>) -> Option<(&'static str, &'static str, String, bool)> {
+    let (lower, upper, _) = violated_pair(obj)?;
+    let (detail, pair) = bound_violation(obj)?;
+    Some((lower, upper, detail, pair))
+}
+
 /// The 400 detail for `found` at `path`.
 fn locate((detail, pair): (String, bool), path: &[String]) -> String {
     let at = json_pointer(path);
@@ -907,6 +915,161 @@ fn merged_violation(arena: &[Source], sources: &[usize], base: &[String]) -> Opt
         ),
         None => format!("no integer meets {lower} ({lo}) at {lo_at} and {upper} ({hi}) at {hi_at}"),
     })
+}
+
+/// A bound pair no value can meet, as [`relax_unsatisfiable_bounds`] drops
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsatisfiableBound {
+    /// The keys (array indices as decimal text) from the root to the object
+    /// holding the pair.
+    pub path: Vec<String>,
+    /// The lower bound's keyword, such as `minLength`.
+    pub lower: &'static str,
+    /// The upper bound's keyword, such as `maxLength`.
+    pub upper: &'static str,
+    /// The pair, its values and its pointer, as [`unsatisfiable_bound`]
+    /// words a pair one object holds.
+    pub detail: String,
+}
+
+/// The first bound pair no value can meet on the schema object `obj` itself
+/// (not its subschemas), at `path`, worded as [`unsatisfiable_bound`]
+/// words it.
+fn bound_pair_here(obj: &Map<String, Value>, path: &[String]) -> Option<UnsatisfiableBound> {
+    let (lower, upper, detail, pair) = violated_bound(obj)?;
+    Some(UnsatisfiableBound {
+        path: path.to_vec(),
+        lower,
+        upper,
+        detail: locate((detail, pair), path),
+    })
+}
+
+/// The keys from `root` to `target`, one of [`backstop_targets`] for the
+/// local `$ref` `r`: its RFC 6901 keys (`~1`, `~0` unescaped), or the raw
+/// keys for the converter's reading. `None` when neither leads there, so
+/// [`relax_unsatisfiable_bounds`] never gets a path it cannot follow.
+fn path_to_target(root: &Value, r: &str, target: &Value) -> Option<Vec<String>> {
+    let raw: Vec<String> = r
+        .trim_start_matches('#')
+        .split('/')
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .collect();
+    let unescaped: Vec<String> = raw
+        .iter()
+        .map(|k| k.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    [unescaped, raw].into_iter().find(|path| {
+        path.iter()
+            .try_fold(root, |v, k| match v {
+                Value::Object(o) => o.get(k),
+                Value::Array(a) => k.parse::<usize>().ok().and_then(|i| a.get(i)),
+                _ => None,
+            })
+            .is_some_and(|v| std::ptr::eq(v, target))
+    })
+}
+
+/// The first bound pair one object of `schema` holds that no value can
+/// meet, with its location: the schemas [`unsatisfiable_bound`] visits, then
+/// whatever a local `$ref` points to.
+fn first_unsatisfiable_pair(schema: &Value) -> Option<UnsatisfiableBound> {
+    fn search(v: &Value, path: &mut Vec<String>, depth: usize) -> Option<UnsatisfiableBound> {
+        if depth > MAX_SCHEMA_DEPTH {
+            return None;
+        }
+        let descend = |path: &mut Vec<String>, key: String, child: &Value| {
+            path.push(key);
+            let found = search(child, path, depth + 1);
+            path.pop();
+            found
+        };
+        match v {
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(i, c)| descend(path, i.to_string(), c)),
+            Value::Object(obj) => {
+                if let Some(found) = bound_pair_here(obj, path) {
+                    return Some(found);
+                }
+                for (key, child) in obj {
+                    if DATA_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
+                    let hit = match child {
+                        Value::Object(map) if SCHEMA_MAPS.contains(&key.as_str()) => {
+                            path.push(key.clone());
+                            let hit = map
+                                .iter()
+                                .find_map(|(name, sub)| descend(path, name.clone(), sub));
+                            path.pop();
+                            hit
+                        }
+                        _ => descend(path, key.clone(), child),
+                    };
+                    if hit.is_some() {
+                        return hit;
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    search(schema, &mut Vec::new(), 0).or_else(|| {
+        let mut stack = vec![schema];
+        while let Some(v) = stack.pop() {
+            match v {
+                Value::Object(o) => {
+                    if let Some(r) = o.get("$ref").and_then(Value::as_str) {
+                        for target in backstop_targets(schema, r) {
+                            let Some(mut path) = path_to_target(schema, r, target) else {
+                                continue;
+                            };
+                            let found = search(target, &mut path, 0);
+                            if found.is_some() {
+                                return found;
+                            }
+                        }
+                    }
+                    stack.extend(o.values());
+                }
+                Value::Array(a) => stack.extend(a.iter()),
+                _ => {}
+            }
+        }
+        None
+    })
+}
+
+/// `schema` with every bound pair no value can meet removed: while
+/// [`first_unsatisfiable_pair`] finds one, exactly that pair's two keywords
+/// are dropped from the object holding it, everything else kept in order.
+/// Returns what was dropped, in the order found; empty (and `schema`
+/// untouched) when there was nothing to drop.
+pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound> {
+    let mut dropped = Vec::new();
+    while let Some(found) = first_unsatisfiable_pair(schema) {
+        let mut node = &mut *schema;
+        for key in &found.path {
+            node = match node {
+                Value::Object(obj) => obj.get_mut(key),
+                Value::Array(items) => key.parse::<usize>().ok().and_then(|i| items.get_mut(i)),
+                _ => None,
+            }
+            .expect("the path a search just found leads to an object");
+        }
+        let obj = node
+            .as_object_mut()
+            .expect("a bound pair sits in an object");
+        obj.shift_remove(found.lower);
+        obj.shift_remove(found.upper);
+        dropped.push(found);
+    }
+    dropped
 }
 
 /// The RFC 6901 pointer of `path`, as a URI fragment: `#`, `#/items`, ...
@@ -4550,6 +4713,161 @@ mod tests {
             }))
             .as_deref(),
             Some("minLength (5) is greater than maxLength (2) at #/properties/a; no value can satisfy both")
+        );
+    }
+
+    #[test]
+    fn relax_names_the_pair_and_where() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"a": {"type": "array", "items": [{"type": "string", "minLength": 5, "maxLength": 2}]}}
+        });
+        let [found] =
+            <[UnsatisfiableBound; 1]>::try_from(relax_unsatisfiable_bounds(&mut schema)).unwrap();
+        assert_eq!(found.path, ["properties", "a", "items", "0"]);
+        assert_eq!((found.lower, found.upper), ("minLength", "maxLength"));
+        assert_eq!(
+            found.detail,
+            "minLength (5) is greater than maxLength (2) at #/properties/a/items/0; no value can satisfy both"
+        );
+    }
+
+    /// `schema` relaxed, and the details of what was dropped.
+    fn relaxed(mut schema: Value) -> (Value, Vec<String>) {
+        let dropped = relax_unsatisfiable_bounds(&mut schema);
+        (schema, dropped.into_iter().map(|d| d.detail).collect())
+    }
+
+    #[test]
+    fn relax_drops_a_nested_length_pair_and_keeps_the_rest() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "A city.", "minLength": 5,
+                    "pattern": "^[A-Z]", "maxLength": 2},
+                "n": {"type": "integer", "minimum": 1}
+            },
+            "required": ["city"]
+        }));
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "A city.", "pattern": "^[A-Z]"},
+                    "n": {"type": "integer", "minimum": 1}
+                },
+                "required": ["city"]
+            })
+        );
+        assert_eq!(
+            dropped,
+            ["minLength (5) is greater than maxLength (2) at #/properties/city; no value can satisfy both"]
+        );
+    }
+
+    #[test]
+    fn relax_drops_an_integer_range_holding_no_integer() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "object",
+            "properties": {"n": {"type": "integer", "exclusiveMinimum": 2,
+                "exclusiveMaximum": 3, "multipleOf": 1}}
+        }));
+        assert_eq!(
+            schema,
+            json!({"type": "object", "properties": {"n": {"type": "integer", "multipleOf": 1}}})
+        );
+        assert_eq!(
+            dropped,
+            ["no integer meets exclusiveMinimum (2) and exclusiveMaximum (3) at #/properties/n"]
+        );
+    }
+
+    #[test]
+    fn relax_drops_an_items_count_pair() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "array", "items": {"type": "string", "maxLength": 9},
+            "minItems": 4, "maxItems": 3, "uniqueItems": true
+        }));
+        assert_eq!(
+            schema,
+            json!({"type": "array", "items": {"type": "string", "maxLength": 9}, "uniqueItems": true})
+        );
+        assert_eq!(
+            dropped,
+            ["minItems (4) is greater than maxItems (3) at #; no value can satisfy both"]
+        );
+    }
+
+    #[test]
+    fn relax_drops_every_pair_in_one_schema() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "minLength": 5, "maxLength": 2},
+                "b": {"type": "number", "minimum": 3, "maximum": 1, "multipleOf": 0.5}
+            }
+        }));
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string"},
+                    "b": {"type": "number", "multipleOf": 0.5}
+                }
+            })
+        );
+        assert_eq!(
+            dropped,
+            [
+                "minLength (5) is greater than maxLength (2) at #/properties/a; no value can satisfy both",
+                "minimum (3) is greater than maximum (1) at #/properties/b; no value can satisfy both",
+            ]
+        );
+        assert_eq!(unsatisfiable_bound(&schema), None);
+    }
+
+    /// A pair reached only through a local `$ref` into a data keyword is
+    /// dropped where it sits, so the relaxed schema passes the check.
+    #[test]
+    fn relax_drops_a_pair_a_ref_reaches_inside_a_data_keyword() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/default/x"}},
+            "default": {"x": {"type": "string", "minLength": 5, "maxLength": 2}}
+        }));
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {"a": {"$ref": "#/default/x"}},
+                "default": {"x": {"type": "string"}}
+            })
+        );
+        assert_eq!(
+            dropped,
+            ["minLength (5) is greater than maxLength (2) at #/default/x; no value can satisfy both"]
+        );
+        assert_eq!(unsatisfiable_bound(&schema), None);
+    }
+
+    #[test]
+    fn relax_leaves_a_satisfiable_schema_untouched() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "minLength": 2, "maxLength": 5},
+                "n": {"type": "integer", "exclusiveMinimum": 2, "exclusiveMaximum": 4}
+            },
+            "required": ["city"]
+        });
+        let (relaxed_schema, dropped) = relaxed(schema.clone());
+        assert!(dropped.is_empty());
+        assert_eq!(relaxed_schema, schema);
+        assert_eq!(
+            serde_json::to_string(&relaxed_schema).unwrap(),
+            serde_json::to_string(&schema).unwrap()
         );
     }
 

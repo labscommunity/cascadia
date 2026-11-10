@@ -904,6 +904,19 @@ llama-server as a `json_schema` `response_format`; llama-server's own
 `definitions` are kept (moved to the root of the combined schema, and its
 `$ref`s rewritten to match).
 
+A tool whose `parameters` hold a bound pair no value can meet, such as
+`minLength` above `maxLength`, `minItems` above `maxItems`, or an integer
+range holding no integer, is accepted with that pair dropped: the API
+removes exactly those two keywords at that place, logs a warning naming the
+tool and the pair, and uses the tool without them everywhere (the prompt,
+the tools sent to the engine, and the constraint). The rest of the call
+shape is still enforced; a forced call stays forced. When the constraint is
+sent over such a tool, `cascadia_constraint_unenforced_total{reason="schema_rejected"}`
+counts it once. Left in, no call could match the schema and a backend that
+builds its own grammar from the tools (llama-server on `sycl-llama`) would
+decode until the request is killed. A `response_format` schema with such a
+pair is still a 400.
+
 - Thinking is turned off for an enforced turn: the constraint starts at the
   first token. On `ov-genai` it is also off for a forced turn that could not
   be constrained.
@@ -936,7 +949,7 @@ enforced` when the API could not build it) with the reason, and
 | `draft_model` | `ov-genai` with `--draft-model`. |
 | `genai_version` | `ov-genai` on OpenVINO GenAI older than 2026.4. |
 | `probe_failed` | `ov-genai`: the startup structured-output check failed for this model. |
-| `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile. |
+| `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile. Also counted when the constraint is sent without a tool's bound pair no value can meet (see above): the rest is enforced, that pair is not. |
 | `too_complex` | The combined schema is over the [schema limits](#structured-output-response_format), or took longer than the 2 s build budget (llguidance engines). |
 | `busy` | The llguidance engines' schema check had no free slot. |
 | `unsupported_ref` | A tool schema (or the `response_format` schema beside it) has a `$ref` that can't be kept once nested: anything other than `#` or `#/$defs/…` / `#/definitions/…` naming its own definitions, or a `$ref` beside a nested `$id`. |

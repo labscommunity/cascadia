@@ -4006,6 +4006,23 @@ mod unix_tests {
     }
 
     #[test]
+    fn chat_body_forwards_the_tools_exactly_as_the_api_sent_them() {
+        // llama-server builds its own grammar from these, so the API drops a
+        // bound pair no value can meet before they get here; nothing on the
+        // way may change them, or put such a pair back.
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "get_city",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string", "description": "Its name.", "pattern": "^[A-Z]"}},
+                "required": ["city"]}}}]);
+        let mut task = chat_task();
+        task.tools = Some(tools.clone());
+        task.tool_choice = Some(serde_json::json!("required"));
+        let body = captured_chat_body(task);
+        assert_eq!(body["tools"], tools, "{body}");
+        assert_eq!(body["tool_choice"], "required", "{body}");
+    }
+
+    #[test]
     fn chat_body_without_grammar_has_no_response_format() {
         let body = captured_chat_body(chat_task());
         assert!(body.get("response_format").is_none(), "{body}");

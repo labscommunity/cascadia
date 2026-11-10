@@ -3052,6 +3052,14 @@ async fn chat_completions(
         other => other,
     };
     let tool_grammar_sent = tool_constrained && grammar.is_some();
+    // A tool's bound pair no value can meet was dropped (see
+    // `ToolPolicy::from_request`): the call grammar enforces the rest of its
+    // schema, not all of it.
+    if tool_grammar_sent && policy.grammar_relaxed() {
+        cascadia_metrics::count_constraint_unenforced(
+            cascadia_metrics::UnenforcedReason::SchemaRejected,
+        );
+    }
     let union_sent = tool_grammar_sent && !policy.forced();
     // A JSON answer has no room for a reasoning preamble: thinking is off,
     // and so is it under a tool-call constraint, which starts at the first
@@ -10899,17 +10907,30 @@ level={{ effort_map[eff] }}";
     }
 
     #[tokio::test]
-    async fn a_tool_schema_no_value_can_meet_runs_unconstrained() {
+    async fn a_tool_bound_pair_no_value_can_meet_is_dropped_before_the_engine() {
+        // One test, run in order: the counter is process-wide.
         let rejected = || {
             cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
                 .with_label_values(&[cascadia_metrics::UnenforcedReason::SchemaRejected.as_str()])
                 .get()
         };
+        let tool = serde_json::json!({"type": "function", "function": {"name": "get_city",
+            "description": "Look a city up.",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string", "description": "Its name.", "minLength": 5,
+                    "maxLength": 2, "pattern": "^[A-Z]"},
+                "n": {"type": "integer", "minimum": 1, "maximum": 9}},
+                "required": ["city"]}}});
+        let relaxed = serde_json::json!([{"type": "function", "function": {"name": "get_city",
+            "description": "Look a city up.",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string", "description": "Its name.", "pattern": "^[A-Z]"},
+                "n": {"type": "integer", "minimum": 1, "maximum": 9}},
+                "required": ["city"]}}}]);
+
+        // Forced: the call stays forced, over the tool without the pair.
         let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
         let before = rejected();
-        let tool = serde_json::json!({"type": "function", "function": {"name": "get_city",
-            "parameters": {"type": "object", "properties": {
-                "city": {"type": "string", "minLength": 5, "maxLength": 2}}}}});
         let (status, v) = post_chat(
             app,
             tool_body(
@@ -10919,8 +10940,62 @@ level={{ effort_map[eff] }}";
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert_eq!(last_task(&seen).grammar, None);
-        assert!(rejected() > before);
+        let task = last_task(&seen);
+        assert_eq!(task.tools, Some(relaxed.clone()));
+        assert!(!task.prompt.contains("minLength"), "{}", task.prompt);
+        assert!(task.prompt.contains("Its name."), "{}", task.prompt);
+        let grammar = task.grammar.expect("the call grammar is still sent");
+        assert!(!grammar.body.contains("minLength"), "{}", grammar.body);
+        assert!(!grammar.body.contains("maxLength"), "{}", grammar.body);
+        assert!(grammar.body.contains("get_city"), "{}", grammar.body);
+        assert!(grammar.body.contains("\"minimum\":1"), "{}", grammar.body);
+        assert_eq!(rejected(), before + 1);
+
+        // Auto: no grammar, the tools still reach the engine relaxed, and
+        // nothing is counted (no constraint was dropped).
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let before = rejected();
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([tool]),
+                serde_json::json!({"tool_choice": "auto"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.tools, Some(relaxed));
+        assert!(!task.prompt.contains("minLength"), "{}", task.prompt);
+        assert_eq!(task.grammar, None);
+        assert_eq!(rejected(), before);
+    }
+
+    #[tokio::test]
+    async fn a_format_schema_no_value_can_meet_beside_tools_is_a_400() {
+        // The union's format half never reaches the tool grammar with such
+        // a pair: response_format is refused first.
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let format = serde_json::json!({"type": "json_schema", "json_schema": {"name": "r",
+            "schema": {"type": "object", "properties": {
+                "a": {"type": "string", "minLength": 5, "maxLength": 2}}}}});
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([city_tool("get_city")]),
+                serde_json::json!({"tool_choice": "auto", "response_format": format}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("minLength (5) is greater than maxLength (2)"),
+            "{v}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     /// SSE events of a streamed chat body with the per-response values
