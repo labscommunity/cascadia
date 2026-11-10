@@ -2319,29 +2319,22 @@ pub fn parse_tool_calls_marked(text: &str) -> Option<Vec<ToolCall>> {
 }
 
 fn parse_tool_calls_with(text: &str, bare_json: bool) -> Option<Vec<ToolCall>> {
-    let mut calls = Vec::new();
     // The dialect whose open marker comes first: the other's marker may be
-    // text inside its arguments.
+    // text inside its arguments. A Gemma 4 marker that opens no Gemma 4
+    // call is only text, so the other dialects are still tried after it.
     let gemma_first = match (text.find(GEMMA_CALL_OPEN), text.find(TOOL_CALL_OPEN)) {
         (Some(g), Some(h)) => g < h,
         (Some(_), None) => true,
         (None, _) => false,
     };
     if gemma_first {
-        // Gemma 4: each <|tool_call>call:NAME{ARGS}<tool_call|>; a malformed
-        // one is skipped and the search goes on after its open marker.
-        let mut rest = text;
-        while let Some(start) = rest.find(GEMMA_CALL_OPEN) {
-            let after = &rest[start + GEMMA_CALL_OPEN.len()..];
-            rest = match call_from_gemma(after) {
-                Some((c, used)) => {
-                    calls.push(c);
-                    &after[used..]
-                }
-                None => after,
-            };
+        let calls = gemma_calls(text);
+        if !calls.is_empty() {
+            return Some(calls);
         }
-    } else if text.contains(TOOL_CALL_OPEN) {
+    }
+    let mut calls = Vec::new();
+    if text.contains(TOOL_CALL_OPEN) {
         // Qwen/Hermes: each <tool_call>…</tool_call> block.
         let mut rest = text;
         while let Some(start) = rest.find("<tool_call>") {
@@ -2418,6 +2411,24 @@ fn parse_tool_calls_with(text: &str, bare_json: bool) -> Option<Vec<ToolCall>> {
         }
     }
     (!calls.is_empty()).then_some(calls)
+}
+
+/// Gemma 4 calls: each `<|tool_call>call:NAME{ARGS}<tool_call|>`; a
+/// malformed one is skipped and the search goes on after its open marker.
+fn gemma_calls(text: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(GEMMA_CALL_OPEN) {
+        let after = &rest[start + GEMMA_CALL_OPEN.len()..];
+        rest = match call_from_gemma(after) {
+            Some((c, used)) => {
+                calls.push(c);
+                &after[used..]
+            }
+            None => after,
+        };
+    }
+    calls
 }
 
 /// Byte length of the balanced JSON value starting at `s[0]` (`{` or `[`),
@@ -11919,5 +11930,84 @@ level={{ effort_map[eff] }}";
         assert!(strip.is_poisoned());
         assert_eq!(strip_streamed(&strip, "a<|\"|>b<".into(), false), "ab");
         assert_eq!(strip_streamed(&strip, "|tool_call>c".into(), true), "c");
+    }
+
+    /// Texts that mention the Gemma 4 open marker as data, before (or
+    /// without) the real call. The Gemma 4 reader finds no call in them, so
+    /// the other dialects must still be tried.
+    const GEMMA_MARKER_AS_DATA: [&str; 3] = [
+        r#"{"name":"write_file","arguments":{"path":"a.md","content":"Gemma opens a call with <|tool_call>"}}"#,
+        r#"<|python_tag|>{"name":"write_file","parameters":{"content":"<|tool_call>"}}"#,
+        r#"The Gemma marker is <|tool_call>. <tool_call>{"name":"write_file","arguments":{"content":"x"}}</tool_call>"#,
+    ];
+
+    #[test]
+    fn a_gemma4_marker_with_no_gemma4_call_falls_through_to_other_dialects() {
+        let want = [
+            serde_json::json!({"path": "a.md", "content": "Gemma opens a call with <|tool_call>"}),
+            serde_json::json!({"content": "<|tool_call>"}),
+            serde_json::json!({"content": "x"}),
+        ];
+        for (text, want) in GEMMA_MARKER_AS_DATA.iter().zip(want) {
+            let calls = parse_tool_calls(text).unwrap_or_else(|| panic!("a call in {text}"));
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!(calls[0].function.name, "write_file", "{text}");
+            assert_eq!(call_args(&calls[0]), want, "{text}");
+        }
+        // The marked reader keeps its own rule: a marked call counts, a bare
+        // whole-output JSON object does not.
+        assert_eq!(parse_tool_calls_marked(GEMMA_MARKER_AS_DATA[0]), None);
+        for text in &GEMMA_MARKER_AS_DATA[1..] {
+            let calls = parse_tool_calls_marked(text).expect("a marked call");
+            assert_eq!(calls[0].function.name, "write_file", "{text}");
+        }
+        // A real Gemma 4 call still wins over a later Hermes block.
+        let text = format!("{GEMMA_WEATHER_CALL}{WEATHER_CALL}");
+        let calls = parse_tool_calls(&text).expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(call_args(&calls[0]), serde_json::json!({"city": "Paris"}));
+    }
+
+    #[test]
+    fn build_choice_reads_a_hermes_call_after_a_gemma4_marker_mention() {
+        let (m, fr) = build_choice(
+            GEMMA_MARKER_AS_DATA[2].into(),
+            &tool_policy(&["write_file"], Some(serde_json::json!("auto"))),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(fr, Some("tool_calls"));
+        assert!(m.content.is_none());
+        let calls = m.tool_calls.expect("tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name(), "write_file");
+    }
+
+    #[test]
+    fn streamed_hermes_call_after_a_gemma4_marker_mention_matches_non_streamed() {
+        for gemma in [false, true] {
+            for text in GEMMA_MARKER_AS_DATA {
+                // Split at every 7th char boundary.
+                let mut pieces = Vec::new();
+                let mut from = 0;
+                for (n, (i, _)) in text.char_indices().enumerate() {
+                    if n > 0 && n % 7 == 0 {
+                        pieces.push(&text[from..i]);
+                        from = i;
+                    }
+                }
+                pieces.push(&text[from..]);
+                pieces.push("");
+                let (out, calls) = run_splitter_with(&pieces, false, gemma);
+                let calls = calls.unwrap_or_else(|| panic!("streamed calls in {text}"));
+                let whole = parse_tool_calls(text).expect("non-streamed calls");
+                assert_eq!(calls.len(), whole.len(), "{text}");
+                assert_eq!(calls[0].function.name, whole[0].function.name);
+                assert_eq!(call_args(&calls[0]), call_args(&whole[0]), "{text}");
+                // Released content never reaches into the call.
+                assert!(!out.concat().contains("write_file"), "{text}: {out:?}");
+            }
+        }
     }
 }
