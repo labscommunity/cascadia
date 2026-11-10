@@ -568,10 +568,18 @@ impl Engine for OvGenaiEngine {
         // The shim decodes the last `tail_tokens` generated ids per write and
         // the check runs on that suffix decode (M18 D8): it is a substring of
         // the returned text (OneShotStop's input contract), unlike streamer
-        // pieces. The +16 covers a run of 0-byte (special) tokens. 0 = no
-        // decode at all when nothing is checked.
+        // pieces. The +16 covers a run of 0-byte (special) tokens. A draft
+        // model or prompt-lookup writes a whole speculative round at once
+        // (up to `num_assistant_tokens` + 1 ids), so the window grows by that
+        // round too, as sparse-moe's `extra_slack` does. 0 = no decode at all
+        // when nothing is checked.
+        let round_slack = if cfg.num_assistant_tokens > 0 {
+            cfg.num_assistant_tokens as usize + 1
+        } else {
+            0
+        };
         let tail_tokens = if stop.is_active() {
-            stop.max_stop_bytes() + 16
+            stop.max_stop_bytes() + 16 + round_slack
         } else {
             0
         };
@@ -2023,6 +2031,9 @@ mod tests {
         /// Call the poll closure from a spawned thread, as ov-genai does when
         /// it runs the streamer on its worker thread (the CB adapter).
         poll_from_thread: bool,
+        /// Instead of `pieces`: one entry per streamer write, each the token
+        /// texts it carries (a speculative round writes several ids at once).
+        writes: Vec<Vec<String>>,
         /// Pieces polled (the end flush not included).
         consumed: usize,
         /// Every poll call: (text, n_tokens, answer).
@@ -2079,13 +2090,36 @@ mod tests {
             poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
         ) -> Result<GenResult, OvError> {
             let tail_override = self.st.lock().unwrap().tail_override.clone();
-            let (pieces, cancel_before, err_after_cancel, poll_panic_at) = {
+            let (pieces, tokens, ends, cancel_before, err_after_cancel, poll_panic_at) = {
                 let mut st = self.st.lock().unwrap();
+                // Per write: (text, n_tokens); per token: its text; per write:
+                // the token count after it.
+                let (pieces, tokens): (Vec<(String, usize)>, Vec<String>) = if st.writes.is_empty()
+                {
+                    let toks = st.pieces.iter().map(|(t, _)| t.clone()).collect();
+                    (st.pieces.clone(), toks)
+                } else {
+                    let pieces = st.writes.iter().map(|w| (w.concat(), w.len())).collect();
+                    (pieces, st.writes.concat())
+                };
+                let ends: Vec<usize> = if st.writes.is_empty() {
+                    (1..=pieces.len()).collect()
+                } else {
+                    st.writes
+                        .iter()
+                        .scan(0, |acc, w| {
+                            *acc += w.len();
+                            Some(*acc)
+                        })
+                        .collect()
+                };
                 st.polled_calls += 1;
                 st.tail_tokens.push(tail_tokens);
                 st.last_cfg = Some(cfg.clone());
                 (
-                    st.pieces.clone(),
+                    pieces,
+                    tokens,
+                    ends,
                     st.cancel_before.clone(),
                     st.err_after_cancel,
                     st.poll_panic_at,
@@ -2110,8 +2144,8 @@ mod tests {
                     if let Some((_, t)) = tail_override.as_ref().filter(|(at, _)| *at == i) {
                         t.clone()
                     } else if tail_tokens > 0 && *n > 0 {
-                        let from = (i + 1).saturating_sub(tail_tokens);
-                        pieces[from..=i].iter().map(|(t, _)| t.as_str()).collect()
+                        let end = ends[i];
+                        tokens[end.saturating_sub(tail_tokens)..end].concat()
                     } else {
                         String::new()
                     };
@@ -2569,6 +2603,51 @@ mod tests {
             logs.contains("engine stopped on a stop the returned text lacks (D8 invariant)"),
             "{logs}"
         );
+    }
+
+    /// A speculative round writes up to `num_assistant_tokens` + 1 ids at
+    /// once, so the window grows by that much with a draft model or
+    /// prompt-lookup on.
+    #[test]
+    fn stateful_tail_tokens_adds_the_round_with_draft_or_prompt_lookup() {
+        type Configure = fn(OvGenaiBuilder) -> OvGenaiBuilder;
+        let cases: [(&str, Configure, usize); 3] = [
+            ("plain", |b| b, 4 + 16),
+            ("draft k=7", |b| b.with_draft("/d", "CPU", 7), 4 + 16 + 8),
+            // prompt-lookup proposes max(k, 5) candidates per round.
+            ("prompt-lookup", |b| b.with_prompt_lookup(3), 4 + 16 + 6),
+        ];
+        for (name, configure, want) in cases {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a", " b"]);
+            let mut e = stateful_engine_with(&st, configure);
+            e.submit(stop_task("t1", 64, &["stop"])).unwrap();
+            e.step().unwrap();
+            assert_eq!(st.lock().unwrap().tail_tokens, [want], "{name}");
+        }
+    }
+
+    /// One write carries a whole speculative round of 23 ids, with the stop
+    /// at its start: the window without the round slack (6 + 16 = 22 ids)
+    /// misses it, with the slack the engine stops on that write.
+    #[test]
+    fn stateful_stop_at_the_start_of_a_long_round_is_found() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut round = vec!["twenty".to_string()];
+            round.extend(std::iter::repeat_n(" a".to_string(), 22));
+            let mut s = st.lock().unwrap();
+            s.writes = vec![vec!["one ".into()], round, vec![" more".into()]];
+        }
+        let mut e = stateful_engine_with(&st, |b| b.with_draft("/d", "CPU", 22));
+        e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
+        let out = e.step().unwrap();
+        let s = st.lock().unwrap();
+        assert_eq!(s.polls[1].1, 23, "one write of 23 ids");
+        assert_eq!(s.consumed, 2, "stopped on the long write");
+        assert_eq!(s.polls[1].2, PollAction::Stop);
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+        assert!(out[0].1.text.starts_with("one twenty"));
     }
 
     /// A match on the last allowed token is `stop`, not `length`.
