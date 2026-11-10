@@ -20,6 +20,8 @@ use thiserror::Error;
 
 pub mod inflight_cancel;
 pub use inflight_cancel::{InflightCancel, MAX_EARLY_CANCELS};
+pub mod one_shot_stop;
+pub use one_shot_stop::OneShotStop;
 
 #[cfg(feature = "kv_coord")]
 pub mod kv_handoff;
