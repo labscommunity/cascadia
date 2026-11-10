@@ -13,13 +13,16 @@
 //! short greedy decodes, which inflates reported tok/s).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use cascadia_engine::{
+    Builder, Engine, EngineError, EngineResult, InflightCancel, LoadStream, OneShotStop,
+};
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
-    GenConfig, LlmPipeline, PluginConfig,
+    GenConfig, GenResult, LlmPipeline, PluginConfig, PollAction,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
@@ -28,7 +31,6 @@ use cascadia_types::{
 use futures::stream;
 use tracing::{info, warn};
 
-#[derive(Default)]
 pub struct OvGenaiBuilder {
     pub model_path: String,
     pub device: String,
@@ -52,8 +54,18 @@ pub struct OvGenaiBuilder {
     /// call makes the whole answer, so its limit is cut to what the prompt
     /// leaves of this window.
     pub context_window: Option<u32>,
-    pipe: Option<LlmPipeline>,
+    /// End a running stateful generation at a `stop` match (M18 D6). Default
+    /// true; off when the server has a marker dialect, whose filtered text is
+    /// not what the engine sees (the CLI decides).
+    pub engine_stop_check: bool,
+    pipe: Option<Box<dyn StatefulPipe>>,
     cb_pipe: Option<CbPipeline>,
+}
+
+impl Default for OvGenaiBuilder {
+    fn default() -> Self {
+        Self::new(String::new(), String::new())
+    }
 }
 
 impl OvGenaiBuilder {
@@ -72,9 +84,17 @@ impl OvGenaiBuilder {
             prompt_pretemplated: false,
             continuous_batching: None,
             context_window: None,
+            engine_stop_check: true,
             pipe: None,
             cb_pipe: None,
         }
+    }
+
+    /// Whether the stateful engine ends a running generation at a `stop`
+    /// match (see [`Self::engine_stop_check`]).
+    pub fn with_engine_stop_check(mut self, on: bool) -> Self {
+        self.engine_stop_check = on;
+        self
     }
 
     /// The server's known context window (see [`Self::context_window`]).
@@ -327,7 +347,7 @@ impl Builder for OvGenaiBuilder {
         };
         progress.push(LoadProgress::ready());
 
-        self.pipe = Some(pipe);
+        self.pipe = Some(Box::new(pipe));
         Ok(Box::pin(stream::iter(progress)))
     }
 
@@ -352,6 +372,8 @@ impl Builder for OvGenaiBuilder {
             pending: Vec::new(),
             max_tokens_default: 256,
             context_window: self.context_window,
+            inflight: Arc::new(InflightCancel::new()),
+            engine_stop_check: self.engine_stop_check,
         }))
     }
 }
@@ -378,8 +400,53 @@ fn stateful_max_new(max_new: u32, prompt_tokens: Option<u32>, window: Option<u32
     }
 }
 
+/// The slice of [`LlmPipeline`] the stateful engine uses: a test seam like
+/// [`CbPipe`], so `step()`'s cancel and stop handling runs without OpenVINO.
+trait StatefulPipe: Send {
+    fn count_tokens(&self, text: &str) -> Option<u32>;
+    fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError>;
+    fn generate_polled(
+        &self,
+        prompt: &str,
+        cfg: &GenConfig,
+        poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
+    ) -> Result<GenResult, OvError>;
+}
+
+impl StatefulPipe for LlmPipeline {
+    fn count_tokens(&self, text: &str) -> Option<u32> {
+        LlmPipeline::count_tokens(self, text)
+    }
+    fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
+        LlmPipeline::generate(self, prompt, cfg)
+    }
+    fn generate_polled(
+        &self,
+        prompt: &str,
+        cfg: &GenConfig,
+        poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
+    ) -> Result<GenResult, OvError> {
+        LlmPipeline::generate_polled(self, prompt, cfg, poll)
+    }
+}
+
+/// Calls [`InflightCancel::end`] when dropped, so every path out of a begun
+/// task (success, error, a panic unwinding through `step`) frees the handle.
+struct EndInflight(Arc<InflightCancel>);
+
+impl Drop for EndInflight {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
+/// The final chunk for a cancelled task: empty, `Cancelled` (M18 D4).
+fn cancelled_chunk(task_id: &TaskId) -> Chunk {
+    Chunk::final_marker(task_id.clone(), "").with_finish_reason(FinishReason::Cancelled)
+}
+
 pub struct OvGenaiEngine {
-    pipe: LlmPipeline,
+    pipe: Box<dyn StatefulPipe>,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -388,6 +455,11 @@ pub struct OvGenaiEngine {
     /// The server's known context window: one `generate()` call makes the
     /// whole answer, so its limit is cut to what the prompt leaves of it.
     context_window: Option<u32>,
+    /// M18: the runner signals a cancel here while `step()` holds the engine
+    /// lock; the poll closure reads it once per streamer write.
+    inflight: Arc<InflightCancel>,
+    /// End a running generation at a `stop` match (M18 D6).
+    engine_stop_check: bool,
 }
 
 impl Engine for OvGenaiEngine {
@@ -438,12 +510,17 @@ impl Engine for OvGenaiEngine {
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
-        // Monolithic step(): a generation already running holds the engine
-        // mutex for its whole duration, so cancel() (also &mut self) can only
-        // run between tasks — it drops queued tasks before they start.
-        // Interrupting an in-flight ov-genai generation needs a StreamerBase
-        // callback returning CANCEL (C++ shim work) — tracked as a follow-up.
+        // A running generation holds the engine mutex for its whole step(), so
+        // this (&mut self) only runs between tasks and drops a queued one. A
+        // running one is ended through `inflight` instead, which the runner
+        // signals without the lock. The runner signalled it for this id too;
+        // the task will now never begin, so drop that early entry.
         self.pending.retain(|t| &t.task_id != task_id);
+        self.inflight.forget(task_id);
+    }
+
+    fn inflight_cancel(&self) -> Option<Arc<InflightCancel>> {
+        Some(self.inflight.clone())
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -451,6 +528,12 @@ impl Engine for OvGenaiEngine {
             return Ok(Vec::new());
         }
         let task = self.pending.remove(0);
+        let _end = EndInflight(self.inflight.clone());
+        if self.inflight.begin(&task.task_id) {
+            info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
+            let chunk = cancelled_chunk(&task.task_id);
+            return Ok(vec![(task.task_id, chunk)]);
+        }
         let max_new = if task.max_tokens > 0 {
             task.max_tokens
         } else {
@@ -468,9 +551,75 @@ impl Engine for OvGenaiEngine {
         );
 
         let started = Instant::now();
-        let result = match self.pipe.generate(&task.prompt, &cfg) {
+        // Always the polled generate, so a cancel always works (the A/B in the
+        // hardware check prices the per-token callback).
+        let inflight = self.inflight.clone();
+        let mut stop = if self.engine_stop_check {
+            OneShotStop::new(&task.sampling.stop)
+        } else {
+            OneShotStop::new(&[])
+        };
+        let check_stop = stop.is_active();
+        let mut polled_tokens: u64 = 0;
+        let mut stopped_on_match = false;
+        let generated = {
+            // The answer the closure has given once it ended the generation:
+            // the shim polls once more at the end (n_tokens 0), and that call
+            // must not feed or decide again.
+            let mut ended: Option<PollAction> = None;
+            // Still inside the answer's leading whitespace. `step` trims it
+            // off (`trim_start` below), so the stop check must not see it:
+            // a stop like "\n" would otherwise end the answer on text the
+            // client never gets (OneShotStop's input contract). Skipping it
+            // always is safe even when step does not trim (its prompt-echo
+            // strip didn't apply): the fed text is then a suffix of the
+            // answer, and any match in it is a match in the answer.
+            let mut leading = true;
+            let mut poll = |piece: &str, n_tokens: usize| -> PollAction {
+                polled_tokens += n_tokens as u64;
+                if let Some(action) = ended {
+                    return action;
+                }
+                if inflight.cancelled() {
+                    ended = Some(PollAction::Cancel);
+                    return PollAction::Cancel;
+                }
+                if check_stop {
+                    let piece = if leading {
+                        let rest = piece.trim_start();
+                        leading = rest.is_empty();
+                        rest
+                    } else {
+                        piece
+                    };
+                    if !piece.is_empty() && stop.push(piece) {
+                        stopped_on_match = true;
+                        ended = Some(PollAction::Stop);
+                        return PollAction::Stop;
+                    }
+                }
+                PollAction::Running
+            };
+            self.pipe.generate_polled(&task.prompt, &cfg, &mut poll)
+        };
+        if self.inflight.cancelled() {
+            // Also when generate failed after the CANCEL: the task ends as
+            // cancelled, never as an error or a partial success (M18 D4).
+            info!(
+                task = %task.task_id,
+                tokens = polled_tokens,
+                elapsed_s = started.elapsed().as_secs_f64(),
+                "task cancelled"
+            );
+            let chunk = cancelled_chunk(&task.task_id);
+            return Ok(vec![(task.task_id, chunk)]);
+        }
+        let result = match generated {
             Ok(r) => r,
             Err(err) => {
+                // A panic in the poll closure lands here too
+                // (`err.is_poll_panic()`): it cancelled the generation, and
+                // its partial text must not read as a success.
                 warn!(task = %task.task_id, error = %err, "generate failed");
                 // Chunk::error, not an empty final_marker: the latter reads as
                 // a SUCCESSFUL empty completion, so the client got a 200 with
@@ -499,13 +648,22 @@ impl Engine for OvGenaiEngine {
         } else {
             0.0
         };
-        info!(
-            task = %task.task_id,
-            tokens,
-            elapsed_s = elapsed,
-            tok_s,
-            "task done"
-        );
+        if stopped_on_match {
+            info!(
+                task = %task.task_id,
+                tokens,
+                elapsed_s = elapsed,
+                "task stopped at stop string"
+            );
+        } else {
+            info!(
+                task = %task.task_id,
+                tokens,
+                elapsed_s = elapsed,
+                tok_s,
+                "task done"
+            );
+        }
 
         // Carry the real token counts on the final chunk so the API's
         // `usage` block is populated (issue #55 — previously always 0 for
@@ -519,7 +677,9 @@ impl Engine for OvGenaiEngine {
         // so infer — reaching the token cap is `length`, anything short of it
         // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
         // exactly at the cap reports `length` (OpenAI is also ambiguous here).
-        let finish = if tokens >= max_new {
+        // A stop match ended it: `stop`, whatever the count. The text keeps
+        // the match; the API's StopMatcher makes the cut.
+        let finish = if !stopped_on_match && tokens >= max_new {
             FinishReason::Length
         } else {
             FinishReason::Stop
@@ -1795,6 +1955,417 @@ mod tests {
                 .to_string();
             assert!(err.contains("staged tree"), "{err}");
             assert!(err.contains(&format!("--engine {engine}")), "{err}");
+        }
+    }
+
+    // ---- stateful engine: polled generate (M18 task 5) ---------------------
+    //
+    // Driven through the StatefulPipe seam: the mock feeds the engine's poll
+    // closure one scripted piece at a time, as the shim's streamer does.
+
+    use cascadia_engine::InflightCancel;
+    use cascadia_ov_genai_shim::{GenResult, PollAction, POLL_PANICKED};
+
+    #[derive(Default)]
+    struct StatefulState {
+        /// (piece text, n_tokens) per streamer write.
+        pieces: Vec<(String, usize)>,
+        /// Before piece i is polled, cancel the running task through this
+        /// handle (what the runner does on a disconnect).
+        cancel_before: Option<(usize, Arc<InflightCancel>, TaskId)>,
+        /// After a CANCEL answer, return Err (as a native generate may).
+        err_after_cancel: bool,
+        /// At piece i, fail the way the shim does after the poll panicked.
+        poll_panic_at: Option<usize>,
+        /// Pieces polled (the end flush not included).
+        consumed: usize,
+        /// Every poll call: (text, n_tokens, answer).
+        polls: Vec<(String, usize, PollAction)>,
+        plain_calls: usize,
+        polled_calls: usize,
+        last_cfg: Option<GenConfig>,
+    }
+
+    struct MockStatefulPipe {
+        st: Arc<Mutex<StatefulState>>,
+    }
+
+    impl StatefulPipe for MockStatefulPipe {
+        fn count_tokens(&self, text: &str) -> Option<u32> {
+            Some(text.split_whitespace().count() as u32)
+        }
+        fn generate(&self, _prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
+            let mut st = self.st.lock().unwrap();
+            st.plain_calls += 1;
+            st.last_cfg = Some(cfg.clone());
+            Ok(GenResult {
+                text: "warm".into(),
+                generated_tokens: 1,
+            })
+        }
+        fn generate_polled(
+            &self,
+            _prompt: &str,
+            cfg: &GenConfig,
+            poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
+        ) -> Result<GenResult, OvError> {
+            let (pieces, cancel_before, err_after_cancel, poll_panic_at) = {
+                let mut st = self.st.lock().unwrap();
+                st.polled_calls += 1;
+                st.last_cfg = Some(cfg.clone());
+                (
+                    st.pieces.clone(),
+                    st.cancel_before.clone(),
+                    st.err_after_cancel,
+                    st.poll_panic_at,
+                )
+            };
+            let mut text = String::new();
+            let mut n_total = 0usize;
+            for (i, (piece, n)) in pieces.iter().enumerate() {
+                if poll_panic_at == Some(i) {
+                    return Err(OvError::Native(POLL_PANICKED.into()));
+                }
+                if let Some((at, h, id)) = &cancel_before {
+                    if *at == i {
+                        h.cancel(id);
+                    }
+                }
+                let action = poll(piece, *n);
+                text.push_str(piece);
+                n_total += n;
+                {
+                    let mut st = self.st.lock().unwrap();
+                    st.consumed += 1;
+                    st.polls.push((piece.clone(), *n, action));
+                }
+                if action != PollAction::Running {
+                    // The end flush comes after a STOP/CANCEL too.
+                    let flush = poll("", 0);
+                    self.st
+                        .lock()
+                        .unwrap()
+                        .polls
+                        .push((String::new(), 0, flush));
+                    if action == PollAction::Cancel && err_after_cancel {
+                        return Err(OvError::Native("mock: generate failed after cancel".into()));
+                    }
+                    return Ok(GenResult {
+                        text,
+                        generated_tokens: n_total as u32,
+                    });
+                }
+            }
+            let flush = poll("", 0);
+            self.st
+                .lock()
+                .unwrap()
+                .polls
+                .push((String::new(), 0, flush));
+            Ok(GenResult {
+                text,
+                generated_tokens: n_total as u32,
+            })
+        }
+    }
+
+    fn pieces(texts: &[&str]) -> Vec<(String, usize)> {
+        texts.iter().map(|t| (t.to_string(), 1)).collect()
+    }
+
+    /// The stateful engine as `build()` makes it, over the mock pipe.
+    fn stateful_engine_with(
+        st: &Arc<Mutex<StatefulState>>,
+        configure: impl FnOnce(OvGenaiBuilder) -> OvGenaiBuilder,
+    ) -> Box<dyn Engine> {
+        let mut b = configure(OvGenaiBuilder::new("/x", "CPU"));
+        b.pipe = Some(Box::new(MockStatefulPipe { st: st.clone() }));
+        Box::new(b).build().expect("build")
+    }
+
+    fn stateful_engine(st: &Arc<Mutex<StatefulState>>) -> Box<dyn Engine> {
+        stateful_engine_with(st, |b| b)
+    }
+
+    fn stop_task(id: &str, max_tokens: u32, stops: &[&str]) -> GenerationTask {
+        task(id, max_tokens).with_sampling(SamplingParams {
+            stop: stops.iter().map(|s| s.to_string()).collect(),
+            ..SamplingParams::default()
+        })
+    }
+
+    /// Run `f` with an INFO fmt subscriber writing to a buffer; returns the
+    /// buffer.
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let r = tracing::subscriber::with_default(sub, f);
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, out)
+    }
+
+    fn is_empty_cancelled(c: &Chunk) -> bool {
+        c.is_final
+            && c.error.is_none()
+            && c.text.is_empty()
+            && c.finish_reason == Some(FinishReason::Cancelled)
+    }
+
+    #[test]
+    fn stateful_engine_exposes_its_inflight_handle() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let e = stateful_engine(&st);
+        let a = e.inflight_cancel().expect("stateful engine has a handle");
+        let b = e.inflight_cancel().expect("same handle again");
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn stateful_cancel_mid_generate_ends_within_one_piece_and_is_empty_cancelled() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let mut e = stateful_engine(&st);
+        let h = e.inflight_cancel().unwrap();
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["one", " two", " three", " four", " five", " six"]);
+            s.cancel_before = Some((2, h.clone(), TaskId::from("t1")));
+        }
+        e.submit(task("t1", 64)).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        assert_eq!(out.len(), 1);
+        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+        let s = st.lock().unwrap();
+        // The cancel landed before piece 2's poll: that poll answers Cancel.
+        assert_eq!(s.consumed, 3, "at most one more piece after the cancel");
+        assert_eq!(s.polls[2].2, PollAction::Cancel);
+        // Idempotent: the end flush after the Cancel also says Cancel.
+        assert_eq!(
+            s.polls.last().unwrap(),
+            &(String::new(), 0, PollAction::Cancel)
+        );
+        assert!(logs.contains("task cancelled"), "{logs}");
+        assert!(logs.contains("tokens=3"), "{logs}");
+        // end() ran: the handle is free for the next task.
+        assert!(!h.cancelled());
+    }
+
+    #[test]
+    fn stateful_cancel_before_begin_never_generates() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["a"]);
+        let mut e = stateful_engine(&st);
+        let h = e.inflight_cancel().unwrap();
+        e.submit(task("t1", 64)).unwrap();
+        // The runner signals the handle while the task is still queued.
+        h.cancel(&TaskId::from("t1"));
+        let out = e.step().unwrap();
+        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+        let s = st.lock().unwrap();
+        assert_eq!((s.polled_calls, s.plain_calls), (0, 0));
+        drop(s);
+        // end() ran: a next task begins clean.
+        assert!(!h.begin(&TaskId::from("t2")));
+        h.end();
+    }
+
+    #[test]
+    fn stateful_engine_cancel_forgets_a_queued_task() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["a"]);
+        let mut e = stateful_engine(&st);
+        let h = e.inflight_cancel().unwrap();
+        e.submit(task("t1", 64)).unwrap();
+        // Runner order: signal the handle (an early entry), then Engine::cancel.
+        h.cancel(&TaskId::from("t1"));
+        e.cancel(&TaskId::from("t1"));
+        // The early entry is gone: a resubmit of the same id runs.
+        e.submit(task("t1", 64)).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out[0].1.text, "a");
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn stateful_stop_match_stops_keeps_the_match_and_logs() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["one", " two", " tw", "enty", " more", " more"]);
+        let mut e = stateful_engine(&st);
+        e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        let c = &out[0].1;
+        assert!(c.error.is_none(), "{c:?}");
+        assert_eq!(c.text, "one two twenty");
+        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+        let s = st.lock().unwrap();
+        assert_eq!(s.consumed, 4);
+        assert_eq!(s.polls[3].2, PollAction::Stop);
+        // Idempotent at the end flush.
+        assert_eq!(s.polls.last().unwrap().2, PollAction::Stop);
+        assert!(logs.contains("task stopped at stop string"), "{logs}");
+        assert!(logs.contains("tokens=3"), "{logs}");
+    }
+
+    #[test]
+    fn stateful_stop_check_off_runs_to_the_end() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["one", " twenty", " more"]);
+        let mut e = stateful_engine_with(&st, |b| b.with_engine_stop_check(false));
+        e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out[0].1.text, "one twenty more");
+        let s = st.lock().unwrap();
+        assert_eq!(s.consumed, 3);
+        assert!(s.polls.iter().all(|p| p.2 == PollAction::Running));
+    }
+
+    #[test]
+    fn stateful_poll_panic_is_a_chunk_error() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["a", " b", " c"]);
+            s.poll_panic_at = Some(1);
+        }
+        let mut e = stateful_engine(&st);
+        let h = e.inflight_cancel().unwrap();
+        e.submit(task("t1", 64)).unwrap();
+        let out = e.step().unwrap();
+        let c = &out[0].1;
+        assert!(c.is_final);
+        assert!(c.error.is_some(), "a poll panic must fail the task: {c:?}");
+        assert!(c.text.is_empty());
+        // end() ran on the error path too.
+        assert!(!h.begin(&TaskId::from("t2")));
+        h.end();
+    }
+
+    #[test]
+    fn stateful_err_after_cancel_is_cancelled_not_an_error() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let mut e = stateful_engine(&st);
+        let h = e.inflight_cancel().unwrap();
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["a", " b", " c"]);
+            s.cancel_before = Some((1, h.clone(), TaskId::from("t1")));
+            s.err_after_cancel = true;
+        }
+        e.submit(task("t1", 64)).unwrap();
+        let out = e.step().unwrap();
+        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+        assert!(!h.cancelled());
+    }
+
+    #[test]
+    fn stateful_without_stop_keeps_text_finish_and_counts() {
+        for (max_tokens, want) in [(64u32, FinishReason::Stop), (3, FinishReason::Length)] {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["alpha", " beta", " gamma"]);
+            let mut e = stateful_engine(&st);
+            e.submit(task("t1", max_tokens)).unwrap();
+            let (out, logs) = capture_logs(|| e.step().unwrap());
+            let c = &out[0].1;
+            assert!(c.is_final && c.error.is_none(), "{c:?}");
+            assert_eq!(c.text, "alpha beta gamma");
+            assert_eq!(c.n_tokens, Some(3));
+            // The mock's count of the prompt "hello".
+            assert_eq!(c.prompt_tokens, Some(1));
+            assert_eq!(c.finish_reason, Some(want), "max_tokens {max_tokens}");
+            assert!(logs.contains("task done"), "{logs}");
+            let s = st.lock().unwrap();
+            assert_eq!((s.polled_calls, s.plain_calls), (1, 0));
+            assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, max_tokens);
+        }
+    }
+
+    /// `step` trims the start of the answer; the stop check must see the
+    /// same text, so leading whitespace is never fed. A stop of "\n" would
+    /// otherwise end the answer on text the client never gets.
+    #[test]
+    fn stateful_leading_whitespace_is_not_fed_to_the_stop_check() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["\n", "\n ", "Hi", " there", "\n", "rest"]);
+        let mut e = stateful_engine(&st);
+        let mut t = stop_task("t1", 64, &["\n"]);
+        // Prompt echo so step's strip_prefix + trim_start applies.
+        t.prompt = String::new();
+        e.submit(t).unwrap();
+        let out = e.step().unwrap();
+        let s = st.lock().unwrap();
+        // Not stopped on the two leading newlines; stopped on the one after
+        // "there".
+        assert_eq!(s.consumed, 5, "{:?}", s.polls);
+        assert_eq!(s.polls[4].2, PollAction::Stop);
+        assert_eq!(out[0].1.text, "Hi there\n");
+    }
+
+    #[test]
+    fn stateful_warmup_uses_plain_generate() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let mut e = stateful_engine(&st);
+        e.warmup();
+        let s = st.lock().unwrap();
+        assert_eq!((s.plain_calls, s.polled_calls), (1, 0));
+        assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, 4);
+    }
+
+    #[test]
+    fn stateful_window_still_caps_max_new() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["x"]);
+        let mut e = stateful_engine_with(&st, |b| b.with_context_window(Some(10)));
+        // The mock counts 3 prompt tokens: 10 - 3 = 7 left.
+        let mut t = task("t1", 4096);
+        t.prompt = "a b c".into();
+        e.submit(t).unwrap();
+        e.step().unwrap();
+        let s = st.lock().unwrap();
+        assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, 7);
+    }
+
+    #[test]
+    fn stateful_draft_and_prompt_lookup_builds_use_the_polled_seam() {
+        type Configure = fn(OvGenaiBuilder) -> OvGenaiBuilder;
+        let cases: [(&str, Configure); 2] = [
+            ("draft", |b| b.with_draft("/d", "CPU", 5)),
+            ("prompt-lookup", |b| b.with_prompt_lookup(3)),
+        ];
+        for (name, configure) in cases {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a", " stop", " b"]);
+            let mut e = stateful_engine_with(&st, configure);
+            assert!(e.inflight_cancel().is_some(), "{name}");
+            e.submit(stop_task("t1", 64, &["stop"])).unwrap();
+            let out = e.step().unwrap();
+            assert_eq!(out[0].1.text, "a stop", "{name}");
+            let s = st.lock().unwrap();
+            assert_eq!(s.polled_calls, 1, "{name}");
+            let cfg = s.last_cfg.as_ref().unwrap();
+            match name {
+                "draft" => assert_eq!(cfg.num_assistant_tokens, 5),
+                _ => assert_eq!(cfg.max_ngram_size, 3),
+            }
         }
     }
 }
