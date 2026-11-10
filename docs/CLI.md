@@ -962,8 +962,8 @@ the process and at debug after; the counter counts every request. Reasons:
 | `genai_version` | `ov-genai` on OpenVINO GenAI older than 2026.4. |
 | `probe_failed` | `ov-genai`: the startup structured-output check failed for this model. |
 | `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile. Also counted, once the answer is in, when the constraint was applied without a tool's bound pair no value can meet (see above): the rest is enforced, that pair is not. |
-| `too_complex` | The combined schema is over the [schema limits](#structured-output-response_format), or took longer than the 2 s build budget (llguidance engines). |
-| `busy` | The llguidance engines' schema check had no free slot. |
+| `too_complex` | The combined schema is over the [schema limits](#structured-output-response_format), or took longer than the 2 s build budget (llguidance engines). Such a schema is remembered (up to 256), so a later turn resending it runs unconstrained at once instead of waiting out the budget again. |
+| `busy` | The llguidance engines' schema check had no free slot. A tool constraint does not wait for one, so it never delays a `response_format` request queued for a slot. |
 | `unsupported_ref` | A tool schema (or the `response_format` schema beside it) has a `$ref` that can't be kept once nested: anything other than `#` or `#/$defs/…` / `#/definitions/…` naming its own definitions, or a `$ref` beside a nested `$id`. |
 | `no_tokenizer` | A llguidance engine could not build its grammar factory from the model's tokenizer. |
 | `stage_unsupported` | A later pipeline stage can't apply token masks (see below). |

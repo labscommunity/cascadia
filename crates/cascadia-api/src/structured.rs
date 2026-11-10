@@ -186,6 +186,10 @@ pub struct SchemaCompileCheck {
     budget: Duration,
     passed: Arc<std::sync::Mutex<PassedSchemas>>,
     factory: GrammarFactory,
+    /// Best-effort schemas that ran past the budget, at most
+    /// [`SCHEMA_PASS_CACHE`] of them: a tool-call grammar is resent every
+    /// turn, and would otherwise cost each turn the whole budget and a slot.
+    slow: Arc<std::sync::Mutex<PassedSchemas>>,
 }
 
 impl std::fmt::Debug for SchemaCompileCheck {
@@ -218,6 +222,7 @@ impl SchemaCompileCheck {
             budget,
             passed: Arc::new(std::sync::Mutex::new(PassedSchemas::new(SCHEMA_PASS_CACHE))),
             factory: GrammarFactory::byte_level(),
+            slow: Arc::new(std::sync::Mutex::new(PassedSchemas::new(SCHEMA_PASS_CACHE))),
         }
     }
 
@@ -228,6 +233,12 @@ impl SchemaCompileCheck {
     }
 
     /// Builds `spec` within the budget, or says why not.
+    ///
+    /// A best-effort `spec` (answered unconstrained on any refusal) never
+    /// waits for a slot: none free is `Busy` at once, so it never delays a
+    /// strict request waiting for one. One that ran past the budget is
+    /// remembered and refused `TooComplex` at once after that. A strict
+    /// `spec` waits for a slot and is built every time it hasn't passed.
     pub async fn check(&self, spec: &GrammarSpec) -> Result<(), SchemaCheckError> {
         if spec.body == JSON_OBJECT_SCHEMA {
             return Ok(());
@@ -240,11 +251,27 @@ impl SchemaCompileCheck {
         if passed {
             return Ok(());
         }
-        let permit =
+        let best_effort = spec.best_effort;
+        if best_effort
+            && self
+                .slow
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&spec.body)
+        {
+            return Err(SchemaCheckError::TooComplex);
+        }
+        let permit = if best_effort {
+            match self.permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => return Err(SchemaCheckError::Busy),
+            }
+        } else {
             match tokio::time::timeout(self.wait, self.permits.clone().acquire_owned()).await {
                 Ok(Ok(permit)) => permit,
                 _ => return Err(SchemaCheckError::Busy),
-            };
+            }
+        };
         let spec = spec.clone();
         let body = spec.body.clone();
         let factory = self.factory.clone();
@@ -265,12 +292,19 @@ impl SchemaCompileCheck {
             }
         });
         let joined = tokio::time::timeout(self.budget, build).await;
-        if joined.is_err() {
+        // Past the budget, not a panic (which proved nothing).
+        let timed_out = joined.is_err();
+        if timed_out {
             abandoned.store(true, Ordering::Relaxed);
         }
         let verdict = build_verdict(joined);
         if verdict.is_ok() {
             self.passed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(&body);
+        } else if best_effort && timed_out {
+            self.slow
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(&body);
@@ -3195,6 +3229,58 @@ mod tests {
         let check = SchemaCompileCheck::default()
             .with_factory(GrammarFactory::byte_level_with_row_cap_for_tests(2000));
         assert_eq!(check.check(&spec_of(body)).await, Ok(()));
+    }
+
+    /// A best-effort schema (a tool-call grammar, resent every turn) that ran
+    /// past the budget is remembered: the next turn is told `TooComplex` at
+    /// once, without a permit or a build, and runs unconstrained. A strict
+    /// one is still tried again (see above).
+    #[tokio::test]
+    async fn a_best_effort_schema_over_the_budget_is_built_once() {
+        let check = SchemaCompileCheck::new(1, Duration::from_millis(500), Duration::from_nanos(1));
+        let body = r#"{"type":"object","properties":{"a":{"type":"string"}}}"#;
+        let soft = GrammarSpec::best_effort_json_schema(body);
+        assert_eq!(check.check(&soft).await, Err(SchemaCheckError::TooComplex));
+        // The only permit taken (once the abandoned build lets go of it).
+        let _all = check.permits.clone().acquire_owned().await.unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(check.check(&soft).await, Err(SchemaCheckError::TooComplex));
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "{:?}",
+            start.elapsed()
+        );
+        // The same text as a strict schema is not refused from memory: it
+        // waits for a permit as before.
+        assert_eq!(
+            check.check(&spec_of(body)).await,
+            Err(SchemaCheckError::Busy)
+        );
+    }
+
+    /// A best-effort check never waits for a permit: with every one taken it
+    /// is `Busy` at once (the turn runs unconstrained), so it never delays a
+    /// strict request queued for one. A strict check still waits.
+    #[tokio::test]
+    async fn a_best_effort_check_does_not_wait_for_a_permit() {
+        let wait = Duration::from_millis(300);
+        let check = SchemaCompileCheck::new(1, wait, Duration::from_secs(2));
+        let _all = check.permits.clone().acquire_owned().await.unwrap();
+        let body = r#"{"type":"object","properties":{"b":{"type":"integer"}}}"#;
+        let start = std::time::Instant::now();
+        assert_eq!(
+            check
+                .check(&GrammarSpec::best_effort_json_schema(body))
+                .await,
+            Err(SchemaCheckError::Busy)
+        );
+        assert!(start.elapsed() < wait / 2, "{:?}", start.elapsed());
+        let start = std::time::Instant::now();
+        assert_eq!(
+            check.check(&spec_of(body)).await,
+            Err(SchemaCheckError::Busy)
+        );
+        assert!(start.elapsed() >= wait, "{:?}", start.elapsed());
     }
 
     /// A build that panicked proved nothing about the schema: it is neither
