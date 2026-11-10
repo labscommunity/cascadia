@@ -3068,10 +3068,7 @@ mod unix_tests {
     #[test]
     fn chat_body_keeps_the_schema_key_order() {
         let schema = r#"{"type":"object","properties":{"thinking":{"type":"string"},"action":{"type":"string"}},"required":["thinking","action"]}"#;
-        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: schema.into(),
-        });
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema(schema));
         let text = captured_chat_text(task);
         assert!(text.contains(schema), "{text}");
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -3157,10 +3154,7 @@ mod unix_tests {
 
     #[test]
     fn grammar_that_is_not_json_is_refused_at_submit() {
-        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: "{not json".into(),
-        });
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema("{not json"));
         let mut engine = test_engine(1);
         match engine.submit(task) {
             Err(EngineError::InvalidConfig(m)) => {
@@ -3171,10 +3165,7 @@ mod unix_tests {
     }
 
     fn grammar(body: serde_json::Value) -> cascadia_types::GrammarSpec {
-        cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: body.to_string(),
-        }
+        cascadia_types::GrammarSpec::json_schema(body.to_string())
     }
 
     fn list_schema() -> serde_json::Value {
@@ -3252,10 +3243,7 @@ mod unix_tests {
     #[test]
     fn an_escaped_ref_key_is_inlined_too() {
         let escaped = r##"{"$defs":{"B":{"type":"integer"}},"type":"object","properties":{"b":{"\u0024ref":"#/$defs/B"}}}"##;
-        let mut task = chat_task().with_grammar(cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: escaped.into(),
-        });
+        let mut task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema(escaped));
         let params: serde_json::Value = serde_json::from_str(escaped).unwrap();
         task.tools = Some(
             serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": params}}]),
@@ -3400,10 +3388,7 @@ mod unix_tests {
             .map(|i| (format!("p{i}"), serde_json::json!({})))
             .collect();
         let body = serde_json::json!({"type": "object", "properties": props}).to_string();
-        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body,
-        });
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema(body));
         let mut engine = test_engine(1);
         match engine.submit(task) {
             Err(EngineError::InvalidConfig(m)) => {
@@ -3432,10 +3417,7 @@ mod unix_tests {
     #[test]
     fn chat_body_forwards_grammar_as_response_format() {
         let schema = r#"{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}"#;
-        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: schema.into(),
-        });
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema(schema));
         let body = captured_chat_body(task);
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["name"], "response");
@@ -3445,10 +3427,7 @@ mod unix_tests {
 
     /// The schema text forwarded for a chat task whose grammar is `schema`.
     fn forwarded_schema(schema: &str) -> String {
-        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: schema.into(),
-        });
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema(schema));
         let text = captured_chat_text(task);
         let tag = r#""json_schema":{"name":"response","schema":"#;
         let start = text.find(tag).expect("response_format in body") + tag.len();
@@ -3501,6 +3480,7 @@ mod unix_tests {
             chat_task().with_grammar(cascadia_types::GrammarSpec {
                 kind: cascadia_types::GrammarKind::JsonSchema,
                 body: r#"{"type":"object"}"#.into(),
+                best_effort: false,
             })
         };
         let mut task = json();

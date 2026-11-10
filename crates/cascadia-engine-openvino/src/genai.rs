@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use cascadia_metrics::UnenforcedReason;
 use cascadia_ov_genai_shim::{
     clean_backend_message, CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus,
     Error as OvError, GenConfig, GenResult, LlmPipeline, PluginConfig,
@@ -531,24 +532,41 @@ fn ov_message(err: OvError) -> String {
     }
 }
 
+/// What submit does with a task's output constraint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrammarVerdict {
+    /// The task has no constraint.
+    None,
+    /// The constraint is applied.
+    Apply,
+    /// A best-effort constraint this engine can't apply: the task runs
+    /// without it.
+    Drop(UnenforcedReason),
+}
+
 /// Submit-time check of a task's output constraint: refuse it when this model
 /// cannot do structured output, when xgrammar would take too long to compile
 /// the schema (it compiles inside the request with no time limit, and a
 /// worker stuck in a minutes-long compile answers nothing else), or when the
-/// schema does not compile. Tasks without a grammar pass straight through.
+/// schema does not compile. A best-effort constraint the backend rejects is
+/// dropped instead of refused. Tasks without a grammar pass straight through.
 fn check_grammar(
     task: &GenerationTask,
-    unavailable: Option<&str>,
+    unavailable: Option<&(UnenforcedReason, String)>,
     validate: impl FnOnce(&str) -> Result<(), OvError>,
-) -> EngineResult<()> {
+) -> EngineResult<GrammarVerdict> {
     // The text GenAI will compile: priced and validated as sent.
     let Some(schema) = genai_json_schema(task) else {
-        return Ok(());
+        return Ok(GrammarVerdict::None);
     };
     let schema = schema.as_str();
-    if let Some(reason) = unavailable {
+    let best_effort = task.grammar.as_ref().is_some_and(|g| g.best_effort);
+    if let Some((reason, text)) = unavailable {
+        if best_effort {
+            return Ok(GrammarVerdict::Drop(*reason));
+        }
         return Err(EngineError::InvalidConfig(format!(
-            "structured output is not available for this model: {reason}"
+            "structured output is not available for this model: {text}"
         )));
     }
     // A schema that is not JSON is left to `validate` to report. (One nested
@@ -561,12 +579,35 @@ fn check_grammar(
             )));
         }
     }
-    validate(schema).map_err(|err| {
-        EngineError::InvalidConfig(format!(
+    match validate(schema) {
+        Ok(()) => Ok(GrammarVerdict::Apply),
+        Err(err) if best_effort => {
+            info!(
+                task = %task.task_id,
+                error = %clean_backend_message(&ov_message(err)),
+                "the backend refused a best-effort schema"
+            );
+            Ok(GrammarVerdict::Drop(UnenforcedReason::SchemaRejected))
+        }
+        Err(err) => Err(EngineError::InvalidConfig(format!(
             "response_format json_schema: {}",
             client_message(err, "schema validation failed")
-        ))
-    })
+        ))),
+    }
+}
+
+/// [`check_grammar`] at submit, for both pipelines: a dropped best-effort
+/// constraint is removed from the task (logged and counted) before the task
+/// is stored, so nothing downstream sees it.
+fn admit_grammar(
+    task: &mut GenerationTask,
+    unavailable: Option<&(UnenforcedReason, String)>,
+    validate: impl FnOnce(&str) -> Result<(), OvError>,
+) -> EngineResult<()> {
+    if let GrammarVerdict::Drop(reason) = check_grammar(task, unavailable, validate)? {
+        crate::structured::drop_best_effort_grammar(task, reason);
+    }
+    Ok(())
 }
 
 /// The one line of a shim error a client may see: the backend's raw text,
@@ -696,10 +737,11 @@ fn structured_gate(
     device: &str,
     draft_model: bool,
     version: Result<cascadia_ov_genai_shim::OvVersion, OvError>,
-) -> Option<String> {
+) -> Option<(UnenforcedReason, String)> {
     version_gate(version)
-        .or_else(|| npu_gate(device))
-        .or_else(|| draft_model_gate(draft_model))
+        .map(|m| (UnenforcedReason::GenaiVersion, m))
+        .or_else(|| npu_gate(device).map(|m| (UnenforcedReason::Npu, m)))
+        .or_else(|| draft_model_gate(draft_model).map(|m| (UnenforcedReason::DraftModel, m)))
 }
 
 /// True when `device` is an NPU or lists one: `NPU`, `NPU.0`, or a
@@ -808,9 +850,9 @@ fn generate_failure_chunk(task: &GenerationTask, err: OvError, resource: bool) -
 
 /// Log the probe's outcome and turn it into the engine's
 /// `structured_unavailable` value.
-fn record_probe(verdict: Option<String>) -> Option<String> {
+fn record_probe(verdict: Option<(UnenforcedReason, String)>) -> Option<(UnenforcedReason, String)> {
     match &verdict {
-        Some(reason) => warn!(
+        Some((_, reason)) => warn!(
             reason = %reason,
             "structured output (response_format) unavailable for this model"
         ),
@@ -1305,8 +1347,9 @@ pub struct OvGenaiEngine {
     pending: Vec<GenerationTask>,
     max_tokens_default: u32,
     /// Set by the warmup probe when this model cannot do structured output;
-    /// tasks with a grammar are then refused at submit with this reason.
-    structured_unavailable: Option<String>,
+    /// tasks with a grammar are then refused at submit with this reason (a
+    /// best-effort grammar is dropped instead).
+    structured_unavailable: Option<(UnenforcedReason, String)>,
     schema_budget: SchemaBudget,
     /// Builds the pipeline again when the schema budget is full.
     build_pipe: Rebuild<dyn StatefulPipe>,
@@ -1359,10 +1402,11 @@ impl Engine for OvGenaiEngine {
                 }
             })
         });
-        self.structured_unavailable = record_probe(probe_verdict(result));
+        self.structured_unavailable =
+            record_probe(probe_verdict(result).map(|m| (UnenforcedReason::ProbeFailed, m)));
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         // No forced-prefix path in the ov-genai pipelines: accepting a resumed task
         // would regenerate from scratch and report success on a corrupt "resume".
         // The enterprise shard backend declines these pre-submit (its
@@ -1390,7 +1434,7 @@ impl Engine for OvGenaiEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
-        check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
+        admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
         if self.schema_budget.check(&task).is_err() {
@@ -1399,7 +1443,7 @@ impl Engine for OvGenaiEngine {
             }
             // Rebuilt: admitted on the new pipeline, whose check and budget
             // (which counts the schemas still queued) it must pass too.
-            check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
+            admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
                 self.pipe.validate_json_schema(s)
             })?;
             if self.schema_budget.check(&task).is_err() {
@@ -1433,18 +1477,21 @@ impl Engine for OvGenaiEngine {
                 .map(|t| (t.task_id.clone(), Chunk::error(t.task_id, reason.clone())))
                 .collect());
         }
-        let task = self.pending.remove(0);
+        let mut task = self.pending.remove(0);
         // Queued before a rebuild whose structured-output check failed: refused
-        // as a new one would be at submit.
-        if let (Some(_), Some(reason)) = (
-            grammar_json_schema(&task),
-            self.structured_unavailable.as_deref(),
+        // as a new one would be at submit (a best-effort grammar is dropped
+        // and the task runs unconstrained).
+        if let (true, Some((why, reason))) = (
+            grammar_json_schema(&task).is_some(),
+            self.structured_unavailable.as_ref(),
         ) {
-            let msg = format!("structured output is not available for this model: {reason}");
-            return Ok(vec![(
-                task.task_id.clone(),
-                Chunk::rejected(task.task_id, msg),
-            )]);
+            if !crate::structured::drop_best_effort_grammar(&mut task, *why) {
+                let msg = format!("structured output is not available for this model: {reason}");
+                return Ok(vec![(
+                    task.task_id.clone(),
+                    Chunk::rejected(task.task_id, msg),
+                )]);
+            }
         }
         let max_new = if task.max_tokens > 0 {
             task.max_tokens
@@ -1714,7 +1761,7 @@ pub struct OvGenaiCbEngine {
     /// A canary failed during the current run of failures.
     canary_failed_in_run: bool,
     /// Set by the warmup probe when this model cannot do structured output.
-    structured_unavailable: Option<String>,
+    structured_unavailable: Option<(UnenforcedReason, String)>,
     /// Schemas that recently took a scheduler iteration down with them.
     quarantined: QuarantineSet,
     /// Strikes against schemas that shared a failed step with others.
@@ -1796,10 +1843,11 @@ impl Engine for OvGenaiCbEngine {
             request_id -= 1;
             r
         });
-        self.structured_unavailable = record_probe(probe_verdict(result));
+        self.structured_unavailable =
+            record_probe(probe_verdict(result).map(|m| (UnenforcedReason::ProbeFailed, m)));
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         // No forced-prefix path in the ov-genai pipelines: accepting a resumed task
         // would regenerate from scratch and report success on a corrupt "resume".
         // The enterprise shard backend declines these pre-submit (its
@@ -1869,29 +1917,36 @@ impl Engine for OvGenaiCbEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        let quarantined = grammar_json_schema(&task)
+            .filter(|s| *s != JSON_OBJECT_PROBE)
+            .map(|s| self.schema_hash(s))
+            .is_some_and(|h| self.quarantined.contains(h, Instant::now()));
+        if quarantined
+            && !crate::structured::drop_best_effort_grammar(
+                &mut task,
+                UnenforcedReason::SchemaRejected,
+            )
+        {
+            return Err(EngineError::InvalidConfig(
+                "response_format json_schema: this schema failed to compile on this \
+                 server; retry later or change the schema"
+                    .to_string(),
+            ));
+        }
+        admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
+            self.pipe.validate_json_schema(s)
+        })?;
         let schema = grammar_json_schema(&task);
         let grammar_hash = schema
             .filter(|s| *s != JSON_OBJECT_PROBE)
             .map(|s| self.schema_hash(s));
-        if let Some(h) = grammar_hash {
-            if self.quarantined.contains(h, Instant::now()) {
-                return Err(EngineError::InvalidConfig(
-                    "response_format json_schema: this schema failed to compile on this \
-                     server; retry later or change the schema"
-                        .to_string(),
-                ));
-            }
-        }
-        check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
-            self.pipe.validate_json_schema(s)
-        })?;
         if self.schema_budget.check(&task).is_err() {
             if let Some(err) = self.budget_full() {
                 return Err(err);
             }
             // Rebuilt: admitted on the new pipeline, whose check and budget
             // (which counts the schemas still queued) it must pass too.
-            check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
+            admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
                 self.pipe.validate_json_schema(s)
             })?;
             if self.schema_budget.check(&task).is_err() {
@@ -3174,10 +3229,7 @@ mod tests {
     // ---- structured output (JSON schema) ------------------------------------
 
     fn schema_task(id: &str, body: &str) -> GenerationTask {
-        task(id, 8).with_grammar(cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: body.to_string(),
-        })
+        task(id, 8).with_grammar(cascadia_types::GrammarSpec::json_schema(body))
     }
 
     const SCHEMA_A: &str = r#"{"type":"object","properties":{"a":{"type":"integer"}}}"#;
@@ -3389,10 +3441,16 @@ mod tests {
     fn check_grammar_paths() {
         // No grammar: validate must not run.
         let plain = task("p", 8);
-        assert!(check_grammar(&plain, Some("x"), |_| panic!("validate called")).is_ok());
+        assert!(check_grammar(
+            &plain,
+            Some(&(UnenforcedReason::ProbeFailed, "x".into())),
+            |_| panic!("validate called")
+        )
+        .is_ok());
 
         let t = schema_task("s", SCHEMA_A);
-        let err = check_grammar(&t, Some("no xgrammar"), |_| Ok(())).unwrap_err();
+        let gate = (UnenforcedReason::ProbeFailed, "no xgrammar".to_owned());
+        let err = check_grammar(&t, Some(&gate), |_| Ok(())).unwrap_err();
         match err {
             EngineError::InvalidConfig(m) => assert_eq!(
                 m,
@@ -3421,6 +3479,123 @@ mod tests {
             genai_json_schema(&t).as_deref(),
             "validates the schema GenAI is sent"
         );
+    }
+
+    fn soft_schema_task(id: &str, body: &str) -> GenerationTask {
+        task(id, 8).with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(body))
+    }
+
+    fn unenforced(reason: UnenforcedReason) -> u64 {
+        cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+            .with_label_values(&[reason.as_str()])
+            .get()
+    }
+
+    #[test]
+    fn check_grammar_drops_best_effort_when_gated() {
+        let t = soft_schema_task("s", SCHEMA_A);
+        for reason in [
+            UnenforcedReason::Npu,
+            UnenforcedReason::DraftModel,
+            UnenforcedReason::GenaiVersion,
+            UnenforcedReason::ProbeFailed,
+        ] {
+            let gate = (reason, "gated".to_owned());
+            let verdict = check_grammar(&t, Some(&gate), |_| panic!("validate called")).unwrap();
+            assert_eq!(verdict, GrammarVerdict::Drop(reason));
+        }
+        // Not gated and valid: applied.
+        assert_eq!(
+            check_grammar(&t, None, |_| Ok(())).unwrap(),
+            GrammarVerdict::Apply
+        );
+        assert_eq!(
+            check_grammar(&task("p", 8), None, |_| panic!("validate called")).unwrap(),
+            GrammarVerdict::None
+        );
+    }
+
+    #[test]
+    fn check_grammar_drops_best_effort_when_validation_fails() {
+        let t = soft_schema_task("s", SCHEMA_A);
+        let verdict =
+            check_grammar(&t, None, |_| Err(OvError::Native("bad schema".into()))).unwrap();
+        assert_eq!(
+            verdict,
+            GrammarVerdict::Drop(UnenforcedReason::SchemaRejected)
+        );
+    }
+
+    #[test]
+    fn admit_grammar_clears_a_dropped_best_effort_grammar() {
+        let gate = (UnenforcedReason::Npu, "npu".to_owned());
+        let before = unenforced(UnenforcedReason::Npu);
+        let mut t = soft_schema_task("s", SCHEMA_A);
+        admit_grammar(&mut t, Some(&gate), |_| panic!("validate called")).unwrap();
+        assert_eq!(t.grammar, None);
+        assert!(unenforced(UnenforcedReason::Npu) > before);
+
+        let before = unenforced(UnenforcedReason::SchemaRejected);
+        let mut t = soft_schema_task("s", SCHEMA_A);
+        admit_grammar(&mut t, None, |_| Err(OvError::Native("bad".into()))).unwrap();
+        assert_eq!(t.grammar, None);
+        assert!(unenforced(UnenforcedReason::SchemaRejected) > before);
+    }
+
+    #[test]
+    fn admit_grammar_keeps_an_applicable_one() {
+        let mut t = soft_schema_task("s", SCHEMA_A);
+        admit_grammar(&mut t, None, |_| Ok(())).unwrap();
+        assert_eq!(t.grammar.as_ref().map(|g| g.body.as_str()), Some(SCHEMA_A));
+        let mut t = schema_task("s", SCHEMA_A);
+        admit_grammar(&mut t, None, |_| Ok(())).unwrap();
+        assert!(t.grammar.is_some());
+        let mut plain = task("p", 8);
+        admit_grammar(&mut plain, None, |_| panic!("validate called")).unwrap();
+        assert_eq!(plain.grammar, None);
+    }
+
+    #[test]
+    fn admit_grammar_refuses_non_best_effort_as_today() {
+        let gate = (UnenforcedReason::Npu, "no xgrammar".to_owned());
+        let mut t = schema_task("s", SCHEMA_A);
+        match admit_grammar(&mut t, Some(&gate), |_| Ok(())).unwrap_err() {
+            EngineError::InvalidConfig(m) => assert_eq!(
+                m,
+                "structured output is not available for this model: no xgrammar"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(t.grammar.is_some());
+        let mut t = schema_task("s", SCHEMA_A);
+        match admit_grammar(&mut t, None, |_| Err(OvError::Native("bad schema".into())))
+            .unwrap_err()
+        {
+            EngineError::InvalidConfig(m) => {
+                assert_eq!(m, "response_format json_schema: bad schema")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn cb_submit_drops_a_best_effort_grammar_the_model_cannot_apply() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.structured_unavailable = Some((UnenforcedReason::ProbeFailed, "probe".into()));
+        let before = unenforced(UnenforcedReason::ProbeFailed);
+        e.submit(soft_schema_task("a", SCHEMA_A)).unwrap();
+        assert!(!st.lock().unwrap().last_added_grammar, "sent unconstrained");
+        assert_eq!(e.active[0].grammar_hash, None);
+        assert!(unenforced(UnenforcedReason::ProbeFailed) > before);
+        // A strict one is still refused.
+        assert!(matches!(
+            e.submit(schema_task("b", SCHEMA_A)),
+            Err(EngineError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -4107,14 +4282,18 @@ mod tests {
         };
         let builder = |device: &str| OvGenaiBuilder::new("m", device);
         for device in ["NPU", "npu", "NPU.0", "HETERO:GPU,NPU", "AUTO:NPU.1,CPU"] {
-            assert_eq!(gate(&builder(device)).as_deref(), Some(NPU), "{device}");
+            assert_eq!(
+                gate(&builder(device)),
+                Some((UnenforcedReason::Npu, NPU.to_owned())),
+                "{device}"
+            );
         }
         for device in ["GPU", "GPU.1", "CPU", "HETERO:GPU,CPU", "AUTO"] {
             assert_eq!(gate(&builder(device)), None, "{device}: the probe runs");
         }
         assert_eq!(
-            gate(&builder("GPU").with_draft("d", "GPU", 3)).as_deref(),
-            Some(DRAFT)
+            gate(&builder("GPU").with_draft("d", "GPU", 3)),
+            Some((UnenforcedReason::DraftModel, DRAFT.to_owned()))
         );
         assert_eq!(
             gate(&builder("CPU").with_prompt_lookup(3)),
@@ -4128,8 +4307,11 @@ mod tests {
             runtime_core: "2026.2.0".into(),
         };
         assert_eq!(
-            structured_gate("GPU", false, Ok(old)).as_deref(),
-            Some("needs OpenVINO GenAI 2026.4 or newer; this runtime is 2026.2.0")
+            structured_gate("GPU", false, Ok(old)),
+            Some((
+                UnenforcedReason::GenaiVersion,
+                "needs OpenVINO GenAI 2026.4 or newer; this runtime is 2026.2.0".to_owned()
+            ))
         );
     }
 
@@ -4347,6 +4529,29 @@ mod tests {
         st.lock().unwrap().step_fails = false;
         e.submit(schema_task("a3", SCHEMA_A)).unwrap();
         let err = e.submit(schema_task("c2", SCHEMA_C)).unwrap_err();
+        assert!(err.to_string().contains("failed to compile"), "{err}");
+    }
+
+    #[test]
+    fn cb_quarantined_best_effort_schema_is_dropped() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        let h = e.schema_hash(SCHEMA_A);
+        e.quarantined.insert(h, Instant::now());
+        let before = unenforced(UnenforcedReason::SchemaRejected);
+        e.submit(soft_schema_task("a", SCHEMA_A)).unwrap();
+        let s = st.lock().unwrap();
+        assert_eq!(s.added.len(), 1, "admitted");
+        assert!(!s.last_added_grammar, "without its grammar");
+        assert_eq!(s.validate_calls, 0, "a dropped schema is not validated");
+        drop(s);
+        assert_eq!(e.active[0].grammar_hash, None, "never a suspect");
+        assert!(unenforced(UnenforcedReason::SchemaRejected) > before);
+        // The strict form of the same schema is still refused.
+        let err = e.submit(schema_task("b", SCHEMA_A)).unwrap_err();
         assert!(err.to_string().contains("failed to compile"), "{err}");
     }
 
@@ -4575,8 +4780,11 @@ mod tests {
 
         let (e, _) = cb_warmup_with(vec![vec![finished("Hello there!")]]);
         assert_eq!(
-            e.structured_unavailable.as_deref(),
-            Some("the output constraint was not applied: Hello there!")
+            e.structured_unavailable,
+            Some((
+                UnenforcedReason::ProbeFailed,
+                "the output constraint was not applied: Hello there!".to_owned()
+            ))
         );
 
         // A probe the scheduler dropped proves nothing either way.
@@ -4607,7 +4815,10 @@ mod tests {
                 "[01:02:03] src/x.cpp:9: second".into(),
             ))],
         ]);
-        assert_eq!(e.structured_unavailable.as_deref(), Some("second"));
+        assert_eq!(
+            e.structured_unavailable,
+            Some((UnenforcedReason::ProbeFailed, "second".to_owned()))
+        );
     }
 
     #[test]
@@ -5253,7 +5464,7 @@ mod tests {
         );
         assert_eq!(e.rebuild.rebuilds, 1);
         assert_eq!(
-            e.structured_unavailable.as_deref(),
+            e.structured_unavailable.as_ref().map(|(_, m)| m.as_str()),
             Some("the output constraint was not applied: Hello there!")
         );
         assert_eq!(
@@ -5438,7 +5649,7 @@ mod tests {
         st.lock().unwrap().probe_answer = Some("Hello".into());
         refusal(e.submit(schema_task("new", &full_budget_body(1000))));
         assert_eq!(
-            e.structured_unavailable.as_deref(),
+            e.structured_unavailable.as_ref().map(|(_, m)| m.as_str()),
             Some("the output constraint was not applied: Hello")
         );
         assert_eq!(

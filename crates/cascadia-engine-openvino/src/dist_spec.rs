@@ -1634,7 +1634,7 @@ impl Engine for OvDistSpecEngine {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         if self.pending.iter().any(|p| p.task.task_id == task.task_id)
             || self
                 .active
@@ -1654,7 +1654,9 @@ impl Engine for OvDistSpecEngine {
                 cap: MAX_PENDING_TASKS,
             });
         }
-        let grammar = self.grammar_factory.compile(Some(&self.tokenizer), &task)?;
+        let grammar = self
+            .grammar_factory
+            .admit(Some(&self.tokenizer), &mut task)?;
         structured::log_grammar_warnings("ov-dist-spec", &task.task_id, grammar.as_ref());
         self.pending.push(PendingSpec { task, grammar });
         Ok(())
@@ -3677,10 +3679,7 @@ mod tests {
     }
 
     fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
-        cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: body.to_string(),
-        }
+        cascadia_types::GrammarSpec::json_schema(body)
     }
 
     fn compiled(gf: &GrammarFactory, body: &str) -> CompiledGrammar {

@@ -22,6 +22,7 @@ cascadia-runner = { workspace = true }
 cascadia-transport = { workspace = true }
 cascadia-ov-genai-shim = { workspace = true }
 cascadia-grammar = { workspace = true }
+cascadia-metrics = { workspace = true }
 cascadia-kv-wire = { path = "../cascadia-kv-wire", optional = true }
 crc32fast = { version = "1.4", optional = true }
 async-trait = { workspace = true }

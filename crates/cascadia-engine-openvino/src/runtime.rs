@@ -2330,23 +2330,40 @@ async fn drain_late_replies(
     }
 }
 
-/// Head: the refusal of a structured-output task while a later stage that
-/// can't mask latched the link. A latched link is read first (see
+/// Head, before a structured-output task's latch check (see
+/// [`latched_link_check`]): a latched link is read first (see
 /// [`drain_late_replies`]): a slow but new tail's acknowledged late answer,
 /// already on the socket, clears the latch, and the task is admitted.
 /// Called at submit, which answers the HTTP request, and again at admission;
 /// between steps nothing is owed on the link but late replies.
-fn latched_refusal(
+fn read_latched_link(
     handle: &tokio::runtime::Handle,
     downstream: Option<&Arc<tokio::sync::Mutex<ActivationClient>>>,
     link: &mut MaskLink,
-) -> Option<EngineError> {
+) {
     if link.latched_at.is_some() {
         if let Some(downstream) = downstream {
             crate::dist_spec::run_async_pub(handle, drain_late_replies(downstream, link));
         }
     }
-    link.refusal(std::time::Instant::now())
+}
+
+/// Head, at submit and at admission of a structured-output task on a
+/// multi-stage pipeline, after [`read_latched_link`]: a best-effort grammar
+/// on a latched link is dropped (see [`structured::drop_on_latched_link`]);
+/// a strict one gets the link's refusal while the latch holds.
+fn latched_link_check(
+    task: &mut GenerationTask,
+    link: &MaskLink,
+    now: std::time::Instant,
+) -> EngineResult<()> {
+    if structured::drop_on_latched_link(task, link.latched_at.is_some()) {
+        return Ok(());
+    }
+    match link.refusal(now) {
+        Some(refused) => Err(refused),
+        None => Ok(()),
+    }
 }
 
 /// Head: the token mask to send with a step whose last row is at
@@ -4102,7 +4119,7 @@ impl OvRuntimeEngine {
             return self.step_first_packed();
         }
         if self.active.is_none() && !self.pending.is_empty() {
-            let PendingTask { task, grammar } = self.pending.remove(0);
+            let PendingTask { mut task, grammar } = self.pending.remove(0);
             info!(prompt_len = task.prompt.len(), "ov_prefill_begin");
             let tok = self
                 .tokenizer
@@ -4143,7 +4160,7 @@ impl OvRuntimeEngine {
             // Structured output: the matcher starts after the resume seed (if
             // any), before any model work, so a seed the grammar rejects costs
             // nothing and fails only this task.
-            let grammar = match grammar.as_ref() {
+            let mut grammar = match grammar.as_ref() {
                 Some(g) => {
                     let seed = cascadia_types::resume_generated_seed(resume.as_deref());
                     match start_grammar(g, &seed) {
@@ -4163,13 +4180,19 @@ impl OvRuntimeEngine {
             if grammar.is_some() && multi_stage {
                 // A slow but new tail's late acknowledged answer, already in
                 // the socket, clears the latch before it refuses.
-                if let Some(refused) = latched_refusal(
+                read_latched_link(
                     &self.runtime_handle,
                     self.downstream.as_ref(),
                     &mut self.mask_link,
-                ) {
+                );
+                if let Err(refused) =
+                    latched_link_check(&mut task, &self.mask_link, std::time::Instant::now())
+                {
                     let id = task.task_id.clone();
                     return Ok(vec![(id.clone(), Chunk::error(id, refused.to_string()))]);
+                }
+                if task.grammar.is_none() {
+                    grammar = None;
                 }
             }
             // No evidence yet that every later stage masks: probe the link
@@ -4177,8 +4200,17 @@ impl OvRuntimeEngine {
             // stage costs this task a short probe wait, not a token deadline.
             if needs_mask_probe(grammar.is_some(), multi_stage, &self.mask_link) {
                 if let Err(e) = self.probe_downstream() {
-                    let id = task.task_id.clone();
-                    return Ok(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+                    // An unanswered probe latched the link: a best-effort
+                    // task runs unmasked instead of failing.
+                    if structured::drop_on_latched_link(
+                        &mut task,
+                        self.mask_link.latched_at.is_some(),
+                    ) {
+                        grammar = None;
+                    } else {
+                        let id = task.task_id.clone();
+                        return Ok(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
+                    }
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
@@ -6073,7 +6105,7 @@ impl Engine for OvRuntimeEngine {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         if !self.spec.is_first_stage {
             warn!("ov-runtime submit() ignored on non-first stage");
             return Err(EngineError::Backend(
@@ -6136,19 +6168,19 @@ impl Engine for OvRuntimeEngine {
             }
         }
         // A later stage that can't mask latched this pipeline: structured-output
-        // tasks fail at once (5xx) instead of each stalling a token deadline.
+        // tasks fail at once (5xx) instead of each stalling a token deadline;
+        // a best-effort one runs unmasked instead.
         if task.grammar.is_some() && !self.spec.is_last_stage {
-            if let Some(refused) = latched_refusal(
+            read_latched_link(
                 &self.runtime_handle,
                 self.downstream.as_ref(),
                 &mut self.mask_link,
-            ) {
-                return Err(refused);
-            }
+            );
+            latched_link_check(&mut task, &self.mask_link, std::time::Instant::now())?;
         }
         let grammar = self
             .grammar_factory
-            .compile(self.tokenizer.as_deref(), &task)?;
+            .admit(self.tokenizer.as_deref(), &mut task)?;
         structured::log_grammar_warnings("ov-runtime", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
@@ -9299,10 +9331,7 @@ mod tests {
     }
 
     fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
-        cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: body.to_string(),
-        }
+        cascadia_types::GrammarSpec::json_schema(body)
     }
 
     fn test_mask(body: &str, seed: &str) -> GrammarMask {
@@ -9773,6 +9802,51 @@ mod tests {
         let err = link.verdict(std::time::Instant::now(), got).unwrap_err();
         assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
         assert!(link.refusal(std::time::Instant::now()).is_some());
+    }
+
+    /// The head's latch check at submit and at admission: a best-effort task
+    /// on a latched link runs unmasked, counted, and never pays for the
+    /// re-probe; a strict one is refused while the latch holds, as before.
+    #[test]
+    fn a_best_effort_task_runs_unmasked_on_a_latched_link() {
+        let reason = cascadia_metrics::UnenforcedReason::StageUnsupported;
+        let count = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[reason.as_str()])
+                .get()
+        };
+        let soft = || {
+            GenerationTask::new("s", "p").with_grammar(
+                cascadia_types::GrammarSpec::best_effort_json_schema(OK_ENUM),
+            )
+        };
+        let strict = || GenerationTask::new("j", "p").with_grammar(json_spec(OK_ENUM));
+        let now = std::time::Instant::now();
+        let mut link = MaskLink::default();
+        let mut t = soft();
+        latched_link_check(&mut t, &link, now).unwrap();
+        assert!(t.grammar.is_some(), "an unlatched link keeps it");
+
+        let _ = link.on_probe_unanswered(now, &EngineError::Backend("silence".into()));
+        let before = count();
+        let mut t = soft();
+        latched_link_check(&mut t, &link, now).unwrap();
+        assert_eq!(t.grammar, None);
+        assert!(count() > before);
+        let mut t = strict();
+        let err = latched_link_check(&mut t, &link, now).unwrap_err();
+        assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
+        assert!(t.grammar.is_some());
+
+        // Due a re-probe: the strict one goes ahead and probes; the
+        // best-effort one still runs unmasked.
+        let later = now + MASK_PROBE_REPROBE_AFTER;
+        let mut t = strict();
+        latched_link_check(&mut t, &link, later).unwrap();
+        assert!(t.grammar.is_some());
+        let mut t = soft();
+        latched_link_check(&mut t, &link, later).unwrap();
+        assert_eq!(t.grammar, None);
     }
 
     /// An acknowledged NACK is a stage failure on a chain that masks: the task
@@ -12568,6 +12642,18 @@ mod tests {
         until_readable(&downstream).await;
         drain_late_replies(&downstream, &mut link).await;
         assert!(link.refusal(std::time::Instant::now()).is_some());
+    }
+
+    /// The head's latch check of a strict structured-output task, as submit
+    /// and admission run it: the latched link read first, then the refusal.
+    fn latched_refusal(
+        handle: &tokio::runtime::Handle,
+        downstream: Option<&Arc<tokio::sync::Mutex<ActivationClient>>>,
+        link: &mut MaskLink,
+    ) -> Option<EngineError> {
+        read_latched_link(handle, downstream, link);
+        let mut task = GenerationTask::new("j", "p").with_grammar(json_spec(OK_ENUM));
+        latched_link_check(&mut task, link, std::time::Instant::now()).err()
     }
 
     /// A latched head reads a slow but new tail's late probe answer at the

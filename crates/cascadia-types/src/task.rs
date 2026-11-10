@@ -157,11 +157,38 @@ pub enum GrammarKind {
 }
 
 /// Backend-neutral constraint on the output. `body` is a JSON Schema as compact JSON.
-/// Engines that cannot enforce it reject the task at submit or are never sent one (the API checks the server's capability).
+/// Engines that cannot enforce it reject the task at submit or are never sent one (the API checks the server's capability);
+/// a `best_effort` one is dropped instead, and the task runs unconstrained.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrammarSpec {
     pub kind: GrammarKind,
     pub body: String,
+    /// The constraint is wanted but not required: an engine that can't apply
+    /// it drops it and answers unconstrained (logged and counted) instead of
+    /// refusing the task. Absent on the wire when false, so older payloads
+    /// and older peers keep the strict meaning.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub best_effort: bool,
+}
+
+impl GrammarSpec {
+    /// A JSON Schema constraint the engine must apply or refuse.
+    pub fn json_schema(body: impl Into<String>) -> Self {
+        Self {
+            kind: GrammarKind::JsonSchema,
+            body: body.into(),
+            best_effort: false,
+        }
+    }
+
+    /// A JSON Schema constraint an engine that can't apply it may drop,
+    /// answering unconstrained instead of refusing the task.
+    pub fn best_effort_json_schema(body: impl Into<String>) -> Self {
+        Self {
+            best_effort: true,
+            ..Self::json_schema(body)
+        }
+    }
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -285,10 +312,7 @@ mod tests {
             !json.contains("grammar"),
             "absent grammar is not serialized: {json}"
         );
-        let g = GrammarSpec {
-            kind: GrammarKind::JsonSchema,
-            body: r#"{"type":"object"}"#.into(),
-        };
+        let g = GrammarSpec::json_schema(r#"{"type":"object"}"#);
         let t2 = t.with_grammar(g.clone());
         let back: GenerationTask =
             serde_json::from_str(&serde_json::to_string(&t2).unwrap()).unwrap();
@@ -298,6 +322,29 @@ mod tests {
         v.as_object_mut().unwrap().remove("grammar");
         let old: GenerationTask = serde_json::from_value(v).unwrap();
         assert_eq!(old.grammar, None);
+    }
+
+    #[test]
+    fn grammar_spec_best_effort_round_trips_and_defaults_false() {
+        let strict = GrammarSpec::json_schema(r#"{"type":"object"}"#);
+        assert!(!strict.best_effort);
+        assert_eq!(strict.kind, GrammarKind::JsonSchema);
+        let json = serde_json::to_string(&strict).unwrap();
+        assert!(
+            !json.contains("best_effort"),
+            "a strict grammar is serialized as before: {json}"
+        );
+        let soft = GrammarSpec::best_effort_json_schema(r#"{"type":"array"}"#);
+        assert!(soft.best_effort);
+        assert_eq!(soft.body, r#"{"type":"array"}"#);
+        let json = serde_json::to_string(&soft).unwrap();
+        assert!(json.contains(r#""best_effort":true"#), "{json}");
+        let back: GrammarSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, soft);
+        // A payload from before the field existed decodes as strict.
+        let old: GrammarSpec =
+            serde_json::from_str(r#"{"kind":"JsonSchema","body":"{}"}"#).unwrap();
+        assert!(!old.best_effort);
     }
 
     #[test]

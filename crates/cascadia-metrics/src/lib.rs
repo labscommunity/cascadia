@@ -118,6 +118,88 @@ pub static API_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cascadia_api_rejected_total")
 });
 
+/// Output constraints (`response_format`, forced tool calls) that were wanted
+/// but not applied: a best-effort grammar the engine or the API could not
+/// enforce, so the request was answered unconstrained instead of refused.
+/// `reason` is a closed set, see [`UnenforcedReason`].
+pub static CONSTRAINT_UNENFORCED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_constraint_unenforced_total",
+        "Best-effort output constraints dropped (answered unconstrained), by reason.",
+        &["reason"]
+    )
+    .expect("register cascadia_constraint_unenforced_total")
+});
+
+/// Why a best-effort output constraint was not applied. Each value names
+/// what would have to change for it to be enforced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnenforcedReason {
+    /// The device is (or includes) an NPU, where the backend does not apply
+    /// the constraint reliably.
+    Npu,
+    /// Speculative decoding with a draft model, which the backend's
+    /// constraint does not support.
+    DraftModel,
+    /// The OpenVINO GenAI runtime is too old for output constraints.
+    GenaiVersion,
+    /// The startup probe found that the constraint is not applied on this
+    /// model or pipeline.
+    ProbeFailed,
+    /// The backend refused the schema, or the schema recently failed to
+    /// compile on this server.
+    SchemaRejected,
+    /// The schema exceeds the build budget or the schema limits.
+    TooComplex,
+    /// The schema compile pool was full.
+    Busy,
+    /// The schema has a `$ref` that can't be kept when it is nested.
+    UnsupportedRef,
+    /// No grammar factory: the model has no usable tokenizer here.
+    NoTokenizer,
+    /// A later pipeline stage can't apply the constraint.
+    StageUnsupported,
+}
+
+impl UnenforcedReason {
+    /// Every reason, in label order.
+    pub const ALL: [UnenforcedReason; 10] = [
+        Self::Npu,
+        Self::DraftModel,
+        Self::GenaiVersion,
+        Self::ProbeFailed,
+        Self::SchemaRejected,
+        Self::TooComplex,
+        Self::Busy,
+        Self::UnsupportedRef,
+        Self::NoTokenizer,
+        Self::StageUnsupported,
+    ];
+
+    /// The `reason` label value (snake_case).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Npu => "npu",
+            Self::DraftModel => "draft_model",
+            Self::GenaiVersion => "genai_version",
+            Self::ProbeFailed => "probe_failed",
+            Self::SchemaRejected => "schema_rejected",
+            Self::TooComplex => "too_complex",
+            Self::Busy => "busy",
+            Self::UnsupportedRef => "unsupported_ref",
+            Self::NoTokenizer => "no_tokenizer",
+            Self::StageUnsupported => "stage_unsupported",
+        }
+    }
+}
+
+/// Count one best-effort output constraint dropped for `reason`.
+pub fn count_constraint_unenforced(reason: UnenforcedReason) {
+    CONSTRAINT_UNENFORCED_TOTAL
+        .with_label_values(&[reason.as_str()])
+        .inc();
+}
+
 // --- Generation-level (bumped by cascadia-runner) ------------------------
 
 /// Time from task submission to the first TOKEN-BEARING chunk delivered
@@ -317,6 +399,7 @@ pub fn init() {
     LazyLock::force(&HTTP_REQUESTS_TOTAL);
     LazyLock::force(&HTTP_REQUEST_DURATION_SECONDS);
     LazyLock::force(&API_REJECTED_TOTAL);
+    LazyLock::force(&CONSTRAINT_UNENFORCED_TOTAL);
     LazyLock::force(&GENERATION_TTFT_SECONDS);
     LazyLock::force(&GENERATION_INTER_TOKEN_SECONDS);
     LazyLock::force(&GENERATION_DURATION_SECONDS);
@@ -378,6 +461,41 @@ mod tests {
         );
         assert!(
             text.contains("cascadia_tokens_generated_total{model=\"test-model\"} 3"),
+            "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn count_constraint_unenforced_increments_its_label() {
+        let read = |r: UnenforcedReason| {
+            CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[r.as_str()])
+                .get()
+        };
+        let before = read(UnenforcedReason::StageUnsupported);
+        count_constraint_unenforced(UnenforcedReason::StageUnsupported);
+        assert!(read(UnenforcedReason::StageUnsupported) > before);
+        let labels: Vec<&str> = UnenforcedReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "npu",
+                "draft_model",
+                "genai_version",
+                "probe_failed",
+                "schema_rejected",
+                "too_complex",
+                "busy",
+                "unsupported_ref",
+                "no_tokenizer",
+                "stage_unsupported",
+            ]
+        );
+        init();
+        let (_, body) = encode_text();
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            text.contains("cascadia_constraint_unenforced_total{reason=\"stage_unsupported\"}"),
             "got:\n{text}"
         );
     }

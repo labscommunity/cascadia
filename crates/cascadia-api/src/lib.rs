@@ -105,6 +105,47 @@ impl Drop for InFlightGuard {
 
 /// Count a pre-engine rejection in `cascadia_api_rejected_total`. Reasons
 /// are a closed set — see the metric's docs in `cascadia-metrics`.
+/// The schema compile check's verdict applied to the request's grammar: a
+/// grammar that passed is kept; a best-effort one that is too complex, or
+/// found the compile pool full, is dropped (logged and counted) and the
+/// request runs unconstrained; a strict one is refused (400 / 503).
+// The error is the handler's own response, returned at once.
+#[allow(clippy::result_large_err)]
+fn apply_schema_check(
+    spec: Option<cascadia_types::GrammarSpec>,
+    res: Result<(), SchemaCheckError>,
+) -> Result<Option<cascadia_types::GrammarSpec>, Response> {
+    let Err(e) = res else {
+        return Ok(spec);
+    };
+    if spec.as_ref().is_some_and(|g| g.best_effort) {
+        let reason = match e {
+            SchemaCheckError::Busy => cascadia_metrics::UnenforcedReason::Busy,
+            SchemaCheckError::TooComplex => cascadia_metrics::UnenforcedReason::TooComplex,
+        };
+        warn!(
+            reason = reason.as_str(),
+            "output constraint not enforced; answering unconstrained"
+        );
+        cascadia_metrics::count_constraint_unenforced(reason);
+        return Ok(None);
+    }
+    let (status, reason, msg) = match e {
+        SchemaCheckError::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capacity",
+            "busy compiling response_format schemas; retry shortly".to_owned(),
+        ),
+        SchemaCheckError::TooComplex => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid response_format: response_format schema is too complex to compile".to_owned(),
+        ),
+    };
+    count_rejected(reason);
+    Err((status, Json(serde_json::json!({ "error": msg }))).into_response())
+}
+
 fn count_rejected(reason: &str) {
     cascadia_metrics::API_REJECTED_TOTAL
         .with_label_values(&[reason])
@@ -2678,25 +2719,16 @@ async fn chat_completions(
     };
     // The engine builds the grammar inside its submit, under the engine
     // lock: a schema that takes too long to build is refused here first.
-    if let Some(spec) = grammar.as_ref().filter(|_| state.schema_build_check) {
-        if let Err(e) = state.schema_check.check(spec).await {
-            let (status, reason, msg) = match e {
-                SchemaCheckError::Busy => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "capacity",
-                    "busy compiling response_format schemas; retry shortly".to_owned(),
-                ),
-                SchemaCheckError::TooComplex => (
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "invalid response_format: response_format schema is too complex to compile"
-                        .to_owned(),
-                ),
-            };
-            count_rejected(reason);
-            return (status, Json(serde_json::json!({ "error": msg }))).into_response();
+    let grammar = match grammar {
+        Some(spec) if state.schema_build_check => {
+            let checked = state.schema_check.check(&spec).await;
+            match apply_schema_check(Some(spec), checked) {
+                Ok(grammar) => grammar,
+                Err(resp) => return resp,
+            }
         }
-    }
+        other => other,
+    };
     // A JSON answer has no room for a reasoning preamble: thinking is off.
     // With callable tools the format is not enforced and the model may want
     // to reason before a tool call, so thinking stays as requested, except
@@ -3937,6 +3969,84 @@ mod tests {
     use cascadia_types::{Chunk, PeerLayout, ShardSpec};
     use serde_json::Value;
     use tower::ServiceExt;
+
+    fn unenforced(reason: cascadia_metrics::UnenforcedReason) -> u64 {
+        cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+            .with_label_values(&[reason.as_str()])
+            .get()
+    }
+
+    async fn error_of(resp: Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        (status, v["error"].as_str().unwrap_or_default().to_owned())
+    }
+
+    #[tokio::test]
+    async fn apply_schema_check_keeps_a_grammar_that_passed() {
+        let strict = cascadia_types::GrammarSpec::json_schema(r#"{"type":"object"}"#);
+        let soft = cascadia_types::GrammarSpec::best_effort_json_schema(r#"{"type":"object"}"#);
+        assert_eq!(
+            apply_schema_check(Some(strict.clone()), Ok(())).unwrap(),
+            Some(strict)
+        );
+        assert_eq!(
+            apply_schema_check(Some(soft.clone()), Ok(())).unwrap(),
+            Some(soft)
+        );
+        assert_eq!(apply_schema_check(None, Ok(())).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn apply_schema_check_refuses_a_strict_grammar_as_today() {
+        let strict = || {
+            Some(cascadia_types::GrammarSpec::json_schema(
+                r#"{"type":"object"}"#,
+            ))
+        };
+        let resp = apply_schema_check(strict(), Err(SchemaCheckError::TooComplex)).unwrap_err();
+        assert_eq!(
+            error_of(resp).await,
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid response_format: response_format schema is too complex to compile"
+                    .to_owned()
+            )
+        );
+        let resp = apply_schema_check(strict(), Err(SchemaCheckError::Busy)).unwrap_err();
+        assert_eq!(
+            error_of(resp).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy compiling response_format schemas; retry shortly".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_schema_check_drops_a_best_effort_grammar_that_is_too_complex() {
+        use cascadia_metrics::UnenforcedReason;
+        let before = unenforced(UnenforcedReason::TooComplex);
+        let soft = cascadia_types::GrammarSpec::best_effort_json_schema(r#"{"type":"object"}"#);
+        assert_eq!(
+            apply_schema_check(Some(soft), Err(SchemaCheckError::TooComplex)).unwrap(),
+            None
+        );
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+    }
+
+    #[tokio::test]
+    async fn apply_schema_check_drops_a_best_effort_grammar_when_busy() {
+        use cascadia_metrics::UnenforcedReason;
+        let before = unenforced(UnenforcedReason::Busy);
+        let soft = cascadia_types::GrammarSpec::best_effort_json_schema(r#"{"type":"object"}"#);
+        assert_eq!(
+            apply_schema_check(Some(soft), Err(SchemaCheckError::Busy)).unwrap(),
+            None
+        );
+        assert!(unenforced(UnenforcedReason::Busy) > before);
+    }
 
     #[test]
     fn sanitizes_numeric_dot_index_for_minijinja() {

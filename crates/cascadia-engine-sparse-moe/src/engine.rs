@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use cascadia_metrics::UnenforcedReason;
 use cascadia_ov_genai_shim::PluginConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
 use cascadia_types::{
@@ -29,7 +30,10 @@ use tokenizers::Tokenizer;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
-use crate::constrained::{activate, commit, unconfirmed_step, GrammarSlot, StageMasks};
+use crate::constrained::{
+    activate, commit, drop_best_effort_grammar, drop_on_latched_link, is_best_effort,
+    unconfirmed_step, GrammarSlot, StageMasks,
+};
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
     recv_kind_server, recv_stream_close_body_server, recv_stream_tokens_body_client,
@@ -1973,7 +1977,7 @@ impl Engine for SparseMoEEngine {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
@@ -1986,7 +1990,7 @@ impl Engine for SparseMoEEngine {
                 cap: MAX_PENDING_TASKS,
             });
         }
-        if let Some(compiled) = self.grammar.compile(&task)? {
+        if let Some(compiled) = self.grammar.admit(&mut task)? {
             self.grammars.insert(task.task_id.clone(), compiled);
         }
         self.pending.push_back(task);
@@ -2371,11 +2375,13 @@ impl SparseMoEEngine {
     /// prompt, the zero-budget resume case, spec-decode's burst path, EOS on
     /// the very first generated token); `None` means `self.active` is armed.
     fn begin_generation_sparse(&mut self) -> Option<Vec<(TaskId, Chunk)>> {
-        let task = match self.pending.pop_front() {
+        let mut task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Some(Vec::new()),
         };
-        let compiled = self.grammars.remove(&task.task_id);
+        let mut compiled = self.grammars.remove(&task.task_id);
+        // A best-effort json task on a latched pipeline runs unmasked.
+        drop_on_latched_link(&mut task, &mut compiled, &self.stage_masks);
         if compiled.is_some() {
             if let Err(msg) = refuse_dequeued_json(
                 &self.runtime_handle,
@@ -2518,10 +2524,18 @@ impl SparseMoEEngine {
                 ),
             );
             if let Err(msg) = admitted {
-                return Some(vec![(
-                    task.task_id.clone(),
-                    Chunk::error(task.task_id, msg),
-                )]);
+                // An unanswered probe latched the link: a best-effort task
+                // runs unmasked instead of failing.
+                if self.stage_masks.latch.is_set()
+                    && drop_best_effort_grammar(&mut task, UnenforcedReason::StageUnsupported)
+                {
+                    grammar = None;
+                } else {
+                    return Some(vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, msg),
+                    )]);
+                }
             }
         }
 
@@ -4810,11 +4824,13 @@ impl OvMoeEngine {
     /// prompt, the zero-budget resume case); `None` means `self.active_ov` is
     /// now armed.
     fn begin_generation_ovmoe(&mut self) -> Option<Vec<(TaskId, Chunk)>> {
-        let task = match self.pending.pop_front() {
+        let mut task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Some(Vec::new()),
         };
-        let compiled = self.grammars.remove(&task.task_id);
+        let mut compiled = self.grammars.remove(&task.task_id);
+        // A best-effort json task on a latched pipeline runs unmasked.
+        drop_on_latched_link(&mut task, &mut compiled, &self.stage_masks);
         if compiled.is_some() {
             if let Err(msg) = refuse_dequeued_json(
                 &self.runtime_handle,
@@ -4944,7 +4960,15 @@ impl OvMoeEngine {
                 ),
             );
             if let Err(msg) = admitted {
-                return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+                // An unanswered probe latched the link: a best-effort task
+                // runs unmasked instead of failing.
+                if self.stage_masks.latch.is_set()
+                    && drop_best_effort_grammar(&mut task, UnenforcedReason::StageUnsupported)
+                {
+                    grammar = None;
+                } else {
+                    return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+                }
             }
         }
 
@@ -5872,7 +5896,7 @@ impl Engine for OvMoeEngine {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
@@ -5885,7 +5909,7 @@ impl Engine for OvMoeEngine {
                 cap: OV_MAX_PENDING,
             });
         }
-        if let Some(compiled) = self.grammar.compile(&task)? {
+        if let Some(compiled) = self.grammar.admit(&mut task)? {
             self.grammars.insert(task.task_id.clone(), compiled);
         }
         self.pending.push_back(task);
@@ -6984,8 +7008,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let latched = self.stage_masks.refusal().is_some();
             let owed = latched && self.owed_late.is_owed();
             let probing = !self.mask_evidence && !latched;
-            let waits =
-                |t: &GenerationTask| (probing || owed) && self.grammars.contains_key(&t.task_id);
+            // A best-effort json request on a latched link never waits for,
+            // nor pays for, the re-probe: it runs unmasked (an owed late
+            // answer is still read first).
+            let set = self.stage_masks.latch.is_set();
+            let waits = |t: &GenerationTask| {
+                self.grammars.contains_key(&t.task_id)
+                    && (owed || (probing && !(set && is_best_effort(t))))
+            };
             let mut at = 0;
             if self.pending.front().is_some_and(waits) {
                 let idle =
@@ -7007,7 +7037,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         self.redial_next = None;
                         break;
                     }
-                    // Still latched: refused at its admission below.
+                    // Still latched: refused at its admission below (a
+                    // best-effort grammar is dropped there instead).
                     let probe = !self.mask_evidence && self.stage_masks.refusal().is_none();
                     let probed = if probe {
                         self.probe_link(&down)
@@ -7015,14 +7046,22 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         Ok(())
                     };
                     if let Err(msg) = probed {
-                        let task = self.pending.pop_front().expect("non-empty");
-                        admitted += 1;
-                        self.grammars.remove(&task.task_id);
-                        out.push((task.task_id.clone(), Chunk::error(task.task_id, msg)));
-                        if self.peer_disconnected {
-                            break;
+                        // An unanswered probe latched the link: a best-effort
+                        // request is admitted unmasked below instead. A dead
+                        // link admits nothing more this step.
+                        let falls_back = !self.peer_disconnected
+                            && self.stage_masks.latch.is_set()
+                            && self.pending.front().is_some_and(is_best_effort);
+                        if !falls_back {
+                            let task = self.pending.pop_front().expect("non-empty");
+                            admitted += 1;
+                            self.grammars.remove(&task.task_id);
+                            out.push((task.task_id.clone(), Chunk::error(task.task_id, msg)));
+                            if self.peer_disconnected {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 } else {
                     let since = *self.probe_wait_since.get_or_insert_with(Instant::now);
@@ -7359,14 +7398,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
     #[allow(clippy::result_large_err)]
     fn admit_stream_pipeline(
         &mut self,
-        task: GenerationTask,
+        mut task: GenerationTask,
         g: usize,
         down: &Arc<TokioMutex<ActivationClient>>,
-        compiled: Option<CompiledGrammar>,
+        mut compiled: Option<CompiledGrammar>,
     ) -> Result<usize, (TaskId, Chunk)> {
         let started = Instant::now();
         // Structured output: no forced-prefix path here, refused at once
-        // while the pipeline is known not to mask, else a fresh matcher.
+        // while the pipeline is known not to mask (a best-effort request
+        // runs unmasked instead), else a fresh matcher.
+        drop_on_latched_link(&mut task, &mut compiled, &self.stage_masks);
         if compiled.is_some() {
             if task.resume_ids().is_some() {
                 return Err(decline_resumed_grammar_task(&task.task_id));
@@ -8455,11 +8496,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// token). This is the old monolithic `step_first` up to — but not
     /// including — the decode loop, which is now `decode_step`.
     fn begin_generation(&mut self) -> Option<Vec<(TaskId, Chunk)>> {
-        let task = match self.pending.pop_front() {
+        let mut task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Some(Vec::new()),
         };
-        let compiled = self.grammars.remove(&task.task_id);
+        let mut compiled = self.grammars.remove(&task.task_id);
         // No forced-prefix path here: silently ignoring the ids would regenerate
         // from scratch and the caller would splice that after the client's
         // already-received prefix as if it were the resumed tail. Decline with the
@@ -8522,12 +8563,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Chunk::error(id, PROBE_LINK_FAILED.to_string()),
                 )]);
             }
+            // A best-effort request runs unmasked on a latched link: it never
+            // fails on the latch nor pays for the re-probe.
+            drop_on_latched_link(&mut task, &mut compiled, &self.stage_masks);
+        }
+        if compiled.is_some() {
             if let Some(msg) = self.stage_masks.refusal() {
                 return Some(vec![(id.clone(), Chunk::error(id, msg))]);
             }
             if !self.mask_evidence {
                 if let Err(msg) = self.probe_link(&downstream) {
-                    return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+                    // An unanswered probe latched the link: a best-effort
+                    // request runs unmasked instead of failing.
+                    if !drop_on_latched_link(&mut task, &mut compiled, &self.stage_masks) {
+                        return Some(vec![(id.clone(), Chunk::error(id, msg))]);
+                    }
                 }
             }
         }
@@ -10098,7 +10148,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
@@ -10111,7 +10161,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 cap: OV_MAX_PENDING,
             });
         }
-        if let Some(compiled) = self.grammar.compile(&task)? {
+        if let Some(compiled) = self.grammar.admit(&mut task)? {
             self.grammars.insert(task.task_id.clone(), compiled);
         }
         self.pending.push_back(task);

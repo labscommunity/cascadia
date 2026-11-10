@@ -3,7 +3,7 @@
 //! lists JSON Schema keywords the decoder cannot enforce.
 
 use cascadia_grammar::GrammarFactory;
-use cascadia_types::{GrammarKind, GrammarSpec};
+use cascadia_types::GrammarSpec;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
@@ -2365,10 +2365,7 @@ pub fn grammar_for(rf: &ResponseFormat) -> Option<GrammarSpec> {
         ResponseFormat::JsonObject => JSON_OBJECT_SCHEMA.to_owned(),
         ResponseFormat::JsonSchema { raw, .. } => raw.clone(),
     };
-    Some(GrammarSpec {
-        kind: GrammarKind::JsonSchema,
-        body,
-    })
+    Some(GrammarSpec::json_schema(body))
 }
 
 const SIBLINGS: &str = "siblings of $ref/const/enum/anyOf/oneOf/allOf";
@@ -2793,10 +2790,7 @@ mod tests {
     }
 
     fn spec_of(body: &str) -> GrammarSpec {
-        GrammarSpec {
-            kind: GrammarKind::JsonSchema,
-            body: body.to_owned(),
-        }
+        GrammarSpec::json_schema(body)
     }
 
     /// `json_object`'s grammar is the same constant every time: no build, no

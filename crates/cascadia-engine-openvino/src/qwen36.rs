@@ -1901,7 +1901,10 @@ impl Qwen36Engine {
             if self.pending.is_empty() {
                 return Vec::new();
             }
-            let PendingTask { task, grammar } = self.pending.remove(0);
+            let PendingTask {
+                mut task,
+                mut grammar,
+            } = self.pending.remove(0);
             if let Some(reason) = &self.poisoned {
                 warn!(task = %task.task_id, reason = %reason, "qwen36: refusing task (handshake mismatch)");
                 let reason = format!("qwen36 pipeline poisoned by handshake mismatch: {reason}");
@@ -1917,7 +1920,17 @@ impl Qwen36Engine {
                 }
             }
             // A structured-output task needs every later rank to apply its masks: refuse it
-            // before any frame of its own when the handshake said one can't.
+            // before any frame of its own when the handshake said one can't. A best-effort
+            // one runs unmasked instead.
+            if grammar.is_some()
+                && !self.chain_grammar_mask
+                && structured::drop_best_effort_grammar(
+                    &mut task,
+                    cascadia_metrics::UnenforcedReason::StageUnsupported,
+                )
+            {
+                grammar = None;
+            }
             if grammar.is_some() && !self.chain_grammar_mask {
                 warn!(task = %task.task_id, "qwen36: {UPGRADE_EVERY_STAGE}");
                 let reason = UPGRADE_EVERY_STAGE.to_string();
@@ -3160,7 +3173,7 @@ impl Engine for Qwen36Engine {
         self.reset_all();
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         if self.pending.iter().any(|p| p.task.task_id == task.task_id) {
             return Ok(());
         }
@@ -3196,7 +3209,7 @@ impl Engine for Qwen36Engine {
         // known at the first admission (the handshake), checked there.
         let grammar = self
             .grammar_factory
-            .compile(self.tokenizer.as_ref(), &task)?;
+            .admit(self.tokenizer.as_ref(), &mut task)?;
         structured::log_grammar_warnings("qwen35", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
@@ -4276,10 +4289,7 @@ mod tests {
     const INTEGER: &str = r#"{"type":"integer"}"#;
 
     fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
-        cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: body.to_string(),
-        }
+        cascadia_types::GrammarSpec::json_schema(body)
     }
 
     fn compiled(body: &str) -> CompiledGrammar {
@@ -4926,6 +4936,34 @@ mod tests {
                 FRAME_FORWARD
             ]
         );
+    }
+
+    /// The same chain, a best-effort json task: it runs unmasked instead of
+    /// failing, counted as a stage that can't apply the constraint.
+    #[test]
+    fn a_best_effort_task_on_a_chain_without_the_mask_bit_runs_unmasked() {
+        let rt = pipe_rt();
+        let (c, frames) = fake_tail(&rt, CAPTURE_V2_CAP, false);
+        let mut head = pipe_head(2, &rt);
+        head.downstream = shared(c);
+        let reason = cascadia_metrics::UnenforcedReason::StageUnsupported;
+        let count = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[reason.as_str()])
+                .get()
+        };
+        let before = count();
+        let mut task = pipe_task("j", 3, None);
+        task = task.with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            OK_ENUM,
+        ));
+        let (ids, fin) = run_pipe_task(&mut head, task);
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(ids, vec![BAD as i64; 3], "the model's own picks");
+        assert!(count() > before);
+        drop(head);
+        let kinds = kinds(&rt.block_on(frames).unwrap());
+        assert!(!kinds.contains(&FRAME_FORWARD_MASKED), "{kinds:?}");
     }
 
     /// The bytes of a plain task's FORWARD frames, fixed from the encoding

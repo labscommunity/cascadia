@@ -5,6 +5,7 @@
 
 use cascadia_engine::{EngineError, EngineResult};
 use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
+use cascadia_metrics::{count_constraint_unenforced, UnenforcedReason};
 use cascadia_types::{GenerationTask, TaskId};
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
@@ -80,8 +81,22 @@ impl LazyGrammarFactory {
         self.cell.get()
     }
 
+    /// [`admit_task_grammar`], building the factory only for a task that
+    /// has a grammar.
+    pub(crate) fn admit(
+        &self,
+        tokenizer: Option<&Tokenizer>,
+        task: &mut GenerationTask,
+    ) -> EngineResult<Option<CompiledGrammar>> {
+        if task.grammar.is_none() {
+            return Ok(None);
+        }
+        admit_task_grammar(self.get(tokenizer), task)
+    }
+
     /// [`compile_task_grammar`], building the factory only for a task that
     /// has a grammar.
+    #[cfg(test)]
     pub(crate) fn compile(
         &self,
         tokenizer: Option<&Tokenizer>,
@@ -125,6 +140,58 @@ pub(crate) fn compile_task_grammar(
         ))
     })?;
     factory.compile(spec).map(Some)
+}
+
+/// Removes a best-effort grammar the engine can't apply from `task`, logging
+/// and counting why, so the task runs unconstrained. `false` (the task is
+/// untouched) when the task has no grammar or a strict one: the caller then
+/// refuses it as before.
+pub(crate) fn drop_best_effort_grammar(
+    task: &mut GenerationTask,
+    reason: UnenforcedReason,
+) -> bool {
+    if !task.grammar.as_ref().is_some_and(|g| g.best_effort) {
+        return false;
+    }
+    task.grammar = None;
+    warn!(
+        task = %task.task_id,
+        reason = reason.as_str(),
+        "output constraint not enforced; answering unconstrained"
+    );
+    count_constraint_unenforced(reason);
+    true
+}
+
+/// A pipeline head's admission of a structured-output task whose link has
+/// `latched` (refusing, due a re-probe, or just tripped by an unanswered
+/// probe): a best-effort grammar is dropped and the task runs unmasked; it
+/// never fails on the latch nor pays for the re-probe. `true` when dropped.
+pub(crate) fn drop_on_latched_link(task: &mut GenerationTask, latched: bool) -> bool {
+    latched && drop_best_effort_grammar(task, UnenforcedReason::StageUnsupported)
+}
+
+/// [`compile_task_grammar`] at submit: a best-effort grammar that has no
+/// factory or doesn't compile is dropped from the task (see
+/// [`drop_best_effort_grammar`]) and the task runs unconstrained; a strict
+/// one is refused as before.
+pub(crate) fn admit_task_grammar(
+    factory: &Result<GrammarFactory, String>,
+    task: &mut GenerationTask,
+) -> EngineResult<Option<CompiledGrammar>> {
+    match compile_task_grammar(factory, task) {
+        Err(e) if task.grammar.as_ref().is_some_and(|g| g.best_effort) => {
+            let reason = if factory.is_err() {
+                UnenforcedReason::NoTokenizer
+            } else {
+                UnenforcedReason::SchemaRejected
+            };
+            info!(task = %task.task_id, error = %e, "a best-effort grammar can't be built");
+            drop_best_effort_grammar(task, reason);
+            Ok(None)
+        }
+        other => other,
+    }
 }
 
 /// One `info!` per task whose schema uses keywords the grammar accepts but
@@ -191,6 +258,7 @@ pub(crate) fn words_via_apply(mask: &mut GrammarMask, width: usize) -> EngineRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cascadia_types::GrammarSpec;
 
     /// The EOS of [`GrammarFactory::single_byte_for_tests`].
     const TEST_EOS: u32 = 261;
@@ -198,10 +266,7 @@ mod tests {
     const WEATHER: &str = r#"{"type":"object","properties":{"city":{"type":"string"},"temperature_celsius":{"type":"number"},"conditions":{"type":"string","enum":["sunny","cloudy","rainy"]}},"required":["city","temperature_celsius","conditions"],"additionalProperties":false}"#;
 
     fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
-        cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: body.to_string(),
-        }
+        cascadia_types::GrammarSpec::json_schema(body)
     }
 
     fn compiled(body: &str) -> CompiledGrammar {
@@ -324,6 +389,93 @@ mod tests {
                 other.map(|g| g.is_some())
             ),
         }
+    }
+
+    fn unenforced(reason: UnenforcedReason) -> u64 {
+        cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+            .with_label_values(&[reason.as_str()])
+            .get()
+    }
+
+    #[test]
+    fn admit_task_grammar_drops_best_effort_on_compile_error() {
+        let gf: Result<GrammarFactory, String> = Ok(GrammarFactory::single_byte_for_tests());
+        let before = unenforced(UnenforcedReason::SchemaRejected);
+        let mut soft = GenerationTask::new("t", "p")
+            .with_grammar(GrammarSpec::best_effort_json_schema(r#"{"type":42}"#));
+        assert!(admit_task_grammar(&gf, &mut soft).unwrap().is_none());
+        assert_eq!(soft.grammar, None, "the dropped grammar leaves the task");
+        assert!(unenforced(UnenforcedReason::SchemaRejected) > before);
+
+        // A best-effort grammar that compiles is kept.
+        let mut good = GenerationTask::new("t", "p")
+            .with_grammar(GrammarSpec::best_effort_json_schema(WEATHER));
+        assert!(admit_task_grammar(&gf, &mut good).unwrap().is_some());
+        assert!(good.grammar.is_some());
+
+        // A strict one is refused as before, and kept on the task.
+        let mut strict = GenerationTask::new("t", "p").with_grammar(json_spec(r#"{"type":42}"#));
+        assert!(matches!(
+            admit_task_grammar(&gf, &mut strict),
+            Err(EngineError::InvalidConfig(_))
+        ));
+        assert!(strict.grammar.is_some());
+    }
+
+    #[test]
+    fn admit_task_grammar_drops_best_effort_without_a_factory() {
+        let none: Result<GrammarFactory, String> = Err("no tokenizer loaded".into());
+        let before = unenforced(UnenforcedReason::NoTokenizer);
+        let mut soft = GenerationTask::new("t", "p")
+            .with_grammar(GrammarSpec::best_effort_json_schema(WEATHER));
+        assert!(admit_task_grammar(&none, &mut soft).unwrap().is_none());
+        assert_eq!(soft.grammar, None);
+        assert!(unenforced(UnenforcedReason::NoTokenizer) > before);
+
+        let mut strict = GenerationTask::new("t", "p").with_grammar(json_spec(WEATHER));
+        match admit_task_grammar(&none, &mut strict) {
+            Err(EngineError::InvalidConfig(m)) => assert_eq!(
+                m,
+                "structured output is not available for this model: no tokenizer loaded"
+            ),
+            other => panic!(
+                "expected InvalidConfig, got {:?}",
+                other.map(|g| g.is_some())
+            ),
+        }
+
+        // Through the lazy factory too: a stage without a tokenizer.
+        let lazy = LazyGrammarFactory::unavailable("this stage has no tokenizer");
+        let mut soft = GenerationTask::new("t", "p")
+            .with_grammar(GrammarSpec::best_effort_json_schema(WEATHER));
+        assert!(lazy.admit(None, &mut soft).unwrap().is_none());
+        assert_eq!(soft.grammar, None);
+        let mut plain = GenerationTask::new("t", "p");
+        assert!(lazy.admit(None, &mut plain).unwrap().is_none());
+    }
+
+    #[test]
+    fn drop_best_effort_grammar_leaves_a_strict_one() {
+        let before = unenforced(UnenforcedReason::StageUnsupported);
+        let mut strict = GenerationTask::new("t", "p").with_grammar(json_spec(WEATHER));
+        assert!(!drop_best_effort_grammar(
+            &mut strict,
+            UnenforcedReason::StageUnsupported
+        ));
+        assert!(strict.grammar.is_some());
+        let mut plain = GenerationTask::new("t", "p");
+        assert!(!drop_best_effort_grammar(
+            &mut plain,
+            UnenforcedReason::StageUnsupported
+        ));
+        let mut soft = GenerationTask::new("t", "p")
+            .with_grammar(GrammarSpec::best_effort_json_schema(WEATHER));
+        assert!(drop_best_effort_grammar(
+            &mut soft,
+            UnenforcedReason::StageUnsupported
+        ));
+        assert_eq!(soft.grammar, None);
+        assert!(unenforced(UnenforcedReason::StageUnsupported) > before);
     }
 
     #[test]

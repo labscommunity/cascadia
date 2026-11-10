@@ -1571,6 +1571,25 @@ fn latched_refusal(
     }
 }
 
+/// [`latched_refusal`] at a task's admission, where a best-effort grammar on
+/// a latched multi-stage pipeline (refusing, or due a re-probe) is dropped
+/// instead (see [`structured::drop_on_latched_link`]): the task is stepped
+/// unmasked and never pays for the re-probe, which is left to the next
+/// strict task. `Ok(true)` when the task keeps a grammar.
+fn admit_on_latch(
+    latch: &mut MaskLatch,
+    multi_stage: bool,
+    task: &mut GenerationTask,
+    has_grammar: bool,
+    now: std::time::Instant,
+) -> EngineResult<bool> {
+    if multi_stage && has_grammar && structured::drop_on_latched_link(task, latch.since.is_some()) {
+        return Ok(false);
+    }
+    latched_refusal(latch, multi_stage, has_grammar, now)?;
+    Ok(has_grammar)
+}
+
 /// The head's token from a masked step's wait, or the error that fails the
 /// task with how to log it.
 fn head_masked_token(
@@ -2249,7 +2268,7 @@ impl Gemma4Engine {
 
     fn step_first(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.active.is_none() && !self.pending.is_empty() {
-            let PendingTask { task, grammar } = self.pending.remove(0);
+            let PendingTask { mut task, grammar } = self.pending.remove(0);
             let tok = self
                 .tokenizer
                 .clone()
@@ -2286,7 +2305,7 @@ impl Gemma4Engine {
             // Structured output: the matcher starts after the resume seed (if
             // any), before any model work, so a seed the grammar rejects costs
             // nothing and fails this task only.
-            let grammar = match grammar.as_ref().map(|g| {
+            let mut grammar = match grammar.as_ref().map(|g| {
                 start_grammar(g, &cascadia_types::resume_generated_seed(resume.as_deref()))
             }) {
                 None => None,
@@ -2304,22 +2323,37 @@ impl Gemma4Engine {
             if multi_stage && grammar.is_some() && self.mask_latch.since.is_some() {
                 self.drain_late_downstream_replies();
             }
-            if let Err(e) = latched_refusal(
+            match admit_on_latch(
                 &mut self.mask_latch,
                 multi_stage,
+                &mut task,
                 grammar.is_some(),
                 std::time::Instant::now(),
             ) {
-                self.grammar_failure = Some(GrammarFailure::Latched);
-                return Err(e.for_task(task.task_id.clone()));
+                Ok(keep) => {
+                    if !keep {
+                        grammar = None;
+                    }
+                }
+                Err(e) => {
+                    self.grammar_failure = Some(GrammarFailure::Latched);
+                    return Err(e.for_task(task.task_id.clone()));
+                }
             }
             // No evidence yet that every later stage masks: probe now, before
             // any warm-resume exchange or prefill, so an older stage costs this
             // task a short probe wait, not a token deadline.
             if needs_mask_probe(&self.mask_latch, multi_stage, grammar.is_some()) {
                 if let Err((e, kind)) = self.probe_downstream() {
-                    self.grammar_failure = kind;
-                    return Err(e.for_task(task.task_id.clone()));
+                    // An unanswered probe latched the pipeline: a best-effort
+                    // task is stepped unmasked instead of failing.
+                    if structured::drop_on_latched_link(&mut task, self.mask_latch.since.is_some())
+                    {
+                        grammar = None;
+                    } else {
+                        self.grammar_failure = kind;
+                        return Err(e.for_task(task.task_id.clone()));
+                    }
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
@@ -3051,7 +3085,7 @@ impl Engine for Gemma4Engine {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         if !self.spec.is_first_stage {
             warn!("gemma4 submit() ignored on non-first stage");
             return Err(EngineError::Backend(
@@ -3079,7 +3113,7 @@ impl Engine for Gemma4Engine {
         }
         let grammar = self
             .grammar_factory
-            .compile(self.tokenizer.as_deref(), &task)?;
+            .admit(self.tokenizer.as_deref(), &mut task)?;
         structured::log_grammar_warnings("gemma4", &task.task_id, grammar.as_ref());
         self.pending.push(PendingTask { task, grammar });
         Ok(())
@@ -4239,10 +4273,7 @@ mod tests {
     const OK_ENUM: &str = r#"{"type":"string","enum":["ok"]}"#;
 
     fn json_spec(body: &str) -> cascadia_types::GrammarSpec {
-        cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: body.to_string(),
-        }
+        cascadia_types::GrammarSpec::json_schema(body)
     }
 
     fn ok_grammar() -> CompiledGrammar {
@@ -5319,6 +5350,60 @@ mod tests {
         // Plain tasks and single-stage pipelines are never refused.
         assert!(latched_refusal(&mut latch, true, false, now).is_ok());
         assert!(latched_refusal(&mut latch, false, true, now).is_ok());
+    }
+
+    /// The head's latch check at admission: a best-effort task on a latched
+    /// pipeline is stepped unmasked, counted, and never pays for the
+    /// re-probe; a strict one is refused as before.
+    #[test]
+    fn a_best_effort_task_is_stepped_unmasked_on_a_latched_pipeline() {
+        let reason = cascadia_metrics::UnenforcedReason::StageUnsupported;
+        let count = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[reason.as_str()])
+                .get()
+        };
+        let soft = || {
+            GenerationTask::new("s", "p").with_grammar(
+                cascadia_types::GrammarSpec::best_effort_json_schema(OK_ENUM),
+            )
+        };
+        let strict = || GenerationTask::new("j", "p").with_grammar(json_spec(OK_ENUM));
+        let now = std::time::Instant::now();
+        let mut latch = MaskLatch::default();
+        let mut t = soft();
+        assert!(admit_on_latch(&mut latch, true, &mut t, true, now).unwrap());
+        assert!(t.grammar.is_some());
+
+        latch.trip_probe(now);
+        let before = count();
+        let mut t = soft();
+        assert!(!admit_on_latch(&mut latch, true, &mut t, true, now).unwrap());
+        assert_eq!(t.grammar, None);
+        assert!(count() > before);
+        let mut t = strict();
+        match admit_on_latch(&mut latch, true, &mut t, true, now) {
+            Err(EngineError::Backend(m)) => assert_eq!(m, UPGRADE_EVERY_STAGE),
+            other => panic!("{other:?}"),
+        }
+
+        // Due a re-probe: the best-effort task doesn't pay for it (the latch
+        // stays for the next strict task), which then goes ahead.
+        let later = now + MASK_PROBE_REPROBE_AFTER;
+        let mut t = soft();
+        assert!(!admit_on_latch(&mut latch, true, &mut t, true, later).unwrap());
+        assert!(latch.since.is_some(), "left for a strict task to re-probe");
+        let mut t = strict();
+        assert!(admit_on_latch(&mut latch, true, &mut t, true, later).unwrap());
+        assert!(needs_mask_probe(&latch, true, true));
+
+        // Single-stage pipelines and plain tasks are never touched.
+        let mut t = soft();
+        latch.trip(now);
+        assert!(admit_on_latch(&mut latch, false, &mut t, true, now).unwrap());
+        assert!(t.grammar.is_some());
+        let mut plain = GenerationTask::new("p", "p");
+        assert!(!admit_on_latch(&mut latch, true, &mut plain, false, now).unwrap());
     }
 
     /// A late two-lane reply still queued when a control exchange starts must

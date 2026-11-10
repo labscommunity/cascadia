@@ -365,10 +365,8 @@ mod tests {
     }
 
     fn json_schema_task(id: &str, body: &str) -> GenerationTask {
-        GenerationTask::new(id, "ignored prompt words").with_grammar(cascadia_types::GrammarSpec {
-            kind: cascadia_types::GrammarKind::JsonSchema,
-            body: body.to_string(),
-        })
+        GenerationTask::new(id, "ignored prompt words")
+            .with_grammar(cascadia_types::GrammarSpec::json_schema(body))
     }
 
     fn drain(e: &mut MockEngine) -> Vec<Chunk> {

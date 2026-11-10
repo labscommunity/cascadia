@@ -2121,6 +2121,101 @@ fn a_probe_latch_re_probes_after_a_minute() {
     assert_eq!(log.probes(), 1);
 }
 
+fn soft_json_task(id: &str, max_tokens: u32) -> GenerationTask {
+    GenerationTask::new(id, "hi")
+        .with_max_tokens(max_tokens)
+        .with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            WEATHER,
+        ))
+}
+
+fn stage_unsupported_count() -> u64 {
+    cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+        .with_label_values(&[cascadia_metrics::UnenforcedReason::StageUnsupported.as_str()])
+        .get()
+}
+
+/// A best-effort json request on a chain with an older last stage: the
+/// probe goes unanswered, the request runs unmasked instead of failing, and
+/// the link latches as for any json request.
+#[test]
+fn a_best_effort_request_runs_unmasked_when_the_probe_goes_unanswered() {
+    for streams in [0, 2] {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let log = fixture_tail(&rt, l[0].0.clone(), true);
+        let mut head = head_engine_with(
+            &rt,
+            JsonStub::new(),
+            l.remove(0).1,
+            2,
+            streams,
+            TEST_PROBE,
+            IDLE_LINK_CHECK,
+        );
+        let before = stage_unsupported_count();
+        let (j, _) = timed(&mut head, soft_json_task("j", 4));
+        assert_eq!(final_chunk(&j).error, None, "{streams}");
+        assert_eq!(j.tokens, vec![u32::from(b'a'); 4], "{streams}: unmasked");
+        assert!(head.stage_masks.latch.is_set(), "{streams}");
+        assert!(stage_unsupported_count() > before, "{streams}");
+        // The old tail logs the probe as one masked Forward it skipped.
+        assert_eq!(log.frames()[0], (FrameKind::Forward, true), "{streams}");
+        assert!(
+            log.frames().iter().skip(1).all(|(_, masked)| !masked),
+            "{streams}: only the probe is masked: {:?}",
+            log.frames()
+        );
+    }
+}
+
+/// On a latched link, refusing or due a re-probe, a best-effort json
+/// request runs unmasked at once: it never fails on the latch and never
+/// pays for the re-probe. A strict one is refused, then re-probes.
+#[test]
+fn a_best_effort_request_runs_unmasked_on_a_latched_link_without_a_probe() {
+    for streams in [0, 2] {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let log = fixture_tail(&rt, l[0].0.clone(), false);
+        let mut head = head_engine_with(
+            &rt,
+            JsonStub::new(),
+            l.remove(0).1,
+            2,
+            streams,
+            TEST_PROBE,
+            IDLE_LINK_CHECK,
+        );
+        let before = stage_unsupported_count();
+        head.stage_masks.latch.set_probe_at(Instant::now());
+        let (j, _) = timed(&mut head, soft_json_task("j1", 4));
+        assert_eq!(final_chunk(&j).error, None, "{streams}");
+        assert_eq!(j.tokens, vec![u32::from(b'a'); 4], "{streams}");
+        let (s, _) = timed(&mut head, json_task("s1", 4));
+        assert_eq!(
+            final_chunk(&s).error.as_deref(),
+            Some(UPGRADE_EVERY_STAGE),
+            "{streams}"
+        );
+        // Due a re-probe: still no probe for the best-effort one.
+        let past = Instant::now() - cascadia_grammar::MASK_PROBE_REPROBE_AFTER;
+        head.stage_masks.latch.set_probe_at(past);
+        let (j, _) = timed(&mut head, soft_json_task("j2", 4));
+        assert_eq!(final_chunk(&j).error, None, "{streams}");
+        assert_eq!(
+            log.probes(),
+            0,
+            "{streams}: the best-effort ones never probe"
+        );
+        assert!(stage_unsupported_count() >= before + 2, "{streams}");
+        // The strict one pays for it, and is then enforced.
+        let (s, _) = timed(&mut head, json_task("s2", 4));
+        assert_eq!(final_chunk(&s).error, None, "{streams}");
+        assert_eq!(log.probes(), 1, "{streams}");
+    }
+}
+
 // ---- the MiniMax engine's probe, driven step by step -----------------------
 //
 // The SparseMoE head and its workers need model files, so the probe is

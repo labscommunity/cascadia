@@ -27,10 +27,7 @@ fn single_byte() -> GrammarFactory {
 }
 
 fn spec(body: &str) -> GrammarSpec {
-    GrammarSpec {
-        kind: GrammarKind::JsonSchema,
-        body: body.to_string(),
-    }
+    GrammarSpec::json_schema(body)
 }
 
 fn mask_for(gf: &GrammarFactory, body: &str) -> GrammarMask {
