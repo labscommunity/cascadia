@@ -87,6 +87,30 @@ pub fn prompt_counts(detail: &str) -> (Option<u32>, Option<u32>) {
     (tokens, window)
 }
 
+/// OpenVINO GenAI's own NPU prompt cap, which fires inside generation rather
+/// than as a typed over-window error: "Stateful LLM pipeline on NPU may only
+/// process prompts or generated texts up to N tokens. M is passed. ...".
+/// `Some((prompt tokens, window))` when `detail` carries that wording (matched
+/// case-insensitively on "may only process prompts", anywhere in the text, as
+/// the native exception may put its own preamble first), with the window
+/// read after "up to " and the tokens before " is passed"; `None` otherwise.
+pub fn genai_npu_prompt_cap(detail: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let lower = detail.to_ascii_lowercase();
+    let at = lower.find("may only process prompts")?;
+    let rest = &lower[at..];
+    let window = rest
+        .find("up to ")
+        .and_then(|i| leading_count(&rest[i + "up to ".len()..]));
+    let tokens = rest.find(" is passed").and_then(|i| {
+        let before = &rest[..i];
+        let start = before
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map_or(0, |j| j + 1);
+        before[start..].parse().ok()
+    });
+    Some((tokens, window))
+}
+
 /// OpenAI's wording for a prompt over the context window, which client
 /// libraries match to recognise context overflow: every form starts with
 /// "This model's maximum context length is". `noun` is the request field
@@ -303,6 +327,34 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// OpenVINO GenAI's own NPU prompt cap, raised inside generation.
+    const GENAI_NPU_CAP: &str = "Stateful LLM pipeline on NPU may only process prompts or \
+         generated texts up to 1024 tokens. 6393 is passed. Set the \"MAX_PROMPT_LEN\" config \
+         option to increase the limit.";
+
+    #[test]
+    fn genai_npu_cap_reads_its_counts() {
+        assert_eq!(
+            genai_npu_prompt_cap(GENAI_NPU_CAP),
+            Some((Some(6393), Some(1024)))
+        );
+        // Lower case, and behind the native exception's own preamble.
+        let wrapped = format!(
+            "Exception from src/cpp/src/llm/pipeline_stateful.cpp:123:\n{}",
+            GENAI_NPU_CAP.to_lowercase()
+        );
+        assert_eq!(
+            genai_npu_prompt_cap(&wrapped),
+            Some((Some(6393), Some(1024)))
+        );
+        // The wording without numbers still matches.
+        assert_eq!(
+            genai_npu_prompt_cap("pipeline may only process prompts of limited length"),
+            Some((None, None))
+        );
+        assert_eq!(genai_npu_prompt_cap("stage 1 hung up"), None);
     }
 
     /// One row per engine's over-window wording, numbers filled in.

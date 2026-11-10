@@ -5573,7 +5573,8 @@ fn sse_error_frame(task_id: &str, reason: &str, prompt_param: &str) -> Bytes {
 /// `backend error: ` wrapper (as `cascadia_engine::is_client_error_reason`
 /// reads it); behind them, a prompt over the window is a 400
 /// `context_length_exceeded` naming `prompt_param` and worded as
-/// [`engine_error_response`] words the typed refusal, and the other
+/// [`engine_error_response`] words the typed refusal (OpenVINO GenAI's own
+/// NPU prompt cap, [`errors::genai_npu_prompt_cap`], is one too), and the other
 /// client-fault refusals (`unsupported input: `, `invalid_request: `,
 /// `invalid configuration: `) are a 400 with the text as it came, the status
 /// `EngineError::http_status` gives those variants. Anything else is the
@@ -5594,6 +5595,14 @@ fn classify_chunk_error<'p>(
         return (
             StatusCode::BAD_REQUEST,
             errors::context_length_message(prompt_param, window, tokens, detail),
+            Some(prompt_param),
+            Some("context_length_exceeded"),
+        );
+    }
+    if let Some((tokens, window)) = errors::genai_npu_prompt_cap(r) {
+        return (
+            StatusCode::BAD_REQUEST,
+            errors::context_length_message(prompt_param, window, tokens, r),
             Some(prompt_param),
             Some("context_length_exceeded"),
         );
@@ -11823,6 +11832,106 @@ level={{ effort_map[eff] }}";
         );
         // The caller's fault says nothing about the pipeline.
         assert_eq!(health_status(app).await, StatusCode::OK);
+    }
+
+    /// OpenVINO GenAI's NPU prompt cap, raised mid-generation and reported
+    /// the way the ov-genai engine's step reports it.
+    const MID_GENERATION_NPU_CAP: &str = "task t-9: backend error: Stateful LLM pipeline on NPU \
+         may only process prompts or generated texts up to 1024 tokens. 6393 is passed. Set the \
+         \"MAX_PROMPT_LEN\" config option to increase the limit.";
+
+    const NPU_CAP_SENTENCE: &str = "This model's maximum context length is 1024 tokens. \
+         However, your messages resulted in 6393 tokens.";
+
+    #[test]
+    fn classify_reads_the_genai_npu_cap_with_or_without_prefixes() {
+        let bare = MID_GENERATION_NPU_CAP
+            .strip_prefix("task t-9: backend error: ")
+            .unwrap();
+        for reason in [
+            MID_GENERATION_NPU_CAP,
+            bare,
+            &format!("backend error: {bare}"),
+        ] {
+            let (s, m, p, c) = classify_chunk_error(reason, "messages");
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{reason}");
+            assert_eq!((p, c), (Some("messages"), Some("context_length_exceeded")));
+            assert!(m.starts_with(NPU_CAP_SENTENCE), "{m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_generation_genai_npu_cap_is_context_length_exceeded() {
+        let (app, _release) = gated_app_failing(&[], Some(MID_GENERATION_NPU_CAP)).await;
+        let resp = app
+            .clone()
+            .oneshot(chat_http_request("hi", false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        assert_eq!(v["error"]["code"], "context_length_exceeded", "{v}");
+        assert_eq!(v["error"]["param"], "messages", "{v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with(NPU_CAP_SENTENCE), "{msg}");
+        assert_eq!(health_status(app).await, StatusCode::OK);
+
+        // Streamed chat: the error frame.
+        let (app, release) = gated_app_failing(&["Hi "], Some(MID_GENERATION_NPU_CAP)).await;
+        release.store(true, Ordering::SeqCst);
+        let resp = app
+            .clone()
+            .oneshot(chat_http_request("hi", true))
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        let events = sse_events(&body);
+        let last = events.last().unwrap();
+        assert_eq!(last["object"], "error", "{body}");
+        assert_eq!(last["error"]["code"], "context_length_exceeded", "{body}");
+        assert_eq!(last["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(last["error"]["param"], "messages", "{body}");
+        assert_eq!(health_status(app).await, StatusCode::OK);
+
+        // Streamed Responses: response.failed.
+        let (app, release) = gated_app_failing(&["Hi "], Some(MID_GENERATION_NPU_CAP)).await;
+        release.store(true, Ordering::SeqCst);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model": "mock-model", "input": "hi", "stream": true})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        let data = body
+            .split("\n\n")
+            .find_map(|f| f.strip_prefix("event: response.failed\ndata: "))
+            .unwrap_or_else(|| panic!("no response.failed: {body}"));
+        let v: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(
+            v["response"]["error"]["code"], "context_length_exceeded",
+            "{v}"
+        );
+        let msg = v["response"]["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with(
+                "This model's maximum context length is 1024 tokens. However, your input \
+                 resulted in 6393 tokens."
+            ),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
