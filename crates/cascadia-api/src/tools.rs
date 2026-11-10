@@ -526,7 +526,11 @@ fn empty_parameters() -> Value {
 /// `response_format` schema. A `$ref` of any other form, a `$ref` in a
 /// schema that also has a nested `$id` (which would change what the ref
 /// resolves against), or a result over those limits, gives `None`, logged and counted: the turn then runs
-/// unconstrained. The grammar is best-effort for the same reason.
+/// unconstrained. So does a tool's parameters (or the format) schema holding
+/// a bound pair no value can meet ([`crate::unsatisfiable_bound`]), such as
+/// `minLength` above `maxLength`: no call could match it, and some backends
+/// would decode until the request is killed. The log names the tool and the
+/// pointer to the pair. The grammar is best-effort for the same reason.
 pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<GrammarSpec> {
     // Under a forced choice the format is moot: the answer is the call.
     let format_schema = match (policy.forced(), format_schema) {
@@ -536,14 +540,48 @@ pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<
     };
     match tool_schema(policy, format_schema) {
         Ok(body) => body.map(GrammarSpec::best_effort_json_schema),
-        Err(reason) => {
-            tracing::warn!(
-                reason = reason.as_str(),
-                "tool-call output constraint not enforced; answering unconstrained"
-            );
+        Err(Unenforced { reason, detail }) => {
+            match detail {
+                Some(detail) => tracing::warn!(
+                    reason = reason.as_str(),
+                    %detail,
+                    "tool-call output constraint not enforced; answering unconstrained"
+                ),
+                None => tracing::warn!(
+                    reason = reason.as_str(),
+                    "tool-call output constraint not enforced; answering unconstrained"
+                ),
+            }
             cascadia_metrics::count_constraint_unenforced(reason);
             None
         }
+    }
+}
+
+/// Why [`tool_schema`] built nothing, and where when it can tell.
+struct Unenforced {
+    reason: UnenforcedReason,
+    detail: Option<String>,
+}
+
+impl From<UnenforcedReason> for Unenforced {
+    fn from(reason: UnenforcedReason) -> Self {
+        Unenforced {
+            reason,
+            detail: None,
+        }
+    }
+}
+
+/// `Err` naming the first bound pair in `schema` no value can meet, found
+/// by [`crate::unsatisfiable_bound`]; `what` says whose schema it is.
+fn check_meetable(schema: &Value, what: &str) -> Result<(), Unenforced> {
+    match crate::unsatisfiable_bound(schema) {
+        Some(found) => Err(Unenforced {
+            reason: UnenforcedReason::SchemaRejected,
+            detail: Some(format!("{what}: {found}; no call can match it")),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -552,7 +590,7 @@ pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<
 fn tool_schema(
     policy: &ToolPolicy,
     format_schema: Option<&str>,
-) -> Result<Option<String>, UnenforcedReason> {
+) -> Result<Option<String>, Unenforced> {
     let named = match &policy.mode {
         ToolMode::Named(name) => Some(name.as_str()),
         _ => None,
@@ -568,7 +606,10 @@ fn tool_schema(
         }
         let parameters = match tool.function.get("parameters") {
             None | Some(Value::Null) => empty_parameters(),
-            Some(p) => hoisted.take(p.clone(), &format!("t{i}_"))?,
+            Some(p) => {
+                check_meetable(p, &format!("tool `{name}` parameters"))?;
+                hoisted.take(p.clone(), &format!("t{i}_"))?
+            }
         };
         items.push(json!({
             "type": "object",
@@ -599,6 +640,7 @@ fn tool_schema(
             // The format schema was parsed once already; it can't fail here.
             let format: Value =
                 serde_json::from_str(text).map_err(|_| UnenforcedReason::SchemaRejected)?;
+            check_meetable(&format, "response_format schema")?;
             let format = hoisted.take(format, "rf_")?;
             let mut root = Map::new();
             root.insert("anyOf".into(), json!([Value::Object(calls), format]));
@@ -617,7 +659,7 @@ fn tool_schema(
     let text = serde_json::to_string(&root).map_err(|_| UnenforcedReason::TooComplex)?;
     check_schema(&root, &text)
         .map(Some)
-        .map_err(|_| UnenforcedReason::TooComplex)
+        .map_err(|_| UnenforcedReason::TooComplex.into())
 }
 
 /// The definitions moved to the root of a tool grammar, by keyword.
@@ -1574,6 +1616,48 @@ mod tests {
             json!({"type": "object", "properties": {"next": {"$ref": "#/$defs/rf_root"}}})
         );
         assert_eq!(b["anyOf"][1], json!({"$ref": "#/$defs/rf_root"}));
+    }
+
+    #[test]
+    fn tool_schema_no_value_can_meet_gives_no_grammar() {
+        let unmeetable = [
+            json!({"type": "object", "properties": {
+                "city": {"type": "string", "minLength": 5, "maxLength": 2}}}),
+            // An integer range that holds numbers but no integer.
+            json!({"type": "object", "properties": {
+                "n": {"type": "integer", "exclusiveMinimum": 2, "exclusiveMaximum": 3}}}),
+        ];
+        for params in unmeetable {
+            let before = unenforced(UnenforcedReason::SchemaRejected);
+            let p = pol(
+                json!([weather(), with_params("f", params.clone())]),
+                Some(json!("required")),
+                None,
+            );
+            assert!(tool_grammar(&p, None).is_none(), "{params}");
+            assert!(
+                unenforced(UnenforcedReason::SchemaRejected) > before,
+                "{params}"
+            );
+        }
+        // A tool a named choice leaves out doesn't count.
+        let bad = json!({"type": "string", "minLength": 5, "maxLength": 2});
+        let p = pol(
+            json!([weather(), with_params("f", bad)]),
+            Some(json!({"type": "function", "function": {"name": "get_weather"}})),
+            None,
+        );
+        assert!(tool_grammar(&p, None).is_some());
+        // Bounds that some value meets: the grammar as before.
+        let fine = json!({"type": "object", "properties": {
+            "city": {"type": "string", "minLength": 2, "maxLength": 5},
+            "n": {"type": "integer", "exclusiveMinimum": 2, "exclusiveMaximum": 4}}});
+        let p = pol(
+            json!([with_params("f", fine)]),
+            Some(json!("required")),
+            None,
+        );
+        assert!(tool_grammar(&p, None).is_some());
     }
 
     #[test]

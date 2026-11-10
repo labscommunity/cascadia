@@ -10898,6 +10898,31 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    #[tokio::test]
+    async fn a_tool_schema_no_value_can_meet_runs_unconstrained() {
+        let rejected = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[cascadia_metrics::UnenforcedReason::SchemaRejected.as_str()])
+                .get()
+        };
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let before = rejected();
+        let tool = serde_json::json!({"type": "function", "function": {"name": "get_city",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string", "minLength": 5, "maxLength": 2}}}}});
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([tool]),
+                serde_json::json!({"tool_choice": "required"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(last_task(&seen).grammar, None);
+        assert!(rejected() > before);
+    }
+
     /// SSE events of a streamed chat body with the per-response values
     /// (`id`, `created`, call ids) replaced by fixed ones.
     fn normalised_events(body: &str) -> Vec<Value> {
