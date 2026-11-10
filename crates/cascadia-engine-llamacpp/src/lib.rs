@@ -3451,6 +3451,36 @@ mod unix_tests {
         assert_eq!(counted, 1);
     }
 
+    /// A tool-call grammar travels as `response_format` like a json one, so
+    /// with thinking off it caps reasoning at 0 too, and the resend without
+    /// the grammar keeps the cap: thinking is still off.
+    #[test]
+    fn a_tool_call_grammar_with_thinking_off_caps_reasoning_on_both_sends() {
+        let mut task = chat_task().with_grammar(
+            cascadia_types::GrammarSpec::best_effort_json_schema(TOOL_SCHEMA),
+        );
+        task.enable_thinking = false;
+        task.tools = Some(serde_json::json!([{"type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}}]));
+        let Run { bodies, .. } = run_against(
+            task,
+            vec![
+                error_reply("400 Bad Request", "failed to parse grammar"),
+                ok_reply("Sunny."),
+            ],
+        );
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        for (i, text) in bodies.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["reasoning_budget_tokens"], 0, "send {i}: {text}");
+            assert_eq!(
+                body["response_format"].is_object(),
+                i == 0,
+                "send {i}: {text}"
+            );
+        }
+    }
+
     #[test]
     fn names_the_constraint_matches_grammar_and_schema_refusals() {
         for body in [

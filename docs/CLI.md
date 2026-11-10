@@ -919,7 +919,9 @@ pair is still a 400.
 
 - Thinking is turned off for an enforced turn: the constraint starts at the
   first token. On `ov-genai` it is also off for a forced turn that could not
-  be constrained.
+  be constrained. On `sycl-llama` an enforced turn also sets
+  `reasoning_budget_tokens: 0`, as a JSON request with thinking off does,
+  and keeps it when the request is sent again without the constraint.
 - `finish_reason` is `"stop"` for a named function or custom tool (as OpenAI
   reports it) and `"tool_calls"` for every other answer with calls. A
   forced answer cut by `max_tokens` before it parses is returned as content
