@@ -469,3 +469,188 @@ fn mid_decode_silent_worker_errors_within_deadline() {
          (gateway inter-token budget is 180s; the engine must beat it)"
     );
 }
+
+// ---- M18 task 6a: single-stage in-flight cancel and stop ------------------
+//
+// The single-stage path makes the whole answer in one blocking runner call.
+// These drive the polled runner calls directly (a `should_stop` that ends at a
+// known token, deterministic) and the single-stage engine through
+// `Engine::step`. Gated like the rest of this file; red at the base (no
+// `*_polled` API, no handle), green at the tip, on the box.
+
+/// A full-range single-stage `Runner` (layer 0 + every shell + the head).
+fn single_stage_runner() -> cascadia_engine_sparse_moe::Runner {
+    let dir = tiny_dir().expect("caller must gate on tiny_dir() first");
+    let m = Manifest::load(&dir).expect("manifest");
+    cascadia_engine_sparse_moe::Runner::load(
+        dir,
+        "CPU",
+        cascadia_ov_genai_shim::PluginConfig::new(),
+        cascadia_engine_sparse_moe::runner::LayerRange {
+            layer_start: 1,
+            layer_end: moe_end(&m),
+            is_first: true,
+            is_last: true,
+        },
+    )
+    .expect("single-stage Runner::load")
+}
+
+/// A single-stage (`total == 1`) engine over the tiny tree.
+fn single_stage_engine(stop_check: bool) -> Box<dyn Engine> {
+    let dir = tiny_dir().expect("caller must gate on tiny_dir() first");
+    let m = Manifest::load(&dir).expect("manifest");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let engine: Box<dyn Engine> = rt.block_on(async move {
+        let mut b = SparseMoEBuilder::new(
+            SparseMoEBuilderConfig::new(dir.to_str().expect("utf8 path"), "CPU")
+                .with_engine_stop_check(stop_check),
+        );
+        let _progress = b.load(shard(&m, true, true)).await.expect("load");
+        Box::new(b).build().expect("build")
+    });
+    std::mem::forget(rt);
+    engine
+}
+
+const POLL_PROMPT: [i64; 6] = [3, 4, 5, 6, 7, 8];
+
+#[test]
+fn single_stage_polled_cancel_at_decode_token_k_returns_k_tokens() {
+    let Some(_dir) = tiny_dir() else {
+        return;
+    };
+    let mut r = single_stage_runner();
+    let cfg = cascadia_engine_sparse_moe::SamplingConfig::default(); // greedy
+    let baseline = r.generate(&POLL_PROMPT, 12, &cfg).expect("baseline");
+    let k = 3usize;
+    assert!(baseline.len() > k, "baseline too short: {baseline:?}");
+    let mut polls = 0usize;
+    let got = r
+        .generate_with_cache_polled(&POLL_PROMPT, 12, &cfg, None, &mut |ids| {
+            polls += 1;
+            ids.len() >= k
+        })
+        .expect("polled");
+    assert_eq!(got, baseline[..k], "a stop at token k returns the first k");
+    // One poll per prefill token, then one per decode token up to the stop.
+    assert_eq!(polls, POLL_PROMPT.len() + k);
+
+    // Speculative: polled per round, so it may run one round past k.
+    let mut draft = cascadia_engine_sparse_moe::Draft::new().with_draft_k(4);
+    let spec_base = r
+        .generate_speculative(&POLL_PROMPT, 12, &cfg, &mut draft)
+        .expect("spec baseline");
+    let mut draft = cascadia_engine_sparse_moe::Draft::new().with_draft_k(4);
+    let spec = r
+        .generate_speculative_polled(&POLL_PROMPT, 12, &cfg, &mut draft, &mut |ids| {
+            ids.len() >= k
+        })
+        .expect("spec polled");
+    assert!(spec.len() >= k && spec.len() <= k + 4 + 1, "{spec:?}");
+    assert_eq!(
+        spec[..],
+        spec_base[..spec.len()],
+        "a prefix of the full run"
+    );
+}
+
+#[test]
+fn single_stage_prefill_cancel_leaves_the_prefix_cache_unchanged() {
+    let Some(_dir) = tiny_dir() else {
+        return;
+    };
+    let mut r = single_stage_runner();
+    let cfg = cascadia_engine_sparse_moe::SamplingConfig::default();
+    let baseline = r.generate(&POLL_PROMPT, 6, &cfg).expect("baseline");
+    let mut cache = cascadia_engine_sparse_moe::KvPrefixCache::new(4);
+    // Stop before the third prefill token.
+    let mut polls = 0usize;
+    let got = r
+        .generate_with_cache_polled(&POLL_PROMPT, 6, &cfg, Some(&mut cache), &mut |_| {
+            polls += 1;
+            polls >= 3
+        })
+        .expect("polled");
+    assert!(got.is_empty(), "a prefill stop generates nothing: {got:?}");
+    assert_eq!(cache.len(), 0, "a partial prefill must not be cached");
+    // The next same-prompt run is a MISS (it inserts) with the baseline answer.
+    let again = r
+        .generate_with_cache(&POLL_PROMPT, 6, &cfg, Some(&mut cache))
+        .expect("again");
+    assert_eq!(cache.len(), 1, "a miss inserts the full prompt");
+    assert_eq!(again, baseline);
+}
+
+#[test]
+fn single_stage_engine_cancel_before_begin_is_an_empty_cancelled_final() {
+    let Some(_dir) = tiny_dir() else {
+        return;
+    };
+    let mut eng = single_stage_engine(true);
+    let h = eng
+        .inflight_cancel()
+        .expect("single-stage engine has a handle");
+    h.cancel(&"c1".to_string());
+    eng.submit(GenerationTask::new("c1", "hello").with_max_tokens(8))
+        .unwrap();
+    let out = eng.step().unwrap();
+    assert_eq!(out.len(), 1);
+    let c = &out[0].1;
+    assert!(
+        c.is_final && c.error.is_none() && c.text.is_empty(),
+        "{c:?}"
+    );
+    assert_eq!(c.finish_reason, Some(FinishReason::Cancelled));
+    assert!(!h.cancelled(), "end() freed the handle");
+    // The next task runs normally.
+    eng.submit(GenerationTask::new("c2", "hello").with_max_tokens(2))
+        .unwrap();
+    let out = eng.step().unwrap();
+    assert!(out[0].1.is_final && out[0].1.error.is_none());
+    assert_ne!(out[0].1.finish_reason, Some(FinishReason::Cancelled));
+}
+
+/// A stop taken from the middle of the baseline answer ends the run early with
+/// `stop`, and the text keeps the stop (the API makes the cut).
+#[test]
+fn single_stage_engine_stops_at_a_stop_string() {
+    let Some(_dir) = tiny_dir() else {
+        return;
+    };
+    let mut eng = single_stage_engine(true);
+    eng.submit(GenerationTask::new("s0", "hello").with_max_tokens(24))
+        .unwrap();
+    let base = eng.step().unwrap().remove(0).1;
+    let text = base.text.clone();
+    let Some(stop) = middle_stop(&text) else {
+        eprintln!("baseline text too short for a stop test: {text:?}; skipping");
+        return;
+    };
+    let mut task = GenerationTask::new("s1", "hello").with_max_tokens(24);
+    task.sampling.stop = vec![stop.clone()];
+    eng.submit(task).unwrap();
+    let c = eng.step().unwrap().remove(0).1;
+    assert_eq!(c.finish_reason, Some(FinishReason::Stop), "{c:?}");
+    assert!(c.text.contains(&stop), "{:?} lacks {stop:?}", c.text);
+    assert!(c.n_tokens.unwrap() < base.n_tokens.unwrap(), "ended early");
+
+    // The check off: the same request runs to the end.
+    let mut off = single_stage_engine(false);
+    let mut task = GenerationTask::new("s2", "hello").with_max_tokens(24);
+    task.sampling.stop = vec![stop];
+    off.submit(task).unwrap();
+    let c = off.step().unwrap().remove(0).1;
+    assert_eq!(c.n_tokens, base.n_tokens);
+    assert_eq!(c.text, text);
+}
+
+/// A few chars from the second quarter of `text`, if it has enough.
+fn middle_stop(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 16 {
+        return None;
+    }
+    let s: String = chars[chars.len() / 4..chars.len() / 4 + 4].iter().collect();
+    (!s.trim().is_empty() && !s.contains('\u{FFFD}')).then_some(s)
+}

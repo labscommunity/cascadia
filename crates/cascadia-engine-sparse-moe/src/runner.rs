@@ -2242,7 +2242,27 @@ impl Runner {
         prompt_ids: &[i64],
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
+        cache: Option<&mut KvPrefixCache>,
+    ) -> Result<Vec<i64>, RunnerError> {
+        self.generate_with_cache_polled(prompt_ids, max_tokens, cfg, cache, &mut |_| false)
+    }
+
+    /// [`Self::generate_with_cache`] that can end early (M18 D3).
+    /// `should_stop` gets the ids generated so far and returns `true` to stop.
+    /// It is polled before each prefill token's forward (with no ids yet) and
+    /// before each decode token's forward. On a stop the ids so far are
+    /// returned (`Ok`, never an error), so the bound is one token.
+    ///
+    /// A stop during prefill returns at once with no ids and never touches the
+    /// prefix cache: a partial KV must never be stored under the full prompt
+    /// key. A stop after prefill completed keeps the snapshot it inserted.
+    pub fn generate_with_cache_polled(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
         mut cache: Option<&mut KvPrefixCache>,
+        should_stop: &mut dyn FnMut(&[i64]) -> bool,
     ) -> Result<Vec<i64>, RunnerError> {
         self.reset_kv();
         let eos: Vec<i64> = self
@@ -2310,6 +2330,16 @@ impl Runner {
                 // contract enforces `cache_skip < prompt.len()`, so
                 // there is always at least one suffix token below.
                 continue;
+            }
+            if should_stop(&generated) {
+                // Before the cache insert below: nothing of this partial
+                // prefill is cached.
+                info!(
+                    prefilled = i,
+                    prompt_len = prompt_ids.len(),
+                    "prefill stopped early; not caching"
+                );
+                return Ok(generated);
             }
             let logits = self.step(&history, 1)?;
             last_logits = Some(logits);
@@ -2387,6 +2417,10 @@ impl Runner {
 
         // Decode.
         for step_i in 1..max_tokens {
+            if should_stop(&generated) {
+                debug!(step = step_i, "should_stop — stopping");
+                break;
+            }
             let t_step = Instant::now();
             let logits = self.step(&history, 1)?;
             let next = crate::sampling::sample(&logits, &history, cfg, &mut rng);
@@ -2502,11 +2536,29 @@ impl Runner {
         cfg: &crate::sampling::SamplingConfig,
         draft: &mut crate::ngram_draft::Draft,
     ) -> Result<Vec<i64>, RunnerError> {
+        self.generate_speculative_polled(prompt_ids, max_tokens, cfg, draft, &mut |_| false)
+    }
+
+    /// [`Self::generate_speculative`] that can end early (M18 D3).
+    /// `should_stop` gets the ids generated so far and returns `true` to stop.
+    /// It is polled before each prefill token's forward (with no ids yet) and
+    /// before each speculative round, so the bound is one round (up to the
+    /// draft K plus the bonus token). On a stop the ids so far are returned.
+    /// The temperature > 0 fallback polls like
+    /// [`Self::generate_with_cache_polled`] (no prefix cache).
+    pub fn generate_speculative_polled(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        draft: &mut crate::ngram_draft::Draft,
+        should_stop: &mut dyn FnMut(&[i64]) -> bool,
+    ) -> Result<Vec<i64>, RunnerError> {
         // Non-greedy sampling falls through to the standard path —
         // greedy-acceptance spec decode would change the output
         // distribution under temperature > 0.
         if cfg.temperature > 0.0 {
-            return self.generate(prompt_ids, max_tokens, cfg);
+            return self.generate_with_cache_polled(prompt_ids, max_tokens, cfg, None, should_stop);
         }
 
         self.reset_kv();
@@ -2530,6 +2582,10 @@ impl Runner {
         let mut last_logits: Option<Vec<f32>> = None;
         let t_pre = Instant::now();
         for &t in prompt_ids.iter() {
+            if should_stop(&generated) {
+                info!("spec: prefill stopped early");
+                return Ok(generated);
+            }
             history.push(t);
             let logits = self.step(&history, 1)?;
             last_logits = Some(logits);
@@ -2554,6 +2610,10 @@ impl Runner {
         let mut n_drafts_total: u32 = 0;
         let mut n_accepted_total: u32 = 0;
         while generated.len() < max_tokens {
+            if should_stop(&generated) {
+                debug!(round = n_rounds, "spec: should_stop — stopping");
+                break;
+            }
             n_rounds += 1;
             let budget = max_tokens - generated.len();
             // 1. Propose draft tokens via n-gram lookup.

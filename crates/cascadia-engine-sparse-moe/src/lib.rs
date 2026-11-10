@@ -46,6 +46,7 @@ pub mod kv_coordination;
 pub mod kv_prefix_cache;
 pub mod manifest;
 pub mod ngram_draft;
+mod one_shot;
 pub mod ov_kv_cache;
 #[cfg(feature = "kv_coord")]
 pub mod ov_kv_coordination;

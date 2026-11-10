@@ -184,6 +184,12 @@ pub struct SparseMoEBuilderConfig {
     /// Only meaningful while the AXPY-form path is active — the
     /// non-AXPY (bf16 boundary) path doesn't surface `silu(gate)`.
     pub ffn_sparsity_capture_dir: Option<PathBuf>,
+    /// M18 D6: a single-stage one-shot generation ends at a `stop` match
+    /// (checked in-engine on a suffix decode of the generated ids) instead of
+    /// running to `max_tokens`. Default `true`; off when the server has a
+    /// marker dialect, whose engine text isn't what the API matches. A cancel
+    /// ends the generation either way.
+    pub engine_stop_check: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -222,7 +228,15 @@ impl SparseMoEBuilderConfig {
             ffn_axpy_prebuild: false,
             ffn_sparsity_thresholds_file: None,
             ffn_sparsity_capture_dir: None,
+            engine_stop_check: true,
         }
+    }
+
+    /// M18 D6: whether a single-stage one-shot generation ends at a `stop`
+    /// match (see [`Self::engine_stop_check`]).
+    pub fn with_engine_stop_check(mut self, on: bool) -> Self {
+        self.engine_stop_check = on;
+        self
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
@@ -1181,6 +1195,8 @@ impl Builder for SparseMoEBuilder {
                 cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
             ),
             active: None,
+            inflight: Arc::new(cascadia_engine::InflightCancel::new()),
+            engine_stop_check: self.config.engine_stop_check,
         }))
     }
 }
@@ -1575,6 +1591,11 @@ pub struct SparseMoEEngine {
     pub(crate) kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
     /// In-flight multi-stage generation, streamed one token per `step()`.
     active: Option<SparseActive>,
+    /// M18: the runner signals a cancel here while the single-stage `step()`
+    /// holds the engine lock; the runner's `should_stop` reads it per token.
+    inflight: Arc<cascadia_engine::InflightCancel>,
+    /// End a running single-stage generation at a `stop` match (M18 D6).
+    engine_stop_check: bool,
 }
 
 impl SparseMoEEngine {
@@ -1701,6 +1722,17 @@ impl Engine for SparseMoEEngine {
                                 // cancelled task-ids)
         }
         self.pending.retain(|t| &t.task_id != task_id);
+        // A running single-stage task is ended through `inflight`, which the
+        // runner signalled for this id too; a queued one will now never
+        // begin, so drop that early entry.
+        self.inflight.forget(task_id);
+    }
+
+    /// Single-stage only (M18): there one blocking runner call makes the whole
+    /// answer. The multi-stage driver already ends at the next token through
+    /// [`Engine::cancel`], so it keeps no handle (unchanged).
+    fn inflight_cancel(&self) -> Option<Arc<cascadia_engine::InflightCancel>> {
+        (self.total == 1).then(|| Arc::clone(&self.inflight))
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -1807,6 +1839,13 @@ impl SparseMoEEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        let inflight = Arc::clone(&self.inflight);
+        let _end = crate::one_shot::EndInflight(Arc::clone(&inflight));
+        if inflight.begin(&task.task_id) {
+            info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            return vec![(task.task_id, chunk)];
+        }
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
         let tokenizer = match self.tokenizer.as_ref() {
@@ -1887,7 +1926,21 @@ impl SparseMoEEngine {
         // KV-cache state internally, so wiring prefix-cache replay into
         // it would need extra plumbing — deferred.
         let use_spec = self.spec_decode_k.is_some() && sampling_cfg.temperature <= 0.0;
-        let generated = if use_spec {
+        // M18: the runner polls this before each prefill token, decode token
+        // and speculative round. The stop check decodes the newest ids with
+        // the final decode's tokenizer and options (skip_special_tokens), so
+        // its text is a substring of the decode below (D8).
+        let mut poll = crate::one_shot::OneShotPoll::new(
+            &inflight,
+            &task.sampling.stop,
+            self.engine_stop_check,
+            |ids: &[i64]| {
+                let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+                tokenizer.decode(&ids, true).ok()
+            },
+        );
+        // Err = (log line, error-chunk text).
+        let generated: Result<Vec<i64>, (String, String)> = if use_spec {
             let k = self.spec_decode_k.unwrap();
             let mut draft = crate::ngram_draft::Draft::new().with_draft_k(k as usize);
             info!(
@@ -1895,35 +1948,56 @@ impl SparseMoEEngine {
                 draft_k = k,
                 "using n-gram speculative decode"
             );
-            match self
-                .runner
-                .generate_speculative(&prompt_ids, max_new, &sampling_cfg, &mut draft)
-            {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!(task = %task.task_id, "runner spec-decode failed: {e}");
-                    let final_chunk =
-                        Chunk::error(task.task_id.clone(), format!("spec-decode failed: {e}"));
-                    return vec![(task.task_id, final_chunk)];
-                }
-            }
+            self.runner
+                .generate_speculative_polled(
+                    &prompt_ids,
+                    max_new,
+                    &sampling_cfg,
+                    &mut draft,
+                    &mut |ids| poll.should_stop(ids),
+                )
+                .map_err(|e| {
+                    (
+                        format!("runner spec-decode failed: {e}"),
+                        format!("spec-decode failed: {e}"),
+                    )
+                })
         } else {
             let cache_opt: Option<&mut KvPrefixCache> = if self.kv_prefix_cache.enabled() {
                 Some(&mut self.kv_prefix_cache)
             } else {
                 None
             };
-            match self
-                .runner
-                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
-            {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!(task = %task.task_id, "runner failed: {e}");
-                    let final_chunk =
-                        Chunk::error(task.task_id.clone(), format!("runner failed: {e}"));
-                    return vec![(task.task_id, final_chunk)];
-                }
+            self.runner
+                .generate_with_cache_polled(
+                    &prompt_ids,
+                    max_new,
+                    &sampling_cfg,
+                    cache_opt,
+                    &mut |ids| poll.should_stop(ids),
+                )
+                .map_err(|e| (format!("runner failed: {e}"), format!("runner failed: {e}")))
+        };
+        let stopped_on_match = poll.stopped_on_match();
+        drop(poll);
+        if inflight.cancelled() {
+            // Also when generate failed after the cancel: the task ends as
+            // cancelled, never as an error or a partial success (M18 D4).
+            info!(
+                task = %task.task_id,
+                tokens = generated.as_ref().map_or(0, Vec::len),
+                elapsed_s = started.elapsed().as_secs_f64(),
+                "task cancelled"
+            );
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            return vec![(task.task_id, chunk)];
+        }
+        let generated = match generated {
+            Ok(g) => g,
+            Err((log, msg)) => {
+                warn!(task = %task.task_id, "{log}");
+                let final_chunk = Chunk::error(task.task_id.clone(), msg);
+                return vec![(task.task_id, final_chunk)];
             }
         };
         let n_tokens = generated.len() as u32;
@@ -1987,27 +2061,47 @@ impl SparseMoEEngine {
             }
         } else {
             let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
-            let mut t = tokenizer
+            let raw = tokenizer
                 .decode(&ids_u32, true)
                 .unwrap_or_else(|_| String::new());
-            if let Some(stripped) = t.strip_prefix(&task.prompt) {
-                t = stripped.trim_start().to_string();
+            let visible = match raw.strip_prefix(&task.prompt) {
+                Some(stripped) => stripped.trim_start().to_string(),
+                None => raw.clone(),
+            };
+            if stopped_on_match {
+                // The strip / trim can remove the text the stop matched in
+                // (M18 D8): return the raw decode then.
+                crate::one_shot::text_after_stop(&task.task_id, &task.sampling.stop, visible, raw)
+            } else {
+                visible
             }
-            t
         };
         let elapsed = started.elapsed().as_secs_f64();
-        info!(
-            task = %task.task_id,
-            tokens = n_tokens,
-            elapsed_s = elapsed,
-            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
-            "task done (single-stage)"
-        );
+        if stopped_on_match {
+            info!(
+                task = %task.task_id,
+                tokens = n_tokens,
+                elapsed_s = elapsed,
+                "task stopped at stop string"
+            );
+        } else {
+            info!(
+                task = %task.task_id,
+                tokens = n_tokens,
+                elapsed_s = elapsed,
+                tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+                "task done (single-stage)"
+            );
+        }
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
         chunk.prompt_tokens = Some(prompt_ids.len() as u32);
         chunk.token_ids = generated;
-        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+        chunk.finish_reason = Some(if stopped_on_match {
+            FinishReason::Stop
+        } else {
+            finish_reason_for(n_tokens as usize, max_new)
+        });
         vec![(task.task_id.clone(), chunk)]
     }
 
