@@ -10,9 +10,12 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use cascadia_metrics::UnenforcedReason;
+use cascadia_types::GrammarSpec;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
+use crate::structured::{check_schema, DATA_KEYS, MAX_SCHEMA_DEPTH, SCHEMA_MAPS};
 use crate::{FunctionCall, Tool, ToolCall};
 
 /// One entry of a request's `tools` list.
@@ -412,6 +415,296 @@ pub(crate) fn de_tool_calls<'de, D: serde::Deserializer<'de>>(
         .map(Some)
 }
 
+/// The parameters schema of a tool that declares none: any object.
+fn empty_parameters() -> Value {
+    json!({"type": "object", "properties": {}})
+}
+
+/// The output constraint for a turn with callable tools, or `None` when
+/// there is nothing to enforce or it can't be built.
+///
+/// A forced turn (`"required"` or a named tool) gets the call array: a JSON
+/// array of at least one `{"name", "parameters"}` object, `name` one of the
+/// tools (only the named one for a named choice), `parameters` that tool's
+/// schema; at most one item for a named choice or `parallel_tool_calls:
+/// false`. An `auto` turn with a JSON `response_format` (`format_schema`,
+/// its schema text) gets `{"anyOf": [<call array>, <format schema>]}`: a
+/// call or the asked-for JSON.
+///
+/// Each nested schema's `$defs` and `definitions` move to the root, renamed
+/// with a prefix per source (`t<i>_` for the tool at index `i`, `rf_` for
+/// the format schema), and its `$ref`s are rewritten to match; a reference
+/// to the schema's own root (`#`) points at a copy stored as
+/// `$defs/<prefix>root`. `$schema` and `$id` are dropped from moved schemas.
+/// The result passes the same limits and normalisation as a
+/// `response_format` schema. A `$ref` of any other form, or a result over
+/// those limits, gives `None`, logged and counted: the turn then runs
+/// unconstrained. The grammar is best-effort for the same reason.
+pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<GrammarSpec> {
+    // Under a forced choice the format is moot: the answer is the call.
+    let format_schema = match (policy.forced(), format_schema) {
+        (true, _) => None,
+        (false, Some(format)) if policy.callable() => Some(format),
+        (false, _) => return None,
+    };
+    match tool_schema(policy, format_schema) {
+        Ok(body) => body.map(GrammarSpec::best_effort_json_schema),
+        Err(reason) => {
+            tracing::warn!(
+                reason = reason.as_str(),
+                "tool-call output constraint not enforced; answering unconstrained"
+            );
+            cascadia_metrics::count_constraint_unenforced(reason);
+            None
+        }
+    }
+}
+
+/// The text of [`tool_grammar`]'s schema; `Ok(None)` when no tool has a
+/// name to call.
+fn tool_schema(
+    policy: &ToolPolicy,
+    format_schema: Option<&str>,
+) -> Result<Option<String>, UnenforcedReason> {
+    let named = match &policy.mode {
+        ToolMode::Named(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let mut hoisted = Hoisted::default();
+    let mut items = Vec::new();
+    for (i, tool) in policy.tools.iter().enumerate() {
+        let Some(name) = tool.function.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if named.is_some_and(|n| n != name) {
+            continue;
+        }
+        let parameters = match tool.function.get("parameters") {
+            None | Some(Value::Null) => empty_parameters(),
+            Some(p) => hoisted.take(p.clone(), &format!("t{i}_"))?,
+        };
+        items.push(json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "enum": [name]},
+                "parameters": parameters
+            },
+            "required": ["name", "parameters"],
+            "additionalProperties": false
+        }));
+        if named.is_some() {
+            break;
+        }
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut calls = Map::new();
+    calls.insert("type".into(), json!("array"));
+    calls.insert("minItems".into(), json!(1));
+    if named.is_some() || policy.single_call {
+        calls.insert("maxItems".into(), json!(1));
+    }
+    calls.insert("items".into(), json!({"anyOf": items}));
+    let mut root = match format_schema {
+        None => calls,
+        Some(text) => {
+            // The format schema was parsed once already; it can't fail here.
+            let format: Value =
+                serde_json::from_str(text).map_err(|_| UnenforcedReason::SchemaRejected)?;
+            let format = hoisted.take(format, "rf_")?;
+            let mut root = Map::new();
+            root.insert("anyOf".into(), json!([Value::Object(calls), format]));
+            root
+        }
+    };
+    for (key, defs) in [
+        ("$defs", hoisted.defs),
+        ("definitions", hoisted.definitions),
+    ] {
+        if !defs.is_empty() {
+            root.insert(key.into(), Value::Object(defs));
+        }
+    }
+    let root = Value::Object(root);
+    let text = serde_json::to_string(&root).map_err(|_| UnenforcedReason::TooComplex)?;
+    check_schema(&root, &text)
+        .map(Some)
+        .map_err(|_| UnenforcedReason::TooComplex)
+}
+
+/// The definitions moved to the root of a tool grammar, by keyword.
+#[derive(Default)]
+struct Hoisted {
+    defs: Map<String, Value>,
+    definitions: Map<String, Value>,
+}
+
+impl Hoisted {
+    /// `schema`, about to be nested, with its definitions moved here under
+    /// `prefix` and its references rewritten to match (see
+    /// [`tool_grammar`]).
+    fn take(&mut self, schema: Value, prefix: &str) -> Result<Value, UnenforcedReason> {
+        let Value::Object(mut root) = schema else {
+            return Ok(schema);
+        };
+        let own = |root: &Map<String, Value>, key: &str| -> HashSet<String> {
+            match root.get(key) {
+                Some(Value::Object(m)) => m.keys().cloned().collect(),
+                _ => HashSet::new(),
+            }
+        };
+        let names = [own(&root, "$defs"), own(&root, "definitions")];
+        let mut self_ref = false;
+        let mut root_value = Value::Object(std::mem::take(&mut root));
+        walk_schemas(&mut root_value, 0, &mut |obj| {
+            obj.shift_remove("$schema");
+            obj.shift_remove("$id");
+            if let Some(Value::String(r)) = obj.get_mut("$ref") {
+                *r = rewrite_ref(r, prefix, &names, &mut self_ref)?;
+            }
+            Ok(())
+        })?;
+        let Value::Object(mut root) = root_value else {
+            unreachable!("an object stays an object");
+        };
+        for (key, into) in [
+            ("$defs", &mut self.defs),
+            ("definitions", &mut self.definitions),
+        ] {
+            if !matches!(root.get(key), Some(Value::Object(_))) {
+                continue;
+            }
+            if let Some(Value::Object(defs)) = root.shift_remove(key) {
+                for (name, def) in defs {
+                    into.insert(format!("{prefix}{name}"), def);
+                }
+            }
+        }
+        if !self_ref {
+            return Ok(Value::Object(root));
+        }
+        let name = format!("{prefix}root");
+        if self.defs.contains_key(&name) {
+            // The schema has its own definition named `root`.
+            return Err(UnenforcedReason::UnsupportedRef);
+        }
+        self.defs.insert(name.clone(), Value::Object(root));
+        Ok(json!({"$ref": format!("#/$defs/{name}")}))
+    }
+}
+
+/// `r` as it reads once its schema is nested and its definitions are moved
+/// under `prefix`. `names` are the schema's own `$defs` and `definitions`
+/// names; a reference to anything else can't be kept.
+fn rewrite_ref(
+    r: &str,
+    prefix: &str,
+    names: &[HashSet<String>; 2],
+    self_ref: &mut bool,
+) -> Result<String, UnenforcedReason> {
+    if r == "#" {
+        *self_ref = true;
+        return Ok(format!("#/$defs/{prefix}root"));
+    }
+    for (keyword, names) in ["$defs", "definitions"].iter().zip(names) {
+        let Some(rest) = r.strip_prefix(&format!("#/{keyword}/")) else {
+            continue;
+        };
+        let token = rest.split('/').next().unwrap_or_default();
+        let name = token.replace("~1", "/").replace("~0", "~");
+        if names.contains(&name) {
+            return Ok(format!("#/{keyword}/{prefix}{rest}"));
+        }
+    }
+    Err(UnenforcedReason::UnsupportedRef)
+}
+
+/// Calls `f` on every schema object in `v`, as the schema checks walk it:
+/// values of schema maps (never their names) and every other key's value,
+/// except instance data. A schema nested past the depth limit is refused
+/// rather than left partly rewritten.
+fn walk_schemas(
+    v: &mut Value,
+    depth: usize,
+    f: &mut impl FnMut(&mut Map<String, Value>) -> Result<(), UnenforcedReason>,
+) -> Result<(), UnenforcedReason> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(UnenforcedReason::TooComplex);
+    }
+    match v {
+        Value::Array(items) => {
+            for item in items {
+                walk_schemas(item, depth + 1, f)?;
+            }
+        }
+        Value::Object(obj) => {
+            f(obj)?;
+            for (key, value) in obj.iter_mut() {
+                let key = key.as_str();
+                if DATA_KEYS.contains(&key) {
+                    continue;
+                }
+                match value {
+                    Value::Object(map) if SCHEMA_MAPS.contains(&key) => {
+                        for sub in map.values_mut() {
+                            walk_schemas(sub, depth + 1, f)?;
+                        }
+                    }
+                    _ => walk_schemas(value, depth + 1, f)?,
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The tool calls in a forced turn's answer, when it is exactly the shape
+/// the call grammar produces: the whole text (inside at most one ```` ``` ````
+/// or ```` ```json ```` fence) a non-empty JSON array whose every item is an
+/// object with exactly the keys `name`, one of the effective tools, and
+/// `parameters`, which become the call's arguments. Anything else is `None`,
+/// left for the model's own tool-call dialect.
+pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<ToolCall>> {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("```")
+        .and_then(|t| t.strip_suffix("```"))
+        .map(|t| t.strip_prefix("json").unwrap_or(t))
+        .unwrap_or(text);
+    let Value::Array(items) = serde_json::from_str(text.trim()).ok()? else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let names: HashSet<&str> = policy
+        .tools
+        .iter()
+        .filter_map(|t| t.function.get("name").and_then(Value::as_str))
+        .collect();
+    items
+        .iter()
+        .map(|item| {
+            let obj = item.as_object().filter(|o| o.len() == 2)?;
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|n| names.contains(n))?;
+            let arguments = serde_json::to_string(obj.get("parameters")?).ok()?;
+            Some(ToolCall {
+                id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: name.to_owned(),
+                    arguments,
+                },
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +1009,502 @@ mod tests {
         // Quadratic lookups take tens of seconds here; one name map, well
         // under one even in a debug build on a loaded runner.
         assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    // --- output constraints -------------------------------------------
+
+    use crate::structured::{JSON_OBJECT_SCHEMA, MAX_SCHEMA_BYTES};
+
+    fn unenforced(reason: UnenforcedReason) -> u64 {
+        cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+            .with_label_values(&[reason.as_str()])
+            .get()
+    }
+
+    fn weather() -> Value {
+        json!({"type": "function", "function": {"name": "get_weather", "description": "Weather.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                "required": ["city"]}}})
+    }
+
+    fn with_params(name: &str, parameters: Value) -> Value {
+        json!({"type": "function", "function": {"name": name, "parameters": parameters}})
+    }
+
+    fn pol(t: Value, choice: Option<Value>, parallel: Option<bool>) -> ToolPolicy {
+        let t = tools(t);
+        ToolPolicy::from_request(Some(&t), choice.as_ref(), parallel).unwrap()
+    }
+
+    fn item(name: &str, parameters: Value) -> Value {
+        json!({"type": "object",
+            "properties": {"name": {"type": "string", "enum": [name]}, "parameters": parameters},
+            "required": ["name", "parameters"], "additionalProperties": false})
+    }
+
+    fn no_params() -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+
+    fn weather_params() -> Value {
+        weather()["function"]["parameters"].clone()
+    }
+
+    /// The grammar body, parsed.
+    fn body(spec: &GrammarSpec) -> Value {
+        serde_json::from_str(&spec.body).unwrap()
+    }
+
+    #[test]
+    fn required_schema_matches_the_vllm_shape() {
+        let p = pol(
+            json!([weather(), func("get_time")]),
+            Some(json!("required")),
+            None,
+        );
+        let spec = tool_grammar(&p, None).expect("a grammar");
+        let want = json!({"type": "array", "minItems": 1, "items": {"anyOf": [
+            item("get_weather", weather_params()), item("get_time", no_params())]}});
+        assert_eq!(spec.body, serde_json::to_string(&want).unwrap());
+        assert!(spec.best_effort);
+        assert_eq!(spec.kind, cascadia_types::GrammarKind::JsonSchema);
+        // Not forced and no format: nothing to enforce.
+        assert!(tool_grammar(&pol(json!([weather()]), None, None), None).is_none());
+        assert!(tool_grammar(&pol(json!([weather()]), Some(json!("auto")), None), None).is_none());
+        let none = pol(json!([weather()]), Some(json!("none")), None);
+        assert!(tool_grammar(&none, None).is_none());
+        assert!(tool_grammar(&none, Some(JSON_OBJECT_SCHEMA)).is_none());
+        let no_tools = ToolPolicy::from_request(None, Some(&json!("required")), None).unwrap();
+        assert!(tool_grammar(&no_tools, Some(JSON_OBJECT_SCHEMA)).is_none());
+    }
+
+    #[test]
+    fn named_schema_has_one_item_and_max_one() {
+        let named = json!({"type": "function", "function": {"name": "get_time"}});
+        let p = pol(json!([weather(), func("get_time")]), Some(named), None);
+        let spec = tool_grammar(&p, Some(JSON_OBJECT_SCHEMA)).unwrap();
+        let want = json!({"type": "array", "minItems": 1, "maxItems": 1,
+            "items": {"anyOf": [item("get_time", no_params())]}});
+        assert_eq!(
+            spec.body,
+            serde_json::to_string(&want).unwrap(),
+            "the format is ignored"
+        );
+        // A named custom tool: its shim's parameters.
+        let t = json!([weather(), {"type": "custom", "custom": {"name": "patch"}}]);
+        let p = pol(
+            t,
+            Some(json!({"type": "custom", "custom": {"name": "patch"}})),
+            None,
+        );
+        let spec = tool_grammar(&p, None).unwrap();
+        assert_eq!(
+            body(&spec)["items"]["anyOf"],
+            json!([item(
+                "patch",
+                json!({"type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"], "additionalProperties": false})
+            )])
+        );
+    }
+
+    #[test]
+    fn single_call_sets_max_items() {
+        let t = json!([weather(), func("get_time")]);
+        let p = pol(t.clone(), Some(json!("required")), Some(false));
+        let b = body(&tool_grammar(&p, None).unwrap());
+        assert_eq!(b["maxItems"], 1);
+        assert_eq!(b["items"]["anyOf"].as_array().unwrap().len(), 2);
+        let p = pol(t.clone(), Some(json!("required")), Some(true));
+        assert!(body(&tool_grammar(&p, None).unwrap())
+            .get("maxItems")
+            .is_none());
+        let p = pol(t, None, Some(false));
+        let b = body(&tool_grammar(&p, Some(JSON_OBJECT_SCHEMA)).unwrap());
+        assert_eq!(b["anyOf"][0]["maxItems"], 1);
+    }
+
+    #[test]
+    fn union_wraps_the_format_schema() {
+        let format =
+            r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#;
+        let t = json!([weather(), func("get_time")]);
+        let calls = json!({"type": "array", "minItems": 1, "items": {"anyOf": [
+            item("get_weather", weather_params()), item("get_time", no_params())]}});
+        let want = format!(
+            r#"{{"anyOf":[{},{format}]}}"#,
+            serde_json::to_string(&calls).unwrap()
+        );
+        for choice in [None, Some(json!("auto"))] {
+            let spec = tool_grammar(&pol(t.clone(), choice, None), Some(format)).unwrap();
+            assert_eq!(spec.body, want);
+            assert!(spec.best_effort);
+        }
+        // allowed_tools in auto mode: the union over the allowed tools only.
+        let choice = json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+            "tools": [func("get_time")]}});
+        let spec = tool_grammar(&pol(t, Some(choice), None), Some(format)).unwrap();
+        assert_eq!(
+            body(&spec)["anyOf"][0]["items"]["anyOf"],
+            json!([item("get_time", no_params())])
+        );
+    }
+
+    #[test]
+    fn json_object_format_unions_with_the_object_schema() {
+        let spec = tool_grammar(
+            &pol(json!([weather()]), None, None),
+            Some(JSON_OBJECT_SCHEMA),
+        )
+        .unwrap();
+        let b = body(&spec);
+        assert_eq!(
+            b["anyOf"][1],
+            serde_json::from_str::<Value>(JSON_OBJECT_SCHEMA).unwrap()
+        );
+        assert_eq!(
+            b["anyOf"][0]["items"]["anyOf"],
+            json!([item("get_weather", weather_params())])
+        );
+    }
+
+    #[test]
+    fn hoists_defs_with_prefixes_and_rewrites_refs() {
+        let addr = json!({"type": "object", "properties": {"street": {"type": "string"}}});
+        let other = json!({"type": "integer"});
+        let t = json!([
+            with_params(
+                "a",
+                json!({"type": "object",
+                "properties": {"home": {"$ref": "#/$defs/Addr"},
+                    "street": {"$ref": "#/$defs/Addr/properties/street"}},
+                "$defs": {"Addr": addr}})
+            ),
+            with_params(
+                "b",
+                json!({"type": "object",
+                "properties": {"n": {"$ref": "#/definitions/Addr"}},
+                "definitions": {"Addr": other}})
+            )
+        ]);
+        let format = r##"{"type":"object","properties":{"x":{"$ref":"#/$defs/Addr"}},"$defs":{"Addr":{"type":"boolean"}}}"##;
+        let b = body(&tool_grammar(&pol(t, None, None), Some(format)).unwrap());
+        assert_eq!(
+            b["$defs"],
+            json!({"t0_Addr": addr, "rf_Addr": {"type": "boolean"}})
+        );
+        assert_eq!(b["definitions"], json!({"t1_Addr": other}));
+        let items = &b["anyOf"][0]["items"]["anyOf"];
+        assert_eq!(
+            items[0]["properties"]["parameters"],
+            json!({"type": "object", "properties": {"home": {"$ref": "#/$defs/t0_Addr"},
+                "street": {"$ref": "#/$defs/t0_Addr/properties/street"}}})
+        );
+        assert_eq!(
+            items[1]["properties"]["parameters"],
+            json!({"type": "object", "properties": {"n": {"$ref": "#/definitions/t1_Addr"}}})
+        );
+        assert_eq!(
+            b["anyOf"][1],
+            json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/rf_Addr"}}})
+        );
+        // A ref inside a hoisted definition is rewritten too; data is left alone.
+        let t = json!([with_params(
+            "a",
+            json!({"$ref": "#/$defs/List",
+            "$defs": {"List": {"type": "array", "items": {"$ref": "#/$defs/Item"},
+                "default": [{"$ref": "#/$defs/Item"}]},
+                "Item": {"type": "string"}}})
+        )]);
+        let b = body(&tool_grammar(&pol(t, Some(json!("required")), None), None).unwrap());
+        assert_eq!(
+            b["$defs"],
+            json!({"t0_List": {"type": "array", "items": {"$ref": "#/$defs/t0_Item"},
+                "default": [{"$ref": "#/$defs/Item"}]}, "t0_Item": {"type": "string"}})
+        );
+        assert_eq!(
+            b["items"]["anyOf"][0]["properties"]["parameters"],
+            json!({"$ref": "#/$defs/t0_List"})
+        );
+    }
+
+    #[test]
+    fn root_self_ref_is_hoisted() {
+        let tree = json!({"type": "object", "properties": {"name": {"type": "string"},
+            "children": {"type": "array", "items": {"$ref": "#"}}}});
+        let t = json!([func("x"), with_params("tree", tree)]);
+        let format = r##"{"type":"object","properties":{"next":{"$ref":"#"}}}"##;
+        let b = body(&tool_grammar(&pol(t, None, None), Some(format)).unwrap());
+        assert_eq!(
+            b["$defs"]["t1_root"],
+            json!({"type": "object", "properties": {"name": {"type": "string"},
+                "children": {"type": "array", "items": {"$ref": "#/$defs/t1_root"}}}})
+        );
+        assert_eq!(
+            b["anyOf"][0]["items"]["anyOf"][1]["properties"]["parameters"],
+            json!({"$ref": "#/$defs/t1_root"})
+        );
+        assert_eq!(
+            b["$defs"]["rf_root"],
+            json!({"type": "object", "properties": {"next": {"$ref": "#/$defs/rf_root"}}})
+        );
+        assert_eq!(b["anyOf"][1], json!({"$ref": "#/$defs/rf_root"}));
+    }
+
+    #[test]
+    fn unhoistable_ref_gives_no_grammar() {
+        for r in [
+            "#/properties/a",
+            "https://example.com/s.json",
+            "other.json#/$defs/A",
+            "#/$defs/Missing",
+            "#/$defs",
+            "#A",
+        ] {
+            let params = json!({"type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"$ref": r}},
+                "$defs": {"A": {"type": "string"}}});
+            let before = unenforced(UnenforcedReason::UnsupportedRef);
+            let p = pol(
+                json!([with_params("f", params)]),
+                Some(json!("required")),
+                None,
+            );
+            assert!(tool_grammar(&p, None).is_none(), "{r}");
+            assert!(unenforced(UnenforcedReason::UnsupportedRef) > before, "{r}");
+        }
+        // In the format schema too.
+        let before = unenforced(UnenforcedReason::UnsupportedRef);
+        let format = r##"{"type":"object","properties":{"a":{"type":"string"},"b":{"$ref":"#/properties/a"}}}"##;
+        assert!(tool_grammar(&pol(json!([weather()]), None, None), Some(format)).is_none());
+        assert!(unenforced(UnenforcedReason::UnsupportedRef) > before);
+    }
+
+    #[test]
+    fn oversized_or_too_deep_union_gives_no_grammar() {
+        // Each tool fits the byte limit alone; together they don't.
+        let half = json!({"type": "object", "description": "x".repeat(MAX_SCHEMA_BYTES / 2)});
+        assert!(check_schema(&half, &half.to_string()).is_ok());
+        let before = unenforced(UnenforcedReason::TooComplex);
+        let p = pol(
+            json!([
+                with_params("a", half.clone()),
+                with_params("b", half.clone())
+            ]),
+            Some(json!("required")),
+            None,
+        );
+        assert!(tool_grammar(&p, None).is_none());
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+        // A tool and a format schema that only exceed it once combined.
+        let before = unenforced(UnenforcedReason::TooComplex);
+        let p = pol(json!([with_params("a", half.clone())]), None, None);
+        assert!(tool_grammar(&p, Some(&half.to_string())).is_none());
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+        // The deepest parameters schema the limits accept alone are too deep
+        // once nested in the call array.
+        let nest = |k: usize| {
+            (0..k).fold(
+                json!({"type": "string"}),
+                |s, _| json!({"type": "array", "items": s}),
+            )
+        };
+        let deepest = (1..200)
+            .take_while(|&k| check_schema(&nest(k), &nest(k).to_string()).is_ok())
+            .last()
+            .unwrap();
+        let before = unenforced(UnenforcedReason::TooComplex);
+        let p = pol(
+            json!([with_params("a", nest(deepest))]),
+            Some(json!("required")),
+            None,
+        );
+        assert!(tool_grammar(&p, None).is_none());
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+    }
+
+    fn validator(spec: &GrammarSpec) -> jsonschema::Validator {
+        jsonschema::validator_for(&body(spec)).unwrap()
+    }
+
+    #[test]
+    fn schemas_validate_their_examples() {
+        let t = json!([weather(), func("get_time")]);
+        let required =
+            validator(&tool_grammar(&pol(t.clone(), Some(json!("required")), None), None).unwrap());
+        let call = json!([{"name": "get_weather", "parameters": {"city": "Paris"}}]);
+        assert!(required.is_valid(&call));
+        assert!(required.is_valid(
+            &json!([{"name": "get_weather", "parameters": {"city": "Paris"}},
+            {"name": "get_time", "parameters": {}}])
+        ));
+        assert!(!required.is_valid(&json!([])));
+        assert!(!required.is_valid(&json!([{"name": "get_stock", "parameters": {}}])));
+        assert!(!required.is_valid(&json!([{"name": "get_weather", "parameters": {}}])));
+        assert!(!required.is_valid(&json!([{"name": "get_time", "parameters": {}, "extra": 1}])));
+        assert!(!required.is_valid(&json!({"name": "get_time", "parameters": {}})));
+        let single = validator(
+            &tool_grammar(&pol(t.clone(), Some(json!("required")), Some(false)), None).unwrap(),
+        );
+        assert!(single.is_valid(&call));
+        assert!(
+            !single.is_valid(&json!([{"name": "get_time", "parameters": {}},
+            {"name": "get_time", "parameters": {}}]))
+        );
+        let named = json!({"type": "function", "function": {"name": "get_time"}});
+        let named = validator(&tool_grammar(&pol(t.clone(), Some(named), None), None).unwrap());
+        assert!(named.is_valid(&json!([{"name": "get_time", "parameters": {}}])));
+        assert!(!named.is_valid(&call));
+        let format =
+            r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#;
+        let union = validator(&tool_grammar(&pol(t, None, None), Some(format)).unwrap());
+        assert!(union.is_valid(&call));
+        assert!(union.is_valid(&json!({"answer": "42"})));
+        assert!(!union.is_valid(&json!({"answer": 42})));
+        assert!(!union.is_valid(&json!([])));
+        // Hoisted definitions and a root self-reference resolve.
+        let tree = json!({"type": "object", "properties": {"kids": {"type": "array", "items": {"$ref": "#"}},
+            "addr": {"$ref": "#/$defs/Addr"}}, "$defs": {"Addr": {"type": "string"}}});
+        let hoisted = validator(
+            &tool_grammar(
+                &pol(
+                    json!([with_params("tree", tree)]),
+                    Some(json!("required")),
+                    None,
+                ),
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(hoisted.is_valid(&json!([{"name": "tree", "parameters":
+            {"addr": "a", "kids": [{"addr": "b", "kids": []}]}}])));
+        assert!(!hoisted.is_valid(&json!([{"name": "tree", "parameters":
+            {"kids": [{"addr": 1}]}}])));
+    }
+
+    #[test]
+    fn schemas_compile_with_llguidance() {
+        let t =
+            json!([weather(), func("get_time"), {"type": "custom", "custom": {"name": "patch"}}]);
+        let tree = json!({"type": "object", "properties": {"kids": {"type": "array", "items": {"$ref": "#"}},
+            "addr": {"$ref": "#/$defs/Addr"}, "n": {"$ref": "#/definitions/N"}},
+            "$defs": {"Addr": {"type": "string"}}, "definitions": {"N": {"type": "integer"}}});
+        let named = json!({"type": "function", "function": {"name": "get_time"}});
+        let format =
+            r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#;
+        let specs = [
+            tool_grammar(&pol(t.clone(), Some(json!("required")), None), None),
+            tool_grammar(&pol(t.clone(), Some(json!("required")), Some(false)), None),
+            tool_grammar(&pol(t.clone(), Some(named), None), None),
+            tool_grammar(&pol(t.clone(), None, None), Some(format)),
+            tool_grammar(&pol(t, None, None), Some(JSON_OBJECT_SCHEMA)),
+            tool_grammar(
+                &pol(
+                    json!([with_params("tree", tree)]),
+                    Some(json!("required")),
+                    None,
+                ),
+                None,
+            ),
+        ];
+        for spec in specs {
+            let spec = spec.expect("a grammar");
+            if let Err(e) = cascadia_grammar::GrammarFactory::byte_level().compile(&spec) {
+                panic!("{}: {e}", spec.body);
+            }
+        }
+    }
+
+    #[test]
+    fn object_allof_in_tool_params_is_merged() {
+        // zod's `.and()`: an allOf of plain object schemas.
+        let params = json!({"allOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            {"type": "object", "properties": {"b": {"type": "number"}}, "required": ["b"],
+                "additionalProperties": false}
+        ]});
+        let p = pol(
+            json!([with_params("f", params)]),
+            Some(json!("required")),
+            None,
+        );
+        let spec = tool_grammar(&p, None).unwrap();
+        assert!(!spec.body.contains("allOf"), "{}", spec.body);
+        assert_eq!(
+            body(&spec)["items"]["anyOf"][0]["properties"]["parameters"],
+            json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "number"}},
+                "required": ["a", "b"], "additionalProperties": false})
+        );
+    }
+
+    #[test]
+    fn nested_schema_and_id_keys_are_dropped() {
+        let params = json!({"$schema": "http://json-schema.org/draft-07/schema#",
+            "$id": "https://example.com/p", "type": "object",
+            "properties": {"$id": {"type": "string"}, "a": {"$ref": "#/$defs/A"}},
+            "$defs": {"A": {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "a", "type": "string"}}});
+        let format = r#"{"$schema":"http://json-schema.org/draft-07/schema#","type":"object"}"#;
+        let p = pol(json!([with_params("f", params)]), None, None);
+        let spec = tool_grammar(&p, Some(format)).unwrap();
+        assert!(!spec.body.contains("$schema"), "{}", spec.body);
+        let b = body(&spec);
+        assert_eq!(
+            b["anyOf"][0]["items"]["anyOf"][0]["properties"]["parameters"],
+            json!({"type": "object", "properties": {"$id": {"type": "string"},
+                "a": {"$ref": "#/$defs/t0_A"}}}),
+            "a property named $id stays"
+        );
+        assert_eq!(b["$defs"]["t0_A"], json!({"type": "string"}));
+        assert_eq!(b["anyOf"][1], json!({"type": "object"}));
+        cascadia_grammar::GrammarFactory::byte_level()
+            .compile(&spec)
+            .unwrap();
+    }
+
+    #[test]
+    fn calls_from_forced_output_reads_only_the_exact_shape() {
+        let p = pol(
+            json!([weather(), {"type": "custom", "custom": {"name": "patch"}}]),
+            Some(json!("required")),
+            None,
+        );
+        let text = r#"[{"name":"get_weather","parameters":{"city":"Paris","unit":"c"}},
+            {"name":"patch","parameters":{"input":"x"}}]"#;
+        for wrapped in [
+            text.to_string(),
+            format!("  {text}\n"),
+            format!("```json\n{text}\n```"),
+            format!("```\n{text}\n```  "),
+        ] {
+            let calls = calls_from_forced_output(&wrapped, &p).expect(&wrapped);
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].r#type, "function");
+            assert!(calls[0].id.starts_with("call_"), "{}", calls[0].id);
+            assert_ne!(calls[0].id, calls[1].id);
+            assert_eq!(calls[0].function.name, "get_weather");
+            assert_eq!(
+                calls[0].function.arguments,
+                r#"{"city":"Paris","unit":"c"}"#
+            );
+            assert_eq!(calls[1].function.name, "patch");
+            assert_eq!(calls[1].function.arguments, r#"{"input":"x"}"#);
+        }
+        for bad in [
+            r#"{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+            r#"[{"name":"get_weather","parameters":{"city":"Paris"},"id":"x"}]"#,
+            r#"[{"name":"get_weather"}]"#,
+            r#"[{"name":"get_stock","parameters":{}}]"#,
+            r#"[{"name":"get_weather","parameters":{"city":"Paris"}}] and more"#,
+            r#"Sure: [{"name":"get_weather","parameters":{"city":"Paris"}}]"#,
+            r#"[{"name":"get_weather","parameters":{"city":"Paris"}}, 3]"#,
+            r#"[{"name":1,"parameters":{}}]"#,
+            "```json\n```json\n[{\"name\":\"get_weather\",\"parameters\":{}}]\n```\n```",
+            "[]",
+            "",
+        ] {
+            assert!(calls_from_forced_output(bad, &p).is_none(), "{bad}");
+        }
     }
 }

@@ -389,22 +389,7 @@ fn parse_json_schema(js: Option<&Value>, raw: &str) -> Result<ResponseFormat, St
             let text = raw_schema_text(raw)?;
             check_limits(schema, &text)?;
             check_bounds(schema)?;
-            let (schema, text) = match merge_object_all_of(&text) {
-                Some(merged) => (
-                    serde_json::from_str(&merged).map_err(|e| format!("{FIELD}: {e}"))?,
-                    merged,
-                ),
-                None => (schema.clone(), text),
-            };
-            let raw: Box<RawValue> =
-                serde_json::from_str(&text).map_err(|e| format!("{FIELD}: {e}"))?;
-            check_converter_depth(&Node::parse(raw).map_err(|e| format!("{FIELD}: {e}"))?)?;
-            check_ref_depth_bound(&schema)?;
-            // A ref to a document outside the schema: no backend fetches
-            // one, refused for every engine.
-            if let Some(why) = cascadia_grammar::ref_outside_the_schema(&schema) {
-                return Err(format!("{FIELD}: {why}"));
-            }
+            let (schema, text) = normalized_schema(schema, &text)?;
             Ok(ResponseFormat::JsonSchema {
                 name: js.get("name").and_then(Value::as_str).map(str::to_owned),
                 schema,
@@ -414,6 +399,41 @@ fn parse_json_schema(js: Option<&Value>, raw: &str) -> Result<ResponseFormat, St
         }
         Some(_) => Err("response_format.json_schema.schema must be a JSON Schema object".into()),
     }
+}
+
+/// The limits and normalisation every enforced schema goes through:
+/// [`check_limits`] on `raw` (the schema's compact text), each object
+/// `allOf` merged ([`merge_object_all_of`]), then the depth checks on the
+/// merged schema. Returns the schema as the decoder gets it: the merged
+/// text, or `raw` when nothing was merged. A bound pair no value meets is
+/// not refused here ([`unsatisfiable_bound`] reports it).
+pub(crate) fn check_schema(schema: &Value, raw: &str) -> Result<String, String> {
+    check_limits(schema, raw)?;
+    normalized_schema(schema, raw).map(|(_, text)| text)
+}
+
+/// The normalisation half of [`check_schema`], for a schema whose limits
+/// were checked: each object `allOf` merged, then the depth checks and the
+/// ref check ([`cascadia_grammar::ref_outside_the_schema`]) on the merged
+/// schema. Returns the merged schema and its text (`raw` when nothing was
+/// merged).
+fn normalized_schema(schema: &Value, raw: &str) -> Result<(Value, String), String> {
+    let (schema, text) = match merge_object_all_of(raw) {
+        Some(merged) => (
+            serde_json::from_str(&merged).map_err(|e| format!("{FIELD}: {e}"))?,
+            merged,
+        ),
+        None => (schema.clone(), raw.to_owned()),
+    };
+    let tree: Box<RawValue> = serde_json::from_str(&text).map_err(|e| format!("{FIELD}: {e}"))?;
+    check_converter_depth(&Node::parse(tree).map_err(|e| format!("{FIELD}: {e}"))?)?;
+    check_ref_depth_bound(&schema)?;
+    // A ref to a document outside the schema: no backend fetches one,
+    // refused for every engine.
+    if let Some(why) = cascadia_grammar::ref_outside_the_schema(&schema) {
+        return Err(format!("{FIELD}: {why}"));
+    }
+    Ok((schema, text))
 }
 
 /// Keywords whose value is a repetition count, capped at [`MAX_SCHEMA_COUNT`],
@@ -2406,7 +2426,7 @@ const ALWAYS_UNENFORCED: [&str; 10] = [
 
 /// Keys whose value is a map from names to subschemas: walk the values,
 /// never treat the names as keywords.
-const SCHEMA_MAPS: [&str; 6] = [
+pub(crate) const SCHEMA_MAPS: [&str; 6] = [
     "properties",
     "patternProperties",
     "$defs",
@@ -2416,7 +2436,7 @@ const SCHEMA_MAPS: [&str; 6] = [
 ];
 
 /// Keys whose value is instance data, not a schema.
-const DATA_KEYS: [&str; 4] = ["enum", "const", "default", "examples"];
+pub(crate) const DATA_KEYS: [&str; 4] = ["enum", "const", "default", "examples"];
 
 /// JSON Schema keywords in `schema` the output grammar does not enforce,
 /// sorted and de-duplicated. Output may still be valid JSON that violates them.
@@ -4605,6 +4625,44 @@ mod tests {
                 "{schema}"
             );
             assert_eq!(unsatisfiable_bound(&schema), None, "{schema}");
+        }
+    }
+
+    #[test]
+    fn check_schema_is_what_parse_json_schema_applied() {
+        let merged = json!({"allOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            {"type": "object", "properties": {"b": {"type": "integer"}}}
+        ]});
+        let plain = json!({"type": "object", "properties": {"z": {"type": "string"}, "a": {}}});
+        for schema in [merged, plain] {
+            let text = schema.to_string();
+            let Ok(ResponseFormat::JsonSchema { raw, .. }) = parse_schema(schema.clone()) else {
+                panic!("{schema} parses");
+            };
+            assert_eq!(check_schema(&schema, &text), Ok(raw), "{schema}");
+        }
+        assert_eq!(
+            check_schema(
+                &json!({"allOf": [{"type": "object"}, {"type": "object"}]}),
+                r#"{"allOf":[{"type":"object"},{"type":"object"}]}"#
+            ),
+            Ok(r#"{"type":"object"}"#.to_owned())
+        );
+        // The same limits, with the same messages.
+        let deep = (0..70).fold(
+            json!({"type": "string"}),
+            |s, _| json!({"type": "array", "items": s}),
+        );
+        let wide = json!({"type": "string", "maxLength": 10_001});
+        let big = json!({"type": "string", "description": "x".repeat(70_000)});
+        for schema in [deep, wide, big] {
+            let want = parse_schema(schema.clone()).unwrap_err();
+            assert_eq!(
+                check_schema(&schema, &schema.to_string()),
+                Err(want),
+                "{schema}"
+            );
         }
     }
 }
