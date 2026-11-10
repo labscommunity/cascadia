@@ -2136,7 +2136,9 @@ fn gemma_strip(state: &AppState) -> SharedGemmaStrip {
 
 /// One streamed piece of content through the response's stripper, if any.
 fn strip_streamed(strip: &SharedGemmaStrip, text: String, last: bool) -> String {
-    match strip.lock().unwrap().as_mut() {
+    // A poisoned lock still holds a usable stripper: recover it rather than
+    // fail every later chunk.
+    match strip.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         Some(g) if last => g.feed_last(&text),
         Some(g) => g.feed(&text),
         None => text,
@@ -2157,8 +2159,9 @@ fn strip_streamed(strip: &SharedGemmaStrip, text: String, last: bool) -> String 
 ///   scan text, so none of it is content until the reply ends; when a tool
 ///   grammar was sent, also while it starts a code fence (```), which the
 ///   forced-shape reader takes as a call when the engine dropped the grammar;
-/// * otherwise from the first `<tool_call>` or Gemma 4 `<|tool_call>`, or
-///   from a trailing proper prefix of either (a marker split across chunks).
+/// * otherwise from the first `<tool_call>` (or, for a model that writes
+///   Gemma 4 calls, `<|tool_call>`), or from a trailing proper prefix of it
+///   (a marker split across chunks).
 ///
 /// Before `</think>` arrives the rules apply from 0; once it does, text held
 /// only for a scratchpad draft is released. Released text is never taken
@@ -2178,6 +2181,8 @@ struct ToolStreamSplitter {
     lead: usize,
     /// A tool grammar was sent: a fenced call array is read as a call.
     grammar_sent: bool,
+    /// The model writes Gemma 4 tool calls: hold from `<|tool_call>` too.
+    gemma_markers: bool,
 }
 
 /// The decision at the end of a tools-active stream; `T` is what the
@@ -2192,7 +2197,7 @@ enum ToolStreamEnd<'a, T> {
 }
 
 impl ToolStreamSplitter {
-    fn new(enable_thinking: bool, grammar_sent: bool) -> Self {
+    fn new(enable_thinking: bool, grammar_sent: bool, gemma_markers: bool) -> Self {
         Self {
             buf: String::new(),
             emitted: 0,
@@ -2201,6 +2206,7 @@ impl ToolStreamSplitter {
             think_from: enable_thinking.then_some(0),
             lead: 0,
             grammar_sent,
+            gemma_markers,
         }
     }
 
@@ -2275,7 +2281,11 @@ impl ToolStreamSplitter {
         // resume at the release point.
         let from = start.max(self.emitted);
         let rest = &self.buf[from..];
-        let opens = [TOOL_CALL_OPEN, GEMMA_CALL_OPEN];
+        let opens: &[&str] = if self.gemma_markers {
+            &[TOOL_CALL_OPEN, GEMMA_CALL_OPEN]
+        } else {
+            &[TOOL_CALL_OPEN]
+        };
         from + opens
             .iter()
             .filter_map(|m| rest.find(m))
@@ -2310,7 +2320,28 @@ pub fn parse_tool_calls_marked(text: &str) -> Option<Vec<ToolCall>> {
 
 fn parse_tool_calls_with(text: &str, bare_json: bool) -> Option<Vec<ToolCall>> {
     let mut calls = Vec::new();
-    if text.contains("<tool_call>") {
+    // The dialect whose open marker comes first: the other's marker may be
+    // text inside its arguments.
+    let gemma_first = match (text.find(GEMMA_CALL_OPEN), text.find(TOOL_CALL_OPEN)) {
+        (Some(g), Some(h)) => g < h,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if gemma_first {
+        // Gemma 4: each <|tool_call>call:NAME{ARGS}<tool_call|>; a malformed
+        // one is skipped and the search goes on after its open marker.
+        let mut rest = text;
+        while let Some(start) = rest.find(GEMMA_CALL_OPEN) {
+            let after = &rest[start + GEMMA_CALL_OPEN.len()..];
+            rest = match call_from_gemma(after) {
+                Some((c, used)) => {
+                    calls.push(c);
+                    &after[used..]
+                }
+                None => after,
+            };
+        }
+    } else if text.contains(TOOL_CALL_OPEN) {
         // Qwen/Hermes: each <tool_call>…</tool_call> block.
         let mut rest = text;
         while let Some(start) = rest.find("<tool_call>") {
@@ -2351,20 +2382,6 @@ fn parse_tool_calls_with(text: &str, bare_json: bool) -> Option<Vec<ToolCall>> {
                 calls.push(c);
             }
             rest = &after[end + "</tool_call>".len()..];
-        }
-    } else if text.contains(GEMMA_CALL_OPEN) {
-        // Gemma 4: each <|tool_call>call:NAME{ARGS}<tool_call|>; a malformed
-        // one is skipped and the search goes on after its open marker.
-        let mut rest = text;
-        while let Some(start) = rest.find(GEMMA_CALL_OPEN) {
-            let after = &rest[start + GEMMA_CALL_OPEN.len()..];
-            rest = match call_from_gemma(after) {
-                Some((c, used)) => {
-                    calls.push(c);
-                    &after[used..]
-                }
-                None => after,
-            };
         }
     } else {
         // Llama-3.1: <|python_tag|> is an explicit tool-call marker. A BARE
@@ -2506,7 +2523,7 @@ fn call_from_gemma(s: &str) -> Option<(ToolCall, usize)> {
     let body = s.trim_start().strip_prefix("call:")?;
     let brace = body.find('{')?;
     let name = body[..brace].trim();
-    if !is_bare_function_name(name) {
+    if !is_gemma_function_name(name) {
         return None;
     }
     let mut args = GemmaArgs {
@@ -2526,6 +2543,14 @@ fn call_from_gemma(s: &str) -> Option<(ToolCall, usize)> {
         },
     };
     Some((call, used))
+}
+
+/// A Gemma 4 call's name: ASCII letters, digits, `_`, `.` and `-`, any of
+/// them first (OpenAI function names may start with a digit).
+fn is_gemma_function_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 /// Cursor over a Gemma 4 argument object; see [`call_from_gemma`].
@@ -3738,7 +3763,11 @@ async fn stream_completion(
                 _inflight: inflight,
             },
             marker: state.marker_dialect.clone().map(MarkerFilter::new),
-            splitter: ToolStreamSplitter::new(enable_thinking, tools.grammar_sent),
+            splitter: ToolStreamSplitter::new(
+                enable_thinking,
+                tools.grammar_sent,
+                state.gemma_tool_markers,
+            ),
             strip: state.gemma_tool_markers.then(GemmaMarkerStrip::default),
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
@@ -7815,7 +7844,17 @@ level={{ effort_map[eff] }}";
     /// Feed every piece but the last, finish with the last. Returns each
     /// released content piece (the finish content last) and parsed calls.
     fn run_splitter(pieces: &[&str], thinking: bool) -> (Vec<String>, Option<Vec<ToolCall>>) {
-        let mut s = ToolStreamSplitter::new(thinking, false);
+        run_splitter_with(pieces, thinking, false)
+    }
+
+    /// [`run_splitter`] for a model that writes Gemma 4 tool calls when
+    /// `gemma` is set.
+    fn run_splitter_with(
+        pieces: &[&str],
+        thinking: bool,
+        gemma: bool,
+    ) -> (Vec<String>, Option<Vec<ToolCall>>) {
+        let mut s = ToolStreamSplitter::new(thinking, false, gemma);
         let (last, body) = pieces.split_last().unwrap();
         let mut out: Vec<String> = body.iter().map(|p| s.feed(p).to_owned()).collect();
         match s.finish(last, parse_tool_calls) {
@@ -11319,7 +11358,7 @@ level={{ effort_map[eff] }}";
     #[test]
     fn gemma4_call_is_held_not_leaked() {
         // Split inside the open marker, the way a stream can deliver it.
-        let (out, calls) = run_splitter(
+        let (out, calls) = run_splitter_with(
             &[
                 "Checking. <|tool",
                 "_call>call:get_weather{city:",
@@ -11327,13 +11366,14 @@ level={{ effort_map[eff] }}";
                 "<tool_call|>",
             ],
             false,
+            true,
         );
         assert_eq!(out, ["Checking. ", "", "", ""]);
         let calls = calls.expect("a Gemma 4 call");
         assert_eq!(calls[0].function.name, "get_weather");
         // Not a call after all: everything is released, nothing lost.
         let pieces = ["a <|tool", "_call>call:oops", " more"];
-        let (out, calls) = run_splitter(&pieces, false);
+        let (out, calls) = run_splitter_with(&pieces, false, true);
         assert!(calls.is_none());
         assert_eq!(out.concat(), pieces.concat());
     }
@@ -11349,6 +11389,10 @@ level={{ effort_map[eff] }}";
             assert_eq!(status, StatusCode::OK, "{v}");
             assert_eq!(call_names(&v), ["get_weather"], "{v}");
             assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
+            // Streamed, the call is held only for a Gemma 4 model.
+            if !gemma {
+                continue;
+            }
             let app = scripted_app_with(&text, cascadia_types::FinishReason::Stop, gemma).await;
             let events = stream_events(app, body.clone()).await;
             let calls = streamed_calls(&events);
@@ -11463,5 +11507,78 @@ level={{ effort_map[eff] }}";
         let pieces = ["éa<|\"|>ü", "日本<tool_call|>", "ß", "😀<|tool_call>x"];
         let out: String = pieces.iter().map(|p| s.feed(p)).collect();
         assert_eq!(out + &s.finish(), "éaü日本ß😀x");
+    }
+
+    #[test]
+    fn gemma4_call_wins_when_its_marker_comes_first() {
+        let text = "<|tool_call>call:f{code:<|\"|>see <tool_call><|\"|>}<tool_call|>";
+        let calls = parse_tool_calls(text).expect("the Gemma 4 call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "f");
+        assert_eq!(
+            call_args(&calls[0]),
+            serde_json::json!({"code": "see <tool_call>"})
+        );
+        // And the other way round: a Hermes call whose argument mentions
+        // the Gemma 4 marker is still the Hermes call.
+        let text = r#"<tool_call>{"name":"g","arguments":{"s":"<|tool_call>"}}</tool_call>"#;
+        let calls = parse_tool_calls(text).expect("the Hermes call");
+        assert_eq!(calls[0].function.name, "g");
+        assert_eq!(
+            call_args(&calls[0]),
+            serde_json::json!({"s": "<|tool_call>"})
+        );
+    }
+
+    #[test]
+    fn gemma4_call_name_may_start_with_a_digit() {
+        let calls = parse_tool_calls("<|tool_call>call:3d_render{}<tool_call|>").expect("a call");
+        assert_eq!(calls[0].function.name, "3d_render");
+        let calls =
+            parse_tool_calls("<|tool_call>call:ns.get-item_2{}<tool_call|>").expect("a call");
+        assert_eq!(calls[0].function.name, "ns.get-item_2");
+        // The other dialects keep their own name rule.
+        assert_eq!(parse_tool_calls("<tool_call>3d_render\n</tool_call>"), None);
+    }
+
+    #[test]
+    fn non_gemma_stream_keeps_its_frame_boundaries_around_angle_pipe() {
+        // Without the Gemma 4 flag the splitter cuts exactly as before the
+        // Gemma 4 marker existed: `<|` is not held mid-reply.
+        for (pieces, want) in [
+            (
+                vec!["a <|", "tool_call>x", " y", ""],
+                vec!["a <|", "tool_call>x", " y", ""],
+            ),
+            (
+                vec!["say <|im", "_end|> ok", ""],
+                vec!["say <|im", "_end|> ok", ""],
+            ),
+            (
+                vec!["a <|tool_call>call:f{}<tool_call|>", " b", ""],
+                vec!["a <|tool_call>call:f{}<tool_call|>", " b", ""],
+            ),
+        ] {
+            let (out, _) = run_splitter_with(&pieces, false, false);
+            assert_eq!(out, want, "{pieces:?}");
+        }
+        // With the flag the Gemma 4 marker (and a split prefix) is held.
+        let (out, _) = run_splitter_with(&["a <|", "tool_call>x", " y", ""], false, true);
+        assert_eq!(out, ["a ", "", "", "<|tool_call>x y"]);
+    }
+
+    #[test]
+    fn a_poisoned_stream_stripper_still_strips() {
+        let strip: SharedGemmaStrip =
+            Arc::new(std::sync::Mutex::new(Some(GemmaMarkerStrip::default())));
+        let held = strip.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(strip.is_poisoned());
+        assert_eq!(strip_streamed(&strip, "a<|\"|>b<".into(), false), "ab");
+        assert_eq!(strip_streamed(&strip, "|tool_call>c".into(), true), "c");
     }
 }
