@@ -7282,8 +7282,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 Ok(())
             }
             Err(crate::dist::ProbeFailure::Link(reason)) => {
-                warn!(%reason, "the downstream link failed the mask-support probe; re-dialing");
-                // The next step re-dials before anything else goes down it.
+                warn!(%reason, "the downstream link failed the mask-support probe");
+                // On the stream path the next step re-dials before anything
+                // else goes down it; the one-task path has no re-dial.
                 self.peer_disconnected = true;
                 self.redial_next = None;
                 Err(format!("{PROBE_LINK_FAILED} ({reason})"))
