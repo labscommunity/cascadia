@@ -101,7 +101,7 @@ pub use cascadia_engine::genai_npu_prompt_cap;
 /// to generate, says so); without one it says the context is exceeded, with
 /// the tokens when known, and no number right after "is" for a client to
 /// read as the limit. A non-empty `detail` (the engine's own text) follows in
-/// parentheses.
+/// parentheses, tidied ([`tidy_detail`]).
 pub fn context_length_message(
     noun: &str,
     window: Option<u32>,
@@ -132,11 +132,51 @@ pub fn context_length_message(
              available context size. Please reduce the length of the {noun}."
         ),
     };
+    let detail = tidy_detail(detail);
     if !detail.is_empty() {
         msg.push_str(&format!(" ({detail})"));
     }
     msg
 }
+
+/// An engine's own text made fit to follow OpenAI's sentence: whitespace
+/// and newlines collapsed to single spaces; a leading native source location
+/// (`Exception from <path>:<line>:`, `Check '<expr>' failed at
+/// <path>:<line>:`, as OpenVINO raises them) dropped so the text starts at
+/// the human sentence; and cut at [`MAX_DETAIL_CHARS`], ending in `…`.
+fn tidy_detail(detail: &str) -> String {
+    let joined = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut t = joined.as_str();
+    loop {
+        let located = t.starts_with("Exception from ")
+            || (t.starts_with("Check '") && t.contains(" failed at "));
+        match located.then(|| after_line_marker(t)).flatten() {
+            Some(rest) => t = rest.trim_start(),
+            None => break,
+        }
+    }
+    if t.chars().count() <= MAX_DETAIL_CHARS {
+        return t.to_owned();
+    }
+    let mut cut: String = t.chars().take(MAX_DETAIL_CHARS - 1).collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    cut
+}
+
+/// The text after the first `:<digits>:` in `s` (a `<path>:<line>:`
+/// location's end); `None` when there is none.
+fn after_line_marker(s: &str) -> Option<&str> {
+    s.match_indices(':').find_map(|(i, _)| {
+        let rest = &s[i + 1..];
+        let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+        (digits > 0 && rest[digits..].starts_with(':')).then(|| &rest[digits + 1..])
+    })
+}
+
+/// Longest engine detail, in characters, that an over-window message
+/// carries; a longer one is cut and ends in `…`.
+pub const MAX_DETAIL_CHARS: usize = 300;
 
 /// Most of a non-JSON error body that is read to reuse as the message. Such
 /// bodies are short text (a rejection's reason); a longer one is not read.
@@ -308,6 +348,38 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// GenAI's raw NPU exception, as the Windows build raises it: a source
+    /// location, a `Check` prefix, and a line per sentence.
+    const RAW_GENAI_NPU_CAP: &str = "Exception from src\\cpp\\src\\llm\\pipeline_stateful.cpp:364:\n\
+        Check 'prompt_len <= m_max_prompt_len' failed at src\\cpp\\src\\llm\\pipeline_stateful.cpp:364:\n\
+        Stateful LLM pipeline on NPU may only process prompts or generated texts up to 1024 tokens.\n\
+        6393 is passed.\n\
+        Set the \"MAX_PROMPT_LEN\" config option to increase the limit.\n";
+
+    /// The engine detail in an over-window message is tidy: one line, no
+    /// source location, starting at the human sentence, and capped.
+    #[test]
+    fn over_window_detail_is_tidied() {
+        let m = context_length_message("messages", Some(1024), Some(6393), RAW_GENAI_NPU_CAP);
+        assert!(
+            m.ends_with(
+                " (Stateful LLM pipeline on NPU may only process prompts or generated texts up \
+                 to 1024 tokens. 6393 is passed. Set the \"MAX_PROMPT_LEN\" config option to \
+                 increase the limit.)"
+            ),
+            "{m}"
+        );
+        assert!(!m.contains('\n') && !m.contains(".cpp"), "{m}");
+        let long = "word ".repeat(200);
+        let m = context_length_message("input", None, None, &long);
+        let detail = &m[m.find(" (").unwrap() + 2..m.len() - 1];
+        assert!(detail.chars().count() <= MAX_DETAIL_CHARS, "{detail}");
+        assert!(detail.ends_with('…'), "{detail}");
+        // Short, clean details pass through unchanged.
+        let m = context_length_message("input", None, None, "prompt is 9 tokens");
+        assert!(m.ends_with(" (prompt is 9 tokens)"), "{m}");
     }
 
     /// OpenVINO GenAI's own NPU prompt cap, raised inside generation.

@@ -523,7 +523,8 @@ and `code` a machine-readable reason, both `null` when unset:
 | 500 / 503 `server_error` | The engine failed the request (500), or failed it mid-generation (503). An engine refusal of the input itself (`unsupported input: …`, `invalid_request: …`, `invalid configuration: …`) is a 400 instead. |
 
 An over-window message is OpenAI's sentence, which client libraries match to
-detect context overflow, followed by the engine's own text in parentheses:
+detect context overflow, followed by the engine's own text in parentheses (on
+one line, without a native source location, and cut at 300 characters):
 
 ```
 This model's maximum context length is 4096 tokens. However, your messages resulted in 5000 tokens. Please reduce the length of the messages. (prompt is 5000 tokens but the model's context is 4096; send a shorter prompt)
