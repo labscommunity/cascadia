@@ -19,6 +19,9 @@
 #                        ov-genai CB-adapter backend: 2)
 #   --eps S              latency allowance for the hang-up to reach the node, seconds (0.5)
 #   --n-tol PCT          tolerance on the cancelled task's token count vs D*R, percent (25)
+#   --prefill-s S        the long prompt's prefill takes S seconds (a token-by-token prefill on a large
+#                        model): hang up S seconds later, so the cancel lands in decode, and still expect
+#                        R*(D-S) tokens. Read S from the node log's 'prefill done secs=' line (0)
 #   --long-max-tokens N  max_tokens of the long request (default: none, the server's window-long default)
 #   --long-timeout S     client limit on a long request that should end early (stop cases) (300)
 #   --settle S           client limit on a request queued behind a long one (600)
@@ -39,7 +42,7 @@ set -uo pipefail
 
 URL=${CHECK_URL:-}; MODEL=${CHECK_MODEL:-}; LOG_FILE=${CHECK_LOG:-}; LOG_CMD=${CHECK_LOG_CMD:-}
 AB_URL=${CHECK_AB_URL:-}; AB_MODEL=""
-ONLY=""; SKIPS=""; ROUND=1; EPS=0.5; NTOL=25; LONG_MAX=""; LONG_TIMEOUT=300; SETTLE=600
+ONLY=""; SKIPS=""; ROUND=1; EPS=0.5; NTOL=25; PREFILL_S=0; LONG_MAX=""; LONG_TIMEOUT=300; SETTLE=600
 LOG_WAIT=20; REF_MAX=200; T0_MAX=24; AB_RUNS=3; AB_BAR=97; NO_TASK_LOG=0; THINK=1; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,6 +56,7 @@ while [ $# -gt 0 ]; do
     --round-tokens) ROUND=$2; shift ;;
     --eps) EPS=$2; shift ;;
     --n-tol) NTOL=$2; shift ;;
+    --prefill-s) PREFILL_S=$2; shift ;;
     --long-max-tokens) LONG_MAX=$2; shift ;;
     --long-timeout) LONG_TIMEOUT=$2; shift ;;
     --settle) SETTLE=$2; shift ;;
@@ -391,7 +395,7 @@ check_cancel_log() { # label offset follow-up-name
   fle "${el:-1e9}" "$bound" \
     && verdict "$lab: cancelled within $ROUND token time(s) of the hang-up (elapsed_s=$el <= D + $ROUND/R + eps = $bound)" ok \
     || verdict "$lab: cancelled within $ROUND token time(s) of the hang-up" bad "elapsed_s=${el:-?} > $bound"
-  nexp=$(calc "$R * $D"); tol=$(calc "$ROUND + (2 > $NTOL / 100 * $nexp ? 2 : $NTOL / 100 * $nexp)")
+  nexp=$(calc "$R * ($D - $PREFILL_S)"); tol=$(calc "$ROUND + (2 > $NTOL / 100 * $nexp ? 2 : $NTOL / 100 * $nexp)")
   awk -v n="${n:-x}" -v e="$nexp" -v t="$tol" 'BEGIN { d = n - e; if (d < 0) d = -d; exit !(n ~ /^[0-9]+$/ && d <= t) }' \
     && verdict "$lab: tokens=$n ~ D*R = $nexp (+-$tol)" ok \
     || verdict "$lab: tokens ~ D*R" bad "tokens=${n:-?} vs $nexp +-$tol"
@@ -428,8 +432,8 @@ case_baseline() {
     R=$(calc "${ct:-0} / ($tl > 0 ? $tl : 1)"); echo "baseline: R = $R tok/s ($ct tokens / ${tl}s client time; no tok_s in the log)"
   fi
   fle 0.01 "$R" || { verdict "baseline: a decode rate" bad "R=$R"; R=1; }
-  D=$(calc "(20 / $R > 3) ? 20 / $R : 3")
-  echo "baseline: D = max(3, 20/R) = ${D}s, one token time = $(calc "1 / $R")s, T0 first byte ${TTFB0}s"
+  D=$(calc "((20 / $R > 3) ? 20 / $R : 3) + $PREFILL_S")
+  echo "baseline: D = max(3, 20/R) + prefill $PREFILL_S = ${D}s, one token time = $(calc "1 / $R")s, T0 first byte ${TTFB0}s"
   ref_pair T "$URL" chat count "$REF_MAX"
   echo "baseline: reference T ($(py get "$WORK/T.json" completion_tokens) tokens, $(py get "$WORK/T.json" finish)): $(py show "$WORK/T.json" 100)"
 }
