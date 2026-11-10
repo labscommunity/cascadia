@@ -1341,14 +1341,7 @@ impl LlamaCppEngine {
                 // ...unless the refused part is a best-effort constraint:
                 // then the request is resent once without it, before any
                 // output, and answered unconstrained.
-                if let Some(plain) = fallback.take().filter(|_| names_the_constraint(&err)) {
-                    tracing::warn!(
-                        task = %tid,
-                        reason = UnenforcedReason::SchemaRejected.as_str(),
-                        child_error = %reason,
-                        "output constraint not enforced (llama-server refused the schema); answering unconstrained"
-                    );
-                    count_constraint_unenforced(UnenforcedReason::SchemaRejected);
+                if let Some(plain) = fallback.take().filter(|_| names_the_constraint(&reason)) {
                     let next = match connect_child(port) {
                         Ok(n) => n,
                         Err(e) => {
@@ -1361,6 +1354,17 @@ impl LlamaCppEngine {
                         let _ = next.shutdown(std::net::Shutdown::Both);
                         return;
                     }
+                    // Counted once the resend is under way, so a request
+                    // cancelled in between is not. A failed connect above
+                    // requeues the task on a respawned child, which may
+                    // count the same request again.
+                    tracing::warn!(
+                        task = %tid,
+                        reason = UnenforcedReason::SchemaRejected.as_str(),
+                        child_error = %reason.chars().take(ERROR_TEXT_CHARS).collect::<String>(),
+                        "output constraint not enforced (llama-server refused the schema); answering unconstrained"
+                    );
+                    count_constraint_unenforced(UnenforcedReason::SchemaRejected);
                     (s, body) = (next, plain);
                     continue;
                 }
@@ -1548,13 +1552,24 @@ fn read_response_head(r: &mut impl BufRead) -> Option<ResponseHead> {
     }
 }
 
-/// Whether a child's error body is about the output constraint: llama-server
-/// names the grammar or the schema when it refuses one ("failed to parse
-/// grammar", "JSON schema conversion failed"), or fails to build the
-/// samplers, which a request's grammar is part of ("Failed to initialize
-/// samplers"). Case-insensitive.
-fn names_the_constraint(body: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(body).to_lowercase();
+/// Whether a child's error message is about the output constraint:
+/// llama-server names the grammar or the schema when it refuses one
+/// ("failed to parse grammar", "JSON schema conversion failed"), or fails to
+/// build the samplers, which a request's grammar is part of ("Failed to
+/// initialize samplers"). Case-insensitive. Its tools and messages parse
+/// errors are never a constraint refusal, and they echo the request
+/// ("...; tools = [...]"), whose own schemas may say "schema": only the
+/// text before such an echo is read.
+fn names_the_constraint(message: &str) -> bool {
+    let text = message.to_lowercase();
+    if text.starts_with("failed to parse tools") || text.starts_with("failed to parse messages") {
+        return false;
+    }
+    let text = ["; tools =", "; messages ="]
+        .iter()
+        .filter_map(|echo| text.find(echo))
+        .min()
+        .map_or(text.as_str(), |at| &text[..at]);
     ["grammar", "schema", "failed to initialize samplers"]
         .iter()
         .any(|k| text.contains(k))
@@ -3284,14 +3299,19 @@ mod unix_tests {
                 let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
                 let mut reader = BufReader::new(s.try_clone().unwrap());
                 let mut content_length = 0usize;
+                let mut sent_request = false;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
+                    sent_request = true;
                     if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                         content_length = v.trim().parse().unwrap_or(0);
                     }
+                }
+                if !sent_request {
+                    continue; // connected and closed without a request
                 }
                 let mut body = vec![0u8; content_length];
                 let _ = reader.read_exact(&mut body);
@@ -3332,6 +3352,10 @@ mod unix_tests {
         r
     }
 
+    /// Held by the tests that read or move the `schema_rejected` counter,
+    /// so one test's count is not moved by another running in parallel.
+    static SCHEMA_REJECTED_COUNTER: Mutex<()> = Mutex::new(());
+
     fn schema_rejected_count() -> u64 {
         cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
             .with_label_values(&[cascadia_metrics::UnenforcedReason::SchemaRejected.as_str()])
@@ -3340,12 +3364,21 @@ mod unix_tests {
 
     const TOOL_SCHEMA: &str = r#"{"type":"array","items":{"type":"object","properties":{"name":{"const":"get_weather"}},"required":["name"]},"minItems":1}"#;
 
-    /// Run `task` against a child answering `replies` in order; returns the
-    /// chunks the engine produced and the request bodies the child got.
-    fn run_against(
-        task: GenerationTask,
-        replies: Vec<String>,
-    ) -> (Vec<(TaskId, Chunk)>, Vec<String>) {
+    /// What a task run against a scripted child produced.
+    struct Run {
+        chunks: Vec<(TaskId, Chunk)>,
+        /// The request bodies the child got, in order.
+        bodies: Vec<String>,
+        /// How much the `schema_rejected` counter grew meanwhile.
+        counted: u64,
+    }
+
+    /// Run `task` against a child answering `replies` in order.
+    fn run_against(task: GenerationTask, replies: Vec<String>) -> Run {
+        let _counter = SCHEMA_REJECTED_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = schema_rejected_count();
         let (port, stop, server) = mock_server_replies(replies);
         let mut engine = test_engine(port);
         engine.submit(task).unwrap();
@@ -3353,7 +3386,12 @@ mod unix_tests {
         // a retry, if any, has connected by the time the final chunk is out
         std::thread::sleep(Duration::from_millis(50));
         stop.store(true, Ordering::Relaxed);
-        (chunks, server.join().unwrap())
+        let bodies = server.join().unwrap();
+        Run {
+            chunks,
+            bodies,
+            counted: schema_rejected_count() - before,
+        }
     }
 
     #[test]
@@ -3361,7 +3399,11 @@ mod unix_tests {
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
             TOOL_SCHEMA,
         ));
-        let (chunks, bodies) = run_against(task, vec![ok_reply("[]")]);
+        let Run {
+            chunks,
+            bodies,
+            counted,
+        } = run_against(task, vec![ok_reply("[]")]);
         assert_eq!(bodies.len(), 1, "{bodies:?}");
         assert!(bodies[0].contains(TOOL_SCHEMA), "{}", bodies[0]);
         let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
@@ -3372,15 +3414,19 @@ mod unix_tests {
             serde_json::from_str::<serde_json::Value>(TOOL_SCHEMA).unwrap()
         );
         assert!(chunks.iter().all(|(_, c)| c.error.is_none()), "{chunks:?}");
+        assert_eq!(counted, 0);
     }
 
     #[test]
     fn best_effort_grammar_refused_by_the_child_is_retried_without_it() {
-        let before = schema_rejected_count();
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
             TOOL_SCHEMA,
         ));
-        let (chunks, bodies) = run_against(
+        let Run {
+            chunks,
+            bodies,
+            counted,
+        } = run_against(
             task,
             vec![
                 error_reply("400 Bad Request", "failed to parse grammar"),
@@ -3402,7 +3448,7 @@ mod unix_tests {
         assert!(last.is_final);
         assert!(last.error.is_none() && !last.invalid_request, "{last:?}");
         assert_eq!(last.finish_reason, Some(FinishReason::Stop));
-        assert!(schema_rejected_count() > before);
+        assert_eq!(counted, 1);
     }
 
     #[test]
@@ -3413,10 +3459,21 @@ mod unix_tests {
             r#"{"error":{"message":"Unrecognized json_schema"}}"#,
             r#"{"error":{"message":"Failed to initialize samplers"}}"#,
         ] {
-            assert!(names_the_constraint(body.as_bytes()), "{body}");
+            assert!(
+                names_the_constraint(&child_error_message(body.as_bytes())),
+                "{body}"
+            );
+        }
+        for message in [
+            r#"Failed to parse tools: bad type; tools = [{"$schema":"x"}]"#,
+            "failed to parse messages: oops; messages = [] grammar",
+            r#"unexpected input; tools = [{"$schema":"x"}]"#,
+            "unexpected input; messages = [{\"content\":\"a grammar\"}]",
+        ] {
+            assert!(!names_the_constraint(message), "{message}");
         }
         assert!(!names_the_constraint(
-            br#"{"error":{"message":"the request exceeds the available context size"}}"#
+            "the request exceeds the available context size"
         ));
     }
 
@@ -3436,7 +3493,11 @@ mod unix_tests {
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
             TOOL_SCHEMA,
         ));
-        let (chunks, bodies) = run_against(
+        let Run {
+            chunks,
+            bodies,
+            counted,
+        } = run_against(
             task,
             vec![
                 error_reply("400 Bad Request", "JSON schema conversion failed"),
@@ -3453,12 +3514,17 @@ mod unix_tests {
             last.error.as_deref(),
             Some("llama-server rejected the request: Failed to initialize samplers: bad grammar")
         );
+        assert_eq!(counted, 1);
     }
 
     #[test]
     fn non_best_effort_refusal_is_unchanged() {
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema(TOOL_SCHEMA));
-        let (chunks, bodies) = run_against(
+        let Run {
+            chunks,
+            bodies,
+            counted,
+        } = run_against(
             task,
             vec![
                 error_reply("400 Bad Request", "failed to parse grammar"),
@@ -3472,6 +3538,7 @@ mod unix_tests {
             last.error.as_deref(),
             Some("llama-server rejected the request: failed to parse grammar")
         );
+        assert_eq!(counted, 0);
     }
 
     #[test]
@@ -3479,7 +3546,11 @@ mod unix_tests {
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
             TOOL_SCHEMA,
         ));
-        let (chunks, bodies) = run_against(
+        let Run {
+            chunks,
+            bodies,
+            counted,
+        } = run_against(
             task,
             vec![
                 error_reply("400 Bad Request", "the request exceeds the context size"),
@@ -3493,6 +3564,97 @@ mod unix_tests {
             last.error.as_deref(),
             Some("llama-server rejected the request: the request exceeds the context size")
         );
+        assert_eq!(counted, 0);
+    }
+
+    #[test]
+    fn best_effort_request_whose_tools_fail_to_parse_is_unchanged() {
+        let message = r#"Failed to parse tools: unsupported type; tools = [{"type":"function","function":{"name":"f","parameters":{"$schema":"http://json-schema.org/draft-07/schema#"}}}]"#;
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            TOOL_SCHEMA,
+        ));
+        let Run {
+            chunks,
+            bodies,
+            counted,
+        } = run_against(
+            task,
+            vec![
+                error_reply("400 Bad Request", message),
+                ok_reply("unreachable"),
+            ],
+        );
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        let last = &chunks.last().unwrap().1;
+        assert!(last.is_final && last.invalid_request, "{last:?}");
+        assert_eq!(
+            last.error.as_deref(),
+            Some(format!("llama-server rejected the request: {message}").as_str())
+        );
+        assert_eq!(counted, 0);
+    }
+
+    #[test]
+    fn best_effort_request_cancelled_before_the_resend_is_not_resent() {
+        let _counter = SCHEMA_REJECTED_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = schema_rejected_count();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (refusing, refusing_rx) = std::sync::mpsc::channel();
+        let (cancelled, cancelled_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut reader = BufReader::new(s.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            // A refusal naming the grammar whose body never completes: the
+            // reader waits for the rest until the cancel shuts it down.
+            let part = r#"{"error":{"message":"failed to parse grammar"#;
+            let head = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n";
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(part.as_bytes()).unwrap();
+            refusing.send(()).unwrap();
+            cancelled_rx.recv().unwrap();
+            // Any later connection that carries a request is a resend.
+            l.set_nonblocking(true).unwrap();
+            let mut resent = 0;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match l.accept() {
+                    Ok((c, _)) => {
+                        c.set_nonblocking(false).unwrap();
+                        let _ = c.set_read_timeout(Some(Duration::from_millis(200)));
+                        let mut line = String::new();
+                        if BufReader::new(c).read_line(&mut line).unwrap_or(0) > 0 {
+                            resent += 1;
+                        }
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            resent
+        });
+        let mut engine = test_engine(port);
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            TOOL_SCHEMA,
+        ));
+        engine.submit(task).unwrap();
+        // start the stream, then let the reader take the partial refusal
+        let _ = engine.step().unwrap();
+        refusing_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the child got the request");
+        std::thread::sleep(Duration::from_millis(100));
+        engine.cancel(&"task-1".to_string());
+        cancelled.send(()).unwrap();
+        assert_eq!(server.join().unwrap(), 0, "a cancelled request was resent");
+        assert_eq!(schema_rejected_count(), before);
     }
 
     #[test]
