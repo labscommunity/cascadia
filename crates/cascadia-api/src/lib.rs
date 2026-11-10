@@ -3864,6 +3864,11 @@ struct EngineChunks {
     task_id: cascadia_types::TaskId,
     /// A final chunk arrived, or the forwarder ended: nothing to interrupt.
     ended: bool,
+    /// Set by the forwarder once the engine stream has ended for it: it took
+    /// a final chunk, or it is about to drop or finish the stream. A drop
+    /// after that interrupts nothing, even while the forwarder still runs
+    /// its tail (`JoinHandle::is_finished` is false until it returns).
+    stream_ended: Arc<std::sync::atomic::AtomicBool>,
     forwarder: tokio::task::JoinHandle<()>,
 }
 
@@ -3908,11 +3913,14 @@ impl Drop for EngineChunks {
     /// A body or handler dropped before the answer ended (a client
     /// disconnect): the forwarder, blocked inside the task's step, can't drop
     /// its stream until the step returns, so ask the engine to end the step.
-    /// Not once the forwarder has ended (the task is over, its final perhaps
-    /// still unread in the channel): that would only park a finished id in
-    /// the engine's early-cancel set.
+    /// Not once the engine stream has ended for the forwarder (the task is
+    /// over, its final perhaps still unread in the channel or not yet sent):
+    /// that would only park a finished id in the engine's early-cancel set.
     fn drop(&mut self) {
-        if !self.ended && self.early.get().is_none() && !self.forwarder.is_finished() {
+        if !self.ended
+            && self.early.get().is_none()
+            && !self.stream_ended.load(std::sync::atomic::Ordering::Acquire)
+        {
             self.runner.interrupt(&self.task_id);
         }
     }
@@ -3959,15 +3967,21 @@ fn spawn_engine_forwarder(
     let (tx, rx) = tokio::sync::mpsc::channel(FORWARD_BUFFER);
     let early = Arc::new(std::sync::OnceLock::new());
     let finished = early.clone();
+    let stream_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ended_flag = stream_ended.clone();
     let forwarded_id = task_id.clone();
     let forwarder = tokio::spawn(async move {
         let task_id = forwarded_id;
+        let end_stream = || ended_flag.store(true, std::sync::atomic::Ordering::Release);
         loop {
             tokio::select! {
                 biased;
                 () = tx.closed() => break,
                 chunk = std::panic::AssertUnwindSafe(chunks.next()).catch_unwind() => match chunk {
                     Ok(Some(chunk)) => {
+                        if chunk.is_final {
+                            end_stream();
+                        }
                         if tx.send(chunk).await.is_err() {
                             break;
                         }
@@ -3996,6 +4010,7 @@ fn spawn_engine_forwarder(
                 },
             }
         }
+        end_stream();
         match finished.get() {
             Some(&reason) => chunks.finish_early(reason),
             None => drop(chunks),
@@ -4007,6 +4022,7 @@ fn spawn_engine_forwarder(
         runner,
         task_id,
         ended: false,
+        stream_ended,
         forwarder,
     }
 }
@@ -9654,7 +9670,7 @@ level={{ effort_map[eff] }}";
                 return Ok(Vec::new());
             };
             if let Some(handle) = self.inflight.clone() {
-                return Ok(vec![self.one_shot_step(&handle, id)]);
+                return Ok(self.one_shot_step(&handle, id));
             }
             if !self.step_delay.is_zero() {
                 std::thread::sleep(self.step_delay);
@@ -9692,12 +9708,13 @@ level={{ effort_map[eff] }}";
     }
 
     impl ScriptEngine {
-        /// The whole task in one step, as a one-shot engine runs it.
+        /// The whole task in one step, as a one-shot engine runs it: `parts`
+        /// as token chunks, then the final, all from this one step.
         fn one_shot_step(
             &mut self,
             handle: &cascadia_engine::InflightCancel,
             id: cascadia_types::TaskId,
-        ) -> (cascadia_types::TaskId, Chunk) {
+        ) -> Vec<(cascadia_types::TaskId, Chunk)> {
             let mut cancelled = handle.begin(&id);
             self.log
                 .step_starts
@@ -9716,15 +9733,22 @@ level={{ effort_map[eff] }}";
                 .lock()
                 .unwrap()
                 .push((std::time::Instant::now(), cancelled));
-            let last = if cancelled {
-                Chunk::final_marker(&id, "")
-                    .with_finish_reason(cascadia_types::FinishReason::Cancelled)
-            } else {
-                Chunk::final_marker(&id, self.final_text.clone())
-                    .with_finish_reason(cascadia_types::FinishReason::Length)
-                    .with_prompt_tokens(5)
-            };
-            (id, last)
+            if cancelled {
+                let last = Chunk::final_marker(&id, "")
+                    .with_finish_reason(cascadia_types::FinishReason::Cancelled);
+                return vec![(id, last)];
+            }
+            let mut out: Vec<_> = self
+                .parts
+                .iter()
+                .enumerate()
+                .map(|(i, part)| (id.clone(), Chunk::token(&id, i as i64, part.clone())))
+                .collect();
+            let last = Chunk::final_marker(&id, self.final_text.clone())
+                .with_finish_reason(cascadia_types::FinishReason::Length)
+                .with_prompt_tokens(5);
+            out.push((id, last));
+            out
         }
     }
 
@@ -11763,6 +11787,71 @@ level={{ effort_map[eff] }}";
             );
             assert!(reply.contains("done"), "stream={stream}: {reply}");
         }
+    }
+
+    /// A receiver dropped while its forwarder still runs its tail, after it
+    /// already took the engine's final (here: blocked sending the final into
+    /// a full channel), interrupts nothing: the stream had ended, so the
+    /// finished id is not parked in the engine's early-cancel set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drop_while_the_forwarder_holds_the_final_interrupts_nothing() {
+        let log = Arc::new(ScriptLog::default());
+        let handle = Arc::new(cascadia_engine::InflightCancel::new());
+        let runner = Arc::new(Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
+            parts: vec!["a ".into()],
+            final_text: "done".into(),
+            prompt_first: true,
+            step_delay: SLICE,
+            end: ScriptEnd::Final,
+            gate: None,
+            log: log.clone(),
+            pending: None,
+            inflight: Some(handle.clone()),
+            slices: 0,
+        })))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("api-inflight-tail", "CPU"),
+            )
+            .await
+            .unwrap();
+        let task = GenerationTask::new("t-tail", "hi").with_max_tokens(1);
+        let id = task.task_id.clone();
+        let stream = runner.generate_async(task).await.unwrap();
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let chunks = spawn_engine_forwarder(
+            id.clone(),
+            runner.clone(),
+            StreamWithPermit::with_slot(
+                guard_window(stream, None),
+                permit,
+                InFlightGuard::new(log.stats.clone()),
+            ),
+        );
+        for _ in 0..1000 {
+            if !log.step_ends.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            !log.step_ends.lock().unwrap().is_empty(),
+            "the step never ran"
+        );
+        // The part fills the one-slot channel; the forwarder then takes the
+        // final and blocks sending it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !chunks.forwarder.is_finished(),
+            "the forwarder should be blocked sending the final"
+        );
+        drop(chunks);
+        assert!(
+            !handle.begin(&id),
+            "the finished task's id was parked in the early-cancel set"
+        );
+        handle.end();
     }
 
     /// A stop match closes the channel with a reason and returns at once,
