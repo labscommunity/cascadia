@@ -918,7 +918,8 @@ fn word_level_with_a_decoder_that_rewrites_tokens_is_still_unsupported() {
 /// What llguidance does with a schema whose bounds no value meets: it
 /// refuses each one at build time, naming the pair, rather than building a
 /// grammar no output can finish. `contains` is not enforced, so
-/// `minContains > maxContains` builds with a warning. The API refuses all
+/// `minContains > maxContains` builds with a warning. An integer range
+/// with no integer in it is refused too; one holding an integer builds. The API refuses all
 /// of them but the last before any engine sees them: llama-server builds
 /// a grammar for such a schema and then decodes until killed.
 #[test]
@@ -957,6 +958,19 @@ fn unsatisfiable_bounds_are_refused_at_build() {
             r#"{"type":"object","properties":{"a":{"type":"string","minLength":5,"maxLength":2}},"required":["a"]}"#,
             "required property 'a' is unsatisfiable",
         ),
+        // Integer ranges holding numbers but no integer.
+        (
+            r#"{"type":"integer","exclusiveMinimum":2,"exclusiveMaximum":3}"#,
+            "integer interval (2, 3) contains no integer values",
+        ),
+        (
+            r#"{"type":"integer","minimum":2.5,"maximum":2.9}"#,
+            "integer interval [2.5, 2.9] contains no integer values",
+        ),
+        (
+            r#"{"type":["integer"],"minimum":2.1,"exclusiveMaximum":3}"#,
+            "integer interval [2.1, 3) contains no integer values",
+        ),
     ] {
         let err = gf
             .compile(&spec(body))
@@ -965,6 +979,13 @@ fn unsatisfiable_bounds_are_refused_at_build() {
         let msg = err.to_string();
         assert!(msg.contains("Unsatisfiable schema"), "{body}: {msg}");
         assert!(msg.contains(says), "{body}: {msg}");
+    }
+    for body in [
+        r#"{"type":"integer","exclusiveMinimum":2,"exclusiveMaximum":4}"#,
+        r#"{"type":["integer","number"],"exclusiveMinimum":2,"exclusiveMaximum":3}"#,
+    ] {
+        gf.compile(&spec(body))
+            .unwrap_or_else(|e| panic!("{body}: {e}"));
     }
     let contains = gf
         .compile(&spec(

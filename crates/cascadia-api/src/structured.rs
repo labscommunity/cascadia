@@ -446,6 +446,8 @@ const BOUND_PAIRS: [(&str, &str, bool); 7] = [
 /// Like [`sum_counts`], it visits every object in the document, data keys
 /// included: a `$ref` may point anywhere. Only numeric values are compared,
 /// so a property map whose names are keywords is never read as bounds.
+/// For a schema whose every `type` is `integer`, a range holding no integer
+/// (`exclusiveMinimum` 2 with `exclusiveMaximum` 3) is reported too.
 /// `minContains`/`maxContains` are left alone: no backend enforces
 /// `contains`, so they never empty the grammar. The boolean (draft 4) form
 /// of `exclusiveMinimum`/`exclusiveMaximum` is not a number and is skipped.
@@ -487,20 +489,86 @@ fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> 
                     } else {
                         "is greater than"
                     };
-                    let mut pointer = String::from("#");
-                    for key in path.iter() {
-                        pointer.push('/');
-                        pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
-                    }
                     return Some(format!(
-                        "{lower} ({lo}) {relation} {upper} ({hi}) at {pointer}"
+                        "{lower} ({lo}) {relation} {upper} ({hi}) at {}",
+                        json_pointer(path)
                     ));
                 }
+            }
+            if let Some((lower, upper)) = empty_integer_range(obj) {
+                return Some(format!(
+                    "no integer meets {lower} ({}) and {upper} ({}) at {}",
+                    obj[lower],
+                    obj[upper],
+                    json_pointer(path)
+                ));
             }
             obj.iter().find_map(|(k, c)| descend(path, k.clone(), c))
         }
         _ => None,
     }
+}
+
+/// The RFC 6901 pointer of `path`, as a URI fragment: `#`, `#/items`, ...
+fn json_pointer(path: &[String]) -> String {
+    let mut pointer = String::from("#");
+    for key in path {
+        pointer.push('/');
+        pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+    }
+    pointer
+}
+
+/// For a schema whose every `type` is `integer`, the lower and upper bound
+/// keywords that leave no integer between them, or `None`. The smallest
+/// integer allowed is the largest of `ceil(minimum)` and
+/// `floor(exclusiveMinimum) + 1`, the largest the smallest of
+/// `floor(maximum)` and `ceil(exclusiveMaximum) - 1`; the keywords named
+/// are the ones that set them. A pair that is empty for any number is
+/// already reported by [`BOUND_PAIRS`]; this catches ranges like
+/// `(2, 3)` or `[2.5, 2.9]` that hold numbers but no integer.
+fn empty_integer_range(obj: &Map<String, Value>) -> Option<(&'static str, &'static str)> {
+    let integer = |t: &Value| t.as_str() == Some("integer");
+    let only_integer = match obj.get("type")? {
+        Value::Array(types) => !types.is_empty() && types.iter().all(integer),
+        t => integer(t),
+    };
+    if !only_integer {
+        return None;
+    }
+    // An integer bound as is; a fraction rounded the given way. Saturates
+    // far outside any count a schema can hold.
+    let bound = |key: &str, round: fn(f64) -> f64| -> Option<i128> {
+        let n = obj.get(key)?.as_number()?;
+        match (n.as_i64(), n.as_u64()) {
+            (Some(i), _) => Some(i128::from(i)),
+            (_, Some(u)) => Some(i128::from(u)),
+            _ => Some(round(n.as_f64()?) as i128),
+        }
+    };
+    let lowers = [
+        ("minimum", bound("minimum", f64::ceil)),
+        (
+            "exclusiveMinimum",
+            bound("exclusiveMinimum", f64::floor).map(|b| b.saturating_add(1)),
+        ),
+    ];
+    let uppers = [
+        ("maximum", bound("maximum", f64::floor)),
+        (
+            "exclusiveMaximum",
+            bound("exclusiveMaximum", f64::ceil).map(|b| b.saturating_sub(1)),
+        ),
+    ];
+    let (lower, lo) = lowers
+        .into_iter()
+        .filter_map(|(k, b)| Some((k, b?)))
+        .max_by_key(|(_, b)| *b)?;
+    let (upper, hi) = uppers
+        .into_iter()
+        .filter_map(|(k, b)| Some((k, b?)))
+        .min_by_key(|(_, b)| *b)?;
+    (lo > hi).then_some((lower, upper))
 }
 
 /// `a` against `b`: exactly when both are integers, else as doubles.
@@ -3559,5 +3627,80 @@ mod tests {
             .as_deref(),
             Some("minLength (5) is greater than maxLength (2) at #/properties/a")
         );
+    }
+
+    #[test]
+    fn integer_range_with_no_integer_is_rejected() {
+        assert_eq!(
+            parse_schema(json!({"type": "integer", "exclusiveMinimum": 2, "exclusiveMaximum": 3})),
+            unsat("no integer meets exclusiveMinimum (2) and exclusiveMaximum (3) at #")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": "integer", "minimum": 2.5, "maximum": 2.9})),
+            unsat("no integer meets minimum (2.5) and maximum (2.9) at #")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": ["integer"], "minimum": 2.1, "exclusiveMaximum": 3})),
+            unsat("no integer meets minimum (2.1) and exclusiveMaximum (3) at #")
+        );
+        // The tighter of two lower bounds is the one named.
+        assert_eq!(
+            parse_schema(json!({
+                "type": "integer", "minimum": 1, "exclusiveMinimum": 4.5, "maximum": 4.9
+            })),
+            unsat("no integer meets exclusiveMinimum (4.5) and maximum (4.9) at #")
+        );
+    }
+
+    #[test]
+    fn integer_range_with_no_integer_is_found_nested_and_through_ref() {
+        assert_eq!(
+            parse_schema(json!({
+                "type": "object",
+                "properties": {"n": {"type": "integer", "exclusiveMinimum": 0, "exclusiveMaximum": 1}}
+            })),
+            unsat(
+                "no integer meets exclusiveMinimum (0) and exclusiveMaximum (1) at #/properties/n"
+            )
+        );
+        assert_eq!(
+            parse_schema(json!({
+                "type": "array",
+                "items": {"type": "integer", "minimum": -0.5, "maximum": -0.25}
+            })),
+            unsat("no integer meets minimum (-0.5) and maximum (-0.25) at #/items")
+        );
+        assert_eq!(
+            parse_schema(json!({
+                "type": "object",
+                "properties": {"n": {"$ref": "#/$defs/N"}},
+                "$defs": {"N": {"type": "integer", "minimum": 7.1, "exclusiveMaximum": 8}}
+            })),
+            unsat("no integer meets minimum (7.1) and exclusiveMaximum (8) at #/$defs/N")
+        );
+    }
+
+    #[test]
+    fn integer_range_holding_an_integer_is_accepted() {
+        for schema in [
+            json!({"type": "integer", "exclusiveMinimum": 2, "exclusiveMaximum": 4}),
+            json!({"type": "integer", "minimum": 2.5, "maximum": 3}),
+            json!({"type": "integer", "minimum": 3, "maximum": 3}),
+            json!({"type": "integer", "exclusiveMinimum": 2.5, "exclusiveMaximum": 3.5}),
+            json!({"type": "integer", "minimum": 2.5}),
+            // A type list allowing other numbers keeps the range.
+            json!({"type": ["integer", "number"], "exclusiveMinimum": 2, "exclusiveMaximum": 3}),
+            json!({"type": "number", "minimum": 2.5, "maximum": 2.9}),
+            json!({"minimum": 2.5, "maximum": 2.9}),
+        ] {
+            assert!(
+                matches!(
+                    parse_schema(schema.clone()),
+                    Ok(ResponseFormat::JsonSchema { .. })
+                ),
+                "{schema}"
+            );
+            assert_eq!(unsatisfiable_bound(&schema), None, "{schema}");
+        }
     }
 }
