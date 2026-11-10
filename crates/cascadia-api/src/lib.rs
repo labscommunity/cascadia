@@ -6805,6 +6805,17 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "max_tokens": 64, "stop": "charlie",
+                "prompt": "alpha bravo charlie delta"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["choices"][0]["text"].as_str().unwrap().trim(),
+            "alpha bravo"
+        );
     }
 
     /// Nine stop strings, more than OpenAI documents, are served: clients
@@ -10969,15 +10980,11 @@ level={{ effort_map[eff] }}";
         assert_eq!(
             err,
             &serde_json::json!({
-                "message": err["message"],
+                "message": "mock injected engine failure",
                 "type": "server_error",
                 "param": null,
                 "code": null,
             }),
-            "{body}"
-        );
-        assert!(
-            err["message"].as_str().unwrap().contains("mock injected"),
             "{body}"
         );
     }
@@ -11511,6 +11518,29 @@ level={{ effort_map[eff] }}";
     }
 
     #[tokio::test]
+    async fn mid_generation_prompt_too_long_on_responses_names_input() {
+        let (app, _release) = gated_app_failing(&[], Some(MID_GENERATION_TOO_LONG)).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model": "mock-model", "input": "hi"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["param"], "input", "{v}");
+        assert_eq!(v["error"]["code"], "context_length_exceeded", "{v}");
+    }
+
+    #[tokio::test]
     async fn mid_generation_prompt_too_long_on_completions_names_prompt() {
         let (app, _release) = gated_app_failing(&[], Some(MID_GENERATION_TOO_LONG)).await;
         let (status, v) = post_completions(
@@ -11637,9 +11667,17 @@ level={{ effort_map[eff] }}";
             .unwrap();
         let body =
             String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
         let events = sse_events(&body);
         let last = events.last().unwrap();
         assert_eq!(last["object"], "error", "{body}");
+        // The frame carries the stream's id, as its text frames do.
+        let id = last["id"].as_str().unwrap();
+        assert!(id.starts_with("cmpl-"), "{body}");
+        assert!(
+            events[..events.len() - 1].iter().all(|e| e["id"] == id),
+            "{body}"
+        );
         assert_eq!(last["error"]["type"], "server_error", "{body}");
         let err = last["error"].as_object().unwrap();
         assert!(
@@ -12337,6 +12375,51 @@ level={{ effort_map[eff] }}";
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert_eq!(&body[..], b"not found");
+    }
+
+    /// Any other non-JSON error keeps its body text as the message, or the
+    /// status's reason when it has none, and is served as JSON whose length
+    /// is the new body's.
+    #[tokio::test]
+    async fn other_text_errors_keep_their_text() {
+        let app = with_error_bodies(
+            Router::new()
+                .route(
+                    "/v1/big",
+                    get(|| async { (StatusCode::PAYLOAD_TOO_LARGE, "too big") }),
+                )
+                .route(
+                    "/v1/media",
+                    get(|| async { StatusCode::UNSUPPORTED_MEDIA_TYPE }),
+                ),
+        );
+        for (path, status, message) in [
+            ("/v1/big", StatusCode::PAYLOAD_TOO_LARGE, "too big"),
+            (
+                "/v1/media",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Unsupported Media Type",
+            ),
+        ] {
+            let resp = send(app.clone(), "GET", path).await;
+            assert_eq!(resp.status(), status);
+            assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+            let declared = resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .map(|v| v.to_str().unwrap().parse::<u64>().unwrap());
+            let hinted = axum::body::HttpBody::size_hint(resp.body()).exact();
+            let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let len = body.len() as u64;
+            assert!(
+                declared.is_none_or(|n| n == len),
+                "{path}: {declared:?} vs {len}"
+            );
+            assert_eq!(hinted, Some(len), "{path}");
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["error"]["message"], message, "{path}");
+            assert_eq!(v["error"]["type"], "invalid_request_error", "{path}");
+        }
     }
 
     #[tokio::test]
