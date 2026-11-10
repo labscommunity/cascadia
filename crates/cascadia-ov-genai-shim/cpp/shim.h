@@ -149,8 +149,9 @@ typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len, size
 /// step later. Don't rely on thread-locals in `poll`. It is never called after
 /// this function returns or fails, so `ctx` may live on the caller's stack.
 ///
-/// `out_text` is decoded from all generated tokens: after a STOP it holds the
-/// text up to and including the token that completed the match.
+/// `out_text` is decoded from all generated tokens: after a STOP it includes
+/// at least the token that completed the match (more under ov-genai's
+/// threaded streamer wrapper or in a multi-token draft/prompt-lookup round).
 int32_t cascadia_pipeline_generate_polled(
     cascadia_pipeline_t* handle,
     const char* prompt,

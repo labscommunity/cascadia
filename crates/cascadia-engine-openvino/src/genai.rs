@@ -640,8 +640,25 @@ impl Engine for OvGenaiEngine {
         // get an answer cut short with nothing to show why. Return the raw
         // text instead, so the API's cut is the one generation stopped on
         // (OpenAI: stop applies to the generated output) (M18 D8).
-        if stopped_on_match && !OneShotStop::new(&task.sampling.stop).push(&text) {
-            text = raw;
+        //
+        // If raw lacks the stop too, the D8 invariant (a window decode is a
+        // substring of the final decode) broke. That can rarely happen when a
+        // detokenizer cleanup rule (`clean_up_tokenization_spaces`) rewrites
+        // text based on later tokens, so a window matched what the final
+        // decode no longer has. Keep the visible text and warn: the hardware
+        // check fails on that line.
+        if stopped_on_match {
+            let has_stop = |t: &str| OneShotStop::new(&task.sampling.stop).push(t);
+            if !has_stop(&text) {
+                if has_stop(&raw) {
+                    text = raw;
+                } else {
+                    warn!(
+                        task = %task.task_id,
+                        "engine stopped on a stop the returned text lacks (D8 invariant)"
+                    );
+                }
+            }
         }
         // Prefer tokenizer-based count; fall back to perf_metrics value.
         let tokens = self
@@ -1987,6 +2004,9 @@ mod tests {
         err_after_cancel: bool,
         /// At piece i, fail the way the shim does after the poll panicked.
         poll_panic_at: Option<usize>,
+        /// At piece i, pass this tail instead of the decode (a detokenizer
+        /// whose window decode disagrees with the final decode).
+        tail_override: Option<(usize, String)>,
         /// Pieces polled (the end flush not included).
         consumed: usize,
         /// Every poll call: (text, n_tokens, answer).
@@ -2023,6 +2043,7 @@ mod tests {
             tail_tokens: usize,
             poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
         ) -> Result<GenResult, OvError> {
+            let tail_override = self.st.lock().unwrap().tail_override.clone();
             let (pieces, cancel_before, err_after_cancel, poll_panic_at) = {
                 let mut st = self.st.lock().unwrap();
                 st.polled_calls += 1;
@@ -2050,12 +2071,15 @@ mod tests {
                 n_total += n;
                 // What the shim passes: a decode of the last `tail_tokens`
                 // tokens, or nothing.
-                let tail: String = if tail_tokens > 0 && *n > 0 {
-                    let from = (i + 1).saturating_sub(tail_tokens);
-                    pieces[from..=i].iter().map(|(t, _)| t.as_str()).collect()
-                } else {
-                    String::new()
-                };
+                let tail: String =
+                    if let Some((_, t)) = tail_override.as_ref().filter(|(at, _)| *at == i) {
+                        t.clone()
+                    } else if tail_tokens > 0 && *n > 0 {
+                        let from = (i + 1).saturating_sub(tail_tokens);
+                        pieces[from..=i].iter().map(|(t, _)| t.as_str()).collect()
+                    } else {
+                        String::new()
+                    };
                 let action = poll(&tail, *n);
                 {
                     let mut st = self.st.lock().unwrap();
@@ -2391,6 +2415,53 @@ mod tests {
         assert_eq!(st.lock().unwrap().consumed, 1);
         assert_eq!(out[0].1.text, "\n");
         assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// The window is the last `tail_tokens` tokens, not the whole history:
+    /// stop "x" asks for 1 + 16 = 17.
+    #[test]
+    fn stateful_tail_window_is_the_last_tail_tokens() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let names: Vec<String> = (0..30).map(|i| format!(" p{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        st.lock().unwrap().pieces = pieces(&refs);
+        let mut e = stateful_engine(&st);
+        e.submit(stop_task("t1", 64, &["x"])).unwrap();
+        e.step().unwrap();
+        let s = st.lock().unwrap();
+        assert_eq!(s.tail_tokens, [17]);
+        assert_eq!(s.consumed, 30);
+        let want: String = names[30 - 17..].concat();
+        // The last write's tail (the end call after it is empty).
+        assert_eq!(s.polls[29].0, want);
+        assert_eq!(s.polls[29].1, 1);
+        assert_eq!(s.polls[30], (String::new(), 0, PollAction::Running));
+    }
+
+    /// D8 invariant broken (a window decode that matched while neither the
+    /// returned nor the visible text holds the stop): keep the visible text,
+    /// and say so in a warn the hardware check fails on.
+    #[test]
+    fn stateful_stop_missing_from_both_texts_keeps_visible_and_warns() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["  alpha", " beta", " gamma"]);
+            s.tail_override = Some((1, "STOP".into()));
+        }
+        let mut e = stateful_engine(&st);
+        let mut t = stop_task("t1", 64, &["STOP"]);
+        // An empty prompt: the visible text is the raw text trimmed.
+        t.prompt = String::new();
+        e.submit(t).unwrap();
+        let (out, logs) = capture_logs(|| e.step().unwrap());
+        assert_eq!(st.lock().unwrap().consumed, 2);
+        assert_eq!(out[0].1.text, "alpha beta");
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+        assert!(
+            logs.contains("engine stopped on a stop the returned text lacks (D8 invariant)"),
+            "{logs}"
+        );
     }
 
     /// A match on the last allowed token is `stop`, not `length`.

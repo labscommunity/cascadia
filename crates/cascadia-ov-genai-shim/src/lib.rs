@@ -784,7 +784,9 @@ impl LlmPipeline {
     ///   generation, with empty text and `n_tokens` 0, also after it returned
     ///   Stop/Cancel; that answer is ignored.
     /// - **The returned text** is decoded from all generated tokens: after a
-    ///   Stop it ends with the token whose write answered Stop.
+    ///   Stop it includes at least the token that completed the match (more
+    ///   under ov-genai's threaded streamer wrapper or in a multi-token
+    ///   draft/prompt-lookup round).
     ///
     /// A panic in `poll` cancels the generation and returns
     /// `Error::Native(POLL_PANICKED)` ([`Error::is_poll_panic`]). A native

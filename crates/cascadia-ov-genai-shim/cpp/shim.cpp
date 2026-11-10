@@ -405,10 +405,14 @@ namespace {
 // returned decode (M18 D8), so text checked against them could disagree with
 // the answer.
 //
-// The decode uses the tokenizer's defaults (no detokenization params), the
-// same call the pipeline makes for its result (tokenizer.hpp:198,
-// `decode(tokens, detokenization_params = {})`), so the window decodes the
-// way the returned text does.
+// The decode passes no detokenization params (tokenizer.hpp:198,
+// `decode(tokens, detokenization_params = {})`): the same default
+// detokenization params as ov-genai's TextStreamer (text_streamer.hpp:30).
+// Whether the pipeline's own result decode passes other params is unverified
+// and is checked on hardware.
+//
+// Only a window's worth of ids is kept: none when `tail_tokens` is 0, else the
+// buffer is cut back to the last `tail_tokens` ids once it passes twice that.
 //
 // Every entry point holds `m_mu`, and close() (called by the shim when
 // generate returns or throws) sets `m_closed` under it: after close() no call
@@ -422,12 +426,12 @@ public:
         : m_tokenizer(tokenizer), m_tail_tokens(tail_tokens), m_poll(poll), m_ctx(ctx) {}
 
     ov::genai::StreamingStatus write(int64_t token) override {
-        return feed_and_poll([&] { m_ids.push_back(token); }, 1);
+        return feed_and_poll([&] { keep_ids(&token, &token + 1); }, 1);
     }
 
     ov::genai::StreamingStatus write(const std::vector<int64_t>& tokens) override {
-        return feed_and_poll(
-            [&] { m_ids.insert(m_ids.end(), tokens.begin(), tokens.end()); }, tokens.size());
+        return feed_and_poll([&] { keep_ids(tokens.data(), tokens.data() + tokens.size()); },
+                             tokens.size());
     }
 
     void end() override {
@@ -451,6 +455,16 @@ public:
     }
 
 private:
+    // Appends ids for the tail decode; with m_mu held.
+    void keep_ids(const int64_t* first, const int64_t* last) {
+        if (m_tail_tokens == 0) return;
+        m_ids.insert(m_ids.end(), first, last);
+        if (m_ids.size() > 2 * m_tail_tokens) {
+            m_ids.erase(m_ids.begin(),
+                        m_ids.end() - static_cast<std::ptrdiff_t>(m_tail_tokens));
+        }
+    }
+
     template <typename Feed>
     ov::genai::StreamingStatus feed_and_poll(Feed&& feed, size_t n_tokens) {
         std::lock_guard<std::mutex> lock(m_mu);
