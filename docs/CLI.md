@@ -515,7 +515,7 @@ and `code` a machine-readable reason, both `null` when unset:
 |---|---|
 | 400 | Body is not valid JSON (`request body is not valid JSON: …`), a field has the wrong type (serde's message with its JSON path), or `Content-Type` is not JSON (``request must have `Content-Type: application/json` ``). |
 | 400 | A field out of range or one this server refuses (table below); `param` is that field. |
-| 400 `context_length_exceeded` | The prompt does not fit the model's window; `param` is `messages`, `prompt` or `input` (the route's prompt field). |
+| 400 `context_length_exceeded` | The prompt does not fit the model's window; `param` is `messages`, `prompt` or `input` (the route's prompt field). On NPU, `ov-genai`'s own prompt cap (`MAX_PROMPT_LEN`, default 1024 tokens) counts as the window and is quoted. |
 | 404 | Unknown `/v1/` path: `Invalid URL (POST /v1/foo)`. Also the engine not finding the model it was asked for. |
 | 405 | Wrong method: `Method GET is not allowed for /v1/chat/completions`, with an `Allow` header. |
 | 413 | Body over `--api-max-body-mb`, or the prompt over its byte cap (`prompt is N bytes; max allowed is M (max_prompt_bytes)`). A chat request's turns are capped too: `messages are N bytes (content + tool fields); max allowed is M (max_prompt_bytes)`, with `param: messages`. On a model that takes images, `/v1/chat/completions` and `/v1/responses` accept a larger body (the image allowance, plus the video allowance when videos are on, see [VLM.md](VLM.md)), but a chat request's text alone is still held to `--api-max-body-mb` (`request text (everything but image URLs) is N bytes; …`). |
