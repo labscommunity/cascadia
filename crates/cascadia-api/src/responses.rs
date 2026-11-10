@@ -112,6 +112,14 @@ impl Refusal {
         }
     }
 
+    /// A value outside OpenAI's range, booked as chat's are.
+    fn invalid(param: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            reason: "invalid_request",
+            ..Self::new(param, message)
+        }
+    }
+
     /// The machine-readable `code` other servers give this refusal.
     fn with_code(self, code: &'static str) -> Self {
         Self {
@@ -489,7 +497,7 @@ fn chat_request(req: &ResponsesRequest, messages: Vec<ChatMessage>) -> ChatCompl
 /// Hold the sampling fields to OpenAI's ranges, named as this endpoint
 /// spells them (`reasoning.effort`, not the chat `reasoning_effort`).
 fn check_ranges(req: &ResponsesRequest) -> Result<(), Refusal> {
-    let refuse = |e: validate::FieldError| Refusal::malformed(e.param, e.message);
+    let refuse = |e: validate::FieldError| Refusal::invalid(e.param, e.message);
     if let Some(v) = req.temperature {
         validate::check_temperature(v, "temperature").map_err(refuse)?;
     }
@@ -1627,6 +1635,25 @@ mod tests {
         )
         .await;
         assert_eq!(v["max_output_tokens"], default_max_tokens());
+    }
+
+    /// A value out of range books the same rejection reason as chat's.
+    #[tokio::test]
+    async fn range_refusals_count_as_invalid_request() {
+        let count = |reason: &str| {
+            cascadia_metrics::API_REJECTED_TOTAL
+                .with_label_values(&[reason])
+                .get()
+        };
+        let before = count("invalid_request");
+        let (status, v) = post_json(
+            make_app().await,
+            json!({"model": "mock-model", "input": "hi", "temperature": 3}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["param"], "temperature", "{v}");
+        assert!(count("invalid_request") > before);
     }
 
     /// Refusals book their own rejection reason, apart from bodies that do

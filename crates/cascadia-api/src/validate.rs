@@ -105,8 +105,11 @@ pub fn check_n(n: Option<u32>) -> Result<(), FieldError> {
     }
 }
 
-/// Fields OpenAI defines that this server can't honour: non-empty logit_bias object, modalities containing "audio",
-/// non-null audio, non-null web_search_options. `null`, `{}`, `[]`, `["text"]` pass.
+/// Fields OpenAI defines that this server can't honour: a non-empty
+/// `logit_bias` object, `modalities` containing "audio", a non-null `audio`, a
+/// non-null `web_search_options`. `null`, `{}`, `[]`, `["text"]` pass. A
+/// `modalities` that is neither `null` nor an array of strings is refused
+/// too.
 pub fn check_unsupported(
     logit_bias: Option<&Value>,
     modalities: Option<&Value>,
@@ -114,6 +117,17 @@ pub fn check_unsupported(
     web_search_options: Option<&Value>,
 ) -> Result<(), FieldError> {
     check_logit_bias(logit_bias)?;
+    let well_formed = match modalities {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(m)) => m.iter().all(Value::is_string),
+        Some(_) => false,
+    };
+    if !well_formed {
+        return Err(FieldError::new(
+            "modalities",
+            "modalities must be an array of strings (such as [\"text\"])".to_owned(),
+        ));
+    }
     let wants_audio = modalities
         .and_then(Value::as_array)
         .is_some_and(|m| m.iter().any(|x| x == "audio"));
@@ -254,6 +268,15 @@ mod tests {
         assert!(ok(json!(null), json!(null), json!(null), json!(null)).is_ok());
         assert!(ok(json!({}), json!([]), json!(null), json!(null)).is_ok());
         assert!(ok(json!({}), json!(["text"]), json!(null), json!(null)).is_ok());
+        for m in [json!("text"), json!([1]), json!({}), json!(["text", null])] {
+            assert_eq!(
+                ok(json!(null), m.clone(), json!(null), json!(null))
+                    .unwrap_err()
+                    .param,
+                "modalities",
+                "{m}"
+            );
+        }
         let param = |r: Result<(), FieldError>| r.unwrap_err().param;
         assert_eq!(
             param(ok(json!({"1": 5}), json!(null), json!(null), json!(null))),

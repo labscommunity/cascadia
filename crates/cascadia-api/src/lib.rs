@@ -4179,6 +4179,50 @@ async fn admit_chat(
             ));
         }
     }
+    // The tools themselves before the choice that names one of them, so a
+    // malformed tool is reported as `tools`.
+    // Only function tools exist; any other `type` is text the template
+    // would print as is.
+    let bad_call = req.messages.iter().position(|m| {
+        m.tool_calls
+            .iter()
+            .flatten()
+            .any(|c| c.r#type != "function")
+    });
+    let bad_param = if req.tools.iter().flatten().any(|t| t.r#type != "function") {
+        Some("tools".to_owned())
+    } else {
+        bad_call.map(|i| format!("messages[{i}].tool_calls"))
+    };
+    if let Some(param) = bad_param {
+        count_rejected("malformed_body");
+        return Err(api_error_for(
+            StatusCode::BAD_REQUEST,
+            "only `function` tools and tool calls are supported (`type` must be `function`)",
+            Some(&param),
+            None,
+        ));
+    }
+    if let Some((i, t)) = req
+        .tools
+        .iter()
+        .flatten()
+        .enumerate()
+        .find(|(_, t)| !t.function.is_object())
+    {
+        count_rejected("malformed_body");
+        let message = if t.function.is_null() {
+            format!("tools[{i}]: missing field `function`")
+        } else {
+            format!("tools[{i}]: `function` must be an object")
+        };
+        return Err(api_error_for(
+            StatusCode::BAD_REQUEST,
+            message,
+            Some("tools"),
+            None,
+        ));
+    }
     if let Err(e) = req.validate_tool_choice() {
         count_rejected("invalid_request");
         return Err(api_error_for(
@@ -4211,42 +4255,6 @@ async fn admit_chat(
     } else {
         None
     };
-    // Only function tools exist; any other `type` is text the template
-    // would print as is.
-    let bad_call = req.messages.iter().position(|m| {
-        m.tool_calls
-            .iter()
-            .flatten()
-            .any(|c| c.r#type != "function")
-    });
-    let bad_param = if req.tools.iter().flatten().any(|t| t.r#type != "function") {
-        Some("tools".to_owned())
-    } else {
-        bad_call.map(|i| format!("messages[{i}].tool_calls"))
-    };
-    if let Some(param) = bad_param {
-        count_rejected("malformed_body");
-        return Err(api_error_for(
-            StatusCode::BAD_REQUEST,
-            "only `function` tools and tool calls are supported (`type` must be `function`)",
-            Some(&param),
-            None,
-        ));
-    }
-    if let Some(i) = req
-        .tools
-        .iter()
-        .flatten()
-        .position(|t| t.function.is_null())
-    {
-        count_rejected("malformed_body");
-        return Err(api_error_for(
-            StatusCode::BAD_REQUEST,
-            format!("tools[{i}]: missing field `function`"),
-            Some("tools"),
-            None,
-        ));
-    }
     if let Some(resp) = refuse_reserved_text(
         state,
         "message text",
@@ -6660,6 +6668,9 @@ mod tests {
                 serde_json::json!({"modalities": ["text", "audio"]}),
                 "modalities",
             ),
+            (serde_json::json!({"modalities": "text"}), "modalities"),
+            (serde_json::json!({"modalities": [1]}), "modalities"),
+            (serde_json::json!({"modalities": {}}), "modalities"),
             (
                 serde_json::json!({"audio": {"voice": "alloy", "format": "wav"}}),
                 "audio",
@@ -6675,6 +6686,29 @@ mod tests {
             ),
             (
                 serde_json::json!({"tools": [{"type": "function"}]}),
+                "tools",
+            ),
+            // The tool's own fault, not the choice naming it.
+            (
+                serde_json::json!({"tools": [{"type": "custom", "custom": {"name": "f"}}],
+                    "tool_choice": {"type": "function", "function": {"name": "f"}}}),
+                "tools",
+            ),
+            (
+                serde_json::json!({"tools": [{"type": "function", "function": null}],
+                    "tool_choice": {"type": "function", "function": {"name": "f"}}}),
+                "tools",
+            ),
+            (
+                serde_json::json!({"tools": [{"type": "function", "function": "f"}]}),
+                "tools",
+            ),
+            (
+                serde_json::json!({"tools": [{"type": "function", "function": ["f"]}]}),
+                "tools",
+            ),
+            (
+                serde_json::json!({"tools": [{"type": "function", "function": 3}]}),
                 "tools",
             ),
         ];
@@ -6714,6 +6748,8 @@ mod tests {
             serde_json::json!({"logit_bias": {}}),
             serde_json::json!({"logit_bias": null}),
             serde_json::json!({"modalities": ["text"]}),
+            serde_json::json!({"modalities": []}),
+            serde_json::json!({"modalities": null}),
             serde_json::json!({"audio": null}),
             serde_json::json!({"web_search_options": null}),
             serde_json::json!({"response_format": {"type": "json_object"}}),
