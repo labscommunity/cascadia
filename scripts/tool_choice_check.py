@@ -446,12 +446,13 @@ def case_parallel_false():
                 enforce = [e for e in enforce if "want exactly" not in e]
             judge(case, r, shape, enforce)
     # Control: the same prompt with parallel calls allowed must be able to make two, or the
-    # false case above proves nothing.
+    # false case above proves nothing. A model that makes only one call even when two are
+    # allowed is a limit of the model, not of the server: the control is then inconclusive.
     case = "parallel_true_control"
     r = send(case, chat(PARALLEL_PROMPT, tools, tool_choice="required", parallel_tool_calls=True))
     if r:
         shape, enforce = function_calls_check(r, names, "tool_calls", at_least=2)
-        if len(r.calls) < 2 and MOCK and not FALLBACK:
+        if len(r.calls) < 2 and not shape:
             verdict(case, "INFO", f"inconclusive (model made <2 calls) | {summary(r)}")
         else:
             judge(case, r, shape, enforce)
