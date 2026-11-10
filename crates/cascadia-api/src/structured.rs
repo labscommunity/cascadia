@@ -1035,12 +1035,20 @@ fn path_to_target(root: &Value, r: &str, target: &Value) -> Option<Vec<String>> 
 pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound> {
     let mut dropped = Vec::new();
     let mut refs = Vec::new();
-    relax_in_place(schema, &mut Vec::new(), &mut dropped, &mut refs);
-    // Each ref string is resolved once, and a target already inside a
-    // relaxed subtree (the root's, or an earlier target's) is not walked
-    // again: every node is relaxed at most once per round of new refs.
+    // One record of every place relaxed, shared by the root pass and every
+    // target walk: no walk enters a place an earlier one relaxed, so each
+    // object is relaxed at most once however the targets nest.
+    let mut visited = Visited::new();
+    relax_in_place(
+        schema,
+        &mut Vec::new(),
+        Visited::ROOT,
+        &mut visited,
+        &mut dropped,
+        &mut refs,
+    );
+    // Each ref string is resolved once.
     let mut seen: HashSet<String> = HashSet::new();
-    let mut walked: HashSet<Vec<String>> = HashSet::new();
     while !refs.is_empty() {
         let mut paths: Vec<Vec<String>> = Vec::new();
         for r in std::mem::take(&mut refs) {
@@ -1052,14 +1060,15 @@ pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound>
                     .filter_map(|target| path_to_target(schema, &r, target)),
             );
         }
-        // Shallow targets first, so a deeper one inside them is covered.
         paths.sort_by_key(Vec::len);
         paths.dedup();
         for mut path in paths {
-            if already_relaxed(schema, &path, &walked) || !schema_position(schema, &path) {
+            let at = path
+                .iter()
+                .fold(Visited::ROOT, |at, key| visited.place(at, key));
+            if visited.relaxed[at] || !schema_position(schema, &path) {
                 continue;
             }
-            walked.insert(path.clone());
             let mut node = &mut *schema;
             for key in &path {
                 node = match node {
@@ -1069,60 +1078,47 @@ pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound>
                 }
                 .expect("path_to_target only returns a path that leads somewhere");
             }
-            relax_in_place(node, &mut path, &mut dropped, &mut refs);
+            relax_in_place(node, &mut path, at, &mut visited, &mut dropped, &mut refs);
         }
     }
     dropped
 }
 
-/// True when [`relax_in_place`] has already been at `path`: it is reached
-/// from the root or from a `walked` target through only the keys that walk
-/// descends into (`properties` entries, `items`, `anyOf` members, ...).
-fn already_relaxed(root: &Value, path: &[String], walked: &HashSet<Vec<String>>) -> bool {
-    let mut node = root;
-    // Whether the walk reached `node`, and whether the next key names an
-    // entry of a schema map or an array of member schemas.
-    let mut reached = true;
-    let mut entry = false;
-    for (i, key) in path.iter().enumerate() {
-        if !reached && !walked.is_empty() && walked.contains(&path[..i]) {
-            reached = true;
-            entry = false;
+/// The places in a schema [`relax_in_place`] has relaxed, as a tree of
+/// path keys: a place is an index, its children found by key, so a path is
+/// stored once per key rather than once per place under it.
+struct Visited {
+    children: Vec<HashMap<String, usize>>,
+    relaxed: Vec<bool>,
+}
+
+impl Visited {
+    const ROOT: usize = 0;
+
+    /// Only the root, not yet relaxed.
+    fn new() -> Self {
+        Self {
+            children: vec![HashMap::new()],
+            relaxed: vec![false],
         }
-        let child = match node {
-            Value::Object(obj) => obj.get(key),
-            Value::Array(items) => key.parse::<usize>().ok().and_then(|i| items.get(i)),
-            _ => None,
-        };
-        let Some(child) = child else {
-            return false;
-        };
-        if entry {
-            entry = false;
-        } else if reached {
-            match (key.as_str(), child) {
-                (
-                    "properties" | "patternProperties" | "$defs" | "definitions",
-                    Value::Object(_),
-                )
-                | ("prefixItems" | "allOf" | "anyOf" | "oneOf" | "items", Value::Array(_)) => {
-                    entry = true;
-                }
-                (
-                    "additionalProperties"
-                    | "items"
-                    | "contains"
-                    | "propertyNames"
-                    | "unevaluatedItems"
-                    | "unevaluatedProperties",
-                    _,
-                ) if matches!(node, Value::Object(_)) => {}
-                _ => reached = false,
-            }
-        }
-        node = child;
     }
-    reached || walked.contains(path)
+
+    /// The place `key` names under `at`, added (not relaxed) when new.
+    fn place(&mut self, at: usize, key: &str) -> usize {
+        if let Some(&child) = self.children[at].get(key) {
+            return child;
+        }
+        let child = self.children.len();
+        self.children.push(HashMap::new());
+        self.relaxed.push(false);
+        self.children[at].insert(key.to_owned(), child);
+        child
+    }
+
+    /// Marks `at` relaxed; false when it already was.
+    fn enter(&mut self, at: usize) -> bool {
+        !std::mem::replace(&mut self.relaxed[at], true)
+    }
 }
 
 /// False when `path` from `root` passes through a data keyword (`enum`,
@@ -1163,17 +1159,35 @@ fn schema_position(root: &Value, path: &[String]) -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    /// When set, every path [`relax_in_place`] relaxes an object at, in order.
+    static RELAX_VISITS: std::cell::RefCell<Option<Vec<Vec<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// [`relax_unsatisfiable_bounds`] on `v`, at `path`, and the schemas
 /// below it; the local `$ref`s met are added to `refs`.
 fn relax_in_place(
     v: &mut Value,
     path: &mut Vec<String>,
+    at: usize,
+    visited: &mut Visited,
     dropped: &mut Vec<UnsatisfiableBound>,
     refs: &mut Vec<String>,
 ) {
     let Value::Object(obj) = v else {
         return;
     };
+    if !visited.enter(at) {
+        return;
+    }
+    #[cfg(test)]
+    RELAX_VISITS.with(|visits| {
+        if let Some(visits) = visits.borrow_mut().as_mut() {
+            visits.push(path.clone());
+        }
+    });
     // An object can hold more than one such pair.
     while let Some(found) = bound_pair_here(obj, path) {
         obj.shift_remove(found.lower);
@@ -1187,16 +1201,21 @@ fn relax_in_place(
         path.push(key.clone());
         match (key.as_str(), child) {
             ("properties" | "patternProperties" | "$defs" | "definitions", Value::Object(map)) => {
+                let here = visited.place(at, key);
                 for (name, sub) in map.iter_mut() {
+                    let entry = visited.place(here, name);
                     path.push(name.clone());
-                    relax_in_place(sub, path, dropped, refs);
+                    relax_in_place(sub, path, entry, visited, dropped, refs);
                     path.pop();
                 }
             }
             ("prefixItems" | "allOf" | "anyOf" | "oneOf" | "items", Value::Array(subs)) => {
+                let here = visited.place(at, key);
                 for (i, sub) in subs.iter_mut().enumerate() {
-                    path.push(i.to_string());
-                    relax_in_place(sub, path, dropped, refs);
+                    let index = i.to_string();
+                    let entry = visited.place(here, &index);
+                    path.push(index);
+                    relax_in_place(sub, path, entry, visited, dropped, refs);
                     path.pop();
                 }
             }
@@ -1208,7 +1227,10 @@ fn relax_in_place(
                 | "unevaluatedItems"
                 | "unevaluatedProperties",
                 sub,
-            ) => relax_in_place(sub, path, dropped, refs),
+            ) => {
+                let here = visited.place(at, key);
+                relax_in_place(sub, path, here, visited, dropped, refs);
+            }
             _ => {}
         }
         path.pop();
@@ -5299,6 +5321,49 @@ mod tests {
             assert_eq!(out, schema);
             assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
         }
+    }
+
+    /// The paths [`relax_in_place`] relaxed an object at while relaxing
+    /// `schema`, in order.
+    fn relax_visits(schema: &mut Value) -> Vec<Vec<String>> {
+        RELAX_VISITS.with(|v| *v.borrow_mut() = Some(Vec::new()));
+        relax_unsatisfiable_bounds(schema);
+        RELAX_VISITS.with(|v| v.borrow_mut().take().unwrap())
+    }
+
+    /// Each `$ref` target names the parent of the one before it, so every
+    /// round of refs finds a shallower target holding the targets already
+    /// walked: each object is still relaxed at most once, not levels x
+    /// leaves times.
+    #[test]
+    fn relax_visits_each_object_once_when_targets_climb_a_chain() {
+        let (levels, leaves) = (115, 300);
+        let ptr = |d: usize| format!("#/x{}", "/items".repeat(d));
+        let properties: Map<String, Value> = (0..leaves)
+            .map(|i| (format!("{i:x}"), json!({"type": "string"})))
+            .collect();
+        let mut chain =
+            json!({"type": "object", "$ref": ptr(levels - 1), "properties": properties});
+        for d in (0..levels).rev() {
+            chain = if d == 0 {
+                json!({"items": chain})
+            } else {
+                json!({"$ref": ptr(d - 1), "items": chain})
+            };
+        }
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"p": {"$ref": ptr(levels)}},
+            "x": chain
+        });
+        let start = std::time::Instant::now();
+        let visits = relax_visits(&mut schema);
+        let elapsed = start.elapsed();
+        let distinct: HashSet<&Vec<String>> = visits.iter().collect();
+        assert_eq!(distinct.len(), visits.len(), "an object was relaxed twice");
+        // The root, `p`, every chain level from `#/x` down, and the leaves.
+        assert_eq!(visits.len(), 2 + levels + 1 + leaves);
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 
     #[test]
