@@ -2415,12 +2415,20 @@ fn parse_tool_calls_with(text: &str, bare_json: bool) -> Option<Vec<ToolCall>> {
 
 /// Gemma 4 calls: each `<|tool_call>call:NAME{ARGS}<tool_call|>`; a
 /// malformed one is skipped and the search goes on after its open marker.
+/// Each call is read from its own segment, up to the first close marker
+/// (included) or the next open marker, so the whole parse is linear.
 fn gemma_calls(text: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find(GEMMA_CALL_OPEN) {
         let after = &rest[start + GEMMA_CALL_OPEN.len()..];
-        rest = match call_from_gemma(after) {
+        let next_open = after.find(GEMMA_CALL_OPEN).unwrap_or(after.len());
+        let segment = &after[..next_open];
+        let segment = match segment.find(GEMMA_CALL_CLOSE) {
+            Some(i) => &segment[..i + GEMMA_CALL_CLOSE.len()],
+            None => segment,
+        };
+        rest = match call_from_gemma(segment) {
             Some((c, used)) => {
                 calls.push(c);
                 &after[used..]
@@ -12007,6 +12015,33 @@ level={{ effort_map[eff] }}";
                 assert_eq!(call_args(&calls[0]), call_args(&whole[0]), "{text}");
                 // Released content never reaches into the call.
                 assert!(!out.concat().contains("write_file"), "{text}: {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn gemma4_parse_is_linear_in_degenerate_input() {
+        // Many open markers with no call: each call's scan stops at the
+        // next marker, so the parse doesn't rescan to the end per marker.
+        for unit in [
+            "<|tool_call>call:a{k:",
+            "<|tool_call>call:a",
+            "<|tool_call>call:a{k:<|\"|>",
+        ] {
+            let junk = unit.repeat(32_000);
+            let text = format!("{GEMMA_WEATHER_CALL}{junk}{GEMMA_WEATHER_CALL}");
+            let t = std::time::Instant::now();
+            let calls = parse_tool_calls(&text).expect("the two valid calls");
+            let took = t.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(1),
+                "{unit:?} x 32000 ({} bytes) took {took:?}",
+                text.len()
+            );
+            assert_eq!(calls.len(), 2, "{unit:?}");
+            for c in &calls {
+                assert_eq!(c.function.name, "get_weather");
+                assert_eq!(call_args(c), serde_json::json!({"city": "Paris"}));
             }
         }
     }
