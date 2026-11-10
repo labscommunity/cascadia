@@ -17,6 +17,28 @@ use tokenizers::Tokenizer;
 /// Gemma 4's tool-call markers, in the order they are looked up.
 const TOOL_MARKERS: [&str; 3] = ["<|tool_call>", "<tool_call|>", "<|\"|>"];
 
+/// Whether a `tokenizer.json`'s bytes hold Gemma 4's call-open marker
+/// `<|tool_call>`. A vocabulary without it has no markers to keep, so
+/// this byte search spares parsing the whole file to find that out; one
+/// with it is then read by [`tool_marker_ids`].
+pub fn mentions_tool_markers(tokenizer_json: &[u8]) -> bool {
+    const OPEN: &[u8] = TOOL_MARKERS[0].as_bytes();
+    tokenizer_json.windows(OPEN.len()).any(|w| w == OPEN)
+}
+
+/// Whether a `tokenizer.json` the engines read for `model_dir` holds
+/// Gemma 4's call-open marker (see [`mentions_tool_markers`]): the OpenVINO
+/// runtime engines read `tokenizer/tokenizer.json`, OpenVINO GenAI
+/// `tokenizer.json`. Then the engines keep the markers in the text.
+pub fn model_has_tool_markers(model_dir: &std::path::Path) -> bool {
+    [
+        model_dir.join("tokenizer").join("tokenizer.json"),
+        model_dir.join("tokenizer.json"),
+    ]
+    .iter()
+    .any(|path| std::fs::read(path).is_ok_and(|bytes| mentions_tool_markers(&bytes)))
+}
+
 /// Gemma 4's tool-call markers in this vocabulary (`<|tool_call>`,
 /// `<tool_call|>`, `<|"|>`), as `(id, text)`; empty when absent.
 ///

@@ -109,11 +109,14 @@ fn ref_resolver_for(kind: EngineKind, llama_args: &[String]) -> cascadia_api::Re
     }
 }
 
-/// Whether the chat template writes Gemma 4 tool calls
-/// (`<|tool_call>call:NAME{…}<tool_call|>`): then the engines keep those
-/// markers in the text and the API removes them from content.
-fn gemma_tool_markers_for(template: Option<&str>) -> bool {
+/// Whether the model writes Gemma 4 tool calls
+/// (`<|tool_call>call:NAME{…}<tool_call|>`): its chat template does, or a
+/// `tokenizer.json` the engines read has the markers, which the engines
+/// then keep in the text whatever the template. The API removes them from
+/// content.
+fn gemma_tool_markers_for(template: Option<&str>, model_dir: &std::path::Path) -> bool {
     template.is_some_and(|t| t.contains("<|tool_call>call:"))
+        || cascadia_engine_openvino::decode_keep::model_has_tool_markers(model_dir)
 }
 
 /// Whether `kind` constrains output with OpenVINO GenAI's xgrammar backend,
@@ -2625,7 +2628,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             std::path::Path::new(&args.model),
             chat_template.template.as_deref(),
         );
-        cfg.gemma_tool_markers = gemma_tool_markers_for(chat_template.template.as_deref());
+        cfg.gemma_tool_markers = gemma_tool_markers_for(
+            chat_template.template.as_deref(),
+            std::path::Path::new(&args.model),
+        );
         cfg.chat_template = chat_template;
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
@@ -3887,18 +3893,38 @@ mod tests {
         }
     }
 
+    /// The engines keep Gemma 4's markers whenever the vocabulary has them,
+    /// whatever the template: the API strips them then too. The tokenizer
+    /// is looked for where the engines read it.
+    #[test]
+    fn gemma_tool_markers_also_for_a_vocabulary_that_has_them() {
+        let vocab = r#"{"added_tokens":[{"id":4,"content":"<|tool_call>","special":true}]}"#;
+        let plain = r#"{"added_tokens":[{"id":2,"content":"<turn|>","special":true}]}"#;
+        for sub in ["", "tokenizer"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+            std::fs::write(dir.path().join(sub).join("tokenizer.json"), vocab).unwrap();
+            assert!(gemma_tool_markers_for(None, dir.path()), "{sub:?}");
+            std::fs::write(dir.path().join(sub).join("tokenizer.json"), plain).unwrap();
+            assert!(!gemma_tool_markers_for(None, dir.path()), "{sub:?}");
+        }
+        let none = tempfile::tempdir().unwrap();
+        assert!(!gemma_tool_markers_for(None, none.path()));
+    }
+
     #[test]
     fn gemma_tool_markers_only_for_a_template_that_writes_gemma4_calls() {
         let gemma4 = "{%- macro format_argument(v) -%}{%- endmacro -%}\
                       {{- '<|tool_call>call:' + tc.function.name + '{' -}}";
-        assert!(gemma_tool_markers_for(Some(gemma4)));
+        let no_model = std::path::Path::new("/nonexistent-model-dir");
+        assert!(gemma_tool_markers_for(Some(gemma4), no_model));
         for other in [
             None,
             Some("{% for m in messages %}{{ m.content }}{% endfor %}"),
             Some("<tool_call>{{ tc | tojson }}</tool_call>"),
             Some("<|tool_call>"),
         ] {
-            assert!(!gemma_tool_markers_for(other), "{other:?}");
+            assert!(!gemma_tool_markers_for(other, no_model), "{other:?}");
         }
     }
 
