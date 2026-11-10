@@ -377,7 +377,26 @@ fn map_ov_err(err: OvError) -> EngineError {
 /// the server's own fixed schema, never a client's, so a failed batch is
 /// never blamed on it: quarantining it would refuse every json_object
 /// request.
-const JSON_OBJECT_PROBE: &str = r#"{"type":"object","additionalProperties":true}"#;
+const JSON_OBJECT_PROBE: &str = cascadia_types::JSON_OBJECT_SCHEMA;
+
+/// What a `json_object` request is constrained by on GenAI: any JSON object,
+/// with at most 20 spaces, tabs or newlines between two tokens. GenAI's
+/// schema path allows no whitespace at all, so a model that pretty-prints
+/// (`{` then a newline) could only close the object at once and answered
+/// `{}`; the bound keeps it from looping on whitespace. GBNF syntax for the
+/// xgrammar backend, `root` rooted at an object. A `json_schema` request
+/// keeps its schema.
+const JSON_OBJECT_EBNF: &str = r#"root ::= object
+object ::= "{" ws ( member ( ws "," ws member )* ws )? "}"
+member ::= string ws ":" ws value
+array ::= "[" ws ( value ( ws "," ws value )* ws )? "]"
+value ::= object | array | string | number | "true" | "false" | "null"
+string ::= "\"" char* "\""
+char ::= [^"\\\x00-\x1F] | "\\" escape
+escape ::= ["\\/bfnrt] | "u" [A-Fa-f0-9]{4}
+number ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )?
+ws ::= [ \n\r\t]{0,20}
+"#;
 
 /// Schema, prompt and token budget for the warmup structured-output probe.
 /// The prompt does not ask for JSON and the schema allows exactly one
@@ -1829,6 +1848,10 @@ fn build_gen_config(
         frequency_penalty: sampling.frequency_penalty,
         presence_penalty: sampling.presence_penalty,
         seed: sampling.seed,
+        // json_object: the bounded-whitespace grammar is what GenAI applies;
+        // the schema stays, for the bookkeeping that keys on it.
+        grammar: (json_schema.as_deref() == Some(JSON_OBJECT_PROBE))
+            .then(|| JSON_OBJECT_EBNF.to_owned()),
         json_schema,
     };
     if speculative_k > 0 {
@@ -3704,5 +3727,99 @@ mod tests {
             assert!(err.contains("staged tree"), "{err}");
             assert!(err.contains(&format!("--engine {engine}")), "{err}");
         }
+    }
+
+    // ---- json_object: a JSON grammar with bounded whitespace ---------------
+
+    /// A json_object request goes to GenAI as the EBNF JSON-object grammar
+    /// (the schema stays on the config, for the bookkeeping that keys on
+    /// it); a json_schema request keeps its schema and no grammar.
+    #[test]
+    fn json_object_requests_carry_the_bounded_whitespace_grammar() {
+        let sp = SamplingParams::default();
+        let cfg = build_gen_config(
+            0,
+            0,
+            false,
+            8,
+            0.0,
+            false,
+            &sp,
+            Some(JSON_OBJECT_PROBE.into()),
+        );
+        assert_eq!(cfg.grammar.as_deref(), Some(JSON_OBJECT_EBNF));
+        assert_eq!(cfg.json_schema.as_deref(), Some(JSON_OBJECT_PROBE));
+        let schema = r#"{"type":"object","properties":{"a":{"type":"integer"}}}"#;
+        let cfg = build_gen_config(0, 0, false, 8, 0.0, false, &sp, Some(schema.into()));
+        assert_eq!(cfg.grammar, None);
+        assert_eq!(cfg.json_schema.as_deref(), Some(schema));
+        let cfg = build_gen_config(0, 0, false, 8, 0.0, false, &sp, None);
+        assert_eq!((cfg.grammar, cfg.json_schema), (None, None));
+        let st = stateful_gen_config(
+            0,
+            0,
+            false,
+            8,
+            0.0,
+            false,
+            &sp,
+            Some(JSON_OBJECT_PROBE.into()),
+        );
+        assert_eq!(st.grammar.as_deref(), Some(JSON_OBJECT_EBNF));
+    }
+
+    /// The EBNF is only compiled by GenAI on Windows, so its shape is checked
+    /// here: a `root` rule, every rule it names defined, and every run of
+    /// whitespace bounded to `{0,20}` (no `*` or `+` on a whitespace class).
+    #[test]
+    fn the_json_object_ebnf_is_closed_and_bounds_its_whitespace() {
+        use std::collections::BTreeSet;
+        let mut defined = BTreeSet::new();
+        let mut used = BTreeSet::new();
+        for line in JSON_OBJECT_EBNF.lines().filter(|l| !l.trim().is_empty()) {
+            let (name, body) = line.split_once("::=").expect("one rule per line");
+            defined.insert(name.trim().to_string());
+            // Names outside quoted strings and character classes.
+            let (mut in_str, mut in_class, mut esc) = (false, false, false);
+            let mut word = String::new();
+            for c in body.chars().chain(std::iter::once(' ')) {
+                if esc {
+                    esc = false;
+                    continue;
+                }
+                match c {
+                    '\\' if in_str || in_class => esc = true,
+                    '"' if !in_class => in_str = !in_str,
+                    '[' if !in_str => in_class = true,
+                    ']' if in_class => in_class = false,
+                    c if !in_str && !in_class && (c.is_ascii_alphanumeric() || c == '_') => {
+                        word.push(c)
+                    }
+                    _ => {
+                        if !word.is_empty() && !word.chars().all(|c| c.is_ascii_digit()) {
+                            used.insert(std::mem::take(&mut word));
+                        }
+                        word.clear();
+                    }
+                }
+            }
+        }
+        assert!(defined.contains("root"));
+        assert!(
+            used.is_subset(&defined),
+            "undefined: {:?}",
+            used.difference(&defined)
+        );
+        assert!(
+            JSON_OBJECT_EBNF.contains("ws ::= [ \\n\\r\\t]{0,20}"),
+            "{JSON_OBJECT_EBNF}"
+        );
+        for unbounded in ["\\t]*", "\\t]+", "ws*", "ws+"] {
+            assert!(!JSON_OBJECT_EBNF.contains(unbounded), "{unbounded}");
+        }
+        assert!(
+            JSON_OBJECT_EBNF.starts_with("root ::= object"),
+            "rooted at an object"
+        );
     }
 }

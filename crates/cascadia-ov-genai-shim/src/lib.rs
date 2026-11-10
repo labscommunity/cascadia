@@ -139,6 +139,10 @@ mod sys {
             cfg: *mut cascadia_genconfig_t,
             schema: *const c_char,
         ) -> c_int;
+        pub fn cascadia_genconfig_set_grammar(
+            cfg: *mut cascadia_genconfig_t,
+            grammar: *const c_char,
+        ) -> c_int;
 
         pub fn cascadia_pipeline_validate_json_schema(
             handle: *mut cascadia_pipeline_t,
@@ -377,7 +381,11 @@ mod sys {
 #[cfg(feature = "openvino")]
 unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconfig_t> {
     // Convert before allocating so an interior NUL cannot leak the config.
-    let schema_c = cfg.json_schema.as_deref().map(cstr).transpose()?;
+    let constraint = match structured_output(cfg) {
+        Some(StructuredOutput::Grammar(g)) => Some((true, cstr(g)?)),
+        Some(StructuredOutput::JsonSchema(s)) => Some((false, cstr(s)?)),
+        None => None,
+    };
     let raw_cfg = sys::cascadia_genconfig_new();
     if raw_cfg.is_null() {
         return Err(Error::Native("genconfig allocation failed".into()));
@@ -410,8 +418,13 @@ unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconf
     }
     // A schema that fails to attach must fail the request: generating without
     // the constraint would return output the caller did not ask for.
-    if let Some(c) = &schema_c {
-        if sys::cascadia_genconfig_set_json_schema(raw_cfg, c.as_ptr()) != 0 {
+    if let Some((grammar, c)) = &constraint {
+        let rc = if *grammar {
+            sys::cascadia_genconfig_set_grammar(raw_cfg, c.as_ptr())
+        } else {
+            sys::cascadia_genconfig_set_json_schema(raw_cfg, c.as_ptr())
+        };
+        if rc != 0 {
             sys::cascadia_genconfig_destroy(raw_cfg);
             return Err(Error::Native(last_native_error()));
         }
@@ -546,6 +559,30 @@ pub struct GenConfig {
     /// JSON schema the output must match. `None` (the default) leaves
     /// generation unconstrained.
     pub json_schema: Option<String>,
+    /// EBNF grammar (GBNF syntax, the xgrammar backend) the output must
+    /// match. When set it is the constraint attached, in place of
+    /// `json_schema`.
+    pub grammar: Option<String>,
+}
+
+/// The output constraint a [`GenConfig`] attaches to a request, and so which
+/// native setter carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructuredOutput<'a> {
+    /// `cascadia_genconfig_set_grammar`.
+    Grammar(&'a str),
+    /// `cascadia_genconfig_set_json_schema`.
+    JsonSchema(&'a str),
+}
+
+/// The constraint `cfg` attaches: its grammar when it has one, else its
+/// schema, else none.
+pub fn structured_output(cfg: &GenConfig) -> Option<StructuredOutput<'_>> {
+    match (&cfg.grammar, &cfg.json_schema) {
+        (Some(g), _) => Some(StructuredOutput::Grammar(g)),
+        (None, Some(s)) => Some(StructuredOutput::JsonSchema(s)),
+        (None, None) => None,
+    }
 }
 
 /// Optional plugin-config knob (CACHE_DIR, KV_CACHE_PRECISION, etc.).
@@ -2171,6 +2208,30 @@ mod tests {
     #[test]
     fn gen_config_has_no_json_schema_by_default() {
         assert_eq!(GenConfig::default().json_schema, None);
+    }
+
+    /// The constraint a config attaches, and which setter carries it: a
+    /// grammar goes through `cascadia_genconfig_set_grammar` and takes the
+    /// place of a schema; a schema alone through `..._set_json_schema`.
+    #[test]
+    fn a_grammar_takes_the_place_of_the_schema() {
+        let mut cfg = GenConfig::default();
+        assert_eq!(structured_output(&cfg), None);
+        cfg.json_schema = Some("{}".into());
+        assert_eq!(
+            structured_output(&cfg),
+            Some(StructuredOutput::JsonSchema("{}"))
+        );
+        cfg.grammar = Some("root ::= \"x\"".into());
+        assert_eq!(
+            structured_output(&cfg),
+            Some(StructuredOutput::Grammar("root ::= \"x\""))
+        );
+        cfg.json_schema = None;
+        assert_eq!(
+            structured_output(&cfg),
+            Some(StructuredOutput::Grammar("root ::= \"x\""))
+        );
     }
 
     #[cfg(not(feature = "openvino"))]

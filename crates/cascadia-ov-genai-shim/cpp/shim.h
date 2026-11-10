@@ -114,6 +114,11 @@ void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v);
 /// ov::genai::StructuredOutputConfig. Returns 0 on success, 1 on failure with
 /// the last error set; the caller must not generate with `cfg` after a failure.
 int32_t cascadia_genconfig_set_json_schema(cascadia_genconfig_t* cfg, const char* schema);
+/// Constrain the output to `grammar`, an EBNF grammar (GBNF syntax, compiled
+/// by GenAI's xgrammar backend), through ov::genai::StructuredOutputConfig.
+/// Replaces any constraint set before. Same return contract as
+/// cascadia_genconfig_set_json_schema.
+int32_t cascadia_genconfig_set_grammar(cascadia_genconfig_t* cfg, const char* grammar);
 
 /// Check that `schema` can be compiled into an output constraint for this
 /// pipeline's tokenizer, without generating. Returns 0 when it can. On 1,

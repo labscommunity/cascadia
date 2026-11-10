@@ -19,6 +19,8 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -419,6 +421,47 @@ int32_t cascadia_genconfig_set_json_schema(cascadia_genconfig_t* cfg, const char
         set_last_error(e); return 1;
     } catch (...) {
         set_last_error("set_json_schema failed"); return 1;
+    }
+}
+
+namespace {
+// Whether this GenAI's StructuredOutputConfig has an EBNF `grammar` field.
+// Detected at compile time so the shim builds against GenAI headers with or
+// without it; without it, setting a grammar fails the request at run time
+// instead of silently generating unconstrained.
+template <typename T, typename = void>
+struct has_grammar_field : std::false_type {};
+template <typename T>
+struct has_grammar_field<T, std::void_t<decltype(std::declval<T&>().grammar)>>
+    : std::true_type {};
+
+template <typename T>
+bool set_grammar_field(T& soc, const char* grammar) {
+    if constexpr (has_grammar_field<T>::value) {
+        soc.grammar = std::string(grammar);
+        return true;
+    } else {
+        (void)soc;
+        (void)grammar;
+        return false;
+    }
+}
+}  // namespace
+
+int32_t cascadia_genconfig_set_grammar(cascadia_genconfig_t* cfg, const char* grammar) {
+    if (!cfg || !grammar) { set_last_error("null arg in set_grammar"); return 1; }
+    try {
+        ov::genai::StructuredOutputConfig soc;
+        if (!set_grammar_field(soc, grammar)) {
+            set_last_error("this OpenVINO GenAI has no EBNF grammar in StructuredOutputConfig");
+            return 1;
+        }
+        cfg->cfg.structured_output_config = soc;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("set_grammar failed"); return 1;
     }
 }
 
