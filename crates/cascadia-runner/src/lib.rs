@@ -179,36 +179,85 @@ struct EngineSlot {
     /// failed `try_lock` rather than block a tokio worker here (#122).
     engine: Mutex<Option<Box<dyn Engine>>>,
     buffers: Mutex<Buffers>,
-    /// Unix milliseconds at which the engine call now running (a `step` or a
+    /// [`monotonic_ms`] at which the engine call now running (a `step` or a
     /// `submit` for a stream) began; `0` while none is. See
-    /// [`Runner::engine_busy_since_ms`].
+    /// [`EngineActivity::busy_since_ms`].
     busy_since_ms: AtomicU64,
-    /// Unix milliseconds of the last `step` that produced output; `0` before
-    /// the first. See [`Runner::last_output_ms`].
+    /// [`monotonic_ms`] at which the last engine call returned, `Ok` or
+    /// `Err`; `0` before the first. See [`EngineActivity::last_step_end_ms`].
+    last_step_end_ms: AtomicU64,
+    /// [`monotonic_ms`] at which the current run of engine calls began. See
+    /// [`EngineActivity::stepping_since_ms`].
+    stepping_since_ms: AtomicU64,
+    /// [`monotonic_ms`] of the last `step` that produced real output; `0`
+    /// before the first. See [`EngineActivity::last_output_ms`].
     last_output_ms: AtomicU64,
+    /// An engine call that starts more than this many milliseconds after the
+    /// last one returned starts a new run ([`STEP_GAP`]; a field so tests can
+    /// shorten it).
+    step_gap_ms: AtomicU64,
 }
 
-/// Milliseconds since the Unix epoch (`0` if the clock is before it).
-fn unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+/// Engine calls closer together than this belong to one run of stepping
+/// (see [`EngineActivity::stepping_since_ms`]); a stream being read steps
+/// back to back, so a longer gap means nobody was driving the engine.
+pub const STEP_GAP: Duration = Duration::from_secs(5);
+
+/// Milliseconds since this process first read the clock, from a monotonic
+/// [`Instant`], so wall-clock jumps (NTP, suspend) can neither fake nor hide
+/// a stall. Starts at 1: `0` is kept for "never" in the stamps that use it.
+pub fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    u64::try_from(start.elapsed().as_millis())
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1)
 }
 
-/// Holds [`EngineSlot::busy_since_ms`] at the time an engine call began, and
-/// clears it when the call returns (or unwinds).
-struct BusyStamp<'a>(&'a AtomicU64);
+/// What the engine has been doing, in [`monotonic_ms`]; read by the API's
+/// readiness rule. Every field is `0` / `None` before the first engine call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineActivity {
+    /// When the engine call now running for a stream (a `step`, or a task's
+    /// `submit`) began; `None` while the engine is not inside one. The engine
+    /// steps only while some stream is read, so an idle server, or one whose
+    /// clients are not reading, is never inside a call.
+    pub busy_since_ms: Option<u64>,
+    /// When the last engine call returned, `Ok` or `Err`.
+    pub last_step_end_ms: u64,
+    /// When the current run of engine calls began: the start of the first
+    /// call that followed an idle gap longer than [`STEP_GAP`].
+    pub stepping_since_ms: u64,
+    /// When a `step` last produced real output for any task: a chunk that is
+    /// neither a progress marker ([`Chunk::is_progress`]) nor an error.
+    pub last_output_ms: u64,
+}
+
+/// Marks an engine call: stamps [`EngineSlot::busy_since_ms`] (and, after an
+/// idle gap, [`EngineSlot::stepping_since_ms`]) when it begins, and clears the
+/// busy stamp and records [`EngineSlot::last_step_end_ms`] when it returns (or
+/// unwinds).
+struct BusyStamp<'a>(&'a EngineSlot);
 
 impl<'a> BusyStamp<'a> {
-    fn start(since: &'a AtomicU64) -> Self {
-        since.store(unix_millis(), Ordering::Relaxed);
-        Self(since)
+    fn start(slot: &'a EngineSlot) -> Self {
+        let now = monotonic_ms();
+        let last_end = slot.last_step_end_ms.load(Ordering::Relaxed);
+        let gap = slot.step_gap_ms.load(Ordering::Relaxed);
+        if last_end == 0 || now.saturating_sub(last_end) > gap {
+            slot.stepping_since_ms.store(now, Ordering::Relaxed);
+        }
+        slot.busy_since_ms.store(now, Ordering::Relaxed);
+        Self(slot)
     }
 }
 
 impl Drop for BusyStamp<'_> {
     fn drop(&mut self) {
-        self.0.store(0, Ordering::Relaxed);
+        self.0
+            .last_step_end_ms
+            .store(monotonic_ms(), Ordering::Relaxed);
+        self.0.busy_since_ms.store(0, Ordering::Relaxed);
     }
 }
 
@@ -290,7 +339,10 @@ impl EngineSlot {
             engine: Mutex::new(engine),
             buffers: Mutex::new(Buffers::default()),
             busy_since_ms: AtomicU64::new(0),
+            last_step_end_ms: AtomicU64::new(0),
+            stepping_since_ms: AtomicU64::new(0),
             last_output_ms: AtomicU64::new(0),
+            step_gap_ms: AtomicU64::new(u64::try_from(STEP_GAP.as_millis()).unwrap_or(u64::MAX)),
         }
     }
 
@@ -532,7 +584,7 @@ impl Runner {
             // ==== END; the branch below is the original submit path ====
             match guard.engine() {
                 Some(engine) => {
-                    let _busy = BusyStamp::start(&self.slot.busy_since_ms);
+                    let _busy = BusyStamp::start(&self.slot);
                     engine.submit(task)
                 }
                 None => Err(EngineError::NotLoaded),
@@ -540,21 +592,21 @@ impl Runner {
         }
     }
 
-    /// Unix milliseconds at which the engine call now running for a stream
-    /// (a `step`, or a task's `submit`) began; `None` while the engine is not
-    /// inside one. The engine steps only while some stream is read, so an
-    /// idle server, or one whose clients are not reading, is never inside a
-    /// call: a call that has been running for long is a stuck pipeline (a
-    /// peer that stopped answering), not a slow client.
-    pub fn engine_busy_since_ms(&self) -> Option<u64> {
-        match self.slot.busy_since_ms.load(Ordering::Relaxed) {
-            0 => None,
-            t => Some(t),
+    /// What the engine has been doing; see [`EngineActivity`].
+    pub fn activity(&self) -> EngineActivity {
+        let slot = &self.slot;
+        EngineActivity {
+            busy_since_ms: match slot.busy_since_ms.load(Ordering::Relaxed) {
+                0 => None,
+                t => Some(t),
+            },
+            last_step_end_ms: slot.last_step_end_ms.load(Ordering::Relaxed),
+            stepping_since_ms: slot.stepping_since_ms.load(Ordering::Relaxed),
+            last_output_ms: slot.last_output_ms.load(Ordering::Relaxed),
         }
     }
 
-    /// Unix milliseconds of the last engine `step` that produced output for
-    /// any task; `0` before the first.
+    /// [`EngineActivity::last_output_ms`].
     pub fn last_output_ms(&self) -> u64 {
         self.slot.last_output_ms.load(Ordering::Relaxed)
     }
@@ -1120,16 +1172,22 @@ impl Stream for ChunkStream {
                     None => None,
                     Some(engine) => Some({
                         let out = {
-                            let _busy = BusyStamp::start(&this.slot.busy_since_ms);
+                            let _busy = BusyStamp::start(&this.slot);
                             engine.step()
                         };
                         match out {
                             Ok(produced) => {
                                 let empty = produced.is_empty();
-                                if !empty {
+                                // Progress markers and error chunks are not
+                                // output: an engine stepping through them is
+                                // not serving anyone.
+                                if produced
+                                    .iter()
+                                    .any(|(_, c)| !c.is_progress() && c.error.is_none())
+                                {
                                     this.slot
                                         .last_output_ms
-                                        .store(unix_millis(), Ordering::Relaxed);
+                                        .store(monotonic_ms(), Ordering::Relaxed);
                                 }
                                 let mut bufs = this.slot.buffers.lock();
                                 for (tid, chunk) in produced {
@@ -3673,5 +3731,97 @@ mod tests {
             .await
             .expect("the lock holder never finished after teardown")
             .unwrap();
+    }
+
+    /// The stall clock is monotonic, starts at 1 (0 means "never"), and
+    /// never goes backwards.
+    #[test]
+    fn monotonic_ms_is_nonzero_and_ordered() {
+        let a = monotonic_ms();
+        let b = monotonic_ms();
+        assert!(a >= 1);
+        assert!(b >= a);
+    }
+
+    /// A progress marker is engine work, not output: steps that produce only
+    /// progress advance `last_step_end_ms` but not `last_output_ms`; the
+    /// first real chunk advances both.
+    #[tokio::test]
+    async fn progress_markers_are_steps_not_output() {
+        let runner = Runner::new(Box::new(SlowPrefillBuilder { prefill_steps: 3 }));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runner.activity(), EngineActivity::default());
+        let mut stream = runner
+            .generate(GenerationTask::new("t1", "a long prompt").with_max_tokens(8))
+            .unwrap();
+        let first = stream.next().await.unwrap();
+        assert!(first.is_progress(), "{first:?}");
+        let a = runner.activity();
+        assert_ne!(a.last_step_end_ms, 0, "a step returned");
+        assert_ne!(a.stepping_since_ms, 0, "the engine started stepping");
+        assert_eq!(a.last_output_ms, 0, "progress is not output");
+        while stream.next().await.is_some() {}
+        let a = runner.activity();
+        assert_ne!(a.last_output_ms, 0, "the final chunk is output");
+        assert!(a.busy_since_ms.is_none());
+    }
+
+    /// A step that fails is still a step that ended, and is not output.
+    #[tokio::test]
+    async fn failed_steps_count_as_steps_not_output() {
+        let runner = Runner::new(Box::new(FailingBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("t1", "x").with_max_tokens(4))
+            .unwrap();
+        let c = stream.next().await.unwrap();
+        assert!(c.error.is_some(), "{c:?}");
+        let a = runner.activity();
+        assert_ne!(a.last_step_end_ms, 0);
+        assert_eq!(a.last_output_ms, 0, "an error is not output");
+    }
+
+    /// `stepping_since_ms` marks the start of the current run of engine
+    /// calls: calls that follow each other within the gap keep it, a call
+    /// after an idle gap restarts it, so a node idle for long does not look
+    /// like one that has stepped without output all that time.
+    #[tokio::test]
+    async fn stepping_since_restarts_after_an_idle_gap() {
+        let runner = make_runner().await;
+        runner.slot.step_gap_ms.store(30, Ordering::Relaxed);
+        let run = |id: &'static str| {
+            let mut s = runner
+                .generate(GenerationTask::new(id, "a b c").with_max_tokens(2))
+                .unwrap();
+            async move { while s.next().await.is_some() {} }
+        };
+        run("t1").await;
+        let first = runner.activity();
+        assert_ne!(first.stepping_since_ms, 0);
+        run("t2").await;
+        assert_eq!(
+            runner.activity().stepping_since_ms,
+            first.stepping_since_ms,
+            "back-to-back calls are one run"
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        run("t3").await;
+        let after = runner.activity();
+        assert!(
+            after.stepping_since_ms > first.last_output_ms,
+            "a call after an idle gap starts a new run: {first:?} -> {after:?}"
+        );
     }
 }

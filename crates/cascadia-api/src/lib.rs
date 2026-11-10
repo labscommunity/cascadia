@@ -111,13 +111,6 @@ impl InFlightGuard {
     }
 }
 
-/// Milliseconds since the Unix epoch (0 if the clock is before it).
-fn unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -295,9 +288,10 @@ pub struct AppState {
     pub decode_permits: Arc<Semaphore>,
     /// See [`Config::stall_after`].
     pub stall_after: std::time::Duration,
-    /// Unix milliseconds at which a stall (not a failed request) last marked
-    /// the server unready; `0` when readiness was not lost that way. `/health`
-    /// clears such a mark once the engine has produced output since.
+    /// The evidence time ([`cascadia_runner::monotonic_ms`]) of the stall
+    /// that last marked the server unready (not a failed request); `0` when
+    /// readiness was not lost that way. `/health` clears such a mark once the
+    /// engine has produced real output after it.
     pub stall_marked_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -338,8 +332,9 @@ pub struct Config {
     /// the request answered `408`. 30 s carries the largest allowed body
     /// (about 69 MB) at under 20 Mbit/s.
     pub media_body_timeout: std::time::Duration,
-    /// How long one engine call may run, with requests in flight, before a
-    /// capacity 503 marks the server unready (see [`track_pipeline_health`]).
+    /// How long one engine call may run, or the engine step without real
+    /// output, with requests in flight, before a capacity 503 marks the
+    /// server unready (see [`STALL_SECS`] and [`track_pipeline_health`]).
     /// [`STALL_SECS`] by default.
     pub stall_after: std::time::Duration,
 }
@@ -923,14 +918,16 @@ struct PreEngineFailure;
 #[derive(Clone, Copy)]
 struct CapacityRefusal;
 
-/// Default [`Config::stall_after`]: how long one engine call (a step, or a
-/// task's submit) may run, with requests in flight, before a capacity 503
-/// marks the server unready. A busy server returns from its steps; a wedged
-/// pipeline (a peer that stopped answering) sits in one while it holds every
+/// Default [`Config::stall_after`]. With requests in flight, the pipeline is
+/// stalled, and a capacity 503 marks the server unready, when one engine call
+/// (a step, or a task's submit) has run for longer than this, or when the
+/// engine keeps stepping but has produced no real output (a token or a final,
+/// not a progress marker or an error) for longer than this. A busy server
+/// returns from its steps with output; a wedged pipeline (a peer that stopped
+/// answering) sits in one call, or fails every step, while it holds every
 /// slot. The engine steps only while a stream is read, so clients that open
 /// streams and never read them leave it idle, never stalled.
 pub const STALL_SECS: u64 = 60;
-
 /// The 503 for a request past the in-flight cap: `Retry-After` tells the
 /// client when to come back, and [`PreEngineFailure`] keeps it out of
 /// readiness. A busy node is not a broken one, and since a streamed request's
@@ -947,15 +944,102 @@ fn capacity_refusal() -> Response {
     errors::with_retry_after(resp, errors::RETRY_AFTER_SECS)
 }
 
-/// Requests are in flight and the engine has been inside one call for longer
-/// than [`Config::stall_after`].
-fn pipeline_stalled(state: &AppState) -> bool {
+/// Whether the engine counts as stepping, and since when it has stepped
+/// without real output, are judged on this window: a call that ended within
+/// it (or one still running) means a stream is driving the engine.
+fn stepping_window_ms(bound_ms: u64) -> u64 {
+    u64::try_from(cascadia_runner::STEP_GAP.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(bound_ms / 2)
+}
+
+/// The stall rule on one reading of the engine's activity (all in
+/// [`cascadia_runner::monotonic_ms`]): `Some(evidence)` when the pipeline is
+/// stalled, where `evidence` is the time the stall is measured from (the
+/// stuck call's start, or the start of the output-less stretch); `None`
+/// otherwise. A stretch without output starts at the later of the last real
+/// output and the start of the current run of steps, so time spent idle
+/// before a burst never counts.
+fn stall_evidence(a: &cascadia_runner::EngineActivity, now: u64, bound_ms: u64) -> Option<u64> {
+    if let Some(since) = a.busy_since_ms {
+        if now.saturating_sub(since) > bound_ms {
+            return Some(since);
+        }
+    }
+    let stepping = a.busy_since_ms.is_some()
+        || (a.last_step_end_ms != 0
+            && now.saturating_sub(a.last_step_end_ms) <= stepping_window_ms(bound_ms));
+    if !stepping {
+        return None;
+    }
+    let quiet_since = a.last_output_ms.max(a.stepping_since_ms);
+    (now.saturating_sub(quiet_since) > bound_ms).then_some(quiet_since)
+}
+
+/// Requests are in flight and the engine is stalled ([`stall_evidence`]).
+fn pipeline_stalled(state: &AppState) -> Option<u64> {
+    if state.stats.requests_in_flight.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     let bound = u64::try_from(state.stall_after.as_millis()).unwrap_or(u64::MAX);
-    state.stats.requests_in_flight.load(Ordering::Relaxed) > 0
-        && state
-            .runner
-            .engine_busy_since_ms()
-            .is_some_and(|since| unix_millis().saturating_sub(since) > bound)
+    stall_evidence(
+        &state.runner.activity(),
+        cascadia_runner::monotonic_ms(),
+        bound,
+    )
+}
+
+/// A capacity 503 met a stalled pipeline: unready, and the mark stamped with
+/// the stall's evidence time. A mark from a failed request (unready with no
+/// stall mark) stays that kind: only the 2xx it has always waited for clears
+/// it.
+fn note_stall(
+    ready: &std::sync::atomic::AtomicBool,
+    marked: &std::sync::atomic::AtomicU64,
+    evidence: u64,
+) {
+    let was_ready = ready.swap(false, Ordering::Relaxed);
+    if was_ready || marked.load(Ordering::Relaxed) != 0 {
+        marked.store(evidence, Ordering::Relaxed);
+    }
+}
+
+/// A completion returned 2xx: ready, and no stall mark.
+fn note_success(ready: &std::sync::atomic::AtomicBool, marked: &std::sync::atomic::AtomicU64) {
+    note_success_with(ready, marked, || ());
+}
+
+/// [`note_success`], with `between` run between its two stores so a test
+/// can land a concurrent [`note_stall`] there. The mark is cleared BEFORE
+/// `ready` is stored: the other order lets a stall between them read
+/// "was ready", stamp a mark that this then wipes, and leave the server
+/// unready with no mark for `/health` to heal.
+fn note_success_with(
+    ready: &std::sync::atomic::AtomicBool,
+    marked: &std::sync::atomic::AtomicU64,
+    between: impl FnOnce(),
+) {
+    marked.store(0, Ordering::Relaxed);
+    between();
+    ready.store(true, Ordering::Relaxed);
+}
+
+/// `/health`'s heal: unready from a stall, and the engine has produced real
+/// output after the stall's evidence time, so the pipeline is moving again.
+fn heal_stall_mark(
+    ready: &std::sync::atomic::AtomicBool,
+    marked: &std::sync::atomic::AtomicU64,
+    last_output_ms: u64,
+) {
+    let mark = marked.load(Ordering::Relaxed);
+    if mark != 0
+        && last_output_ms > mark
+        && marked
+            .compare_exchange(mark, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        ready.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Response middleware: for completion routes, flip `AppState.ready` from the
@@ -984,21 +1068,12 @@ async fn track_pipeline_health(
         if s.is_server_error() && ext.get::<PreEngineFailure>().is_none() {
             state.stall_marked_ms.store(0, Ordering::Relaxed);
             state.ready.store(false, Ordering::Relaxed);
-        } else if s.is_server_error()
-            && ext.get::<CapacityRefusal>().is_some()
-            && pipeline_stalled(&state)
-        {
-            // A mark from a failed request stays that kind: only the 2xx it
-            // has always waited for clears it.
-            let was_ready = state.ready.swap(false, Ordering::Relaxed);
-            if was_ready || state.stall_marked_ms.load(Ordering::Relaxed) != 0 {
-                state
-                    .stall_marked_ms
-                    .store(unix_millis(), Ordering::Relaxed);
+        } else if s.is_server_error() && ext.get::<CapacityRefusal>().is_some() {
+            if let Some(evidence) = pipeline_stalled(&state) {
+                note_stall(&state.ready, &state.stall_marked_ms, evidence);
             }
         } else if s.is_success() {
-            state.ready.store(true, Ordering::Relaxed);
-            state.stall_marked_ms.store(0, Ordering::Relaxed);
+            note_success(&state.ready, &state.stall_marked_ms);
         }
     }
     resp
@@ -1015,16 +1090,11 @@ async fn health(
     use std::sync::atomic::Ordering;
     // Unready from a stall, and the engine has produced output since: the
     // pipeline is moving again.
-    let marked = state.stall_marked_ms.load(Ordering::Relaxed);
-    if marked != 0
-        && state.runner.last_output_ms() > marked
-        && state
-            .stall_marked_ms
-            .compare_exchange(marked, 0, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        state.ready.store(true, Ordering::Relaxed);
-    }
+    heal_stall_mark(
+        &state.ready,
+        &state.stall_marked_ms,
+        state.runner.last_output_ms(),
+    );
     if state.ready.load(Ordering::Relaxed) {
         (StatusCode::OK, Json(HealthResponse { status: "ok" }))
     } else {
@@ -8195,6 +8265,244 @@ mod tests {
         let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(stall_health(&app).await, StatusCode::OK, "healed by a 2xx");
+    }
+
+    /// How a [`PhaseEngine`] answers a step.
+    const PHASE_TOKENS: u8 = 0;
+    /// Every step fails for a task nobody reads, as the steps of a pipeline
+    /// whose peer went silent mid-decode do when each token wait times out.
+    const PHASE_ERRORS: u8 = 1;
+    /// Every step returns only a progress marker.
+    const PHASE_PROGRESS: u8 = 2;
+
+    /// Emits three tokens and a final for its task, except that in the
+    /// error or progress phase every step (a few ms long) returns no real
+    /// output.
+    struct PhaseEngine {
+        phase: Arc<std::sync::atomic::AtomicU8>,
+        pending: Option<(cascadia_types::TaskId, usize)>,
+        failures: u64,
+    }
+
+    impl cascadia_engine::Engine for PhaseEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some((task.task_id, 0));
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some((id, i)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            match self.phase.load(Ordering::SeqCst) {
+                PHASE_ERRORS => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    self.pending = Some((id, i));
+                    self.failures += 1;
+                    // A distinct task each time, so the stream being read
+                    // keeps stepping rather than closing on a repeat.
+                    return Err(
+                        cascadia_engine::EngineError::Backend("peer timed out".into()).for_task(
+                            cascadia_types::TaskId::from(format!("gone-{}", self.failures)),
+                        ),
+                    );
+                }
+                PHASE_PROGRESS => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    self.pending = Some((id.clone(), i));
+                    return Ok(vec![(id.clone(), Chunk::progress(id))]);
+                }
+                _ => {}
+            }
+            if i < 3 {
+                self.pending = Some((id.clone(), i + 1));
+                return Ok(vec![(id.clone(), Chunk::token(&id, i as i64, "tok "))]);
+            }
+            Ok(vec![(
+                id.clone(),
+                Chunk::final_marker(&id, "").with_finish_reason(cascadia_types::FinishReason::Stop),
+            )])
+        }
+    }
+
+    struct PhaseBuilder(Option<PhaseEngine>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for PhaseBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            mut self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0.take().unwrap()))
+        }
+    }
+
+    /// A one-slot router over a [`PhaseEngine`] in `phase`, with the short
+    /// test stall bound.
+    async fn phase_app(phase: u8) -> (Router, Arc<std::sync::atomic::AtomicU8>) {
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(phase));
+        let runner = Runner::new(Box::new(PhaseBuilder(Some(PhaseEngine {
+            phase: phase.clone(),
+            pending: None,
+            failures: 0,
+        }))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_concurrent_requests: 1,
+            stall_after: STALL_TEST_BOUND,
+            ..Config::default()
+        };
+        (
+            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            phase,
+        )
+    }
+
+    /// The engine keeps stepping, each step short, but none produces real
+    /// output: past the bound a capacity 503 marks the server unready, and
+    /// once real output resumes `/health` is ready with no new request.
+    async fn stepping_without_output_marks_unready(phase: u8) {
+        let (app, phase_switch) = phase_app(phase).await;
+        let reader = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+            })
+        };
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let refused = app
+            .clone()
+            .oneshot(stall_chat(false))
+            .await
+            .unwrap()
+            .status();
+        let health = stall_health(&app).await;
+        // Let the reader finish before asserting: a stream left stepping
+        // pins a worker, and a failed assertion would hang, not fail.
+        phase_switch.store(PHASE_TOKENS, Ordering::SeqCst);
+        let body = reader.await.unwrap();
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            health,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stepping without output past the bound"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("tok"));
+        assert_eq!(stall_health(&app).await, StatusCode::OK, "output resumed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pipeline_whose_steps_fail_without_output_marks_unready() {
+        stepping_without_output_marks_unready(PHASE_ERRORS).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_progress_only_engine_counts_as_no_output() {
+        stepping_without_output_marks_unready(PHASE_PROGRESS).await;
+    }
+
+    fn activity(
+        busy_since_ms: Option<u64>,
+        last_step_end_ms: u64,
+        stepping_since_ms: u64,
+        last_output_ms: u64,
+    ) -> cascadia_runner::EngineActivity {
+        cascadia_runner::EngineActivity {
+            busy_since_ms,
+            last_step_end_ms,
+            stepping_since_ms,
+            last_output_ms,
+        }
+    }
+
+    /// The rule itself, on a fixed clock (bound 1000 ms).
+    #[test]
+    fn stall_evidence_follows_the_rule() {
+        let b = 1000;
+        // One call busy past the bound: evidence is its start.
+        assert_eq!(
+            stall_evidence(&activity(Some(500), 400, 100, 400), 2000, b),
+            Some(500)
+        );
+        // Busy, but not for long, with output just now: not stalled.
+        assert_eq!(
+            stall_evidence(&activity(Some(1900), 1890, 100, 1890), 2000, b),
+            None
+        );
+        // Stepping (a step just ended), no output past the bound: evidence
+        // is the last output.
+        assert_eq!(
+            stall_evidence(&activity(None, 1999, 100, 600), 2000, b),
+            Some(600)
+        );
+        // Inside a short call after a run of output-less steps: stalled too.
+        assert_eq!(
+            stall_evidence(&activity(Some(1990), 1990, 100, 600), 2000, b),
+            Some(600)
+        );
+        // Not stepping (the last call ended long ago, nobody reads): never.
+        assert_eq!(
+            stall_evidence(&activity(None, 600, 100, 600), 9000, b),
+            None
+        );
+        // Never stepped at all.
+        assert_eq!(stall_evidence(&activity(None, 0, 0, 0), 9000, b), None);
+        // Idle for long, then a fresh run of steps that has not yet gone a
+        // bound without output: the idle time does not count.
+        assert_eq!(
+            stall_evidence(&activity(None, 9990, 9500, 600), 10_000, b),
+            None
+        );
+        // ...but a fresh run that does go past the bound counts from its start.
+        assert_eq!(
+            stall_evidence(&activity(None, 10_990, 9500, 600), 11_000, b),
+            Some(9500)
+        );
+    }
+
+    /// The mark is stamped with the evidence, not "now", so output in the
+    /// very millisecond the mark was made still clears it.
+    #[test]
+    fn output_in_the_marking_millisecond_clears_the_mark() {
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let marked = std::sync::atomic::AtomicU64::new(0);
+        let now = 5000;
+        let evidence = stall_evidence(&activity(None, now - 1, 100, 1000), now, 1000).unwrap();
+        note_stall(&ready, &marked, evidence);
+        assert!(!ready.load(Ordering::SeqCst));
+        heal_stall_mark(&ready, &marked, now);
+        assert!(
+            ready.load(Ordering::SeqCst),
+            "output at {now} must clear the mark"
+        );
+        assert_eq!(marked.load(Ordering::SeqCst), 0);
+    }
+
+    /// A stall 503 landing in the middle of a 2xx's update must not leave
+    /// the server unready with no stall mark (which only a later 2xx could
+    /// clear): the 2xx clears the mark before it stores `ready`.
+    #[test]
+    fn a_stall_mark_racing_a_2xx_is_not_stranded() {
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let marked = std::sync::atomic::AtomicU64::new(0);
+        note_success_with(&ready, &marked, || note_stall(&ready, &marked, 1234));
+        let stranded = !ready.load(Ordering::SeqCst) && marked.load(Ordering::SeqCst) == 0;
+        assert!(!stranded, "unready with no stall mark");
     }
 
     /// A short step that returns keeps a busy server ready: the 503 that
