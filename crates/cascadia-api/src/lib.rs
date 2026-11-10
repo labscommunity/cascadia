@@ -2095,8 +2095,10 @@ impl GemmaMarkerStrip {
                 self.pending = rest.to_owned();
                 break;
             }
-            // Up to the next `<`: every marker starts with one.
-            let next = rest[1..].find('<').map_or(rest.len(), |k| k + 1);
+            // Up to the next `<`: every marker starts with one. Step over
+            // the whole first character, which may be more than one byte.
+            let first = rest.chars().next().map_or(1, char::len_utf8);
+            let next = rest[first..].find('<').map_or(rest.len(), |k| k + first);
             out.push_str(&rest[..next]);
             i += next;
         }
@@ -11451,5 +11453,15 @@ level={{ effort_map[eff] }}";
         // Removing a marker never forms a new one from the text around it.
         let mut s = GemmaMarkerStrip::default();
         assert_eq!(s.feed("<|<|\"|>\"|>") + &s.finish(), "<|\"|>");
+    }
+
+    #[test]
+    fn gemma_marker_strip_keeps_non_ascii_text_whole() {
+        // Multi-byte characters at the start of a piece, right after a
+        // marker and right before one must pass through unchanged.
+        let mut s = GemmaMarkerStrip::default();
+        let pieces = ["éa<|\"|>ü", "日本<tool_call|>", "ß", "😀<|tool_call>x"];
+        let out: String = pieces.iter().map(|p| s.feed(p)).collect();
+        assert_eq!(out + &s.finish(), "éaü日本ß😀x");
     }
 }
