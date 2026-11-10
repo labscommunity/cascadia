@@ -51,6 +51,69 @@ pub fn with_retry_after(mut resp: Response, secs: u32) -> Response {
     resp
 }
 
+/// The leading decimal digits of `s` as a count; `None` when `s` does not
+/// start with a digit or the number does not fit.
+fn leading_count(s: &str) -> Option<u32> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s[..end].parse().ok()
+}
+
+/// `(prompt tokens, window)` read from an engine's over-window text (the
+/// inner text of `EngineError::PromptTooLong`, without the `prompt too long: `
+/// prefix).
+///
+/// The tokens are the digits right after the first `prompt is ` (an
+/// `at least ` there is skipped). The window is the digits right after
+/// whichever of `context is `, `window is ` or `holds ` comes first in the
+/// text: the packed runtime's text names its region with `holds ` and later
+/// explains it with `(per-slot context is (static_context - …`, so the
+/// earliest marker wins, not the first in the list. Either is `None` when its
+/// marker is missing or not followed by digits.
+pub fn prompt_counts(detail: &str) -> (Option<u32>, Option<u32>) {
+    let tokens = detail.find("prompt is ").and_then(|i| {
+        let rest = &detail[i + "prompt is ".len()..];
+        leading_count(rest.strip_prefix("at least ").unwrap_or(rest))
+    });
+    let window = ["context is ", "window is ", "holds "]
+        .iter()
+        .filter_map(|m| detail.find(m).map(|i| i + m.len()))
+        .min()
+        .and_then(|at| leading_count(&detail[at..]));
+    (tokens, window)
+}
+
+/// OpenAI's wording for a prompt over the context window, which client
+/// libraries match to recognise context overflow. `noun` is the request field
+/// that carries the prompt (`messages`, `prompt` or `input`). With a known
+/// `window` the message states it, and the prompt's `tokens` when known;
+/// without one it says only that the context was exceeded. A non-empty
+/// `detail` (the engine's own text) follows in parentheses.
+pub fn context_length_message(
+    noun: &str,
+    window: Option<u32>,
+    tokens: Option<u32>,
+    detail: &str,
+) -> String {
+    let mut msg = match (window, tokens) {
+        (Some(n), Some(m)) => format!(
+            "This model's maximum context length is {n} tokens. However, your {noun} resulted \
+             in {m} tokens. Please reduce the length of the {noun}."
+        ),
+        (Some(n), None) => format!(
+            "This model's maximum context length is {n} tokens. However, your {noun} is longer \
+             than that. Please reduce the length of the {noun}."
+        ),
+        (None, _) => format!(
+            "This model's maximum context length was exceeded: the prompt exceeds the \
+             available context size. Please reduce the length of the {noun}."
+        ),
+    };
+    if !detail.is_empty() {
+        msg.push_str(&format!(" ({detail})"));
+    }
+    msg
+}
+
 /// Most of a non-JSON error body that is read to reuse as the message. Such
 /// bodies are short text (a rejection's reason); a longer one is not read.
 const MAX_TEXT_BODY_BYTES: usize = 64 * 1024;
@@ -221,5 +284,121 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// One row per engine's over-window wording, numbers filled in.
+    #[test]
+    fn prompt_counts_reads_every_engine_wording() {
+        type Row = (&'static str, (Option<u32>, Option<u32>));
+        let rows: &[Row] = &[
+            // ov-genai, text
+            (
+                "prompt is 900 tokens but the model's context is 512; send a shorter prompt",
+                (Some(900), Some(512)),
+            ),
+            // ov-genai, media
+            (
+                "prompt is at least 900 tokens with its images and videos expanded but the \
+                 model's context is 512; send a shorter prompt (or fewer or smaller images)",
+                (Some(900), Some(512)),
+            ),
+            // gemma4
+            (
+                "prompt is 900 tokens with its images and videos expanded; the model's window is \
+                 512 (max_position_embeddings)",
+                (Some(900), Some(512)),
+            ),
+            // packed runtime, in full: its tail says "context is" after "holds"
+            (
+                "prompt is 207 tokens but this worker's per-slot KV region holds \
+                 127; raise --static-context or lower --packed-slots (per-slot context is \
+                 (static_context - 1 - packed_prefix) / packed_slots)",
+                (Some(207), Some(127)),
+            ),
+            // static runtime tree
+            (
+                "prompt is 2000 tokens with its images expanded but this static tree's KV window \
+                 holds 1023 (static_context - 1); send a shorter prompt (or fewer or smaller \
+                 images), or convert the tree with a larger context",
+                (Some(2000), Some(1023)),
+            ),
+            // stateful runtime tree
+            (
+                "prompt is 5000 tokens but the model's context is 4096; send a \
+                 shorter prompt (or fewer or smaller images)",
+                (Some(5000), Some(4096)),
+            ),
+            // distributed speculative decoding
+            (
+                "prompt is 900 tokens; the target's window is 512 (max_position_embeddings)",
+                (Some(900), Some(512)),
+            ),
+            // qwen36, text and media
+            (
+                "prompt is 900 tokens; the model's window is 512 (max_position_embeddings)",
+                (Some(900), Some(512)),
+            ),
+            (
+                "prompt is 900 tokens with its images; the model's window is 512",
+                (Some(900), Some(512)),
+            ),
+            // mock engine
+            (
+                "prompt is 9000 tokens; the model's window is 8192",
+                (Some(9000), Some(8192)),
+            ),
+            // a count without a window
+            ("prompt is at least 5875 tokens", (Some(5875), None)),
+            // neither
+            ("3 images do not fit the context", (None, None)),
+            ("stage 1 hung up", (None, None)),
+        ];
+        for (detail, want) in rows {
+            assert_eq!(prompt_counts(detail), *want, "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_marker_without_digits_is_no_count() {
+        assert_eq!(
+            prompt_counts("prompt is long; the model's window is unknown"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn context_length_message_has_openais_three_forms() {
+        assert_eq!(
+            context_length_message("messages", Some(8192), Some(9000), ""),
+            "This model's maximum context length is 8192 tokens. However, your messages \
+             resulted in 9000 tokens. Please reduce the length of the messages."
+        );
+        assert_eq!(
+            context_length_message("prompt", Some(8192), None, ""),
+            "This model's maximum context length is 8192 tokens. However, your prompt is \
+             longer than that. Please reduce the length of the prompt."
+        );
+        for tokens in [None, Some(5875)] {
+            assert_eq!(
+                context_length_message("input", None, tokens, ""),
+                "This model's maximum context length was exceeded: the prompt exceeds the \
+                 available context size. Please reduce the length of the input."
+            );
+        }
+    }
+
+    #[test]
+    fn context_length_message_appends_the_detail() {
+        assert_eq!(
+            context_length_message(
+                "messages",
+                Some(127),
+                Some(207),
+                "prompt is 207 tokens but this worker's per-slot KV region holds 127"
+            ),
+            "This model's maximum context length is 127 tokens. However, your messages \
+             resulted in 207 tokens. Please reduce the length of the messages. (prompt is 207 \
+             tokens but this worker's per-slot KV region holds 127)"
+        );
     }
 }

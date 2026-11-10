@@ -5325,11 +5325,14 @@ fn engine_error_response(
         StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     // OpenAI's shape for a prompt over the model's window: 400,
     // `invalid_request_error`, `context_length_exceeded`, and `param` naming
-    // the prompt field. SDKs and agents key truncate-and-retry off the code.
-    if matches!(err, EngineError::PromptTooLong(_)) {
+    // the prompt field. SDKs and agents key truncate-and-retry off the code,
+    // and client libraries off OpenAI's wording of the message, so the
+    // engine's text follows that wording in parentheses.
+    if let EngineError::PromptTooLong(detail) = &err {
+        let (tokens, window) = errors::prompt_counts(detail);
         return api_error_for(
             status,
-            err.to_string(),
+            errors::context_length_message(prompt_param, window, tokens, detail),
             Some(prompt_param),
             Some("context_length_exceeded"),
         );
@@ -5456,10 +5459,33 @@ mod tests {
         assert_eq!(v["error"]["type"], "invalid_request_error");
         assert_eq!(v["error"]["code"], "context_length_exceeded");
         assert_eq!(v["error"]["param"], "messages");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("prompt too long"));
+        // No window in the engine's text: OpenAI's no-window form, with the
+        // engine's own text after it.
+        assert_eq!(
+            v["error"]["message"],
+            "This model's maximum context length was exceeded: the prompt exceeds the \
+             available context size. Please reduce the length of the messages. (x)"
+        );
+    }
+
+    /// Client libraries spot context overflow by these: LiteLLM matches
+    /// "this model's maximum context length is", crewAI and pydantic-ai
+    /// "maximum context length", Cline a 400 with `context_length_exceeded`.
+    #[tokio::test]
+    async fn over_window_message_matches_client_detectors() {
+        let r = engine_error_response(
+            cascadia_engine::EngineError::PromptTooLong(
+                "prompt is 9000 tokens; the model's window is 8192".into(),
+            ),
+            "messages",
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let m = v["error"]["message"].as_str().unwrap().to_lowercase();
+        assert!(m.contains("this model's maximum context length is"), "{m}");
+        assert!(m.contains("maximum context length"), "{m}");
+        assert_eq!(v["error"]["code"], "context_length_exceeded");
     }
 
     /// Only the window refusal carries `param` and a code; every other
@@ -6882,12 +6908,13 @@ mod tests {
                 assert_eq!(v["error"]["type"], "invalid_request_error", "{ctx}: {v}");
                 assert_eq!(v["error"]["code"], "context_length_exceeded", "{ctx}: {v}");
                 assert_eq!(v["error"]["param"], param, "{ctx}: {v}");
-                assert!(
-                    v["error"]["message"]
-                        .as_str()
-                        .is_some_and(|m| m.contains("window")),
-                    "{ctx}: {v}"
+                let m = v["error"]["message"].as_str().unwrap_or_default();
+                let want = format!(
+                    "This model's maximum context length is 8192 tokens. However, your \
+                     {param} resulted in 9000 tokens."
                 );
+                assert!(m.starts_with(&want), "{ctx}: {v}");
+                assert!(m.contains("window"), "{ctx}: {v}");
             }
         }
     }
