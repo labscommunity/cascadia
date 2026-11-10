@@ -281,6 +281,15 @@ impl EngineSlot {
         }
     }
 
+    /// Ask the engine to end whatever task it is running inside `step()` (a shutdown), through
+    /// its [`InflightCancel`] handle. Never touches the engine lock.
+    fn cancel_inflight_current(&self) {
+        let handle = self.inflight.lock().clone();
+        if let Some(handle) = handle {
+            handle.cancel_current();
+        }
+    }
+
     /// Take the engine lock, blocking the calling thread until it is free.
     /// Sync callers only — see the mutex's note on #122.
     fn lock(&self) -> EngineGuard<'_> {
@@ -729,6 +738,9 @@ impl Runner {
         // whole point: set it after, and a stream that polls in between books
         // a client cancellation for a server restart.
         self.closing.store(true, Ordering::SeqCst);
+        // A one-shot engine runs a whole generation in one step with the engine lock held: end
+        // that generation first, or the lock below waits it out (M18).
+        self.slot.cancel_inflight_current();
         {
             // Tear down and empty the slot under ONE guard, where this used
             // to take the lock twice. Releasing in between now means waking,
@@ -1071,6 +1083,14 @@ impl Stream for ChunkStream {
                             bufs.chunks.remove(&this.task_id);
                         }
                         drop(bufs);
+                        if is_final
+                            && chunk.finish_reason == Some(FinishReason::Cancelled)
+                            && this.closing.load(Ordering::SeqCst)
+                        {
+                            // `close()` ended this task through the in-flight handle: a
+                            // shutdown, not a client cancel (see `record_cancelled_metrics`).
+                            return this.fail_teardown();
+                        }
                         this.record_chunk_metrics(&chunk);
                         return Poll::Ready(Some(chunk));
                     }
@@ -2393,6 +2413,56 @@ mod tests {
         );
         assert!(b_last.is_final && b_last.error.is_none(), "{b_last:?}");
         assert_eq!(b_last.text, "done");
+    }
+
+    /// M18: `Runner::close` doesn't wait out a running one-shot generation: it ends the current
+    /// task through the in-flight handle before it takes the engine lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_ends_a_running_step_through_the_inflight_handle() {
+        let rig = polling_cancel_rig("runner-inflight-close-model").await;
+        let a = rig
+            .runner
+            .generate_async(GenerationTask::new("spin-close", "spin"))
+            .await
+            .unwrap();
+        let a_task = tokio::spawn(async move {
+            let mut a = a;
+            let mut last = None;
+            while let Some(c) = a.next().await {
+                last = Some(c);
+            }
+            last
+        });
+        let start = Instant::now();
+        while logged_at(&rig.log, "spin-close", "start").is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the step never started"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let runner = rig.runner.clone();
+        let closed_at = Instant::now();
+        tokio::task::spawn_blocking(move || runner.close())
+            .await
+            .unwrap();
+        let took = closed_at.elapsed();
+        assert!(
+            took < Duration::from_millis(100),
+            "close() waited {took:?} for the running step"
+        );
+        let last = tokio::time::timeout(Duration::from_secs(5), a_task)
+            .await
+            .expect("the stream never ended")
+            .unwrap()
+            .expect("the stream yielded nothing");
+        // A shutdown, not a client cancel: the teardown error, as when the slot empties.
+        assert!(
+            last.error
+                .as_deref()
+                .is_some_and(|e| e.contains("shutting down")),
+            "{last:?}"
+        );
     }
 
     /// M18: `Runner::interrupt` only signals the handle. It books no metric, writes no tombstone,

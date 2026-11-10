@@ -90,6 +90,14 @@ impl InflightCancel {
         s.early.push_back(task_id.clone());
     }
 
+    /// Ask whatever task is running now to stop (a shutdown). Nothing is remembered when none is.
+    pub fn cancel_current(&self) {
+        let s = self.lock();
+        if s.current.is_some() {
+            self.flag.store(true, Ordering::Release);
+        }
+    }
+
     /// The running task is over: clear it and reset the flag.
     pub fn end(&self) {
         let mut s = self.lock();
@@ -124,6 +132,24 @@ mod tests {
 
     fn id(s: &str) -> TaskId {
         s.to_string()
+    }
+
+    #[test]
+    fn cancel_current_cancels_only_the_running_task() {
+        let ic = InflightCancel::new();
+        // Nothing running: nothing to do, and nothing is remembered.
+        ic.cancel_current();
+        assert!(!ic.cancelled());
+        assert_eq!(ic.early_len(), 0);
+        assert!(!ic.begin(&id("a")));
+        ic.cancel_current();
+        assert!(ic.cancelled());
+        ic.end();
+        assert!(
+            !ic.begin(&id("b")),
+            "it doesn't carry over to the next task"
+        );
+        ic.end();
     }
 
     #[test]
