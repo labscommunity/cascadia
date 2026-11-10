@@ -51,6 +51,91 @@ pub fn with_retry_after(mut resp: Response, secs: u32) -> Response {
     resp
 }
 
+/// Most of a non-JSON error body that is read to reuse as the message. Such
+/// bodies are short text (a rejection's reason); a longer one is not read.
+const MAX_TEXT_BODY_BYTES: usize = 64 * 1024;
+
+/// Response middleware: under `/v1/`, a 4xx/5xx whose `Content-Type` is not
+/// JSON (axum's empty 404 and 405, a path rejection's text, a fallback's
+/// plain "not found") becomes the OpenAI envelope with the same status.
+///
+/// A 404 reads `Invalid URL ({METHOD} {path})` and a 405
+/// `Method {METHOD} is not allowed for {path}`; any other status keeps its
+/// body text, or the status's reason when the body is empty. The 405's
+/// `Allow` header is added by axum after this runs, so it is not in the text,
+/// but it still reaches the client. Headers other than `Content-Type` and
+/// `Content-Length` are kept.
+///
+/// A JSON body passes through untouched, so applying the layer twice is
+/// harmless, and a 1xx/2xx/3xx body (a stream included) is never read.
+/// Apply it as the outermost layer, after any `merge`: the merged router's
+/// fallback is only covered by a layer added afterwards.
+pub async fn openai_error_bodies(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = req.method().clone();
+    let path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|u| u.path().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let resp = next.run(req).await;
+
+    let status = resp.status();
+    let under_v1 = path == "/v1" || path.starts_with("/v1/");
+    if !under_v1
+        || !(status.is_client_error() || status.is_server_error())
+        || is_json(resp.headers())
+    {
+        return resp;
+    }
+
+    let (mut parts, body) = resp.into_parts();
+    let message = match status {
+        StatusCode::NOT_FOUND => format!("Invalid URL ({method} {path})"),
+        StatusCode::METHOD_NOT_ALLOWED => format!("Method {method} is not allowed for {path}"),
+        _ => {
+            let text = axum::body::to_bytes(body, MAX_TEXT_BODY_BYTES)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
+                .unwrap_or_default();
+            if text.is_empty() {
+                status
+                    .canonical_reason()
+                    .unwrap_or("request failed")
+                    .to_owned()
+            } else {
+                text
+            }
+        }
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let body = error_body(status, &message, None, None).to_string();
+    Response::from_parts(parts, axum::body::Body::from(body))
+}
+
+/// `application/json` or a `+json` type, parameters ignored.
+fn is_json(headers: &axum::http::HeaderMap) -> bool {
+    let Some(ct) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json" || essence.ends_with("+json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

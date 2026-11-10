@@ -2925,7 +2925,13 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // routes live at /api/* plus the SPA (when the `dashboard-embed`
         // feature is on) at /. The dashboard router carries the SPA
         // fallback, so it must be merged second.
-        let app = api_router.merge(cascadia_dashboard::make_router(dash_state));
+        // The merged router keeps the dashboard's fallback, so the OpenAI
+        // error layer is applied again here to cover unknown /v1/ routes.
+        let app = api_router
+            .merge(cascadia_dashboard::make_router(dash_state))
+            .layer(axum::middleware::from_fn(
+                cascadia_api::errors::openai_error_bodies,
+            ));
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
         // Only claim a dashboard when this build actually embeds one — the
         // unconditional "API + dashboard serving" line sent the first

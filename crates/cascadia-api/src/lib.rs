@@ -761,9 +761,13 @@ pub fn make_router_with_stats(
         // every route; the image routes' own layer (inner, so it wins)
         // raises theirs.
         .layer(DefaultBodyLimit::max(cfg.max_body_bytes))
-        // Outermost: request count + latency per matched route (#16), so it
-        // observes rejections from the inner layers too.
+        // Request count + latency per matched route (#16), so it observes
+        // rejections from the inner layers too.
         .layer(axum::middleware::from_fn(track_http_metrics))
+        // Outermost: unknown routes, wrong methods and plain-text rejections
+        // under /v1/ answer in the OpenAI error shape. A server that merges
+        // this router with another must apply it again after the merge.
+        .layer(axum::middleware::from_fn(errors::openai_error_bodies))
 }
 
 /// See [`gate_media_body`].
@@ -11314,5 +11318,136 @@ level={{ effort_map[eff] }}";
         let text = echo(v.clone());
         // The echo splits on whitespace: "[ a b ]" comes back as its words.
         assert!(text.contains("[ a b ]"), "{text:?}");
+    }
+
+    async fn send(app: Router, method: &str, uri: &str) -> Response {
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The response's envelope, after checking it is served as JSON.
+    async fn envelope(resp: Response) -> Value {
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            "application/json",
+            "{:?}",
+            resp.headers()
+        );
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"]["param"].is_null(), "{v}");
+        assert!(v["error"]["code"].is_null(), "{v}");
+        v
+    }
+
+    fn with_error_bodies(app: Router) -> Router {
+        app.layer(axum::middleware::from_fn(errors::openai_error_bodies))
+    }
+
+    #[tokio::test]
+    async fn unknown_v1_route_is_an_openai_404() {
+        let resp = send(make_app().await, "POST", "/v1/embeddings").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let v = envelope(resp).await;
+        assert_eq!(v["error"]["message"], "Invalid URL (POST /v1/embeddings)");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn wrong_method_is_an_openai_405() {
+        let resp = send(make_app().await, "GET", "/v1/chat/completions").await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let allow = resp.headers()[header::ALLOW].to_str().unwrap().to_owned();
+        assert!(allow.contains("POST"), "{allow}");
+        let v = envelope(resp).await;
+        assert_eq!(
+            v["error"]["message"],
+            "Method GET is not allowed for /v1/chat/completions"
+        );
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn default_fallback_merge_is_rewritten() {
+        // Merging keeps the second router's (default) fallback, so only a
+        // layer applied after the merge covers unknown routes.
+        let app = with_error_bodies(
+            make_app()
+                .await
+                .merge(Router::new().route("/api/x", get(|| async { "x" }))),
+        );
+        let resp = send(app, "GET", "/v1/nope").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let v = envelope(resp).await;
+        assert_eq!(v["error"]["message"], "Invalid URL (GET /v1/nope)");
+    }
+
+    #[tokio::test]
+    async fn spa_style_fallback_is_rewritten_under_v1() {
+        let app = with_error_bodies(
+            make_app()
+                .await
+                .merge(Router::new().fallback(|| async { (StatusCode::NOT_FOUND, "not found") })),
+        );
+        let resp = send(app.clone(), "GET", "/v1/nope").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let v = envelope(resp).await;
+        assert_eq!(v["error"]["message"], "Invalid URL (GET /v1/nope)");
+
+        let resp = send(app, "GET", "/some/page").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(&body[..], b"not found");
+    }
+
+    #[tokio::test]
+    async fn non_v1_and_success_responses_are_untouched() {
+        let resp = send(make_app().await, "GET", "/health").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert!(v.get("error").is_none(), "{v}");
+
+        let resp = send(make_app().await, "GET", "/metrics").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"));
+
+        let resp = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "mock-model",
+                            "messages": [{"role": "user", "content": "alpha bravo"}],
+                            "max_tokens": 4,
+                            "stream": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(String::from_utf8_lossy(&body)
+            .trim_end()
+            .ends_with("data: [DONE]"));
     }
 }
