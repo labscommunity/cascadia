@@ -4351,15 +4351,13 @@ async fn collect_generation(
         // A failed task carries `error` on its final chunk. Without this
         // branch the empty text below would build a normal 200 with empty
         // content — indistinguishable from "the model said nothing". Fail
-        // loud with a 5xx instead (e.g. a sharded chain poisoned by a
+        // loud instead: a 400 when the request is at fault (a prompt over the
+        // window), else a 5xx (e.g. a sharded chain poisoned by a
         // handshake/manifest mismatch).
         if let Some(reason) = &chunk.error {
-            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return Err(api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                reason.clone(),
-                None,
-            ));
+            let (status, message, param, code) = classify_chunk_error(reason, prompt_param);
+            warn!(task = %task_id, reason = %reason, status = status.as_u16(), "engine failed task");
+            return Err(api_error_for(status, message, param, code));
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
@@ -4627,8 +4625,9 @@ async fn completions(
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
     while let Some(chunk) = chunk_stream.next().await {
         if let Some(reason) = &chunk.error {
-            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return api_error(StatusCode::SERVICE_UNAVAILABLE, reason.clone(), None);
+            let (status, message, param, code) = classify_chunk_error(reason, "prompt");
+            warn!(task = %task_id, reason = %reason, status = status.as_u16(), "engine failed task");
+            return api_error_for(status, message, param, code);
         }
         match marker.as_mut() {
             Some(f) => {
@@ -4763,13 +4762,9 @@ async fn stream_text_completion(
                 }
                 if let Some(reason) = &chunk.error {
                     warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
-                    let payload = serde_json::json!({
-                        "id": task_id,
-                        "object": "error",
-                        "error": { "message": reason, "type": "engine_error" },
-                    });
+                    let frame = sse_error_frame(&task_id, reason, "prompt");
                     tokio::task::yield_now().await;
-                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                    return Ok::<Bytes, std::convert::Infallible>(frame);
                 }
                 // Prepend the echo prefix to the first content frame, once.
                 let mut text = chunk.text.clone();
@@ -4963,13 +4958,9 @@ async fn stream_completion(
                 // SSE error event instead of a silent empty delta + [DONE].
                 if let Some(reason) = &chunk.error {
                     warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
-                    let payload = serde_json::json!({
-                        "id": task_id,
-                        "object": "error",
-                        "error": { "message": reason, "type": "engine_error" },
-                    });
+                    let frame = sse_error_frame(&task_id, reason, "messages");
                     tokio::task::yield_now().await;
-                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                    return Ok::<Bytes, std::convert::Infallible>(frame);
                 }
                 // Custom (non-OpenAI) `n_tokens` field: how many model
                 // tokens this chunk carries. Spec-decode emits 1..=K+1
@@ -5140,13 +5131,9 @@ impl ToolStream {
             if let Some(reason) = &chunk.error {
                 warn!(task = %self.task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
                 self.phase = ToolStreamPhase::Tail;
-                let payload = serde_json::json!({
-                    "id": self.task_id,
-                    "object": "error",
-                    "error": { "message": reason, "type": "engine_error" },
-                });
+                let frame = sse_error_frame(&self.task_id, reason, "messages");
                 tokio::task::yield_now().await;
-                return Some(Bytes::from(format!("data: {payload}\n\n")));
+                return Some(frame);
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             self.held_tokens += chunk.token_count();
@@ -5347,6 +5334,65 @@ fn engine_error_response(
     // The 503s here (queue full, engine not loaded or not connected) are all
     // "come back shortly"; `with_retry_after` leaves every other status bare.
     errors::with_retry_after(resp, errors::RETRY_AFTER_SECS)
+}
+
+/// The SSE event for an engine error that arrives once a stream's 200 is on
+/// the wire: `{"id","object":"error","error":{...}}`, the error object
+/// classified as [`classify_chunk_error`] does for a non-streamed answer.
+/// `prompt_param` is the request field that carries the prompt.
+fn sse_error_frame(task_id: &str, reason: &str, prompt_param: &str) -> Bytes {
+    let (status, message, param, code) = classify_chunk_error(reason, prompt_param);
+    let mut payload = errors::error_body(status, &message, param, code);
+    payload["id"] = serde_json::Value::from(task_id);
+    payload["object"] = serde_json::Value::from("error");
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
+/// How an engine error that arrives mid-generation (a chunk's `error` text)
+/// is answered: `(status, message, param, code)`.
+///
+/// The text may carry a `task <id>: ` attribution and then a
+/// `backend error: ` wrapper (as `cascadia_engine::is_client_error_reason`
+/// reads it); behind them, a prompt over the window is a 400
+/// `context_length_exceeded` naming `prompt_param` and worded as
+/// [`engine_error_response`] words the typed refusal, and the other
+/// client-fault refusals (`unsupported input: `, `invalid_request: `,
+/// `invalid configuration: `) are a 400 with the text as it came, the status
+/// `EngineError::http_status` gives those variants. Anything else is the
+/// pipeline's failure: a 503 with the text.
+fn classify_chunk_error<'p>(
+    reason: &str,
+    prompt_param: &'p str,
+) -> (StatusCode, String, Option<&'p str>, Option<&'static str>) {
+    let mut r = reason;
+    if let Some(rest) = r.strip_prefix("task ") {
+        r = rest.split_once(": ").map_or(r, |(_, after)| after);
+    }
+    if let Some(rest) = r.strip_prefix("backend error: ") {
+        r = rest;
+    }
+    if let Some(detail) = r.strip_prefix("prompt too long: ") {
+        let (tokens, window) = errors::prompt_counts(detail);
+        return (
+            StatusCode::BAD_REQUEST,
+            errors::context_length_message(prompt_param, window, tokens, detail),
+            Some(prompt_param),
+            Some("context_length_exceeded"),
+        );
+    }
+    let client_fault = [
+        "unsupported input: ",
+        cascadia_engine::CLIENT_ERROR_PREFIX,
+        "invalid configuration: ",
+    ]
+    .iter()
+    .any(|p| r.starts_with(p));
+    let status = if client_fault {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, reason.to_owned(), None, None)
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -7946,6 +7992,7 @@ mod tests {
                 .contains("mock injected"),
             "5xx body should carry the engine's failure reason, got {v}"
         );
+        assert_eq!(v["error"]["type"], "server_error", "{v}");
     }
 
     #[test]
@@ -10330,6 +10377,22 @@ level={{ effort_map[eff] }}";
             "expected SSE error event: {body}"
         );
         assert!(!body.contains("tool_calls"), "{body}");
+        let events = sse_events(&body);
+        let err = &events.last().unwrap()["error"];
+        assert_eq!(
+            err,
+            &serde_json::json!({
+                "message": err["message"],
+                "type": "server_error",
+                "param": null,
+                "code": null,
+            }),
+            "{body}"
+        );
+        assert!(
+            err["message"].as_str().unwrap().contains("mock injected"),
+            "{body}"
+        );
     }
 
     /// Feed every piece but the last, finish with the last. Returns each
@@ -10504,12 +10567,12 @@ level={{ effort_map[eff] }}";
     }
 
     /// Emits `parts[0]`, then nothing until `release` is set, then the rest
-    /// and a final chunk (an error chunk when `fail`), so a test can read
-    /// frames while generation is provably still running.
+    /// and a final chunk (an error chunk carrying `fail` when set), so a test
+    /// can read frames while generation is provably still running.
     struct GatedEngine {
         parts: Vec<String>,
         release: Arc<std::sync::atomic::AtomicBool>,
-        fail: bool,
+        fail: Option<String>,
         pending: Option<(cascadia_types::TaskId, usize)>,
     }
 
@@ -10532,8 +10595,8 @@ level={{ effort_map[eff] }}";
                 self.pending = Some((id.clone(), i + 1));
                 return Ok(vec![(id, chunk)]);
             }
-            let last = if self.fail {
-                Chunk::error(&id, "gated engine failure")
+            let last = if let Some(reason) = &self.fail {
+                Chunk::error(&id, reason.clone())
             } else {
                 Chunk::final_marker(&id, "")
                     .with_finish_reason(cascadia_types::FinishReason::Stop)
@@ -10567,11 +10630,20 @@ level={{ effort_map[eff] }}";
     /// Router over a [`GatedEngine`] with a template that renders tools, so
     /// tool requests are accepted. Returns the gate.
     async fn gated_app(parts: &[&str], fail: bool) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        gated_app_failing(parts, fail.then_some("gated engine failure")).await
+    }
+
+    /// [`gated_app`] whose final chunk, when `fail` is set, is an error chunk
+    /// carrying that reason.
+    async fn gated_app_failing(
+        parts: &[&str],
+        fail: Option<&str>,
+    ) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runner = Runner::new(Box::new(GatedBuilder(GatedEngine {
             parts: parts.iter().map(|p| (*p).to_owned()).collect(),
             release: release.clone(),
-            fail,
+            fail: fail.map(str::to_owned),
             pending: None,
         })));
         runner
@@ -10778,8 +10850,200 @@ level={{ effort_map[eff] }}";
         let events = sse_events(&body);
         assert_eq!(streamed_content(&events), "Checking more ");
         assert_eq!(events.last().unwrap()["object"], "error", "{body}");
+        assert_eq!(
+            events.last().unwrap()["error"],
+            serde_json::json!({
+                "message": "gated engine failure",
+                "type": "server_error",
+                "param": null,
+                "code": null,
+            }),
+            "{body}"
+        );
         assert!(!body.contains("tool_calls"), "{body}");
         assert!(!body.contains("\"usage\""), "{body}");
+    }
+
+    /// An over-window refusal the engine raises mid-generation, as a step
+    /// path reports it: attributed to the task and wrapped as a backend error.
+    const MID_GENERATION_TOO_LONG: &str =
+        "task t-9: backend error: prompt too long: prompt is 900 \
+         tokens; the model's window is 512";
+
+    fn chat_http_request(content: &str, stream: bool) -> Request<Body> {
+        let payload = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":content}],"stream":stream});
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    }
+
+    async fn health_status(app: Router) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn mid_generation_prompt_too_long_is_context_length_exceeded() {
+        let (app, _release) = gated_app_failing(&[], Some(MID_GENERATION_TOO_LONG)).await;
+        let resp = app
+            .clone()
+            .oneshot(chat_http_request("hi", false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        assert_eq!(v["error"]["code"], "context_length_exceeded", "{v}");
+        assert_eq!(v["error"]["param"], "messages", "{v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with(
+                "This model's maximum context length is 512 tokens. However, your messages \
+                 resulted in 900 tokens."
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.ends_with("(prompt is 900 tokens; the model's window is 512)"),
+            "{msg}"
+        );
+        // The caller's fault says nothing about the pipeline.
+        assert_eq!(health_status(app).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mid_generation_prompt_too_long_on_completions_names_prompt() {
+        let (app, _release) = gated_app_failing(&[], Some(MID_GENERATION_TOO_LONG)).await;
+        let (status, v) = post_completions(
+            app,
+            serde_json::json!({"model": "mock-model", "prompt": "hi", "max_tokens": 8}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["code"], "context_length_exceeded", "{v}");
+        assert_eq!(v["error"]["param"], "prompt", "{v}");
+    }
+
+    #[tokio::test]
+    async fn streamed_mid_generation_prompt_too_long_frame_is_context_length_exceeded() {
+        let (app, release) = gated_app_failing(&["Hi "], Some(MID_GENERATION_TOO_LONG)).await;
+        release.store(true, Ordering::SeqCst);
+        let resp = app
+            .clone()
+            .oneshot(chat_http_request("hi", true))
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+        let events = sse_events(&body);
+        let last = events.last().unwrap();
+        assert_eq!(last["object"], "error", "{body}");
+        assert!(last["id"].is_string(), "{body}");
+        assert_eq!(last["error"]["code"], "context_length_exceeded", "{body}");
+        assert_eq!(last["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(last["error"]["param"], "messages", "{body}");
+        assert_eq!(health_status(app).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn streamed_engine_failure_frame_is_server_error() {
+        let resp = make_app()
+            .await
+            .oneshot(chat_http_request("__engine_error__", true))
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+        let events = sse_events(&body);
+        let err = events.last().unwrap()["error"].as_object().unwrap().clone();
+        assert_eq!(err["type"], "server_error", "{body}");
+        assert!(err["param"].is_null() && err["code"].is_null(), "{body}");
+        assert!(
+            err.contains_key("param") && err.contains_key("code"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_completions_engine_failure_frame_is_server_error() {
+        let payload = serde_json::json!({"model":"mock-model",
+            "prompt":"__engine_error__","max_tokens":8,"stream":true});
+        let resp = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        let events = sse_events(&body);
+        let last = events.last().unwrap();
+        assert_eq!(last["object"], "error", "{body}");
+        assert_eq!(last["error"]["type"], "server_error", "{body}");
+        let err = last["error"].as_object().unwrap();
+        assert!(
+            err.contains_key("param") && err.contains_key("code"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn classify_chunk_error_splits_client_and_server_faults() {
+        let (s, m, p, c) = classify_chunk_error(MID_GENERATION_TOO_LONG, "input");
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!((p, c), (Some("input"), Some("context_length_exceeded")));
+        assert!(m.contains("your input resulted in 900 tokens"), "{m}");
+        for reason in [
+            "unsupported input: a resumed turn cannot carry images",
+            "invalid_request: empty prompt after tokenize",
+            "task t-1: invalid configuration: bad knob",
+            "backend error: invalid_request: empty prompt",
+        ] {
+            assert_eq!(
+                classify_chunk_error(reason, "messages"),
+                (StatusCode::BAD_REQUEST, reason.to_owned(), None, None),
+                "{reason}"
+            );
+        }
+        for reason in [
+            "mock injected engine failure",
+            "model not found at /x",
+            "peer layout rejected: mismatch",
+            "shard rejected: bad",
+            "resume_unsupported: no",
+            "task t-1: backend error: stage 2 hung up",
+        ] {
+            assert_eq!(
+                classify_chunk_error(reason, "messages"),
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    reason.to_owned(),
+                    None,
+                    None
+                ),
+                "{reason}"
+            );
+        }
     }
 
     // Helper: GET /metrics, return the exposition text.
