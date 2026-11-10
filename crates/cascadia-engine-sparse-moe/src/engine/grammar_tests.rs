@@ -2097,6 +2097,44 @@ fn the_sparse_moe_head_clears_its_latch_on_a_late_probe_answer() {
     }
 }
 
+/// The same late answer, seen where the SparseMoE and MiniMax heads first
+/// check a json task they take off the queue: it is read there, so that
+/// check doesn't refuse on a latch the answer already cleared.
+#[test]
+fn a_dequeued_json_task_reads_the_late_probe_answer_before_refusing() {
+    for i in 0..20 {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let (srv, down) = l.remove(0);
+        let late = Duration::from_millis(150);
+        let log = fixture_tail_full(&rt, srv, false, false, late);
+        let (mut masks, mut evidence) = (StageMasks::default(), false);
+        let owed = crate::dist::OwedLateReply::default();
+        let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        assert!(r.is_err(), "{i}");
+        assert!(masks.latch.is_set());
+        std::thread::sleep(late + Duration::from_millis(100));
+        let r = refuse_dequeued_json(rt.handle(), Some(&down), &mut masks, &owed);
+        assert_eq!(r, Ok(()), "{i}: the late answer cleared the latch");
+        assert!(!masks.latch.is_set());
+        let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        assert_eq!(r, Ok(()), "{i}");
+        assert_eq!(log.probes(), 2, "{i}");
+        assert_eq!(
+            plain_round(&rt, &down, &masks),
+            i64::from(b'a'),
+            "{i}: aligned"
+        );
+    }
+    // Nothing owed on the link: the latch refuses as it stands.
+    let rt = runtime();
+    let mut masks = StageMasks::default();
+    masks.latch.set_probe();
+    let owed = crate::dist::OwedLateReply::default();
+    let r = refuse_dequeued_json(rt.handle(), None, &mut masks, &owed);
+    assert_eq!(r.unwrap_err(), UPGRADE_EVERY_STAGE);
+}
+
 /// A probe latch past its minute: the next json admission probes again.
 #[test]
 fn the_sparse_moe_head_re_probes_after_a_minute() {

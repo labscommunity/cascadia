@@ -2330,6 +2330,25 @@ async fn drain_late_replies(
     }
 }
 
+/// Head: the refusal of a structured-output task while a later stage that
+/// can't mask latched the link. A latched link is read first (see
+/// [`drain_late_replies`]): a slow but new tail's acknowledged late answer,
+/// already on the socket, clears the latch, and the task is admitted.
+/// Called at submit, which answers the HTTP request, and again at admission;
+/// between steps nothing is owed on the link but late replies.
+fn latched_refusal(
+    handle: &tokio::runtime::Handle,
+    downstream: Option<&Arc<tokio::sync::Mutex<ActivationClient>>>,
+    link: &mut MaskLink,
+) -> Option<EngineError> {
+    if link.latched_at.is_some() {
+        if let Some(downstream) = downstream {
+            crate::dist_spec::run_async_pub(handle, drain_late_replies(downstream, link));
+        }
+    }
+    link.refusal(std::time::Instant::now())
+}
+
 /// Head: the token mask to send with a step whose last row is at
 /// `last_row_position`, or `None` when the step isn't masked (no grammar, or
 /// a prompt row before the last). Fails a structured-output task at once
@@ -3827,19 +3846,6 @@ impl OvRuntimeEngine {
         verdict
     }
 
-    /// Head: skip, without waiting, any late replies already in the
-    /// downstream socket (see [`drain_late_replies`]).
-    fn drain_late_downstream_replies(&mut self) {
-        let Some(downstream) = self.downstream.clone() else {
-            return;
-        };
-        let handle = self.runtime_handle.clone();
-        crate::dist_spec::run_async_pub(
-            &handle,
-            drain_late_replies(&downstream, &mut self.mask_link),
-        );
-    }
-
     /// The next activation's seq, static position and hidden frame.
     fn stamp_hidden(
         &mut self,
@@ -4157,10 +4163,11 @@ impl OvRuntimeEngine {
             if grammar.is_some() && multi_stage {
                 // A slow but new tail's late acknowledged answer, already in
                 // the socket, clears the latch before it refuses.
-                if self.mask_link.latched_at.is_some() {
-                    self.drain_late_downstream_replies();
-                }
-                if let Some(refused) = self.mask_link.refusal(std::time::Instant::now()) {
+                if let Some(refused) = latched_refusal(
+                    &self.runtime_handle,
+                    self.downstream.as_ref(),
+                    &mut self.mask_link,
+                ) {
                     let id = task.task_id.clone();
                     return Ok(vec![(id.clone(), Chunk::error(id, refused.to_string()))]);
                 }
@@ -6131,7 +6138,11 @@ impl Engine for OvRuntimeEngine {
         // A later stage that can't mask latched this pipeline: structured-output
         // tasks fail at once (5xx) instead of each stalling a token deadline.
         if task.grammar.is_some() && !self.spec.is_last_stage {
-            if let Some(refused) = self.mask_link.refusal(std::time::Instant::now()) {
+            if let Some(refused) = latched_refusal(
+                &self.runtime_handle,
+                self.downstream.as_ref(),
+                &mut self.mask_link,
+            ) {
                 return Err(refused);
             }
         }
@@ -12489,6 +12500,70 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         drain_late_replies(&downstream, &mut link).await;
         assert!(link.refusal(std::time::Instant::now()).is_some());
+    }
+
+    /// A latched head reads a slow but new tail's late probe answer at the
+    /// next structured-output request's submit, before it refuses: submit
+    /// answers the HTTP request, so a refusal there must not outlive the
+    /// answer already on the link. Run as the engine runs: a multi-thread
+    /// runtime, entered from a plain thread.
+    #[test]
+    fn submit_reads_a_late_probe_answer_before_refusing() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        for i in 0..10u32 {
+            let (downstream, upstream, mut link, seq) = rt.block_on(async {
+                let (client, server) = loopback().await;
+                let downstream = Arc::new(tokio::sync::Mutex::new(client));
+                let upstream = Arc::new(tokio::sync::Mutex::new(server));
+                let mut link = MaskLink::default();
+                let (head, seq) = tokio::join!(
+                    probe_exchange(&downstream, 1, None, 2, TEST_PROBE, &mut link),
+                    async {
+                        let (lead, _) = recv_hidden_frames(&upstream, false).await.unwrap();
+                        decode_wire_lead_masks(&lead, false).unwrap().0
+                    }
+                );
+                assert!(head.is_err());
+                (downstream, upstream, link, seq)
+            });
+            // Nothing on the link yet: still refused.
+            assert!(
+                latched_refusal(rt.handle(), Some(&downstream), &mut link).is_some(),
+                "{i}"
+            );
+            rt.block_on(async {
+                upstream
+                    .lock()
+                    .await
+                    .send(&encode_token_reply(MASK_PROBE_OK_TOKEN, seq, true))
+                    .await
+                    .unwrap();
+            });
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                latched_refusal(rt.handle(), Some(&downstream), &mut link).is_none(),
+                "{i}: the late answer unlatched the link"
+            );
+            assert!(link.acked, "{i}");
+        }
+        // A late mask miss is no evidence: still refused.
+        let (downstream, mut link) = rt.block_on(async {
+            let (client, mut server) = loopback().await;
+            server
+                .send(&encode_token_reply(MASK_MISS_TOKEN, 1, true))
+                .await
+                .unwrap();
+            let mut link = MaskLink::default();
+            let now = std::time::Instant::now();
+            let _ = link.on_probe_unanswered(now, &EngineError::Backend("silence".into()));
+            (Arc::new(tokio::sync::Mutex::new(client)), link)
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(latched_refusal(rt.handle(), Some(&downstream), &mut link).is_some());
     }
 
     /// A probe's own replies: an unacknowledged answer for its seq latches;

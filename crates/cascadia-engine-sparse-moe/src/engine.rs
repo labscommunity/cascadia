@@ -1352,6 +1352,44 @@ async fn masked_forward_exchange(
 const PROBE_LINK_FAILED: &str =
     "structured output: the downstream pipeline link failed before the request started; retry it";
 
+/// Rank 0, a json task just taken off the queue, the link idle: its
+/// refusal while the latch holds, after the late probe answer already on
+/// the link is read (see [`refuse_while_latched`]). `down` is the
+/// downstream link (`None` on a single stage).
+pub(crate) fn refuse_dequeued_json(
+    handle: &tokio::runtime::Handle,
+    down: Option<&Arc<TokioMutex<ActivationClient>>>,
+    masks: &mut StageMasks,
+    owed: &crate::dist::OwedLateReply,
+) -> Result<(), String> {
+    match down {
+        Some(down) => cascadia_runner::run_async(handle, refuse_while_latched(down, masks, owed)),
+        None => masks.refusal().map_or(Ok(()), Err),
+    }
+}
+
+/// Rank 0, a json task on a multi-stage link, the link idle: read a slow
+/// stage's late probe answer already on the link (an acknowledged one
+/// clears the latch), then refuse while the latch holds. `Err` is the
+/// task's error.
+async fn refuse_while_latched(
+    down: &TokioMutex<ActivationClient>,
+    masks: &mut StageMasks,
+    owed: &crate::dist::OwedLateReply,
+) -> Result<(), String> {
+    if owed.is_owed() {
+        let alive = crate::dist::drain_idle_link(&mut *down.lock().await, owed).await;
+        if !alive {
+            return Err(PROBE_LINK_FAILED.to_string());
+        }
+        if owed.take_acked() && masks.latch.is_set() {
+            info!("a late acknowledged answer to the mask-support probe arrived; json requests accepted again");
+            masks.latch.clear();
+        }
+    }
+    masks.refusal().map_or(Ok(()), Err)
+}
+
 /// Rank 0, a json task's admission on a multi-stage link: read a slow
 /// stage's late probe answer already on the idle link (it clears the
 /// latch), refuse while the latch holds, and probe a link without
@@ -1367,19 +1405,7 @@ pub(crate) async fn admit_json_task(
     evidence: &mut bool,
     owed: &crate::dist::OwedLateReply,
 ) -> Result<(), String> {
-    if owed.is_owed() {
-        let alive = crate::dist::drain_idle_link(&mut *down.lock().await, owed).await;
-        if !alive {
-            return Err(PROBE_LINK_FAILED.to_string());
-        }
-        if owed.take_acked() && masks.latch.is_set() {
-            info!("a late acknowledged answer to the mask-support probe arrived; json requests accepted again");
-            masks.latch.clear();
-        }
-    }
-    if let Some(msg) = masks.refusal() {
-        return Err(msg);
-    }
+    refuse_while_latched(down, masks, owed).await?;
     if *evidence {
         return Ok(());
     }
@@ -2351,7 +2377,12 @@ impl SparseMoEEngine {
         };
         let compiled = self.grammars.remove(&task.task_id);
         if compiled.is_some() {
-            if let Some(msg) = self.stage_masks.refusal() {
+            if let Err(msg) = refuse_dequeued_json(
+                &self.runtime_handle,
+                self.transport.downstream.as_ref(),
+                &mut self.stage_masks,
+                &self.owed_late,
+            ) {
                 let id = task.task_id.clone();
                 return Some(vec![(id.clone(), Chunk::error(id, msg))]);
             }
@@ -4785,7 +4816,12 @@ impl OvMoeEngine {
         };
         let compiled = self.grammars.remove(&task.task_id);
         if compiled.is_some() {
-            if let Some(msg) = self.stage_masks.refusal() {
+            if let Err(msg) = refuse_dequeued_json(
+                &self.runtime_handle,
+                self.transport.downstream.as_ref(),
+                &mut self.stage_masks,
+                &self.owed_late,
+            ) {
                 let id = task.task_id.clone();
                 return Some(vec![(id.clone(), Chunk::error(id, msg))]);
             }
