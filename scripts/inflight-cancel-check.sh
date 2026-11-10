@@ -20,8 +20,9 @@
 #   --eps S              latency allowance for the hang-up to reach the node, seconds (0.5)
 #   --n-tol PCT          tolerance on the cancelled task's token count vs D*R, percent (25)
 #   --prefill-s S        the long prompt's prefill takes S seconds (a token-by-token prefill on a large
-#                        model): hang up S seconds later, so the cancel lands in decode, and still expect
-#                        R*(D-S) tokens. Read S from the node log's 'prefill done secs=' line (0)
+#                        model): hang up S seconds later, so the cancel lands in decode, take R as the decode-
+#                        only rate (tokens / (elapsed - S)) and expect R*(D-S) tokens. Read S from the node
+#                        log's 'prefill done secs=' line of the count prompt (0)
 #   --long-max-tokens N  max_tokens of the long request (default: none, the server's window-long default)
 #   --long-timeout S     client limit on a long request that should end early (stop cases) (300)
 #   --settle S           client limit on a request queued behind a long one (600)
@@ -430,6 +431,14 @@ case_baseline() {
   else
     ct=$(py get "$WORK/Rrun.json" completion_tokens); tl=$(wget_ Rrun total)
     R=$(calc "${ct:-0} / ($tl > 0 ? $tl : 1)"); echo "baseline: R = $R tok/s ($ct tokens / ${tl}s client time; no tok_s in the log)"
+  fi
+  if fle 0.01 "$PREFILL_S"; then
+    # The rate above counts the prefill too; with --prefill-s, take the decode-only rate of the same request.
+    ct=$(field "$line" tokens); el=$(field "$line" elapsed_s)
+    [ -n "$ct" ] && [ -n "$el" ] || { ct=$(py get "$WORK/Rrun.json" completion_tokens); el=$(wget_ Rrun total); }
+    if fle 0.5 "$(calc "${el:-0} - $PREFILL_S")"; then
+      R=$(calc "${ct:-0} / (${el} - $PREFILL_S)"); echo "baseline: decode-only R = $R tok/s ($ct tokens / (${el}s - prefill ${PREFILL_S}s))"
+    fi
   fi
   fle 0.01 "$R" || { verdict "baseline: a decode rate" bad "R=$R"; R=1; }
   D=$(calc "((20 / $R > 3) ? 20 / $R : 3) + $PREFILL_S")
