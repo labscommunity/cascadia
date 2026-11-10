@@ -105,10 +105,61 @@ struct InFlightGuard(Arc<ApiStats>);
 
 impl InFlightGuard {
     fn new(stats: Arc<ApiStats>) -> Self {
-        stats.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+        // Going from idle to busy starts the stall clock afresh: a server
+        // that sat idle has not stalled, it has had nothing to deliver.
+        if stats.requests_in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
+            stats
+                .last_progress_ms
+                .store(unix_millis(), Ordering::Relaxed);
+        }
         cascadia_metrics::INFLIGHT_TASKS.inc();
         InFlightGuard(stats)
     }
+}
+
+/// Milliseconds since the Unix epoch (0 if the clock is before it).
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// An admitted task's chunk stream that records each delivered chunk in
+/// [`ApiStats::last_progress_ms`], so [`track_pipeline_health`] can tell a
+/// busy server from a stalled one. Every completion route reads its chunks
+/// through one of these (see [`generate`]).
+struct Delivering {
+    inner: cascadia_runner::ChunkStream,
+    stats: Arc<ApiStats>,
+}
+
+impl Stream for Delivering {
+    type Item = cascadia_types::Chunk;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if let std::task::Poll::Ready(Some(_)) = &polled {
+            self.stats
+                .last_progress_ms
+                .store(unix_millis(), Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+/// Submit `task` to the engine ([`Runner::generate_async`]) and read its
+/// chunks through [`Delivering`].
+async fn generate(
+    state: &AppState,
+    task: GenerationTask,
+) -> Result<Delivering, cascadia_engine::EngineError> {
+    let inner = state.runner.generate_async(task).await?;
+    Ok(Delivering {
+        inner,
+        stats: state.stats.clone(),
+    })
 }
 
 impl Drop for InFlightGuard {
@@ -896,6 +947,18 @@ async fn metrics() -> impl IntoResponse {
 #[derive(Clone, Copy)]
 struct PreEngineFailure;
 
+/// Marks a 503 that refused a request for want of capacity (the in-flight
+/// gate, or the engine's full queue). Also tagged [`PreEngineFailure`]; this
+/// marker lets [`track_pipeline_health`] still mark a stalled server unready
+/// (see [`STALL_SECS`]).
+#[derive(Clone, Copy)]
+struct CapacityRefusal;
+
+/// How long a server with requests in flight may go without delivering a
+/// generated chunk before a capacity 503 marks it unready: a busy server keeps
+/// producing, a wedged pipeline holds every slot and produces nothing.
+const STALL_SECS: u64 = 60;
+
 /// The 503 for a request past the in-flight cap: `Retry-After` tells the
 /// client when to come back, and [`PreEngineFailure`] keeps it out of
 /// readiness. A busy node is not a broken one, and since a streamed request's
@@ -908,14 +971,26 @@ fn capacity_refusal() -> Response {
         None,
     );
     resp.extensions_mut().insert(PreEngineFailure);
+    resp.extensions_mut().insert(CapacityRefusal);
     errors::with_retry_after(resp, errors::RETRY_AFTER_SECS)
+}
+
+/// Requests are in flight and none has been delivered a chunk for longer than
+/// [`STALL_SECS`] (or the server went busy that long ago and has delivered
+/// nothing since).
+fn pipeline_stalled(stats: &ApiStats) -> bool {
+    stats.requests_in_flight.load(Ordering::Relaxed) > 0
+        && unix_millis().saturating_sub(stats.last_progress_ms.load(Ordering::Relaxed))
+            > STALL_SECS * 1000
 }
 
 /// Response middleware: for completion routes, flip `AppState.ready` from the
 /// response status (5xx → not ready, 2xx → ready) so `/health` reflects whether
 /// the pipeline is actually serving. Non-completion routes don't touch it.
 /// 5xx responses tagged [`PreEngineFailure`] are excluded — they say nothing
-/// about the pipeline.
+/// about the pipeline — except a [`CapacityRefusal`] while the pipeline is
+/// stalled ([`pipeline_stalled`]): a wedged step holds every slot, so every
+/// new request is a capacity 503 and nothing else would ever mark it unready.
 async fn track_pipeline_health(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
@@ -929,7 +1004,10 @@ async fn track_pipeline_health(
     let resp = next.run(req).await;
     if is_completion {
         let s = resp.status();
-        if s.is_server_error() && resp.extensions().get::<PreEngineFailure>().is_none() {
+        let ext = resp.extensions();
+        let pipeline_failed = ext.get::<PreEngineFailure>().is_none()
+            || (ext.get::<CapacityRefusal>().is_some() && pipeline_stalled(&state.stats));
+        if s.is_server_error() && pipeline_failed {
             state.ready.store(false, Ordering::Relaxed);
         } else if s.is_success() {
             state.ready.store(true, Ordering::Relaxed);
@@ -4391,7 +4469,7 @@ async fn collect_generation(
     let _permit = permit;
     let _inflight = inflight;
     let task_id = task.task_id.clone();
-    let mut chunk_stream = match state.runner.generate_async(task).await {
+    let mut chunk_stream = match generate(&state, task).await {
         Ok(s) => s,
         Err(err) => return Err(engine_error_response(err, prompt_param)),
     };
@@ -4674,7 +4752,7 @@ async fn completions(
 
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate_async(task).await {
+    let mut chunk_stream = match generate(&state, task).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err, "prompt"),
     };
@@ -4775,7 +4853,7 @@ async fn stream_text_completion(
     include_usage: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
-    let chunk_stream = match state.runner.generate_async(task).await {
+    let chunk_stream = match generate(&state, task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "completions-stream: generate failed");
@@ -4906,7 +4984,7 @@ async fn stream_completion(
     let enable_thinking = task.enable_thinking;
     let _ = SystemTime::now();
 
-    let chunk_stream = match state.runner.generate_async(task).await {
+    let chunk_stream = match generate(&state, task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "ov-stream: generate failed");
@@ -5121,7 +5199,7 @@ async fn stream_completion(
 /// permit and the permit is released when the stream is dropped (which
 /// happens on client disconnect — axum drops the SSE response).
 struct StreamWithPermit {
-    inner: cascadia_runner::ChunkStream,
+    inner: Delivering,
     _permit: tokio::sync::OwnedSemaphorePermit,
     /// Decrements `requests_in_flight` when the stream body is dropped.
     _inflight: InFlightGuard,
@@ -5391,6 +5469,7 @@ fn engine_error_response(
     // is down, so those 503s still flip `/health`.
     if matches!(err, EngineError::QueueFull { .. }) {
         resp.extensions_mut().insert(PreEngineFailure);
+        resp.extensions_mut().insert(CapacityRefusal);
     }
     // The 503s here (queue full, engine not loaded or not connected) are all
     // "come back shortly"; `with_retry_after` leaves every other status bare.
@@ -5535,6 +5614,15 @@ mod tests {
             assert_eq!(r.headers()[header::RETRY_AFTER], "1");
             // The pipeline really is down: readiness must flip.
             assert!(r.extensions().get::<PreEngineFailure>().is_none());
+            assert!(r.extensions().get::<CapacityRefusal>().is_none());
+        }
+        // A full queue is a capacity refusal, like the in-flight gate's 503.
+        for r in [
+            engine_error_response(EngineError::QueueFull { queued: 8, cap: 8 }, "messages"),
+            capacity_refusal(),
+        ] {
+            assert!(r.extensions().get::<PreEngineFailure>().is_some());
+            assert!(r.extensions().get::<CapacityRefusal>().is_some());
         }
         for (err, status) in [
             (
@@ -7858,6 +7946,195 @@ mod tests {
                 .unwrap();
             assert_eq!(health.status(), StatusCode::OK, "{uri}");
         }
+    }
+
+    /// A capacity 503 marks the server unready only when it is stalled:
+    /// requests are in flight and nothing has been delivered for longer than
+    /// [`STALL_SECS`]. A busy server that is still producing stays ready, so
+    /// does one with nothing in flight, and the next 2xx heals a stalled one.
+    #[tokio::test]
+    async fn stalled_capacity_503s_mark_the_server_unready() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let stats = Arc::new(ApiStats::default());
+        let cfg = Config {
+            max_concurrent_requests: 1,
+            ..Config::default()
+        };
+        let app = make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats.clone());
+        let post = |stream: bool| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                        "stream": stream,
+                        "messages": [{"role": "user", "content": "alpha bravo"}]})
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let health = || async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        };
+        let now_ms = || {
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+
+        // Nothing in flight: a capacity 503 never flips, however old the
+        // last delivery.
+        let empty = make_router_with_config(
+            Arc::new({
+                let r = Runner::new(Box::new(MockBuilder::new()));
+                r.start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+                r
+            }),
+            "mock-model",
+            Config {
+                max_concurrent_requests: 0,
+                ..Config::default()
+            },
+        );
+        let resp = empty.clone().oneshot(post(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = empty
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "nothing in flight");
+
+        // A streamed request holds the only slot while its body is unread.
+        let held = app.clone().oneshot(post(true)).await.unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        assert_eq!(stats.requests_in_flight.load(Ordering::Relaxed), 1);
+
+        // Busy but moving: delivered just now.
+        stats.last_progress_ms.store(now_ms(), Ordering::Relaxed);
+        let resp = app.clone().oneshot(post(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health().await, StatusCode::OK, "busy but moving");
+
+        // Stalled: in flight, nothing delivered for longer than the bound.
+        stats
+            .last_progress_ms
+            .store(now_ms() - (STALL_SECS + 1) * 1000, Ordering::Relaxed);
+        let resp = app.clone().oneshot(post(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health().await, StatusCode::SERVICE_UNAVAILABLE, "stalled");
+
+        // The slot frees and the next 2xx heals it.
+        drop(held);
+        let resp = app.clone().oneshot(post(false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(health().await, StatusCode::OK, "healed");
+    }
+
+    /// Every delivered chunk records progress, on every completion route,
+    /// streamed or not; so does a server going from idle to busy.
+    #[tokio::test]
+    async fn delivered_chunks_record_progress() {
+        let cases = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                    "messages": [{"role": "user", "content": "alpha bravo"}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                    "prompt": "alpha bravo"}),
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "mock-model", "input": "alpha bravo"}),
+            ),
+        ];
+        for (uri, payload) in cases {
+            for stream in [false, true] {
+                let runner = Runner::new(Box::new(MockBuilder::new()));
+                runner
+                    .start(
+                        PeerLayout::single_stage(),
+                        ShardSpec::single_stage("mock-model", "CPU"),
+                    )
+                    .await
+                    .unwrap();
+                let stats = Arc::new(ApiStats::default());
+                // Another request already in flight: this one is no idle-to-
+                // busy edge, so only a delivered chunk can move the stamp.
+                stats.requests_in_flight.store(1, Ordering::Relaxed);
+                let app = make_router_with_stats(
+                    Arc::new(runner),
+                    "mock-model",
+                    Config::default(),
+                    stats.clone(),
+                );
+                let mut body = payload.clone();
+                body["stream"] = stream.into();
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri} stream={stream}");
+                // Reading the body drives the generation to its end.
+                let _ = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                assert!(
+                    stats.last_progress_ms.load(Ordering::Relaxed) > 0,
+                    "{uri} stream={stream}: no progress recorded"
+                );
+            }
+        }
+
+        let stats = Arc::new(ApiStats::default());
+        let first = InFlightGuard::new(stats.clone());
+        assert!(
+            stats.last_progress_ms.load(Ordering::Relaxed) > 0,
+            "idle to busy"
+        );
+        stats.last_progress_ms.store(0, Ordering::Relaxed);
+        let second = InFlightGuard::new(stats.clone());
+        assert_eq!(
+            stats.last_progress_ms.load(Ordering::Relaxed),
+            0,
+            "already busy"
+        );
+        drop((first, second));
     }
 
     /// On a server that takes images, the request past the in-flight cap
