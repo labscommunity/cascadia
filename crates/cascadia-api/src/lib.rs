@@ -11011,6 +11011,47 @@ level={{ effort_map[eff] }}";
             assert!(last_task(&seen).grammar.is_some(), "{name}");
             assert_eq!(rejected(), before + counted, "{name}");
         }
+
+        // A pair split across `allOf` members is not relaxed: the tool is
+        // forwarded as written, but no call grammar is sent (one could
+        // merge the members into a pair no value meets), counted once. The
+        // per-object pair above still gets its grammar after relaxing.
+        let split = serde_json::json!({"type": "function", "function": {"name": "get_city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string",
+                "allOf": [{"minLength": 5}, {"maxLength": 2}]}}}}});
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let before = rejected();
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([split]),
+                serde_json::json!({"tool_choice": "required"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.grammar, None);
+        assert_eq!(task.tools, Some(serde_json::json!([split])));
+        assert_eq!(rejected(), before + 1);
+
+        // Left out by a named choice: the named tool's grammar, no count.
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let before = rejected();
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([split, city_tool("get_weather")]),
+                serde_json::json!({"tool_choice":
+                    {"type": "function", "function": {"name": "get_weather"}}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let grammar = last_task(&seen).grammar.expect("the named tool's grammar");
+        assert!(grammar.body.contains("get_weather"), "{}", grammar.body);
+        assert!(!grammar.body.contains("get_city"), "{}", grammar.body);
+        assert_eq!(rejected(), before);
     }
 
     #[tokio::test]

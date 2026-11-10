@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 use crate::structured::{
     check_schema, relax_unsatisfiable_bounds, DATA_KEYS, MAX_SCHEMA_DEPTH, SCHEMA_MAPS,
 };
-use crate::{FunctionCall, Tool, ToolCall};
+use crate::{unsatisfiable_bound, FunctionCall, Tool, ToolCall};
 
 /// One entry of a request's `tools` list.
 ///
@@ -592,8 +592,11 @@ fn empty_parameters() -> Value {
 /// schema that also has a nested `$id` (which would change what the ref
 /// resolves against), or a result over those limits, gives `None`, logged and counted: the turn then runs
 /// unconstrained. The grammar is best-effort for the same reason. A bound
-/// pair no value can meet never gets here: [`ToolPolicy::from_request`]
-/// drops it from the tools, and `response_format` refuses it with a 400.
+/// pair no value can meet within one object never gets here:
+/// [`ToolPolicy::from_request`] drops it from the tools, and
+/// `response_format` refuses it with a 400. One that relaxing leaves (split
+/// across `allOf` members, or under `not`/`if`) in a tool the grammar
+/// would cover gives `None`, logged and counted as a rejected schema.
 pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<GrammarSpec> {
     // Under a forced choice the format is moot: the answer is the call.
     let format_schema = match (policy.forced(), format_schema) {
@@ -635,7 +638,22 @@ fn tool_schema(
         }
         let parameters = match tool.function.get("parameters") {
             None | Some(Value::Null) => empty_parameters(),
-            Some(p) => hoisted.take(p.clone(), &format!("t{i}_"))?,
+            Some(p) => {
+                // Relaxing drops only a pair within one object; one split
+                // across `allOf` members (or under `not`/`if`) is left as
+                // sent. A grammar that merges the members could match
+                // nothing, so the turn gets none.
+                if let Some(detail) = unsatisfiable_bound(p) {
+                    tracing::warn!(
+                        tool = name,
+                        detail = %detail,
+                        "tool parameters still hold a bound pair no value can meet; \
+                         no call grammar"
+                    );
+                    return Err(UnenforcedReason::SchemaRejected);
+                }
+                hoisted.take(p.clone(), &format!("t{i}_"))?
+            }
         };
         items.push(json!({
             "type": "object",
@@ -1702,6 +1720,29 @@ mod tests {
         );
         assert_eq!(p.tools[0].function["parameters"], fine);
         assert!(p.relaxed.is_empty() && !p.grammar_relaxed());
+    }
+
+    #[test]
+    fn a_pair_split_across_all_of_gives_no_call_grammar() {
+        // Relaxing leaves a pair split across `allOf` members alone; a
+        // grammar merging them would match nothing.
+        let split = json!({"type": "object", "properties": {"city": {"type": "string",
+            "allOf": [{"minLength": 5}, {"maxLength": 2}]}}});
+        let t = json!([weather(), with_params("f", split.clone())]);
+        let p = pol(t.clone(), Some(json!("required")), None);
+        // Forwarded as written, but no grammar for the turn.
+        assert_eq!(p.tools[1].function["parameters"], split);
+        assert!(p.relaxed.is_empty());
+        assert_eq!(tool_schema(&p, None), Err(UnenforcedReason::SchemaRejected));
+        assert!(tool_grammar(&p, None).is_none());
+        // Beside a JSON format under auto, too.
+        let p = pol(t.clone(), None, None);
+        assert!(tool_grammar(&p, Some(JSON_OBJECT_SCHEMA)).is_none());
+        // Left out by a named choice or allowed_tools: not checked.
+        let named = json!({"type": "function", "function": {"name": "get_weather"}});
+        assert!(tool_grammar(&pol(t.clone(), Some(named), None), None).is_some());
+        let narrowed = allowed("required", json!([func("get_weather")]));
+        assert!(tool_grammar(&pol(t, Some(narrowed), None), None).is_some());
     }
 
     #[test]
