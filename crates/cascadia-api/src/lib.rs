@@ -2152,7 +2152,8 @@ fn strip_streamed(strip: &SharedGemmaStrip, text: String, last: bool) -> String 
 /// active. Fed the same translated text the non-streaming path accumulates,
 /// it releases every byte that can no longer become part of a tool call and
 /// withholds the rest, so content streams live while the final decision is
-/// still exactly `parse_tool_calls(tool_call_scan_text(full_text, …))`.
+/// still exactly the non-streamed reading, `answer_calls(…, gemma)` over
+/// `tool_call_scan_text(full_text, …)`.
 ///
 /// Withheld from the hold point on, where scanning starts at 0 or (thinking
 /// on) just past the first `</think>`, mirroring `tool_call_scan_text`:
@@ -11710,6 +11711,15 @@ level={{ effort_map[eff] }}";
         let calls = gemma_parse(&format!("Let me check.\n{GEMMA_WEATHER_CALL}\n"))
             .expect("a call after prose");
         assert_eq!(calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn public_parse_tool_calls_reads_no_gemma4_dialect() {
+        // External callers get the dialects every model shares: a Gemma 4
+        // call is read only when the caller says the model is Gemma 4.
+        assert!(parse_tool_calls(GEMMA_WEATHER_CALL).is_none());
+        assert!(parse_tool_calls_for(GEMMA_WEATHER_CALL, false).is_none());
+        assert!(parse_tool_calls_for(GEMMA_WEATHER_CALL, true).is_some());
     }
 
     #[test]
