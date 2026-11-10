@@ -225,16 +225,20 @@ elif cmd == "same":
     x, y = load(a[0]), load(a[1])
     sys.exit(0 if (x["text"], x["finish"]) == (y["text"], y["finish"]) else 1)
 elif cmd == "cut2":
-    # Does the answer equal either reference cut at its first stop (or uncut, with the reference's
-    # finish, when it holds none)? -> verdict mode est anyhold detail
-    refs, got = [load(a[0]), load(a[1])], load(a[2])
-    st = [x for x in stops(a[3]) if x]
+    # Does the answer equal any reference run cut at its first stop (or uncut, with the reference's
+    # finish, when it holds none)? args: ref... answer stops -> verdict mode est anyhold detail
+    refs, got = [load(x) for x in a[:-2]], load(a[-2])
+    st = [x for x in stops(a[-1]) if x]
     anyhold, found, first = 0, None, None
     for r in refs:
         t = r["text"]; hits = [t.find(x) for x in st if t.find(x) >= 0]
         if hits:
             anyhold = 1; i = min(hits); want, wf, mode = t[:i], "stop", "match"
-            est = math.ceil((r.get("completion_tokens") or 0) * (i + max(len(x) for x in st)) / max(1, len(t)))
+            # Tokens up to the end of the stop, by the reference's own tokens-per-character, but at
+            # least the stop's UTF-8 byte count + 1: a byte-fallback tokenizer spends one token per
+            # byte on a character outside its vocabulary (an emoji is 4), plus a leading-space token.
+            sb = max(len(x.encode("utf-8")) for x in st)
+            est = max(sb + 1, math.ceil((r.get("completion_tokens") or 0) * (i + max(len(x) for x in st)) / max(1, len(t))))
         else:
             want, wf, mode, est = t, r["finish"], "nomatch", 0
         first = first or (want, wf)
@@ -351,6 +355,20 @@ ref_pair() {
     : > "$WORK/$n.varies"
     echo "INFO reference $n differs between two calls: $(py show "$WORK/$n.json" 70) vs $(py show "$WORK/$n.again.json" 70)"
   }
+}
+
+# Two equal reference runs do not prove a device reproducible. Before a mismatch counts as a FAIL,
+# varies_more takes up to $EXTRA_REFS more runs and stops at the first that differs; exit 0 = varies.
+# The answer is cached in $WORK/<name>.more; the differing run is $WORK/<name>.extra.json.
+EXTRA_REFS=${EXTRA_REFS:-3}
+varies_more() { # name base kind key
+  local n=$1 i
+  [ -e "$WORK/$n.more" ] && { [ "$(cat "$WORK/$n.more")" = varies ]; return; }
+  for i in $(seq 1 "$EXTRA_REFS"); do
+    req "$n.extra" "$2" "$3" "$4" "$(cat "$WORK/${n%.base}.mx")" 0 none "$SETTLE"
+    py same "$WORK/$n.json" "$WORK/$n.extra.json" || { echo varies > "$WORK/$n.more"; return 0; }
+  done
+  echo stable > "$WORK/$n.more"; return 1
 }
 
 health() { curl -s -o "$WORK/models.$2" --max-time 10 "$1/v1/models" -w '%{http_code}'; }
@@ -487,6 +505,13 @@ stop_case() { # label kind prompt-key max_tokens stops ref-name [lax: the log li
     echo "INFO $lab: reference output varies across calls on this device; the answer must match either run"
   fi
   read -r v mode est anyhold detail <<<"$(py cut2 "$WORK/$ref.json" "$WORK/$ref.again.json" "$WORK/$s.json" "$sp")"
+  if [ "$v" != ok ] && [ "$varies" = 0 ]; then
+    if varies_more "$ref" "$URL" "$kind" "$key"; then
+      : > "$WORK/$ref.varies"; varies=1; STRUCT_N=$((STRUCT_N + 1))
+      echo "INFO $lab: a further reference run differs; the answer must match one of the runs"
+      read -r v mode est anyhold detail <<<"$(py cut2 "$WORK/$ref.json" "$WORK/$ref.again.json" "$WORK/$ref.extra.json" "$WORK/$s.json" "$sp")"
+    fi
+  fi
   if [ "$v" = ok ] && [ "$mode" = match ]; then
     verdict "$lab: finish stop, text = the reference up to the stop" ok
   elif [ "$v" = ok ]; then
@@ -530,8 +555,16 @@ stop_case() { # label kind prompt-key max_tokens stops ref-name [lax: the log li
       return
     fi
     nx; b=$NX; req "$b" "$AB_URL" "$kind" "$key" "$mx" 0 "$sp" "$LONG_TIMEOUT"
-    py same "$WORK/$s.json" "$WORK/$b.json" && verdict "H4 $lab: content and finish byte-identical to the base node" ok \
-      || verdict "H4 $lab: same as the base node" bad "tip $(py show "$WORK/$s.json") base $(py show "$WORK/$b.json")"
+    if py same "$WORK/$s.json" "$WORK/$b.json"; then
+      verdict "H4 $lab: content and finish byte-identical to the base node" ok
+      return
+    fi
+    # A mismatch counts only if both nodes look reproducible over further reference runs.
+    if varies_more "$ref" "$URL" "$kind" "$key" || varies_more "$ref.base" "$AB_URL" "$kind" "$key"; then
+      echo "INFO H4 $lab: a further reference run differs on the tip or the base, byte-identity skipped (tip $(py show "$WORK/$s.json") base $(py show "$WORK/$b.json"))"
+    else
+      verdict "H4 $lab: same as the base node" bad "tip $(py show "$WORK/$s.json") base $(py show "$WORK/$b.json")"
+    fi
   fi
 }
 
