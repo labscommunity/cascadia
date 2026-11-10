@@ -461,19 +461,25 @@ pub fn unsatisfiable_bound(schema: &Value) -> Option<String> {
     let mut path = Vec::new();
     find_unsatisfiable_bound(schema, &mut path, 0).or_else(|| {
         // A local `$ref` makes whatever it points to a schema, inside a data
-        // keyword too, which the walk above skips.
+        // keyword too, which the walk above skips. Only such targets need a
+        // walk of their own, and each one once, however many refs name it.
+        let mut walked: HashSet<*const Value> = HashSet::new();
         let mut stack = vec![schema];
         while let Some(v) = stack.pop() {
             match v {
                 Value::Object(o) => {
                     if let Some(r) = o.get("$ref").and_then(Value::as_str) {
+                        let mut path: Vec<String> = r
+                            .trim_start_matches('#')
+                            .split('/')
+                            .filter(|k| !k.is_empty())
+                            .map(|k| k.replace("~1", "/").replace("~0", "~"))
+                            .collect();
+                        let in_data = path.iter().any(|k| DATA_KEYS.contains(&k.as_str()));
                         for target in backstop_targets(schema, r) {
-                            let mut path: Vec<String> = r
-                                .trim_start_matches('#')
-                                .split('/')
-                                .filter(|k| !k.is_empty())
-                                .map(|k| k.replace("~1", "/").replace("~0", "~"))
-                                .collect();
+                            if !in_data || !walked.insert(target as *const Value) {
+                                continue;
+                            }
                             let found = find_unsatisfiable_bound(target, &mut path, 0);
                             if found.is_some() {
                                 return found;
@@ -600,14 +606,11 @@ fn all_of_violation(
     if let Some(found) = bound_violation(&merged_bounds(sources)) {
         return Some(locate(found, " across the allOf", path));
     }
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut names: Vec<&String> = Vec::new();
     for source in sources {
         if let Some(Value::Object(props)) = source.get("properties") {
-            for name in props.keys() {
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
+            names.extend(props.keys().filter(|k| seen.insert(k.as_str())));
         }
     }
     for name in names {
