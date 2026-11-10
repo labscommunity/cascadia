@@ -3052,14 +3052,6 @@ async fn chat_completions(
         other => other,
     };
     let tool_grammar_sent = tool_constrained && grammar.is_some();
-    // A tool's bound pair no value can meet was dropped (see
-    // `ToolPolicy::from_request`): the call grammar enforces the rest of its
-    // schema, not all of it.
-    if tool_grammar_sent && policy.grammar_relaxed() {
-        cascadia_metrics::count_constraint_unenforced(
-            cascadia_metrics::UnenforcedReason::SchemaRejected,
-        );
-    }
     let union_sent = tool_grammar_sent && !policy.forced();
     // A JSON answer has no room for a reasoning preamble: thinking is off,
     // and so is it under a tool-call constraint, which starts at the first
@@ -3344,6 +3336,7 @@ async fn chat_completions(
             grammar_dropped = chunk.grammar_dropped;
         }
     }
+    count_relaxed_tools(&policy, tool_grammar_sent, grammar_dropped);
     state
         .stats
         .tokens_total
@@ -3739,6 +3732,20 @@ async fn stream_text_completion(
         .into_response()
 }
 
+/// Counts `schema_rejected` once an answer is in when the call grammar
+/// covered a tool whose bound pair no value can meet was dropped (see
+/// `ToolPolicy::from_request`): the grammar enforced the rest of its
+/// schema, not all of it. Not when the engine dropped the grammar itself
+/// (`grammar_dropped`): it counted its own reason, and nothing was
+/// enforced.
+fn count_relaxed_tools(policy: &ToolPolicy, grammar_sent: bool, grammar_dropped: bool) {
+    if grammar_sent && policy.grammar_relaxed() && !grammar_dropped {
+        cascadia_metrics::count_constraint_unenforced(
+            cascadia_metrics::UnenforcedReason::SchemaRejected,
+        );
+    }
+}
+
 /// How a chat answer's tool calls are read: the request's tool policy and
 /// which tool grammar was sent (see [`resolve_calls`]).
 struct ToolReading {
@@ -4092,6 +4099,11 @@ impl ToolStream {
                 // one generated without it. The splitter held a leading
                 // `{`/`[` whatever was sent, so a bare JSON call is still
                 // undecided here.
+                count_relaxed_tools(
+                    &self.tools.policy,
+                    self.tools.grammar_sent,
+                    chunk.grammar_dropped,
+                );
                 if chunk.grammar_dropped {
                     self.tools.grammar_sent = false;
                     self.tools.union_sent = false;
@@ -10943,6 +10955,43 @@ level={{ effort_map[eff] }}";
             // Forced without a JSON format: thinking as requested.
             assert!(task.enable_thinking, "{}", reason.as_str());
             assert!(unenforced(reason) > before, "{}", reason.as_str());
+        }
+    }
+
+    /// The relaxed tool's `schema_rejected` is counted once the answer is
+    /// in, and only when the engine kept the grammar: an engine that drops
+    /// it counts its own reason, and the relaxed schema was never enforced.
+    #[tokio::test]
+    async fn a_relaxed_tool_is_counted_only_when_the_engine_kept_the_grammar() {
+        let rejected = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[cascadia_metrics::UnenforcedReason::SchemaRejected.as_str()])
+                .get()
+        };
+        let tool = serde_json::json!({"type": "function", "function": {"name": "get_city",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string", "minLength": 5, "maxLength": 2}}}}});
+        let body = tool_body(
+            serde_json::json!([tool]),
+            serde_json::json!({"tool_choice": "required"}),
+        );
+        let text = r#"<tool_call>{"name":"get_city","arguments":{"city":"Paris"}}</tool_call>"#;
+        for (dropped, counted) in [(true, 0), (false, 1)] {
+            let app = || async {
+                if dropped {
+                    grammar_dropping_app(text).await
+                } else {
+                    scripted_app(text, cascadia_types::FinishReason::Stop).await
+                }
+            };
+            let before = rejected();
+            let (status, v) = post_chat(app().await, body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(rejected(), before + counted, "dropped={dropped}");
+            let before = rejected();
+            let events = stream_events(app().await, body.clone()).await;
+            assert_eq!(streamed_calls(&events).len(), 1, "{events:?}");
+            assert_eq!(rejected(), before + counted, "streamed, dropped={dropped}");
         }
     }
 
