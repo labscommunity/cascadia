@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::decode_keep::{decode_keeping, tool_marker_ids};
 use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
@@ -1583,6 +1584,9 @@ pub struct OvDistSpecEngine {
     target: DistributedMaskedReq,
     draft: MaskedReq,
     tokenizer: Arc<Tokenizer>,
+    /// Tool-call marker tokens decoded as text (Gemma 4); empty for other
+    /// vocabularies. See `decode_keep`.
+    tool_markers: Vec<(u32, String)>,
     /// All EOS token ids configured for the model. Generation truncates
     /// at the first token that matches ANY of these.
     eos_token_ids: Vec<u32>,
@@ -1761,8 +1765,13 @@ impl Engine for OvDistSpecEngine {
                     .or((active.out.len() >= max_tokens).then_some(MaskedEnd::Budget)),
             );
             let finished = active.out.len() >= max_tokens || hit_eos || grammar_end.is_some();
-            let new_text =
-                decode_delta(&self.tokenizer, &active.out, &mut active.emitted, !finished);
+            let new_text = decode_delta(
+                &self.tokenizer,
+                &active.out,
+                &mut active.emitted,
+                !finished,
+                &self.tool_markers,
+            );
             if finished {
                 let reason = grammar_end.map(MaskedEnd::finish_reason);
                 self.finish_task(task_id.clone(), new_text, 1, reason)
@@ -1931,8 +1940,7 @@ impl OvDistSpecEngine {
             // Propagate, never `unwrap_or_default()`: an empty seed here would make the
             // first delta re-emit the entire forced prefix to the client. Failing the
             // task is the honest outcome — same call as the qwen36 seed-decode fix.
-            self.tokenizer
-                .decode(&seed_u32, true)
+            decode_keeping(&self.tokenizer, &seed_u32, &self.tool_markers)
                 .map_err(|e| EngineError::Backend(format!("resume seed decode failed: {e}")))?
                 .into_bytes()
         };
@@ -2054,6 +2062,7 @@ impl OvDistSpecEngine {
             &active.out,
             &mut active.emitted,
             !(hit_eos || hit_max),
+            &self.tool_markers,
         );
         Ok(RoundResult {
             delta,
@@ -2124,7 +2133,13 @@ impl OvDistSpecEngine {
         }
 
         let finished = round.end.is_some();
-        let delta = decode_delta(&self.tokenizer, &active.out, &mut active.emitted, !finished);
+        let delta = decode_delta(
+            &self.tokenizer,
+            &active.out,
+            &mut active.emitted,
+            !finished,
+            &self.tool_markers,
+        );
         Ok(RoundResult {
             delta,
             finished,
@@ -2206,7 +2221,8 @@ impl OvDistSpecEngine {
 
 /// Detokenize `tokens` and return only the text added since the last call.
 /// `emitted` holds the bytes already handed out; `running` is false on the
-/// terminal read, which flushes anything held back.
+/// terminal read, which flushes anything held back. The ids in `keep` are
+/// decoded as their literal text (see `decode_keep`).
 ///
 /// Delegates to the shim's `advance_emitted` rather than remembering a byte
 /// LENGTH and slicing at it. That offset is not safe: a detokenizer can rewrite
@@ -2218,9 +2234,10 @@ fn decode_delta(
     tokens: &[i64],
     emitted: &mut Vec<u8>,
     running: bool,
+    keep: &[(u32, String)],
 ) -> String {
     let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-    let full = tokenizer.decode(&ids, true).unwrap_or_default();
+    let full = decode_keeping(tokenizer, &ids, keep).unwrap_or_default();
     let (delta, diverged) = advance_emitted(emitted, full.as_bytes(), running);
     if diverged {
         warn!("spec-decode detokenizer decode diverged; re-anchored");
@@ -2425,6 +2442,7 @@ impl Builder for OvDistSpecBuilder {
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
             target,
             draft: masked_draft,
+            tool_markers: tool_marker_ids(&tokenizer),
             tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             grammar_factory,
@@ -3614,6 +3632,28 @@ fn lookup_eos(model_dir: &std::path::Path) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spec round's tokens decode with the tool-call markers kept, against
+    /// bytes decoded the same way.
+    #[test]
+    fn decode_delta_streams_the_tool_call_markers() {
+        use crate::decode_keep::{tests as dk, tool_marker_ids};
+        let tok = dk::marker_tokenizer();
+        let keep = tool_marker_ids(&tok);
+        let mut emitted: Vec<u8> = Vec::new();
+        let mut client = String::new();
+        for n in 1..=dk::CALL_IDS.len() {
+            let ids: Vec<i64> = dk::CALL_IDS[..n].iter().map(|&t| t as i64).collect();
+            client.push_str(&decode_delta(
+                &tok,
+                &ids,
+                &mut emitted,
+                n < dk::CALL_IDS.len(),
+                &keep,
+            ));
+        }
+        assert_eq!(client, dk::CALL_TEXT);
+    }
     use cascadia_transport::{ActivationClient, ActivationServer};
 
     /// `decode_delta` used to remember a byte LENGTH and slice `full[len..]`.

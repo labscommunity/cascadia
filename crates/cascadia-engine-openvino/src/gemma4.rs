@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::decode_keep::{decode_keeping, tool_marker_ids};
 use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
@@ -528,6 +529,47 @@ fn final_chunk(task_id: TaskId, token: i64, delta: String, prompt_len: usize, st
             FinishReason::Length
         }),
     }
+}
+
+/// Decode `generated` (tool-call markers in `keep` kept as text) and return
+/// the text added since `last_text`, which is updated to the new decode. The
+/// bool is true when the decode diverged from `last_text` and was re-anchored.
+///
+/// Uses strip_prefix instead of byte-slice indexing — `last_text` is not
+/// always a clean byte-prefix of the new decode (BPE can emit a partial UTF-8
+/// sequence on token N and complete the glyph on token N+1, in which case the
+/// prefix bytes change). Slicing past a UTF-8 boundary panics.
+///
+/// On divergence RE-ANCHOR (empty delta), never `unwrap_or(&full_text)`: that
+/// re-emits everything decoded so far, which under Option B resume is the
+/// whole forced prefix duplicated into the client stream. Same contract as
+/// the shim's `advance_emitted` — bounded loss at the seam, never duplication.
+///
+/// A trailing U+FFFD means the newest token ends mid-glyph (byte-fallback
+/// BPE): the decode is TRANSIENT, not diverged. Hold — emit nothing and keep
+/// `last_text`, so the next token completes the glyph and the strip emits it
+/// whole. Updating `last_text` here (the old behavior) baked the replacement
+/// char into the anchor, so the completed glyph then failed strip_prefix and
+/// was dropped as a fake divergence.
+fn text_delta(
+    tok: &Tokenizer,
+    generated: &[i32],
+    last_text: &mut String,
+    keep: &[(u32, String)],
+) -> tokenizers::Result<(String, bool)> {
+    let ids: Vec<u32> = generated.iter().map(|&t| t as u32).collect();
+    let full_text = decode_keeping(tok, &ids, keep)?;
+    if full_text.ends_with('\u{FFFD}') {
+        return Ok((String::new(), false));
+    }
+    let delta = full_text
+        .strip_prefix(last_text.as_str())
+        .map(str::to_string);
+    *last_text = full_text;
+    Ok(match delta {
+        Some(d) => (d, false),
+        None => (String::new(), true),
+    })
 }
 
 /// How a task ends after `generated` tokens: `Stop` on EOS or a grammar finish
@@ -1838,6 +1880,9 @@ pub struct Gemma4Engine {
     num_stages: u32,
     runtime: OvRuntime,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Tool-call marker tokens decoded as text (Gemma 4); empty for other
+    /// vocabularies or without a tokenizer. See `decode_keep`.
+    tool_markers: Vec<(u32, String)>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -2471,7 +2516,7 @@ impl Gemma4Engine {
                 String::new()
             } else {
                 let seed_u32: Vec<u32> = resume_seed.iter().map(|&t| t as u32).collect();
-                match tok.decode(&seed_u32, true) {
+                match decode_keeping(&tok, &seed_u32, &self.tool_markers) {
                     Ok(t) => t,
                     Err(e) => {
                         // Attributed like the validation branch above: the task is
@@ -2752,46 +2797,19 @@ impl Gemma4Engine {
             .tokenizer
             .as_ref()
             .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-        let all_ids: Vec<u32> = active.generated.iter().map(|&t| t as u32).collect();
-        let full_text = tok
-            .decode(&all_ids, true)
-            .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
-        // Use strip_prefix instead of byte-slice indexing — `last_text`
-        // is not always a clean byte-prefix of `full_text` (BPE can
-        // emit a partial UTF-8 sequence on token N and complete the
-        // glyph on token N+1, in which case the prefix bytes change).
-        // Slicing past a UTF-8 boundary panics.
-        //
-        // On divergence RE-ANCHOR (empty delta), never `unwrap_or(&full_text)`:
-        // that re-emits everything decoded so far, which under Option B resume is
-        // the whole forced prefix duplicated into the client stream. Same contract
-        // as the shim's `advance_emitted` — bounded loss at the seam, never
-        // duplication.
-        // A trailing U+FFFD means the newest token ends mid-glyph (byte-fallback
-        // BPE): the decode is TRANSIENT, not diverged. Hold — emit nothing and
-        // keep `last_text`, so the next token completes the glyph and the strip
-        // emits it whole. Updating `last_text` here (the old behavior) baked the
-        // replacement char into the anchor, so the completed glyph then failed
-        // strip_prefix and was dropped as a fake divergence.
-        let delta = if full_text.ends_with('\u{FFFD}') {
-            String::new()
-        } else {
-            match full_text.strip_prefix(active.last_text.as_str()) {
-                Some(d) => {
-                    let d = d.to_string();
-                    active.last_text = full_text;
-                    d
-                }
-                None => {
-                    warn!(
-                        task = %active.task.task_id,
-                        "decode diverged from the emitted prefix; re-anchoring (delta dropped)"
-                    );
-                    active.last_text = full_text;
-                    String::new()
-                }
-            }
-        };
+        let (delta, diverged) = text_delta(
+            tok,
+            &active.generated,
+            &mut active.last_text,
+            &self.tool_markers,
+        )
+        .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
+        if diverged {
+            warn!(
+                task = %active.task.task_id,
+                "decode diverged from the emitted prefix; re-anchoring (delta dropped)"
+            );
+        }
 
         let max_tokens = active.task.max_tokens.max(1) as usize;
         let is_eos = self.eos_token_ids.contains(&(next_token as u32));
@@ -3972,6 +3990,11 @@ impl Builder for Gemma4Builder {
             num_kv_shared_layers: self.num_kv_shared_layers,
             num_stages: self.total,
             runtime,
+            tool_markers: self
+                .tokenizer
+                .as_deref()
+                .map(tool_marker_ids)
+                .unwrap_or_default(),
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             grammar_factory,
@@ -4008,6 +4031,25 @@ impl Builder for Gemma4Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Streaming a Gemma 4 call token by token hands the client the markers,
+    /// and the anchor it diffs against is decoded the same way.
+    #[test]
+    fn text_delta_streams_the_tool_call_markers() {
+        use crate::decode_keep::{tests as dk, tool_marker_ids};
+        let tok = dk::marker_tokenizer();
+        let keep = tool_marker_ids(&tok);
+        let mut last_text = String::new();
+        let mut client = String::new();
+        for n in 1..=dk::CALL_IDS.len() {
+            let ids: Vec<i32> = dk::CALL_IDS[..n].iter().map(|&t| t as i32).collect();
+            let (delta, diverged) = text_delta(&tok, &ids, &mut last_text, &keep).unwrap();
+            assert!(!diverged, "prefix {n} diverged");
+            client.push_str(&delta);
+        }
+        assert_eq!(client, dk::CALL_TEXT);
+        assert_eq!(last_text, dk::CALL_TEXT);
+    }
     use cascadia_types::PeerLayout;
 
     /// Rig incident (2026-08-17): RESTORE/ABORT ack recvs were UNBOUNDED while

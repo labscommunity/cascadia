@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::decode_keep::{decode_keeping, tool_marker_ids};
 use crate::structured::{self, start_grammar};
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
@@ -427,6 +428,23 @@ fn pick_packed_rows(
 /// After a token is committed: advance a grammar task's matcher. `Ok(true)`
 /// when the JSON is complete (the task ends with `stop`); `Err` when the
 /// grammar rejects the token. Always `Ok(false)` without a grammar.
+/// Decode `generated` (tool-call markers in `keep` kept as text) and hand
+/// back only what `emitted` doesn't hold yet, via the shim's
+/// `advance_emitted`; `running` is false on the terminal read, which flushes
+/// anything held back. The bool is true when the decode diverged from
+/// `emitted` and was re-anchored.
+fn emitted_delta(
+    tok: &Tokenizer,
+    generated: &[i32],
+    emitted: &mut Vec<u8>,
+    running: bool,
+    keep: &[(u32, String)],
+) -> tokenizers::Result<(String, bool)> {
+    let ids: Vec<u32> = generated.iter().map(|&t| t as u32).collect();
+    let full_text = decode_keeping(tok, &ids, keep)?;
+    Ok(advance_emitted(emitted, full_text.as_bytes(), running))
+}
+
 fn commit_grammar_token(grammar: Option<&mut GrammarMask>, token: i32) -> EngineResult<bool> {
     let Some(mask) = grammar else {
         return Ok(false);
@@ -3295,6 +3313,9 @@ pub struct OvRuntimeEngine {
     rotary: Rotary,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Tool-call marker tokens decoded as text (Gemma 4); empty for other
+    /// vocabularies or without a tokenizer. See `decode_keep`.
+    tool_markers: Vec<(u32, String)>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -4331,7 +4352,7 @@ impl OvRuntimeEngine {
                 String::new()
             } else {
                 let seed_u32: Vec<u32> = resume_seed.iter().map(|&t| t as u32).collect();
-                match tok.decode(&seed_u32, true) {
+                match decode_keeping(&tok, &seed_u32, &self.tool_markers) {
                     Ok(t) => t,
                     Err(e) => {
                         // Attributed like the validation branch above: the task is
@@ -5029,11 +5050,14 @@ impl OvRuntimeEngine {
         let is_final = finish.is_some();
         let task_id = t.task.task_id.clone();
 
-        let all_ids: Vec<u32> = t.generated.iter().map(|&x| x as u32).collect();
-        let full_text = tok
-            .decode(&all_ids, true)
-            .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
-        let (delta, resynced) = advance_emitted(&mut t.emitted, full_text.as_bytes(), !is_final);
+        let (delta, resynced) = emitted_delta(
+            &tok,
+            &t.generated,
+            &mut t.emitted,
+            !is_final,
+            &self.tool_markers,
+        )
+        .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
         if resynced {
             warn!(task = %task_id, slot, "detokenizer decode diverged; re-anchored");
         }
@@ -5369,12 +5393,14 @@ impl OvRuntimeEngine {
             .tokenizer
             .as_ref()
             .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-        let all_ids: Vec<u32> = active.generated.iter().map(|&t| t as u32).collect();
-        let full_text = tok
-            .decode(&all_ids, true)
-            .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
-        let (delta, resynced) =
-            advance_emitted(&mut active.emitted, full_text.as_bytes(), !is_final);
+        let (delta, resynced) = emitted_delta(
+            tok,
+            &active.generated,
+            &mut active.emitted,
+            !is_final,
+            &self.tool_markers,
+        )
+        .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
         if resynced {
             warn!(task = %task_id, "detokenizer decode diverged; re-anchored");
         }
@@ -7760,6 +7786,11 @@ impl Builder for OvRuntimeBuilder {
             runtime,
             rotary,
             hidden_size: self.hidden_size,
+            tool_markers: self
+                .tokenizer
+                .as_deref()
+                .map(tool_marker_ids)
+                .unwrap_or_default(),
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             grammar_factory,
@@ -7804,6 +7835,26 @@ impl Builder for OvRuntimeBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Streaming a Gemma 4 call token by token hands the client the markers,
+    /// and the bytes it diffs against are decoded the same way.
+    #[test]
+    fn emitted_delta_streams_the_tool_call_markers() {
+        use crate::decode_keep::{tests as dk, tool_marker_ids};
+        let tok = dk::marker_tokenizer();
+        let keep = tool_marker_ids(&tok);
+        let mut emitted: Vec<u8> = Vec::new();
+        let mut client = String::new();
+        for n in 1..=dk::CALL_IDS.len() {
+            let ids: Vec<i32> = dk::CALL_IDS[..n].iter().map(|&t| t as i32).collect();
+            let running = n < dk::CALL_IDS.len();
+            let (delta, resynced) =
+                emitted_delta(&tok, &ids, &mut emitted, running, &keep).unwrap();
+            assert!(!resynced, "prefix {n} resynced");
+            client.push_str(&delta);
+        }
+        assert_eq!(client, dk::CALL_TEXT);
+    }
     use cascadia_types::PeerLayout;
 
     #[tokio::test]
