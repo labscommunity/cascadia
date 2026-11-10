@@ -425,9 +425,6 @@ fn pick_packed_rows(
     Ok(picks)
 }
 
-/// After a token is committed: advance a grammar task's matcher. `Ok(true)`
-/// when the JSON is complete (the task ends with `stop`); `Err` when the
-/// grammar rejects the token. Always `Ok(false)` without a grammar.
 /// Decode `generated` (tool-call markers in `keep` kept as text) and hand
 /// back only what `emitted` doesn't hold yet, via the shim's
 /// `advance_emitted`; `running` is false on the terminal read, which flushes
@@ -445,6 +442,9 @@ fn emitted_delta(
     Ok(advance_emitted(emitted, full_text.as_bytes(), running))
 }
 
+/// After a token is committed: advance a grammar task's matcher. `Ok(true)`
+/// when the JSON is complete (the task ends with `stop`); `Err` when the
+/// grammar rejects the token. Always `Ok(false)` without a grammar.
 fn commit_grammar_token(grammar: Option<&mut GrammarMask>, token: i32) -> EngineResult<bool> {
     let Some(mask) = grammar else {
         return Ok(false);
