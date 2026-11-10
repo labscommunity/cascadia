@@ -73,7 +73,7 @@ cascadia run [OPTIONS] <MODEL>
 | `--engine <ENGINE>` | `ov-genai` | Inference engine. Use `ov-runtime` for a `cascadia shard` tree. |
 | `--api <API>` | `:8000` | API bind address. `127.0.0.1:8000` binds loopback only. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only: budget of the in-process prefix cache (system-block + chat-boundary state snapshots, restored for prompts that extend a cached prefix). `0` disables. |
-| `--api-max-body-mb <MB>` | `1` | Largest chat-completions request body (MiB); the rendered prompt is capped at the same size (1 MiB ≈ 250K tokens of English). `qwen35`, `gemma4`, `ov-genai`, `ov-runtime` and `ov-dist-spec` also bound the prompt in tokens (against the model window, or a static tree's KV window); on other engines this byte cap is the whole guard, so lower it on an exposed endpoint. |
+| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions`, `/v1/completions` or `/v1/responses` request body (MiB); the rendered prompt is capped at the same size (1 MiB ≈ 250K tokens of English). `qwen35`, `gemma4`, `ov-genai`, `ov-runtime` and `ov-dist-spec` also bound the prompt in tokens (against the model window, or a static tree's KV window); on other engines this byte cap is the whole guard, so lower it on an exposed endpoint. |
 | `--ov-cache-dir <DIR>` | platform cache | Compiled-blob cache (plugin `CACHE_DIR`), as on `worker`; `""` disables. See the [`worker` note](#cascadia-worker). |
 
 Note the defaults differ from `worker` (`GPU`/`ov-genai` here, `CPU`/`mock`
@@ -198,7 +198,7 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~130 KB per context token as serialised (1.2 GB at 8 K, 4.45 GB at 32 K). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
-| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` or `/v1/responses` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. A prompt that fits this cap but not the model's window is a 400 `context_length_exceeded` (as OpenAI does), not a 413, on every engine that checks the window (`qwen35`, `gemma4`, `ov-genai`, `ov-runtime`, `ov-dist-spec`); `sparse-moe` instead drops the prompt's newest tokens past its context budget (with a warning in the log), and `sycl-llama` never refuses one. See [API errors](#api-errors). A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
+| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions`, `/v1/completions` or `/v1/responses` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. A prompt that fits this cap but not the model's window is a 400 `context_length_exceeded` (as OpenAI does), not a 413, on every engine that checks the window (`qwen35`, `gemma4`, `ov-genai`, `ov-runtime`, `ov-dist-spec`); `sparse-moe` instead drops the prompt's newest tokens past its context budget (with a warning in the log), and `sycl-llama` never refuses one. See [API errors](#api-errors). A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
 | `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers (each entry may also be a [unix socket](#unix-domain-sockets) `unix:/path.sock`); this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
 | `--ep-worker-index <N>` / `--ep-worker-count <W>` | — | `sparse-moe` (Inkling) expert-parallel **worker**: serve expert shard N of W (experts with `id % W == N`, shared experts included) for every MoE layer on `--listen`; no API, no attention, no sequence state. |
 | `--ov-config <KEY=VALUE>` | — | Raw OV plugin property passthrough, repeatable. See below. |
@@ -516,11 +516,11 @@ and `code` a machine-readable reason, both `null` when unset:
 | 400 | Body is not valid JSON (`request body is not valid JSON: …`), a field has the wrong type (serde's message with its JSON path), or `Content-Type` is not JSON (``request must have `Content-Type: application/json` ``). |
 | 400 | A field out of range or one this server refuses (table below); `param` is that field. |
 | 400 `context_length_exceeded` | The prompt does not fit the model's window; `param` is `messages`, `prompt` or `input` (the route's prompt field). |
-| 404 | Unknown `/v1/` path: `Invalid URL (POST /v1/foo)`. |
+| 404 | Unknown `/v1/` path: `Invalid URL (POST /v1/foo)`. Also the engine not finding the model it was asked for. |
 | 405 | Wrong method: `Method GET is not allowed for /v1/chat/completions`, with an `Allow` header. |
-| 413 | Body over `--api-max-body-mb`, or the prompt over its byte cap (`prompt is N bytes; max allowed is M (max_prompt_bytes)`). |
+| 413 | Body over `--api-max-body-mb`, or the prompt over its byte cap (`prompt is N bytes; max allowed is M (max_prompt_bytes)`). A chat request's turns are capped too: `messages are N bytes (content + tool fields); max allowed is M (max_prompt_bytes)`, with `param: messages`. On a model that takes images, `/v1/chat/completions` and `/v1/responses` accept a larger body (the image allowance, plus the video allowance when videos are on, see [VLM.md](VLM.md)), but a chat request's text alone is still held to `--api-max-body-mb` (`request text (everything but image URLs) is N bytes; …`). |
 | 503 + `Retry-After: 1` | At capacity (`engine at capacity; retry after current requests complete`), engine queue full, or engine not loaded / not connected. |
-| 500 / 503 `server_error` | The engine failed the request (500), or failed it mid-generation (503). An engine refusal of the input itself (`unsupported input: …`, `invalid_request: …`) is a 400 instead. |
+| 500 / 503 `server_error` | The engine failed the request (500), or failed it mid-generation (503). An engine refusal of the input itself (`unsupported input: …`, `invalid_request: …`, `invalid configuration: …`) is a 400 instead. |
 
 An over-window message is OpenAI's sentence, which client libraries match to
 detect context overflow, followed by the engine's own text in parentheses:
@@ -552,6 +552,12 @@ Unknown fields are ignored.
 | `modalities` | no `"audio"` (`["text"]`, `[]` or `null`) | chat |
 | `audio` | `null` | chat |
 | `web_search_options` | `null` | chat |
+
+Chat also refuses a tool or tool call whose `type` is not `function`, with
+`param` `tools` or `messages[i].tool_calls`. `/v1/responses` refuses more
+fields it cannot serve (`store: true`, `previous_response_id`, `tools`, `stop`,
+…), each a 400 naming the field in `param`; [VLM.md](VLM.md#the-request) lists
+them.
 
 **Errors inside a stream.** A refusal before generation starts is the JSON
 error above, even with `"stream": true`. Once a chat or completions stream's 200
