@@ -2069,7 +2069,8 @@ impl SparseMoEEngine {
             // re-emits prefix bytes or drops seam text. Re-anchor instead —
             // emit only what provably follows the prefix (same contract as the
             // shim's `advance_emitted`).
-            let tail = if full_text.as_bytes().starts_with(prefix_text.as_bytes()) {
+            let seam_ok = full_text.as_bytes().starts_with(prefix_text.as_bytes());
+            let tail = if seam_ok {
                 full_text.get(prefix_text.len()..).unwrap_or("").to_string()
             } else {
                 // Whole-turn path: re-anchoring here withholds the ENTIRE
@@ -2084,7 +2085,8 @@ impl SparseMoEEngine {
                     "resume seam diverged; whole-turn tail TEXT withheld, ids still surfaced");
                 String::new()
             };
-            if stopped_on_match {
+            // A withheld tail lacks the stop on purpose; only a tail we emit can break the invariant.
+            if stopped_on_match && seam_ok {
                 crate::one_shot::check_text_after_stop(&task.task_id, &task.sampling.stop, &tail);
             }
             tail
