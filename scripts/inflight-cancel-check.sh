@@ -14,7 +14,7 @@
 #   --log-cmd CMD        a command that prints the node's whole log so far    (env CHECK_LOG_CMD)
 #   --ab URL             a second node (the base build, same model): adds case 6 and H6 (tok/s A/B)
 #                        and compares every stop case's content with it (H4)  (env CHECK_AB_URL)
-#   --only LIST / --skip LIST   comma list of: baseline stream nonstream stop cancel h1 h2 h7 h8 ab h6
+#   --only LIST / --skip LIST   comma list of: baseline stream nonstream stop cancel prefill h1 h2 h7 h8 ab h6
 #   --round-tokens K     tokens one engine round may add after a cancel (1; draft / prompt-lookup: k;
 #                        ov-genai CB-adapter backend: 2)
 #   --eps S              latency allowance for the hang-up to reach the node, seconds (0.5)
@@ -22,12 +22,16 @@
 #   --long-max-tokens N  max_tokens of the long request (default: none, the server's window-long default)
 #   --long-timeout S     client limit on a long request that should end early (stop cases) (300)
 #   --settle S           client limit on a request queued behind a long one (600)
-#   --log-wait S         how long to wait for a task line to show in the log (20)
+#   --log-wait S         how long to wait for a task line to show in the log (20); before each case the
+#                        script also waits this long for the lines of the requests already sent
 #   --ref-max-tokens N   max_tokens of the reference count run the stop cases compare with (200)
 #   --ab-runs N          timed runs per node in the A/B (3); --ab-bar PCT  tip >= PCT % of base (97)
 #   --no-task-log        the engine logs no per-task lines (--cb, multi-stage): skip those log checks
 #   --no-thinking-flag   don't send enable_thinking: false on chat requests
 #   --dry-run            print the plan and exit
+# Every reference run is made twice. Long temperature-0 answers are not reproducible across calls on
+# some devices (ov-genai GPU); when the two differ, the case prints an INFO line and checks only the
+# structure (no stop string in the content; the log line and its token bound) instead of the text.
 # Needs bash, curl, python3 (or python) and standard tools; runs from Linux, macOS, Git Bash or WSL.
 # Prints one PASS/FAIL (or SKIP) line per claim and
 # "INFLIGHT CANCEL CHECK: ALL PASS" or "INFLIGHT CANCEL CHECK: <n> FAILED" (exit 1).
@@ -59,14 +63,14 @@ while [ $# -gt 0 ]; do
     --no-task-log) NO_TASK_LOG=1 ;;
     --no-thinking-flag) THINK=0 ;;
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n '3,33p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,36p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)"; exit 2 ;;
   esac
   shift
 done
 URL=${URL%/}; AB_URL=${AB_URL%/}
 
-ALL="baseline stream nonstream stop cancel h1 h2 h7 h8"
+ALL="baseline stream nonstream stop cancel prefill h1 h2 h7 h8"
 [ -n "$AB_URL" ] && ALL="$ALL ab h6"
 want() { # case name -> 0 when it runs
   local c=$1
@@ -91,15 +95,16 @@ EOF
   want baseline || [ "$NEED_BASE" = 1 ] && cat <<EOF
    baseline   T0 twice (must be equal); LONG max_tokens 128 -> R = tok_s of its 'task done' line
               (else completion_tokens / time); LONG max_tokens $REF_MAX with a never-matching stop -> T.
-              D = max(3 s, 20/R s); one token time = 1/R.
+              D = max(3 s, 20/R s); one token time = 1/R. T is made twice (see the reference rule).
 EOF
   want stream && echo "   stream     case 2: LONG streamed, client hangs up at D (curl --max-time D); T0 sent 0.1 s later.
               PASS: curl timed out (the task was running); the next task line in the log is 'task cancelled'
               for the long task (not 'task done'); its elapsed_s <= D + K/R + eps; |tokens - R*D| <= K +
               max(2, ${NTOL}% of R*D); the T0 follow-up's first byte <= T0's own + (K+1)/R + eps; its text = T0."
   want nonstream && echo "   nonstream  case 3: the same with LONG not streamed."
-  want stop && echo "   stop       case 4: LONG with stop [\"twenty\"]. PASS: finish stop, text = T up to the first 'twenty';
-              the log's task line is 'task stopped at stop string' with tokens < 40; the next T0 text = T0."
+  want stop && echo "   stop       case 4: LONG with stop [\"twenty\"]: the stop rule below against T (the token bound is
+              scaled to where 'twenty' sits in T, so a model that writes a preamble first still passes);
+              the next T0 text = T0."
   want cancel && echo "   cancel     case 5: LONG streamed; the task id is read from the first streamed frame, then
               POST /v1/cancel/<id> at D; the case 2 checks. A one-shot engine sends no frame before its final
               chunk, so no client can learn the id while it runs: then SKIP (the hang-up still ends the task)."
@@ -107,16 +112,24 @@ EOF
   want h2 && echo "   h2         stops [\"\\nThirty\"], [\" thirty\"] on LONG max_tokens $REF_MAX: the stop rule below."
   want h7 && echo "   h7         a CJK answer with stop [\"\\u3002\"] and the near miss [\"\\u3003\"]; an emoji answer with
               its first emoji as the stop and the next code point as a near miss: the stop rule below."
-  want h8 && echo "   h8         /v1/completions, empty prompt, stop [\"\\n\"], max_tokens 32 -> text \"\", finish stop
-              (and = base with --ab)."
-  echo "              stop rule: a reference run with a never-matching stop gives Tr. If Tr holds the stop: finish
-              stop, text = Tr up to the first stop, log 'task stopped at stop string' with tokens <= 1.25 x
-              (Tr's tokens up to the stop) + K + 2. Else: no stop, log 'task done', text and finish = Tr.
-              With --ab, the content and finish also equal the base node's (H4)."
+  want prefill && echo "   prefill    a ~3k-token prompt, max_tokens 1, timed: P. Then the same size of prompt (a fresh one, so no
+              prefix cache hit) with the client hanging up at P/2, inside the prefill. INFO only: when the
+              task line came and how long after the hang-up (ov-genai's prefill is one call a cancel waits for)."
+  want h8 && echo "   h8         /v1/completions, empty prompt, stop [\"\\n\"], max_tokens 32: the stop rule below against a
+              reference with a never-matching stop, cut at its first stop. The log line is INFO only: the engine
+              may leave a stop in leading whitespace to the API."
+  echo "              stop rule: a reference run with a never-matching stop, made twice, gives Tr. If the two agree:
+              if Tr holds the stop, finish stop, text = Tr up to the first stop, log 'task stopped at stop
+              string' with tokens <= 1.25 x (Tr's tokens up to the stop) + K + 2; else no stop, log 'task done',
+              text and finish = Tr. With --ab, the content and finish also equal the base node's (H4).
+              If the two differ (INFO): the content holds no stop string; the log is 'task stopped at stop
+              string' with finish stop and tokens <= 1.25 x (Tr's tokens scaled to the returned text) + K + 2,
+              or 'task done'. With --ab, H4 compares only if the base's two reference runs agree."
   want ab && echo "   ab         case 6: LONG max_tokens 512, $AB_RUNS timed runs per node alternating; median tok/s
               (completion_tokens / time); PASS tip >= ${AB_BAR}% of base."
   want h6 && echo "   h6         the A/B with stops [\"zzzz-never\", <256-byte never-matching string>]."
-  echo "   always     the node log holds no 'D8 invariant' line."
+  echo "   always     the node log holds no 'D8 invariant' line. Before each case the script waits for the task line
+              of every request sent so far, and ignores task lines of ids it has already seen."
   exit 0
 fi
 
@@ -144,6 +157,10 @@ PROMPTS = {
     "emoji": "Reply with five sea-themed emoji separated by spaces, then the word done.",
     "empty": "",
 }
+# About 3k tokens; the nonce makes each one new, so no prefix cache serves it.
+PROMPTS["long"] = ("Request %s. Here is a list of facts.\n" % os.environ.get("CK_NONCE", "0")) + "".join(
+    "Fact %d: the sea at station %d was calm and blue on day %d.\n" % (i, i, i) for i in range(1, 201)
+) + "Summarize the list in one sentence."
 def stops(s):
     if s == "none": return None
     if s == "never": return ["zzzz-never"]
@@ -219,6 +236,13 @@ elif cmd == "cut":
         ok = got["text"] == t and got["finish"] == ref["finish"]
         print("ok" if ok else "bad", "nomatch", 0,
               "got=%s finish=%s want=%s finish=%s" % (short(got["text"], 70), got["finish"], short(t, 70), ref["finish"]))
+elif cmd == "struct":
+    ref, got, st = load(a[0]), load(a[1]), [s for s in stops(a[2]) if s]
+    g, t = got["text"], ref["text"]
+    held = [s for s in st if s in g]
+    est = math.ceil((ref.get("completion_tokens") or 0) * (len(g) + max(len(s) for s in st)) / max(1, len(t)))
+    print("bad" if held else "ok", est, got["finish"],
+          "content holds %s: %s" % (json.dumps(held), short(g[-60:], 70)) if held else "content=%s" % short(g[-60:], 70))
 elif cmd == "emoji":
     t = load(a[0])["text"]
     c = next((ch for ch in t if ord(ch) >= 0x1F000 or 0x2600 <= ord(ch) <= 0x27BF), None)
@@ -245,7 +269,23 @@ log_dump() {
 }
 log_lines() { log_dump | wc -l | tr -d ' '; }
 TERM_RE='task (cancelled|done|stopped at stop string)'
-term_since() { log_dump | tail -n +"$(( $1 + 1 ))" | grep -E "$TERM_RE"; }
+unseen() { # drops task lines whose task= id is in $WORK/seen
+  awk -v f="$WORK/seen" 'BEGIN { while ((getline l < f) > 0) s[l] = 1 }
+    { id = ""; if (match($0, /[ \t]task=[^ \t]+/)) id = substr($0, RSTART + 6, RLENGTH - 6); if (!(id in s)) print }'
+}
+term_since() { log_dump | tail -n +"$(( $1 + 1 ))" | grep -E "$TERM_RE" | unseen; }
+count_term() { log_dump | grep -cE "$TERM_RE"; }
+SENT=0; TERM0=0
+# Before a case: wait (up to --log-wait) until the log holds a task line for every request sent so far
+# (the log may be a polled mirror that lags), mark those ids seen, then set OFF to the log's length.
+sync_log() {
+  local t_end=$((SECONDS + LOG_WAIT))
+  if [ "$NO_TASK_LOG" != 1 ]; then
+    while [ "$(count_term)" -lt $((TERM0 + SENT)) ] && [ "$SECONDS" -lt "$t_end" ]; do sleep 0.5; done
+    log_dump | grep -E "$TERM_RE" | sed -nE 's/.*[[:space:]]task=([^[:space:]]+).*/\1/p' > "$WORK/seen"
+  fi
+  OFF=$(log_lines)
+}
 wait_term() { # offset count timeout_s -> the task lines since offset (waits for <count> of them)
   local out="" t_end=$((SECONDS + $3))
   while :; do
@@ -272,7 +312,7 @@ kind_of() {
 req() {
   local n=$1 base=$2 kind=$3 key=$4 mx=$5 st=$6 sp=$7 mt=$8 ep=/v1/chat/completions m=$MODEL
   [ "$kind" = cmpl ] && ep=/v1/completions
-  [ "$base" = "$AB_URL" ] && m=$AB_MODEL
+  if [ -n "$AB_URL" ] && [ "$base" = "$AB_URL" ]; then m=$AB_MODEL; else SENT=$((SENT + 1)); fi
   CK_MODEL=$m CK_THINK=$THINK py body "$kind" "$key" "$mx" "$st" "$sp" > "$WORK/$n.body"
   curl -s -N --max-time "$mt" -H 'content-type: application/json' --data-binary @- \
     -o "$WORK/$n.raw" -w '%{time_starttransfer} %{time_total} %{http_code}' "$base$ep" \
@@ -282,6 +322,19 @@ req() {
 }
 wget_() { local _a _b _c _d; read -r _a _b _c _d < "$WORK/$1.w"; case "$2" in ttfb) echo "$_a" ;; total) echo "$_b" ;; code) echo "$_c" ;; rc) echo "$_d" ;; esac; }
 nx() { SEQ=$((SEQ + 1)); NX="r$SEQ"; }  # sets NX (no subshell, so SEQ advances)
+# ref_pair <name> <base-url> <chat|cmpl> <prompt key> <max_tokens>: a reference run with a never-matching
+# stop, made twice -> $WORK/<name>.json; $WORK/<name>.varies when the two runs differ.
+ref_pair() {
+  local n=$1 base=$2
+  printf '%s\n' "$5" > "$WORK/$n.mx"
+  req "$n" "$base" "$3" "$4" "$5" 0 never "$SETTLE"
+  req "$n.again" "$base" "$3" "$4" "$5" 0 never "$SETTLE"
+  rm -f "$WORK/$n.varies"
+  py same "$WORK/$n.json" "$WORK/$n.again.json" || {
+    : > "$WORK/$n.varies"
+    echo "INFO reference $n differs between two calls: $(py show "$WORK/$n.json" 70) vs $(py show "$WORK/$n.again.json" 70)"
+  }
+}
 
 health() { curl -s -o "$WORK/models.$2" --max-time 10 "$1/v1/models" -w '%{http_code}'; }
 
@@ -328,7 +381,7 @@ case_baseline() {
     && verdict "baseline: T0 is the same twice at temperature 0 ($(py show "$WORK/T0.json" 60))" ok \
     || verdict "baseline: T0 is deterministic" bad "$(py show "$WORK/T0a.json") vs $(py show "$WORK/T0.json")"
   TTFB0=$(wget_ T0 ttfb)
-  off=$(log_lines)
+  sync_log; off=$OFF
   req Rrun "$URL" chat count 128 0 none "$SETTLE"
   line=""; [ "$NO_TASK_LOG" = 1 ] || line=$(wait_term "$off" 1 "$LOG_WAIT" | head -1)
   tps=$(field "$line" tok_s)
@@ -341,14 +394,14 @@ case_baseline() {
   fle 0.01 "$R" || { verdict "baseline: a decode rate" bad "R=$R"; R=1; }
   D=$(calc "(20 / $R > 3) ? 20 / $R : 3")
   echo "baseline: D = max(3, 20/R) = ${D}s, one token time = $(calc "1 / $R")s, T0 first byte ${TTFB0}s"
-  req T "$URL" chat count "$REF_MAX" 0 never "$SETTLE"
+  ref_pair T "$URL" chat count "$REF_MAX"
   echo "baseline: reference T ($(py get "$WORK/T.json" completion_tokens) tokens, $(py get "$WORK/T.json" finish)): $(py show "$WORK/T.json" 100)"
 }
 
 case_disconnect() { # label stream(0|1)
   local lab=$1 st=$2 off d f rc
   nx; d=$NX; nx; f=$NX
-  off=$(log_lines)
+  sync_log; off=$OFF
   req "$d" "$URL" chat count "$LONG_MAX" "$st" none "$D"
   rc=$(wget_ "$d" rc)
   sleep 0.1
@@ -360,20 +413,9 @@ case_disconnect() { # label stream(0|1)
 }
 
 case_stop() {
-  local lab="case 4 stop" s f off v mode est detail line k n
-  nx; s=$NX; nx; f=$NX
-  off=$(log_lines)
-  req "$s" "$URL" chat count "$LONG_MAX" 0 '["twenty"]' "$LONG_TIMEOUT"
-  read -r v mode est detail <<<"$(py cut "$WORK/T.json" "$WORK/$s.json" '["twenty"]')"
-  [ "$v" = ok ] && [ "$mode" = match ] \
-    && verdict "$lab: finish stop, the text ends right before 'twenty' (= T up to it)" ok \
-    || verdict "$lab: finish stop, text ends before 'twenty'" bad "$mode $detail; curl exit $(wget_ "$s" rc)"
-  if [ "$NO_TASK_LOG" = 1 ]; then skip "$lab: engine task-line check (--no-task-log)"; else
-    line=$(wait_term "$off" 1 "$LOG_WAIT" | head -1); k=$(kind_of "$line"); n=$(field "$line" tokens)
-    [ "$k" = stopped ] && [ -n "$n" ] && [ "$n" -lt 40 ] 2>/dev/null \
-      && verdict "$lab: the log shows 'task stopped at stop string' tokens=$n < 40" ok \
-      || verdict "$lab: 'task stopped at stop string' with tokens < 40" bad "next task line: ${line:-none}"
-  fi
+  local lab="case 4 stop" f
+  stop_case "$lab" chat count "$LONG_MAX" '["twenty"]' T
+  nx; f=$NX
   req "$f" "$URL" chat t0 "$T0_MAX" 1 none "$SETTLE"
   py same "$WORK/T0.json" "$WORK/$f.json" && verdict "$lab: the next request's text = T0" ok \
     || verdict "$lab: the next request's text = T0" bad "got $(py show "$WORK/$f.json")"
@@ -382,11 +424,11 @@ case_stop() {
 case_cancel() {
   local lab="case 5 /v1/cancel" c f off cpid t0 id="" rem code t_end
   nx; c=$NX; nx; f=$NX
-  off=$(log_lines)
+  sync_log; off=$OFF
   CK_MODEL=$MODEL CK_THINK=$THINK py body chat count "$LONG_MAX" 1 none > "$WORK/$c.body"
   curl -s -N --max-time "$SETTLE" -H 'content-type: application/json' --data-binary @- \
     -o "$WORK/$c.raw" "$URL/v1/chat/completions" < "$WORK/$c.body" &
-  cpid=$!; t0=$(now)
+  cpid=$!; t0=$(now); SENT=$((SENT + 1))
   while :; do
     if grep -q '^data: {' "$WORK/$c.raw" 2>/dev/null; then
       py parse "$WORK/$c.raw" 1 "$WORK/$c.json"; id=$(py get "$WORK/$c.json" id); [ -n "$id" ] && break
@@ -417,21 +459,40 @@ case_cancel() {
   check_followup "$lab" "$f"
 }
 
-stop_case() { # label kind prompt-key max_tokens stops ref-name
-  local lab=$1 kind=$2 key=$3 mx=$4 sp=$5 ref=$6 s b off v mode est detail line k n lim
+stop_case() { # label kind prompt-key max_tokens stops ref-name [lax: the log line is INFO only]
+  local lab=$1 kind=$2 key=$3 mx=$4 sp=$5 ref=$6 lax=${7:-0} s b off v mode est detail line k n lim fin
   nx; s=$NX
-  off=$(log_lines)
+  sync_log; off=$OFF
   req "$s" "$URL" "$kind" "$key" "$mx" 0 "$sp" "$LONG_TIMEOUT"
-  read -r v mode est detail <<<"$(py cut "$WORK/$ref.json" "$WORK/$s.json" "$sp")"
-  if [ "$mode" = match ]; then
-    verdict "$lab: finish stop, text = the reference up to the stop" "$v" "$detail"
+  if [ -e "$WORK/$ref.varies" ]; then
+    echo "INFO $lab: reference output varies across calls on this device, comparison skipped"
+    read -r v est fin detail <<<"$(py struct "$WORK/$ref.json" "$WORK/$s.json" "$sp")"
+    verdict "$lab: the content holds no stop string (structural)" "$v" "$detail; HTTP $(wget_ "$s" code)"
+    mode=struct
   else
-    verdict "$lab: the reference has no such stop: no stop fired, text and finish = the reference" "$v" "$detail"
+    read -r v mode est detail <<<"$(py cut "$WORK/$ref.json" "$WORK/$s.json" "$sp")"
+    if [ "$mode" = match ]; then
+      verdict "$lab: finish stop, text = the reference up to the stop" "$v" "$detail"
+    else
+      verdict "$lab: the reference has no such stop: no stop fired, text and finish = the reference" "$v" "$detail"
+    fi
   fi
+  fin=$(py get "$WORK/$s.json" finish)
   if [ "$NO_TASK_LOG" != 1 ]; then
     line=$(wait_term "$off" 1 "$LOG_WAIT" | head -1); k=$(kind_of "$line"); n=$(field "$line" tokens)
-    if [ "$mode" = match ]; then
-      lim=$(calc "1.25 * $est + $ROUND + 2")
+    lim=$(calc "1.25 * $est + $ROUND + 2")
+    if [ "$lax" = 1 ]; then
+      echo "INFO $lab: log ${line#*INFO }"
+    elif [ "$mode" = struct ]; then
+      if [ "$k" = stopped ]; then
+        [ "$fin" = stop ] && fle "${n:-1e9}" "$lim" \
+          && verdict "$lab: log 'task stopped at stop string' tokens=$n <= $lim, finish stop (structural)" ok \
+          || verdict "$lab: an engine stop has finish stop and small tokens (structural)" bad "finish $fin; next task line: $line; limit $lim"
+      else
+        [ "$k" = "done" ] && verdict "$lab: log 'task done' (no engine stop; structural)" ok \
+          || verdict "$lab: log 'task stopped at stop string' or 'task done' (structural)" bad "next task line: ${line:-none}"
+      fi
+    elif [ "$mode" = match ]; then
       [ "$k" = stopped ] && fle "${n:-1e9}" "$lim" \
         && verdict "$lab: log 'task stopped at stop string' tokens=$n <= $lim" ok \
         || verdict "$lab: log 'task stopped at stop string' with small tokens" bad "next task line: ${line:-none}; limit $lim"
@@ -441,6 +502,13 @@ stop_case() { # label kind prompt-key max_tokens stops ref-name
     fi
   fi
   if [ -n "$AB_URL" ]; then
+    if [ "$mode" = struct ]; then
+      [ -e "$WORK/$ref.base.json" ] || ref_pair "$ref.base" "$AB_URL" "$kind" "$key" "$(cat "$WORK/$ref.mx")"
+      if [ -e "$WORK/$ref.base.varies" ]; then
+        echo "INFO H4 $lab: the base node's reference varies across calls too, byte-identity skipped"
+        return
+      fi
+    fi
     nx; b=$NX; req "$b" "$AB_URL" "$kind" "$key" "$mx" 0 "$sp" "$LONG_TIMEOUT"
     py same "$WORK/$s.json" "$WORK/$b.json" && verdict "H4 $lab: content and finish byte-identical to the base node" ok \
       || verdict "H4 $lab: same as the base node" bad "tip $(py show "$WORK/$s.json") base $(py show "$WORK/$b.json")"
@@ -459,11 +527,11 @@ case_h2() {
 }
 case_h7() {
   local pick st near
-  req Tcjk "$URL" chat cjk 96 0 never "$SETTLE"
+  ref_pair Tcjk "$URL" chat cjk 96
   echo "H7 CJK reference: $(py show "$WORK/Tcjk.json" 100)"
   stop_case 'H7 CJK stop ["\u3002"]' chat cjk 96 '["\u3002"]' Tcjk
   stop_case 'H7 CJK near-miss stop ["\u3003"]' chat cjk 96 '["\u3003"]' Tcjk
-  req Temo "$URL" chat emoji 64 0 never "$SETTLE"
+  ref_pair Temo "$URL" chat emoji 64
   echo "H7 emoji reference: $(py show "$WORK/Temo.json" 100)"
   pick=$(py emoji "$WORK/Temo.json")
   if [ -z "$pick" ]; then skip "H7 emoji stop: the reference answer holds no emoji"; return; fi
@@ -472,16 +540,31 @@ case_h7() {
   stop_case "H7 emoji near-miss stop $near" chat emoji 64 "$near" Temo
 }
 case_h8() {
-  local s b txt fin
-  nx; s=$NX; req "$s" "$URL" cmpl empty 32 0 '["\n"]' "$LONG_TIMEOUT"
-  txt=$(py show "$WORK/$s.json"); fin=$(py get "$WORK/$s.json" finish)
-  [ "$txt" = '""' ] && [ "$fin" = stop ] && [ "$(wget_ "$s" code)" = 200 ] \
-    && verdict 'H8 completions, empty prompt, stop ["\n"]: text "" and finish stop' ok \
-    || verdict 'H8 completions, empty prompt, stop ["\n"]: text "" and finish stop' bad "HTTP $(wget_ "$s" code) text $txt finish $fin"
-  if [ -n "$AB_URL" ]; then
-    nx; b=$NX; req "$b" "$AB_URL" cmpl empty 32 0 '["\n"]' "$LONG_TIMEOUT"
-    py same "$WORK/$s.json" "$WORK/$b.json" && verdict "H8: same as the base node" ok \
-      || verdict "H8: same as the base node" bad "tip $txt base $(py show "$WORK/$b.json")"
+  # The answer equals the base's: a reference with a never-matching stop, cut at its first stop. The
+  # engine may leave a stop in leading whitespace (text the answer strips) to the API, so the log line
+  # is INFO only.
+  ref_pair Th8 "$URL" cmpl empty 32
+  echo "H8 reference: $(py show "$WORK/Th8.json" 100)"
+  stop_case 'H8 completions, empty prompt, stop ["\n"]' cmpl empty 32 '["\n"]' Th8 1
+}
+
+case_prefill() { # INFO only: a hang-up during a long prompt's prefill
+  local lab="prefill disconnect" p d off line k tp hang el
+  nx; p=$NX; nx; d=$NX
+  sync_log
+  CK_NONCE="$RANDOM-$p" req "$p" "$URL" chat long 1 0 none "$SETTLE"
+  tp=$(wget_ "$p" total)
+  hang=$(calc "($tp / 2 > 0.2) ? $tp / 2 : 0.2")
+  echo "INFO $lab: a ~3k-token prompt with max_tokens 1 took ${tp}s (HTTP $(wget_ "$p" code)); hanging up at ${hang}s"
+  sync_log; off=$OFF
+  CK_NONCE="$RANDOM-$d" req "$d" "$URL" chat long "$LONG_MAX" 0 none "$hang"
+  if [ "$NO_TASK_LOG" = 1 ]; then echo "INFO $lab: curl exit $(wget_ "$d" rc); no task lines (--no-task-log)"; return; fi
+  line=$(wait_term "$off" 1 "$(calc "$tp * 2 + $LOG_WAIT" | cut -d. -f1)" | head -1); k=$(kind_of "$line")
+  el=$(field "$line" elapsed_s)
+  if [ -n "$el" ]; then
+    echo "INFO $lab: curl exit $(wget_ "$d" rc); task line '$k' tokens=$(field "$line" tokens) elapsed_s=$el, $(calc "$el - $hang")s after the hang-up"
+  else
+    echo "INFO $lab: curl exit $(wget_ "$d" rc); task line: ${line:-none within the wait}"
   fi
 }
 
@@ -516,12 +599,13 @@ log_dump | grep -q . || echo "warning: the node log is empty so far (${LOG_FILE:
 echo "node $URL model $MODEL${AB_URL:+ ; base node $AB_URL model $AB_MODEL}; K=$ROUND eps=${EPS}s long max_tokens=${LONG_MAX:-server default}"
 startup=$(log_dump | grep -m1 'request defaults'); [ -n "$startup" ] && echo "startup: ${startup#*INFO }"
 
-R=1; D=3; TTFB0=0
+TERM0=$(count_term); R=1; D=3; TTFB0=0
 [ "$NEED_BASE" = 1 ] && case_baseline
 want stream && case_disconnect "case 2 streamed disconnect" 1
 want nonstream && case_disconnect "case 3 non-streamed disconnect" 0
 want stop && case_stop
 want cancel && case_cancel
+want prefill && case_prefill
 want h1 && case_h1
 want h2 && case_h2
 want h7 && case_h7
