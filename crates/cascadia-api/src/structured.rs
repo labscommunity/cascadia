@@ -1002,15 +1002,30 @@ pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound>
     let mut dropped = Vec::new();
     let mut refs = Vec::new();
     relax_in_place(schema, &mut Vec::new(), &mut dropped, &mut refs);
+    // Each ref string is resolved once, and a target already inside a
+    // relaxed subtree (the root's, or an earlier target's) is not walked
+    // again: every node is relaxed at most once per round of new refs.
+    let mut seen: HashSet<String> = HashSet::new();
     let mut walked: HashSet<Vec<String>> = HashSet::new();
-    while let Some(r) = refs.pop() {
-        let paths: Vec<Vec<String>> = backstop_targets(schema, &r)
-            .filter_map(|target| path_to_target(schema, &r, target))
-            .collect();
-        for mut path in paths {
-            if !schema_position(schema, &path) || !walked.insert(path.clone()) {
+    while !refs.is_empty() {
+        let mut paths: Vec<Vec<String>> = Vec::new();
+        for r in std::mem::take(&mut refs) {
+            if !seen.insert(r.clone()) {
                 continue;
             }
+            paths.extend(
+                backstop_targets(schema, &r)
+                    .filter_map(|target| path_to_target(schema, &r, target)),
+            );
+        }
+        // Shallow targets first, so a deeper one inside them is covered.
+        paths.sort_by_key(Vec::len);
+        paths.dedup();
+        for mut path in paths {
+            if already_relaxed(schema, &path, &walked) || !schema_position(schema, &path) {
+                continue;
+            }
+            walked.insert(path.clone());
             let mut node = &mut *schema;
             for key in &path {
                 node = match node {
@@ -1024,6 +1039,56 @@ pub fn relax_unsatisfiable_bounds(schema: &mut Value) -> Vec<UnsatisfiableBound>
         }
     }
     dropped
+}
+
+/// True when [`relax_in_place`] has already been at `path`: it is reached
+/// from the root or from a `walked` target through only the keys that walk
+/// descends into (`properties` entries, `items`, `anyOf` members, ...).
+fn already_relaxed(root: &Value, path: &[String], walked: &HashSet<Vec<String>>) -> bool {
+    let mut node = root;
+    // Whether the walk reached `node`, and whether the next key names an
+    // entry of a schema map or an array of member schemas.
+    let mut reached = true;
+    let mut entry = false;
+    for (i, key) in path.iter().enumerate() {
+        if !reached && !walked.is_empty() && walked.contains(&path[..i]) {
+            reached = true;
+            entry = false;
+        }
+        let child = match node {
+            Value::Object(obj) => obj.get(key),
+            Value::Array(items) => key.parse::<usize>().ok().and_then(|i| items.get(i)),
+            _ => None,
+        };
+        let Some(child) = child else {
+            return false;
+        };
+        if entry {
+            entry = false;
+        } else if reached {
+            match (key.as_str(), child) {
+                (
+                    "properties" | "patternProperties" | "$defs" | "definitions",
+                    Value::Object(_),
+                )
+                | ("prefixItems" | "allOf" | "anyOf" | "oneOf" | "items", Value::Array(_)) => {
+                    entry = true;
+                }
+                (
+                    "additionalProperties"
+                    | "items"
+                    | "contains"
+                    | "propertyNames"
+                    | "unevaluatedItems"
+                    | "unevaluatedProperties",
+                    _,
+                ) if matches!(node, Value::Object(_)) => {}
+                _ => reached = false,
+            }
+        }
+        node = child;
+    }
+    reached || walked.contains(path)
 }
 
 /// False when `path` from `root` passes through a data keyword (`enum`,
@@ -5116,6 +5181,38 @@ mod tests {
         // that signal without failing on a loaded CI runner, where a
         // ratio against a smaller run would be timer noise.
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// A chain of `items` whose every level names its own path by `$ref`,
+    /// over many leaves that `$ref` the bottom of the chain: no pair at all.
+    /// Each ref string is read once and a target the walk already relaxed is
+    /// not walked again, so this is linear, not levels x leaves x levels.
+    /// The same chain under a keyword the walk skips is walked once from its
+    /// top, not once per level.
+    #[test]
+    fn relax_walks_a_ref_heavy_schema_once() {
+        fn chain(prefix: &str, levels: usize, leaves: usize) -> Value {
+            let leaf = json!({"$ref": format!("#{prefix}{}", "/items".repeat(levels))});
+            let properties: Map<String, Value> = (0..leaves)
+                .map(|i| (format!("{i:x}"), leaf.clone()))
+                .collect();
+            let mut s = json!({"type": "object", "properties": properties});
+            for k in (1..=levels).rev() {
+                s = json!({"$ref": format!("#{prefix}{}", "/items".repeat(k)), "items": s});
+            }
+            s
+        }
+        let walked = chain("", 60, 600);
+        let mut skipped = json!({"type": "object", "properties": {"p": {"$ref": "#/x"}}});
+        skipped["x"] = chain("/x", 60, 600);
+        for schema in [walked, skipped] {
+            let start = std::time::Instant::now();
+            let (out, dropped) = relaxed(schema.clone());
+            let elapsed = start.elapsed();
+            assert!(dropped.is_empty(), "{dropped:?}");
+            assert_eq!(out, schema);
+            assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        }
     }
 
     #[test]
