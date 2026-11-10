@@ -971,6 +971,15 @@ fn unsatisfiable_bounds_are_refused_at_build() {
             r#"{"type":["integer"],"minimum":2.1,"exclusiveMaximum":3}"#,
             "integer interval [2.1, 3) contains no integer values",
         ),
+        // A pair split across the members of an allOf.
+        (
+            r#"{"allOf":[{"type":"string","minLength":5},{"maxLength":2}]}"#,
+            "minLength (5) is greater than maxLength (2)",
+        ),
+        (
+            r#"{"type":"object","allOf":[{"properties":{"a":{"type":"string","minLength":5}},"required":["a"]},{"properties":{"a":{"maxLength":2}}}]}"#,
+            "required property 'a' is unsatisfiable",
+        ),
     ] {
         let err = gf
             .compile(&spec(body))
@@ -980,7 +989,10 @@ fn unsatisfiable_bounds_are_refused_at_build() {
         assert!(msg.contains("Unsatisfiable schema"), "{body}: {msg}");
         assert!(msg.contains(says), "{body}: {msg}");
     }
+    // Builds: a value may leave the property out (the API still refuses it,
+    // as a mistake in the schema).
     for body in [
+        r#"{"type":"object","allOf":[{"properties":{"a":{"type":"string","minLength":5}}},{"properties":{"a":{"maxLength":2}}}]}"#,
         r#"{"type":"integer","exclusiveMinimum":2,"exclusiveMaximum":4}"#,
         r#"{"type":["integer","number"],"exclusiveMinimum":2,"exclusiveMaximum":3}"#,
     ] {

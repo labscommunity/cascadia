@@ -507,35 +507,8 @@ fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> 
             .enumerate()
             .find_map(|(i, c)| descend(path, i.to_string(), c)),
         Value::Object(obj) => {
-            for (lower, upper, strict) in BOUND_PAIRS {
-                let (Some(Value::Number(lo)), Some(Value::Number(hi))) =
-                    (obj.get(lower), obj.get(upper))
-                else {
-                    continue;
-                };
-                let Some(order) = compare_numbers(lo, hi) else {
-                    continue;
-                };
-                let empty = if strict { order.is_ge() } else { order.is_gt() };
-                if empty {
-                    let relation = if strict {
-                        "is not less than"
-                    } else {
-                        "is greater than"
-                    };
-                    return Some(format!(
-                        "{lower} ({lo}) {relation} {upper} ({hi}) at {}; no value can satisfy both",
-                        json_pointer(path)
-                    ));
-                }
-            }
-            if let Some((lower, upper)) = empty_integer_range(obj) {
-                return Some(format!(
-                    "no integer meets {lower} ({}) and {upper} ({}) at {}",
-                    obj[lower],
-                    obj[upper],
-                    json_pointer(path)
-                ));
+            if let Some(found) = bound_violation(obj) {
+                return Some(locate(found, "", path));
             }
             for (key, child) in obj {
                 if DATA_KEYS.contains(&key.as_str()) {
@@ -558,10 +531,158 @@ fn find_unsatisfiable_bound(v: &Value, path: &mut Vec<String>, depth: usize) -> 
                     return found;
                 }
             }
+            // The members of an `allOf` all apply to the same value: bounds
+            // from different members (and the holder) can leave nothing.
+            if let Some(Value::Array(members)) = obj.get("allOf") {
+                let sources: Vec<&Map<String, Value>> = std::iter::once(obj)
+                    .chain(members.iter().filter_map(Value::as_object))
+                    .collect();
+                return all_of_violation(&sources, path, depth);
+            }
             None
         }
         _ => None,
     }
+}
+
+/// A bound pair in `obj` no value meets, or an integer-only range with no
+/// integer: its description and whether it is a pair.
+fn bound_violation(obj: &Map<String, Value>) -> Option<(String, bool)> {
+    for (lower, upper, strict) in BOUND_PAIRS {
+        let (Some(Value::Number(lo)), Some(Value::Number(hi))) = (obj.get(lower), obj.get(upper))
+        else {
+            continue;
+        };
+        let Some(order) = compare_numbers(lo, hi) else {
+            continue;
+        };
+        let empty = if strict { order.is_ge() } else { order.is_gt() };
+        if empty {
+            let relation = if strict {
+                "is not less than"
+            } else {
+                "is greater than"
+            };
+            return Some((format!("{lower} ({lo}) {relation} {upper} ({hi})"), true));
+        }
+    }
+    let (lower, upper) = empty_integer_range(obj)?;
+    Some((
+        format!(
+            "no integer meets {lower} ({}) and {upper} ({})",
+            obj[lower], obj[upper]
+        ),
+        false,
+    ))
+}
+
+/// The 400 detail for `found` at `path`.
+fn locate((detail, pair): (String, bool), across: &str, path: &[String]) -> String {
+    let at = json_pointer(path);
+    if pair {
+        format!("{detail}{across} at {at}; no value can satisfy both")
+    } else {
+        format!("{detail}{across} at {at}")
+    }
+}
+
+/// A bound pair no value meets across `sources`, schemas that all apply to
+/// one value (an `allOf` holder and its object members), reported at `path`;
+/// then the same for each property more than one of them defines.
+fn all_of_violation(
+    sources: &[&Map<String, Value>],
+    path: &mut Vec<String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return None;
+    }
+    if let Some(found) = bound_violation(&merged_bounds(sources)) {
+        return Some(locate(found, " across the allOf", path));
+    }
+    let mut names: Vec<&String> = Vec::new();
+    for source in sources {
+        if let Some(Value::Object(props)) = source.get("properties") {
+            for name in props.keys() {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    for name in names {
+        let defs: Vec<&Map<String, Value>> = sources
+            .iter()
+            .filter_map(|s| s.get("properties")?.get(name.as_str())?.as_object())
+            .collect();
+        if defs.len() < 2 {
+            continue;
+        }
+        path.push("properties".into());
+        path.push(name.clone());
+        let found = all_of_violation(&defs, path, depth + 1);
+        path.pop();
+        path.pop();
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// The bounds `sources` together put on one value: the tightest lower and
+/// upper of each keyword, and `type: "integer"` when one of them allows only
+/// integers. A source that is a `$ref` is left out.
+fn merged_bounds(sources: &[&Map<String, Value>]) -> Map<String, Value> {
+    const LOWER: [&str; 5] = [
+        "minLength",
+        "minItems",
+        "minProperties",
+        "minimum",
+        "exclusiveMinimum",
+    ];
+    const UPPER: [&str; 5] = [
+        "maxLength",
+        "maxItems",
+        "maxProperties",
+        "maximum",
+        "exclusiveMaximum",
+    ];
+    let sources: Vec<&Map<String, Value>> = sources
+        .iter()
+        .copied()
+        .filter(|m| !m.contains_key("$ref"))
+        .collect();
+    let mut merged = Map::new();
+    for (keys, keep) in [
+        (LOWER, std::cmp::Ordering::Greater),
+        (UPPER, std::cmp::Ordering::Less),
+    ] {
+        for key in keys {
+            for source in &sources {
+                let Some(Value::Number(n)) = source.get(key) else {
+                    continue;
+                };
+                let tighter = match merged.get(key) {
+                    Some(Value::Number(m)) => compare_numbers(n, m) == Some(keep),
+                    _ => true,
+                };
+                if tighter {
+                    merged.insert(key.to_string(), Value::Number(n.clone()));
+                }
+            }
+        }
+    }
+    let integer = |t: &Value| t.as_str() == Some("integer");
+    let only_integer = |m: &&Map<String, Value>| match m.get("type") {
+        Some(Value::Array(types)) => !types.is_empty() && types.iter().all(integer),
+        Some(t) => integer(t),
+        None => false,
+    };
+    if sources.iter().any(only_integer) {
+        merged.insert("type".into(), Value::String("integer".into()));
+    }
+    merged
 }
 
 /// The RFC 6901 pointer of `path`, as a URI fragment: `#`, `#/items`, ...
@@ -3704,6 +3825,42 @@ mod tests {
             }})),
             unsat("minLength (5) is greater than maxLength (2) at #/properties/default; no value can satisfy both")
         );
+    }
+
+    /// The members of an `allOf` all apply to one value: a lower bound in one
+    /// and an upper bound in another can leave nothing. A pair inside one
+    /// member keeps that member's pointer.
+    #[test]
+    fn a_pair_split_across_all_of_members_is_refused() {
+        assert_eq!(
+            parse_schema(json!({"allOf": [{"type": "string", "minLength": 5}, {"maxLength": 2}]})),
+            unsat("minLength (5) is greater than maxLength (2) across the allOf at #; no value can satisfy both")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": "integer", "exclusiveMinimum": 2, "allOf": [{"exclusiveMaximum": 3}]})),
+            unsat("no integer meets exclusiveMinimum (2) and exclusiveMaximum (3) across the allOf at #")
+        );
+        assert_eq!(
+            parse_schema(json!({"type": "object", "allOf": [
+                {"properties": {"a": {"type": "string", "minLength": 5}}},
+                {"properties": {"a": {"maxLength": 2}}}
+            ]})),
+            unsat("minLength (5) is greater than maxLength (2) across the allOf at #/properties/a; no value can satisfy both")
+        );
+        assert_eq!(
+            parse_schema(json!({"allOf": [{"minItems": 1}, {"minItems": 4, "maxItems": 3}]})),
+            unsat(
+                "minItems (4) is greater than maxItems (3) at #/allOf/1; no value can satisfy both"
+            )
+        );
+        // Bounds that leave room across the members, and members that are
+        // references, are not refused.
+        for schema in [
+            json!({"allOf": [{"minLength": 2}, {"maxLength": 5}]}),
+            json!({"$defs": {"N": {"maxLength": 2}}, "allOf": [{"minLength": 5}, {"$ref": "#/$defs/N"}]}),
+        ] {
+            assert_eq!(unsatisfiable_bound(&schema), None, "{schema}");
+        }
     }
 
     /// A local `$ref` into a data keyword makes that value a schema: its
