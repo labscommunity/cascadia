@@ -590,10 +590,11 @@ the message above), `invalid_prompt` for another refusal of the input, and
 **Readiness.** `GET /health` answers 503 `{"status": "degraded"}` once a
 completion fails with a 5xx that points at the pipeline (a peer link dropped,
 the engine not loaded), or a stream ends with such an engine error (its 200
-was already sent, so the error is the stream's last event). It is 200 again
-after the next completion that succeeds; for a stream, one that finishes. A
-stream that is still running, or that the client closes before its end, does
-not count. Errors that are the client's fault never mark it unready, streamed
+was already sent, so the error arrives as an event in the stream: the error
+event, followed by `data: [DONE]`, on chat and completions; `response.failed`
+on responses). It is 200 again after the next completion that succeeds; for a
+stream, one that finishes. A stream that is still running, that is cancelled,
+or that the client closes before its end, does not count. Errors that are the client's fault never mark it unready, streamed
 or not. A peer that stops answering makes the step waiting on it time out
 (after 60 s) and fail, which marks the server unready. Capacity 503s do not
 mark it, unless requests are in flight and the pipeline is stalled: the engine has

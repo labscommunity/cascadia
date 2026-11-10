@@ -767,7 +767,9 @@ pub fn make_router_with_stats(
         .with_state(state)
         // Flip `ready` from each completion's final status so /health tracks the
         // pipeline (a peer-link drop fails generation with a 5xx before streaming
-        // starts, so the response status is authoritative for that case).
+        // starts, so the response status is authoritative for that case). A
+        // stream's 200 is not a success here: the stream notes its own outcome
+        // when it finishes or fails (`note_stream_chunk`).
         .layer(axum::middleware::from_fn_with_state(
             mw_state,
             track_pipeline_health,
@@ -1074,8 +1076,10 @@ fn note_failure(h: &Health) {
 /// from the status: the stream notes it here. An engine error that
 /// [`classify_chunk_error`] puts on the pipeline (a 5xx) is a failure, as it
 /// is for a non-streamed answer; a real final chunk is the success. A
-/// client-fault error, and every other chunk, changes nothing, so a stream
-/// the client abandons before its end leaves readiness as it was.
+/// client-fault error, a final chunk that ends `Cancelled` (the stream did
+/// not finish, as the usage frame and the Responses end read it), and every
+/// other chunk change nothing, so a stream the client abandons before its
+/// end leaves readiness as it was.
 fn note_stream_chunk(state: &AppState, chunk: &cascadia_types::Chunk) {
     match &chunk.error {
         Some(reason) => {
@@ -1083,7 +1087,11 @@ fn note_stream_chunk(state: &AppState, chunk: &cascadia_types::Chunk) {
                 note_failure(&Health::of(state));
             }
         }
-        None if chunk.is_final => note_success(&Health::of(state)),
+        None if chunk.is_final
+            && chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled) =>
+        {
+            note_success(&Health::of(state))
+        }
         None => {}
     }
 }
@@ -1092,8 +1100,11 @@ fn note_stream_chunk(state: &AppState, chunk: &cascadia_types::Chunk) {
 /// produced real output after the stall's evidence time (the pipeline is
 /// moving again) or nothing is in flight (the stall rule needs work in
 /// flight to see a stall; if the pipeline is still broken, the next capacity
-/// 503 under load marks it again). A drained server whose failed streams
-/// have all ended would otherwise stay unready with nothing left to step.
+/// 503 under load marks it again). A drained server whose clients have
+/// given up their streams would otherwise stay unready with nothing left to
+/// step. A stream that ends with the pipeline's own failure marks
+/// [`ReadinessState::Pipeline`] instead, which this heal leaves alone: only
+/// a success clears it.
 /// `observe` reads the last real output time and the requests in flight; it
 /// runs under the lock, so both are read after any stall it could clear was
 /// noted. Any other cause is left as it is.
@@ -13382,12 +13393,16 @@ level={{ effort_map[eff] }}";
     /// One task at a time. A prompt carrying `__fail__` streams "Hi " and then
     /// an error chunk with `DOWNSTREAM_TIMEOUT`; one carrying `__refuse__`
     /// streams "Hi " and then an error chunk with a client-fault reason (a
-    /// prompt over the window). Any other prompt streams "Hi " and then, once
-    /// `release` is set, a real final chunk.
+    /// prompt over the window). One carrying `__cancel__` streams "Hi " and
+    /// then a final chunk that ends `Cancelled`. Any other prompt streams "Hi "
+    /// and then, once `release` is set, a real final chunk.
     struct ReadinessEngine {
         release: Arc<std::sync::atomic::AtomicBool>,
         pending: Option<(cascadia_types::TaskId, Option<&'static str>, usize)>,
     }
+
+    /// The `fail` mark of a `__cancel__` task in [`ReadinessEngine`].
+    const CANCELLED_MARK: &str = "__cancelled__";
 
     impl cascadia_engine::Engine for ReadinessEngine {
         fn warmup(&mut self) {}
@@ -13396,6 +13411,8 @@ level={{ effort_map[eff] }}";
                 Some(DOWNSTREAM_TIMEOUT)
             } else if task.prompt.contains("__refuse__") {
                 Some(MID_GENERATION_TOO_LONG)
+            } else if task.prompt.contains("__cancel__") {
+                Some(CANCELLED_MARK)
             } else {
                 None
             };
@@ -13409,6 +13426,11 @@ level={{ effort_map[eff] }}";
             if i == 0 {
                 self.pending = Some((id.clone(), fail, 1));
                 return Ok(vec![(id.clone(), Chunk::token(&id, 0, "Hi ".to_owned()))]);
+            }
+            if fail == Some(CANCELLED_MARK) {
+                let last = Chunk::final_marker(&id, "")
+                    .with_finish_reason(cascadia_types::FinishReason::Cancelled);
+                return Ok(vec![(id, last)]);
             }
             if let Some(reason) = fail {
                 return Ok(vec![(id.clone(), Chunk::error(&id, reason))]);
@@ -13607,5 +13629,57 @@ level={{ effort_map[eff] }}";
                 "{route}: a finished stream must mark the server ready"
             );
         }
+    }
+
+    /// A stream that ends `Cancelled` did not finish: it says nothing about
+    /// the pipeline, so it neither clears a pipeline failure nor marks one.
+    #[tokio::test]
+    async fn cancelled_stream_leaves_readiness_alone() {
+        for route in STREAM_ROUTES {
+            let (app, _release) = readiness_app().await;
+            drain_stream(app.clone(), route, "__cancel__").await;
+            assert_eq!(health_status(app.clone()).await, StatusCode::OK, "{route}");
+            drain_stream(app.clone(), route, "__fail__").await;
+            drain_stream(app.clone(), route, "__cancel__").await;
+            assert_eq!(
+                health_status(app).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}: a cancelled stream must not clear a pipeline failure"
+            );
+        }
+    }
+
+    /// A stall mark is not cleared by a new stream's 200 headers: with the
+    /// pipeline still producing nothing and that stream open, `/health`
+    /// stays unready.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_open_stream_does_not_clear_a_stall_mark() {
+        let (app, _phase) = phase_app(PHASE_ERRORS).await;
+        let reader = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+            })
+        };
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let refused = app
+            .clone()
+            .oneshot(stall_chat(false))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        // The first client gives up; a new stream takes the freed slot.
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        let held = app.clone().oneshot(stall_chat(true)).await.unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        assert_eq!(
+            stall_health(&app).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an open stream's 200 must not clear a stall mark"
+        );
+        drop(held);
     }
 }
