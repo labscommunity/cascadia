@@ -679,7 +679,7 @@ fn an_unacknowledged_masked_step_fails_the_task_and_latches() {
 }
 
 /// A stream tail that answers a masked stream frame with a plain
-/// `StreamTokens`.
+/// `StreamTokens`, and the probe with a plain `Token`.
 fn plain_answering_stream_tail(
     rt: &tokio::runtime::Runtime,
     srv: Arc<TokioMutex<ActivationServer>>,
@@ -701,6 +701,13 @@ fn plain_answering_stream_tail(
                         crate::dist::recv_stream_close_body_server(&srv)
                             .await
                             .unwrap();
+                    }
+                    // The probe gets a plain token, unacknowledged, too.
+                    Ok(Some(FrameKind::Forward)) => {
+                        crate::dist::recv_forward_step_body_server(&srv)
+                            .await
+                            .unwrap();
+                        send_token_upstream(&srv, i64::from(b'a')).await.unwrap();
                     }
                     _ => return,
                 }
@@ -2242,4 +2249,28 @@ fn a_main_build_sparse_moe_worker_reads_the_probe_and_stays_aligned() {
         let (past, _, _, h, shape) = recv_forward_body_server(&srv).await.unwrap();
         assert_eq!((past, shape, h), (3, [1, 1, 4], vec![0.5; 4]));
     });
+}
+
+/// A dead downstream at a json admission is a link failure: the task fails
+/// without latching and without naming an upgrade, whether the idle check
+/// (a late answer owed) or the probe itself finds it.
+#[test]
+fn a_dead_downstream_fails_json_admission_without_a_latch() {
+    for owed_first in [true, false] {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let (srv, down) = l.remove(0);
+        rt.block_on(async { srv.lock().await.close().await });
+        drop(srv);
+        let (mut masks, mut evidence) = (StageMasks::default(), false);
+        let owed = crate::dist::OwedLateReply::default();
+        if owed_first {
+            owed.owe_until(Instant::now() + Duration::from_secs(60));
+        }
+        let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        let e = r.unwrap_err();
+        assert!(!e.contains(UPGRADE_EVERY_STAGE), "{owed_first}: {e}");
+        assert!(!masks.latch.is_set(), "{owed_first}: no latch");
+        assert!(!evidence);
+    }
 }

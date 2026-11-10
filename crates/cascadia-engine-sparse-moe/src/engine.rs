@@ -1347,6 +1347,11 @@ async fn masked_forward_exchange(
     masks.outcome(reply).inspect_err(|_| link.clear())
 }
 
+/// A json task's error when the downstream link failed at its admission:
+/// a dead or out-of-step link, which says nothing about the stages' builds.
+const PROBE_LINK_FAILED: &str =
+    "structured output: the downstream pipeline link failed before the request started; retry it";
+
 /// Rank 0, a json task's admission on a multi-stage link: read a slow
 /// stage's late probe answer already on the idle link (it clears the
 /// latch), refuse while the latch holds, and probe a link without
@@ -1363,7 +1368,10 @@ pub(crate) async fn admit_json_task(
     owed: &crate::dist::OwedLateReply,
 ) -> Result<(), String> {
     if owed.is_owed() {
-        let _ = crate::dist::drain_idle_link(&mut *down.lock().await, owed).await;
+        let alive = crate::dist::drain_idle_link(&mut *down.lock().await, owed).await;
+        if !alive {
+            return Err(PROBE_LINK_FAILED.to_string());
+        }
         if owed.take_acked() && masks.latch.is_set() {
             info!("a late acknowledged answer to the mask-support probe arrived; json requests accepted again");
             masks.latch.clear();
@@ -1389,7 +1397,11 @@ pub(crate) async fn admit_json_task(
             *evidence = true;
             Ok(())
         }
-        Err(reason) => {
+        Err(crate::dist::ProbeFailure::Link(reason)) => {
+            warn!(%reason, "the downstream link failed the mask-support probe");
+            Err(format!("{PROBE_LINK_FAILED} ({reason})"))
+        }
+        Err(crate::dist::ProbeFailure::Unanswered(reason)) => {
             masks.latch.set_probe();
             // A slow but new stage may still answer: read that answer as a
             // late reply, not as a dead link.
@@ -7188,7 +7200,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 self.mask_evidence = true;
                 Ok(())
             }
-            Err(reason) => {
+            Err(crate::dist::ProbeFailure::Link(reason)) => {
+                warn!(%reason, "the downstream link failed the mask-support probe");
+                Err(format!("{PROBE_LINK_FAILED} ({reason})"))
+            }
+            Err(crate::dist::ProbeFailure::Unanswered(reason)) => {
                 self.stage_masks.latch.set_probe();
                 // A slow but new stage may still answer: read that answer
                 // as a late reply, not as a dead link.

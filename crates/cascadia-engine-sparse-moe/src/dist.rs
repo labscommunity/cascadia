@@ -3410,15 +3410,16 @@ impl MaskRecvLink {
 /// single-row `Forward` that carries no mask words. Every stage on this
 /// build acknowledges it without touching any state; a stage on an older
 /// build fails to decode it, survives (a failed `Forward` is not fatal on
-/// any older worker), and never answers. `Err` names why there was no
-/// acknowledgement; the socket is kept as on any masked step.
+/// any older worker), and never answers. `Err` says why there was no
+/// acknowledgement, telling a failed link apart; the socket is kept as on
+/// any masked step.
 pub async fn probe_mask_support(
     down: &Mutex<ActivationClient>,
     h: usize,
     deadline: std::time::Duration,
     tag: u32,
     latch: &MaskLatch,
-) -> Result<(), String> {
+) -> Result<(), ProbeFailure> {
     let mut cols = MaskCols::new(1, 0);
     cols.set(0, tag, &[]);
     send_forward_step(
@@ -3433,14 +3434,17 @@ pub async fn probe_mask_support(
         None,
     )
     .await
-    .map_err(|e| format!("send mask probe: {e}"))?;
+    .map_err(|e| ProbeFailure::Link(format!("send mask probe: {e}")))?;
     match wait_token_ack(down, deadline, tag, Some(latch)).await {
         AckWait::Acked(_, MASK_ACK) => Ok(()),
-        AckWait::Acked(_, MASK_UNCONFIRMED) => {
-            Err("a later stage did not acknowledge the mask".into())
-        }
-        AckWait::Acked(_, s) => Err(format!("unknown acknowledgement status 0x{s:08x}")),
-        AckWait::NoAck(reason) => Err(reason),
+        AckWait::Acked(_, MASK_UNCONFIRMED) => Err(ProbeFailure::Unanswered(
+            "a later stage did not acknowledge the mask".into(),
+        )),
+        AckWait::Acked(_, s) => Err(ProbeFailure::Unanswered(format!(
+            "unknown acknowledgement status 0x{s:08x}"
+        ))),
+        AckWait::NoAck(reason) => Err(ProbeFailure::Unanswered(reason)),
+        AckWait::LinkFailed(reason) => Err(ProbeFailure::Link(reason)),
     }
 }
 
@@ -3504,7 +3508,30 @@ pub enum MaskedReply {
 
 enum AckWait {
     Acked(i64, u32),
+    /// No acknowledged reply: silence within the deadline, or a reply
+    /// without the acknowledgement.
     NoAck(String),
+    /// The link closed, or the stream went out of step, before a reply.
+    LinkFailed(String),
+}
+
+/// Why a mask-support probe got no acknowledged answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// Silence, or an answer without the acknowledgement: a later stage is
+    /// likely on an older build.
+    Unanswered(String),
+    /// The link failed (closed, out of step, a send error): says nothing
+    /// about the stages' builds.
+    Link(String),
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unanswered(r) | Self::Link(r) => f.write_str(r),
+        }
+    }
 }
 
 /// Wait for the `TokenAck` tagged `tag`, dropping stale acknowledged replies
@@ -3524,7 +3551,7 @@ async fn wait_token_ack(
                 Ok(Some(FrameKind::TokenAck)) => {
                     let (token, got, status) = recv_token_ack_body_client(down)
                         .await
-                        .map_err(|e| (format!("recv_token_ack: {e}"), true))?;
+                        .map_err(|e| (format!("recv_token_ack: {e}"), true, true))?;
                     if got != tag {
                         note_stale_ack(latch, status, &[token]);
                         continue;
@@ -3534,29 +3561,39 @@ async fn wait_token_ack(
                 Ok(Some(FrameKind::StreamTokensAck)) => {
                     let (_, status, stale_rows) = recv_stream_tokens_ack_body_client(down)
                         .await
-                        .map_err(|e| (format!("recv_stream_tokens_ack: {e}"), true))?;
+                        .map_err(|e| (format!("recv_stream_tokens_ack: {e}"), true, true))?;
                     note_stale_ack(latch, status, &rows_tokens(&stale_rows));
                 }
                 Ok(Some(FrameKind::Token)) => {
                     recv_token_body_client(down)
                         .await
-                        .map_err(|e| (format!("recv_token: {e}"), true))?;
-                    return Err(("a reply without acknowledgement".to_string(), false));
+                        .map_err(|e| (format!("recv_token: {e}"), true, true))?;
+                    return Err(("a reply without acknowledgement".to_string(), false, false));
                 }
-                Ok(Some(other)) => return Err((format!("unexpected {other:?} reply"), true)),
-                Ok(None) => return Err(("downstream closed before the reply".to_string(), false)),
-                Err(e) => return Err((format!("recv_kind: {e}"), true)),
+                Ok(Some(other)) => return Err((format!("unexpected {other:?} reply"), true, true)),
+                Ok(None) => {
+                    return Err((
+                        "downstream closed before the reply".to_string(),
+                        false,
+                        true,
+                    ))
+                }
+                Err(e) => return Err((format!("recv_kind: {e}"), true, true)),
             }
         }
     })
     .await;
     match waited {
         Ok(Ok((token, status))) => AckWait::Acked(token, status),
-        Ok(Err((reason, out_of_step))) => {
+        Ok(Err((reason, out_of_step, link))) => {
             if out_of_step {
                 down.lock().await.close().await;
             }
-            AckWait::NoAck(reason)
+            if link {
+                AckWait::LinkFailed(reason)
+            } else {
+                AckWait::NoAck(reason)
+            }
         }
         Err(_) => AckWait::NoAck(format!("no reply within {deadline:?}")),
     }
@@ -3582,7 +3619,7 @@ pub async fn recv_token_reply_masked(
         AckWait::Acked(_, s) => {
             MaskedReply::Unconfirmed(format!("unknown acknowledgement status 0x{s:08x}"))
         }
-        AckWait::NoAck(reason) => MaskedReply::Unconfirmed(reason),
+        AckWait::NoAck(reason) | AckWait::LinkFailed(reason) => MaskedReply::Unconfirmed(reason),
     }
 }
 
@@ -3603,7 +3640,7 @@ pub async fn relay_masked_token_reply(
 ) -> Result<(), String> {
     let (token, status) = match wait_token_ack(down, deadline, tag, Some(late)).await {
         AckWait::Acked(token, status) => (token, status),
-        AckWait::NoAck(reason) => {
+        AckWait::NoAck(reason) | AckWait::LinkFailed(reason) => {
             tracing::warn!(%reason, "masked step not acknowledged downstream");
             (-1, MASK_UNCONFIRMED)
         }
@@ -4920,9 +4957,13 @@ mod mask_probe_tests {
         (srv, Arc::new(Mutex::new(cli)))
     }
 
-    /// Lets bytes just written on loopback reach the reader's socket.
-    async fn settle() {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    /// Waits (up to 5 s) until bytes written on loopback are readable on
+    /// `cli`'s socket.
+    async fn readable(cli: &Mutex<ActivationClient>) {
+        let c = cli.lock().await;
+        tokio::time::timeout(Duration::from_secs(5), c.wait_readable())
+            .await
+            .expect("bytes reach the socket");
     }
 
     /// A latch set by an unanswered probe refuses for a minute; one set by
@@ -4972,7 +5013,7 @@ mod mask_probe_tests {
         send_token_ack_upstream(&srv, MASK_MISS_TOKEN.into(), 3, MASK_ACK)
             .await
             .unwrap();
-        settle().await;
+        readable(&cli).await;
         assert!(drain_idle_link(&mut *cli.lock().await, &owed).await);
         assert!(!owed.take_acked(), "a late mask miss proves nothing");
 
@@ -4980,8 +5021,15 @@ mod mask_probe_tests {
             .await
             .unwrap();
         send_token_upstream(&srv, 9).await.unwrap();
-        settle().await;
+        readable(&cli).await;
         assert!(drain_idle_link(&mut *cli.lock().await, &owed).await);
+        // The plain late token, if it came after the drain's look.
+        if tokio::time::timeout(Duration::from_millis(50), cli.lock().await.wait_readable())
+            .await
+            .is_ok()
+        {
+            assert!(drain_idle_link(&mut *cli.lock().await, &owed).await);
+        }
         assert!(owed.take_acked(), "the late probe answer");
         assert!(!owed.take_acked(), "taken once");
 
@@ -4994,7 +5042,7 @@ mod mask_probe_tests {
         send_token_ack_upstream(&srv, -1, 5, MASK_ACK)
             .await
             .unwrap();
-        settle().await;
+        readable(&cli).await;
         assert!(!drain_idle_link(&mut *cli.lock().await, &idle).await);
 
         // An owed reply that has expired is no longer expected.
@@ -5004,14 +5052,33 @@ mod mask_probe_tests {
         send_token_ack_upstream(&srv, -1, 5, MASK_ACK)
             .await
             .unwrap();
-        settle().await;
+        readable(&cli).await;
         assert!(!drain_idle_link(&mut *cli.lock().await, &expired).await);
 
         // EOF while owed is still a dead link.
         let (srv, cli) = pair().await;
         owed.owe_until(std::time::Instant::now() + Duration::from_secs(60));
         srv.lock().await.close().await;
-        settle().await;
+        readable(&cli).await;
         assert!(!drain_idle_link(&mut *cli.lock().await, &owed).await);
+    }
+
+    /// A probe whose link closes before an answer is a link failure, not a
+    /// stage that can't mask; silence is.
+    #[tokio::test]
+    async fn a_closed_link_fails_the_probe_as_a_link_error() {
+        let latch = MaskLatch::default();
+        let (srv, cli) = pair().await;
+        let tail = tokio::spawn(async move {
+            recv_kind_server(&srv).await.unwrap();
+            let _ = recv_forward_step_body_server(&srv).await.unwrap();
+            srv.lock().await.close().await;
+        });
+        let got = probe_mask_support(&cli, 4, Duration::from_secs(5), 3, &latch).await;
+        tail.await.unwrap();
+        assert!(matches!(got, Err(ProbeFailure::Link(_))), "{got:?}");
+        let (_srv, cli) = pair().await;
+        let got = probe_mask_support(&cli, 4, Duration::from_millis(50), 4, &latch).await;
+        assert!(matches!(got, Err(ProbeFailure::Unanswered(_))), "{got:?}");
     }
 }
