@@ -5323,6 +5323,26 @@ mod tests {
         }
     }
 
+    /// A `$ref` to a whole map of named schemas reads that map as a schema:
+    /// a def named `properties` is then its `properties`, and a pair in an
+    /// entry of it is relaxed, though the walk had only passed the map.
+    #[test]
+    fn relax_follows_a_ref_to_a_schema_map() {
+        let (schema, dropped) = relaxed(json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs"}},
+            "$defs": {"properties": {"x": {"type": "string", "minLength": 5, "maxLength": 1}}}
+        }));
+        assert_eq!(
+            dropped,
+            ["minLength (5) is greater than maxLength (1) at #/$defs/properties/x; no value can satisfy both"]
+        );
+        assert_eq!(
+            schema["$defs"]["properties"]["x"],
+            json!({"type": "string"})
+        );
+    }
+
     /// The paths [`relax_in_place`] relaxed an object at while relaxing
     /// `schema`, in order.
     fn relax_visits(schema: &mut Value) -> Vec<Vec<String>> {
