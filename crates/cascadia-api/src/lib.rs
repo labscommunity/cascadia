@@ -2952,12 +2952,20 @@ async fn chat_completions(
         .into_response();
     }
 
-    // Non-streaming: collect full output. Hold the permit + in-flight guard
-    // until the task completes; drop frees the slot.
-    let _permit = permit;
-    let _inflight = inflight;
-    let mut chunk_stream = match generate_in_window(&state, task.clone()).await {
-        Ok(s) => s,
+    // Non-streaming: collect full output. The engine stream, with the permit
+    // + in-flight guard, runs on a forwarder task, so a client that goes away
+    // drops this handler (and interrupts a running step) even while a step
+    // blocks; `close` frees the slot before the answer is built.
+    let mut chunks = match generate_in_window(&state, task.clone()).await {
+        Ok(s) => spawn_engine_forwarder(
+            task_id.clone(),
+            state.runner.clone(),
+            StreamWithPermit {
+                inner: s,
+                _permit: permit,
+                _inflight: inflight,
+            },
+        ),
         Err(err) => return engine_error_response(err),
     };
     let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
@@ -2970,7 +2978,8 @@ async fn chat_completions(
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
     let stops = req.sampling_params(&state.generation_defaults).stop;
     let mut stop = StopMatcher::new(&stops);
-    while let Some(chunk) = chunk_stream.next().await {
+    let mut early = None;
+    while let Some(chunk) = chunks.recv().await {
         // A failed task carries `error` on its final chunk. Without this
         // branch the empty text below would build a normal 200 with empty
         // content — indistinguishable from "the model said nothing". Fail
@@ -2978,6 +2987,7 @@ async fn chat_completions(
         // handshake/manifest mismatch).
         if let Some(reason) = &chunk.error {
             warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
+            chunks.close(None).await;
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "error": reason })),
@@ -3015,11 +3025,11 @@ async fn chat_completions(
         // cancels the engine task; usage counts the tokens received so far.
         if stop.stopped() {
             finish_reason = "stop";
-            chunk_stream.finish_early(cascadia_types::FinishReason::Stop);
+            early = Some(cascadia_types::FinishReason::Stop);
             break;
         }
     }
-    drop(chunk_stream);
+    chunks.close(early).await;
     buf.push_str(&stop.finish());
     state
         .stats
@@ -3194,10 +3204,17 @@ async fn completions(
         .into_response();
     }
 
-    let _permit = permit;
-    let _inflight = inflight;
-    let mut chunk_stream = match generate_in_window(&state, task).await {
-        Ok(s) => s,
+    // On a forwarder task, as the chat path (see there).
+    let mut chunks = match generate_in_window(&state, task).await {
+        Ok(s) => spawn_engine_forwarder(
+            task_id.clone(),
+            state.runner.clone(),
+            StreamWithPermit {
+                inner: s,
+                _permit: permit,
+                _inflight: inflight,
+            },
+        ),
         Err(err) => return engine_error_response(err),
     };
     let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
@@ -3208,9 +3225,11 @@ async fn completions(
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
     let stops = req.sampling_params(&state.generation_defaults).stop;
     let mut stop = StopMatcher::new(&stops);
-    while let Some(chunk) = chunk_stream.next().await {
+    let mut early = None;
+    while let Some(chunk) = chunks.recv().await {
         if let Some(reason) = &chunk.error {
             warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
+            chunks.close(None).await;
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "error": reason })),
@@ -3246,11 +3265,11 @@ async fn completions(
         // cancels the engine task; usage counts the tokens received so far.
         if stop.stopped() {
             finish_reason = "stop";
-            chunk_stream.finish_early(cascadia_types::FinishReason::Stop);
+            early = Some(cascadia_types::FinishReason::Stop);
             break;
         }
     }
-    drop(chunk_stream);
+    chunks.close(early).await;
     buf.push_str(&stop.finish());
     state
         .stats
@@ -3327,6 +3346,7 @@ async fn stream_text_completion(
     let text_stream = TextStream {
         chunks: Some(spawn_engine_forwarder(
             task_id.clone(),
+            state.runner.clone(),
             StreamWithPermit {
                 inner: chunk_stream,
                 _permit: permit,
@@ -3388,6 +3408,7 @@ async fn stream_completion(
     // disconnect or a stop match).
     let chunks = Some(spawn_engine_forwarder(
         task_id.clone(),
+        state.runner.clone(),
         StreamWithPermit {
             inner: chunk_stream,
             _permit: permit,
@@ -3808,24 +3829,57 @@ impl KeepAlive {
 }
 
 /// The receiving end of an engine stream run by [`spawn_engine_forwarder`].
-/// Dropping it ends the engine stream as a client cancel;
+/// Dropping it ends the engine stream as a client cancel, and also
+/// interrupts a step already running for the task (see [`Runner::interrupt`]);
 /// [`EngineChunks::finish_early`] ends it with a reason instead.
 struct EngineChunks {
     rx: tokio::sync::mpsc::Receiver<cascadia_types::Chunk>,
     /// Set before `rx` drops when the body ended the answer itself; the
     /// forwarder reads it once the channel closes.
     early: Arc<std::sync::OnceLock<cascadia_types::FinishReason>>,
+    runner: Arc<Runner>,
+    task_id: cascadia_types::TaskId,
+    /// A final chunk arrived, or the forwarder ended: nothing to interrupt.
+    ended: bool,
+    forwarder: tokio::task::JoinHandle<()>,
 }
 
 impl EngineChunks {
     async fn recv(&mut self) -> Option<cascadia_types::Chunk> {
-        self.rx.recv().await
+        let chunk = self.rx.recv().await;
+        if chunk.as_ref().is_none_or(|c| c.is_final) {
+            self.ended = true;
+        }
+        chunk
     }
 
     /// The body has the whole answer (a stop match): the forwarder ends the
     /// engine stream with `reason` rather than as a client cancel.
     fn finish_early(self, reason: cascadia_types::FinishReason) {
         let _ = self.early.set(reason);
+    }
+
+    /// Ends the engine stream, with `reason` when the answer ended early
+    /// (as [`EngineChunks::finish_early`]), and waits for the forwarder to
+    /// release it: the task's permit and in-flight guard are back once this
+    /// returns. For the non-streaming handlers, which answer only after it.
+    async fn close(mut self, reason: Option<cascadia_types::FinishReason>) {
+        if let Some(reason) = reason {
+            let _ = self.early.set(reason);
+        }
+        self.rx.close();
+        let _ = (&mut self.forwarder).await;
+    }
+}
+
+impl Drop for EngineChunks {
+    /// A body or handler dropped before the answer ended (a client
+    /// disconnect): the forwarder, blocked inside the task's step, can't drop
+    /// its stream until the step returns, so ask the engine to end the step.
+    fn drop(&mut self) {
+        if !self.ended && self.early.get().is_none() {
+            self.runner.interrupt(&self.task_id);
+        }
     }
 }
 
@@ -3840,13 +3894,16 @@ const FORWARD_BUFFER: usize = 1;
 /// task's worker, and the SSE body, reading the channel on another worker,
 /// still sends keep-alive comments.
 ///
-/// Disconnect and cancel are unchanged: dropping the receiver (the body
-/// dropped on a client disconnect) ends the forwarder at its next poll,
-/// which drops the engine stream — that cancels the task and releases the
-/// permit and in-flight guard, as dropping the body did. A receiver ended
-/// with [`EngineChunks::finish_early`] (a stop match) finishes the engine
-/// stream with that reason instead, which cancels and releases the same
-/// way. A step already running cannot be interrupted either way.
+/// Dropping the receiver (the body or the non-streaming handler, dropped on
+/// a client disconnect) ends the forwarder at its next poll, which drops the
+/// engine stream — that cancels the task and releases the permit and
+/// in-flight guard. A step already running is interrupted too: the drop
+/// signals the engine's in-flight handle ([`Runner::interrupt`]), so an
+/// engine that polls it ends the step early with a `Cancelled` final; one
+/// that doesn't runs the step out first. A receiver ended with
+/// [`EngineChunks::finish_early`] (a stop match) finishes the engine stream
+/// with that reason instead, which cancels and releases the same way, and
+/// interrupts nothing.
 ///
 /// A panic inside `step()` is caught here and forwarded as an error chunk,
 /// so the client sees an SSE error event rather than a clean `[DONE]` after
@@ -3854,13 +3911,16 @@ const FORWARD_BUFFER: usize = 1;
 /// guard) as on every other exit.
 fn spawn_engine_forwarder(
     task_id: cascadia_types::TaskId,
+    runner: Arc<Runner>,
     mut chunks: StreamWithPermit,
 ) -> EngineChunks {
     use futures::FutureExt;
     let (tx, rx) = tokio::sync::mpsc::channel(FORWARD_BUFFER);
     let early = Arc::new(std::sync::OnceLock::new());
     let finished = early.clone();
-    tokio::spawn(async move {
+    let forwarded_id = task_id.clone();
+    let forwarder = tokio::spawn(async move {
+        let task_id = forwarded_id;
         loop {
             tokio::select! {
                 biased;
@@ -3900,7 +3960,14 @@ fn spawn_engine_forwarder(
             None => drop(chunks),
         }
     });
-    EngineChunks { rx, early }
+    EngineChunks {
+        rx,
+        early,
+        runner,
+        task_id,
+        ended: false,
+        forwarder,
+    }
 }
 
 /// The OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
@@ -9490,6 +9557,12 @@ level={{ effort_map[eff] }}";
         gate: Option<Arc<std::sync::atomic::AtomicBool>>,
         log: Arc<ScriptLog>,
         pending: Option<(cascadia_types::TaskId, usize)>,
+        /// One-shot mode: each task is one step of up to `max_tokens`
+        /// `step_delay` slices, polling this handle between slices; a
+        /// cancelled task ends at once with an empty `Cancelled` final.
+        inflight: Option<Arc<cascadia_engine::InflightCancel>>,
+        /// The pending task's slice count (its `max_tokens`).
+        slices: u32,
     }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -9509,6 +9582,11 @@ level={{ effort_map[eff] }}";
         emitted: std::sync::atomic::AtomicUsize,
         /// The router's counters.
         stats: Arc<ApiStats>,
+        /// One-shot mode: when each task's step started.
+        step_starts: std::sync::Mutex<Vec<std::time::Instant>>,
+        /// One-shot mode: when each task's step ended, and whether it ended
+        /// on a cancel.
+        step_ends: std::sync::Mutex<Vec<(std::time::Instant, bool)>>,
     }
 
     impl cascadia_engine::Engine for ScriptEngine {
@@ -9518,15 +9596,25 @@ level={{ effort_map[eff] }}";
             if self.pending.as_ref().is_some_and(|(id, _)| id == task_id) {
                 self.pending = None;
             }
+            if let Some(handle) = &self.inflight {
+                handle.forget(task_id);
+            }
         }
         fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.slices = task.max_tokens;
             self.pending = Some((task.task_id, 0));
             Ok(())
+        }
+        fn inflight_cancel(&self) -> Option<Arc<cascadia_engine::InflightCancel>> {
+            self.inflight.clone()
         }
         fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
             let Some((id, i)) = self.pending.take() else {
                 return Ok(Vec::new());
             };
+            if let Some(handle) = self.inflight.clone() {
+                return Ok(vec![self.one_shot_step(&handle, id)]);
+            }
             if !self.step_delay.is_zero() {
                 std::thread::sleep(self.step_delay);
             }
@@ -9559,6 +9647,43 @@ level={{ effort_map[eff] }}";
                 ScriptEnd::Panic => panic!("script engine panic"),
             };
             Ok(vec![(id, last)])
+        }
+    }
+
+    impl ScriptEngine {
+        /// The whole task in one step, as a one-shot engine runs it.
+        fn one_shot_step(
+            &mut self,
+            handle: &cascadia_engine::InflightCancel,
+            id: cascadia_types::TaskId,
+        ) -> (cascadia_types::TaskId, Chunk) {
+            let mut cancelled = handle.begin(&id);
+            self.log
+                .step_starts
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
+            let mut slice = 0;
+            while !cancelled && slice < self.slices {
+                std::thread::sleep(self.step_delay);
+                slice += 1;
+                cancelled = handle.cancelled();
+            }
+            handle.end();
+            self.log
+                .step_ends
+                .lock()
+                .unwrap()
+                .push((std::time::Instant::now(), cancelled));
+            let last = if cancelled {
+                Chunk::final_marker(&id, "")
+                    .with_finish_reason(cascadia_types::FinishReason::Cancelled)
+            } else {
+                Chunk::final_marker(&id, self.final_text.clone())
+                    .with_finish_reason(cascadia_types::FinishReason::Length)
+                    .with_prompt_tokens(5)
+            };
+            (id, last)
         }
     }
 
@@ -9628,6 +9753,8 @@ level={{ effort_map[eff] }}";
         window: Option<u32>,
         /// The runner's model label on the generation metrics.
         metrics_model: &'static str,
+        /// One-shot mode (see [`ScriptEngine::inflight`]).
+        inflight: bool,
     }
 
     impl Default for ScriptOpts<'_> {
@@ -9642,6 +9769,7 @@ level={{ effort_map[eff] }}";
                 max_concurrent: DEFAULT_MAX_CONCURRENT,
                 window: None,
                 metrics_model: "mock-model",
+                inflight: false,
             }
         }
     }
@@ -9660,6 +9788,7 @@ level={{ effort_map[eff] }}";
             max_concurrent,
             window,
             metrics_model,
+            inflight,
         } = opts;
         let log = Arc::new(ScriptLog::default());
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -9672,6 +9801,8 @@ level={{ effort_map[eff] }}";
             gate: gated.then(|| gate.clone()),
             log: log.clone(),
             pending: None,
+            inflight: inflight.then(|| Arc::new(cascadia_engine::InflightCancel::new())),
+            slices: 0,
         }))));
         runner
             .start(
@@ -11312,5 +11443,159 @@ level={{ effort_map[eff] }}";
                 .get(),
             1
         );
+    }
+
+    // --- A client disconnect ends a running one-shot step ------------------
+
+    /// One poll slice of the one-shot [`ScriptEngine`].
+    const SLICE: Duration = Duration::from_millis(25);
+
+    /// Serves `app` on a local port, as the node does.
+    async fn serve_local(app: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// Opens a raw TCP connection and sends `payload` as a POST to `uri`.
+    async fn raw_post(
+        addr: std::net::SocketAddr,
+        uri: &str,
+        payload: &serde_json::Value,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = payload.to_string();
+        let head = format!(
+            "POST {uri} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+             connection: close\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(body.as_bytes()).await.unwrap();
+        sock
+    }
+
+    /// Waits up to `limit` for `log` to hold `n` entries; returns the `n`th.
+    async fn wait_for<T: Clone>(
+        log: &std::sync::Mutex<Vec<T>>,
+        n: usize,
+        limit: Duration,
+    ) -> Option<T> {
+        let until = std::time::Instant::now() + limit;
+        loop {
+            if let Some(v) = log.lock().unwrap().get(n - 1) {
+                return Some(v.clone());
+            }
+            if std::time::Instant::now() >= until {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// A client that closes its socket while a one-shot step runs ends that
+    /// step within a few slices (not the whole generation), books exactly one
+    /// cancel, and the next request's step starts right after.
+    async fn disconnect_ends_the_running_step(uri: &str, stream: bool, model: &'static str) {
+        let (app, log, _) = script_app_opts(
+            &[],
+            ScriptOpts {
+                final_text: "done",
+                step_delay: SLICE,
+                inflight: true,
+                metrics_model: model,
+                ..ScriptOpts::default()
+            },
+        )
+        .await;
+        let addr = serve_local(app).await;
+        let payload = |max_tokens: u32| {
+            let mut v = if uri == "/v1/completions" {
+                serde_json::json!({"model": "mock-model", "prompt": "hi"})
+            } else {
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}]})
+            };
+            v["stream"] = serde_json::json!(stream);
+            v["max_tokens"] = serde_json::json!(max_tokens);
+            v
+        };
+        // 400 slices: 10 s, if nothing ends the step.
+        let sock = raw_post(addr, uri, &payload(400)).await;
+        wait_for(&log.step_starts, 1, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|| panic!("{model}: the step never started"));
+        tokio::time::sleep(SLICE * 2).await;
+        let closed = std::time::Instant::now();
+        drop(sock);
+        let (ended, cancelled) = wait_for(&log.step_ends, 1, Duration::from_secs(15))
+            .await
+            .unwrap_or_else(|| panic!("{model}: the step never ended"));
+        let took = ended.saturating_duration_since(closed);
+        assert!(cancelled, "{model}: the step ran to its end ({took:?})");
+        assert!(
+            took < SLICE * 6,
+            "{model}: the step ended {took:?} after the disconnect"
+        );
+        // Exactly one cancel, from the engine's `Cancelled` final or the drop.
+        assert_eq!(outcome_samples(model, "cancelled", 1).await, 1, "{model}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[model])
+                .get(),
+            1,
+            "{model}"
+        );
+        // The next request is served at once.
+        let sent = std::time::Instant::now();
+        let mut next = raw_post(addr, uri, &payload(2)).await;
+        let mut reply = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read_to_end(&mut next, &mut reply),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{model}: no reply to the next request"))
+        .unwrap();
+        let started = wait_for(&log.step_starts, 2, Duration::from_secs(1))
+            .await
+            .unwrap_or_else(|| panic!("{model}: the next step never started"));
+        let wait = started.saturating_duration_since(sent);
+        assert!(
+            wait < SLICE * 6,
+            "{model}: the next step started {wait:?} after its request"
+        );
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 200"), "{model}: {reply}");
+        assert!(reply.contains("done"), "{model}: {reply}");
+        assert_eq!(
+            log.step_ends.lock().unwrap().get(1).map(|e| e.1),
+            Some(false),
+            "{model}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_ends_the_running_step_streamed_chat() {
+        disconnect_ends_the_running_step("/v1/chat/completions", true, "api-inflight-sse-chat")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_ends_the_running_step_streamed_completions() {
+        disconnect_ends_the_running_step("/v1/completions", true, "api-inflight-sse-cmpl").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_ends_the_running_step_non_streamed_chat() {
+        disconnect_ends_the_running_step("/v1/chat/completions", false, "api-inflight-chat").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_ends_the_running_step_non_streamed_completions() {
+        disconnect_ends_the_running_step("/v1/completions", false, "api-inflight-cmpl").await;
     }
 }
