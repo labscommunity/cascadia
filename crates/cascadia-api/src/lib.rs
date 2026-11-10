@@ -808,7 +808,7 @@ async fn gate_media_body(
             None,
         );
         resp.extensions_mut().insert(PreEngineFailure);
-        return resp;
+        return errors::with_retry_after(resp, errors::RETRY_AFTER_SECS);
     };
     let (parts, body) = req.into_parts();
     let read = async {
@@ -2675,10 +2675,8 @@ fn media_error_response(err: MediaError) -> Response {
         MediaError::Busy(msg) => {
             count_rejected("capacity");
             let mut resp = api_error(StatusCode::SERVICE_UNAVAILABLE, msg, None);
-            resp.headers_mut()
-                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
             resp.extensions_mut().insert(PreEngineFailure);
-            resp
+            errors::with_retry_after(resp, errors::RETRY_AFTER_SECS)
         }
         MediaError::Internal(msg) => {
             let mut resp = api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, None);
@@ -4079,10 +4077,13 @@ async fn admit_chat(
             Ok(p) => Some(p),
             Err(_) => {
                 count_rejected("capacity");
-                return Err(api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "engine at capacity; retry after current requests complete",
-                    None,
+                return Err(errors::with_retry_after(
+                    api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "engine at capacity; retry after current requests complete",
+                        None,
+                    ),
+                    errors::RETRY_AFTER_SECS,
                 ));
             }
         }
@@ -4280,10 +4281,13 @@ async fn admit_chat(
             Ok(p) => p,
             Err(_) => {
                 count_rejected("capacity");
-                return Err(api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "engine at capacity; retry after current requests complete",
-                    None,
+                return Err(errors::with_retry_after(
+                    api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "engine at capacity; retry after current requests complete",
+                        None,
+                    ),
+                    errors::RETRY_AFTER_SECS,
                 ));
             }
         },
@@ -4584,10 +4588,13 @@ async fn completions(
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "engine at capacity; retry after current requests complete",
-                None,
+            return errors::with_retry_after(
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "engine at capacity; retry after current requests complete",
+                    None,
+                ),
+                errors::RETRY_AFTER_SECS,
             );
         }
     };
@@ -5335,7 +5342,12 @@ fn engine_error_response(
             Some("context_length_exceeded"),
         );
     }
-    api_error(status, err.to_string(), None)
+    // The 503s here (queue full, engine not loaded or not connected) are all
+    // "come back shortly"; `with_retry_after` leaves every other status bare.
+    errors::with_retry_after(
+        api_error(status, err.to_string(), None),
+        errors::RETRY_AFTER_SECS,
+    )
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -5404,6 +5416,32 @@ mod tests {
             "messages",
         );
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An engine that is not up yet is a "come back later" 503 like a full
+    /// queue, so it carries `Retry-After`; a 500 or a 400 does not.
+    #[test]
+    fn engine_not_loaded_503_carries_retry_after() {
+        use cascadia_engine::EngineError;
+        for err in [EngineError::NotLoaded, EngineError::NotConnected] {
+            let r = engine_error_response(err, "messages");
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(r.headers()[header::RETRY_AFTER], "1");
+        }
+        for (err, status) in [
+            (
+                EngineError::Backend("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                EngineError::PromptTooLong("x".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let r = engine_error_response(err, "messages");
+            assert_eq!(r.status(), status);
+            assert!(r.headers().get(header::RETRY_AFTER).is_none(), "{status}");
+        }
     }
 
     /// Over-window is OpenAI's `context_length_exceeded`, with `param`
@@ -7378,6 +7416,72 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
     }
 
+    /// Every capacity refusal tells the client when to come back: the
+    /// in-flight gates on chat, completions and responses, and the image
+    /// gate, all answer 503 with `Retry-After: 1`.
+    #[tokio::test]
+    async fn capacity_gate_503_carries_retry_after() {
+        let app = |media: bool| async move {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                media: media.then(|| MediaConfig::ov_genai(None)),
+                max_concurrent_requests: 0,
+                ..Config::default()
+            };
+            make_router_with_config(Arc::new(runner), "mock-model", cfg)
+        };
+        let text = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}]});
+        let image = serde_json::json!({"model": "mock-model",
+            "messages": [image_msg("x", "data:image/png;base64,aGVsbG8=")]});
+        let cases = [
+            (false, "/v1/chat/completions", text.clone()),
+            (
+                false,
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "hi"}),
+            ),
+            (
+                false,
+                "/v1/responses",
+                serde_json::json!({"model": "mock-model", "input": "hi"}),
+            ),
+            (true, "/v1/chat/completions", image),
+            (true, "/v1/chat/completions", text),
+        ];
+        for (media, uri, payload) in cases {
+            let resp = app(media)
+                .await
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri} media={media}"
+            );
+            assert_eq!(
+                resp.headers()[header::RETRY_AFTER],
+                "1",
+                "{uri} media={media}"
+            );
+        }
+    }
+
     /// On a server that takes images, the request past the in-flight cap
     /// on a media route is refused before its body is read: a slow upload
     /// holding the only slot leaves the next one a 503 whose body was never
@@ -7447,7 +7551,21 @@ mod tests {
             .expect("refused without reading its body")
             .unwrap();
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(resp.headers()[header::RETRY_AFTER], "1", "{uri}");
             assert!(!second_read.load(Ordering::SeqCst), "{uri}: body was read");
+            // A capacity refusal says nothing about the pipeline: `/health`
+            // stays ready after it.
+            let health = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK, "{uri}");
             let body = to_bytes(resp.into_body(), 4096).await.unwrap();
             let v: Value = serde_json::from_slice(&body).unwrap();
             assert!(v["error"]["message"]
@@ -10743,15 +10861,25 @@ level={{ effort_map[eff] }}";
             .await
             .unwrap();
         let app = make_router(Arc::new(runner), "queuefull-model");
-        let (status, _) = post_chat(
-            app,
-            serde_json::json!({
-                "model": "queuefull-model",
-                "messages": [{"role": "user", "content": "hi"}],
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "queuefull-model",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
         let capacity_after = cascadia_metrics::API_REJECTED_TOTAL
             .with_label_values(&["capacity"])
             .get();
