@@ -473,13 +473,25 @@ fn tool_marker_keep_list(model_dir: &Path) -> Vec<(u32, String)> {
         );
         return Vec::new();
     }
-    match tokenizers::Tokenizer::from_file(&path) {
-        Ok(tok) => tool_marker_ids(&tok),
+    match read_keep_list(&path) {
+        Ok(keep) => keep,
         Err(e) => {
             warn!(path = %path.display(), error = %e, "tokenizer.json unreadable; tool-call markers are not kept");
             Vec::new()
         }
     }
+}
+
+/// [`tool_marker_keep_list`] from the file at `path`. A vocabulary whose
+/// bytes lack the call-open marker has none to keep, so it is not parsed:
+/// a load builds no tokenizer for a model that isn't Gemma 4.
+fn read_keep_list(path: &Path) -> Result<Vec<(u32, String)>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if !crate::decode_keep::mentions_tool_markers(&bytes) {
+        return Ok(Vec::new());
+    }
+    let tok = tokenizers::Tokenizer::from_bytes(&bytes).map_err(|e| e.to_string())?;
+    Ok(tool_marker_ids(&tok))
 }
 
 /// A pipeline that can be told which token ids to keep as text when decoding.
@@ -5828,6 +5840,23 @@ mod tests {
                 (6, "<|\"|>".to_string()),
             ]
         );
+    }
+
+    /// The tokenizer is parsed only when its bytes hold the call-open
+    /// marker: a file without it gives an empty list unparsed (here, not
+    /// even JSON), one with it is parsed (and its errors are reported).
+    #[test]
+    fn keep_list_parses_the_tokenizer_only_when_it_has_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, "not json, no marker").unwrap();
+        assert_eq!(read_keep_list(&path), Ok(Vec::new()));
+        std::fs::write(&path, "not json, but <|tool_call>").unwrap();
+        assert!(read_keep_list(&path).is_err());
+        crate::decode_keep::tests::marker_tokenizer()
+            .save(&path, false)
+            .unwrap();
+        assert_eq!(read_keep_list(&path).map(|k| k.len()), Ok(3));
     }
 
     #[test]
