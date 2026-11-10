@@ -591,6 +591,11 @@ pub fn argmax_allowed(row: &[f32], words: &[u32]) -> Option<usize> {
 #[cfg(test)]
 mod tests;
 
+mod llama_cost;
+pub use llama_cost::{
+    llama_grammar_cost, llama_grammar_cost_error, LLAMA_VISIT_COST, MAX_LLAMA_GRAMMAR_COST,
+};
+
 mod stage_mask;
 pub use stage_mask::{
     MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN,

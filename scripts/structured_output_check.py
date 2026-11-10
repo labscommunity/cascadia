@@ -391,6 +391,25 @@ def case_unsatisfiable_bounds(base):
     status, raw, dt = post(base, chat([{"role": "user", "content": "Say hello."}], max_tokens=8))
     verdict("server_alive_after_unsatisfiable_bounds", status == 200, f"HTTP {status} {dt:.2f}s")
 
+def case_optional_properties(base):
+    # 6000 optional properties (65 KB, inside the size cap): llama-server's grammar converter takes
+    # time cubic in an object's optional properties (minutes here). The server must answer fast,
+    # and stay up.
+    schema = {"type": "object", "properties": {f"p{i}": {} for i in range(6000)}}
+    body = chat([{"role": "user", "content": "hi"}], response_format=rf_schema(schema), max_tokens=8)
+    def timed(b):
+        t0 = time.time()
+        try:
+            return post(base, b, timeout=60)
+        except OSError as e:  # a timeout: the converter is still running
+            return 0, f"no answer: {e}", time.time() - t0
+    status, raw, dt = timed(body)
+    a_status, _, a_dt = timed(chat([{"role": "user", "content": "Say hello."}], max_tokens=8))
+    ok = status in (200, 400) and dt < 15 and a_status == 200
+    verdict("optional_properties_compile_fast", ok,
+            f"HTTP {status} {dt:.2f}s {raw[:200]}; then plain HTTP {a_status} {a_dt:.2f}s")
+
+
 def case_text(base):
     body = chat(
         [{"role": "user", "content": "Say hello."}],
@@ -466,6 +485,7 @@ CASES = {
     "cap": case_cap,
     "ref_depth": case_ref_depth,
     "unsatisfiable_bounds": case_unsatisfiable_bounds,
+    "optional_properties": case_optional_properties,
     "text": case_text,
     "tools": case_tools,
 }

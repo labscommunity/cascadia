@@ -1497,12 +1497,19 @@ fn child_error_message(body: &[u8]) -> String {
         .collect()
 }
 
-/// Refuse a grammar body that is not JSON: it is spliced into the request
-/// text as is (see [`with_response_format`]).
+/// Refuse a grammar body that is not JSON (it is spliced into the request
+/// text as is, see [`with_response_format`]), or that llama-server would
+/// take too long to build a grammar from: its converter has no time limit
+/// and runs inside the request (see [`cascadia_grammar::llama_grammar_cost`]).
 fn check_grammar_body(body: &str) -> EngineResult<()> {
-    serde_json::from_str::<serde_json::Value>(body)
-        .map(|_| ())
-        .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))
+    let schema = serde_json::from_str::<serde_json::Value>(body)
+        .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))?;
+    match cascadia_grammar::llama_grammar_cost_error(&schema) {
+        Some(e) => Err(EngineError::InvalidConfig(format!(
+            "response_format json_schema: {e}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// `schema` without the `pattern`s and `patternProperties` keys the regex
@@ -3066,6 +3073,29 @@ mod unix_tests {
         match engine.submit(task) {
             Err(EngineError::InvalidConfig(m)) => {
                 assert!(m.starts_with("response_format json_schema: "), "{m}")
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_schema_too_costly_for_llama_server_is_refused_at_submit() {
+        let props: serde_json::Map<String, serde_json::Value> = (0..600)
+            .map(|i| (format!("p{i}"), serde_json::json!({})))
+            .collect();
+        let body = serde_json::json!({"type": "object", "properties": props}).to_string();
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body,
+        });
+        let mut engine = test_engine(1);
+        match engine.submit(task) {
+            Err(EngineError::InvalidConfig(m)) => {
+                assert!(
+                    m.starts_with("response_format json_schema: llama-server would take too long"),
+                    "{m}"
+                );
+                assert!(m.contains("600 at #"), "{m}");
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
