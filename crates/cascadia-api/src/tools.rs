@@ -706,7 +706,16 @@ fn tool_schema(
                     );
                     return Err(UnenforcedReason::SchemaRejected);
                 }
-                hoisted.take(p.clone(), &format!("t{i}_"))?
+                // A call's `parameters` is an object: say so in the
+                // grammar's copy of a schema that names no type (the
+                // prompt shows the tool as sent).
+                let mut p = p.clone();
+                if let Value::Object(schema) = &mut p {
+                    schema
+                        .entry("type")
+                        .or_insert_with(|| Value::String("object".into()));
+                }
+                hoisted.take(p, &format!("t{i}_"))?
             }
         };
         items.push(json!({
@@ -898,8 +907,10 @@ fn walk_schemas(
 /// the call grammar produces: the whole text (inside at most one ```` ``` ````
 /// or ```` ```json ```` fence) a non-empty JSON array whose every item is an
 /// object with exactly the keys `name`, one of the effective tools, and
-/// `parameters`, an object, which become the call's arguments. Anything else is `None`,
-/// left for the model's own tool-call dialect.
+/// `parameters`, which become the call's arguments. Anything else is `None`,
+/// left for the model's own tool-call dialect. An item whose `parameters` is
+/// not an object (a string, `null`, an array) is malformed and makes no
+/// call; it is not handed to the dialect parser, so `Some` may be empty.
 pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<ToolCall>> {
     let text = text.trim();
     let text = text
@@ -918,28 +929,27 @@ pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<T
         .iter()
         .filter_map(|t| t.function.get("name").and_then(Value::as_str))
         .collect();
-    items
-        .iter()
-        .map(|item| {
-            let obj = item.as_object().filter(|o| o.len() == 2)?;
-            let name = obj
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|n| names.contains(n))?;
-            // Anything but an object (a string of JSON, say) is left to the
-            // dialect parser, which reads it as today.
-            let parameters = obj.get("parameters").filter(|p| p.is_object())?;
-            let arguments = serde_json::to_string(parameters).ok()?;
-            Some(ToolCall {
-                id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-                r#type: "function".into(),
-                function: FunctionCall {
-                    name: name.to_owned(),
-                    arguments,
-                },
-            })
-        })
-        .collect()
+    let mut calls = Vec::new();
+    for item in &items {
+        let obj = item.as_object().filter(|o| o.len() == 2)?;
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| names.contains(n))?;
+        let parameters = obj.get("parameters")?;
+        if !parameters.is_object() {
+            continue;
+        }
+        calls.push(ToolCall {
+            id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: name.to_owned(),
+                arguments: serde_json::to_string(parameters).ok()?,
+            },
+        });
+    }
+    Some(calls)
 }
 
 /// The tool calls in an answer, read the way the turn was constrained.
@@ -947,7 +957,8 @@ pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<T
 /// When a tool grammar was sent (`grammar_sent`), the call array it
 /// produces is read first ([`calls_from_forced_output`]); the engine may
 /// have dropped the grammar, so the model's own tool-call dialect is read
-/// next. Without a grammar the answer is read by the dialect parser alone,
+/// next, unless the answer was the call array (with no valid call in it).
+/// Without a grammar the answer is read by the dialect parser alone,
 /// as before tool grammars existed. Under a union grammar
 /// (`union_sent`: a call or the client's JSON) only marked calls count
 /// ([`crate::parse_tool_calls_marked`]): a bare JSON object with `name` and
@@ -1686,9 +1697,10 @@ mod tests {
             json!({"t0_List": {"type": "array", "items": {"$ref": "#/$defs/t0_Item"},
                 "default": [{"$ref": "#/$defs/Item"}]}, "t0_Item": {"type": "string"}})
         );
+        // A call's parameters are an object whatever the schema's root says.
         assert_eq!(
             b["items"]["anyOf"][0]["properties"]["parameters"],
-            json!({"$ref": "#/$defs/t0_List"})
+            json!({"$ref": "#/$defs/t0_List", "type": "object"})
         );
     }
 
@@ -2090,26 +2102,64 @@ mod tests {
     }
 
     #[test]
-    fn non_object_parameters_are_left_to_the_dialect_parser() {
-        let p = pol(json!([weather()]), Some(json!("required")), None);
+    fn non_object_parameters_make_no_call() {
+        let p = pol(
+            json!([with_params("f", json!({}))]),
+            Some(json!("required")),
+            None,
+        );
         for params in [
+            json!("hello"),
             json!("{\"city\":\"Paris\"}"),
             Value::Null,
             json!(3),
             json!([1]),
         ] {
-            let text = json!([{"name": "get_weather", "parameters": params}]).to_string();
-            assert!(calls_from_forced_output(&text, &p).is_none(), "{text}");
+            let text = json!([{"name": "f", "parameters": params}]).to_string();
+            let forced = calls_from_forced_output(&text, &p);
+            assert!(forced.is_some_and(|c| c.is_empty()), "{text}");
+            // Not handed to the dialect parser either, which would make
+            // `arguments` of the non-object value.
+            assert_eq!(resolve_calls(&text, &p, true, false), None, "{text}");
         }
-        // Read forced-shape first, then by dialect: a string `parameters`
-        // comes out once-encoded.
-        let text = r#"[{"name":"get_weather","parameters":"{\"city\":\"Paris\"}"}]"#;
-        let calls = calls_from_forced_output(text, &p)
-            .or_else(|| crate::parse_tool_calls(text))
-            .expect("the dialect parser reads it");
+        // A malformed item is skipped; a good one beside it is the call.
+        let text = r#"[{"name":"f","parameters":"hello"},{"name":"f","parameters":{"a":1}}]"#;
+        let calls = resolve_calls(text, &p, true, false).expect("the good call");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "get_weather");
-        assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
+        assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn call_grammar_parameters_are_always_objects() {
+        for (params, want) in [
+            (json!({}), json!({"type": "object"})),
+            (
+                json!({"properties": {"a": {"type": "string"}}}),
+                json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+            ),
+            (weather_params(), weather_params()),
+        ] {
+            let p = pol(
+                json!([with_params("f", params.clone())]),
+                Some(json!("required")),
+                None,
+            );
+            let spec = tool_grammar(&p, None).expect("a grammar");
+            assert_eq!(
+                body(&spec)["items"]["anyOf"][0]["properties"]["parameters"],
+                want,
+                "{params}"
+            );
+            let only = |b: &Value| b["items"]["anyOf"][0].clone();
+            let one = only(&body(&spec));
+            assert_eq!(one, item("f", want.clone()), "{params}");
+            // The prompt shows the tool as sent.
+            assert_eq!(p.prompt_tools().unwrap()[0].function["parameters"], params);
+            assert_eq!(
+                p.engine_tools().unwrap()[0]["function"]["parameters"],
+                params
+            );
+        }
     }
 
     #[test]
