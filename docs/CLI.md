@@ -915,7 +915,8 @@ the call shape is still enforced; a forced call stays forced. When the
 constraint is sent over such a tool and the engine applies it,
 `cascadia_constraint_unenforced_total{reason="schema_rejected"}` counts it
 once, when the answer is in (not when the engine dropped the constraint and
-counted its own reason). Left in, no call could match the schema and a backend that
+counted its own reason, and not for a request that ends on an error or is
+cancelled before its final chunk). Left in, no call could match the schema and a backend that
 builds its own grammar from the tools (llama-server on `sycl-llama`) would
 decode until the request is killed. A `response_format` schema with such a
 pair is still a 400.
@@ -961,7 +962,7 @@ the process and at debug after; the counter counts every request. Reasons:
 | `draft_model` | `ov-genai` with `--draft-model`. |
 | `genai_version` | `ov-genai` on OpenVINO GenAI older than 2026.4. |
 | `probe_failed` | `ov-genai`: the startup structured-output check failed for this model. |
-| `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile. Also counted, once the answer is in, when the constraint was applied without a tool's bound pair no value can meet (see above): the rest is enforced, that pair is not. |
+| `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile. Also counted, once the answer is in, when the constraint was applied without a tool's bound pair no value can meet (see above): the rest is enforced, that pair is not. A request that ends on an error or is cancelled before its final chunk is not counted. |
 | `too_complex` | The combined schema is over the [schema limits](#structured-output-response_format), or took longer than the 2 s build budget (llguidance engines). Such a schema is remembered for 10 minutes (up to 256), so a later turn resending it runs unconstrained at once instead of waiting out the budget again; after that it is built again, in case the machine was only busy. |
 | `busy` | The llguidance engines' schema check had no free slot. A tool constraint does not wait for one, so it never delays a `response_format` request queued for a slot. |
 | `unsupported_ref` | A tool schema (or the `response_format` schema beside it) has a `$ref` that can't be kept once nested: anything other than `#` or `#/$defs/…` / `#/definitions/…` naming its own definitions, or a `$ref` beside a nested `$id`. |
