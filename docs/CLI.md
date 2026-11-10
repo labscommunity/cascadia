@@ -552,16 +552,17 @@ Unknown fields are ignored.
 | `top_p` | 0 to 1 | chat, completions, responses |
 | `frequency_penalty`, `presence_penalty` | -2 to 2 | chat, completions |
 | `n` | absent or 1 (this server returns one choice) | chat, completions |
-| `stop` | at most 4 sequences | chat, completions |
 | `top_logprobs` | 0 to 20 | chat |
 | `reasoning_effort` (`reasoning.effort` on responses) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | chat, responses |
 | `logit_bias` | `null` or `{}` | chat, completions |
-| `modalities` | no `"audio"` (`["text"]`, `[]` or `null`) | chat |
+| `modalities` | an array of strings without `"audio"` (`["text"]`, `[]`) or `null` | chat |
 | `audio` | `null` | chat |
 | `web_search_options` | `null` | chat |
 
-Chat also refuses a tool or tool call whose `type` is not `function`, with
-`param` `tools` or `messages[i].tool_calls`. `/v1/responses` refuses more
+Chat also refuses a tool or tool call whose `type` is not `function`, and a
+`function` tool whose `function` is missing or not an object, with `param`
+`tools` or `messages[i].tool_calls`; these are checked before `tool_choice`.
+Any number of `stop` sequences is taken, and the output is cut at every one. `/v1/responses` refuses more
 fields it cannot serve (`store: true`, `previous_response_id`, `tools`, `stop`,
 …), each a 400 naming the field in `param`; [VLM.md](VLM.md#the-request) lists
 them.
@@ -578,7 +579,20 @@ data: {"error":{"message":"…","type":"server_error","param":null,"code":null},
 ```
 
 A `/v1/responses` stream ends with a `response.failed` event instead, whose
-`response.error` is `{"code": "server_error", "message": "…"}`.
+`response.error` is that API's `{"code": "…", "message": "…"}`, classified the
+same way: `code` is `context_length_exceeded` for an over-window prompt (with
+the message above), `invalid_prompt` for another refusal of the input, and
+`server_error` otherwise.
+
+**Readiness.** `GET /health` answers 503 `{"status": "degraded"}` once a
+completion fails with a 5xx that points at the pipeline (a peer link dropped,
+the engine not loaded), and 200 again after the next successful completion.
+Errors that are the client's fault never mark it unready. Neither do capacity
+503s, unless requests are in flight and the engine has been stuck inside one
+call (a step, or a request's submit) for 60 s (a peer that stopped answering holds every slot, so every new
+request is a capacity 503); the server is then ready again as soon as the
+engine produces output. Clients that open streams and leave them unread do
+not count as a stall: the engine only steps while a stream is read.
 
 ---
 

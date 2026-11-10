@@ -83,7 +83,7 @@ Load with `launchctl load ~/Library/LaunchAgents/com.cascadia.worker.plist`.
 
 The HTTP API exposes:
 
-- `GET /health` → `{"status": "ok"}`
+- `GET /health` → `{"status": "ok"}`, or 503 `{"status": "degraded"}` while the pipeline is failing or stalled (see [Readiness](../CLI.md#api-errors))
 - `GET /v1/models` → list of served model ids
 
 For supervisors that probe via TCP or HTTP, point them at the API port. Pipeline workers (rank > 0) don't serve an API; supervise them by process state and exit code — under systemd `Type=simple` that's automatic, and a TCP probe of the `--listen` port works as a liveness check.

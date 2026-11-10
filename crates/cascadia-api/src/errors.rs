@@ -1,9 +1,13 @@
 //! The OpenAI error envelope: `{"error":{"message","type","param","code"}}`.
 //!
-//! Every refusal this crate sends is built here, so the shape stays the same
-//! on every route; an engine error that reaches a stream after its 200 is
-//! sent as an SSE event whose `error` is this same object. Another server that embeds these routes can call
-//! [`error_body`] to answer its own refusals in the same shape.
+//! Every HTTP error response this crate builds goes through [`error_body`],
+//! and [`openai_error_bodies`] rewrites the plain-text ones axum makes
+//! (unknown routes, wrong methods, rejections), so the shape is the same on
+//! every `/v1/` route. An engine error that reaches a chat or completions
+//! stream after its 200 is an SSE event whose `error` is this same object; a
+//! `/v1/responses` stream ends with `response.failed`, whose `error` is that
+//! API's own `{code, message}`. Another server that embeds these routes can
+//! call [`error_body`] to answer its own refusals in the same shape.
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
