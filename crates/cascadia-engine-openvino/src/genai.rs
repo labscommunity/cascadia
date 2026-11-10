@@ -409,6 +409,7 @@ trait StatefulPipe: Send {
         &self,
         prompt: &str,
         cfg: &GenConfig,
+        tail_tokens: usize,
         poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
     ) -> Result<GenResult, OvError>;
 }
@@ -424,9 +425,10 @@ impl StatefulPipe for LlmPipeline {
         &self,
         prompt: &str,
         cfg: &GenConfig,
+        tail_tokens: usize,
         poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
     ) -> Result<GenResult, OvError> {
-        LlmPipeline::generate_polled(self, prompt, cfg, poll)
+        LlmPipeline::generate_polled(self, prompt, cfg, tail_tokens, poll)
     }
 }
 
@@ -554,28 +556,29 @@ impl Engine for OvGenaiEngine {
         // Always the polled generate, so a cancel always works (the A/B in the
         // hardware check prices the per-token callback).
         let inflight = self.inflight.clone();
-        let mut stop = if self.engine_stop_check {
+        let stop = if self.engine_stop_check {
             OneShotStop::new(&task.sampling.stop)
         } else {
             OneShotStop::new(&[])
         };
-        let check_stop = stop.is_active();
+        // The shim decodes the last `tail_tokens` generated ids per write and
+        // the check runs on that suffix decode (M18 D8): it is a substring of
+        // the returned text (OneShotStop's input contract), unlike streamer
+        // pieces. The +16 covers a run of 0-byte (special) tokens. 0 = no
+        // decode at all when nothing is checked.
+        let tail_tokens = if stop.is_active() {
+            stop.max_stop_bytes() + 16
+        } else {
+            0
+        };
         let mut polled_tokens: u64 = 0;
         let mut stopped_on_match = false;
         let generated = {
             // The answer the closure has given once it ended the generation:
             // the shim polls once more at the end (n_tokens 0), and that call
-            // must not feed or decide again.
+            // must not decide again.
             let mut ended: Option<PollAction> = None;
-            // Still inside the answer's leading whitespace. `step` trims it
-            // off (`trim_start` below), so the stop check must not see it:
-            // a stop like "\n" would otherwise end the answer on text the
-            // client never gets (OneShotStop's input contract). Skipping it
-            // always is safe even when step does not trim (its prompt-echo
-            // strip didn't apply): the fed text is then a suffix of the
-            // answer, and any match in it is a match in the answer.
-            let mut leading = true;
-            let mut poll = |piece: &str, n_tokens: usize| -> PollAction {
+            let mut poll = |tail: &str, n_tokens: usize| -> PollAction {
                 polled_tokens += n_tokens as u64;
                 if let Some(action) = ended {
                     return action;
@@ -584,23 +587,15 @@ impl Engine for OvGenaiEngine {
                     ended = Some(PollAction::Cancel);
                     return PollAction::Cancel;
                 }
-                if check_stop {
-                    let piece = if leading {
-                        let rest = piece.trim_start();
-                        leading = rest.is_empty();
-                        rest
-                    } else {
-                        piece
-                    };
-                    if !piece.is_empty() && stop.push(piece) {
-                        stopped_on_match = true;
-                        ended = Some(PollAction::Stop);
-                        return PollAction::Stop;
-                    }
+                if tail_tokens > 0 && n_tokens > 0 && stop.matches_tail(tail) {
+                    stopped_on_match = true;
+                    ended = Some(PollAction::Stop);
+                    return PollAction::Stop;
                 }
                 PollAction::Running
             };
-            self.pipe.generate_polled(&task.prompt, &cfg, &mut poll)
+            self.pipe
+                .generate_polled(&task.prompt, &cfg, tail_tokens, &mut poll)
         };
         if self.inflight.cancelled() {
             // Also when generate failed after the CANCEL: the task ends as
@@ -634,9 +629,19 @@ impl Engine for OvGenaiEngine {
         };
         let elapsed = started.elapsed().as_secs_f64();
 
-        let mut text = result.text;
-        if let Some(stripped) = text.strip_prefix(&task.prompt) {
-            text = stripped.trim_start().to_string();
+        let raw = result.text;
+        let mut text = match raw.strip_prefix(&task.prompt) {
+            Some(stripped) => stripped.trim_start().to_string(),
+            None => raw.clone(),
+        };
+        // The generation stopped on a match in the raw text, but the strip
+        // (a prompt echo) or the trim (leading whitespace) can remove the text
+        // it matched in. The API would then find no stop, and the client would
+        // get an answer cut short with nothing to show why. Return the raw
+        // text instead, so the API's cut is the one generation stopped on
+        // (OpenAI: stop applies to the generated output) (M18 D8).
+        if stopped_on_match && !OneShotStop::new(&task.sampling.stop).push(&text) {
+            text = raw;
         }
         // Prefer tokenizer-based count; fall back to perf_metrics value.
         let tokens = self
@@ -1968,8 +1973,13 @@ mod tests {
 
     #[derive(Default)]
     struct StatefulState {
-        /// (piece text, n_tokens) per streamer write.
+        /// (token text, n_tokens) per streamer write. Each entry is one
+        /// "token" for the tail decode (the shim decodes ids, not writes).
         pieces: Vec<(String, usize)>,
+        /// The `tail_tokens` of every generate_polled call.
+        tail_tokens: Vec<usize>,
+        /// Panic in count_tokens (a panic inside step, after begin).
+        count_panics: bool,
         /// Before piece i is polled, cancel the running task through this
         /// handle (what the runner does on a disconnect).
         cancel_before: Option<(usize, Arc<InflightCancel>, TaskId)>,
@@ -1992,6 +2002,9 @@ mod tests {
 
     impl StatefulPipe for MockStatefulPipe {
         fn count_tokens(&self, text: &str) -> Option<u32> {
+            if self.st.lock().unwrap().count_panics {
+                panic!("mock: count_tokens panicked");
+            }
             Some(text.split_whitespace().count() as u32)
         }
         fn generate(&self, _prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
@@ -2007,11 +2020,13 @@ mod tests {
             &self,
             _prompt: &str,
             cfg: &GenConfig,
+            tail_tokens: usize,
             poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
         ) -> Result<GenResult, OvError> {
             let (pieces, cancel_before, err_after_cancel, poll_panic_at) = {
                 let mut st = self.st.lock().unwrap();
                 st.polled_calls += 1;
+                st.tail_tokens.push(tail_tokens);
                 st.last_cfg = Some(cfg.clone());
                 (
                     st.pieces.clone(),
@@ -2031,13 +2046,21 @@ mod tests {
                         h.cancel(id);
                     }
                 }
-                let action = poll(piece, *n);
                 text.push_str(piece);
                 n_total += n;
+                // What the shim passes: a decode of the last `tail_tokens`
+                // tokens, or nothing.
+                let tail: String = if tail_tokens > 0 && *n > 0 {
+                    let from = (i + 1).saturating_sub(tail_tokens);
+                    pieces[from..=i].iter().map(|(t, _)| t.as_str()).collect()
+                } else {
+                    String::new()
+                };
+                let action = poll(&tail, *n);
                 {
                     let mut st = self.st.lock().unwrap();
                     st.consumed += 1;
-                    st.polls.push((piece.clone(), *n, action));
+                    st.polls.push((tail, *n, action));
                 }
                 if action != PollAction::Running {
                     // The end flush comes after a STOP/CANCEL too.
@@ -2299,25 +2322,109 @@ mod tests {
         }
     }
 
-    /// `step` trims the start of the answer; the stop check must see the
-    /// same text, so leading whitespace is never fed. A stop of "\n" would
-    /// otherwise end the answer on text the client never gets.
+    /// A stop split over two tokens is found: the tail decode spans them.
     #[test]
-    fn stateful_leading_whitespace_is_not_fed_to_the_stop_check() {
+    fn stateful_stop_across_a_token_boundary() {
         let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["\n", "\n ", "Hi", " there", "\n", "rest"]);
+        st.lock().unwrap().pieces = pieces(&["a", " sto", "p!", " more"]);
+        let mut e = stateful_engine(&st);
+        e.submit(stop_task("t1", 64, &["stop"])).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out[0].1.text, "a stop!");
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+        let s = st.lock().unwrap();
+        assert_eq!(s.consumed, 3);
+        // The window covers the longest stop plus slack.
+        assert_eq!(s.tail_tokens, [4 + 16]);
+    }
+
+    /// With nothing to match, the shim decodes nothing per token.
+    #[test]
+    fn stateful_tail_tokens_is_zero_without_an_active_stop_check() {
+        let cases: [(&str, bool, Vec<&str>); 3] = [
+            ("no stops", true, vec![]),
+            ("only empty stops", true, vec![""]),
+            ("check off", false, vec!["x"]),
+        ];
+        for (name, check, stops) in cases {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a", " x", " b"]);
+            let mut e = stateful_engine_with(&st, |b| b.with_engine_stop_check(check));
+            e.submit(stop_task("t1", 64, &stops)).unwrap();
+            let out = e.step().unwrap();
+            assert_eq!(out[0].1.text, "a x b", "{name}");
+            let s = st.lock().unwrap();
+            assert_eq!(s.tail_tokens, [0], "{name}");
+            assert!(s.polls.iter().all(|p| p.0.is_empty()), "{name}");
+        }
+    }
+
+    /// The model repeats the prompt. step's strip_prefix + trim_start would
+    /// remove the "\n" the generation stopped on and leave "": the raw text
+    /// goes out instead, so the API's cut gives "Hi".
+    #[test]
+    fn stateful_stop_in_a_prompt_echo_returns_the_raw_text() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["Hi", "\n", "There", "\n"]);
         let mut e = stateful_engine(&st);
         let mut t = stop_task("t1", 64, &["\n"]);
-        // Prompt echo so step's strip_prefix + trim_start applies.
+        t.prompt = "Hi".into();
+        e.submit(t).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(st.lock().unwrap().consumed, 2);
+        assert_eq!(out[0].1.text, "Hi\n");
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// The answer starts with the stop: the engine stops on the first token
+    /// and returns it as is, so the API cut gives "".
+    #[test]
+    fn stateful_stop_in_leading_whitespace_returns_the_raw_text() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["\n", "\n", "Hi", "\n"]);
+        let mut e = stateful_engine(&st);
+        let mut t = stop_task("t1", 64, &["\n"]);
+        // An empty prompt makes step's strip_prefix + trim_start apply.
         t.prompt = String::new();
         e.submit(t).unwrap();
         let out = e.step().unwrap();
-        let s = st.lock().unwrap();
-        // Not stopped on the two leading newlines; stopped on the one after
-        // "there".
-        assert_eq!(s.consumed, 5, "{:?}", s.polls);
-        assert_eq!(s.polls[4].2, PollAction::Stop);
-        assert_eq!(out[0].1.text, "Hi there\n");
+        assert_eq!(st.lock().unwrap().consumed, 1);
+        assert_eq!(out[0].1.text, "\n");
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// A match on the last allowed token is `stop`, not `length`.
+    #[test]
+    fn stateful_stop_beats_length() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["a", " b", " stop", " x"]);
+        let mut e = stateful_engine(&st);
+        e.submit(stop_task("t1", 3, &["stop"])).unwrap();
+        let out = e.step().unwrap();
+        let c = &out[0].1;
+        assert_eq!(c.text, "a b stop");
+        assert_eq!(c.n_tokens, Some(3));
+        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// A panic inside step after begin still ends the handle's task.
+    #[test]
+    fn stateful_panic_in_step_still_ends_the_inflight_task() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().count_panics = true;
+        let mut e = stateful_engine(&st);
+        let h = e.inflight_cancel().unwrap();
+        e.submit(task("t1", 64)).unwrap();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.step()));
+        assert!(r.is_err(), "count_tokens panicked inside step");
+        // t1 is not current: its cancel doesn't set the flag.
+        h.cancel(&TaskId::from("t1"));
+        assert!(!h.cancelled());
+        // A new task begins clean and becomes current.
+        assert!(!h.begin(&TaskId::from("t2")));
+        h.cancel(&TaskId::from("t2"));
+        assert!(h.cancelled());
+        h.end();
     }
 
     #[test]

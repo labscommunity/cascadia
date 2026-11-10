@@ -98,11 +98,12 @@ impl<'a> PollCtx<'a> {
     }
 }
 
-/// `cascadia_poll_fn`: called by the shim's streamer once per write with the
-/// text decoded since the previous call (`len` may be 0) and the number of
-/// tokens that write carried (`n_tokens`: 1 per token, the round's size on
-/// draft / prompt-lookup, 0 for the end-of-generation flush). Decodes the bytes
-/// lossily (a piece may end inside a UTF-8 sequence), runs the closure and
+/// `cascadia_poll_fn`: called by the shim's streamer once per write with a
+/// decode of the last `tail_tokens` generated ids (`len` may be 0) and the
+/// number of tokens that write carried (`n_tokens`: 1 per token, the round's
+/// size on draft / prompt-lookup, 0 for the end-of-generation call). Decodes
+/// the bytes lossily (the window may start inside a UTF-8 sequence), runs the
+/// closure and
 /// returns its action. A panic never crosses the FFI edge: it is caught,
 /// latched in `ctx.panicked` and answered with CANCEL; once latched, every
 /// later call returns CANCEL without re-entering the closure.
@@ -267,6 +268,7 @@ mod sys {
             handle: *mut cascadia_pipeline_t,
             prompt: *const c_char,
             cfg: *const cascadia_genconfig_t,
+            tail_tokens: usize,
             poll: CascadiaPollFn,
             ctx: *mut c_void,
             out_text: *mut *mut c_char,
@@ -761,11 +763,15 @@ impl LlmPipeline {
     }
 
     /// [`generate`](Self::generate) with a per-token poll: the shim's
-    /// streamer calls `poll(text, n_tokens)` once per decoded write, with the
-    /// text decoded since the last call (possibly empty) and the number of
-    /// tokens that write carried (1, or the round's size on draft /
-    /// prompt-lookup). [`PollAction::Stop`] / [`PollAction::Cancel`] end the
-    /// generation. It is never called after this returns.
+    /// streamer calls `poll(tail_text, n_tokens)` once per decoded write, with
+    /// the number of tokens that write carried (1, or the round's size on
+    /// draft / prompt-lookup) and `tail_text`, a fresh decode of the last
+    /// `tail_tokens` generated ids. That is a suffix decode, not an
+    /// incremental piece: a substring of the returned text, except that it
+    /// may start with U+FFFD or without a leading space the full decode has.
+    /// With `tail_tokens` 0 nothing is decoded and `tail_text` is empty.
+    /// [`PollAction::Stop`] / [`PollAction::Cancel`] end the generation. It is
+    /// never called after this returns.
     ///
     /// - **Threads.** The closure may run on an ov-genai worker thread, even
     ///   for a plain `LlmPipeline::new`: when ov-genai picks its paged-
@@ -774,12 +780,11 @@ impl LlmPipeline {
     ///   `ThreadedStreamerWrapper` worker, and a Stop/Cancel then takes
     ///   effect about one step later. Hence `Send`; don't rely on
     ///   thread-locals or tracing spans inside the closure.
-    /// - **The end flush.** The closure is called once more at the end of the
-    ///   generation, with the held-back rest of the text and `n_tokens` 0,
-    ///   also after it returned Stop/Cancel; that answer is ignored.
-    /// - **The returned text** is decoded from all generated tokens, not
-    ///   built from the pieces: after a Stop it holds the match plus up to
-    ///   the few tokens the text streamer was holding back.
+    /// - **The end call.** The closure is called once more at the end of the
+    ///   generation, with empty text and `n_tokens` 0, also after it returned
+    ///   Stop/Cancel; that answer is ignored.
+    /// - **The returned text** is decoded from all generated tokens: after a
+    ///   Stop it ends with the token whose write answered Stop.
     ///
     /// A panic in `poll` cancels the generation and returns
     /// `Error::Native(POLL_PANICKED)` ([`Error::is_poll_panic`]). A native
@@ -789,6 +794,7 @@ impl LlmPipeline {
         &self,
         _prompt: &str,
         _cfg: &GenConfig,
+        _tail_tokens: usize,
         _poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
     ) -> Result<GenResult> {
         Err(Error::Stub)
@@ -800,6 +806,7 @@ impl LlmPipeline {
         &self,
         prompt: &str,
         cfg: &GenConfig,
+        tail_tokens: usize,
         poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
     ) -> Result<GenResult> {
         let prompt_c = cstr(prompt)?;
@@ -812,6 +819,7 @@ impl LlmPipeline {
                 self.handle,
                 prompt_c.as_ptr(),
                 raw_cfg,
+                tail_tokens,
                 Some(poll_trampoline),
                 &mut ctx as *mut PollCtx<'_> as *mut std::os::raw::c_void,
                 &mut text_p,
@@ -2454,7 +2462,7 @@ mod tests {
             calls += 1;
             PollAction::Running
         };
-        let r = pipe.generate_polled("hi", &GenConfig::default(), &mut f);
+        let r = pipe.generate_polled("hi", &GenConfig::default(), 8, &mut f);
         assert!(matches!(r, Err(Error::Stub)));
         assert_eq!(calls, 0);
     }

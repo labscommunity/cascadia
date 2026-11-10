@@ -29,7 +29,6 @@
 #include <openvino/genai/generation_config.hpp>
 #include <openvino/genai/tokenizer.hpp>
 #include <openvino/genai/streamer_base.hpp>
-#include <openvino/genai/text_streamer.hpp>
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include <openvino/genai/continuous_batching_pipeline.hpp>
 #include <openvino/genai/chat_history.hpp>
@@ -394,14 +393,22 @@ void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v) {
 
 namespace {
 
-// Streamer behind cascadia_pipeline_generate_polled. Each write feeds an inner
-// TextStreamer (built from the pipeline's tokenizer, so the pieces are what
-// ov-genai's own text streaming would print), whose text callback appends to
-// `m_pending`; then it polls Rust once with the pending text and maps the
-// answer to a StreamingStatus. Each poll also carries the number of tokens the
-// write held (1, or the vector's size; 0 for end()). end() flushes the inner
-// streamer and polls once more with the rest, also after a STOP/CANCEL; that
-// answer is ignored.
+// Streamer behind cascadia_pipeline_generate_polled. It keeps every generated
+// id. On each write it polls Rust once with the write's token count and, when
+// `tail_tokens` > 0, a fresh decode of the last `tail_tokens` ids (a suffix
+// decode: a substring of the full decode apart from a dropped leading space
+// or U+FFFD at the window start). With `tail_tokens` 0 it decodes nothing and
+// passes len 0. The answer maps to a StreamingStatus. end() polls once more
+// with n_tokens 0 and len 0, also after a STOP/CANCEL; that answer is ignored.
+//
+// No TextStreamer: its pieces are not guaranteed to concatenate to the
+// returned decode (M18 D8), so text checked against them could disagree with
+// the answer.
+//
+// The decode uses the tokenizer's defaults (no detokenization params), the
+// same call the pipeline makes for its result (tokenizer.hpp:198,
+// `decode(tokens, detokenization_params = {})`), so the window decodes the
+// way the returned text does.
 //
 // Every entry point holds `m_mu`, and close() (called by the shim when
 // generate returns or throws) sets `m_closed` under it: after close() no call
@@ -410,40 +417,24 @@ namespace {
 // on the continuous-batching based pipelines) or keeps a reference to it.
 class PolledStreamer final : public ov::genai::StreamerBase {
 public:
-    PolledStreamer(const ov::genai::Tokenizer& tokenizer, cascadia_poll_fn poll, void* ctx)
-        : m_poll(poll),
-          m_ctx(ctx),
-          m_inner(tokenizer, [this](std::string piece) -> ov::genai::CallbackTypeVariant {
-              // Runs inside m_inner.write/end, i.e. with m_mu held.
-              m_pending += piece;
-              return ov::genai::StreamingStatus::RUNNING;
-          }) {}
+    PolledStreamer(const ov::genai::Tokenizer& tokenizer, size_t tail_tokens,
+                   cascadia_poll_fn poll, void* ctx)
+        : m_tokenizer(tokenizer), m_tail_tokens(tail_tokens), m_poll(poll), m_ctx(ctx) {}
 
     ov::genai::StreamingStatus write(int64_t token) override {
-        return feed_and_poll([&] { m_inner.write(token); }, 1);
+        return feed_and_poll([&] { m_ids.push_back(token); }, 1);
     }
 
     ov::genai::StreamingStatus write(const std::vector<int64_t>& tokens) override {
-        return feed_and_poll([&] { m_inner.write(tokens); }, tokens.size());
+        return feed_and_poll(
+            [&] { m_ids.insert(m_ids.end(), tokens.begin(), tokens.end()); }, tokens.size());
     }
 
     void end() override {
         std::lock_guard<std::mutex> lock(m_mu);
-        if (m_closed || m_ended) return;
+        if (m_closed || m_ended || m_poisoned) return;
         m_ended = true;
-        // A status-ending streamer still gets the flushed rest: the closure's
-        // answer is ignored here, but a STOP's caller may want the tail.
-        if (m_poisoned) return;
-        try {
-            m_inner.end();
-        } catch (const std::exception& e) {
-            record_error_locked(e.what());
-            return;
-        } catch (...) {
-            record_error_locked("unknown C++ exception in TextStreamer::end");
-            return;
-        }
-        poll_locked(0);
+        call_poll_locked(nullptr, 0, 0);
     }
 
     // No poll after this returns. Idempotent.
@@ -452,8 +443,8 @@ public:
         m_closed = true;
     }
 
-    // An exception the inner TextStreamer threw (it was turned into a CANCEL
-    // rather than let loose on an ov-genai worker thread). Read after close().
+    // An exception the tail decode threw (it was turned into a CANCEL rather
+    // than let loose on an ov-genai worker thread). Read after close().
     std::string error() {
         std::lock_guard<std::mutex> lock(m_mu);
         return m_error;
@@ -467,21 +458,27 @@ private:
         // Once Rust said STOP / CANCEL, keep saying it without polling again
         // (a threaded wrapper may still drain queued tokens).
         if (m_status != ov::genai::StreamingStatus::RUNNING) return m_status;
+        std::string tail;
         try {
             feed();
+            if (m_tail_tokens > 0 && n_tokens > 0) {
+                const size_t n = std::min(m_tail_tokens, m_ids.size());
+                const std::vector<int64_t> window(m_ids.end() - static_cast<std::ptrdiff_t>(n),
+                                                  m_ids.end());
+                tail = m_tokenizer.decode(window);
+            }
         } catch (const std::exception& e) {
             record_error_locked(e.what());
             return ov::genai::StreamingStatus::CANCEL;
         } catch (...) {
-            record_error_locked("unknown C++ exception in TextStreamer::write");
+            record_error_locked("unknown C++ exception in the streamer's tail decode");
             return ov::genai::StreamingStatus::CANCEL;
         }
-        return poll_locked(n_tokens);
+        return call_poll_locked(tail.data(), tail.size(), n_tokens);
     }
 
-    ov::genai::StreamingStatus poll_locked(size_t n_tokens) {
-        const int32_t rc = m_poll(m_ctx, m_pending.data(), m_pending.size(), n_tokens);
-        m_pending.clear();
+    ov::genai::StreamingStatus call_poll_locked(const char* ptr, size_t len, size_t n_tokens) {
+        const int32_t rc = m_poll(m_ctx, ptr, len, n_tokens);
         ov::genai::StreamingStatus status;
         switch (rc) {
             case CASCADIA_POLL_RUNNING: status = ov::genai::StreamingStatus::RUNNING; break;
@@ -498,16 +495,16 @@ private:
     }
 
     std::mutex m_mu;
+    ov::genai::Tokenizer m_tokenizer;
+    const size_t m_tail_tokens;
     cascadia_poll_fn m_poll;
     void* m_ctx;
-    std::string m_pending;
+    std::vector<int64_t> m_ids;
     ov::genai::StreamingStatus m_status = ov::genai::StreamingStatus::RUNNING;
     bool m_closed = false;
     bool m_ended = false;
     bool m_poisoned = false;
     std::string m_error;
-    // Last: its callback captures `this` and touches m_pending.
-    ov::genai::TextStreamer m_inner;
 };
 
 // Closes the streamer when generate returns or unwinds.
@@ -522,8 +519,8 @@ struct PolledStreamerCloser {
 // as before) and cascadia_pipeline_generate_polled.
 int32_t pipeline_generate_impl(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
-    cascadia_poll_fn poll, void* ctx, char** out_text, uint32_t* out_token_count,
-    const char* fn_name) {
+    size_t tail_tokens, cascadia_poll_fn poll, void* ctx, char** out_text,
+    uint32_t* out_token_count, const char* fn_name) {
     if (!handle || (!handle->pipe && !handle->vlm) || !prompt || !out_text) {
         set_last_error((std::string("null arg in ") + fn_name).c_str()); return 1;
     }
@@ -537,7 +534,7 @@ int32_t pipeline_generate_impl(
         if (poll) {
             polled = std::make_shared<PolledStreamer>(
                 handle->vlm ? handle->vlm->get_tokenizer() : handle->pipe->get_tokenizer(),
-                poll, ctx);
+                tail_tokens, poll, ctx);
             streamer = std::static_pointer_cast<ov::genai::StreamerBase>(polled);
         }
         std::string text;
@@ -600,14 +597,15 @@ extern "C" {
 int32_t cascadia_pipeline_generate(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
     char** out_text, uint32_t* out_token_count) {
-    return pipeline_generate_impl(handle, prompt, cfg, nullptr, nullptr, out_text,
+    return pipeline_generate_impl(handle, prompt, cfg, 0, nullptr, nullptr, out_text,
                                   out_token_count, "pipeline_generate");
 }
 
 int32_t cascadia_pipeline_generate_polled(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
-    cascadia_poll_fn poll, void* ctx, char** out_text, uint32_t* out_token_count) {
-    return pipeline_generate_impl(handle, prompt, cfg, poll, ctx, out_text,
+    size_t tail_tokens, cascadia_poll_fn poll, void* ctx, char** out_text,
+    uint32_t* out_token_count) {
+    return pipeline_generate_impl(handle, prompt, cfg, tail_tokens, poll, ctx, out_text,
                                   out_token_count, "pipeline_generate_polled");
 }
 

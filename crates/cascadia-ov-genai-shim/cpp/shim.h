@@ -120,11 +120,13 @@ int32_t cascadia_pipeline_generate(
     char** out_text,
     uint32_t* out_token_count);
 
-/// Per-token poll for cascadia_pipeline_generate_polled. Called with the text
-/// decoded since the previous call (`len` may be 0; `ptr` is then not to be
-/// read; the bytes may end inside a UTF-8 sequence) and `n_tokens`, the
-/// number of tokens that write carried: 1 for write(int64_t), tokens.size()
-/// for write(vector) (draft / prompt-lookup rounds), 0 for the end() flush.
+/// Per-token poll for cascadia_pipeline_generate_polled. Called with `n_tokens`,
+/// the number of tokens that write carried (1 for write(int64_t),
+/// tokens.size() for write(vector) on draft / prompt-lookup rounds, 0 for the
+/// end() call), and a text: a fresh decode of the last `tail_tokens` generated
+/// ids (a suffix decode, not an incremental piece; it may start with a
+/// U+FFFD or without a leading space the full decode has). `len` is 0, and
+/// `ptr` not to be read, when `tail_tokens` is 0 and on the end() call.
 /// Returns one of the CASCADIA_POLL_* values; anything else is CANCEL.
 typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len, size_t n_tokens);
 
@@ -133,9 +135,10 @@ typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len, size
 #define CASCADIA_POLL_CANCEL 2   /* ov::genai::StreamingStatus::CANCEL */
 
 /// cascadia_pipeline_generate with a streamer that calls `poll(ctx, ...)` once
-/// per token write (once per round on draft / prompt-lookup pipelines) and
-/// once more from the streamer's end() with the rest of the text (n_tokens 0;
-/// this end call also comes after a STOP/CANCEL, and its answer is ignored).
+/// per token write (once per round on draft / prompt-lookup pipelines) with a
+/// decode of the last `tail_tokens` generated ids (0: no decode, len 0), and
+/// once more from the streamer's end() (n_tokens 0, len 0; this end call also
+/// comes after a STOP/CANCEL, and its answer is ignored).
 /// STOP or CANCEL ends the generation. Works for LLMPipeline and VLMPipeline
 /// handles; `poll == NULL` is exactly cascadia_pipeline_generate (no streamer).
 ///
@@ -147,11 +150,12 @@ typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len, size
 /// this function returns or fails, so `ctx` may live on the caller's stack.
 ///
 /// `out_text` is decoded from all generated tokens: after a STOP it holds the
-/// text up to the match plus up to the few tokens the streamer held back.
+/// text up to and including the token that completed the match.
 int32_t cascadia_pipeline_generate_polled(
     cascadia_pipeline_t* handle,
     const char* prompt,
     const cascadia_genconfig_t* cfg,
+    size_t tail_tokens,
     cascadia_poll_fn poll,
     void* ctx,
     char** out_text,
