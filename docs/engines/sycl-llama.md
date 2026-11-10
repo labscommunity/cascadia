@@ -366,9 +366,15 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   `tools` narrowed to that one function (llama-server itself parses only the
   string forms, silently treating an object as `"auto"`). llama-server's
   `"required"` is weaker than OpenAI's: its grammar allows free text before
-  the call, so a model can spend `max_tokens` on text and return
-  `finish_reason: "length"` with no call (seen once with Qwen2.5-1.5B on an
-  Arc B390, named choice). An unknown string,
+  the call, and a named choice may be ignored. So for a forced choice
+  (`"required"`, a named function or custom tool, `allowed_tools` with mode
+  `"required"`), and for `response_format` beside callable tools, the API
+  also sends its tool-call constraint, which the bridge forwards as a
+  `json_schema` `response_format`; llama-server's grammar then enforces it
+  (see [CLI.md § Tool calling](../CLI.md#tool-calling-tools-tool_choice)).
+  If llama-server refuses that schema with a 4xx naming the grammar or
+  schema, the bridge sends the request again once without it and answers
+  unconstrained (counted as `schema_rejected`). An unknown string,
   a malformed object, or a name absent from `tools` is rejected with a 400
   before the request reaches the engine. The child's streamed `delta.tool_calls` fragments
   are re-assembled and emitted as `<tool_call>` text before the final chunk,

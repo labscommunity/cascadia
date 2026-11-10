@@ -18,7 +18,7 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 
 ## Features
 
-- **OpenAI-compatible API**: `/v1/chat/completions` with SSE streaming; point existing clients at it unchanged
+- **OpenAI-compatible API**: `/v1/chat/completions` with SSE streaming; point existing clients at it unchanged. Structured output (`response_format`) and tool calling (function and custom tools, every `tool_choice` form, `parallel_tool_calls`), with forced calls enforced by constrained decoding; see [docs/CLI.md](docs/CLI.md#tool-calling-tools-tool_choice)
 - **Pipeline parallelism**: shard a model into stages and run each stage on a different machine, activations relayed over TCP
 - **Built-in sharder**: `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling
 - **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models (Kimi K2.6, MiniMax-M2, GLM-5, DeepSeek-V4, Inkling), and `qwen35` for the Qwen3.5 hybrid family (Qwen3.6 MoE, dense Qwen3.8)

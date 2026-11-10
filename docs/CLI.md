@@ -665,12 +665,16 @@ Behaviour:
 
 - Thinking is turned off for a JSON request: a JSON answer has no room for
   a reasoning preamble.
-- The format is **not enforced** when the request offers tools the model may
-  call (`tools` non-empty and `tool_choice` other than `"none"`): the model may
-  answer with a tool call, which the format does not constrain. The server logs
-  `response_format not enforced` for such a request. Thinking then
-  stays as requested, except on `ov-genai`, where it is turned off (thinking
-  with tools is otherwise refused there).
+- When the request also offers tools the model may call (`tools` non-empty
+  and `tool_choice` `"auto"` or absent), the answer is constrained to either
+  a tool call or JSON matching the format; see
+  [Tool calling](#tool-calling-tools-tool_choice). Under `"required"` or a
+  named tool the format plays no part: the answer is the call. Where that
+  constraint can't be applied, the format is **not enforced** and the server
+  logs `response_format not enforced`; thinking then stays as requested,
+  except on `ov-genai`, where it is turned off (thinking with tools is
+  otherwise refused there). Such a request is answered (200) even on a node
+  where `response_format` alone gets a 400 (NPU, `--draft-model`).
 - A token limit can cut the JSON short: the response then has
   `finish_reason: "length"` and the content does not parse. Leave room in
   `max_tokens`.
@@ -857,3 +861,131 @@ last one; its first success clears the limit and that request is admitted.
 Schemas refused during a run of failures (since the last successful step)
 in which the health check failed, or that ended with the limit clearing, are
 released when the run ends; in any other run they stay refused.
+
+## Tool calling (`tools`, `tool_choice`)
+
+`/v1/chat/completions` accepts OpenAI's `tools`, `tool_choice` and
+`parallel_tool_calls`. Tools reach the model through its chat template; the
+answer is read back into `message.tool_calls` (streamed: one `tool_calls`
+delta before the final chunk).
+
+`tool_choice`:
+
+| Value | What the model may do |
+|---|---|
+| absent or `"auto"` | Call any tool or answer in text. |
+| `"none"` | Answer in text; the tools may still be rendered, and nothing is read as a call. |
+| `"required"` | Call at least one tool. |
+| `{"type":"function","function":{"name":N}}` | Call function `N`. |
+| `{"type":"custom","custom":{"name":N}}` | Call custom tool `N` (see below). |
+| `{"type":"allowed_tools","allowed_tools":{"mode":"auto"\|"required","tools":[…]}}` | Only the listed tools (each `{"type":"function","function":{"name":N}}` or `{"type":"custom","custom":{"name":N}}`) exist for this turn: the prompt, the constraint and the answer use that subset. `mode` then acts as `"auto"` or `"required"`. A call to an unlisted tool is dropped from the answer. |
+
+A malformed `tool_choice` is a 400 (`{"error": "<message>"}`) before the
+request reaches the engine: an unknown string or `type`, a named choice
+without a name, a name not in `tools` or of the other kind (a function
+choice naming a custom tool, or the reverse), and for `allowed_tools` a
+`mode` other than `"auto"`/`"required"`, an empty or missing `tools` list,
+or an entry that is malformed or not in `tools`. A custom tool without a
+name, or whose name another tool already uses, is a 400 too. As before,
+`"required"` with no `tools` is accepted and answered as text.
+
+### Enforcement
+
+A turn that must call a tool (`"required"`, a named function or custom
+tool, `allowed_tools` with mode `"required"`) is enforced by constrained
+decoding, the same machinery as `response_format`: the output is a JSON
+array of `{"name": …, "parameters": …}` objects, each `name` one of the
+callable tools and `parameters` that tool's JSON Schema (a named choice: one
+item, that tool). It does not depend on the model's own tool-call syntax.
+This runs on every engine with structured output: `ov-genai`, `ov-runtime`,
+`ov-dist-spec`, `gemma4`, `qwen35`, `sparse-moe`, and `sycl-llama` (sent to
+llama-server as a `json_schema` `response_format`; llama-server's own
+`tool_choice` handling does not force a call). Each tool's `$defs` /
+`definitions` are kept (moved to the root of the combined schema, and its
+`$ref`s rewritten to match).
+
+- Thinking is turned off for an enforced turn: the constraint starts at the
+  first token. On `ov-genai` it is also off for a forced turn that could not
+  be constrained.
+- `finish_reason` is `"stop"` for a named function or custom tool (as OpenAI
+  reports it) and `"tool_calls"` for every other answer with calls. A
+  forced answer cut by `max_tokens` before it parses is returned as content
+  with `finish_reason: "length"`.
+- `parallel_tool_calls: false` gives at most one call: enforced in the
+  constraint when one is sent, otherwise the first parsed call is kept
+  (streamed and not). Only an explicit `false` counts; a non-boolean value is
+  ignored.
+- `response_format` `json_object` / `json_schema` together with callable
+  tools under `"auto"`: the answer is either a tool call or JSON matching the
+  format. A JSON answer whose root is itself an array of
+  `{"name", "parameters"}` objects naming declared tools is read as tool
+  calls.
+
+**Best effort.** The tool constraint never turns a request into an error.
+Where it can't be applied, the request is still answered (200) without it:
+the answer is read as the model wrote it (the array form first, then the
+model's own tool-call syntax), the server logs `output constraint not
+enforced; answering unconstrained` (or `tool-call output constraint not
+enforced` when the API could not build it) with the reason, and
+`cascadia_constraint_unenforced_total{reason}` counts it
+([METRICS.md](METRICS.md)). Reasons:
+
+| `reason` | When |
+|---|---|
+| `npu` | `ov-genai` on NPU (`--device NPU`, or a `HETERO:`/`AUTO:` list with NPU). |
+| `draft_model` | `ov-genai` with `--draft-model`. |
+| `genai_version` | `ov-genai` on OpenVINO GenAI older than 2026.4. |
+| `probe_failed` | `ov-genai`: the startup structured-output check failed for this model. |
+| `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile. |
+| `too_complex` | The combined schema is over the [schema limits](#structured-output-response_format), or took longer than the 2 s build budget (llguidance engines). |
+| `busy` | The llguidance engines' schema check had no free slot. |
+| `unsupported_ref` | A tool schema (or the `response_format` schema beside it) has a `$ref` that can't be kept once nested: anything other than `#` or `#/$defs/…` / `#/definitions/…` naming its own definitions, or a `$ref` beside a nested `$id`. |
+| `no_tokenizer` | A llguidance engine could not build its grammar factory from the model's tokenizer. |
+| `stage_unsupported` | A later pipeline stage can't apply token masks (see below). |
+
+Multi-stage pipelines: enforcement needs every stage to run a build with
+structured-output support, so upgrade every stage before relying on it.
+With an older later stage, the first enforced request on a link waits for
+the first stage's mask check (about 10 s on `ov-runtime`, `gemma4` and
+`sparse-moe`; `qwen35` knows from its handshake) and then runs
+unconstrained; later enforced requests on that link run unconstrained at
+once (`stage_unsupported`) until the check runs again. A link that fails
+outright, or a masked step that fails mid-generation, still fails that
+request (5xx) as for a JSON request.
+
+### Custom tools
+
+`{"type":"custom","custom":{"name":N,"description"?:D,"format"?:F}}` tools
+are accepted. The model sees each one as a function with a single required
+string parameter, `input`, described by `D`. When `F` is a grammar
+(`{"type":"grammar","grammar":{"syntax","definition"}}`), its syntax and
+definition are added to that description so the model can follow it; the
+grammar is **not enforced** inside `input`.
+
+A call to a custom tool comes back as
+`{"id","type":"custom","custom":{"name":N,"input":"…"}}`, in the message and
+streamed alike (the streamed delta adds `index`; OpenAI's chunk schema has
+no custom shape). `input` is the call's `input` string, else its only string
+argument, else the raw arguments text. An assistant message replaying a
+custom call in `tool_calls` is accepted and rendered to the template as the
+function form with arguments `{"input": …}`.
+
+### Gemma 4
+
+Gemma 4's own tool-call syntax
+(`<|tool_call>call:NAME{key:<|"|>text<|"|>,…}<tool_call|>`) is parsed into
+`tool_calls`. `ov-runtime`, `gemma4` and `ov-dist-spec` keep those three
+marker tokens when decoding a model whose vocabulary has them, and
+`sycl-llama` gets Gemma 4 calls back from llama-server already parsed. The
+markers never appear in `content`, with or without tools.
+
+### Unchanged for existing requests
+
+A request without `tool_choice`, or with `"auto"` or `"none"`, and without
+`response_format`, is decoded and read as before: no constraint, and an
+answer with calls reports `finish_reason: "tool_calls"` as before. What is
+new: `"required"` and named choices are now enforced; `parallel_tool_calls:
+false` now limits the answer to one call; `response_format` beside callable
+tools is now enforced as "a call or the JSON"; custom tools and
+`allowed_tools` (previously a 422 / 400) are accepted; Gemma 4 calls are
+parsed on the engines above.
