@@ -156,12 +156,26 @@ pub enum GrammarKind {
     JsonSchema,
 }
 
+/// The grammar body of `response_format: json_object` (and of a
+/// `json_schema` whose schema is missing, `null`, `true` or `{}`): any JSON
+/// object. Engines recognise it to allow the short runs of whitespace a
+/// model writes when it pretty-prints; every other schema keeps
+/// `json.dumps` separators.
+pub const JSON_OBJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":true}"#;
+
 /// Backend-neutral constraint on the output. `body` is a JSON Schema as compact JSON.
 /// Engines that cannot enforce it reject the task at submit or are never sent one (the API checks the server's capability).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrammarSpec {
     pub kind: GrammarKind,
     pub body: String,
+}
+
+impl GrammarSpec {
+    /// The `json_object` grammar ([`JSON_OBJECT_SCHEMA`]).
+    pub fn is_json_object(&self) -> bool {
+        self.kind == GrammarKind::JsonSchema && self.body == JSON_OBJECT_SCHEMA
+    }
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
