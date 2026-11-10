@@ -3876,8 +3876,11 @@ impl Drop for EngineChunks {
     /// A body or handler dropped before the answer ended (a client
     /// disconnect): the forwarder, blocked inside the task's step, can't drop
     /// its stream until the step returns, so ask the engine to end the step.
+    /// Not once the forwarder has ended (the task is over, its final perhaps
+    /// still unread in the channel): that would only park a finished id in
+    /// the engine's early-cancel set.
     fn drop(&mut self) {
-        if !self.ended && self.early.get().is_none() {
+        if !self.ended && self.early.get().is_none() && !self.forwarder.is_finished() {
             self.runner.interrupt(&self.task_id);
         }
     }
@@ -3904,6 +3907,12 @@ const FORWARD_BUFFER: usize = 1;
 /// [`EngineChunks::finish_early`] (a stop match) finishes the engine stream
 /// with that reason instead, which cancels and releases the same way, and
 /// interrupts nothing.
+///
+/// The forwarder reads one step ahead of its receiver. So when a stop match
+/// ends the answer (streamed or not) and the engine's very next chunk is its
+/// final, the forwarder may already have taken that final: the runner then
+/// books the final's reason (e.g. `length`) and its tokens while the response
+/// says `stop`. Metrics only; the response is cut at the match either way.
 ///
 /// A panic inside `step()` is caught here and forwarded as an error chunk,
 /// so the client sees an SSE error event rather than a clean `[DONE]` after
@@ -10709,6 +10718,36 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// A panicking engine step fails a non-streaming request with a 503
+    /// naming the panic (the forwarder catches it), and frees its slot.
+    #[tokio::test]
+    async fn engine_panic_without_stream_is_a_503() {
+        for (uri, payload) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "hi"}),
+            ),
+        ] {
+            let (app, log, _) = script_app_opts(
+                &["partial "],
+                ScriptOpts {
+                    end: ScriptEnd::Panic,
+                    ..ScriptOpts::default()
+                },
+            )
+            .await;
+            let (status, body) = post_text(app, uri, &payload).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+            assert!(body.contains("engine panicked"), "{uri}: {body}");
+            assert_released(&log).await;
+        }
+    }
+
     /// The request's slot and in-flight count are given back.
     async fn assert_released(log: &ScriptLog) {
         for _ in 0..200 {
@@ -11597,5 +11636,115 @@ level={{ effort_map[eff] }}";
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn disconnect_ends_the_running_step_non_streamed_completions() {
         disconnect_ends_the_running_step("/v1/completions", false, "api-inflight-cmpl").await;
+    }
+
+    /// A request queued behind a running one-shot step starts as soon as the
+    /// running request's client goes away, not when its step would end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_queued_behind_a_disconnected_step_starts_at_once() {
+        for stream in [false, true] {
+            let (app, log, _) = script_app_opts(
+                &[],
+                ScriptOpts {
+                    final_text: "done",
+                    step_delay: SLICE,
+                    inflight: true,
+                    ..ScriptOpts::default()
+                },
+            )
+            .await;
+            let addr = serve_local(app).await;
+            let payload = |max_tokens: u32| {
+                serde_json::json!({"model": "mock-model", "stream": stream,
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": "hi"}]})
+            };
+            let first = raw_post(addr, "/v1/chat/completions", &payload(400)).await;
+            wait_for(&log.step_starts, 1, Duration::from_secs(5))
+                .await
+                .unwrap_or_else(|| panic!("stream={stream}: the first step never started"));
+            let mut second = raw_post(addr, "/v1/chat/completions", &payload(2)).await;
+            // Request 2 is queued behind the running step.
+            tokio::time::sleep(SLICE * 4).await;
+            assert_eq!(log.step_starts.lock().unwrap().len(), 1, "stream={stream}");
+            let closed = std::time::Instant::now();
+            drop(first);
+            let started = wait_for(&log.step_starts, 2, Duration::from_secs(15))
+                .await
+                .unwrap_or_else(|| panic!("stream={stream}: the second step never started"));
+            let wait = started.saturating_duration_since(closed);
+            assert!(
+                wait < SLICE * 6,
+                "stream={stream}: the queued step started {wait:?} after the disconnect"
+            );
+            let mut reply = Vec::new();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::io::AsyncReadExt::read_to_end(&mut second, &mut reply),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("stream={stream}: no reply to the queued request"))
+            .unwrap();
+            let reply = String::from_utf8_lossy(&reply);
+            assert!(
+                reply.starts_with("HTTP/1.1 200"),
+                "stream={stream}: {reply}"
+            );
+            assert!(reply.contains("done"), "stream={stream}: {reply}");
+        }
+    }
+
+    /// A receiver dropped once its forwarder has ended (the final chunk still
+    /// unread in the channel) interrupts nothing: the finished task's id is
+    /// not parked in the engine's early-cancel set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drop_after_the_forwarder_ended_interrupts_nothing() {
+        let log = Arc::new(ScriptLog::default());
+        let handle = Arc::new(cascadia_engine::InflightCancel::new());
+        let runner = Arc::new(Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
+            parts: Vec::new(),
+            final_text: "done".into(),
+            prompt_first: true,
+            step_delay: SLICE,
+            end: ScriptEnd::Final,
+            gate: None,
+            log: log.clone(),
+            pending: None,
+            inflight: Some(handle.clone()),
+            slices: 0,
+        })))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("api-inflight-ended", "CPU"),
+            )
+            .await
+            .unwrap();
+        let task = GenerationTask::new("t-ended", "hi").with_max_tokens(1);
+        let id = task.task_id.clone();
+        let stream = runner.generate_async(task).await.unwrap();
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let chunks = spawn_engine_forwarder(
+            id.clone(),
+            runner.clone(),
+            StreamWithPermit {
+                inner: guard_window(stream, None),
+                _permit: permit,
+                _inflight: InFlightGuard::new(log.stats.clone()),
+            },
+        );
+        for _ in 0..1000 {
+            if chunks.forwarder.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(chunks.forwarder.is_finished(), "the forwarder never ended");
+        drop(chunks);
+        assert!(
+            !handle.begin(&id),
+            "the finished task's id was parked in the early-cancel set"
+        );
+        handle.end();
     }
 }

@@ -4594,6 +4594,74 @@ mod tests {
             ]
         );
     }
+
+    /// The node's own server loop drops a request's handler when the client
+    /// closes its socket mid-request, even while the handler is just
+    /// waiting: the API relies on that to interrupt a running one-shot step
+    /// on a non-streaming disconnect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_with_nodelay_drops_the_handler_on_a_client_close() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let app = {
+            let (dropped, entered) = (dropped.clone(), entered.clone());
+            axum::Router::new().route(
+                "/hang",
+                axum::routing::post(move || {
+                    let guard = SetOnDrop(dropped.clone());
+                    let entered = entered.clone();
+                    async move {
+                        let _guard = guard;
+                        entered.store(true, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_with_nodelay(listener, app));
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"POST /hang HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\n\r\n{}")
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            if entered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(entered.load(Ordering::SeqCst), "the handler never ran");
+        assert!(!dropped.load(Ordering::SeqCst));
+        let closed = std::time::Instant::now();
+        drop(sock);
+        while !dropped.load(Ordering::SeqCst)
+            && closed.elapsed() < std::time::Duration::from_secs(5)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let took = closed.elapsed();
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the handler was never dropped"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "the handler was dropped {took:?} after the close"
+        );
+    }
 }
 
 #[cfg(test)]
