@@ -739,6 +739,9 @@ struct ResponseStream {
     sequence: u64,
     started: bool,
     done: bool,
+    /// For readiness: the stream notes how it ended
+    /// ([`crate::note_stream_chunk`]).
+    health: AppState,
 }
 
 impl ResponseStream {
@@ -793,6 +796,7 @@ impl ResponseStream {
             self.finish(&mut out, End::Cancelled);
             return out;
         };
+        crate::note_stream_chunk(&self.health, &chunk);
         // The 200 is on the wire already, so a failed task is reported the
         // Responses way: a `response.failed` event, as the chat endpoint's
         // SSE error event does for its stream.
@@ -902,6 +906,7 @@ async fn stream_response(
         sequence: 0,
         started: false,
         done: false,
+        health: state.clone(),
     };
     let body = stream::unfold(st, |mut st| async move {
         if st.done {

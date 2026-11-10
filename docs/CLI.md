@@ -589,22 +589,25 @@ the message above), `invalid_prompt` for another refusal of the input, and
 
 **Readiness.** `GET /health` answers 503 `{"status": "degraded"}` once a
 completion fails with a 5xx that points at the pipeline (a peer link dropped,
-the engine not loaded), and 200 again after the next successful completion.
-Errors that are the client's fault never mark it unready. Neither do capacity
-503s, unless requests are in flight and the pipeline is stalled: the engine has
+the engine not loaded), or a stream ends with such an engine error (its 200
+was already sent, so the error is the stream's last event). It is 200 again
+after the next completion that succeeds; for a stream, one that finishes. A
+stream that is still running, or that the client closes before its end, does
+not count. Errors that are the client's fault never mark it unready, streamed
+or not. A peer that stops answering makes the step waiting on it time out
+(after 60 s) and fail, which marks the server unready. Capacity 503s do not
+mark it, unless requests are in flight and the pipeline is stalled: the engine has
 been inside one call (a step, or a request's submit) for more than 60 s, or it
 keeps stepping but has produced no real output (a token, a final answer, or a
 refusal of a request for its own fault, such as a prompt over the window; a
 progress marker or a step that fails for the server's fault does not count) for
-more than 60 s. A peer
-that stops answering does either: the step waiting on it hangs, or times out
-and fails, while its requests hold every slot, so every new request is a
-capacity 503. The server is then ready again as soon as the engine produces
-real output, or once no request is left in flight (a load balancer that
-drained the node lets its failed streams end), with no new request needed; if
-the pipeline is still broken, the next capacity 503 under load marks it
-unready again. Clients that open streams and leave
-them unread never count as a stall: the engine only steps while a stream is
+more than 60 s. This covers a step that hangs without failing while its
+requests hold every slot, so every new request is a capacity 503. The server
+is then ready again as soon as the engine produces real output, or once no
+request is left in flight (a load balancer that drained the node lets its
+clients give up their streams), with no new request needed; if the pipeline is
+still broken, the next capacity 503 under load marks it unready again. Clients
+that open streams and leave them unread never count as a stall: the engine only steps while a stream is
 read, and time it spent idle before a burst of requests is not counted. Any
 engine call longer than 60 s counts while every slot is full, whatever the
 engine: an engine that runs a whole answer as one call (`ov-genai` without

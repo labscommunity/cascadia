@@ -1069,6 +1069,25 @@ fn note_failure(h: &Health) {
     h.transition(|_| ReadinessState::Pipeline);
 }
 
+/// Readiness from one chunk of a streamed completion. Its 200 went out when
+/// the stream started, so [`track_pipeline_health`] cannot read the outcome
+/// from the status: the stream notes it here. An engine error that
+/// [`classify_chunk_error`] puts on the pipeline (a 5xx) is a failure, as it
+/// is for a non-streamed answer; a real final chunk is the success. A
+/// client-fault error, and every other chunk, changes nothing, so a stream
+/// the client abandons before its end leaves readiness as it was.
+fn note_stream_chunk(state: &AppState, chunk: &cascadia_types::Chunk) {
+    match &chunk.error {
+        Some(reason) => {
+            if classify_chunk_error(reason, "").0.is_server_error() {
+                note_failure(&Health::of(state));
+            }
+        }
+        None if chunk.is_final => note_success(&Health::of(state)),
+        None => {}
+    }
+}
+
 /// `/health`'s heal: unready from a stall, and either the engine has
 /// produced real output after the stall's evidence time (the pipeline is
 /// moving again) or nothing is in flight (the stall rule needs work in
@@ -1095,6 +1114,8 @@ fn heal_stall_mark(h: &Health, observe: impl FnOnce() -> (u64, u64)) {
 /// Response middleware: for completion routes, flip `AppState.ready` from the
 /// response status (5xx → not ready, 2xx → ready) so `/health` reflects whether
 /// the pipeline is actually serving. Non-completion routes don't touch it.
+/// A stream's 200 is sent before generation runs, so it is not a success
+/// here: the stream notes its own outcome ([`note_stream_chunk`]).
 /// 5xx responses tagged [`PreEngineFailure`] are excluded — they say nothing
 /// about the pipeline — except a [`CapacityRefusal`] while the pipeline is
 /// stalled ([`pipeline_stalled`]): a wedged step holds every slot, so every
@@ -1121,11 +1142,18 @@ async fn track_pipeline_health(
             if let Some(evidence) = pipeline_stalled(&state) {
                 note_stall(&Health::of(&state), evidence);
             }
-        } else if s.is_success() {
+        } else if s.is_success() && !is_event_stream(&resp) {
             note_success(&Health::of(&state));
         }
     }
     resp
+}
+
+/// The response is an SSE stream (`Content-Type: text/event-stream`).
+fn is_event_stream(resp: &axum::response::Response) -> bool {
+    resp.headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"))
 }
 
 #[derive(Serialize)]
@@ -5004,8 +5032,10 @@ async fn stream_text_completion(
         _permit: permit,
         _inflight: inflight,
     };
+    let health = state.clone();
     let body_stream = permit_carrier
         .then(move |chunk| {
+            note_stream_chunk(&health, &chunk);
             let model = model.clone();
             let task_id = task_id.clone();
             let stats = stats.clone();
@@ -5142,6 +5172,7 @@ async fn stream_completion(
             task_id,
             model,
             include_usage,
+            health: state.clone(),
         };
         let body = stream::unfold(tool_stream, |mut s| async move {
             let frame = s.next_frame().await?;
@@ -5195,8 +5226,10 @@ async fn stream_completion(
     let marker: Arc<std::sync::Mutex<Option<MarkerFilter>>> = Arc::new(std::sync::Mutex::new(
         state.marker_dialect.clone().map(MarkerFilter::new),
     ));
+    let health = state.clone();
     let body_stream = permit_carrier
         .then(move |chunk| {
+            note_stream_chunk(&health, &chunk);
             let model = model.clone();
             let task_id = task_id.clone();
             let stats = stats.clone();
@@ -5362,6 +5395,8 @@ struct ToolStream {
     task_id: String,
     model: String,
     include_usage: bool,
+    /// For readiness: the stream notes how it ended ([`note_stream_chunk`]).
+    health: AppState,
 }
 
 enum ToolStreamPhase {
@@ -5393,6 +5428,7 @@ impl ToolStream {
             if chunk.is_progress() {
                 continue;
             }
+            note_stream_chunk(&self.health, &chunk);
             // The 200 headers are already on the wire: surface the failure
             // as an SSE error event. No tool_calls or usage follow it.
             if let Some(reason) = &chunk.error {
@@ -8885,42 +8921,58 @@ mod tests {
         );
     }
 
-    /// A peer that times out makes every stream fail without output; once
-    /// the failed streams have ended and nothing is in flight, `/health` is
-    /// ready again with no new request (the next capacity 503 under load
-    /// marks it again if the pipeline is still broken).
+    /// A peer that times out makes every stream fail without output. Once
+    /// the streams behind a stall mark have ended and nothing is in flight,
+    /// `/health` is ready again with no new request (the next capacity 503
+    /// under load marks it again if the pipeline is still broken), when the
+    /// client gave them up. A stream that ends with the pipeline's own
+    /// failure is a failed completion: it marks the server unready until a
+    /// success, as a non-streamed 5xx does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stall_mark_clears_when_the_failed_streams_end() {
-        let (app, phase_switch) = phase_app(PHASE_ERRORS).await;
-        let reader = {
-            let app = app.clone();
-            tokio::spawn(async move {
-                let resp = app.oneshot(stall_chat(true)).await.unwrap();
-                to_bytes(resp.into_body(), 1 << 20).await.unwrap()
-            })
-        };
-        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
-        let refused = app
-            .clone()
-            .oneshot(stall_chat(false))
-            .await
-            .unwrap()
-            .status();
-        let health = stall_health(&app).await;
-        // The reader's own task now fails too, with no output.
-        phase_switch.store(PHASE_FAIL_OWN, Ordering::SeqCst);
-        let body = reader.await.unwrap();
-        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(health, StatusCode::SERVICE_UNAVAILABLE, "stalled");
-        assert!(
-            String::from_utf8_lossy(&body).contains("peer timeout"),
-            "{body:?}"
-        );
-        assert_eq!(
-            stall_health(&app).await,
-            StatusCode::OK,
-            "nothing in flight"
-        );
+        for abandoned in [true, false] {
+            let (app, phase_switch) = phase_app(PHASE_ERRORS).await;
+            let reader = {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                    to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+                })
+            };
+            tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+            let refused = app
+                .clone()
+                .oneshot(stall_chat(false))
+                .await
+                .unwrap()
+                .status();
+            let health = stall_health(&app).await;
+            assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(health, StatusCode::SERVICE_UNAVAILABLE, "stalled");
+            if abandoned {
+                // The client gives up its stream.
+                reader.abort();
+                assert!(reader.await.unwrap_err().is_cancelled());
+                assert_eq!(
+                    stall_health(&app).await,
+                    StatusCode::OK,
+                    "nothing in flight"
+                );
+            } else {
+                // The reader's own task now fails too, with no output.
+                phase_switch.store(PHASE_FAIL_OWN, Ordering::SeqCst);
+                let body = reader.await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("peer timeout"),
+                    "{body:?}"
+                );
+                assert_eq!(
+                    stall_health(&app).await,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the stream failed in the pipeline"
+                );
+            }
+        }
     }
 
     /// A short step that returns keeps a busy server ready: the 503 that
@@ -13320,5 +13372,240 @@ level={{ effort_map[eff] }}";
         assert!(String::from_utf8_lossy(&body)
             .trim_end()
             .ends_with("data: [DONE]"));
+    }
+
+    /// A pipeline failure as rank 0 reports it when its downstream stage goes
+    /// silent: the transport's token wait times out.
+    const DOWNSTREAM_TIMEOUT: &str =
+        "task t-1: backend error: timed out after 60s waiting for the downstream token";
+
+    /// One task at a time. A prompt carrying `__fail__` streams "Hi " and then
+    /// an error chunk with `DOWNSTREAM_TIMEOUT`; one carrying `__refuse__`
+    /// streams "Hi " and then an error chunk with a client-fault reason (a
+    /// prompt over the window). Any other prompt streams "Hi " and then, once
+    /// `release` is set, a real final chunk.
+    struct ReadinessEngine {
+        release: Arc<std::sync::atomic::AtomicBool>,
+        pending: Option<(cascadia_types::TaskId, Option<&'static str>, usize)>,
+    }
+
+    impl cascadia_engine::Engine for ReadinessEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            let fail = if task.prompt.contains("__fail__") {
+                Some(DOWNSTREAM_TIMEOUT)
+            } else if task.prompt.contains("__refuse__") {
+                Some(MID_GENERATION_TOO_LONG)
+            } else {
+                None
+            };
+            self.pending = Some((task.task_id, fail, 0));
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some((id, fail, i)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            if i == 0 {
+                self.pending = Some((id.clone(), fail, 1));
+                return Ok(vec![(id.clone(), Chunk::token(&id, 0, "Hi ".to_owned()))]);
+            }
+            if let Some(reason) = fail {
+                return Ok(vec![(id.clone(), Chunk::error(&id, reason))]);
+            }
+            if !self.release.load(Ordering::SeqCst) {
+                self.pending = Some((id, fail, i));
+                return Ok(Vec::new());
+            }
+            let last = Chunk::final_marker(&id, "")
+                .with_finish_reason(cascadia_types::FinishReason::Stop)
+                .with_prompt_tokens(5)
+                .with_completion_tokens(1);
+            Ok(vec![(id, last)])
+        }
+    }
+
+    struct ReadinessBuilder(ReadinessEngine);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ReadinessBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0))
+        }
+    }
+
+    /// Router over a [`ReadinessEngine`]; returns its gate.
+    async fn readiness_app() -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Runner::new(Box::new(ReadinessBuilder(ReadinessEngine {
+            release: release.clone(),
+            pending: None,
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        (
+            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            release,
+        )
+    }
+
+    /// Every streamed completion route: chat, chat with tools (its own
+    /// stream), completions and responses.
+    const STREAM_ROUTES: [&str; 4] = ["chat", "chat+tools", "completions", "responses"];
+
+    fn stream_request(route: &str, content: &str) -> Request<Body> {
+        let (uri, payload) = match route {
+            "chat" => (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": content}]}),
+            ),
+            "chat+tools" => (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": content}],
+                    "tools": [{"type": "function", "function": {"name": "get_weather"}}]}),
+            ),
+            "completions" => (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "stream": true, "prompt": content}),
+            ),
+            "responses" => (
+                "/v1/responses",
+                serde_json::json!({"model": "mock-model", "stream": true, "input": content}),
+            ),
+            other => panic!("unknown route {other}"),
+        };
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    }
+
+    /// Sends a streamed request and reads its body to the end.
+    async fn drain_stream(app: Router, route: &str, content: &str) -> String {
+        let resp = app.oneshot(stream_request(route, content)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{route}");
+        String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap()
+    }
+
+    /// A stream whose engine fails in the pipeline after the 200 went out
+    /// marks the server unready, on every streamed route.
+    #[tokio::test]
+    async fn streamed_pipeline_failure_marks_unready() {
+        for route in STREAM_ROUTES {
+            let (app, _release) = readiness_app().await;
+            let body = drain_stream(app.clone(), route, "__fail__").await;
+            assert!(body.contains("timed out after 60s"), "{route}: {body}");
+            assert_eq!(
+                health_status(app).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}: a stream that failed in the pipeline must mark the server unready"
+            );
+        }
+    }
+
+    /// A stream that ends with the caller's fault (a prompt over the window)
+    /// says nothing about the pipeline: readiness is untouched, whether it
+    /// was ready or already marked by a pipeline failure.
+    #[tokio::test]
+    async fn streamed_client_fault_leaves_readiness_alone() {
+        for route in STREAM_ROUTES {
+            let (app, _release) = readiness_app().await;
+            let body = drain_stream(app.clone(), route, "__refuse__").await;
+            assert!(body.contains("context_length_exceeded"), "{route}: {body}");
+            assert_eq!(health_status(app.clone()).await, StatusCode::OK, "{route}");
+            drain_stream(app.clone(), route, "__fail__").await;
+            drain_stream(app.clone(), route, "__refuse__").await;
+            assert_eq!(
+                health_status(app).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}: a client-fault stream must not clear a pipeline failure"
+            );
+        }
+    }
+
+    /// After a pipeline failure, a stream's 200 headers do not clear the
+    /// mark while it runs, nor does a stream the client abandons; one that
+    /// finishes with a real final chunk does.
+    #[tokio::test]
+    async fn finished_stream_clears_a_pipeline_failure_open_one_does_not() {
+        for route in STREAM_ROUTES {
+            let (app, release) = readiness_app().await;
+            drain_stream(app.clone(), route, "__fail__").await;
+            assert_eq!(
+                health_status(app.clone()).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}"
+            );
+
+            // Open, first frame read, not finished: still unready.
+            let resp = app
+                .clone()
+                .oneshot(stream_request(route, "hello"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{route}");
+            let mut body = resp.into_body().into_data_stream();
+            loop {
+                let frame = tokio::time::timeout(std::time::Duration::from_secs(10), body.next())
+                    .await
+                    .expect("a frame while generation is gated")
+                    .expect("body still open")
+                    .unwrap();
+                if !frame.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(
+                health_status(app.clone()).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}: an open stream's 200 must not clear a pipeline failure"
+            );
+
+            // Abandoned before its final chunk: still unready.
+            drop(body);
+            assert_eq!(
+                health_status(app.clone()).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}: an abandoned stream must not clear a pipeline failure"
+            );
+
+            // A stream that finishes: ready again.
+            release.store(true, Ordering::SeqCst);
+            let body = drain_stream(app.clone(), route, "hello").await;
+            assert!(!body.contains("timed out after"), "{route}: {body}");
+            assert_eq!(
+                health_status(app).await,
+                StatusCode::OK,
+                "{route}: a finished stream must mark the server ready"
+            );
+        }
     }
 }
