@@ -47,6 +47,8 @@ layers 0–2).
 - **Pipeline** (`src/engine.rs`, `src/dist.rs`) — rank 0 embeds + drives, mid
   ranks relay the HC-copy hidden state, the last rank runs the head + sampler.
 
+Cancel and `stop` on the single-stage path (DeepSeek-V4 included): see [MiniMax-M2: Cancel and `stop` (single-stage)](minimax-m2.md#cancel-and-stop-single-stage).
+
 ## Performance
 
 Steady-state 4-node decode is **compute-bound** — experts ~50%, attention

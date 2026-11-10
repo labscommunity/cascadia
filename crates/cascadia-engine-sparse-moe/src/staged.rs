@@ -251,6 +251,12 @@ pub trait StagedRunner: Send + 'static {
     /// before and after the batch, so a cancel during its prefill waits for
     /// the whole batch. A stop during prefill returns no tokens. The
     /// single-stage path keeps no prefix cache, so there is none to protect.
+    ///
+    /// The single-stage engine calls this method, not
+    /// [`Self::generate_reason_timed`]. A runner outside this crate that
+    /// overrides `generate_reason_timed` with its own loop should override
+    /// this method instead (and poll `should_stop` in it): otherwise the
+    /// engine runs this provided loop and bypasses its override.
     fn generate_reason_timed_polled(
         &mut self,
         prompt: &[u32],

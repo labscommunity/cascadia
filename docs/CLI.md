@@ -330,6 +330,20 @@ context window still ends an answer where the prompt plus the answer fill it
     prompt as one batch.
   - On these paths every generated token now costs one extra check, plus a
     short decode of the newest tokens while a `stop` is set.
+  - ov-genai prefills the prompt in one call that can't be interrupted, so a
+    cancel during a long prompt's prefill waits for it to finish.
+  - When ov-genai runs its streamer on a worker thread (the paged-attention /
+    continuous-batching backend a plain pipeline can pick, or the speculative
+    pipelines; the node logs `ov-genai streamer thread threaded_streamer=true`
+    once), a cancel or stop lands one step later.
+  - When the answer starts with text the server strips (a repeat of the
+    prompt, leading whitespace), the engine checks for a `stop` only after
+    it. A stop there is still cut by the API at the end, so the answer is the
+    same as without the engine check.
+  - A non-streaming client that half-closes its socket after the request
+    (`shutdown(SHUT_WR)`: raw sockets, `nc -N`, some proxies) counts as a
+    disconnect, and the request is cancelled. curl and the OpenAI SDKs don't
+    half-close.
 - **What still runs to the window.** On the two one-shot engines above, an
   answer that never reaches end-of-sequence or a `stop` match holds the engine
   for up to one context window instead of 256 tokens, unless the client

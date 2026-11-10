@@ -249,6 +249,8 @@ set: the row-parallel GEMVs gain nothing from a core's second hyperthread
 and lose 3× to it on macOS (Mac Pro 28c/56t, pinned: 33 → 10.4 ms per MoE
 layer); Linux is indifferent (miner 24c/48t: 14.2 → 13.4).
 
+Cancel and `stop` on the single-stage path (Inkling included): see [MiniMax-M2: Cancel and `stop` (single-stage)](minimax-m2.md#cancel-and-stop-single-stage).
+
 ## Sizing and the hardware honesty note
 
 Per generated token the engine touches ~41B active parameters: ~21.7B routed

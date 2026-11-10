@@ -83,6 +83,8 @@ deployment, never from `max_position` (1M would preallocate TB-scale KV).
   ≈ 1 forward; no draft head). Learned-pin residency (`.coli_usage` histogram +
   `mlock` of the hottest experts, per-node budget from the layer slice).
 
+Cancel and `stop` on the single-stage path (GLM-5 included): see [MiniMax-M2: Cancel and `stop` (single-stage)](minimax-m2.md#cancel-and-stop-single-stage).
+
 ## Reuse map (vs the `dsv4` shell)
 
 | Reuse | Rewrite (different family) | Drop |
