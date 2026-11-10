@@ -2169,9 +2169,9 @@ fn a_best_effort_request_runs_unmasked_when_the_probe_goes_unanswered() {
     }
 }
 
-/// On a latched link, refusing or due a re-probe, a best-effort json
-/// request runs unmasked at once: it never fails on the latch and never
-/// pays for the re-probe. A strict one is refused, then re-probes.
+/// While the link's latch refuses, a best-effort json request runs unmasked
+/// at once, without a probe, where a strict one is refused. Once the latch
+/// is due a re-probe, the best-effort request re-probes like a strict one.
 #[test]
 fn a_best_effort_request_runs_unmasked_on_a_latched_link_without_a_probe() {
     for streams in [0, 2] {
@@ -2198,22 +2198,126 @@ fn a_best_effort_request_runs_unmasked_on_a_latched_link_without_a_probe() {
             Some(UPGRADE_EVERY_STAGE),
             "{streams}"
         );
-        // Due a re-probe: still no probe for the best-effort one.
+        assert_eq!(log.probes(), 0, "{streams}: refused or dropped at once");
+        assert!(stage_unsupported_count() > before, "{streams}");
+        // Due a re-probe: the best-effort one re-probes, the new tail
+        // answers, and it is enforced from then on.
         let past = Instant::now() - cascadia_grammar::MASK_PROBE_REPROBE_AFTER;
         head.stage_masks.latch.set_probe_at(past);
         let (j, _) = timed(&mut head, soft_json_task("j2", 4));
         assert_eq!(final_chunk(&j).error, None, "{streams}");
-        assert_eq!(
-            log.probes(),
-            0,
-            "{streams}: the best-effort ones never probe"
-        );
-        assert!(stage_unsupported_count() >= before + 2, "{streams}");
-        // The strict one pays for it, and is then enforced.
+        assert_eq!(log.probes(), 1, "{streams}: the best-effort one re-probed");
+        assert!(!head.stage_masks.latch.refuses(), "{streams}");
         let (s, _) = timed(&mut head, json_task("s2", 4));
         assert_eq!(final_chunk(&s).error, None, "{streams}");
-        assert_eq!(log.probes(), 1, "{streams}");
+        assert_eq!(log.probes(), 1, "{streams}: evidence, no more probes");
     }
+}
+
+/// An expired latch and a re-probe that goes unanswered again (an old last
+/// stage): the best-effort request runs unmasked instead of failing, and the
+/// link latches again.
+#[test]
+fn a_best_effort_re_probe_that_goes_unanswered_runs_unmasked() {
+    for streams in [0, 2] {
+        let rt = runtime();
+        let mut l = links(&rt, 1);
+        let log = fixture_tail(&rt, l[0].0.clone(), true);
+        let mut head = head_engine_with(
+            &rt,
+            JsonStub::new(),
+            l.remove(0).1,
+            2,
+            streams,
+            TEST_PROBE,
+            IDLE_LINK_CHECK,
+        );
+        let past = Instant::now() - cascadia_grammar::MASK_PROBE_REPROBE_AFTER;
+        head.stage_masks.latch.set_probe_at(past);
+        let before = stage_unsupported_count();
+        let (j, _) = timed(&mut head, soft_json_task("j", 4));
+        assert_eq!(final_chunk(&j).error, None, "{streams}");
+        assert_eq!(j.tokens, vec![u32::from(b'a'); 4], "{streams}: unmasked");
+        assert!(stage_unsupported_count() > before, "{streams}");
+        assert!(head.stage_masks.latch.refuses(), "{streams}: latched again");
+        assert_eq!(
+            log.frames()[0],
+            (FrameKind::Forward, true),
+            "{streams}: the re-probe"
+        );
+    }
+}
+
+/// The SparseMoE and MiniMax heads read a slow stage's late acknowledged
+/// probe answer before deciding a best-effort task's grammar: the answer
+/// clears the latch, so the task keeps its grammar. With nothing owed and
+/// the latch refusing, the best-effort task drops it and a strict one is
+/// refused.
+#[test]
+fn a_late_probe_answer_is_read_before_a_best_effort_drop() {
+    let compiled_for = |task: &GenerationTask| {
+        Some(
+            test_env::factory()
+                .compile(task.grammar.as_ref().unwrap())
+                .unwrap(),
+        )
+    };
+    let rt = runtime();
+    let mut l = links(&rt, 1);
+    let (srv, down) = l.remove(0);
+    let (late, ctl) = late_probe();
+    let _log = fixture_tail_full(&rt, srv, false, false, Some(late));
+    let (mut masks, mut evidence) = (StageMasks::default(), false);
+    let owed = crate::dist::OwedLateReply::default();
+    let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+    assert!(r.is_err());
+    assert!(masks.latch.refuses());
+    ctl.land();
+    wait_late_answer_at_head(&rt, &down, &owed);
+    let mut task = soft_json_task("j", 4);
+    let mut compiled = compiled_for(&task);
+    let r = check_dequeued_json(
+        rt.handle(),
+        Some(&down),
+        &mut masks,
+        &owed,
+        &mut task,
+        &mut compiled,
+    );
+    assert_eq!(r, Ok(()));
+    assert!(!masks.latch.is_set(), "the late answer cleared it");
+    assert!(compiled.is_some() && task.grammar.is_some());
+
+    let mut masks = StageMasks::default();
+    masks.latch.set_probe();
+    let owed = crate::dist::OwedLateReply::default();
+    let mut task = soft_json_task("j", 4);
+    let mut compiled = compiled_for(&task);
+    let r = check_dequeued_json(
+        rt.handle(),
+        None,
+        &mut masks,
+        &owed,
+        &mut task,
+        &mut compiled,
+    );
+    assert_eq!(r, Ok(()));
+    assert!(
+        compiled.is_none() && task.grammar.is_none(),
+        "runs unmasked"
+    );
+    let mut task = json_task("s", 4);
+    let mut compiled = compiled_for(&task);
+    let r = check_dequeued_json(
+        rt.handle(),
+        None,
+        &mut masks,
+        &owed,
+        &mut task,
+        &mut compiled,
+    );
+    assert_eq!(r.unwrap_err(), UPGRADE_EVERY_STAGE);
+    assert!(compiled.is_some(), "a strict task keeps it");
 }
 
 // ---- the MiniMax engine's probe, driven step by step -----------------------

@@ -1394,6 +1394,26 @@ async fn refuse_while_latched(
     masks.refusal().map_or(Ok(()), Err)
 }
 
+/// Rank 0, a json task just taken off the queue, the link idle: the late
+/// probe answer already on the link is read first (see
+/// [`refuse_dequeued_json`]); then, while the latch still refuses, a
+/// best-effort grammar is dropped, with its compiled form, and the task runs
+/// unmasked (see [`drop_on_latched_link`]), where a strict one gets the
+/// refusal. `compiled` must be `Some`.
+pub(crate) fn check_dequeued_json(
+    handle: &tokio::runtime::Handle,
+    down: Option<&Arc<TokioMutex<ActivationClient>>>,
+    masks: &mut StageMasks,
+    owed: &crate::dist::OwedLateReply,
+    task: &mut GenerationTask,
+    compiled: &mut Option<CompiledGrammar>,
+) -> Result<(), String> {
+    match refuse_dequeued_json(handle, down, masks, owed) {
+        Err(_) if drop_on_latched_link(task, compiled, masks) => Ok(()),
+        checked => checked,
+    }
+}
+
 /// Rank 0, a json task's admission on a multi-stage link: read a slow
 /// stage's late probe answer already on the idle link (it clears the
 /// latch), refuse while the latch holds, and probe a link without
@@ -2380,14 +2400,16 @@ impl SparseMoEEngine {
             None => return Some(Vec::new()),
         };
         let mut compiled = self.grammars.remove(&task.task_id);
-        // A best-effort json task on a latched pipeline runs unmasked.
-        drop_on_latched_link(&mut task, &mut compiled, &self.stage_masks);
+        // A best-effort json task runs unmasked while the pipeline's latch
+        // refuses, read after any late probe answer already on the link.
         if compiled.is_some() {
-            if let Err(msg) = refuse_dequeued_json(
+            if let Err(msg) = check_dequeued_json(
                 &self.runtime_handle,
                 self.transport.downstream.as_ref(),
                 &mut self.stage_masks,
                 &self.owed_late,
+                &mut task,
+                &mut compiled,
             ) {
                 let id = task.task_id.clone();
                 return Some(vec![(id.clone(), Chunk::error(id, msg))]);
@@ -2526,7 +2548,7 @@ impl SparseMoEEngine {
             if let Err(msg) = admitted {
                 // An unanswered probe latched the link: a best-effort task
                 // runs unmasked instead of failing.
-                if self.stage_masks.latch.is_set()
+                if self.stage_masks.latch.refuses()
                     && drop_best_effort_grammar(&mut task, UnenforcedReason::StageUnsupported)
                 {
                     grammar = None;
@@ -4829,14 +4851,16 @@ impl OvMoeEngine {
             None => return Some(Vec::new()),
         };
         let mut compiled = self.grammars.remove(&task.task_id);
-        // A best-effort json task on a latched pipeline runs unmasked.
-        drop_on_latched_link(&mut task, &mut compiled, &self.stage_masks);
+        // A best-effort json task runs unmasked while the pipeline's latch
+        // refuses, read after any late probe answer already on the link.
         if compiled.is_some() {
-            if let Err(msg) = refuse_dequeued_json(
+            if let Err(msg) = check_dequeued_json(
                 &self.runtime_handle,
                 self.transport.downstream.as_ref(),
                 &mut self.stage_masks,
                 &self.owed_late,
+                &mut task,
+                &mut compiled,
             ) {
                 let id = task.task_id.clone();
                 return Some(vec![(id.clone(), Chunk::error(id, msg))]);
@@ -4962,7 +4986,7 @@ impl OvMoeEngine {
             if let Err(msg) = admitted {
                 // An unanswered probe latched the link: a best-effort task
                 // runs unmasked instead of failing.
-                if self.stage_masks.latch.is_set()
+                if self.stage_masks.latch.refuses()
                     && drop_best_effort_grammar(&mut task, UnenforcedReason::StageUnsupported)
                 {
                     grammar = None;
@@ -7008,14 +7032,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let latched = self.stage_masks.refusal().is_some();
             let owed = latched && self.owed_late.is_owed();
             let probing = !self.mask_evidence && !latched;
-            // A best-effort json request on a latched link never waits for,
-            // nor pays for, the re-probe: it runs unmasked (an owed late
-            // answer is still read first).
-            let set = self.stage_masks.latch.is_set();
-            let waits = |t: &GenerationTask| {
-                self.grammars.contains_key(&t.task_id)
-                    && (owed || (probing && !(set && is_best_effort(t))))
-            };
+            // (While the latch refuses nothing probes: once any owed answer
+            // is read, a best-effort request is admitted and runs unmasked.)
+            let waits =
+                |t: &GenerationTask| (probing || owed) && self.grammars.contains_key(&t.task_id);
             let mut at = 0;
             if self.pending.front().is_some_and(waits) {
                 let idle =
@@ -7050,7 +7070,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         // request is admitted unmasked below instead. A dead
                         // link admits nothing more this step.
                         let falls_back = !self.peer_disconnected
-                            && self.stage_masks.latch.is_set()
+                            && self.stage_masks.latch.refuses()
                             && self.pending.front().is_some_and(is_best_effort);
                         if !falls_back {
                             let task = self.pending.pop_front().expect("non-empty");

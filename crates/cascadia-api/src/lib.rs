@@ -103,8 +103,6 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Count a pre-engine rejection in `cascadia_api_rejected_total`. Reasons
-/// are a closed set — see the metric's docs in `cascadia-metrics`.
 /// The schema compile check's verdict applied to the request's grammar: a
 /// grammar that passed is kept; a best-effort one that is too complex, or
 /// found the compile pool full, is dropped (logged and counted) and the
@@ -146,6 +144,8 @@ fn apply_schema_check(
     Err((status, Json(serde_json::json!({ "error": msg }))).into_response())
 }
 
+/// Count a pre-engine rejection in `cascadia_api_rejected_total`. Reasons
+/// are a closed set — see the metric's docs in `cascadia-metrics`.
 fn count_rejected(reason: &str) {
     cascadia_metrics::API_REJECTED_TOTAL
         .with_label_values(&[reason])

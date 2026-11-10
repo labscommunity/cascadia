@@ -2348,16 +2348,23 @@ fn read_latched_link(
     }
 }
 
+/// Head: drops a best-effort grammar while the link's latch refuses (see
+/// [`structured::drop_on_latched_link`]). An expired latch drops nothing:
+/// the task re-probes like a strict one. `true` when dropped.
+fn drop_while_refused(task: &mut GenerationTask, link: &MaskLink, now: std::time::Instant) -> bool {
+    structured::drop_on_latched_link(task, link.refusal(now).is_some())
+}
+
 /// Head, at submit and at admission of a structured-output task on a
-/// multi-stage pipeline, after [`read_latched_link`]: a best-effort grammar
-/// on a latched link is dropped (see [`structured::drop_on_latched_link`]);
-/// a strict one gets the link's refusal while the latch holds.
+/// multi-stage pipeline, after [`read_latched_link`], while the link's latch
+/// refuses: a best-effort grammar is dropped (see [`drop_while_refused`]); a
+/// strict one gets the refusal.
 fn latched_link_check(
     task: &mut GenerationTask,
     link: &MaskLink,
     now: std::time::Instant,
 ) -> EngineResult<()> {
-    if structured::drop_on_latched_link(task, link.latched_at.is_some()) {
+    if drop_while_refused(task, link, now) {
         return Ok(());
     }
     match link.refusal(now) {
@@ -4201,11 +4208,9 @@ impl OvRuntimeEngine {
             if needs_mask_probe(grammar.is_some(), multi_stage, &self.mask_link) {
                 if let Err(e) = self.probe_downstream() {
                     // An unanswered probe latched the link: a best-effort
-                    // task runs unmasked instead of failing.
-                    if structured::drop_on_latched_link(
-                        &mut task,
-                        self.mask_link.latched_at.is_some(),
-                    ) {
+                    // task runs unmasked instead of failing (a link failure,
+                    // or an acknowledged NACK, still fails it).
+                    if drop_while_refused(&mut task, &self.mask_link, std::time::Instant::now()) {
                         grammar = None;
                     } else {
                         let id = task.task_id.clone();
@@ -4445,7 +4450,10 @@ impl OvRuntimeEngine {
             let Some(slot) = self.packed.as_ref().unwrap().free_slot() else {
                 break;
             };
-            let PendingTask { task, grammar } = self.pending.remove(0);
+            let PendingTask {
+                mut task,
+                mut grammar,
+            } = self.pending.remove(0);
             // Option B: the packed path has no forced-prefix support — it neither
             // appends `resume_token_ids` to the prompt nor seeds `generated`/`emitted`.
             // Admitting a resume task here would regenerate the turn FROM SCRATCH and
@@ -4484,6 +4492,14 @@ impl OvRuntimeEngine {
                     EngineError::Backend("empty prompt: no tokens to prefill".into())
                         .for_task(task.task_id),
                 );
+            }
+            // A best-effort task admitted while the link's latch refuses runs
+            // unmasked (a strict one fails at its first masked step).
+            if grammar.is_some()
+                && !self.spec.is_last_stage
+                && drop_while_refused(&mut task, &self.mask_link, std::time::Instant::now())
+            {
+                grammar = None;
             }
             // Structured output: a fresh matcher (no resume seed on this path).
             // A failure is this task's error chunk only.
@@ -9838,15 +9854,68 @@ mod tests {
         assert!(err.to_string().contains(MASK_UPGRADE_ERROR), "{err}");
         assert!(t.grammar.is_some());
 
-        // Due a re-probe: the strict one goes ahead and probes; the
-        // best-effort one still runs unmasked.
+        // Due a re-probe: both go ahead and probe, the best-effort one too.
         let later = now + MASK_PROBE_REPROBE_AFTER;
         let mut t = strict();
         latched_link_check(&mut t, &link, later).unwrap();
         assert!(t.grammar.is_some());
         let mut t = soft();
         latched_link_check(&mut t, &link, later).unwrap();
+        assert!(t.grammar.is_some(), "it re-probes");
+        assert!(needs_mask_probe(true, true, &link));
+    }
+
+    /// Packed admission on a latched link: a best-effort task drops its
+    /// grammar and runs unmasked; a strict one keeps it (it fails at its
+    /// first masked step, as before); an expired latch drops nothing.
+    #[test]
+    fn a_best_effort_packed_task_admitted_on_a_latched_link_runs_unmasked() {
+        let now = std::time::Instant::now();
+        let mut link = MaskLink::default();
+        let soft = || {
+            GenerationTask::new("s", "p").with_grammar(
+                cascadia_types::GrammarSpec::best_effort_json_schema(OK_ENUM),
+            )
+        };
+        let mut t = soft();
+        assert!(!drop_while_refused(&mut t, &link, now));
+        let _ = link.on_probe_unanswered(now, &EngineError::Backend("silence".into()));
+        let mut t = soft();
+        assert!(drop_while_refused(&mut t, &link, now));
         assert_eq!(t.grammar, None);
+        let mut strict = GenerationTask::new("j", "p").with_grammar(json_spec(OK_ENUM));
+        assert!(!drop_while_refused(&mut strict, &link, now));
+        assert!(strict.grammar.is_some());
+        let mut t = soft();
+        assert!(!drop_while_refused(
+            &mut t,
+            &link,
+            now + MASK_PROBE_REPROBE_AFTER
+        ));
+        assert!(t.grammar.is_some());
+    }
+
+    /// A best-effort task re-probing an expired latch that goes unanswered
+    /// again: it runs unmasked instead of failing, and the link latches
+    /// again for the next tasks.
+    #[test]
+    fn a_best_effort_re_probe_that_goes_unanswered_runs_unmasked() {
+        let now = std::time::Instant::now();
+        let mut link = MaskLink::default();
+        let _ = link.on_probe_unanswered(now, &EngineError::Backend("silence".into()));
+        let later = now + MASK_PROBE_REPROBE_AFTER;
+        let mut t = GenerationTask::new("s", "p").with_grammar(
+            cascadia_types::GrammarSpec::best_effort_json_schema(OK_ENUM),
+        );
+        latched_link_check(&mut t, &link, later).unwrap();
+        assert!(t.grammar.is_some());
+        let _ = link.on_probe_unanswered(later, &EngineError::Backend("silence".into()));
+        assert!(drop_while_refused(&mut t, &link, later));
+        assert_eq!(t.grammar, None, "runs unmasked");
+        assert!(link.refusal(later).is_some(), "latched again");
+        // A strict task is still refused by it.
+        let mut strict = GenerationTask::new("j", "p").with_grammar(json_spec(OK_ENUM));
+        assert!(latched_link_check(&mut strict, &link, later).is_err());
     }
 
     /// An acknowledged NACK is a stage failure on a chain that masks: the task

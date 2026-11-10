@@ -291,18 +291,18 @@ pub(crate) fn drop_best_effort_grammar(
     true
 }
 
-/// Rank 0's admission of a json task whose pipeline has latched (refusing,
-/// due a re-probe, or just tripped by an unanswered probe): a best-effort
-/// grammar is dropped, with its compiled form, and the task runs unmasked;
-/// it never fails on the latch nor pays for the re-probe. `true` when
-/// dropped.
+/// Rank 0's admission of a json task while its pipeline's latch refuses
+/// (set by an unacknowledged step or an unanswered probe, this one's
+/// included): a best-effort grammar is dropped, with its compiled form, and
+/// the task runs unmasked. An expired latch drops nothing: the task
+/// re-probes like a strict one. `true` when dropped.
 pub(crate) fn drop_on_latched_link(
     task: &mut GenerationTask,
     compiled: &mut Option<CompiledGrammar>,
     masks: &StageMasks,
 ) -> bool {
     let dropped = compiled.is_some()
-        && masks.latch.is_set()
+        && masks.latch.refuses()
         && drop_best_effort_grammar(task, UnenforcedReason::StageUnsupported);
     if dropped {
         *compiled = None;

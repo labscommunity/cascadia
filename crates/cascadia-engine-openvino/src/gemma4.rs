@@ -1538,6 +1538,12 @@ impl MaskLatch {
         }
     }
 
+    /// Whether the latch refuses at `now`, without dropping an expired one.
+    fn refusing(&self, now: std::time::Instant) -> bool {
+        self.since
+            .is_some_and(|t| now.saturating_duration_since(t) < self.reprobe_after)
+    }
+
     /// `Err` while latched; an expired latch is dropped (the next masked
     /// step probes the chain again).
     fn refusal(&mut self, now: std::time::Instant) -> EngineResult<()> {
@@ -1572,10 +1578,10 @@ fn latched_refusal(
 }
 
 /// [`latched_refusal`] at a task's admission, where a best-effort grammar on
-/// a latched multi-stage pipeline (refusing, or due a re-probe) is dropped
-/// instead (see [`structured::drop_on_latched_link`]): the task is stepped
-/// unmasked and never pays for the re-probe, which is left to the next
-/// strict task. `Ok(true)` when the task keeps a grammar.
+/// a multi-stage pipeline whose latch refuses now is dropped instead (see
+/// [`structured::drop_on_latched_link`]) and the task is stepped unmasked.
+/// An expired latch is cleared as for a strict task, which then re-probes.
+/// `Ok(true)` when the task keeps a grammar.
 fn admit_on_latch(
     latch: &mut MaskLatch,
     multi_stage: bool,
@@ -1583,7 +1589,7 @@ fn admit_on_latch(
     has_grammar: bool,
     now: std::time::Instant,
 ) -> EngineResult<bool> {
-    if multi_stage && has_grammar && structured::drop_on_latched_link(task, latch.since.is_some()) {
+    if multi_stage && has_grammar && structured::drop_on_latched_link(task, latch.refusing(now)) {
         return Ok(false);
     }
     latched_refusal(latch, multi_stage, has_grammar, now)?;
@@ -5387,15 +5393,24 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // Due a re-probe: the best-effort task doesn't pay for it (the latch
-        // stays for the next strict task), which then goes ahead.
+        // Due a re-probe: the best-effort task re-probes like a strict one
+        // (the expired latch is cleared).
         let later = now + MASK_PROBE_REPROBE_AFTER;
         let mut t = soft();
-        assert!(!admit_on_latch(&mut latch, true, &mut t, true, later).unwrap());
-        assert!(latch.since.is_some(), "left for a strict task to re-probe");
-        let mut t = strict();
         assert!(admit_on_latch(&mut latch, true, &mut t, true, later).unwrap());
+        assert!(t.grammar.is_some());
+        assert!(latch.since.is_none(), "the expired latch is cleared");
         assert!(needs_mask_probe(&latch, true, true));
+        // That re-probe goes unanswered: it trips the latch again, and the
+        // best-effort task is stepped unmasked instead of failing.
+        latch.trip_probe(later);
+        assert!(structured::drop_on_latched_link(
+            &mut t,
+            latch.since.is_some()
+        ));
+        assert_eq!(t.grammar, None);
+        let mut t = strict();
+        assert!(admit_on_latch(&mut latch, true, &mut t, true, later).is_err());
 
         // Single-stage pipelines and plain tasks are never touched.
         let mut t = soft();
