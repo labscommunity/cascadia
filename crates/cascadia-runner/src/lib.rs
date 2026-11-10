@@ -180,7 +180,7 @@ struct EngineSlot {
     /// failed `try_lock` rather than block a tokio worker here (#122).
     engine: Mutex<Option<Box<dyn Engine>>>,
     buffers: Mutex<Buffers>,
-    /// The engine's [`InflightCancel`] handle (M18), if it hands one out. Taken from the engine
+    /// The engine's [`InflightCancel`] handle, if it hands one out. Taken from the engine
     /// before the engine is installed, and kept outside the engine lock so a cancel can reach an
     /// engine parked in `step()` with that lock held. Its own short lock is a leaf: nothing else is
     /// taken while it is held.
@@ -747,7 +747,7 @@ impl Runner {
         // A one-shot engine runs a whole generation in one step with the engine lock held: end
         // that generation first, or the lock below waits it out. Latched, so a queued task that
         // wins the lock before this call does, or one popped but not yet begun, doesn't run its
-        // whole generation either (M18).
+        // whole generation either.
         self.slot.shutdown_inflight();
         {
             // Tear down and empty the slot under ONE guard, where this used
@@ -832,7 +832,7 @@ pub struct ChunkStream {
     /// than `done`, which `fail_stream` also sets for endings about the stream
     /// alone (a foreign-task wedge, a task-less engine error, no progress),
     /// where the task may still be queued. Drop skips the in-flight handle
-    /// signal only when this is set (M18).
+    /// signal only when this is set.
     ended: bool,
     /// `model` label for the generation metrics below (#16).
     model: Arc<str>,
@@ -1373,7 +1373,7 @@ impl Drop for ChunkStream {
         // An ended stream (its final chunk was delivered, its cancel
         // tombstone was seen, or the server tore down) skips the in-flight
         // handle signal: its task isn't running, so the signal would only
-        // park its id in the handle's bounded early-cancel set (M18). A
+        // park its id in the handle's bounded early-cancel set. A
         // stream `fail_stream` ended still signals: that ending is about the
         // stream, and its task may still be queued.
         if self.ended {
@@ -2394,7 +2394,7 @@ mod tests {
             .map(|(_, _, at)| *at)
     }
 
-    /// M18: `Runner::cancel` reaches a task running inside one long `step()` through the engine's
+    /// `Runner::cancel` reaches a task running inside one long `step()` through the engine's
     /// `InflightCancel` handle. The deferred engine cancel alone waits for the step to return,
     /// which for a one-shot engine is the whole generation. The step ends within 50 ms and the
     /// next queued task's step starts right after.
@@ -2460,7 +2460,7 @@ mod tests {
         assert_eq!(b_last.text, "done");
     }
 
-    /// M18: `Runner::close` doesn't wait out a running one-shot generation: it ends the current
+    /// `Runner::close` doesn't wait out a running one-shot generation: it ends the current
     /// task through the in-flight handle before it takes the engine lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn close_ends_a_running_step_through_the_inflight_handle() {
@@ -2544,7 +2544,7 @@ mod tests {
         );
     }
 
-    /// M18: a `close()` that lands after a task was popped but before it began still ends it:
+    /// A `close()` that lands after a task was popped but before it began still ends it:
     /// the shutdown is latched in the in-flight handle, so the late `begin` reports a cancel and
     /// the task never runs its generation while `close()` waits for the engine lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2587,7 +2587,7 @@ mod tests {
         );
     }
 
-    /// M18: `Runner::interrupt` only signals the handle. It books no metric, writes no tombstone,
+    /// `Runner::interrupt` only signals the handle. It books no metric, writes no tombstone,
     /// defers no engine cancel and never touches the engine lock: the API calls it from a stream
     /// owner's drop while that owner is itself blocked in `step()` holding the lock.
     #[tokio::test]
@@ -2636,7 +2636,7 @@ mod tests {
         rig.ic.end();
     }
 
-    /// M18: a stream that `fail_stream` ended (here: no progress) while its task is still queued
+    /// A stream that `fail_stream` ended (here: no progress) while its task is still queued
     /// signals the handle on drop. That ending is about the stream, not the task: the task can
     /// still be begun later, with no consumer left.
     #[tokio::test]
@@ -2663,7 +2663,7 @@ mod tests {
         rig.ic.end();
     }
 
-    /// M18: the slot holds the engine's handle once the runner has started, and lets it go on
+    /// The slot holds the engine's handle once the runner has started, and lets it go on
     /// close.
     #[tokio::test]
     async fn the_slots_inflight_handle_is_set_on_start_and_cleared_on_close() {
@@ -2680,7 +2680,7 @@ mod tests {
         );
     }
 
-    /// M18: a stream that saw its final chunk doesn't signal the handle on drop, so finished ids
+    /// A stream that saw its final chunk doesn't signal the handle on drop, so finished ids
     /// don't fill its bounded early-cancel set. A stream dropped before its end still does.
     #[tokio::test]
     async fn a_done_streams_drop_does_not_signal_the_inflight_handle() {

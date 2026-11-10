@@ -1,4 +1,4 @@
-//! M18: ending a running single-stage one-shot generation early (D3, D4, D6).
+//! ending a running single-stage one-shot generation early (D3, D4, D6).
 //!
 //! The three single-stage paths (`SparseMoEEngine`, `OvMoeEngine`,
 //! `PipelineEngine`) each run a whole generation in one blocking runner call
@@ -16,7 +16,7 @@ use cascadia_types::{Chunk, FinishReason, TaskId};
 use tracing::warn;
 
 /// Ids decoded past the longest stop's byte length, so a run of 0-byte
-/// (skipped special) tokens doesn't push a stop out of the window (D6).
+/// (skipped special) tokens doesn't push a stop out of the window.
 pub(crate) const TAIL_SLACK_IDS: usize = 16;
 
 /// Calls [`InflightCancel::end`] when dropped, so every path out of a begun
@@ -29,7 +29,7 @@ impl Drop for EndInflight {
     }
 }
 
-/// The final chunk for a cancelled task: empty, `Cancelled` (M18 D4), with
+/// The final chunk for a cancelled task: empty, `Cancelled`, with
 /// the prompt's token count when it is known, so the runner books the prompt.
 /// No text and no `n_tokens`: no TTFT sample, 0 generated tokens.
 pub(crate) fn cancelled_chunk(task_id: &TaskId, prompt_tokens: Option<u32>) -> Chunk {
@@ -59,13 +59,13 @@ pub(crate) enum PollEnd {
 /// window; 0 for a runner polled per token. `decode`
 /// must use the tokenizer and options of the engine's final decode: a decode of
 /// a suffix of the ids is then a substring of the final text (OneShotStop's
-/// input contract; M18 D8). With no active stop nothing is decoded.
+/// input contract). With no active stop nothing is decoded.
 pub(crate) struct OneShotPoll<'a, T> {
     inflight: &'a InflightCancel,
     stop: OneShotStop,
     window: usize,
     decode: TailDecode<'a, T>,
-    /// When the check may run (M18 D9); armed at once unless
+    /// When the check may run; armed at once unless
     /// [`Self::with_visible_arm`] says the answer strips text.
     arm: VisibleArm,
     ended: Option<PollEnd>,
@@ -102,7 +102,7 @@ impl<'a, T> OneShotPoll<'a, T> {
     /// For an engine whose answer is `strip_prefix(prompt)` + `trim_start`
     /// of its decode: arm the stop check only on text that answer keeps, so
     /// an engine stop never lands in a stripped prompt echo or leading
-    /// whitespace (M18 D9; see [`VisibleArm`]).
+    /// whitespace (see [`VisibleArm`]).
     pub(crate) fn with_visible_arm(mut self, prompt: &str) -> Self {
         self.arm = VisibleArm::new(prompt, self.window);
         self
@@ -137,7 +137,7 @@ impl<'a, T> OneShotPoll<'a, T> {
 }
 
 /// After an engine stop: warns when the returned text holds no stop. The check
-/// armed only on text that text keeps (M18 D9), so this means the D8 invariant
+/// armed only on text that text keeps, so this means the stop-text invariant
 /// broke (a detokenizer cleanup rule rewrote text based on later tokens); the
 /// hardware check fails on that line.
 pub(crate) fn check_text_after_stop(task_id: &TaskId, stops: &[String], text: &str) {
@@ -153,7 +153,7 @@ fn has_stop(stops: &[String], text: &str) -> bool {
 fn warn_d8_invariant(task_id: &TaskId) {
     warn!(
         task = %task_id,
-        "engine stopped on a stop the returned text lacks (D8 invariant)"
+        "engine stopped on a stop the returned text lacks (stop-text invariant)"
     );
 }
 
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn a_stop_pushed_out_of_the_window_is_missed() {
-        // Only latency: the API still cuts at the end (D6).
+        // Only latency: the API still cuts at the end.
         let h = InflightCancel::new();
         let mut p = OneShotPoll::new(&h, &stops(&["a"]), true, 0, |ids: &[u32]| {
             Some(letters(ids))
@@ -319,7 +319,7 @@ mod tests {
     }
 
     /// An empty prompt: the strip always applies. The leading "\n"s are not
-    /// in the answer, so no engine stop there (M18 D9): the visible text is
+    /// in the answer, so no engine stop there: the visible text is
     /// the check-off text, and the API cut gives "Hi".
     #[test]
     fn an_empty_prompt_does_not_stop_in_leading_whitespace() {

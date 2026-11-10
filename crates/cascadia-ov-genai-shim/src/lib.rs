@@ -2327,7 +2327,7 @@ mod tests {
         assert_eq!(kind, 0, "partial-numeric value must fall back to string");
     }
 
-    // ---- polled generate (M18 task 4) ----------------------------------
+    // ---- polled generate ----------------------------------
 
     /// Call the trampoline the way the C++ streamer does: one call per
     /// write with the pending bytes (len may be 0) and the write's token

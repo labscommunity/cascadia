@@ -1,4 +1,4 @@
-//! A bounded `stop`-string check for a one-shot engine to run while it generates (M18 D6).
+//! A bounded `stop`-string check for a one-shot engine to run while it generates.
 //!
 //! An engine that runs a whole generation in one `step()` can end it early at a `stop` match
 //! instead of generating to `max_tokens` and leaving the cut to the API. This is only an early
@@ -143,7 +143,7 @@ impl OneShotStop {
 }
 
 /// When an engine whose answer is `strip_prefix(prompt)` + `trim_start` of its decode (else the
-/// decode as is) may start its in-engine stop check (M18 D9).
+/// decode as is) may start its in-engine stop check.
 ///
 /// The engine must never stop on a match inside text that the visible answer strips (a prompt
 /// echo, leading whitespace): the API would then cut a different answer than a run with the check

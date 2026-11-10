@@ -887,9 +887,9 @@ impl OvMoeRunner {
         self.generate_with_cache_polled(prompt_ids, max_new, cfg, cache, &mut |_| false)
     }
 
-    /// [`Self::generate_with_cache`] that can end early (M18 D3). `should_stop`
+    /// [`Self::generate_with_cache`] that can end early. `should_stop`
     /// gets the tokens generated so far and returns `true` to stop. It is
-    /// polled before each prefill token's forward (with no tokens yet) and
+    /// Polled before each prefill token's forward (with no tokens yet) and
     /// before each decode token's forward. On a stop the tokens so far are
     /// returned (`Ok`), so the bound is one token.
     ///

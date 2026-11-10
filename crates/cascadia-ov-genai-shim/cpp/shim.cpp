@@ -402,7 +402,7 @@ namespace {
 // with n_tokens 0 and len 0, also after a STOP/CANCEL; that answer is ignored.
 //
 // No TextStreamer: its pieces are not guaranteed to concatenate to the
-// returned decode (M18 D8), so text checked against them could disagree with
+// returned decode, so text checked against them could disagree with
 // the answer.
 //
 // The decode passes no detokenization params (tokenizer.hpp:198,

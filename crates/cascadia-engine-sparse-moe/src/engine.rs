@@ -184,7 +184,7 @@ pub struct SparseMoEBuilderConfig {
     /// Only meaningful while the AXPY-form path is active — the
     /// non-AXPY (bf16 boundary) path doesn't surface `silu(gate)`.
     pub ffn_sparsity_capture_dir: Option<PathBuf>,
-    /// M18 D6: a single-stage one-shot generation ends at a `stop` match
+    /// A single-stage one-shot generation ends at a `stop` match
     /// (checked in-engine on a suffix decode of the generated ids) instead of
     /// running to `max_tokens`. Default `true`; off when the server has a
     /// marker dialect, whose engine text isn't what the API matches. A cancel
@@ -232,7 +232,7 @@ impl SparseMoEBuilderConfig {
         }
     }
 
-    /// M18 D6: whether a single-stage one-shot generation ends at a `stop`
+    /// Whether a single-stage one-shot generation ends at a `stop`
     /// match (see [`Self::engine_stop_check`]).
     pub fn with_engine_stop_check(mut self, on: bool) -> Self {
         self.engine_stop_check = on;
@@ -1600,10 +1600,10 @@ pub struct SparseMoEEngine {
     pub(crate) kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
     /// In-flight multi-stage generation, streamed one token per `step()`.
     active: Option<SparseActive>,
-    /// M18: the runner signals a cancel here while the single-stage `step()`
+    /// The runner signals a cancel here while the single-stage `step()`
     /// holds the engine lock; the runner's `should_stop` reads it per token.
     inflight: Arc<cascadia_engine::InflightCancel>,
-    /// End a running single-stage generation at a `stop` match (M18 D6).
+    /// End a running single-stage generation at a `stop` match.
     engine_stop_check: bool,
 }
 
@@ -1737,7 +1737,7 @@ impl Engine for SparseMoEEngine {
         self.inflight.forget(task_id);
     }
 
-    /// Single-stage only (M18): there one blocking runner call makes the whole
+    /// Single-stage only: there one blocking runner call makes the whole
     /// answer. The multi-stage driver already ends at the next token through
     /// [`Engine::cancel`], so it keeps no handle (unchanged).
     fn inflight_cancel(&self) -> Option<Arc<cascadia_engine::InflightCancel>> {
@@ -1935,10 +1935,10 @@ impl SparseMoEEngine {
         // KV-cache state internally, so wiring prefix-cache replay into
         // it would need extra plumbing — deferred.
         let use_spec = self.spec_decode_k.is_some() && sampling_cfg.temperature <= 0.0;
-        // M18: the runner polls this before each prefill token, decode token
+        // The runner polls this before each prefill token, decode token
         // and speculative round. The stop check decodes the newest ids with
         // the final decode's tokenizer and options (skip_special_tokens), so
-        // its text is a substring of the decode below (D8).
+        // its text is a substring of the decode below.
         // A speculative round accepts up to draft K + the bonus id per poll.
         let round_slack = if use_spec {
             self.spec_decode_k.unwrap_or(0) as usize + 1
@@ -1956,8 +1956,8 @@ impl SparseMoEEngine {
             },
         );
         // A fresh turn returns the decode with the prompt echo stripped and
-        // leading whitespace trimmed: arm the stop only on what it keeps
-        // (M18 D9). A resumed turn returns its tail as decoded.
+        // leading whitespace trimmed: arm the stop only on what it keeps.
+        // A resumed turn returns its tail as decoded.
         let mut poll = if resume.is_none() {
             poll.with_visible_arm(&task.prompt)
         } else {
@@ -2006,7 +2006,7 @@ impl SparseMoEEngine {
         drop(poll);
         if inflight.cancelled() {
             // Also when generate failed after the cancel: the task ends as
-            // cancelled, never as an error or a partial success (M18 D4).
+            // cancelled, never as an error or a partial success.
             info!(
                 task = %task.task_id,
                 tokens = generated.as_ref().map_or(0, Vec::len),
@@ -4033,10 +4033,10 @@ pub struct OvMoeEngine {
     kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
     /// In-flight multi-stage generation, streamed one token per `step()`.
     active_ov: Option<OvMoeActive>,
-    /// M18: the runner signals a cancel here while the single-stage `step()`
+    /// The runner signals a cancel here while the single-stage `step()`
     /// holds the engine lock; the runner's `should_stop` reads it per token.
     inflight: Arc<cascadia_engine::InflightCancel>,
-    /// End a running single-stage generation at a `stop` match (M18 D6).
+    /// End a running single-stage generation at a `stop` match.
     /// Set by the builder after `new` (default `true`).
     engine_stop_check: bool,
 }
@@ -4199,10 +4199,10 @@ impl OvMoeEngine {
             } else {
                 None
             };
-        // M18: polled before each prefill and decode token. The stop check
+        // Polled before each prefill and decode token. The stop check
         // decodes the newest tokens exactly as the final decode below does
         // (same tokenizer, skip_special_tokens), so its text is a substring of
-        // the returned text (D8).
+        // the returned text.
         let mut poll = crate::one_shot::OneShotPoll::new(
             &inflight,
             &task.sampling.stop,
@@ -4237,7 +4237,7 @@ impl OvMoeEngine {
             g
         });
         if inflight.cancelled() {
-            // Also when generate failed after the cancel (M18 D4).
+            // Also when generate failed after the cancel.
             info!(
                 task = %task.task_id,
                 tokens = generated.as_ref().map_or(0, Vec::len),
@@ -5280,7 +5280,7 @@ impl Engine for OvMoeEngine {
         self.inflight.forget(task_id);
     }
 
-    /// Single-stage only (M18), as for `SparseMoEEngine`: the multi-stage
+    /// Single-stage only, as for `SparseMoEEngine`: the multi-stage
     /// driver already ends at the next token through [`Engine::cancel`].
     fn inflight_cancel(&self) -> Option<Arc<cascadia_engine::InflightCancel>> {
         (self.total == 1).then(|| Arc::clone(&self.inflight))
@@ -5604,7 +5604,7 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_log: (u64, Duration, u64),
     /// Per-window time account of this rank (`CASCADIA_STAGE_PROFILE_SECS`).
     stage_profile: Option<StageProfile>,
-    /// M18: the runner signals a cancel here while the single-stage one-shot
+    /// The runner signals a cancel here while the single-stage one-shot
     /// `step()` holds the engine lock; the runner's `should_stop` reads it per
     /// token.
     inflight: Arc<cascadia_engine::InflightCancel>,
@@ -5972,7 +5972,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
     }
 
-    /// M18 D6: whether a single-stage one-shot generation ends at a `stop`
+    /// Whether a single-stage one-shot generation ends at a `stop`
     /// match (checked in-engine on a suffix decode of the generated ids).
     /// Off when the server has a marker dialect. A cancel ends it either way.
     pub fn with_engine_stop_check(mut self, on: bool) -> Self {
@@ -7176,10 +7176,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // has no error channel: catch it here, reset the sequence state the
         // half-finished turn left behind, and fail THIS task instead of the
         // process. The panic message carries the worker/layer diagnostics.
-        // M18: polled before each prefill token (or around a batched prefill)
+        // Polled before each prefill token (or around a batched prefill)
         // and each decode token. The stop check decodes the newest ids with
         // the tokenizer and options of the per-token decode below, so its text
-        // is a substring of the streamed text (D8).
+        // is a substring of the streamed text.
         let mut poll = crate::one_shot::OneShotPoll::new(
             &inflight,
             &task.sampling.stop,
@@ -7203,7 +7203,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         if inflight.cancelled() {
             // Also when the forward failed after the cancel: the task ends as
-            // cancelled, never as an error or a partial success (M18 D4).
+            // cancelled, never as an error or a partial success.
             info!(
                 task = %task.task_id,
                 tokens = outcome.as_ref().map_or(0, |(g, _, _)| g.len()),
@@ -8617,7 +8617,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
         self.note_link_busy();
     }
 
-    /// Only for the single-stage one-shot path (M18), where one blocking
+    /// Only for the single-stage one-shot path, where one blocking
     /// runner call makes the whole answer. The multi-stage driver and the
     /// multi-stream path (`CASCADIA_STREAMS`) already end at the next token
     /// through [`Engine::cancel`], so they keep no handle (unchanged).

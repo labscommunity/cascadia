@@ -241,7 +241,7 @@ pub trait StagedRunner: Send + 'static {
         self.generate_reason_timed_polled(prompt, max_new, cfg, &mut |_| false)
     }
 
-    /// [`Self::generate_reason_timed`] that can end early (M18 D3).
+    /// [`Self::generate_reason_timed`] that can end early.
     /// `should_stop` gets the tokens generated so far and returns `true` to
     /// stop; the tokens so far are then returned (the `bool` is `false`).
     ///

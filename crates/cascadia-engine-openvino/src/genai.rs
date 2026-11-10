@@ -54,7 +54,7 @@ pub struct OvGenaiBuilder {
     /// call makes the whole answer, so its limit is cut to what the prompt
     /// leaves of this window.
     pub context_window: Option<u32>,
-    /// End a running stateful generation at a `stop` match (M18 D6). Default
+    /// End a running stateful generation at a `stop` match. Default
     /// true; off when the server has a marker dialect, whose filtered text is
     /// not what the engine sees (the CLI decides).
     pub engine_stop_check: bool,
@@ -443,7 +443,7 @@ impl Drop for EndInflight {
     }
 }
 
-/// The final chunk for a cancelled task: empty, `Cancelled` (M18 D4), with
+/// The final chunk for a cancelled task: empty, `Cancelled`, with
 /// the prompt's token count when it is known, so the runner books the prompt.
 /// No text and no `n_tokens`: no TTFT sample, 0 generated tokens.
 fn cancelled_chunk(task_id: &TaskId, prompt_tokens: Option<u32>) -> Chunk {
@@ -463,10 +463,10 @@ pub struct OvGenaiEngine {
     /// The server's known context window: one `generate()` call makes the
     /// whole answer, so its limit is cut to what the prompt leaves of it.
     context_window: Option<u32>,
-    /// M18: the runner signals a cancel here while `step()` holds the engine
+    /// The runner signals a cancel here while `step()` holds the engine
     /// lock; the poll closure reads it once per streamer write.
     inflight: Arc<InflightCancel>,
-    /// End a running generation at a `stop` match (M18 D6).
+    /// End a running generation at a `stop` match.
     engine_stop_check: bool,
     /// Set once the first poll of the engine's life has told which thread
     /// runs ov-genai's streamer (logged once, for the hardware check).
@@ -571,7 +571,7 @@ impl Engine for OvGenaiEngine {
             OneShotStop::new(&[])
         };
         // The shim decodes the last `tail_tokens` generated ids per write and
-        // the check runs on that suffix decode (M18 D8): it is a substring of
+        // the check runs on that suffix decode: it is a substring of
         // the returned text (OneShotStop's input contract), unlike streamer
         // pieces. The +16 covers a run of 0-byte (special) tokens. A draft
         // model or prompt-lookup writes a whole speculative round at once
@@ -588,7 +588,7 @@ impl Engine for OvGenaiEngine {
         } else {
             0
         };
-        // Arm the check only on text the visible answer keeps (M18 D9): an
+        // Arm the check only on text the visible answer keeps: an
         // engine stop inside a stripped prompt echo or leading whitespace
         // would give a different answer than a run with the check off.
         let mut arm = VisibleArm::new(&task.prompt, tail_tokens);
@@ -639,7 +639,7 @@ impl Engine for OvGenaiEngine {
         }
         if self.inflight.cancelled() {
             // Also when generate failed after the CANCEL: the task ends as
-            // cancelled, never as an error or a partial success (M18 D4).
+            // cancelled, never as an error or a partial success.
             info!(
                 task = %task.task_id,
                 tokens = polled_tokens,
@@ -674,8 +674,8 @@ impl Engine for OvGenaiEngine {
             Some(stripped) => stripped.trim_start().to_string(),
             None => raw,
         };
-        // The check armed only on text this visible answer keeps (M18 D9),
-        // so it holds the stop. If it doesn't, the D8 invariant (a window
+        // The check armed only on text this visible answer keeps,
+        // so it holds the stop. If it doesn't, the stop-text invariant (a window
         // decode is a substring of the final decode) broke. That can rarely
         // happen when a detokenizer cleanup rule (`clean_up_tokenization_spaces`)
         // rewrites text based on later tokens. Keep the text and warn: the
@@ -683,7 +683,7 @@ impl Engine for OvGenaiEngine {
         if stopped_on_match && !OneShotStop::new(&task.sampling.stop).push(&text) {
             warn!(
                 task = %task.task_id,
-                "engine stopped on a stop the returned text lacks (D8 invariant)"
+                "engine stopped on a stop the returned text lacks (stop-text invariant)"
             );
         }
         // Prefer tokenizer-based count; fall back to perf_metrics value.
@@ -2006,7 +2006,7 @@ mod tests {
         }
     }
 
-    // ---- stateful engine: polled generate (M18 task 5) ---------------------
+    // ---- stateful engine: polled generate ---------------------
     //
     // Driven through the StatefulPipe seam: the mock feeds the engine's poll
     // closure one scripted piece at a time, as the shim's streamer does.
@@ -2591,7 +2591,7 @@ mod tests {
 
     /// An empty prompt: step's strip_prefix + trim_start apply, and the
     /// leading "\n"s are not part of the answer. The engine must not stop on
-    /// them (M18 D9): it returns the visible text, so the API cut gives "Hi",
+    /// them: it returns the visible text, so the API cut gives "Hi",
     /// the same as with the check off.
     #[test]
     fn stateful_empty_prompt_does_not_stop_in_leading_whitespace() {
@@ -2609,7 +2609,7 @@ mod tests {
     }
 
     /// The model repeats the prompt: the strip removes it, so a stop inside
-    /// the echo must not end the generation (M18 D9). The answer is built on
+    /// the echo must not end the generation. The answer is built on
     /// "There", the same as with the check off.
     #[test]
     fn stateful_stop_in_a_prompt_echo_keeps_the_visible_answer() {
@@ -2673,7 +2673,7 @@ mod tests {
         assert_eq!(s.polls[30], (String::new(), 0, PollAction::Running));
     }
 
-    /// D8 invariant broken (a window decode that matched while the visible
+    /// The stop-text invariant broken (a window decode that matched while the visible
     /// text doesn't hold the stop): keep the visible text,
     /// and say so in a warn the hardware check fails on.
     #[test]
@@ -2692,7 +2692,7 @@ mod tests {
         assert_eq!(out[0].1.text, "  alpha beta");
         assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
         assert!(
-            logs.contains("engine stopped on a stop the returned text lacks (D8 invariant)"),
+            logs.contains("engine stopped on a stop the returned text lacks (stop-text invariant)"),
             "{logs}"
         );
     }

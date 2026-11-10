@@ -2247,7 +2247,7 @@ impl Runner {
         self.generate_with_cache_polled(prompt_ids, max_tokens, cfg, cache, &mut |_| false)
     }
 
-    /// [`Self::generate_with_cache`] that can end early (M18 D3).
+    /// [`Self::generate_with_cache`] that can end early.
     /// `should_stop` gets the ids generated so far and returns `true` to stop.
     /// It is polled before each prefill token's forward (with no ids yet) and
     /// before each decode token's forward. On a stop the ids so far are
@@ -2539,7 +2539,7 @@ impl Runner {
         self.generate_speculative_polled(prompt_ids, max_tokens, cfg, draft, &mut |_| false)
     }
 
-    /// [`Self::generate_speculative`] that can end early (M18 D3).
+    /// [`Self::generate_speculative`] that can end early.
     /// `should_stop` gets the ids generated so far and returns `true` to stop.
     /// It is polled before each prefill token's forward (with no ids yet) and
     /// before each speculative round, so the bound is one round (up to the

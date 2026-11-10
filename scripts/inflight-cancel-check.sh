@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2015,SC2028  # verdict returns 0, so `A && verdict ok || verdict bad` is if-else; the plan prints "\\n" as is
-# In-flight cancel check (M18) against ONE already-running OpenAI-compatible cascadia node.
+# In-flight cancel check against ONE already-running OpenAI-compatible cascadia node.
 # A client hang-up, a `stop` match and /v1/cancel must end a running one-shot generation
 # (stateful ov-genai, single-stage sparse-moe), and the engine must be free for the next request
-# at once. The engines log one line per task (M18 D7), which this script reads:
+# at once. The engines log one line per task, which this script reads:
 #   task cancelled tokens=N elapsed_s=S | task stopped at stop string tokens=N | task done ...
-# and it FAILs on any "engine stopped on a stop the returned text lacks (D8 invariant)" line.
+# and it FAILs on any "engine stopped on a stop the returned text lacks (stop-text invariant)" line.
 #
 # usage: scripts/inflight-cancel-check.sh --url <base-url> (--log <file> | --log-cmd <cmd>) [options]
 #   --url URL            node base URL, e.g. http://127.0.0.1:8671          (env CHECK_URL)
@@ -138,7 +138,7 @@ EOF
   want ab && echo "   ab         case 6: LONG max_tokens 512, $AB_RUNS timed runs per node alternating; median tok/s
               (completion_tokens / time); PASS tip >= ${AB_BAR}% of base."
   want h6 && echo "   h6         the A/B with stops [\"zzzz-never\", <256-byte never-matching string>]."
-  echo "   always     the node log holds no 'D8 invariant' line. Before each case the script waits for the task line
+  echo "   always     the node log holds no 'stop-text invariant' line. Before each case the script waits for the task line
               of every request sent so far (HTTP 200, or a hang-up after the body was sent), and ignores task
               lines of ids it has already seen. If they don't all show in --log-wait it prints WARN and the
               case's log checks SKIP."
@@ -684,9 +684,9 @@ want h8 && case_h8
 want ab && ab_case "case 6 A/B tok/s" none
 want h6 && ab_case "H6 A/B tok/s with stops active" never256
 
-N8=$(log_dump | grep -c 'D8 invariant')
-[ "$N8" = 0 ] && verdict "the node log has no 'D8 invariant' line" ok \
-  || verdict "the node log has no 'D8 invariant' line" bad "$N8 line(s): $(log_dump | grep -m1 'D8 invariant')"
+N8=$(log_dump | grep -c 'stop-text invariant')
+[ "$N8" = 0 ] && verdict "the node log has no 'stop-text invariant' line" ok \
+  || verdict "the node log has no 'stop-text invariant' line" bad "$N8 line(s): $(log_dump | grep -m1 'stop-text invariant')"
 
 [ "$STRUCT_N" -gt 0 ] && echo "INFO $STRUCT_N stop case(s) ran against references that varied across calls; $UNVER_N of them unverifiable (SKIP)"
 if [ "$FAILS" = 0 ]; then echo "INFLIGHT CANCEL CHECK: ALL PASS"; else echo "INFLIGHT CANCEL CHECK: $FAILS FAILED"; exit 1; fi

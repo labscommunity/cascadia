@@ -39,5 +39,5 @@ half = "2"
 # timeout on the paused clock instead of sleeping it for real.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
-# Captures the engine's log lines in the stateful-cancel tests (M18 D7).
+# Captures the engine's log lines in the stateful-cancel tests.
 tracing-subscriber = { workspace = true }
