@@ -908,11 +908,14 @@ A tool whose `parameters` hold a bound pair no value can meet, such as
 `minLength` above `maxLength`, `minItems` above `maxItems`, or an integer
 range holding no integer, is accepted with that pair dropped: the API
 removes exactly those two keywords at that place, logs a warning naming the
-tool and the pair, and uses the tool without them everywhere (the prompt,
-the tools sent to the engine, and the constraint). The rest of the call
-shape is still enforced; a forced call stays forced. When the constraint is
-sent over such a tool, `cascadia_constraint_unenforced_total{reason="schema_rejected"}`
-counts it once. Left in, no call could match the schema and a backend that
+tool and the pair (the first time the tool's name is seen; later at debug),
+and uses the tool without them everywhere (the prompt, the tools sent to
+the engine, and the constraint), in every `tool_choice` mode. The rest of
+the call shape is still enforced; a forced call stays forced. When the
+constraint is sent over such a tool and the engine applies it,
+`cascadia_constraint_unenforced_total{reason="schema_rejected"}` counts it
+once, when the answer is in (not when the engine dropped the constraint and
+counted its own reason). Left in, no call could match the schema and a backend that
 builds its own grammar from the tools (llama-server on `sycl-llama`) would
 decode until the request is killed. A `response_format` schema with such a
 pair is still a 400.
@@ -943,7 +946,14 @@ model's own tool-call syntax), the server logs `output constraint not
 enforced; answering unconstrained` (or `tool-call output constraint not
 enforced` when the API could not build it) with the reason, and
 `cascadia_constraint_unenforced_total{reason}` counts it
-([METRICS.md](METRICS.md)). Reasons:
+([METRICS.md](METRICS.md)). When the engine drops the constraint, its final
+chunk says so and the answer is read exactly as one sent without it: under
+`"auto"` beside a JSON `response_format`, the model's own bare JSON call
+(`{"name": …, "parameters": …}`) is then a tool call, as before the
+constraint existed, streamed and not. A reason that holds for every request
+on the server (`npu`, `draft_model`, `genai_version`, `probe_failed`,
+`no_tokenizer`, `stage_unsupported`) is logged at warn the first time in
+the process and at debug after; the counter counts every request. Reasons:
 
 | `reason` | When |
 |---|---|
@@ -951,7 +961,7 @@ enforced` when the API could not build it) with the reason, and
 | `draft_model` | `ov-genai` with `--draft-model`. |
 | `genai_version` | `ov-genai` on OpenVINO GenAI older than 2026.4. |
 | `probe_failed` | `ov-genai`: the startup structured-output check failed for this model. |
-| `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile. Also counted when the constraint is sent without a tool's bound pair no value can meet (see above): the rest is enforced, that pair is not. |
+| `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile. Also counted, once the answer is in, when the constraint was applied without a tool's bound pair no value can meet (see above): the rest is enforced, that pair is not. |
 | `too_complex` | The combined schema is over the [schema limits](#structured-output-response_format), or took longer than the 2 s build budget (llguidance engines). |
 | `busy` | The llguidance engines' schema check had no free slot. |
 | `unsupported_ref` | A tool schema (or the `response_format` schema beside it) has a `$ref` that can't be kept once nested: anything other than `#` or `#/$defs/…` / `#/definitions/…` naming its own definitions, or a `$ref` beside a nested `$id`. |
@@ -994,7 +1004,10 @@ those three marker tokens when decoding a model whose vocabulary has them
 (`ov-genai` in continuous batching and for stateful and VLM-layout exports
 such as `OpenVINO/gemma-4-E2B-it-int4-ov`, checked end to end on Linux), and
 `sycl-llama` gets Gemma 4 calls back from llama-server already parsed. The
-markers never appear in `content`, with or without tools.
+markers never appear in `content`, with or without tools: the API removes
+them when the chat template writes Gemma 4 calls or a `tokenizer.json` the
+engines read (`tokenizer/tokenizer.json` or `tokenizer.json` in the model
+directory) has `<|tool_call>`.
 
 ### Unchanged for existing requests
 
@@ -1005,4 +1018,8 @@ new: `"required"` and named choices are now enforced; `parallel_tool_calls:
 false` now limits the answer to one call; `response_format` beside callable
 tools is now enforced as "a call or the JSON"; custom tools and
 `allowed_tools` (previously a 422 / 400) are accepted; Gemma 4 calls are
-parsed on the engines above.
+parsed on the engines above. A tool whose `parameters` hold a bound pair
+no value can meet is sent without that pair in every mode, `"auto"` and
+`"none"` included (see Enforcement). Under a named choice, a call to
+another tool is dropped from the answer; when no call is left, the text is
+the content.
