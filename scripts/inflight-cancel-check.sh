@@ -35,7 +35,9 @@
 #   --dry-run            print the plan and exit
 # Every reference run (no stop) is made twice. Long temperature-0 answers are not reproducible across
 # calls on some devices (ov-genai GPU); when the two differ, an answer must equal one of the two cut at
-# the stop, and one that equals neither is SKIPped as unverifiable (counted at the end).
+# the stop, and one that equals neither is SKIPped as unverifiable (counted at the end). When the two
+# agree but the answer (or, with --ab, the base node's answer) still differs, up to EXTRA_REFS (3) more
+# reference runs are made before it counts as a FAIL; one that differs marks the device as varying.
 # Needs bash, curl, python3 (or python) and standard tools; runs from Linux, macOS, Git Bash or WSL.
 # Prints one PASS/FAIL (or SKIP) line per claim and
 # "INFLIGHT CANCEL CHECK: ALL PASS" or "INFLIGHT CANCEL CHECK: <n> FAILED" (exit 1).
@@ -100,7 +102,7 @@ EOF
   want baseline || [ "$NEED_BASE" = 1 ] && cat <<EOF
    baseline   T0 twice (must be equal); LONG max_tokens 128 -> R = tok_s of its 'task done' line
               (else completion_tokens / time); LONG max_tokens $REF_MAX with a never-matching stop -> T.
-              D = max(3 s, 20/R s); one token time = 1/R. T (no stop) is made twice (see the stop rule).
+              D = max(3 s, 20/R s) + --prefill-s; one token time = 1/R. T (no stop) is made twice (see the stop rule).
 EOF
   want stream && echo "   stream     case 2: LONG streamed, client hangs up at D (curl --max-time D); T0 sent 0.1 s later.
               PASS: curl timed out (the task was running); the next task line in the log is 'task cancelled'
@@ -128,8 +130,11 @@ EOF
               (Tr's tokens up to the stop) + K + 2. Else: no stop, log 'task done', text and finish = Tr.
               If the two runs differ (INFO): the answer must match either one by that rule; one matching
               neither is SKIPped as unverifiable, but an engine stop when neither run holds the stop FAILs.
+              If they agree and the answer matches neither, up to EXTRA_REFS (env, 3) more reference runs are made
+              first; one that differs makes the device varying (as above). The token bound counts at least
+              the stop's UTF-8 bytes + 1 (a byte-fallback tokenizer spends a token per byte of an emoji).
               With --ab, the content and finish also equal the base node's (H4), when both nodes' references
-              are stable (else INFO)."
+              are stable over the extra runs too (else INFO)."
   want ab && echo "   ab         case 6: LONG max_tokens 512, $AB_RUNS timed runs per node alternating; median tok/s
               (completion_tokens / time); PASS tip >= ${AB_BAR}% of base."
   want h6 && echo "   h6         the A/B with stops [\"zzzz-never\", <256-byte never-matching string>]."
