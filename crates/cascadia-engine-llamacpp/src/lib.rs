@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use cascadia_metrics::{count_constraint_unenforced, UnenforcedReason};
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
     TaskId,
@@ -1125,7 +1126,8 @@ pub struct LlamaCppEngine {
     /// receive, so `step()` can poll briefly and let the runtime thread go.
     last_chunk_at: Instant,
     cancelled: Arc<AtomicBool>,
-    socket: Option<TcpStream>,
+    /// The active request's connection; see [`RequestSocket`].
+    socket: Option<Arc<RequestSocket>>,
 }
 
 impl LlamaCppEngine {
@@ -1158,7 +1160,7 @@ impl LlamaCppEngine {
         self.active = None;
         self.rx = None;
         if let Some(s) = self.socket.take() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+            s.close();
         }
         self.pending.insert(0, task);
         self.start_respawn();
@@ -1280,78 +1282,92 @@ impl LlamaCppEngine {
             ("/v1/chat/completions", body)
         };
         apply_sampling(&mut body, &task.sampling);
-        let body = match (&task.grammar, task.messages.is_empty()) {
-            (Some(g), false) => with_response_format(body.to_string(), &sanitized_schema(&g.body)),
-            _ => body.to_string(),
+        let plain = body.to_string();
+        // A best-effort constraint the child refuses is dropped: the reader
+        // resends the request once without it (see below).
+        let (body, mut fallback) = match (&task.grammar, task.messages.is_empty()) {
+            (Some(g), false) => (
+                with_response_format(plain.clone(), &sanitized_schema(&g.body)),
+                g.best_effort.then_some(plain),
+            ),
+            _ => (plain, None),
         };
-        let mut s = match TcpStream::connect(("127.0.0.1", port)) {
+        let s = match connect_child(port) {
             Ok(s) => s,
             Err(e) => {
-                let _ = tx.send(Err(EngineError::Backend(format!("connect: {e}"))));
+                let _ = tx.send(Err(e));
                 return;
             }
         };
-        let _ = s.set_read_timeout(Some(READ_TIMEOUT));
-        self.socket = s.try_clone().ok();
+        let live = Arc::new(RequestSocket::new(s.try_clone().ok()));
+        self.socket = Some(live.clone());
 
         std::thread::spawn(move || {
             let send = |r: EngineResult<(TaskId, Chunk)>| {
                 let _ = tx.send(r);
             };
-            let req = format!(
-                "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                endpoint,
-                body.len(),
-                body
-            );
-            if s.write_all(req.as_bytes()).is_err() {
-                send(Err(EngineError::Backend("write request".into())));
-                return;
-            }
-            let mut reader = BufReader::new(s);
-            // Skip response headers.
-            let mut chunked = false;
-            let mut content_length = None;
-            let mut status = String::new();
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    send(Err(EngineError::Backend("no response".into())));
+            let (mut s, mut body) = (s, body);
+            let (mut reader, chunked) = loop {
+                let req = format!(
+                    "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    endpoint,
+                    body.len(),
+                    body
+                );
+                if s.write_all(req.as_bytes()).is_err() {
+                    send(Err(EngineError::Backend("write request".into())));
                     return;
                 }
-                if status.is_empty() {
-                    status = line.trim().to_string();
+                let mut reader = BufReader::new(s);
+                let Some(head) = read_response_head(&mut reader) else {
+                    send(Err(EngineError::Backend("no response".into())));
+                    return;
+                };
+                if head.status.contains(" 200") {
+                    break (reader, head.chunked);
                 }
-                if line.to_lowercase().contains("transfer-encoding:")
-                    && line.to_lowercase().contains("chunked")
-                {
-                    chunked = true;
-                }
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = v.trim().parse::<usize>().ok();
-                }
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            if !status.contains(" 200") {
+                let status = head.status;
                 // A 4xx means the child refused this request itself (e.g. a
                 // schema its grammar converter rejects): resending it fails
                 // the same way, so it reaches the client as a 400 with the
                 // child's reason. Timeouts and rate limits are not the
                 // request's fault and stay backend errors like a 5xx.
-                if status_code(&status).is_some_and(is_request_rejection) {
-                    let body = read_error_body(&mut reader, chunked, content_length);
-                    let reason = format!(
-                        "llama-server rejected the request: {}",
-                        child_error_message(&body)
-                    );
-                    send(Ok((tid.clone(), Chunk::rejected(tid.clone(), reason))));
+                if !status_code(&status).is_some_and(is_request_rejection) {
+                    send(Err(EngineError::Backend(format!("server {status}"))));
                     return;
                 }
-                send(Err(EngineError::Backend(format!("server {status}"))));
+                let err = read_error_body(&mut reader, head.chunked, head.content_length);
+                let reason = child_error_message(&err);
+                // ...unless the refused part is a best-effort constraint:
+                // then the request is resent once without it, before any
+                // output, and answered unconstrained.
+                if let Some(plain) = fallback.take().filter(|_| names_the_constraint(&err)) {
+                    tracing::warn!(
+                        task = %tid,
+                        reason = UnenforcedReason::SchemaRejected.as_str(),
+                        child_error = %reason,
+                        "output constraint not enforced (llama-server refused the schema); answering unconstrained"
+                    );
+                    count_constraint_unenforced(UnenforcedReason::SchemaRejected);
+                    let next = match connect_child(port) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            send(Err(e));
+                            return;
+                        }
+                    };
+                    // cancelled or aborted meanwhile: nothing to resend
+                    if !live.replace(&next) {
+                        let _ = next.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    (s, body) = (next, plain);
+                    continue;
+                }
+                let reason = format!("llama-server rejected the request: {reason}");
+                send(Ok((tid.clone(), Chunk::rejected(tid.clone(), reason))));
                 return;
-            }
+            };
             // Body is one byte stream of SSE `data: ...` lines, possibly
             // chunk-framed. Read chunk sizes as hex when chunked.
             let mut st = SseState::default();
@@ -1454,6 +1470,95 @@ fn apply_sampling(body: &mut serde_json::Value, sp: &SamplingParams) {
 const ERROR_BODY_CAP: usize = 64 * 1024;
 /// The most characters of a non-JSON error body quoted to the client.
 const ERROR_TEXT_CHARS: usize = 300;
+
+/// The active request's connection to the child, shared with its reader
+/// thread. A reader that resends the request on a new connection registers
+/// it here, so cancel and abort shut down whichever connection is live.
+struct RequestSocket(Mutex<(bool, Option<TcpStream>)>);
+
+impl RequestSocket {
+    fn new(s: Option<TcpStream>) -> Self {
+        Self(Mutex::new((false, s)))
+    }
+
+    /// Shut the live connection down (waking its reader); later
+    /// [`replace`](Self::replace) calls are refused.
+    fn close(&self) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = true;
+        if let Some(s) = g.1.take() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// Make `s` the live connection; false once closed.
+    fn replace(&self, s: &TcpStream) -> bool {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if g.0 {
+            return false;
+        }
+        g.1 = s.try_clone().ok();
+        true
+    }
+}
+
+/// A connection to the child's HTTP port, with the reader's
+/// [`READ_TIMEOUT`] (longer than the stall limit, so `step()` decides).
+fn connect_child(port: u16) -> EngineResult<TcpStream> {
+    let s = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| EngineError::Backend(format!("connect: {e}")))?;
+    let _ = s.set_read_timeout(Some(READ_TIMEOUT));
+    Ok(s)
+}
+
+/// What the reader needs from a response's head.
+struct ResponseHead {
+    /// The status line, trimmed.
+    status: String,
+    chunked: bool,
+    content_length: Option<usize>,
+}
+
+/// Read a response's status line and headers, up to the blank line; `None`
+/// when the connection ends first.
+fn read_response_head(r: &mut impl BufRead) -> Option<ResponseHead> {
+    let mut head = ResponseHead {
+        status: String::new(),
+        chunked: false,
+        content_length: None,
+    };
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line).unwrap_or(0) == 0 {
+            return None;
+        }
+        if head.status.is_empty() {
+            head.status = line.trim().to_string();
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("transfer-encoding:") && lower.contains("chunked") {
+            head.chunked = true;
+        }
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            head.content_length = v.trim().parse::<usize>().ok();
+        }
+        if line == "\r\n" {
+            return Some(head);
+        }
+    }
+}
+
+/// Whether a child's error body is about the output constraint: llama-server
+/// names the grammar or the schema when it refuses one ("failed to parse
+/// grammar", "JSON schema conversion failed"), or fails to build the
+/// samplers, which a request's grammar is part of ("Failed to initialize
+/// samplers"). Case-insensitive.
+fn names_the_constraint(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_lowercase();
+    ["grammar", "schema", "failed to initialize samplers"]
+        .iter()
+        .any(|k| text.contains(k))
+}
 
 /// The numeric code of an HTTP status line (`HTTP/1.1 400 Bad Request`).
 fn status_code(status_line: &str) -> Option<u16> {
@@ -2069,7 +2174,7 @@ impl Engine for LlamaCppEngine {
             // from read_line() now instead of lingering until the child's
             // own read timeout fires (300s) after a stall-side abort.
             if let Some(s) = self.socket.take() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
+                s.close();
             }
         }
         // Child died mid-stream? A request it never answered is retried on
@@ -2087,7 +2192,7 @@ impl Engine for LlamaCppEngine {
             self.rx = None;
             // wake the SSE reader now rather than at its read timeout
             if let Some(s) = self.socket.take() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
+                s.close();
             }
         }
         Ok(out)
@@ -2098,7 +2203,7 @@ impl Engine for LlamaCppEngine {
         if self.active.as_ref() == Some(task_id) {
             self.cancelled.store(true, Ordering::Relaxed);
             if let Some(s) = self.socket.take() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
+                s.close();
             }
             self.active = None;
             self.active_retry = None;
@@ -2110,7 +2215,7 @@ impl Engine for LlamaCppEngine {
         self.closing.store(true, Ordering::Relaxed);
         self.cancelled.store(true, Ordering::Relaxed);
         if let Some(s) = self.socket.take() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+            s.close();
         }
         self.proc.kill();
     }
@@ -3150,6 +3255,244 @@ mod unix_tests {
         let long = "x".repeat(1000);
         assert_eq!(child_error_message(long.as_bytes()).chars().count(), 300);
         assert_eq!(child_error_message(b"  \n"), "");
+    }
+
+    /// A mock child that answers its n-th connection with `replies[n]` (the
+    /// whole raw HTTP response). It keeps accepting until `stop` is set and
+    /// then returns the request bodies it received, in order; a connection
+    /// past the last reply is recorded and closed without an answer.
+    fn mock_server_replies(
+        replies: Vec<String>,
+    ) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<Vec<String>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let t = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !stop2.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let mut s = match l.accept() {
+                    Ok((s, _)) => s,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                s.set_nonblocking(false).unwrap();
+                let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+                let mut reader = BufReader::new(s.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                if let Some(reply) = replies.get(bodies.len()) {
+                    s.write_all(reply.as_bytes()).unwrap();
+                }
+                bodies.push(String::from_utf8_lossy(&body).into_owned());
+            }
+            bodies
+        });
+        (port, stop, t)
+    }
+
+    /// llama-server's JSON error reply with `status` and `message`.
+    fn error_reply(status: &str, message: &str) -> String {
+        let body = serde_json::json!({
+            "error": {"code": 400, "message": message, "type": "invalid_request_error"}
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A streamed 200 whose answer is `text`.
+    fn ok_reply(text: &str) -> String {
+        let mut r = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n".to_string();
+        let delta = serde_json::json!({"choices":[{"delta":{"content": text}}]});
+        for p in [
+            format!("data: {delta}\n"),
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n".to_string(),
+            "data: [DONE]\n".to_string(),
+        ] {
+            r.push_str(&chunked(&p));
+        }
+        r.push_str("0\r\n\r\n");
+        r
+    }
+
+    fn schema_rejected_count() -> u64 {
+        cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+            .with_label_values(&[cascadia_metrics::UnenforcedReason::SchemaRejected.as_str()])
+            .get()
+    }
+
+    const TOOL_SCHEMA: &str = r#"{"type":"array","items":{"type":"object","properties":{"name":{"const":"get_weather"}},"required":["name"]},"minItems":1}"#;
+
+    /// Run `task` against a child answering `replies` in order; returns the
+    /// chunks the engine produced and the request bodies the child got.
+    fn run_against(
+        task: GenerationTask,
+        replies: Vec<String>,
+    ) -> (Vec<(TaskId, Chunk)>, Vec<String>) {
+        let (port, stop, server) = mock_server_replies(replies);
+        let mut engine = test_engine(port);
+        engine.submit(task).unwrap();
+        let chunks = drain(&mut engine);
+        // a retry, if any, has connected by the time the final chunk is out
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        (chunks, server.join().unwrap())
+    }
+
+    #[test]
+    fn best_effort_grammar_is_forwarded_as_response_format() {
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            TOOL_SCHEMA,
+        ));
+        let (chunks, bodies) = run_against(task, vec![ok_reply("[]")]);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(bodies[0].contains(TOOL_SCHEMA), "{}", bodies[0]);
+        let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["name"], "response");
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"],
+            serde_json::from_str::<serde_json::Value>(TOOL_SCHEMA).unwrap()
+        );
+        assert!(chunks.iter().all(|(_, c)| c.error.is_none()), "{chunks:?}");
+    }
+
+    #[test]
+    fn best_effort_grammar_refused_by_the_child_is_retried_without_it() {
+        let before = schema_rejected_count();
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            TOOL_SCHEMA,
+        ));
+        let (chunks, bodies) = run_against(
+            task,
+            vec![
+                error_reply("400 Bad Request", "failed to parse grammar"),
+                ok_reply("Sunny."),
+            ],
+        );
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert!(first.get("response_format").is_some(), "{}", bodies[0]);
+        let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert!(second.get("response_format").is_none(), "{}", bodies[1]);
+        // the resent request is the same request otherwise
+        let mut first = first;
+        first.as_object_mut().unwrap().remove("response_format");
+        assert_eq!(first, second);
+        let texts: String = chunks.iter().map(|(_, c)| c.text.as_str()).collect();
+        assert_eq!(texts, "Sunny.");
+        let last = &chunks.last().unwrap().1;
+        assert!(last.is_final);
+        assert!(last.error.is_none() && !last.invalid_request, "{last:?}");
+        assert_eq!(last.finish_reason, Some(FinishReason::Stop));
+        assert!(schema_rejected_count() > before);
+    }
+
+    #[test]
+    fn names_the_constraint_matches_grammar_and_schema_refusals() {
+        for body in [
+            r#"{"error":{"message":"failed to parse grammar"}}"#,
+            r#"{"error":{"message":"JSON Schema conversion failed"}}"#,
+            r#"{"error":{"message":"Unrecognized json_schema"}}"#,
+            r#"{"error":{"message":"Failed to initialize samplers"}}"#,
+        ] {
+            assert!(names_the_constraint(body.as_bytes()), "{body}");
+        }
+        assert!(!names_the_constraint(
+            br#"{"error":{"message":"the request exceeds the available context size"}}"#
+        ));
+    }
+
+    #[test]
+    fn request_socket_refuses_a_new_connection_once_closed() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let live = RequestSocket::new(None);
+        assert!(live.replace(&a));
+        live.close();
+        let b = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        assert!(!live.replace(&b), "a cancelled request must not resend");
+    }
+
+    #[test]
+    fn best_effort_fallback_is_tried_once() {
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            TOOL_SCHEMA,
+        ));
+        let (chunks, bodies) = run_against(
+            task,
+            vec![
+                error_reply("400 Bad Request", "JSON schema conversion failed"),
+                error_reply(
+                    "400 Bad Request",
+                    "Failed to initialize samplers: bad grammar",
+                ),
+            ],
+        );
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        let last = &chunks.last().unwrap().1;
+        assert!(last.invalid_request, "{last:?}");
+        assert_eq!(
+            last.error.as_deref(),
+            Some("llama-server rejected the request: Failed to initialize samplers: bad grammar")
+        );
+    }
+
+    #[test]
+    fn non_best_effort_refusal_is_unchanged() {
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema(TOOL_SCHEMA));
+        let (chunks, bodies) = run_against(
+            task,
+            vec![
+                error_reply("400 Bad Request", "failed to parse grammar"),
+                ok_reply("unreachable"),
+            ],
+        );
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        let last = &chunks.last().unwrap().1;
+        assert!(last.is_final && last.invalid_request, "{last:?}");
+        assert_eq!(
+            last.error.as_deref(),
+            Some("llama-server rejected the request: failed to parse grammar")
+        );
+    }
+
+    #[test]
+    fn best_effort_refusal_not_about_the_schema_is_unchanged() {
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            TOOL_SCHEMA,
+        ));
+        let (chunks, bodies) = run_against(
+            task,
+            vec![
+                error_reply("400 Bad Request", "the request exceeds the context size"),
+                ok_reply("unreachable"),
+            ],
+        );
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        let last = &chunks.last().unwrap().1;
+        assert!(last.invalid_request, "{last:?}");
+        assert_eq!(
+            last.error.as_deref(),
+            Some("llama-server rejected the request: the request exceeds the context size")
+        );
     }
 
     #[test]

@@ -13,6 +13,8 @@ cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
 # The same `pattern` check the llguidance engines apply (see `sanitized_schema`).
 cascadia-grammar = { workspace = true }
+# Counts a best-effort output constraint the child refused (see `start_stream`).
+cascadia-metrics = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 
