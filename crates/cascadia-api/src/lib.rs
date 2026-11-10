@@ -974,14 +974,6 @@ impl ChatCompletionRequest {
         }
     }
 
-    /// The request's tools as the chat template and the engine see them:
-    /// function tools unchanged, custom tools as their function shims.
-    fn request_tools(&self) -> Option<Vec<Tool>> {
-        self.tools
-            .as_ref()
-            .map(|ts| ts.iter().map(RequestTool::to_tool).collect())
-    }
-
     /// Resolves `enable_thinking`, highest precedence first:
     /// `chat_template_kwargs.enable_thinking` (the vLLM/SGLang convention),
     /// then the legacy top-level `enable_thinking`, then `reasoning_effort:
@@ -1045,7 +1037,7 @@ struct ChatChoiceMessage {
     /// `Option` so a tool-call turn emits `content: null` (OpenAI shape).
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ToolCall>>,
+    tool_calls: Option<Vec<OutputToolCall>>,
 }
 
 /// OpenAI chat `logprobs` object: one entry per generated token under
@@ -1953,25 +1945,36 @@ fn render_prompt(
     )
 }
 
-/// Decide the response message + finish_reason from accumulated text.
-/// `tool_choice == Some("none")` skips parsing (always "stop").
+/// Decide the response message from accumulated text, and the
+/// `finish_reason` that overrides the engine's: `"tool_calls"` when the
+/// answer is tool calls, `"stop"` when it is the call a named `tool_choice`
+/// forced (as OpenAI reports it). `None` when the answer is content, which
+/// keeps the engine's reason (`"length"` for a cut-off call, say).
+/// `grammar_sent` / `union_sent`: see [`resolve_calls`].
 fn build_choice(
     buf: String,
-    tool_choice: &Option<serde_json::Value>,
-    tools_present: bool,
+    policy: &ToolPolicy,
     enable_thinking: bool,
-) -> (ChatChoiceMessage, &'static str) {
-    let parse_enabled =
-        tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
-    if parse_enabled {
-        if let Some(calls) = parse_tool_calls(tool_call_scan_text(&buf, enable_thinking)) {
+    grammar_sent: bool,
+    union_sent: bool,
+) -> (ChatChoiceMessage, Option<&'static str>) {
+    if policy.callable() {
+        if let Some(calls) = resolve_calls(
+            tool_call_scan_text(&buf, enable_thinking),
+            policy,
+            grammar_sent,
+            union_sent,
+        ) {
             return (
                 ChatChoiceMessage {
                     role: "assistant",
                     content: None,
-                    tool_calls: Some(calls),
+                    tool_calls: Some(output_calls(calls, policy)),
                 },
-                "tool_calls",
+                Some(match policy.mode {
+                    ToolMode::Named(_) => "stop",
+                    _ => "tool_calls",
+                }),
             );
         }
     }
@@ -1981,7 +1984,7 @@ fn build_choice(
             content: Some(buf),
             tool_calls: None,
         },
-        "stop",
+        None,
     )
 }
 
@@ -2161,6 +2164,18 @@ impl ToolStreamSplitter {
 /// Shape-based + engine-agnostic; never panics (each block parsed independently,
 /// malformed blocks skipped).
 pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    parse_tool_calls_with(text, true)
+}
+
+/// [`parse_tool_calls`] without its bare-JSON branch: only calls behind a
+/// tool-call marker (`<tool_call>`, `<|python_tag|>`) count. A whole-output
+/// JSON object or array with `name` and `arguments`/`parameters` keys stays
+/// text, for answers where such JSON may be the client's own data.
+pub fn parse_tool_calls_marked(text: &str) -> Option<Vec<ToolCall>> {
+    parse_tool_calls_with(text, false)
+}
+
+fn parse_tool_calls_with(text: &str, bare_json: bool) -> Option<Vec<ToolCall>> {
     let mut calls = Vec::new();
     if text.contains("<tool_call>") {
         // Qwen/Hermes: each <tool_call>…</tool_call> block.
@@ -2217,7 +2232,7 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             .map(str::trim)
             .unwrap_or(trimmed);
         let looks_json = candidate.starts_with('{') || candidate.starts_with('[');
-        if explicit || looks_json {
+        if explicit || (bare_json && looks_json) {
             let tool_shaped = |v: &serde_json::Value| {
                 explicit || v.get("arguments").is_some() || v.get("parameters").is_some()
             };
@@ -2574,29 +2589,26 @@ fn chat_turns(req: &ChatCompletionRequest) -> Vec<ChatTurn> {
         .collect()
 }
 
-/// The request's tool definitions as wire JSON for the engine.
-fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
-    req.request_tools()
-        .and_then(|ts| serde_json::to_value(ts).ok())
-}
-
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    if let Err(e) = ToolPolicy::from_request(
+    let policy = match ToolPolicy::from_request(
         req.tools.as_deref(),
         req.tool_choice.as_ref(),
         req.parallel_tool_calls,
     ) {
-        count_rejected("invalid_request");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
-        )
-            .into_response();
-    }
+        Ok(policy) => policy,
+        Err(e) => {
+            count_rejected("invalid_request");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
     let response_format =
         match parse_response_format(req.response_format.as_deref().map(|r| r.get())) {
             Ok(rf) => rf,
@@ -2633,10 +2645,8 @@ async fn chat_completions(
         let mut budget = cascadia_grammar::Budget::default();
         // Only what is sent counts: no response_format while tools are
         // callable, and only the tools `tool_choice` leaves.
-        let tools_callable = req.tools.as_ref().is_some_and(|t| !t.is_empty())
-            && req.tool_choice.as_ref().and_then(|c| c.as_str()) != Some("none");
         if let (ResponseFormat::JsonSchema { schema, .. }, false) =
-            (&response_format, tools_callable)
+            (&response_format, policy.callable())
         {
             if let Err(msg) = structured::inline_for_llama_server(schema, no_jinja, &mut budget) {
                 count_rejected("invalid_request");
@@ -2647,9 +2657,11 @@ async fn chat_completions(
                     .into_response();
             }
         }
-        if let Some(serde_json::Value::Array(tools)) = chat_tools(&req) {
-            let sent =
-                cascadia_grammar::tools_llama_server_receives(&tools, req.tool_choice.as_ref());
+        // The tools and choice the engine is given (see `ToolPolicy`), so
+        // `t{i}` is the index the engine inlines tool `i` under.
+        if let Some(serde_json::Value::Array(tools)) = policy.engine_tools() {
+            let choice = policy.engine_tool_choice();
+            let sent = cascadia_grammar::tools_llama_server_receives(&tools, choice.as_ref());
             for i in sent {
                 let Some(params) = tools[i].pointer("/function/parameters") else {
                     continue;
@@ -2675,8 +2687,7 @@ async fn chat_completions(
             }
         }
     }
-    let tools_callable = req.tools.as_ref().is_some_and(|t| !t.is_empty())
-        && req.tool_choice.as_ref().and_then(|c| c.as_str()) != Some("none");
+    let tools_callable = policy.callable();
     let json = response_format.is_json();
     // Engines that cannot enforce a JSON format answer 400 rather than
     // silently ignoring the field. A request that offers callable tools is
@@ -2700,7 +2711,23 @@ async fn chat_completions(
             .into_response();
     }
     let structured = json && state.structured_output;
-    let grammar = if structured && !tools_callable {
+    // A forced tool choice, or a JSON format beside callable tools, is
+    // enforced as a tool-call constraint (see `tool_grammar`): the call
+    // array, or "a call or the asked-for JSON". It is best-effort: where it
+    // can't be built or applied the turn runs unconstrained and the answer
+    // is read as the model wrote it. Engines that apply their own chat
+    // template get it too: their server's own tool_choice handling doesn't
+    // force a call. Streamed answers are not read this way yet, so a
+    // streamed request is constrained as before.
+    let tool_constrained =
+        !req.stream && state.structured_output && (policy.forced() || (json && tools_callable));
+    let grammar = if tool_constrained {
+        let format = json
+            .then(|| grammar_for(&response_format))
+            .flatten()
+            .map(|g| g.body);
+        tool_grammar(&policy, format.as_deref())
+    } else if structured && !tools_callable {
         grammar_for(&response_format)
     } else {
         None
@@ -2717,12 +2744,16 @@ async fn chat_completions(
         }
         other => other,
     };
-    // A JSON answer has no room for a reasoning preamble: thinking is off.
-    // With callable tools the format is not enforced and the model may want
-    // to reason before a tool call, so thinking stays as requested, except
-    // where the engine refuses thinking with tools when it renders the
-    // template itself (ov-genai: `defer_template_on_thinking`).
-    let thinking_off = structured && (!tools_callable || state.defer_template_on_thinking);
+    let tool_grammar_sent = tool_constrained && grammar.is_some();
+    let union_sent = tool_grammar_sent && !policy.forced();
+    // A JSON answer has no room for a reasoning preamble: thinking is off,
+    // and so is it under a tool-call constraint, which starts at the first
+    // token. A JSON format beside callable tools that could not be
+    // constrained leaves thinking as requested (the model may reason before
+    // a call), except where the engine refuses thinking with tools when it
+    // renders the template itself (ov-genai: `defer_template_on_thinking`).
+    let thinking_off =
+        tool_grammar_sent || (structured && (!tools_callable || state.defer_template_on_thinking));
     let enable_thinking = if thinking_off {
         false
     } else {
@@ -2757,13 +2788,12 @@ async fn chat_completions(
     // client's "low" reaches such a template unescalated — or, when the caller
     // sent nothing of their own, with the effort undefined (the template's
     // default). A caller word the template also rejects is a 400.
-    let request_tools = req.request_tools();
     let prompt = match render_prompt(
         &state,
         &req.messages,
         enable_thinking,
         effort,
-        request_tools.as_deref(),
+        policy.prompt_tools(),
     ) {
         Ok(p) => p,
         // A tools request that cannot be templated must not return a 200: the
@@ -2856,8 +2886,8 @@ async fn chat_completions(
         // llama-server renders the GGUF chat template). Other engines ignore
         // the field and keep consuming `prompt`.
         messages: chat_turns(&req),
-        tools: chat_tools(&req),
-        tool_choice: req.tool_choice.clone(),
+        tools: policy.engine_tools(),
+        tool_choice: policy.engine_tool_choice(),
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
@@ -2877,7 +2907,7 @@ async fn chat_completions(
     };
     let keywords = keywords_to_log(
         state.xgrammar_keyword_log,
-        task.grammar.is_some(),
+        task.grammar.is_some() && !policy.forced(),
         &response_format,
     );
     if !keywords.is_empty() {
@@ -2887,7 +2917,7 @@ async fn chat_completions(
             "response_format schema uses keywords the output constraint does not enforce"
         );
     }
-    if json && tools_callable {
+    if json && tools_callable && task.grammar.is_none() {
         info!(
             task = %task_id,
             "response_format not enforced: the request offers tools the model may call"
@@ -3012,16 +3042,12 @@ async fn chat_completions(
         }
     }
 
-    let (message, choice_finish) = build_choice(
-        buf,
-        &req.tool_choice,
-        req.tools.as_ref().is_some_and(|t| !t.is_empty()),
-        enable_thinking,
-    );
+    let (message, choice_finish) =
+        build_choice(buf, &policy, enable_thinking, tool_grammar_sent, union_sent);
     // A parsed tool call overrides the streamed length/stop detection;
     // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
-    if choice_finish == "tool_calls" {
-        finish_reason = "tool_calls";
+    if let Some(fr) = choice_finish {
+        finish_reason = fr;
     }
     Json(ChatCompletionResponse {
         id: task_id,
@@ -4338,6 +4364,10 @@ mod tests {
         make_router(Arc::new(runner), "mock-model")
     }
 
+    /// A minimal chat template that renders the tools it is given.
+    const TOOLS_TEMPLATE: &str = "{% if tools %}{{ tools | tojson }}{% endif %}\
+                                  {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+
     /// A router whose model carries a (minimal) tools-capable chat template.
     /// Tool requests need one: without a template there is nothing that can
     /// render tool definitions, and the API refuses rather than answering as
@@ -4353,11 +4383,7 @@ mod tests {
             .unwrap();
         let cfg = Config {
             chat_template: ChatTemplateConfig {
-                template: Some(
-                    "{% if tools %}{{ tools | tojson }}{% endif %}\
-                     {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}"
-                        .into(),
-                ),
+                template: Some(TOOLS_TEMPLATE.into()),
                 bos_token: None,
                 eos_token: None,
             },
@@ -5524,7 +5550,13 @@ mod tests {
             "description":"Get weather","parameters":{"type":"object",
             "properties":{"city":{"type":"string"}}}}}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
-        let tools = req.request_tools().expect("tools parse");
+        let tools: Vec<Tool> = req
+            .tools
+            .as_ref()
+            .expect("tools parse")
+            .iter()
+            .map(RequestTool::to_tool)
+            .collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].r#type, "function");
         assert_eq!(tools[0].function["name"], "get_weather");
@@ -5608,7 +5640,13 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"f"}},
                      {"type":"custom","custom":{"name":"apply_patch","description":"Patch."}}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
-        let tools = req.request_tools().expect("tools parse");
+        let tools: Vec<Tool> = req
+            .tools
+            .as_ref()
+            .expect("tools parse")
+            .iter()
+            .map(RequestTool::to_tool)
+            .collect();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].function, serde_json::json!({"name": "f"}));
         assert_eq!(tools[1].r#type, "function");
@@ -6395,7 +6433,10 @@ mod tests {
         );
         assert_eq!(turns[1].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(turns[1].name.as_deref(), Some("get_weather"));
-        let tools = chat_tools(&req).expect("tools forwarded");
+        let tools = ToolPolicy::from_request(req.tools.as_deref(), None, None)
+            .unwrap()
+            .engine_tools()
+            .expect("tools forwarded");
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
     }
@@ -7226,29 +7267,45 @@ level={{ effort_map[eff] }}";
         );
     }
 
+    /// A policy over `tools` (function tools named by `names`) and `choice`.
+    fn tool_policy(names: &[&str], choice: Option<Value>) -> ToolPolicy {
+        let tools: Vec<RequestTool> = names
+            .iter()
+            .map(|n| {
+                serde_json::from_value(serde_json::json!(
+                    {"type": "function", "function": {"name": n}}
+                ))
+                .unwrap()
+            })
+            .collect();
+        ToolPolicy::from_request(Some(&tools), choice.as_ref(), None).unwrap()
+    }
+
     #[test]
     fn build_choice_emits_tool_calls_when_parsed() {
         let (m, fr) = build_choice(
             "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>"
                 .into(),
-            &Some(serde_json::json!("auto")),
+            &tool_policy(&["get_weather"], Some(serde_json::json!("auto"))),
             true,
-            true,
+            false,
+            false,
         );
-        assert_eq!(fr, "tool_calls");
+        assert_eq!(fr, Some("tool_calls"));
         assert!(m.content.is_none());
-        assert_eq!(m.tool_calls.unwrap()[0].function.name, "get_weather");
+        assert_eq!(m.tool_calls.unwrap()[0].name(), "get_weather");
     }
 
     #[test]
     fn build_choice_none_skips_parse() {
         let (m, fr) = build_choice(
             "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
-            &Some(serde_json::json!("none")),
+            &tool_policy(&["x"], Some(serde_json::json!("none"))),
             true,
-            true,
+            false,
+            false,
         );
-        assert_eq!(fr, "stop");
+        assert_eq!(fr, None);
         assert!(m.tool_calls.is_none());
         assert!(m.content.is_some());
     }
@@ -7258,11 +7315,12 @@ level={{ effort_map[eff] }}";
         // tools absent -> never parse, even if output looks like a tool call.
         let (m, fr) = build_choice(
             "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
-            &Some(serde_json::json!("auto")),
-            false,
+            &ToolPolicy::from_request(None, Some(&serde_json::json!("auto")), None).unwrap(),
             true,
+            false,
+            false,
         );
-        assert_eq!(fr, "stop");
+        assert_eq!(fr, None);
         assert!(m.tool_calls.is_none());
         assert!(m.content.is_some());
     }
@@ -7274,18 +7332,25 @@ level={{ effort_map[eff] }}";
         // contain "</think>".
         let (m, fr) = build_choice(
             r#"<tool_call>{"name":"echo","arguments":{"text":"</think>"}}</tool_call>"#.into(),
-            &Some(serde_json::json!("auto")),
-            true,
+            &tool_policy(&["echo"], Some(serde_json::json!("auto"))),
+            false,
+            false,
             false,
         );
-        assert_eq!(fr, "tool_calls");
-        assert_eq!(m.tool_calls.unwrap()[0].function.name, "echo");
+        assert_eq!(fr, Some("tool_calls"));
+        assert_eq!(m.tool_calls.unwrap()[0].name(), "echo");
     }
 
     #[test]
     fn build_choice_plain_is_stop() {
-        let (m, fr) = build_choice("hello".into(), &None, true, true);
-        assert_eq!(fr, "stop");
+        let (m, fr) = build_choice(
+            "hello".into(),
+            &tool_policy(&["x"], None),
+            true,
+            false,
+            false,
+        );
+        assert_eq!(fr, None);
         assert!(m.tool_calls.is_none());
         assert_eq!(m.content.as_deref(), Some("hello"));
     }
@@ -9462,8 +9527,10 @@ level={{ effort_map[eff] }}";
         v
     }
 
+    // With callable tools a JSON format is enforced as "a tool call or the
+    // asked-for JSON": thinking is off, as for any JSON answer.
     #[tokio::test]
-    async fn tools_callable_skips_grammar_and_turns_thinking_off_on_ov_genai() {
+    async fn tools_callable_sends_the_union_and_turns_thinking_off_on_ov_genai() {
         let cfg = Config {
             defer_template_on_thinking: true,
             ..minimal_cfg()
@@ -9472,18 +9539,20 @@ level={{ effort_map[eff] }}";
         let (status, v) = post_chat(app, json_with_tools(serde_json::json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         let task = last_task(&seen);
-        assert_eq!(task.grammar, None);
+        assert!(task.grammar.as_ref().is_some_and(|g| g.best_effort));
         assert!(!task.enable_thinking);
     }
 
     #[tokio::test]
-    async fn tools_callable_keeps_thinking_as_requested_elsewhere() {
+    async fn tools_callable_with_a_json_format_turns_thinking_off_elsewhere() {
         let (app, seen) = capture_app(true, minimal_cfg()).await;
         let (status, v) = post_chat(app.clone(), json_with_tools(serde_json::json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         let with_format = last_task(&seen);
-        assert_eq!(with_format.grammar, None);
-        assert!(with_format.enable_thinking);
+        assert!(with_format.grammar.as_ref().is_some_and(|g| g.best_effort));
+        assert!(!with_format.enable_thinking);
+        // The model's JSON answer is content.
+        assert_eq!(v["choices"][0]["message"]["content"], r#"{"ok":true}"#);
 
         let mut plain = json_with_tools(serde_json::json!({}));
         plain.as_object_mut().unwrap().remove("response_format");
@@ -9491,7 +9560,8 @@ level={{ effort_map[eff] }}";
         assert_eq!(status, StatusCode::OK, "{v}");
         let without = last_task(&seen);
         assert_eq!(with_format.prompt, without.prompt);
-        assert_eq!(with_format.enable_thinking, without.enable_thinking);
+        assert_eq!(without.grammar, None);
+        assert!(without.enable_thinking);
 
         let (status, v) = post_chat(
             app.clone(),
@@ -9660,5 +9730,594 @@ level={{ effort_map[eff] }}";
             v,
             serde_json::json!({"error": "invalid configuration: response_format json_schema: x"})
         );
+    }
+
+    // ---- tool_choice, allowed_tools, parallel_tool_calls ----
+
+    /// Records every submitted task and answers it as the mock engine does:
+    /// a constrained task with the minimal instance of its schema, any other
+    /// with the prompt's words.
+    struct RecordingMock {
+        seen: Captured,
+        inner: cascadia_engine_mock::MockEngine,
+    }
+
+    impl cascadia_engine::Engine for RecordingMock {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.seen.lock().unwrap().push(task.clone());
+            self.inner.submit(task)
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            self.inner.step()
+        }
+        fn cancel(&mut self, task_id: &cascadia_types::TaskId) {
+            self.inner.cancel(task_id)
+        }
+    }
+
+    struct RecordingMockBuilder(RecordingMock);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for RecordingMockBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0))
+        }
+    }
+
+    /// A router over the mock engine with structured output on, rendering
+    /// prompts with `template_src`, that records every task it is given.
+    async fn mock_capture_app(cfg: Config, template_src: &str) -> (Router, Captured) {
+        let seen: Captured = Arc::default();
+        let runner = Runner::new(Box::new(RecordingMockBuilder(RecordingMock {
+            seen: seen.clone(),
+            inner: cascadia_engine_mock::MockEngine::new(),
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            structured_output: true,
+            engine_name: "mock".into(),
+            chat_template: template(template_src),
+            ..cfg
+        };
+        (
+            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            seen,
+        )
+    }
+
+    /// A function tool taking one required string, `city`.
+    fn city_tool(name: &str) -> Value {
+        serde_json::json!({"type": "function", "function": {
+            "name": name,
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }})
+    }
+
+    fn custom_tool(name: &str) -> Value {
+        serde_json::json!({"type": "custom", "custom": {"name": name, "description": "Apply a patch"}})
+    }
+
+    fn named(name: &str) -> Value {
+        serde_json::json!({"type": "function", "function": {"name": name}})
+    }
+
+    fn allowed(mode: &str, names: &[&str]) -> Value {
+        let tools: Vec<Value> = names.iter().map(|n| named(n)).collect();
+        serde_json::json!({"type": "allowed_tools", "allowed_tools": {"mode": mode, "tools": tools}})
+    }
+
+    /// A chat request offering `tools`, with `extra` fields merged in.
+    fn tool_body(tools: Value, extra: Value) -> Value {
+        let mut v = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "tools": tools,
+        });
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    }
+
+    /// The policy the handler builds for `body`.
+    fn policy_of(body: &Value) -> ToolPolicy {
+        let tools: Option<Vec<RequestTool>> = body
+            .get("tools")
+            .map(|t| serde_json::from_value(t.clone()).unwrap());
+        ToolPolicy::from_request(
+            tools.as_deref(),
+            body.get("tool_choice"),
+            body.get("parallel_tool_calls").and_then(Value::as_bool),
+        )
+        .unwrap()
+    }
+
+    /// Every `enum` value anywhere in a schema.
+    fn enum_values(schema: &Value, out: &mut Vec<String>) {
+        match schema {
+            Value::Object(o) => {
+                if let Some(Value::Array(e)) = o.get("enum") {
+                    out.extend(e.iter().filter_map(|x| x.as_str().map(str::to_owned)));
+                }
+                o.values().for_each(|v| enum_values(v, out));
+            }
+            Value::Array(a) => a.iter().for_each(|v| enum_values(v, out)),
+            _ => {}
+        }
+    }
+
+    fn call_names(v: &Value) -> Vec<String> {
+        v["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .map(|cs| {
+                cs.iter()
+                    .map(|c| c["function"]["name"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn required_sends_the_call_grammar_and_returns_the_call() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather"), city_tool("get_time")]),
+            serde_json::json!({"tool_choice": "required", "enable_thinking": true}),
+        );
+        let (status, v) = post_chat(app, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        let expected = tool_grammar(&policy_of(&body), None).expect("a call grammar");
+        assert!(expected.best_effort);
+        assert_eq!(task.grammar, Some(expected));
+        assert!(!task.enable_thinking);
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{v}");
+        assert!(choice["message"]["content"].is_null(), "{v}");
+        let call = &choice["message"]["tool_calls"][0];
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], r#"{"city":""}"#);
+    }
+
+    #[tokio::test]
+    async fn named_function_returns_the_call_with_stop() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather"), city_tool("get_time")]),
+            serde_json::json!({"tool_choice": named("get_time")}),
+        );
+        let (status, v) = post_chat(app, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(
+            last_task(&seen).grammar,
+            tool_grammar(&policy_of(&body), None)
+        );
+        assert_eq!(call_names(&v), ["get_time"], "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+    }
+
+    #[tokio::test]
+    async fn named_custom_returns_a_custom_call() {
+        let (app, _seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather"), custom_tool("apply_patch")]),
+            serde_json::json!({"tool_choice": {"type": "custom", "custom": {"name": "apply_patch"}}}),
+        );
+        let (status, v) = post_chat(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let call = &v["choices"][0]["message"]["tool_calls"][0];
+        let id = call["id"].as_str().expect("an id");
+        assert!(id.starts_with("call_"), "{v}");
+        assert_eq!(
+            call,
+            &serde_json::json!({"id": id, "type": "custom", "custom": {"name": "apply_patch", "input": ""}})
+        );
+        assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+    }
+
+    #[tokio::test]
+    async fn allowed_tools_narrows_the_prompt_and_the_grammar() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("a"), city_tool("b"), city_tool("c")]),
+            serde_json::json!({"tool_choice": allowed("required", &["c", "a"])}),
+        );
+        let (status, v) = post_chat(app.clone(), body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(call_names(&v), ["a"], "{v}");
+        let narrowed = last_task(&seen);
+
+        let (status, v) = post_chat(
+            app,
+            tool_body(
+                serde_json::json!([city_tool("a"), city_tool("c")]),
+                serde_json::json!({"tool_choice": "required"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let only_allowed = last_task(&seen);
+        assert_eq!(narrowed.prompt, only_allowed.prompt);
+        assert_eq!(narrowed.tools, only_allowed.tools);
+        assert_eq!(narrowed.grammar, only_allowed.grammar);
+        let schema: Value =
+            serde_json::from_str(&narrowed.grammar.expect("a grammar").body).unwrap();
+        let mut names = Vec::new();
+        enum_values(&schema, &mut names);
+        names.sort();
+        assert_eq!(names, ["a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn parallel_false_truncates_unconstrained_calls() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        // The mock echoes the prompt, so the model "writes" these two calls.
+        let two = r#"<tool_call>{"name":"a","arguments":{"city":"Paris"}}</tool_call> <tool_call>{"name":"b","arguments":{"city":"Rome"}}</tool_call>"#;
+        let body = |extra: Value| {
+            let mut v = tool_body(serde_json::json!([city_tool("a"), city_tool("b")]), extra);
+            v["messages"][0]["content"] = two.into();
+            v
+        };
+        let (status, v) = post_chat(app.clone(), body(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(call_names(&v), ["a", "b"], "{v}");
+
+        let (status, v) =
+            post_chat(app, body(serde_json::json!({"parallel_tool_calls": false}))).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(last_task(&seen).grammar, None);
+        assert_eq!(call_names(&v), ["a"], "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
+    }
+
+    #[tokio::test]
+    async fn json_format_with_tools_sends_the_union() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = json_with_tools(serde_json::json!({}));
+        let (status, v) = post_chat(app, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let format = grammar_for(
+            &parse_response_format(Some(&json_schema_format(nested_schema()).to_string())).unwrap(),
+        )
+        .unwrap();
+        let expected = tool_grammar(&policy_of(&body), Some(&format.body)).expect("a union");
+        let task = last_task(&seen);
+        assert_eq!(task.grammar, Some(expected));
+        assert!(!task.enable_thinking);
+        // The mock answers the union's first branch: a call.
+        assert_eq!(call_names(&v), ["get_weather"], "{v}");
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
+    }
+
+    #[test]
+    fn union_content_branch_is_content() {
+        let policy = tool_policy(&["get_weather"], None);
+        for text in [
+            r#"{"name":"Alice","parameters":{"age":30}}"#,
+            r#"[{"name":"Alice","parameters":{}}]"#,
+        ] {
+            let (m, fr) = build_choice(text.into(), &policy, false, true, true);
+            assert_eq!(fr, None, "{text}");
+            assert!(m.tool_calls.is_none(), "{text}");
+            assert_eq!(m.content.as_deref(), Some(text));
+        }
+        // Without the union the bare object reads as a call, as before.
+        let (m, _) = build_choice(
+            r#"{"name":"Alice","parameters":{"age":30}}"#.into(),
+            &policy,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(m.tool_calls.unwrap()[0].name(), "Alice");
+    }
+
+    #[test]
+    fn dropped_grammar_still_reads_the_dialect_call() {
+        let text = r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
+        let required = tool_policy(&["get_weather"], Some(serde_json::json!("required")));
+        for grammar_sent in [false, true] {
+            let calls = resolve_calls(text, &required, grammar_sent, false).expect("a call");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].function.name, "get_weather");
+            assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
+        }
+        let auto = tool_policy(&["get_weather"], None);
+        let calls = resolve_calls(text, &auto, true, true).expect("a call under the union");
+        assert_eq!(calls[0].function.name, "get_weather");
+    }
+
+    #[tokio::test]
+    async fn engine_that_applies_its_template_gets_the_tool_grammar_too() {
+        let cfg = Config {
+            engine_applies_template: true,
+            ..Config::default()
+        };
+        let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+
+        let body = tool_body(
+            serde_json::json!([city_tool("a"), city_tool("b")]),
+            serde_json::json!({"tool_choice": "required"}),
+        );
+        let (status, v) = post_chat(app.clone(), body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert!(task.grammar.is_some());
+        assert_eq!(task.grammar, tool_grammar(&policy_of(&body), None));
+        assert_eq!(task.tool_choice, Some(serde_json::json!("required")));
+        assert_eq!(call_names(&v), ["a"], "{v}");
+
+        let body = tool_body(
+            serde_json::json!([city_tool("a"), custom_tool("apply_patch")]),
+            serde_json::json!({"tool_choice": {"type": "custom", "custom": {"name": "apply_patch"}}}),
+        );
+        let (status, v) = post_chat(app.clone(), body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert!(task.grammar.is_some());
+        assert_eq!(task.tool_choice, Some(named("apply_patch")));
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["custom"]["name"], "apply_patch",
+            "{v}"
+        );
+
+        let body = tool_body(
+            serde_json::json!([city_tool("a"), city_tool("b"), city_tool("c")]),
+            serde_json::json!({"tool_choice": allowed("required", &["b"])}),
+        );
+        let (status, v) = post_chat(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.tools, Some(serde_json::json!([city_tool("b")])));
+        assert_eq!(task.tool_choice, Some(serde_json::json!("required")));
+        assert!(task.grammar.is_some());
+    }
+
+    #[tokio::test]
+    async fn structured_output_off_engine_keeps_todays_behaviour() {
+        let cfg = Config {
+            chat_template: template(TOOLS_TEMPLATE),
+            ..Config::default()
+        };
+        let (app, seen) = capture_app(false, cfg).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("a")]),
+            serde_json::json!({"tool_choice": "required"}),
+        );
+        let (status, v) = post_chat(app.clone(), body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.grammar, None);
+        assert!(task.enable_thinking);
+        assert_eq!(task.tool_choice, Some(serde_json::json!("required")));
+        assert_eq!(v["choices"][0]["message"]["content"], r#"{"ok":true}"#);
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+
+        let (status, v) = post_chat(app, json_with_tools(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.grammar, None);
+        assert!(task.enable_thinking);
+    }
+
+    #[tokio::test]
+    async fn json_tools_fallback_on_ov_genai_keeps_thinking_off() {
+        let cfg = Config {
+            defer_template_on_thinking: true,
+            ..Config::default()
+        };
+        let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+        // A `$ref` into `properties` can't be moved under the union.
+        let tool = serde_json::json!({"type": "function", "function": {
+            "name": "f",
+            "parameters": {
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"$ref": "#/properties/a"}}
+            }
+        }});
+        let body = tool_body(
+            serde_json::json!([tool]),
+            serde_json::json!({"response_format": {"type": "json_object"}}),
+        );
+        let (status, v) = post_chat(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.grammar, None);
+        assert!(!task.enable_thinking);
+    }
+
+    #[test]
+    fn undeclared_call_dropped_only_when_narrowed() {
+        let text = r#"<tool_call>{"name":"other","arguments":{}}</tool_call>"#;
+        let narrowed = tool_policy(&["a", "b"], Some(allowed("auto", &["a"])));
+        let (m, fr) = build_choice(text.into(), &narrowed, false, false, false);
+        assert_eq!(fr, None);
+        assert!(m.tool_calls.is_none());
+        assert_eq!(m.content.as_deref(), Some(text));
+
+        let plain = tool_policy(&["a"], None);
+        let (m, fr) = build_choice(text.into(), &plain, false, false, false);
+        assert_eq!(fr, Some("tool_calls"));
+        assert_eq!(m.tool_calls.unwrap()[0].name(), "other");
+    }
+
+    #[tokio::test]
+    async fn truncated_forced_output_is_content_with_length() {
+        let (app, _seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather")]),
+            serde_json::json!({"tool_choice": "required", "max_tokens": 2}),
+        );
+        let (status, v) = post_chat(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], "length", "{v}");
+        assert!(choice["message"].get("tool_calls").is_none(), "{v}");
+        // Two 8-character pieces of the call array.
+        assert_eq!(choice["message"]["content"], r#"[{"name":"get_we"#, "{v}");
+    }
+
+    /// What a plain tools request produced before tool_choice was enforced:
+    /// the task fields and the answer, for one request.
+    async fn plain_outcome(app: Router, seen: &Captured, body: Value) -> Value {
+        let (status, v) = post_chat(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(seen);
+        let message = &v["choices"][0]["message"];
+        serde_json::json!({
+            "prompt": task.prompt,
+            "tools": task.tools,
+            "tool_choice": task.tool_choice,
+            "grammar": task.grammar.is_some(),
+            "thinking": task.enable_thinking,
+            "content": message["content"],
+            "calls": message.get("tool_calls").map(|cs| cs.as_array().unwrap().iter()
+                .map(|c| serde_json::json!([c["type"], c["function"]["name"], c["function"]["arguments"]]))
+                .collect::<Vec<_>>()),
+            "finish": v["choices"][0]["finish_reason"],
+        })
+    }
+
+    #[tokio::test]
+    async fn plain_tool_requests_are_unchanged() {
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let tools = serde_json::json!([city_tool("get_weather")]);
+        let call = r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
+        let mut cases = vec![
+            tool_body(tools.clone(), serde_json::json!({})),
+            tool_body(tools.clone(), serde_json::json!({"tool_choice": "auto"})),
+            tool_body(tools.clone(), serde_json::json!({"tool_choice": "none"})),
+            tool_body(
+                tools.clone(),
+                serde_json::json!({"parallel_tool_calls": true}),
+            ),
+            tool_body(tools.clone(), serde_json::json!({"tool_choice": "auto"})),
+        ];
+        cases[4]["messages"][0]["content"] = call.into();
+        let mut no_tools = tool_body(serde_json::json!([]), serde_json::json!({}));
+        no_tools.as_object_mut().unwrap().remove("tools");
+        cases.push(no_tools);
+        let mut got = Vec::new();
+        for body in cases {
+            got.push(plain_outcome(app.clone(), &seen, body).await);
+        }
+        // Captured from the server before tool_choice was enforced.
+        const RENDERED: &str = r#"[{"function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}, "type": "function"}]"#;
+        let wire_tools = serde_json::json!([{"type": "function", "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }}]);
+        let echoed = |choice: Value| {
+            serde_json::json!({
+                "prompt": format!("{RENDERED}user: weather in Paris?\n"),
+                "tools": wire_tools,
+                "tool_choice": choice,
+                "grammar": false,
+                "thinking": true,
+                "content": format!("{RENDERED}user: weather in Paris? "),
+                "calls": null,
+                "finish": "stop",
+            })
+        };
+        let expected = serde_json::json!([
+            echoed(Value::Null),
+            echoed("auto".into()),
+            echoed("none".into()),
+            echoed(Value::Null),
+            {
+                "prompt": format!("{RENDERED}user: {call}\n"),
+                "tools": wire_tools,
+                "tool_choice": "auto",
+                "grammar": false,
+                "thinking": true,
+                "content": null,
+                "calls": [["function", "get_weather", r#"{"city":"Paris"}"#]],
+                "finish": "tool_calls",
+            },
+            {
+                "prompt": "user: weather in Paris?\n",
+                "tools": null,
+                "tool_choice": null,
+                "grammar": false,
+                "thinking": true,
+                "content": "user: weather in Paris? ",
+                "calls": null,
+                "finish": "stop",
+            },
+        ]);
+        assert_eq!(
+            Value::Array(got.clone()),
+            expected,
+            "{:#}",
+            Value::Array(got)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_forced_requests_each_get_their_call() {
+        let (app, _seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let body = |name: &str| {
+            tool_body(
+                serde_json::json!([city_tool("a"), city_tool("b")]),
+                serde_json::json!({"tool_choice": named(name)}),
+            )
+        };
+        for _ in 0..10 {
+            let ((sa, va), (sb, vb)) = tokio::join!(
+                post_chat(app.clone(), body("a")),
+                post_chat(app.clone(), body("b"))
+            );
+            assert_eq!((sa, sb), (StatusCode::OK, StatusCode::OK), "{va} {vb}");
+            assert_eq!(call_names(&va), ["a"], "{va}");
+            assert_eq!(call_names(&vb), ["b"], "{vb}");
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_and_empty_tools_render_as_before() {
+        let src = "{% if tools is not none %}TOOLS{{ tools | tojson }}|{% endif %}\
+                   {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        let (app, seen) = mock_capture_app(Config::default(), src).await;
+        let mut absent = tool_body(serde_json::json!([]), serde_json::json!({}));
+        absent.as_object_mut().unwrap().remove("tools");
+        let (status, v) = post_chat(app.clone(), absent).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.prompt, "user: weather in Paris?\n");
+        assert_eq!(task.tools, None);
+
+        let (status, v) =
+            post_chat(app, tool_body(serde_json::json!([]), serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let task = last_task(&seen);
+        assert_eq!(task.prompt, "TOOLS[]|user: weather in Paris?\n");
+        assert_eq!(task.tools, Some(serde_json::json!([])));
     }
 }

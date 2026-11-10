@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use cascadia_metrics::UnenforcedReason;
 use cascadia_types::GrammarSpec;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::structured::{check_schema, DATA_KEYS, MAX_SCHEMA_DEPTH, SCHEMA_MAPS};
@@ -801,6 +801,120 @@ pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<T
             })
         })
         .collect()
+}
+
+/// The tool calls in an answer, read the way the turn was constrained.
+///
+/// The call array a tool grammar produces is read first
+/// ([`calls_from_forced_output`]); the engine may have dropped the grammar,
+/// so the model's own tool-call dialect is read next. Under a union grammar
+/// (`union_sent`: a call or the client's JSON) only marked calls count
+/// ([`crate::parse_tool_calls_marked`]): a bare JSON object with `name` and
+/// `parameters` keys is the client's data there, not a call.
+///
+/// Calls are kept only for the effective tools when `allowed_tools`
+/// narrowed them or a grammar was sent (`grammar_sent`); otherwise any name
+/// stays, as before. `parallel_tool_calls: false` keeps the first call.
+/// `None` when no call is left.
+pub fn resolve_calls(
+    text: &str,
+    policy: &ToolPolicy,
+    grammar_sent: bool,
+    union_sent: bool,
+) -> Option<Vec<ToolCall>> {
+    let mut calls = calls_from_forced_output(text, policy).or_else(|| {
+        if union_sent {
+            crate::parse_tool_calls_marked(text)
+        } else {
+            crate::parse_tool_calls(text)
+        }
+    })?;
+    if policy.narrowed || grammar_sent {
+        let names: HashSet<&str> = policy
+            .tools
+            .iter()
+            .filter_map(|t| t.function.get("name").and_then(Value::as_str))
+            .collect();
+        calls.retain(|c| names.contains(c.function.name.as_str()));
+    }
+    if policy.single_call {
+        calls.truncate(1);
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// One tool call in a chat completion's answer.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum OutputToolCall {
+    /// `{"id","type":"function","function":{"name","arguments"}}`.
+    Function(ToolCall),
+    /// `{"id","type":"custom","custom":{"name","input"}}`.
+    Custom {
+        id: String,
+        r#type: &'static str,
+        custom: CustomCall,
+    },
+}
+
+/// The `custom` object of a custom tool call.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct CustomCall {
+    pub name: String,
+    pub input: String,
+}
+
+impl OutputToolCall {
+    /// The called tool's name.
+    pub fn name(&self) -> &str {
+        match self {
+            OutputToolCall::Function(call) => &call.function.name,
+            OutputToolCall::Custom { custom, .. } => &custom.name,
+        }
+    }
+}
+
+/// The answer's calls in their output shape: a call to a custom tool
+/// becomes `{"id","type":"custom","custom":{"name","input"}}`, every other
+/// call stays a function call.
+///
+/// A custom tool's `input` is the `input` string of the call's arguments;
+/// else the arguments object's only string field (a model that renamed the
+/// parameter); else the arguments text as written.
+pub fn output_calls(calls: Vec<ToolCall>, policy: &ToolPolicy) -> Vec<OutputToolCall> {
+    calls
+        .into_iter()
+        .map(|call| {
+            if !policy.custom_names.contains(&call.function.name) {
+                return OutputToolCall::Function(call);
+            }
+            let input = custom_input(&call.function.arguments)
+                .unwrap_or_else(|| call.function.arguments.clone());
+            OutputToolCall::Custom {
+                id: call.id,
+                r#type: "custom",
+                custom: CustomCall {
+                    name: call.function.name,
+                    input,
+                },
+            }
+        })
+        .collect()
+}
+
+/// The `input` a custom call's arguments carry, when one can be found.
+fn custom_input(arguments: &str) -> Option<String> {
+    let Ok(Value::Object(args)) = serde_json::from_str::<Value>(arguments) else {
+        return None;
+    };
+    if let Some(Value::String(input)) = args.get("input") {
+        return Some(input.clone());
+    }
+    let mut strings = args.values().filter_map(Value::as_str);
+    match (strings.next(), strings.next()) {
+        (Some(only), None) => Some(only.to_owned()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1758,5 +1872,111 @@ mod tests {
         ] {
             assert!(calls_from_forced_output(bad, &p).is_none(), "{bad}");
         }
+    }
+
+    fn call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn resolve_calls_reads_the_forced_shape_first() {
+        let p = policy(&json!([func("a"), func("b")]), Some(json!("required"))).unwrap();
+        let calls = resolve_calls(r#"[{"name":"b","parameters":{"x":1}}]"#, &p, true, false)
+            .expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "b");
+        assert_eq!(calls[0].function.arguments, r#"{"x":1}"#);
+        // Fenced, as some servers answer a JSON format.
+        let calls = resolve_calls(
+            "```json\n[{\"name\":\"a\",\"parameters\":{}}]\n```",
+            &p,
+            true,
+            false,
+        )
+        .expect("a fenced call");
+        assert_eq!(calls[0].function.name, "a");
+    }
+
+    #[test]
+    fn resolve_calls_under_a_union_ignores_bare_json() {
+        let p = policy(&json!([func("a")]), None).unwrap();
+        assert_eq!(
+            resolve_calls(r#"{"name":"a","parameters":{}}"#, &p, true, true),
+            None
+        );
+        let calls = resolve_calls(
+            r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#,
+            &p,
+            true,
+            true,
+        )
+        .expect("a marked call");
+        assert_eq!(calls[0].function.name, "a");
+    }
+
+    #[test]
+    fn resolve_calls_filters_to_the_tools_once_a_grammar_applied() {
+        let p = policy(&json!([func("a")]), Some(json!("required"))).unwrap();
+        let text = r#"<tool_call>{"name":"zzz","arguments":{}}</tool_call>"#;
+        assert_eq!(resolve_calls(text, &p, true, false), None);
+        // Without a grammar (and without narrowing) the call stays, as today.
+        assert_eq!(
+            resolve_calls(text, &p, false, false).unwrap()[0]
+                .function
+                .name,
+            "zzz"
+        );
+    }
+
+    #[test]
+    fn resolve_calls_keeps_one_call_when_parallel_is_off() {
+        let t = tools(json!([func("a"), func("b")]));
+        let p = ToolPolicy::from_request(Some(&t), None, Some(false)).unwrap();
+        let text = r#"<tool_call>{"name":"a","arguments":{}}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call>"#;
+        let calls = resolve_calls(text, &p, false, false).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "a");
+    }
+
+    #[test]
+    fn output_calls_recover_a_custom_input() {
+        let p = policy(
+            &json!([func("f"), {"type": "custom", "custom": {"name": "c"}}]),
+            None,
+        )
+        .unwrap();
+        let input = |arguments: &str| match output_calls(vec![call("c", arguments)], &p).remove(0) {
+            OutputToolCall::Custom { id, r#type, custom } => {
+                assert_eq!(
+                    (id.as_str(), r#type, custom.name.as_str()),
+                    ("call_1", "custom", "c")
+                );
+                custom.input
+            }
+            other => panic!("not a custom call: {other:?}"),
+        };
+        assert_eq!(input(r#"{"input":"x"}"#), "x");
+        assert_eq!(input(r#"{"patch":"y","n":1}"#), "y");
+        assert_eq!(input(r#"{"a":"1","b":"2"}"#), r#"{"a":"1","b":"2"}"#);
+        assert_eq!(input("not json"), "not json");
+        assert_eq!(input(r#"{"input":5}"#), r#"{"input":5}"#);
+        // A function tool's call keeps the function shape.
+        assert_eq!(
+            output_calls(vec![call("f", "{}")], &p),
+            vec![OutputToolCall::Function(call("f", "{}"))]
+        );
+        let custom =
+            serde_json::to_value(output_calls(vec![call("c", r#"{"input":"x"}"#)], &p)).unwrap();
+        assert_eq!(
+            custom,
+            json!([{"id": "call_1", "type": "custom", "custom": {"name": "c", "input": "x"}}])
+        );
     }
 }
