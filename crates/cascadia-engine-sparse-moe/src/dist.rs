@@ -4961,7 +4961,8 @@ mod mask_probe_tests {
     /// `cli`'s socket.
     async fn readable(cli: &Mutex<ActivationClient>) {
         let c = cli.lock().await;
-        tokio::time::timeout(Duration::from_secs(5), c.wait_readable())
+        // An error is a closed socket: readable too, as EOF.
+        let _ = tokio::time::timeout(Duration::from_secs(5), c.wait_readable())
             .await
             .expect("bytes reach the socket");
     }
