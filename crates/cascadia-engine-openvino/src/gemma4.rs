@@ -42,7 +42,10 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 #[cfg(test)]
 use cascadia_grammar::GrammarFactory;
 use cascadia_grammar::{CompiledGrammar, GrammarMask};
-use cascadia_grammar::{MaskRecvCache, MaskSendCache, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, REPEAT};
+use cascadia_grammar::{
+    MaskRecvCache, MaskSendCache, MASK_MISS_MESSAGE, MASK_MISS_TOKEN, MASK_PROBE,
+    MASK_PROBE_OK_TOKEN, MASK_PROBE_REPROBE_AFTER, MASK_PROBE_TIMEOUT, REPEAT,
+};
 use cascadia_ov_genai_shim::{
     DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -750,6 +753,18 @@ fn report_step_error(
 // A receiver with nothing to repeat runs nothing and answers
 // `[MASK_MISS_TOKEN, MASK_ACK]`; middles pass that up unchanged and the head
 // fails the task without latching.
+//
+// Mask-support probe: before a structured-output task's first masked step on
+// a pipeline with no evidence that every later stage masks, the head sends a
+// step at position 0 whose hidden is I32 `[1, 1, 2]` = `[0, MASK_PROBE]` (one
+// zero row; `MASK_PROBE` where a masked frame has `W`), then the decode
+// step's cross-KV header and one F32 `[1,1,1]` zero frame per tag. An older
+// stage reads every frame (the header's count is the one it expects) and
+// rejects the I32 hidden, so it stays aligned and silent; the head stops
+// waiting after `MASK_PROBE_TIMEOUT` and latches. A newer middle forwards its
+// own probe and passes the answer up; the tail answers
+// `[MASK_PROBE_OK_TOKEN, MASK_ACK]` at once. No stage runs a layer or touches
+// its KV, position, cross-KV inputs or mask caches for it.
 
 /// Second lane of a masked step's reply from a stage that acknowledged it.
 const MASK_ACK: i32 = 0x4d41_534b;
@@ -857,6 +872,9 @@ enum HiddenIn {
     /// A repeat marker with no mask to repeat on this link: the stage runs
     /// nothing and answers [`StageReply::MaskMiss`].
     MaskMiss,
+    /// A mask-support probe: the stage runs nothing and changes no state; the
+    /// tail answers [`StageReply::ProbeOk`], a middle relays it.
+    Probe,
 }
 
 /// Resolves a decoded hidden frame against the link's receive cache, once
@@ -933,7 +951,14 @@ fn decode_masked_hidden(t: &WireTensor, shape: [usize; 3]) -> HiddenIn {
     if batch != 1 || h == 0 || elems.len() != rows * h {
         return HiddenIn::BadMask(format!("masked hidden frame of shape {shape:?}"));
     }
-    // The marker is checked first: its last element is no word count.
+    // The probe, then the marker, are checked first: their last element is
+    // no word count. A probe is one row of zeros ending in MASK_PROBE.
+    if elems.last() == Some(&MASK_PROBE) {
+        if rows != 1 || h < 2 || elems[..h - 1].iter().any(|&x| x != 0) {
+            return HiddenIn::BadMask(format!("mask-support probe frame of shape {shape:?}"));
+        }
+        return HiddenIn::Probe;
+    }
     // `[1, n, H+1]`, every row ending in REPEAT.
     if elems.last() == Some(&REPEAT) {
         let width = h;
@@ -1004,6 +1029,9 @@ enum StageReply {
     /// `[MASK_MISS_TOKEN, MASK_ACK]`: a stage got a repeat marker with no
     /// mask to repeat.
     MaskMiss,
+    /// `[MASK_PROBE_OK_TOKEN, MASK_ACK]`: every stage below can mask (the
+    /// answer to a mask-support probe).
+    ProbeOk,
 }
 
 /// The plain token reply, `[1,1,1]` I32.
@@ -1019,6 +1047,7 @@ fn encode_masked_reply(reply: StageReply) -> WireTensor {
         StageReply::Nack => (MASK_NACK_TOKEN, MASK_ACK),
         StageReply::NotAcked => (MASK_NACK_TOKEN, MASK_NOT_ACKED),
         StageReply::MaskMiss => (MASK_MISS_TOKEN, MASK_ACK),
+        StageReply::ProbeOk => (MASK_PROBE_OK_TOKEN, MASK_ACK),
     };
     let mut data = token.to_le_bytes().to_vec();
     data.extend_from_slice(&lane.to_le_bytes());
@@ -1034,6 +1063,7 @@ fn decode_stage_reply(t: &WireTensor) -> EngineResult<StageReply> {
             (MASK_NACK_TOKEN, MASK_ACK) => Ok(StageReply::Nack),
             (MASK_NACK_TOKEN, MASK_NOT_ACKED) => Ok(StageReply::NotAcked),
             (MASK_MISS_TOKEN, MASK_ACK) => Ok(StageReply::MaskMiss),
+            (MASK_PROBE_OK_TOKEN, MASK_ACK) => Ok(StageReply::ProbeOk),
             (token, MASK_ACK) if token >= 0 => Ok(StageReply::Token(token)),
             (a, b) => Err(EngineError::Backend(format!(
                 "downstream sent an unrecognised two-lane token reply [{a}, {b}]"
@@ -1167,7 +1197,10 @@ async fn wait_plain_reply(g: &mut ActivationClient, prefill: bool) -> EngineResu
                     "discarding a late reply to an earlier structured-output step"
                 );
                 // A late mask miss proves nothing about the chain.
-                late_ack |= matches!(reply, StageReply::Token(_) | StageReply::Nack);
+                late_ack |= matches!(
+                    reply,
+                    StageReply::Token(_) | StageReply::Nack | StageReply::ProbeOk
+                );
             }
         }
     }
@@ -1199,7 +1232,10 @@ async fn drain_late_replies(g: &mut ActivationClient) -> EngineResult<bool> {
                     "discarding a late reply to an earlier structured-output step"
                 );
                 // A late mask miss proves nothing about the chain.
-                late_ack |= matches!(reply, Ok(StageReply::Token(_) | StageReply::Nack));
+                late_ack |= matches!(
+                    reply,
+                    Ok(StageReply::Token(_) | StageReply::Nack | StageReply::ProbeOk)
+                );
             }
         }
     }
@@ -1219,6 +1255,8 @@ enum MaskedWait {
     Unacked(String),
     /// A stage below got a repeat marker with no mask to repeat.
     MaskMiss,
+    /// The answer to a mask-support probe: every stage below masks.
+    ProbeOk,
     /// The link failed.
     Failed(EngineError),
 }
@@ -1251,16 +1289,28 @@ fn masked_wait_budget(prefill: bool, stages_below: u32) -> Duration {
 /// A masked step's wait. Bounded and never closes the socket: a stage that
 /// doesn't answer leaves the link usable for the next plain step.
 async fn wait_masked_reply(g: &mut ActivationClient, budget: Duration) -> MaskedWait {
-    let tensor = match g.recv_token(budget).await {
-        Ok((t, _)) => t,
-        Err(cascadia_transport::TransportError::FrameStartTimeout(_)) => {
-            return MaskedWait::Unacked(format!(
-                "no reply within {budget:?} to a structured-output step"
-            ))
+    let deadline = std::time::Instant::now() + budget;
+    let reply = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let tensor = match g.recv_token(remaining).await {
+            Ok((t, _)) => t,
+            Err(cascadia_transport::TransportError::FrameStartTimeout(_)) => {
+                return MaskedWait::Unacked(format!(
+                    "no reply within {budget:?} to a structured-output step"
+                ))
+            }
+            Err(e) => return MaskedWait::Failed(EngineError::Backend(e.to_string())),
+        };
+        match decode_stage_reply(&tensor) {
+            // A probe answer never answers a step: a late one, skipped.
+            Ok(StageReply::ProbeOk) => {
+                debug!("discarding a late answer to a mask-support probe");
+            }
+            reply => break reply,
         }
-        Err(e) => return MaskedWait::Failed(EngineError::Backend(e.to_string())),
     };
-    match decode_stage_reply(&tensor) {
+    match reply {
+        Ok(StageReply::ProbeOk) => MaskedWait::ProbeOk,
         Ok(StageReply::Token(t)) => MaskedWait::Token(t),
         Ok(StageReply::Nack) => MaskedWait::Nack,
         Ok(StageReply::MaskMiss) => MaskedWait::MaskMiss,
@@ -1284,6 +1334,8 @@ fn middle_reply(w: MaskedWait) -> (StageReply, Option<EngineError>) {
         MaskedWait::Nack => (StageReply::Nack, None),
         // Passed up unchanged: the head fails the task without latching.
         MaskedWait::MaskMiss => (StageReply::MaskMiss, None),
+        // Never the answer to a masked step (see `wait_masked_reply`).
+        MaskedWait::ProbeOk => (StageReply::Nack, None),
         MaskedWait::Unacked(why) => {
             warn!(%why, "gemma4: downstream did not acknowledge a structured-output step");
             (StageReply::NotAcked, None)
@@ -1442,20 +1494,45 @@ fn upstream_plain_frames(owed: &mut OwedLateAck, reply: WireTensor) -> Vec<WireT
 #[derive(Debug, Default)]
 struct MaskLatch {
     since: Option<std::time::Instant>,
+    /// How long the latch set at `since` refuses.
+    reprobe_after: Duration,
+    /// A later stage has acknowledged a masked step or a mask-support probe
+    /// since the last latch: no probe is needed.
+    evidence: bool,
 }
 
 impl MaskLatch {
+    /// A masked step went unacknowledged.
     fn trip(&mut self, now: std::time::Instant) {
+        self.trip_for(now, MASK_LATCH_REPROBE);
+    }
+
+    /// A mask-support probe went unanswered: a shorter latch, since a probe
+    /// costs a request only a short wait.
+    fn trip_probe(&mut self, now: std::time::Instant) {
+        self.trip_for(now, MASK_PROBE_REPROBE_AFTER);
+    }
+
+    fn trip_for(&mut self, now: std::time::Instant, reprobe_after: Duration) {
         if self.since.is_none() {
             warn!(
-                reprobe_after = ?MASK_LATCH_REPROBE,
+                reprobe_after = ?reprobe_after,
                 "gemma4: structured output disabled on this pipeline: {UPGRADE_EVERY_STAGE}"
             );
         }
         self.since = Some(now);
+        self.reprobe_after = reprobe_after;
+        self.evidence = false;
     }
 
+    /// A later stage acknowledged a structured-output step or probe.
+    fn on_evidence(&mut self) {
+        self.evidence = true;
+    }
+
+    /// A late acknowledged reply: the chain masks after all.
     fn clear(&mut self) {
+        self.evidence = true;
         if self.since.take().is_some() {
             info!("gemma4: a later stage acknowledged a structured-output step; structured output re-enabled");
         }
@@ -1465,7 +1542,7 @@ impl MaskLatch {
     /// step probes the chain again).
     fn refusal(&mut self, now: std::time::Instant) -> EngineResult<()> {
         match self.since {
-            Some(t) if now.saturating_duration_since(t) < MASK_LATCH_REPROBE => {
+            Some(t) if now.saturating_duration_since(t) < self.reprobe_after => {
                 Err(EngineError::Backend(UPGRADE_EVERY_STAGE.into()))
             }
             Some(_) => {
@@ -1502,14 +1579,18 @@ fn head_masked_token(
     now: std::time::Instant,
 ) -> Result<i32, (EngineError, Option<GrammarFailure>)> {
     match w {
-        MaskedWait::Token(t) => Ok(t),
+        MaskedWait::Token(t) => {
+            latch.on_evidence();
+            Ok(t)
+        }
         MaskedWait::Nack => Err((
             EngineError::Backend(
                 "a later pipeline stage could not apply the structured-output mask to this step"
                     .into(),
             ),
             Some(GrammarFailure::Nack),
-        )),
+        ))
+        .inspect_err(|_| latch.on_evidence()),
         // A stage below lost its mask state: fail the task (the client may
         // retry), never latch.
         MaskedWait::MaskMiss => Err((EngineError::Backend(MASK_MISS_MESSAGE.into()), None)),
@@ -1520,8 +1601,175 @@ fn head_masked_token(
                 Some(GrammarFailure::Upgrade),
             ))
         }
+        // Never the answer to a masked step (see `wait_masked_reply`).
+        MaskedWait::ProbeOk => Err((
+            EngineError::Backend("a mask-support probe answer to a structured-output step".into()),
+            None,
+        )),
         MaskedWait::Failed(e) => Err((e, None)),
     }
+}
+
+/// The frames of a mask-support probe (see the stage-wire notes above
+/// `MASK_ACK`): position 0, the one-row probe hidden, and for each of `tags`
+/// (this stage's cross-KV outputs, so the next stage reads the count it
+/// expects) an F32 `[1,1,1]` zero frame.
+fn probe_frames(tags: &[i64]) -> StepFrames {
+    let mut hid = 0u32.to_le_bytes().to_vec();
+    hid.extend_from_slice(&MASK_PROBE.to_le_bytes());
+    let zero = WireTensor::new(WireDType::F32, [1, 1, 1], vec![0; 4]);
+    StepFrames {
+        pos: encode_wire_position(0),
+        hid: WireTensor::new(WireDType::I32, [1, 1, 2], hid),
+        header: encode_cross_kv_header(tags),
+        cross: vec![zero; tags.len()],
+        mask: None,
+    }
+}
+
+/// The wait for a probe's answer at a stage with `stages_below` stages after
+/// it: `probe_timeout` just before the tail, a fifth of it more per stage
+/// above (the [`masked_wait_budget`] pattern), so a middle above a silent
+/// stage answers inside its upstream's wait.
+fn probe_wait_budget(probe_timeout: Duration, stages_below: u32) -> Duration {
+    let hops = stages_below.saturating_sub(1);
+    probe_timeout.saturating_add((probe_timeout / 5).saturating_mul(hops))
+}
+
+/// A probe's wait: bounded, never closes the socket. Its answer is
+/// [`StageReply::ProbeOk`]; a middle's not-acknowledged answer means a stage
+/// below can't mask. Every other reply is a late one to an earlier step
+/// (gemma4 replies carry no sequence number): skipped, the wait goes on. The
+/// bool says a skipped reply was acknowledged (a late mask miss proves
+/// nothing).
+async fn wait_probe_reply(g: &mut ActivationClient, budget: Duration) -> (MaskedWait, bool) {
+    let deadline = std::time::Instant::now() + budget;
+    let mut late_ack = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let tensor = match g.recv_token(remaining).await {
+            Ok((t, _)) => t,
+            Err(cascadia_transport::TransportError::FrameStartTimeout(_)) => {
+                return (
+                    MaskedWait::Unacked(format!(
+                        "no answer within {budget:?} to a mask-support probe"
+                    )),
+                    late_ack,
+                )
+            }
+            Err(e) => {
+                return (
+                    MaskedWait::Failed(EngineError::Backend(e.to_string())),
+                    late_ack,
+                )
+            }
+        };
+        match decode_stage_reply(&tensor) {
+            Ok(StageReply::ProbeOk) => return (MaskedWait::ProbeOk, late_ack),
+            Ok(StageReply::NotAcked) => {
+                return (
+                    MaskedWait::Unacked(
+                        "a later stage relayed a mask-support probe to a stage that did not \
+                         acknowledge it"
+                            .into(),
+                    ),
+                    late_ack,
+                )
+            }
+            Ok(reply) => {
+                debug!(
+                    ?reply,
+                    "discarding a late reply in a mask-support probe's wait"
+                );
+                late_ack |= matches!(reply, StageReply::Token(_) | StageReply::Nack);
+            }
+            Err(e) => return (MaskedWait::Failed(e), late_ack),
+        }
+    }
+}
+
+/// A probe on the downstream link, as the head and every middle run it:
+/// discard late replies, send the probe (the send cache untouched), wait for
+/// its answer. The bool says a discarded late reply was acknowledged.
+async fn probe_round(
+    g: &mut ActivationClient,
+    frames: StepFrames,
+    budget: Duration,
+) -> (MaskedWait, bool) {
+    let late_ack = match drain_late_replies(g).await {
+        Ok(late_ack) => late_ack,
+        Err(e) => return (MaskedWait::Failed(e), false),
+    };
+    if let Err(e) = send_step(g, &frames.pos, &frames.hid, &frames.header, &frames.cross).await {
+        return (
+            MaskedWait::Failed(EngineError::Backend(e.to_string())),
+            late_ack,
+        );
+    }
+    let (wait, more) = wait_probe_reply(g, budget).await;
+    (wait, late_ack || more)
+}
+
+/// A middle's probe after it read one from upstream: forward `frames` (its
+/// own probe) and wait. Returns the answer it owes upstream —
+/// [`StageReply::ProbeOk`] only when the stage below answered so, else
+/// [`StageReply::NotAcked`] — and whether the round discarded an
+/// acknowledged late reply from below.
+async fn middle_probe_step(
+    down: &mut ActivationClient,
+    frames: StepFrames,
+    budget: Duration,
+) -> (StageReply, bool) {
+    let (wait, late_ack) = probe_round(down, frames, budget).await;
+    let reply = match wait {
+        MaskedWait::ProbeOk => StageReply::ProbeOk,
+        other => {
+            warn!(
+                ?other,
+                "gemma4: the stage below did not acknowledge a mask-support probe"
+            );
+            StageReply::NotAcked
+        }
+    };
+    (reply, late_ack)
+}
+
+/// The head's verdict on a probe's answer: `Ok` records the evidence that
+/// every later stage masks; silence or a not-acknowledged answer latches
+/// (for [`MASK_PROBE_REPROBE_AFTER`]) and fails the task with the upgrade
+/// message; a link failure fails the task without latching.
+fn head_probe_verdict(
+    w: MaskedWait,
+    latch: &mut MaskLatch,
+    now: std::time::Instant,
+) -> Result<(), (EngineError, Option<GrammarFailure>)> {
+    match w {
+        MaskedWait::ProbeOk => {
+            latch.on_evidence();
+            Ok(())
+        }
+        MaskedWait::Unacked(why) => {
+            latch.trip_probe(now);
+            Err((
+                EngineError::Backend(format!("{why}; {UPGRADE_EVERY_STAGE}")),
+                Some(GrammarFailure::Upgrade),
+            ))
+        }
+        MaskedWait::Failed(e) => Err((e, None)),
+        other => Err((
+            EngineError::Backend(format!(
+                "unexpected answer to a mask-support probe: {other:?}"
+            )),
+            None,
+        )),
+    }
+}
+
+/// Whether a structured-output task admitted now must probe the pipeline
+/// first: more than one stage, and no evidence yet that every later stage
+/// masks (never shown, or latched since).
+fn needs_mask_probe(latch: &MaskLatch, multi_stage: bool, has_grammar: bool) -> bool {
+    multi_stage && has_grammar && !latch.evidence
 }
 
 /// A queued task with its grammar compiled at submit.
@@ -1593,6 +1841,10 @@ pub struct Gemma4Engine {
     owed_late_ack: OwedLateAck,
     /// Pipeline stages after this one (0 on the tail); sizes masked waits.
     stages_below: u32,
+    /// How long the stage just before the tail waits for the answer to a
+    /// mask-support probe; stages above it wait a little more
+    /// ([`probe_wait_budget`]).
+    mask_probe_timeout: Duration,
     /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
@@ -1877,6 +2129,13 @@ impl Gemma4Engine {
         // Decode + strictly validate the position outside the transport
         // closure (so a bad frame is a clear EngineError, not a silent desync).
         let position = decode_wire_position(&pos_t)?;
+        // Every frame of the step is read before the hidden is decoded, so a
+        // frame this stage rejects leaves the link aligned. A mask-support
+        // probe leaves this stage's cross-KV inputs as they were.
+        let hidden_in = decode_hidden_frame(&hid_t)?;
+        if hidden_in == HiddenIn::Probe {
+            return Ok((hidden_in, position));
+        }
         // Index each cross-KV frame by its tag (validating dtype), so
         // feed_external_kv can match it to the right `external_kv.*` input.
         self.pending_external_kv.clear();
@@ -1896,9 +2155,7 @@ impl Gemma4Engine {
                 ),
             );
         }
-        // Every frame of the step is read before the hidden is decoded, so a
-        // frame this stage rejects leaves the link aligned.
-        Ok((decode_hidden_frame(&hid_t)?, position))
+        Ok((hidden_in, position))
     }
 
     /// Read one frame from upstream, transparently handling any I8 control frame (CAPTURE/RESTORE/
@@ -2016,7 +2273,12 @@ impl Gemma4Engine {
             };
             // A structured-output task on a pipeline that didn't acknowledge an
             // earlier masked step fails here, before any warm-resume exchange.
+            // A slow but new tail's late answer, already in the socket, clears
+            // the latch first.
             let multi_stage = !(self.spec.is_first_stage && self.spec.is_last_stage);
+            if multi_stage && grammar.is_some() && self.mask_latch.since.is_some() {
+                self.drain_late_downstream_replies();
+            }
             if let Err(e) = latched_refusal(
                 &mut self.mask_latch,
                 multi_stage,
@@ -2025,6 +2287,15 @@ impl Gemma4Engine {
             ) {
                 self.grammar_failure = Some(GrammarFailure::Latched);
                 return Err(e.for_task(task.task_id.clone()));
+            }
+            // No evidence yet that every later stage masks: probe now, before
+            // any warm-resume exchange or prefill, so an older stage costs this
+            // task a short probe wait, not a token deadline.
+            if needs_mask_probe(&self.mask_latch, multi_stage, grammar.is_some()) {
+                if let Err((e, kind)) = self.probe_downstream() {
+                    self.grammar_failure = kind;
+                    return Err(e.for_task(task.task_id.clone()));
+                }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
@@ -2588,8 +2859,69 @@ impl Gemma4Engine {
                 self.send_masked_reply_upstream(StageReply::Nack, false)
             }
             HiddenIn::MaskMiss => self.answer_mask_miss(),
+            // Nothing runs: the answer goes up at once.
+            HiddenIn::Probe => self.send_masked_reply_upstream(StageReply::ProbeOk, false),
             // `recv_hidden_from_upstream` resolves every marker.
             HiddenIn::Repeat { .. } => self.send_masked_reply_upstream(StageReply::Nack, false),
+        }
+    }
+
+    /// A middle's mask-support probe: forward its own probe (nothing runs)
+    /// and pass the answer up (see [`middle_probe_step`]).
+    fn relay_probe(&mut self) -> EngineResult<()> {
+        let tags: Vec<i64> = self.cross_kv_out.iter().map(|o| o.tag).collect();
+        let budget = probe_wait_budget(self.mask_probe_timeout, self.stages_below);
+        let (reply, late_ack) = match self.downstream.clone() {
+            Some(downstream) => crate::dist_spec::run_async_pub(&self.runtime_handle, async move {
+                let mut guard = downstream.lock().await;
+                middle_probe_step(&mut guard, probe_frames(&tags), budget).await
+            }),
+            None => (StageReply::NotAcked, false),
+        };
+        self.send_masked_reply_upstream(reply, late_ack)
+    }
+
+    /// Head: probe the pipeline for mask support (see [`probe_round`]) and
+    /// judge the answer ([`head_probe_verdict`]).
+    fn probe_downstream(&mut self) -> Result<(), (EngineError, Option<GrammarFailure>)> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| (EngineError::Backend("no downstream".into()), None))?;
+        let tags: Vec<i64> = self.cross_kv_out.iter().map(|o| o.tag).collect();
+        let budget = probe_wait_budget(self.mask_probe_timeout, self.stages_below);
+        let t0 = std::time::Instant::now();
+        let (wait, late_ack) = crate::dist_spec::run_async_pub(&self.runtime_handle, async move {
+            let mut guard = downstream.lock().await;
+            probe_round(&mut guard, probe_frames(&tags), budget).await
+        });
+        if late_ack {
+            self.mask_latch.clear();
+        }
+        let verdict = head_probe_verdict(wait, &mut self.mask_latch, std::time::Instant::now());
+        info!(
+            ok = verdict.is_ok(),
+            took_ms = t0.elapsed().as_millis() as u64,
+            "gemma4: mask-support probe answered"
+        );
+        verdict
+    }
+
+    /// Head: skip, without waiting, replies already in the downstream socket;
+    /// an acknowledged one (a slow but new tail's late answer) clears the
+    /// latch.
+    fn drain_late_downstream_replies(&mut self) {
+        let Some(downstream) = self.downstream.clone() else {
+            return;
+        };
+        let drained = crate::dist_spec::run_async_pub(&self.runtime_handle, async move {
+            let mut guard = downstream.lock().await;
+            drain_late_replies(&mut guard).await
+        });
+        match drained {
+            Ok(true) => self.mask_latch.clear(),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "gemma4: reading late replies from downstream failed"),
         }
     }
 
@@ -2614,6 +2946,7 @@ impl Gemma4Engine {
                 return self.send_masked_reply_upstream(StageReply::Nack, false);
             }
             HiddenIn::MaskMiss => return self.answer_mask_miss(),
+            HiddenIn::Probe => return self.relay_probe(),
             // `recv_hidden_from_upstream` resolves every marker.
             HiddenIn::Repeat { .. } => {
                 return self.send_masked_reply_upstream(StageReply::Nack, false)
@@ -2860,7 +3193,10 @@ async fn recv_control_ack_bounded(
                     "discarding a late reply to an earlier structured-output step"
                 );
                 // A late mask miss proves nothing about the chain.
-                late_ack |= matches!(reply, Ok(StageReply::Token(_) | StageReply::Nack));
+                late_ack |= matches!(
+                    reply,
+                    Ok(StageReply::Token(_) | StageReply::Nack | StageReply::ProbeOk)
+                );
                 continue;
             }
             return Ok((t, late_ack));
@@ -3592,6 +3928,7 @@ impl Builder for Gemma4Builder {
             mask_send: MaskSendCache::default(),
             mask_recv: MaskRecvCache::default(),
             owed_late_ack: OwedLateAck::default(),
+            mask_probe_timeout: MASK_PROBE_TIMEOUT,
             stages_below: self.total.saturating_sub(self.rank + 1),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
@@ -5747,5 +6084,370 @@ mod tests {
         // Drained: the link is empty again.
         let empty = tokio::time::timeout(Duration::from_millis(200), client.wait_readable()).await;
         assert!(empty.is_err());
+    }
+
+    // ---- the mask-support probe ----
+
+    /// A short probe wait for tests; the real one is `MASK_PROBE_TIMEOUT`.
+    const TEST_PROBE: Duration = Duration::from_millis(60);
+
+    /// The tail's step on a probe or a masked step, as `step_last` answers
+    /// them (the model replaced by `tail_row`). Returns what it read.
+    async fn new_tail_answer(up: &mut ActivationServer, cache: &mut MaskRecvCache) -> HiddenIn {
+        let (hidden_in, _) = new_stage_read(up, 2).await;
+        let hidden_in = resolve_hidden(hidden_in, cache);
+        let reply = match &hidden_in {
+            HiddenIn::Probe => StageReply::ProbeOk,
+            HiddenIn::Masked { words, .. } => {
+                let (row, shape) = tail_row();
+                tail_masked_reply(Ok((row, shape)), words).0
+            }
+            other => panic!("expected a probe or a masked step, got {other:?}"),
+        };
+        up.send(&encode_masked_reply(reply)).await.unwrap();
+        hidden_in
+    }
+
+    /// The middle's step on a probe (`step_middle`): forward its own probe
+    /// and pass the answer up.
+    async fn new_middle_probe(
+        up: &mut ActivationServer,
+        down: &mut ActivationClient,
+        budget: Duration,
+    ) {
+        let (hidden_in, _) = new_stage_read(up, 2).await;
+        assert_eq!(hidden_in, HiddenIn::Probe);
+        let (reply, _) = middle_probe_step(down, probe_frames(&[10, 11]), budget).await;
+        up.send(&encode_masked_reply(reply)).await.unwrap();
+    }
+
+    /// The probe's exact frames: position 0, an I32 `[1,1,2]` hidden of one
+    /// zero element and `MASK_PROBE`, the decode step's cross-KV header and
+    /// one F32 `[1,1,1]` zero frame per tag. Its answer is `[-3, MASK_ACK]`.
+    #[test]
+    fn the_probe_frames_and_their_answer_have_exact_bytes() {
+        let f = probe_frames(&[10, 11]);
+        assert_eq!(f.pos, encode_wire_position(0));
+        let mut hid = 0u32.to_le_bytes().to_vec();
+        hid.extend_from_slice(&MASK_PROBE.to_le_bytes());
+        assert_eq!(f.hid, WireTensor::new(WireDType::I32, [1, 1, 2], hid));
+        assert_eq!(f.header, encode_cross_kv_header(&[10, 11]));
+        let zero = WireTensor::new(WireDType::F32, [1, 1, 1], vec![0; 4]);
+        assert_eq!(f.cross, vec![zero.clone(), zero]);
+        assert!(f.mask.is_none(), "a probe carries no mask");
+        assert!(probe_frames(&[]).cross.is_empty());
+        let mut ok = (-3i32).to_le_bytes().to_vec();
+        ok.extend_from_slice(&MASK_ACK.to_le_bytes());
+        assert_eq!(
+            encode_masked_reply(StageReply::ProbeOk),
+            WireTensor::new(WireDType::I32, [1, 1, 2], ok)
+        );
+        assert_eq!(
+            decode_stage_reply(&encode_masked_reply(StageReply::ProbeOk)).unwrap(),
+            StageReply::ProbeOk
+        );
+    }
+
+    /// New decoders read a probe before a repeat marker or a mask; anything
+    /// but one zero row ending in `MASK_PROBE` is a bad masked frame.
+    #[test]
+    fn a_probe_hidden_decodes_as_a_probe_and_nothing_else_does() {
+        let f = probe_frames(&[]);
+        assert_eq!(decode_hidden_frame(&f.hid).unwrap(), HiddenIn::Probe);
+        let i32s = |v: &[u32], shape: [u32; 3]| {
+            WireTensor::new(
+                WireDType::I32,
+                shape,
+                v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            )
+        };
+        // Wider rows are a probe too.
+        assert_eq!(
+            decode_hidden_frame(&i32s(&[0, 0, 0, MASK_PROBE], [1, 1, 4])).unwrap(),
+            HiddenIn::Probe
+        );
+        for bad in [
+            i32s(&[7, MASK_PROBE], [1, 1, 2]),
+            i32s(&[0, MASK_PROBE, 0, MASK_PROBE], [1, 2, 2]),
+            i32s(&[MASK_PROBE], [1, 1, 1]),
+        ] {
+            assert!(
+                matches!(decode_hidden_frame(&bad).unwrap(), HiddenIn::BadMask(_)),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// A chain that masks answers the probe at once; the head records the
+    /// evidence, stops probing, and its masked step runs.
+    #[tokio::test]
+    async fn a_new_tail_acknowledges_the_probe_at_once_then_the_masked_step_runs() {
+        let (mut up, mut head) = link().await;
+        let mut latch = MaskLatch::default();
+        assert!(needs_mask_probe(&latch, true, true));
+        let mut recv = MaskRecvCache::default();
+        let t0 = std::time::Instant::now();
+        let ((wait, _), read) = tokio::join!(
+            probe_round(&mut head, probe_frames(&[10, 11]), MASK_PROBE_TIMEOUT),
+            new_tail_answer(&mut up, &mut recv)
+        );
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert_eq!(read, HiddenIn::Probe);
+        head_probe_verdict(wait, &mut latch, std::time::Instant::now()).unwrap();
+        assert!(
+            !needs_mask_probe(&latch, true, true),
+            "evidence: no more probes"
+        );
+
+        let words = ok_words();
+        let (hidden, shape) = sample_hidden();
+        let (tags, cross) = sample_cross();
+        let mut frames = StepFrames {
+            pos: encode_wire_position(0),
+            hid: encode_hidden_frame(&hidden, shape, Some(&words)).unwrap(),
+            header: encode_cross_kv_header(&tags),
+            cross,
+            mask: Some(words),
+        };
+        let mut send = MaskSendCache::default();
+        let ((wait, _), _) = tokio::join!(
+            masked_round(&mut head, &mut frames, MASK_PROBE_TIMEOUT, &mut send),
+            new_tail_answer(&mut up, &mut recv)
+        );
+        assert!(
+            matches!(wait, MaskedWait::Token(t) if t == b'"' as i32),
+            "{wait:?}"
+        );
+    }
+
+    /// An older tail (the relay read before masks) reads every probe frame,
+    /// the cross-KV header's count included, rejects the hidden and answers
+    /// nothing. The head gives up at its short probe wait, latches with the
+    /// upgrade message, and the link stays aligned for the next plain step.
+    #[tokio::test]
+    async fn an_old_tail_leaves_the_probe_unanswered_and_the_head_latches_quickly() {
+        for i in 0..25 {
+            let (mut up, mut head) = link().await;
+            let mut latch = MaskLatch::default();
+            let t0 = std::time::Instant::now();
+            let ((wait, _), old) = tokio::join!(
+                probe_round(&mut head, probe_frames(&[10, 11]), TEST_PROBE),
+                old_stage_read(&mut up, 2)
+            );
+            let took = t0.elapsed();
+            let why = old.unwrap_err().to_string();
+            assert!(
+                why.contains("hidden dtype"),
+                "{i}: rejected at the hidden: {why}"
+            );
+            let (e, kind) =
+                head_probe_verdict(wait, &mut latch, std::time::Instant::now()).unwrap_err();
+            assert!(e.to_string().contains(UPGRADE_EVERY_STAGE), "{e}");
+            assert_eq!(kind, Some(GrammarFailure::Upgrade));
+            assert!(took >= TEST_PROBE, "{i}: {took:?}");
+            assert!(took < Duration::from_secs(5), "{i}: {took:?}");
+            assert!(latch.refusal(std::time::Instant::now()).is_err(), "latched");
+            // The next plain step: read whole by the old stage, answered.
+            send_sample_step(&mut head, 0, None).await;
+            let (_, shape, pos) = old_stage_read(&mut up, 2).await.unwrap();
+            assert_eq!((shape, pos), (sample_hidden().1, 0), "{i}: aligned");
+            up.send(&encode_token_reply(42)).await.unwrap();
+            assert_eq!(
+                wait_plain_reply(&mut head, false).await.unwrap(),
+                (42, false)
+            );
+        }
+    }
+
+    /// A probe changes no state at a new stage: the receive cache keeps its
+    /// last mask, and the head's send cache isn't touched.
+    #[tokio::test]
+    async fn a_probe_touches_no_mask_cache() {
+        let words = ok_words();
+        let (mut up, mut head) = link().await;
+        let mut recv = MaskRecvCache::default();
+        recv.commit(&words);
+        let ((wait, _), _) = tokio::join!(
+            probe_round(&mut head, probe_frames(&[10, 11]), MASK_PROBE_TIMEOUT),
+            new_tail_answer(&mut up, &mut recv)
+        );
+        assert!(matches!(wait, MaskedWait::ProbeOk), "{wait:?}");
+        assert_eq!(recv.last(), Some(words.as_slice()));
+        assert_eq!(resolve_hidden(HiddenIn::Probe, &mut recv), HiddenIn::Probe);
+        assert_eq!(recv.last(), Some(words.as_slice()));
+    }
+
+    /// Head → middle → tail: the middle forwards its own probe and passes
+    /// the tail's answer up. A middle's probe wait is shorter than the stage
+    /// above it.
+    #[tokio::test]
+    async fn a_middle_relays_the_probe_and_its_answer() {
+        for k in 1..5 {
+            assert!(
+                probe_wait_budget(MASK_PROBE_TIMEOUT, k)
+                    < probe_wait_budget(MASK_PROBE_TIMEOUT, k + 1)
+            );
+        }
+        assert_eq!(probe_wait_budget(MASK_PROBE_TIMEOUT, 1), MASK_PROBE_TIMEOUT);
+        let (mut mid_up, mut head) = link().await;
+        let (mut tail_up, mut mid_down) = link().await;
+        let mut recv = MaskRecvCache::default();
+        let mut latch = MaskLatch::default();
+        let ((wait, _), _, read) = tokio::join!(
+            probe_round(
+                &mut head,
+                probe_frames(&[10, 11]),
+                probe_wait_budget(MASK_PROBE_TIMEOUT, 2)
+            ),
+            new_middle_probe(
+                &mut mid_up,
+                &mut mid_down,
+                probe_wait_budget(MASK_PROBE_TIMEOUT, 1)
+            ),
+            new_tail_answer(&mut tail_up, &mut recv)
+        );
+        assert_eq!(read, HiddenIn::Probe);
+        head_probe_verdict(wait, &mut latch, std::time::Instant::now()).unwrap();
+        assert!(!needs_mask_probe(&latch, true, true));
+    }
+
+    /// Head → middle → old tail: the middle's shorter wait runs out first and
+    /// its not-acknowledged answer reaches the head inside the head's wait.
+    #[tokio::test]
+    async fn a_middle_above_an_old_tail_answers_the_probe_inside_the_heads_wait() {
+        for i in 0..20 {
+            let (mut mid_up, mut head) = link().await;
+            let (mut tail_up, mut mid_down) = link().await;
+            let mut latch = MaskLatch::default();
+            let head_budget = probe_wait_budget(TEST_PROBE, 2);
+            let t0 = std::time::Instant::now();
+            let ((wait, _), _, old) = tokio::join!(
+                probe_round(&mut head, probe_frames(&[10, 11]), head_budget),
+                new_middle_probe(&mut mid_up, &mut mid_down, probe_wait_budget(TEST_PROBE, 1)),
+                old_stage_read(&mut tail_up, 2)
+            );
+            assert!(old.is_err());
+            assert!(t0.elapsed() < head_budget, "{i}: {:?}", t0.elapsed());
+            assert!(
+                matches!(&wait, MaskedWait::Unacked(m) if m.contains("relayed")),
+                "{i}: the middle's answer, not the head's own timeout: {wait:?}"
+            );
+            assert!(head_probe_verdict(wait, &mut latch, std::time::Instant::now()).is_err());
+            assert!(latch.refusal(std::time::Instant::now()).is_err());
+        }
+    }
+
+    /// A slow but new tail whose answer arrives after the head gave up: the
+    /// next structured-output request drains it before the refusal, and the
+    /// acknowledged late answer clears the latch.
+    #[tokio::test]
+    async fn a_late_probe_answer_clears_the_latch_on_the_next_request() {
+        for i in 0..20 {
+            let (mut up, mut head) = link().await;
+            let mut latch = MaskLatch::default();
+            let ((wait, _), _) = tokio::join!(
+                probe_round(&mut head, probe_frames(&[10, 11]), TEST_PROBE),
+                new_stage_read(&mut up, 2)
+            );
+            assert!(head_probe_verdict(wait, &mut latch, std::time::Instant::now()).is_err());
+            assert!(
+                !drain_late_replies(&mut head).await.unwrap(),
+                "{i}: nothing yet"
+            );
+            up.send(&encode_masked_reply(StageReply::ProbeOk))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                drain_late_replies(&mut head).await.unwrap(),
+                "{i}: the late answer"
+            );
+            latch.clear();
+            assert!(latch.refusal(std::time::Instant::now()).is_ok());
+            assert!(!needs_mask_probe(&latch, true, true), "{i}: evidence");
+        }
+    }
+
+    /// In a probe's wait every reply but its own answer is a late one:
+    /// skipped (acknowledged ones counted as evidence) while the wait goes
+    /// on. A plain wait and the drain skip a late probe answer the same way.
+    #[tokio::test]
+    async fn the_probe_wait_skips_late_replies() {
+        let (mut up, mut head) = link().await;
+        for r in [
+            encode_token_reply(4),
+            encode_masked_reply(StageReply::Token(5)),
+            encode_masked_reply(StageReply::Nack),
+            encode_masked_reply(StageReply::MaskMiss),
+            encode_masked_reply(StageReply::ProbeOk),
+        ] {
+            up.send(&r).await.unwrap();
+        }
+        let (wait, late_ack) = wait_probe_reply(&mut head, TEST_PROBE).await;
+        assert!(matches!(wait, MaskedWait::ProbeOk), "{wait:?}");
+        assert!(late_ack);
+        // Only a mask miss before it: no evidence, and the wait runs out.
+        up.send(&encode_masked_reply(StageReply::MaskMiss))
+            .await
+            .unwrap();
+        let (wait, late_ack) = wait_probe_reply(&mut head, TEST_PROBE).await;
+        assert!(matches!(wait, MaskedWait::Unacked(_)), "{wait:?}");
+        assert!(!late_ack);
+
+        up.send(&encode_masked_reply(StageReply::ProbeOk))
+            .await
+            .unwrap();
+        up.send(&encode_token_reply(42)).await.unwrap();
+        assert_eq!(
+            wait_plain_reply(&mut head, false).await.unwrap(),
+            (42, true)
+        );
+        up.send(&encode_masked_reply(StageReply::ProbeOk))
+            .await
+            .unwrap();
+        up.send(&encode_masked_reply(StageReply::Token(7)))
+            .await
+            .unwrap();
+        let w = wait_masked_reply(&mut head, TEST_PROBE).await;
+        assert!(matches!(w, MaskedWait::Token(7)), "{w:?}");
+    }
+
+    /// A latch set by an unanswered probe refuses for a minute; one set by a
+    /// masked step keeps ten. Either way the next request after it probes.
+    /// Only a structured-output task on a multi-stage pipeline without
+    /// evidence probes.
+    #[test]
+    fn a_probe_latch_re_probes_after_a_minute() {
+        let t0 = std::time::Instant::now();
+        let sec = Duration::from_secs(1);
+        let mut latch = MaskLatch::default();
+        latch.trip_probe(t0);
+        assert!(latch.refusal(t0 + MASK_PROBE_REPROBE_AFTER - sec).is_err());
+        assert!(latch.refusal(t0 + MASK_PROBE_REPROBE_AFTER).is_ok());
+        assert!(needs_mask_probe(&latch, true, true));
+
+        let mut latch = MaskLatch::default();
+        latch.on_evidence();
+        assert!(!needs_mask_probe(&latch, true, true));
+        latch.trip(t0);
+        assert!(latch.refusal(t0 + MASK_PROBE_REPROBE_AFTER).is_err());
+        assert!(latch.refusal(t0 + MASK_LATCH_REPROBE).is_ok());
+        assert!(needs_mask_probe(&latch, true, true));
+
+        assert!(
+            !needs_mask_probe(&MaskLatch::default(), true, false),
+            "plain task"
+        );
+        assert!(
+            !needs_mask_probe(&MaskLatch::default(), false, true),
+            "one stage"
+        );
+        // A masked step's acknowledged reply is evidence too.
+        let mut latch = MaskLatch::default();
+        head_masked_token(MaskedWait::Token(3), &mut latch, t0).unwrap();
+        assert!(!needs_mask_probe(&latch, true, true));
+        let mut latch = MaskLatch::default();
+        let _ = head_masked_token(MaskedWait::Nack, &mut latch, t0);
+        assert!(!needs_mask_probe(&latch, true, true));
     }
 }
