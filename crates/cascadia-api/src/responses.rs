@@ -478,7 +478,28 @@ fn chat_request(req: &ResponsesRequest, messages: Vec<ChatMessage>) -> ChatCompl
         chat_template_kwargs: None,
         tools: None,
         tool_choice: None,
+        n: None,
+        logit_bias: None,
+        modalities: None,
+        audio: None,
+        web_search_options: None,
     }
+}
+
+/// Hold the sampling fields to OpenAI's ranges, named as this endpoint
+/// spells them (`reasoning.effort`, not the chat `reasoning_effort`).
+fn check_ranges(req: &ResponsesRequest) -> Result<(), Refusal> {
+    let refuse = |e: validate::FieldError| Refusal::malformed(e.param, e.message);
+    if let Some(v) = req.temperature {
+        validate::check_temperature(v, "temperature").map_err(refuse)?;
+    }
+    if let Some(v) = req.top_p {
+        validate::check_top_p(v, "top_p").map_err(refuse)?;
+    }
+    if let Some(e) = req.reasoning.as_ref().and_then(|r| r.effort.as_deref()) {
+        validate::check_reasoning_effort(e, "reasoning.effort").map_err(refuse)?;
+    }
+    Ok(())
 }
 
 /// The request-derived fields of the response object, shared by the
@@ -633,7 +654,10 @@ pub(crate) async fn create_response(
     State(state): State<AppState>,
     OpenAiJson(req): OpenAiJson<ResponsesRequest>,
 ) -> Response {
-    let messages = match refuse_unsupported(&req).and_then(|()| input_messages(&req)) {
+    let messages = match refuse_unsupported(&req)
+        .and_then(|()| check_ranges(&req))
+        .and_then(|()| input_messages(&req))
+    {
         Ok(m) => m,
         Err(refusal) => return refusal.into_response(),
     };
@@ -1263,6 +1287,38 @@ mod tests {
             assert_eq!(v["error"]["param"], param, "{v}");
             assert!(!v["error"]["message"].as_str().unwrap().is_empty());
         }
+    }
+
+    /// Sampling values outside OpenAI's range are a 400 naming the field,
+    /// with the Responses spelling (`reasoning.effort`).
+    #[tokio::test]
+    async fn out_of_range_values_name_their_param() {
+        let cases = [
+            (json!({"temperature": 3}), "temperature"),
+            (json!({"top_p": 2}), "top_p"),
+            (
+                json!({"reasoning": {"effort": "turbo"}}),
+                "reasoning.effort",
+            ),
+        ];
+        for (extra, param) in cases {
+            for stream in [false, true] {
+                let mut body = json!({"model": "mock-model", "input": "hello", "stream": stream});
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let (status, v) = post_json(make_app().await, body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{param}: {v}");
+                assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+                assert_eq!(v["error"]["param"], param, "{v}");
+            }
+        }
+        let (status, v) = post_json(
+            make_app().await,
+            json!({"model": "mock-model", "input": "hello", "reasoning": {"effort": "xhigh"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
     /// The no-op forms of the refused fields are accepted.

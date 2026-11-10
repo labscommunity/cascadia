@@ -84,6 +84,7 @@ mod video;
 pub use media_setup::{attach_ffmpeg, media_setup, MediaEngine, MediaSetup};
 pub use video::{video_url_bytes, Ffmpeg};
 mod responses;
+pub mod validate;
 pub use responses::{ReasoningParam, ResponsesRequest};
 
 /// Tokens a chunk contributes to the cumulative counter. The convention
@@ -1120,9 +1121,13 @@ impl ChatMessage {
 
 /// OpenAI tool spec (request input). `function` is opaque JSON (name,
 /// description, parameters schema) forwarded verbatim to the chat template.
+/// Absent `function` reads as `null` so a tool of another `type` (OpenAI's
+/// `custom` has none) reaches the refusal that names `tools`; a `function`
+/// tool without one is refused there too.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Tool {
     pub r#type: String,
+    #[serde(default)]
     pub function: serde_json::Value,
 }
 
@@ -1323,6 +1328,21 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI `n`: only absent or 1; one choice is returned.
+    #[serde(default)]
+    pub n: Option<u32>,
+    /// Only `null` or `{}`: the engines take no per-token bias.
+    #[serde(default)]
+    pub logit_bias: Option<serde_json::Value>,
+    /// Only text: `["text"]`, `[]` or absent.
+    #[serde(default)]
+    pub modalities: Option<serde_json::Value>,
+    /// Only `null`: no audio output.
+    #[serde(default)]
+    pub audio: Option<serde_json::Value>,
+    /// Only `null`: no web search.
+    #[serde(default)]
+    pub web_search_options: Option<serde_json::Value>,
 }
 
 /// `chat_template_kwargs` as sent by vLLM/SGLang-shaped clients. Only
@@ -1537,6 +1557,12 @@ pub struct CompletionRequest {
     /// Prepend the prompt to the returned text (OpenAI `echo`).
     #[serde(default)]
     pub echo: bool,
+    /// OpenAI `n`: only absent or 1; one choice is returned.
+    #[serde(default)]
+    pub n: Option<u32>,
+    /// Only `null` or `{}`: the engines take no per-token bias.
+    #[serde(default)]
+    pub logit_bias: Option<serde_json::Value>,
 }
 
 impl CompletionRequest {
@@ -4048,6 +4074,17 @@ async fn admit_chat(
     task_id: String,
     empty_hint: &str,
 ) -> Result<AdmittedChat, Response> {
+    // Ranges and refused fields first, so a streaming request gets its 400
+    // as JSON rather than a 200 stream.
+    if let Err(e) = validate::check_chat(req) {
+        count_rejected("invalid_request");
+        return Err(api_error_for(
+            StatusCode::BAD_REQUEST,
+            e.message,
+            Some(&e.param),
+            None,
+        ));
+    }
     // First, before any scan or render: the body limit was raised for
     // images, so the text alone is held to the text limit here.
     if let Some(max) = state.max_text_bytes {
@@ -4098,17 +4135,37 @@ async fn admit_chat(
     };
     // Only function tools exist; any other `type` is text the template
     // would print as is.
-    let mut calls = req
-        .messages
-        .iter()
-        .flat_map(|m| m.tool_calls.iter().flatten());
-    if req.tools.iter().flatten().any(|t| t.r#type != "function")
-        || calls.any(|c| c.r#type != "function")
-    {
+    let bad_call = req.messages.iter().position(|m| {
+        m.tool_calls
+            .iter()
+            .flatten()
+            .any(|c| c.r#type != "function")
+    });
+    let bad_param = if req.tools.iter().flatten().any(|t| t.r#type != "function") {
+        Some("tools".to_owned())
+    } else {
+        bad_call.map(|i| format!("messages[{i}].tool_calls"))
+    };
+    if let Some(param) = bad_param {
         count_rejected("malformed_body");
-        return Err(api_error(
+        return Err(api_error_for(
             StatusCode::BAD_REQUEST,
             "only `function` tools and tool calls are supported (`type` must be `function`)",
+            Some(&param),
+            None,
+        ));
+    }
+    if let Some(i) = req
+        .tools
+        .iter()
+        .flatten()
+        .position(|t| t.function.is_null())
+    {
+        count_rejected("malformed_body");
+        return Err(api_error_for(
+            StatusCode::BAD_REQUEST,
+            format!("tools[{i}]: missing field `function`"),
+            Some("tools"),
             None,
         ));
     }
@@ -4514,6 +4571,10 @@ async fn completions(
     State(state): State<AppState>,
     OpenAiJson(req): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
+    if let Err(e) = validate::check_completion(&req) {
+        count_rejected("invalid_request");
+        return api_error_for(StatusCode::BAD_REQUEST, e.message, Some(&e.param), None);
+    }
     // The raw prompt reaches the engine as is, so an image tag in it is
     // refused here exactly as in chat text (both forms, before the array
     // form's own 400).
@@ -6464,6 +6525,158 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A value outside OpenAI's range, or a field OpenAI defines that this
+    /// server cannot honour, is a 400 naming the field in `param` — on a
+    /// streaming request too, before any 200 stream starts. The in-range
+    /// and no-op forms are served.
+    #[tokio::test]
+    async fn out_of_range_and_unsupported_fields_name_their_param() {
+        let app = make_tool_app().await;
+        let five: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
+        let refused = [
+            (serde_json::json!({"temperature": -0.1}), "temperature"),
+            (serde_json::json!({"temperature": 2.5}), "temperature"),
+            (serde_json::json!({"top_p": 1.5}), "top_p"),
+            (
+                serde_json::json!({"frequency_penalty": 3}),
+                "frequency_penalty",
+            ),
+            (
+                serde_json::json!({"presence_penalty": -3}),
+                "presence_penalty",
+            ),
+            (serde_json::json!({"n": 0}), "n"),
+            (serde_json::json!({"n": 2}), "n"),
+            (
+                serde_json::json!({"logprobs": true, "top_logprobs": 21}),
+                "top_logprobs",
+            ),
+            (serde_json::json!({"stop": five}), "stop"),
+            (
+                serde_json::json!({"reasoning_effort": "turbo"}),
+                "reasoning_effort",
+            ),
+            (
+                serde_json::json!({"logit_bias": {"50256": -100}}),
+                "logit_bias",
+            ),
+            (
+                serde_json::json!({"modalities": ["text", "audio"]}),
+                "modalities",
+            ),
+            (
+                serde_json::json!({"audio": {"voice": "alloy", "format": "wav"}}),
+                "audio",
+            ),
+            (
+                serde_json::json!({"web_search_options": {}}),
+                "web_search_options",
+            ),
+            (
+                serde_json::json!({"tools": [{"type": "custom",
+                    "custom": {"name": "f"}}]}),
+                "tools",
+            ),
+            (
+                serde_json::json!({"tools": [{"type": "function"}]}),
+                "tools",
+            ),
+        ];
+        for (extra, param) in refused {
+            for stream in [false, true] {
+                let mut body = serde_json::json!({"model": "mock-model", "stream": stream,
+                    "messages": [{"role": "user", "content": "hi"}]});
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let (status, v) = post_chat(app.clone(), body).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{extra} stream={stream}: {v}"
+                );
+                assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+                assert_eq!(v["error"]["param"], param, "{extra}: {v}");
+                assert!(!v["error"]["message"].as_str().unwrap().is_empty());
+            }
+        }
+
+        let four: Vec<String> = (0..4).map(|i| format!("s{i}")).collect();
+        let mut accepted = vec![
+            serde_json::json!({"temperature": 0}),
+            serde_json::json!({"temperature": 2}),
+            serde_json::json!({"top_p": 0}),
+            serde_json::json!({"top_p": 1}),
+            serde_json::json!({"frequency_penalty": 2, "presence_penalty": -2}),
+            serde_json::json!({"frequency_penalty": -2, "presence_penalty": 2}),
+            serde_json::json!({"n": 1}),
+            serde_json::json!({"n": null}),
+            serde_json::json!({"logprobs": true, "top_logprobs": 20}),
+            serde_json::json!({"top_logprobs": null}),
+            serde_json::json!({"stop": four}),
+            serde_json::json!({"stop": []}),
+            serde_json::json!({"logit_bias": {}}),
+            serde_json::json!({"logit_bias": null}),
+            serde_json::json!({"modalities": ["text"]}),
+            serde_json::json!({"audio": null}),
+            serde_json::json!({"web_search_options": null}),
+            serde_json::json!({"response_format": {"type": "json_object"}}),
+            serde_json::json!({"stream_options": {"include_usage": true}}),
+        ];
+        accepted.extend(
+            validate::REASONING_EFFORTS
+                .iter()
+                .map(|e| serde_json::json!({ "reasoning_effort": e })),
+        );
+        for extra in accepted {
+            let mut body = serde_json::json!({"model": "mock-model", "max_tokens": 4,
+                "messages": [{"role": "user", "content": "hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (status, v) = post_chat(app.clone(), body).await;
+            assert_eq!(status, StatusCode::OK, "{extra}: {v}");
+        }
+    }
+
+    /// `/v1/completions` holds its sampling fields to the same ranges.
+    #[tokio::test]
+    async fn completions_out_of_range_fields_name_their_param() {
+        let five: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
+        let cases = [
+            (serde_json::json!({"temperature": 3}), "temperature"),
+            (serde_json::json!({"n": 2}), "n"),
+            (
+                serde_json::json!({"logit_bias": {"50256": -100}}),
+                "logit_bias",
+            ),
+            (serde_json::json!({"stop": five}), "stop"),
+        ];
+        for (extra, param) in cases {
+            for stream in [false, true] {
+                let mut body = serde_json::json!({"model": "mock-model", "prompt": "hi",
+                    "stream": stream});
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let (status, v) = post_completions(make_app().await, body).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{extra} stream={stream}: {v}"
+                );
+                assert_eq!(v["error"]["param"], param, "{extra}: {v}");
+            }
+        }
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "prompt": "hi", "max_tokens": 4,
+                "temperature": 2, "n": 1, "logit_bias": {}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
     /// End to end: an array-content request is served like the string form.
