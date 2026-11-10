@@ -120,6 +120,32 @@ int32_t cascadia_pipeline_generate(
     char** out_text,
     uint32_t* out_token_count);
 
+/// Per-token poll for cascadia_pipeline_generate_polled. Called with the text
+/// decoded since the previous call (`len` may be 0; `ptr` is then not to be
+/// read; the bytes may end inside a UTF-8 sequence). Returns one of the
+/// CASCADIA_POLL_* values; anything else is treated as CANCEL.
+typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len);
+
+#define CASCADIA_POLL_RUNNING 0  /* keep generating */
+#define CASCADIA_POLL_STOP 1     /* ov::genai::StreamingStatus::STOP */
+#define CASCADIA_POLL_CANCEL 2   /* ov::genai::StreamingStatus::CANCEL */
+
+/// cascadia_pipeline_generate with a streamer that calls `poll(ctx, ...)` once
+/// per token write (once per round on draft / prompt-lookup pipelines) and
+/// once more from the streamer's end() with the rest of the text. STOP or
+/// CANCEL ends the generation. `poll` may run on an ov-genai worker thread,
+/// but never after this function returns or fails, so `ctx` may live on the
+/// caller's stack. `poll == NULL` is exactly cascadia_pipeline_generate (no
+/// streamer). Works for LLMPipeline and VLMPipeline handles.
+int32_t cascadia_pipeline_generate_polled(
+    cascadia_pipeline_t* handle,
+    const char* prompt,
+    const cascadia_genconfig_t* cfg,
+    cascadia_poll_fn poll,
+    void* ctx,
+    char** out_text,
+    uint32_t* out_token_count);
+
 void cascadia_free_string(char* s);
 
 // ---- Continuous batching (ContinuousBatchingPipeline, issue #20) ----------

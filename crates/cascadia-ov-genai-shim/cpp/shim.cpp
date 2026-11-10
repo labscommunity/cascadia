@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <sstream>
 #include <stdexcept>
@@ -27,6 +28,8 @@
 #include <openvino/genai/llm_pipeline.hpp>
 #include <openvino/genai/generation_config.hpp>
 #include <openvino/genai/tokenizer.hpp>
+#include <openvino/genai/streamer_base.hpp>
+#include <openvino/genai/text_streamer.hpp>
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include <openvino/genai/continuous_batching_pipeline.hpp>
 #include <openvino/genai/chat_history.hpp>
@@ -387,25 +390,162 @@ void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v) {
     if (cfg) cfg->cfg.rng_seed = static_cast<size_t>(v);
 }
 
-int32_t cascadia_pipeline_generate(
+}  // extern "C" (reopened below: the streamer is C++ and internal)
+
+namespace {
+
+// Streamer behind cascadia_pipeline_generate_polled. Each write feeds an inner
+// TextStreamer (built from the pipeline's tokenizer, so the pieces are what
+// ov-genai's own text streaming would print), whose text callback appends to
+// `m_pending`; then it polls Rust once with the pending text and maps the
+// answer to a StreamingStatus. end() flushes the inner streamer and polls once
+// more with the rest.
+//
+// Every entry point holds `m_mu`, and close() (called by the shim when
+// generate returns or throws) sets `m_closed` under it: after close() no call
+// reaches `m_poll`, so the Rust `ctx` may live on the caller's stack even if
+// ov-genai drives this streamer from a worker thread (ThreadedStreamerWrapper
+// on the continuous-batching based pipelines) or keeps a reference to it.
+class PolledStreamer final : public ov::genai::StreamerBase {
+public:
+    PolledStreamer(const ov::genai::Tokenizer& tokenizer, cascadia_poll_fn poll, void* ctx)
+        : m_poll(poll),
+          m_ctx(ctx),
+          m_inner(tokenizer, [this](std::string piece) -> ov::genai::CallbackTypeVariant {
+              // Runs inside m_inner.write/end, i.e. with m_mu held.
+              m_pending += piece;
+              return ov::genai::StreamingStatus::RUNNING;
+          }) {}
+
+    ov::genai::StreamingStatus write(int64_t token) override {
+        return feed_and_poll([&] { m_inner.write(token); });
+    }
+
+    ov::genai::StreamingStatus write(const std::vector<int64_t>& tokens) override {
+        return feed_and_poll([&] { m_inner.write(tokens); });
+    }
+
+    void end() override {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_closed || m_ended) return;
+        m_ended = true;
+        // A status-ending streamer still gets the flushed rest: the closure's
+        // answer is ignored here, but a STOP's caller may want the tail.
+        if (m_poisoned) return;
+        try {
+            m_inner.end();
+        } catch (const std::exception& e) {
+            record_error_locked(e.what());
+            return;
+        } catch (...) {
+            record_error_locked("unknown C++ exception in TextStreamer::end");
+            return;
+        }
+        poll_locked();
+    }
+
+    // No poll after this returns. Idempotent.
+    void close() {
+        std::lock_guard<std::mutex> lock(m_mu);
+        m_closed = true;
+    }
+
+    // An exception the inner TextStreamer threw (it was turned into a CANCEL
+    // rather than let loose on an ov-genai worker thread). Read after close().
+    std::string error() {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_error;
+    }
+
+private:
+    template <typename Feed>
+    ov::genai::StreamingStatus feed_and_poll(Feed&& feed) {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_closed || m_poisoned) return ov::genai::StreamingStatus::CANCEL;
+        // Once Rust said STOP / CANCEL, keep saying it without polling again
+        // (a threaded wrapper may still drain queued tokens).
+        if (m_status != ov::genai::StreamingStatus::RUNNING) return m_status;
+        try {
+            feed();
+        } catch (const std::exception& e) {
+            record_error_locked(e.what());
+            return ov::genai::StreamingStatus::CANCEL;
+        } catch (...) {
+            record_error_locked("unknown C++ exception in TextStreamer::write");
+            return ov::genai::StreamingStatus::CANCEL;
+        }
+        return poll_locked();
+    }
+
+    ov::genai::StreamingStatus poll_locked() {
+        const int32_t rc = m_poll(m_ctx, m_pending.data(), m_pending.size());
+        m_pending.clear();
+        ov::genai::StreamingStatus status;
+        switch (rc) {
+            case CASCADIA_POLL_RUNNING: status = ov::genai::StreamingStatus::RUNNING; break;
+            case CASCADIA_POLL_STOP: status = ov::genai::StreamingStatus::STOP; break;
+            default: status = ov::genai::StreamingStatus::CANCEL; break;
+        }
+        if (status != ov::genai::StreamingStatus::RUNNING) m_status = status;
+        return status;
+    }
+
+    void record_error_locked(const char* msg) {
+        m_poisoned = true;
+        if (m_error.empty()) m_error = msg ? msg : "(null)";
+    }
+
+    std::mutex m_mu;
+    cascadia_poll_fn m_poll;
+    void* m_ctx;
+    std::string m_pending;
+    ov::genai::StreamingStatus m_status = ov::genai::StreamingStatus::RUNNING;
+    bool m_closed = false;
+    bool m_ended = false;
+    bool m_poisoned = false;
+    std::string m_error;
+    // Last: its callback captures `this` and touches m_pending.
+    ov::genai::TextStreamer m_inner;
+};
+
+// Closes the streamer when generate returns or unwinds.
+struct PolledStreamerCloser {
+    std::shared_ptr<PolledStreamer>& streamer;
+    ~PolledStreamerCloser() {
+        if (streamer) streamer->close();
+    }
+};
+
+// One body for cascadia_pipeline_generate (poll == NULL: no streamer, exactly
+// as before) and cascadia_pipeline_generate_polled.
+int32_t pipeline_generate_impl(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
-    char** out_text, uint32_t* out_token_count) {
+    cascadia_poll_fn poll, void* ctx, char** out_text, uint32_t* out_token_count,
+    const char* fn_name) {
     if (!handle || (!handle->pipe && !handle->vlm) || !prompt || !out_text) {
-        set_last_error("null arg in pipeline_generate"); return 1;
+        set_last_error((std::string("null arg in ") + fn_name).c_str()); return 1;
     }
     try {
+        std::shared_ptr<PolledStreamer> polled;
+        PolledStreamerCloser closer{polled};
+        // StreamerVariant{} default-constructs its FIRST alternative — an
+        // empty std::function — which fast-fails (0xc0000409) when invoked.
+        // Pass monostate explicitly: "no streamer".
+        ov::genai::StreamerVariant streamer{std::monostate{}};
+        if (poll) {
+            polled = std::make_shared<PolledStreamer>(
+                handle->vlm ? handle->vlm->get_tokenizer() : handle->pipe->get_tokenizer(),
+                poll, ctx);
+            streamer = std::static_pointer_cast<ov::genai::StreamerBase>(polled);
+        }
         std::string text;
         uint32_t generated = 0;
         if (handle->vlm) {
             // Text-only generate on a VLM-layout export; no image tensors.
             ov::genai::GenerationConfig gen_cfg =
                 cfg ? cfg->cfg : ov::genai::GenerationConfig{};
-            // StreamerVariant{} default-constructs its FIRST alternative —
-            // an empty std::function — which fast-fails (0xc0000409) when
-            // invoked. Pass monostate explicitly: "no streamer".
             ov::genai::VLMDecodedResults results = handle->vlm->generate(
-                std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg,
-                ov::genai::StreamerVariant{std::monostate{}});
+                std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg, streamer);
             text = results.texts.empty() ? std::string{} : results.texts[0];
             try {
                 generated = static_cast<uint32_t>(
@@ -413,13 +553,21 @@ int32_t cascadia_pipeline_generate(
             } catch (...) { generated = 0; }
         } else {
             ov::genai::DecodedResults results = cfg
-                ? handle->pipe->generate(std::string(prompt), cfg->cfg)
-                : handle->pipe->generate(std::string(prompt));
+                ? handle->pipe->generate(std::string(prompt), cfg->cfg, streamer)
+                : handle->pipe->generate(std::string(prompt), std::nullopt, streamer);
             text = results;
             try {
                 generated = static_cast<uint32_t>(
                     results.perf_metrics.get_num_generated_tokens());
             } catch (...) { generated = 0; }
+        }
+        if (polled) {
+            polled->close();
+            const std::string streamer_error = polled->error();
+            if (!streamer_error.empty()) {
+                set_last_error(("streamer failed: " + streamer_error).c_str());
+                return 1;
+            }
         }
         if (text.size() > MAX_GENERATED_TEXT_BYTES) {
             set_last_error(
@@ -439,8 +587,26 @@ int32_t cascadia_pipeline_generate(
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
     } catch (...) {
-        set_last_error("unknown C++ exception in pipeline_generate"); return 1;
+        set_last_error((std::string("unknown C++ exception in ") + fn_name).c_str()); return 1;
     }
+}
+
+}  // namespace
+
+extern "C" {
+
+int32_t cascadia_pipeline_generate(
+    cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
+    char** out_text, uint32_t* out_token_count) {
+    return pipeline_generate_impl(handle, prompt, cfg, nullptr, nullptr, out_text,
+                                  out_token_count, "pipeline_generate");
+}
+
+int32_t cascadia_pipeline_generate_polled(
+    cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
+    cascadia_poll_fn poll, void* ctx, char** out_text, uint32_t* out_token_count) {
+    return pipeline_generate_impl(handle, prompt, cfg, poll, ctx, out_text,
+                                  out_token_count, "pipeline_generate_polled");
 }
 
 void cascadia_free_string(char* s) { std::free(s); }

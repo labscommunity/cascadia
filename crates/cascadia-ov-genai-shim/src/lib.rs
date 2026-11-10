@@ -34,6 +34,109 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The [`Error::Native`] message [`LlmPipeline::generate_polled`] returns
+/// when its poll closure panicked. The panic was caught at the FFI edge and
+/// the generation cancelled; its partial text is discarded.
+pub const POLL_PANICKED: &str = "poll callback panicked; generation cancelled";
+
+impl Error {
+    /// True when this is the error [`LlmPipeline::generate_polled`] returns
+    /// after its poll closure panicked ([`POLL_PANICKED`]).
+    pub fn is_poll_panic(&self) -> bool {
+        matches!(self, Error::Native(m) if m == POLL_PANICKED)
+    }
+}
+
+/// What a [`LlmPipeline::generate_polled`] closure tells the running
+/// generation after each decoded piece. Maps onto ov-genai's
+/// `StreamingStatus`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollAction {
+    /// Keep generating.
+    Running,
+    /// End the generation, keeping the text so far (`StreamingStatus::STOP`).
+    Stop,
+    /// End the generation and drop it (`StreamingStatus::CANCEL`).
+    Cancel,
+}
+
+/// ABI values of `cascadia_poll_fn`'s return (`shim.h`).
+pub const POLL_RUNNING: i32 = 0;
+pub const POLL_STOP: i32 = 1;
+pub const POLL_CANCEL: i32 = 2;
+
+impl PollAction {
+    const fn to_abi(self) -> i32 {
+        match self {
+            PollAction::Running => POLL_RUNNING,
+            PollAction::Stop => POLL_STOP,
+            PollAction::Cancel => POLL_CANCEL,
+        }
+    }
+}
+
+/// The `ctx` behind [`poll_trampoline`]: the caller's closure plus a latch
+/// for a panic inside it. Lives on [`LlmPipeline::generate_polled`]'s stack;
+/// the shim's streamer guarantees no call after `generate` returns or throws.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+struct PollCtx<'a> {
+    poll: &'a mut (dyn FnMut(&str) -> PollAction + Send + 'a),
+    panicked: bool,
+}
+
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+impl<'a> PollCtx<'a> {
+    fn new(poll: &'a mut (dyn FnMut(&str) -> PollAction + Send + 'a)) -> Self {
+        Self {
+            poll,
+            panicked: false,
+        }
+    }
+
+    fn panicked(&self) -> bool {
+        self.panicked
+    }
+}
+
+/// `cascadia_poll_fn`: called by the shim's streamer once per write with the
+/// text decoded since the previous call (`len` may be 0). Decodes the bytes
+/// lossily (a piece may end inside a UTF-8 sequence), runs the closure and
+/// returns its action. A panic never crosses the FFI edge: it is caught,
+/// latched in `ctx.panicked` and answered with CANCEL; once latched, every
+/// later call returns CANCEL without re-entering the closure.
+///
+/// # Safety
+/// `ctx` must point to a live `PollCtx` not otherwise borrowed for the
+/// call's duration, and `ptr` must be valid for `len` bytes when `len > 0`.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+unsafe extern "C" fn poll_trampoline(
+    ctx: *mut std::os::raw::c_void,
+    ptr: *const c_char,
+    len: usize,
+) -> i32 {
+    if ctx.is_null() {
+        return POLL_CANCEL;
+    }
+    let ctx = &mut *(ctx as *mut PollCtx<'_>);
+    if ctx.panicked {
+        return POLL_CANCEL;
+    }
+    let bytes: &[u8] = if len == 0 || ptr.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr as *const u8, len)
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let poll = &mut *ctx.poll;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll(&text))) {
+        Ok(action) => action.to_abi(),
+        Err(_) => {
+            ctx.panicked = true;
+            POLL_CANCEL
+        }
+    }
+}
+
 /// Construct a C string, returning an Error on interior NUL.
 #[allow(dead_code)]
 fn cstr(s: &str) -> Result<CString> {
@@ -42,7 +145,11 @@ fn cstr(s: &str) -> Result<CString> {
 
 #[cfg(feature = "openvino")]
 mod sys {
-    use std::os::raw::{c_char, c_int};
+    use std::os::raw::{c_char, c_int, c_void};
+
+    /// `cascadia_poll_fn` in `shim.h`; `None` is NULL (no streamer).
+    pub type CascadiaPollFn =
+        Option<unsafe extern "C" fn(ctx: *mut c_void, ptr: *const c_char, len: usize) -> i32>;
 
     #[repr(C)]
     pub struct cascadia_pipeline_t {
@@ -140,6 +247,16 @@ mod sys {
             handle: *mut cascadia_pipeline_t,
             prompt: *const c_char,
             cfg: *const cascadia_genconfig_t,
+            out_text: *mut *mut c_char,
+            out_token_count: *mut u32,
+        ) -> c_int;
+
+        pub fn cascadia_pipeline_generate_polled(
+            handle: *mut cascadia_pipeline_t,
+            prompt: *const c_char,
+            cfg: *const cascadia_genconfig_t,
+            poll: CascadiaPollFn,
+            ctx: *mut c_void,
             out_text: *mut *mut c_char,
             out_token_count: *mut u32,
         ) -> c_int;
@@ -619,6 +736,69 @@ impl LlmPipeline {
                 &mut tok_count,
             );
             sys::cascadia_genconfig_destroy(raw_cfg);
+            if rc != 0 || text_p.is_null() {
+                return Err(Error::Native(last_native_error()));
+            }
+            let text = CStr::from_ptr(text_p).to_string_lossy().into_owned();
+            sys::cascadia_free_string(text_p);
+            Ok(GenResult {
+                text,
+                generated_tokens: tok_count,
+            })
+        }
+    }
+
+    /// [`generate`](Self::generate) with a per-token poll: the shim's
+    /// streamer calls `poll` once per decoded write with the text decoded
+    /// since the last call (possibly empty), and once more at the end with
+    /// the rest. [`PollAction::Stop`] / [`PollAction::Cancel`] end the
+    /// generation (on draft / prompt-lookup pipelines, after the current
+    /// round). The closure may run on an ov-genai worker thread, hence
+    /// `Send`; it is never called after this returns.
+    ///
+    /// A panic in `poll` cancels the generation and returns
+    /// `Error::Native(POLL_PANICKED)` ([`Error::is_poll_panic`]). A native
+    /// error after a Stop/Cancel is returned as-is.
+    #[cfg(not(feature = "openvino"))]
+    pub fn generate_polled(
+        &self,
+        _prompt: &str,
+        _cfg: &GenConfig,
+        _poll: &mut (dyn FnMut(&str) -> PollAction + Send),
+    ) -> Result<GenResult> {
+        Err(Error::Stub)
+    }
+
+    /// See the stub's doc above.
+    #[cfg(feature = "openvino")]
+    pub fn generate_polled(
+        &self,
+        prompt: &str,
+        cfg: &GenConfig,
+        poll: &mut (dyn FnMut(&str) -> PollAction + Send),
+    ) -> Result<GenResult> {
+        let prompt_c = cstr(prompt)?;
+        let mut ctx = PollCtx::new(poll);
+        unsafe {
+            let raw_cfg = native_genconfig(cfg)?;
+            let mut text_p: *mut c_char = ptr::null_mut();
+            let mut tok_count: u32 = 0;
+            let rc = sys::cascadia_pipeline_generate_polled(
+                self.handle,
+                prompt_c.as_ptr(),
+                raw_cfg,
+                Some(poll_trampoline),
+                &mut ctx as *mut PollCtx<'_> as *mut std::os::raw::c_void,
+                &mut text_p,
+                &mut tok_count,
+            );
+            sys::cascadia_genconfig_destroy(raw_cfg);
+            if ctx.panicked() {
+                if !text_p.is_null() {
+                    sys::cascadia_free_string(text_p);
+                }
+                return Err(Error::Native(POLL_PANICKED.into()));
+            }
             if rc != 0 || text_p.is_null() {
                 return Err(Error::Native(last_native_error()));
             }
@@ -2110,5 +2290,120 @@ mod tests {
             )
         };
         assert_eq!(kind, 0, "partial-numeric value must fall back to string");
+    }
+
+    // ---- polled generate (M18 task 4) ----------------------------------
+
+    /// Call the trampoline the way the C++ streamer does: one call per
+    /// write with the pending bytes (len may be 0).
+    fn call_trampoline(ctx: &mut PollCtx<'_>, bytes: &[u8]) -> i32 {
+        let ptr = if bytes.is_empty() {
+            ptr::null()
+        } else {
+            bytes.as_ptr() as *const c_char
+        };
+        unsafe {
+            poll_trampoline(
+                ctx as *mut PollCtx<'_> as *mut std::os::raw::c_void,
+                ptr,
+                bytes.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn poll_trampoline_maps_each_action_to_its_abi_value() {
+        let mut next = [PollAction::Running, PollAction::Stop, PollAction::Cancel].into_iter();
+        let mut seen: Vec<String> = Vec::new();
+        let mut f = |s: &str| {
+            seen.push(s.to_owned());
+            next.next().expect("one action per call")
+        };
+        let mut ctx = PollCtx::new(&mut f);
+        assert_eq!(call_trampoline(&mut ctx, b"a"), POLL_RUNNING);
+        assert_eq!(call_trampoline(&mut ctx, b"b"), POLL_STOP);
+        assert_eq!(call_trampoline(&mut ctx, b"c"), POLL_CANCEL);
+        assert!(!ctx.panicked());
+        assert_eq!(seen, ["a", "b", "c"]);
+        assert_eq!((POLL_RUNNING, POLL_STOP, POLL_CANCEL), (0, 1, 2));
+    }
+
+    #[test]
+    fn poll_trampoline_panic_returns_cancel_and_latches_panicked() {
+        let mut calls = 0u32;
+        let mut f = |_: &str| -> PollAction {
+            calls += 1;
+            panic!("poll closure blew up");
+        };
+        let mut ctx = PollCtx::new(&mut f);
+        assert_eq!(call_trampoline(&mut ctx, b"x"), POLL_CANCEL);
+        assert!(ctx.panicked());
+        // Latched: a later write is cancelled without re-entering the
+        // closure that already panicked.
+        assert_eq!(call_trampoline(&mut ctx, b"y"), POLL_CANCEL);
+        assert!(ctx.panicked());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn poll_trampoline_decodes_invalid_utf8_lossily() {
+        let mut seen: Vec<String> = Vec::new();
+        let mut f = |s: &str| {
+            seen.push(s.to_owned());
+            PollAction::Running
+        };
+        let mut ctx = PollCtx::new(&mut f);
+        // "h", an invalid lone 0xFF, "i"; then the first 2 of 4 emoji bytes.
+        assert_eq!(call_trampoline(&mut ctx, b"h\xFFi"), POLL_RUNNING);
+        assert_eq!(
+            call_trampoline(&mut ctx, &"\u{1F600}".as_bytes()[..2]),
+            POLL_RUNNING
+        );
+        assert_eq!(seen, ["h\u{FFFD}i", "\u{FFFD}"]);
+    }
+
+    #[test]
+    fn poll_trampoline_len_zero_passes_empty_str() {
+        let mut seen: Vec<String> = Vec::new();
+        let mut f = |s: &str| {
+            seen.push(s.to_owned());
+            PollAction::Running
+        };
+        let mut ctx = PollCtx::new(&mut f);
+        // Null pointer with len 0 (an empty std::string's data() may be
+        // anything; the trampoline must not read it).
+        assert_eq!(call_trampoline(&mut ctx, b""), POLL_RUNNING);
+        // A non-null pointer with len 0.
+        let buf = b"zzz";
+        let rc = unsafe {
+            poll_trampoline(
+                &mut ctx as *mut PollCtx<'_> as *mut std::os::raw::c_void,
+                buf.as_ptr() as *const c_char,
+                0,
+            )
+        };
+        assert_eq!(rc, POLL_RUNNING);
+        assert_eq!(seen, ["", ""]);
+    }
+
+    #[test]
+    fn poll_panic_error_is_recognisable() {
+        assert!(Error::Native(POLL_PANICKED.into()).is_poll_panic());
+        assert!(!Error::Native("other".into()).is_poll_panic());
+        assert!(!Error::Stub.is_poll_panic());
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn stub_generate_polled_returns_stub() {
+        let pipe = LlmPipeline {};
+        let mut calls = 0u32;
+        let mut f = |_: &str| {
+            calls += 1;
+            PollAction::Running
+        };
+        let r = pipe.generate_polled("hi", &GenConfig::default(), &mut f);
+        assert!(matches!(r, Err(Error::Stub)));
+        assert_eq!(calls, 0);
     }
 }
