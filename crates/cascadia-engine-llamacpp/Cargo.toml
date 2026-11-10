@@ -11,6 +11,8 @@ description = "External llama.cpp SYCL engine: spawns llama-server, proxies its 
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
+# The same `pattern` check the llguidance engines apply (see `sanitized_schema`).
+cascadia-grammar = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 

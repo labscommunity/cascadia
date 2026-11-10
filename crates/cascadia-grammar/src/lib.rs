@@ -210,14 +210,7 @@ impl GrammarFactory {
                         // Only on a regex error: drop every pattern the regex
                         // front end can't parse (a parse, no grammar build),
                         // then build once more.
-                        let mut dropped = Vec::new();
-                        visit_patterns(&mut schema, &mut |p| {
-                            let ok = pattern_parses(p);
-                            if !ok && !dropped.iter().any(|d| d == p) {
-                                dropped.push(p.to_owned());
-                            }
-                            ok
-                        });
+                        let dropped = drop_unparseable_patterns(&mut schema);
                         if dropped.is_empty() {
                             return Err(e);
                         }
@@ -311,6 +304,22 @@ fn pattern_parses(pattern: &str) -> bool {
     llguidance::derivre::RegexBuilder::new()
         .mk_regex_for_serach(&llguidance::regex_to_lark(pattern, "dw"))
         .is_ok()
+}
+
+/// Removes from `schema` every `pattern`, and every `patternProperties` key,
+/// that llguidance's regex front end can't parse (look-around, a
+/// backreference, ...), and returns the removed regexes, each once, in the
+/// order found. Everything else, key order included, is left as it was.
+pub fn drop_unparseable_patterns(schema: &mut serde_json::Value) -> Vec<String> {
+    let mut dropped: Vec<String> = Vec::new();
+    visit_patterns(schema, &mut |p| {
+        let ok = pattern_parses(p);
+        if !ok && !dropped.iter().any(|d| d == p) {
+            dropped.push(p.to_owned());
+        }
+        ok
+    });
+    dropped
 }
 
 /// Schema keywords whose values are data, not schemas: never searched for patterns.

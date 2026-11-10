@@ -437,6 +437,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cascadia-engine",
+ "cascadia-grammar",
  "cascadia-types",
  "futures",
  "libc",

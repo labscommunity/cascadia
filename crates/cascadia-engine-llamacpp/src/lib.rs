@@ -1256,7 +1256,7 @@ impl LlamaCppEngine {
         };
         apply_sampling(&mut body, &task.sampling);
         let body = match (&task.grammar, task.messages.is_empty()) {
-            (Some(g), false) => with_response_format(body.to_string(), &g.body),
+            (Some(g), false) => with_response_format(body.to_string(), &sanitized_schema(&g.body)),
             _ => body.to_string(),
         };
         let mut s = match TcpStream::connect(("127.0.0.1", port)) {
@@ -1497,10 +1497,30 @@ fn check_grammar_body(body: &str) -> EngineResult<()> {
         .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))
 }
 
+/// `schema` without the `pattern`s and `patternProperties` keys the regex
+/// engine can't parse (look-around, ...), which llama-server's grammar
+/// converter rejects with a 400; the llguidance engines drop the same ones.
+/// Logs one warning naming what was dropped. A schema with nothing to drop
+/// is returned verbatim; otherwise it is re-serialized, keeping its key order
+/// (serde_json's `preserve_order`).
+fn sanitized_schema(schema: &str) -> std::borrow::Cow<'_, str> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(schema) else {
+        return schema.into();
+    };
+    let dropped = cascadia_grammar::drop_unparseable_patterns(&mut value);
+    if dropped.is_empty() {
+        return schema.into();
+    }
+    tracing::warn!(
+        dropped = ?dropped,
+        "response_format pattern not enforced (the regex engine can't parse it)"
+    );
+    value.to_string().into()
+}
+
 /// The serialized request `body` (a JSON object without `response_format`)
 /// with a `json_schema` `response_format` whose schema is `schema`, inserted
-/// verbatim. Parsing the schema into a `serde_json::Value` would sort its
-/// keys, and llama-server's grammar emits object properties in schema
+/// verbatim. llama-server's grammar emits object properties in schema
 /// order, so the client's order must survive. The API has already
 /// validated and capped the schema; the child compiles it to its own
 /// grammar.
@@ -3067,6 +3087,53 @@ mod unix_tests {
         assert_eq!(body["response_format"]["json_schema"]["name"], "response");
         let want: serde_json::Value = serde_json::from_str(schema).unwrap();
         assert_eq!(body["response_format"]["json_schema"]["schema"], want);
+    }
+
+    /// The schema text forwarded for a chat task whose grammar is `schema`.
+    fn forwarded_schema(schema: &str) -> String {
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: schema.into(),
+        });
+        let text = captured_chat_text(task);
+        let tag = r#""json_schema":{"name":"response","schema":"#;
+        let start = text.find(tag).expect("response_format in body") + tag.len();
+        let rest = &text[start..];
+        assert!(rest.ends_with("}}}"), "{text}");
+        rest[..rest.len() - 3].to_string()
+    }
+
+    #[test]
+    fn chat_body_drops_a_pattern_the_regex_engine_cannot_parse() {
+        // zod's email regex (look-ahead): llama-server's grammar converter
+        // rejects it, so it is dropped and the rest is forwarded in order.
+        let schema = r#"{"type":"object","properties":{"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"},"name":{"type":"string"}},"required":["email","name"],"additionalProperties":false}"#;
+        assert_eq!(
+            forwarded_schema(schema),
+            r#"{"type":"object","properties":{"email":{"type":"string"},"name":{"type":"string"}},"required":["email","name"],"additionalProperties":false}"#
+        );
+    }
+
+    #[test]
+    fn chat_body_keeps_a_parseable_pattern() {
+        let schema = r#"{"type":"object","properties":{"z":{"type":"string","pattern":"^[a-z]+$"},"a":{"type":"integer"}}}"#;
+        assert_eq!(forwarded_schema(schema), schema);
+    }
+
+    #[test]
+    fn chat_body_drops_a_pattern_properties_key_with_look_ahead() {
+        let schema = r#"{"type":"object","patternProperties":{"^(?!x)[a-z]+$":{"type":"integer"},"^y[0-9]*$":{"type":"string"}},"additionalProperties":false}"#;
+        assert_eq!(
+            forwarded_schema(schema),
+            r#"{"type":"object","patternProperties":{"^y[0-9]*$":{"type":"string"}},"additionalProperties":false}"#
+        );
+    }
+
+    #[test]
+    fn chat_body_forwards_a_schema_without_patterns_verbatim() {
+        // Whitespace and key order intact: no pattern, nothing re-serialized.
+        let schema = r#"{ "type": "object", "properties": {"b": {"type": "string"}, "a": {"type": "integer"}} }"#;
+        assert_eq!(forwarded_schema(schema), schema);
     }
 
     #[test]
