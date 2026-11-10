@@ -38,6 +38,8 @@
 # the stop, and one that equals neither is SKIPped as unverifiable (counted at the end). When the two
 # agree but the answer (or, with --ab, the base node's answer) still differs, up to EXTRA_REFS (3) more
 # reference runs are made before it counts as a FAIL; one that differs marks the device as varying.
+# An answer that equals no reference run passes only by the stop rule itself: it holds no stop text and
+# ran to max_tokens (finish length), so no stop ended it (counted at the end).
 # Needs bash, curl, python3 (or python) and standard tools; runs from Linux, macOS, Git Bash or WSL.
 # Prints one PASS/FAIL (or SKIP) line per claim and
 # "INFLIGHT CANCEL CHECK: ALL PASS" or "INFLIGHT CANCEL CHECK: <n> FAILED" (exit 1).
@@ -131,7 +133,9 @@ EOF
               If the two runs differ (INFO): the answer must match either one by that rule; one matching
               neither is SKIPped as unverifiable, but an engine stop when neither run holds the stop FAILs.
               If they agree and the answer matches neither, up to EXTRA_REFS (env, 3) more reference runs are made
-              first; one that differs makes the device varying (as above). The token bound counts at least
+              first; one that differs makes the device varying (as above). An answer equal to no reference
+              run passes only by the stop rule: no stop text in it and it ran to max_tokens (finish length);
+              its log line must still be 'task done'. The token bound counts at least
               the stop's UTF-8 bytes + 1 (a byte-fallback tokenizer spends a token per byte of an emoji).
               With --ab, the content and finish also equal the base node's (H4), when both nodes' references
               are stable over the extra runs too (else INFO)."
@@ -258,6 +262,13 @@ elif cmd == "cut2":
     else:
         print("bad", "none", 0, anyhold, "got=%s finish=%s want=...%s finish=%s" % (
             short(got["text"][-60:], 70), got["finish"], short(first[0][-60:], 70), first[1]))
+elif cmd == "rule":
+    # The stop rule alone, for an answer that equals no reference run: no stop text in it, and it ran to
+    # max_tokens with finish "length" (so no stop ended it early). args: answer stops max_tokens -> ok|bad
+    got, st, mx = load(a[0]), [x for x in stops(a[1]) if x], int(a[2])
+    held = [x for x in st if x in got["text"]]
+    ok = not held and got["finish"] == "length" and (got.get("completion_tokens") or 0) == mx
+    print("ok" if ok else "bad")
 elif cmd == "emoji":
     t = load(a[0])["text"]
     c = next((ch for ch in t if ord(ch) >= 0x1F000 or 0x2600 <= ord(ch) <= 0x27BF), None)
@@ -290,7 +301,7 @@ unseen() { # drops task lines whose task= id is in $WORK/seen
 }
 term_since() { log_dump | tail -n +"$(( $1 + 1 ))" | grep -E "$TERM_RE" | unseen; }
 count_term() { log_dump | grep -cE "$TERM_RE"; }
-SENT=0; TERM0=0; LOGSYNC_OK=1; STRUCT_N=0; UNVER_N=0
+SENT=0; TERM0=0; LOGSYNC_OK=1; STRUCT_N=0; UNVER_N=0; RULE_N=0
 # Before a case: wait (up to --log-wait) until the log holds a task line for every request sent so far
 # (the log may be a polled mirror that lags), mark those ids seen, then set OFF to the log's length.
 sync_log() {
@@ -514,7 +525,7 @@ case_cancel() {
 }
 
 stop_case() { # label kind prompt-key max_tokens stops ref-name [lax: the log line is INFO only]
-  local lab=$1 kind=$2 key=$3 mx=$4 sp=$5 ref=$6 lax=${7:-0} s b off v mode est anyhold detail line k n lim varies=0
+  local lab=$1 kind=$2 key=$3 mx=$4 sp=$5 ref=$6 lax=${7:-0} s b off v mode est anyhold detail line k n lim varies=0 ruled=0
   nx; s=$NX
   sync_log; off=$OFF
   req "$s" "$URL" "$kind" "$key" "$mx" 0 "$sp" "$LONG_TIMEOUT"
@@ -530,7 +541,15 @@ stop_case() { # label kind prompt-key max_tokens stops ref-name [lax: the log li
       read -r v mode est anyhold detail <<<"$(py cut2 "$WORK/$ref.json" "$WORK/$ref.again.json" "$WORK/$ref.extra.json" "$WORK/$s.json" "$sp")"
     fi
   fi
-  if [ "$v" = ok ] && [ "$mode" = match ]; then
+  if [ "$v" != ok ] && [ "$(py rule "$WORK/$s.json" "$sp" "$mx")" = ok ]; then
+    # The device gave an answer no reference run gave (prompt-lookup on GPU does, on the base build too).
+    # Judge it by the stop rule instead: no stop text, and it ran to max_tokens, so no stop ended it.
+    v=ok; mode=nomatch; varies=1; ruled=1; RULE_N=$((RULE_N + 1))
+    echo "INFO $lab: the answer equals no reference run ($detail)"
+  fi
+  if [ "$ruled" = 1 ]; then
+    verdict "$lab: by the stop rule: no stop text in the answer and it ran to max_tokens $mx (finish length)" ok
+  elif [ "$v" = ok ] && [ "$mode" = match ]; then
     verdict "$lab: finish stop, text = the reference up to the stop" ok
   elif [ "$v" = ok ]; then
     verdict "$lab: the reference has no such stop: no stop fired, text and finish = the reference" ok
@@ -689,4 +708,5 @@ N8=$(log_dump | grep -c 'stop-text invariant')
   || verdict "the node log has no 'stop-text invariant' line" bad "$N8 line(s): $(log_dump | grep -m1 'stop-text invariant')"
 
 [ "$STRUCT_N" -gt 0 ] && echo "INFO $STRUCT_N stop case(s) ran against references that varied across calls; $UNVER_N of them unverifiable (SKIP)"
+[ "$RULE_N" -gt 0 ] && echo "INFO $RULE_N stop case(s) gave an answer no reference run gave and were judged by the stop rule"
 if [ "$FAILS" = 0 ]; then echo "INFLIGHT CANCEL CHECK: ALL PASS"; else echo "INFLIGHT CANCEL CHECK: $FAILS FAILED"; exit 1; fi
