@@ -584,7 +584,20 @@ fn single_stage_prefill_cancel_leaves_the_prefix_cache_unchanged() {
     let (baseline, _) = r
         .generate_with_cache(&OV_POLL_PROMPT, 6, &cfg, None)
         .expect("baseline");
+    // Another prompt (no shared prefix) is cached first; the cancel must leave
+    // that entry alone.
+    let other: [u32; 4] = [7, 8, 9, 10];
     let mut cache = cascadia_engine_sparse_moe::ov_kv_cache::OvMoeKvPrefixCache::new(4);
+    let (_, snap) = r
+        .generate_with_cache(&other, 6, &cfg, Some(&mut cache))
+        .expect("other");
+    assert!(snap.is_some());
+    assert_eq!(cache.len(), 1);
+    // A prompt that extends `other`: it hits that entry while it is intact.
+    let other_ext: [u32; 5] = [7, 8, 9, 10, 11];
+    let (other_ext_cold, _) = r
+        .generate_with_cache(&other_ext, 6, &cfg, None)
+        .expect("cold");
     let mut polls = 0usize;
     let (got, snap) = r
         .generate_with_cache_polled(&OV_POLL_PROMPT, 6, &cfg, Some(&mut cache), &mut |_| {
@@ -594,15 +607,23 @@ fn single_stage_prefill_cancel_leaves_the_prefix_cache_unchanged() {
         .expect("polled");
     assert!(got.is_empty(), "a prefill stop generates nothing: {got:?}");
     assert!(snap.is_none(), "nothing for the engine to mirror");
-    assert_eq!(cache.len(), 0, "a partial prefill must not be cached");
+    assert_eq!(cache.len(), 1, "a partial prefill must not be cached");
     // The next same-prompt run is a MISS (it inserts and returns the
     // snapshot) with the baseline answer.
     let (again, snap) = r
         .generate_with_cache(&OV_POLL_PROMPT, 6, &cfg, Some(&mut cache))
         .expect("again");
     assert!(snap.is_some(), "a miss returns the inserted snapshot");
-    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.len(), 2);
     assert_eq!(again, baseline);
+    // The other entry is untouched: the extended prompt HITs it (no snapshot,
+    // no insert) and the warm answer equals the cold one.
+    let (warm, snap) = r
+        .generate_with_cache(&other_ext, 6, &cfg, Some(&mut cache))
+        .expect("warm");
+    assert!(snap.is_none(), "a hit returns no snapshot");
+    assert_eq!(cache.len(), 2);
+    assert_eq!(warm, other_ext_cold);
 }
 
 #[test]
@@ -659,6 +680,8 @@ fn single_stage_engine_stops_at_a_stop_string() {
     assert!(c.text.contains(&stop), "{:?} lacks {stop:?}", c.text);
     assert!(c.n_tokens.unwrap() < base.n_tokens.unwrap(), "ended early");
 
+    // One model in memory at a time.
+    drop(eng);
     let mut off = single_stage_ovmoe_engine(false);
     let mut task = GenerationTask::new("s2", "hello").with_max_tokens(24);
     task.sampling.stop = vec![stop];

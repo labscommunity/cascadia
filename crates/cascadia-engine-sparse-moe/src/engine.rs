@@ -1939,10 +1939,17 @@ impl SparseMoEEngine {
         // and speculative round. The stop check decodes the newest ids with
         // the final decode's tokenizer and options (skip_special_tokens), so
         // its text is a substring of the decode below (D8).
+        // A speculative round accepts up to draft K + the bonus id per poll.
+        let round_slack = if use_spec {
+            self.spec_decode_k.unwrap_or(0) as usize + 1
+        } else {
+            0
+        };
         let mut poll = crate::one_shot::OneShotPoll::new(
             &inflight,
             &task.sampling.stop,
             self.engine_stop_check,
+            round_slack,
             |ids: &[i64]| {
                 let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
                 tokenizer.decode(&ids, true).ok()
@@ -2053,7 +2060,7 @@ impl SparseMoEEngine {
             // re-emits prefix bytes or drops seam text. Re-anchor instead —
             // emit only what provably follows the prefix (same contract as the
             // shim's `advance_emitted`).
-            if full_text.as_bytes().starts_with(prefix_text.as_bytes()) {
+            let tail = if full_text.as_bytes().starts_with(prefix_text.as_bytes()) {
                 full_text.get(prefix_text.len()..).unwrap_or("").to_string()
             } else {
                 // Whole-turn path: re-anchoring here withholds the ENTIRE
@@ -2067,7 +2074,13 @@ impl SparseMoEEngine {
                     full_len = full_text.len(), prefix_len = prefix_text.len(),
                     "resume seam diverged; whole-turn tail TEXT withheld, ids still surfaced");
                 String::new()
+            };
+            if stopped_on_match {
+                // No raw form to fall back to here: the prefix's text is the
+                // client's already (M18 D8).
+                crate::one_shot::check_text_after_stop(&task.task_id, &task.sampling.stop, &tail);
             }
+            tail
         } else {
             let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
             let raw = tokenizer
@@ -4184,6 +4197,7 @@ impl OvMoeEngine {
             &inflight,
             &task.sampling.stop,
             self.engine_stop_check,
+            0,
             |ids: &[u32]| tok.decode(ids, true).ok(),
         );
         let generated = self.runner.generate_with_cache_polled(
@@ -4199,21 +4213,24 @@ impl OvMoeEngine {
         // mirror it into the lock-free holder so a cross-chain GET can serve
         // this prefix. It is a complete prefill even when the task was then
         // cancelled or stopped in decode (a prefill stop returns none).
-        #[cfg(feature = "kv_coord")]
-        if let Ok((_, Some(snap))) = &generated {
-            let fp = self.runner.fingerprint();
-            let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
-            self.kv_share
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .prefix
-                .insert(prompt64, &fp, snap.clone());
-        }
+        let generated = generated.map(|(g, _cached)| {
+            #[cfg(feature = "kv_coord")]
+            if let Some(snap) = _cached {
+                let fp = self.runner.fingerprint();
+                let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
+                self.kv_share
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .prefix
+                    .insert(prompt64, &fp, snap);
+            }
+            g
+        });
         if inflight.cancelled() {
             // Also when generate failed after the cancel (M18 D4).
             info!(
                 task = %task.task_id,
-                tokens = generated.as_ref().map_or(0, |(g, _)| g.len()),
+                tokens = generated.as_ref().map_or(0, Vec::len),
                 elapsed_s = started.elapsed().as_secs_f64(),
                 "task cancelled"
             );
@@ -4221,7 +4238,7 @@ impl OvMoeEngine {
             return vec![(task.task_id, chunk)];
         }
         let generated = match generated {
-            Ok((g, _)) => g,
+            Ok(g) => g,
             Err(e) => {
                 warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
                 return vec![(
@@ -7156,6 +7173,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             &inflight,
             &task.sampling.stop,
             self.engine_stop_check,
+            0,
             |ids: &[u32]| tok.decode(ids, true).ok(),
         );
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8944,12 +8962,20 @@ mod tests {
         runner: ScriptRunner,
         total: u32,
     ) -> (PipelineEngine<ScriptRunner>, tokio::runtime::Runtime) {
+        script_engine_with(runner, total, script_tokenizer())
+    }
+
+    fn script_engine_with(
+        runner: ScriptRunner,
+        total: u32,
+        tok: Tokenizer,
+    ) -> (PipelineEngine<ScriptRunner>, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let eng = PipelineEngine::new(
             runner,
-            Some(script_tokenizer()),
+            Some(tok),
             StageTransport {
                 upstream: None,
                 downstream: None,
@@ -9131,6 +9157,42 @@ mod tests {
         );
         assert!(logs.contains("task stopped at stop string"), "{logs}");
         assert!(logs.contains("tokens=3"), "{logs}");
+    }
+
+    /// A byte-level tokenizer: `x` is id 0; id 1 is the bytes of `是`, id 2
+    /// the bytes of `的` plus the first byte of `你`, id 3 the rest of `你`.
+    fn byte_level_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,
+                "trim_offsets":true,"use_regex":true},
+            "post_processor":null,
+            "decoder":{"type":"ByteLevel","add_prefix_space":true,
+                "trim_offsets":true,"use_regex":true},
+            "model":{"type":"BPE","dropout":null,"unk_token":null,
+                "continuing_subword_prefix":null,"end_of_word_suffix":null,
+                "fuse_unk":false,"byte_fallback":false,
+                "vocab":{"x":0,"æĺ¯":1,"çļĦä":2,
+                    "½ł":3},
+                "merges":[]}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("byte-level tokenizer")
+    }
+
+    /// A token that completes the stop and also begins a multibyte char: its
+    /// window decode ends in U+FFFD, and the streamer withholds its text. The
+    /// stop must land one token later, so the answer still holds the stop.
+    #[test]
+    fn pipeline_single_stage_stop_waits_for_a_split_char_to_complete() {
+        let tok = byte_level_tokenizer();
+        assert_eq!(tok.decode(&[1, 2], true).unwrap(), "是的\u{FFFD}");
+        let (mut e, _rt) = script_engine_with(ScriptRunner::new(4, vec![1, 2, 3, 0, 0, 0]), 1, tok);
+        let mut t = GenerationTask::new("t1", "xxxx").with_max_tokens(6);
+        t.sampling.stop = vec!["的".to_string()];
+        e.submit(t).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 4, "three tokens, then the final: {out:?}");
+        assert_eq!(streamed_text(&out), "是的你", "the text holds the stop");
+        assert_eq!(out[3].1.finish_reason, Some(FinishReason::Stop));
     }
 
     #[test]

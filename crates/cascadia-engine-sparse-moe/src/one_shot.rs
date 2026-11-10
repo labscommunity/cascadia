@@ -48,7 +48,10 @@ pub(crate) enum PollEnd {
 ///
 /// [`Self::should_stop`] is true once the task is cancelled, or (with the
 /// check on and a stop active) once a decode of the last
-/// `max_stop_bytes() + TAIL_SLACK_IDS` generated ids holds a stop. `decode`
+/// `max_stop_bytes() + TAIL_SLACK_IDS + extra_slack` generated ids holds a
+/// stop. `extra_slack` is how many ids one poll interval can add beyond one
+/// (a speculative round: `draft_k + 1`), so they can't push a stop out of the
+/// window; 0 for a runner polled per token. `decode`
 /// must use the tokenizer and options of the engine's final decode: a decode of
 /// a suffix of the ids is then a substring of the final text (OneShotStop's
 /// input contract; M18 D8). With no active stop nothing is decoded.
@@ -65,6 +68,7 @@ impl<'a, T> OneShotPoll<'a, T> {
         inflight: &'a InflightCancel,
         stops: &[String],
         engine_stop_check: bool,
+        extra_slack: usize,
         decode: impl Fn(&[T]) -> Option<String> + 'a,
     ) -> Self {
         let stop = if engine_stop_check {
@@ -73,7 +77,7 @@ impl<'a, T> OneShotPoll<'a, T> {
             OneShotStop::new(&[])
         };
         let window = if stop.is_active() {
-            stop.max_stop_bytes() + TAIL_SLACK_IDS
+            stop.max_stop_bytes() + TAIL_SLACK_IDS + extra_slack
         } else {
             0
         };
@@ -129,18 +133,33 @@ pub(crate) fn text_after_stop(
     visible: String,
     raw: String,
 ) -> String {
-    let has_stop = |t: &str| OneShotStop::new(stops).push(t);
-    if has_stop(&visible) {
+    if has_stop(stops, &visible) {
         return visible;
     }
-    if has_stop(&raw) {
+    if has_stop(stops, &raw) {
         return raw;
     }
+    warn_d8_invariant(task_id);
+    visible
+}
+
+/// After an engine stop, for text that has no raw form to fall back to (a
+/// resumed turn's tail): warns when it holds no stop (the D8 invariant broke).
+pub(crate) fn check_text_after_stop(task_id: &TaskId, stops: &[String], text: &str) {
+    if !has_stop(stops, text) {
+        warn_d8_invariant(task_id);
+    }
+}
+
+fn has_stop(stops: &[String], text: &str) -> bool {
+    OneShotStop::new(stops).push(text)
+}
+
+fn warn_d8_invariant(task_id: &TaskId) {
     warn!(
         task = %task_id,
         "engine stopped on a stop the returned text lacks (D8 invariant)"
     );
-    visible
 }
 
 #[cfg(test)]
@@ -161,7 +180,7 @@ mod tests {
     fn no_stop_and_no_cancel_never_stops_and_never_decodes() {
         let h = InflightCancel::new();
         let calls = std::cell::Cell::new(0);
-        let mut p = OneShotPoll::new(&h, &[], true, |ids: &[u32]| {
+        let mut p = OneShotPoll::new(&h, &[], true, 0, |ids: &[u32]| {
             calls.set(calls.get() + 1);
             Some(letters(ids))
         });
@@ -178,7 +197,9 @@ mod tests {
         let h = InflightCancel::new();
         let id = TaskId::from("t");
         assert!(!h.begin(&id));
-        let mut p = OneShotPoll::new(&h, &stops(&["zz"]), true, |ids: &[u32]| Some(letters(ids)));
+        let mut p = OneShotPoll::new(&h, &stops(&["zz"]), true, 0, |ids: &[u32]| {
+            Some(letters(ids))
+        });
         assert!(!p.should_stop(&[0, 1]));
         h.cancel(&id);
         assert!(p.should_stop(&[0, 1, 2]));
@@ -193,7 +214,7 @@ mod tests {
         let id = TaskId::from("t");
         h.begin(&id);
         h.cancel(&id);
-        let mut p = OneShotPoll::new(&h, &[], true, |_: &[i64]| None);
+        let mut p = OneShotPoll::new(&h, &[], true, 0, |_: &[i64]| None);
         assert!(p.should_stop(&[]));
     }
 
@@ -201,7 +222,9 @@ mod tests {
     fn a_stop_in_the_decoded_tail_stops() {
         let h = InflightCancel::new();
         // "cd" = ids [2, 3].
-        let mut p = OneShotPoll::new(&h, &stops(&["cd"]), true, |ids: &[u32]| Some(letters(ids)));
+        let mut p = OneShotPoll::new(&h, &stops(&["cd"]), true, 0, |ids: &[u32]| {
+            Some(letters(ids))
+        });
         assert!(!p.should_stop(&[0]));
         assert!(!p.should_stop(&[0, 1]));
         assert!(!p.should_stop(&[0, 1, 2]));
@@ -213,7 +236,7 @@ mod tests {
     fn the_window_is_the_longest_stop_plus_slack() {
         let h = InflightCancel::new();
         let seen = std::cell::RefCell::new(Vec::new());
-        let mut p = OneShotPoll::new(&h, &stops(&["x", "abc"]), true, |ids: &[u32]| {
+        let mut p = OneShotPoll::new(&h, &stops(&["x", "abc"]), true, 0, |ids: &[u32]| {
             seen.borrow_mut().push(ids.len());
             Some(letters(ids))
         });
@@ -222,11 +245,28 @@ mod tests {
         assert_eq!(*seen.borrow(), vec![3 + TAIL_SLACK_IDS]);
     }
 
+    /// A speculative round can accept up to K drafts plus the bonus id in one
+    /// poll interval; the window grows by that much so the round can't push a
+    /// stop out of it.
+    #[test]
+    fn extra_slack_widens_the_window() {
+        let h = InflightCancel::new();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut p = OneShotPoll::new(&h, &stops(&["abc"]), true, 4 + 1, |ids: &[u32]| {
+            seen.borrow_mut().push(ids.len());
+            Some(letters(ids))
+        });
+        assert!(!p.should_stop(&[25; 100]));
+        assert_eq!(*seen.borrow(), vec![3 + TAIL_SLACK_IDS + 5]);
+    }
+
     #[test]
     fn a_stop_pushed_out_of_the_window_is_missed() {
         // Only latency: the API still cuts at the end (D6).
         let h = InflightCancel::new();
-        let mut p = OneShotPoll::new(&h, &stops(&["a"]), true, |ids: &[u32]| Some(letters(ids)));
+        let mut p = OneShotPoll::new(&h, &stops(&["a"]), true, 0, |ids: &[u32]| {
+            Some(letters(ids))
+        });
         let mut ids = vec![0u32];
         ids.extend(std::iter::repeat_n(25, 1 + TAIL_SLACK_IDS));
         assert!(!p.should_stop(&ids));
@@ -237,7 +277,9 @@ mod tests {
         let h = InflightCancel::new();
         let id = TaskId::from("t");
         h.begin(&id);
-        let mut p = OneShotPoll::new(&h, &stops(&["cd"]), false, |ids: &[u32]| Some(letters(ids)));
+        let mut p = OneShotPoll::new(&h, &stops(&["cd"]), false, 0, |ids: &[u32]| {
+            Some(letters(ids))
+        });
         assert!(!p.should_stop(&[2, 3]));
         h.cancel(&id);
         assert!(p.should_stop(&[2, 3]));
@@ -246,14 +288,14 @@ mod tests {
     #[test]
     fn a_failed_decode_is_no_match() {
         let h = InflightCancel::new();
-        let mut p = OneShotPoll::new(&h, &stops(&["cd"]), true, |_: &[u32]| None);
+        let mut p = OneShotPoll::new(&h, &stops(&["cd"]), true, 0, |_: &[u32]| None);
         assert!(!p.should_stop(&[2, 3]));
     }
 
     #[test]
     fn a_replacement_char_stop_is_never_checked() {
         let h = InflightCancel::new();
-        let mut p = OneShotPoll::new(&h, &stops(&["\u{FFFD}"]), true, |_: &[u32]| {
+        let mut p = OneShotPoll::new(&h, &stops(&["\u{FFFD}"]), true, 0, |_: &[u32]| {
             Some("\u{FFFD}".to_string())
         });
         assert!(!p.should_stop(&[1]));

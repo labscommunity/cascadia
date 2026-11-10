@@ -563,7 +563,16 @@ fn single_stage_prefill_cancel_leaves_the_prefix_cache_unchanged() {
     let mut r = single_stage_runner();
     let cfg = cascadia_engine_sparse_moe::SamplingConfig::default();
     let baseline = r.generate(&POLL_PROMPT, 6, &cfg).expect("baseline");
+    // Another prompt (no shared prefix) is cached first; the cancel must leave
+    // that entry alone.
+    let other: [i64; 4] = [9, 10, 11, 12];
     let mut cache = cascadia_engine_sparse_moe::KvPrefixCache::new(4);
+    r.generate_with_cache(&other, 6, &cfg, Some(&mut cache))
+        .expect("other");
+    assert_eq!(cache.len(), 1);
+    // A prompt that extends `other`: it hits that entry while it is intact.
+    let other_ext: [i64; 5] = [9, 10, 11, 12, 13];
+    let other_ext_cold = r.generate(&other_ext, 6, &cfg).expect("cold");
     // Stop before the third prefill token.
     let mut polls = 0usize;
     let got = r
@@ -573,13 +582,20 @@ fn single_stage_prefill_cancel_leaves_the_prefix_cache_unchanged() {
         })
         .expect("polled");
     assert!(got.is_empty(), "a prefill stop generates nothing: {got:?}");
-    assert_eq!(cache.len(), 0, "a partial prefill must not be cached");
+    assert_eq!(cache.len(), 1, "a partial prefill must not be cached");
     // The next same-prompt run is a MISS (it inserts) with the baseline answer.
     let again = r
         .generate_with_cache(&POLL_PROMPT, 6, &cfg, Some(&mut cache))
         .expect("again");
-    assert_eq!(cache.len(), 1, "a miss inserts the full prompt");
+    assert_eq!(cache.len(), 2, "a miss inserts the full prompt");
     assert_eq!(again, baseline);
+    // The other entry is untouched: the extended prompt HITs it (no insert)
+    // and the warm answer equals the cold one.
+    let warm = r
+        .generate_with_cache(&other_ext, 6, &cfg, Some(&mut cache))
+        .expect("warm");
+    assert_eq!(cache.len(), 2, "a hit inserts nothing");
+    assert_eq!(warm, other_ext_cold);
 }
 
 #[test]
@@ -636,6 +652,8 @@ fn single_stage_engine_stops_at_a_stop_string() {
     assert!(c.n_tokens.unwrap() < base.n_tokens.unwrap(), "ended early");
 
     // The check off: the same request runs to the end.
+    // One model in memory at a time.
+    drop(eng);
     let mut off = single_stage_engine(false);
     let mut task = GenerationTask::new("s2", "hello").with_max_tokens(24);
     task.sampling.stop = vec![stop];

@@ -117,7 +117,17 @@ impl OneShotStop {
     /// the cost is latency only.
     ///
     /// The decoded text must be a substring of the final decode (the module's input contract).
+    ///
+    /// A tail that ends in U+FFFD never matches. Its newest id began a multibyte character that a
+    /// later id completes, and a byte-level id can do that while also completing a stop (`是的\xe4`,
+    /// stop `的`). Ending generation there would end it on an id whose text a UTF-8-safe streamer
+    /// withholds, so the answer would lack the stop and the text before it. The match lands one id
+    /// later instead, once the character is complete. A U+FFFD elsewhere in the tail (a character
+    /// split at the window's start) does not block a match.
     pub fn matches_tail(&self, tail: &str) -> bool {
+        if tail.ends_with('\u{FFFD}') {
+            return false;
+        }
         self.stops.iter().any(|stop| tail.contains(stop.as_str()))
     }
 
@@ -377,5 +387,17 @@ mod tests {
         // Stateless: a stop split across two calls is not a match.
         assert!(!s.matches_tail("tw"));
         assert!(!s.matches_tail("enty"));
+    }
+
+    /// A byte-level token can complete the stop and also begin a multibyte character: the window
+    /// decode then ends in U+FFFD. Stopping there would end the answer on a token whose text a
+    /// UTF-8-safe streamer withholds, so the stop lands one token later, once the char completes.
+    #[test]
+    fn matches_tail_waits_for_a_trailing_partial_char() {
+        let s = OneShotStop::new(&stops(&["的"]));
+        assert!(!s.matches_tail("是的\u{FFFD}"));
+        assert!(s.matches_tail("是的你"));
+        // A U+FFFD earlier in the window (a split char at its start) doesn't block a match.
+        assert!(s.matches_tail("\u{FFFD}是的"));
     }
 }
