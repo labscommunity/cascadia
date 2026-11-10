@@ -443,7 +443,19 @@ impl<'de> Deserialize<'de> for WireToolCall {
                 custom: c.custom,
             })
         } else {
-            ToolCall::deserialize(v).map(WireToolCall::Function)
+            match ToolCall::deserialize(&v) {
+                Ok(call) => Ok(WireToolCall::Function(call)),
+                // The untagged parse this replaced fell back to the custom
+                // form; keep accepting what it accepted.
+                Err(e) if v.get("custom").is_some() => WireCustomForm::deserialize(&v)
+                    .map(|c| WireToolCall::Custom {
+                        id: c.id,
+                        r#type: c.r#type,
+                        custom: c.custom,
+                    })
+                    .map_err(|_| e),
+                Err(e) => Err(e),
+            }
         };
         call.map_err(serde::de::Error::custom)
     }
@@ -511,8 +523,9 @@ fn empty_parameters() -> Value {
 /// to the schema's own root (`#`) points at a copy stored as
 /// `$defs/<prefix>root`. `$schema` and `$id` are dropped from moved schemas.
 /// The result passes the same limits and normalisation as a
-/// `response_format` schema. A `$ref` of any other form, or a result over
-/// those limits, gives `None`, logged and counted: the turn then runs
+/// `response_format` schema. A `$ref` of any other form, a `$ref` in a
+/// schema that also has a nested `$id` (which would change what the ref
+/// resolves against), or a result over those limits, gives `None`, logged and counted: the turn then runs
 /// unconstrained. The grammar is best-effort for the same reason.
 pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<GrammarSpec> {
     // Under a forced choice the format is moot: the answer is the call.
@@ -629,16 +642,24 @@ impl Hoisted {
             }
         };
         let names = [own(&root, "$defs"), own(&root, "definitions")];
-        let mut self_ref = false;
+        // The root's own `$id` only names the schema; once nested it means
+        // nothing. A nested one starts a new base for the refs below it.
+        root.shift_remove("$schema");
+        root.shift_remove("$id");
+        let (mut self_ref, mut has_ref, mut nested_id) = (false, false, false);
         let mut root_value = Value::Object(std::mem::take(&mut root));
         walk_schemas(&mut root_value, 0, &mut |obj| {
             obj.shift_remove("$schema");
-            obj.shift_remove("$id");
+            nested_id |= obj.shift_remove("$id").is_some();
             if let Some(Value::String(r)) = obj.get_mut("$ref") {
+                has_ref = true;
                 *r = rewrite_ref(r, prefix, &names, &mut self_ref)?;
             }
             Ok(())
         })?;
+        if has_ref && nested_id {
+            return Err(UnenforcedReason::UnsupportedRef);
+        }
         let Value::Object(mut root) = root_value else {
             unreachable!("an object stays an object");
         };
@@ -738,7 +759,7 @@ fn walk_schemas(
 /// the call grammar produces: the whole text (inside at most one ```` ``` ````
 /// or ```` ```json ```` fence) a non-empty JSON array whose every item is an
 /// object with exactly the keys `name`, one of the effective tools, and
-/// `parameters`, which become the call's arguments. Anything else is `None`,
+/// `parameters`, an object, which become the call's arguments. Anything else is `None`,
 /// left for the model's own tool-call dialect.
 pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<ToolCall>> {
     let text = text.trim();
@@ -766,7 +787,10 @@ pub fn calls_from_forced_output(text: &str, policy: &ToolPolicy) -> Option<Vec<T
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|n| names.contains(n))?;
-            let arguments = serde_json::to_string(obj.get("parameters")?).ok()?;
+            // Anything but an object (a string of JSON, say) is left to the
+            // dialect parser, which reads it as today.
+            let parameters = obj.get("parameters").filter(|p| p.is_object())?;
+            let arguments = serde_json::to_string(parameters).ok()?;
             Some(ToolCall {
                 id: format!("call_{}", uuid::Uuid::new_v4().simple()),
                 r#type: "function".into(),
@@ -1150,6 +1174,16 @@ mod tests {
         assert!(e.contains("missing field `input`"), "{e}");
         let e = err(json!({"id": "c", "type": "function"}));
         assert!(e.contains("missing field `function`"), "{e}");
+        // A function key that doesn't parse, beside a custom object: the
+        // custom replay, as the untagged parse read it.
+        let replay = serde_json::from_value::<Calls>(json!({"tool_calls": [
+            {"id": "c", "type": "custom", "function": "x", "custom": {"name": "f", "input": ""}}]}))
+        .unwrap()
+        .tool_calls
+        .unwrap();
+        assert_eq!(replay[0].r#type, "function");
+        assert_eq!(replay[0].function.name, "f");
+        assert_eq!(replay[0].function.arguments, r#"{"input":""}"#);
         let ok = serde_json::from_value::<Calls>(json!({"tool_calls": [
             {"id": "c", "type": "custom", "function": {"name": "f", "arguments": "{}"}}]}))
         .unwrap();
@@ -1610,8 +1644,9 @@ mod tests {
             "$id": "https://example.com/p", "type": "object",
             "properties": {"$id": {"type": "string"}, "a": {"$ref": "#/$defs/A"}},
             "$defs": {"A": {"$schema": "https://json-schema.org/draft/2020-12/schema",
-                "$id": "a", "type": "string"}}});
-        let format = r#"{"$schema":"http://json-schema.org/draft-07/schema#","type":"object"}"#;
+                "type": "string"}}});
+        // A nested `$id` in a schema without references is dropped too.
+        let format = r#"{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"x":{"$id":"x","type":"string"}}}"#;
         let p = pol(json!([with_params("f", params)]), None, None);
         let spec = tool_grammar(&p, Some(format)).unwrap();
         assert!(!spec.body.contains("$schema"), "{}", spec.body);
@@ -1623,10 +1658,61 @@ mod tests {
             "a property named $id stays"
         );
         assert_eq!(b["$defs"]["t0_A"], json!({"type": "string"}));
-        assert_eq!(b["anyOf"][1], json!({"type": "object"}));
+        assert_eq!(
+            b["anyOf"][1],
+            json!({"type": "object", "properties": {"x": {"type": "string"}}})
+        );
         cascadia_grammar::GrammarFactory::byte_level()
             .compile(&spec)
             .unwrap();
+    }
+
+    #[test]
+    fn a_nested_id_beside_refs_gives_no_grammar() {
+        // Refs under a nested `$id` resolve against it, not the root, so
+        // they can't be rewritten safely.
+        for params in [
+            json!({"type": "object", "properties": {"a": {"$id": "https://example.com/a",
+                "type": "object", "properties": {"b": {"$ref": "#/$defs/B"}}}},
+                "$defs": {"B": {"type": "string"}}}),
+            json!({"type": "object", "properties": {"a": {"$ref": "#/$defs/B"}},
+                "$defs": {"B": {"$id": "b", "type": "string"}}}),
+        ] {
+            let before = unenforced(UnenforcedReason::UnsupportedRef);
+            let p = pol(
+                json!([with_params("f", params.clone())]),
+                Some(json!("required")),
+                None,
+            );
+            assert!(tool_grammar(&p, None).is_none(), "{params}");
+            assert!(
+                unenforced(UnenforcedReason::UnsupportedRef) > before,
+                "{params}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_object_parameters_are_left_to_the_dialect_parser() {
+        let p = pol(json!([weather()]), Some(json!("required")), None);
+        for params in [
+            json!("{\"city\":\"Paris\"}"),
+            Value::Null,
+            json!(3),
+            json!([1]),
+        ] {
+            let text = json!([{"name": "get_weather", "parameters": params}]).to_string();
+            assert!(calls_from_forced_output(&text, &p).is_none(), "{text}");
+        }
+        // Read forced-shape first, then by dialect: a string `parameters`
+        // comes out once-encoded.
+        let text = r#"[{"name":"get_weather","parameters":"{\"city\":\"Paris\"}"}]"#;
+        let calls = calls_from_forced_output(text, &p)
+            .or_else(|| crate::parse_tool_calls(text))
+            .expect("the dialect parser reads it");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
     }
 
     #[test]
