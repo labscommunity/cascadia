@@ -7037,6 +7037,45 @@ level={{ effort_map[eff] }}";
     }
 
     #[tokio::test]
+    async fn malformed_tools_and_tool_calls_are_422s_naming_the_field() {
+        let app = make_tool_app().await;
+        let cases = [
+            (
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{"type": "function"}]}),
+                "missing field `function`",
+            ),
+            (
+                serde_json::json!({"model": "mock-model", "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c", "content": "ok"}]}),
+                "missing field `id`",
+            ),
+        ];
+        for (payload, needle) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{payload}");
+            let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+    }
+
+    #[tokio::test]
     async fn tool_choice_shape_is_validated_before_the_engine() {
         // a templated app, so the only thing that can 400 here is tool_choice
         let app = make_tool_app().await;

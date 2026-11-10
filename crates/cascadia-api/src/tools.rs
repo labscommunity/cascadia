@@ -20,18 +20,56 @@ use crate::{FunctionCall, Tool, ToolCall};
 
 /// One entry of a request's `tools` list.
 ///
-/// The function form is tried first: any entry carrying a `function` object
-/// is accepted as a function tool whatever its `type` says, as before custom
-/// tools existed. The custom form needs `type: "custom"`, which
+/// Any entry carrying a `function` key is a function tool whatever its
+/// `type` says, as before custom tools existed. Otherwise an entry with a
+/// `custom` key or `type: "custom"` is a custom tool, and anything else is
+/// read as a function tool, so a malformed entry's error names the field it
+/// lacks. The custom form needs `type: "custom"`, which
 /// [`ToolPolicy::from_request`] checks.
-#[derive(Deserialize, Debug, Clone)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum RequestTool {
     /// `{"type":"function","function":{"name",...}}`; `function` is opaque
     /// JSON forwarded to the chat template as the client wrote it.
     Function { r#type: String, function: Value },
     /// `{"type":"custom","custom":{"name","description"?,"format"?}}`.
     Custom { r#type: String, custom: Value },
+}
+
+#[derive(Deserialize)]
+struct FunctionToolForm {
+    r#type: String,
+    function: Value,
+}
+
+#[derive(Deserialize)]
+struct CustomToolForm {
+    r#type: String,
+    custom: Value,
+}
+
+/// Whether a `tools` or `tool_calls` entry is in the custom form: no
+/// `function` key, and a `custom` key or `type: "custom"`.
+fn is_custom_form(v: &Value) -> bool {
+    v.get("function").is_none()
+        && (v.get("custom").is_some() || v.get("type").and_then(Value::as_str) == Some("custom"))
+}
+
+impl<'de> Deserialize<'de> for RequestTool {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = Value::deserialize(d)?;
+        let tool = if is_custom_form(&v) {
+            CustomToolForm::deserialize(v).map(|t| RequestTool::Custom {
+                r#type: t.r#type,
+                custom: t.custom,
+            })
+        } else {
+            FunctionToolForm::deserialize(v).map(|t| RequestTool::Function {
+                r#type: t.r#type,
+                function: t.function,
+            })
+        };
+        tool.map_err(serde::de::Error::custom)
+    }
 }
 
 impl RequestTool {
@@ -137,6 +175,33 @@ pub struct ToolPolicy {
 enum Kind {
     Function,
     Custom,
+}
+
+impl Kind {
+    /// How an error names a tool of this kind.
+    fn what(self) -> &'static str {
+        match self {
+            Kind::Function => "function",
+            Kind::Custom => "custom tool",
+        }
+    }
+
+    /// "a function tool" / "a custom tool".
+    fn a_tool(self) -> &'static str {
+        match self {
+            Kind::Function => "a function tool",
+            Kind::Custom => "a custom tool",
+        }
+    }
+}
+
+/// Why `name`, named as a `wanted` tool, isn't one: `None` when it is.
+fn kind_mismatch(by_name: &HashMap<&str, Kind>, name: &str, wanted: Kind) -> Option<String> {
+    match by_name.get(name) {
+        Some(&kind) if kind == wanted => None,
+        Some(&kind) => Some(format!("but '{name}' is {}", kind.a_tool())),
+        None => Some("which is not in tools".into()),
+    }
 }
 
 impl ToolPolicy {
@@ -278,23 +343,16 @@ fn choice_mode<'a>(
         };
         return Ok((mode, None));
     }
-    let named_mode = |kind: Kind, key: &str, shape: &str, what: &str| {
+    let named_mode = |kind: Kind, key: &str, shape: &str| {
         let name = named(choice, key).ok_or_else(|| shape.to_string())?;
-        if by_name.get(name) != Some(&kind) {
-            return Err(format!(
-                "tool_choice names {what} '{name}', which is not in tools"
-            ));
+        if let Some(why) = kind_mismatch(by_name, name, kind) {
+            return Err(format!("tool_choice names {} '{name}', {why}", kind.what()));
         }
         Ok((ToolMode::Named(name.to_string()), None))
     };
     match choice.get("type").and_then(Value::as_str) {
-        Some("function") => named_mode(
-            Kind::Function,
-            "function",
-            FUNCTION_CHOICE_SHAPE,
-            "function",
-        ),
-        Some("custom") => named_mode(Kind::Custom, "custom", CUSTOM_CHOICE_SHAPE, "custom tool"),
+        Some("function") => named_mode(Kind::Function, "function", FUNCTION_CHOICE_SHAPE),
+        Some("custom") => named_mode(Kind::Custom, "custom", CUSTOM_CHOICE_SHAPE),
         Some("allowed_tools") => {
             let (mode, names) = allowed_tools(choice, by_name)?;
             Ok((mode, Some(names)))
@@ -348,14 +406,8 @@ fn allowed_tools<'a>(
                 "{FIELD}.tools[{i}] must be {{\"type\":\"function\",\"function\":{{\"name\":...}}}} or {{\"type\":\"custom\",\"custom\":{{\"name\":...}}}}"
             ));
         };
-        if by_name.get(name) != Some(&kind) {
-            let what = match kind {
-                Kind::Function => "function",
-                Kind::Custom => "custom tool",
-            };
-            return Err(format!(
-                "{FIELD} lists {what} '{name}', which is not in tools"
-            ));
+        if let Some(why) = kind_mismatch(by_name, name, kind) {
+            return Err(format!("{FIELD} lists {} '{name}', {why}", kind.what()));
         }
         names.insert(name);
     }
@@ -363,9 +415,8 @@ fn allowed_tools<'a>(
 }
 
 /// A `tool_calls` entry of an assistant message: the function form, or a
-/// replayed custom call.
-#[derive(Deserialize)]
-#[serde(untagged)]
+/// replayed custom call. The form is chosen as for [`RequestTool`], so a
+/// malformed entry's error names the field it lacks.
 enum WireToolCall {
     Function(ToolCall),
     Custom {
@@ -373,6 +424,29 @@ enum WireToolCall {
         r#type: String,
         custom: WireCustomCall,
     },
+}
+
+#[derive(Deserialize)]
+struct WireCustomForm {
+    id: String,
+    r#type: String,
+    custom: WireCustomCall,
+}
+
+impl<'de> Deserialize<'de> for WireToolCall {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = Value::deserialize(d)?;
+        let call = if is_custom_form(&v) {
+            WireCustomForm::deserialize(v).map(|c| WireToolCall::Custom {
+                id: c.id,
+                r#type: c.r#type,
+                custom: c.custom,
+            })
+        } else {
+            ToolCall::deserialize(v).map(WireToolCall::Function)
+        };
+        call.map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Deserialize)]
@@ -817,7 +891,10 @@ mod tests {
             Some(json!({"type": "function", "function": {"name": "c"}})),
         )
         .unwrap_err();
-        assert_eq!(e, "tool_choice names function 'c', which is not in tools");
+        assert_eq!(
+            e,
+            "tool_choice names function 'c', but 'c' is a custom tool"
+        );
     }
 
     fn allowed(mode: &str, list: Value) -> Value {
@@ -925,7 +1002,16 @@ mod tests {
         let e = policy(&t, Some(json!({"type": "custom", "custom": {"name": "a"}}))).unwrap_err();
         assert_eq!(
             e,
-            "tool_choice names custom tool 'a', which is not in tools"
+            "tool_choice names custom tool 'a', but 'a' is a function tool"
+        );
+        let e = policy(
+            &t,
+            Some(json!({"type": "custom", "custom": {"name": "zz"}})),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "tool_choice names custom tool 'zz', which is not in tools"
         );
         let e = policy(&t, Some(json!({"type": "custom"}))).unwrap_err();
         assert!(e.starts_with("tool_choice must be"), "{e}");
@@ -992,6 +1078,86 @@ mod tests {
             assert_eq!(p.engine_tool_choice(), Some(want), "{choice}");
         }
         assert_eq!(policy(&t, None).unwrap().engine_tool_choice(), None);
+    }
+
+    #[test]
+    fn allowed_tools_says_when_a_name_is_the_other_kind() {
+        let t = json!([func("a"), {"type": "custom", "custom": {"name": "patch"}}]);
+        let e = policy(&t, Some(allowed("auto", json!([func("patch")])))).unwrap_err();
+        assert_eq!(
+            e,
+            "tool_choice.allowed_tools lists function 'patch', but 'patch' is a custom tool"
+        );
+        let e = policy(
+            &t,
+            Some(allowed(
+                "auto",
+                json!([{"type": "custom", "custom": {"name": "a"}}]),
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "tool_choice.allowed_tools lists custom tool 'a', but 'a' is a function tool"
+        );
+    }
+
+    #[test]
+    fn malformed_tool_entries_name_the_missing_field() {
+        let err = |v: Value| {
+            serde_json::from_value::<RequestTool>(v)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err(json!({"type": "function"})).contains("missing field `function`"));
+        assert!(err(json!({"type": "custom"})).contains("missing field `custom`"));
+        assert!(err(json!({"custom": {"name": "x"}})).contains("missing field `type`"));
+        assert!(err(json!([1])).contains("expected"), "{}", err(json!([1])));
+        // What parsed before still parses the same way.
+        let tool = |v: Value| serde_json::from_value::<RequestTool>(v).unwrap();
+        assert!(matches!(
+            tool(json!({"type": "custom", "function": {"name": "f"}})),
+            RequestTool::Function { .. }
+        ));
+        assert!(matches!(
+            tool(json!({"type": "other", "function": {"name": "f"}})),
+            RequestTool::Function { .. }
+        ));
+        assert!(matches!(
+            tool(json!({"type": "function_x", "custom": {"name": "f"}})),
+            RequestTool::Custom { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_tool_calls_name_the_missing_field() {
+        #[derive(Deserialize)]
+        struct Calls {
+            #[serde(deserialize_with = "de_tool_calls")]
+            tool_calls: Option<Vec<ToolCall>>,
+        }
+        let err = |call: Value| {
+            serde_json::from_value::<Calls>(json!({"tool_calls": [call]}))
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        let e = err(json!({"type": "function", "function": {"name": "f", "arguments": "{}"}}));
+        assert!(e.contains("missing field `id`"), "{e}");
+        let e = err(json!({"type": "custom", "custom": {"name": "f", "input": ""}}));
+        assert!(e.contains("missing field `id`"), "{e}");
+        let e = err(json!({"id": "c", "type": "custom", "custom": {"name": "f"}}));
+        assert!(e.contains("missing field `input`"), "{e}");
+        let e = err(json!({"id": "c", "type": "function"}));
+        assert!(e.contains("missing field `function`"), "{e}");
+        let ok = serde_json::from_value::<Calls>(json!({"tool_calls": [
+            {"id": "c", "type": "custom", "function": {"name": "f", "arguments": "{}"}}]}))
+        .unwrap();
+        assert_eq!(
+            ok.tool_calls.unwrap()[0].r#type,
+            "custom",
+            "a function object wins, as before"
+        );
     }
 
     #[test]
