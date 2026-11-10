@@ -74,6 +74,7 @@ fn record_stream_tokens(
     }
 }
 
+pub mod errors;
 mod media;
 pub use media::{
     check_request_pixels, image_url_bytes, is_remote, source_size, FetchPolicy, MediaConfig, Remote,
@@ -141,23 +142,8 @@ fn api_error_for(
     param: Option<&str>,
     code: Option<&str>,
 ) -> Response {
-    let kind = if status.is_client_error() {
-        "invalid_request_error"
-    } else {
-        "server_error"
-    };
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "message": message.into(),
-                "type": kind,
-                "param": param,
-                "code": code,
-            }
-        })),
-    )
-        .into_response()
+    let body = errors::error_body(status, &message.into(), param, code);
+    (status, Json(body)).into_response()
 }
 
 /// `Json<T>` whose rejections (bad JSON, wrong field types, unsupported
@@ -4069,11 +4055,12 @@ async fn admit_chat(
     }
     if let Err(e) = req.validate_tool_choice() {
         count_rejected("invalid_request");
-        return Err((
+        return Err(api_error_for(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
-        )
-            .into_response());
+            e,
+            Some("tool_choice"),
+            None,
+        ));
     }
     let enable_thinking = req.effective_enable_thinking();
     // effective_reasoning_effort() hardcodes GLM's high/max vocabulary and is
@@ -4213,17 +4200,16 @@ async fn admit_chat(
         .sum();
     if messages_bytes > state.max_prompt_bytes {
         count_rejected("prompt_too_large");
-        return Err((
+        return Err(api_error_for(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error": format!(
-                    "messages are {messages_bytes} bytes (content + tool fields); \
-                     max allowed is {} (max_prompt_bytes)",
-                    state.max_prompt_bytes,
-                )
-            })),
-        )
-            .into_response());
+            format!(
+                "messages are {messages_bytes} bytes (content + tool fields); \
+                 max allowed is {} (max_prompt_bytes)",
+                state.max_prompt_bytes,
+            ),
+            Some("messages"),
+            None,
+        ));
     }
     if let Some(m) = &media {
         if let Err(msg) = m.check_placeholders(&prompt) {
@@ -9093,7 +9079,10 @@ mod tests {
         let (status, body) = post_chat(app, payload).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
         assert!(
-            body["error"].as_str().unwrap_or("").contains("messages"),
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("messages"),
             "error must name the messages payload: {body}"
         );
     }
@@ -9725,8 +9714,141 @@ level={{ effort_map[eff] }}";
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), want, "{choice}");
+            let status = resp.status();
+            assert_eq!(status, want, "{choice}");
+            if status == StatusCode::BAD_REQUEST {
+                let body = to_bytes(resp.into_body(), 16384).await.unwrap();
+                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                assert_eq!(v["error"]["type"], "invalid_request_error", "{choice}: {v}");
+                assert_eq!(v["error"]["param"], "tool_choice", "{choice}: {v}");
+                assert!(v["error"]["message"].is_string(), "{choice}: {v}");
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn tool_choice_errors_use_the_envelope() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "get_weather"}}]);
+        let (status, body) = post_chat(
+            make_tool_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+                "tool_choice": "sometimes",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(body["error"]["param"], "tool_choice", "{body}");
+        assert!(body["error"]["code"].is_null(), "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("sometimes"),
+            "{body}"
+        );
+
+        // a named function that is not among the declared tools
+        let (status, body) = post_chat(
+            make_tool_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+                "tool_choice": {"type": "function", "function": {"name": "get_time"}},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(body["error"]["param"], "tool_choice", "{body}");
+        assert!(body["error"]["code"].is_null(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn structured_message_bytes_over_limit_use_the_envelope() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_prompt_bytes: 128,
+            // roles-only template keeps the rendered prompt under the limit,
+            // so the messages-bytes check is the one that refuses
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% if tools %}{{ tools | tojson }}{% endif %}\
+                     {% for m in messages %}{{ m.role }}\n{% endfor %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "mock-model",
+                "tools": [{"type":"function","function":{"name":"f"}}],
+                "messages": [
+                    {"role":"user","content":"hi"},
+                    {"role":"tool","tool_call_id":"c1","content": "x".repeat(4096)},
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(body["error"]["param"], "messages", "{body}");
+        assert!(body["error"]["code"].is_null(), "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("max_prompt_bytes"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_uses_the_envelope() {
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 16384).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        assert!(v["error"]["param"].is_null(), "{v}");
+        assert!(v["error"]["code"].is_null(), "{v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Content-Type: application/json"),
+            "{v}"
+        );
     }
 
     #[test]
