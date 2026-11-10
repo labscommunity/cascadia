@@ -315,11 +315,12 @@ context window still ends an answer where the prompt plus the answer fill it
   call: the default (non-`--cb`) ov-genai path and single-stage sparse-moe.
   That call now ends early when the client disconnects (streaming or not),
   on `/v1/cancel/{task_id}`, or when a `stop` sequence matches. It ends within one token,
-  or within one decode round with `--draft-model`, `--prompt-lookup` or
-  sparse-moe's speculative decode. Then the engine is free for the next request.
-  - The engine checks at most 4 `stop` sequences of up to 256 bytes each.
-    Longer ones, and any past the fourth, are still cut by the API, but only
-    once the answer is complete.
+  or within one decode round with ov-genai's `--draft-model` / `--prompt-lookup`
+  or Kimi-K2.6's speculative decode (sparse-moe `--prompt-lookup`). Then the
+  engine is free for the next request.
+  - The first 4 `stop` sequences that are non-empty, at most 256 bytes and
+    contain no U+FFFD are checked in the engine; all others are still cut by
+    the API once the answer is complete.
   - The engine's own stop check is off for models whose chat template frames
     output with special tokens (Inkling's `<|content_thinking|>` style), since
     there the engine's text is not the text the API matches. The API still

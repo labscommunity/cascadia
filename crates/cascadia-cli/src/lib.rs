@@ -1901,15 +1901,15 @@ fn api_chat_template(engine: EngineKind, model: &str) -> cascadia_api::ChatTempl
     }
 }
 
-/// Whether the engine may end a running one-shot generation at a `stop` match
-/// it finds itself. Off when the API translates the model's special-token
-/// message framing (a marker dialect): there the engine's text isn't the text
-/// the API matches stops against, so an engine stop could end an answer the
-/// API never cuts. Decided from the same template and tokenizer_config.json
-/// the API reads. A cancel ends the generation either way.
-fn engine_stop_check(engine: EngineKind, model: &str) -> bool {
+/// The marker dialect the API translates for `engine` serving `model`: the
+/// model's special-token message framing, read from the template the API
+/// renders and its tokenizer_config.json. `cmd_worker` loads it once and uses
+/// it for both the API and the engines' stop check: with a dialect the
+/// engine's text isn't the text the API matches stops against, so the engine
+/// must not end an answer at a `stop` match itself (a cancel still works).
+fn model_marker_dialect(engine: EngineKind, model: &str) -> Option<cascadia_api::MarkerDialect> {
     let template = api_chat_template(engine, model).template;
-    cascadia_api::MarkerDialect::load(std::path::Path::new(model), template.as_deref()).is_none()
+    cascadia_api::MarkerDialect::load(std::path::Path::new(model), template.as_deref())
 }
 
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
@@ -2085,64 +2085,132 @@ fn preflight_model_path(args: &WorkerArgs) -> Result<()> {
 
 /// `prefix_cache_bytes` is resolved by the caller before the model loads (see
 /// [`cmd_worker`]); only the qwen35 arm has anywhere to put it.
-fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn Builder>> {
+/// The ov-genai builder for `args` (the `--engine ov-genai` arm of
+/// [`build_builder`]).
+fn ov_genai_builder(args: &WorkerArgs, engine_stop_check: bool) -> Result<OvGenaiBuilder> {
+    if args.total != 1 {
+        return Err(anyhow!("ov-genai is single-stage only; use --total 1"));
+    }
+    if args.draft_model.is_some() && args.prompt_lookup > 0 {
+        return Err(anyhow!(
+            "--draft-model and --prompt-lookup are mutually exclusive"
+        ));
+    }
+    if args.cb && (args.draft_model.is_some() || args.prompt_lookup > 0) {
+        return Err(anyhow!(
+            "--cb is incompatible with --draft-model / --prompt-lookup"
+        ));
+    }
+    let mut b = OvGenaiBuilder::new(&args.model, &args.device);
+    if args.cb {
+        b = b.with_continuous_batching(cascadia_ov_genai_shim::CbSchedulerConfig {
+            cache_size_gb: args.cb_cache_size,
+            max_num_seqs: args.cb_max_num_seqs,
+            max_num_batched_tokens: args.cb_max_batched_tokens,
+            dynamic_split_fuse: args.cb_dynamic_split_fuse,
+            enable_prefix_caching: args.cb_prefix_caching,
+        });
+    }
+    if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+        b = b.with_cache_dir(&dir);
+    }
+    if let Some(prec) = &args.ov_kv_precision {
+        b = b.with_kv_cache_precision(prec);
+    }
+    if let Some(group) = &args.ov_dyn_quant_group {
+        b = b.with_dyn_quant_group(group);
+    }
+    b = b.with_ov_properties(ov_perf_properties(args));
+    if let Some(draft) = &args.draft_model {
+        let device = args
+            .draft_device
+            .clone()
+            .unwrap_or_else(|| args.device.clone());
+        b = b.with_draft(draft, &device, args.spec_k);
+    } else if args.prompt_lookup > 0 {
+        b = b.with_prompt_lookup(args.prompt_lookup);
+    }
+    // If the model ships a chat template, the API renders it (honoring
+    // enable_thinking) and the engine tells ov-genai to skip its own
+    // internal apply. No template → leave ov-genai's apply on.
+    b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
+    // Without --cb one generate() call makes the whole answer, so the
+    // engine cuts its limit to what the prompt leaves of the window.
+    let info = cascadia_api::read_model_generation_info(std::path::Path::new(&args.model));
+    b = b.with_context_window(resolve_generation_defaults(args, &info).0.context_window);
+    b = b.with_engine_stop_check(engine_stop_check);
+    Ok(b)
+}
+
+/// The sparse-moe builder config for `args` (the `--engine sparse-moe` arm of
+/// [`build_builder`]).
+fn sparse_moe_config(args: &WorkerArgs, engine_stop_check: bool) -> Result<SparseMoEBuilderConfig> {
+    let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
+        .with_rank(args.rank, args.total)
+        .with_kv_prefix_cache_size(args.kv_prefix_cache_size);
+    if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+        cfg.cache_dir = Some(dir);
+    }
+    cfg.ov_properties = ov_perf_properties(args);
+    cfg.top_k_override = args.top_k_override;
+    cfg.routing_threshold = args.routing_threshold;
+    cfg.max_cached_experts = args.max_cached_experts;
+    cfg.ffn_sparsity_threshold = args.ffn_sparsity_threshold;
+    cfg.ffn_axpy_down = args.ffn_axpy_down;
+    cfg.ffn_axpy_prebuild = args.ffn_axpy_prebuild;
+    cfg.ffn_sparsity_thresholds_file = args.ffn_sparsity_thresholds_file.clone();
+    cfg.ffn_sparsity_capture_dir = args.ffn_sparsity_capture_dir.clone();
+    // Expert-parallel roles (Inkling).
+    cfg.ep_workers = args
+        .ep_workers
+        .iter()
+        .map(|w| parse_addr(w, "127.0.0.1"))
+        .collect::<Result<Vec<_>>>()?;
+    cfg.ep_worker = match (args.ep_worker_index, args.ep_worker_count) {
+        (Some(i), Some(n)) => Some((i, n)),
+        _ => None,
+    };
+    cfg.ep_placement = args.ep_placement.clone();
+    // Issue #38: capture surfaces silu(gate) via the AXPY
+    // scratch — if the user asked to capture but didn't ask
+    // for AXPY, warn (the capture will silently be empty
+    // because the non-AXPY path doesn't expose silu(gate)).
+    if args.ffn_sparsity_capture_dir.is_some() && !args.ffn_axpy_down {
+        tracing::warn!(
+            "--ffn-sparsity-capture-dir requires --ffn-axpy-down to surface silu(gate); \
+             capture will be empty without it"
+        );
+    }
+    // N-gram speculative decode (sparse-moe single-stage).
+    // The `--prompt-lookup` flag is the canonical opt-in (it
+    // already drives the ov-genai prompt-lookup path); when
+    // set on sparse-moe single-stage, we enable n-gram spec
+    // decode with K = max(prompt_lookup, spec_k). On
+    // multi-stage configs this is ignored — see
+    // `SparseMoEBuilder::build` for the warning.
+    let spec_k = if args.prompt_lookup > 0 {
+        Some(args.spec_k.max(args.prompt_lookup))
+    } else {
+        None
+    };
+    if let Some(k) = spec_k {
+        cfg = cfg.with_spec_decode_k(k);
+    }
+    Ok(cfg.with_engine_stop_check(engine_stop_check))
+}
+
+/// `engine_stop_check`: whether a one-shot engine may end a generation at a
+/// `stop` match itself (off for a marker-dialect model; see
+/// [`model_marker_dialect`]).
+fn build_builder(
+    args: &WorkerArgs,
+    prefix_cache_bytes: usize,
+    engine_stop_check: bool,
+) -> Result<Box<dyn Builder>> {
     warn_ignored_ov_perf_flags(args);
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
-        EngineKind::OvGenai => {
-            if args.total != 1 {
-                return Err(anyhow!("ov-genai is single-stage only; use --total 1"));
-            }
-            if args.draft_model.is_some() && args.prompt_lookup > 0 {
-                return Err(anyhow!(
-                    "--draft-model and --prompt-lookup are mutually exclusive"
-                ));
-            }
-            if args.cb && (args.draft_model.is_some() || args.prompt_lookup > 0) {
-                return Err(anyhow!(
-                    "--cb is incompatible with --draft-model / --prompt-lookup"
-                ));
-            }
-            let mut b = OvGenaiBuilder::new(&args.model, &args.device);
-            if args.cb {
-                b = b.with_continuous_batching(cascadia_ov_genai_shim::CbSchedulerConfig {
-                    cache_size_gb: args.cb_cache_size,
-                    max_num_seqs: args.cb_max_num_seqs,
-                    max_num_batched_tokens: args.cb_max_batched_tokens,
-                    dynamic_split_fuse: args.cb_dynamic_split_fuse,
-                    enable_prefix_caching: args.cb_prefix_caching,
-                });
-            }
-            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
-                b = b.with_cache_dir(&dir);
-            }
-            if let Some(prec) = &args.ov_kv_precision {
-                b = b.with_kv_cache_precision(prec);
-            }
-            if let Some(group) = &args.ov_dyn_quant_group {
-                b = b.with_dyn_quant_group(group);
-            }
-            b = b.with_ov_properties(ov_perf_properties(args));
-            if let Some(draft) = &args.draft_model {
-                let device = args
-                    .draft_device
-                    .clone()
-                    .unwrap_or_else(|| args.device.clone());
-                b = b.with_draft(draft, &device, args.spec_k);
-            } else if args.prompt_lookup > 0 {
-                b = b.with_prompt_lookup(args.prompt_lookup);
-            }
-            // If the model ships a chat template, the API renders it (honoring
-            // enable_thinking) and the engine tells ov-genai to skip its own
-            // internal apply. No template → leave ov-genai's apply on.
-            b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
-            b = b.with_engine_stop_check(engine_stop_check(args.engine, &args.model));
-            // Without --cb one generate() call makes the whole answer, so the
-            // engine cuts its limit to what the prompt leaves of the window.
-            let info = cascadia_api::read_model_generation_info(std::path::Path::new(&args.model));
-            b = b.with_context_window(resolve_generation_defaults(args, &info).0.context_window);
-            Ok(Box::new(b))
-        }
+        EngineKind::OvGenai => Ok(Box::new(ov_genai_builder(args, engine_stop_check)?)),
         EngineKind::OvRuntime => {
             let mut b = OvRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
             if let Some(dev) = &args.prefill_device {
@@ -2217,61 +2285,10 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 Ok(Box::new(b))
             }
         }
-        EngineKind::SparseMoe => {
-            let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total)
-                .with_kv_prefix_cache_size(args.kv_prefix_cache_size)
-                .with_engine_stop_check(engine_stop_check(args.engine, &args.model));
-            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
-                cfg.cache_dir = Some(dir);
-            }
-            cfg.ov_properties = ov_perf_properties(args);
-            cfg.top_k_override = args.top_k_override;
-            cfg.routing_threshold = args.routing_threshold;
-            cfg.max_cached_experts = args.max_cached_experts;
-            cfg.ffn_sparsity_threshold = args.ffn_sparsity_threshold;
-            cfg.ffn_axpy_down = args.ffn_axpy_down;
-            cfg.ffn_axpy_prebuild = args.ffn_axpy_prebuild;
-            cfg.ffn_sparsity_thresholds_file = args.ffn_sparsity_thresholds_file.clone();
-            cfg.ffn_sparsity_capture_dir = args.ffn_sparsity_capture_dir.clone();
-            // Expert-parallel roles (Inkling).
-            cfg.ep_workers = args
-                .ep_workers
-                .iter()
-                .map(|w| parse_addr(w, "127.0.0.1"))
-                .collect::<Result<Vec<_>>>()?;
-            cfg.ep_worker = match (args.ep_worker_index, args.ep_worker_count) {
-                (Some(i), Some(n)) => Some((i, n)),
-                _ => None,
-            };
-            cfg.ep_placement = args.ep_placement.clone();
-            // Issue #38: capture surfaces silu(gate) via the AXPY
-            // scratch — if the user asked to capture but didn't ask
-            // for AXPY, warn (the capture will silently be empty
-            // because the non-AXPY path doesn't expose silu(gate)).
-            if args.ffn_sparsity_capture_dir.is_some() && !args.ffn_axpy_down {
-                tracing::warn!(
-                    "--ffn-sparsity-capture-dir requires --ffn-axpy-down to surface silu(gate); \
-                     capture will be empty without it"
-                );
-            }
-            // N-gram speculative decode (sparse-moe single-stage).
-            // The `--prompt-lookup` flag is the canonical opt-in (it
-            // already drives the ov-genai prompt-lookup path); when
-            // set on sparse-moe single-stage, we enable n-gram spec
-            // decode with K = max(prompt_lookup, spec_k). On
-            // multi-stage configs this is ignored — see
-            // `SparseMoEBuilder::build` for the warning.
-            let spec_k = if args.prompt_lookup > 0 {
-                Some(args.spec_k.max(args.prompt_lookup))
-            } else {
-                None
-            };
-            if let Some(k) = spec_k {
-                cfg = cfg.with_spec_decode_k(k);
-            }
-            Ok(Box::new(SparseMoEBuilder::new(cfg)))
-        }
+        EngineKind::SparseMoe => Ok(Box::new(SparseMoEBuilder::new(sparse_moe_config(
+            args,
+            engine_stop_check,
+        )?))),
         EngineKind::SyclLlama => {
             if args.total != 1 {
                 return Err(anyhow!("sycl-llama is single-stage only; use --total 1"));
@@ -2702,7 +2719,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
 
     preflight_model_path(&args)?;
-    let builder = build_builder(&args, prefix_cache_bytes)?;
+    // Loaded once, for the API (marker translation) and for the engines'
+    // in-engine stop check, which is off with a dialect.
+    let marker_dialect = model_marker_dialect(args.engine, &args.model);
+    let builder = build_builder(&args, prefix_cache_bytes, marker_dialect.is_none())?;
     let runner = Arc::new(Runner::new(builder));
     let listen = if !is_first {
         Some((listen_host.as_str(), listen_port))
@@ -2920,10 +2940,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let mut cfg = cascadia_api::Config::default();
         // Special-token message framing (Inkling): translated back into the
         // textual delimiters the API's response side understands.
-        cfg.marker_dialect = cascadia_api::MarkerDialect::load(
-            std::path::Path::new(&args.model),
-            chat_template.template.as_deref(),
-        );
+        cfg.marker_dialect = marker_dialect.clone();
         cfg.chat_template = chat_template;
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
@@ -4209,7 +4226,10 @@ mod tests {
     }
 
     /// The engine stop check is off exactly when the API gets a marker
-    /// dialect, for both engines that run one-shot generations.
+    /// dialect, on the builders of both engines that run one-shot
+    /// generations: decided the way `cmd_worker` does (one dialect load,
+    /// `is_none()`), then read back off the built ov-genai builder and the
+    /// sparse-moe config.
     #[test]
     fn engine_stop_check_is_off_for_a_marker_dialect_model() {
         let marker = model_with_template(
@@ -4217,21 +4237,39 @@ mod tests {
         );
         let plain = model_with_template("{% for m in messages %}{{ m.content }}{% endfor %}");
         let none = tempfile::tempdir().unwrap();
-        for engine in [EngineKind::OvGenai, EngineKind::SparseMoe] {
+        let built = |engine: EngineKind, name: &str, model: &str| -> bool {
+            let argv = [
+                "cascadia", "worker", "--rank", "0", "--total", "1", "--engine", name, "--model",
+                model,
+            ];
+            let Command::Worker(args) = Cli::try_parse_from(argv).expect("parse worker argv").cmd
+            else {
+                panic!("expected worker subcommand");
+            };
+            assert_eq!(args.engine, engine);
+            let check = model_marker_dialect(args.engine, &args.model).is_none();
+            match engine {
+                EngineKind::OvGenai => ov_genai_builder(&args, check).unwrap().engine_stop_check,
+                EngineKind::SparseMoe => sparse_moe_config(&args, check).unwrap().engine_stop_check,
+                _ => unreachable!(),
+            }
+        };
+        for (engine, name) in [
+            (EngineKind::OvGenai, "ov-genai"),
+            (EngineKind::SparseMoe, "sparse-moe"),
+        ] {
             let m = marker.path().to_str().unwrap();
-            let tpl = api_chat_template(engine, m);
             assert!(
-                cascadia_api::MarkerDialect::load(std::path::Path::new(m), tpl.template.as_deref())
-                    .is_some(),
+                model_marker_dialect(engine, m).is_some(),
                 "{engine:?}: the fixture must give the API a marker dialect"
             );
-            assert!(!engine_stop_check(engine, m), "{engine:?}: marker model");
+            assert!(!built(engine, name, m), "{engine:?}: marker model");
             assert!(
-                engine_stop_check(engine, plain.path().to_str().unwrap()),
+                built(engine, name, plain.path().to_str().unwrap()),
                 "{engine:?}: plain template"
             );
             assert!(
-                engine_stop_check(engine, none.path().to_str().unwrap()),
+                built(engine, name, none.path().to_str().unwrap()),
                 "{engine:?}: no template"
             );
         }

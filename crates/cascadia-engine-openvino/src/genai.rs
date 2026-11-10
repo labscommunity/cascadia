@@ -374,6 +374,7 @@ impl Builder for OvGenaiBuilder {
             context_window: self.context_window,
             inflight: Arc::new(InflightCancel::new()),
             engine_stop_check: self.engine_stop_check,
+            streamer_thread_logged: false,
         }))
     }
 }
@@ -462,6 +463,9 @@ pub struct OvGenaiEngine {
     inflight: Arc<InflightCancel>,
     /// End a running generation at a `stop` match (M18 D6).
     engine_stop_check: bool,
+    /// Set once the first poll of the engine's life has told which thread
+    /// runs ov-genai's streamer (logged once, for the hardware check).
+    streamer_thread_logged: bool,
 }
 
 impl Engine for OvGenaiEngine {
@@ -573,12 +577,23 @@ impl Engine for OvGenaiEngine {
         };
         let mut polled_tokens: u64 = 0;
         let mut stopped_on_match = false;
+        // Which thread ov-genai calls the streamer on, probed on the first
+        // poll of the engine's life only: inline (the stateful backend) or its
+        // own worker thread (the paged-attention / CB adapter, speculative
+        // pipelines). Logged after generate, on this thread.
+        let step_thread = std::thread::current().id();
+        let mut probe_thread = !self.streamer_thread_logged;
+        let mut threaded_streamer: Option<bool> = None;
         let generated = {
             // The answer the closure has given once it ended the generation:
             // the shim polls once more at the end (n_tokens 0), and that call
             // must not decide again.
             let mut ended: Option<PollAction> = None;
             let mut poll = |tail: &str, n_tokens: usize| -> PollAction {
+                if probe_thread {
+                    probe_thread = false;
+                    threaded_streamer = Some(std::thread::current().id() != step_thread);
+                }
                 polled_tokens += n_tokens as u64;
                 if let Some(action) = ended {
                     return action;
@@ -597,6 +612,10 @@ impl Engine for OvGenaiEngine {
             self.pipe
                 .generate_polled(&task.prompt, &cfg, tail_tokens, &mut poll)
         };
+        if let Some(threaded_streamer) = threaded_streamer {
+            self.streamer_thread_logged = true;
+            info!(threaded_streamer, "ov-genai streamer thread");
+        }
         if self.inflight.cancelled() {
             // Also when generate failed after the CANCEL: the task ends as
             // cancelled, never as an error or a partial success (M18 D4).
@@ -2007,6 +2026,9 @@ mod tests {
         /// At piece i, pass this tail instead of the decode (a detokenizer
         /// whose window decode disagrees with the final decode).
         tail_override: Option<(usize, String)>,
+        /// Call the poll closure from a spawned thread, as ov-genai does when
+        /// it runs the streamer on its worker thread (the CB adapter).
+        poll_from_thread: bool,
         /// Pieces polled (the end flush not included).
         consumed: usize,
         /// Every poll call: (text, n_tokens, answer).
@@ -2037,6 +2059,25 @@ mod tests {
             })
         }
         fn generate_polled(
+            &self,
+            prompt: &str,
+            cfg: &GenConfig,
+            tail_tokens: usize,
+            poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
+        ) -> Result<GenResult, OvError> {
+            if self.st.lock().unwrap().poll_from_thread {
+                return std::thread::scope(|sc| {
+                    sc.spawn(|| self.run_polled(prompt, cfg, tail_tokens, poll))
+                        .join()
+                        .expect("mock streamer thread")
+                });
+            }
+            self.run_polled(prompt, cfg, tail_tokens, poll)
+        }
+    }
+
+    impl MockStatefulPipe {
+        fn run_polled(
             &self,
             _prompt: &str,
             cfg: &GenConfig,
@@ -2177,6 +2218,37 @@ mod tests {
             && c.error.is_none()
             && c.text.is_empty()
             && c.finish_reason == Some(FinishReason::Cancelled)
+    }
+
+    /// The first poll of the engine's life logs whether ov-genai runs the
+    /// streamer inline (the stateful backend) or on its own worker thread
+    /// (the CB adapter, speculative pipelines); later polls and steps don't.
+    #[test]
+    fn stateful_engine_logs_the_streamer_thread_once() {
+        for (threaded, want) in [
+            (false, "threaded_streamer=false"),
+            (true, "threaded_streamer=true"),
+        ] {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            {
+                let mut s = st.lock().unwrap();
+                s.pieces = pieces(&["one", " two", " three"]);
+                s.poll_from_thread = threaded;
+            }
+            let mut e = stateful_engine(&st);
+            e.submit(task("t1", 64)).unwrap();
+            e.submit(task("t2", 64)).unwrap();
+            let (_, logs) = capture_logs(|| {
+                e.step().unwrap();
+                e.step().unwrap();
+            });
+            assert!(logs.contains(want), "{threaded}: {logs}");
+            assert_eq!(
+                logs.matches("ov-genai streamer thread").count(),
+                1,
+                "{threaded}: logged once for the engine's life: {logs}"
+            );
+        }
     }
 
     #[test]

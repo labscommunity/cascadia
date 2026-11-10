@@ -91,16 +91,18 @@ resident.
 A single-stage sparse-moe server (MiniMax-M2, Kimi-K2.6, and the
 DeepSeek-V4 / GLM-5 / Inkling one-task path) makes the whole answer in one
 call. That call now checks between tokens whether to end early: on a client
-disconnect, on `/v1/cancel/{task_id}`, or at a `stop` match. It ends within one token, or
-within one round of speculative decode (`--prompt-lookup`). The engine is then
-free for the next request.
+disconnect, on `/v1/cancel/{task_id}`, or at a `stop` match. It ends within one
+token; Kimi-K2.6 with `--prompt-lookup` (speculative decode) ends within one
+round. MiniMax-M2 and DeepSeek-V4 / GLM-5 / Inkling have no speculative path.
+The engine is then free for the next request.
 
 - A cancel during the prompt prefill ends before the next prompt token, and
   nothing of that partial prefill goes into the KV prefix cache. GLM-5 and
   Inkling prefill the prompt as one batch, so there a cancel waits for that
   batch to finish.
-- The engine checks at most 4 `stop` sequences of up to 256 bytes each. Longer
-  ones are still cut by the API, once the answer is complete.
+- The first 4 `stop` sequences that are non-empty, at most 256 bytes and
+  contain no U+FFFD are checked in the engine; all others are still cut by the
+  API once the answer is complete.
 - For models whose chat template frames output with special tokens (Inkling),
   the engine's stop check is off, because there its text is not what the API
   matches. The API still cuts at the stop, and cancel still works.
