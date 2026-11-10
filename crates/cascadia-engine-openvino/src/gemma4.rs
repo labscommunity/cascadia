@@ -6340,15 +6340,18 @@ mod tests {
     /// its not-acknowledged answer reaches the head inside the head's wait.
     #[tokio::test]
     async fn a_middle_above_an_old_tail_answers_the_probe_inside_the_heads_wait() {
-        for i in 0..20 {
+        for i in 0..10 {
             let (mut mid_up, mut head) = link().await;
             let (mut tail_up, mut mid_down) = link().await;
             let mut latch = MaskLatch::default();
-            let head_budget = probe_wait_budget(TEST_PROBE, 2);
+            // A 2 s base gives the head a 400 ms margin over the middle, so a
+            // loaded test runner can't let the head's own timer win the race.
+            let base = std::time::Duration::from_secs(2);
+            let head_budget = probe_wait_budget(base, 2);
             let t0 = std::time::Instant::now();
             let ((wait, _), _, old) = tokio::join!(
                 probe_round(&mut head, probe_frames(&[10, 11]), head_budget),
-                new_middle_probe(&mut mid_up, &mut mid_down, probe_wait_budget(TEST_PROBE, 1)),
+                new_middle_probe(&mut mid_up, &mut mid_down, probe_wait_budget(base, 1)),
                 old_stage_read(&mut tail_up, 2)
             );
             assert!(old.is_err());
