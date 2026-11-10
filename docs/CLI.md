@@ -198,7 +198,7 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~130 KB per context token as serialised (1.2 GB at 8 K, 4.45 GB at 32 K). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
-| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` or `/v1/responses` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. `qwen35` additionally rejects prompts at or past `max_position_embeddings` with a 400 `context_length_exceeded` (as OpenAI does), not a 413. A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
+| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` or `/v1/responses` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. A prompt that fits this cap but not the model's window is a 400 `context_length_exceeded` (as OpenAI does), not a 413, on every engine that checks the window (`qwen35`, `gemma4`, `ov-genai`, `ov-runtime`, `ov-dist-spec`); `sparse-moe` instead drops the prompt's newest tokens past its context budget (with a warning in the log), and `sycl-llama` never refuses one. See [API errors](#api-errors). A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
 | `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers (each entry may also be a [unix socket](#unix-domain-sockets) `unix:/path.sock`); this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
 | `--ep-worker-index <N>` / `--ep-worker-count <W>` | — | `sparse-moe` (Inkling) expert-parallel **worker**: serve expert shard N of W (experts with `id % W == N`, shared experts included) for every MoE layer on `--listen`; no API, no attention, no sequence state. |
 | `--ov-config <KEY=VALUE>` | — | Raw OV plugin property passthrough, repeatable. See below. |
@@ -496,6 +496,76 @@ goes to stdout.
 cascadia completions zsh  > ~/.zfunc/_cascadia
 cascadia completions bash > /etc/bash_completion.d/cascadia
 ```
+
+---
+
+## API errors
+
+Every error from the OpenAI-compatible API (`run` and `worker --api`) is
+OpenAI's envelope, on every `/v1/` route. `type` is `invalid_request_error` for
+a 4xx and `server_error` for a 5xx; `param` names the request field at fault
+and `code` a machine-readable reason, both `null` when unset:
+
+```json
+{"error": {"message": "temperature 2.5 is out of range; it must be between 0 and 2",
+           "type": "invalid_request_error", "param": "temperature", "code": null}}
+```
+
+| Status | When |
+|---|---|
+| 400 | Body is not valid JSON (`request body is not valid JSON: …`), a field has the wrong type (serde's message with its JSON path), or `Content-Type` is not JSON (``request must have `Content-Type: application/json` ``). |
+| 400 | A field out of range or one this server refuses (table below); `param` is that field. |
+| 400 `context_length_exceeded` | The prompt does not fit the model's window; `param` is `messages`, `prompt` or `input` (the route's prompt field). |
+| 404 | Unknown `/v1/` path: `Invalid URL (POST /v1/foo)`. |
+| 405 | Wrong method: `Method GET is not allowed for /v1/chat/completions`, with an `Allow` header. |
+| 413 | Body over `--api-max-body-mb`, or the prompt over its byte cap (`prompt is N bytes; max allowed is M (max_prompt_bytes)`). |
+| 503 + `Retry-After: 1` | At capacity (`engine at capacity; retry after current requests complete`), engine queue full, or engine not loaded / not connected. |
+| 500 / 503 `server_error` | The engine failed the request (500), or failed it mid-generation (503). An engine refusal of the input itself (`unsupported input: …`, `invalid_request: …`) is a 400 instead. |
+
+An over-window message is OpenAI's sentence, which client libraries match to
+detect context overflow, followed by the engine's own text in parentheses:
+
+```
+This model's maximum context length is 4096 tokens. However, your messages resulted in 5000 tokens. Please reduce the length of the messages. (prompt is 5000 tokens but the model's context is 4096; send a shorter prompt)
+```
+
+Without a token count it reads `However, your messages is longer than that.`;
+without a known window, `This model's maximum context length was exceeded: the
+prompt exceeds the available context size. Please reduce the length of the
+messages.` `sparse-moe` truncates an over-window prompt instead, and
+`sycl-llama` never sends this code.
+
+**Validated fields.** Ranges are inclusive; a value outside them, or a refused
+field in any form but its no-op one, is a 400 naming the field in `param`.
+Unknown fields are ignored.
+
+| Field (`param`) | Allowed | Routes |
+|---|---|---|
+| `temperature` | 0 to 2 | chat, completions, responses |
+| `top_p` | 0 to 1 | chat, completions, responses |
+| `frequency_penalty`, `presence_penalty` | -2 to 2 | chat, completions |
+| `n` | absent or 1 (this server returns one choice) | chat, completions |
+| `stop` | at most 4 sequences | chat, completions |
+| `top_logprobs` | 0 to 20 | chat |
+| `reasoning_effort` (`reasoning.effort` on responses) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | chat, responses |
+| `logit_bias` | `null` or `{}` | chat, completions |
+| `modalities` | no `"audio"` (`["text"]`, `[]` or `null`) | chat |
+| `audio` | `null` | chat |
+| `web_search_options` | `null` | chat |
+
+**Errors inside a stream.** A refusal before generation starts is the JSON
+error above, even with `"stream": true`. Once a chat or completions stream's 200
+is sent, an engine failure arrives as one SSE event with the same `error`
+object, classified as for a non-streamed request (an over-window prompt is
+`invalid_request_error` / `context_length_exceeded`, a pipeline failure
+`server_error`), then `data: [DONE]`:
+
+```
+data: {"error":{"message":"…","type":"server_error","param":null,"code":null},"id":"chatcmpl-…","object":"error"}
+```
+
+A `/v1/responses` stream ends with a `response.failed` event instead, whose
+`response.error` is `{"code": "server_error", "message": "…"}`.
 
 ---
 
