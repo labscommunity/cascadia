@@ -4259,7 +4259,7 @@ impl OvMoeEngine {
             }
         };
         let n_tokens = generated.len() as u32;
-        // The returned text is this decode, unprocessed: no D8 raw/visible
+        // The returned text is this decode, unprocessed: no raw/visible
         // fallback is needed after a stop.
         let text = tok.decode(&generated, true).unwrap_or_default();
         let elapsed = started.elapsed().as_secs_f64();
@@ -5608,8 +5608,8 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// `step()` holds the engine lock; the runner's `should_stop` reads it per
     /// token.
     inflight: Arc<cascadia_engine::InflightCancel>,
-    /// End a running single-stage one-shot generation at a `stop` match (M18
-    /// D6). Default `true`; see [`Self::with_engine_stop_check`].
+    /// End a running single-stage one-shot generation at a `stop` match.
+    /// Default `true`; see [`Self::with_engine_stop_check`].
     engine_stop_check: bool,
 }
 
@@ -8859,7 +8859,7 @@ mod tests {
         );
     }
 
-    // -------- M18 task 6c: PipelineEngine single-stage in-flight cancel/stop --------
+    // -------- PipelineEngine single-stage in-flight cancel/stop --------
 
     /// A `StagedRunner` that "generates" a fixed script of ids: the head's
     /// logits are one-hot at `script[n]` for the n-th generated token. It
@@ -9246,7 +9246,7 @@ mod tests {
         assert!(is_empty_cancelled(&e.step().unwrap()[0].1));
     }
 
-    /// No stop match, no cancel: the same chunks as before M18.
+    /// No stop match, no cancel: the same chunks as without the in-flight cancel.
     #[test]
     fn pipeline_single_stage_without_a_match_is_unchanged() {
         let (mut e, _rt) = script_engine(ScriptRunner::new(4, (0..10).collect()), 1);

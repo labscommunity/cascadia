@@ -511,7 +511,7 @@ fn mid_decode_silent_worker_errors_within_deadline() {
     );
 }
 
-// ---- M18 task 6b: single-stage in-flight cancel and stop ------------------
+// ---- single-stage in-flight cancel and stop -------------------------------
 //
 // The MiniMax-M2 single-stage path makes the whole answer in one blocking
 // `OvMoeRunner::generate_with_cache` call. These drive the polled runner call

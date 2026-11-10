@@ -385,7 +385,7 @@ pub trait Engine: Send {
         None
     }
 
-    /// M18: a lock-free cancel handle for the task this engine is running, if it can end one early.
+    /// A lock-free cancel handle for the task this engine is running, if it can end one early.
     /// Default `None`. Grabbed once at engine load (cheap `Arc` clone), before the engine is
     /// installed, like [`Self::kv_holder`]: a cancel can then reach an engine parked in `step()`
     /// holding the engine mutex, which [`Self::cancel`] never can. The runner signals it on every

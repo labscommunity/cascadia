@@ -1,4 +1,4 @@
-//! ending a running single-stage one-shot generation early (D3, D4, D6).
+//! Ending a running single-stage one-shot generation early.
 //!
 //! The three single-stage paths (`SparseMoEEngine`, `OvMoeEngine`,
 //! `PipelineEngine`) each run a whole generation in one blocking runner call

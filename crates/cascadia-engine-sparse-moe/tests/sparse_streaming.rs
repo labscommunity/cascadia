@@ -470,7 +470,7 @@ fn mid_decode_silent_worker_errors_within_deadline() {
     );
 }
 
-// ---- M18 task 6a: single-stage in-flight cancel and stop ------------------
+// ---- single-stage in-flight cancel and stop -------------------------------
 //
 // The single-stage path makes the whole answer in one blocking runner call.
 // These drive the polled runner calls directly (a `should_stop` that ends at a
