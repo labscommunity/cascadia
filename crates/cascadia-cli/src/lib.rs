@@ -109,6 +109,13 @@ fn ref_resolver_for(kind: EngineKind, llama_args: &[String]) -> cascadia_api::Re
     }
 }
 
+/// Whether the chat template writes Gemma 4 tool calls
+/// (`<|tool_call>call:NAME{…}<tool_call|>`): then the engines keep those
+/// markers in the text and the API removes them from content.
+fn gemma_tool_markers_for(template: Option<&str>) -> bool {
+    template.is_some_and(|t| t.contains("<|tool_call>call:"))
+}
+
 /// Whether `kind` constrains output with OpenVINO GenAI's xgrammar backend,
 /// whose unenforced schema keywords the API logs per request.
 fn xgrammar_keyword_log_for(kind: EngineKind) -> bool {
@@ -2618,6 +2625,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             std::path::Path::new(&args.model),
             chat_template.template.as_deref(),
         );
+        cfg.gemma_tool_markers = gemma_tool_markers_for(chat_template.template.as_deref());
         cfg.chat_template = chat_template;
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
@@ -3875,6 +3883,21 @@ mod tests {
             EngineKind::OvRuntime,
         ] {
             assert!(structured_output_for(kind), "{}", engine_name(kind));
+        }
+    }
+
+    #[test]
+    fn gemma_tool_markers_only_for_a_template_that_writes_gemma4_calls() {
+        let gemma4 = "{%- macro format_argument(v) -%}{%- endmacro -%}\
+                      {{- '<|tool_call>call:' + tc.function.name + '{' -}}";
+        assert!(gemma_tool_markers_for(Some(gemma4)));
+        for other in [
+            None,
+            Some("{% for m in messages %}{{ m.content }}{% endfor %}"),
+            Some("<tool_call>{{ tc | tojson }}</tool_call>"),
+            Some("<|tool_call>"),
+        ] {
+            assert!(!gemma_tool_markers_for(other), "{other:?}");
         }
     }
 

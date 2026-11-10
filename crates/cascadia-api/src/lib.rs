@@ -215,6 +215,12 @@ pub struct AppState {
     /// engines whose backend builds grammars another way (ov-genai's
     /// xgrammar), where llguidance's time and verdict say nothing.
     pub schema_build_check: bool,
+    /// The model writes Gemma 4's tool-call markers (`<|tool_call>`,
+    /// `<tool_call|>`, `<|"|>`), which the engines keep in the text so calls
+    /// can be read. Those literal markers are removed from every content
+    /// string the API returns, streamed and not, after calls are parsed.
+    /// Other models' content is never touched.
+    pub gemma_tool_markers: bool,
 }
 
 /// How an engine's grammar backend resolves a schema's `$ref`s.
@@ -266,6 +272,9 @@ pub struct Config {
     pub schema_check: SchemaCompileCheck,
     /// See [`AppState::schema_build_check`]. Set by the CLI per engine.
     pub schema_build_check: bool,
+    /// See [`AppState::gemma_tool_markers`]. Set by the CLI when the chat
+    /// template writes Gemma 4 tool calls.
+    pub gemma_tool_markers: bool,
 }
 
 impl Default for Config {
@@ -284,6 +293,7 @@ impl Default for Config {
             ref_resolver: RefResolver::Full,
             schema_check: SchemaCompileCheck::default(),
             schema_build_check: false,
+            gemma_tool_markers: false,
         }
     }
 }
@@ -624,6 +634,7 @@ pub fn make_router_with_stats(
         ref_resolver: cfg.ref_resolver,
         schema_check: cfg.schema_check.clone(),
         schema_build_check: cfg.schema_build_check,
+        gemma_tool_markers: cfg.gemma_tool_markers,
     };
     let state = AppState {
         effort_words: state
@@ -2047,6 +2058,89 @@ const PYTHON_TAG: &str = "<|python_tag|>";
 /// Opening of a Markdown code fence, which may wrap a forced call array.
 const CODE_FENCE: &str = "```";
 
+/// Gemma 4's tool-call open marker: `<|tool_call>call:NAME{ARGS}<tool_call|>`.
+const GEMMA_CALL_OPEN: &str = "<|tool_call>";
+
+/// Gemma 4's tool-call close marker.
+const GEMMA_CALL_CLOSE: &str = "<tool_call|>";
+
+/// Gemma 4's string delimiter inside call arguments: `<|"|>text<|"|>`.
+const GEMMA_STR: &str = "<|\"|>";
+
+/// Removes Gemma 4's tool-call markers (`<|tool_call>`, `<tool_call|>`,
+/// `<|"|>`) from content, fed in pieces: a trailing piece that may be the
+/// start of a marker is held until the next feed (or [`Self::finish`]).
+/// One left-to-right pass, so removing a marker never joins the text around
+/// it into a new one; the result does not depend on how the text is split.
+#[derive(Default)]
+struct GemmaMarkerStrip {
+    pending: String,
+}
+
+impl GemmaMarkerStrip {
+    const MARKERS: [&'static str; 3] = [GEMMA_CALL_OPEN, GEMMA_CALL_CLOSE, GEMMA_STR];
+
+    /// The newly releasable text of `text`, markers removed.
+    fn feed(&mut self, text: &str) -> String {
+        let buf = std::mem::take(&mut self.pending) + text;
+        let mut out = String::with_capacity(buf.len());
+        let mut i = 0;
+        while i < buf.len() {
+            let rest = &buf[i..];
+            if let Some(m) = Self::MARKERS.iter().find(|m| rest.starts_with(**m)) {
+                i += m.len();
+                continue;
+            }
+            if Self::MARKERS.iter().any(|m| m.starts_with(rest)) {
+                self.pending = rest.to_owned();
+                break;
+            }
+            // Up to the next `<`: every marker starts with one.
+            let next = rest[1..].find('<').map_or(rest.len(), |k| k + 1);
+            out.push_str(&rest[..next]);
+            i += next;
+        }
+        out
+    }
+
+    /// The text still held at the end of the reply.
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// `text` with every marker removed.
+    fn strip(text: &str) -> String {
+        let mut s = Self::default();
+        s.feed_last(text)
+    }
+
+    /// [`Self::feed`] the reply's last piece, and release what is held.
+    fn feed_last(&mut self, text: &str) -> String {
+        let mut out = self.feed(text);
+        out.push_str(&self.finish());
+        out
+    }
+}
+
+/// A per-response marker stripper for a streamed reply; `None` (text
+/// untouched) unless the model writes Gemma 4 tool-call markers.
+type SharedGemmaStrip = Arc<std::sync::Mutex<Option<GemmaMarkerStrip>>>;
+
+fn gemma_strip(state: &AppState) -> SharedGemmaStrip {
+    Arc::new(std::sync::Mutex::new(
+        state.gemma_tool_markers.then(GemmaMarkerStrip::default),
+    ))
+}
+
+/// One streamed piece of content through the response's stripper, if any.
+fn strip_streamed(strip: &SharedGemmaStrip, text: String, last: bool) -> String {
+    match strip.lock().unwrap().as_mut() {
+        Some(g) if last => g.feed_last(&text),
+        Some(g) => g.feed(&text),
+        None => text,
+    }
+}
+
 /// Incremental content/tool-call split for a streamed chat reply with tools
 /// active. Fed the same translated text the non-streaming path accumulates,
 /// it releases every byte that can no longer become part of a tool call and
@@ -2061,8 +2155,8 @@ const CODE_FENCE: &str = "```";
 ///   scan text, so none of it is content until the reply ends; when a tool
 ///   grammar was sent, also while it starts a code fence (```), which the
 ///   forced-shape reader takes as a call when the engine dropped the grammar;
-/// * otherwise from the first `<tool_call>`, or from a trailing proper
-///   prefix of it (a marker split across chunks).
+/// * otherwise from the first `<tool_call>` or Gemma 4 `<|tool_call>`, or
+///   from a trailing proper prefix of either (a marker split across chunks).
 ///
 /// Before `</think>` arrives the rules apply from 0; once it does, text held
 /// only for a scratchpad draft is released. Released text is never taken
@@ -2179,12 +2273,20 @@ impl ToolStreamSplitter {
         // resume at the release point.
         let from = start.max(self.emitted);
         let rest = &self.buf[from..];
-        from + rest.find(TOOL_CALL_OPEN).unwrap_or_else(|| {
-            (1..TOOL_CALL_OPEN.len())
-                .rev()
-                .find(|&k| rest.ends_with(&TOOL_CALL_OPEN[..k]))
-                .map_or(rest.len(), |k| rest.len() - k)
-        })
+        let opens = [TOOL_CALL_OPEN, GEMMA_CALL_OPEN];
+        from + opens
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .unwrap_or_else(|| {
+                // The longest trailing proper prefix of either marker.
+                let held = opens
+                    .iter()
+                    .filter_map(|m| (1..m.len()).rev().find(|&k| rest.ends_with(&m[..k])))
+                    .max()
+                    .unwrap_or(0);
+                rest.len() - held
+            })
     }
 }
 
@@ -2196,7 +2298,8 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
 }
 
 /// [`parse_tool_calls`] without its bare-JSON branch: only calls behind a
-/// tool-call marker (`<tool_call>`, `<|python_tag|>`) count. A whole-output
+/// tool-call marker (`<tool_call>`, `<|python_tag|>`, Gemma 4's
+/// `<|tool_call>`) count. A whole-output
 /// JSON object or array with `name` and `arguments`/`parameters` keys stays
 /// text, for answers where such JSON may be the client's own data.
 pub fn parse_tool_calls_marked(text: &str) -> Option<Vec<ToolCall>> {
@@ -2246,6 +2349,20 @@ fn parse_tool_calls_with(text: &str, bare_json: bool) -> Option<Vec<ToolCall>> {
                 calls.push(c);
             }
             rest = &after[end + "</tool_call>".len()..];
+        }
+    } else if text.contains(GEMMA_CALL_OPEN) {
+        // Gemma 4: each <|tool_call>call:NAME{ARGS}<tool_call|>; a malformed
+        // one is skipped and the search goes on after its open marker.
+        let mut rest = text;
+        while let Some(start) = rest.find(GEMMA_CALL_OPEN) {
+            let after = &rest[start + GEMMA_CALL_OPEN.len()..];
+            rest = match call_from_gemma(after) {
+                Some((c, used)) => {
+                    calls.push(c);
+                    &after[used..]
+                }
+                None => after,
+            };
         }
     } else {
         // Llama-3.1: <|python_tag|> is an explicit tool-call marker. A BARE
@@ -2375,6 +2492,143 @@ fn call_from_xml_function(block: &str) -> Option<ToolCall> {
             arguments: serde_json::to_string(&serde_json::Value::Object(args)).ok()?,
         },
     })
+}
+
+/// One Gemma 4 call from the text right after `<|tool_call>`:
+/// `call:NAME{ARGS}<tool_call|>`, and the bytes it spans (close marker
+/// included). `ARGS` is comma-separated `key:value` with bare keys; a value
+/// is a `<|"|>…<|"|>` raw string, a number, `true`/`false`/`null`, an object
+/// `{…}` of the same shape or a list `[…]`. Arguments become a compact JSON
+/// object, keys in the order written. `None` for anything else.
+fn call_from_gemma(s: &str) -> Option<(ToolCall, usize)> {
+    let body = s.trim_start().strip_prefix("call:")?;
+    let brace = body.find('{')?;
+    let name = body[..brace].trim();
+    if !is_bare_function_name(name) {
+        return None;
+    }
+    let mut args = GemmaArgs {
+        s: &body[brace..],
+        i: 0,
+    };
+    let value = args.object(0)?;
+    let tail = &body[brace + args.i..];
+    let close = tail.trim_start().strip_prefix(GEMMA_CALL_CLOSE)?;
+    let used = s.len() - close.len();
+    let call = ToolCall {
+        id: format!("call_{}", Uuid::new_v4().simple()),
+        r#type: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments: serde_json::to_string(&value).ok()?,
+        },
+    };
+    Some((call, used))
+}
+
+/// Cursor over a Gemma 4 argument object; see [`call_from_gemma`].
+struct GemmaArgs<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl<'a> GemmaArgs<'a> {
+    /// Nesting bound, as serde_json's default recursion limit.
+    const MAX_DEPTH: usize = 128;
+
+    fn rest(&self) -> &'a str {
+        let s: &'a str = self.s;
+        &s[self.i..]
+    }
+
+    fn skip_ws(&mut self) {
+        let rest = self.rest();
+        self.i += rest.len() - rest.trim_start().len();
+    }
+
+    /// Consume `c` (after whitespace) if it comes next.
+    fn eat(&mut self, c: char) -> bool {
+        self.skip_ws();
+        let hit = self.rest().starts_with(c);
+        if hit {
+            self.i += c.len_utf8();
+        }
+        hit
+    }
+
+    fn value(&mut self, depth: usize) -> Option<serde_json::Value> {
+        self.skip_ws();
+        let rest = self.rest();
+        if let Some(body) = rest.strip_prefix(GEMMA_STR) {
+            let end = body.find(GEMMA_STR)?;
+            self.i += 2 * GEMMA_STR.len() + end;
+            return Some(serde_json::Value::String(body[..end].to_string()));
+        }
+        match rest.as_bytes().first()? {
+            b'{' => self.object(depth + 1),
+            b'[' => self.list(depth + 1),
+            _ => {
+                let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
+                let token = rest[..end].trim();
+                self.i += end;
+                match token {
+                    "true" => Some(serde_json::Value::Bool(true)),
+                    "false" => Some(serde_json::Value::Bool(false)),
+                    "null" => Some(serde_json::Value::Null),
+                    _ => serde_json::from_str::<serde_json::Value>(token)
+                        .ok()
+                        .filter(serde_json::Value::is_number),
+                }
+            }
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Option<serde_json::Value> {
+        if depth > Self::MAX_DEPTH || !self.eat('{') {
+            return None;
+        }
+        let mut map = serde_json::Map::new();
+        if self.eat('}') {
+            return Some(serde_json::Value::Object(map));
+        }
+        loop {
+            let rest = self.rest();
+            let colon = rest.find(':')?;
+            let key = rest[..colon].trim();
+            if key.is_empty()
+                || key
+                    .chars()
+                    .any(|c| c.is_whitespace() || "{}[],<>\"".contains(c))
+            {
+                return None;
+            }
+            let key = key.to_string();
+            self.i += colon + 1;
+            let value = self.value(depth)?;
+            map.insert(key, value);
+            if self.eat(',') {
+                continue;
+            }
+            return self.eat('}').then_some(serde_json::Value::Object(map));
+        }
+    }
+
+    fn list(&mut self, depth: usize) -> Option<serde_json::Value> {
+        if depth > Self::MAX_DEPTH || !self.eat('[') {
+            return None;
+        }
+        let mut items = Vec::new();
+        if self.eat(']') {
+            return Some(serde_json::Value::Array(items));
+        }
+        loop {
+            items.push(self.value(depth)?);
+            if self.eat(',') {
+                continue;
+            }
+            return self.eat(']').then_some(serde_json::Value::Array(items));
+        }
+    }
 }
 
 /// Shape test for a bare tool-call name with no arguments: `^[A-Za-z_][A-Za-z0-9_.-]*$`.
@@ -3072,8 +3326,15 @@ async fn chat_completions(
         }
     }
 
-    let (message, choice_finish) =
+    let (mut message, choice_finish) =
         build_choice(buf, &policy, enable_thinking, tool_grammar_sent, union_sent);
+    // Gemma 4's markers stay in the text so calls can be read; content never
+    // carries them.
+    if state.gemma_tool_markers {
+        if let Some(content) = message.content.as_mut() {
+            *content = GemmaMarkerStrip::strip(content);
+        }
+    }
     // A parsed tool call overrides the streamed length/stop detection;
     // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
     if let Some(fr) = choice_finish {
@@ -3264,6 +3525,10 @@ async fn completions(
         }
     }
 
+    if state.gemma_tool_markers {
+        buf = GemmaMarkerStrip::strip(&buf);
+    }
+
     // `echo`: prepend the (raw) prompt to the returned text.
     let text = if req.echo {
         format!("{prompt}{buf}")
@@ -3328,6 +3593,7 @@ async fn stream_text_completion(
     let usage_task_id = task_id.clone();
     // First-frame flag for `echo` (prepend the prompt once).
     let echo_pending = Arc::new(std::sync::Mutex::new(echo_prefix));
+    let gemma = gemma_strip(&state);
     let permit_carrier = StreamWithPermit {
         inner: chunk_stream,
         _permit: permit,
@@ -3342,6 +3608,7 @@ async fn stream_text_completion(
             let usage_prompt = usage_prompt.clone();
             let usage_finished = usage_finished.clone();
             let echo_pending = echo_pending.clone();
+            let gemma = gemma.clone();
             async move {
                 // A progress marker (a long prompt still going down the
                 // pipeline, one window per engine step): nothing to send,
@@ -3367,7 +3634,7 @@ async fn stream_text_completion(
                     return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
                 }
                 // Prepend the echo prefix to the first content frame, once.
-                let mut text = chunk.text.clone();
+                let mut text = strip_streamed(&gemma, chunk.text.clone(), chunk.is_final);
                 if let Some(prefix) = echo_pending.lock().unwrap().take() {
                     text = format!("{prefix}{text}");
                 }
@@ -3470,6 +3737,7 @@ async fn stream_completion(
             },
             marker: state.marker_dialect.clone().map(MarkerFilter::new),
             splitter: ToolStreamSplitter::new(enable_thinking, tools.grammar_sent),
+            strip: state.gemma_tool_markers.then(GemmaMarkerStrip::default),
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
             held_tokens: 0,
@@ -3533,6 +3801,7 @@ async fn stream_completion(
     let marker: Arc<std::sync::Mutex<Option<MarkerFilter>>> = Arc::new(std::sync::Mutex::new(
         state.marker_dialect.clone().map(MarkerFilter::new),
     ));
+    let gemma = gemma_strip(&state);
     let body_stream = permit_carrier
         .then(move |chunk| {
             let model = model.clone();
@@ -3542,6 +3811,7 @@ async fn stream_completion(
             let usage_prompt = usage_prompt.clone();
             let usage_finished = usage_finished.clone();
             let marker = marker.clone();
+            let gemma = gemma.clone();
             async move {
                 // Publish real per-chunk counts live; authoritative-only
                 // engines reconcile their full model count at completion.
@@ -3592,6 +3862,7 @@ async fn stream_completion(
                         None => chunk.text.clone(),
                     }
                 };
+                let text = strip_streamed(&gemma, text, chunk.is_final);
                 let payload = serde_json::json!({
                     "id": task_id,
                     "object": "chat.completion.chunk",
@@ -3692,6 +3963,9 @@ struct ToolStream {
     chunks: StreamWithPermit,
     marker: Option<MarkerFilter>,
     splitter: ToolStreamSplitter,
+    /// Removes Gemma 4's markers from released content; see
+    /// [`AppState::gemma_tool_markers`].
+    strip: Option<GemmaMarkerStrip>,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
     /// Model tokens not yet reported in a frame's `n_tokens` (their text is
@@ -3770,7 +4044,11 @@ impl ToolStream {
                     .unwrap_or("stop");
                 Some(self.close_choice(text, chunk.completion_tokens, reason))
             } else {
-                let content = self.splitter.feed(text);
+                let released = self.splitter.feed(text);
+                let content = match self.strip.as_mut() {
+                    Some(g) => std::borrow::Cow::Owned(g.feed(released)),
+                    None => std::borrow::Cow::Borrowed(released),
+                };
                 if content.is_empty() {
                     None
                 } else {
@@ -3778,7 +4056,7 @@ impl ToolStream {
                     Some(Bytes::from(content_frame(
                         &self.task_id,
                         &self.model,
-                        content,
+                        &content,
                         n_tokens,
                         chunk.completion_tokens,
                         None,
@@ -3808,13 +4086,18 @@ impl ToolStream {
         let n_tokens = std::mem::take(&mut self.held_tokens);
         let (task_id, model) = (&self.task_id, &self.model);
         let tools = &self.tools;
+        let strip = &mut self.strip;
+        let mut clean = |content: &str| match strip.as_mut() {
+            Some(g) => g.feed_last(content),
+            None => content.to_owned(),
+        };
         let read =
             |scan: &str| answer_calls(scan, &tools.policy, tools.grammar_sent, tools.union_sent);
         let out = match self.splitter.finish(text, read) {
             ToolStreamEnd::Content(content) => content_frame(
                 task_id,
                 model,
-                content,
+                &clean(content),
                 n_tokens,
                 completion_tokens,
                 Some(finish_reason),
@@ -3826,8 +4109,9 @@ impl ToolStream {
                 // The held tokens are the call's: they ride the tool_calls
                 // delta, so each model token is counted in exactly one frame.
                 let mut out = String::new();
+                let content = clean(content);
                 if !content.is_empty() {
-                    out.push_str(&content_frame(task_id, model, content, 0, None, None));
+                    out.push_str(&content_frame(task_id, model, &content, 0, None, None));
                 }
                 let tool_calls: Vec<serde_json::Value> = calls
                     .into_iter()
@@ -10419,6 +10703,16 @@ level={{ effort_map[eff] }}";
     /// A router (structured output on, tools-rendering template) whose
     /// engine always answers `text` and stops with `finish`.
     async fn scripted_app(text: &str, finish: cascadia_types::FinishReason) -> Router {
+        scripted_app_with(text, finish, false).await
+    }
+
+    /// [`scripted_app`] for a model whose template writes Gemma 4 tool
+    /// calls when `gemma_tool_markers` is set.
+    async fn scripted_app_with(
+        text: &str,
+        finish: cascadia_types::FinishReason,
+        gemma_tool_markers: bool,
+    ) -> Router {
         let runner = Runner::new(Box::new(ScriptedBuilder(ScriptedEngine {
             text: text.into(),
             finish,
@@ -10435,6 +10729,7 @@ level={{ effort_map[eff] }}";
             structured_output: true,
             engine_name: "mock".into(),
             chat_template: template(TOOLS_TEMPLATE),
+            gemma_tool_markers,
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
@@ -10924,5 +11219,237 @@ level={{ effort_map[eff] }}";
         );
         assert_eq!(streamed_content(&events), "", "{events:?}");
         assert_eq!(streamed_finishes(&events), ["tool_calls"]);
+    }
+
+    /// Arguments of a parsed call as JSON.
+    fn call_args(c: &ToolCall) -> Value {
+        serde_json::from_str(&c.function.arguments).unwrap()
+    }
+
+    const GEMMA_WEATHER_CALL: &str =
+        "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>";
+
+    #[test]
+    fn parse_tool_calls_gemma4_basic() {
+        for parse in [parse_tool_calls, parse_tool_calls_marked] {
+            let calls = parse(GEMMA_WEATHER_CALL).expect("a Gemma 4 call");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].function.name, "get_weather");
+            assert_eq!(calls[0].r#type, "function");
+            assert!(calls[0].id.starts_with("call_"));
+            assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
+        }
+        // Text around the call does not stop it from being read.
+        let calls = parse_tool_calls(&format!("Let me check.\n{GEMMA_WEATHER_CALL}\n"))
+            .expect("a call after prose");
+        assert_eq!(calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn parse_tool_calls_gemma4_types() {
+        let q = "<|\"|>";
+        let text = format!(
+            "<|tool_call>call:book{{n:3,price:-12.5,big:1e3,ok:true,no:false,none:null,\
+             opts:{{seat:{q}aisle{q},bags:{{count:2}}}},tags:[{q}a{q},1,[true,null],{{k:{q}v{q}}}],\
+             note:{q}a, b: {{c}} [d]{q}, empty:{q}{q}, list:[]}}<tool_call|>"
+        );
+        let calls = parse_tool_calls(&text).expect("a typed Gemma 4 call");
+        assert_eq!(calls[0].function.name, "book");
+        assert_eq!(
+            call_args(&calls[0]),
+            serde_json::json!({
+                "n": 3, "price": -12.5, "big": 1e3, "ok": true, "no": false, "none": null,
+                "opts": {"seat": "aisle", "bags": {"count": 2}},
+                "tags": ["a", 1, [true, null], {"k": "v"}],
+                "note": "a, b: {c} [d]", "empty": "", "list": []
+            })
+        );
+        // Compact JSON, keys in the order written.
+        assert!(calls[0]
+            .function
+            .arguments
+            .starts_with(r#"{"n":3,"price":-12.5,"#));
+    }
+
+    #[test]
+    fn parse_tool_calls_gemma4_two_calls() {
+        let text = format!(
+            "{GEMMA_WEATHER_CALL}<|tool_call>call:get_time{{tz:<|\"|>CET<|\"|>}}<tool_call|>"
+        );
+        let calls = parse_tool_calls(&text).expect("two calls");
+        let names: Vec<_> = calls.iter().map(|c| c.function.name.as_str()).collect();
+        assert_eq!(names, ["get_weather", "get_time"]);
+        assert_eq!(call_args(&calls[1]), serde_json::json!({"tz": "CET"}));
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn parse_tool_calls_gemma4_zero_args() {
+        let calls = parse_tool_calls("<|tool_call>call:now{}<tool_call|>").expect("a call");
+        assert_eq!(calls[0].function.name, "now");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn parse_tool_calls_gemma4_malformed_is_skipped() {
+        let q = "<|\"|>";
+        for bad in [
+            "<|tool_call>call:f{a:}<tool_call|>".to_string(),
+            format!("<|tool_call>call:f{{a:{q}x}}<tool_call|>"),
+            "<|tool_call>call:f{a:Paris}<tool_call|>".to_string(),
+            "<|tool_call>call:f{a:1".to_string(),
+            "<|tool_call>call:f{a:1}".to_string(),
+            "<|tool_call>call:f{a 1}<tool_call|>".to_string(),
+            "<|tool_call>call:f{a:[1,}<tool_call|>".to_string(),
+            "<|tool_call>call:two words{}<tool_call|>".to_string(),
+            "<|tool_call>f{}<tool_call|>".to_string(),
+            "<|tool_call>call:{}<tool_call|>".to_string(),
+        ] {
+            assert_eq!(parse_tool_calls(&bad), None, "{bad}");
+            // A good call after a malformed one is still read.
+            let calls = parse_tool_calls(&format!("{bad}{GEMMA_WEATHER_CALL}"))
+                .unwrap_or_else(|| panic!("the good call after {bad}"));
+            assert_eq!(calls.len(), 1, "{bad}");
+            assert_eq!(calls[0].function.name, "get_weather", "{bad}");
+        }
+    }
+
+    #[test]
+    fn gemma4_call_is_held_not_leaked() {
+        // Split inside the open marker, the way a stream can deliver it.
+        let (out, calls) = run_splitter(
+            &[
+                "Checking. <|tool",
+                "_call>call:get_weather{city:",
+                "<|\"|>Paris<|\"|>}",
+                "<tool_call|>",
+            ],
+            false,
+        );
+        assert_eq!(out, ["Checking. ", "", "", ""]);
+        let calls = calls.expect("a Gemma 4 call");
+        assert_eq!(calls[0].function.name, "get_weather");
+        // Not a call after all: everything is released, nothing lost.
+        let pieces = ["a <|tool", "_call>call:oops", " more"];
+        let (out, calls) = run_splitter(&pieces, false);
+        assert!(calls.is_none());
+        assert_eq!(out.concat(), pieces.concat());
+    }
+
+    #[tokio::test]
+    async fn gemma4_call_is_read_streamed_and_not() {
+        let tools = serde_json::json!([city_tool("get_weather")]);
+        let body = tool_body(tools, serde_json::json!({}));
+        let text = format!("{GEMMA_WEATHER_CALL}\n");
+        for gemma in [true, false] {
+            let app = scripted_app_with(&text, cascadia_types::FinishReason::Stop, gemma).await;
+            let (status, v) = post_chat(app, body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(call_names(&v), ["get_weather"], "{v}");
+            assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
+            let app = scripted_app_with(&text, cascadia_types::FinishReason::Stop, gemma).await;
+            let events = stream_events(app, body.clone()).await;
+            let calls = streamed_calls(&events);
+            assert_eq!(calls.len(), 1, "{events:?}");
+            assert_eq!(calls[0]["function"]["arguments"], r#"{"city":"Paris"}"#);
+            assert_eq!(streamed_content(&events), "", "{events:?}");
+        }
+    }
+
+    /// POST `body` to `uri` and return the JSON reply.
+    async fn post_json(app: Router, uri: &str, body: Value) -> Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Content of a chat or legacy completion reply, streamed or not, for
+    /// every request shape whose content Gemma 4's markers could reach.
+    async fn contents_for(text: &str, gemma: bool) -> Vec<(String, String)> {
+        let tools = serde_json::json!([city_tool("get_weather")]);
+        let chats = [
+            (
+                "no tools",
+                serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                "tool_choice none",
+                tool_body(tools.clone(), serde_json::json!({"tool_choice": "none"})),
+            ),
+            ("tools auto", tool_body(tools, serde_json::json!({}))),
+        ];
+        let mut out = Vec::new();
+        for (case, body) in chats {
+            let app = scripted_app_with(text, cascadia_types::FinishReason::Stop, gemma).await;
+            let v = post_json(app, "/v1/chat/completions", body.clone()).await;
+            let content = v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or_default();
+            out.push((format!("{case}, not streamed"), content.to_owned()));
+            let app = scripted_app_with(text, cascadia_types::FinishReason::Stop, gemma).await;
+            let events = stream_events(app, body).await;
+            assert!(streamed_calls(&events).is_empty(), "{case}: {events:?}");
+            out.push((format!("{case}, streamed"), streamed_content(&events)));
+        }
+        let legacy = serde_json::json!({"model": "mock-model", "prompt": "hi"});
+        let app = scripted_app_with(text, cascadia_types::FinishReason::Stop, gemma).await;
+        let v = post_json(app, "/v1/completions", legacy.clone()).await;
+        out.push((
+            "completions, not streamed".into(),
+            v["choices"][0]["text"].as_str().unwrap().into(),
+        ));
+        let mut body = legacy;
+        body["stream"] = Value::from(true);
+        let app = scripted_app_with(text, cascadia_types::FinishReason::Stop, gemma).await;
+        let events = sse_events(&post_stream(app, "/v1/completions", body).await);
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["text"].as_str())
+            .collect();
+        out.push(("completions, streamed".into(), streamed));
+        out
+    }
+
+    #[tokio::test]
+    async fn gemma4_markers_are_stripped_from_content() {
+        // A malformed call (no close marker) and a stray string marker.
+        let text =
+            "Sure.<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>} and <|\"|>x<tool_call|>";
+        let want = "Sure.call:get_weather{city:Paris} and x";
+        for (case, content) in contents_for(text, true).await {
+            assert_eq!(content, want, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_gemma_content_is_untouched() {
+        let text = "Quote it as <|\"|>x<|\"|> please.";
+        for (case, content) in contents_for(text, false).await {
+            assert_eq!(content, text, "{case}");
+        }
+    }
+
+    #[test]
+    fn gemma_marker_strip_holds_a_split_marker() {
+        let mut s = GemmaMarkerStrip::default();
+        let pieces = ["a<|", "\"|>b<tool_", "call|>c<", "x <|tool_call", ">d<"];
+        let out: Vec<String> = pieces.iter().map(|p| s.feed(p)).collect();
+        assert_eq!(out, ["a", "b", "c", "<x ", "d"]);
+        assert_eq!(s.finish(), "<");
+        // Removing a marker never forms a new one from the text around it.
+        let mut s = GemmaMarkerStrip::default();
+        assert_eq!(s.feed("<|<|\"|>\"|>") + &s.finish(), "<|\"|>");
     }
 }
