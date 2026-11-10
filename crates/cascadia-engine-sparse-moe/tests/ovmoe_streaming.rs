@@ -510,3 +510,170 @@ fn mid_decode_silent_worker_errors_within_deadline() {
          (gateway inter-token budget is 180s; the engine must beat it)"
     );
 }
+
+// ---- M18 task 6b: single-stage in-flight cancel and stop ------------------
+//
+// The MiniMax-M2 single-stage path makes the whole answer in one blocking
+// `OvMoeRunner::generate_with_cache` call. These drive the polled runner call
+// directly (a `should_stop` that ends at a known token, deterministic) and the
+// single-stage engine through `Engine::step`. Gated on `M2_MODEL_DIR`; red at
+// the base (no `*_polled` API, no handle), green at the tip, on the box.
+
+fn single_stage_ov_runner() -> cascadia_engine_sparse_moe::OvMoeRunner {
+    let dir = model_dir().expect("caller must gate on model_dir() first");
+    cascadia_engine_sparse_moe::OvMoeRunner::load(
+        dir,
+        "CPU",
+        cascadia_ov_genai_shim::PluginConfig::new(),
+        None,
+    )
+    .expect("load OvMoeRunner")
+}
+
+fn single_stage_ovmoe_engine(stop_check: bool) -> Box<dyn Engine> {
+    let dir = model_dir().expect("caller must gate on model_dir() first");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let engine: Box<dyn Engine> = rt.block_on(async move {
+        let mut b = SparseMoEBuilder::new(
+            SparseMoEBuilderConfig::new(dir.to_str().expect("utf8 path"), "CPU")
+                .with_engine_stop_check(stop_check),
+        );
+        let _progress = b.load(shard(true, true)).await.expect("load");
+        Box::new(b).build().expect("build")
+    });
+    std::mem::forget(rt);
+    engine
+}
+
+const OV_POLL_PROMPT: [u32; 6] = [1, 2, 3, 4, 5, 6];
+
+#[test]
+fn single_stage_polled_cancel_at_decode_token_k_returns_k_tokens() {
+    let Some(_dir) = model_dir() else {
+        eprintln!("M2_MODEL_DIR not set; skipping");
+        return;
+    };
+    let mut r = single_stage_ov_runner();
+    let cfg = cascadia_engine_sparse_moe::SamplingConfig::default(); // greedy
+    let (baseline, _) = r
+        .generate_with_cache(&OV_POLL_PROMPT, 12, &cfg, None)
+        .expect("baseline");
+    let k = 3usize;
+    assert!(baseline.len() > k, "baseline too short: {baseline:?}");
+    let mut polls = 0usize;
+    let (got, snap) = r
+        .generate_with_cache_polled(&OV_POLL_PROMPT, 12, &cfg, None, &mut |ids| {
+            polls += 1;
+            ids.len() >= k
+        })
+        .expect("polled");
+    assert!(snap.is_none(), "no cache, no snapshot");
+    assert_eq!(got, baseline[..k], "a stop at token k returns the first k");
+    // One poll per prefill token, then one per decode token after the first.
+    assert_eq!(polls, OV_POLL_PROMPT.len() + k);
+}
+
+#[test]
+fn single_stage_prefill_cancel_leaves_the_prefix_cache_unchanged() {
+    let Some(_dir) = model_dir() else {
+        eprintln!("M2_MODEL_DIR not set; skipping");
+        return;
+    };
+    let mut r = single_stage_ov_runner();
+    let cfg = cascadia_engine_sparse_moe::SamplingConfig::default();
+    let (baseline, _) = r
+        .generate_with_cache(&OV_POLL_PROMPT, 6, &cfg, None)
+        .expect("baseline");
+    let mut cache = cascadia_engine_sparse_moe::ov_kv_cache::OvMoeKvPrefixCache::new(4);
+    let mut polls = 0usize;
+    let (got, snap) = r
+        .generate_with_cache_polled(&OV_POLL_PROMPT, 6, &cfg, Some(&mut cache), &mut |_| {
+            polls += 1;
+            polls >= 3 // before the third prefill token
+        })
+        .expect("polled");
+    assert!(got.is_empty(), "a prefill stop generates nothing: {got:?}");
+    assert!(snap.is_none(), "nothing for the engine to mirror");
+    assert_eq!(cache.len(), 0, "a partial prefill must not be cached");
+    // The next same-prompt run is a MISS (it inserts and returns the
+    // snapshot) with the baseline answer.
+    let (again, snap) = r
+        .generate_with_cache(&OV_POLL_PROMPT, 6, &cfg, Some(&mut cache))
+        .expect("again");
+    assert!(snap.is_some(), "a miss returns the inserted snapshot");
+    assert_eq!(cache.len(), 1);
+    assert_eq!(again, baseline);
+}
+
+#[test]
+fn single_stage_engine_cancel_before_begin_is_an_empty_cancelled_final() {
+    let Some(_dir) = model_dir() else {
+        eprintln!("M2_MODEL_DIR not set; skipping");
+        return;
+    };
+    let mut eng = single_stage_ovmoe_engine(true);
+    let h = eng
+        .inflight_cancel()
+        .expect("single-stage engine has a handle");
+    h.cancel(&"c1".to_string());
+    eng.submit(GenerationTask::new("c1", "hello").with_max_tokens(8))
+        .unwrap();
+    let out = eng.step().unwrap();
+    assert_eq!(out.len(), 1);
+    let c = &out[0].1;
+    assert!(
+        c.is_final && c.error.is_none() && c.text.is_empty(),
+        "{c:?}"
+    );
+    assert_eq!(c.finish_reason, Some(FinishReason::Cancelled));
+    assert!(!h.cancelled(), "end() freed the handle");
+    eng.submit(GenerationTask::new("c2", "hello").with_max_tokens(2))
+        .unwrap();
+    let out = eng.step().unwrap();
+    assert!(out[0].1.is_final && out[0].1.error.is_none());
+    assert_ne!(out[0].1.finish_reason, Some(FinishReason::Cancelled));
+}
+
+/// A stop taken from the middle of the baseline answer ends the run early with
+/// `stop`, and the text keeps the stop (the API makes the cut).
+#[test]
+fn single_stage_engine_stops_at_a_stop_string() {
+    let Some(_dir) = model_dir() else {
+        eprintln!("M2_MODEL_DIR not set; skipping");
+        return;
+    };
+    let mut eng = single_stage_ovmoe_engine(true);
+    eng.submit(GenerationTask::new("s0", "hello").with_max_tokens(24))
+        .unwrap();
+    let base = eng.step().unwrap().remove(0).1;
+    let text = base.text.clone();
+    let Some(stop) = middle_stop(&text) else {
+        eprintln!("baseline text too short for a stop test: {text:?}; skipping");
+        return;
+    };
+    let mut task = GenerationTask::new("s1", "hello").with_max_tokens(24);
+    task.sampling.stop = vec![stop.clone()];
+    eng.submit(task).unwrap();
+    let c = eng.step().unwrap().remove(0).1;
+    assert_eq!(c.finish_reason, Some(FinishReason::Stop), "{c:?}");
+    assert!(c.text.contains(&stop), "{:?} lacks {stop:?}", c.text);
+    assert!(c.n_tokens.unwrap() < base.n_tokens.unwrap(), "ended early");
+
+    let mut off = single_stage_ovmoe_engine(false);
+    let mut task = GenerationTask::new("s2", "hello").with_max_tokens(24);
+    task.sampling.stop = vec![stop];
+    off.submit(task).unwrap();
+    let c = off.step().unwrap().remove(0).1;
+    assert_eq!(c.n_tokens, base.n_tokens);
+    assert_eq!(c.text, text);
+}
+
+/// A few chars from the second quarter of `text`, if it has enough.
+fn middle_stop(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 16 {
+        return None;
+    }
+    let s: String = chars[chars.len() / 4..chars.len() / 4 + 4].iter().collect();
+    (!s.trim().is_empty() && !s.contains('\u{FFFD}')).then_some(s)
+}

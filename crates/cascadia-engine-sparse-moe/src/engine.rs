@@ -1059,7 +1059,7 @@ impl Builder for SparseMoEBuilder {
                     rank, total, "OvMoe kv-prefix-cache enabled (warm-resume)"
                 );
             }
-            return Ok(Box::new(OvMoeEngine::new(
+            let mut engine = OvMoeEngine::new(
                 ov,
                 self.tokenizer,
                 self.transport,
@@ -1067,7 +1067,9 @@ impl Builder for SparseMoEBuilder {
                 rank,
                 total,
                 ov_kv_cache,
-            )));
+            );
+            engine.engine_stop_check = self.config.engine_stop_check;
+            return Ok(Box::new(engine));
         }
         let runner = self.runner.ok_or(EngineError::NotLoaded)?;
         let total = self.config.total.max(1);
@@ -4001,6 +4003,12 @@ pub struct OvMoeEngine {
     kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
     /// In-flight multi-stage generation, streamed one token per `step()`.
     active_ov: Option<OvMoeActive>,
+    /// M18: the runner signals a cancel here while the single-stage `step()`
+    /// holds the engine lock; the runner's `should_stop` reads it per token.
+    inflight: Arc<cascadia_engine::InflightCancel>,
+    /// End a running single-stage generation at a `stop` match (M18 D6).
+    /// Set by the builder after `new` (default `true`).
+    engine_stop_check: bool,
 }
 
 impl OvMoeEngine {
@@ -4052,6 +4060,8 @@ impl OvMoeEngine {
                 cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
             ),
             active_ov: None,
+            inflight: Arc::new(cascadia_engine::InflightCancel::new()),
+            engine_stop_check: true,
         }
     }
 
@@ -4108,6 +4118,13 @@ impl OvMoeEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        let inflight = Arc::clone(&self.inflight);
+        let _end = crate::one_shot::EndInflight(Arc::clone(&inflight));
+        if inflight.begin(&task.task_id) {
+            info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            return vec![(task.task_id, chunk)];
+        }
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
         let Some(tok) = self.tokenizer.as_ref() else {
@@ -4144,52 +4161,97 @@ impl OvMoeEngine {
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
         // Warm-resume + capture via the prefix cache (Issue-34 Phase 2). Disabled cache ⇒
-        // byte-identical to a plain `generate`. On a fresh prompt, `_cached` is the prompt's KV
-        // snapshot — mirror it into the lock-free holder so a cross-chain GET can serve this prefix.
+        // byte-identical to a plain `generate`. On a fresh prompt the runner returns the prompt's KV
+        // snapshot, mirrored below into the lock-free holder.
         let cache_opt: Option<&mut crate::ov_kv_cache::OvMoeKvPrefixCache> =
             if self.kv_prefix_cache.enabled() {
                 Some(&mut self.kv_prefix_cache)
             } else {
                 None
             };
-        let (generated, _cached) =
-            match self
-                .runner
-                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
-            {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
-                    return vec![(
-                        task.task_id.clone(),
-                        Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
-                    )];
-                }
-            };
+        // M18: polled before each prefill and decode token. The stop check
+        // decodes the newest tokens exactly as the final decode below does
+        // (same tokenizer, skip_special_tokens), so its text is a substring of
+        // the returned text (D8).
+        let mut poll = crate::one_shot::OneShotPoll::new(
+            &inflight,
+            &task.sampling.stop,
+            self.engine_stop_check,
+            |ids: &[u32]| tok.decode(ids, true).ok(),
+        );
+        let generated = self.runner.generate_with_cache_polled(
+            &prompt_ids,
+            max_new,
+            &sampling_cfg,
+            cache_opt,
+            &mut |ids| poll.should_stop(ids),
+        );
+        let stopped_on_match = poll.stopped_on_match();
+        drop(poll);
+        // On a fresh prompt the runner hands back the snapshot it inserted;
+        // mirror it into the lock-free holder so a cross-chain GET can serve
+        // this prefix. It is a complete prefill even when the task was then
+        // cancelled or stopped in decode (a prefill stop returns none).
         #[cfg(feature = "kv_coord")]
-        if let Some(snap) = _cached {
+        if let Ok((_, Some(snap))) = &generated {
             let fp = self.runner.fingerprint();
             let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
             self.kv_share
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .prefix
-                .insert(prompt64, &fp, snap);
+                .insert(prompt64, &fp, snap.clone());
         }
+        if inflight.cancelled() {
+            // Also when generate failed after the cancel (M18 D4).
+            info!(
+                task = %task.task_id,
+                tokens = generated.as_ref().map_or(0, |(g, _)| g.len()),
+                elapsed_s = started.elapsed().as_secs_f64(),
+                "task cancelled"
+            );
+            let chunk = crate::one_shot::cancelled_chunk(&task.task_id);
+            return vec![(task.task_id, chunk)];
+        }
+        let generated = match generated {
+            Ok((g, _)) => g,
+            Err(e) => {
+                warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
+                )];
+            }
+        };
         let n_tokens = generated.len() as u32;
+        // The returned text is this decode, unprocessed: no D8 raw/visible
+        // fallback is needed after a stop.
         let text = tok.decode(&generated, true).unwrap_or_default();
         let elapsed = started.elapsed().as_secs_f64();
-        info!(
-            task = %task.task_id,
-            tokens = n_tokens,
-            elapsed_s = elapsed,
-            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
-            "task done (MiniMax-M2 single-stage)"
-        );
+        if stopped_on_match {
+            info!(
+                task = %task.task_id,
+                tokens = n_tokens,
+                elapsed_s = elapsed,
+                "task stopped at stop string"
+            );
+        } else {
+            info!(
+                task = %task.task_id,
+                tokens = n_tokens,
+                elapsed_s = elapsed,
+                tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+                "task done (MiniMax-M2 single-stage)"
+            );
+        }
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
         chunk.prompt_tokens = Some(prompt_ids.len() as u32);
-        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+        chunk.finish_reason = Some(if stopped_on_match {
+            FinishReason::Stop
+        } else {
+            finish_reason_for(n_tokens as usize, max_new)
+        });
         vec![(task.task_id.clone(), chunk)]
     }
 
@@ -5178,6 +5240,15 @@ impl Engine for OvMoeEngine {
             self.active_ov = None;
         }
         self.pending.retain(|t| &t.task_id != task_id);
+        // A running single-stage task is ended through `inflight` (signalled
+        // by the runner for this id too); a queued one will now never begin.
+        self.inflight.forget(task_id);
+    }
+
+    /// Single-stage only (M18), as for `SparseMoEEngine`: the multi-stage
+    /// driver already ends at the next token through [`Engine::cancel`].
+    fn inflight_cancel(&self) -> Option<Arc<cascadia_engine::InflightCancel>> {
+        (self.total == 1).then(|| Arc::clone(&self.inflight))
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {

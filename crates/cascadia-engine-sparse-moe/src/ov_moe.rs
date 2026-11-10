@@ -882,7 +882,28 @@ impl OvMoeRunner {
         prompt_ids: &[u32],
         max_new: usize,
         cfg: &SamplingConfig,
+        cache: Option<&mut OvMoeKvPrefixCache>,
+    ) -> Result<(Vec<u32>, Option<OvMoeKvSnapshot>), OvMoeError> {
+        self.generate_with_cache_polled(prompt_ids, max_new, cfg, cache, &mut |_| false)
+    }
+
+    /// [`Self::generate_with_cache`] that can end early (M18 D3). `should_stop`
+    /// gets the tokens generated so far and returns `true` to stop. It is
+    /// polled before each prefill token's forward (with no tokens yet) and
+    /// before each decode token's forward. On a stop the tokens so far are
+    /// returned (`Ok`), so the bound is one token.
+    ///
+    /// A stop during prefill returns `(vec![], None)` at once and never touches
+    /// the prefix cache: no insert and no snapshot for the caller to mirror, so
+    /// a partial KV is never stored under the full prompt key. A stop after
+    /// prefill completed keeps the snapshot it inserted.
+    pub fn generate_with_cache_polled(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
         mut cache: Option<&mut OvMoeKvPrefixCache>,
+        should_stop: &mut dyn FnMut(&[u32]) -> bool,
     ) -> Result<(Vec<u32>, Option<OvMoeKvSnapshot>), OvMoeError> {
         if prompt_ids.is_empty() || max_new == 0 {
             return Ok((Vec::new(), None));
@@ -917,6 +938,11 @@ impl OvMoeRunner {
                 pos += 1;
                 continue;
             }
+            if should_stop(&[]) {
+                // Before the insert below: nothing of this partial prefill is
+                // cached or handed back for the holder mirror.
+                return Ok((Vec::new(), None));
+            }
             logits = self.step_logits(t, pos)?;
             pos += 1;
         }
@@ -948,6 +974,9 @@ impl OvMoeRunner {
             out.push(next);
             history.push(next as i64);
             if out.len() >= max_new || eos.contains(&next) {
+                break;
+            }
+            if should_stop(&out) {
                 break;
             }
             logits = self.step_logits(next, pos)?;
