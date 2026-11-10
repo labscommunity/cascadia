@@ -2044,6 +2044,9 @@ const TOOL_CALL_OPEN: &str = "<tool_call>";
 /// Llama-3.1's explicit whole-output tool-call marker.
 const PYTHON_TAG: &str = "<|python_tag|>";
 
+/// Opening of a Markdown code fence, which may wrap a forced call array.
+const CODE_FENCE: &str = "```";
+
 /// Incremental content/tool-call split for a streamed chat reply with tools
 /// active. Fed the same translated text the non-streaming path accumulates,
 /// it releases every byte that can no longer become part of a tool call and
@@ -2055,7 +2058,9 @@ const PYTHON_TAG: &str = "<|python_tag|>";
 /// * from the scan start, while the first non-whitespace text there is
 ///   undecided or starts a whole-output call (`{`, `[`, `<|python_tag|>` or
 ///   a prefix of it) — the bare-JSON / Llama-3.1 dialects parse the whole
-///   scan text, so none of it is content until the reply ends;
+///   scan text, so none of it is content until the reply ends; when a tool
+///   grammar was sent, also while it starts a code fence (```), which the
+///   forced-shape reader takes as a call when the engine dropped the grammar;
 /// * otherwise from the first `<tool_call>`, or from a trailing proper
 ///   prefix of it (a marker split across chunks).
 ///
@@ -2075,6 +2080,8 @@ struct ToolStreamSplitter {
     /// only whitespace has arrived). Advanced per feed, so a long leading
     /// whitespace run is scanned once, not on every feed.
     lead: usize,
+    /// A tool grammar was sent: a fenced call array is read as a call.
+    grammar_sent: bool,
 }
 
 /// The decision at the end of a tools-active stream; `T` is what the
@@ -2089,7 +2096,7 @@ enum ToolStreamEnd<'a, T> {
 }
 
 impl ToolStreamSplitter {
-    fn new(enable_thinking: bool) -> Self {
+    fn new(enable_thinking: bool, grammar_sent: bool) -> Self {
         Self {
             buf: String::new(),
             emitted: 0,
@@ -2097,6 +2104,7 @@ impl ToolStreamSplitter {
             scan_start: 0,
             think_from: enable_thinking.then_some(0),
             lead: 0,
+            grammar_sent,
         }
     }
 
@@ -2163,6 +2171,7 @@ impl ToolStreamSplitter {
             || lead.starts_with(['{', '['])
             || lead.starts_with(PYTHON_TAG)
             || PYTHON_TAG.starts_with(lead)
+            || (self.grammar_sent && (lead.starts_with(CODE_FENCE) || CODE_FENCE.starts_with(lead)))
         {
             return start;
         }
@@ -3460,7 +3469,7 @@ async fn stream_completion(
                 _inflight: inflight,
             },
             marker: state.marker_dialect.clone().map(MarkerFilter::new),
-            splitter: ToolStreamSplitter::new(enable_thinking),
+            splitter: ToolStreamSplitter::new(enable_thinking, tools.grammar_sent),
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
             held_tokens: 0,
@@ -7520,7 +7529,7 @@ level={{ effort_map[eff] }}";
     /// Feed every piece but the last, finish with the last. Returns each
     /// released content piece (the finish content last) and parsed calls.
     fn run_splitter(pieces: &[&str], thinking: bool) -> (Vec<String>, Option<Vec<ToolCall>>) {
-        let mut s = ToolStreamSplitter::new(thinking);
+        let mut s = ToolStreamSplitter::new(thinking, false);
         let (last, body) = pieces.split_last().unwrap();
         let mut out: Vec<String> = body.iter().map(|p| s.feed(p).to_owned()).collect();
         match s.finish(last, parse_tool_calls) {
@@ -10557,20 +10566,24 @@ level={{ effort_map[eff] }}";
     /// (`id`, `created`, call ids) replaced by fixed ones.
     fn normalised_events(body: &str) -> Vec<Value> {
         let mut events = sse_events(body);
+        // Read with `get_mut` only: indexing a missing key would insert it.
         for e in &mut events {
-            if e.get("id").is_some() {
-                e["id"] = Value::from("ID");
+            if let Some(id) = e.get_mut("id") {
+                *id = Value::from("ID");
             }
-            if e.get("created").is_some() {
-                e["created"] = Value::from(0);
+            if let Some(created) = e.get_mut("created") {
+                *created = Value::from(0);
             }
-            let calls = e["choices"]
-                .as_array_mut()
+            let calls = e
+                .get_mut("choices")
+                .and_then(Value::as_array_mut)
                 .and_then(|cs| cs.first_mut())
-                .and_then(|c| c["delta"]["tool_calls"].as_array_mut());
+                .and_then(|c| c.get_mut("delta"))
+                .and_then(|d| d.get_mut("tool_calls"))
+                .and_then(Value::as_array_mut);
             for c in calls.into_iter().flatten() {
-                if c.get("id").is_some() {
-                    c["id"] = Value::from("CALL");
+                if let Some(id) = c.get_mut("id") {
+                    *id = Value::from("CALL");
                 }
             }
         }
@@ -10883,5 +10896,33 @@ level={{ effort_map[eff] }}";
         assert!(streamed_calls(&events).is_empty(), "{events:?}");
         assert_eq!(streamed_content(&events), text);
         assert_eq!(streamed_finishes(&events), ["stop"]);
+    }
+    #[tokio::test]
+    async fn streamed_fenced_forced_call_under_a_dropped_grammar_is_one_call() {
+        // The engine ignored the call grammar and fenced the call array:
+        // the non-streamed reply reads it as a call, so the stream must
+        // hold it rather than release it live as content.
+        let text = "```json\n[{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Paris\"}}]\n```";
+        let body = tool_body(
+            serde_json::json!([city_tool("get_weather")]),
+            serde_json::json!({"tool_choice": "required"}),
+        );
+        let app = scripted_app(text, cascadia_types::FinishReason::Stop).await;
+        let (status, v) = post_chat(app, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(call_names(&v), ["get_weather"], "{v}");
+        assert!(v["choices"][0]["message"]["content"].is_null(), "{v}");
+        let app = scripted_app(text, cascadia_types::FinishReason::Stop).await;
+        let events = stream_events(app, body).await;
+        let calls = streamed_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap())
+                .unwrap(),
+            serde_json::json!({"city": "Paris"})
+        );
+        assert_eq!(streamed_content(&events), "", "{events:?}");
+        assert_eq!(streamed_finishes(&events), ["tool_calls"]);
     }
 }

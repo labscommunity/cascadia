@@ -36,9 +36,7 @@
       "choices": [
         {
           "index": 0,
-          "delta": {
-            "tool_calls": null
-          },
+          "delta": {},
           "finish_reason": "tool_calls"
         }
       ]
@@ -57,8 +55,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "[{\"function\": {\"name\": \"get_weather\"}, \"type\": \"function\"}, {\"function\": {\"name\": \"get_time\"}, \"type\": \"function\"}]user: hello there ",
-            "tool_calls": null
+            "content": "[{\"function\": {\"name\": \"get_weather\"}, \"type\": \"function\"}, {\"function\": {\"name\": \"get_time\"}, \"type\": \"function\"}]user: hello there "
           },
           "finish_reason": "stop"
         }
@@ -90,8 +87,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "[{\"function\": ",
-            "tool_calls": null
+            "content": "[{\"function\": "
           },
           "finish_reason": null
         }
@@ -109,8 +105,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "{\"name\": ",
-            "tool_calls": null
+            "content": "{\"name\": "
           },
           "finish_reason": null
         }
@@ -128,8 +123,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "\"get_weather\"}, ",
-            "tool_calls": null
+            "content": "\"get_weather\"}, "
           },
           "finish_reason": null
         }
@@ -147,8 +141,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "\"type\": ",
-            "tool_calls": null
+            "content": "\"type\": "
           },
           "finish_reason": null
         }
@@ -166,8 +159,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "\"function\"}, ",
-            "tool_calls": null
+            "content": "\"function\"}, "
           },
           "finish_reason": null
         }
@@ -185,8 +177,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "{\"function\": ",
-            "tool_calls": null
+            "content": "{\"function\": "
           },
           "finish_reason": null
         }
@@ -204,8 +195,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "{\"name\": ",
-            "tool_calls": null
+            "content": "{\"name\": "
           },
           "finish_reason": null
         }
@@ -223,8 +213,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "\"get_time\"}, ",
-            "tool_calls": null
+            "content": "\"get_time\"}, "
           },
           "finish_reason": null
         }
@@ -242,8 +231,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "\"type\": ",
-            "tool_calls": null
+            "content": "\"type\": "
           },
           "finish_reason": null
         }
@@ -261,8 +249,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "\"function\"}]user: ",
-            "tool_calls": null
+            "content": "\"function\"}]user: "
           },
           "finish_reason": null
         }
@@ -280,8 +267,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call> ",
-            "tool_calls": null
+            "content": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call> "
           },
           "finish_reason": null
         }
@@ -299,8 +285,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "",
-            "tool_calls": null
+            "content": ""
           },
           "finish_reason": "stop"
         }
@@ -353,9 +338,7 @@
       "choices": [
         {
           "index": 0,
-          "delta": {
-            "tool_calls": null
-          },
+          "delta": {},
           "finish_reason": "tool_calls"
         }
       ]
@@ -386,8 +369,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "user: ",
-            "tool_calls": null
+            "content": "user: "
           },
           "finish_reason": null
         }
@@ -405,8 +387,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call> ",
-            "tool_calls": null
+            "content": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call> "
           },
           "finish_reason": null
         }
@@ -424,8 +405,7 @@
           "index": 0,
           "delta": {
             "role": "assistant",
-            "content": "",
-            "tool_calls": null
+            "content": ""
           },
           "finish_reason": "stop"
         }
