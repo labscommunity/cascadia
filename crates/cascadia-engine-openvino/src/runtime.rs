@@ -2434,7 +2434,8 @@ fn warm_abort_needed(active: Option<&mut ActiveTask>, ok: bool) -> bool {
 /// row of a grammar slot, `None` when no row is masked (today's plan frame).
 /// A grammar slot that can't be masked — the link is latched (`refused`), or
 /// its grammar hit a dead end — comes back with its error, for the caller to
-/// fail alone.
+/// fail alone; on a latched link a best-effort slot drops its grammar and
+/// its row goes unmasked instead.
 fn packed_step_masks(
     slots: &mut [Option<crate::packed_exec::PackedSlot>],
     sampled: &[(usize, usize)],
@@ -2445,11 +2446,23 @@ fn packed_step_masks(
     let mut masks: PlanMasks = vec![None; rows];
     let mut failed = Vec::new();
     for &(row, slot) in sampled {
-        let Some(grammar) = slots
-            .get_mut(slot)
-            .and_then(|s| s.as_mut())
-            .and_then(|s| s.grammar.as_mut())
-        else {
+        let Some(packed) = slots.get_mut(slot).and_then(|s| s.as_mut()) else {
+            continue;
+        };
+        // A best-effort slot admitted before the latch tripped (its probe
+        // or a sibling's went unanswered) runs unmasked from here, as one
+        // admitted after it would; only a strict one fails.
+        if refused
+            && packed.grammar.is_some()
+            && structured::drop_best_effort_grammar(
+                &mut packed.task,
+                cascadia_metrics::UnenforcedReason::StageUnsupported,
+            )
+        {
+            packed.grammar = None;
+            continue;
+        }
+        let Some(grammar) = packed.grammar.as_mut() else {
             continue;
         };
         let words = match width {
@@ -10656,6 +10669,30 @@ mod tests {
         let narrow: Result<usize, String> = Ok(256);
         let (masks, failed) = packed_step_masks(&mut slots, &[(0, 0)], 1, &narrow, false);
         assert!(masks.is_none() && failed.len() == 1);
+    }
+
+    /// A best-effort slot admitted before the latch tripped (a second
+    /// forced request in the same packed step, whose probe went unanswered)
+    /// is not failed by the latch: its grammar is dropped and its row goes
+    /// unmasked. A strict slot still fails with the upgrade error.
+    #[test]
+    fn a_latched_link_drops_a_best_effort_slots_grammar_instead_of_failing_it() {
+        let width: Result<usize, String> = Ok(test_factory().mask_width());
+        let mut soft = packed_slot(Some(test_mask(OK_ENUM, "")));
+        soft.task.grammar = Some(cascadia_types::GrammarSpec::best_effort_json_schema(
+            OK_ENUM,
+        ));
+        let dropped = soft.task.grammar_dropped.clone();
+        let mut strict = packed_slot(Some(test_mask(OK_ENUM, "")));
+        strict.task.grammar = Some(cascadia_types::GrammarSpec::json_schema(OK_ENUM));
+        let mut slots = vec![Some(soft), Some(strict)];
+        let (masks, failed) = packed_step_masks(&mut slots, &[(0, 0), (1, 1)], 2, &width, true);
+        assert_eq!(masks, None, "no row is masked");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].0, 1);
+        let soft = slots[0].as_ref().unwrap();
+        assert!(soft.grammar.is_none() && soft.task.grammar.is_none());
+        assert!(dropped.get());
     }
 
     /// The relay side of a packed masked plan: `relay_downstream_answer`
