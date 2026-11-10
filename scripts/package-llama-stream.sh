@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Package a patched SYCL llama-server build into a release tarball.
 #
-# Usage: scripts/package-llama-stream.sh BUILD_DIR OUT_TARBALL
+# Usage: scripts/package-llama-stream.sh BUILD_DIR OUT_TARBALL [--no-run-check]
 #   BUILD_DIR    the DEST passed to build-llama-stream.sh (contains build/bin)
 #   OUT_TARBALL  e.g. cascadia-llama-sycl-linux-x86_64-v0.3.0.tar.gz
+#   --no-run-check  skip the staged-server run. Use it only on a builder with
+#                no Intel GPU (hosted CI): the SYCL runtime aborts at startup
+#                when it finds no device, even for --version. The relocation
+#                ldd checks still run.
 #
 # Run in the oneAPI environment used to build the server. Requires patchelf,
 # readelf and ldd. The selected SYCL runtime's dlopened UR/legacy PI plugins
@@ -20,6 +24,14 @@ BIN_DIR="$(realpath "$BUILD_DIR/build/bin")"
 SERVER="$BIN_DIR/llama-server"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
+
+NO_RUN_CHECK=0
+for arg in "${@:3}"; do
+    case "$arg" in
+        --no-run-check) NO_RUN_CHECK=1 ;;
+        *) fail "unknown option: $arg" ;;
+    esac
+done
 [ -x "$SERVER" ] || fail "$SERVER missing — run build-llama-stream.sh first"
 for tool in patchelf readelf ldd; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is required for a relocatable bundle"
@@ -88,6 +100,11 @@ inspect_dependencies() {
     fi
     while IFS= read -r line; do
         if [[ "$line" == *"=> not found"* ]]; then
+            # Host libraries are destination-provided, so a packaging box
+            # without the GPU stack (a CI runner) must not fail here.
+            missing="${line%%=> not found*}"
+            missing="${missing//[[:space:]]/}"
+            is_host_library "$missing" && continue
             fail "unresolved dependency in $file: $line"
         fi
         if [[ "$line" =~ ^[[:space:]]*([^[:space:]]+)[[:space:]]+\=\>[[:space:]]+(.*)[[:space:]]+\(0x[[:xdigit:]]+\) ]]; then
@@ -152,7 +169,12 @@ done
 
 # Exercise the staged executable, not the working build. The clean loader
 # environment must also work for plugin loading performed by --version.
-if ! env -u LD_LIBRARY_PATH -u LD_PRELOAD "$PKG/llama-server" --version > "$PKG/VERSION.txt" 2>&1; then
+# A builder without an Intel GPU cannot run it: the SYCL runtime throws
+# "No device of requested type available" before --version is handled, so CI
+# passes --no-run-check and gets the relocation checks above only.
+if [ "$NO_RUN_CHECK" = 1 ]; then
+    echo "run check skipped (--no-run-check): no staged-server run without a GPU device"
+elif ! env -u LD_LIBRARY_PATH -u LD_PRELOAD "$PKG/llama-server" --version > "$PKG/VERSION.txt" 2>&1; then
     cat "$PKG/VERSION.txt" >&2
     fail "relocated llama-server --version failed"
 fi
