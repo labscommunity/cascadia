@@ -10958,11 +10958,17 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// Held by every test that asserts an exact `schema_rejected` delta:
+    /// the counter is process-wide, and tests run in parallel. A test that
+    /// only needs a rejection checks `tool_schema`, which counts nothing.
+    static SCHEMA_REJECTED_COUNTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// The relaxed tool's `schema_rejected` is counted once the answer is
     /// in, and only when the engine kept the grammar: an engine that drops
     /// it counts its own reason, and the relaxed schema was never enforced.
     #[tokio::test]
     async fn a_relaxed_tool_is_counted_only_when_the_engine_kept_the_grammar() {
+        let _counter = SCHEMA_REJECTED_COUNTER.lock().await;
         let rejected = || {
             cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
                 .with_label_values(&[cascadia_metrics::UnenforcedReason::SchemaRejected.as_str()])
@@ -10997,7 +11003,8 @@ level={{ effort_map[eff] }}";
 
     #[tokio::test]
     async fn a_tool_bound_pair_no_value_can_meet_is_dropped_before_the_engine() {
-        // One test, run in order: the counter is process-wide.
+        let _counter = SCHEMA_REJECTED_COUNTER.lock().await;
+        // One test, run in order, under the counter's lock.
         let rejected = || {
             cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
                 .with_label_values(&[cascadia_metrics::UnenforcedReason::SchemaRejected.as_str()])

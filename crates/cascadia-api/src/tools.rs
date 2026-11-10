@@ -1777,11 +1777,15 @@ mod tests {
         // Forwarded as written, but no grammar for the turn.
         assert_eq!(p.tools[1].function["parameters"], split);
         assert!(p.relaxed.is_empty());
+        // `tool_schema`, not `tool_grammar`: the latter counts
+        // `schema_rejected`, which other tests assert exactly.
         assert_eq!(tool_schema(&p, None), Err(UnenforcedReason::SchemaRejected));
-        assert!(tool_grammar(&p, None).is_none());
         // Beside a JSON format under auto, too.
         let p = pol(t.clone(), None, None);
-        assert!(tool_grammar(&p, Some(JSON_OBJECT_SCHEMA)).is_none());
+        assert_eq!(
+            tool_schema(&p, Some(JSON_OBJECT_SCHEMA)),
+            Err(UnenforcedReason::SchemaRejected)
+        );
         // Left out by a named choice or allowed_tools: not checked.
         let named = json!({"type": "function", "function": {"name": "get_weather"}});
         assert!(tool_grammar(&pol(t.clone(), Some(named), None), None).is_some());
