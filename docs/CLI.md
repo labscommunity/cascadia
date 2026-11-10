@@ -974,8 +974,10 @@ function form with arguments `{"input": …}`.
 
 Gemma 4's own tool-call syntax
 (`<|tool_call>call:NAME{key:<|"|>text<|"|>,…}<tool_call|>`) is parsed into
-`tool_calls`. `ov-runtime`, `gemma4` and `ov-dist-spec` keep those three
-marker tokens when decoding a model whose vocabulary has them, and
+`tool_calls`. `ov-runtime`, `gemma4`, `ov-dist-spec` and `ov-genai` keep
+those three marker tokens when decoding a model whose vocabulary has them
+(`ov-genai` in continuous batching and for stateful and VLM-layout exports
+such as `OpenVINO/gemma-4-E2B-it-int4-ov`, checked end to end on Linux), and
 `sycl-llama` gets Gemma 4 calls back from llama-server already parsed. The
 markers never appear in `content`, with or without tools.
 
