@@ -198,7 +198,7 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~130 KB per context token as serialised (1.2 GB at 8 K, 4.45 GB at 32 K). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
-| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions`, `/v1/completions` or `/v1/responses` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. A prompt that fits this cap but not the model's window is a 400 `context_length_exceeded` (as OpenAI does), not a 413, on every engine that checks the window (`qwen35`, `gemma4`, `ov-genai`, `ov-runtime`, `ov-dist-spec`); `sparse-moe` instead drops the prompt's newest tokens past its context budget (with a warning in the log), and `sycl-llama` never refuses one. See [API errors](#api-errors). A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
+| `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions`, `/v1/completions` or `/v1/responses` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. A prompt that fits this cap but not the model's window is a 400 `context_length_exceeded` (as OpenAI does), not a 413, on every engine that checks the window (`qwen35`, `gemma4`, `ov-genai`, `ov-runtime`, `ov-dist-spec`); `sparse-moe` instead drops the prompt's newest tokens past its context budget (with a warning in the log), and `sycl-llama` answers `llama-server`'s own over-window refusal as the same 400 `context_length_exceeded`. See [API errors](#api-errors). A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
 | `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers (each entry may also be a [unix socket](#unix-domain-sockets) `unix:/path.sock`); this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
 | `--ep-worker-index <N>` / `--ep-worker-count <W>` | — | `sparse-moe` (Inkling) expert-parallel **worker**: serve expert shard N of W (experts with `id % W == N`, shared experts included) for every MoE layer on `--listen`; no API, no attention, no sequence state. |
 | `--ov-config <KEY=VALUE>` | — | Raw OV plugin property passthrough, repeatable. See below. |
@@ -539,8 +539,10 @@ Its forms, by what the engine reported (`messages` is the route's prompt field):
 | prompt M only | `This model's maximum context length is exceeded: your messages resulted in M tokens, which exceeds the available context size. Please reduce the length of the messages.` |
 | neither | `This model's maximum context length is exceeded: your messages exceeds the available context size. Please reduce the length of the messages.` |
 
-`sparse-moe` truncates an over-window prompt instead, and `sycl-llama` never
-sends this code.
+`sparse-moe` truncates an over-window prompt instead. `sycl-llama` sends this
+code when `llama-server` refuses the prompt as over its window (with the counts
+when `llama-server` reports them, the "neither" form otherwise); any other
+request `llama-server` refuses is a plain 400 with its message.
 
 **Validated fields.** Ranges are inclusive; a value outside them, or a refused
 field in any form but its no-op one, is a 400 naming the field in `param`.
@@ -588,14 +590,21 @@ the message above), `invalid_prompt` for another refusal of the input, and
 completion fails with a 5xx that points at the pipeline (a peer link dropped,
 the engine not loaded), and 200 again after the next successful completion.
 Errors that are the client's fault never mark it unready. Neither do capacity
-503s, unless requests are in flight and the engine has been stuck inside one
-call (a step, or a request's submit) for 60 s (a peer that stopped answering holds every slot, so every new
-request is a capacity 503); the server is then ready again as soon as the
-engine produces output. Clients that open streams and leave them unread do
-not count as a stall: the engine only steps while a stream is read. On engines
-that run a whole answer as one call (`ov-genai` without `--cb`, single-stage
-`sparse-moe`), an answer that takes longer than 60 s while further requests are
-refused for capacity also marks the server unready until that answer ends.
+503s, unless requests are in flight and the pipeline is stalled: the engine has
+been inside one call (a step, or a request's submit) for more than 60 s, or it
+keeps stepping but has produced no real output (a token or a final answer; a
+progress marker or a failed step does not count) for more than 60 s. A peer
+that stops answering does either: the step waiting on it hangs, or times out
+and fails, while its requests hold every slot, so every new request is a
+capacity 503. The server is then ready again as soon as the engine produces
+real output, with no new request needed. Clients that open streams and leave
+them unread never count as a stall: the engine only steps while a stream is
+read, and time it spent idle before a burst of requests is not counted. Any
+engine call longer than 60 s counts while every slot is full, whatever the
+engine: an engine that runs a whole answer as one call (`ov-genai` without
+`--cb`, single-stage `sparse-moe`), or a long prompt's prefill that runs as a
+single step or as steps that only report progress, marks the server unready if
+further requests are refused for capacity meanwhile, until it produces output.
 
 ---
 
