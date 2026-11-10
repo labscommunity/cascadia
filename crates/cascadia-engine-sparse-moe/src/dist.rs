@@ -3226,6 +3226,13 @@ impl OwedLateReply {
     pub fn take_acked(&self) -> bool {
         self.acked.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Whether an acknowledged late reply was read and not yet taken (tests:
+    /// the idle-link keeper may read it before a request does).
+    #[cfg(test)]
+    pub fn has_acked(&self) -> bool {
+        self.acked.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// One reply frame off an idle link, under the caller's lock: its status

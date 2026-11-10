@@ -12478,7 +12478,7 @@ mod tests {
                 .send(&encode_token_reply(MASK_PROBE_OK_TOKEN, seq, true))
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            until_readable(&downstream).await;
             drain_late_replies(&downstream, &mut link).await;
             assert!(
                 link.refusal(std::time::Instant::now()).is_none(),
@@ -12497,7 +12497,7 @@ mod tests {
             .send(&encode_token_reply(MASK_MISS_TOKEN, 1, true))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        until_readable(&downstream).await;
         drain_late_replies(&downstream, &mut link).await;
         assert!(link.refusal(std::time::Instant::now()).is_some());
     }
@@ -12543,7 +12543,7 @@ mod tests {
                     .await
                     .unwrap();
             });
-            std::thread::sleep(Duration::from_millis(20));
+            wait_readable(&rt, &downstream);
             assert!(
                 latched_refusal(rt.handle(), Some(&downstream), &mut link).is_none(),
                 "{i}: the late answer unlatched the link"
@@ -12562,8 +12562,27 @@ mod tests {
             let _ = link.on_probe_unanswered(now, &EngineError::Backend("silence".into()));
             (Arc::new(tokio::sync::Mutex::new(client)), link)
         });
-        std::thread::sleep(Duration::from_millis(20));
+        wait_readable(&rt, &downstream);
         assert!(latched_refusal(rt.handle(), Some(&downstream), &mut link).is_some());
+    }
+
+    /// Until the runtime has seen bytes on `downstream`, so the head's
+    /// zero-budget drain finds them however loaded the machine is.
+    async fn until_readable(downstream: &Arc<tokio::sync::Mutex<ActivationClient>>) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            downstream.lock().await.wait_readable().await
+        })
+        .await
+        .expect("the reply reached the head")
+        .unwrap();
+    }
+
+    /// [`until_readable`] from a plain thread.
+    fn wait_readable(
+        rt: &tokio::runtime::Runtime,
+        downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    ) {
+        rt.block_on(until_readable(downstream));
     }
 
     /// A probe's own replies: an unacknowledged answer for its seq latches;

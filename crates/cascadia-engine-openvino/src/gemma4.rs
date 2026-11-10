@@ -5032,6 +5032,15 @@ mod tests {
         assert!(fastest < Duration::from_micros(500), "{fastest:?}");
     }
 
+    /// Until the runtime has seen bytes on `c`, so a drain that looks
+    /// without waiting finds them however loaded the machine is.
+    async fn until_readable(c: &ActivationClient) {
+        tokio::time::timeout(Duration::from_secs(30), c.wait_readable())
+            .await
+            .expect("the reply reached this end")
+            .unwrap();
+    }
+
     /// The drain before a masked step doesn't wait: a reply that landed
     /// while the stage computed is drained, and an empty link returns at once.
     /// The thread sleeps instead of awaiting, so the I/O driver doesn't run
@@ -5177,7 +5186,7 @@ mod tests {
             .send(&encode_masked_reply(StageReply::Nack))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        until_readable(&client).await;
         assert!(drain_late_replies(&mut client).await.unwrap());
         assert!(!drain_late_replies(&mut client).await.unwrap());
         server.send(&encode_token_reply(19)).await.unwrap();
@@ -5467,7 +5476,7 @@ mod tests {
             .send(&encode_masked_reply(StageReply::Token(5)))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        until_readable(&down).await;
         let words = ok_words();
         let (hidden, shape) = sample_hidden();
         let (tags, cross) = sample_cross();
@@ -5515,7 +5524,7 @@ mod tests {
             .send(&encode_masked_reply(StageReply::Token(5)))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        until_readable(&client).await;
         let words = ok_words();
         let tail = tokio::spawn(async move {
             new_tail_step(&mut server).await;
@@ -6385,7 +6394,7 @@ mod tests {
             up.send(&encode_masked_reply(StageReply::ProbeOk))
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            until_readable(&head).await;
             assert!(
                 drain_late_replies(&mut head).await.unwrap(),
                 "{i}: the late answer"

@@ -826,17 +826,84 @@ fn fixture_tail_with(
     old: bool,
     forget: bool,
 ) -> Arc<TailLog> {
-    fixture_tail_full(rt, srv, old, forget, Duration::ZERO)
+    fixture_tail_full(rt, srv, old, forget, None)
 }
 
-/// [`fixture_tail_with`]; a new stage answers its first mask-support probe
-/// only after `probe_delay` (a slow but new stage).
+/// A slow but new stage's answer to its first mask-support probe, held
+/// until the test lets it go: the answer lands after the head gave up, with
+/// no wall-clock window a loaded machine could stretch.
+struct LateProbe {
+    release: tokio::sync::oneshot::Receiver<()>,
+    sent: std::sync::mpsc::Sender<()>,
+}
+
+/// The test's end of a [`LateProbe`].
+struct LateProbeCtl {
+    release: tokio::sync::oneshot::Sender<()>,
+    sent: std::sync::mpsc::Receiver<()>,
+}
+
+impl LateProbeCtl {
+    /// Let the held answer go, and return once it is on the link.
+    fn land(self) {
+        self.release.send(()).expect("the tail is running");
+        self.sent
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the late answer was written");
+    }
+}
+
+fn late_probe() -> (LateProbe, LateProbeCtl) {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+    (
+        LateProbe {
+            release: release_rx,
+            sent: sent_tx,
+        },
+        LateProbeCtl {
+            release: release_tx,
+            sent: sent_rx,
+        },
+    )
+}
+
+/// After [`LateProbeCtl::land`]: wait until the head can see the late
+/// answer, readable on its link (the runtime has seen the bytes, so the
+/// head's 1 ms idle check finds them) or already read by the idle-link
+/// keeper.
+fn wait_late_answer_at_head(
+    rt: &tokio::runtime::Runtime,
+    down: &Arc<TokioMutex<ActivationClient>>,
+    owed: &crate::dist::OwedLateReply,
+) {
+    let t0 = Instant::now();
+    while !owed.has_acked() {
+        let readable = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(10), async {
+                down.lock().await.wait_readable().await
+            })
+            .await
+        });
+        if matches!(readable, Ok(Ok(()))) {
+            return;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "the late answer never reached the head"
+        );
+    }
+}
+
+/// [`fixture_tail_with`]; with `late`, a new stage holds its answer to the
+/// first mask-support probe until the test releases it (a slow but new
+/// stage).
 fn fixture_tail_full(
     rt: &tokio::runtime::Runtime,
     srv: Arc<TokioMutex<ActivationServer>>,
     old: bool,
     forget: bool,
-    probe_delay: Duration,
+    late: Option<LateProbe>,
 ) -> Arc<TailLog> {
     use crate::dist::*;
     let log = Arc::new(TailLog::default());
@@ -862,6 +929,7 @@ fn fixture_tail_full(
             c.words(r).map_or(-1, first_allowed)
         }
     };
+    let mut late = late;
     std::thread::spawn(move || {
         handle.block_on(async move {
             let die = |l: &TailLog| l.died.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -951,10 +1019,12 @@ fn fixture_tail_full(
                             };
                         let (_, _, cols) = step.split(4).unwrap();
                         l.saw(kind, cols.is_some());
+                        let mut written = None;
                         if cols.as_ref().is_some_and(is_mask_probe) {
-                            let n = l.probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            if n == 0 && !probe_delay.is_zero() {
-                                tokio::time::sleep(probe_delay).await;
+                            l.probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(LateProbe { release, sent }) = late.take() {
+                                release.await.expect("the test releases the late answer");
+                                written = Some(sent);
                             }
                         }
                         let cols = cols.map(|c| match kind {
@@ -967,6 +1037,9 @@ fn fixture_tail_full(
                                 send_token_ack_upstream(&srv, t, c.tag(rows - 1), MASK_ACK)
                                     .await
                                     .unwrap();
+                                if let Some(sent) = written {
+                                    sent.send(()).unwrap();
+                                }
                             }
                             None => {
                                 let t = if sample { i64::from(b'a') } else { -1 };
@@ -1730,6 +1803,11 @@ fn a_stream_window_miss_at_the_last_rank_runs_no_layer() {
 /// A short probe wait for tests; the real one is `MASK_PROBE_TIMEOUT`.
 const TEST_PROBE: Duration = Duration::from_millis(80);
 
+/// The wait for a probe a new stage answers at once: the real one, so a
+/// loaded machine can't time it out. (`TEST_PROBE` is for probes that must
+/// go unanswered.)
+const ANSWERED_PROBE: Duration = cascadia_grammar::MASK_PROBE_TIMEOUT;
+
 /// [`head_engine`] with its probe wait and its link keeper's interval set.
 fn head_engine_with(
     rt: &tokio::runtime::Runtime,
@@ -1889,12 +1967,13 @@ fn a_late_probe_answer_clears_the_latch_and_keeps_the_link() {
         for i in 0..20 {
             let rt = runtime();
             let mut l = links(&rt, 1);
-            let late = Duration::from_millis(150);
-            let log = fixture_tail_full(&rt, l[0].0.clone(), false, false, late);
+            let (late, ctl) = late_probe();
+            let log = fixture_tail_full(&rt, l[0].0.clone(), false, false, Some(late));
+            let down = l.remove(0).1;
             let mut head = head_engine_with(
                 &rt,
                 JsonStub::new(),
-                l.remove(0).1,
+                down.clone(),
                 2,
                 streams,
                 TEST_PROBE,
@@ -1905,16 +1984,18 @@ fn a_late_probe_answer_clears_the_latch_and_keeps_the_link() {
             let e = final_chunk(&j1).error.clone().expect("error chunk");
             assert!(e.ends_with(UPGRADE_EVERY_STAGE), "{streams}/{i}: {e}");
             assert!(head.stage_masks.latch.is_set());
-            // The late answer lands; with streams the keeper looks at the
-            // idle link several times meanwhile.
-            std::thread::sleep(late + Duration::from_millis(150));
+            // The late answer lands; with streams the keeper may read it off
+            // the idle link before j2 does.
+            ctl.land();
+            wait_late_answer_at_head(&rt, &down, &head.owed_late);
+            head.mask_probe_timeout = ANSWERED_PROBE;
+            let (j2, _) = timed(&mut head, json_task("j2", 6));
+            assert_eq!(final_chunk(&j2).error, None, "{streams}/{i}");
             assert_eq!(
                 head.link_epoch.load(std::sync::atomic::Ordering::SeqCst),
                 epoch,
                 "{streams}/{i}: no re-dial"
             );
-            let (j2, _) = timed(&mut head, json_task("j2", 6));
-            assert_eq!(final_chunk(&j2).error, None, "{streams}/{i}");
             assert!(!head.stage_masks.latch.is_set());
             assert!(!head.peer_disconnected);
             assert_eq!(
@@ -1937,12 +2018,13 @@ fn a_late_probe_answer_clears_the_latch_and_keeps_the_link() {
 fn a_late_probe_answer_behind_a_running_stream_does_not_refuse_json() {
     let rt = runtime();
     let mut l = links(&rt, 1);
-    let late = Duration::from_millis(150);
-    let log = fixture_tail_full(&rt, l[0].0.clone(), false, false, late);
+    let (late, ctl) = late_probe();
+    let log = fixture_tail_full(&rt, l[0].0.clone(), false, false, Some(late));
+    let down = l.remove(0).1;
     let mut head = head_engine_with(
         &rt,
         JsonStub::new(),
-        l.remove(0).1,
+        down.clone(),
         2,
         3,
         TEST_PROBE,
@@ -1968,7 +2050,9 @@ fn a_late_probe_answer_behind_a_running_stream_does_not_refuse_json() {
     assert!(head.stage_masks.latch.is_set());
     assert_eq!(head.streams.len(), 1, "p1 is running");
     // The late answer is on the link, in front of p1's reply.
-    std::thread::sleep(late + Duration::from_millis(150));
+    ctl.land();
+    wait_late_answer_at_head(&rt, &down, &head.owed_late);
+    head.mask_probe_timeout = ANSWERED_PROBE;
     head.submit(json_task("j2", 6)).unwrap();
     let (out, _) = drive_timeline(&mut head, &["p1", "j2"]);
     assert_eq!(final_chunk(&out["j2"]).error, None);
@@ -2166,14 +2250,15 @@ fn the_sparse_moe_head_clears_its_latch_on_a_late_probe_answer() {
         let rt = runtime();
         let mut l = links(&rt, 1);
         let (srv, down) = l.remove(0);
-        let late = Duration::from_millis(150);
-        let log = fixture_tail_full(&rt, srv, false, false, late);
+        let (late, ctl) = late_probe();
+        let log = fixture_tail_full(&rt, srv, false, false, Some(late));
         let (mut masks, mut evidence) = (StageMasks::default(), false);
         let owed = crate::dist::OwedLateReply::default();
         let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
         assert!(r.is_err(), "{i}");
-        std::thread::sleep(late + Duration::from_millis(100));
-        let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        ctl.land();
+        wait_late_answer_at_head(&rt, &down, &owed);
+        let (r, _) = admit(&rt, &down, ANSWERED_PROBE, &mut masks, &mut evidence, &owed);
         assert_eq!(r, Ok(()), "{i}");
         assert!(!masks.latch.is_set());
         assert!(evidence);
@@ -2195,18 +2280,19 @@ fn a_dequeued_json_task_reads_the_late_probe_answer_before_refusing() {
         let rt = runtime();
         let mut l = links(&rt, 1);
         let (srv, down) = l.remove(0);
-        let late = Duration::from_millis(150);
-        let log = fixture_tail_full(&rt, srv, false, false, late);
+        let (late, ctl) = late_probe();
+        let log = fixture_tail_full(&rt, srv, false, false, Some(late));
         let (mut masks, mut evidence) = (StageMasks::default(), false);
         let owed = crate::dist::OwedLateReply::default();
         let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
         assert!(r.is_err(), "{i}");
         assert!(masks.latch.is_set());
-        std::thread::sleep(late + Duration::from_millis(100));
+        ctl.land();
+        wait_late_answer_at_head(&rt, &down, &owed);
         let r = refuse_dequeued_json(rt.handle(), Some(&down), &mut masks, &owed);
         assert_eq!(r, Ok(()), "{i}: the late answer cleared the latch");
         assert!(!masks.latch.is_set());
-        let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+        let (r, _) = admit(&rt, &down, ANSWERED_PROBE, &mut masks, &mut evidence, &owed);
         assert_eq!(r, Ok(()), "{i}");
         assert_eq!(log.probes(), 2, "{i}");
         assert_eq!(
@@ -2239,7 +2325,7 @@ fn the_sparse_moe_head_re_probes_after_a_minute() {
     assert_eq!(r.unwrap_err(), UPGRADE_EVERY_STAGE);
     assert_eq!(log.probes(), 0);
     masks.latch.set_probe_at(past);
-    let (r, _) = admit(&rt, &down, TEST_PROBE, &mut masks, &mut evidence, &owed);
+    let (r, _) = admit(&rt, &down, ANSWERED_PROBE, &mut masks, &mut evidence, &owed);
     r.unwrap();
     assert_eq!(log.probes(), 1);
 }
