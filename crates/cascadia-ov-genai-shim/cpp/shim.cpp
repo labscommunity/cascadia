@@ -398,8 +398,10 @@ namespace {
 // TextStreamer (built from the pipeline's tokenizer, so the pieces are what
 // ov-genai's own text streaming would print), whose text callback appends to
 // `m_pending`; then it polls Rust once with the pending text and maps the
-// answer to a StreamingStatus. end() flushes the inner streamer and polls once
-// more with the rest.
+// answer to a StreamingStatus. Each poll also carries the number of tokens the
+// write held (1, or the vector's size; 0 for end()). end() flushes the inner
+// streamer and polls once more with the rest, also after a STOP/CANCEL; that
+// answer is ignored.
 //
 // Every entry point holds `m_mu`, and close() (called by the shim when
 // generate returns or throws) sets `m_closed` under it: after close() no call
@@ -418,11 +420,11 @@ public:
           }) {}
 
     ov::genai::StreamingStatus write(int64_t token) override {
-        return feed_and_poll([&] { m_inner.write(token); });
+        return feed_and_poll([&] { m_inner.write(token); }, 1);
     }
 
     ov::genai::StreamingStatus write(const std::vector<int64_t>& tokens) override {
-        return feed_and_poll([&] { m_inner.write(tokens); });
+        return feed_and_poll([&] { m_inner.write(tokens); }, tokens.size());
     }
 
     void end() override {
@@ -441,7 +443,7 @@ public:
             record_error_locked("unknown C++ exception in TextStreamer::end");
             return;
         }
-        poll_locked();
+        poll_locked(0);
     }
 
     // No poll after this returns. Idempotent.
@@ -459,7 +461,7 @@ public:
 
 private:
     template <typename Feed>
-    ov::genai::StreamingStatus feed_and_poll(Feed&& feed) {
+    ov::genai::StreamingStatus feed_and_poll(Feed&& feed, size_t n_tokens) {
         std::lock_guard<std::mutex> lock(m_mu);
         if (m_closed || m_poisoned) return ov::genai::StreamingStatus::CANCEL;
         // Once Rust said STOP / CANCEL, keep saying it without polling again
@@ -474,11 +476,11 @@ private:
             record_error_locked("unknown C++ exception in TextStreamer::write");
             return ov::genai::StreamingStatus::CANCEL;
         }
-        return poll_locked();
+        return poll_locked(n_tokens);
     }
 
-    ov::genai::StreamingStatus poll_locked() {
-        const int32_t rc = m_poll(m_ctx, m_pending.data(), m_pending.size());
+    ov::genai::StreamingStatus poll_locked(size_t n_tokens) {
+        const int32_t rc = m_poll(m_ctx, m_pending.data(), m_pending.size(), n_tokens);
         m_pending.clear();
         ov::genai::StreamingStatus status;
         switch (rc) {

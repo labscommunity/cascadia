@@ -122,9 +122,11 @@ int32_t cascadia_pipeline_generate(
 
 /// Per-token poll for cascadia_pipeline_generate_polled. Called with the text
 /// decoded since the previous call (`len` may be 0; `ptr` is then not to be
-/// read; the bytes may end inside a UTF-8 sequence). Returns one of the
-/// CASCADIA_POLL_* values; anything else is treated as CANCEL.
-typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len);
+/// read; the bytes may end inside a UTF-8 sequence) and `n_tokens`, the
+/// number of tokens that write carried: 1 for write(int64_t), tokens.size()
+/// for write(vector) (draft / prompt-lookup rounds), 0 for the end() flush.
+/// Returns one of the CASCADIA_POLL_* values; anything else is CANCEL.
+typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len, size_t n_tokens);
 
 #define CASCADIA_POLL_RUNNING 0  /* keep generating */
 #define CASCADIA_POLL_STOP 1     /* ov::genai::StreamingStatus::STOP */
@@ -132,11 +134,20 @@ typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len);
 
 /// cascadia_pipeline_generate with a streamer that calls `poll(ctx, ...)` once
 /// per token write (once per round on draft / prompt-lookup pipelines) and
-/// once more from the streamer's end() with the rest of the text. STOP or
-/// CANCEL ends the generation. `poll` may run on an ov-genai worker thread,
-/// but never after this function returns or fails, so `ctx` may live on the
-/// caller's stack. `poll == NULL` is exactly cascadia_pipeline_generate (no
-/// streamer). Works for LLMPipeline and VLMPipeline handles.
+/// once more from the streamer's end() with the rest of the text (n_tokens 0;
+/// this end call also comes after a STOP/CANCEL, and its answer is ignored).
+/// STOP or CANCEL ends the generation. Works for LLMPipeline and VLMPipeline
+/// handles; `poll == NULL` is exactly cascadia_pipeline_generate (no streamer).
+///
+/// Threads: `poll` may run on an ov-genai worker thread (its
+/// ThreadedStreamerWrapper), even for a plain LLMPipeline when ov-genai picks
+/// its paged-attention / continuous-batching backend (ATTENTION_BACKEND), and
+/// always on draft / prompt-lookup; a STOP/CANCEL then takes effect about one
+/// step later. Don't rely on thread-locals in `poll`. It is never called after
+/// this function returns or fails, so `ctx` may live on the caller's stack.
+///
+/// `out_text` is decoded from all generated tokens: after a STOP it holds the
+/// text up to the match plus up to the few tokens the streamer held back.
 int32_t cascadia_pipeline_generate_polled(
     cascadia_pipeline_t* handle,
     const char* prompt,

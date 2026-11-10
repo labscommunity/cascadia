@@ -80,13 +80,13 @@ impl PollAction {
 /// the shim's streamer guarantees no call after `generate` returns or throws.
 #[cfg_attr(not(feature = "openvino"), allow(dead_code))]
 struct PollCtx<'a> {
-    poll: &'a mut (dyn FnMut(&str) -> PollAction + Send + 'a),
+    poll: &'a mut (dyn FnMut(&str, usize) -> PollAction + Send + 'a),
     panicked: bool,
 }
 
 #[cfg_attr(not(feature = "openvino"), allow(dead_code))]
 impl<'a> PollCtx<'a> {
-    fn new(poll: &'a mut (dyn FnMut(&str) -> PollAction + Send + 'a)) -> Self {
+    fn new(poll: &'a mut (dyn FnMut(&str, usize) -> PollAction + Send + 'a)) -> Self {
         Self {
             poll,
             panicked: false,
@@ -99,7 +99,9 @@ impl<'a> PollCtx<'a> {
 }
 
 /// `cascadia_poll_fn`: called by the shim's streamer once per write with the
-/// text decoded since the previous call (`len` may be 0). Decodes the bytes
+/// text decoded since the previous call (`len` may be 0) and the number of
+/// tokens that write carried (`n_tokens`: 1 per token, the round's size on
+/// draft / prompt-lookup, 0 for the end-of-generation flush). Decodes the bytes
 /// lossily (a piece may end inside a UTF-8 sequence), runs the closure and
 /// returns its action. A panic never crosses the FFI edge: it is caught,
 /// latched in `ctx.panicked` and answered with CANCEL; once latched, every
@@ -113,6 +115,7 @@ unsafe extern "C" fn poll_trampoline(
     ctx: *mut std::os::raw::c_void,
     ptr: *const c_char,
     len: usize,
+    n_tokens: usize,
 ) -> i32 {
     if ctx.is_null() {
         return POLL_CANCEL;
@@ -128,9 +131,12 @@ unsafe extern "C" fn poll_trampoline(
     };
     let text = String::from_utf8_lossy(bytes);
     let poll = &mut *ctx.poll;
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll(&text))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll(&text, n_tokens))) {
         Ok(action) => action.to_abi(),
-        Err(_) => {
+        Err(payload) => {
+            // Never drop the payload here: a payload whose Drop panics would
+            // unwind across the FFI edge. Leaking one panic payload is fine.
+            std::mem::forget(payload);
             ctx.panicked = true;
             POLL_CANCEL
         }
@@ -148,8 +154,14 @@ mod sys {
     use std::os::raw::{c_char, c_int, c_void};
 
     /// `cascadia_poll_fn` in `shim.h`; `None` is NULL (no streamer).
-    pub type CascadiaPollFn =
-        Option<unsafe extern "C" fn(ctx: *mut c_void, ptr: *const c_char, len: usize) -> i32>;
+    pub type CascadiaPollFn = Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            ptr: *const c_char,
+            len: usize,
+            n_tokens: usize,
+        ) -> i32,
+    >;
 
     #[repr(C)]
     pub struct cascadia_pipeline_t {
@@ -749,12 +761,25 @@ impl LlmPipeline {
     }
 
     /// [`generate`](Self::generate) with a per-token poll: the shim's
-    /// streamer calls `poll` once per decoded write with the text decoded
-    /// since the last call (possibly empty), and once more at the end with
-    /// the rest. [`PollAction::Stop`] / [`PollAction::Cancel`] end the
-    /// generation (on draft / prompt-lookup pipelines, after the current
-    /// round). The closure may run on an ov-genai worker thread, hence
-    /// `Send`; it is never called after this returns.
+    /// streamer calls `poll(text, n_tokens)` once per decoded write, with the
+    /// text decoded since the last call (possibly empty) and the number of
+    /// tokens that write carried (1, or the round's size on draft /
+    /// prompt-lookup). [`PollAction::Stop`] / [`PollAction::Cancel`] end the
+    /// generation. It is never called after this returns.
+    ///
+    /// - **Threads.** The closure may run on an ov-genai worker thread, even
+    ///   for a plain `LlmPipeline::new`: when ov-genai picks its paged-
+    ///   attention / continuous-batching backend (`ATTENTION_BACKEND`), and
+    ///   always on draft / prompt-lookup, it drives the streamer from a
+    ///   `ThreadedStreamerWrapper` worker, and a Stop/Cancel then takes
+    ///   effect about one step later. Hence `Send`; don't rely on
+    ///   thread-locals or tracing spans inside the closure.
+    /// - **The end flush.** The closure is called once more at the end of the
+    ///   generation, with the held-back rest of the text and `n_tokens` 0,
+    ///   also after it returned Stop/Cancel; that answer is ignored.
+    /// - **The returned text** is decoded from all generated tokens, not
+    ///   built from the pieces: after a Stop it holds the match plus up to
+    ///   the few tokens the text streamer was holding back.
     ///
     /// A panic in `poll` cancels the generation and returns
     /// `Error::Native(POLL_PANICKED)` ([`Error::is_poll_panic`]). A native
@@ -764,7 +789,7 @@ impl LlmPipeline {
         &self,
         _prompt: &str,
         _cfg: &GenConfig,
-        _poll: &mut (dyn FnMut(&str) -> PollAction + Send),
+        _poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
     ) -> Result<GenResult> {
         Err(Error::Stub)
     }
@@ -775,7 +800,7 @@ impl LlmPipeline {
         &self,
         prompt: &str,
         cfg: &GenConfig,
-        poll: &mut (dyn FnMut(&str) -> PollAction + Send),
+        poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
     ) -> Result<GenResult> {
         let prompt_c = cstr(prompt)?;
         let mut ctx = PollCtx::new(poll);
@@ -2295,8 +2320,9 @@ mod tests {
     // ---- polled generate (M18 task 4) ----------------------------------
 
     /// Call the trampoline the way the C++ streamer does: one call per
-    /// write with the pending bytes (len may be 0).
-    fn call_trampoline(ctx: &mut PollCtx<'_>, bytes: &[u8]) -> i32 {
+    /// write with the pending bytes (len may be 0) and the write's token
+    /// count (0 for the end() flush).
+    fn call_trampoline(ctx: &mut PollCtx<'_>, bytes: &[u8], n_tokens: usize) -> i32 {
         let ptr = if bytes.is_empty() {
             ptr::null()
         } else {
@@ -2307,56 +2333,81 @@ mod tests {
                 ctx as *mut PollCtx<'_> as *mut std::os::raw::c_void,
                 ptr,
                 bytes.len(),
+                n_tokens,
             )
         }
     }
 
     #[test]
-    fn poll_trampoline_maps_each_action_to_its_abi_value() {
+    fn poll_trampoline_maps_each_action_and_passes_n_tokens() {
         let mut next = [PollAction::Running, PollAction::Stop, PollAction::Cancel].into_iter();
-        let mut seen: Vec<String> = Vec::new();
-        let mut f = |s: &str| {
-            seen.push(s.to_owned());
+        let mut seen: Vec<(String, usize)> = Vec::new();
+        let mut f = |s: &str, n: usize| {
+            seen.push((s.to_owned(), n));
             next.next().expect("one action per call")
         };
         let mut ctx = PollCtx::new(&mut f);
-        assert_eq!(call_trampoline(&mut ctx, b"a"), POLL_RUNNING);
-        assert_eq!(call_trampoline(&mut ctx, b"b"), POLL_STOP);
-        assert_eq!(call_trampoline(&mut ctx, b"c"), POLL_CANCEL);
+        assert_eq!(call_trampoline(&mut ctx, b"a", 1), POLL_RUNNING);
+        assert_eq!(call_trampoline(&mut ctx, b"bc", 4), POLL_STOP);
+        assert_eq!(call_trampoline(&mut ctx, b"", 0), POLL_CANCEL);
         assert!(!ctx.panicked());
-        assert_eq!(seen, ["a", "b", "c"]);
+        assert_eq!(
+            seen,
+            [
+                ("a".to_owned(), 1),
+                ("bc".to_owned(), 4),
+                (String::new(), 0)
+            ]
+        );
         assert_eq!((POLL_RUNNING, POLL_STOP, POLL_CANCEL), (0, 1, 2));
     }
 
     #[test]
     fn poll_trampoline_panic_returns_cancel_and_latches_panicked() {
         let mut calls = 0u32;
-        let mut f = |_: &str| -> PollAction {
+        let mut f = |_: &str, _: usize| -> PollAction {
             calls += 1;
             panic!("poll closure blew up");
         };
         let mut ctx = PollCtx::new(&mut f);
-        assert_eq!(call_trampoline(&mut ctx, b"x"), POLL_CANCEL);
+        assert_eq!(call_trampoline(&mut ctx, b"x", 1), POLL_CANCEL);
         assert!(ctx.panicked());
         // Latched: a later write is cancelled without re-entering the
         // closure that already panicked.
-        assert_eq!(call_trampoline(&mut ctx, b"y"), POLL_CANCEL);
+        assert_eq!(call_trampoline(&mut ctx, b"y", 1), POLL_CANCEL);
         assert!(ctx.panicked());
         assert_eq!(calls, 1);
+    }
+
+    /// A panic payload whose own Drop panics: dropping it inside the
+    /// trampoline would unwind across the FFI edge (an abort).
+    struct PanicsOnDrop;
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic!("payload drop panicked");
+        }
+    }
+
+    #[test]
+    fn poll_trampoline_never_drops_the_panic_payload() {
+        let mut f = |_: &str, _: usize| -> PollAction { std::panic::panic_any(PanicsOnDrop) };
+        let mut ctx = PollCtx::new(&mut f);
+        assert_eq!(call_trampoline(&mut ctx, b"x", 1), POLL_CANCEL);
+        assert!(ctx.panicked());
     }
 
     #[test]
     fn poll_trampoline_decodes_invalid_utf8_lossily() {
         let mut seen: Vec<String> = Vec::new();
-        let mut f = |s: &str| {
+        let mut f = |s: &str, _: usize| {
             seen.push(s.to_owned());
             PollAction::Running
         };
         let mut ctx = PollCtx::new(&mut f);
         // "h", an invalid lone 0xFF, "i"; then the first 2 of 4 emoji bytes.
-        assert_eq!(call_trampoline(&mut ctx, b"h\xFFi"), POLL_RUNNING);
+        assert_eq!(call_trampoline(&mut ctx, b"h\xFFi", 1), POLL_RUNNING);
         assert_eq!(
-            call_trampoline(&mut ctx, &"\u{1F600}".as_bytes()[..2]),
+            call_trampoline(&mut ctx, &"\u{1F600}".as_bytes()[..2], 1),
             POLL_RUNNING
         );
         assert_eq!(seen, ["h\u{FFFD}i", "\u{FFFD}"]);
@@ -2365,14 +2416,14 @@ mod tests {
     #[test]
     fn poll_trampoline_len_zero_passes_empty_str() {
         let mut seen: Vec<String> = Vec::new();
-        let mut f = |s: &str| {
+        let mut f = |s: &str, _: usize| {
             seen.push(s.to_owned());
             PollAction::Running
         };
         let mut ctx = PollCtx::new(&mut f);
         // Null pointer with len 0 (an empty std::string's data() may be
         // anything; the trampoline must not read it).
-        assert_eq!(call_trampoline(&mut ctx, b""), POLL_RUNNING);
+        assert_eq!(call_trampoline(&mut ctx, b"", 1), POLL_RUNNING);
         // A non-null pointer with len 0.
         let buf = b"zzz";
         let rc = unsafe {
@@ -2380,6 +2431,7 @@ mod tests {
                 &mut ctx as *mut PollCtx<'_> as *mut std::os::raw::c_void,
                 buf.as_ptr() as *const c_char,
                 0,
+                1,
             )
         };
         assert_eq!(rc, POLL_RUNNING);
@@ -2398,7 +2450,7 @@ mod tests {
     fn stub_generate_polled_returns_stub() {
         let pipe = LlmPipeline {};
         let mut calls = 0u32;
-        let mut f = |_: &str| {
+        let mut f = |_: &str, _: usize| {
             calls += 1;
             PollAction::Running
         };
