@@ -1950,6 +1950,15 @@ impl Engine for LlamaCppEngine {
                         ));
                         out.push((tid, c));
                         done = true;
+                        // Silent that long, the child is wedged (for one, in
+                        // a schema conversion, which has no time limit): kill
+                        // it, so the next task respawns a fresh one rather
+                        // than queue behind it.
+                        tracing::warn!(
+                            "llama-server silent for {}s: killing it; the next task respawns it",
+                            STALL_LIMIT.as_secs()
+                        );
+                        self.proc.kill();
                     } else if let Some(tid) = self.active.clone() {
                         out.push((tid.clone(), Chunk::progress(tid)));
                     }
@@ -3281,6 +3290,10 @@ mod unix_tests {
             out[0].1
         );
         assert!(engine.active.is_none());
+        // A child silent that long is wedged (llama-server converting a
+        // schema answers nothing until it is done): it is killed, so the
+        // next task respawns a fresh one instead of waiting on it too.
+        assert!(engine.proc.exited(), "the stalled child must be killed");
         drop(engine);
         server.join().unwrap();
     }
