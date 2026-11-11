@@ -176,6 +176,7 @@ fn check_stream(body: &str, needs_finish: bool) {
             assert!(delta.get("role").is_none(), "role on a later delta: {body}");
         }
     }
+    check_usage_placement(&events, body);
     let ends_in_error = events.last().is_some_and(|e| e["object"] == "error");
     let finishes: Vec<&Value> = chunks
         .iter()
@@ -206,6 +207,59 @@ fn check_stream(body: &str, needs_finish: bool) {
             ]
             .contains(&f.as_str().unwrap_or_default()),
             "finish_reason {f} is not a spec value: {body}"
+        );
+    }
+}
+
+/// `include_usage` placement: the usage chunk (`choices: []`) comes once,
+/// last, with an object; every chunk with choices then has a `usage` key
+/// (null, or the usage so far in continuous mode). Without it no chunk has
+/// the key.
+fn check_usage_placement(events: &[Value], body: &str) {
+    let with_choices: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["object"] != "error")
+        .filter(|e| e["choices"].as_array().is_some_and(|c| !c.is_empty()))
+        .collect();
+    let keyed = with_choices
+        .iter()
+        .filter(|e| e.get("usage").is_some())
+        .count();
+    assert!(
+        keyed == 0 || keyed == with_choices.len(),
+        "usage key on some chunks but not others: {body}"
+    );
+    for e in &with_choices {
+        let u = &e["usage"];
+        assert!(
+            u.is_null() || u.is_object(),
+            "a chunk's usage is neither null nor an object: {body}"
+        );
+    }
+    let usage_chunks: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["choices"].as_array().is_some_and(Vec::is_empty))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        usage_chunks.len() <= 1,
+        "more than one choices-less usage chunk: {body}"
+    );
+    if let Some(&i) = usage_chunks.first() {
+        assert_eq!(
+            i,
+            events.len() - 1,
+            "the usage chunk is not the last chunk before [DONE]: {body}"
+        );
+        assert!(
+            events[i]["usage"].is_object(),
+            "the usage chunk has no usage object: {body}"
+        );
+        assert_eq!(
+            keyed,
+            with_choices.len(),
+            "a chunk before the usage chunk has no usage key: {body}"
         );
     }
 }
@@ -279,6 +333,58 @@ fn assert_stream_spec_rejects_extension_fields_and_repeated_roles() {
         (
             format!("{first}{last}data: [DONE]\n\n{last}"),
             "event after data: [DONE]",
+        ),
+    ];
+    for (body, rule) in bad {
+        let panic = std::panic::catch_unwind(|| assert_stream_spec(&body))
+            .expect_err("a bad stream must fail");
+        let msg = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        assert!(msg.contains(rule), "want {rule:?}, got: {msg}");
+    }
+}
+
+#[test]
+fn assert_stream_spec_checks_usage_placement() {
+    let chunk = |delta: &str, finish: &str, usage: &str| {
+        format!(
+            "data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+             \"model\":\"m\",\"system_fingerprint\":\"fp_0123456789\"{usage},\
+             \"choices\":[{{\"index\":0,\"delta\":{delta},\"logprobs\":null,\
+             \"finish_reason\":{finish}}}]}}\n\n"
+        )
+    };
+    let tail = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+                \"model\":\"m\",\"system_fingerprint\":\"fp_0123456789\",\"choices\":[],\
+                \"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n";
+    let first = |usage: &str| chunk(r#"{"role":"assistant","content":"hi"}"#, "null", usage);
+    let last = |usage: &str| chunk("{}", "\"stop\"", usage);
+    let null = ",\"usage\":null";
+    assert_stream_spec(&format!(
+        "{}{}{tail}data: [DONE]\n\n",
+        first(null),
+        last(null)
+    ));
+    assert_stream_spec(&format!("{}{}data: [DONE]\n\n", first(""), last("")));
+    let bad = [
+        (
+            format!("{}{}{tail}data: [DONE]\n\n", first(""), last(null)),
+            "usage key on some chunks but not others",
+        ),
+        (
+            format!("{}{}{tail}{tail}data: [DONE]\n\n", first(null), last(null)),
+            "more than one choices-less usage chunk",
+        ),
+        (
+            format!("{}{tail}{}data: [DONE]\n\n", first(null), last(null)),
+            "the usage chunk is not the last chunk before [DONE]",
+        ),
+        (
+            format!("{}{}{tail}data: [DONE]\n\n", first(""), last("")),
+            "a chunk before the usage chunk has no usage key",
         ),
     ];
     for (body, rule) in bad {

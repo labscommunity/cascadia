@@ -4880,12 +4880,7 @@ mod tests {
             let usage = if streaming {
                 let body = String::from_utf8(bytes.to_vec()).unwrap();
                 assert!(body.trim_end().ends_with("data: [DONE]"));
-                let events: Vec<Value> = body
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("data: "))
-                    .filter(|line| *line != "[DONE]")
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
+                let events = sse_events(&body);
                 let tails: Vec<_> = events
                     .iter()
                     .filter(|event| event.get("usage").is_some_and(|u| !u.is_null()))
@@ -5418,11 +5413,8 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
             let body = String::from_utf8(bytes.to_vec()).unwrap();
-            let tail: Value = body
-                .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .filter(|line| *line != "[DONE]")
-                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            let tail: Value = sse_events(&body)
+                .into_iter()
                 .find(|event| event.get("usage").is_some_and(|u| !u.is_null()))
                 .unwrap_or_else(|| panic!("no usage chunk: {body}"));
             assert!(tail["choices"].as_array().unwrap().is_empty(), "{body}");
