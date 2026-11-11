@@ -1013,3 +1013,23 @@ fn unsatisfiable_bounds_are_refused_at_build() {
         contains.warnings()
     );
 }
+
+#[test]
+fn a_wide_optional_object_builds_from_a_small_stack() {
+    // llguidance's build recurses once per optional property: 2000 of them
+    // overflowed a 512 KiB thread (and 6000 the 2 MiB blocking thread of an
+    // optimized Windows build), which aborts the whole process. The build
+    // must not depend on its caller's stack.
+    let props: Vec<String> = (0..3000).map(|i| format!("\"p{i}\":{{}}")).collect();
+    let body = format!(
+        r#"{{"type":"object","properties":{{{}}}}}"#,
+        props.join(",")
+    );
+    let built = std::thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(move || single_byte().compile(&spec(&body)).map(|_| ()))
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(built.is_ok(), "{built:?}");
+}

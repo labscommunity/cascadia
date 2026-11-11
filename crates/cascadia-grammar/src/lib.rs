@@ -238,16 +238,33 @@ impl GrammarFactory {
         #[cfg(test)]
         tests::SCHEMA_BUILDS.with(|c| c.set(c.get() + 1));
         let grammar = TopLevelGrammar::from_json_schema(schema);
-        // Building the parser compiles the schema, so every error surfaces here.
-        let parser = self
-            .factory
-            .create_parser(grammar)
-            .map_err(invalid_schema)?;
-        let mut matcher = Matcher::new(Ok(parser));
-        if let Some(e) = matcher.get_error() {
-            return Err(invalid_schema(e));
-        }
-        warnings.extend(matcher.grammar_warnings());
+        // Building the parser compiles the schema, so every error surfaces
+        // here. llguidance's build recurses once per optional property, deep
+        // enough for a schema inside the API's limits to overflow a 2 MiB
+        // thread (which aborts the process): build on a thread of its own
+        // with a stack that can't run out, whoever the caller is.
+        let factory = &self.factory;
+        let built = std::thread::scope(|scope| {
+            let build = std::thread::Builder::new()
+                .name("grammar-build".into())
+                .stack_size(BUILD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    let parser = factory.create_parser(grammar).map_err(invalid_schema)?;
+                    let mut matcher = Matcher::new(Ok(parser));
+                    if let Some(e) = matcher.get_error() {
+                        return Err(invalid_schema(e));
+                    }
+                    let warnings = matcher.grammar_warnings();
+                    Ok((matcher, warnings))
+                })
+                .map_err(|e| EngineError::Backend(format!("grammar build thread: {e}")))?;
+            // A panic in the build is the caller's, as if it had built inline.
+            build
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        let (matcher, build_warnings) = built?;
+        warnings.extend(build_warnings);
         Ok(CompiledGrammar {
             pristine: Arc::new(matcher),
             warnings: warnings.into(),
@@ -256,6 +273,13 @@ impl GrammarFactory {
         })
     }
 }
+
+/// Stack for the thread that builds a grammar (see `compile_schema`). Only
+/// reserved address space: pages are committed as the build touches them.
+/// llguidance recurses once per optional property (about 350 bytes a level
+/// in an optimized macOS build, more on Windows); a schema at the API's
+/// size cap has fewer than 10,000 of them.
+const BUILD_STACK_BYTES: usize = 256 << 20;
 
 /// Whether decoding `tokenizer` only joins its token strings: a word-level
 /// vocab with a `Fuse` decoder. Without a decoder `tokenizers` joins tokens
