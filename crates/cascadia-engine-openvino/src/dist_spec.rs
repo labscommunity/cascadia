@@ -2135,6 +2135,9 @@ impl OvDistSpecEngine {
                 let undo = dropped_round_kv(drafts.len(), d_advanced);
                 self.target.rewind(undo.target_rewind);
                 self.draft.rewind(undo.draft_rewind);
+                // The rerun counts this round again; take it back here.
+                active.stats.n_steps -= 1;
+                active.stats.total_drafts -= drafts.len() as u32;
                 return self.do_one_round(max_tokens);
             }
             Err(e) => return Err(e),
