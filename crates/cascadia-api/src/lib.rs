@@ -8808,6 +8808,71 @@ level={{ effort_map[eff] }}";
         assert_eq!(finish_reasons(&events), ["tool_calls"], "{all}");
     }
 
+    /// With `enable_thinking: false`, a template that honours the switch
+    /// writes no reasoning, so a call's header goes out while the engine is
+    /// still held after its first chunk; a template that forces reasoning
+    /// still waits for `</think>`, so the call drafted in the reasoning
+    /// never goes out.
+    #[tokio::test]
+    async fn thinking_off_streams_calls_early_only_where_the_template_honours_it() {
+        let early: [&str; 2] = [
+            r#"<tool_call>{"name":"get_weather","arguments":{"#,
+            r#""city":"Paris"}}</tool_call>"#,
+        ];
+        for (template, parts, header_first) in [
+            (THINK_TEMPLATE, &early[..], true),
+            (FORCED_THINK_TEMPLATE, &DRAFT_THEN_CALL[..], false),
+        ] {
+            let ctx = format!("header_first={header_first}");
+            let (app, release) = gated_app_with(parts, false, template).await;
+            let payload = serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}], "stream": true,
+                "enable_thinking": false,
+                "tools": [{"type": "function", "function": {"name": "get_weather"}},
+                          {"type": "function", "function": {"name": "rm"}}]});
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut body = resp.into_body().into_data_stream();
+            // The engine is held after its first chunk: what this frame
+            // carries went out before the engine's later chunks.
+            let first = loop {
+                let frame = tokio::time::timeout(Duration::from_secs(10), body.next())
+                    .await
+                    .expect("a frame while generation is held")
+                    .expect("body still open")
+                    .unwrap();
+                if !frame.is_empty() {
+                    break String::from_utf8(frame.to_vec()).unwrap();
+                }
+            };
+            let held = stream_calls(&sse_events_partial(&first));
+            if header_first {
+                let names: Vec<&str> = held.iter().map(|c| c.1.as_str()).collect();
+                assert_eq!(names, ["get_weather"], "{ctx}: {first}");
+            } else {
+                assert!(held.is_empty(), "{ctx}: {first}");
+            }
+            release.store(true, Ordering::SeqCst);
+            let mut all = first;
+            while let Some(frame) = body.next().await {
+                all.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+            }
+            let events = sse_events(&all);
+            let names: Vec<String> = stream_calls(&events).into_iter().map(|c| c.1).collect();
+            assert_eq!(names, ["get_weather"], "{ctx}: {all}");
+            assert_eq!(finish_reasons(&events), ["tool_calls"], "{ctx}: {all}");
+        }
+    }
+
     /// Stream and non-stream decide the same calls for a model with no
     /// reasoning block, one whose template switches reasoning with
     /// `enable_thinking`, and one whose template forces it; thinking at its
@@ -12154,6 +12219,86 @@ level={{ effort_map[eff] }}";
             post_cancel(app.clone(), &id).await;
             post_cancel(app, "chatcmpl-not-a-task").await;
             assert_eq!(log.live.len(), 0, "tools={tools}: a cancel added an entry");
+        }
+    }
+
+    /// A `/v1/cancel` on a tools stream after its call completed (arguments
+    /// closed, closing tag sent) ends as a call: `tool_calls`, or
+    /// `function_call` for a `functions` request. A cancel while the
+    /// arguments are still open ends `stop`.
+    #[tokio::test]
+    async fn a_cancel_after_a_completed_call_ends_as_a_call() {
+        let complete = r#"<tool_call>{"name":"f","arguments":{"a":1}}</tool_call>"#;
+        let open = r#"<tool_call>{"name":"f","arguments":{"a":"#;
+        for legacy in [false, true] {
+            for (part, want_args, done) in
+                [(complete, r#"{"a":1}"#, true), (open, r#"{"a":"#, false)]
+            {
+                let ctx = format!("legacy={legacy} done={done}");
+                let (app, _log, gate) =
+                    script_app(&[part, "never sent"], true, SSE_KEEPALIVE_INTERVAL).await;
+                let mut payload = serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}]});
+                if legacy {
+                    payload["functions"] = serde_json::json!([{"name": "f"}]);
+                } else {
+                    payload["tools"] =
+                        serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+                }
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header("content-type", "application/json")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let mut body = resp.into_body().into_data_stream();
+                let mut text = String::new();
+                // Everything the first part allows has gone out.
+                let sent = |text: &str| {
+                    let events = sse_events_partial(text);
+                    if legacy {
+                        events
+                            .iter()
+                            .any(|e| e["choices"][0]["delta"].get("function_call").is_some())
+                            .then(|| stream_function_call(&events).1)
+                    } else {
+                        stream_calls(&events).first().map(|c| c.2.clone())
+                    }
+                };
+                while sent(&text).as_deref() != Some(want_args) {
+                    let frame = tokio::time::timeout(Duration::from_secs(10), body.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    text.push_str(std::str::from_utf8(&frame).unwrap());
+                }
+                let id = sse_events_partial(&text)[0]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                post_cancel(app.clone(), &id).await;
+                while let Some(frame) = body.next().await {
+                    text.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+                }
+                drop(body);
+                drop(gate);
+                let events = sse_events(&text);
+                assert_eq!(sent(&text).as_deref(), Some(want_args), "{ctx}: {text}");
+                let want = match (done, legacy) {
+                    (false, _) => "stop",
+                    (true, false) => "tool_calls",
+                    (true, true) => "function_call",
+                };
+                assert_eq!(finish_reasons(&events), [want], "{ctx}: {text}");
+                assert!(!text.contains("never sent"), "{ctx}: {text}");
+            }
         }
     }
 
