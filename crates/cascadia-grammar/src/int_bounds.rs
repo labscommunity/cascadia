@@ -31,15 +31,19 @@ const SKIP_KEYWORDS: &[&str] = &[
 ///
 /// Left as they are: `number` (llguidance can't bound a fraction's length
 /// and xgrammar already caps it at 6 digits; a bound on a type list that
-/// holds `number` would bound its numbers too), a schema with `enum` or
-/// `const`, a side whose other bound is past the cap (it would leave no
+/// holds `number` would bound its numbers too), a schema with `enum`,
+/// `const` or `multipleOf` (a bound can leave no multiple in range), a side whose other bound is past the cap (it would leave no
 /// value), and anything under `not` or `if`.
 ///
 /// Returns how many schemas it bounded.
 pub fn bound_integers(schema: &mut Value) -> usize {
     let mut bounded = 0;
     visit_schemas(schema, &mut |obj| {
-        if !is_integer_only(obj) || obj.contains_key("enum") || obj.contains_key("const") {
+        if !is_integer_only(obj)
+            || ["enum", "const", "multipleOf"]
+                .iter()
+                .any(|k| obj.contains_key(*k))
+        {
             return;
         }
         let cap = INTEGER_DIGITS_CAP as f64;
@@ -234,6 +238,17 @@ mod tests {
             bounded(json!({"type": "integer", "exclusiveMaximum": -1e19})),
             json!({"type": "integer", "exclusiveMaximum": -1e19})
         );
+    }
+
+    #[test]
+    fn an_integer_with_multiple_of_is_left_alone() {
+        // A bound at the cap can leave no multiple in range: this accepts
+        // 1000000000000000302 and nothing at or below the cap.
+        let schema =
+            json!({"type": "integer", "minimum": 999999999999999360u64, "multipleOf": 1009});
+        assert_eq!(bounded(schema.clone()), schema);
+        let schema = json!({"type": "integer", "multipleOf": 2});
+        assert_eq!(bounded(schema.clone()), schema);
     }
 
     #[test]
