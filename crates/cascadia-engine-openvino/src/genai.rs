@@ -391,6 +391,8 @@ impl Builder for OvGenaiBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        let recipe = self.recipe.ok_or(EngineError::NotLoaded)?;
+        let rebuild = RebuildState::new(Box::new(SystemClock::new()));
         if let Some(pipe) = self.cb_pipe {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
@@ -411,6 +413,10 @@ impl Builder for OvGenaiBuilder {
                 compiled: QuarantineSet::default(),
                 schema_keys: RandomState::new(),
                 schema_budget: SchemaBudget::default(),
+                build_pipe: Box::new(move || {
+                    recipe.build_cb().map(|p| Box::new(p) as Box<dyn CbPipe>)
+                }),
+                rebuild,
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -425,6 +431,12 @@ impl Builder for OvGenaiBuilder {
             max_tokens_default: 256,
             structured_unavailable: None,
             schema_budget: SchemaBudget::default(),
+            build_pipe: Box::new(move || {
+                recipe
+                    .build_stateful()
+                    .map(|p| Box::new(p) as Box<dyn StatefulPipe>)
+            }),
+            rebuild,
         }))
     }
 }
@@ -926,13 +938,16 @@ const QUARANTINE_STRIKES: u32 = 2;
 /// pipeline's life, with no size limit and no way to evict one: about
 /// 30–50 MB each with a 151k-token vocabulary (process RSS, xgrammar 0.1.31),
 /// so a client sending ever-new schemas would grow the worker until it runs
-/// out of memory. 64 of them is about 2–3 GB.
+/// out of memory. 64 of them is about 2–3 GB. Dropping the pipeline frees
+/// them, so once the budget is full and a new schema is refused, the engine
+/// rebuilds the pipeline (see [`RebuildState`]).
 const MAX_DISTINCT_SCHEMAS: usize = 64;
 
-/// The distinct schemas let through to GenAI since the pipeline loaded (their
-/// text, at most 64 of the API's 64 KiB): past [`MAX_DISTINCT_SCHEMAS`] a new
-/// one is refused, one already let through still runs (GenAI compiles it
-/// from its cache).
+/// The distinct schemas let through to GenAI since the pipeline was built
+/// (their text, at most 64 of the API's 64 KiB): past
+/// [`MAX_DISTINCT_SCHEMAS`] a new one is refused, one already let through
+/// still runs (GenAI compiles it from its cache). A rebuilt pipeline starts
+/// a new budget.
 #[derive(Default)]
 struct SchemaBudget {
     seen: HashSet<String>,
@@ -941,6 +956,10 @@ struct SchemaBudget {
     /// Times the budget-full warning was logged: once per pipeline.
     full_warnings: u32,
 }
+
+/// [`SchemaBudget::check`] refused a new schema: the budget is full.
+#[derive(Debug, PartialEq, Eq)]
+struct BudgetFull;
 
 /// The schema [`SchemaBudget`] counts for `task`: a client's. json_object's
 /// fixed schema is one grammar per pipeline, compiled once, so it neither
@@ -954,9 +973,10 @@ impl SchemaBudget {
     /// Refuses `task` when its schema is new and the budget is full, and
     /// counts the refusal. Checked before the request is handed to GenAI;
     /// [`Self::record`] counts it once GenAI has taken it. The first refusal
-    /// is logged at WARN (the budget is full for the pipeline's life), each
-    /// one at DEBUG with the running count.
-    fn check(&mut self, task: &GenerationTask) -> EngineResult<()> {
+    /// is logged at WARN (once per pipeline), each one at DEBUG with the
+    /// running count. The caller answers the refusal with
+    /// [`budget_full_error`].
+    fn check(&mut self, task: &GenerationTask) -> Result<(), BudgetFull> {
         let Some(schema) = counted_schema(task) else {
             return Ok(());
         };
@@ -970,8 +990,9 @@ impl SchemaBudget {
                 distinct = self.seen.len(),
                 limit = MAX_DISTINCT_SCHEMAS,
                 "ov-genai: the response_format schema budget is full: new schemas are refused \
-                 until the worker restarts (GenAI keeps every compiled grammar); schemas already \
-                 served keep working. Further refusals are logged at debug"
+                 until the pipeline is rebuilt (GenAI keeps every compiled grammar for the \
+                 pipeline's life); schemas already served keep working. Further refusals are \
+                 logged at debug"
             );
         }
         tracing::debug!(
@@ -979,12 +1000,7 @@ impl SchemaBudget {
             limit = MAX_DISTINCT_SCHEMAS,
             "ov-genai: refused a new response_format schema: the schema budget is full"
         );
-        Err(EngineError::InvalidConfig(format!(
-            "structured output is not available for this model: this worker has reached its \
-             limit of {MAX_DISTINCT_SCHEMAS} distinct response_format schemas per pipeline \
-             (GenAI keeps each compiled grammar until the worker restarts); schemas it has \
-             already served keep working, and restarting the worker clears the limit"
-        )))
+        Err(BudgetFull)
     }
 
     /// Counts `task`'s schema as let through to GenAI.
@@ -996,6 +1012,174 @@ impl SchemaBudget {
         }
     }
 }
+
+/// How long a pipeline serves before the schema budget may rebuild it: at
+/// most one rebuild per this long (plus jitter), counted from when the
+/// pipeline was built. A rebuild takes seconds (about 6.5 s on CPU, 1.3–5.3 s
+/// on an Arc GPU for small models), so a client sending ever-new schemas
+/// costs the other clients at most that once per floor.
+const REBUILD_FLOOR: Duration = Duration::from_secs(10 * 60);
+
+/// Most random time added to [`REBUILD_FLOOR`], drawn for each pipeline, so
+/// workers whose budgets filled together do not all rebuild together.
+const REBUILD_JITTER_MAX: Duration = Duration::from_secs(60);
+
+/// Longest the CB engine waits for the requests in flight to finish before
+/// a rebuild. It admits nothing meanwhile; those still running at the cap
+/// fail with [`REBUILD_DRAIN_FAILED`].
+const REBUILD_DRAIN_CAP: Duration = Duration::from_secs(15);
+
+/// What a CB request still running at [`REBUILD_DRAIN_CAP`] is told (a
+/// retryable failure: 503).
+const REBUILD_DRAIN_FAILED: &str = "cb pipeline rebuild: this request was still running when \
+     the worker stopped waiting to rebuild its pipeline; retry the request";
+
+/// What a client of a refused new schema learns about the rebuild that
+/// clears the budget.
+enum RebuildNote {
+    /// The pipeline was rebuilt during this request: a retry is admitted.
+    Rebuilt,
+    /// The CB engine rebuilds once the requests in flight finish.
+    AfterDrain,
+    /// [`REBUILD_FLOOR`] holds: no rebuild may start for this long.
+    Wait(Duration),
+}
+
+/// The 400 for a new schema refused by a full [`SchemaBudget`]. Starts with
+/// "structured output is not available for this model": a node routes the
+/// refusal by that prefix.
+fn budget_full_error(note: RebuildNote) -> EngineError {
+    let next = match note {
+        RebuildNote::Rebuilt => {
+            "the worker has just rebuilt its pipeline to clear the limit; retry the request"
+                .to_owned()
+        }
+        RebuildNote::AfterDrain => format!(
+            "the worker rebuilds its pipeline to clear the limit once the requests in flight \
+             finish (within {} s); retry the request after that",
+            REBUILD_DRAIN_CAP.as_secs()
+        ),
+        RebuildNote::Wait(wait) => format!(
+            "the worker rebuilds its pipeline to clear the limit at most once every {} minutes; \
+             the next rebuild can start in {} s, on the first new schema after that",
+            REBUILD_FLOOR.as_secs() / 60,
+            wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
+        ),
+    };
+    EngineError::InvalidConfig(format!(
+        "structured output is not available for this model: this worker has reached its \
+         limit of {MAX_DISTINCT_SCHEMAS} distinct response_format schemas per pipeline (GenAI \
+         keeps each compiled grammar for the pipeline's life); schemas it has already served \
+         keep working, and {next}"
+    ))
+}
+
+/// The time source of the rebuild schedule. Injectable so the floor, its
+/// jitter and the CB drain cap are testable without waiting.
+trait RebuildClock: Send {
+    fn now(&self) -> Instant;
+    /// A random duration in `0..=max`.
+    fn jitter(&mut self, max: Duration) -> Duration;
+}
+
+/// The real clock, with jitter drawn from a randomly keyed hash.
+struct SystemClock {
+    keys: RandomState,
+    draws: u64,
+}
+
+impl SystemClock {
+    fn new() -> Self {
+        Self {
+            keys: RandomState::new(),
+            draws: 0,
+        }
+    }
+}
+
+impl RebuildClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn jitter(&mut self, max: Duration) -> Duration {
+        self.draws += 1;
+        let span = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis(self.keys.hash_one(self.draws) % span.saturating_add(1))
+    }
+}
+
+/// Builds the pipeline again from the builder's [`PipelineRecipe`].
+type Rebuild<P> = Box<dyn FnMut() -> Result<Box<P>, OvError> + Send>;
+
+/// When an engine may rebuild its pipeline to clear a full [`SchemaBudget`],
+/// and how its rebuilds went. Shared by both engines; each runs the rebuild
+/// itself, at a point where nothing is in flight.
+struct RebuildState {
+    clock: Box<dyn RebuildClock>,
+    /// No rebuild starts before this: when the pipeline was built, plus
+    /// [`REBUILD_FLOOR`] and up to [`REBUILD_JITTER_MAX`].
+    not_before: Instant,
+    /// CB only: since when the engine admits nothing, draining for a rebuild.
+    draining_since: Option<Instant>,
+    /// Rebuilds done. Engine-local, like [`SchemaBudget::refused`]: logged on
+    /// each rebuild.
+    rebuilds: u64,
+    /// Set when a rebuild failed: the engine has no pipeline and refuses
+    /// every request with this until the worker restarts.
+    failed: Option<String>,
+}
+
+impl RebuildState {
+    fn new(mut clock: Box<dyn RebuildClock>) -> Self {
+        let not_before = clock.now() + REBUILD_FLOOR + clock.jitter(REBUILD_JITTER_MAX);
+        Self {
+            clock,
+            not_before,
+            draining_since: None,
+            rebuilds: 0,
+            failed: None,
+        }
+    }
+
+    /// How long until a rebuild may start; `None` when one may start now.
+    fn wait(&self) -> Option<Duration> {
+        let now = self.clock.now();
+        (now < self.not_before).then(|| self.not_before - now)
+    }
+
+    /// A new pipeline was built: count it, and start its floor.
+    fn rebuilt(&mut self) {
+        self.rebuilds += 1;
+        self.not_before = self.clock.now() + REBUILD_FLOOR + self.clock.jitter(REBUILD_JITTER_MAX);
+    }
+
+    /// The error every request gets once a rebuild failed: a 5xx, so the
+    /// API's readiness (`/health`) reports the worker degraded from the
+    /// first one on, and nothing ever succeeds to clear it.
+    fn refusal(&self) -> Option<EngineError> {
+        self.failed.clone().map(EngineError::Backend)
+    }
+
+    /// The message for a failed rebuild, logged in full.
+    fn fail(&mut self, err: OvError) {
+        let reason = client_message(err, "ov-genai pipeline rebuild failed");
+        tracing::error!(
+            reason = %reason,
+            "ov-genai: the pipeline rebuild failed; this worker serves no requests until it \
+             is restarted"
+        );
+        self.failed = Some(format!(
+            "ov-genai pipeline rebuild failed: {reason}; this worker serves no requests until \
+             it is restarted"
+        ));
+    }
+}
+
+/// Stands in for the pipeline while a rebuild builds the next one, and for
+/// good once a rebuild failed: every call fails.
+struct NoPipe;
+
+const NO_PIPE: &str = "no pipeline: it is being rebuilt or its rebuild failed";
 
 /// The slice of [`LlmPipeline`] the stateful engine uses. Like [`CbPipe`],
 /// it exists so the engine's state machine (the schema budget's rebuild in
@@ -1018,6 +1202,18 @@ impl StatefulPipe for LlmPipeline {
     }
 }
 
+impl StatefulPipe for NoPipe {
+    fn generate(&self, _prompt: &str, _cfg: &GenConfig) -> Result<GenResult, OvError> {
+        Err(OvError::Native(NO_PIPE.into()))
+    }
+    fn count_tokens(&self, _text: &str) -> Option<u32> {
+        None
+    }
+    fn validate_json_schema(&self, _schema: &str) -> Result<(), OvError> {
+        Err(OvError::Native(NO_PIPE.into()))
+    }
+}
+
 pub struct OvGenaiEngine {
     pipe: Box<dyn StatefulPipe>,
     /// The OpenVINO device string the pipeline was compiled for.
@@ -1034,6 +1230,9 @@ pub struct OvGenaiEngine {
     /// tasks with a grammar are then refused at submit with this reason.
     structured_unavailable: Option<String>,
     schema_budget: SchemaBudget,
+    /// Builds the pipeline again when the schema budget is full.
+    build_pipe: Rebuild<dyn StatefulPipe>,
+    rebuild: RebuildState,
 }
 
 impl Engine for OvGenaiEngine {
@@ -1096,6 +1295,9 @@ impl Engine for OvGenaiEngine {
                 "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
             ));
         }
+        if let Some(err) = self.rebuild.refusal() {
+            return Err(err);
+        }
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -1113,7 +1315,9 @@ impl Engine for OvGenaiEngine {
         check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
-        self.schema_budget.check(&task)?;
+        if self.schema_budget.check(&task).is_err() {
+            return Err(self.budget_full());
+        }
         self.schema_budget.record(&task);
         self.pending.push(task);
         Ok(())
@@ -1131,6 +1335,15 @@ impl Engine for OvGenaiEngine {
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.pending.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(reason) = &self.rebuild.failed {
+            // No pipeline: the tasks queued before the rebuild failed get
+            // its reason, as a failure (a 503).
+            return Ok(self
+                .pending
+                .drain(..)
+                .map(|t| (t.task_id.clone(), Chunk::error(t.task_id, reason.clone())))
+                .collect());
         }
         let task = self.pending.remove(0);
         let max_new = if task.max_tokens > 0 {
@@ -1315,6 +1528,26 @@ impl CbPipe for CbPipeline {
     }
 }
 
+impl CbPipe for NoPipe {
+    fn add_request(
+        &self,
+        _request_id: u64,
+        _prompt: &str,
+        _cfg: &GenConfig,
+    ) -> Result<Box<dyn CbReq>, OvError> {
+        Err(OvError::Native(NO_PIPE.into()))
+    }
+    fn step(&self) -> Result<(), OvError> {
+        Err(OvError::Native(NO_PIPE.into()))
+    }
+    fn count_tokens(&self, _text: &str) -> Option<u32> {
+        None
+    }
+    fn validate_json_schema(&self, _schema: &str) -> Result<(), OvError> {
+        Err(OvError::Native(NO_PIPE.into()))
+    }
+}
+
 impl CbReq for CbHandle {
     fn read(&mut self) -> Result<CbRead, OvError> {
         CbHandle::read(self)
@@ -1392,6 +1625,9 @@ pub struct OvGenaiCbEngine {
     /// Random keys for [`Self::schema_hash`], drawn once per engine.
     schema_keys: RandomState,
     schema_budget: SchemaBudget,
+    /// Builds the pipeline again when the schema budget is full.
+    build_pipe: Rebuild<dyn CbPipe>,
+    rebuild: RebuildState,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -1471,8 +1707,26 @@ impl Engine for OvGenaiCbEngine {
                 "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
             ));
         }
+        if let Some(err) = self.rebuild.refusal() {
+            return Err(err);
+        }
         if self.active.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
+        }
+        // Draining for a rebuild (the schema budget is full): admit nothing
+        // until the requests in flight are gone, then rebuild before this
+        // request. The refusal is the retryable capacity 503.
+        if self.rebuild.draining_since.is_some() {
+            if !self.active.is_empty() {
+                return Err(EngineError::QueueFull {
+                    queued: self.active.len(),
+                    cap: 0,
+                });
+            }
+            self.rebuild_pipeline();
+            if let Some(err) = self.rebuild.refusal() {
+                return Err(err);
+            }
         }
         // A pipeline that has failed every recent scheduler iteration will fail
         // this request too. Admitting it means paying add_request and a step
@@ -1526,7 +1780,9 @@ impl Engine for OvGenaiCbEngine {
         check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
-        self.schema_budget.check(&task)?;
+        if self.schema_budget.check(&task).is_err() {
+            return Err(self.budget_full());
+        }
         let max_tokens = if task.max_tokens > 0 {
             task.max_tokens
         } else {
@@ -1578,6 +1834,27 @@ impl Engine for OvGenaiCbEngine {
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.active.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(since) = self.rebuild.draining_since {
+            if self.rebuild.clock.now().saturating_duration_since(since) >= REBUILD_DRAIN_CAP {
+                // The drain for a rebuild is over: whatever still runs fails
+                // with a retryable error, and the next request rebuilds.
+                warn!(
+                    in_flight = self.active.len(),
+                    drain_cap_s = REBUILD_DRAIN_CAP.as_secs(),
+                    "ov-genai cb: requests still running when the drain for the pipeline \
+                     rebuild ended; failing them"
+                );
+                return Ok(self
+                    .active
+                    .drain(..)
+                    .map(|t| {
+                        let _ = t.handle.cancel();
+                        let chunk = Chunk::error(t.task_id.clone(), REBUILD_DRAIN_FAILED);
+                        (t.task_id, chunk)
+                    })
+                    .collect());
+            }
         }
         if let Err(err) = self.pipe.step() {
             // A failed scheduler iteration poisons every in-flight request:
@@ -1879,6 +2156,78 @@ impl Engine for OvGenaiCbEngine {
 }
 
 impl OvGenaiCbEngine {
+    /// The refusal of a new schema on a full budget. Past the rebuild floor
+    /// the pipeline is rebuilt: at once when nothing is in flight, else
+    /// after a drain (see [`REBUILD_DRAIN_CAP`]). The request still gets the
+    /// 400; a failed rebuild answers it with the failure instead.
+    fn budget_full(&mut self) -> EngineError {
+        if let Some(wait) = self.rebuild.wait() {
+            return budget_full_error(RebuildNote::Wait(wait));
+        }
+        if self.active.is_empty() {
+            self.rebuild_pipeline();
+            return self
+                .rebuild
+                .refusal()
+                .unwrap_or_else(|| budget_full_error(RebuildNote::Rebuilt));
+        }
+        self.rebuild.draining_since = Some(self.rebuild.clock.now());
+        warn!(
+            in_flight = self.active.len(),
+            drain_cap_s = REBUILD_DRAIN_CAP.as_secs(),
+            "ov-genai cb: the response_format schema budget is full; admitting nothing until \
+             the requests in flight finish, then rebuilding the pipeline"
+        );
+        budget_full_error(RebuildNote::AfterDrain)
+    }
+
+    /// Drop the pipeline, build it again from the recipe, and start over:
+    /// a new schema budget, no quarantined, struck or compiled schemas, no
+    /// run of failures, and the warmup, structured-output check included,
+    /// run again. Only with nothing in flight (each request's handle keeps
+    /// the old pipeline alive). On failure the engine has no pipeline and
+    /// refuses everything.
+    fn rebuild_pipeline(&mut self) {
+        debug_assert!(self.active.is_empty());
+        let started = Instant::now();
+        let cleared = self.schema_budget.seen.len();
+        warn!(
+            cleared,
+            refused = self.schema_budget.refused,
+            "ov-genai cb: rebuilding the pipeline to clear the response_format schema budget \
+             (GenAI frees compiled grammars only with the pipeline)"
+        );
+        self.rebuild.draining_since = None;
+        // The old pipeline goes first: a GPU may not hold two.
+        drop(std::mem::replace(&mut self.pipe, Box::new(NoPipe)));
+        match (self.build_pipe)() {
+            Ok(pipe) => self.pipe = pipe,
+            Err(err) => {
+                self.rebuild.fail(err);
+                return;
+            }
+        }
+        self.schema_budget = SchemaBudget::default();
+        self.quarantined = QuarantineSet::default();
+        self.strikes = StrikeSet::default();
+        self.compiled = QuarantineSet::default();
+        self.blamed_in_run.clear();
+        self.canary_failed_in_run = false;
+        self.step_failures = 0;
+        self.suspect_failures = 0;
+        self.latched_at = None;
+        self.idle_steps = 0;
+        self.structured_unavailable = None;
+        self.warmup();
+        self.rebuild.rebuilt();
+        warn!(
+            duration_s = started.elapsed().as_secs_f64(),
+            cleared,
+            rebuilds = self.rebuild.rebuilds,
+            "ov-genai cb: pipeline rebuilt; the response_format schema budget is reset"
+        );
+    }
+
     /// Check the device with an internal canary: a short plain request (no
     /// schema), run on its own, as the warmup does. True when it finishes.
     /// Only ever called with nothing else in flight.
@@ -2060,6 +2409,59 @@ fn build_gen_config(
 }
 
 impl OvGenaiEngine {
+    /// The refusal of a new schema on a full budget. Past the rebuild floor
+    /// the pipeline is rebuilt first: nothing is in flight between steps
+    /// (one generation runs per `step()`, the rest wait in `pending`), so
+    /// no answer is cut. The request still gets the 400; a failed rebuild
+    /// answers it with the failure instead.
+    fn budget_full(&mut self) -> EngineError {
+        if let Some(wait) = self.rebuild.wait() {
+            return budget_full_error(RebuildNote::Wait(wait));
+        }
+        self.rebuild_pipeline();
+        self.rebuild
+            .refusal()
+            .unwrap_or_else(|| budget_full_error(RebuildNote::Rebuilt))
+    }
+
+    /// Drop the pipeline, build it again from the recipe, start a new
+    /// schema budget (the queued tasks' schemas count against it) and run
+    /// the warmup, structured-output check included, again. On failure the
+    /// engine has no pipeline and refuses everything.
+    fn rebuild_pipeline(&mut self) {
+        let started = Instant::now();
+        let cleared = self.schema_budget.seen.len();
+        warn!(
+            cleared,
+            refused = self.schema_budget.refused,
+            queued = self.pending.len(),
+            "ov-genai: rebuilding the pipeline to clear the response_format schema budget \
+             (GenAI frees compiled grammars only with the pipeline)"
+        );
+        // The old pipeline goes first: a GPU may not hold two.
+        drop(std::mem::replace(&mut self.pipe, Box::new(NoPipe)));
+        match (self.build_pipe)() {
+            Ok(pipe) => self.pipe = pipe,
+            Err(err) => {
+                self.rebuild.fail(err);
+                return;
+            }
+        }
+        self.schema_budget = SchemaBudget::default();
+        for t in &self.pending {
+            self.schema_budget.record(t);
+        }
+        self.structured_unavailable = None;
+        self.warmup();
+        self.rebuild.rebuilt();
+        warn!(
+            duration_s = started.elapsed().as_secs_f64(),
+            cleared,
+            rebuilds = self.rebuild.rebuilds,
+            "ov-genai: pipeline rebuilt; the response_format schema budget is reset"
+        );
+    }
+
     /// SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1; not re-checked on
     /// the current 2026.2 floor): `seed` is forwarded to
     /// `GenerationConfig.rng_seed`, but it does NOT make ov-genai reproducible
@@ -2156,6 +2558,10 @@ mod tests {
         /// Returned by `validate_json_schema` when set.
         validate_err: Option<String>,
         validate_calls: usize,
+        /// Pipelines dropped and built, in order: "drop", "build".
+        events: Vec<&'static str>,
+        /// The next rebuild fails with this.
+        build_err: Option<String>,
     }
 
     struct MockPipe {
@@ -2214,6 +2620,57 @@ mod tests {
         }
     }
 
+    impl Drop for MockPipe {
+        fn drop(&mut self) {
+            if let Ok(mut st) = self.st.lock() {
+                st.events.push("drop");
+            }
+        }
+    }
+
+    /// Builds the next [`MockPipe`] on the same script, or fails with
+    /// `build_err`.
+    fn mock_rebuild(st: &Arc<Mutex<MockState>>) -> Rebuild<dyn CbPipe> {
+        let st = st.clone();
+        Box::new(move || {
+            let mut s = st.lock().unwrap();
+            s.events.push("build");
+            if let Some(m) = s.build_err.clone() {
+                return Err(OvError::Native(m));
+            }
+            drop(s);
+            Ok(Box::new(MockPipe { st: st.clone() }) as Box<dyn CbPipe>)
+        })
+    }
+
+    /// The rebuild schedule's clock, moved by hand. Jitter is fixed.
+    #[derive(Clone)]
+    struct FakeClock {
+        now: Arc<Mutex<Instant>>,
+        jitter: Duration,
+    }
+
+    impl FakeClock {
+        fn new(jitter: Duration) -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Instant::now())),
+                jitter,
+            }
+        }
+        fn advance(&self, by: Duration) {
+            *self.now.lock().unwrap() += by;
+        }
+    }
+
+    impl RebuildClock for FakeClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+        fn jitter(&mut self, max: Duration) -> Duration {
+            self.jitter.min(max)
+        }
+    }
+
     impl CbReq for MockReq {
         fn read(&mut self) -> Result<CbRead, OvError> {
             let mut st = self.st.lock().unwrap();
@@ -2248,6 +2705,10 @@ mod tests {
     }
 
     fn mock_engine(st: &Arc<Mutex<MockState>>) -> OvGenaiCbEngine {
+        mock_engine_at(st, &FakeClock::new(Duration::ZERO))
+    }
+
+    fn mock_engine_at(st: &Arc<Mutex<MockState>>, clock: &FakeClock) -> OvGenaiCbEngine {
         OvGenaiCbEngine {
             active: Vec::new(),
             pipe: Box::new(MockPipe { st: st.clone() }),
@@ -2267,6 +2728,8 @@ mod tests {
             compiled: QuarantineSet::default(),
             schema_keys: RandomState::new(),
             schema_budget: SchemaBudget::default(),
+            build_pipe: mock_rebuild(st),
+            rebuild: RebuildState::new(Box::new(clock.clone())),
         }
     }
 
@@ -2825,12 +3288,30 @@ mod tests {
         e.submit(GenerationTask::new("plain", "hi")).unwrap();
     }
 
-    /// The 400 a new schema gets once the budget is full. The node maps it
-    /// by its prefix, "structured output is not available".
+    /// The 400 a new schema gets once the budget is full, before the
+    /// rebuild floor of a pipeline built at the mock clock's start has
+    /// passed (no jitter). The node maps it by its prefix, "structured
+    /// output is not available".
     const BUDGET_FULL_400: &str = "structured output is not available for this model: \
         this worker has reached its limit of 64 distinct response_format schemas per pipeline \
-        (GenAI keeps each compiled grammar until the worker restarts); schemas it has already \
-        served keep working, and restarting the worker clears the limit";
+        (GenAI keeps each compiled grammar for the pipeline's life); schemas it has already \
+        served keep working, and the worker rebuilds its pipeline to clear the limit at most \
+        once every 10 minutes; the next rebuild can start in 600 s, on the first new schema \
+        after that";
+
+    /// The 400 for the new schema whose refusal rebuilt an idle pipeline.
+    const BUDGET_FULL_REBUILT_400: &str = "structured output is not available for this model: \
+        this worker has reached its limit of 64 distinct response_format schemas per pipeline \
+        (GenAI keeps each compiled grammar for the pipeline's life); schemas it has already \
+        served keep working, and the worker has just rebuilt its pipeline to clear the limit; \
+        retry the request";
+
+    /// The 400 for the new schema whose refusal starts a CB drain.
+    const BUDGET_FULL_DRAIN_400: &str = "structured output is not available for this model: \
+        this worker has reached its limit of 64 distinct response_format schemas per pipeline \
+        (GenAI keeps each compiled grammar for the pipeline's life); schemas it has already \
+        served keep working, and the worker rebuilds its pipeline to clear the limit once the \
+        requests in flight finish (within 15 s); retry the request after that";
 
     /// A full budget refuses each new schema with the same 400, counts every
     /// refusal, and warns once, however many it refuses.
@@ -2846,10 +3327,7 @@ mod tests {
         assert_eq!((budget.refused, budget.full_warnings), (0, 0));
         for n in 1..=5u64 {
             let t = schema_task("over", &full_budget_body(1000 + n as usize));
-            match budget.check(&t) {
-                Err(EngineError::InvalidConfig(m)) => assert_eq!(m, BUDGET_FULL_400),
-                other => panic!("expected InvalidConfig, got {other:?}"),
-            }
+            assert_eq!(budget.check(&t), Err(BudgetFull));
             assert_eq!(budget.refused, n);
         }
         assert_eq!(budget.full_warnings, 1);
@@ -4167,5 +4645,414 @@ mod tests {
             assert!(err.contains("staged tree"), "{err}");
             assert!(err.contains(&format!("--engine {engine}")), "{err}");
         }
+    }
+
+    // ---- Rebuilding the pipeline when the schema budget is full ------------
+
+    /// Submit `n` new schemas starting at body `from`, and finish them all.
+    fn cb_fill_and_finish(e: &mut OvGenaiCbEngine, st: &Arc<Mutex<MockState>>, from: usize) {
+        st.lock().unwrap().default_read = Some(finished_read());
+        for i in from..from + MAX_DISTINCT_SCHEMAS {
+            e.submit(schema_task(&format!("t{i}"), &full_budget_body(i)))
+                .unwrap();
+        }
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), MAX_DISTINCT_SCHEMAS);
+        assert!(e.active.is_empty());
+    }
+
+    /// A CB engine whose budget is full, with nothing in flight, its rebuild
+    /// floor (with the clock's jitter) passed.
+    fn cb_full_budget(clock: &FakeClock) -> (OvGenaiCbEngine, Arc<Mutex<MockState>>) {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine_at(&st, clock);
+        cb_fill_and_finish(&mut e, &st, 0);
+        clock.advance(REBUILD_FLOOR + clock.jitter);
+        (e, st)
+    }
+
+    fn refusal(r: EngineResult<()>) -> String {
+        match r {
+            Err(EngineError::InvalidConfig(m)) => m,
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cb_full_budget_on_an_idle_engine_rebuilds_at_once_and_admits_the_next_new_schema() {
+        let clock = FakeClock::new(Duration::from_secs(30));
+        let (mut e, st) = cb_full_budget(&clock);
+        let now = Instant::now();
+        e.quarantined.insert(1, now);
+        e.strikes.strike(2, now);
+        assert_eq!(e.compiled.len(), MAX_DISTINCT_SCHEMAS);
+        let added = st.lock().unwrap().added.len();
+
+        // The new schema that found the budget full is still refused...
+        assert_eq!(
+            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
+            BUDGET_FULL_REBUILT_400
+        );
+        // ...but the pipeline was rebuilt during it: the old one dropped
+        // before the new one was built, and the warmup ran again on it (the
+        // plain request, then the structured-output probe).
+        {
+            let s = st.lock().unwrap();
+            assert_eq!(s.events, vec!["drop", "build"]);
+            assert_eq!(s.added[added..], [u64::MAX, PROBE_REQUEST_ID]);
+        }
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert!(e.schema_budget.seen.is_empty());
+        assert_eq!(e.schema_budget.refused, 0);
+        assert_eq!(
+            (e.quarantined.len(), e.strikes.len(), e.compiled.len()),
+            (0, 0, 0)
+        );
+        assert_eq!(e.structured_unavailable, None);
+
+        // The next new schema is admitted.
+        e.submit(schema_task("next", &full_budget_body(1001)))
+            .unwrap();
+        assert_eq!(e.active.len(), 1);
+        assert_eq!(e.schema_budget.seen.len(), 1);
+    }
+
+    /// With requests in flight, a full budget makes the CB engine stop
+    /// admitting work until they finish, then it rebuilds.
+    #[test]
+    fn cb_full_budget_with_requests_in_flight_admits_nothing_until_they_finish_then_rebuilds() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = cb_full_budget(&clock);
+        st.lock().unwrap().default_read =
+            Some(read_of(CbStatus::Running, 1, "x", CbFinish::Unknown));
+        e.submit(task("a", 8)).unwrap();
+        e.submit(task("b", 8)).unwrap();
+
+        assert_eq!(
+            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
+            BUDGET_FULL_DRAIN_400
+        );
+        assert!(st.lock().unwrap().events.is_empty(), "nothing is cut");
+        // Nothing is admitted meanwhile, plain or schema: a retryable 503.
+        for t in [task("c", 8), schema_task("d", &full_budget_body(0))] {
+            assert!(
+                matches!(e.submit(t), Err(EngineError::QueueFull { .. })),
+                "admitted during the drain"
+            );
+        }
+        // The two keep streaming until they finish.
+        clock.advance(REBUILD_DRAIN_CAP - Duration::from_secs(1));
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(_, c)| c.error.is_none() && !c.is_final));
+        st.lock().unwrap().default_read = Some(finished_read());
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(_, c)| c.error.is_none() && c.is_final));
+        assert!(e.active.is_empty());
+        assert!(st.lock().unwrap().events.is_empty());
+
+        // The next request finds nothing in flight: the pipeline is rebuilt,
+        // then the request is admitted, a new schema included.
+        e.submit(schema_task("next", &full_budget_body(1000)))
+            .unwrap();
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(e.rebuild.draining_since, None);
+        assert_eq!(e.active.len(), 1);
+        assert_eq!(e.schema_budget.seen.len(), 1);
+    }
+
+    #[test]
+    fn cb_requests_still_running_at_the_drain_cap_fail_retryably_then_the_pipeline_is_rebuilt() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = cb_full_budget(&clock);
+        st.lock().unwrap().default_read =
+            Some(read_of(CbStatus::Running, 1, "x", CbFinish::Unknown));
+        e.submit(task("a", 8)).unwrap();
+        e.submit(task("b", 8)).unwrap();
+        let ids: Vec<u64> = st.lock().unwrap().added[MAX_DISTINCT_SCHEMAS..].to_vec();
+        refusal(e.submit(schema_task("new", &full_budget_body(1000))));
+
+        clock.advance(REBUILD_DRAIN_CAP);
+        let out = e.step().unwrap();
+        let mut failed: Vec<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
+        failed.sort_unstable();
+        assert_eq!(failed, ["a", "b"]);
+        for (_, c) in &out {
+            assert!(c.is_final);
+            assert!(!c.invalid_request, "retryable: a 503, not a 400");
+            assert_eq!(c.error.as_deref(), Some(REBUILD_DRAIN_FAILED));
+        }
+        assert!(e.active.is_empty());
+        {
+            let s = st.lock().unwrap();
+            for id in &ids {
+                assert!(s.cancelled.contains(id), "request {id} not aborted");
+            }
+            assert!(s.events.is_empty());
+        }
+
+        st.lock().unwrap().default_read = Some(finished_read());
+        e.submit(task("next", 8)).unwrap();
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(e.active.len(), 1);
+    }
+
+    /// At most one rebuild per pipeline per floor (plus its jitter), counted
+    /// from when the pipeline was built: meanwhile a new schema on a full
+    /// budget keeps getting the 400, with the time left.
+    #[test]
+    fn a_second_rebuild_waits_for_the_floor_and_the_refusal_continues_meanwhile() {
+        let jitter = Duration::from_secs(30);
+        let clock = FakeClock::new(jitter);
+        let (mut e, st) = cb_full_budget(&clock);
+        assert_eq!(
+            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
+            BUDGET_FULL_REBUILT_400
+        );
+        cb_fill_and_finish(&mut e, &st, 2000);
+
+        let wait_400 =
+            |secs: u64| BUDGET_FULL_400.replace("start in 600 s", &format!("start in {secs} s"));
+        assert_eq!(
+            refusal(e.submit(schema_task("x", &full_budget_body(3000)))),
+            wait_400(630)
+        );
+        clock.advance(REBUILD_FLOOR + jitter - Duration::from_secs(1));
+        assert_eq!(
+            refusal(e.submit(schema_task("y", &full_budget_body(3001)))),
+            wait_400(1)
+        );
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(st.lock().unwrap().events.len(), 2);
+        assert_eq!(e.schema_budget.refused, 2);
+
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            refusal(e.submit(schema_task("z", &full_budget_body(3002)))),
+            BUDGET_FULL_REBUILT_400
+        );
+        assert_eq!(e.rebuild.rebuilds, 2);
+        assert_eq!(
+            st.lock().unwrap().events,
+            vec!["drop", "build", "drop", "build"]
+        );
+    }
+
+    #[test]
+    fn a_failed_rebuild_refuses_every_request_with_a_clear_error() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = cb_full_budget(&clock);
+        st.lock().unwrap().build_err = Some("device lost".into());
+        const FAILED: &str = "backend error: ov-genai pipeline rebuild failed: device lost; \
+            this worker serves no requests until it is restarted";
+
+        // A 5xx, not the 400: the API's readiness latches on it.
+        let err = e
+            .submit(schema_task("new", &full_budget_body(1000)))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+        assert_eq!(err.to_string(), FAILED);
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+        assert_eq!(e.rebuild.rebuilds, 0);
+        // Everything after it gets the same error, a seen schema too.
+        for t in [task("p", 8), schema_task("s", &full_budget_body(0))] {
+            assert_eq!(e.submit(t).unwrap_err().to_string(), FAILED);
+        }
+        assert!(e.step().unwrap().is_empty());
+    }
+
+    // The stateful engine, through the StatefulPipe seam.
+
+    #[derive(Default)]
+    struct LlmState {
+        /// "p<n>: <prompt>" per generate on pipeline n, "drop p<n>", "build".
+        events: Vec<String>,
+        builds: usize,
+        /// The next rebuild fails with this.
+        build_err: Option<String>,
+        /// What the structured-output probe returns; its one answer if unset.
+        probe_answer: Option<String>,
+    }
+
+    struct MockLlm {
+        st: Arc<Mutex<LlmState>>,
+        id: usize,
+    }
+
+    impl StatefulPipe for MockLlm {
+        fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
+            let mut st = self.st.lock().unwrap();
+            st.events.push(format!("p{}: {prompt}", self.id));
+            let text = if cfg.json_schema.as_deref() == Some(PROBE_SCHEMA) {
+                st.probe_answer
+                    .clone()
+                    .unwrap_or_else(|| PROBE_ANSWER.to_owned())
+            } else {
+                "ok".to_owned()
+            };
+            Ok(GenResult {
+                text,
+                generated_tokens: 1,
+            })
+        }
+        fn count_tokens(&self, _text: &str) -> Option<u32> {
+            Some(1)
+        }
+        fn validate_json_schema(&self, _schema: &str) -> Result<(), OvError> {
+            Ok(())
+        }
+    }
+
+    impl Drop for MockLlm {
+        fn drop(&mut self) {
+            if let Ok(mut st) = self.st.lock() {
+                st.events.push(format!("drop p{}", self.id));
+            }
+        }
+    }
+
+    fn stateful_engine_at(st: &Arc<Mutex<LlmState>>, clock: &FakeClock) -> OvGenaiEngine {
+        let rebuild_st = st.clone();
+        OvGenaiEngine {
+            pipe: Box::new(MockLlm {
+                st: st.clone(),
+                id: 0,
+            }),
+            device: "CPU".into(),
+            draft_model: false,
+            speculative_k: 0,
+            prompt_lookup_ngram: 0,
+            prompt_pretemplated: false,
+            pending: Vec::new(),
+            max_tokens_default: 256,
+            structured_unavailable: None,
+            schema_budget: SchemaBudget::default(),
+            build_pipe: Box::new(move || {
+                let mut s = rebuild_st.lock().unwrap();
+                s.events.push("build".into());
+                if let Some(m) = s.build_err.clone() {
+                    return Err(OvError::Native(m));
+                }
+                s.builds += 1;
+                Ok(Box::new(MockLlm {
+                    st: rebuild_st.clone(),
+                    id: s.builds,
+                }) as Box<dyn StatefulPipe>)
+            }),
+            rebuild: RebuildState::new(Box::new(clock.clone())),
+        }
+    }
+
+    /// A stateful engine whose budget is full, its queue empty and its
+    /// rebuild floor passed.
+    fn stateful_full_budget(clock: &FakeClock) -> (OvGenaiEngine, Arc<Mutex<LlmState>>) {
+        let st = Arc::new(Mutex::new(LlmState::default()));
+        let mut e = stateful_engine_at(&st, clock);
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            e.submit(schema_task(&format!("t{i}"), &full_budget_body(i)))
+                .unwrap();
+        }
+        for _ in 0..MAX_DISTINCT_SCHEMAS {
+            assert_eq!(e.step().unwrap().len(), 1);
+        }
+        assert!(e.pending.is_empty());
+        st.lock().unwrap().events.clear();
+        clock.advance(REBUILD_FLOOR + clock.jitter);
+        (e, st)
+    }
+
+    /// The stateful engine runs one generation per step and queues the
+    /// rest, so it rebuilds between two answers: nothing is cut, and the
+    /// queue carries on on the new pipeline.
+    #[test]
+    fn stateful_rebuilds_between_answers_and_the_queue_proceeds_on_the_new_pipeline() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = stateful_full_budget(&clock);
+        e.submit(GenerationTask::new("q1", "first")).unwrap();
+        e.submit(GenerationTask::new("q2", "second")).unwrap();
+        e.submit(schema_task("q3", &full_budget_body(5))).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out[0].0, "q1");
+
+        assert_eq!(
+            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
+            BUDGET_FULL_REBUILT_400
+        );
+        assert_eq!(e.rebuild.rebuilds, 1);
+        // The schema still queued is counted against the new budget.
+        assert_eq!(e.schema_budget.seen.len(), 1);
+        assert!(e.schema_budget.seen.contains(&full_budget_body(5)));
+
+        for want in ["q2", "q3"] {
+            let out = e.step().unwrap();
+            assert_eq!(out[0].0, want);
+            assert!(out[0].1.is_final && out[0].1.error.is_none());
+        }
+        assert_eq!(
+            st.lock().unwrap().events,
+            vec![
+                "p0: first",
+                "drop p0",
+                "build",
+                // The warmup, then the structured-output probe, again.
+                "p1: Hi",
+                &format!("p1: {PROBE_PROMPT}"),
+                "p1: second",
+                "p1: hello",
+            ]
+        );
+        e.submit(schema_task("next", &full_budget_body(1001)))
+            .unwrap();
+    }
+
+    #[test]
+    fn stateful_warmup_reruns_after_a_rebuild_and_its_verdict_holds() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = stateful_full_budget(&clock);
+        // The rebuilt pipeline fails the structured-output check.
+        st.lock().unwrap().probe_answer = Some("Hello".into());
+        refusal(e.submit(schema_task("new", &full_budget_body(1000))));
+        assert_eq!(
+            e.structured_unavailable.as_deref(),
+            Some("the output constraint was not applied: Hello")
+        );
+        assert_eq!(
+            refusal(e.submit(schema_task("next", &full_budget_body(1001)))),
+            "structured output is not available for this model: the output constraint was \
+             not applied: Hello"
+        );
+    }
+
+    #[test]
+    fn stateful_failed_rebuild_fails_the_queue_and_refuses_everything() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = stateful_full_budget(&clock);
+        e.submit(GenerationTask::new("q1", "first")).unwrap();
+        st.lock().unwrap().build_err = Some("device lost".into());
+        const FAILED: &str = "ov-genai pipeline rebuild failed: device lost; this worker \
+            serves no requests until it is restarted";
+
+        let err = e
+            .submit(schema_task("new", &full_budget_body(1000)))
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Backend(m) if m == FAILED),
+            "{err:?}"
+        );
+        // The queued request fails (a 503), with the same reason.
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "q1");
+        assert!(!out[0].1.invalid_request);
+        assert_eq!(out[0].1.error.as_deref(), Some(FAILED));
+        assert!(e.step().unwrap().is_empty());
+        assert!(matches!(
+            e.submit(GenerationTask::new("p", "hi")),
+            Err(EngineError::Backend(m)) if m == FAILED
+        ));
+        assert_eq!(st.lock().unwrap().events, vec!["drop p0", "build"]);
     }
 }
