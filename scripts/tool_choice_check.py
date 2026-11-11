@@ -30,8 +30,8 @@ Cases (`--cases` takes these names; "+stream" means a streamed variant runs too)
                       content (a call is INFO)
     plain_unchanged   tools without tool_choice → 200, content or a function call, no custom objects
     too_complex_forced  tool_choice "required" over one tool with 600 optional string
-                      properties, above the ~499 where llguidance's row limit trips on the first
-                      token, yet a prompt a 2-stage chain prefills in time (max_tokens 32) → HTTP 200 within 300 s, any content or call;
+                      properties: a wide forced grammar, yet a prompt a 2-stage chain prefills in
+                      time (max_tokens 32) → HTTP 200 within 300 s, any content or call;
                       the elapsed seconds are reported, not judged. The one 400 accepted (PASS, with
                       a note) is sycl-llama's documented refusal of the tools themselves:
                       `error` (a string, or an object's `message`/`param`) names `tools`, says
@@ -39,8 +39,9 @@ Cases (`--cases` takes these names; "+stream" means a streamed variant runs too)
                       parameters" and names "tools[0] (fill_form)"; any other 400 or non-200
                       FAILs. What a node does at 600 properties is engine-dependent and reported
                       as INFO, from the rise of `cascadia_constraint_unenforced_total` (summed over
-                      reasons, read from /metrics before and after): a llguidance engine over its
-                      row limit drops the grammar (or, with that limit raised, may enforce it);
+                      reasons, read from /metrics before and after): a llguidance engine enforces it
+                      (its row limit is sized for schemas up to the 64 KiB cap) or, should a build or
+                      mask fail, drops it and answers unconstrained;
                       ov-genai drops it only when its xgrammar compile-time estimate is over its
                       limit, else enforces it; sycl-llama refuses the tools with that 400 under any
                       tool_choice (llama-server builds a grammar from the tools itself). Then a
@@ -96,9 +97,9 @@ DRY_COUNT = 0
 FAILED = []
 NOT_ENFORCED = "not enforced on this node (expected)"
 UNENFORCED_METRIC = "cascadia_constraint_unenforced_total"
-# too_complex_forced: optional properties on the one tool. Above the ~499 at which llguidance's
-# 2000-item row limit (`max_items_in_row`) trips on the first token, so the grammar path is hit;
-# not 2000, whose ~31k-token prompt takes a 2-stage chain over its 60 s per-stage prefill timeout.
+# too_complex_forced: optional properties on the one tool. Wide enough to have tripped llguidance's
+# former 2000-item row limit on the first token (~499 properties); not 2000, whose ~31k-token prompt
+# takes a 2-stage chain over its 60 s per-stage prefill timeout.
 # Also above the ~430 optional properties llama.cpp's grammar cost limit allows, so sycl-llama
 # refuses the tool with a 400 (see tools_cost_refusal).
 WIDE_PROPS = 600
