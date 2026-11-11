@@ -1258,8 +1258,10 @@ impl LlamaCppEngine {
             // for some templates (Gemma 4) allows a thought block before the
             // JSON whatever enable_thinking says, and a thought can run to
             // the token cap. A reasoning budget of 0 makes its sampler close
-            // a thought block the moment one opens.
-            if task.grammar.is_some() && !task.enable_thinking {
+            // a thought block the moment one opens. A grammar dropped at
+            // submit keeps it, as the resend without one does: thinking is
+            // still off.
+            if (task.grammar.is_some() || task.grammar_dropped.get()) && !task.enable_thinking {
                 body["reasoning_budget_tokens"] = serde_json::json!(0);
             }
             // The schema is added after serialization (below), verbatim.
@@ -1675,17 +1677,17 @@ fn drop_too_complex_grammar(task: &mut GenerationTask) {
 /// under any tool_choice (a lazy grammar), with the same converter and no
 /// time limit (see [`cascadia_grammar::llama_grammar_cost`]). Only the tools
 /// [`apply_tool_choice`] forwards are priced: none under `"none"`, the named
-/// one under a named choice. Their costs are summed; the error names the
-/// costliest by its index in `tools`.
+/// one under a named choice. Their costs are summed and the sum returned;
+/// the error names the costliest by its index in `tools`.
 fn check_tools_cost(
     tools: &serde_json::Value,
     choice: Option<&serde_json::Value>,
-) -> EngineResult<()> {
+) -> EngineResult<u64> {
     let Some(list) = tools.as_array() else {
-        return Ok(());
+        return Ok(0);
     };
     let named = match choice {
-        Some(serde_json::Value::String(s)) if s == "none" => return Ok(()),
+        Some(serde_json::Value::String(s)) if s == "none" => return Ok(0),
         Some(c) => c
             .get("function")
             .and_then(|f| f.get("name"))
@@ -1715,7 +1717,7 @@ fn check_tools_cost(
     }
     let max = cascadia_grammar::MAX_LLAMA_GRAMMAR_COST;
     let Some((i, cost)) = costliest.filter(|_| total > max) else {
-        return Ok(());
+        return Ok(total);
     };
     let name = name_of(&list[i]).unwrap_or_default();
     // the costliest alone over the limit: its own message says where
@@ -2107,13 +2109,34 @@ impl Engine for LlamaCppEngine {
         let mut budget = cascadia_grammar::Budget::default();
         if let Some(tools) = &mut task.tools {
             inline_tool_parameters(tools, task.tool_choice.as_ref(), no_jinja, &mut budget)?;
-            // Priced as llama-server receives them: inlined.
-            check_tools_cost(tools, task.tool_choice.as_ref())?;
         }
+        // Only a chat task forwards its tools (see `start_stream`); they are
+        // priced as llama-server receives them, inlined.
+        let tools_cost = match &task.tools {
+            Some(tools) if !task.messages.is_empty() => {
+                check_tools_cost(tools, task.tool_choice.as_ref())?
+            }
+            _ => 0,
+        };
         if let Some(g) = &mut task.grammar {
             g.body = inlined_schema(&g.body, no_jinja, &mut budget)?;
             let schema = parse_grammar_body(&g.body)?;
-            if let Some(e) = cascadia_grammar::llama_grammar_cost_error(&schema) {
+            // llama-server may build its tool-call grammar and this one in
+            // the same request, so they are priced together.
+            let max = cascadia_grammar::MAX_LLAMA_GRAMMAR_COST;
+            let too_costly = cascadia_grammar::llama_grammar_cost_error(&schema).or_else(|| {
+                (tools_cost > 0
+                    && tools_cost.saturating_add(cascadia_grammar::llama_grammar_cost(&schema))
+                        > max)
+                    .then(|| {
+                        format!(
+                            "llama-server would take too long to build a grammar for this \
+                             schema together with the tools' parameters: their cost is over \
+                             the limit of {max}"
+                        )
+                    })
+            });
+            if let Some(e) = too_costly {
                 // A best-effort grammar (the tool-call grammar) is dropped,
                 // as engines drop one they can't apply; a strict one is
                 // refused.
@@ -4160,6 +4183,98 @@ mod unix_tests {
         task.tools = Some(tools.clone());
         let text = captured_chat_text(task);
         assert!(text.contains(&format!(r#""tools":{tools}"#)), "{text}");
+    }
+
+    /// A tool-call grammar dropped at submit as too costly keeps the
+    /// reasoning cap: thinking is still off, and llama-server's own grammar
+    /// for the tools (Gemma 4) allows a thought block before the call.
+    #[test]
+    fn a_grammar_dropped_at_submit_with_thinking_off_keeps_the_reasoning_cap() {
+        let _counter = TOO_COMPLEX_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut task = chat_task().with_grammar(
+            cascadia_types::GrammarSpec::best_effort_json_schema(optional_object(600).to_string()),
+        );
+        task.enable_thinking = false;
+        task.tools = Some(serde_json::json!([tool(
+            "get_weather",
+            serde_json::json!({"type": "object"})
+        )]));
+        let dropped = task.grammar_dropped.clone();
+        let body = captured_chat_body(task);
+        assert!(dropped.get());
+        assert!(body.get("response_format").is_none(), "{body}");
+        assert!(body["tools"].is_array(), "{body}");
+        assert_eq!(body["reasoning_budget_tokens"], 0, "{body}");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    /// llama-server may build its tool-call grammar and the response_format
+    /// grammar in one request, so the two are priced together: tools under
+    /// the limit whose cost with a best-effort grammar is over it keep the
+    /// tools and drop the grammar (counted as `too_complex`).
+    #[test]
+    fn tools_and_a_best_effort_grammar_over_the_limit_together_drop_the_grammar() {
+        let _counter = TOO_COMPLEX_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = too_complex_count();
+        let tools = serde_json::json!([tool("extract", optional_object(420))]);
+        let mut task = chat_task().with_grammar(
+            cascadia_types::GrammarSpec::best_effort_json_schema(optional_object(420).to_string()),
+        );
+        task.tools = Some(tools.clone());
+        let dropped = task.grammar_dropped.clone();
+        let text = captured_chat_text(task);
+        assert!(dropped.get());
+        assert_eq!(too_complex_count() - before, 1);
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(body.get("response_format").is_none(), "{text}");
+        assert!(text.contains(&format!(r#""tools":{tools}"#)), "{text}");
+    }
+
+    /// Tools over the limit alone are refused naming the tools, whatever
+    /// grammar comes with them.
+    #[test]
+    fn tools_over_the_limit_alone_are_refused_with_a_grammar_too() {
+        let mut task = chat_task().with_grammar(
+            cascadia_types::GrammarSpec::best_effort_json_schema(optional_object(10).to_string()),
+        );
+        task.tools = Some(serde_json::json!([tool("extract", optional_object(600))]));
+        let dropped = task.grammar_dropped.clone();
+        match test_engine(1).submit(task) {
+            Err(EngineError::InvalidConfig(m)) => assert!(m.starts_with("tools: "), "{m}"),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        assert!(!dropped.get());
+    }
+
+    /// A strict response_format whose cost with the tools' is over the
+    /// limit is refused like one over the limit alone.
+    #[test]
+    fn a_strict_format_over_the_limit_with_the_tools_is_refused() {
+        let mut task = chat_task().with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: optional_object(420).to_string(),
+            best_effort: false,
+        });
+        task.tools = Some(serde_json::json!([tool("extract", optional_object(420))]));
+        match test_engine(1).submit(task) {
+            Err(EngineError::InvalidConfig(m)) => {
+                assert!(m.starts_with("response_format json_schema: "), "{m}");
+                assert!(m.contains("tools"), "{m}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// A completion task never forwards tools, so its tools are not priced.
+    #[test]
+    fn a_completion_tasks_tools_are_not_priced() {
+        let mut task = GenerationTask::new("task-1", "a prompt");
+        task.tools = Some(serde_json::json!([tool("extract", optional_object(600))]));
+        assert!(test_engine(1).submit(task).is_ok());
     }
 
     #[test]
