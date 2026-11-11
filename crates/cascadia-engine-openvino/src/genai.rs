@@ -1323,15 +1323,21 @@ fn is_best_effort(task: &GenerationTask) -> bool {
 
 /// A best-effort grammar whose refusal by a full budget rebuilt the
 /// pipeline: it runs on the new pipeline, constrained, unless the rebuilt
-/// pipeline failed its structured-output check (`unavailable`), when it is
-/// dropped for that reason. Never refused: the new budget has room.
+/// pipeline failed its structured-output check (`unavailable`), or the new
+/// `budget` is full already (the stateful rebuild counts the queued tasks'
+/// schemas against it), when it is dropped for that reason. Never refused,
+/// and never recorded past the budget's limit.
 fn after_best_effort_rebuild(
     task: &mut GenerationTask,
     unavailable: Option<&(UnenforcedReason, String)>,
+    budget: &SchemaBudget,
 ) {
     if let Some((why, _)) = unavailable {
         crate::structured::drop_best_effort_grammar(task, *why);
+    } else if !budget.has_room(task) {
+        crate::structured::drop_best_effort_grammar(task, UnenforcedReason::TooComplex);
     }
+    debug_assert!(budget.has_room(task));
 }
 
 /// The time source of the rebuild schedule. Injectable so the floor, its
@@ -1602,7 +1608,11 @@ impl Engine for OvGenaiEngine {
                 if let Some(err) = self.rebuild.refusal() {
                     return Err(err);
                 }
-                after_best_effort_rebuild(&mut task, self.structured_unavailable.as_ref());
+                after_best_effort_rebuild(
+                    &mut task,
+                    self.structured_unavailable.as_ref(),
+                    &self.schema_budget,
+                );
             }
         }
         self.schema_budget.record(&task);
@@ -2119,7 +2129,11 @@ impl Engine for OvGenaiCbEngine {
                 if let Some(err) = self.rebuild.refusal() {
                     return Err(err);
                 }
-                after_best_effort_rebuild(&mut task, self.structured_unavailable.as_ref());
+                after_best_effort_rebuild(
+                    &mut task,
+                    self.structured_unavailable.as_ref(),
+                    &self.schema_budget,
+                );
             }
         }
         let schema = grammar_json_schema(&task);
@@ -6404,5 +6418,44 @@ mod tests {
             ..recipe
         };
         assert!(recipe.with_keep_tokens(KeepSpy::default()).calls.is_empty());
+    }
+
+    /// The stateful rebuild counts the queued tasks' schemas against the new
+    /// budget, which can fill it again. A best-effort grammar whose refusal
+    /// rebuilt the pipeline is then re-checked: dropped (too_complex), not
+    /// recorded, so the budget never passes its limit.
+    #[test]
+    fn stateful_best_effort_after_a_rebuild_refilled_by_the_queue_is_dropped() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, _st) = stateful_full_budget(&clock);
+        // 64 queued tasks whose schemas were let through already.
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            e.submit(schema_task(&format!("q{i}"), &full_budget_body(i)))
+                .unwrap();
+        }
+        let before = unenforced(UnenforcedReason::TooComplex);
+        e.submit(soft_schema_task("soft", &full_budget_body(1000)))
+            .unwrap();
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(e.pending.last().unwrap().grammar, None, "dropped");
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+        assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
+        assert!(!e.schema_budget.seen.contains(&full_budget_body(1000)));
+    }
+
+    /// The CB rebuild runs with nothing in flight and starts an empty
+    /// budget: the best-effort schema that triggered it is the only one
+    /// recorded.
+    #[test]
+    fn cb_best_effort_rebuild_starts_an_empty_budget_and_records_only_its_schema() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, _st) = cb_full_budget(&clock);
+        assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
+        let body = full_budget_body(1000);
+        e.submit(soft_schema_task("soft", &body)).unwrap();
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(e.schema_budget.len(), 1);
+        assert!(e.schema_budget.seen.contains(&body));
+        assert!(e.active.last().unwrap().grammar_hash.is_some());
     }
 }
