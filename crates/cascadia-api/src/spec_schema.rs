@@ -121,8 +121,10 @@ pub(crate) fn assert_stream_chunk_spec(event: &Value) {
 /// Checks a whole SSE body of a chat or completions stream: only `data:`
 /// lines and `:` comments, every chunk spec-shaped, one `id` and `created`
 /// throughout, `role` on the first chat delta only, and either exactly one
-/// spec `finish_reason` or an error event as the last event (with no
-/// `finish_reason` and no usage chunk before it); then `[DONE]`.
+/// spec `finish_reason` (`function_call` only on `function_call` deltas,
+/// `tool_calls` only on `tool_calls` deltas) or an error event as the last
+/// event (with no `finish_reason` and no usage chunk before it); then
+/// `[DONE]`.
 pub(crate) fn assert_stream_spec(body: &str) {
     let mut events = Vec::new();
     let mut done = false;
@@ -235,6 +237,17 @@ pub(crate) fn assert_stream_spec(body: &str) {
             ]
             .contains(&f.as_str().unwrap_or_default()),
             "finish_reason {f} is not a spec value: {body}"
+        );
+        // The finish names the kind of call the deltas carried: a client
+        // that reads calls by the finish looks for that field.
+        let carries = |key: &str| deltas.iter().any(|d| d.get(key).is_some());
+        assert!(
+            !(f == "function_call" && carries("tool_calls")),
+            "a function_call finish on a stream of tool_calls deltas: {body}"
+        );
+        assert!(
+            !(f == "tool_calls" && carries("function_call")),
+            "a tool_calls finish on a stream of function_call deltas: {body}"
         );
     }
 }
@@ -525,7 +538,28 @@ fn bad_call_deltas(chunk: &dyn Fn(&str, &str, &str) -> String) -> Vec<(String, &
         more(r#"{"index":0,"function":{"arguments":"{}"}}"#)
     );
     assert_stream_spec(&good);
+    let legacy_head = chunk(
+        "",
+        r#"{"role":"assistant","function_call":{"name":"f","arguments":"{}"}}"#,
+        "null",
+    );
+    assert_stream_spec(&format!(
+        "{legacy_head}{}data: [DONE]\n\n",
+        chunk("", "{}", "\"function_call\"")
+    ));
     vec![
+        (
+            format!(
+                "{}{}data: [DONE]\n\n",
+                head(header),
+                chunk("", "{}", "\"function_call\"")
+            ),
+            "a function_call finish on a stream of tool_calls deltas",
+        ),
+        (
+            format!("{legacy_head}{end}data: [DONE]\n\n"),
+            "a tool_calls finish on a stream of function_call deltas",
+        ),
         (
             format!(
                 "{}{end}data: [DONE]\n\n",
