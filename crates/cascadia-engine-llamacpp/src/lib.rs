@@ -3811,6 +3811,95 @@ mod unix_tests {
         assert_eq!(schema_rejected_count(), before);
     }
 
+    /// A child that goes silent on the resend without the grammar (wedged,
+    /// as in a schema conversion) is stalled out and killed like any other:
+    /// the request ends with the stall error and is not sent a third time.
+    #[test]
+    fn a_stall_during_the_resend_kills_the_child_and_does_not_resend_again() {
+        // The resend counts schema_rejected: hold the counter's lock.
+        let _counter = SCHEMA_REJECTED_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (resent, resent_rx) = std::sync::mpsc::channel();
+        let read_request = |s: &TcpStream| {
+            let mut reader = BufReader::new(s.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+        };
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = l.accept().unwrap();
+            read_request(&first);
+            first
+                .write_all(error_reply("400 Bad Request", "failed to parse grammar").as_bytes())
+                .unwrap();
+            // The resend: read it, then answer nothing until the client goes.
+            let (mut second, _) = l.accept().unwrap();
+            read_request(&second);
+            resent.send(()).unwrap();
+            let _ = second.set_read_timeout(Some(Duration::from_secs(30)));
+            let mut buf = [0u8; 64];
+            let _ = second.read(&mut buf);
+            // Any later connection that carries a request is a second resend.
+            l.set_nonblocking(true).unwrap();
+            let mut again = 0;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match l.accept() {
+                    Ok((c, _)) => {
+                        c.set_nonblocking(false).unwrap();
+                        let _ = c.set_read_timeout(Some(Duration::from_millis(200)));
+                        let mut line = String::new();
+                        if BufReader::new(c).read_line(&mut line).unwrap_or(0) > 0 {
+                            again += 1;
+                        }
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            again
+        });
+        let mut engine = test_engine(port);
+        let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            TOOL_SCHEMA,
+        ));
+        engine.submit(task).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out = engine.step().unwrap();
+            assert!(out.iter().all(|(_, c)| c.is_progress()), "{out:?}");
+            if resent_rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the request was never resent");
+        }
+        engine.last_chunk_at = Instant::now() - STALL_LIMIT;
+        let out = engine.step().unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].1.is_final);
+        assert!(
+            out[0].1.error.as_deref().unwrap().contains("stalled"),
+            "{:?}",
+            out[0].1
+        );
+        assert!(engine.active.is_none());
+        assert!(engine.proc.exited(), "the stalled child must be killed");
+        // Nothing is left to run: no requeue onto a respawned child.
+        assert!(engine.pending.is_empty());
+        assert_eq!(server.join().unwrap(), 0, "the request was resent again");
+    }
+
     #[test]
     fn grammar_that_is_not_json_is_refused_at_submit() {
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::json_schema("{not json"));
