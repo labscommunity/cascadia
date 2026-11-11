@@ -226,28 +226,53 @@ impl GrammarFactory {
                 // treated as anyOf (pydantic's discriminated unions); keywords
                 // llguidance can't enforce become warnings, not errors.
                 obj.insert("x-guidance".into(), guidance_options());
-                match self.compile_schema(schema.clone(), Vec::new()) {
-                    Err(e) if is_regex_error(&e) => {
-                        // Only on a regex error: drop every pattern the regex
-                        // front end can't parse (a parse, no grammar build),
-                        // then build once more.
-                        let dropped = drop_unparseable_patterns(&mut schema);
-                        if dropped.is_empty() {
-                            return Err(e);
-                        }
-                        let warnings = dropped
-                            .iter()
-                            .map(|p| {
-                                clean_message(&format!(
-                                    "pattern not enforced (the regex engine can't parse it): {p}"
-                                ))
-                            })
-                            .collect();
-                        self.compile_schema(schema, warnings)
-                    }
+                int_bounds::clamp_for_llguidance(&mut schema);
+                let mut bounded = schema.clone();
+                if bound_integers(&mut bounded) == 0 {
+                    return self.compile_with_patterns_dropped(schema, Vec::new());
+                }
+                match self.compile_with_patterns_dropped(bounded, Vec::new()) {
+                    // Each bounded integer is a range regex of its own: a
+                    // schema with hundreds of them can pass llguidance's
+                    // lexer budget. It is built without the added bounds
+                    // then, as the client wrote it.
+                    Err(e) if is_lexer_too_big(&e) => self.compile_with_patterns_dropped(
+                        schema,
+                        vec!["integer length not bounded (the schema has too many \
+                              integers for the bounded grammar)"
+                            .into()],
+                    ),
                     other => other,
                 }
             }
+        }
+    }
+
+    /// [`Self::compile_schema`], and once more without every pattern the
+    /// regex front end can't parse when the build fails on a regex error.
+    fn compile_with_patterns_dropped(
+        &self,
+        mut schema: serde_json::Value,
+        warnings: Vec<String>,
+    ) -> EngineResult<CompiledGrammar> {
+        match self.compile_schema(schema.clone(), warnings.clone()) {
+            Err(e) if is_regex_error(&e) => {
+                // Only on a regex error: drop every pattern the regex
+                // front end can't parse (a parse, no grammar build),
+                // then build once more.
+                let dropped = drop_unparseable_patterns(&mut schema);
+                if dropped.is_empty() {
+                    return Err(e);
+                }
+                let mut warnings = warnings;
+                warnings.extend(dropped.iter().map(|p| {
+                    clean_message(&format!(
+                        "pattern not enforced (the regex engine can't parse it): {p}"
+                    ))
+                }));
+                self.compile_schema(schema, warnings)
+            }
+            other => other,
         }
     }
 
@@ -404,6 +429,10 @@ fn guidance_options() -> serde_json::Value {
         "coerce_one_of": true,
         "lenient": true,
     })
+}
+
+fn is_lexer_too_big(e: &EngineError) -> bool {
+    matches!(e, EngineError::InvalidConfig(m) if m.contains("initial lexer configuration (grammar) too big"))
 }
 
 fn is_regex_error(e: &EngineError) -> bool {
@@ -741,6 +770,9 @@ pub use llama_cost::{
 
 mod xgrammar_cost;
 pub use xgrammar_cost::{xgrammar_cost, xgrammar_cost_error, MAX_XGRAMMAR_COST};
+
+mod int_bounds;
+pub use int_bounds::{bound_integers, INTEGER_DIGITS_CAP};
 
 mod stage_mask;
 pub use stage_mask::{

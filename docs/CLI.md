@@ -582,6 +582,14 @@ The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
   `patternProperties` key) the regex engine can't parse, such as one with
   look-around or a backreference, is dropped and logged the same way; the
   rest of the schema is still enforced.
+- Bound an `integer` the schema leaves unbounded to at most 18 digits
+  (`minimum: -999999999999999999`, `maximum: 999999999999999999` where the
+  schema sets none), so a model can't repeat digits until `max_tokens`. A
+  schema with too many integers for that (several hundred) is built
+  without the added bounds, and logged (`integer length not bounded`).
+  `number` is not bounded. A lower bound at or below -2^63 (C#'s
+  `long.MinValue`), which llguidance can't build, is raised to
+  -9223372036854774784.
 - Compile the schema when the request is submitted: a schema llguidance
   cannot build (for example `{"type": 42}` or an unresolvable `$ref`) is a
   400 before the request queues. A client's own top-level `x-guidance`

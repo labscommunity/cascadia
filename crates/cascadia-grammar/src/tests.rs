@@ -1219,3 +1219,85 @@ fn a_cancelled_first_step_check_stops_before_its_next_mask() {
     let err = grammar.check_first_step(&stop).unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err}");
 }
+
+/// C#/NJsonSchema writes a `long` property with the full `i64` range.
+const NJSON_LONG: &str = r#"{"type":"object","properties":{"x":{"type":"integer","format":"int64","minimum":-9223372036854775808,"maximum":9223372036854775807}},"required":["x"]}"#;
+
+#[test]
+fn an_integer_bounded_at_the_ends_of_i64_builds() {
+    // llguidance reads integer bounds as f64 and refuses a lower bound at or
+    // below -2^63 ("Failed to generate regex for integer range").
+    let gf = single_byte();
+    assert!(accepts(&gf, NJSON_LONG, r#"{"x":-12}"#));
+    for x in [
+        r#"{"type":"integer","minimum":-9223372036854775807}"#,
+        r#"{"type":"integer","minimum":-1e19}"#,
+        r#"{"type":"integer","exclusiveMinimum":-9223372036854775808}"#,
+        r#"{"type":"integer","minimum":-9223372036854775808,"maximum":5}"#,
+        r#"{"type":"integer","maximum":1e20}"#,
+        r#"{"type":"integer","exclusiveMaximum":18446744073709551615}"#,
+    ] {
+        let body = format!(r#"{{"type":"object","properties":{{"x":{x}}},"required":["x"]}}"#);
+        assert!(accepts(&gf, &body, r#"{"x":-12}"#), "{x}");
+    }
+}
+
+#[test]
+fn an_unbounded_integer_takes_at_most_eighteen_digits() {
+    // A small model in JSON mode can repeat digits until max_tokens. Any
+    // integer with no bound gets ±(10^18 - 1): 18 digits at most.
+    let gf = single_byte();
+    for (body, sign) in [
+        (
+            r#"{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}"#,
+            "",
+        ),
+        (
+            r#"{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}"#,
+            "-",
+        ),
+        (
+            r#"{"type":"object","properties":{"n":{"type":["integer","null"]}},"required":["n"]}"#,
+            "",
+        ),
+        (
+            r##"{"type":"object","properties":{"n":{"$ref":"#/$defs/N"}},"required":["n"],"$defs":{"N":{"type":"integer","minimum":0}}}"##,
+            "",
+        ),
+    ] {
+        let mut gm = mask_for(&gf, body);
+        let prefix = bytes(&format!(r#"{{"n":{sign}123456789012345678"#));
+        assert_eq!(walk(&gf, &mut gm, &prefix), Ok(()), "{body} {sign}");
+        assert!(!gm.allowed(u32::from(b'9')), "{body} {sign}: a 19th digit");
+        assert!(gm.allowed(u32::from(b'}')), "{body} {sign}");
+    }
+}
+
+#[test]
+fn a_schema_with_too_many_integers_to_bound_builds_unbounded() {
+    // Each bounded integer is a range regex of its own; 600 of them pass
+    // llguidance's lexer budget, which the schema as written stays inside.
+    let props: Vec<String> = (0..600)
+        .map(|i| format!(r#""p{i}":{{"type":"integer"}}"#))
+        .collect();
+    let body = format!(
+        r#"{{"type":"object","properties":{{{}}}}}"#,
+        props.join(",")
+    );
+    let gf = single_byte();
+    let grammar = gf.compile(&spec(&body)).unwrap();
+    assert!(
+        grammar
+            .warnings()
+            .iter()
+            .any(|w| w.contains("integer length not bounded")),
+        "{:?}",
+        grammar.warnings()
+    );
+    let mut gm = grammar.matcher().unwrap();
+    let long = bytes(r#"{"p0":1234567890123456789012"#);
+    assert_eq!(walk(&gf, &mut gm, &long), Ok(()));
+    // A few integers are bounded, with no warning.
+    let few = r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}"#;
+    assert!(gf.compile(&spec(few)).unwrap().warnings().is_empty());
+}
