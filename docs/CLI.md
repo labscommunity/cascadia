@@ -386,9 +386,11 @@ ending with `data: [DONE]`) or not:
 - `logprobs` items are OpenAI's: `{token, logprob, bytes, top_logprobs}`,
   `bytes` being the token's UTF-8 bytes, inside
   `logprobs: {content: [...], refusal: null}`; the engine's token ids are not
-  sent. A logprob too small to represent is sent as `-9999.0`. A streamed
-  chunk carries the items of the tokens whose text it releases, else
-  `logprobs: null`. Items of text that is never sent (cut by a `stop` match,
+  sent. Each item's `top_logprobs` holds the number of alternatives asked
+  for and no more: chat's `top_logprobs` (none, `[]`, when it is absent or 0),
+  completions' `logprobs` count. A logprob too small to represent is sent as
+  `-9999.0`. A streamed chunk carries the items of the tokens whose text it
+  releases, else `logprobs: null`. Items of text that is never sent (cut by a `stop` match,
   streamed or not, or consumed as tool-call markup) are dropped with it. `/v1/completions` uses the same
   item shape for now, not the legacy
   `{tokens, token_logprobs, top_logprobs, text_offset}` one.
@@ -407,21 +409,25 @@ ending with `data: [DONE]`) or not:
   thinking on, calls are looked for only after `</think>`, so a call drafted
   while reasoning is never sent, and a reply that never closes its reasoning
   has its calls decided at the end. A committed call cannot be taken back: if
-  the model then breaks its JSON, the stream keeps it with the model's raw
-  arguments and ends `tool_calls` (the non-streamed reply returns that text as
-  content). A `stop` match or `/v1/cancel` inside a call's arguments ends
-  `stop`, the length limit `length`, with the arguments sent so far. A
-  `functions` request gets the same deltas under `delta.function_call`, first
-  call only.
+  the model then breaks its JSON but closes the arguments object, the stream
+  keeps it with the model's raw arguments and ends `tool_calls` (the
+  non-streamed reply returns that text as content). A call whose arguments
+  object never closed (the reply ended, a `stop` matched or `/v1/cancel` came
+  while it was being written) keeps the arguments sent so far and ends `stop`,
+  or `length` at the length limit, never `tool_calls`. So a streamed call's
+  arguments can be incomplete or invalid JSON: check `finish_reason` and
+  validate the arguments before parsing them. A `functions` request gets the
+  same deltas under `delta.function_call`, first call only, and
+  `function_call` in place of `tool_calls`.
 - **Errors after the stream started.** The 200 headers are already sent, so an
   engine failure arrives as one event and then `[DONE]`, with no usage chunk:
   `{"id": "<chunk id>", "object": "error", "error": {"message": "...",
   "type": "server_error", "param": null, "code": "engine_error"}}`.
   openai-python and openai-node raise `APIError` on it.
-- **A stream whose engine ends without a final chunk** sends the text it was
-  still holding, then that error event (message `engine stream ended without a
-  final chunk`) and `[DONE]`: the answer may be cut short, so it is not
-  reported as complete. On a tools stream, calls already streamed stay sent and
+- **A stream whose engine ends without a final chunk** (chat, completions or
+  tools) sends the text it was still holding, then that error event (message
+  `engine stream ended without a final chunk`) and `[DONE]`: the answer may
+  be cut short, so it is not reported as complete. On a tools stream, calls already streamed stay sent and
   no others follow. A stream ended by `POST /v1/cancel/<task_id>` instead closes
   its choice with `finish_reason: "stop"` and no usage chunk.
 
@@ -437,8 +443,19 @@ ending with `data: [DONE]`) or not:
 - Tool calls arrive as a header delta and then argument fragments, one `index`
   per call, instead of every call in one delta at the end; concatenate
   `function.arguments` by `index`.
-- A tools stream whose engine ends without a final chunk (and was not
-  cancelled) ends with the error event instead of `finish_reason: "stop"`.
+- A stream (chat, completions or tools) whose engine ends without a final
+  chunk, and was not cancelled, ends with the error event. Chat and
+  completions streams used to send `[DONE]` with no `finish_reason` at all,
+  tools streams `finish_reason: "stop"`. A chat or completions stream ended by
+  `/v1/cancel` now closes its choice with a `finish_reason: "stop"` chunk.
+- A streamed tool call can carry incomplete arguments (the stream then ends
+  `stop` or `length`, never `tool_calls`) or the model's own invalid JSON in a
+  closed arguments object (ends `tool_calls`); validate the arguments before
+  parsing them.
+- With `include_usage`, every chunk now has a `usage` key, `null` until the
+  usage chunk: test `usage` for non-null, not for presence.
+- `top_logprobs` holds the requested number of alternatives; `logprobs: true`
+  without `top_logprobs` (or with 0) used to send one per token, now `[]`.
 
 **`--ov-config KEY=VALUE`** forwards any plugin property to OpenVINO verbatim,
 alongside the typed `--ov-*` flags — the escape hatch for knobs without a
