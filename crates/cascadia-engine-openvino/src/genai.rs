@@ -1025,14 +1025,11 @@ const REBUILD_FLOOR: Duration = Duration::from_secs(10 * 60);
 const REBUILD_JITTER_MAX: Duration = Duration::from_secs(60);
 
 /// Longest the CB engine waits for the requests in flight to finish before
-/// a rebuild. It admits nothing meanwhile; those still running at the cap
-/// fail with [`REBUILD_DRAIN_FAILED`].
+/// a rebuild. It admits nothing meanwhile (a retryable
+/// [`EngineError::Unavailable`]); those still running at the cap fail with
+/// the retryable [`cascadia_engine::PIPELINE_REBUILD_INTERRUPTED`]. The API
+/// keeps both out of its readiness latch.
 const REBUILD_DRAIN_CAP: Duration = Duration::from_secs(15);
-
-/// What a CB request still running at [`REBUILD_DRAIN_CAP`] is told (a
-/// retryable failure: 503).
-const REBUILD_DRAIN_FAILED: &str = "cb pipeline rebuild: this request was still running when \
-     the worker stopped waiting to rebuild its pipeline; retry the request";
 
 /// What a client of a refused new schema learns about the rebuild that
 /// clears the budget.
@@ -1715,13 +1712,12 @@ impl Engine for OvGenaiCbEngine {
         }
         // Draining for a rebuild (the schema budget is full): admit nothing
         // until the requests in flight are gone, then rebuild before this
-        // request. The refusal is the retryable capacity 503.
+        // request. The refusal is a retryable 503.
         if self.rebuild.draining_since.is_some() {
             if !self.active.is_empty() {
-                return Err(EngineError::QueueFull {
-                    queued: self.active.len(),
-                    cap: 0,
-                });
+                return Err(EngineError::Unavailable(
+                    cascadia_engine::PIPELINE_REBUILDING.to_owned(),
+                ));
             }
             self.rebuild_pipeline();
             if let Some(err) = self.rebuild.refusal() {
@@ -1850,7 +1846,10 @@ impl Engine for OvGenaiCbEngine {
                     .drain(..)
                     .map(|t| {
                         let _ = t.handle.cancel();
-                        let chunk = Chunk::error(t.task_id.clone(), REBUILD_DRAIN_FAILED);
+                        let chunk = Chunk::error(
+                            t.task_id.clone(),
+                            cascadia_engine::PIPELINE_REBUILD_INTERRUPTED,
+                        );
                         (t.task_id, chunk)
                     })
                     .collect());
@@ -4733,12 +4732,15 @@ mod tests {
             BUDGET_FULL_DRAIN_400
         );
         assert!(st.lock().unwrap().events.is_empty(), "nothing is cut");
-        // Nothing is admitted meanwhile, plain or schema: a retryable 503.
+        // Nothing is admitted meanwhile, plain or schema: a retryable 503
+        // that says why, and that the API's readiness ignores.
         for t in [task("c", 8), schema_task("d", &full_budget_body(0))] {
-            assert!(
-                matches!(e.submit(t), Err(EngineError::QueueFull { .. })),
-                "admitted during the drain"
-            );
+            match e.submit(t) {
+                Err(EngineError::Unavailable(m)) => {
+                    assert_eq!(m, cascadia_engine::PIPELINE_REBUILDING)
+                }
+                other => panic!("admitted during the drain: {other:?}"),
+            }
         }
         // The two keep streaming until they finish.
         clock.advance(REBUILD_DRAIN_CAP - Duration::from_secs(1));
@@ -4782,7 +4784,10 @@ mod tests {
         for (_, c) in &out {
             assert!(c.is_final);
             assert!(!c.invalid_request, "retryable: a 503, not a 400");
-            assert_eq!(c.error.as_deref(), Some(REBUILD_DRAIN_FAILED));
+            assert_eq!(
+                c.error.as_deref(),
+                Some(cascadia_engine::PIPELINE_REBUILD_INTERRUPTED)
+            );
         }
         assert!(e.active.is_empty());
         {
