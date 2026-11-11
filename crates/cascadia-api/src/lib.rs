@@ -8257,6 +8257,9 @@ mod tests {
     struct StuckEngine {
         stuck: Arc<std::sync::atomic::AtomicBool>,
         pending: Option<(cascadia_types::TaskId, usize)>,
+        /// Once unstuck, fail the task for the server's fault (a peer's
+        /// token wait timing out) instead of answering.
+        fail_after: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl cascadia_engine::Engine for StuckEngine {
@@ -8272,6 +8275,12 @@ mod tests {
             let Some((id, i)) = self.pending.take() else {
                 return Ok(Vec::new());
             };
+            if self.fail_after.load(Ordering::SeqCst) {
+                return Err(cascadia_engine::EngineError::Backend(
+                    "timed out after 60s waiting for the downstream token".into(),
+                )
+                .for_task(id));
+            }
             if i < 3 {
                 self.pending = Some((id.clone(), i + 1));
                 return Ok(vec![(id.clone(), Chunk::token(&id, i as i64, "tok "))]);
@@ -8322,6 +8331,7 @@ mod tests {
         let runner = Runner::new(Box::new(StuckBuilder(Some(StuckEngine {
             stuck: stuck.clone(),
             pending: None,
+            fail_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }))));
         runner
             .start(layout, ShardSpec::single_stage("mock-model", "CPU"))
@@ -8480,6 +8490,49 @@ mod tests {
         assert_eq!(health, StatusCode::OK, "busy, not stalled");
         assert!(String::from_utf8_lossy(&body).contains("tok"));
         assert_eq!(stall_health(&app).await, StatusCode::OK);
+    }
+
+    /// A client that gives up while the engine is inside its step (here
+    /// before a peer's token wait times out) does not hide the failure: the
+    /// step runs inside the stream's own poll, so the failed step's error
+    /// chunk still reaches the readiness note before the stream is dropped,
+    /// and `/health` is unready. (Moving engine polling to a separate task
+    /// would change that; see the readiness note's call sites.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_that_gives_up_mid_step_does_not_hide_the_failure() {
+        let stuck = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_after = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Runner::new(Box::new(StuckBuilder(Some(StuckEngine {
+            stuck: stuck.clone(),
+            pending: None,
+            fail_after: fail_after.clone(),
+        }))));
+        runner
+            .start(first_of_two(), ShardSpec::single_stage("mock-model", "CPU"))
+            .await
+            .unwrap();
+        let app = make_router_with_config(Arc::new(runner), "mock-model", Config::default());
+        stuck.store(true, Ordering::SeqCst);
+        fail_after.store(true, Ordering::SeqCst);
+        let reader = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                to_bytes(resp.into_body(), 1 << 20).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The client gives up while the step is blocked on its peer.
+        reader.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The peer wait then times out and fails the step.
+        stuck.store(false, Ordering::SeqCst);
+        let _ = reader.await;
+        assert_eq!(
+            stall_health(&app).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the failed step must reach readiness"
+        );
     }
 
     /// How a [`PhaseEngine`] answers a step.
