@@ -412,9 +412,11 @@ ending with `data: [DONE]`) or not:
   the model then breaks its JSON but closes the arguments object, the stream
   keeps it with the model's raw arguments and ends `tool_calls` (the
   non-streamed reply returns that text as content). A call whose arguments
-  object never closed (the reply ended, a `stop` matched or `/v1/cancel` came
-  while it was being written) keeps the arguments sent so far and ends `stop`,
-  or `length` at the length limit, never `tool_calls`. So a streamed call's
+  object never closed (the reply ended, a `stop` matched, `/v1/cancel` came, or
+  the model wrote `</tool_call>` while it was being written) keeps the
+  arguments sent so far and ends `stop`, or `length` at the length limit, never
+  `tool_calls`. The result does not depend on how the engine chunks its output:
+  a reply that arrives in one piece streams exactly as it would token by token. So a streamed call's
   arguments can be incomplete or invalid JSON: check `finish_reason` and
   validate the arguments before parsing them. A `functions` request gets the
   same deltas under `delta.function_call`, first call only, and
