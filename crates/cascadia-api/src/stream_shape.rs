@@ -291,8 +291,10 @@ pub(crate) fn spec_logprobs(items: &[cascadia_types::TokenLogprobs]) -> serde_js
 /// (cut by a `stop` match, or tool-call markup) are dropped by
 /// [`finish`](Self::finish).
 pub(crate) struct LogprobQueue {
-    /// The request asked for logprobs; otherwise every frame says `null`.
-    asked: bool,
+    /// How many alternatives each item carries when the request asked for
+    /// logprobs; `None` otherwise, and every frame says `null`. The engine
+    /// may be asked for more than this, so its lists are cut to it.
+    top: Option<usize>,
     items: std::collections::VecDeque<(usize, cascadia_types::TokenLogprobs)>,
     /// Bytes of text the engine has produced so far.
     pushed: usize,
@@ -301,9 +303,10 @@ pub(crate) struct LogprobQueue {
 }
 
 impl LogprobQueue {
-    pub(crate) fn new(asked: bool) -> Self {
+    /// `top`: the alternatives asked for per item, `None` for no logprobs.
+    pub(crate) fn new(top: Option<u32>) -> Self {
         Self {
-            asked,
+            top: top.map(|n| n as usize),
             items: std::collections::VecDeque::new(),
             pushed: 0,
             released: 0,
@@ -313,8 +316,10 @@ impl LogprobQueue {
     /// Records the next `len` bytes of text and, when the engine gave one,
     /// their item.
     pub(crate) fn push(&mut self, len: usize, item: Option<&cascadia_types::TokenLogprobs>) {
-        if let (true, Some(item)) = (self.asked, item) {
-            self.items.push_back((self.pushed, item.clone()));
+        if let (Some(top), Some(item)) = (self.top, item) {
+            let mut item = item.clone();
+            item.top_logprobs.truncate(top);
+            self.items.push_back((self.pushed, item));
         }
         self.pushed += len;
     }
@@ -643,7 +648,7 @@ mod logprob_tests {
 
     #[test]
     fn queue_sends_each_item_with_the_frame_that_releases_its_first_byte() {
-        let mut q = LogprobQueue::new(true);
+        let mut q = LogprobQueue::new(Some(20));
         q.push(3, Some(&item("ab ", -1.0)));
         q.push(2, Some(&item(" S", -1.0)));
         // " S": only " " released, the "S" held: the item goes out with it.
@@ -661,12 +666,12 @@ mod logprob_tests {
 
     #[test]
     fn queue_skips_chunks_without_items_and_is_inert_when_not_asked() {
-        let mut q = LogprobQueue::new(true);
+        let mut q = LogprobQueue::new(Some(20));
         q.push(2, None);
         q.push(1, Some(&item("c", -1.0)));
         assert!(q.release(2).is_null());
         assert_eq!(tokens(&q.finish(1)), ["c"]);
-        let mut off = LogprobQueue::new(false);
+        let mut off = LogprobQueue::new(None);
         off.push(1, Some(&item("c", -1.0)));
         assert!(off.release(1).is_null());
     }
