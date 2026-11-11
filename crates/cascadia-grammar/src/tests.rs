@@ -1301,3 +1301,23 @@ fn a_schema_with_too_many_integers_to_bound_builds_unbounded() {
     let few = r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}"#;
     assert!(gf.compile(&spec(few)).unwrap().warnings().is_empty());
 }
+
+#[test]
+fn a_pattern_under_a_property_named_like_a_keyword_is_dropped() {
+    // A property called `default` or `enum` holds a schema like any other:
+    // its look-ahead pattern is dropped and listed, and the schema builds.
+    let gf = single_byte();
+    for name in ["default", "enum", "const", "examples"] {
+        let body = format!(
+            r#"{{"type":"object","properties":{{"{name}":{{"type":"string","pattern":"^(?=a)a$"}}}},"required":["{name}"]}}"#
+        );
+        let grammar = gf
+            .compile(&spec(&body))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(
+            grammar.warnings().iter().any(|w| w.contains("^(?=a)a$")),
+            "{name}: {:?}",
+            grammar.warnings()
+        );
+    }
+}

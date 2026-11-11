@@ -1,5 +1,6 @@
 //! Integer bounds added to a schema before a grammar backend sees it.
 
+use crate::NAME_MAPS;
 use serde_json::{Map, Value};
 
 /// The largest magnitude an unbounded `integer` may take: 18 digits.
@@ -139,17 +140,6 @@ fn has_integer(obj: &Map<String, Value>) -> bool {
 /// The numeric range keywords. One that is not a number is the backend's
 /// to refuse: a bound added beside it would hide it.
 const BOUND_KEYWORDS: [&str; 4] = ["minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum"];
-
-/// Keywords whose value maps names (property names, definition names, ...)
-/// to schemas. A name here is never a keyword: a property called `default`
-/// or `not` holds a schema like any other.
-const NAME_MAPS: &[&str] = &[
-    "properties",
-    "patternProperties",
-    "$defs",
-    "definitions",
-    "dependentSchemas",
-];
 
 /// Calls `f` on every schema object in `v`: through subschema keywords,
 /// lists (`anyOf`, `prefixItems`, ...) and the schemas of name maps

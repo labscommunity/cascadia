@@ -415,6 +415,16 @@ pub fn drop_unparseable_patterns(schema: &mut serde_json::Value) -> Vec<String> 
     dropped
 }
 
+/// Keywords whose value maps names (property names, definition names, ...)
+/// to schemas.
+pub(crate) const NAME_MAPS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+];
+
 /// Schema keywords whose values are data, not schemas: never searched for patterns.
 const DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples", "x-guidance"];
 
@@ -453,8 +463,19 @@ fn visit_patterns(v: &mut serde_json::Value, keep: &mut impl FnMut(&str) -> bool
                 props.retain(|k, _| keep(k));
             }
             for (k, child) in obj.iter_mut() {
-                if !DATA_KEYWORDS.contains(&k.as_str()) {
-                    visit_patterns(child, keep);
+                let k = k.as_str();
+                if DATA_KEYWORDS.contains(&k) {
+                    continue;
+                }
+                match child {
+                    // A name here (a property called `default`) is not a
+                    // keyword: walk the map's schemas.
+                    serde_json::Value::Object(map) if NAME_MAPS.contains(&k) => {
+                        for schema in map.values_mut() {
+                            visit_patterns(schema, keep);
+                        }
+                    }
+                    _ => visit_patterns(child, keep),
                 }
             }
         }
