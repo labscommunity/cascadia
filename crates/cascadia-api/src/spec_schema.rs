@@ -203,6 +203,13 @@ pub(crate) fn assert_stream_spec(body: &str) {
         .filter(|f| !f.is_null())
         .collect();
     if ends_in_error {
+        // Clients match the error to the stream it ends by `id`.
+        if let (Some(first), Some(error)) = (chunks.first(), events.last()) {
+            assert_eq!(
+                error["id"], first["id"],
+                "error event's id differs from the chunks' id: {body}"
+            );
+        }
         assert!(
             finishes.is_empty(),
             "a stream that ends in an error closed its choice: {body}"
@@ -371,6 +378,13 @@ fn assert_stream_spec_rejects_extension_fields_and_repeated_roles() {
         (
             format!("{first}{last}{err}data: [DONE]\n\n"),
             "a stream that ends in an error closed its choice",
+        ),
+        (
+            format!(
+                "{first}{}data: [DONE]\n\n",
+                err.replace("\"c\"", "\"other\"")
+            ),
+            "error event's id differs from the chunks' id",
         ),
     ];
     for (body, rule) in bad {

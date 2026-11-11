@@ -11325,6 +11325,41 @@ level={{ effort_map[eff] }}";
         assert_eq!(live.len(), 0);
     }
 
+    /// A tools stream whose engine goes away after a whole call was parsed
+    /// (not cancelled) sends no call it cannot vouch for: the content before
+    /// the call, the error event, then `[DONE]`.
+    #[tokio::test]
+    async fn unexplained_end_after_a_call_drops_the_call() {
+        let live = stream_shape::LiveStreams::default();
+        let id = "task-tools-call";
+        let reply = r#"hi <tool_call>{"name":"f","arguments":{}}</tool_call>"#;
+        let mut s = unit_tool_stream(ended_channel(id, &[reply]), &live, id);
+        let mut body = String::new();
+        while let Some(frame) = s.next_frame().await {
+            push_frame(&mut body, &frame);
+        }
+        drop(s);
+        let events = sse_events(&body);
+        assert!(
+            events
+                .iter()
+                .filter_map(|e| e["choices"].as_array())
+                .flatten()
+                .all(|c| c["delta"].get("tool_calls").is_none()),
+            "{body}"
+        );
+        let content: String = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(content, "hi ", "{body}");
+        let last = events.last().unwrap();
+        assert_eq!(last["object"], "error", "{body}");
+        assert_eq!(last["id"], id, "{body}");
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        assert_eq!(live.len(), 0);
+    }
+
     /// The live entry goes when a stream ends and when its body is dropped
     /// mid-stream (a client disconnect); a cancel for an id with no open
     /// stream adds nothing.
