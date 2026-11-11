@@ -32,7 +32,9 @@ const SKIP_KEYWORDS: &[&str] = &[
 /// Left as they are: `number` (llguidance can't bound a fraction's length
 /// and xgrammar already caps it at 6 digits; a bound on a type list that
 /// holds `number` would bound its numbers too), a schema with `enum`,
-/// `const` or `multipleOf` (a bound can leave no multiple in range), a side whose other bound is past the cap (it would leave no
+/// `const` or `multipleOf` (a bound can leave no multiple in range), one
+/// with a range keyword that is not a number (left for the backend to
+/// refuse), a side whose other bound is past the cap (it would leave no
 /// value), and anything under `not` or `if`.
 ///
 /// Returns how many schemas it bounded.
@@ -43,6 +45,9 @@ pub fn bound_integers(schema: &mut Value) -> usize {
             || ["enum", "const", "multipleOf"]
                 .iter()
                 .any(|k| obj.contains_key(*k))
+            || BOUND_KEYWORDS
+                .iter()
+                .any(|k| obj.get(*k).is_some_and(|b| !b.is_number()))
         {
             return;
         }
@@ -123,6 +128,10 @@ fn has_integer(obj: &Map<String, Value>) -> bool {
         _ => false,
     }
 }
+
+/// The numeric range keywords. One that is not a number is the backend's
+/// to refuse: a bound added beside it would hide it.
+const BOUND_KEYWORDS: [&str; 4] = ["minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum"];
 
 /// Keywords whose value maps names (property names, definition names, ...)
 /// to schemas. A name here is never a keyword: a property called `default`
@@ -284,6 +293,18 @@ mod tests {
         // The keywords themselves are still skipped.
         let schema = json!({"not": int, "if": int, "default": int, "examples": [int]});
         assert_eq!(bounded(schema.clone()), schema);
+    }
+
+    #[test]
+    fn a_bound_that_is_not_a_number_is_left_for_the_backend_to_refuse() {
+        for schema in [
+            json!({"type": "integer", "maximum": null}),
+            json!({"type": "integer", "minimum": "0"}),
+            json!({"type": "integer", "exclusiveMaximum": true}),
+            json!({"type": "integer", "exclusiveMinimum": [1]}),
+        ] {
+            assert_eq!(bounded(schema.clone()), schema);
+        }
     }
 
     #[test]
