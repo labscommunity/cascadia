@@ -378,6 +378,59 @@ fn regex_bounds_are_parsed_as_xgrammar_parses_them() {
     assert!(!refused(&pattern("^[{]{1,5}$")));
 }
 
+#[test]
+fn property_names_are_compiled_like_any_schema() {
+    // The converter sets `propertyNames`' type to "string", but a `$ref`,
+    // `anyOf` or `allOf` in it is still followed: with 300 optional
+    // properties behind each, 1.52 s, as long as the object alone.
+    let opt300 = object(300, []);
+    let alone = xgrammar_cost(&opt300);
+    for names in [
+        json!({"anyOf": [opt300.clone()]}),
+        json!({"allOf": [opt300.clone()]}),
+        json!({"$ref": "#/$defs/O"}),
+    ] {
+        let schema =
+            json!({"$defs": {"O": opt300.clone()}, "type": "object", "propertyNames": names});
+        let cost = xgrammar_cost(&schema);
+        assert!(
+            cost >= alone && cost < MAX_XGRAMMAR_COST,
+            "{names}: {cost} {alone}"
+        );
+    }
+    // 6000 behind it: refused.
+    let wide = object(6000, []);
+    for names in [
+        json!({"anyOf": [wide.clone()]}),
+        json!({"allOf": [wide.clone()]}),
+        json!({"$ref": "#/$defs/O"}),
+    ] {
+        let schema =
+            json!({"$defs": {"O": wide.clone()}, "type": "object", "propertyNames": names});
+        let e = xgrammar_cost_error(&schema).expect("6000 optional properties");
+        assert!(e.contains("a run of 6000 properties"), "{e}");
+    }
+    // Without them it is a string: `maxLength` 20, 0.28 s.
+    let plain = json!({"type": "object", "propertyNames": {"maxLength": 20}});
+    assert!(xgrammar_cost(&plain) > 200_000 && !refused(&plain));
+}
+
+#[test]
+fn a_unicode_escape_with_braces_is_one_character() {
+    // xgrammar reads `\u{1F600}` as one code point (0.001 s).
+    let pattern = |p: &str| json!({"type": "string", "pattern": p});
+    assert!(!refused(&pattern(r"^[a-z]+\u{1F600}$")));
+    assert!(!refused(&pattern(r"^[\u{1F600}-\u{1F64F}]{1,3}$")));
+    assert_eq!(regex_cost(r"\u{1F600}"), regex_cost("a"));
+    for bad in [r"^\u{}$", r"^\u{1234567}$", r"^\u{12$"] {
+        let e = xgrammar_cost_error(&pattern(bad)).unwrap_or_default();
+        assert!(
+            e.starts_with("xgrammar would reject this schema"),
+            "{bad}: {e}"
+        );
+    }
+}
+
 fn fixture(f: &str) -> Value {
     let path = format!(
         "{}/../cascadia-engine-mock/tests/fixtures/{f}",

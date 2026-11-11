@@ -353,6 +353,21 @@ fn regex_int(c: &[char], i: &mut usize) -> Result<Option<i64>, &'static str> {
     Ok((*i > start).then_some(n))
 }
 
+/// The `{hex}` of a `\u{hex}` escape starting at `c[*i]` (the `{`): one
+/// to six hex digits, as xgrammar's `HandleCharEscape` reads it.
+fn unicode_escape(c: &[char], i: &mut usize) -> Result<(), &'static str> {
+    let start = *i + 1;
+    let mut j = start;
+    while j < c.len() && j - start <= 6 && c[j].is_ascii_hexdigit() {
+        j += 1;
+    }
+    if j == start || j - start > 6 || c.get(j) != Some(&'}') {
+        return Err("a `pattern` with an invalid `\\u{…}` escape");
+    }
+    *i = j + 1;
+    Ok(())
+}
+
 /// A `{x}`, `{x,}` or `{x,y}` starting at `c[*i]` (the `{`), parsed as
 /// xgrammar's `HandleRepetitionRange` does: anything else is an error.
 fn regex_bounds(c: &[char], i: &mut usize) -> Result<(i64, i64), &'static str> {
@@ -440,6 +455,11 @@ fn regex_seq(c: &[char], i: &mut usize, depth: usize) -> Result<(u64, bool), &'s
                     let (lo, width) = if a == '\\' && *i < c.len() {
                         let e = c[*i];
                         *i += 1;
+                        if e == 'u' && c.get(*i) == Some(&'{') {
+                            unicode_escape(c, i)?;
+                            n += 1;
+                            continue;
+                        }
                         let b = escape_breadth(e);
                         if b > 1 {
                             n += b;
@@ -465,7 +485,12 @@ fn regex_seq(c: &[char], i: &mut usize, depth: usize) -> Result<(u64, bool), &'s
             '\\' => {
                 let e = c.get(*i).copied().unwrap_or('\\');
                 *i += 1;
-                atom_price(escape_breadth(e))
+                if e == 'u' && c.get(*i) == Some(&'{') {
+                    unicode_escape(c, i)?;
+                    atom_price(1)
+                } else {
+                    atom_price(escape_breadth(e))
+                }
             }
             _ => atom_price(1),
         };
@@ -701,43 +726,42 @@ impl<'a> Walk<'a> {
                 return;
             }
         };
-        if ty.is_none() {
-            if let Some(r) = o.get("$ref") {
-                return self.visit_ref(r);
+        // `VisitSchema` looks at these before `type`, also on a node whose
+        // `type` the converter has set (`propertyNames` is read as a string
+        // only when none of them is there).
+        if let Some(r) = o.get("$ref") {
+            return self.visit_ref(r);
+        }
+        if let Some(v) = o.get("const") {
+            let n = self.size(v);
+            return self.add(mul(mult, n * VALUE_BYTE_COST));
+        }
+        if let Some(v) = o.get("enum") {
+            if !v.is_array() {
+                return self.reject("an `enum` that is not an array");
             }
-            if let Some(v) = o.get("const") {
-                let n = self.size(v);
-                return self.add(mul(mult, n * VALUE_BYTE_COST));
-            }
-            if let Some(v) = o.get("enum") {
-                if !v.is_array() {
-                    return self.reject("an `enum` that is not an array");
-                }
-                let n = self.size(v);
-                return self.add(mul(mult, n * VALUE_BYTE_COST));
-            }
-            if let Some(v) = o.get("anyOf").or_else(|| o.get("oneOf")) {
-                let Value::Array(branches) = v else {
-                    self.reject("an `anyOf`/`oneOf` that is not an array");
-                    return;
-                };
-                for (i, b) in branches.iter().enumerate() {
-                    self.create_rule(b, name + 6 + index_len(i), mult);
-                }
+            let n = self.size(v);
+            return self.add(mul(mult, n * VALUE_BYTE_COST));
+        }
+        if let Some(v) = o.get("anyOf").or_else(|| o.get("oneOf")) {
+            let Value::Array(branches) = v else {
+                self.reject("an `anyOf`/`oneOf` that is not an array");
                 return;
+            };
+            for (i, b) in branches.iter().enumerate() {
+                self.create_rule(b, name + 6 + index_len(i), mult);
             }
-            if let Some(v) = o.get("allOf") {
-                match v {
-                    // One member is visited as the body, under `<name>_case_0`.
-                    Value::Array(m) if m.len() == 1 => {
-                        return self.visit(&m[0], name + 7, mult, None)
-                    }
-                    // Two or more are fused to `{}`: any value.
-                    Value::Array(_) => return,
-                    _ => {
-                        self.reject("an `allOf` that is not an array");
-                        return;
-                    }
+            return;
+        }
+        if let Some(v) = o.get("allOf") {
+            match v {
+                // One member is visited as the body, under `<name>_case_0`.
+                Value::Array(m) if m.len() == 1 => return self.visit(&m[0], name + 7, mult, None),
+                // Two or more are fused to `{}`: any value.
+                Value::Array(_) => return,
+                _ => {
+                    self.reject("an `allOf` that is not an array");
+                    return;
                 }
             }
         }
@@ -951,6 +975,9 @@ impl<'a> Walk<'a> {
                     self.reject("`propertyNames` that is not an object");
                     return;
                 }
+                // The converter sets its `type` to "string" and compiles it
+                // like any schema: a `$ref`, `anyOf`, `allOf`, `const` or
+                // `enum` in it is followed, not read as a string.
                 self.new_rule(name + 5, mult, 1);
                 self.visit(n, name + 5, mult, Some("string"));
             }
@@ -969,19 +996,8 @@ impl<'a> Walk<'a> {
         if max_p == 0 {
             return;
         }
-        for (i, (prop, v)) in props.iter().enumerate() {
-            if !self.going() {
-                return;
-            }
-            let n = prop.len() as u64;
-            let c =
-                PROPERTY_COST + NAME_BYTE_COST * n.min(4) + NAME_TAIL_BYTE_COST * (n.max(4) - 4);
-            self.add(mul(mult, c));
-            self.create_rule(v, name + 6 + index_len(i), mult);
-        }
-        if let Some(x) = extra {
-            self.create_rule(x, name + 1 + extra_name, mult);
-        }
+        // The object's own rules first: a wide run passes the limit there,
+        // before the walk visits its properties one by one.
         let flags: Vec<bool> = props
             .iter()
             .map(|(n, _)| required.contains(n.as_str()))
@@ -1012,6 +1028,19 @@ impl<'a> Walk<'a> {
         if f > 1 {
             let c = mul(mult, FRACTION_RANGE_COST.saturating_mul(f * f - f));
             self.add_part(c, || Part::Ranges);
+        }
+        for (i, (prop, v)) in props.iter().enumerate() {
+            if !self.going() {
+                return;
+            }
+            let n = prop.len() as u64;
+            let c =
+                PROPERTY_COST + NAME_BYTE_COST * n.min(4) + NAME_TAIL_BYTE_COST * (n.max(4) - 4);
+            self.add(mul(mult, c));
+            self.create_rule(v, name + 6 + index_len(i), mult);
+        }
+        if let Some(x) = extra {
+            self.create_rule(x, name + 1 + extra_name, mult);
         }
     }
 
