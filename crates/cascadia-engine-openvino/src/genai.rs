@@ -3943,6 +3943,23 @@ mod tests {
     }
 
     #[test]
+    fn a_best_effort_grammar_xgrammar_would_reject_is_dropped_as_rejected() {
+        // An unknown `type`: xgrammar's converter refuses it, so the drop is
+        // counted as schema_rejected, not too_complex.
+        let odd = r#"{"type":"object","properties":{"a":{"type":"frobnicate"}}}"#;
+        let t = soft_schema_task("r", odd);
+        assert_eq!(
+            check_grammar(&t, None, |_| panic!("validate called")).unwrap(),
+            GrammarVerdict::Drop(UnenforcedReason::SchemaRejected)
+        );
+        let err = check_grammar(&schema_task("r2", odd), None, |_| Ok(())).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::InvalidConfig(m) if m.contains("xgrammar would reject")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn a_best_effort_grammar_past_the_schema_budget_is_dropped() {
         let st = Arc::new(Mutex::new(MockState::default()));
         let mut e = mock_engine(&st);
