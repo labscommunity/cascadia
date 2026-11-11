@@ -49,6 +49,14 @@ pub enum EngineError {
     #[error("queue full ({queued} pending, cap {cap})")]
     QueueFull { queued: usize, cap: usize },
 
+    /// The engine is healthy but briefly takes no work: an ov-genai pipeline
+    /// waiting for its requests in flight to finish before it is rebuilt.
+    /// Retryable. Unlike [`EngineError::QueueFull`] it is not a capacity
+    /// signal, and the API's readiness (`/health`) does not count it as the
+    /// worker failing: a planned pause must not drain the node.
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
+
     /// The prompt cannot fit this engine's per-request window. Distinct from
     /// `QueueFull`: that one clears when load drops, this one never does, so
     /// the API must answer 413 rather than a retryable 5xx.
@@ -179,6 +187,18 @@ impl EngineError {
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
+
+/// What a request refused while an ov-genai pipeline drains for a rebuild is
+/// told, inside [`EngineError::Unavailable`].
+pub const PIPELINE_REBUILDING: &str =
+    "this worker is rebuilding its structured-output pipeline; retry the request shortly";
+
+/// The error chunk (a 503) for a request an ov-genai pipeline rebuild cut:
+/// still running when the drain before the rebuild ended. The API matches
+/// this exact text to keep it out of its readiness latch, as it does for
+/// [`EngineError::Unavailable`].
+pub const PIPELINE_REBUILD_INTERRUPTED: &str = "this request was still running when the worker \
+     began rebuilding its structured-output pipeline; retry the request shortly";
 
 /// Stream of load-progress events yielded by [`Builder::load`].
 pub type LoadStream = Pin<Box<dyn Stream<Item = LoadProgress> + Send>>;

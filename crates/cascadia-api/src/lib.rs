@@ -644,6 +644,17 @@ async fn metrics() -> impl IntoResponse {
 #[derive(Clone, Copy)]
 struct PreEngineFailure;
 
+/// Marks a 5xx from a planned, brief pause of a healthy engine (an ov-genai
+/// pipeline rebuild: [`EngineError::Unavailable`], or a request the
+/// rebuild's drain cut), so [`track_pipeline_health`] does not read it as the
+/// pipeline failing. Same asymmetry as [`PreEngineFailure`]: latching it
+/// would pull the node from a load balancer gating on `/health` for a pause
+/// that ends by itself, and keep it out after.
+///
+/// [`EngineError::Unavailable`]: cascadia_engine::EngineError::Unavailable
+#[derive(Clone, Copy)]
+struct PlannedPause;
+
 /// Response middleware: for completion routes, flip `AppState.ready` from the
 /// response status (5xx → not ready, 2xx → ready) so `/health` reflects whether
 /// the pipeline is actually serving. Non-completion routes don't touch it.
@@ -659,7 +670,10 @@ async fn track_pipeline_health(
     let resp = next.run(req).await;
     if is_completion {
         let s = resp.status();
-        if s.is_server_error() && resp.extensions().get::<PreEngineFailure>().is_none() {
+        if s.is_server_error()
+            && resp.extensions().get::<PreEngineFailure>().is_none()
+            && resp.extensions().get::<PlannedPause>().is_none()
+        {
             state.ready.store(false, Ordering::Relaxed);
         } else if s.is_success() {
             state.ready.store(true, Ordering::Relaxed);
@@ -3734,7 +3748,11 @@ fn failed_task_response(
         warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(serde_json::json!({ "error": reason }))).into_response()
+    let mut resp = (status, Json(serde_json::json!({ "error": reason }))).into_response();
+    if reason == cascadia_engine::PIPELINE_REBUILD_INTERRUPTED {
+        resp.extensions_mut().insert(PlannedPause);
+    }
+    resp
 }
 
 fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
@@ -3763,6 +3781,9 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
     // to a healthy idle one on every metric here.
     count_rejected(match &err {
         EngineError::QueueFull { .. } => "capacity",
+        // A planned, brief pause (an ov-genai pipeline rebuild): not capacity,
+        // and not a failing worker either.
+        EngineError::Unavailable(_) => "temporarily_unavailable",
         EngineError::PromptTooLong(_) => "prompt_over_window",
         EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
         EngineError::Backend(_)
@@ -3776,6 +3797,7 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
     });
     let status = match &err {
         EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        EngineError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
         // Permanent for this request: retrying sends the identical prompt into
         // the identical window. 413 is what every SDK treats as non-retryable.
@@ -3798,7 +3820,12 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         // this node's to explain, like any other engine failure.
         EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
+    let planned = matches!(err, EngineError::Unavailable(_));
+    let mut resp = (status, Json(serde_json::json!({"error": err.to_string()}))).into_response();
+    if planned {
+        resp.extensions_mut().insert(PlannedPause);
+    }
+    resp
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -3885,6 +3912,10 @@ mod tests {
         // (error, expected reason) — one per arm of the classifier.
         let cases: Vec<(EngineError, &str)> = vec![
             (EngineError::QueueFull { queued: 8, cap: 8 }, "capacity"),
+            (
+                EngineError::Unavailable("x".into()),
+                "temporarily_unavailable",
+            ),
             (EngineError::PromptTooLong("x".into()), "prompt_over_window"),
             (EngineError::NotLoaded, "engine_unavailable"),
             (EngineError::NotConnected, "engine_unavailable"),
@@ -7741,6 +7772,131 @@ level={{ effort_map[eff] }}";
             self: Box<Self>,
         ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
             Ok(Box::new(NoPipelineEngine))
+        }
+    }
+
+    /// How [`RebuildingEngine`] answers: at submit, or with an error chunk.
+    #[derive(Clone, Copy)]
+    enum RebuildAnswer {
+        /// Submit refuses: the pipeline drains for a rebuild.
+        Draining,
+        /// The task fails: the rebuild's drain cut it.
+        Interrupted,
+    }
+
+    /// Engine that answers every request the way an ov-genai engine draining
+    /// for a pipeline rebuild does.
+    struct RebuildingEngine {
+        answer: RebuildAnswer,
+        pending: Vec<cascadia_types::TaskId>,
+    }
+
+    impl cascadia_engine::Engine for RebuildingEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            match self.answer {
+                RebuildAnswer::Draining => Err(cascadia_engine::EngineError::Unavailable(
+                    cascadia_engine::PIPELINE_REBUILDING.into(),
+                )),
+                RebuildAnswer::Interrupted => {
+                    self.pending.push(task.task_id);
+                    Ok(())
+                }
+            }
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            Ok(self
+                .pending
+                .drain(..)
+                .map(|id| {
+                    let chunk =
+                        Chunk::error(id.clone(), cascadia_engine::PIPELINE_REBUILD_INTERRUPTED);
+                    (id, chunk)
+                })
+                .collect())
+        }
+    }
+
+    struct RebuildingBuilder(RebuildAnswer);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for RebuildingBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(RebuildingEngine {
+                answer: self.0,
+                pending: Vec::new(),
+            }))
+        }
+    }
+
+    /// A planned pause is not a failing worker: the 503s an ov-genai
+    /// pipeline rebuild gives (a request refused during its drain, and one
+    /// its drain cut) leave `/health` ready, so a load balancer keeps the
+    /// node and the traffic that follows the rebuild reaches it.
+    #[tokio::test]
+    async fn a_pipeline_rebuild_drain_leaves_health_ready() {
+        for (answer, want) in [
+            (
+                RebuildAnswer::Draining,
+                format!(
+                    "temporarily unavailable: {}",
+                    cascadia_engine::PIPELINE_REBUILDING
+                ),
+            ),
+            (
+                RebuildAnswer::Interrupted,
+                cascadia_engine::PIPELINE_REBUILD_INTERRUPTED.to_owned(),
+            ),
+        ] {
+            let runner = Runner::new(Box::new(RebuildingBuilder(answer)));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("rebuild-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let app = make_router(Arc::new(runner), "rebuild-model");
+            let (status, body) = post_chat(
+                app.clone(),
+                serde_json::json!({
+                    "model": "rebuild-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["error"], want);
+            let health = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(health, StatusCode::OK, "{want}");
         }
     }
 
