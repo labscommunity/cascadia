@@ -920,8 +920,9 @@ struct PreEngineFailure;
 #[derive(Clone, Copy)]
 struct CapacityRefusal;
 
-/// Default [`Config::stall_after`]. With requests in flight, the pipeline is
-/// stalled, and a capacity 503 marks the server unready, when one engine call
+/// Default [`Config::stall_after`]. With requests in flight on a multi-stage
+/// pipeline, the pipeline is stalled, and a capacity 503 marks the server
+/// unready, when one engine call
 /// (a step, or a task's submit) has run for longer than this, or when the
 /// engine keeps stepping but has produced no real output (a token or a final,
 /// not a progress marker or an error) for longer than this. A busy server
@@ -962,7 +963,16 @@ fn stepping_window_ms(bound_ms: u64) -> u64 {
 /// otherwise. A stretch without output starts at the later of the last real
 /// output and the start of the current run of steps, so time spent idle
 /// before a burst never counts.
+///
+/// Only a stage of a multi-stage pipeline can stall this way: its calls wait
+/// on peers. On a single-stage server ([`cascadia_runner::EngineActivity::pipelined`]
+/// false) a long call is the engine's own work (a whole answer in one call,
+/// as stateful `ov-genai` and single-stage `sparse-moe` run it, or a long
+/// prefill), so a capacity 503 there is a busy server, never a stalled one.
 fn stall_evidence(a: &cascadia_runner::EngineActivity, now: u64, bound_ms: u64) -> Option<u64> {
+    if !a.pipelined {
+        return None;
+    }
     if let Some(since) = a.busy_since_ms {
         if now.saturating_sub(since) > bound_ms {
             return Some(since);
@@ -8259,19 +8269,28 @@ mod tests {
         }
     }
 
+    /// The first stage of a two-stage pipeline (the test builders ignore the
+    /// peer): the stall rule applies only to a pipeline with peers.
+    fn first_of_two() -> PeerLayout {
+        PeerLayout::first_of(cascadia_types::PeerEndpoint::new("127.0.0.1", 9))
+    }
+
     /// A one-slot router over a [`StuckEngine`] whose stall bound is short
-    /// enough to pass in a test. Returns the `stuck` switch (initially off).
+    /// enough to pass in a test, as the first stage of a pipeline. Returns
+    /// the `stuck` switch (initially off).
     async fn stall_app() -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        stall_app_on(first_of_two()).await
+    }
+
+    /// [`stall_app`] on `layout`.
+    async fn stall_app_on(layout: PeerLayout) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
         let stuck = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runner = Runner::new(Box::new(StuckBuilder(Some(StuckEngine {
             stuck: stuck.clone(),
             pending: None,
         }))));
         runner
-            .start(
-                PeerLayout::single_stage(),
-                ShardSpec::single_stage("mock-model", "CPU"),
-            )
+            .start(layout, ShardSpec::single_stage("mock-model", "CPU"))
             .await
             .unwrap();
         let cfg = Config {
@@ -8400,6 +8419,33 @@ mod tests {
         let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(stall_health(&app).await, StatusCode::OK, "healed by a 2xx");
+    }
+
+    /// A single-stage server has no peer that could hold an engine call:
+    /// one call that runs past the bound is the engine's own work (a whole
+    /// answer in one call, as stateful `ov-genai` and single-stage
+    /// `sparse-moe` run it, or a long prefill), so a capacity 503 meanwhile
+    /// leaves the server ready, and the answer still arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_stage_engine_in_one_long_call_is_busy_not_stalled() {
+        let (app, stuck) = stall_app_on(PeerLayout::single_stage()).await;
+        stuck.store(true, Ordering::SeqCst);
+        let reader = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+            })
+        };
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        let health = stall_health(&app).await;
+        stuck.store(false, Ordering::SeqCst);
+        let body = reader.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health, StatusCode::OK, "busy, not stalled");
+        assert!(String::from_utf8_lossy(&body).contains("tok"));
+        assert_eq!(stall_health(&app).await, StatusCode::OK);
     }
 
     /// How a [`PhaseEngine`] answers a step.
@@ -8538,10 +8584,7 @@ mod tests {
             failures: 0,
         }))));
         runner
-            .start(
-                PeerLayout::single_stage(),
-                ShardSpec::single_stage("mock-model", "CPU"),
-            )
+            .start(first_of_two(), ShardSpec::single_stage("mock-model", "CPU"))
             .await
             .unwrap();
         let cfg = Config {
@@ -8640,6 +8683,7 @@ mod tests {
             last_step_end_ms,
             stepping_since_ms,
             last_output_ms,
+            pipelined: true,
         }
     }
 
@@ -8675,6 +8719,20 @@ mod tests {
         );
         // Never stepped at all.
         assert_eq!(stall_evidence(&activity(None, 0, 0, 0), 9000, b), None);
+        // A single-stage server: neither a call past the bound nor steps
+        // without output count, as no peer can hold the engine.
+        let single = |a: cascadia_runner::EngineActivity| cascadia_runner::EngineActivity {
+            pipelined: false,
+            ..a
+        };
+        assert_eq!(
+            stall_evidence(&single(activity(Some(500), 400, 100, 400)), 2000, b),
+            None
+        );
+        assert_eq!(
+            stall_evidence(&single(activity(None, 1999, 100, 600)), 2000, b),
+            None
+        );
         // Idle for long, then a fresh run of steps that has not yet gone a
         // bound without output: the idle time does not count.
         assert_eq!(

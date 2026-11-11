@@ -197,6 +197,9 @@ struct EngineSlot {
     /// last one returned starts a new run ([`STEP_GAP`]; a field so tests can
     /// shorten it).
     step_gap_ms: AtomicU64,
+    /// The engine was started with an upstream or downstream peer. See
+    /// [`EngineActivity::pipelined`].
+    pipelined: std::sync::atomic::AtomicBool,
 }
 
 /// Engine calls closer together than this belong to one run of stepping
@@ -235,6 +238,12 @@ pub struct EngineActivity {
     /// for its own fault (a client-fault error or error chunk, as
     /// [`cascadia_engine::is_client_error_reason`] reads it).
     pub last_output_ms: u64,
+    /// The engine was started with an upstream or downstream peer (a stage of
+    /// a multi-stage pipeline). Only then can an engine call wait on
+    /// something other than its own work; a single-stage engine's call,
+    /// however long, is that work (a whole answer in one call, a long
+    /// prefill).
+    pub pipelined: bool,
 }
 
 /// Whether an engine call's error refuses the request for its own fault (a
@@ -360,6 +369,7 @@ impl EngineSlot {
             stepping_since_ms: AtomicU64::new(0),
             last_output_ms: AtomicU64::new(0),
             step_gap_ms: AtomicU64::new(u64::try_from(STEP_GAP.as_millis()).unwrap_or(u64::MAX)),
+            pipelined: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -501,6 +511,10 @@ impl Runner {
             downstream = ?peers.downstream,
             "runner connect"
         );
+        self.slot.pipelined.store(
+            peers.upstream.is_some() || peers.downstream.is_some(),
+            Ordering::Relaxed,
+        );
         builder.connect(peers).await?;
 
         info!("runner load");
@@ -624,6 +638,7 @@ impl Runner {
             last_step_end_ms: slot.last_step_end_ms.load(Ordering::Relaxed),
             stepping_since_ms: slot.stepping_since_ms.load(Ordering::Relaxed),
             last_output_ms: slot.last_output_ms.load(Ordering::Relaxed),
+            pipelined: slot.pipelined.load(Ordering::Relaxed),
         }
     }
 

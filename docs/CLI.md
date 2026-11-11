@@ -600,7 +600,7 @@ request fails and marks it unready again. A stream that is still running, that i
 or that the client closes before its end, does not count. Errors that are the client's fault never mark it unready, streamed
 or not. A peer that stops answering makes the step waiting on it time out
 (after 60 s) and fail, which marks the server unready. Capacity 503s do not
-mark it, unless requests are in flight and the pipeline is stalled: the engine has
+mark it, unless requests are in flight and a multi-stage pipeline is stalled: the engine has
 been inside one call (a step, or a request's submit) for more than 60 s, or it
 keeps stepping but has produced no real output (a token, a final answer, or a
 refusal of a request for its own fault, such as a prompt over the window; a
@@ -612,12 +612,14 @@ request is left in flight (a load balancer that drained the node lets its
 clients give up their streams), with no new request needed; if the pipeline is
 still broken, the next capacity 503 under load marks it unready again. Clients
 that open streams and leave them unread never count as a stall: the engine only steps while a stream is
-read, and time it spent idle before a burst of requests is not counted. Any
-engine call longer than 60 s counts while every slot is full, whatever the
-engine: an engine that runs a whole answer as one call (`ov-genai` without
-`--cb`, single-stage `sparse-moe`), or a long prompt's prefill that runs as a
-single step or as steps that only report progress, marks the server unready if
-further requests are refused for capacity meanwhile, until it produces output.
+read, and time it spent idle before a burst of requests is not counted. A
+single-stage server (no `--rank`/`--total` pipeline, or `--total 1`) is never
+counted as stalled: it has no peer that could hold an engine call, so a long
+call is its own work, such as an answer that runs as one call (`ov-genai`
+without `--cb`, single-stage `sparse-moe`) or a long prompt's prefill, and a
+capacity 503 meanwhile leaves it ready. On a multi-stage pipeline, a first
+stage whose own part of a prefill runs longer than 60 s as one step, or as
+steps that only report progress, counts while every slot is full.
 
 ---
 
