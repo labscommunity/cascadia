@@ -1,6 +1,9 @@
 //! Shared pieces of the OpenAI response wire shape: the `system_fingerprint`
 //! value, the `usage` object and the streamed chunk frames.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use serde::Serialize;
 
 /// OpenAI's `system_fingerprint`: `fp_` plus 10 lowercase hex digits. It is
@@ -237,6 +240,87 @@ pub(crate) fn content_delta(content: &str) -> serde_json::Map<String, serde_json
     let mut delta = serde_json::Map::new();
     delta.insert("content".into(), content.into());
     delta
+}
+
+/// The SSE event that ends a stream which failed after its 200 headers went
+/// out: the OpenAI error object under `error`, so openai-python and -node
+/// raise `APIError` on it. `id` and `object: "error"` stay for clients that
+/// key on them; no usage chunk follows it, only `[DONE]`.
+pub(crate) fn error_frame(id: &str, message: &str) -> String {
+    let payload = serde_json::json!({
+        "id": id,
+        "object": "error",
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "param": null,
+            "code": "engine_error",
+        },
+    });
+    format!("data: {payload}\n\n")
+}
+
+/// The message of the error event sent when an engine stream ends with no
+/// final chunk and nobody cancelled it.
+pub(crate) const UNEXPLAINED_END: &str = "engine stream ended without a final chunk";
+
+/// The task ids of the streams being sent, each with whether
+/// `POST /v1/cancel` named it. A cancelled task's engine stream ends with no
+/// final chunk, as one whose engine went away does; this tells them apart.
+/// Entries live only as long as their stream ([`LiveStream`]), and a cancel
+/// flags only an id already here, so the map never outgrows the open streams.
+#[derive(Clone, Default)]
+pub(crate) struct LiveStreams(Arc<Mutex<HashMap<String, bool>>>);
+
+impl LiveStreams {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, bool>> {
+        // The map holds plain flags: a panic elsewhere cannot leave it torn.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Registers the stream of `id` until the returned guard drops.
+    pub(crate) fn register(&self, id: &str) -> LiveStream {
+        self.lock().insert(id.to_owned(), false);
+        LiveStream {
+            streams: self.clone(),
+            id: id.to_owned(),
+        }
+    }
+
+    /// Flags the stream of `id` as cancelled; an id with no open stream adds
+    /// nothing.
+    pub(crate) fn cancel(&self, id: &str) {
+        if let Some(flag) = self.lock().get_mut(id) {
+            *flag = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// One open stream's entry in [`LiveStreams`], removed on drop: when the
+/// stream body ends or is dropped on a client disconnect.
+pub(crate) struct LiveStream {
+    streams: LiveStreams,
+    id: String,
+}
+
+impl LiveStream {
+    /// `POST /v1/cancel` named this stream's task.
+    pub(crate) fn cancelled(&self) -> bool {
+        self.streams.lock().get(&self.id).copied().unwrap_or(false)
+    }
+}
+
+impl Drop for LiveStream {
+    fn drop(&mut self) {
+        self.streams.lock().remove(&self.id);
+    }
 }
 
 #[cfg(test)]

@@ -160,6 +160,9 @@ pub struct AppState {
     /// OpenAI `system_fingerprint`, computed once from the release, the
     /// engine and the served model id.
     pub system_fingerprint: String,
+    /// The streams being sent, for telling a cancel from an engine that
+    /// went away. See [`stream_shape::LiveStreams`].
+    live_streams: stream_shape::LiveStreams,
 }
 
 /// How long a stream may go without sending anything before it sends the SSE
@@ -567,9 +570,22 @@ pub fn make_router_with_stats(
     cfg: Config,
     stats: Arc<ApiStats>,
 ) -> Router {
+    make_router_with_live(runner, model_id, cfg, stats, Default::default())
+}
+
+/// [`make_router_with_stats`] over a given [`stream_shape::LiveStreams`],
+/// which tests read.
+fn make_router_with_live(
+    runner: Arc<Runner>,
+    model_id: impl Into<String>,
+    cfg: Config,
+    stats: Arc<ApiStats>,
+    live_streams: stream_shape::LiveStreams,
+) -> Router {
     let model_id: String = model_id.into();
     let state = AppState {
         runner,
+        live_streams,
         system_fingerprint: stream_shape::fingerprint(
             env!("CARGO_PKG_VERSION"),
             &cfg.engine_name,
@@ -3351,6 +3367,7 @@ async fn stream_text_completion(
         prompt_tokens: 0,
         finished: false,
         phase: ToolStreamPhase::Streaming,
+        live: state.live_streams.register(&task_id),
         meta: stream_meta(&state, task_id, model, usage),
     };
     sse_response(stream::unfold(text_stream, |mut s| async move {
@@ -3416,6 +3433,7 @@ async fn stream_completion(
             prompt_tokens: 0,
             finished: false,
             phase: ToolStreamPhase::Streaming,
+            live: state.live_streams.register(&task_id),
             meta: stream_meta(&state, task_id, model, usage),
             legacy_functions,
         };
@@ -3461,6 +3479,7 @@ async fn stream_completion(
         prompt_tokens: 0,
         finished: false,
         phase: ToolStreamPhase::Streaming,
+        live: state.live_streams.register(&task_id),
         meta: stream_meta(&state, task_id, model, usage),
     };
     sse_response(stream::unfold(text_stream, |mut s| async move {
@@ -3935,12 +3954,7 @@ fn usage_tail(
 /// SSE `data:` frame for an engine error. The 200 headers are already on the
 /// wire, so the failure travels as an explicit error event.
 fn error_frame(task_id: &str, reason: &str) -> Bytes {
-    let payload = serde_json::json!({
-        "id": task_id,
-        "object": "error",
-        "error": { "message": reason, "type": "engine_error" },
-    });
-    Bytes::from(format!("data: {payload}\n\n"))
+    Bytes::from(stream_shape::error_frame(task_id, reason))
 }
 
 /// Which wire shape a [`TextStream`] sends.
@@ -3970,6 +3984,8 @@ struct TextStream {
     finished: bool,
     phase: ToolStreamPhase,
     meta: stream_shape::StreamMeta,
+    /// This stream's entry in [`AppState::live_streams`].
+    live: stream_shape::LiveStream,
 }
 
 impl TextStream {
@@ -3989,16 +4005,27 @@ impl TextStream {
                     return Some(Bytes::from_static(SSE_KEEPALIVE_COMMENT.as_bytes()))
                 }
                 StreamNext::Chunk(Some(chunk)) => chunk,
-                // Ended without a final chunk (cancelled): no usage. Text
-                // the stop matcher held never matched, so it goes out first
-                // (as the tools stream settles what it holds).
+                // Ended without a final chunk: no usage either way. Text the
+                // stop matcher held never matched, so it goes out first. A
+                // cancel closes the choice with `stop`; any other end is a
+                // failure, not a complete answer.
                 StreamNext::Chunk(None) => {
                     self.phase = ToolStreamPhase::Done;
                     let rest = self.stop.finish();
-                    if rest.is_empty() {
-                        return Some(self.tail());
+                    let mut out = String::new();
+                    if self.live.cancelled() {
+                        out.push_str(&self.frame(rest, Some("stop")));
+                    } else {
+                        warn!(task = %self.meta.id, "engine stream ended without a final chunk; emitting SSE error");
+                        if !rest.is_empty() {
+                            out.push_str(&self.frame(rest, None));
+                        }
+                        out.push_str(&stream_shape::error_frame(
+                            &self.meta.id,
+                            stream_shape::UNEXPLAINED_END,
+                        ));
                     }
-                    let mut out = self.frame(rest, None).into_bytes();
+                    let mut out = out.into_bytes();
                     out.extend_from_slice(&self.tail());
                     return Some(Bytes::from(out));
                 }
@@ -4150,6 +4177,8 @@ struct ToolStream {
     meta: stream_shape::StreamMeta,
     /// Answer a `functions` request: `delta.function_call`.
     legacy_functions: bool,
+    /// This stream's entry in [`AppState::live_streams`].
+    live: stream_shape::LiveStream,
 }
 
 enum ToolStreamPhase {
@@ -4177,11 +4206,37 @@ impl ToolStream {
                 }
                 StreamNext::Chunk(Some(chunk)) => chunk,
                 StreamNext::Chunk(None) => {
-                    // Ended without a final chunk (cancelled): settle what
-                    // is held instead of dropping it.
+                    // Ended without a final chunk: settle what is held
+                    // instead of dropping it, with no usage either way. A
+                    // cancel closes the choice with `stop`; any other end
+                    // is a failure, so the content goes out unclosed (calls
+                    // that may be cut short are not sent) and the error
+                    // event follows.
                     self.phase = ToolStreamPhase::Tail;
                     let rest = self.stop.finish();
-                    return Some(self.close_choice(&rest, "stop"));
+                    if self.live.cancelled() {
+                        return Some(self.close_choice(&rest, "stop"));
+                    }
+                    warn!(task = %self.meta.id, "engine stream ended without a final chunk; emitting SSE error");
+                    let counts = self.counts();
+                    let content = match self.splitter.finish(&rest) {
+                        ToolStreamEnd::Content(content)
+                        | ToolStreamEnd::ToolCalls { content, .. } => content.to_owned(),
+                    };
+                    let mut out = String::new();
+                    if !content.is_empty() {
+                        out.push_str(&self.meta.chat_chunk(
+                            stream_shape::content_delta(&content),
+                            None,
+                            serde_json::Value::Null,
+                            counts,
+                        ));
+                    }
+                    out.push_str(&stream_shape::error_frame(
+                        &self.meta.id,
+                        stream_shape::UNEXPLAINED_END,
+                    ));
+                    return Some(Bytes::from(out));
                 }
             };
             // Progress chunks carry nothing to send or count.
@@ -4392,6 +4447,9 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
+    // Flagged before the runner ends the task, so its stream, which then ends
+    // with no final chunk, reads the flag and closes as cancelled.
+    state.live_streams.cancel(&task_id);
     state.runner.cancel(&task_id);
     info!(task = %task_id, "cancelled");
     (
@@ -9884,6 +9942,8 @@ level={{ effort_map[eff] }}";
         emitted: std::sync::atomic::AtomicUsize,
         /// The router's counters.
         stats: Arc<ApiStats>,
+        /// The router's open streams.
+        live: stream_shape::LiveStreams,
     }
 
     impl cascadia_engine::Engine for ScriptEngine {
@@ -10070,7 +10130,13 @@ level={{ effort_map[eff] }}";
             ..Config::default()
         };
         (
-            make_router_with_stats(Arc::new(runner), "mock-model", cfg, log.stats.clone()),
+            make_router_with_live(
+                Arc::new(runner),
+                "mock-model",
+                cfg,
+                log.stats.clone(),
+                log.live.clone(),
+            ),
             log,
             gate,
         )
@@ -10703,15 +10769,38 @@ level={{ effort_map[eff] }}";
         assert_cancelled(&log).await;
     }
 
-    /// A stream that ends without a final chunk (the task was cancelled)
-    /// still sends the text the stop matcher was holding: it never matched.
+    /// Posts `/v1/cancel/{id}` and checks the reply is unchanged.
+    async fn post_cancel(app: Router, id: &str) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/cancel/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"cancelled": id}));
+    }
+
+    /// A stream whose task is cancelled through `POST /v1/cancel/{id}` ends
+    /// with no final chunk from the engine. It sends the text the stop
+    /// matcher was holding (it never matched), closes the choice with
+    /// `stop`, and sends no usage chunk: the answer did not complete. Its
+    /// live entry goes when the body ends, and cancelling it again or
+    /// cancelling an unknown id adds none.
     #[tokio::test]
-    async fn cancelled_stream_releases_a_held_stop_prefix() {
+    async fn cancelled_stream_ends_with_stop() {
         for tools in [false, true] {
-            let (app, _log, gate) =
+            let (app, log, gate) =
                 script_app(&["first ST", "never sent"], true, SSE_KEEPALIVE_INTERVAL).await;
             let mut payload = serde_json::json!({"model": "mock-model", "stream": true,
-                "messages": [{"role": "user", "content": "hi"}], "stop": "STOP"});
+                "messages": [{"role": "user", "content": "hi"}], "stop": "STOP",
+                "stream_options": {"include_usage": true}});
             if tools {
                 payload["tools"] =
                     serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
@@ -10738,40 +10827,264 @@ level={{ effort_map[eff] }}";
                     .unwrap();
                 text.push_str(std::str::from_utf8(&frame).unwrap());
             }
+            assert_eq!(log.live.len(), 1, "tools={tools}: the stream is live");
             let id = sse_events_partial(&text)[0]["id"]
                 .as_str()
                 .unwrap()
                 .to_owned();
-            let cancel = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(format!("/v1/cancel/{id}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(cancel.status(), StatusCode::OK);
+            post_cancel(app.clone(), &id).await;
             while let Some(frame) = body.next().await {
                 text.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
             }
+            drop(body);
             drop(gate);
-            // The plain stream closes no choice when the engine stream just
-            // ends; the tools stream closes it with `stop`.
-            let events = if tools {
-                sse_events(&text)
-            } else {
-                crate::spec_schema::assert_stream_spec_ended_without_finish(&text);
-                sse_data(&text)
-            };
+            let events = sse_events(&text);
             assert_eq!(
                 streamed_content(&events),
                 "first ST",
                 "tools={tools}: {text}"
             );
+            assert!(
+                events.iter().all(|e| e["object"] != "error"),
+                "tools={tools}: {text}"
+            );
+            assert_eq!(
+                events.last().unwrap()["choices"][0]["finish_reason"],
+                "stop",
+                "tools={tools}: {text}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e["choices"].as_array().is_some_and(|c| !c.is_empty())),
+                "tools={tools}: no usage chunk after a cancel: {text}"
+            );
             assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+            assert_eq!(log.live.len(), 0, "tools={tools}: entry left after the end");
+            post_cancel(app.clone(), &id).await;
+            post_cancel(app, "chatcmpl-not-a-task").await;
+            assert_eq!(log.live.len(), 0, "tools={tools}: a cancel added an entry");
         }
+    }
+
+    /// An engine error after some tokens ends every stream path with the
+    /// OpenAI error object, then `[DONE]`: no usage chunk, even with
+    /// `include_usage`.
+    #[tokio::test]
+    async fn mid_stream_error_uses_the_spec_error_object() {
+        for (uri, payload) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream_options": {"include_usage": true}}),
+            ),
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{"type": "function", "function": {"name": "f"}}],
+                    "stream_options": {"include_usage": true}}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true,
+                    "stream_options": {"include_usage": true}}),
+            ),
+        ] {
+            let (app, log, _) = script_app_opts(
+                &["one ", "two "],
+                ScriptOpts {
+                    end: ScriptEnd::Error,
+                    ..ScriptOpts::default()
+                },
+            )
+            .await;
+            let (status, body) = post_text(app, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK);
+            let events = sse_events(&body);
+            let id = events[0]["id"].clone();
+            assert_eq!(
+                events.last().unwrap(),
+                &serde_json::json!({"id": id, "object": "error", "error": {
+                    "message": "script engine failure", "type": "server_error",
+                    "param": null, "code": "engine_error"}}),
+                "{uri}: {body}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e["choices"].as_array().is_none_or(|c| !c.is_empty())),
+                "{uri}: no usage chunk after an error: {body}"
+            );
+            assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+            assert_eq!(log.live.len(), 0, "{uri}: entry left after the end");
+        }
+    }
+
+    /// An engine channel that ends after `parts` with no final chunk, as
+    /// when the engine's sender goes away without a cancel.
+    fn ended_channel(id: &str, parts: &[&str]) -> EngineChunks {
+        let (tx, rx) = tokio::sync::mpsc::channel(parts.len().max(1));
+        for (i, part) in parts.iter().enumerate() {
+            tx.try_send(Chunk::token(id, i as i64, *part)).unwrap();
+        }
+        drop(tx);
+        EngineChunks {
+            rx,
+            early: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    fn unit_meta(id: &str) -> stream_shape::StreamMeta {
+        stream_shape::StreamMeta::new(
+            id.into(),
+            "m".into(),
+            1,
+            "fp_0123456789".into(),
+            stream_shape::UsageMode::new(true, false),
+        )
+    }
+
+    fn unit_text_stream(
+        kind: TextStreamKind,
+        chunks: EngineChunks,
+        live: &stream_shape::LiveStreams,
+        id: &str,
+    ) -> TextStream {
+        TextStream {
+            chunks: Some(chunks),
+            keepalive: KeepAlive::new(SSE_KEEPALIVE_INTERVAL),
+            kind,
+            marker: None,
+            stop: StopMatcher::new(&["STOP".to_owned()]),
+            stats: Arc::new(ApiStats::default()),
+            completion: std::sync::atomic::AtomicU32::new(0),
+            prompt_tokens: 0,
+            finished: false,
+            phase: ToolStreamPhase::Streaming,
+            meta: unit_meta(id),
+            live: live.register(id),
+        }
+    }
+
+    fn unit_tool_stream(
+        chunks: EngineChunks,
+        live: &stream_shape::LiveStreams,
+        id: &str,
+    ) -> ToolStream {
+        ToolStream {
+            chunks: Some(chunks),
+            keepalive: KeepAlive::new(SSE_KEEPALIVE_INTERVAL),
+            marker: None,
+            stop: StopMatcher::new(&["STOP".to_owned()]),
+            splitter: ToolStreamSplitter::new(false),
+            stats: Arc::new(ApiStats::default()),
+            completion: std::sync::atomic::AtomicU32::new(0),
+            prompt_tokens: 0,
+            finished: false,
+            phase: ToolStreamPhase::Streaming,
+            meta: unit_meta(id),
+            legacy_functions: false,
+            live: live.register(id),
+        }
+    }
+
+    /// Appends one SSE frame to `body`.
+    fn push_frame(body: &mut String, frame: &Bytes) {
+        body.push_str(std::str::from_utf8(frame).unwrap());
+    }
+
+    /// An engine stream that ends with no final chunk and was not cancelled
+    /// (its sender went away) is not reported as complete: the held text
+    /// goes out, then the error event, then `[DONE]`; no finish_reason and
+    /// no usage chunk. The same on the plain, completions and tools paths.
+    #[tokio::test]
+    async fn unexplained_end_ends_with_error_frame() {
+        let live = stream_shape::LiveStreams::default();
+        let mut bodies = Vec::new();
+        for kind in [
+            TextStreamKind::Chat,
+            TextStreamKind::Completion { echo: None },
+        ] {
+            let id = "task-text";
+            let mut s = unit_text_stream(kind, ended_channel(id, &["first ", "ST"]), &live, id);
+            let mut body = String::new();
+            while let Some(frame) = s.next_frame().await {
+                push_frame(&mut body, &frame);
+            }
+            drop(s);
+            bodies.push(body);
+        }
+        let id = "task-tools";
+        let mut s = unit_tool_stream(ended_channel(id, &["first ", "ST"]), &live, id);
+        let mut body = String::new();
+        while let Some(frame) = s.next_frame().await {
+            push_frame(&mut body, &frame);
+        }
+        drop(s);
+        bodies.push(body);
+        for body in bodies {
+            let events = sse_events(&body);
+            let streamed: String = events
+                .iter()
+                .filter_map(|e| {
+                    e["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .or(e["choices"][0]["text"].as_str())
+                })
+                .collect();
+            assert_eq!(streamed, "first ST", "{body}");
+            assert_eq!(
+                events.last().unwrap()["error"],
+                serde_json::json!({"message": "engine stream ended without a final chunk",
+                    "type": "server_error", "param": null, "code": "engine_error"}),
+                "{body}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .filter_map(|e| e["choices"].as_array())
+                    .flatten()
+                    .all(|c| c["finish_reason"].is_null()),
+                "{body}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e["choices"].as_array().is_none_or(|c| !c.is_empty())),
+                "no usage chunk: {body}"
+            );
+            assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        }
+        assert_eq!(live.len(), 0);
+    }
+
+    /// The live entry goes when a stream ends and when its body is dropped
+    /// mid-stream (a client disconnect); a cancel for an id with no open
+    /// stream adds nothing.
+    #[tokio::test]
+    async fn live_streams_hold_only_open_streams() {
+        let live = stream_shape::LiveStreams::default();
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let open = unit_text_stream(
+            TextStreamKind::Chat,
+            EngineChunks {
+                rx,
+                early: Arc::new(std::sync::OnceLock::new()),
+            },
+            &live,
+            "open",
+        );
+        assert_eq!(live.len(), 1);
+        assert!(!open.live.cancelled());
+        live.cancel("open");
+        assert!(open.live.cancelled());
+        drop(open);
+        assert_eq!(live.len(), 0);
+        live.cancel("open");
+        live.cancel("never-seen");
+        assert_eq!(live.len(), 0);
     }
 
     #[tokio::test]

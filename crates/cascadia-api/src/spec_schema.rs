@@ -55,13 +55,36 @@ pub(crate) fn assert_spec(schema_name: &str, value: &Value) {
 
 /// Checks one streamed chunk: the pinned schema for its `object`, plus what
 /// the schema cannot say (no extension counters, a fingerprint, `logprobs`
-/// on every choice). Error events are only required to carry an `error`.
+/// on every choice). An error event is `id`, `object: "error"` and the
+/// OpenAI error object (`message`, `type`, `param`, `code`), nothing else.
 pub(crate) fn assert_stream_chunk_spec(event: &Value) {
     match event["object"].as_str() {
         Some("error") => {
+            let keys = |v: &Value| {
+                let mut k: Vec<String> = v
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect())
+                    .unwrap_or_default();
+                k.sort();
+                k
+            };
+            assert_eq!(keys(event), ["error", "id", "object"], "{event}");
+            assert!(event["id"].is_string(), "error event without id: {event}");
+            let error = &event["error"];
+            assert_eq!(
+                keys(error),
+                ["code", "message", "param", "type"],
+                "error event's error is not the OpenAI error object: {event}"
+            );
+            assert!(error["message"].is_string(), "{event}");
+            assert!(error["type"].is_string(), "{event}");
             assert!(
-                event["error"].is_object(),
-                "error event without error: {event}"
+                error["code"].is_string() || error["code"].is_null(),
+                "{event}"
+            );
+            assert!(
+                error["param"].is_string() || error["param"].is_null(),
+                "{event}"
             );
             return;
         }
@@ -97,20 +120,10 @@ pub(crate) fn assert_stream_chunk_spec(event: &Value) {
 
 /// Checks a whole SSE body of a chat or completions stream: only `data:`
 /// lines and `:` comments, every chunk spec-shaped, one `id` and `created`
-/// throughout, `role` on the first chat delta only, and, unless the stream
-/// ends in an error event, exactly one spec `finish_reason`; then `[DONE]`.
+/// throughout, `role` on the first chat delta only, and either exactly one
+/// spec `finish_reason` or an error event as the last event (with no
+/// `finish_reason` and no usage chunk before it); then `[DONE]`.
 pub(crate) fn assert_stream_spec(body: &str) {
-    check_stream(body, true);
-}
-
-/// [`assert_stream_spec`] for a stream that ended without a final chunk and
-/// without an error event (the engine stream just stopped): it closes no
-/// choice, so it has no `finish_reason`. Every other check still applies.
-pub(crate) fn assert_stream_spec_ended_without_finish(body: &str) {
-    check_stream(body, false);
-}
-
-fn check_stream(body: &str, needs_finish: bool) {
     let mut events = Vec::new();
     let mut done = false;
     // SSE joins consecutive `data:` lines of one event with `\n`, so two
@@ -178,6 +191,10 @@ fn check_stream(body: &str, needs_finish: bool) {
     }
     check_usage_placement(&events, body);
     let ends_in_error = events.last().is_some_and(|e| e["object"] == "error");
+    assert!(
+        events.len() == chunks.len() + usize::from(ends_in_error),
+        "an error event that is not the last event: {body}"
+    );
     let finishes: Vec<&Value> = chunks
         .iter()
         .filter_map(|c| c["choices"].as_array())
@@ -186,16 +203,19 @@ fn check_stream(body: &str, needs_finish: bool) {
         .filter(|f| !f.is_null())
         .collect();
     if ends_in_error {
-        return;
-    }
-    if needs_finish {
-        assert_eq!(finishes.len(), 1, "want exactly one finish_reason: {body}");
-    } else {
         assert!(
             finishes.is_empty(),
-            "this stream was expected to end unfinished: {body}"
+            "a stream that ends in an error closed its choice: {body}"
         );
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c["choices"].as_array().is_some_and(Vec::is_empty)),
+            "a usage chunk in a stream that ends in an error: {body}"
+        );
+        return;
     }
+    assert_eq!(finishes.len(), 1, "want exactly one finish_reason: {body}");
     for f in finishes {
         assert!(
             [
@@ -294,6 +314,9 @@ fn assert_stream_spec_rejects_extension_fields_and_repeated_roles() {
     let last = chunk("", "{}", "\"stop\"");
     let good = format!("{first}: keep-alive\n\n{last}data: [DONE]\n\n");
     assert_stream_spec(&good);
+    let err = "data: {\"id\":\"c\",\"object\":\"error\",\"error\":{\"message\":\"x\",\
+               \"type\":\"server_error\",\"param\":null,\"code\":\"engine_error\"}}\n\n";
+    assert_stream_spec(&format!("{first}{err}data: [DONE]\n\n"));
     // Each bad body and the rule's own message it must fail with.
     let bad = [
         (
@@ -333,6 +356,21 @@ fn assert_stream_spec_rejects_extension_fields_and_repeated_roles() {
         (
             format!("{first}{last}data: [DONE]\n\n{last}"),
             "event after data: [DONE]",
+        ),
+        (
+            format!(
+                "{first}data: {{\"id\":\"c\",\"object\":\"error\",\
+                 \"error\":{{\"message\":\"x\",\"type\":\"engine_error\"}}}}\n\ndata: [DONE]\n\n"
+            ),
+            "not the OpenAI error object",
+        ),
+        (
+            format!("{first}{err}{last}data: [DONE]\n\n"),
+            "an error event that is not the last event",
+        ),
+        (
+            format!("{first}{last}{err}data: [DONE]\n\n"),
+            "a stream that ends in an error closed its choice",
         ),
     ];
     for (body, rule) in bad {
