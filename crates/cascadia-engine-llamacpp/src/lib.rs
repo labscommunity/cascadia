@@ -3695,6 +3695,38 @@ mod unix_tests {
         assert_eq!(counted, 0);
     }
 
+    /// A timeout or rate limit is never a schema refusal, even when its
+    /// message names the schema: the request is not resent without the
+    /// constraint, and it ends as a backend error, not a rejection.
+    #[test]
+    fn best_effort_timeout_or_rate_limit_naming_the_schema_is_not_resent() {
+        for status in ["408 Request Timeout", "429 Too Many Requests"] {
+            let task = chat_task().with_grammar(
+                cascadia_types::GrammarSpec::best_effort_json_schema(TOOL_SCHEMA),
+            );
+            let Run {
+                chunks,
+                bodies,
+                counted,
+            } = run_against(
+                task,
+                vec![
+                    error_reply(status, "timed out converting the JSON schema to a grammar"),
+                    ok_reply("unreachable"),
+                ],
+            );
+            assert_eq!(bodies.len(), 1, "{status}: {bodies:?}");
+            let last = &chunks.last().unwrap().1;
+            assert!(last.is_final && !last.invalid_request, "{status}: {last:?}");
+            assert_eq!(
+                last.error.as_deref(),
+                Some(format!("backend error: server HTTP/1.1 {status}").as_str()),
+                "{status}"
+            );
+            assert_eq!(counted, 0, "{status}");
+        }
+    }
+
     #[test]
     fn best_effort_refusal_not_about_the_schema_is_unchanged() {
         let task = chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
