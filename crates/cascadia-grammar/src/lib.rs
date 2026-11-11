@@ -148,6 +148,9 @@ impl GrammarFactory {
         let mut factory = ParserFactory::new_simple(&tok_env).map_err(backend)?;
         // A server: errors and warnings come back as values, nothing goes to stderr.
         factory.quiet().set_stderr_log_level(0);
+        let limits = factory.limits_mut();
+        limits.max_items_in_row = MAX_ITEMS_IN_ROW;
+        limits.step_max_items = STEP_MAX_ITEMS;
         Ok(Self {
             factory: Arc::new(factory),
             mask_width,
@@ -273,6 +276,24 @@ impl GrammarFactory {
         })
     }
 }
+
+/// llguidance's cap on the Earley items in one parser row. After `{`, each
+/// optional property of an object puts about four items in one row; the
+/// widest object the API admits (7,719 properties of any type within the
+/// 64 KiB cap) needs 30,883, alone or as an array's items. Half again as
+/// many, rounded up. llguidance's default (2000, about 500 properties) let
+/// such a schema build and give its first mask, then fail on the first
+/// accepted token.
+pub(crate) const MAX_ITEMS_IN_ROW: usize = 46_500;
+
+/// llguidance's cap on the Earley items one mask may create. A mask walks
+/// the tokenizer's vocab through the parser: with thousands of keys open,
+/// many tokens start one. The widest admitted object took at most 216,164
+/// items for one mask over Qwen2.5's and Llama 3.1's vocabs (any-typed,
+/// typed and mixed properties, at the top level or as an array's items);
+/// the byte-level vocab never passes 62,000. Half again as many, rounded
+/// up. llguidance's default is 50,000.
+pub(crate) const STEP_MAX_ITEMS: usize = 325_000;
 
 /// Stack for the thread that builds a grammar (see `compile_schema`). Only
 /// reserved address space: pages are committed as the build touches them.

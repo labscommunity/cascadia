@@ -1033,3 +1033,133 @@ fn a_wide_optional_object_builds_from_a_small_stack() {
         .unwrap();
     assert!(built.is_ok(), "{built:?}");
 }
+
+/// The API's cap on a schema's size (JSON without whitespace).
+const API_SCHEMA_CAP: usize = 65_536;
+
+/// The widest object of optional properties `p0`, `p1`, ... whose schema,
+/// as `value(i)` for property `i`, stays within the API's size cap.
+fn widest_optional_object(value: impl Fn(usize) -> &'static str) -> (usize, String) {
+    let mut props = String::new();
+    let mut i = 0;
+    loop {
+        let sep = if i == 0 { "" } else { "," };
+        let prop = format!("{sep}\"p{i}\":{}", value(i));
+        let len = r#"{"type":"object","properties":{}}"#.len() + props.len() + prop.len();
+        if len > API_SCHEMA_CAP {
+            break;
+        }
+        props.push_str(&prop);
+        i += 1;
+    }
+    (
+        i,
+        format!(r#"{{"type":"object","properties":{{{props}}}}}"#),
+    )
+}
+
+#[test]
+fn an_optional_object_at_the_schema_size_cap_generates() {
+    // After `{` every optional property may come next, which puts about four
+    // Earley items per property in one parser row. llguidance refuses a
+    // row past its limit (2000 items by default, about 500 properties) on
+    // the first token, after the schema had built and its first mask came
+    // back, so the request failed mid-generation.
+    const TYPES: [&str; 4] = [
+        r#"{"type":"string"}"#,
+        r#"{"type":"integer"}"#,
+        r#"{"type":"boolean"}"#,
+        r#"{"type":"number"}"#,
+    ];
+    let (width, body) = widest_optional_object(|i| TYPES[i % 4]);
+    assert!(width > 2500, "{width}");
+    let gf = single_byte();
+    let mut gm = mask_for(&gf, &body);
+    let prefix = bytes(r#"{"p0":"a","p1":1"#);
+    assert_eq!(walk(&gf, &mut gm, &prefix), Ok(()));
+    assert_eq!(walk(&gf, &mut gm, &bytes(r#","p2":true}"#)), Ok(()));
+    assert!(gm.finished());
+}
+
+/// A vocab like a real tokenizer's around the keys of an object: every
+/// byte, plus each key's name alone, after a quote, quoted, with the colon,
+/// and after a separator. Its last token is the EOS.
+fn key_vocab(names: impl Iterator<Item = String>) -> GrammarFactory {
+    let mut words: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
+    for n in names {
+        for w in [
+            n.clone(),
+            format!("\"{n}"),
+            format!("\"{n}\""),
+            format!("\"{n}\":"),
+            format!(" \"{n}"),
+            format!(", \"{n}"),
+            format!("{n}\""),
+            format!("{n}\":"),
+        ] {
+            words.push(w.into_bytes());
+        }
+    }
+    let eos = words.len() as u32;
+    words.push(vec![TokTrie::SPECIAL_TOKEN_MARKER, b'e']);
+    let info = TokRxInfo::new(words.len() as u32, eos);
+    let trie = TokTrie::from(&info, &words);
+    GrammarFactory::from_tok_env(Arc::new(ApproximateTokEnv::new(trie)), vec![eos].into()).unwrap()
+}
+
+/// Key `i` of a wide object, shortest names first: `a`..`9`, then `aa`, ...
+fn short_key(mut i: usize) -> String {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let (mut len, mut span) = (1, CHARS.len());
+    while i >= span {
+        i -= span;
+        len += 1;
+        span *= CHARS.len();
+    }
+    (0..len)
+        .map(|_| {
+            let c = CHARS[i % CHARS.len()];
+            i /= CHARS.len();
+            char::from(c)
+        })
+        .collect()
+}
+
+#[test]
+fn a_wide_optional_object_masks_over_a_large_vocab() {
+    // A mask walks the vocab's tokens through the parser, and with
+    // thousands of keys open many tokens start one. Over a real tokenizer's
+    // vocab (Qwen2.5, Llama 3.1) a schema inside the API's caps took up to
+    // 216,164 Earley items for one mask, past llguidance's default of
+    // 50,000 (see `STEP_MAX_ITEMS`); this vocab's keys take about half.
+    const WIDTH: usize = 4000;
+    let props: Vec<String> = (0..WIDTH)
+        .map(|i| format!("\"{}\":true", short_key(i)))
+        .collect();
+    let body = format!(
+        r#"{{"type":"object","properties":{{{}}}}}"#,
+        props.join(",")
+    );
+    assert!(body.len() <= API_SCHEMA_CAP, "{}", body.len());
+    let gf = key_vocab((0..WIDTH).map(short_key));
+    let mut gm = mask_for(&gf, &body);
+    let mut most_items = 0;
+    let doc = dumps(r#"{"a":"x","b":1,"c":true,"d":1.5,"e":"y"}"#);
+    for (i, t) in gf.factory.tok_env().tokenize(&doc).into_iter().enumerate() {
+        assert!(gm.allowed(t), "token {i} of {doc:?} masked out");
+        gm.accept(t)
+            .unwrap_or_else(|e| panic!("token {i} of {doc:?}: {e}"));
+        if !gm.finished() {
+            gm.mask_words()
+                .unwrap_or_else(|e| panic!("mask after token {i} of {doc:?}: {e}"));
+            let items = gm.matcher.last_step_stats().unwrap().all_items;
+            most_items = most_items.max(items);
+        }
+    }
+    assert!(gm.finished());
+    // The heaviest mask here takes 103,997 items. Pinned, so a change to
+    // llguidance or to the limits that makes a step much costlier shows up
+    // here, and stays well inside the cap.
+    assert!(most_items <= 110_000, "{most_items}");
+    assert!(most_items * 3 / 2 <= STEP_MAX_ITEMS, "{most_items}");
+}
