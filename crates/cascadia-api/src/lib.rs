@@ -13102,6 +13102,53 @@ level={{ effort_map[eff] }}";
     // An engine-queue-full 503 must count toward the same capacity-rejection
     // reason as the permit-gate 503 — engines cap pending tasks below the
     // default permit count, so this path is reachable at default config.
+    /// A burst that the engine's queue refuses (64 concurrent requests, each
+    /// a `QueueFull` 503 with `Retry-After`) never flips `/health`: during the
+    /// burst and after it, the node stays ready, so a load spike doesn't pull
+    /// plain traffic away from it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queue_full_burst_keeps_the_server_ready() {
+        let runner = Runner::new(Box::new(QueueFullBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("queuefull-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(Arc::new(runner), "queuefull-model");
+        let burst: Vec<_> = (0..64)
+            .map(|i| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let stream = i % 2 == 0;
+                    app.oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({"model": "queuefull-model", "stream": stream,
+                                    "messages": [{"role": "user", "content": "hi"}]})
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                })
+            })
+            .collect();
+        let during = stall_health(&app).await;
+        for r in burst {
+            let resp = r.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
+        }
+        assert_eq!(during, StatusCode::OK, "during the burst");
+        assert_eq!(stall_health(&app).await, StatusCode::OK, "after the burst");
+    }
+
     #[tokio::test]
     async fn engine_queue_full_counts_capacity_rejection() {
         let capacity_before = cascadia_metrics::API_REJECTED_TOTAL
