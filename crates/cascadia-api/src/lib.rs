@@ -4487,14 +4487,22 @@ impl ToolStream {
     /// the end (header, then its arguments) and a `tool_calls` finish
     /// (`function_call` and the first call only for a `functions` request).
     /// Calls already streamed: the rest of the reply's calls, never its
-    /// markup as content. A `length` finish stays `length`; a reply that
-    /// ends inside a streamed call's arguments keeps its own reason (`stop`),
-    /// never a call finish.
+    /// markup as content. A `length` finish stays `length`; a reply with a
+    /// streamed call cut short (its arguments still open, or ended by a
+    /// closing tag before they closed) keeps its own reason (`stop`), never
+    /// a call finish.
     fn close_choice(&mut self, text: &str, finish_reason: &str) -> Bytes {
         let counts = self.counts();
         let mut out = String::new();
+        // The last text goes past the emitter first, as text in any earlier
+        // chunk would, so what the reply sends does not depend on how the
+        // engine cut it into chunks.
+        self.splitter.push(text);
+        let mut early = self
+            .calls
+            .advance(self.splitter.text(), self.splitter.scan_from());
         let events = if self.calls.started() {
-            let content = self.splitter.feed(text).to_owned();
+            let content = self.splitter.feed("").to_owned();
             if !content.is_empty() {
                 let logprobs = self.logprobs.release(content.len());
                 out.push_str(&self.meta.chat_chunk(
@@ -4506,10 +4514,13 @@ impl ToolStream {
             }
             // Markup items never go out.
             self.logprobs.finish(0);
-            self.calls
-                .finish(self.splitter.text(), self.splitter.scan_from())
+            early.extend(
+                self.calls
+                    .finish(self.splitter.text(), self.splitter.scan_from()),
+            );
+            early
         } else {
-            match self.splitter.finish(text) {
+            match self.splitter.finish("") {
                 ToolStreamEnd::Content(content) => {
                     out.push_str(&self.meta.chat_chunk(
                         stream_shape::content_delta(content),
@@ -4535,11 +4546,12 @@ impl ToolStream {
             }
         };
         self.push_call_events(&mut out, events, counts);
-        let finish_reason = if finish_reason == "length" || self.calls.inside_arguments() {
+        let finish_reason = if finish_reason == "length" || self.calls.call_cut_short() {
             // A generation cut at its limit keeps `length`. A call whose
-            // arguments never closed is cut short however the reply ended:
-            // a call finish would tell the client it is complete, so the
-            // reply keeps its own reason (`stop` for a natural end or a cut).
+            // arguments never closed is cut short however the reply ended
+            // (or a closing tag ended them): a call finish would tell the
+            // client it is complete, so the reply keeps its own reason
+            // (`stop` for a natural end or a cut).
             finish_reason
         } else if self.legacy_functions {
             "function_call"
@@ -8941,9 +8953,13 @@ level={{ effort_map[eff] }}";
         fn closed_invalid(id: &cascadia_types::TaskId) -> Vec<Chunk> {
             ended(id, r#"Paris}}</tool_call>"#)
         }
+        fn open_then_tag(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            ended(id, r#""Pa"</tool_call>"#)
+        }
         type Script = fn(&cascadia_types::TaskId) -> Vec<Chunk>;
-        let cases: [(Script, &str, bool); 3] = [
+        let cases: [(Script, &str, bool); 4] = [
             (open, r#"{"city":"Pa"#, false),
+            (open_then_tag, r#"{"city":"Pa""#, false),
             (closed, r#"{"city":"Paris"}"#, true),
             (closed_invalid, r#"{"city":Paris}"#, true),
         ];
@@ -8980,6 +8996,105 @@ level={{ effort_map[eff] }}";
                 crate::spec_schema::assert_stream_spec(&text);
             }
         }
+    }
+
+    /// What a tools stream sent for `chunks`: the calls (id dropped), the
+    /// content and the finish reasons.
+    async fn tool_stream_outcome(
+        chunks: Vec<Chunk>,
+        legacy: bool,
+    ) -> (Vec<(String, String)>, String, Vec<String>) {
+        let id = "task-split";
+        let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
+        for chunk in chunks {
+            tx.try_send(chunk).unwrap();
+        }
+        drop(tx);
+        let live = stream_shape::LiveStreams::default();
+        let engine = EngineChunks {
+            rx,
+            early: Arc::new(std::sync::OnceLock::new()),
+        };
+        let mut s = unit_tool_stream(engine, &live, id);
+        s.legacy_functions = legacy;
+        s.calls = tool_stream::ToolCallEmitter::new(legacy);
+        let mut body = String::new();
+        while let Some(frame) = s.next_frame().await {
+            push_frame(&mut body, &frame);
+        }
+        crate::spec_schema::assert_stream_spec(&body);
+        let events = sse_events(&body);
+        let has_function_call = events
+            .iter()
+            .any(|e| e["choices"][0]["delta"].get("function_call").is_some());
+        let calls = if legacy {
+            if has_function_call {
+                vec![stream_function_call(&events)]
+            } else {
+                Vec::new()
+            }
+        } else {
+            stream_calls(&events)
+                .into_iter()
+                .map(|(_, name, args)| (name, args))
+                .collect()
+        };
+        let finishes = finish_reasons(&events)
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        (calls, streamed_content(&events), finishes)
+    }
+
+    /// A tools stream sends the same calls, content and finish whether the
+    /// reply arrives a few characters per token or all in the final chunk,
+    /// including a call whose arguments a closing tag cuts short.
+    #[tokio::test]
+    async fn a_tools_stream_does_not_depend_on_the_chunking() {
+        let texts = [
+            r#"<tool_call>{"name":"f","arguments":{"path":"a"</tool_call>"#,
+            r#"<tool_call>{"name":"f","arguments":{"a":1</tool_call><tool_call>{"name":"g","arguments":{}}</tool_call>"#,
+            r#"Hi. <tool_call>{"name":"f","arguments":{"a":[1,"}"]}}</tool_call>"#,
+            r#"<tool_call>{"name":"f","arguments":{"a":1}}</tool_call>"#,
+            r#"<tool_call>{"name":"f","arguments":{"a":1"#,
+            "no call here",
+        ];
+        let tid: cascadia_types::TaskId = "task-split".into();
+        let stop =
+            || Chunk::final_marker(&tid, "").with_finish_reason(cascadia_types::FinishReason::Stop);
+        for legacy in [false, true] {
+            for text in texts {
+                let whole = tool_stream_outcome(
+                    vec![Chunk::final_marker(&tid, text)
+                        .with_finish_reason(cascadia_types::FinishReason::Stop)],
+                    legacy,
+                )
+                .await;
+                let chars: Vec<char> = text.chars().collect();
+                for n in [1, 2, 3, 5, 7, chars.len()] {
+                    let mut chunks: Vec<Chunk> = chars
+                        .chunks(n)
+                        .enumerate()
+                        .map(|(i, c)| Chunk::token(&tid, i as i64, c.iter().collect::<String>()))
+                        .collect();
+                    chunks.push(stop());
+                    let split = tool_stream_outcome(chunks, legacy).await;
+                    assert_eq!(split, whole, "legacy={legacy} n={n}: {text}");
+                }
+            }
+        }
+        // A call cut short by its closing tag: sent as far as it got, the
+        // next call still streams, and the turn ends `stop`.
+        let (calls, content, finishes) = tool_stream_outcome(
+            vec![Chunk::final_marker(&tid, texts[1])
+                .with_finish_reason(cascadia_types::FinishReason::Stop)],
+            false,
+        )
+        .await;
+        let owned = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(calls, [owned("f", r#"{"a":1"#), owned("g", "{}")]);
+        assert_eq!(content, "");
+        assert_eq!(finishes, ["stop"]);
     }
 
     #[tokio::test]

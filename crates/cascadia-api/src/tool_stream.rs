@@ -105,6 +105,9 @@ pub(crate) struct ToolCallEmitter {
     state: State,
     /// Closing-tag searches of the blocks parsed whole, shared between them.
     tags: CloseTags,
+    /// A streamed call's arguments were ended by a closing tag before their
+    /// object closed: that call is incomplete.
+    cut: bool,
     /// Bytes examined so far, for the linear-time test.
     #[cfg(test)]
     work: usize,
@@ -160,6 +163,7 @@ impl ToolCallEmitter {
             sent: 0,
             state: State::Waiting,
             tags: CloseTags::default(),
+            cut: false,
             #[cfg(test)]
             work: 0,
         }
@@ -173,6 +177,12 @@ impl ToolCallEmitter {
     /// A streamed call's arguments object is still open.
     pub(crate) fn inside_arguments(&self) -> bool {
         matches!(self.state, State::Arguments { .. })
+    }
+
+    /// A streamed call is incomplete: its arguments object is still open, or
+    /// a closing tag ended it before it closed.
+    pub(crate) fn call_cut_short(&self) -> bool {
+        self.cut || self.inside_arguments()
     }
 
     /// The events the text so far allows.
@@ -267,8 +277,9 @@ impl ToolCallEmitter {
                     // is read, not sent.
                     Scanned::Closed(at) => self.state = State::Rest(JsonScan::object(at, 1)),
                     // A closing tag outside any string: the model gave up on
-                    // the object; the call stays as sent.
+                    // the object; the call stays as sent, incomplete.
                     Scanned::Tag(at) => {
+                        self.cut = true;
                         self.state = State::Search(Finder::new(at + TOOL_CALL_CLOSE.len()))
                     }
                     Scanned::Wait => {
@@ -1025,6 +1036,78 @@ mod tests {
             Value::Object(args.delta(false)),
             serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]})
         );
+    }
+
+    /// A closing tag ends a streamed call's arguments before their object
+    /// closed: the call stays as sent and is marked cut short, and the next
+    /// block still streams, in every split.
+    #[test]
+    fn a_closing_tag_inside_the_arguments_cuts_the_call_short() {
+        let text = r#"<tool_call>{"name":"f","arguments":{"a":1</tool_call><tool_call>{"name":"g","arguments":{}}</tool_call>"#;
+        for n in [1, 2, 3, 5, 7, text.len()] {
+            let parts = pieces(text, n);
+            let mut splitter = ToolStreamSplitter::new(false);
+            let mut emitter = ToolCallEmitter::new(false);
+            let mut events = Vec::new();
+            for (i, piece) in parts.iter().enumerate() {
+                splitter.feed(piece);
+                for e in emitter.advance(splitter.text(), splitter.scan_from()) {
+                    events.push((i, e));
+                }
+            }
+            assert!(emitter.call_cut_short(), "n={n}");
+            assert!(!emitter.inside_arguments(), "n={n}");
+            let streamed: Vec<_> = assemble(&events)
+                .into_iter()
+                .map(|(_, name, args)| (name, args))
+                .collect();
+            assert_eq!(
+                streamed,
+                [
+                    ("f".to_owned(), r#"{"a":1"#.to_owned()),
+                    ("g".to_owned(), "{}".to_owned())
+                ],
+                "n={n}"
+            );
+            assert!(
+                emitter
+                    .finish(splitter.text(), splitter.scan_from())
+                    .is_empty(),
+                "n={n}"
+            );
+        }
+    }
+
+    /// A block parsed whole that starts with `{` but is not JSON (a `<`
+    /// outside a string) is decided when its closing tag arrives, not when
+    /// the reply ends.
+    #[test]
+    fn a_non_json_block_starting_with_a_brace_is_decided_at_its_tag() {
+        let block = "<tool_call>{<function=f><parameter=a>1</parameter></function></tool_call>";
+        let text = format!("{block} and more text after it");
+        for n in [1, 2, 3, 7, block.len()] {
+            let parts = pieces(&text, n);
+            let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+            let mut fed = 0;
+            let tag_piece = refs
+                .iter()
+                .position(|p| {
+                    fed += p.len();
+                    fed >= block.len()
+                })
+                .unwrap();
+            let r = run(&refs, false, false);
+            assert!(!r.events.is_empty(), "n={n}");
+            assert!(
+                r.events.iter().all(|(i, _)| *i == tag_piece),
+                "n={n}: want piece {tag_piece}: {:?}",
+                r.events
+            );
+            let calls = assemble(&r.events);
+            assert_eq!(calls.len(), 1, "n={n}");
+            assert_eq!(calls[0].1, "f");
+            assert_eq!(json(&calls[0].2), json(r#"{"a":"1"}"#));
+        }
     }
 
     #[test]
