@@ -421,8 +421,13 @@ def case_wide_optional_object(base):
     body = chat([{"role": "user", "content": "Fill in a few of the fields."}],
                 response_format=rf_schema(schema), max_tokens=48)
     status, raw, dt = post(base, body, timeout=300)
+    if status == 400 and "would take too long" in raw:
+        # ov-genai (xgrammar) and sycl-llama (llama-server) price this schema's compile and
+        # refuse it up front; that clean 400 is their answer. The llguidance engines build it.
+        return verdict("wide_optional_object", True,
+                       f"{n} props {size} B: HTTP 400 in {dt:.2f}s (compile-cost refusal): {raw[:160]}")
     if status != 200:
-        # A 5xx fails on every engine, the mock too.
+        # Any other 4xx, and every 5xx, fails on every engine, the mock too.
         return verdict("wide_optional_object", False, f"{n} props {size} B: HTTP {status}: {raw[:200]}",
                        info=MOCK and status < 500)
     text, finish = content_of(raw)
