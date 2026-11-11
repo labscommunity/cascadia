@@ -29,19 +29,33 @@ Cases (`--cases` takes these names; "+stream" means a streamed variant runs too)
                       tool prompt → a call or schema-valid content; "Say hello." → schema-valid
                       content (a call is INFO)
     plain_unchanged   tools without tool_choice → 200, content or a function call, no custom objects
+    too_complex_forced  tool_choice "required" over one tool with 2000 optional string
+                      properties (max_tokens 32) → HTTP 200 within 300 s, any content or call,
+                      never a 400; the elapsed seconds are reported, not judged. Whether the node
+                      dropped the grammar or enforced it is INFO, from the rise of
+                      `cascadia_constraint_unenforced_total` (summed over reasons, read from /metrics
+                      before and after): ov-genai and sycl-llama drop it (cost limits), an engine
+                      that builds it within its budget enforces it. Then a plain request → 200
+    schema_budget     65 sequential tool_choice "required" requests, each with one tool `f` whose
+                      only (required) string property is `p<i>`, a distinct schema each time
+                      (max_tokens 32) → all 65 answer 200, no 400; then a plain request → 200. The
+                      unenforced counter's rise is INFO (a node with a 64-schema budget, ov-genai,
+                      drops the 65th grammar; the others constrain all 65)
     concurrency       (with --concurrency N > 1) N `required` requests at once, each returns a call
     gemma             (with --gemma) a Gemma 4 model under auto → get_weather with a "city"
                       argument, and no Gemma tool-call markers left in the content (+stream)
 
-Every request sends "max_tokens": 512, "temperature": 0 and a top-level "enable_thinking": false.
+Every request sends "max_tokens": 512 (32 in too_complex_forced and schema_budget), "temperature": 0
+and a top-level "enable_thinking": false.
 
 `--mock` is for `cascadia run mock-model --engine mock`. The mock answers a constrained request
 with the minimal instance of the grammar (the first `anyOf` branch, so the first tool, and
 `minItems` calls) and echoes the prompt otherwise. Forced cases (required, named_function,
 named_custom, custom_replay, allowed_*, parallel_false's false half, plain_unchanged,
-concurrency) must pass. These report INFO there because the mock can't produce them:
+schema_budget, too_complex_forced's requests, concurrency) must pass. These report INFO there because the mock can't produce them:
 parallel_false's true control (one call is the minimal instance), json_union's "Say hello."
-half (the first branch of the union is the call array, so it answers with a call) and gemma (no
+half (the first branch of the union is the call array, so it answers with a call),
+too_complex_forced's counter (the mock constrains any schema, so nothing is dropped) and gemma (no
 grammar under auto, so the mock echoes the prompt). Tools need a chat template: a mock model
 without one answers every tools request with a 400, which fails the run.
 
@@ -53,7 +67,8 @@ isn't the schema's JSON) reports INFO "not enforced on this node (expected)". Ma
 objects, broken stream deltas, calls to a tool that allowed_tools left out and a second call
 under parallel_tool_calls false (the server trims those itself) still FAIL.
 
-`--dry-run` prints every request body instead of sending it and checks nothing.
+`--dry-run` prints every request body instead of sending it and checks nothing (the 2000-property
+schema is shown as its first 3 properties and a count).
 """
 
 import argparse
@@ -71,6 +86,9 @@ DRY_RUN = False
 DRY_COUNT = 0
 FAILED = []
 NOT_ENFORCED = "not enforced on this node (expected)"
+UNENFORCED_METRIC = "cascadia_constraint_unenforced_total"
+WIDE_PROPS = 2000  # too_complex_forced: optional properties on the one tool
+SCHEMA_BUDGET_REQUESTS = 65  # schema_budget: one past ov-genai's 64-schema budget
 
 
 def fn_tool(name, desc, props=("city",)):
@@ -104,12 +122,14 @@ GEMMA_MARKERS = ("<|tool_call>", "<tool_call|>", '<|"|>', "call:get_weather")
 # ---------------------------------------------------------------- HTTP
 
 
-def post(body, timeout=900):
-    """Return (status, raw body, seconds). status 0 = no HTTP answer (connection error)."""
+def post(body, timeout=900, shown=None):
+    """Return (status, raw body, seconds). status 0 = no HTTP answer (connection error).
+
+    `shown` is what --dry-run prints in place of `body` (a shortened copy of a huge body)."""
     global DRY_COUNT
     if DRY_RUN:
         DRY_COUNT += 1
-        print(f"DRY-RUN POST {BASE.rstrip('/')}/v1/chat/completions {json.dumps(body)}", flush=True)
+        print(f"DRY-RUN POST {BASE.rstrip('/')}/v1/chat/completions {json.dumps(shown or body)}", flush=True)
         if body.get("stream"):
             return 200, "data: [DONE]\n", 0.0
         return 200, json.dumps({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}), 0.0
@@ -127,6 +147,32 @@ def post(body, timeout=900):
     except (urllib.error.URLError, OSError) as e:
         raw, status = f"connection error: {e}", 0
     return status, raw, time.time() - t0
+
+
+def unenforced_total():
+    """`cascadia_constraint_unenforced_total` summed over its reasons, from /metrics.
+
+    Returns (total, None), or (None, why) when /metrics is unreachable or carries no sample of
+    the family (a counter nothing has incremented yet is absent, not 0)."""
+    url = BASE.rstrip("/") + "/metrics"
+    if DRY_RUN:
+        print(f"DRY-RUN GET {url}", flush=True)
+        return None, "dry run"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            text = r.read().decode(errors="replace")
+    except (urllib.error.URLError, OSError) as e:
+        return None, f"/metrics unreachable: {e}"
+    total, seen = 0.0, False
+    for line in text.splitlines():
+        if not (line.startswith(UNENFORCED_METRIC + "{") or line.startswith(UNENFORCED_METRIC + " ")):
+            continue
+        try:
+            total += float(line.rsplit(None, 1)[1])
+            seen = True
+        except (ValueError, IndexError):
+            pass
+    return (total, None) if seen else (None, f"no {UNENFORCED_METRIC} sample on /metrics")
 
 
 def chat(prompt, tools, stream=False, messages=None, **extra):
@@ -205,9 +251,9 @@ def parse_stream(raw, dt):
     return Resp("".join(text), [calls[i] for i in sorted(calls)], finish, problems, dt)
 
 
-def send(case, body):
+def send(case, body, timeout=900, shown=None):
     """Send, check HTTP 200 and parse. Returns a Resp, or None after a FAIL verdict."""
-    status, raw, dt = post(body)
+    status, raw, dt = post(body, timeout, shown)
     if status != 200:
         hint = ""
         if MOCK and status == 400 and "no chat template" in raw:
@@ -566,6 +612,87 @@ def case_concurrency(n):
         verdict(case, "PASS", detail)
 
 
+def plain_after(case):
+    """A plain request without tools → HTTP 200: the server is still healthy."""
+    body = chat("Say hello.", None, max_tokens=32)
+    del body["tools"]
+    r = send(case, body)
+    if r:
+        verdict(case, "PASS", f"HTTP 200 {summary(r)}")
+
+
+def unenforced_delta(before, after):
+    """(rise, None) or (None, why) from two unenforced_total() readings."""
+    (b, why_b), (a, why_a) = before, after
+    if a is None:
+        return None, why_a
+    if b is None and why_b and "unreachable" in why_b:
+        return None, why_b
+    return a - (b or 0.0), None
+
+
+def case_too_complex_forced():
+    case = "too_complex_forced"
+    props = {f"p{i}": {"type": "string"} for i in range(WIDE_PROPS)}
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "fill_form",
+            "description": "Fill in a form",
+            "parameters": {"type": "object", "properties": props},
+        },
+    }
+    body = chat("Fill in the form.", [tool], tool_choice="required", max_tokens=32)
+    shown = json.loads(json.dumps(body))
+    first = {k: props[k] for k in list(props)[:3]}
+    first["..."] = f"{WIDE_PROPS - 3} more optional string properties, p3 to p{WIDE_PROPS - 1}"
+    shown["tools"][0]["function"]["parameters"]["properties"] = first
+    before = unenforced_total()
+    # Generous: a cold CPU prefill of this prompt takes about 95 s on a 4-vCPU box. The time is
+    # reported, never judged.
+    r = send(case, body, timeout=300, shown=shown)
+    if r:
+        verdict(case, "PASS", f"HTTP 200 in {r.dt:.1f}s (not judged) {summary(r)}")
+        rise, why = unenforced_delta(before, unenforced_total())
+        metric = "too_complex_forced_unenforced"
+        if rise is None:
+            verdict(metric, "INFO", f"counter not read: {why}")
+        elif rise >= 1:
+            verdict(metric, "INFO", f"dropped: {UNENFORCED_METRIC} rose by {rise:g}")
+        else:
+            # An engine that builds this grammar in time (llguidance engines often do, and the
+            # mock constrains any schema) enforces it; either way the answer must be a 200.
+            verdict(metric, "INFO", f"enforced: {UNENFORCED_METRIC} rose by {rise:g}")
+    plain_after("too_complex_forced_after")
+
+
+def case_schema_budget():
+    case = "schema_budget"
+    n = SCHEMA_BUDGET_REQUESTS
+    before = unenforced_total()
+    bad, n400, t0 = [], 0, time.time()
+    for i in range(n):
+        tool = fn_tool("f", "Record a value", (f"p{i}",))
+        status, raw, _ = post(chat("Record a value.", [tool], tool_choice="required", max_tokens=32))
+        if status != 200:
+            n400 += status == 400
+            bad.append(f"#{i} HTTP {status}: {raw[:80]}")
+            continue
+        try:
+            parse_message(raw, 0)
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            bad.append(f"#{i} unparseable ({type(e).__name__}: {e})")
+    detail = f"{time.time() - t0:.1f}s {n - len(bad)}/{n} HTTP 200, {n400} HTTP 400"
+    if bad:
+        verdict(case, "FAIL", f"{detail}: {'; '.join(bad[:3])}")
+    else:
+        verdict(case, "PASS", detail)
+    rise, why = unenforced_delta(before, unenforced_total())
+    note = f"counter not read: {why}" if rise is None else f"{UNENFORCED_METRIC} rose by {rise:g}"
+    verdict("schema_budget_unenforced", "INFO", f"{note} (only a node with a 64-schema budget drops one)")
+    plain_after("schema_budget_after")
+
+
 CASES = {
     "required": case_required,
     "named_function": case_named_function,
@@ -577,6 +704,8 @@ CASES = {
     "parallel_false": case_parallel_false,
     "json_union": case_json_union,
     "plain_unchanged": case_plain_unchanged,
+    "too_complex_forced": case_too_complex_forced,
+    "schema_budget": case_schema_budget,
 }
 
 
