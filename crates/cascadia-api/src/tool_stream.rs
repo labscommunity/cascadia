@@ -81,6 +81,16 @@ fn call_events(index: usize, call: ToolCall) -> Vec<CallEvent> {
     out
 }
 
+/// Whether the served model writes a `<think>…</think>` reasoning block
+/// before its answer: its chat template mentions `</think>` (Qwen3, GLM,
+/// R1-distill templates all do), or its output framing has a thinking
+/// marker that is translated into one. With no template at all the API
+/// cannot tell, so it assumes one may come and keeps guarding against
+/// calls drafted while reasoning.
+pub(crate) fn model_thinks(template: Option<&str>, marker_dialect: bool) -> bool {
+    marker_dialect || template.is_none_or(|t| t.contains(crate::THINK_CLOSE))
+}
+
 /// Turns the held text of a tools stream into call deltas. Driven with the
 /// splitter's whole buffer and where tool-call scanning starts (`None` while
 /// a reasoning block is still open: a call drafted there is not a call).

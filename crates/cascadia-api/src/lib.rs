@@ -147,6 +147,10 @@ pub struct AppState {
     /// Special-token message framing to translate back into text delimiters
     /// (Inkling). See [`MarkerDialect`].
     pub marker_dialect: Option<MarkerDialect>,
+    /// The served model writes a reasoning block that ends in `</think>`
+    /// before its answer. Only then does a request with thinking on keep
+    /// tool calls drafted inside that block from counting, streamed or not.
+    pub thinks: bool,
     /// Pipeline readiness for `/health`. Starts `true`; a completion that fails
     /// with a 5xx (e.g. the distributed pipeline dropped a peer link) flips it
     /// `false`, a success flips it back `true` — so `/health` reflects the real
@@ -617,6 +621,10 @@ fn make_router_with_live(
         defer_template_on_thinking: cfg.defer_template_on_thinking,
         engine_applies_template: cfg.engine_applies_template,
         effort_words: false,
+        thinks: tool_stream::model_thinks(
+            cfg.chat_template.template.as_deref(),
+            cfg.marker_dialect.is_some(),
+        ),
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         generation_defaults: cfg.generation_defaults,
@@ -3099,7 +3107,7 @@ async fn chat_completions(
         buf,
         &req.tool_choice,
         req.tools.as_ref().is_some_and(|t| !t.is_empty()),
-        enable_thinking,
+        enable_thinking && state.thinks,
     );
     // A parsed tool call overrides `stop`. A generation cut at its limit
     // keeps `length` and still carries the calls that came out whole, as
@@ -3405,7 +3413,7 @@ async fn stream_completion(
     let task_id = task.task_id.clone();
     // Captured before `task` moves into `generate` below — arms the tool-call
     // scan the same way the non-streaming path does (see `tool_call_scan_text`).
-    let enable_thinking = task.enable_thinking;
+    let enable_thinking = task.enable_thinking && state.thinks;
     let stop = StopMatcher::new(&task.sampling.stop);
     let logprobs_asked = task.logprobs > 0;
 
@@ -8127,6 +8135,23 @@ level={{ effort_map[eff] }}";
     /// Router over a [`GatedEngine`] with a template that renders tools, so
     /// tool requests are accepted. Returns the gate.
     async fn gated_app(parts: &[&str], fail: bool) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        gated_app_with(parts, fail, PLAIN_TEMPLATE).await
+    }
+
+    /// A chat template with no reasoning block (Llama, Qwen2.5 style).
+    const PLAIN_TEMPLATE: &str = "{% for m in messages %}{{ m.content }}{% endfor %}";
+
+    /// A chat template whose model reasons in `<think>…</think>` first
+    /// (Qwen3 style: thinking off renders an empty block).
+    const THINK_TEMPLATE: &str = "{% for m in messages %}{{ m.content }}{% endfor %}\
+        {% if enable_thinking is defined and not enable_thinking %}<think>\n\n</think>{% endif %}";
+
+    /// [`gated_app`] with chat template `template`.
+    async fn gated_app_with(
+        parts: &[&str],
+        fail: bool,
+        template: &str,
+    ) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runner = Runner::new(Box::new(GatedBuilder(GatedEngine {
             parts: parts.iter().map(|p| (*p).to_owned()).collect(),
@@ -8143,7 +8168,7 @@ level={{ effort_map[eff] }}";
             .unwrap();
         let cfg = Config {
             chat_template: ChatTemplateConfig {
-                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                template: Some(template.into()),
                 bos_token: None,
                 eos_token: None,
             },
@@ -8285,13 +8310,13 @@ level={{ effort_map[eff] }}";
             assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
             let events = sse_events(&body);
             // The gated engine emits one token per part: the running count
-            // never goes back, and every chunk that closes the choice
-            // already counts all of them.
+            // never goes back, and the chunk that closes the choice (and the
+            // usage chunk after it) already counts all of them.
             let running = running_completion(&events);
             assert!(running.windows(2).all(|w| w[0] <= w[1]), "{body}");
             let closing = events
                 .iter()
-                .position(|e| e["choices"][0]["delta"].get("tool_calls").is_some())
+                .position(|e| !e["choices"][0]["finish_reason"].is_null())
                 .unwrap();
             for n in &running[closing..] {
                 assert_eq!(*n, parts.len() as u64, "{body}");
@@ -8389,10 +8414,10 @@ level={{ effort_map[eff] }}";
         ];
         for legacy in [false, true] {
             let (app, release) = gated_app(&parts, false).await;
-            // Thinking on, a call streams only after `</think>`.
+            // Thinking is on by default, but this model's template has no
+            // reasoning block, so nothing waits for `</think>`.
             let mut payload = serde_json::json!({"model": "mock-model",
-                "messages": [{"role": "user", "content": "hi"}], "stream": true,
-                "enable_thinking": false});
+                "messages": [{"role": "user", "content": "hi"}], "stream": true});
             if legacy {
                 payload["functions"] = serde_json::json!([{"name": "get_weather"}]);
             } else {
@@ -8494,6 +8519,131 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    const DRAFT_THEN_CALL: [&str; 4] = [
+        r#"<think>maybe <tool_call>{"name":"rm","arguments":{"path":"/"}}</tool_call>"#,
+        " no</think>",
+        r#"<tool_call>{"name":"get_weather","arguments":{"#,
+        r#""city":"Paris"}}</tool_call>"#,
+    ];
+
+    /// A model that reasons first: nothing is a call until `</think>`, so
+    /// the call drafted inside the reasoning never goes out, and the one
+    /// after it does.
+    #[tokio::test]
+    async fn a_thinking_model_streams_calls_only_after_its_reasoning() {
+        let (app, release) = gated_app_with(&DRAFT_THEN_CALL, false, THINK_TEMPLATE).await;
+        let resp = app.oneshot(tool_stream_request()).await.unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        let first = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), body.next())
+                .await
+                .expect("a frame while generation is held")
+                .expect("body still open")
+                .unwrap();
+            if !frame.is_empty() {
+                break String::from_utf8(frame.to_vec()).unwrap();
+            }
+        };
+        assert!(!first.contains("tool_calls"), "{first}");
+        release.store(true, Ordering::SeqCst);
+        let mut all = first;
+        while let Some(frame) = body.next().await {
+            all.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+        let events = sse_events(&all);
+        let calls = stream_calls(&events);
+        let names: Vec<&str> = calls.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(names, ["get_weather"], "{all}");
+        assert_eq!(finish_reasons(&events), ["tool_calls"], "{all}");
+    }
+
+    /// Stream and non-stream decide the same calls for a model with a
+    /// reasoning block and one without, thinking left at its default.
+    #[tokio::test]
+    async fn streamed_and_non_streamed_replies_decide_tool_calls_alike() {
+        let replies: [&[&str]; 4] = [
+            &DRAFT_THEN_CALL,
+            &DRAFT_THEN_CALL[2..],
+            &["<think>hmm</think>", "The answer ", "is 4"],
+            &DRAFT_THEN_CALL[..2],
+        ];
+        for (template, thinks) in [(PLAIN_TEMPLATE, false), (THINK_TEMPLATE, true)] {
+            for parts in replies {
+                let ctx = format!("thinks={thinks} parts={parts:?}");
+                let mut decided = Vec::new();
+                for stream in [false, true] {
+                    let (app, release) = gated_app_with(parts, false, template).await;
+                    release.store(true, Ordering::SeqCst);
+                    let payload = serde_json::json!({"model": "mock-model",
+                        "messages": [{"role": "user", "content": "hi"}], "stream": stream,
+                        "tools": [{"type": "function", "function": {"name": "get_weather"}},
+                                  {"type": "function", "function": {"name": "rm"}}]});
+                    let (status, text) = post_text(app, "/v1/chat/completions", &payload).await;
+                    assert_eq!(status, StatusCode::OK, "{ctx}: {text}");
+                    let (calls, finish, content) = if stream {
+                        let events = sse_events(&text);
+                        let calls: Vec<(String, Value)> = stream_calls(&events)
+                            .into_iter()
+                            .map(|(_, n, a)| (n, serde_json::from_str(&a).unwrap()))
+                            .collect();
+                        let finish = finish_reasons(&events).concat();
+                        (calls, finish, streamed_content(&events))
+                    } else {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        let choice = &v["choices"][0];
+                        let calls: Vec<(String, Value)> = choice["message"]["tool_calls"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|c| {
+                                (
+                                    c["function"]["name"].as_str().unwrap().to_owned(),
+                                    serde_json::from_str(
+                                        c["function"]["arguments"].as_str().unwrap(),
+                                    )
+                                    .unwrap(),
+                                )
+                            })
+                            .collect();
+                        let content = choice["message"]["content"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        (
+                            calls,
+                            choice["finish_reason"].as_str().unwrap().to_owned(),
+                            content,
+                        )
+                    };
+                    // Content before a call streams; the non-streamed reply
+                    // has none then, so content is compared only without calls.
+                    let content = if calls.is_empty() {
+                        content
+                    } else {
+                        String::new()
+                    };
+                    decided.push((calls, finish, content));
+                }
+                assert_eq!(decided[0], decided[1], "{ctx}");
+                let names: Vec<&str> = decided[0].0.iter().map(|c| c.0.as_str()).collect();
+                let want: &[&str] = match (thinks, parts.len()) {
+                    (_, 3) if parts[0].starts_with("<think>hmm") => &[],
+                    (true, 4) => &["get_weather"],
+                    (false, 4) => &["rm", "get_weather"],
+                    (_, 2) if parts[0].contains("rm") => {
+                        if thinks {
+                            &[]
+                        } else {
+                            &["rm"]
+                        }
+                    }
+                    _ => &["get_weather"],
+                };
+                assert_eq!(names, want, "{ctx}");
+            }
+        }
+    }
+
     /// A cut inside a streamed call's arguments keeps the call as sent and
     /// ends with what ended the generation: the window (`length`) or a
     /// `stop` match (`stop`).
@@ -8520,8 +8670,7 @@ level={{ effort_map[eff] }}";
                 )
                 .await;
                 let mut body = serde_json::json!({"model": "mock-model",
-                    "messages": [{"role": "user", "content": "hi"}], "stream": true,
-                    "enable_thinking": false});
+                    "messages": [{"role": "user", "content": "hi"}], "stream": true});
                 if let Some(stop) = stop {
                     body["stop"] = stop.into();
                 }
