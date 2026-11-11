@@ -3501,7 +3501,7 @@ async fn stream_text_completion(
         stop: StopMatcher::new(&stop),
         stats: state.stats.clone(),
         completion: std::sync::atomic::AtomicU32::new(0),
-        prompt_tokens: 0,
+        prompt_tokens: None,
         finished: false,
         phase: ToolStreamPhase::Streaming,
         live: state.live_streams.register(&task_id),
@@ -3571,7 +3571,7 @@ async fn stream_completion(
             logprobs,
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
-            prompt_tokens: 0,
+            prompt_tokens: None,
             finished: false,
             phase: ToolStreamPhase::Streaming,
             live: state.live_streams.register(&task_id),
@@ -3618,7 +3618,7 @@ async fn stream_completion(
         stop,
         stats: state.stats.clone(),
         completion: std::sync::atomic::AtomicU32::new(0),
-        prompt_tokens: 0,
+        prompt_tokens: None,
         finished: false,
         phase: ToolStreamPhase::Streaming,
         live: state.live_streams.register(&task_id),
@@ -4128,7 +4128,10 @@ struct TextStream {
     stop: StopMatcher,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
-    prompt_tokens: u32,
+    /// The latest prompt count an engine chunk carried; `None` until one
+    /// does (llama.cpp sends it only on its final chunk), and the API has no
+    /// count of its own.
+    prompt_tokens: Option<u32>,
     /// The choice closed with a finish (a complete answer, a stop match or
     /// a cancel), not a failure: gates the usage frame.
     finished: bool,
@@ -4155,10 +4158,11 @@ impl TextStream {
                     return Some(Bytes::from_static(SSE_KEEPALIVE_COMMENT.as_bytes()))
                 }
                 StreamNext::Chunk(Some(chunk)) => chunk,
-                // Ended without a final chunk: no usage either way. Text the
-                // stop matcher held never matched, so it goes out first. A
-                // cancel closes the choice with `stop`; any other end is a
-                // failure, not a complete answer.
+                // Ended without a final chunk. Text the stop matcher held
+                // never matched, so it goes out first. A cancel closes the
+                // choice with `stop` and sends the usage so far (when a
+                // prompt count has arrived, see `usage_due`); any other end
+                // is a failure, not a complete answer, and sends no usage.
                 StreamNext::Chunk(None) => {
                     self.phase = ToolStreamPhase::Done;
                     let rest = self.stop.finish();
@@ -4205,7 +4209,7 @@ impl TextStream {
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             // Latest count from any chunk, before the stop check.
             if let Some(n) = chunk.prompt_tokens {
-                self.prompt_tokens = n;
+                self.prompt_tokens = Some(n);
             }
             if chunk.is_final {
                 self.finished = true;
@@ -4290,9 +4294,17 @@ impl TextStream {
     /// The latest prompt count and the running completion count.
     fn counts(&self) -> stream_shape::Counts {
         stream_shape::Counts {
-            prompt: self.prompt_tokens,
+            prompt: self.prompt_tokens.unwrap_or(0),
             completion: self.completion.load(Ordering::Relaxed),
         }
+    }
+
+    /// The usage chunk goes out when the client asked for it, the choice
+    /// closed with a finish, and an engine chunk carried the prompt count:
+    /// without one (a cancel or an early cut before llama.cpp's final chunk)
+    /// the usage is left out rather than sent with `prompt_tokens: 0`.
+    fn usage_due(&self) -> bool {
+        self.meta.usage.include && self.finished && self.prompt_tokens.is_some()
     }
 
     fn tail(&self) -> Bytes {
@@ -4300,7 +4312,7 @@ impl TextStream {
             TextStreamKind::Chat => "chat.completion.chunk",
             TextStreamKind::Completion { .. } => "text_completion",
         };
-        let usage = (self.meta.usage.include && self.finished).then(|| self.counts());
+        let usage = self.usage_due().then(|| self.counts());
         usage_tail(&self.meta, object, usage)
     }
 }
@@ -4342,7 +4354,10 @@ struct ToolStream {
     logprobs: stream_shape::LogprobQueue,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
-    prompt_tokens: u32,
+    /// The latest prompt count an engine chunk carried; `None` until one
+    /// does (llama.cpp sends it only on its final chunk), and the API has no
+    /// count of its own.
+    prompt_tokens: Option<u32>,
     /// The choice closed with a finish (a complete answer, a stop match or
     /// a cancel), not a failure: gates the usage frame.
     finished: bool,
@@ -4380,11 +4395,12 @@ impl ToolStream {
                 StreamNext::Chunk(Some(chunk)) => chunk,
                 StreamNext::Chunk(None) => {
                     // Ended without a final chunk: settle what is held
-                    // instead of dropping it, with no usage either way. A
-                    // cancel closes the choice with `stop`; any other end
-                    // is a failure, so the content goes out unclosed (calls
-                    // that may be cut short are not sent) and the error
-                    // event follows.
+                    // instead of dropping it. A cancel closes the choice
+                    // with `stop` and sends the usage so far (when a prompt
+                    // count has arrived, see `usage_due`); any other end is
+                    // a failure, so the content goes out unclosed (calls
+                    // that may be cut short are not sent), the error event
+                    // follows, and no usage does.
                     // A call already streamed stays sent (it cannot be
                     // taken back); no more of it, or of any other, follows.
                     self.phase = ToolStreamPhase::Tail;
@@ -4437,7 +4453,7 @@ impl ToolStream {
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             // Latest count from any chunk, before the stop check.
             if let Some(n) = chunk.prompt_tokens {
-                self.prompt_tokens = n;
+                self.prompt_tokens = Some(n);
             }
             let translated = self.marker.as_mut().map(|f| {
                 let mut t = f.feed(&chunk);
@@ -4613,14 +4629,22 @@ impl ToolStream {
     /// The latest prompt count and the running completion count.
     fn counts(&self) -> stream_shape::Counts {
         stream_shape::Counts {
-            prompt: self.prompt_tokens,
+            prompt: self.prompt_tokens.unwrap_or(0),
             completion: self.completion.load(Ordering::Relaxed),
         }
     }
 
+    /// The usage chunk goes out when the client asked for it, the choice
+    /// closed with a finish, and an engine chunk carried the prompt count:
+    /// without one (a cancel or an early cut before llama.cpp's final chunk)
+    /// the usage is left out rather than sent with `prompt_tokens: 0`.
+    fn usage_due(&self) -> bool {
+        self.meta.usage.include && self.finished && self.prompt_tokens.is_some()
+    }
+
     /// OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
     fn tail(&self) -> Bytes {
-        let usage = (self.meta.usage.include && self.finished).then(|| self.counts());
+        let usage = self.usage_due().then(|| self.counts());
         usage_tail(&self.meta, "chat.completion.chunk", usage)
     }
 }
@@ -12243,13 +12267,32 @@ level={{ effort_map[eff] }}";
     /// matcher was holding (it never matched) and closes the choice with
     /// `stop`; a client that asked for `include_usage` then gets the usage
     /// chunk with the counts so far, last before `[DONE]`, and one that did
-    /// not gets no `usage` key at all. Its live entry goes when the body
-    /// ends, and cancelling it again or cancelling an unknown id adds none.
+    /// not gets no `usage` key at all. When no engine chunk has carried the
+    /// prompt count yet (llama.cpp sends it only on its final chunk; any
+    /// engine cancelled during prefill), the API has no count of its own, so
+    /// no usage chunk goes out rather than a `prompt_tokens: 0` read as
+    /// exact. Its live entry goes when the body ends, and cancelling it again
+    /// or cancelling an unknown id adds none.
     #[tokio::test]
     async fn cancelled_stream_ends_with_stop() {
-        for (tools, include_usage) in [(false, true), (true, true), (false, false), (true, false)] {
-            let (app, log, gate) =
-                script_app(&["first ST", "never sent"], true, SSE_KEEPALIVE_INTERVAL).await;
+        for (tools, include_usage, prompt_first) in [
+            (false, true, true),
+            (true, true, true),
+            (false, false, true),
+            (true, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            let ctx = format!("tools={tools} prompt_first={prompt_first}");
+            let (app, log, gate) = script_app_full(
+                &["first ST", "never sent"],
+                "",
+                prompt_first,
+                true,
+                SSE_KEEPALIVE_INTERVAL,
+                Duration::ZERO,
+            )
+            .await;
             let mut payload = serde_json::json!({"model": "mock-model", "stream": true,
                 "messages": [{"role": "user", "content": "hi"}], "stop": "STOP"});
             if include_usage {
@@ -12304,17 +12347,23 @@ level={{ effort_map[eff] }}";
             );
             assert_eq!(finish_reasons(&events), ["stop"], "tools={tools}: {text}");
             let (last, choices) = events.split_last().unwrap();
-            if include_usage {
+            if include_usage && !prompt_first {
+                assert!(
+                    events.iter().all(|e| e["usage"].is_null()),
+                    "{ctx}: no prompt count, so no usage chunk: {text}"
+                );
+                assert_eq!(last["choices"][0]["finish_reason"], "stop", "{ctx}: {text}");
+            } else if include_usage {
                 assert_eq!(
                     last["choices"],
                     serde_json::json!([]),
                     "tools={tools}: {text}"
                 );
                 let usage = &last["usage"];
-                assert!(
-                    usage["completion_tokens"].as_u64().is_some_and(|n| n > 0),
-                    "tools={tools}: counts so far: {text}"
-                );
+                // The script engine sends `prompt_tokens` 5 on its first part
+                // and one token per part; only the first part went out.
+                assert_eq!(usage["prompt_tokens"], 5, "{ctx}: {text}");
+                assert_eq!(usage["completion_tokens"], 1, "{ctx}: {text}");
                 assert_eq!(
                     usage["total_tokens"].as_u64(),
                     Some(
@@ -12521,7 +12570,7 @@ level={{ effort_map[eff] }}";
             stop: StopMatcher::new(&["STOP".to_owned()]),
             stats: Arc::new(ApiStats::default()),
             completion: std::sync::atomic::AtomicU32::new(0),
-            prompt_tokens: 0,
+            prompt_tokens: None,
             finished: false,
             phase: ToolStreamPhase::Streaming,
             meta: unit_meta(id),
@@ -12544,7 +12593,7 @@ level={{ effort_map[eff] }}";
             logprobs: stream_shape::LogprobQueue::new(None),
             stats: Arc::new(ApiStats::default()),
             completion: std::sync::atomic::AtomicU32::new(0),
-            prompt_tokens: 0,
+            prompt_tokens: None,
             finished: false,
             phase: ToolStreamPhase::Streaming,
             meta: unit_meta(id),
