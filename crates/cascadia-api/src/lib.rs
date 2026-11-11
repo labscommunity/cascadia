@@ -4353,7 +4353,13 @@ impl ToolStream {
                 t
             });
             let produced = translated.as_deref().unwrap_or(&chunk.text);
-            self.logprobs.push(produced.len(), chunk.logprobs.as_ref());
+            // Once a call has streamed, the splitter releases no more
+            // content: every later item would wait for text that never goes
+            // out, so it is not kept.
+            let item = (!self.calls.started())
+                .then_some(chunk.logprobs.as_ref())
+                .flatten();
+            self.logprobs.push(produced.len(), item);
             let mut text = self.stop.push(produced);
             let frame = if self.stop.stopped() {
                 // Cut at the match: close the choice on what came before it
@@ -4393,6 +4399,10 @@ impl ToolStream {
                     .calls
                     .advance(self.splitter.text(), self.splitter.scan_from());
                 self.push_call_events(&mut out, events, counts);
+                if self.calls.started() {
+                    // The items still held belong to the call's markup.
+                    self.logprobs.discard();
+                }
                 (!out.is_empty()).then(|| Bytes::from(out))
             };
             // Same per-chunk yield as the plain stream (see the comment
@@ -11825,6 +11835,56 @@ level={{ effort_map[eff] }}";
             legacy_functions: false,
             live: live.register(id),
         }
+    }
+
+    /// A streamed call's argument text is never sent as content, so its
+    /// logprob items are not kept while the arguments stream: the queue
+    /// stays empty from the call's header on, and the output still carries
+    /// the content's items only.
+    #[tokio::test]
+    async fn streamed_call_arguments_keep_no_logprob_items() {
+        let id = "task-lp-call";
+        let tid: cascadia_types::TaskId = id.into();
+        let mut parts = vec![
+            "Sure. ".to_owned(),
+            r#"<tool_call>{"name": "f", "arguments": {"v": ""#.to_owned(),
+        ];
+        parts.extend(std::iter::repeat_n("aaaa".to_owned(), 200));
+        parts.push(r#""}}</tool_call>"#.to_owned());
+        let (tx, rx) = tokio::sync::mpsc::channel(parts.len() + 1);
+        for (i, part) in parts.iter().enumerate() {
+            tx.try_send(lp_chunk(&tid, i as i64, part, -0.5)).unwrap();
+        }
+        tx.try_send(
+            Chunk::final_marker(&tid, "").with_finish_reason(cascadia_types::FinishReason::Stop),
+        )
+        .unwrap();
+        drop(tx);
+        let chunks = EngineChunks {
+            rx,
+            early: Arc::new(std::sync::OnceLock::new()),
+        };
+        let live = stream_shape::LiveStreams::default();
+        let mut s = unit_tool_stream(chunks, &live, id);
+        s.logprobs = stream_shape::LogprobQueue::new(true);
+        let mut body = String::new();
+        let mut frames_after_header = 0;
+        while let Some(frame) = s.next_frame().await {
+            push_frame(&mut body, &frame);
+            if s.calls.started() {
+                frames_after_header += 1;
+                assert_eq!(s.logprobs.held(), 0, "{body}");
+            }
+        }
+        assert!(frames_after_header > 100, "{frames_after_header}: {body}");
+        let mut seen = Vec::new();
+        for e in sse_events(&body) {
+            for choice in e["choices"].as_array().into_iter().flatten() {
+                seen.extend(lp_tokens(&choice["logprobs"]));
+            }
+        }
+        assert_eq!(seen, ["Sure. "], "{body}");
+        assert!(body.contains(r#""finish_reason":"tool_calls""#), "{body}");
     }
 
     /// Appends one SSE frame to `body`.

@@ -343,6 +343,17 @@ impl LogprobQueue {
         }
     }
 
+    /// Drops the items held: their text will never be released.
+    pub(crate) fn discard(&mut self) {
+        self.items.clear();
+    }
+
+    /// Items waiting for their text, for tests.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.items.len()
+    }
+
     /// The last `len` bytes go out; nothing after them ever will, so the
     /// items still held are dropped.
     pub(crate) fn finish(&mut self, len: usize) -> serde_json::Value {
