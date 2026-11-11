@@ -29,8 +29,9 @@ Cases (`--cases` takes these names; "+stream" means a streamed variant runs too)
                       tool prompt → a call or schema-valid content; "Say hello." → schema-valid
                       content (a call is INFO)
     plain_unchanged   tools without tool_choice → 200, content or a function call, no custom objects
-    too_complex_forced  tool_choice "required" over one tool with 2000 optional string
-                      properties (max_tokens 32) → HTTP 200 within 300 s, any content or call,
+    too_complex_forced  tool_choice "required" over one tool with 600 optional string
+                      properties, above the ~499 where llguidance's row limit trips on the first
+                      token, yet a prompt a 2-stage chain prefills in time (max_tokens 32) → HTTP 200 within 300 s, any content or call,
                       never a 400; the elapsed seconds are reported, not judged. Whether the node
                       dropped the grammar or enforced it is INFO, from the rise of
                       `cascadia_constraint_unenforced_total` (summed over reasons, read from /metrics
@@ -67,7 +68,7 @@ isn't the schema's JSON) reports INFO "not enforced on this node (expected)". Ma
 objects, broken stream deltas, calls to a tool that allowed_tools left out and a second call
 under parallel_tool_calls false (the server trims those itself) still FAIL.
 
-`--dry-run` prints every request body instead of sending it and checks nothing (the 2000-property
+`--dry-run` prints every request body instead of sending it and checks nothing (the 600-property
 schema is shown as its first 3 properties and a count).
 """
 
@@ -87,7 +88,10 @@ DRY_COUNT = 0
 FAILED = []
 NOT_ENFORCED = "not enforced on this node (expected)"
 UNENFORCED_METRIC = "cascadia_constraint_unenforced_total"
-WIDE_PROPS = 2000  # too_complex_forced: optional properties on the one tool
+# too_complex_forced: optional properties on the one tool. Above the ~499 at which llguidance's
+# 2000-item row limit (`max_items_in_row`) trips on the first token, so the grammar path is hit;
+# not 2000, whose ~31k-token prompt takes a 2-stage chain over its 60 s per-stage prefill timeout.
+WIDE_PROPS = 600
 SCHEMA_BUDGET_REQUESTS = 65  # schema_budget: one past ov-genai's 64-schema budget
 
 
