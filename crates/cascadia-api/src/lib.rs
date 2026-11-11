@@ -835,12 +835,24 @@ pub enum StopSpec {
     Multiple(Vec<String>),
 }
 
-/// OpenAI `stream_options`. Only `include_usage` is honored today.
+/// OpenAI `stream_options`. Other keys are accepted and ignored.
 #[derive(Deserialize, Debug, Default)]
 pub struct StreamOptions {
     /// `null` = unset = false.
     #[serde(default, deserialize_with = "de_null_default")]
     pub include_usage: bool,
+    /// vLLM's extension: with `include_usage`, every chunk carries the usage
+    /// so far instead of null. Ignored without `include_usage`.
+    #[serde(default, deserialize_with = "de_null_default")]
+    pub continuous_usage_stats: bool,
+}
+
+impl StreamOptions {
+    fn usage_mode(options: Option<&Self>) -> stream_shape::UsageMode {
+        options.map_or_else(Default::default, |o| {
+            stream_shape::UsageMode::new(o.include_usage, o.continuous_usage_stats)
+        })
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -2940,11 +2952,7 @@ async fn chat_completions(
     let inflight = InFlightGuard::new(state.stats.clone());
 
     if req.stream {
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .map(|o| o.include_usage)
-            .unwrap_or(false);
+        let usage = StreamOptions::usage_mode(req.stream_options.as_ref());
         let tool_choice = req.tool_choice.clone();
         let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
         return stream_completion(
@@ -2953,7 +2961,7 @@ async fn chat_completions(
             task,
             permit,
             inflight,
-            include_usage,
+            usage,
             tool_choice,
             tools_present,
             req.legacy_functions,
@@ -3182,11 +3190,7 @@ async fn completions(
     let inflight = InFlightGuard::new(state.stats.clone());
 
     if req.stream {
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .map(|o| o.include_usage)
-            .unwrap_or(false);
+        let usage = StreamOptions::usage_mode(req.stream_options.as_ref());
         let echo_prefix = if req.echo { Some(prompt) } else { None };
         return stream_text_completion(
             state,
@@ -3195,7 +3199,7 @@ async fn completions(
             echo_prefix,
             permit,
             inflight,
-            include_usage,
+            usage,
         )
         .await
         .into_response();
@@ -3317,7 +3321,7 @@ async fn stream_text_completion(
     echo_prefix: Option<String>,
     permit: tokio::sync::OwnedSemaphorePermit,
     inflight: InFlightGuard,
-    include_usage: bool,
+    usage: stream_shape::UsageMode,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     let stop = task.sampling.stop.clone();
@@ -3344,13 +3348,10 @@ async fn stream_text_completion(
         stop: StopMatcher::new(&stop),
         stats: state.stats.clone(),
         completion: std::sync::atomic::AtomicU32::new(0),
-        held_tokens: 0,
         prompt_tokens: 0,
         finished: false,
         phase: ToolStreamPhase::Streaming,
-        task_id,
-        model,
-        include_usage,
+        meta: stream_meta(&state, task_id, model, usage),
     };
     sse_response(stream::unfold(text_stream, |mut s| async move {
         let frame = s.next_frame().await?;
@@ -3368,7 +3369,7 @@ async fn stream_completion(
     task: GenerationTask,
     permit: tokio::sync::OwnedSemaphorePermit,
     inflight: InFlightGuard,
-    include_usage: bool,
+    usage: stream_shape::UsageMode,
     tool_choice: Option<serde_json::Value>,
     tools_present: bool,
     legacy_functions: bool,
@@ -3412,13 +3413,10 @@ async fn stream_completion(
             splitter: ToolStreamSplitter::new(enable_thinking),
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
-            held_tokens: 0,
             prompt_tokens: 0,
             finished: false,
             phase: ToolStreamPhase::Streaming,
-            task_id,
-            model,
-            include_usage,
+            meta: stream_meta(&state, task_id, model, usage),
             legacy_functions,
         };
         return sse_response(stream::unfold(tool_stream, |mut s| async move {
@@ -3460,13 +3458,10 @@ async fn stream_completion(
         stop,
         stats: state.stats.clone(),
         completion: std::sync::atomic::AtomicU32::new(0),
-        held_tokens: 0,
         prompt_tokens: 0,
         finished: false,
         phase: ToolStreamPhase::Streaming,
-        task_id,
-        model,
-        include_usage,
+        meta: stream_meta(&state, task_id, model, usage),
     };
     sse_response(stream::unfold(text_stream, |mut s| async move {
         let frame = s.next_frame().await?;
@@ -3907,19 +3902,31 @@ fn spawn_engine_forwarder(
     EngineChunks { rx, early }
 }
 
+/// The chunk metadata of one stream; `created` is read here, once.
+fn stream_meta(
+    state: &AppState,
+    task_id: String,
+    model: String,
+    usage: stream_shape::UsageMode,
+) -> stream_shape::StreamMeta {
+    stream_shape::StreamMeta::new(
+        task_id,
+        model,
+        now_unix(),
+        state.system_fingerprint.clone(),
+        usage,
+    )
+}
+
 /// The OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
-fn usage_tail(task_id: &str, model: &str, object: &str, usage: Option<(u32, u32)>) -> Bytes {
+fn usage_tail(
+    meta: &stream_shape::StreamMeta,
+    object: &str,
+    usage: Option<stream_shape::Counts>,
+) -> Bytes {
     let mut out = String::new();
-    if let Some((prompt, completion)) = usage {
-        let usage = serde_json::json!({
-            "id": task_id,
-            "object": object,
-            "created": now_unix(),
-            "model": model,
-            "choices": [],
-            "usage": stream_shape::usage_json(prompt, completion),
-        });
-        out.push_str(&format!("data: {usage}\n\n"));
+    if let Some(counts) = usage {
+        out.push_str(&meta.usage_chunk(object, counts));
     }
     out.push_str("data: [DONE]\n\n");
     Bytes::from(out)
@@ -3958,15 +3965,11 @@ struct TextStream {
     stop: StopMatcher,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
-    /// Model tokens whose text the stop matcher still holds.
-    held_tokens: u32,
     prompt_tokens: u32,
     /// Completed normally (not failed, not cancelled): gates the usage frame.
     finished: bool,
     phase: ToolStreamPhase,
-    task_id: String,
-    model: String,
-    include_usage: bool,
+    meta: stream_shape::StreamMeta,
 }
 
 impl TextStream {
@@ -3995,8 +3998,7 @@ impl TextStream {
                     if rest.is_empty() {
                         return Some(self.tail());
                     }
-                    let n_tokens = std::mem::take(&mut self.held_tokens);
-                    let mut out = self.frame(rest, n_tokens, None, None).into_bytes();
+                    let mut out = self.frame(rest, None).into_bytes();
                     out.extend_from_slice(&self.tail());
                     return Some(Bytes::from(out));
                 }
@@ -4009,12 +4011,12 @@ impl TextStream {
                 continue;
             }
             if let Some(reason) = &chunk.error {
-                warn!(task = %self.task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+                warn!(task = %self.meta.id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
                 // Terminal: only `[DONE]` follows (no held text, no usage).
                 self.chunks = None;
                 self.phase = ToolStreamPhase::Tail;
                 tokio::task::yield_now().await;
-                return Some(error_frame(&self.task_id, reason));
+                return Some(error_frame(&self.meta.id, reason));
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             // Latest count from any chunk, before the stop check.
@@ -4038,7 +4040,6 @@ impl TextStream {
                 None => chunk.text.clone(),
             };
             let mut released = self.stop.push(&text);
-            let n_tokens = std::mem::take(&mut self.held_tokens) + chunk.token_count();
             let finish = if self.stop.stopped() {
                 // Cut at the match: end the choice here and finish the
                 // engine stream with `stop`, which cancels the task.
@@ -4061,17 +4062,11 @@ impl TextStream {
                 None
             };
             if finish.is_none() && self.stop.is_active() && released.is_empty() {
-                // All of it may begin a stop sequence: hold it (and its
-                // token count) for the next frame.
-                self.held_tokens = n_tokens;
+                // All of it may begin a stop sequence: hold it for the next
+                // frame.
                 continue;
             }
-            let completion_tokens = if self.stop.stopped() {
-                None
-            } else {
-                chunk.completion_tokens
-            };
-            let frame = self.frame(released, n_tokens, completion_tokens, finish);
+            let frame = self.frame(released, finish);
             // Yield between chunks so the body-sink task can drain this
             // frame to TCP (see the note in `stream_completion`).
             tokio::task::yield_now().await;
@@ -4079,41 +4074,30 @@ impl TextStream {
         }
     }
 
-    fn frame(
-        &mut self,
-        mut text: String,
-        n_tokens: u32,
-        completion_tokens: Option<u32>,
-        finish_reason: Option<&str>,
-    ) -> String {
+    fn frame(&mut self, mut text: String, finish_reason: Option<&str>) -> String {
+        let counts = self.counts();
         match &mut self.kind {
-            TextStreamKind::Chat => content_frame(
-                &self.task_id,
-                &self.model,
-                &text,
-                n_tokens,
-                completion_tokens,
+            TextStreamKind::Chat => self.meta.chat_chunk(
+                stream_shape::content_delta(&text),
                 finish_reason,
+                serde_json::Value::Null,
+                counts,
             ),
             TextStreamKind::Completion { echo } => {
                 if let Some(prefix) = echo.take() {
                     text.insert_str(0, &prefix);
                 }
-                let payload = serde_json::json!({
-                    "id": self.task_id,
-                    "object": "text_completion",
-                    "created": now_unix(),
-                    "model": self.model,
-                    "n_tokens": n_tokens,
-                    "completion_tokens": completion_tokens,
-                    "choices": [{
-                        "index": 0,
-                        "text": text,
-                        "finish_reason": finish_reason,
-                    }],
-                });
-                format!("data: {payload}\n\n")
+                self.meta
+                    .completion_chunk(&text, finish_reason, serde_json::Value::Null, counts)
             }
+        }
+    }
+
+    /// The latest prompt count and the running completion count.
+    fn counts(&self) -> stream_shape::Counts {
+        stream_shape::Counts {
+            prompt: self.prompt_tokens,
+            completion: self.completion.load(Ordering::Relaxed),
         }
     }
 
@@ -4122,9 +4106,8 @@ impl TextStream {
             TextStreamKind::Chat => "chat.completion.chunk",
             TextStreamKind::Completion { .. } => "text_completion",
         };
-        let usage = (self.include_usage && self.finished)
-            .then(|| (self.prompt_tokens, self.completion.load(Ordering::Relaxed)));
-        usage_tail(&self.task_id, &self.model, object, usage)
+        let usage = (self.meta.usage.include && self.finished).then(|| self.counts());
+        usage_tail(&self.meta, object, usage)
     }
 }
 
@@ -4160,16 +4143,11 @@ struct ToolStream {
     splitter: ToolStreamSplitter,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
-    /// Model tokens not yet reported in a frame's `n_tokens` (their text is
-    /// still held).
-    held_tokens: u32,
     prompt_tokens: u32,
     /// Completed normally (not failed, not cancelled): gates the usage frame.
     finished: bool,
     phase: ToolStreamPhase,
-    task_id: String,
-    model: String,
-    include_usage: bool,
+    meta: stream_shape::StreamMeta,
     /// Answer a `functions` request: `delta.function_call`.
     legacy_functions: bool,
 }
@@ -4203,7 +4181,7 @@ impl ToolStream {
                     // is held instead of dropping it.
                     self.phase = ToolStreamPhase::Tail;
                     let rest = self.stop.finish();
-                    return Some(self.close_choice(&rest, None, "stop"));
+                    return Some(self.close_choice(&rest, "stop"));
                 }
             };
             // Progress chunks carry nothing to send or count.
@@ -4214,13 +4192,12 @@ impl ToolStream {
             // The 200 headers are already on the wire: surface the failure
             // as an SSE error event. No tool_calls or usage follow it.
             if let Some(reason) = &chunk.error {
-                warn!(task = %self.task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
+                warn!(task = %self.meta.id, reason = %reason, "engine failed tool task mid-stream; SSE error");
                 self.phase = ToolStreamPhase::Tail;
                 tokio::task::yield_now().await;
-                return Some(error_frame(&self.task_id, reason));
+                return Some(error_frame(&self.meta.id, reason));
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
-            self.held_tokens += chunk.token_count();
             // Latest count from any chunk, before the stop check.
             if let Some(n) = chunk.prompt_tokens {
                 self.prompt_tokens = n;
@@ -4242,7 +4219,7 @@ impl ToolStream {
                     chunks.finish_early(cascadia_types::FinishReason::Stop);
                 }
                 self.phase = ToolStreamPhase::Tail;
-                Some(self.close_choice(&text, None, "stop"))
+                Some(self.close_choice(&text, "stop"))
             } else if chunk.is_final {
                 text.push_str(&self.stop.finish());
                 self.finished =
@@ -4252,20 +4229,18 @@ impl ToolStream {
                     .finish_reason
                     .map(|f| f.as_openai_str())
                     .unwrap_or("stop");
-                Some(self.close_choice(&text, chunk.completion_tokens, reason))
+                Some(self.close_choice(&text, reason))
             } else {
+                let counts = self.counts();
                 let content = self.splitter.feed(&text);
                 if content.is_empty() {
                     None
                 } else {
-                    let n_tokens = std::mem::take(&mut self.held_tokens);
-                    Some(Bytes::from(content_frame(
-                        &self.task_id,
-                        &self.model,
-                        content,
-                        n_tokens,
-                        chunk.completion_tokens,
+                    Some(Bytes::from(self.meta.chat_chunk(
+                        stream_shape::content_delta(content),
                         None,
+                        serde_json::Value::Null,
+                        counts,
                     )))
                 }
             };
@@ -4284,37 +4259,31 @@ impl ToolStream {
     /// request, one `function_call` delta (the first call) and a
     /// `function_call` finish instead. A `length` finish stays `length`,
     /// after the calls that came out whole.
-    fn close_choice(
-        &mut self,
-        text: &str,
-        completion_tokens: Option<u32>,
-        finish_reason: &str,
-    ) -> Bytes {
-        let n_tokens = std::mem::take(&mut self.held_tokens);
-        let (task_id, model) = (&self.task_id, &self.model);
-        let legacy = self.legacy_functions;
+    fn close_choice(&mut self, text: &str, finish_reason: &str) -> Bytes {
+        let counts = self.counts();
+        let null = || serde_json::Value::Null;
         let out = match self.splitter.finish(text) {
-            ToolStreamEnd::Content(content) => content_frame(
-                task_id,
-                model,
-                content,
-                n_tokens,
-                completion_tokens,
+            ToolStreamEnd::Content(content) => self.meta.chat_chunk(
+                stream_shape::content_delta(content),
                 Some(finish_reason),
+                null(),
+                counts,
             ),
             ToolStreamEnd::ToolCalls { content, calls } => {
-                // The held tokens are the call's: they ride the tool_calls
-                // delta, so each model token is counted in exactly one frame.
                 let mut out = String::new();
                 if !content.is_empty() {
-                    out.push_str(&content_frame(task_id, model, content, 0, None, None));
+                    out.push_str(&self.meta.chat_chunk(
+                        stream_shape::content_delta(content),
+                        None,
+                        null(),
+                        counts,
+                    ));
                 }
-                let (call_delta, call_finish) = if legacy {
+                let mut call_delta = serde_json::Map::new();
+                let call_finish = if self.legacy_functions {
                     let first = calls.into_iter().next().map(|c| c.function);
-                    (
-                        serde_json::json!({ "role": "assistant", "function_call": first }),
-                        "function_call",
-                    )
+                    call_delta.insert("function_call".into(), serde_json::json!(first));
+                    "function_call"
                 } else {
                     let tool_calls: Vec<serde_json::Value> = calls
                         .into_iter()
@@ -4326,19 +4295,10 @@ impl ToolStream {
                             })
                         })
                         .collect();
-                    (
-                        serde_json::json!({ "role": "assistant", "tool_calls": tool_calls }),
-                        "tool_calls",
-                    )
+                    call_delta.insert("tool_calls".into(), tool_calls.into());
+                    "tool_calls"
                 };
-                let delta = serde_json::json!({
-                    "id": task_id, "object": "chat.completion.chunk",
-                    "created": now_unix(), "model": model,
-                    "n_tokens": n_tokens, "completion_tokens": completion_tokens,
-                    "choices": [{ "index": 0,
-                        "delta": call_delta,
-                        "finish_reason": serde_json::Value::Null }],
-                });
+                out.push_str(&self.meta.chat_chunk(call_delta, None, null(), counts));
                 // A generation cut at its limit keeps `length`, with the
                 // calls that came out whole above.
                 let finish_reason = if finish_reason == "length" {
@@ -4346,49 +4306,31 @@ impl ToolStream {
                 } else {
                     call_finish
                 };
-                let finish = serde_json::json!({
-                    "id": task_id, "object": "chat.completion.chunk",
-                    "created": now_unix(), "model": model,
-                    "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
-                });
-                out.push_str(&format!("data: {delta}\n\ndata: {finish}\n\n"));
+                out.push_str(&self.meta.chat_chunk(
+                    serde_json::Map::new(),
+                    Some(finish_reason),
+                    null(),
+                    counts,
+                ));
                 out
             }
         };
         Bytes::from(out)
     }
 
+    /// The latest prompt count and the running completion count.
+    fn counts(&self) -> stream_shape::Counts {
+        stream_shape::Counts {
+            prompt: self.prompt_tokens,
+            completion: self.completion.load(Ordering::Relaxed),
+        }
+    }
+
     /// OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
     fn tail(&self) -> Bytes {
-        let usage = (self.include_usage && self.finished)
-            .then(|| (self.prompt_tokens, self.completion.load(Ordering::Relaxed)));
-        usage_tail(&self.task_id, &self.model, "chat.completion.chunk", usage)
+        let usage = (self.meta.usage.include && self.finished).then(|| self.counts());
+        usage_tail(&self.meta, "chat.completion.chunk", usage)
     }
-}
-
-/// One `chat.completion.chunk` content delta, in the plain stream's shape.
-fn content_frame(
-    task_id: &str,
-    model: &str,
-    content: &str,
-    n_tokens: u32,
-    completion_tokens: Option<u32>,
-    finish_reason: Option<&str>,
-) -> String {
-    let payload = serde_json::json!({
-        "id": task_id,
-        "object": "chat.completion.chunk",
-        "created": now_unix(),
-        "model": model,
-        "n_tokens": n_tokens,
-        "completion_tokens": completion_tokens,
-        "choices": [{
-            "index": 0,
-            "delta": { "role": "assistant", "content": content },
-            "finish_reason": finish_reason,
-        }],
-    });
-    format!("data: {payload}\n\n")
 }
 
 fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
@@ -4946,7 +4888,7 @@ mod tests {
                     .collect();
                 let tails: Vec<_> = events
                     .iter()
-                    .filter(|event| event.get("usage").is_some())
+                    .filter(|event| event.get("usage").is_some_and(|u| !u.is_null()))
                     .collect();
                 assert_eq!(tails.len(), 1, "{body}");
                 assert!(tails[0]["choices"].as_array().unwrap().is_empty());
@@ -5005,7 +4947,12 @@ mod tests {
             )
             .unwrap();
             assert!(body.contains("\"object\":\"error\""), "{body}");
-            assert!(!body.contains("\"usage\""), "{body}");
+            assert!(
+                sse_events(&body)
+                    .iter()
+                    .all(|e| e.get("usage").is_none_or(Value::is_null)),
+                "no usage object after a failure: {body}"
+            );
             assert_eq!(stats.tokens_total.load(Ordering::Relaxed), 0);
         }
     }
@@ -5597,11 +5544,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 65536).await.unwrap();
         let text = String::from_utf8_lossy(&body);
+        let events = sse_events(&text);
+        let tail = events.last().unwrap();
+        assert!(tail["choices"].as_array().unwrap().is_empty(), "{text}");
         assert!(
-            text.contains("\"usage\""),
-            "no usage frame in stream: {text}"
+            tail["usage"]["completion_tokens"].is_u64(),
+            "no usage object in stream: {text}"
         );
-        assert!(text.contains("\"completion_tokens\""));
         assert!(text.trim_end().ends_with("data: [DONE]"));
     }
 
@@ -5689,7 +5638,13 @@ mod tests {
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("\"text_completion\""), "wrong object: {text}");
         assert!(text.contains("\"text\""), "no text delta: {text}");
-        assert!(text.contains("\"usage\""));
+        let events = sse_events(&text);
+        let tail = events.last().unwrap();
+        assert!(tail["choices"].as_array().unwrap().is_empty(), "{text}");
+        assert!(
+            tail["usage"]["completion_tokens"].is_u64(),
+            "no usage object in stream: {text}"
+        );
         assert!(text.trim_end().ends_with("data: [DONE]"));
     }
 
@@ -7735,16 +7690,14 @@ level={{ effort_map[eff] }}";
         let body =
             String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
         let (mut saw_tool, mut saw_finish) = (false, false);
-        for line in body.lines().filter_map(|l| l.strip_prefix("data: ")) {
-            if line.trim() == "[DONE]" {
-                continue;
-            }
-            let v: Value = serde_json::from_str(line).unwrap();
+        for (i, v) in sse_events(&body).iter().enumerate() {
             let d = &v["choices"][0]["delta"];
             if d.get("tool_calls").is_some() {
                 saw_tool = true;
                 assert_eq!(d["tool_calls"][0]["index"], 0);
                 assert_eq!(d["tool_calls"][0]["function"]["name"], "get_weather");
+                // The call is the first chunk here, so it carries the role.
+                assert_eq!(i, 0, "{body}");
                 assert_eq!(d["role"], "assistant");
             }
             if v["choices"][0]["finish_reason"] == "tool_calls" {
@@ -8084,8 +8037,24 @@ level={{ effort_map[eff] }}";
             .unwrap()
     }
 
-    /// JSON events of an SSE body, `[DONE]` excluded.
+    /// JSON events of a whole SSE body, `[DONE]` excluded; the body must
+    /// pass [`crate::spec_schema::assert_stream_spec`].
     fn sse_events(body: &str) -> Vec<Value> {
+        crate::spec_schema::assert_stream_spec(body);
+        sse_data(body)
+    }
+
+    /// JSON events of part of an SSE body (no `[DONE]` yet), each checked
+    /// as a chunk on its own.
+    fn sse_events_partial(body: &str) -> Vec<Value> {
+        let events = sse_data(body);
+        events
+            .iter()
+            .for_each(crate::spec_schema::assert_stream_chunk_spec);
+        events
+    }
+
+    fn sse_data(body: &str) -> Vec<Value> {
         body.lines()
             .filter_map(|l| l.strip_prefix("data: "))
             .filter(|l| l.trim() != "[DONE]")
@@ -8118,7 +8087,7 @@ level={{ effort_map[eff] }}";
                 break String::from_utf8(frame.to_vec()).unwrap();
             }
         };
-        let events = sse_events(&first);
+        let events = sse_events_partial(&first);
         assert_eq!(events.len(), 1, "{first}");
         assert_eq!(events[0]["choices"][0]["delta"]["content"], "Checking ");
         assert!(
@@ -8132,7 +8101,8 @@ level={{ effort_map[eff] }}";
         }
         assert!(rest.trim_end().ends_with("data: [DONE]"), "{rest}");
         assert!(!rest.contains("<tool_call>"), "marker leaked: {rest}");
-        let events = sse_events(&rest);
+        sse_events(&format!("{first}{rest}"));
+        let events = sse_events_partial(&rest);
         assert_eq!(streamed_content(&events), "the weather. ");
         let call_events: Vec<_> = events
             .iter()
@@ -8157,13 +8127,17 @@ level={{ effort_map[eff] }}";
         assert_eq!(usage["usage"], crate::stream_shape::usage_json(5, 3));
     }
 
-    /// Sum of the custom per-frame `n_tokens` across an SSE body.
-    fn frame_tokens(events: &[Value]) -> u64 {
-        events.iter().filter_map(|e| e["n_tokens"].as_u64()).sum()
+    /// The running `usage.completion_tokens` of each chunk of a stream sent
+    /// with `continuous_usage_stats`.
+    fn running_completion(events: &[Value]) -> Vec<u64> {
+        events
+            .iter()
+            .map(|e| e["usage"]["completion_tokens"].as_u64().unwrap())
+            .collect()
     }
 
     #[tokio::test]
-    async fn streaming_tools_counts_every_token_in_exactly_one_frame() {
+    async fn streaming_tools_running_usage_counts_every_token() {
         let pieces: Vec<&str> = WEATHER_CALL.split_inclusive([',', ':']).collect();
         assert!(pieces.len() >= 5, "{pieces:?}");
         let mut with_text = vec!["Checking ", "the weather. "];
@@ -8171,13 +8145,32 @@ level={{ effort_map[eff] }}";
         for parts in [pieces.clone(), with_text] {
             let (app, release) = gated_app(&parts, false).await;
             release.store(true, Ordering::SeqCst);
-            let resp = app.oneshot(tool_stream_request()).await.unwrap();
+            let mut request = tool_stream_request();
+            *request.body_mut() = Body::from(
+                serde_json::json!({"model":"mock-model",
+                    "messages":[{"role":"user","content":"hi"}],
+                    "tools":[{"type":"function","function":{"name":"get_weather"}}],
+                    "stream":true,
+                    "stream_options":{"include_usage":true,"continuous_usage_stats":true}})
+                .to_string(),
+            );
+            let resp = app.oneshot(request).await.unwrap();
             let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec())
                 .unwrap();
             assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
             let events = sse_events(&body);
-            // The gated engine emits one token per part.
-            assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+            // The gated engine emits one token per part: the running count
+            // never goes back, and every chunk that closes the choice
+            // already counts all of them.
+            let running = running_completion(&events);
+            assert!(running.windows(2).all(|w| w[0] <= w[1]), "{body}");
+            let closing = events
+                .iter()
+                .position(|e| e["choices"][0]["delta"].get("tool_calls").is_some())
+                .unwrap();
+            for n in &running[closing..] {
+                assert_eq!(*n, parts.len() as u64, "{body}");
+            }
         }
     }
 
@@ -8252,7 +8245,12 @@ level={{ effort_map[eff] }}";
         assert_eq!(streamed_content(&events), "Checking more ");
         assert_eq!(events.last().unwrap()["object"], "error", "{body}");
         assert!(!body.contains("tool_calls"), "{body}");
-        assert!(!body.contains("\"usage\""), "{body}");
+        assert!(
+            events
+                .iter()
+                .all(|e| e.get("usage").is_none_or(Value::is_null)),
+            "no usage object after a failure: {body}"
+        );
     }
 
     // Helper: GET /metrics, return the exposition text.
@@ -9499,6 +9497,8 @@ level={{ effort_map[eff] }}";
             .filter(|d| d.get("function_call").is_some())
             .collect();
         assert_eq!(deltas.len(), 1, "one function_call delta: {body}");
+        // The call is the stream's first chunk, so it carries the role.
+        assert_eq!(&events[0]["choices"][0]["delta"], deltas[0], "{body}");
         assert_eq!(deltas[0]["role"], "assistant");
         assert_eq!(
             deltas[0]["function_call"],
@@ -9564,25 +9564,296 @@ level={{ effort_map[eff] }}";
         norm
     }
 
-    /// The frames a stream without `stop` sends, recorded before the stop
-    /// matcher and keep-alive were added (a9ca3349): they must not change.
-    /// (Only the usage frame's prompt count moved, from 0 to 2, when the mock
-    /// engine began reporting its prompt's words.)
+    /// The exact frames of a stream without `stop`: the stop matcher and the
+    /// keep-alive must not change them. (`id`, `created` and the fingerprint
+    /// are normalized.)
     #[tokio::test]
-    async fn streams_without_stop_are_byte_identical_to_before() {
+    async fn streams_without_stop_keep_their_shape() {
+        let norm = |body: &str| normalize_sse(body).replace(&mock_fingerprint(), "FP");
         let chat = serde_json::json!({"model": "mock-model",
             "messages": [{"role": "user", "content": "alpha bravo"}],
             "max_tokens": 8, "stream": true,
             "stream_options": {"include_usage": true}});
         let (status, body) = post_text(make_app().await, "/v1/chat/completions", &chat).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(normalize_sse(&body), "data: {\"choices\":[{\"delta\":{\"content\":\"alpha \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"bravo \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\",\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":0,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"completion_tokens_details\":{},\"prompt_tokens\":2,\"prompt_tokens_details\":{},\"total_tokens\":4}}\n\ndata: [DONE]\n\n", "chat");
+        sse_events(&body);
+        assert_eq!(norm(&body), "data: {\"choices\":[{\"delta\":{\"content\":\"alpha \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"chat.completion.chunk\",\"system_fingerprint\":\"FP\",\"usage\":null}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"bravo \"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"chat.completion.chunk\",\"system_fingerprint\":\"FP\",\"usage\":null}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"chat.completion.chunk\",\"system_fingerprint\":\"FP\",\"usage\":null}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"chat.completion.chunk\",\"system_fingerprint\":\"FP\",\"usage\":{\"completion_tokens\":2,\"completion_tokens_details\":{},\"prompt_tokens\":2,\"prompt_tokens_details\":{},\"total_tokens\":4}}\n\ndata: [DONE]\n\n", "chat");
         let text = serde_json::json!({"model": "mock-model", "prompt": "alpha bravo",
             "max_tokens": 8, "stream": true, "echo": true,
             "stream_options": {"include_usage": true}});
         let (status, body) = post_text(make_app().await, "/v1/completions", &text).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(normalize_sse(&body), "data: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"alpha bravoalpha \"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"bravo \"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"text\":\"\"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":0,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"text_completion\",\"usage\":{\"completion_tokens\":2,\"completion_tokens_details\":{},\"prompt_tokens\":2,\"prompt_tokens_details\":{},\"total_tokens\":4}}\n\ndata: [DONE]\n\n", "completions");
+        sse_events(&body);
+        assert_eq!(norm(&body), "data: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"text\":\"alpha bravoalpha \"}],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"text_completion\",\"system_fingerprint\":\"FP\",\"usage\":null}\n\ndata: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"text\":\"bravo \"}],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"text_completion\",\"system_fingerprint\":\"FP\",\"usage\":null}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null,\"text\":\"\"}],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"text_completion\",\"system_fingerprint\":\"FP\",\"usage\":null}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"text_completion\",\"system_fingerprint\":\"FP\",\"usage\":{\"completion_tokens\":2,\"completion_tokens_details\":{},\"prompt_tokens\":2,\"prompt_tokens_details\":{},\"total_tokens\":4}}\n\ndata: [DONE]\n\n", "completions");
+    }
+
+    /// Emits the chunks `script` builds for the task, one per step.
+    struct ChunkListEngine {
+        script: fn(&cascadia_types::TaskId) -> Vec<Chunk>,
+        pending: Option<(cascadia_types::TaskId, std::collections::VecDeque<Chunk>)>,
+    }
+
+    impl cascadia_engine::Engine for ChunkListEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            let chunks = (self.script)(&task.task_id).into();
+            self.pending = Some((task.task_id, chunks));
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some((id, mut chunks)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            let Some(chunk) = chunks.pop_front() else {
+                return Ok(Vec::new());
+            };
+            let last = chunk.is_final;
+            if !last {
+                self.pending = Some((id.clone(), chunks));
+            }
+            Ok(vec![(id, chunk)])
+        }
+    }
+
+    struct ChunkListBuilder(Option<ChunkListEngine>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ChunkListBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            mut self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0.take().unwrap()))
+        }
+    }
+
+    async fn chunk_list_app(script: fn(&cascadia_types::TaskId) -> Vec<Chunk>) -> Router {
+        let runner = Runner::new(Box::new(ChunkListBuilder(Some(ChunkListEngine {
+            script,
+            pending: None,
+        }))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// A plain chat stream and a tools stream (content then a call, and a
+    /// call alone) each send `role` once, on their first chunk.
+    #[tokio::test]
+    async fn role_only_on_first_delta() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo charlie"}],
+            "max_tokens": 3, "stream": true});
+        let (_, plain) = post_text(make_app().await, "/v1/chat/completions", &chat).await;
+        let mut bodies = vec![plain];
+        for parts in [vec!["Checking ", WEATHER_CALL], vec![WEATHER_CALL]] {
+            let (app, release) = gated_app(&parts, false).await;
+            release.store(true, Ordering::SeqCst);
+            let resp = app.oneshot(tool_stream_request()).await.unwrap();
+            let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+            bodies.push(String::from_utf8(bytes.to_vec()).unwrap());
+        }
+        for body in bodies {
+            let events = sse_events(&body);
+            let with_role: Vec<usize> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e["choices"][0]["delta"].get("role").is_some())
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(with_role, [0], "{body}");
+            assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
+        }
+    }
+
+    /// No chunk of a chat or completions stream carries the old per-frame
+    /// counters; every chunk names the fingerprint and has `logprobs: null`.
+    #[tokio::test]
+    async fn chunks_have_no_extension_fields() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo"}],
+            "max_tokens": 4, "stream": true,
+            "stream_options": {"include_usage": true}});
+        let text = serde_json::json!({"model": "mock-model", "prompt": "alpha bravo",
+            "max_tokens": 4, "stream": true,
+            "stream_options": {"include_usage": true}});
+        for (uri, payload) in [("/v1/chat/completions", chat), ("/v1/completions", text)] {
+            let (status, body) = post_text(make_app().await, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK);
+            let events = sse_events(&body);
+            assert!(events.len() >= 3, "{body}");
+            for e in &events {
+                assert!(e.get("n_tokens").is_none(), "{body}");
+                assert!(e.get("completion_tokens").is_none(), "{body}");
+                assert_eq!(e["system_fingerprint"], mock_fingerprint(), "{body}");
+                for choice in e["choices"].as_array().unwrap() {
+                    assert!(choice["logprobs"].is_null(), "{body}");
+                    assert!(choice.get("logprobs").is_some(), "{body}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn created_is_constant_across_a_stream() {
+        // A step delay makes the stream span more than one second.
+        let (app, _, _) = script_app_full(
+            &["a ", "b ", "c "],
+            "",
+            true,
+            false,
+            SSE_KEEPALIVE_INTERVAL,
+            Duration::from_millis(400),
+        )
+        .await;
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}], "stream": true,
+            "stream_options": {"include_usage": true}});
+        let (_, body) = post_text(app, "/v1/chat/completions", &chat).await;
+        let events = sse_events(&body);
+        assert!(events.len() >= 4, "{body}");
+        for e in &events {
+            assert_eq!(e["created"], events[0]["created"], "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn include_usage_puts_null_usage_on_earlier_chunks() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo"}],
+            "max_tokens": 4, "stream": true,
+            "stream_options": {"include_usage": true}});
+        let text = serde_json::json!({"model": "mock-model", "prompt": "alpha bravo",
+            "max_tokens": 4, "stream": true,
+            "stream_options": {"include_usage": true}});
+        let mut bodies = Vec::new();
+        for (uri, payload) in [("/v1/chat/completions", chat), ("/v1/completions", text)] {
+            bodies.push(post_text(make_app().await, uri, &payload).await.1);
+        }
+        let (app, release) = gated_app(&["Checking ", WEATHER_CALL], false).await;
+        release.store(true, Ordering::SeqCst);
+        let resp = app.oneshot(tool_stream_request()).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        bodies.push(String::from_utf8(bytes.to_vec()).unwrap());
+        for body in bodies {
+            let events = sse_events(&body);
+            let (last, earlier) = events.split_last().unwrap();
+            assert!(last["choices"].as_array().unwrap().is_empty(), "{body}");
+            assert!(last["usage"].is_object(), "{body}");
+            assert!(!earlier.is_empty(), "{body}");
+            for e in earlier {
+                assert!(e.get("usage").is_some_and(Value::is_null), "{body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_usage_key_without_include_usage() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo"}],
+            "max_tokens": 4, "stream": true});
+        let text = serde_json::json!({"model": "mock-model", "prompt": "alpha bravo",
+            "max_tokens": 4, "stream": true,
+            // Ignored without include_usage.
+            "stream_options": {"continuous_usage_stats": true}});
+        for (uri, payload) in [("/v1/chat/completions", chat), ("/v1/completions", text)] {
+            let (status, body) = post_text(make_app().await, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            for e in sse_events(&body) {
+                assert!(e.get("usage").is_none(), "{body}");
+            }
+        }
+    }
+
+    /// With `continuous_usage_stats`, every chunk carries the usage so far:
+    /// the running completion count (1, 1+3, 1+3+1), then the final chunk's
+    /// authoritative count, which may be lower.
+    #[tokio::test]
+    async fn continuous_usage_stats_carries_running_usage() {
+        fn script(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            vec![
+                Chunk::token(id, 0, "a").with_n_tokens(1),
+                Chunk::token(id, 1, "b")
+                    .with_n_tokens(3)
+                    .with_prompt_tokens(7),
+                Chunk::token(id, 2, "c").with_n_tokens(1),
+                Chunk::final_marker(id, "")
+                    .with_finish_reason(cascadia_types::FinishReason::Stop)
+                    .with_prompt_tokens(7)
+                    .with_completion_tokens(4),
+            ]
+        }
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}], "stream": true,
+            "stream_options": {"include_usage": true, "continuous_usage_stats": true,
+                "include_obfuscation": false}});
+        let text = serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true,
+            "stream_options": {"include_usage": true, "continuous_usage_stats": true}});
+        for (uri, payload) in [("/v1/chat/completions", chat), ("/v1/completions", text)] {
+            let (status, body) = post_text(chunk_list_app(script).await, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let usage: Vec<Value> = sse_events(&body)
+                .iter()
+                .map(|e| e["usage"].clone())
+                .collect();
+            let expected: Vec<Value> = [(0, 1), (7, 4), (7, 5), (7, 4), (7, 4)]
+                .into_iter()
+                .map(|(p, c)| crate::stream_shape::usage_json(p, c))
+                .collect();
+            assert_eq!(usage, expected, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn completions_stream_chunks_are_spec_shaped() {
+        let text = serde_json::json!({"model": "mock-model", "prompt": "alpha bravo",
+            "max_tokens": 4, "stream": true, "echo": true,
+            "stream_options": {"include_usage": true}});
+        let (status, body) = post_text(make_app().await, "/v1/completions", &text).await;
+        assert_eq!(status, StatusCode::OK);
+        crate::spec_schema::assert_stream_spec(&body);
+        let events = sse_events(&body);
+        for e in &events[..events.len() - 1] {
+            assert_eq!(e["object"], "text_completion", "{body}");
+            let choice = &e["choices"][0];
+            let keys: std::collections::BTreeSet<&str> = choice
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                ["finish_reason", "index", "logprobs", "text"].into(),
+                "{body}"
+            );
+            assert!(choice["logprobs"].is_null(), "{body}");
+        }
+        assert!(events[0]["choices"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("alpha bravo"));
     }
 
     /// Emits `parts` one per step (`gate` after the first holds the rest,
@@ -10475,7 +10746,10 @@ level={{ effort_map[eff] }}";
                     .unwrap();
                 text.push_str(std::str::from_utf8(&frame).unwrap());
             }
-            let id = sse_events(&text)[0]["id"].as_str().unwrap().to_owned();
+            let id = sse_events_partial(&text)[0]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             let cancel = app
                 .oneshot(
                     Request::builder()
@@ -10491,8 +10765,16 @@ level={{ effort_map[eff] }}";
                 text.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
             }
             drop(gate);
+            // The plain stream closes no choice when the engine stream just
+            // ends; the tools stream closes it with `stop`.
+            let events = if tools {
+                sse_events(&text)
+            } else {
+                crate::spec_schema::assert_stream_spec_ended_without_finish(&text);
+                sse_data(&text)
+            };
             assert_eq!(
-                streamed_content(&sse_events(&text)),
+                streamed_content(&events),
                 "first ST",
                 "tools={tools}: {text}"
             );
@@ -10511,7 +10793,10 @@ level={{ effort_map[eff] }}";
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(!body.contains("\"usage\""), "{body}");
+        assert!(
+            sse_events(&body).iter().all(|e| e.get("usage").is_none()),
+            "no usage key: {body}"
+        );
         let (status, body) = post_text(
             make_app().await,
             "/v1/completions",
@@ -10520,6 +10805,10 @@ level={{ effort_map[eff] }}";
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            sse_events(&body).iter().all(|e| e.get("usage").is_none()),
+            "no usage key: {body}"
+        );
     }
 
     #[tokio::test]

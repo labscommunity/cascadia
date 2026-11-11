@@ -1,5 +1,5 @@
 //! Shared pieces of the OpenAI response wire shape: the `system_fingerprint`
-//! value and the `usage` object.
+//! value, the `usage` object and the streamed chunk frames.
 
 use serde::Serialize;
 
@@ -79,6 +79,166 @@ pub(crate) fn usage_json(prompt: u32, completion: u32) -> serde_json::Value {
     })
 }
 
+/// What a stream's `usage` key carries, from `stream_options`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct UsageMode {
+    /// `include_usage`: a closing `choices: []` chunk with the usage, and
+    /// `usage: null` on every chunk before it.
+    pub(crate) include: bool,
+    /// `continuous_usage_stats` (with `include_usage` only): every chunk
+    /// carries the usage so far instead of null.
+    pub(crate) continuous: bool,
+}
+
+impl UsageMode {
+    pub(crate) fn new(include_usage: bool, continuous_usage_stats: bool) -> Self {
+        Self {
+            include: include_usage,
+            continuous: include_usage && continuous_usage_stats,
+        }
+    }
+}
+
+/// What every chunk of one stream repeats, plus whether the assistant role
+/// has been sent yet. One per request: `created` is taken once, so every
+/// chunk of a stream carries the same value.
+pub(crate) struct StreamMeta {
+    pub(crate) id: String,
+    pub(crate) model: String,
+    pub(crate) created: i64,
+    pub(crate) fingerprint: String,
+    pub(crate) usage: UsageMode,
+    /// Set by the first chat chunk, which alone carries `role`.
+    role_sent: bool,
+}
+
+/// Token counts at the time a chunk is built: the latest prompt count (0
+/// until one is known) and the stream's running completion count.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Counts {
+    pub(crate) prompt: u32,
+    pub(crate) completion: u32,
+}
+
+impl StreamMeta {
+    pub(crate) fn new(
+        id: String,
+        model: String,
+        created: i64,
+        fingerprint: String,
+        usage: UsageMode,
+    ) -> Self {
+        Self {
+            id,
+            model,
+            created,
+            fingerprint,
+            usage,
+            role_sent: false,
+        }
+    }
+
+    /// One `chat.completion.chunk` frame (`data: …\n\n`) with one choice.
+    /// The first chat chunk of the stream gets `role: assistant`, and
+    /// `content: ""` when it carries neither content nor a call, as
+    /// OpenAI's first chunk does; no later one carries `role`.
+    pub(crate) fn chat_chunk(
+        &mut self,
+        delta: serde_json::Map<String, serde_json::Value>,
+        finish: Option<&str>,
+        logprobs: serde_json::Value,
+        counts: Counts,
+    ) -> String {
+        let mut delta = delta;
+        if !self.role_sent {
+            self.role_sent = true;
+            let says_something = ["content", "tool_calls", "function_call"]
+                .iter()
+                .any(|k| delta.contains_key(*k));
+            if !says_something {
+                delta.insert("content".into(), "".into());
+            }
+            delta.insert("role".into(), "assistant".into());
+        }
+        let choice = serde_json::json!({
+            "index": 0,
+            "delta": delta,
+            "logprobs": logprobs,
+            "finish_reason": finish,
+        });
+        self.frame(
+            "chat.completion.chunk",
+            vec![choice],
+            self.chunk_usage(counts),
+        )
+    }
+
+    /// One `text_completion` chunk frame with one choice.
+    pub(crate) fn completion_chunk(
+        &self,
+        text: &str,
+        finish: Option<&str>,
+        logprobs: serde_json::Value,
+        counts: Counts,
+    ) -> String {
+        let choice = serde_json::json!({
+            "index": 0,
+            "text": text,
+            "logprobs": logprobs,
+            "finish_reason": finish,
+        });
+        self.frame("text_completion", vec![choice], self.chunk_usage(counts))
+    }
+
+    /// The `include_usage` chunk: no choices, the final usage.
+    pub(crate) fn usage_chunk(&self, object: &str, counts: Counts) -> String {
+        self.frame(
+            object,
+            Vec::new(),
+            Some(usage_json(counts.prompt, counts.completion)),
+        )
+    }
+
+    /// The `usage` value of a chunk with choices: absent without
+    /// `include_usage`, else null, or the usage so far in continuous mode.
+    fn chunk_usage(&self, counts: Counts) -> Option<serde_json::Value> {
+        if self.usage.continuous {
+            Some(usage_json(counts.prompt, counts.completion))
+        } else if self.usage.include {
+            Some(serde_json::Value::Null)
+        } else {
+            None
+        }
+    }
+
+    fn frame(
+        &self,
+        object: &str,
+        choices: Vec<serde_json::Value>,
+        usage: Option<serde_json::Value>,
+    ) -> String {
+        let mut payload = serde_json::json!({
+            "id": self.id,
+            "object": object,
+            "created": self.created,
+            "model": self.model,
+            "system_fingerprint": self.fingerprint,
+            "choices": choices,
+        });
+        if let (Some(usage), Some(obj)) = (usage, payload.as_object_mut()) {
+            obj.insert("usage".into(), usage);
+        }
+        format!("data: {payload}\n\n")
+    }
+}
+
+/// A chat delta with just `content`.
+pub(crate) fn content_delta(content: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut delta = serde_json::Map::new();
+    delta.insert("content".into(), content.into());
+    delta
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +283,77 @@ mod tests {
                 serde_json::to_value(Usage::new(p, c)).unwrap()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    fn meta(include: bool, continuous: bool) -> StreamMeta {
+        StreamMeta::new(
+            "chatcmpl-1".into(),
+            "m".into(),
+            42,
+            "fp_0123456789".into(),
+            UsageMode::new(include, continuous),
+        )
+    }
+
+    fn parse(frame: &str) -> serde_json::Value {
+        let data = frame
+            .strip_prefix("data: ")
+            .and_then(|f| f.strip_suffix("\n\n"))
+            .unwrap();
+        serde_json::from_str(data).unwrap()
+    }
+
+    #[test]
+    fn first_chat_chunk_alone_carries_the_role() {
+        let mut m = meta(false, false);
+        let counts = Counts::default();
+        let first = parse(&m.chat_chunk(
+            serde_json::Map::new(),
+            None,
+            serde_json::Value::Null,
+            counts,
+        ));
+        assert_eq!(
+            first["choices"][0]["delta"],
+            serde_json::json!({"role": "assistant", "content": ""})
+        );
+        let next = parse(&m.chat_chunk(
+            content_delta("hi"),
+            Some("stop"),
+            serde_json::Value::Null,
+            counts,
+        ));
+        assert_eq!(
+            next["choices"][0]["delta"],
+            serde_json::json!({"content": "hi"})
+        );
+        assert_eq!(next["choices"][0]["finish_reason"], "stop");
+        assert!(next["choices"][0]["logprobs"].is_null());
+        assert_eq!(next["created"], 42);
+        assert_eq!(next["system_fingerprint"], "fp_0123456789");
+        assert!(next.get("usage").is_none());
+    }
+
+    #[test]
+    fn continuous_usage_needs_include_usage() {
+        assert_eq!(UsageMode::new(false, true), UsageMode::default());
+        let counts = Counts {
+            prompt: 2,
+            completion: 3,
+        };
+        let null =
+            parse(&meta(true, false).completion_chunk("x", None, serde_json::Value::Null, counts));
+        assert!(null["usage"].is_null() && null.get("usage").is_some());
+        let running =
+            parse(&meta(true, true).completion_chunk("x", None, serde_json::Value::Null, counts));
+        assert_eq!(running["usage"], usage_json(2, 3));
+        let tail = parse(&meta(true, false).usage_chunk("text_completion", counts));
+        assert_eq!(tail["choices"], serde_json::json!([]));
+        assert_eq!(tail["usage"], usage_json(2, 3));
     }
 }
