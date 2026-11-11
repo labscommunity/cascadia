@@ -422,11 +422,27 @@ fn genai_json_schema(task: &GenerationTask) -> Option<String> {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(schema) else {
         return Some(schema.to_owned());
     };
-    if cascadia_grammar::bound_integers(&mut value) == 0 {
-        return Some(schema.to_owned());
+    match cascadia_grammar::bound_integers(&mut value) {
+        0 => Some(schema.to_owned()),
+        n if n > GENAI_MAX_BOUNDED_INTEGERS => {
+            tracing::warn!(
+                integers = n,
+                "response_format integer length not bounded: the schema has more than \
+                 {GENAI_MAX_BOUNDED_INTEGERS} integers to bound"
+            );
+            Some(schema.to_owned())
+        }
+        _ => Some(value.to_string()),
     }
-    Some(value.to_string())
 }
+
+/// Most integers [`genai_json_schema`] bounds in one schema. xgrammar
+/// compiles each bounded integer's range on its own, a cost the xgrammar
+/// guard doesn't price: 1000 required ones took 1.37 s against 0.10 s
+/// unbounded, 200 took 0.17 s against 0.02 s (xgrammar 0.1.31, Qwen2.5
+/// tokenizer, one thread). Past this the schema goes as the client wrote it,
+/// as the llguidance engines do for a schema with too many integers.
+const GENAI_MAX_BOUNDED_INTEGERS: usize = 256;
 
 /// The message inside a shim error, without the shim's own prefix.
 fn ov_message(err: OvError) -> String {
@@ -2543,6 +2559,31 @@ mod tests {
     /// model can't repeat digits until max_tokens; a bound the client set is
     /// kept, nested and `$ref`'d integers and `["integer","null"]` are bounded,
     /// and key order stays the client's.
+    #[test]
+    fn a_schema_with_too_many_integers_goes_to_genai_as_written() {
+        // Each bounded integer is a range xgrammar compiles on its own: 1000
+        // of them took 1.37 s against 0.10 s unbounded (xgrammar 0.1.31,
+        // Qwen2.5 tokenizer, one thread), a cost the xgrammar guard doesn't
+        // price. Past the cap the client's schema goes as written.
+        let many = |n: usize| {
+            let props: Vec<String> = (0..n)
+                .map(|i| format!(r#""p{i}":{{"type":"integer"}}"#))
+                .collect();
+            format!(
+                r#"{{"type":"object","properties":{{{}}}}}"#,
+                props.join(",")
+            )
+        };
+        let at_cap = many(GENAI_MAX_BOUNDED_INTEGERS);
+        assert_ne!(
+            genai_json_schema(&schema_task("s", &at_cap)).unwrap(),
+            at_cap,
+            "up to the cap, integers are bounded"
+        );
+        let over = many(GENAI_MAX_BOUNDED_INTEGERS + 1);
+        assert_eq!(genai_json_schema(&schema_task("s", &over)).unwrap(), over);
+    }
+
     #[test]
     fn the_schema_sent_to_genai_bounds_its_integers() {
         let cap = cascadia_grammar::INTEGER_DIGITS_CAP;
