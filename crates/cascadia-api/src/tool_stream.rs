@@ -84,22 +84,28 @@ fn call_events(index: usize, call: ToolCall) -> Vec<CallEvent> {
 /// Turns the held text of a tools stream into call deltas. Driven with the
 /// splitter's whole buffer and where tool-call scanning starts (`None` while
 /// a reasoning block is still open: a call drafted there is not a call).
+///
+/// Every state resumes where the previous feed stopped, so a reply of `n`
+/// bytes costs O(n) however finely it is fed.
 pub(crate) struct ToolCallEmitter {
     /// Only the first call goes out (`functions` request).
     legacy: bool,
     /// Calls sent so far; the next call's index.
     sent: usize,
     state: State,
+    /// Bytes examined so far, for the linear-time test.
+    #[cfg(test)]
+    work: usize,
 }
 
 enum State {
     /// Scanning has not been allowed yet.
     Waiting,
-    /// Looking for the next `<tool_call>` from this byte.
-    Search(usize),
+    /// Looking for the next `<tool_call>`.
+    Search(Finder),
     /// Inside a block whose form is not known yet, or that is parsed whole
-    /// at its closing tag; the byte right after its opening tag.
-    Block(usize),
+    /// at its closing tag.
+    Block(Block),
     /// Streaming a Hermes call's arguments object.
     Arguments {
         index: usize,
@@ -109,11 +115,30 @@ enum State {
     },
     /// The arguments object closed; the rest of the call object follows.
     Rest(JsonScan),
-    /// The call object closed; waiting for the block's closing tag from
-    /// this byte.
-    Close(usize),
+    /// The call object closed; waiting for the block's closing tag.
+    Close(Finder),
     /// Nothing more is sent.
     Done,
+}
+
+/// A `<tool_call>` block being read, from the byte after its opening tag.
+struct Block {
+    after: usize,
+    /// First non-whitespace byte of the block, once seen; before that, how
+    /// far the whitespace run has been read.
+    lead: Result<usize, usize>,
+    /// The Hermes prefix match, while it may still match.
+    prefix: Option<PrefixScan>,
+    /// Form decided as parsed whole: how far its end has been looked for.
+    whole: Option<Whole>,
+}
+
+enum Whole {
+    /// A JSON value: its brace scan.
+    Value(JsonScan),
+    /// After the JSON value (or for a non-JSON block, from the block's
+    /// start): the closing tag search.
+    Tag(Finder),
 }
 
 impl ToolCallEmitter {
@@ -122,6 +147,8 @@ impl ToolCallEmitter {
             legacy,
             sent: 0,
             state: State::Waiting,
+            #[cfg(test)]
+            work: 0,
         }
     }
 
@@ -151,7 +178,7 @@ impl ToolCallEmitter {
         let mut out = Vec::new();
         if matches!(self.state, State::Waiting) {
             match scan_from {
-                Some(at) => self.state = State::Search(at),
+                Some(at) => self.state = State::Search(Finder::new(at)),
                 None => return out,
             }
         }
@@ -164,72 +191,52 @@ impl ToolCallEmitter {
         self.sent - 1
     }
 
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn charge(&mut self, bytes: usize) {
+        #[cfg(test)]
+        {
+            self.work += bytes;
+        }
+    }
+
     /// One transition; `false` when it needs more text (or nothing more is
     /// sent).
     fn step(&mut self, buf: &str, end: bool, out: &mut Vec<CallEvent>) -> bool {
-        match self.state {
-            State::Waiting | State::Done => false,
-            State::Search(_) if self.legacy && self.sent > 0 => {
-                self.state = State::Done;
+        match std::mem::replace(&mut self.state, State::Done) {
+            State::Waiting => {
+                self.state = State::Waiting;
                 false
             }
-            State::Search(from) => match buf.get(from..).and_then(|r| r.find(TOOL_CALL_OPEN)) {
-                Some(i) => {
-                    self.state = State::Block(from + i + TOOL_CALL_OPEN.len());
-                    true
-                }
-                None => false,
-            },
-            State::Block(after) => {
-                let Some(text) = buf.get(after..) else {
-                    return false;
-                };
-                let inner = text.trim_start();
-                if inner.starts_with('{') {
-                    match hermes_prefix(inner) {
-                        Prefix::Match { name, args_at } => {
-                            let index = self.next_index();
-                            out.push(CallEvent::Header {
-                                index,
-                                id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-                                name,
-                            });
-                            let start = after + (text.len() - inner.len()) + args_at;
-                            self.state = State::Arguments {
-                                index,
-                                scan: JsonScan::at(start, 0),
-                                sent_to: start,
-                            };
-                            return true;
-                        }
-                        Prefix::NeedMore if !end => return false,
-                        Prefix::NeedMore | Prefix::No => {}
-                    }
-                }
-                if !end && !block_closed(inner) {
-                    return false;
-                }
-                match parse_tool_call_block(text) {
-                    Some(block) => {
-                        if let Some(call) = block.call {
-                            let index = self.next_index();
-                            out.extend(call_events(index, call));
-                        }
-                        self.state = State::Search(after + block.consumed);
+            State::Done => false,
+            State::Search(_) if self.legacy && self.sent > 0 => false,
+            State::Search(mut finder) => {
+                let (found, work) = finder.find(buf, TOOL_CALL_OPEN);
+                self.charge(work);
+                match found {
+                    Some(at) => {
+                        self.state = State::Block(Block {
+                            after: at + TOOL_CALL_OPEN.len(),
+                            lead: Err(at + TOOL_CALL_OPEN.len()),
+                            prefix: None,
+                            whole: None,
+                        });
                         true
                     }
                     None => {
-                        self.state = State::Done;
+                        self.state = State::Search(finder);
                         false
                     }
                 }
             }
+            State::Block(block) => self.step_block(block, buf, end, out),
             State::Arguments {
                 index,
                 mut scan,
                 sent_to,
             } => {
+                let from = scan.pos;
                 let scanned = scan.run(buf.as_bytes());
+                self.charge(scan.pos - from);
                 let upto = match scanned {
                     Scanned::Closed(at) | Scanned::Tag(at) => at,
                     Scanned::Wait => scan.pos,
@@ -245,10 +252,12 @@ impl ToolCallEmitter {
                 match scanned {
                     // The rest of the call object (`}` and any other keys)
                     // is read, not sent.
-                    Scanned::Closed(at) => self.state = State::Rest(JsonScan::at(at, 1)),
+                    Scanned::Closed(at) => self.state = State::Rest(JsonScan::object(at, 1)),
                     // A closing tag outside any string: the model gave up on
                     // the object; the call stays as sent.
-                    Scanned::Tag(at) => self.state = State::Search(at + TOOL_CALL_CLOSE.len()),
+                    Scanned::Tag(at) => {
+                        self.state = State::Search(Finder::new(at + TOOL_CALL_CLOSE.len()))
+                    }
                     Scanned::Wait => {
                         self.state = State::Arguments {
                             index,
@@ -260,48 +269,188 @@ impl ToolCallEmitter {
                 }
                 true
             }
-            State::Rest(mut scan) => match scan.run(buf.as_bytes()) {
-                Scanned::Closed(at) => {
-                    self.state = State::Close(at);
-                    true
+            State::Rest(mut scan) => {
+                let from = scan.pos;
+                let scanned = scan.run(buf.as_bytes());
+                self.charge(scan.pos - from);
+                match scanned {
+                    Scanned::Closed(at) => {
+                        self.state = State::Close(Finder::new(at));
+                        true
+                    }
+                    Scanned::Tag(at) => {
+                        self.state = State::Search(Finder::new(at + TOOL_CALL_CLOSE.len()));
+                        true
+                    }
+                    Scanned::Wait => {
+                        self.state = State::Rest(scan);
+                        false
+                    }
                 }
-                Scanned::Tag(at) => {
-                    self.state = State::Search(at + TOOL_CALL_CLOSE.len());
-                    true
-                }
-                Scanned::Wait => {
-                    self.state = State::Rest(scan);
-                    false
-                }
-            },
+            }
             // As `parse_tool_call_block`: the block runs to the first
             // closing tag after the object, or, with none, just the object.
-            State::Close(from) => match buf.get(from..).and_then(|r| r.find(TOOL_CALL_CLOSE)) {
-                Some(i) => {
-                    self.state = State::Search(from + i + TOOL_CALL_CLOSE.len());
-                    true
+            State::Close(mut finder) => {
+                let (found, work) = finder.find(buf, TOOL_CALL_CLOSE);
+                self.charge(work);
+                match found {
+                    Some(at) => {
+                        self.state = State::Search(Finder::new(at + TOOL_CALL_CLOSE.len()));
+                        true
+                    }
+                    None if end => {
+                        self.state = State::Search(Finder::new(finder.from));
+                        true
+                    }
+                    None => {
+                        self.state = State::Close(finder);
+                        false
+                    }
                 }
-                None if end => {
-                    self.state = State::Search(from);
-                    true
-                }
-                None => false,
-            },
+            }
         }
+    }
+
+    fn step_block(
+        &mut self,
+        mut block: Block,
+        buf: &str,
+        end: bool,
+        out: &mut Vec<CallEvent>,
+    ) -> bool {
+        let lead = match block.lead {
+            Ok(lead) => lead,
+            Err(from) => {
+                let rest = buf.get(from..).unwrap_or_default();
+                let skipped = rest.len() - rest.trim_start().len();
+                self.charge(skipped);
+                if skipped == rest.len() && !end {
+                    block.lead = Err(from + skipped);
+                    self.state = State::Block(block);
+                    return false;
+                }
+                let lead = from + skipped;
+                block.lead = Ok(lead);
+                if buf.as_bytes().get(lead) == Some(&b'{') {
+                    block.prefix = Some(PrefixScan::new(lead));
+                }
+                lead
+            }
+        };
+        if let Some(mut prefix) = block.prefix.take() {
+            let from = prefix.pos;
+            let matched = prefix.run(buf);
+            self.charge(prefix.pos - from);
+            match matched {
+                Prefix::Match { name, args_at } => {
+                    let index = self.next_index();
+                    out.push(CallEvent::Header {
+                        index,
+                        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                        name,
+                    });
+                    self.state = State::Arguments {
+                        index,
+                        scan: JsonScan::arguments(args_at),
+                        sent_to: args_at,
+                    };
+                    return true;
+                }
+                Prefix::NeedMore if !end => {
+                    block.prefix = Some(prefix);
+                    self.state = State::Block(block);
+                    return false;
+                }
+                Prefix::NeedMore | Prefix::No => {}
+            }
+        }
+        if !end && !self.block_closed(&mut block, buf, lead) {
+            self.state = State::Block(block);
+            return false;
+        }
+        // Parsed once, whole, by the shared parser.
+        let after = block.after;
+        let text = buf.get(after..).unwrap_or_default();
+        self.charge(text.len());
+        match parse_tool_call_block(text) {
+            Some(parsed) => {
+                if let Some(call) = parsed.call {
+                    let index = self.next_index();
+                    out.extend(call_events(index, call));
+                }
+                self.state = State::Search(Finder::new(after + parsed.consumed));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a block parsed whole has all its text: a JSON value and a
+    /// closing tag after it, or for any other form, a closing tag. A closing
+    /// tag inside an unbalanced JSON value may be argument text, so it does
+    /// not count.
+    fn block_closed(&mut self, block: &mut Block, buf: &str, lead: usize) -> bool {
+        let whole = block
+            .whole
+            .get_or_insert_with(|| match buf.as_bytes().get(lead) {
+                Some(b'{') => Whole::Value(JsonScan::value(lead, b'{', b'}')),
+                Some(b'[') => Whole::Value(JsonScan::value(lead, b'[', b']')),
+                _ => Whole::Tag(Finder::new(block.after)),
+            });
+        let mut work = 0;
+        let closed = loop {
+            match whole {
+                Whole::Value(scan) => {
+                    let from = scan.pos;
+                    let scanned = scan.run(buf.as_bytes());
+                    work += scan.pos - from;
+                    match scanned {
+                        Scanned::Closed(at) => *whole = Whole::Tag(Finder::new(at)),
+                        Scanned::Tag(_) | Scanned::Wait => break false,
+                    }
+                }
+                Whole::Tag(finder) => {
+                    let (found, w) = finder.find(buf, TOOL_CALL_CLOSE);
+                    work += w;
+                    break found.is_some();
+                }
+            }
+        };
+        self.charge(work);
+        closed
     }
 }
 
-/// Whether a block that is parsed whole has all its text: a JSON value and
-/// a closing tag after it, or for any other form, a closing tag. `inner` is
-/// the block's text from its first non-space byte.
-fn block_closed(inner: &str) -> bool {
-    if inner.starts_with(['{', '[']) {
-        // A closing tag inside an unbalanced value may be argument text.
-        return crate::balanced_json_end(inner)
-            .and_then(|len| inner.get(len..))
-            .is_some_and(|tail| tail.contains(TOOL_CALL_CLOSE));
+/// A resumable search for an ASCII marker: bytes before `seen` hold no
+/// start of it, so each search reads only what arrived since the last one
+/// (plus a possible partial marker at the end).
+struct Finder {
+    from: usize,
+    seen: usize,
+}
+
+impl Finder {
+    fn new(from: usize) -> Self {
+        Self { from, seen: from }
     }
-    inner.contains(TOOL_CALL_CLOSE)
+
+    /// The marker's position, and how many bytes were read.
+    fn find(&mut self, buf: &str, marker: &str) -> (Option<usize>, usize) {
+        let start = self.from.max(self.seen);
+        let Some(hay) = buf.get(start..) else {
+            return (None, 0);
+        };
+        if let Some(i) = hay.find(marker) {
+            return (Some(start + i), hay.len().min(i + marker.len()));
+        }
+        // Resume at the first tail byte that could start the marker: every
+        // such byte is ASCII, so this is a char boundary.
+        let tail_from = buf.len().saturating_sub(marker.len() - 1).max(start);
+        self.seen = (tail_from..buf.len())
+            .find(|&k| buf.get(k..).is_some_and(|tail| marker.starts_with(tail)))
+            .unwrap_or(buf.len());
+        (None, hay.len())
+    }
 }
 
 /// The Hermes call prefix `{"name": "<name>", "arguments": {`.
@@ -316,84 +465,111 @@ enum Prefix {
     No,
 }
 
-/// Matches `{ "name" : "<name>" , ("arguments"|"parameters") : {` with JSON
-/// whitespace anywhere between the tokens.
-fn hermes_prefix(s: &str) -> Prefix {
-    match hermes_prefix_at(s) {
-        Ok(p) | Err(p) => p,
-    }
+/// Resumable match of `{ "name" : "<name>" , ("arguments"|"parameters") :
+/// {` with JSON whitespace between the tokens, one byte at a time.
+struct PrefixScan {
+    /// Next byte to read.
+    pos: usize,
+    /// Which token is being read (see `run`).
+    step: u8,
+    /// Bytes of the current token read.
+    lit: usize,
+    /// `"arguments"` or `"parameters"`, once its second byte chose it.
+    key: &'static [u8],
+    /// The name string's opening quote.
+    name_start: usize,
+    esc: bool,
+    name: String,
 }
 
-fn hermes_prefix_at(s: &str) -> Result<Prefix, Prefix> {
-    let b = s.as_bytes();
-    let mut i = lit(b, ws(b, 0), b"{")?;
-    i = lit(b, ws(b, i), b"\"name\"")?;
-    i = lit(b, ws(b, i), b":")?;
-    let start = ws(b, i);
-    lit(b, start, b"\"")?;
-    let end = string_end(b, start + 1)?;
-    let name: String = s
-        .get(start..end)
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .ok_or(Prefix::No)?;
-    i = ws(b, lit(b, ws(b, end), b",")?);
-    i = match lit(b, i, b"\"arguments\"") {
-        Ok(j) => j,
-        Err(a) => match lit(b, i, b"\"parameters\"") {
-            Ok(j) => j,
-            Err(p) if matches!(a, Prefix::NeedMore) || matches!(p, Prefix::NeedMore) => {
-                return Err(Prefix::NeedMore)
-            }
-            Err(_) => return Err(Prefix::No),
-        },
-    };
-    i = lit(b, ws(b, i), b":")?;
-    let args_at = ws(b, i);
-    lit(b, args_at, b"{")?;
-    Ok(Prefix::Match { name, args_at })
-}
-
-/// First non-whitespace byte at/after `i`.
-fn ws(b: &[u8], i: usize) -> usize {
-    i + b
-        .get(i..)
-        .unwrap_or_default()
-        .iter()
-        .take_while(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
-        .count()
-}
-
-/// `token` at `i`: the byte after it, or whether more text could still make
-/// it.
-fn lit(b: &[u8], i: usize, token: &[u8]) -> Result<usize, Prefix> {
-    let rest = b.get(i..).unwrap_or_default();
-    if rest.starts_with(token) {
-        Ok(i + token.len())
-    } else if token.starts_with(rest) {
-        Err(Prefix::NeedMore)
-    } else {
-        Err(Prefix::No)
-    }
-}
-
-/// The byte after the closing quote of the JSON string whose body starts at
-/// `i`.
-fn string_end(b: &[u8], i: usize) -> Result<usize, Prefix> {
-    let mut esc = false;
-    for (j, &c) in b.iter().enumerate().skip(i) {
-        if esc {
-            esc = false;
-        } else if c == b'\\' {
-            esc = true;
-        } else if c == b'"' {
-            return Ok(j + 1);
+impl PrefixScan {
+    fn new(pos: usize) -> Self {
+        Self {
+            pos,
+            step: 0,
+            lit: 0,
+            key: b"",
+            name_start: pos,
+            esc: false,
+            name: String::new(),
         }
     }
-    Err(Prefix::NeedMore)
+
+    fn run(&mut self, buf: &str) -> Prefix {
+        let b = buf.as_bytes();
+        while let Some(&c) = b.get(self.pos) {
+            let pos = self.pos;
+            self.pos += 1;
+            if self.step == 4 {
+                // Inside the name string.
+                if self.esc {
+                    self.esc = false;
+                } else if c == b'\\' {
+                    self.esc = true;
+                } else if c == b'"' {
+                    match buf
+                        .get(self.name_start..self.pos)
+                        .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+                    {
+                        Some(name) => self.name = name,
+                        None => return Prefix::No,
+                    }
+                    self.step = 5;
+                }
+                continue;
+            }
+            if self.lit == 0 && matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+                continue;
+            }
+            let token: &[u8] = match (self.step, self.lit) {
+                (0, _) | (8, _) => b"{",
+                (1, _) => b"\"name\"",
+                (2, _) | (7, _) => b":",
+                (3, _) => b"\"",
+                (5, _) => b",",
+                (6, 0) => b"\"",
+                (6, 1) => {
+                    self.key = match c {
+                        b'a' => b"\"arguments\"",
+                        b'p' => b"\"parameters\"",
+                        _ => return Prefix::No,
+                    };
+                    self.key
+                }
+                (6, _) => self.key,
+                _ => return Prefix::No,
+            };
+            if token.get(self.lit) != Some(&c) {
+                return Prefix::No;
+            }
+            self.lit += 1;
+            if self.step == 6 && self.lit == 1 {
+                continue;
+            }
+            if self.lit == token.len() {
+                self.lit = 0;
+                match self.step {
+                    3 => {
+                        self.name_start = pos;
+                        self.step = 4;
+                    }
+                    8 => {
+                        return Prefix::Match {
+                            name: std::mem::take(&mut self.name),
+                            args_at: pos,
+                        }
+                    }
+                    s => self.step = s + 1,
+                }
+            }
+        }
+        Prefix::NeedMore
+    }
 }
 
-/// String- and escape-aware brace scan over a JSON object's text, resumable
-/// as more text arrives. Counts `{`/`}` only, as `balanced_json_end` does.
+/// String- and escape-aware bracket scan over a JSON value's text,
+/// resumable as more text arrives. Counts only the value's own bracket
+/// kind, as `balanced_json_end` does.
 #[derive(Clone, Copy, Debug)]
 struct JsonScan {
     /// Next byte to read.
@@ -401,10 +577,14 @@ struct JsonScan {
     depth: u32,
     in_str: bool,
     esc: bool,
+    open: u8,
+    close: u8,
+    /// Stop at a closing tag outside any string (a streamed call).
+    tags: bool,
 }
 
 enum Scanned {
-    /// The object closed; the byte after its `}`.
+    /// The value closed; the byte after its closing bracket.
     Closed(usize),
     /// A closing tag outside any string starts here.
     Tag(usize),
@@ -413,12 +593,31 @@ enum Scanned {
 }
 
 impl JsonScan {
-    fn at(pos: usize, depth: u32) -> Self {
+    /// A streamed call's object, `depth` levels in.
+    fn object(pos: usize, depth: u32) -> Self {
         Self {
             pos,
             depth,
             in_str: false,
             esc: false,
+            open: b'{',
+            close: b'}',
+            tags: true,
+        }
+    }
+
+    /// A streamed call's arguments object, from its `{`.
+    fn arguments(pos: usize) -> Self {
+        Self::object(pos, 0)
+    }
+
+    /// A value parsed whole, from its opening bracket.
+    fn value(pos: usize, open: u8, close: u8) -> Self {
+        Self {
+            open,
+            close,
+            tags: false,
+            ..Self::object(pos, 0)
         }
     }
 
@@ -432,28 +631,24 @@ impl JsonScan {
                 } else if b == b'"' {
                     self.in_str = false;
                 }
-            } else {
-                match b {
-                    b'"' => self.in_str = true,
-                    b'{' => self.depth += 1,
-                    b'}' => {
-                        self.depth = self.depth.saturating_sub(1);
-                        if self.depth == 0 {
-                            self.pos += 1;
-                            return Scanned::Closed(self.pos);
-                        }
-                    }
-                    // JSON has no `<` outside a string, so this is markup.
-                    b'<' => {
-                        let rest = buf.get(self.pos..).unwrap_or_default();
-                        if rest.starts_with(TOOL_CALL_CLOSE.as_bytes()) {
-                            return Scanned::Tag(self.pos);
-                        }
-                        if TOOL_CALL_CLOSE.as_bytes().starts_with(rest) {
-                            return Scanned::Wait;
-                        }
-                    }
-                    _ => {}
+            } else if b == b'"' {
+                self.in_str = true;
+            } else if b == self.open {
+                self.depth += 1;
+            } else if b == self.close {
+                self.depth = self.depth.saturating_sub(1);
+                if self.depth == 0 {
+                    self.pos += 1;
+                    return Scanned::Closed(self.pos);
+                }
+            } else if b == b'<' && self.tags {
+                // JSON has no `<` outside a string, so this is markup.
+                let rest = buf.get(self.pos..).unwrap_or_default();
+                if rest.starts_with(TOOL_CALL_CLOSE.as_bytes()) {
+                    return Scanned::Tag(self.pos);
+                }
+                if TOOL_CALL_CLOSE.as_bytes().starts_with(rest) {
+                    return Scanned::Wait;
                 }
             }
             self.pos += 1;
@@ -846,6 +1041,64 @@ mod tests {
                     .collect();
                 assert_eq!(got, want, "n={n}: {text}");
             }
+        }
+    }
+
+    /// A long reply fed one byte at a time costs linear work in every
+    /// state: a streamed argument, a value parsed whole, an XML block, prose
+    /// with no call, and a long name inside the Hermes prefix.
+    #[test]
+    fn feeding_a_byte_at_a_time_costs_linear_work() {
+        let big = "x".repeat(64 * 1024);
+        let texts = [
+            format!(r#"<tool_call>{{"name":"f","arguments":{{"v":"{big}"}}}}</tool_call>"#),
+            format!(r#"<tool_call>{{"name":"f","arguments":"{big}"}}</tool_call>"#),
+            format!("<tool_call><function=f><parameter=v>{big}</parameter></function></tool_call>"),
+            format!("{big} no call here"),
+            format!(r#"<tool_call>{{"name":"{big}","arguments":{{}}}}</tool_call>"#),
+        ];
+        for text in &texts {
+            let started = std::time::Instant::now();
+            let mut splitter = ToolStreamSplitter::new(false);
+            let mut emitter = ToolCallEmitter::new(false);
+            let mut events = Vec::new();
+            let mut at = 0;
+            for (i, c) in text.char_indices() {
+                splitter.feed(&text[i..i + c.len_utf8()]);
+                events.extend(
+                    emitter
+                        .advance(splitter.text(), splitter.scan_from())
+                        .into_iter()
+                        .map(|e| (at, e)),
+                );
+                at += 1;
+            }
+            events.extend(
+                emitter
+                    .finish(splitter.text(), splitter.scan_from())
+                    .into_iter()
+                    .map(|e| (at, e)),
+            );
+            let calls = assemble(&events);
+            assert_eq!(
+                calls.len(),
+                usize::from(text.starts_with('<')),
+                "{}",
+                &text[..40]
+            );
+            assert!(
+                emitter.work < 8 * text.len(),
+                "work {} for {} bytes: {}",
+                emitter.work,
+                text.len(),
+                &text[..40]
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "{:?}: {}",
+                started.elapsed(),
+                &text[..40]
+            );
         }
     }
 }
