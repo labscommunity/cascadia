@@ -242,8 +242,8 @@ pub(crate) fn assert_stream_spec(body: &str) {
 /// Tool-call deltas: every `tool_calls` entry has an `index` and a
 /// `function` object (some clients read `function` unchecked); the first
 /// entry of an index introduces the call (`id`, `type`, `function.name`),
-/// later ones never repeat the `id`. The first `function_call` names the
-/// function.
+/// later ones carry none of them (clients that concatenate would repeat the
+/// name). The first `function_call` names the function, later ones don't.
 fn check_call_deltas(deltas: &[&Value], body: &str) {
     let mut seen = std::collections::HashSet::new();
     for call in deltas
@@ -270,14 +270,27 @@ fn check_call_deltas(deltas: &[&Value], body: &str) {
                 call.get("id").is_none(),
                 "a later delta of a tool call repeats its id: {body}"
             );
+            assert!(
+                call.get("type").is_none(),
+                "a later delta of a tool call repeats its type: {body}"
+            );
+            assert!(
+                call["function"].get("name").is_none(),
+                "a later delta of a tool call repeats its name: {body}"
+            );
         }
     }
-    if let Some(first) = deltas.iter().find_map(|d| d.get("function_call")) {
+    let mut function_calls = deltas.iter().filter_map(|d| d.get("function_call"));
+    if let Some(first) = function_calls.next() {
         assert!(
             first["name"].is_string(),
             "first function_call delta without a name: {body}"
         );
     }
+    assert!(
+        function_calls.all(|f| f.get("name").is_none()),
+        "a later function_call delta repeats its name: {body}"
+    );
 }
 
 /// `include_usage` placement: the usage chunk (`choices: []`) comes once,
@@ -531,6 +544,38 @@ fn bad_call_deltas(chunk: &dyn Fn(&str, &str, &str) -> String) -> Vec<(String, &
         (
             format!("{}{}{end}data: [DONE]\n\n", head(header), more(header)),
             "a later delta of a tool call repeats its id",
+        ),
+        (
+            format!(
+                "{}{}{end}data: [DONE]\n\n",
+                head(header),
+                more(r#"{"index":0,"type":"function","function":{"arguments":"{}"}}"#)
+            ),
+            "a later delta of a tool call repeats its type",
+        ),
+        (
+            format!(
+                "{}{}{end}data: [DONE]\n\n",
+                head(header),
+                more(r#"{"index":0,"function":{"name":"f","arguments":"{}"}}"#)
+            ),
+            "a later delta of a tool call repeats its name",
+        ),
+        (
+            format!(
+                "{}{}{end}data: [DONE]\n\n",
+                chunk(
+                    "",
+                    r#"{"role":"assistant","function_call":{"name":"f","arguments":""}}"#,
+                    "null"
+                ),
+                chunk(
+                    "",
+                    r#"{"function_call":{"name":"f","arguments":"{}"}}"#,
+                    "null"
+                )
+            ),
+            "a later function_call delta repeats its name",
         ),
         (
             format!(

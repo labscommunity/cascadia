@@ -477,6 +477,15 @@ enum Prefix {
 
 /// Resumable match of `{ "name" : "<name>" , ("arguments"|"parameters") :
 /// {` with JSON whitespace between the tokens, one byte at a time.
+///
+/// The header goes out as soon as this prefix is read, so the stream
+/// commits to the FIRST `name` and the FIRST `arguments`/`parameters`
+/// object. A call object that repeats a key later is decided differently by
+/// the whole-reply parse (`serde_json` keeps the last `name`, and
+/// `arguments` wins over `parameters`); matching that would mean holding
+/// every call until its object closes, which is what streaming the
+/// arguments exists to avoid. A model writes such a key twice only by
+/// mistake.
 struct PrefixScan {
     /// Next byte to read.
     pos: usize,
@@ -1055,59 +1064,113 @@ mod tests {
     }
 
     /// A long reply fed one byte at a time costs linear work in every
-    /// state: a streamed argument, a value parsed whole, an XML block, prose
-    /// with no call, and a long name inside the Hermes prefix.
+    /// state, counting both the splitter's scans and the emitter's: a
+    /// streamed argument, a value parsed whole, an XML block, prose with no
+    /// call, a long name inside the Hermes prefix, and a long reasoning
+    /// block before a call.
     #[test]
     fn feeding_a_byte_at_a_time_costs_linear_work() {
         let big = "x".repeat(64 * 1024);
+        let call = r#"<tool_call>{"name":"f","arguments":{}}</tool_call>"#;
         let texts = [
-            format!(r#"<tool_call>{{"name":"f","arguments":{{"v":"{big}"}}}}</tool_call>"#),
-            format!(r#"<tool_call>{{"name":"f","arguments":"{big}"}}</tool_call>"#),
-            format!("<tool_call><function=f><parameter=v>{big}</parameter></function></tool_call>"),
-            format!("{big} no call here"),
-            format!(r#"<tool_call>{{"name":"{big}","arguments":{{}}}}</tool_call>"#),
+            (
+                format!(r#"<tool_call>{{"name":"f","arguments":{{"v":"{big}"}}}}</tool_call>"#),
+                false,
+                1,
+            ),
+            (
+                format!(r#"<tool_call>{{"name":"f","arguments":"{big}"}}</tool_call>"#),
+                false,
+                1,
+            ),
+            (
+                format!(
+                    "<tool_call><function=f><parameter=v>{big}</parameter></function></tool_call>"
+                ),
+                false,
+                1,
+            ),
+            (format!("{big} no call here"), false, 0),
+            (
+                format!(r#"<tool_call>{{"name":"{big}","arguments":{{}}}}</tool_call>"#),
+                false,
+                1,
+            ),
+            (format!("<think>{big}</think>{call}"), true, 1),
         ];
-        for text in &texts {
+        for (text, thinking, want_calls) in &texts {
             let started = std::time::Instant::now();
-            let mut splitter = ToolStreamSplitter::new(false);
+            let mut splitter = ToolStreamSplitter::new(*thinking);
             let mut emitter = ToolCallEmitter::new(false);
             let mut events = Vec::new();
-            let mut at = 0;
             for (i, c) in text.char_indices() {
                 splitter.feed(&text[i..i + c.len_utf8()]);
                 events.extend(
                     emitter
                         .advance(splitter.text(), splitter.scan_from())
                         .into_iter()
-                        .map(|e| (at, e)),
+                        .map(|e| (i, e)),
                 );
-                at += 1;
             }
             events.extend(
                 emitter
                     .finish(splitter.text(), splitter.scan_from())
                     .into_iter()
-                    .map(|e| (at, e)),
+                    .map(|e| (text.len(), e)),
             );
-            let calls = assemble(&events);
+            let elapsed = started.elapsed();
+            let head = &text[..40];
+            assert_eq!(assemble(&events).len(), *want_calls, "{head}");
+            let work = emitter.work + splitter.work.get();
+            assert!(
+                work < 8 * text.len(),
+                "work {work} for {} bytes: {head}",
+                text.len()
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "{elapsed:?}: {head}"
+            );
+        }
+    }
+
+    /// A call object that repeats a key: the stream has already sent the
+    /// first `name` and the first arguments object when the repeat arrives,
+    /// so it keeps those, while the whole-reply parse keeps the last `name`
+    /// and prefers `arguments` over `parameters`.
+    #[test]
+    fn a_repeated_key_keeps_what_was_streamed_first() {
+        for (text, streamed, parsed) in [
+            (
+                r#"<tool_call>{"name":"f","parameters":{"a":1},"arguments":{"b":2}}</tool_call>"#,
+                ("f", serde_json::json!({"a": 1})),
+                ("f", serde_json::json!({"b": 2})),
+            ),
+            (
+                r#"<tool_call>{"name":"f","arguments":{"a":1},"name":"g"}</tool_call>"#,
+                ("f", serde_json::json!({"a": 1})),
+                ("g", serde_json::json!({"a": 1})),
+            ),
+        ] {
+            let parts = pieces(text, 1);
+            let calls = assemble(
+                &run(
+                    &parts.iter().map(String::as_str).collect::<Vec<_>>(),
+                    false,
+                    false,
+                )
+                .events,
+            );
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!((calls[0].1.as_str(), json(&calls[0].2)), streamed, "{text}");
+            let whole = crate::parse_tool_calls(text).unwrap();
             assert_eq!(
-                calls.len(),
-                usize::from(text.starts_with('<')),
-                "{}",
-                &text[..40]
-            );
-            assert!(
-                emitter.work < 8 * text.len(),
-                "work {} for {} bytes: {}",
-                emitter.work,
-                text.len(),
-                &text[..40]
-            );
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(20),
-                "{:?}: {}",
-                started.elapsed(),
-                &text[..40]
+                (
+                    whole[0].function.name.as_str(),
+                    json(&whole[0].function.arguments)
+                ),
+                parsed,
+                "{text}"
             );
         }
     }

@@ -2253,8 +2253,10 @@ const PYTHON_TAG: &str = "<|python_tag|>";
 /// Incremental content/tool-call split for a streamed chat reply with tools
 /// active. Fed the same translated text the non-streaming path accumulates,
 /// it releases every byte that can no longer become part of a tool call and
-/// withholds the rest, so content streams live while the final decision is
-/// still exactly `parse_tool_calls(tool_call_scan_text(full_text, …))`.
+/// withholds the rest, so content streams live. Calls stream out of the
+/// withheld text through `tool_stream::ToolCallEmitter` as they are
+/// generated; only when none was streamed is the reply decided at its end,
+/// by exactly `parse_tool_calls(tool_call_scan_text(full_text, …))`.
 ///
 /// Withheld from the hold point on, where scanning starts at 0 or (thinking
 /// on) just past the first `</think>`, mirroring `tool_call_scan_text`:
@@ -2281,6 +2283,13 @@ struct ToolStreamSplitter {
     /// only whitespace has arrived). Advanced per feed, so a long leading
     /// whitespace run is scanned once, not on every feed.
     lead: usize,
+    /// The first `<tool_call>` found by the last search. While the release
+    /// point has not passed it, it is still the first one, so a held call
+    /// is not searched for again on every feed.
+    marker_at: std::cell::Cell<Option<usize>>,
+    /// Bytes examined so far, for the linear-time test.
+    #[cfg(test)]
+    work: std::cell::Cell<usize>,
 }
 
 /// The decision at the end of a tools-active stream.
@@ -2305,7 +2314,16 @@ impl ToolStreamSplitter {
             scan_start: 0,
             think_from: enable_thinking.then_some(0),
             lead: 0,
+            marker_at: std::cell::Cell::new(None),
+            #[cfg(test)]
+            work: std::cell::Cell::new(0),
         }
+    }
+
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn charge(&self, bytes: usize) {
+        #[cfg(test)]
+        self.work.set(self.work.get() + bytes);
     }
 
     /// Append `text`; return the newly releasable content (possibly empty).
@@ -2337,25 +2355,35 @@ impl ToolStreamSplitter {
     fn push(&mut self, text: &str) {
         self.buf.push_str(text);
         if let Some(from) = self.think_from {
-            match self.buf[from..].find(THINK_CLOSE) {
+            let found = self.buf[from..].find(THINK_CLOSE);
+            self.charge(found.map_or(self.buf.len() - from, |i| i + THINK_CLOSE.len()));
+            match found {
                 Some(i) => {
                     self.scan_start = from + i + THINK_CLOSE.len();
                     self.think_from = None;
                     self.lead = self.scan_start;
                 }
-                // Only the last `len - 1` bytes can start a delimiter that the
-                // next feed completes.
+                // Only a tail that is a proper prefix of the delimiter can
+                // start one the next feed completes; it begins with an ASCII
+                // `<`, so it is a char boundary.
                 None => {
-                    let mut next = self.buf.len().saturating_sub(THINK_CLOSE.len() - 1);
-                    while !self.buf.is_char_boundary(next) {
-                        next -= 1;
-                    }
-                    self.think_from = Some(next.max(from));
+                    let tail = self.buf.len().saturating_sub(THINK_CLOSE.len() - 1);
+                    let next = (tail.max(from)..self.buf.len())
+                        .find(|&k| {
+                            self.buf
+                                .get(k..)
+                                .is_some_and(|rest| THINK_CLOSE.starts_with(rest))
+                        })
+                        .unwrap_or(self.buf.len());
+                    self.think_from = Some(next);
                 }
             }
         }
         let rest = &self.buf[self.lead..];
-        self.lead += rest.len() - rest.trim_start().len();
+        let skipped = rest.len() - rest.trim_start().len();
+        // The whitespace run plus the byte that ended it.
+        self.charge(skipped + usize::from(skipped < rest.len()));
+        self.lead += skipped;
     }
 
     /// Everything fed so far.
@@ -2383,8 +2411,14 @@ impl ToolStreamSplitter {
         // Released text holds no marker at/after `start`, so the search can
         // resume at the release point.
         let from = start.max(self.emitted);
+        if let Some(at) = self.marker_at.get().filter(|&at| at >= from) {
+            return at;
+        }
         let rest = &self.buf[from..];
-        from + rest.find(TOOL_CALL_OPEN).unwrap_or_else(|| {
+        let found = rest.find(TOOL_CALL_OPEN);
+        self.charge(found.map_or(rest.len(), |i| i + TOOL_CALL_OPEN.len()));
+        self.marker_at.set(found.map(|i| from + i));
+        from + found.unwrap_or_else(|| {
             (1..TOOL_CALL_OPEN.len())
                 .rev()
                 .find(|&k| rest.ends_with(&TOOL_CALL_OPEN[..k]))
@@ -3437,8 +3471,9 @@ async fn stream_completion(
         },
     ));
     // Tools present and not disabled: content streams as the splitter
-    // releases it; whether the reply is a tool call is decided at the final
-    // chunk, on the same text and parse as the non-streaming path.
+    // releases it, and each tool call streams as it is generated (header,
+    // then its arguments). A reply with no call streamed by its end is
+    // decided there, on the same text and parse as the non-streaming path.
     let tools_active =
         tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
     if tools_active {
