@@ -11692,6 +11692,74 @@ mod tests {
         assert!(head_link.acked);
     }
 
+    /// The grammar rejects, at the head, the token the tail picked: here the
+    /// parser row after `{` is past a lowered cap, so the mask allowed `{`
+    /// but accepting it fails. The exchange had already ended, so the tail
+    /// owes nothing and waits for the next activation as between requests;
+    /// the head fails the task (`emit_token` commits after the exchange, and
+    /// `step_first` clears the task), and the next task's masked step on the
+    /// same link answers at once, with no stage waiting out a timeout.
+    #[tokio::test]
+    async fn a_grammar_failure_at_the_head_leaves_the_link_ready_for_the_next_task() {
+        let props: Vec<String> = (0..600).map(|i| format!("\"p{i}\":{{}}")).collect();
+        let wide = format!(
+            r#"{{"type":"object","properties":{{{}}}}}"#,
+            props.join(",")
+        );
+        let capped = GrammarFactory::byte_level_with_row_cap_for_tests(2000);
+        let w = capped.mask_width();
+        let mut grammar = start_grammar(&capped.compile(&json_spec(&wide)).unwrap(), &[]).unwrap();
+        let words = grammar_mask_words(&mut grammar, w).unwrap();
+        let (picks_open, picks_quote) = (rows(&[bad_then(w, b'{')]), rows(&[bad_then(w, b'"')]));
+        let (client, server) = loopback().await;
+        let down = Arc::new(tokio::sync::Mutex::new(client));
+        let up = Arc::new(tokio::sync::Mutex::new(server));
+        let (mut link, mut recv, mut streak) = (MaskLink::default(), MaskRecvCache::default(), 0);
+        let (head, tail) = tokio::join!(
+            masked_exchange(
+                &down,
+                1,
+                None,
+                &words,
+                f16_hidden(1),
+                decode_budget(),
+                &mut streak,
+                &mut link,
+            ),
+            tail_step(&up, &mut recv, &picks_open)
+        );
+        assert_eq!(tail, (1, Some(Ok(words.clone()))));
+        let token = head.unwrap();
+        assert_eq!(token, b'{' as i32);
+        let err = commit_grammar_token(Some(&mut grammar), token).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("structured output generation failed"),
+            "{err}"
+        );
+
+        // The next task, on the same link.
+        let next = ok_enum_words();
+        let started = std::time::Instant::now();
+        let (head, tail) = tokio::join!(
+            masked_exchange(
+                &down,
+                2,
+                None,
+                &next,
+                f16_hidden(2),
+                decode_budget(),
+                &mut streak,
+                &mut link,
+            ),
+            tail_step(&up, &mut recv, &picks_quote)
+        );
+        assert_eq!(tail, (2, Some(Ok(next))));
+        assert_eq!(head.unwrap(), b'"' as i32);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(streak, 0, "no token wait timed out");
+    }
+
     /// A middle resolves the upstream's marker from its own receive cache and
     /// re-encodes for its downstream with its own send cache. When it fails a
     /// step it decoded without forwarding it, its downstream still holds the
