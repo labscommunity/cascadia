@@ -3021,7 +3021,9 @@ async fn chat_completions(
     // OpenAI `finish_reason`: `length` when the engine hit max_tokens, else
     // `stop`. Engines that don't distinguish leave it None → "stop".
     let mut finish_reason: &'static str = "stop";
-    let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    // Items follow the text they belong to: those of text cut by a `stop`
+    // match or parsed as a tool call never go out.
+    let mut logprobs = stream_shape::LogprobQueue::new(req.logprobs_count() > 0);
     let stops = req.sampling_params(&state.generation_defaults).stop;
     let mut stop = StopMatcher::new(&stops);
     while let Some(chunk) = chunk_stream.next().await {
@@ -3050,11 +3052,9 @@ async fn chat_completions(
             }
             None => chunk.text.clone(),
         };
+        logprobs.push(text.len(), chunk.logprobs.as_ref());
         buf.push_str(&stop.push(&text));
         chunk.accumulate_tokens(&mut completion_tokens);
-        if let Some(lp) = &chunk.logprobs {
-            logprobs_content.push(lp.clone());
-        }
         // The latest count any chunk carries: token-streaming engines report
         // it on their first chunk too, so it is known before an early stop.
         if let Some(n) = chunk.prompt_tokens {
@@ -3116,11 +3116,7 @@ async fn chat_completions(
             };
         }
     }
-    let logprobs = if req.logprobs_count() > 0 && !logprobs_content.is_empty() {
-        stream_shape::spec_logprobs(&logprobs_content)
-    } else {
-        serde_json::Value::Null
-    };
+    let logprobs = logprobs.finish(message.content.as_deref().map_or(0, str::len));
     Json(ChatCompletionResponse {
         id: task_id,
         object: "chat.completion",
@@ -3251,7 +3247,9 @@ async fn completions(
     let mut completion_tokens: u32 = 0;
     let mut prompt_tokens: u32 = 0;
     let mut finish_reason: &'static str = "stop";
-    let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    // Items follow the text they belong to: those of text cut by a `stop`
+    // match or parsed as a tool call never go out.
+    let mut logprobs = stream_shape::LogprobQueue::new(req.logprobs_count() > 0);
     let stops = req.sampling_params(&state.generation_defaults).stop;
     let mut stop = StopMatcher::new(&stops);
     while let Some(chunk) = chunk_stream.next().await {
@@ -3273,11 +3271,9 @@ async fn completions(
             }
             None => chunk.text.clone(),
         };
+        logprobs.push(text.len(), chunk.logprobs.as_ref());
         buf.push_str(&stop.push(&text));
         chunk.accumulate_tokens(&mut completion_tokens);
-        if let Some(lp) = &chunk.logprobs {
-            logprobs_content.push(lp.clone());
-        }
         // The latest count any chunk carries: token-streaming engines report
         // it on their first chunk too, so it is known before an early stop.
         if let Some(n) = chunk.prompt_tokens {
@@ -3316,17 +3312,12 @@ async fn completions(
         }
     }
 
+    let logprobs = logprobs.finish(buf.len());
     // `echo`: prepend the (raw) prompt to the returned text.
     let text = if req.echo {
         format!("{prompt}{buf}")
     } else {
         buf
-    };
-
-    let logprobs = if req.logprobs_count() > 0 && !logprobs_content.is_empty() {
-        stream_shape::spec_logprobs(&logprobs_content)
-    } else {
-        serde_json::Value::Null
     };
     Json(CompletionResponse {
         id: task_id,
@@ -10403,6 +10394,78 @@ level={{ effort_map[eff] }}";
             assert_eq!(released, "Hi  Sx ", "{body}");
             assert_eq!(tokens, ["Hi ", " S", "x", " ST"], "{body}");
         }
+    }
+
+    /// The non-streamed twin: the reply is cut at "STOP", so the items are
+    /// those of the tokens whose text starts before the cut.
+    #[tokio::test]
+    async fn non_stream_logprobs_follow_the_stop_cut() {
+        fn script(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            ["Hi ", " S", "x", " ST", "OP", " tail"]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| lp_chunk(id, i as i64, t, -1.0))
+                .chain([Chunk::final_marker(id, "")])
+                .collect()
+        }
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true, "stop": ["STOP"]});
+        let text = serde_json::json!({"model": "mock-model", "prompt": "hi",
+            "logprobs": 1, "stop": ["STOP"]});
+        for (uri, payload) in [("/v1/chat/completions", chat), ("/v1/completions", text)] {
+            let (status, body) = post_text(chunk_list_app(script).await, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            let choice = &v["choices"][0];
+            let returned = choice["message"]["content"]
+                .as_str()
+                .or(choice["text"].as_str())
+                .unwrap();
+            assert_eq!(returned, "Hi  Sx ", "{body}");
+            assert_eq!(
+                lp_tokens(&choice["logprobs"]),
+                ["Hi ", " S", "x", " ST"],
+                "{uri}: {body}"
+            );
+        }
+    }
+
+    /// The non-streamed twin of the markup case: a reply that is a call has
+    /// no `content`, so no items either.
+    #[tokio::test]
+    async fn non_stream_logprobs_skip_tool_call_markup() {
+        fn script(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            [
+                "Checking <tool",
+                " now ",
+                "<tool_call>",
+                r#"{"name":"get_weather","arguments":{}}"#,
+                "</tool_call>",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| lp_chunk(id, i as i64, t, -1.0))
+            .chain([Chunk::final_marker(id, "")])
+            .collect()
+        }
+        let payload = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "logprobs": true});
+        let (status, body) = post_text(
+            chunk_list_app(script).await,
+            "/v1/chat/completions",
+            &payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{body}");
+        assert!(choice["message"]["content"].is_null(), "{body}");
+        assert!(choice["logprobs"].is_null(), "{body}");
     }
 
     /// With tools, content before a call carries its items; the call's
