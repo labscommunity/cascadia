@@ -631,8 +631,8 @@ enum GrammarVerdict {
 /// cannot do structured output, when xgrammar would take too long to compile
 /// the schema (it compiles inside the request with no time limit, and a
 /// worker stuck in a minutes-long compile answers nothing else), or when the
-/// schema does not compile. A best-effort constraint the backend rejects is
-/// dropped instead of refused. Tasks without a grammar pass straight through.
+/// schema does not compile. A best-effort constraint is dropped instead of
+/// refused in each of these cases. Tasks without a grammar pass straight through.
 fn check_grammar(
     task: &GenerationTask,
     unavailable: Option<&(UnenforcedReason, String)>,
@@ -657,6 +657,17 @@ fn check_grammar(
     // request body with that limit.)
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(schema) {
         if let Some(msg) = cascadia_grammar::xgrammar_cost_error(&value) {
+            if best_effort {
+                // A best-effort grammar (a forced tool call's) runs
+                // unconstrained rather than turn into a 400.
+                info!(task = %task.task_id, reason = %msg, "dropping a best-effort schema");
+                let reason = if msg.starts_with("xgrammar would reject") {
+                    UnenforcedReason::SchemaRejected
+                } else {
+                    UnenforcedReason::TooComplex
+                };
+                return Ok(GrammarVerdict::Drop(reason));
+            }
             return Err(EngineError::InvalidConfig(format!(
                 "response_format json_schema: {msg}"
             )));
@@ -1129,6 +1140,12 @@ impl SchemaBudget {
             "ov-genai: refused a new response_format schema: the schema budget is full"
         );
         Err(BudgetFull)
+    }
+
+    /// How many distinct schemas have been let through.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
     }
 
     /// Counts `task`'s schema as let through to GenAI.
@@ -3861,6 +3878,65 @@ mod tests {
         // An ordinary schema still reaches `validate`.
         e.submit(schema_task("t2", SCHEMA_A)).unwrap();
         assert_eq!(st.lock().unwrap().validate_calls, 1);
+    }
+
+    /// A forced tool call's best-effort grammar whose `arguments` object has
+    /// `n` optional string properties.
+    fn forced_tool_schema(n: usize) -> String {
+        let props: Vec<String> = (0..n)
+            .map(|i| format!("\"p{i}\":{{\"type\":\"string\"}}"))
+            .collect();
+        format!(
+            r#"{{"type":"object","properties":{{"name":{{"const":"lookup"}},"arguments":{{"type":"object","properties":{{{}}}}}}},"required":["name","arguments"]}}"#,
+            props.join(",")
+        )
+    }
+
+    #[test]
+    fn a_best_effort_grammar_xgrammar_would_take_minutes_on_is_dropped() {
+        // ~1500 optional properties: well over xgrammar's compile limit.
+        let wide = forced_tool_schema(1500);
+        let t = soft_schema_task("w", &wide);
+        assert_eq!(
+            check_grammar(&t, None, |_| panic!("validate called")).unwrap(),
+            GrammarVerdict::Drop(UnenforcedReason::TooComplex)
+        );
+
+        // Through submit: sent unconstrained, counted, never validated, and
+        // not counted against the schema budget.
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        let before = unenforced(UnenforcedReason::TooComplex);
+        e.submit(soft_schema_task("t1", &wide)).unwrap();
+        assert!(!st.lock().unwrap().last_added_grammar, "sent unconstrained");
+        assert_eq!(st.lock().unwrap().validate_calls, 0);
+        assert_eq!(e.active[0].grammar_hash, None);
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+        assert_eq!(e.schema_budget.len(), 0);
+
+        // The same schema, strict: the 400 as before.
+        let err = e.submit(schema_task("t2", &wide)).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::InvalidConfig(m) if m.contains("xgrammar would take too long")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_best_effort_grammar_is_not_counted_against_the_budget() {
+        // Dropped by validation and by the probe gate: neither is recorded.
+        let st = Arc::new(Mutex::new(MockState {
+            validate_err: Some("unsupported keyword".into()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(soft_schema_task("a", SCHEMA_A)).unwrap();
+        assert_eq!(e.schema_budget.len(), 0);
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.structured_unavailable = Some((UnenforcedReason::ProbeFailed, "probe".into()));
+        e.submit(soft_schema_task("b", SCHEMA_A)).unwrap();
+        assert_eq!(e.schema_budget.len(), 0);
     }
 
     #[test]
