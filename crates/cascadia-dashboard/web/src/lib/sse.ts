@@ -35,6 +35,7 @@ export type ChatCompletionChunk = {
     index: number;
     /** `role` is only on the first delta. */
     delta: { role?: string; content?: string | null };
+    logprobs?: unknown;
     finish_reason: string | null;
   }[];
 };
@@ -83,9 +84,12 @@ export function countTokens(prev: TokenCount, chunk: ChatCompletionChunk): Token
   // that reports no per-chunk counts.
   const isFinal = choice === undefined || choice.finish_reason != null;
   const unchanged = hasContent && !isFinal && total === prev.total;
+  // A whole reply in one finishing chunk, with no count before it, says
+  // nothing about token timing either.
+  const onlyChunk = hasContent && isFinal && prev.total === 0;
   return {
     total,
-    unknownTokenBoundaries: prev.unknownTokenBoundaries || unchanged,
+    unknownTokenBoundaries: prev.unknownTokenBoundaries || unchanged || onlyChunk,
   };
 }
 
