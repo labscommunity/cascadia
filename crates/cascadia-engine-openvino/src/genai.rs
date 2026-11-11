@@ -417,8 +417,10 @@ fn ov_message(err: OvError) -> String {
 }
 
 /// Submit-time check of a task's output constraint: refuse it when this model
-/// cannot do structured output, or when the schema does not compile. Tasks
-/// without a grammar pass straight through.
+/// cannot do structured output, when xgrammar would take too long to compile
+/// the schema (it compiles inside the request with no time limit, and a
+/// worker stuck in a minutes-long compile answers nothing else), or when the
+/// schema does not compile. Tasks without a grammar pass straight through.
 fn check_grammar(
     task: &GenerationTask,
     unavailable: Option<&str>,
@@ -431,6 +433,16 @@ fn check_grammar(
         return Err(EngineError::InvalidConfig(format!(
             "structured output is not available for this model: {reason}"
         )));
+    }
+    // A schema that is not JSON is left to `validate` to report. (One nested
+    // deeper than serde_json's limit of 128 can't be: the API parses each
+    // request body with that limit.)
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(schema) {
+        if let Some(msg) = cascadia_grammar::xgrammar_cost_error(&value) {
+            return Err(EngineError::InvalidConfig(format!(
+                "response_format json_schema: {msg}"
+            )));
+        }
     }
     validate(schema).map_err(|err| {
         EngineError::InvalidConfig(format!(
@@ -2485,6 +2497,43 @@ mod tests {
         assert!(e.active.is_empty());
         // A plain task never runs the validator.
         e.submit(task("t2", 8)).unwrap();
+        assert_eq!(st.lock().unwrap().validate_calls, 1);
+    }
+
+    #[test]
+    fn check_grammar_refuses_a_schema_xgrammar_would_take_minutes_on() {
+        // 6000 optional properties: the schema that held a worker in
+        // xgrammar's compile for over 15 minutes.
+        let props: Vec<String> = (0..6000).map(|i| format!("\"p{i}\":{{}}")).collect();
+        let wide = format!(
+            r#"{{"type":"object","properties":{{{}}}}}"#,
+            props.join(",")
+        );
+        let t = schema_task("w", &wide);
+        let err = check_grammar(&t, None, |_| panic!("validate called")).unwrap_err();
+        match err {
+            EngineError::InvalidConfig(m) => assert!(
+                m.starts_with(
+                    "response_format json_schema: xgrammar would take too long to compile a \
+                     grammar for this schema"
+                ),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+
+        // Through submit: refused before `validate`, nothing enrolled.
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        let err = e.submit(schema_task("t1", &wide)).unwrap_err();
+        assert!(
+            err.to_string().contains("xgrammar would take too long"),
+            "{err}"
+        );
+        assert_eq!(st.lock().unwrap().validate_calls, 0);
+        assert!(st.lock().unwrap().added.is_empty());
+        // An ordinary schema still reaches `validate`.
+        e.submit(schema_task("t2", SCHEMA_A)).unwrap();
         assert_eq!(st.lock().unwrap().validate_calls, 1);
     }
 

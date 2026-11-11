@@ -596,6 +596,9 @@ pub use llama_cost::{
     llama_grammar_cost, llama_grammar_cost_error, LLAMA_VISIT_COST, MAX_LLAMA_GRAMMAR_COST,
 };
 
+mod xgrammar_cost;
+pub use xgrammar_cost::{xgrammar_cost, xgrammar_cost_error, MAX_XGRAMMAR_COST};
+
 mod stage_mask;
 pub use stage_mask::{
     MaskMiss, MaskRecvCache, MaskSendCache, WireMask, MASK_MISS_MESSAGE, MASK_MISS_TOKEN,
