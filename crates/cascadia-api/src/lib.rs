@@ -2527,7 +2527,9 @@ pub(crate) fn parse_tool_call_block(after: &str) -> Option<ToolCallBlock> {
 
 /// Byte length of the balanced JSON value starting at `s[0]` (`{` or `[`),
 /// string-/escape-aware so brackets inside string values don't miscount.
-/// `None` if `s` doesn't start with a bracket or never balances.
+/// `None` if `s` doesn't start with a bracket, or reaches a `<` outside a
+/// string (JSON has none there: it is markup, so the value is not JSON and
+/// the scan must not run on into the blocks after it) before balancing.
 fn balanced_json_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let (open, close) = match bytes.first()? {
@@ -2549,6 +2551,8 @@ fn balanced_json_end(s: &str) -> Option<usize> {
             }
         } else if b == b'"' {
             in_str = true;
+        } else if b == b'<' {
+            return None;
         } else if b == open {
             depth += 1;
         } else if b == close {
@@ -6513,6 +6517,41 @@ mod tests {
         assert_eq!(calls[1].function.name, "get_weather");
         let args = serde_json::from_str::<serde_json::Value>(&calls[1].function.arguments).unwrap();
         assert_eq!(args["city"], "Paris");
+    }
+
+    /// JSON has no `<` outside a string, so the bracket scan stops there:
+    /// an unbalanced block ends at its own closing tag instead of running
+    /// into the blocks after it.
+    #[test]
+    fn balanced_json_end_stops_at_markup() {
+        assert_eq!(balanced_json_end(r#"{"a":"<b>"}"#), Some(11));
+        assert_eq!(balanced_json_end("{</tool_call>}"), None);
+        assert_eq!(balanced_json_end("[1,<x>]"), None);
+        // A block missing its last brace no longer swallows the next call
+        // up to a stray brace further on.
+        let calls = parse_tool_calls(
+            r#"<tool_call>{"name":"a","arguments":{"x":1}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call> }"#,
+        )
+        .expect("the second call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "b");
+    }
+
+    /// Many blocks that never balance: each is parsed up to its own closing
+    /// tag, so the whole reply parses in linear time.
+    #[test]
+    fn parse_tool_calls_is_linear_in_unbalanced_blocks() {
+        let call = r#"<tool_call>{"name":"f","arguments":{}}</tool_call>"#;
+        let text = format!("{call}{}", "<tool_call>{</tool_call>".repeat(8000));
+        let started = std::time::Instant::now();
+        let calls = parse_tool_calls(&text).expect("the first call");
+        let elapsed = started.elapsed();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{elapsed:?} for {} bytes",
+            text.len()
+        );
     }
 
     #[test]

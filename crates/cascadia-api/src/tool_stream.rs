@@ -378,11 +378,16 @@ impl ToolCallEmitter {
             self.state = State::Block(block);
             return false;
         }
-        // Parsed once, whole, by the shared parser.
+        // Parsed once, whole, by the shared parser, which reads up to the
+        // block's closing tag, or to the end of the text when it has none.
         let after = block.after;
         let text = buf.get(after..).unwrap_or_default();
-        self.charge(text.len());
-        match parse_tool_call_block(text) {
+        let parsed = parse_tool_call_block(text);
+        self.charge(match &parsed {
+            Some(p) if text[..p.consumed].ends_with(TOOL_CALL_CLOSE) => p.consumed,
+            _ => text.len(),
+        });
+        match parsed {
             Some(parsed) => {
                 if let Some(call) = parsed.call {
                     let index = self.next_index();
@@ -396,9 +401,10 @@ impl ToolCallEmitter {
     }
 
     /// Whether a block parsed whole has all its text: a JSON value and a
-    /// closing tag after it, or for any other form, a closing tag. A closing
-    /// tag inside an unbalanced JSON value may be argument text, so it does
-    /// not count.
+    /// closing tag after it, or for any other form (including a value that
+    /// reaches a `<` outside a string before it balances), a closing tag. A
+    /// closing tag inside a string of an unbalanced JSON value may be
+    /// argument text, so it does not count.
     fn block_closed(&mut self, block: &mut Block, buf: &str, lead: usize) -> bool {
         let whole = block
             .whole
@@ -416,7 +422,10 @@ impl ToolCallEmitter {
                     work += scan.pos - from;
                     match scanned {
                         Scanned::Closed(at) => *whole = Whole::Tag(Finder::new(at)),
-                        Scanned::Tag(_) | Scanned::Wait => break false,
+                        // Not JSON: as `parse_tool_call_block`, the block
+                        // runs to its first closing tag.
+                        Scanned::Tag(_) => *whole = Whole::Tag(Finder::new(block.after)),
+                        Scanned::Wait => break false,
                     }
                 }
                 Whole::Tag(finder) => {
@@ -598,14 +607,17 @@ struct JsonScan {
     esc: bool,
     open: u8,
     close: u8,
-    /// Stop at a closing tag outside any string (a streamed call).
+    /// Stop at a closing tag outside any string (a streamed call); when
+    /// unset, at any `<` outside a string (a value parsed whole, which then
+    /// is not JSON, as `balanced_json_end` reads it).
     tags: bool,
 }
 
 enum Scanned {
     /// The value closed; the byte after its closing bracket.
     Closed(usize),
-    /// A closing tag outside any string starts here.
+    /// A closing tag (or, for a value parsed whole, any `<`) outside any
+    /// string starts here.
     Tag(usize),
     /// Out of text (or at a `<` that may start a closing tag).
     Wait,
@@ -660,7 +672,9 @@ impl JsonScan {
                     self.pos += 1;
                     return Scanned::Closed(self.pos);
                 }
-            } else if b == b'<' && self.tags {
+            } else if b == b'<' && !self.tags {
+                return Scanned::Tag(self.pos);
+            } else if b == b'<' {
                 // JSON has no `<` outside a string, so this is markup.
                 let rest = buf.get(self.pos..).unwrap_or_default();
                 if rest.starts_with(TOOL_CALL_CLOSE.as_bytes()) {
@@ -1097,6 +1111,11 @@ mod tests {
                 1,
             ),
             (format!("<think>{big}</think>{call}"), true, 1),
+            (
+                format!("{call}{}", "<tool_call>{</tool_call>".repeat(4000)),
+                false,
+                1,
+            ),
         ];
         for (text, thinking, want_calls) in &texts {
             let started = std::time::Instant::now();
@@ -1132,6 +1151,32 @@ mod tests {
                 "{elapsed:?}: {head}"
             );
         }
+    }
+
+    /// Blocks that never balance, decided only when the reply ends: each is
+    /// parsed up to its own closing tag, not to the end of the reply.
+    #[test]
+    fn unbalanced_blocks_decided_at_the_end_cost_linear_work() {
+        let call = r#"<tool_call>{"name":"f","arguments":{}}</tool_call>"#;
+        let text = format!("{call}{}", "<tool_call>{</tool_call>".repeat(4000));
+        let started = std::time::Instant::now();
+        let mut splitter = ToolStreamSplitter::new(false);
+        splitter.feed(&text);
+        let mut emitter = ToolCallEmitter::new(false);
+        let events: Vec<(usize, CallEvent)> = emitter
+            .finish(splitter.text(), splitter.scan_from())
+            .into_iter()
+            .map(|e| (text.len(), e))
+            .collect();
+        let elapsed = started.elapsed();
+        assert_eq!(assemble(&events).len(), 1);
+        assert!(
+            emitter.work < 8 * text.len(),
+            "work {} for {} bytes",
+            emitter.work,
+            text.len()
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
 
     /// A call object that repeats a key: the stream has already sent the
