@@ -1147,16 +1147,20 @@ impl SchemaBudget {
             .is_none_or(|s| self.seen.contains(s) || self.seen.len() < MAX_DISTINCT_SCHEMAS)
     }
 
-    /// [`Self::check`] at submit: a best-effort grammar (a forced tool
-    /// call's) the budget has no room for is dropped (counted as
-    /// `too_complex`: the closest reason, as the schema is over a limit of
+    /// [`Self::check`] at submit. While no rebuild may start
+    /// (`may_rebuild` false: [`REBUILD_FLOOR`] holds), a best-effort grammar
+    /// (a forced tool call's) the budget has no room for is dropped (counted
+    /// as `too_complex`: the closest reason, as the schema is over a limit of
     /// this worker's, not refused by the backend and not a passing load) and
     /// the task runs unconstrained; a strict one gets the refusal. A drop is
     /// not a refusal: it neither counts in `refused` nor logs the budget-full
-    /// warning. Run before [`Self::record`], which then counts nothing for a
-    /// dropped grammar.
-    fn admit(&mut self, task: &mut GenerationTask) -> Result<(), BudgetFull> {
-        if !self.has_room(task)
+    /// warning. When a rebuild may start, a best-effort grammar is refused
+    /// like a strict one, so it triggers the rebuild (see
+    /// [`after_best_effort_rebuild`]). Run before [`Self::record`], which then
+    /// counts nothing for a dropped grammar.
+    fn admit(&mut self, task: &mut GenerationTask, may_rebuild: bool) -> Result<(), BudgetFull> {
+        if !may_rebuild
+            && !self.has_room(task)
             && crate::structured::drop_best_effort_grammar(task, UnenforcedReason::TooComplex)
         {
             return Ok(());
@@ -1310,6 +1314,24 @@ fn budget_full_error(note: RebuildNote) -> EngineError {
          keeps each compiled grammar for the pipeline's life); schemas it has already served \
          keep working, and {next}"
     ))
+}
+
+/// `task` carries a best-effort grammar (a forced tool call's).
+fn is_best_effort(task: &GenerationTask) -> bool {
+    task.grammar.as_ref().is_some_and(|g| g.best_effort)
+}
+
+/// A best-effort grammar whose refusal by a full budget rebuilt the
+/// pipeline: it runs on the new pipeline, constrained, unless the rebuilt
+/// pipeline failed its structured-output check (`unavailable`), when it is
+/// dropped for that reason. Never refused: the new budget has room.
+fn after_best_effort_rebuild(
+    task: &mut GenerationTask,
+    unavailable: Option<&(UnenforcedReason, String)>,
+) {
+    if let Some((why, _)) = unavailable {
+        crate::structured::drop_best_effort_grammar(task, *why);
+    }
 }
 
 /// The time source of the rebuild schedule. Injectable so the floor, its
@@ -1559,17 +1581,28 @@ impl Engine for OvGenaiEngine {
         admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
-        if self.schema_budget.admit(&mut task).is_err() {
-            if let Some(err) = self.budget_full() {
-                return Err(err);
-            }
-            // Rebuilt: admitted on the new pipeline, whose check and budget
-            // (which counts the schemas still queued) it must pass too.
-            admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
-                self.pipe.validate_json_schema(s)
-            })?;
-            if self.schema_budget.check(&task).is_err() {
-                return Err(budget_full_error(RebuildNote::Rebuilt));
+        let may_rebuild = self.rebuild.wait().is_none();
+        if self.schema_budget.admit(&mut task, may_rebuild).is_err() {
+            if !is_best_effort(&task) {
+                if let Some(err) = self.budget_full() {
+                    return Err(err);
+                }
+                // Rebuilt: admitted on the new pipeline, whose check and
+                // budget (which counts the schemas still queued) it must
+                // pass too.
+                admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
+                    self.pipe.validate_json_schema(s)
+                })?;
+                if self.schema_budget.check(&task).is_err() {
+                    return Err(budget_full_error(RebuildNote::Rebuilt));
+                }
+            } else {
+                // Nothing runs between steps: rebuild now, then go on.
+                self.rebuild_pipeline();
+                if let Some(err) = self.rebuild.refusal() {
+                    return Err(err);
+                }
+                after_best_effort_rebuild(&mut task, self.structured_unavailable.as_ref());
             }
         }
         self.schema_budget.record(&task);
@@ -2058,17 +2091,35 @@ impl Engine for OvGenaiCbEngine {
         admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
-        if self.schema_budget.admit(&mut task).is_err() {
-            if let Some(err) = self.budget_full() {
-                return Err(err);
-            }
-            // Rebuilt: admitted on the new pipeline, whose check and budget
-            // (which counts the schemas still queued) it must pass too.
-            admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
-                self.pipe.validate_json_schema(s)
-            })?;
-            if self.schema_budget.check(&task).is_err() {
-                return Err(budget_full_error(RebuildNote::Rebuilt));
+        let may_rebuild = self.rebuild.wait().is_none();
+        if self.schema_budget.admit(&mut task, may_rebuild).is_err() {
+            if !is_best_effort(&task) {
+                if let Some(err) = self.budget_full() {
+                    return Err(err);
+                }
+                // Rebuilt: admitted on the new pipeline, whose check and
+                // budget (which counts the schemas still queued) it must
+                // pass too.
+                admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
+                    self.pipe.validate_json_schema(s)
+                })?;
+                if self.schema_budget.check(&task).is_err() {
+                    return Err(budget_full_error(RebuildNote::Rebuilt));
+                }
+            } else {
+                if !self.active.is_empty() {
+                    // The rebuild waits for the requests in flight: this one
+                    // gets the drain's retryable 503, as any request would now.
+                    self.start_drain();
+                    return Err(EngineError::Unavailable(
+                        cascadia_engine::PIPELINE_REBUILDING.to_owned(),
+                    ));
+                }
+                self.rebuild_pipeline();
+                if let Some(err) = self.rebuild.refusal() {
+                    return Err(err);
+                }
+                after_best_effort_rebuild(&mut task, self.structured_unavailable.as_ref());
             }
         }
         let schema = grammar_json_schema(&task);
@@ -2449,6 +2500,13 @@ impl OvGenaiCbEngine {
             self.rebuild_pipeline();
             return self.rebuild.refusal();
         }
+        self.start_drain();
+        Some(budget_full_error(RebuildNote::AfterDrain))
+    }
+
+    /// Stop admitting work until the requests in flight finish (at most
+    /// [`REBUILD_DRAIN_CAP`]); the next request then rebuilds the pipeline.
+    fn start_drain(&mut self) {
         self.rebuild.draining_since = Some(self.rebuild.clock.now());
         warn!(
             in_flight = self.active.len(),
@@ -2456,7 +2514,6 @@ impl OvGenaiCbEngine {
             "ov-genai cb: the response_format schema budget is full; admitting nothing until \
              the requests in flight finish, then rebuilding the pipeline"
         );
-        Some(budget_full_error(RebuildNote::AfterDrain))
     }
 
     /// Once the drain for a rebuild has run [`REBUILD_DRAIN_CAP`], cut what
@@ -4027,17 +4084,17 @@ mod tests {
         let mut budget = SchemaBudget::default();
         for i in 0..MAX_DISTINCT_SCHEMAS {
             let mut t = soft_schema_task("t", &forced_tool_schema(i + 1));
-            budget.admit(&mut t).unwrap();
+            budget.admit(&mut t, false).unwrap();
             budget.record(&t);
         }
         let mut over = soft_schema_task("over", &forced_tool_schema(MAX_DISTINCT_SCHEMAS + 1));
-        budget.admit(&mut over).unwrap();
+        budget.admit(&mut over, false).unwrap();
         assert_eq!(over.grammar, None, "dropped");
         budget.record(&over);
         assert_eq!(budget.len(), MAX_DISTINCT_SCHEMAS);
         assert_eq!((budget.refused, budget.full_warnings), (0, 0));
         let mut obj = soft_schema_task("obj", JSON_OBJECT_PROBE);
-        budget.admit(&mut obj).unwrap();
+        budget.admit(&mut obj, false).unwrap();
         assert!(obj.grammar.is_some(), "json_object kept");
         assert_eq!((budget.refused, budget.full_warnings), (0, 0));
     }
@@ -6144,5 +6201,208 @@ mod tests {
         };
         install_keep_tokens(&mut spy, &keep);
         assert_eq!(spy.calls.len(), 1);
+    }
+
+    // ---- A best-effort grammar past a full schema budget -------------------
+
+    /// While the rebuild floor holds, a best-effort grammar past the budget
+    /// is dropped (too_complex) and the task runs unconstrained: no 400, no
+    /// refusal counted, nothing recorded. A strict one in the same state
+    /// gets the budget-full 400.
+    #[test]
+    fn stateful_best_effort_past_the_budget_under_the_floor_is_dropped_and_strict_gets_the_400() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = stateful_full_budget(&clock);
+        clock.advance(Duration::from_secs(1));
+        // Back under the floor: rebuild once (the schema that triggered it
+        // is admitted on the new pipeline), then fill the new budget.
+        e.submit(schema_task("trigger", &full_budget_body(1000)))
+            .unwrap();
+        for i in 0..MAX_DISTINCT_SCHEMAS - 1 {
+            e.submit(schema_task(&format!("u{i}"), &full_budget_body(2000 + i)))
+                .unwrap();
+        }
+        while !e.pending.is_empty() {
+            e.step().unwrap();
+        }
+        assert!(e.rebuild.wait().is_some(), "the floor holds");
+        let builds = st.lock().unwrap().builds;
+
+        let before = unenforced(UnenforcedReason::TooComplex);
+        e.submit(soft_schema_task("soft", &full_budget_body(3000)))
+            .unwrap();
+        assert_eq!(e.pending.last().unwrap().grammar, None, "dropped");
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+        assert_eq!(
+            (e.schema_budget.refused, e.schema_budget.full_warnings),
+            (0, 0)
+        );
+        assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
+        assert_eq!(st.lock().unwrap().builds, builds, "no rebuild");
+
+        let m = refusal(e.submit(schema_task("strict", &full_budget_body(3001))));
+        assert!(
+            m.starts_with(
+                "structured output is not available for this model: this worker has reached its \
+                 limit of 64 distinct response_format schemas per pipeline"
+            ) && m.contains("the next rebuild can start in"),
+            "{m}"
+        );
+        assert_eq!(e.schema_budget.refused, 1);
+    }
+
+    /// Past the budget with a rebuild allowed, a best-effort grammar
+    /// triggers the rebuild like a strict one, then runs constrained on the
+    /// new pipeline (it is not refused: the budget has room again).
+    #[test]
+    fn stateful_best_effort_past_the_budget_rebuilds_then_runs_constrained() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = stateful_full_budget(&clock);
+        let body = full_budget_body(1000);
+        e.submit(soft_schema_task("soft", &body)).unwrap();
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(&st.lock().unwrap().events[..2], ["drop p0", "build"]);
+        assert!(e.pending[0].grammar.is_some(), "still constrained");
+        assert!(e.schema_budget.seen.contains(&body));
+        assert_eq!(e.schema_budget.refused, 0);
+        let out = e.step().unwrap();
+        assert_eq!(out[0].0, "soft");
+        assert!(out[0].1.is_final && out[0].1.error.is_none());
+    }
+
+    /// The rebuilt pipeline fails the structured-output check: the
+    /// best-effort grammar that triggered the rebuild is dropped as
+    /// probe_failed and the task runs unconstrained.
+    #[test]
+    fn stateful_best_effort_after_a_rebuild_whose_check_fails_runs_unconstrained() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = stateful_full_budget(&clock);
+        st.lock().unwrap().probe_answer = Some("Hello".into());
+        let before = unenforced(UnenforcedReason::ProbeFailed);
+        e.submit(soft_schema_task("soft", &full_budget_body(1000)))
+            .unwrap();
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(e.pending[0].grammar, None);
+        assert!(unenforced(UnenforcedReason::ProbeFailed) > before);
+        assert!(e.schema_budget.seen.is_empty());
+    }
+
+    /// A failed rebuild is a node fault: the best-effort request gets the
+    /// same 5xx as everyone.
+    #[test]
+    fn a_failed_rebuild_fails_a_best_effort_request_too() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = stateful_full_budget(&clock);
+        st.lock().unwrap().build_err = Some("device lost".into());
+        assert!(matches!(
+            e.submit(soft_schema_task("soft", &full_budget_body(1000))),
+            Err(EngineError::Backend(_))
+        ));
+
+        let (mut e, st) = cb_full_budget(&clock);
+        st.lock().unwrap().build_err = Some("device lost".into());
+        assert!(matches!(
+            e.submit(soft_schema_task("soft", &full_budget_body(1000))),
+            Err(EngineError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn cb_best_effort_past_the_budget_on_an_idle_engine_rebuilds_then_runs_constrained() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = cb_full_budget(&clock);
+        let body = full_budget_body(1000);
+        e.submit(soft_schema_task("soft", &body)).unwrap();
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert!(st.lock().unwrap().last_added_grammar, "sent constrained");
+        assert!(e.active.last().unwrap().grammar_hash.is_some());
+        assert!(e.schema_budget.seen.contains(&body));
+        assert_eq!(e.schema_budget.refused, 0);
+    }
+
+    /// With requests in flight, a best-effort grammar past the budget starts
+    /// the drain as a strict one does, and takes the drain's retryable 503
+    /// (not the 400); once the drain is over its retry rebuilds and runs
+    /// constrained.
+    #[test]
+    fn cb_best_effort_past_the_budget_with_requests_in_flight_starts_the_drain() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = cb_full_budget(&clock);
+        st.lock().unwrap().default_read =
+            Some(read_of(CbStatus::Running, 1, "x", CbFinish::Unknown));
+        e.submit(task("a", 8)).unwrap();
+        let body = full_budget_body(1000);
+        match e.submit(soft_schema_task("soft", &body)) {
+            Err(EngineError::Unavailable(m)) => {
+                assert_eq!(m, cascadia_engine::PIPELINE_REBUILDING)
+            }
+            other => panic!("expected the drain's 503, got {other:?}"),
+        }
+        assert!(e.rebuild.draining_since.is_some());
+        assert!(st.lock().unwrap().events.is_empty(), "nothing is cut");
+
+        st.lock().unwrap().default_read = Some(finished_read());
+        e.step().unwrap();
+        assert!(e.active.is_empty());
+        e.submit(soft_schema_task("soft", &body)).unwrap();
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+        assert!(st.lock().unwrap().last_added_grammar, "sent constrained");
+        assert!(e.schema_budget.seen.contains(&body));
+    }
+
+    /// During a drain every submit gets the retryable 503, a best-effort
+    /// one included: it is not a grammar error, nothing is dropped.
+    #[test]
+    fn cb_best_effort_during_a_drain_gets_unavailable_like_any_request() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, _st, _) = cb_draining(&clock);
+        for body in [full_budget_body(0), full_budget_body(5000)] {
+            assert!(matches!(
+                e.submit(soft_schema_task("soft", &body)),
+                Err(EngineError::Unavailable(_))
+            ));
+        }
+    }
+
+    /// CB under the floor: the best-effort grammar is dropped and runs now,
+    /// a strict one gets the budget-full 400 that says when the next
+    /// rebuild can start.
+    #[test]
+    fn cb_best_effort_past_the_budget_under_the_floor_is_dropped_and_strict_gets_the_400() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine_at(&st, &clock);
+        cb_fill_and_finish(&mut e, &st, 0);
+        e.submit(soft_schema_task("soft", &full_budget_body(1000)))
+            .unwrap();
+        assert!(!st.lock().unwrap().last_added_grammar, "sent unconstrained");
+        assert!(st.lock().unwrap().events.is_empty(), "no rebuild");
+        assert_eq!(e.schema_budget.refused, 0);
+        assert_eq!(
+            refusal(e.submit(schema_task("strict", &full_budget_body(1001)))),
+            BUDGET_FULL_400
+        );
+    }
+
+    /// Every pipeline built from a recipe, a rebuilt one included, is
+    /// handed the recipe's keep list.
+    #[test]
+    fn a_pipeline_built_from_the_recipe_gets_its_keep_tokens() {
+        let keep = tool_marker_ids(&crate::decode_keep::tests::marker_tokenizer());
+        let recipe = PipelineRecipe {
+            model_path: "m".into(),
+            device: "CPU".into(),
+            plugin: PluginConfig::default(),
+            kind: PipelineKind::Plain,
+            keep: keep.clone(),
+        };
+        let spy = recipe.with_keep_tokens(KeepSpy::default());
+        assert_eq!(spy.calls, vec![keep]);
+        let recipe = PipelineRecipe {
+            keep: Vec::new(),
+            ..recipe
+        };
+        assert!(recipe.with_keep_tokens(KeepSpy::default()).calls.is_empty());
     }
 }
