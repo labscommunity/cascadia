@@ -26,8 +26,15 @@ const SKIP_KEYWORDS: &[&str] = &[
 /// `maximum: 10^18 - 1`, and without a lower bound `minimum: -(10^18 - 1)`.
 /// Both JSON grammars (xgrammar, llguidance) allow an integer of any length,
 /// and a small model in JSON mode can repeat digits until it runs out of
-/// tokens; 18 digits are more than an `i64` id or a count needs. Only
-/// narrows, so every output still matches the client's schema.
+/// tokens; 18 digits are more than an `i64` id or a count needs.
+///
+/// Where a schema is used directly, this only narrows it. A `$defs` entry
+/// is bounded once for every place that names it, so a `$ref` reached from
+/// under `not`, `if`, `contains` with `maxContains`, or one member of a
+/// `oneOf`, lands on the bounded copy, and what those keywords match can
+/// widen. Neither backend enforces those keywords (the API flags `not`,
+/// `if`, `contains` and `maxContains` as not enforced, and `oneOf` is
+/// matched as `anyOf`), so the outputs either backend allows are unchanged.
 ///
 /// Left as they are: `number` (llguidance can't bound a fraction's length
 /// and xgrammar already caps it at 6 digits; a bound on a type list that
