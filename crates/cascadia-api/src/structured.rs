@@ -3320,7 +3320,10 @@ mod tests {
     #[tokio::test]
     async fn a_best_effort_schema_over_the_budget_is_built_once() {
         let check = SchemaCompileCheck::new(1, Duration::from_millis(500), Duration::from_nanos(1));
-        let body = r#"{"type":"object","properties":{"a":{"type":"string"}}}"#;
+        // A build long enough that it can't end before the 1 ns timer is
+        // first polled.
+        let wide = wide_optional_object().body;
+        let body = wide.as_str();
         let soft = GrammarSpec::best_effort_json_schema(body);
         assert_eq!(check.check(&soft).await, Err(SchemaCheckError::TooComplex));
         // The only permit taken (once the abandoned build lets go of it).
@@ -3354,9 +3357,9 @@ mod tests {
         check.clock = Clock(Arc::new(move || {
             base + Duration::from_secs(clock.load(Ordering::Relaxed))
         }));
-        let soft = GrammarSpec::best_effort_json_schema(
-            r#"{"type":"object","properties":{"a":{"type":"string"}}}"#,
-        );
+        // A build long enough that it can't end before the 1 ns timer is
+        // first polled.
+        let soft = GrammarSpec::best_effort_json_schema(wide_optional_object().body);
         assert_eq!(check.check(&soft).await, Err(SchemaCheckError::TooComplex));
         // With the only permit taken, a remembered schema is `TooComplex`
         // and one tried again is `Busy`.
