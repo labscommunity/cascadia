@@ -242,6 +242,116 @@ pub(crate) fn content_delta(content: &str) -> serde_json::Map<String, serde_json
     delta
 }
 
+/// A logprob as sent: OpenAI writes `-9999.0` for a probability too small
+/// to represent, and serde_json would write a non-finite value as `null`,
+/// which the schema rejects. A finite f32 goes through its own shortest
+/// decimal form, so `-0.1` is not sent as `-0.10000000149011612`.
+fn wire_logprob(logprob: f32) -> f64 {
+    if logprob.is_finite() {
+        logprob.to_string().parse().unwrap_or(f64::from(logprob))
+    } else {
+        -9999.0
+    }
+}
+
+/// One entry of OpenAI's `logprobs.content`: the token, its logprob, its
+/// UTF-8 bytes and the alternatives in the same shape. The engine's token
+/// ids stay off the wire.
+pub(crate) fn spec_logprob(lp: &cascadia_types::TokenLogprobs) -> serde_json::Value {
+    let top: Vec<serde_json::Value> = lp
+        .top_logprobs
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "token": t.token,
+                "logprob": wire_logprob(t.logprob),
+                "bytes": t.token.as_bytes(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "token": lp.token,
+        "logprob": wire_logprob(lp.logprob),
+        "bytes": lp.token.as_bytes(),
+        "top_logprobs": top,
+    })
+}
+
+/// OpenAI's choice `logprobs` object over `items`.
+pub(crate) fn spec_logprobs(items: &[cascadia_types::TokenLogprobs]) -> serde_json::Value {
+    let content: Vec<serde_json::Value> = items.iter().map(spec_logprob).collect();
+    serde_json::json!({ "content": content, "refusal": null })
+}
+
+/// The logprob items of a stream whose text has not gone out yet. Text can
+/// be held back (by the `stop` matcher, or while it may start a tool call)
+/// and released later in other pieces, so each item is kept with the byte
+/// offset its token's text starts at in the stream's text, and goes out with
+/// the frame that releases that byte. Items of text that is never released
+/// (cut by a `stop` match, or tool-call markup) are dropped by
+/// [`finish`](Self::finish).
+pub(crate) struct LogprobQueue {
+    /// The request asked for logprobs; otherwise every frame says `null`.
+    asked: bool,
+    items: std::collections::VecDeque<(usize, cascadia_types::TokenLogprobs)>,
+    /// Bytes of text the engine has produced so far.
+    pushed: usize,
+    /// Bytes of that text released so far.
+    released: usize,
+}
+
+impl LogprobQueue {
+    pub(crate) fn new(asked: bool) -> Self {
+        Self {
+            asked,
+            items: std::collections::VecDeque::new(),
+            pushed: 0,
+            released: 0,
+        }
+    }
+
+    /// Records the next `len` bytes of text and, when the engine gave one,
+    /// their item.
+    pub(crate) fn push(&mut self, len: usize, item: Option<&cascadia_types::TokenLogprobs>) {
+        if let (true, Some(item)) = (self.asked, item) {
+            self.items.push_back((self.pushed, item.clone()));
+        }
+        self.pushed += len;
+    }
+
+    /// The next `len` bytes go out: the `logprobs` value of their frame, the
+    /// items whose text starts in them, or `null` when there are none. A
+    /// frame with no text carries `null`.
+    pub(crate) fn release(&mut self, len: usize) -> serde_json::Value {
+        if len == 0 {
+            return serde_json::Value::Null;
+        }
+        self.released += len;
+        let mut out = Vec::new();
+        while let Some((start, _)) = self.items.front() {
+            if *start >= self.released {
+                break;
+            }
+            if let Some((_, item)) = self.items.pop_front() {
+                out.push(item);
+            }
+        }
+        if out.is_empty() {
+            serde_json::Value::Null
+        } else {
+            spec_logprobs(&out)
+        }
+    }
+
+    /// The last `len` bytes go out; nothing after them ever will, so the
+    /// items still held are dropped.
+    pub(crate) fn finish(&mut self, len: usize) -> serde_json::Value {
+        let out = self.release(len);
+        self.items.clear();
+        out
+    }
+}
+
 /// The SSE event that ends a stream which failed after its 200 headers went
 /// out: the OpenAI error object under `error`, so openai-python and -node
 /// raise `APIError` on it. `id` and `object: "error"` stay for clients that
@@ -439,5 +549,114 @@ mod chunk_tests {
         let tail = parse(&meta(true, false).usage_chunk("text_completion", counts));
         assert_eq!(tail["choices"], serde_json::json!([]));
         assert_eq!(tail["usage"], usage_json(2, 3));
+    }
+}
+
+#[cfg(test)]
+mod logprob_tests {
+    use super::*;
+    use cascadia_types::{TokenLogprobs, TopLogprob};
+
+    fn item(token: &str, logprob: f32) -> TokenLogprobs {
+        TokenLogprobs {
+            token: token.into(),
+            token_id: 7,
+            logprob,
+            top_logprobs: vec![
+                TopLogprob {
+                    token: token.into(),
+                    token_id: 7,
+                    logprob,
+                },
+                TopLogprob {
+                    token: "zz".into(),
+                    token_id: 8,
+                    logprob: f32::NEG_INFINITY,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn spec_logprob_has_bytes_and_no_token_id() {
+        assert_eq!(
+            spec_logprob(&item("é", -0.5)),
+            serde_json::json!({
+                "token": "é", "logprob": -0.5, "bytes": [195, 169],
+                "top_logprobs": [
+                    {"token": "é", "logprob": -0.5, "bytes": [195, 169]},
+                    {"token": "zz", "logprob": -9999.0, "bytes": [122, 122]},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn non_finite_logprobs_become_the_floor_and_f32_prints_short() {
+        for bad in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            assert_eq!(spec_logprob(&item("a", bad))["logprob"], -9999.0);
+        }
+        // An f32 widened to f64 prints as -0.10000000149011612; the wire
+        // carries the f32's own shortest form.
+        assert_eq!(
+            spec_logprob(&item("a", -0.1))["logprob"].to_string(),
+            "-0.1"
+        );
+    }
+
+    #[test]
+    fn spec_logprobs_wraps_items_with_a_null_refusal() {
+        let v = spec_logprobs(&[item("a", -1.0), item("b", -2.0)]);
+        assert_eq!(v["refusal"], serde_json::Value::Null);
+        assert!(v.get("refusal").is_some());
+        let tokens: Vec<&str> = v["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["token"].as_str().unwrap())
+            .collect();
+        assert_eq!(tokens, ["a", "b"]);
+    }
+
+    fn tokens(v: &serde_json::Value) -> Vec<String> {
+        v["content"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|i| i["token"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn queue_sends_each_item_with_the_frame_that_releases_its_first_byte() {
+        let mut q = LogprobQueue::new(true);
+        q.push(3, Some(&item("ab ", -1.0)));
+        q.push(2, Some(&item(" S", -1.0)));
+        // " S": only " " released, the "S" held: the item goes out with it.
+        assert_eq!(tokens(&q.release(4)), ["ab ", " S"]);
+        q.push(1, Some(&item("x", -1.0)));
+        assert_eq!(tokens(&q.release(2)), ["x"]);
+        // Nothing released: nothing sent, the item waits.
+        q.push(2, Some(&item("ST", -1.0)));
+        assert!(q.release(0).is_null());
+        // The text from here on was cut: its item is dropped.
+        q.push(2, Some(&item("OP", -1.0)));
+        assert!(q.finish(0).is_null());
+        assert!(q.release(4).is_null());
+    }
+
+    #[test]
+    fn queue_skips_chunks_without_items_and_is_inert_when_not_asked() {
+        let mut q = LogprobQueue::new(true);
+        q.push(2, None);
+        q.push(1, Some(&item("c", -1.0)));
+        assert!(q.release(2).is_null());
+        assert_eq!(tokens(&q.finish(1)), ["c"]);
+        let mut off = LogprobQueue::new(false);
+        off.push(1, Some(&item("c", -1.0)));
+        assert!(off.release(1).is_null());
     }
 }

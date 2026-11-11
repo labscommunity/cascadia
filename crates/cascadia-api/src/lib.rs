@@ -1265,21 +1265,14 @@ impl ChatChoiceMessage {
     }
 }
 
-/// OpenAI chat `logprobs` object: one entry per generated token under
-/// `content`. An object only when the request set `logprobs: true` AND the
-/// engine emitted per-token logprobs; otherwise the choice carries `null`.
-#[derive(Serialize)]
-struct ChatLogprobs {
-    content: Vec<cascadia_types::TokenLogprobs>,
-}
-
 #[derive(Serialize)]
 struct ChatChoice {
     index: u32,
     message: ChatChoiceMessage,
     finish_reason: &'static str,
-    /// Required (nullable) by the OpenAI schema: serialized as `null` when absent.
-    logprobs: Option<ChatLogprobs>,
+    /// Required (nullable) by the OpenAI schema: [`stream_shape::spec_logprobs`]
+    /// when the request set `logprobs: true` and the engine sent any, else `null`.
+    logprobs: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -1375,13 +1368,11 @@ struct CompletionChoice {
     finish_reason: &'static str,
     // NOTE: the real OpenAI *legacy* completions `logprobs` object has a
     // different shape than chat's (`{tokens, token_logprobs, top_logprobs,
-    // text_offset}` vs chat's `{content: [...]}`). We reuse the chat-style
-    // `ChatLogprobs` here for now; it's moot until an engine actually emits
-    // per-token logprobs (none do yet — same deferral as #14), at which point
-    // converting to the legacy schema is the follow-up. The field is `null`
-    // when empty (the OpenAI schema requires it, nullable), so a legacy client
-    // sees no malformed object today.
-    logprobs: Option<ChatLogprobs>,
+    // text_offset}` vs chat's `{content: [...]}`). The chat shape is sent here
+    // for now, through the same converter, so engine token ids stay off the
+    // wire; converting to the legacy schema is the follow-up. `null` when not
+    // asked for or empty (the OpenAI schema requires the key, nullable).
+    logprobs: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -3096,6 +3087,11 @@ async fn chat_completions(
             };
         }
     }
+    let logprobs = if req.logprobs_count() > 0 && !logprobs_content.is_empty() {
+        stream_shape::spec_logprobs(&logprobs_content)
+    } else {
+        serde_json::Value::Null
+    };
     Json(ChatCompletionResponse {
         id: task_id,
         object: "chat.completion",
@@ -3106,13 +3102,7 @@ async fn chat_completions(
             index: 0,
             message,
             finish_reason,
-            logprobs: if logprobs_content.is_empty() {
-                None
-            } else {
-                Some(ChatLogprobs {
-                    content: logprobs_content,
-                })
-            },
+            logprobs,
         }],
         // From the engine's final chunk; 0 when the engine can't tell
         // (e.g. an engine that reports no prompt-token count).
@@ -3304,6 +3294,11 @@ async fn completions(
         buf
     };
 
+    let logprobs = if req.logprobs_count() > 0 && !logprobs_content.is_empty() {
+        stream_shape::spec_logprobs(&logprobs_content)
+    } else {
+        serde_json::Value::Null
+    };
     Json(CompletionResponse {
         id: task_id,
         object: "text_completion",
@@ -3314,13 +3309,7 @@ async fn completions(
             text,
             index: 0,
             finish_reason,
-            logprobs: if logprobs_content.is_empty() {
-                None
-            } else {
-                Some(ChatLogprobs {
-                    content: logprobs_content,
-                })
-            },
+            logprobs,
         }],
         usage: Usage::new(prompt_tokens, completion_tokens),
     })
@@ -3341,6 +3330,7 @@ async fn stream_text_completion(
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     let stop = task.sampling.stop.clone();
+    let logprobs_asked = task.logprobs > 0;
     let chunk_stream = match generate_in_window(&state, task).await {
         Ok(s) => s,
         Err(err) => {
@@ -3359,6 +3349,7 @@ async fn stream_text_completion(
         )),
         keepalive: KeepAlive::new(state.sse_keepalive),
         kind: TextStreamKind::Completion { echo: echo_prefix },
+        logprobs: stream_shape::LogprobQueue::new(logprobs_asked),
         // The raw-prompt endpoint streams the engine's text as is.
         marker: None,
         stop: StopMatcher::new(&stop),
@@ -3396,6 +3387,7 @@ async fn stream_completion(
     // scan the same way the non-streaming path does (see `tool_call_scan_text`).
     let enable_thinking = task.enable_thinking;
     let stop = StopMatcher::new(&task.sampling.stop);
+    let logprobs_asked = task.logprobs > 0;
 
     let chunk_stream = match generate_in_window(&state, task).await {
         Ok(s) => s,
@@ -3428,6 +3420,7 @@ async fn stream_completion(
             marker: state.marker_dialect.clone().map(MarkerFilter::new),
             stop,
             splitter: ToolStreamSplitter::new(enable_thinking),
+            logprobs: stream_shape::LogprobQueue::new(logprobs_asked),
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
             prompt_tokens: 0,
@@ -3472,6 +3465,7 @@ async fn stream_completion(
         chunks,
         keepalive: KeepAlive::new(state.sse_keepalive),
         kind: TextStreamKind::Chat,
+        logprobs: stream_shape::LogprobQueue::new(logprobs_asked),
         marker: state.marker_dialect.clone().map(MarkerFilter::new),
         stop,
         stats: state.stats.clone(),
@@ -3975,6 +3969,8 @@ struct TextStream {
     chunks: Option<EngineChunks>,
     keepalive: KeepAlive,
     kind: TextStreamKind,
+    /// Items wait here until the stop matcher releases their text.
+    logprobs: stream_shape::LogprobQueue,
     marker: Option<MarkerFilter>,
     stop: StopMatcher,
     stats: Arc<ApiStats>,
@@ -4012,13 +4008,14 @@ impl TextStream {
                 StreamNext::Chunk(None) => {
                     self.phase = ToolStreamPhase::Done;
                     let rest = self.stop.finish();
+                    let logprobs = self.logprobs.finish(rest.len());
                     let mut out = String::new();
                     if self.live.cancelled() {
-                        out.push_str(&self.frame(rest, Some("stop")));
+                        out.push_str(&self.frame(rest, Some("stop"), logprobs));
                     } else {
                         warn!(task = %self.meta.id, "engine stream ended without a final chunk; emitting SSE error");
                         if !rest.is_empty() {
-                            out.push_str(&self.frame(rest, None));
+                            out.push_str(&self.frame(rest, None, logprobs));
                         }
                         out.push_str(&stream_shape::error_frame(
                             &self.meta.id,
@@ -4066,6 +4063,7 @@ impl TextStream {
                 }
                 None => chunk.text.clone(),
             };
+            self.logprobs.push(text.len(), chunk.logprobs.as_ref());
             let mut released = self.stop.push(&text);
             let finish = if self.stop.stopped() {
                 // Cut at the match: end the choice here and finish the
@@ -4093,7 +4091,12 @@ impl TextStream {
                 // frame.
                 continue;
             }
-            let frame = self.frame(released, finish);
+            let logprobs = if finish.is_some() {
+                self.logprobs.finish(released.len())
+            } else {
+                self.logprobs.release(released.len())
+            };
+            let frame = self.frame(released, finish, logprobs);
             // Yield between chunks so the body-sink task can drain this
             // frame to TCP (see the note in `stream_completion`).
             tokio::task::yield_now().await;
@@ -4101,13 +4104,18 @@ impl TextStream {
         }
     }
 
-    fn frame(&mut self, mut text: String, finish_reason: Option<&str>) -> String {
+    fn frame(
+        &mut self,
+        mut text: String,
+        finish_reason: Option<&str>,
+        logprobs: serde_json::Value,
+    ) -> String {
         let counts = self.counts();
         match &mut self.kind {
             TextStreamKind::Chat => self.meta.chat_chunk(
                 stream_shape::content_delta(&text),
                 finish_reason,
-                serde_json::Value::Null,
+                logprobs,
                 counts,
             ),
             TextStreamKind::Completion { echo } => {
@@ -4115,7 +4123,7 @@ impl TextStream {
                     text.insert_str(0, &prefix);
                 }
                 self.meta
-                    .completion_chunk(&text, finish_reason, serde_json::Value::Null, counts)
+                    .completion_chunk(&text, finish_reason, logprobs, counts)
             }
         }
     }
@@ -4168,6 +4176,9 @@ struct ToolStream {
     /// parsing.
     stop: StopMatcher,
     splitter: ToolStreamSplitter,
+    /// Items wait here until the stop matcher and the splitter release
+    /// their text.
+    logprobs: stream_shape::LogprobQueue,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
     prompt_tokens: u32,
@@ -4223,12 +4234,13 @@ impl ToolStream {
                         ToolStreamEnd::Content(content)
                         | ToolStreamEnd::ToolCalls { content, .. } => content.to_owned(),
                     };
+                    let logprobs = self.logprobs.finish(content.len());
                     let mut out = String::new();
                     if !content.is_empty() {
                         out.push_str(&self.meta.chat_chunk(
                             stream_shape::content_delta(&content),
                             None,
-                            serde_json::Value::Null,
+                            logprobs,
                             counts,
                         ));
                     }
@@ -4264,7 +4276,9 @@ impl ToolStream {
                 }
                 t
             });
-            let mut text = self.stop.push(translated.as_deref().unwrap_or(&chunk.text));
+            let produced = translated.as_deref().unwrap_or(&chunk.text);
+            self.logprobs.push(produced.len(), chunk.logprobs.as_ref());
+            let mut text = self.stop.push(produced);
             let frame = if self.stop.stopped() {
                 // Cut at the match: close the choice on what came before it
                 // and finish the engine stream with `stop`, which cancels
@@ -4291,10 +4305,11 @@ impl ToolStream {
                 if content.is_empty() {
                     None
                 } else {
+                    let logprobs = self.logprobs.release(content.len());
                     Some(Bytes::from(self.meta.chat_chunk(
                         stream_shape::content_delta(content),
                         None,
-                        serde_json::Value::Null,
+                        logprobs,
                         counts,
                     )))
                 }
@@ -4321,16 +4336,18 @@ impl ToolStream {
             ToolStreamEnd::Content(content) => self.meta.chat_chunk(
                 stream_shape::content_delta(content),
                 Some(finish_reason),
-                null(),
+                self.logprobs.finish(content.len()),
                 counts,
             ),
+            // Items of the call markup never go out: `finish` drops them.
             ToolStreamEnd::ToolCalls { content, calls } => {
+                let logprobs = self.logprobs.finish(content.len());
                 let mut out = String::new();
                 if !content.is_empty() {
                     out.push_str(&self.meta.chat_chunk(
                         stream_shape::content_delta(content),
                         None,
-                        null(),
+                        logprobs,
                         counts,
                     ));
                 }
@@ -9906,6 +9923,252 @@ level={{ effort_map[eff] }}";
             .starts_with("alpha bravo"));
     }
 
+    // --- Logprobs on the wire ----------------------------------------------
+
+    /// A token chunk whose engine filled `logprobs`, with two alternatives.
+    fn lp_chunk(id: &cascadia_types::TaskId, i: i64, text: &str, logprob: f32) -> Chunk {
+        let mut chunk = Chunk::token(id, i, text);
+        chunk.logprobs = Some(cascadia_types::TokenLogprobs {
+            token: text.into(),
+            token_id: i,
+            logprob,
+            top_logprobs: vec![
+                cascadia_types::TopLogprob {
+                    token: text.into(),
+                    token_id: i,
+                    logprob,
+                },
+                cascadia_types::TopLogprob {
+                    token: "zz".into(),
+                    token_id: 99,
+                    logprob: -3.0,
+                },
+            ],
+        });
+        chunk
+    }
+
+    /// "Hi ", a multi-byte "é", a token whose logprob is `-inf`, then the end.
+    fn lp_script(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+        vec![
+            lp_chunk(id, 0, "Hi ", -0.5),
+            lp_chunk(id, 1, "é", -0.25),
+            lp_chunk(id, 2, "!", f32::NEG_INFINITY),
+            Chunk::final_marker(id, "")
+                .with_finish_reason(cascadia_types::FinishReason::Stop)
+                .with_prompt_tokens(2),
+        ]
+    }
+
+    /// The tokens of a `logprobs` value, in order (none for `null`).
+    fn lp_tokens(logprobs: &Value) -> Vec<String> {
+        logprobs["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|i| i["token"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn non_stream_logprobs_are_spec_shaped() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true, "top_logprobs": 2});
+        let (status, body) = post_text(
+            chunk_list_app(lp_script).await,
+            "/v1/chat/completions",
+            &chat,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("token_id"), "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+        let lp = &v["choices"][0]["logprobs"];
+        assert!(lp.get("refusal").is_some_and(Value::is_null), "{body}");
+        assert_eq!(lp_tokens(lp), ["Hi ", "é", "!"], "{body}");
+        assert_eq!(
+            lp["content"][1],
+            serde_json::json!({"token": "é", "logprob": -0.25, "bytes": [195, 169],
+            "top_logprobs": [
+                {"token": "é", "logprob": -0.25, "bytes": [195, 169]},
+                {"token": "zz", "logprob": -3.0, "bytes": [122, 122]},
+            ]})
+        );
+        assert_eq!(lp["content"][2]["logprob"], -9999.0, "{body}");
+
+        // Not asked: null, whatever the engine sent.
+        let plain = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}]});
+        let (_, body) = post_text(
+            chunk_list_app(lp_script).await,
+            "/v1/chat/completions",
+            &plain,
+        )
+        .await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v["choices"][0]["logprobs"].is_null(), "{body}");
+
+        // Completions go through the same converter: no `token_id`.
+        let text = serde_json::json!({"model": "mock-model", "prompt": "hi", "logprobs": 2});
+        let (status, body) =
+            post_text(chunk_list_app(lp_script).await, "/v1/completions", &text).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("token_id"), "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            lp_tokens(&v["choices"][0]["logprobs"]),
+            ["Hi ", "é", "!"],
+            "{body}"
+        );
+        let text = serde_json::json!({"model": "mock-model", "prompt": "hi"});
+        let (_, body) = post_text(chunk_list_app(lp_script).await, "/v1/completions", &text).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v["choices"][0]["logprobs"].is_null(), "{body}");
+    }
+
+    /// The streamed text of a choice: chat `delta.content` or completions `text`.
+    fn choice_text(choice: &Value) -> &str {
+        choice["delta"]["content"]
+            .as_str()
+            .or_else(|| choice["text"].as_str())
+            .unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn streamed_logprobs_ride_with_their_text() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}], "stream": true,
+            "logprobs": true, "top_logprobs": 2,
+            "stream_options": {"include_usage": true}});
+        let text = serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true,
+            "logprobs": 2, "stream_options": {"include_usage": true}});
+        for (uri, payload) in [("/v1/chat/completions", chat), ("/v1/completions", text)] {
+            let (status, body) = post_text(chunk_list_app(lp_script).await, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(!body.contains("token_id"), "{body}");
+            let mut seen = Vec::new();
+            for e in sse_events(&body) {
+                for choice in e["choices"].as_array().unwrap() {
+                    let lp = &choice["logprobs"];
+                    match choice_text(choice) {
+                        "" => assert!(lp.is_null(), "{body}"),
+                        t => {
+                            assert_eq!(lp_tokens(lp), [t], "{body}");
+                            assert!(lp.get("refusal").is_some_and(Value::is_null));
+                        }
+                    }
+                    seen.extend(lp["content"].as_array().into_iter().flatten().cloned());
+                }
+            }
+            assert_eq!(seen.len(), 3, "{body}");
+            assert_eq!(seen[1]["bytes"], serde_json::json!([195, 169]), "{body}");
+            assert_eq!(seen[2]["logprob"], -9999.0, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_not_asking_for_logprobs_send_null() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}], "stream": true});
+        let text = serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true});
+        for (uri, payload) in [("/v1/chat/completions", chat), ("/v1/completions", text)] {
+            let (_, body) = post_text(chunk_list_app(lp_script).await, uri, &payload).await;
+            for e in sse_events(&body) {
+                for choice in e["choices"].as_array().unwrap() {
+                    assert!(choice["logprobs"].is_null(), "{body}");
+                }
+            }
+        }
+    }
+
+    /// `stop` holds " S" back until "x" shows it is no match, then cuts at
+    /// "STOP": every released text carries the items of the tokens it
+    /// starts, and the cut tokens' items never go out.
+    #[tokio::test]
+    async fn streamed_logprobs_follow_the_stop_matcher() {
+        fn script(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            ["Hi ", " S", "x", " ST", "OP", " tail"]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| lp_chunk(id, i as i64, t, -1.0))
+                .chain([Chunk::final_marker(id, "")])
+                .collect()
+        }
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}], "stream": true,
+            "logprobs": true, "stop": ["STOP"]});
+        let text = serde_json::json!({"model": "mock-model", "prompt": "hi", "stream": true,
+            "logprobs": 1, "stop": ["STOP"]});
+        for (uri, payload) in [("/v1/chat/completions", chat), ("/v1/completions", text)] {
+            let (status, body) = post_text(chunk_list_app(script).await, uri, &payload).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let mut released = String::new();
+            let mut tokens = Vec::new();
+            for e in sse_events(&body) {
+                for choice in e["choices"].as_array().unwrap() {
+                    let t = choice_text(choice);
+                    let lp = &choice["logprobs"];
+                    if t.is_empty() {
+                        assert!(lp.is_null(), "{body}");
+                    } else {
+                        assert!(!lp_tokens(lp).is_empty(), "text without items: {body}");
+                    }
+                    released.push_str(t);
+                    tokens.extend(lp_tokens(lp));
+                }
+            }
+            assert_eq!(released, "Hi  Sx ", "{body}");
+            assert_eq!(tokens, ["Hi ", " S", "x", " ST"], "{body}");
+        }
+    }
+
+    /// With tools, content before a call carries its items; the call's
+    /// markup tokens send none.
+    #[tokio::test]
+    async fn streamed_logprobs_skip_tool_call_markup() {
+        fn script(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            [
+                "Checking <tool",
+                " now ",
+                "<tool_call>",
+                r#"{"name":"get_weather","arguments":{}}"#,
+                "</tool_call>",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| lp_chunk(id, i as i64, t, -1.0))
+            .chain([Chunk::final_marker(id, "")])
+            .collect()
+        }
+        let payload = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "stream": true, "logprobs": true});
+        let (status, body) = post_text(
+            chunk_list_app(script).await,
+            "/v1/chat/completions",
+            &payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut content = String::new();
+        let mut tokens = Vec::new();
+        for e in sse_events(&body) {
+            let choice = &e["choices"][0];
+            let t = choice_text(choice);
+            if t.is_empty() {
+                assert!(choice["logprobs"].is_null(), "{body}");
+            }
+            content.push_str(t);
+            tokens.extend(lp_tokens(&choice["logprobs"]));
+        }
+        assert!(body.contains("tool_calls"), "{body}");
+        assert_eq!(content, "Checking <tool now ", "{body}");
+        assert_eq!(tokens, ["Checking <tool", " now "], "{body}");
+    }
+
     /// Emits `parts` one per step (`gate` after the first holds the rest,
     /// sending progress markers, until it is set), then a final chunk; records every task it was told
     /// to cancel and how many parts it emitted.
@@ -10956,6 +11219,7 @@ level={{ effort_map[eff] }}";
             chunks: Some(chunks),
             keepalive: KeepAlive::new(SSE_KEEPALIVE_INTERVAL),
             kind,
+            logprobs: stream_shape::LogprobQueue::new(false),
             marker: None,
             stop: StopMatcher::new(&["STOP".to_owned()]),
             stats: Arc::new(ApiStats::default()),
@@ -10979,6 +11243,7 @@ level={{ effort_map[eff] }}";
             marker: None,
             stop: StopMatcher::new(&["STOP".to_owned()]),
             splitter: ToolStreamSplitter::new(false),
+            logprobs: stream_shape::LogprobQueue::new(false),
             stats: Arc::new(ApiStats::default()),
             completion: std::sync::atomic::AtomicU32::new(0),
             prompt_tokens: 0,
