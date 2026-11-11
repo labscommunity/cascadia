@@ -346,6 +346,7 @@ impl Builder for OvGenaiBuilder {
                 strikes: StrikeSet::default(),
                 compiled: QuarantineSet::default(),
                 schema_keys: RandomState::new(),
+                schema_budget: SchemaBudget::default(),
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -359,6 +360,7 @@ impl Builder for OvGenaiBuilder {
             pending: Vec::new(),
             max_tokens_default: 256,
             structured_unavailable: None,
+            schema_budget: SchemaBudget::default(),
         }))
     }
 }
@@ -818,6 +820,56 @@ impl StrikeSet {
 /// quarantined.
 const QUARANTINE_STRIKES: u32 = 2;
 
+/// Most distinct `response_format` schemas one pipeline lets through to
+/// GenAI. Its xgrammar backend keeps every compiled grammar for the
+/// pipeline's life, with no size limit and no way to evict one: about
+/// 30–50 MB each with a 151k-token vocabulary (process RSS, xgrammar 0.1.31),
+/// so a client sending ever-new schemas would grow the worker until it runs
+/// out of memory. 64 of them is about 2–3 GB.
+const MAX_DISTINCT_SCHEMAS: usize = 64;
+
+/// The distinct schemas let through to GenAI since the pipeline loaded (their
+/// text, at most 64 of the API's 64 KiB): past [`MAX_DISTINCT_SCHEMAS`] a new
+/// one is refused, one already let through still runs (GenAI compiles it
+/// from its cache).
+#[derive(Default)]
+struct SchemaBudget {
+    seen: HashSet<String>,
+}
+
+impl SchemaBudget {
+    /// Refuses `task` when its schema is new and the budget is full. Checked
+    /// before the request is handed to GenAI; [`Self::record`] counts it once
+    /// GenAI has taken it.
+    fn check(&self, task: &GenerationTask) -> EngineResult<()> {
+        let Some(schema) = grammar_json_schema(task) else {
+            return Ok(());
+        };
+        if self.seen.contains(schema) || self.seen.len() < MAX_DISTINCT_SCHEMAS {
+            return Ok(());
+        }
+        tracing::warn!(
+            distinct = self.seen.len(),
+            "ov-genai: refusing a new response_format schema: GenAI keeps every compiled grammar \
+             until the worker restarts"
+        );
+        Err(EngineError::InvalidConfig(format!(
+            "structured output is not available for this model: this worker keeps the compiled \
+             grammars of {MAX_DISTINCT_SCHEMAS} distinct response_format schemas and has no room \
+             for another; a schema it has served already still works, and a restart clears them"
+        )))
+    }
+
+    /// Counts `task`'s schema as let through to GenAI.
+    fn record(&mut self, task: &GenerationTask) {
+        if let Some(schema) = grammar_json_schema(task) {
+            if !self.seen.contains(schema) {
+                self.seen.insert(schema.to_owned());
+            }
+        }
+    }
+}
+
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
     /// The OpenVINO device string the pipeline was compiled for.
@@ -833,6 +885,7 @@ pub struct OvGenaiEngine {
     /// Set by the warmup probe when this model cannot do structured output;
     /// tasks with a grammar are then refused at submit with this reason.
     structured_unavailable: Option<String>,
+    schema_budget: SchemaBudget,
 }
 
 impl Engine for OvGenaiEngine {
@@ -912,6 +965,8 @@ impl Engine for OvGenaiEngine {
         check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
+        self.schema_budget.check(&task)?;
+        self.schema_budget.record(&task);
         self.pending.push(task);
         Ok(())
     }
@@ -1188,6 +1243,7 @@ pub struct OvGenaiCbEngine {
     compiled: QuarantineSet,
     /// Random keys for [`Self::schema_hash`], drawn once per engine.
     schema_keys: RandomState,
+    schema_budget: SchemaBudget,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -1322,6 +1378,7 @@ impl Engine for OvGenaiCbEngine {
         check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
+        self.schema_budget.check(&task)?;
         let max_tokens = if task.max_tokens > 0 {
             task.max_tokens
         } else {
@@ -1343,6 +1400,7 @@ impl Engine for OvGenaiCbEngine {
             .pipe
             .add_request(request_id, &task.prompt, &cfg)
             .map_err(map_ov_err)?;
+        self.schema_budget.record(&task);
         self.active.push(ActiveCbTask {
             prompt_tokens: self.pipe.count_tokens(&task.prompt),
             task_id: task.task_id,
@@ -2057,6 +2115,7 @@ mod tests {
             strikes: StrikeSet::default(),
             compiled: QuarantineSet::default(),
             schema_keys: RandomState::new(),
+            schema_budget: SchemaBudget::default(),
         }
     }
 
@@ -2498,6 +2557,33 @@ mod tests {
         // A plain task never runs the validator.
         e.submit(task("t2", 8)).unwrap();
         assert_eq!(st.lock().unwrap().validate_calls, 1);
+    }
+
+    #[test]
+    fn a_new_schema_past_the_budget_is_refused_and_a_seen_one_still_runs() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        let body = |i: usize| {
+            format!(r#"{{"type":"object","properties":{{"f{i}":{{"type":"integer"}}}}}}"#)
+        };
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            e.submit(schema_task(&format!("t{i}"), &body(i))).unwrap();
+        }
+        // One more distinct schema: refused, in the class a gateway moves to
+        // another node.
+        match e.submit(schema_task("over", &body(MAX_DISTINCT_SCHEMAS))) {
+            Err(EngineError::InvalidConfig(m)) => assert!(
+                m.starts_with(
+                    "structured output is not available for this model: this worker keeps"
+                ),
+                "{m}"
+            ),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        // A schema it already let through is served from GenAI's cache.
+        e.submit(schema_task("again", &body(0))).unwrap();
+        // Plain requests are never counted or refused.
+        e.submit(GenerationTask::new("plain", "hi")).unwrap();
     }
 
     #[test]
