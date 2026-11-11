@@ -871,6 +871,10 @@ const MAX_DISTINCT_SCHEMAS: usize = 64;
 #[derive(Default)]
 struct SchemaBudget {
     seen: HashSet<String>,
+    /// New schemas refused since the budget filled.
+    refused: u64,
+    /// Times the budget-full warning was logged: once per pipeline.
+    full_warnings: u32,
 }
 
 /// The schema [`SchemaBudget`] counts for `task`: a client's. json_object's
@@ -882,25 +886,39 @@ fn counted_schema(task: &GenerationTask) -> Option<&str> {
 }
 
 impl SchemaBudget {
-    /// Refuses `task` when its schema is new and the budget is full. Checked
-    /// before the request is handed to GenAI; [`Self::record`] counts it once
-    /// GenAI has taken it.
-    fn check(&self, task: &GenerationTask) -> EngineResult<()> {
+    /// Refuses `task` when its schema is new and the budget is full, and
+    /// counts the refusal. Checked before the request is handed to GenAI;
+    /// [`Self::record`] counts it once GenAI has taken it. The first refusal
+    /// is logged at WARN (the budget is full for the pipeline's life), each
+    /// one at DEBUG with the running count.
+    fn check(&mut self, task: &GenerationTask) -> EngineResult<()> {
         let Some(schema) = counted_schema(task) else {
             return Ok(());
         };
         if self.seen.contains(schema) || self.seen.len() < MAX_DISTINCT_SCHEMAS {
             return Ok(());
         }
-        tracing::warn!(
-            distinct = self.seen.len(),
-            "ov-genai: refusing a new response_format schema: GenAI keeps every compiled grammar \
-             until the worker restarts"
+        self.refused += 1;
+        if self.full_warnings == 0 {
+            self.full_warnings += 1;
+            tracing::warn!(
+                distinct = self.seen.len(),
+                limit = MAX_DISTINCT_SCHEMAS,
+                "ov-genai: the response_format schema budget is full: new schemas are refused \
+                 until the worker restarts (GenAI keeps every compiled grammar); schemas already \
+                 served keep working. Further refusals are logged at debug"
+            );
+        }
+        tracing::debug!(
+            refused = self.refused,
+            limit = MAX_DISTINCT_SCHEMAS,
+            "ov-genai: refused a new response_format schema: the schema budget is full"
         );
         Err(EngineError::InvalidConfig(format!(
-            "structured output is not available for this model: this worker keeps the compiled \
-             grammars of {MAX_DISTINCT_SCHEMAS} distinct response_format schemas and has no room \
-             for another; a schema it has served already still works, and a restart clears them"
+            "structured output is not available for this model: this worker has reached its \
+             limit of {MAX_DISTINCT_SCHEMAS} distinct response_format schemas per pipeline \
+             (GenAI keeps each compiled grammar until the worker restarts); schemas it has \
+             already served keep working, and restarting the worker clears the limit"
         )))
     }
 
@@ -2712,18 +2730,66 @@ mod tests {
         // One more distinct schema: refused, in the class a gateway moves to
         // another node.
         match e.submit(schema_task("over", &body(MAX_DISTINCT_SCHEMAS))) {
-            Err(EngineError::InvalidConfig(m)) => assert!(
-                m.starts_with(
-                    "structured output is not available for this model: this worker keeps"
-                ),
-                "{m}"
-            ),
+            Err(EngineError::InvalidConfig(m)) => assert_eq!(m, BUDGET_FULL_400),
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
         // A schema it already let through is served from GenAI's cache.
         e.submit(schema_task("again", &body(0))).unwrap();
         // Plain requests are never counted or refused.
         e.submit(GenerationTask::new("plain", "hi")).unwrap();
+    }
+
+    /// The 400 a new schema gets once the budget is full. The node maps it
+    /// by its prefix, "structured output is not available".
+    const BUDGET_FULL_400: &str = "structured output is not available for this model: \
+        this worker has reached its limit of 64 distinct response_format schemas per pipeline \
+        (GenAI keeps each compiled grammar until the worker restarts); schemas it has already \
+        served keep working, and restarting the worker clears the limit";
+
+    /// A full budget refuses each new schema with the same 400, counts every
+    /// refusal, and warns once, however many it refuses.
+    #[test]
+    fn a_full_budget_refuses_with_the_limit_counts_and_warns_once() {
+        // The budget as the stateful engine's submit uses it (check, then record).
+        let mut budget = SchemaBudget::default();
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            let t = schema_task("t", &full_budget_body(i));
+            budget.check(&t).unwrap();
+            budget.record(&t);
+        }
+        assert_eq!((budget.refused, budget.full_warnings), (0, 0));
+        for n in 1..=5u64 {
+            let t = schema_task("over", &full_budget_body(1000 + n as usize));
+            match budget.check(&t) {
+                Err(EngineError::InvalidConfig(m)) => assert_eq!(m, BUDGET_FULL_400),
+                other => panic!("expected InvalidConfig, got {other:?}"),
+            }
+            assert_eq!(budget.refused, n);
+        }
+        assert_eq!(budget.full_warnings, 1);
+        // A schema already served is not a refusal.
+        budget
+            .check(&schema_task("again", &full_budget_body(0)))
+            .unwrap();
+        assert_eq!(budget.refused, 5);
+
+        // The CB engine.
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            e.submit(schema_task(&format!("t{i}"), &full_budget_body(i)))
+                .unwrap();
+        }
+        for n in 1..=3u64 {
+            match e.submit(schema_task("over", &full_budget_body(1000 + n as usize))) {
+                Err(EngineError::InvalidConfig(m)) => assert_eq!(m, BUDGET_FULL_400),
+                other => panic!("expected InvalidConfig, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            (e.schema_budget.refused, e.schema_budget.full_warnings),
+            (3, 1)
+        );
     }
 
     fn full_budget_body(i: usize) -> String {
