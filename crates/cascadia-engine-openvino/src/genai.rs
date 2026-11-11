@@ -857,12 +857,20 @@ struct SchemaBudget {
     seen: HashSet<String>,
 }
 
+/// The schema [`SchemaBudget`] counts for `task`: a client's. json_object's
+/// fixed schema is one grammar per pipeline, compiled once, so it neither
+/// takes a slot nor is ever refused (the budget bounds the client schemas'
+/// grammars, plus that one).
+fn counted_schema(task: &GenerationTask) -> Option<&str> {
+    grammar_json_schema(task).filter(|s| *s != JSON_OBJECT_PROBE)
+}
+
 impl SchemaBudget {
     /// Refuses `task` when its schema is new and the budget is full. Checked
     /// before the request is handed to GenAI; [`Self::record`] counts it once
     /// GenAI has taken it.
     fn check(&self, task: &GenerationTask) -> EngineResult<()> {
-        let Some(schema) = grammar_json_schema(task) else {
+        let Some(schema) = counted_schema(task) else {
             return Ok(());
         };
         if self.seen.contains(schema) || self.seen.len() < MAX_DISTINCT_SCHEMAS {
@@ -882,7 +890,7 @@ impl SchemaBudget {
 
     /// Counts `task`'s schema as let through to GenAI.
     fn record(&mut self, task: &GenerationTask) {
-        if let Some(schema) = grammar_json_schema(task) {
+        if let Some(schema) = counted_schema(task) {
             if !self.seen.contains(schema) {
                 self.seen.insert(schema.to_owned());
             }
@@ -2675,6 +2683,42 @@ mod tests {
         e.submit(schema_task("again", &body(0))).unwrap();
         // Plain requests are never counted or refused.
         e.submit(GenerationTask::new("plain", "hi")).unwrap();
+    }
+
+    fn full_budget_body(i: usize) -> String {
+        format!(r#"{{"type":"object","properties":{{"f{i}":{{"type":"integer"}}}}}}"#)
+    }
+
+    /// json_object is one fixed grammar per pipeline: a full budget never
+    /// refuses it, even as its first request, and it takes no slot. The API
+    /// sends this same text for `json_object` and for a `json_schema` whose
+    /// schema is missing, `null`, `true` or `{}` (pinned in cascadia-api's
+    /// `every_any_object_spelling_reaches_the_engine_as_the_fixed_text`).
+    #[test]
+    fn a_full_schema_budget_never_refuses_json_object() {
+        // The CB engine.
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            e.submit(schema_task(&format!("t{i}"), &full_budget_body(i)))
+                .unwrap();
+        }
+        e.submit(schema_task("obj", JSON_OBJECT_PROBE)).unwrap();
+        assert_eq!(e.schema_budget.seen.len(), MAX_DISTINCT_SCHEMAS);
+        // The budget as the stateful engine's submit uses it (check, then record).
+        let mut budget = SchemaBudget::default();
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            let t = schema_task("t", &full_budget_body(i));
+            budget.check(&t).unwrap();
+            budget.record(&t);
+        }
+        assert!(budget
+            .check(&schema_task("over", &full_budget_body(999)))
+            .is_err());
+        let obj = schema_task("obj", JSON_OBJECT_PROBE);
+        budget.check(&obj).unwrap();
+        budget.record(&obj);
+        assert!(!budget.seen.contains(JSON_OBJECT_PROBE));
     }
 
     #[test]

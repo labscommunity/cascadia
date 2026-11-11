@@ -2523,6 +2523,27 @@ mod tests {
         assert!(reject_duplicate_keys(&ok).is_ok());
     }
 
+    /// Every spelling of "any JSON object" reaches the engine as the one
+    /// fixed text, which ov-genai's schema budget never counts or refuses
+    /// (its `JSON_OBJECT_PROBE` is this same text).
+    #[test]
+    fn every_any_object_spelling_reaches_the_engine_as_the_fixed_text() {
+        assert_eq!(
+            JSON_OBJECT_SCHEMA,
+            r#"{"type":"object","additionalProperties":true}"#
+        );
+        for rf in [
+            json!({"type": "json_object"}),
+            json!({"type": "json_schema", "json_schema": {"name": "x"}}),
+            json!({"type": "json_schema", "json_schema": {"name": "x", "schema": null}}),
+            json!({"type": "json_schema", "json_schema": {"name": "x", "schema": true}}),
+            json!({"type": "json_schema", "json_schema": {"name": "x", "schema": {}}}),
+        ] {
+            let g = grammar_for(&parse(rf.clone()).unwrap()).unwrap();
+            assert_eq!(g.body, JSON_OBJECT_SCHEMA, "{rf}");
+        }
+    }
+
     #[test]
     fn empty_schema_is_json_object() {
         assert_eq!(
