@@ -6,7 +6,7 @@
 use cascadia_engine::{EngineError, EngineResult};
 use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
 use cascadia_metrics::{count_constraint_unenforced, unenforced_warns, UnenforcedReason};
-use cascadia_types::{GenerationTask, TaskId};
+use cascadia_types::{GenerationTask, GrammarDropped, TaskId};
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
@@ -155,21 +155,106 @@ pub(crate) fn drop_best_effort_grammar(
     if !task.drop_best_effort_grammar() {
         return false;
     }
+    note_dropped(&task.task_id, reason);
+    true
+}
+
+/// Logs and counts one best-effort grammar dropped for `reason`.
+fn note_dropped(task_id: &TaskId, reason: UnenforcedReason) {
     // A per-server reason would warn on every request: once, then debug.
     if unenforced_warns(reason) {
         warn!(
-            task = %task.task_id,
+            task = %task_id,
             reason = reason.as_str(),
             "output constraint not enforced; answering unconstrained"
         );
     } else {
         debug!(
-            task = %task.task_id,
+            task = %task_id,
             reason = reason.as_str(),
             "output constraint not enforced; answering unconstrained"
         );
     }
     count_constraint_unenforced(reason);
+}
+
+/// A running task's matcher failed (a token commit or a mask ran past a
+/// parser limit, or the grammar allows no token): a best-effort grammar is
+/// dropped, `grammar` cleared and the drop recorded on `task`, logged and
+/// counted as `too_complex`, and the task carries on unconstrained from the
+/// output it has. `false`, nothing changed, for a strict grammar (or none):
+/// the caller fails the task as before.
+pub(crate) fn drop_failed_grammar<G>(
+    task: &mut GenerationTask,
+    grammar: &mut Option<G>,
+    error: &EngineError,
+) -> bool {
+    let dropped = grammar.is_some() && drop_failed_task_grammar(task, error);
+    if dropped {
+        *grammar = None;
+    }
+    dropped
+}
+
+/// [`drop_failed_grammar`] for an engine holding the task's matcher apart
+/// from the task during a step: it discards the matcher once the step sees
+/// `task.grammar_dropped`.
+pub(crate) fn drop_failed_task_grammar(task: &mut GenerationTask, error: &EngineError) -> bool {
+    if !task.drop_best_effort_grammar() {
+        return false;
+    }
+    info!(task = %task.task_id, %error, "a best-effort grammar failed while generating");
+    note_dropped(&task.task_id, UnenforcedReason::TooComplex);
+    true
+}
+
+/// A pick under a running task's grammar: `pick(Some(matcher))`, or when
+/// that fails and `drop` drops the grammar (see [`drop_failed_grammar`]),
+/// the plain `pick(None)`. The grammar's error otherwise, also when the
+/// plain pick fails too (the failure was not the grammar's).
+pub(crate) fn pick_or_drop<T>(
+    grammar: &mut Option<GrammarMask>,
+    mut pick: impl FnMut(Option<&mut GrammarMask>) -> EngineResult<T>,
+    drop: impl FnOnce(&mut Option<GrammarMask>, &EngineError) -> bool,
+) -> EngineResult<T> {
+    let error = match pick(grammar.as_mut()) {
+        Err(e) if grammar.is_some() => e,
+        other => return other,
+    };
+    match pick(None) {
+        Ok(plain) if drop(grammar, &error) => Ok(plain),
+        _ => Err(error),
+    }
+}
+
+/// The drop flag of `task`'s grammar when it is best-effort, for an engine
+/// that keeps only the task's id while it runs (see
+/// [`drop_failed_grammar_flag`]).
+pub(crate) fn best_effort_flag(task: &GenerationTask) -> Option<GrammarDropped> {
+    task.grammar
+        .as_ref()
+        .filter(|g| g.best_effort)
+        .map(|_| task.grammar_dropped.clone())
+}
+
+/// [`drop_failed_grammar`] for a running task kept as its id and its
+/// [`best_effort_flag`] (`None` for a strict grammar), which a drop takes.
+pub(crate) fn drop_failed_grammar_flag<G>(
+    task_id: &TaskId,
+    best_effort: &mut Option<GrammarDropped>,
+    grammar: &mut Option<G>,
+    error: &EngineError,
+) -> bool {
+    if grammar.is_none() {
+        return false;
+    }
+    let Some(flag) = best_effort.take() else {
+        return false;
+    };
+    flag.set();
+    *grammar = None;
+    info!(task = %task_id, %error, "a best-effort grammar failed while generating");
+    note_dropped(task_id, UnenforcedReason::TooComplex);
     true
 }
 
@@ -322,6 +407,88 @@ mod tests {
         .to_string()
         .parse()
         .unwrap()
+    }
+
+    /// A matcher in llguidance's error state, as one is after a token commit
+    /// or a mask ran past a parser limit (`max_items_in_row`).
+    fn failed_matcher() -> GrammarMask {
+        let mut m = compiled(OK_ENUM).matcher().unwrap();
+        assert!(m.accept(0x01).is_err());
+        m
+    }
+
+    fn too_complex_count() -> u64 {
+        cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+            .with_label_values(&[UnenforcedReason::TooComplex.as_str()])
+            .get()
+    }
+
+    #[test]
+    fn a_best_effort_grammar_that_fails_while_generating_is_dropped_as_too_complex() {
+        let before = too_complex_count();
+        let mut grammar = Some(failed_matcher());
+        let e = grammar.as_mut().unwrap().mask_words().unwrap_err();
+        let mut soft = GenerationTask::new("s", "p")
+            .with_grammar(GrammarSpec::best_effort_json_schema(OK_ENUM));
+        assert!(drop_failed_grammar(&mut soft, &mut grammar, &e));
+        assert!(grammar.is_none() && soft.grammar.is_none() && soft.grammar_dropped.get());
+        assert!(too_complex_count() > before);
+
+        let mut grammar = Some(failed_matcher());
+        let mut strict = GenerationTask::new("j", "p").with_grammar(json_spec(OK_ENUM));
+        assert!(!drop_failed_grammar(&mut strict, &mut grammar, &e));
+        assert!(grammar.is_some() && strict.grammar.is_some() && !strict.grammar_dropped.get());
+
+        // The flag form: only a best-effort task has a flag to take.
+        let soft = GenerationTask::new("s", "p")
+            .with_grammar(GrammarSpec::best_effort_json_schema(OK_ENUM));
+        let mut flag = best_effort_flag(&soft);
+        let mut grammar = Some(failed_matcher());
+        assert!(drop_failed_grammar_flag(
+            &soft.task_id,
+            &mut flag,
+            &mut grammar,
+            &e
+        ));
+        assert!(grammar.is_none() && flag.is_none() && soft.grammar_dropped.get());
+        let strict = GenerationTask::new("j", "p").with_grammar(json_spec(OK_ENUM));
+        let mut flag = best_effort_flag(&strict);
+        let mut grammar = Some(failed_matcher());
+        assert!(!drop_failed_grammar_flag(
+            &strict.task_id,
+            &mut flag,
+            &mut grammar,
+            &e
+        ));
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn a_failed_pick_falls_back_to_the_plain_pick_only_when_the_grammar_is_dropped() {
+        let row = {
+            let mut r = vec![0.0f32; 300];
+            r[1] = 10.0;
+            r[usize::from(b'"')] = 5.0;
+            r
+        };
+        let pick = |m: Option<&mut GrammarMask>| match m {
+            Some(m) => m.pick_greedy(&row),
+            None => Ok(1),
+        };
+        let mut healthy = Some(compiled(OK_ENUM).matcher().unwrap());
+        assert_eq!(
+            pick_or_drop(&mut healthy, pick, |_, _| unreachable!()).unwrap(),
+            usize::from(b'"')
+        );
+        let mut failed = Some(failed_matcher());
+        assert_eq!(
+            pick_or_drop(&mut failed, pick, |g, _| g.take().is_some()).unwrap(),
+            1
+        );
+        assert!(failed.is_none());
+        let mut failed = Some(failed_matcher());
+        assert!(pick_or_drop(&mut failed, pick, |_, _| false).is_err());
+        assert!(failed.is_some());
     }
 
     #[test]

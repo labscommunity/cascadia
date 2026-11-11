@@ -693,6 +693,9 @@ fn advance_grammar(active: &mut Option<ActiveTask>, token: i32) -> EngineResult<
     };
     match mask.accept(token as u32) {
         Ok(()) => Ok(mask.finished()),
+        // A best-effort grammar that fails here is dropped: the task runs on
+        // unconstrained with the token it picked.
+        Err(e) if structured::drop_failed_grammar(&mut a.task, &mut a.grammar, &e) => Ok(false),
         Err(e) => {
             let id = a.task.task_id.clone();
             *active = None;
@@ -2701,7 +2704,8 @@ impl Gemma4Engine {
         if let Some(a) = self.active.as_mut() {
             a.t_alpha_compute += alpha;
             a.t_wire += wire;
-            a.grammar = grammar;
+            // A best-effort grammar dropped during the step leaves its matcher.
+            a.grammar = grammar.filter(|_| !a.task.grammar_dropped.get());
         }
 
         self.emit_token(next_token)
@@ -2728,6 +2732,11 @@ impl Gemma4Engine {
         if single_stage {
             match pick_tagged(out, shape, mask) {
                 Ok(token) => Ok((token, std::time::Duration::ZERO)),
+                // A best-effort grammar that fails here is dropped: the plain
+                // argmax.
+                Err((e, Some(_))) if self.drop_failed_grammar(&e) => {
+                    Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
+                }
                 Err((e, kind)) => {
                     self.grammar_failure = kind;
                     Err(e)
@@ -2740,10 +2749,19 @@ impl Gemma4Engine {
                 .grammar_factory
                 .mask_width()
                 .map_err(EngineError::Backend)?;
-            // A zero width is a broken factory, not a schema dead end.
-            let words = mask_words(mask, width).inspect_err(|_| {
-                self.grammar_failure = (width > 0).then_some(GrammarFailure::DeadEnd)
-            })?;
+            let words = match mask_words(mask, width) {
+                Ok(words) => words,
+                // A best-effort grammar that fails here is dropped: this step
+                // and every later one go unmasked.
+                Err(e) if width > 0 && self.drop_failed_grammar(&e) => {
+                    return self.resolve_next_token(out, shape, false, position, prefill, None);
+                }
+                Err(e) => {
+                    // A zero width is a broken factory, not a schema dead end.
+                    self.grammar_failure = (width > 0).then_some(GrammarFailure::DeadEnd);
+                    return Err(e);
+                }
+            };
             let mut frames = self.step_frames(out, s3, position, Some(words))?;
             let downstream = self
                 .downstream
@@ -2773,6 +2791,15 @@ impl Gemma4Engine {
             let token = self.recv_token_from_downstream(prefill)?;
             Ok((token, ts.elapsed()))
         }
+    }
+
+    /// The active task's matcher (held apart for the step) failed: a
+    /// best-effort grammar is dropped from the task, and the step discards
+    /// the matcher (see [`structured::drop_failed_task_grammar`]).
+    fn drop_failed_grammar(&mut self, error: &EngineError) -> bool {
+        self.active
+            .as_mut()
+            .is_some_and(|a| structured::drop_failed_task_grammar(&mut a.task, error))
     }
 
     /// Decode the delta text for `next_token`, append it to the active task,
@@ -4505,6 +4532,44 @@ mod tests {
         let mut plain = Some(active_task(None));
         assert!(!advance_grammar(&mut plain, BAD as i32).unwrap());
         assert!(plain.is_some());
+    }
+
+    /// A matcher in llguidance's error state, as one is after a token commit
+    /// or a mask ran past a parser limit: every later mask and commit fails.
+    fn failed_mask() -> GrammarMask {
+        let mut m = start_grammar(&ok_grammar(), &[]).unwrap();
+        assert!(m.accept(BAD as u32).is_err());
+        m
+    }
+
+    /// A best-effort grammar that fails at run time (a token commit) is
+    /// dropped, counted as too complex, and the task runs on with the token
+    /// it picked; a strict one ends the task, as before.
+    #[test]
+    fn a_best_effort_grammar_that_fails_mid_task_is_dropped_and_the_task_runs_on() {
+        let count = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[cascadia_metrics::UnenforcedReason::TooComplex.as_str()])
+                .get()
+        };
+        let before = count();
+        let mut soft = active_task(Some(failed_mask()));
+        soft.task.grammar = Some(cascadia_types::GrammarSpec::best_effort_json_schema(
+            OK_ENUM,
+        ));
+        let dropped = soft.task.grammar_dropped.clone();
+        let mut active = Some(soft);
+        assert!(!advance_grammar(&mut active, b'"' as i32).unwrap());
+        let a = active.as_ref().expect("the task runs on");
+        assert!(a.grammar.is_none() && a.task.grammar.is_none());
+        assert!(dropped.get());
+        assert!(count() > before);
+
+        let mut strict = active_task(Some(failed_mask()));
+        strict.task.grammar = Some(json_spec(OK_ENUM));
+        let mut active = Some(strict);
+        assert!(advance_grammar(&mut active, b'"' as i32).is_err());
+        assert!(active.is_none());
     }
 
     #[test]

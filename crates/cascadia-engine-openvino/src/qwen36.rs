@@ -46,7 +46,8 @@ use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
 };
 use cascadia_types::{
-    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId,
+    Chunk, FinishReason, GenerationTask, GrammarDropped, LoadProgress, PeerLayout, ShardSpec,
+    TaskId,
 };
 use futures::stream;
 use tokenizers::Tokenizer;
@@ -1162,6 +1163,24 @@ struct ActiveTask {
     /// (the chain's latest pick) is accepted at the next decode step, before
     /// that step's mask is computed. `None` for every other task.
     grammar: Option<GrammarMask>,
+    /// The task's drop flag while its grammar is best-effort (see
+    /// [`ActiveTask::drop_failed_grammar`]); `None` for a strict grammar or
+    /// none.
+    best_effort: Option<GrammarDropped>,
+}
+
+impl ActiveTask {
+    /// The matcher failed mid-task: a best-effort grammar is dropped and the
+    /// task runs on unconstrained (later pipeline steps carry no mask);
+    /// `false` for a strict one, which the caller fails as before.
+    fn drop_failed_grammar(&mut self, error: &EngineError) -> bool {
+        structured::drop_failed_grammar_flag(
+            &self.task_id,
+            &mut self.best_effort,
+            &mut self.grammar,
+            error,
+        )
+    }
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -1879,7 +1898,7 @@ impl Qwen36Engine {
     /// (`picks`: the final prefill chunk or a decode step) of a
     /// structured-output task; `None` for every other step and task.
     fn step_wire_mask(&mut self, picks: bool) -> EngineResult<Option<WireTensor>> {
-        let Some(grammar) = self.active.as_mut().and_then(|t| t.grammar.as_mut()) else {
+        let Some(t) = self.active.as_mut().filter(|t| t.grammar.is_some()) else {
             return Ok(None);
         };
         if !picks {
@@ -1889,9 +1908,16 @@ impl Qwen36Engine {
             .grammar_factory
             .mask_width()
             .map_err(EngineError::Backend)?;
-        encode_wire_mask(grammar, width)
-            .map(Some)
-            .map_err(|e| EngineError::Backend(format!("structured output failed: {e}")))
+        let grammar = t.grammar.as_mut().expect("a grammar task");
+        match encode_wire_mask(grammar, width) {
+            Ok(mask) => Ok(Some(mask)),
+            // A best-effort grammar that fails here is dropped: this step and
+            // every later one go unmasked.
+            Err(e) if t.drop_failed_grammar(&e) => Ok(None),
+            Err(e) => Err(EngineError::Backend(format!(
+                "structured output failed: {e}"
+            ))),
+        }
     }
 
     /// Rank 0 driver step: same task lifecycle as the single-box step,
@@ -2097,6 +2123,7 @@ impl Qwen36Engine {
                     0
                 }
             };
+            let best_effort = structured::best_effort_flag(&task);
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -2115,6 +2142,7 @@ impl Qwen36Engine {
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
                 grammar,
+                best_effort,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -2217,7 +2245,15 @@ impl Qwen36Engine {
             // The chain picked `next` one step ago under the mask of the matcher's current
             // position: a token that mask disallows never stops the task.
             let t = self.active.as_mut().unwrap();
-            match decode_stop(next, t.grammar.as_mut(), self.eos, &self.eos_ids) {
+            // A best-effort grammar that fails here is dropped: `next` is
+            // read as an unconstrained pick.
+            let stop = match decode_stop(next, t.grammar.as_mut(), self.eos, &self.eos_ids) {
+                Err(e) if t.drop_failed_grammar(&e) => {
+                    decode_stop(next, None, self.eos, &self.eos_ids)
+                }
+                other => other,
+            };
+            match stop {
                 Ok(true) => return self.finalize(FinishReason::Stop),
                 Ok(false) => {}
                 Err(e) => {
@@ -2227,8 +2263,10 @@ impl Qwen36Engine {
             }
             // `next` enters the matcher now, before the mask for the token after it.
             if let Some(Err(e)) = t.grammar.as_mut().map(|m| m.accept(next)) {
-                warn!(task = %task_id, error = %e, "structured output decode failed");
-                return self.finalize_error(format!("structured output failed: {e}"));
+                if !t.drop_failed_grammar(&e) {
+                    warn!(task = %task_id, error = %e, "structured output decode failed");
+                    return self.finalize_error(format!("structured output failed: {e}"));
+                }
             }
             if t.grammar.as_ref().is_some_and(GrammarMask::finished) {
                 return self.finish_on_last_token(&task_id, next);
@@ -2945,6 +2983,7 @@ impl Qwen36Engine {
                     "qwen35 prefix-cache snapshot plan"
                 );
             }
+            let best_effort = structured::best_effort_flag(&task);
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -2963,6 +3002,7 @@ impl Qwen36Engine {
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
                 grammar,
+                best_effort,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -3078,14 +3118,32 @@ impl Qwen36Engine {
                 return self.finalize(reason);
             }
             let t = self.active.as_mut().unwrap();
-            let next = match pick_decode_token(&t.logits, t.grammar.as_mut()) {
+            // A best-effort grammar that fails at any point here is dropped:
+            // the pick is then the plain argmax, read as unconstrained.
+            let logits = &t.logits;
+            let task_id_ref = &t.task_id;
+            let best_effort = &mut t.best_effort;
+            let picked = structured::pick_or_drop(
+                &mut t.grammar,
+                |mask| pick_decode_token(logits, mask),
+                |grammar, e| {
+                    structured::drop_failed_grammar_flag(task_id_ref, best_effort, grammar, e)
+                },
+            );
+            let next = match picked {
                 Ok(next) => next,
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "structured output decode failed");
                     return self.finalize_error(format!("structured output failed: {e}"));
                 }
             };
-            match decode_stop(next, t.grammar.as_mut(), self.eos, &self.eos_ids) {
+            let stop = match decode_stop(next, t.grammar.as_mut(), self.eos, &self.eos_ids) {
+                Err(e) if t.drop_failed_grammar(&e) => {
+                    decode_stop(next, None, self.eos, &self.eos_ids)
+                }
+                other => other,
+            };
+            match stop {
                 Ok(true) => return self.finalize(FinishReason::Stop),
                 Ok(false) => {}
                 Err(e) => {
@@ -3094,8 +3152,10 @@ impl Qwen36Engine {
                 }
             }
             if let Some(Err(e)) = t.grammar.as_mut().map(|m| m.accept(next)) {
-                warn!(task = %task_id, error = %e, "structured output decode failed");
-                return self.finalize_error(format!("structured output failed: {e}"));
+                if !t.drop_failed_grammar(&e) {
+                    warn!(task = %task_id, error = %e, "structured output decode failed");
+                    return self.finalize_error(format!("structured output failed: {e}"));
+                }
             }
             if t.grammar.as_ref().is_some_and(GrammarMask::finished) {
                 return self.finish_on_last_token(&task_id, next);
@@ -4073,6 +4133,7 @@ mod tests {
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
             grammar: None,
+            best_effort: None,
         });
 
         let out = e.finalize_error("pipeline decode failed: wire closed".into());
@@ -4106,6 +4167,7 @@ mod tests {
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
             grammar: None,
+            best_effort: None,
         }
     }
 
@@ -4190,6 +4252,7 @@ mod tests {
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
             grammar: None,
+            best_effort: None,
         });
 
         let id: TaskId = "t0".into();
@@ -4964,6 +5027,113 @@ mod tests {
         drop(head);
         let kinds = kinds(&rt.block_on(frames).unwrap());
         assert!(!kinds.contains(&FRAME_FORWARD_MASKED), "{kinds:?}");
+    }
+
+    /// A matcher in llguidance's error state, as one is after a token commit
+    /// or a mask ran past a parser limit: every later mask and commit fails.
+    fn failed_grammar_task(best_effort: bool, logits: Vec<f32>) -> ActiveTask {
+        let mut t = grammar_task(OK_ENUM, "", 16, logits);
+        assert!(t.grammar.as_mut().unwrap().accept(u32::from(BAD)).is_err());
+        t.best_effort = best_effort.then(GrammarDropped::default);
+        t
+    }
+
+    /// The head's mask for a step whose best-effort grammar fails: dropped,
+    /// recorded on the task's flag, and the step goes unmasked. A strict one
+    /// is the task's error, as before.
+    #[test]
+    fn a_best_effort_grammar_whose_mask_fails_sends_no_mask() {
+        let mut e = pipe_head(2, &pipe_rt());
+        let t = failed_grammar_task(true, Vec::new());
+        let flag = t.best_effort.clone().unwrap();
+        e.active = Some(t);
+        assert!(e.step_wire_mask(true).unwrap().is_none());
+        assert!(e.active.as_ref().unwrap().grammar.is_none());
+        assert!(flag.get());
+        e.active = Some(failed_grammar_task(false, Vec::new()));
+        assert!(e.step_wire_mask(true).is_err());
+    }
+
+    /// Single box: a best-effort grammar that fails at the pick is dropped
+    /// and the plain argmax is taken (here EOS, so the task ends without a
+    /// forward); a strict one fails the task, as before.
+    #[test]
+    fn single_box_drops_a_best_effort_grammar_that_fails_and_picks_unmasked() {
+        let mut e = bare_engine(1, "{}");
+        e.eos = Some(TEST_EOS);
+        e.eos_ids = vec![TEST_EOS];
+        let logits = row(300, &[(TEST_EOS, 10.0), (b'"' as u32, 5.0)]);
+        let t = failed_grammar_task(true, logits.clone());
+        let flag = t.best_effort.clone().unwrap();
+        e.active = Some(t);
+        let out = e.step_local();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].1.error.is_none(), "{:?}", out[0].1);
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+        assert!(flag.get());
+        e.active = Some(failed_grammar_task(false, logits));
+        let out = e.step_local();
+        assert!(out[0].1.error.is_some(), "{:?}", out[0].1);
+    }
+
+    /// A json task on a chain that masks, whose matcher fails after the
+    /// first masked step (as one does when a token commit runs past
+    /// llguidance's `max_items_in_row`): steps the task to its final chunk
+    /// with the head's matcher put in the error state after that step.
+    fn run_pipe_task_failing_grammar(
+        head: &mut Qwen36Engine,
+        task: GenerationTask,
+    ) -> (Vec<i64>, Chunk) {
+        head.submit(task).unwrap();
+        let mut ids = Vec::new();
+        let mut failed = false;
+        for _ in 0..64 {
+            for (_, c) in head.step_pipe_first() {
+                if c.is_final {
+                    return (ids, c);
+                }
+                ids.push(c.token_id);
+            }
+            if !failed {
+                if let Some(g) = head.active.as_mut().and_then(|t| t.grammar.as_mut()) {
+                    assert!(g.accept(u32::from(BAD)).is_err());
+                    failed = true;
+                }
+            }
+        }
+        panic!("task never finished; tokens so far {ids:?}");
+    }
+
+    /// A best-effort grammar that fails mid-task on a pipeline head is
+    /// dropped, counted as too complex: the task runs on unmasked to its
+    /// normal end, keeping what it produced. A strict one fails, as before.
+    #[test]
+    fn a_best_effort_grammar_that_fails_mid_task_runs_on_unmasked_on_a_pipeline() {
+        let rt = pipe_rt();
+        let tail = pipe_rank(1, 2, &rt);
+        let mut head = wire_chain(&rt, pipe_head(2, &rt), vec![tail]);
+        let reason = cascadia_metrics::UnenforcedReason::TooComplex;
+        let count = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[reason.as_str()])
+                .get()
+        };
+        let before = count();
+        let task = pipe_task("s", 3, None).with_grammar(
+            cascadia_types::GrammarSpec::best_effort_json_schema(OK_ENUM),
+        );
+        let dropped = task.grammar_dropped.clone();
+        let (ids, fin) = run_pipe_task_failing_grammar(&mut head, task);
+        assert!(fin.error.is_none(), "{fin:?}");
+        assert_eq!(fin.finish_reason, Some(FinishReason::Length), "{fin:?}");
+        // The masked first pick, then the model's own (unmasked) picks.
+        assert_eq!(ids, vec![b'"' as i64, BAD as i64, BAD as i64]);
+        assert!(dropped.get());
+        assert!(count() > before);
+
+        let (ids, fin) = run_pipe_task_failing_grammar(&mut head, pipe_task("j", 3, Some(OK_ENUM)));
+        assert!(fin.error.is_some(), "{fin:?}");
+        assert!(ids.is_empty(), "{ids:?}");
     }
 
     /// The bytes of a plain task's FORWARD frames, fixed from the encoding

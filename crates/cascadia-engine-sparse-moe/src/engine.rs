@@ -31,8 +31,8 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::constrained::{
-    activate, commit, drop_best_effort_grammar, drop_on_latched_link, is_best_effort,
-    unconfirmed_step, GrammarSlot, StageMasks,
+    activate, drop_best_effort_grammar, drop_on_latched_link, is_best_effort, unconfirmed_step,
+    BestEffort, GrammarSlot, StageMasks,
 };
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
@@ -1800,6 +1800,8 @@ struct SparseActive {
     /// over each token the last rank returns, and whether the JSON is done.
     grammar: Option<GrammarMask>,
     grammar_finished: bool,
+    /// Drops a best-effort grammar that fails mid-generation.
+    best_effort: BestEffort,
 }
 
 pub struct SparseMoEEngine {
@@ -2266,12 +2268,13 @@ impl SparseMoEEngine {
             } else {
                 None
             };
-            match self.runner.generate_with_cache(
+            match self.runner.generate_with_cache_dropping(
                 &prompt_ids,
                 max_new,
                 &sampling_cfg,
                 cache_opt,
                 grammar.as_mut(),
+                &mut BestEffort::of(&task),
             ) {
                 Ok((g, finished)) => {
                     grammar_finished = finished;
@@ -2473,6 +2476,7 @@ impl SparseMoEEngine {
             }
             None => None,
         };
+        let mut best_effort = BestEffort::of(&task);
         if prompt_ids.is_empty() {
             return Some(vec![(
                 task.task_id.clone(),
@@ -2741,7 +2745,9 @@ impl SparseMoEEngine {
             }
             if i + 1 == prompt_ids.len() {
                 // Last prompt token: a sampling Forward; the token it returns
-                // is the first generated token.
+                // is the first generated token. A best-effort grammar that
+                // can't be masked is dropped: the step goes unmasked.
+                best_effort.drop_unmaskable(&mut grammar);
                 match self.forward_one_token_first(
                     &history,
                     &sampling_cfg,
@@ -2795,7 +2801,7 @@ impl SparseMoEEngine {
                 Chunk::error(task.task_id, "prefill produced no token"),
             )]);
         }
-        let grammar_finished = match commit(grammar.as_mut(), token_back) {
+        let grammar_finished = match best_effort.commit(&mut grammar, token_back) {
             Ok(f) => f,
             Err(e) => {
                 warn!(task = %task.task_id, error = %e, "structured output failed; task aborted");
@@ -2837,6 +2843,7 @@ impl SparseMoEEngine {
             tenant: task.tenant.clone(),
             grammar,
             grammar_finished,
+            best_effort,
         });
         None
     }
@@ -2924,7 +2931,11 @@ impl SparseMoEEngine {
         // memcpy over the turn. forward only reads the slice; put it back on
         // success (the Err arm drops the whole slot, history with it).
         let history = std::mem::take(&mut self.active.as_mut().unwrap().history);
-        let mut gm = self.active.as_mut().unwrap().grammar.take();
+        let a = self.active.as_mut().unwrap();
+        let mut gm = a.grammar.take();
+        // A best-effort grammar that can't be masked is dropped: the step
+        // goes unmasked.
+        a.best_effort.drop_unmaskable(&mut gm);
         match self.forward_one_token_first(
             &history,
             &cfg,
@@ -2934,8 +2945,8 @@ impl SparseMoEEngine {
             gm.as_mut(),
         ) {
             Ok(tok_back) => {
-                let committed = commit(gm.as_mut(), tok_back);
                 let a = self.active.as_mut().unwrap();
+                let committed = a.best_effort.commit(&mut gm, tok_back);
                 a.history = history;
                 a.next = tok_back;
                 a.grammar = gm;
@@ -4447,6 +4458,8 @@ struct OvMoeActive {
     /// over each token the last rank returns, and whether the JSON is done.
     grammar: Option<GrammarMask>,
     grammar_finished: bool,
+    /// Drops a best-effort grammar that fails mid-generation.
+    best_effort: BestEffort,
 }
 
 pub struct OvMoeEngine {
@@ -4705,12 +4718,13 @@ impl OvMoeEngine {
             tokens: generated,
             cached: _cached,
             grammar_finished,
-        } = match self.runner.generate_with_cache(
+        } = match self.runner.generate_with_cache_dropping(
             &prompt_ids,
             max_new,
             &sampling_cfg,
             cache_opt,
             grammar.as_mut(),
+            &mut BestEffort::of(&task),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -4934,6 +4948,7 @@ impl OvMoeEngine {
             }
             None => None,
         };
+        let mut best_effort = BestEffort::of(&task);
         if prompt64.is_empty() {
             return Some(vec![(id.clone(), Chunk::final_marker(id, ""))]);
         }
@@ -5067,6 +5082,9 @@ impl OvMoeEngine {
         let n_prompt = prompt_ids.len();
         for (i, &t) in prompt_ids.iter().enumerate().skip(warm_prefix) {
             let sample_back = i + 1 == n_prompt;
+            if sample_back {
+                best_effort.drop_unmaskable(&mut grammar);
+            }
             let gm = if sample_back { grammar.as_mut() } else { None };
             match self.forward_one_token_first(
                 t,
@@ -5086,7 +5104,7 @@ impl OvMoeEngine {
             pos += 1;
         }
 
-        let grammar_finished = match commit(grammar.as_mut(), next) {
+        let grammar_finished = match best_effort.commit(&mut grammar, next) {
             Ok(f) => f,
             Err(e) => {
                 warn!(task = %id, error = %e, "structured output failed; task aborted");
@@ -5119,6 +5137,7 @@ impl OvMoeEngine {
             tenant: task.tenant.clone(),
             grammar,
             grammar_finished,
+            best_effort,
         });
         None
     }
@@ -5196,7 +5215,11 @@ impl OvMoeEngine {
         }
         let downstream = self.active_ov.as_ref().unwrap().downstream.clone();
         let cfg = self.active_ov.as_ref().unwrap().cfg.clone();
-        let mut gm = self.active_ov.as_mut().unwrap().grammar.take();
+        let a = self.active_ov.as_mut().unwrap();
+        let mut gm = a.grammar.take();
+        // A best-effort grammar that can't be masked is dropped: the step
+        // goes unmasked.
+        a.best_effort.drop_unmaskable(&mut gm);
         match self.forward_one_token_first(
             next_u,
             pos,
@@ -5207,8 +5230,8 @@ impl OvMoeEngine {
             gm.as_mut(),
         ) {
             Ok(tok_back) => {
-                let committed = commit(gm.as_mut(), tok_back);
                 let a = self.active_ov.as_mut().unwrap();
+                let committed = a.best_effort.commit(&mut gm, tok_back);
                 a.next = tok_back;
                 a.pos += 1;
                 a.grammar = gm;
@@ -6585,6 +6608,8 @@ struct StreamActive {
     /// over `next` when it is sampled, and whether the JSON is complete.
     grammar: Option<GrammarMask>,
     grammar_finished: bool,
+    /// Drops a best-effort grammar that fails mid-generation.
+    best_effort: BestEffort,
 }
 
 /// Rank-0 per-token streaming state: everything the decode loop threaded as
@@ -6614,6 +6639,8 @@ struct PipeActive {
     /// over each token the last rank returns, and whether the JSON is done.
     grammar: Option<GrammarMask>,
     grammar_finished: bool,
+    /// Drops a best-effort grammar that fails mid-generation.
+    best_effort: BestEffort,
 }
 
 impl<R: StagedRunner> PipelineEngine<R> {
@@ -6970,7 +6997,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         failed.push((slot, crate::constrained::REFUSED_STEP.to_string()));
                         continue;
                     }
-                    match commit(st.grammar.as_mut(), token) {
+                    match st.best_effort.commit(&mut st.grammar, token) {
                         Ok(finished) => st.grammar_finished = finished,
                         Err(e) => {
                             failed.push((slot, e.to_string()));
@@ -7196,6 +7223,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Ok(w) => {
                         row_masks.insert(st.slot, w);
                     }
+                    // A best-effort grammar is dropped: the row goes unmasked.
+                    Err(e) if st.best_effort.drop_failed(&mut st.grammar, &e) => {}
                     Err(e) => dead.push((st.slot, e.to_string())),
                 }
             }
@@ -7491,6 +7520,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let rows = prompt_ids.len();
         // A whole prompt in one `StreamOpen` samples its last row: masked for
         // a json task (a windowed prompt masks its final window instead).
+        let mut best_effort = BestEffort::of(&task);
+        if !windowed {
+            best_effort.drop_unmaskable(&mut grammar);
+        }
         let cols = match grammar.as_mut().filter(|_| !windowed) {
             Some(gm) => match stage_mask_cols(&mut self.stage_masks, &self.grammar, gm, rows) {
                 Ok((c, _)) => Some(c),
@@ -7599,6 +7632,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             feed,
             grammar,
             grammar_finished: false,
+            best_effort,
         });
         Ok(rows)
     }
@@ -7658,7 +7692,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
         };
         // Structured output: a json prompt's final window samples its last
-        // row under the mask.
+        // row under the mask (a best-effort grammar that can't be masked is
+        // dropped, the window goes unmasked).
+        if last {
+            let st = &mut self.streams[i];
+            st.best_effort.drop_unmaskable(&mut st.grammar);
+        }
         let cols = match self.streams[i].grammar.as_mut().filter(|_| last) {
             Some(gm) => match stage_mask_cols(&mut self.stage_masks, &self.grammar, gm, rows) {
                 Ok((c, _)) => Some(c),
@@ -8026,12 +8065,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let mut failed: Vec<(usize, String)> = Vec::new();
         for (i, st) in self.streams.iter_mut().enumerate() {
             let l = &logits[i * vocab..(i + 1) * vocab];
-            if let Some(gm) = st.grammar.as_mut() {
+            if st.grammar.is_some() {
                 // A json stream: masked pick, committed now (the next
-                // emission always sends it); a failure ends this stream only.
-                let picked =
-                    crate::sampling::sample(l, &st.history, &st.cfg, &mut st.rng, Some(gm))
-                        .and_then(|next| Ok((next, commit(Some(gm), next)?)));
+                // emission always sends it); a failure ends this stream only
+                // (a best-effort grammar is dropped instead).
+                let (history, cfg, rng) = (&st.history, &st.cfg, &mut st.rng);
+                let picked = st
+                    .best_effort
+                    .pick(&mut st.grammar, |mask| {
+                        crate::sampling::sample(l, history, cfg, rng, mask)
+                    })
+                    .and_then(|next| Ok((next, st.best_effort.commit(&mut st.grammar, next)?)));
                 match picked {
                     Ok((next, finished)) => {
                         st.next = next;
@@ -8141,12 +8185,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // every later one in `step_streams`.
         let mut grammar = None;
         let mut grammar_finished = false;
+        let mut best_effort = BestEffort::of(&task);
         let next = if let Some(compiled) = compiled {
-            let picked = activate(&compiled, &[]).and_then(|mut gm| {
-                let next =
-                    crate::sampling::sample(&logits, &history, &cfg, &mut rng, Some(&mut gm))?;
-                grammar_finished = commit(Some(&mut gm), next)?;
+            let picked = activate(&compiled, &[]).and_then(|gm| {
                 grammar = Some(gm);
+                let next = best_effort.pick(&mut grammar, |mask| {
+                    crate::sampling::sample(&logits, &history, &cfg, &mut rng, mask)
+                })?;
+                grammar_finished = best_effort.commit(&mut grammar, next)?;
                 Ok(next)
             });
             match picked {
@@ -8193,6 +8239,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             feed: VecDeque::new(),
             grammar,
             grammar_finished,
+            best_effort,
         });
         Ok(())
     }
@@ -8300,8 +8347,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
             match compiled.as_ref() {
                 // Structured output: a masked run that ends when the JSON does.
                 Some(c) => activate(c, &[]).and_then(|mut gm| {
-                    self.runner
-                        .generate_grammar_timed(&prompt_ids, max_new, &sampling_cfg, &mut gm)
+                    crate::staged::run_generation(
+                        &mut self.runner,
+                        &prompt_ids,
+                        max_new,
+                        &sampling_cfg,
+                        Some(&mut gm),
+                        &mut BestEffort::of(&task),
+                    )
                 }),
                 None => {
                     let (tokens, hit_context_cap, timing) =
@@ -8608,6 +8661,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 return Some(vec![(id.clone(), Chunk::error(id, e.to_string()))]);
             }
         };
+        let mut best_effort = BestEffort::of(&task);
         let max_new = task.max_tokens.max(1) as usize;
         let cfg = sampling_from_task(&task);
         let eos = self.runner.eos_token_ids().to_vec();
@@ -8718,6 +8772,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let mut wbase = reuse;
             for (wi, chunk) in suffix.chunks(win).enumerate() {
                 let is_last = wi + 1 == n_windows && last_row.is_none();
+                if is_last {
+                    best_effort.drop_unmaskable(&mut grammar);
+                }
                 let gm = if is_last { grammar.as_mut() } else { None };
                 match self.forward_prompt_batch_first(chunk, wbase, &cfg, &downstream, is_last, gm)
                 {
@@ -8734,6 +8791,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 wbase += chunk.len();
             }
             if let Some(t) = last_row {
+                best_effort.drop_unmaskable(&mut grammar);
                 match self.forward_one_token_first(
                     t,
                     n_prefill - 1,
@@ -8754,6 +8812,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         } else {
             for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
                 let sample_back = i + 1 == n_prefill;
+                if sample_back {
+                    best_effort.drop_unmaskable(&mut grammar);
+                }
                 let gm = if sample_back { grammar.as_mut() } else { None };
                 match self.forward_one_token_first(
                     t,
@@ -8774,7 +8835,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
         }
 
-        let grammar_finished = match commit(grammar.as_mut(), next) {
+        let grammar_finished = match best_effort.commit(&mut grammar, next) {
             Ok(f) => f,
             Err(e) => {
                 warn!(task = %id, error = %e, "structured output failed; task aborted");
@@ -8802,6 +8863,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             hit_context_cap: false,
             grammar,
             grammar_finished,
+            best_effort,
         });
         None
     }
@@ -8878,7 +8940,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // Forward the emitted token to sample the next one.
         let downstream = self.active.as_ref().unwrap().downstream.clone();
         let cfg = self.active.as_ref().unwrap().cfg.clone();
-        let mut gm = self.active.as_mut().unwrap().grammar.take();
+        let a = self.active.as_mut().unwrap();
+        let mut gm = a.grammar.take();
+        // A best-effort grammar that can't be masked is dropped: the step
+        // goes unmasked.
+        a.best_effort.drop_unmaskable(&mut gm);
         let json = gm.is_some();
         match self.forward_one_token_first(
             next_u,
@@ -8890,8 +8956,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             gm.as_mut(),
         ) {
             Ok(tok_back) => {
-                let committed = commit(gm.as_mut(), tok_back);
                 let a = self.active.as_mut().unwrap();
+                let committed = a.best_effort.commit(&mut gm, tok_back);
                 a.next = tok_back;
                 a.pos += 1;
                 a.grammar = gm;

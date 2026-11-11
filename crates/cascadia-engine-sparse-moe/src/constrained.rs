@@ -11,7 +11,7 @@ use cascadia_grammar::{CompiledGrammar, GrammarFactory, GrammarMask};
 use cascadia_metrics::{count_constraint_unenforced, unenforced_warns, UnenforcedReason};
 
 use crate::dist::{MaskCols, MaskLatch, MaskedReply};
-use cascadia_types::GenerationTask;
+use cascadia_types::{GenerationTask, GrammarDropped, TaskId};
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
@@ -283,22 +283,110 @@ pub(crate) fn drop_best_effort_grammar(
     if !task.drop_best_effort_grammar() {
         return false;
     }
+    note_dropped(&task.task_id, reason);
+    true
+}
+
+/// Logs and counts one best-effort grammar dropped for `reason`.
+fn note_dropped(task_id: &TaskId, reason: UnenforcedReason) {
     // A per-server reason would warn on every request: once, then debug.
     if unenforced_warns(reason) {
         warn!(
-            task = %task.task_id,
+            task = %task_id,
             reason = reason.as_str(),
             "output constraint not enforced; answering unconstrained"
         );
     } else {
         debug!(
-            task = %task.task_id,
+            task = %task_id,
             reason = reason.as_str(),
             "output constraint not enforced; answering unconstrained"
         );
     }
     count_constraint_unenforced(reason);
-    true
+}
+
+/// A running task's handle for dropping its grammar mid-generation: the
+/// task's id and drop flag while its grammar is best-effort, empty for a
+/// strict grammar (or none). Taken by the first drop.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BestEffort(Option<(TaskId, GrammarDropped)>);
+
+impl BestEffort {
+    /// The handle of `task`, empty unless its grammar is best-effort.
+    pub(crate) fn of(task: &GenerationTask) -> Self {
+        Self(is_best_effort(task).then(|| (task.task_id.clone(), task.grammar_dropped.clone())))
+    }
+
+    /// The task's matcher failed while generating (a token commit or a mask
+    /// ran past a parser limit, or the grammar allows no token): a
+    /// best-effort grammar is dropped, `grammar` cleared and the drop
+    /// recorded on the task, logged and counted as `too_complex`, and the
+    /// task carries on unconstrained from the output it has. `false`,
+    /// nothing changed, for a strict grammar: the caller fails the task as
+    /// before.
+    pub(crate) fn drop_failed<G>(
+        &mut self,
+        grammar: &mut Option<G>,
+        error: &dyn std::fmt::Display,
+    ) -> bool {
+        if grammar.is_none() {
+            return false;
+        }
+        let Some((task_id, dropped)) = self.0.take() else {
+            return false;
+        };
+        dropped.set();
+        *grammar = None;
+        info!(task = %task_id, %error, "a best-effort grammar failed while generating");
+        note_dropped(&task_id, UnenforcedReason::TooComplex);
+        true
+    }
+
+    /// Before a step that would send or apply `grammar`'s mask: a
+    /// best-effort grammar whose mask can't be computed is dropped
+    /// ([`Self::drop_failed`]), so the step goes unmasked. The matcher
+    /// caches the mask, so the step's own read of it costs nothing. A
+    /// strict grammar is not touched here: its step fails as before.
+    pub(crate) fn drop_unmaskable<G: std::borrow::BorrowMut<GrammarMask>>(
+        &mut self,
+        grammar: &mut Option<G>,
+    ) -> bool {
+        if self.0.is_none() {
+            return false;
+        }
+        match grammar.as_mut().map(|g| g.borrow_mut().mask_words()) {
+            Some(Err(e)) => self.drop_failed(grammar, &e),
+            _ => false,
+        }
+    }
+
+    /// A masked pick `pick(mask)`, made again unmasked after dropping a
+    /// best-effort grammar whose mask failed ([`Self::drop_failed`]).
+    pub(crate) fn pick<G: std::borrow::BorrowMut<GrammarMask>>(
+        &mut self,
+        grammar: &mut Option<G>,
+        mut pick: impl FnMut(Option<&mut GrammarMask>) -> EngineResult<i64>,
+    ) -> EngineResult<i64> {
+        match pick(grammar.as_mut().map(|g| g.borrow_mut())) {
+            Err(e) if self.drop_failed(grammar, &e) => pick(None),
+            other => other,
+        }
+    }
+
+    /// [`commit`], dropping a best-effort grammar the token can't be
+    /// committed to ([`Self::drop_failed`]): `Ok(false)` then, the task
+    /// carries on unconstrained.
+    pub(crate) fn commit<G: std::borrow::BorrowMut<GrammarMask>>(
+        &mut self,
+        grammar: &mut Option<G>,
+        token: i64,
+    ) -> EngineResult<bool> {
+        match commit(grammar.as_mut().map(|g| g.borrow_mut()), token) {
+            Err(e) if self.drop_failed(grammar, &e) => Ok(false),
+            other => other,
+        }
+    }
 }
 
 /// Rank 0's admission of a json task while its pipeline's latch refuses
@@ -808,5 +896,53 @@ mod tests {
         let mut gm = mask(WEATHER);
         assert!(commit(Some(&mut gm), i64::from(b'x')).is_err());
         assert!(!commit(None, 5).unwrap());
+    }
+
+    /// A matcher in llguidance's error state, as a parser limit hit
+    /// mid-generation leaves it: every later mask and commit fails.
+    fn failed_mask(body: &str) -> GrammarMask {
+        let mut gm = mask(body);
+        assert!(gm.accept(0x01).is_err());
+        gm
+    }
+
+    #[test]
+    fn a_best_effort_grammar_that_fails_mid_generation_is_dropped_and_counted() {
+        use cascadia_metrics::UnenforcedReason;
+        let before = unenforced(UnenforcedReason::TooComplex);
+        let task = soft_task(WEATHER);
+        let mut handle = BestEffort::of(&task);
+        let mut gm = Some(failed_mask(WEATHER));
+        // A failed commit: dropped, the task carries on unconstrained.
+        assert!(!handle.commit(&mut gm, i64::from(b'{')).unwrap());
+        assert!(gm.is_none());
+        assert!(task.grammar_dropped.get());
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+        // The handle is spent: nothing left to drop.
+        let mut again = Some(failed_mask(WEATHER));
+        assert!(!handle.drop_failed(&mut again, &"x"));
+        assert!(again.is_some());
+
+        // A failed mask, before the step: dropped, the step goes unmasked.
+        let task = soft_task(WEATHER);
+        let mut gm = Some(failed_mask(WEATHER));
+        assert!(BestEffort::of(&task).drop_unmaskable(&mut gm));
+        assert!(gm.is_none() && task.grammar_dropped.get());
+        // A healthy one is kept, its mask computed once.
+        let task = soft_task(WEATHER);
+        let mut gm = Some(mask(WEATHER));
+        assert!(!BestEffort::of(&task).drop_unmaskable(&mut gm));
+        assert!(gm.is_some() && !task.grammar_dropped.get());
+    }
+
+    #[test]
+    fn a_strict_grammar_that_fails_mid_generation_still_errors() {
+        let task = task_with(Some(WEATHER));
+        let mut handle = BestEffort::of(&task);
+        let mut gm = Some(failed_mask(WEATHER));
+        assert!(!handle.drop_unmaskable(&mut gm));
+        assert!(handle.commit(&mut gm, i64::from(b'{')).is_err());
+        assert!(gm.is_some());
+        assert!(!task.grammar_dropped.get());
     }
 }

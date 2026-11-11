@@ -2248,8 +2248,24 @@ impl Runner {
         prompt_ids: &[i64],
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
+        cache: Option<&mut KvPrefixCache>,
+        grammar: Option<&mut cascadia_grammar::GrammarMask>,
+    ) -> Result<(Vec<i64>, bool), RunnerError> {
+        let strict = &mut crate::constrained::BestEffort::default();
+        self.generate_with_cache_dropping(prompt_ids, max_tokens, cfg, cache, grammar, strict)
+    }
+
+    /// [`Self::generate_with_cache`], where a best-effort grammar that fails
+    /// mid-run is dropped ([`crate::constrained::BestEffort`]) and the run
+    /// carries on unconstrained.
+    pub(crate) fn generate_with_cache_dropping(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
         mut cache: Option<&mut KvPrefixCache>,
         mut grammar: Option<&mut cascadia_grammar::GrammarMask>,
+        best_effort: &mut crate::constrained::BestEffort,
     ) -> Result<(Vec<i64>, bool), RunnerError> {
         self.reset_kv();
         let eos: Vec<i64> = self
@@ -2385,9 +2401,13 @@ impl Runner {
         // Masked pick + grammar commit (both no-ops without a grammar).
         // Returns the token and whether the grammar finished on it.
         let mut pick = |logits: &[f32], history: &[i64], rng: &mut u64| {
-            let next = crate::sampling::sample(logits, history, cfg, rng, grammar.as_deref_mut())
+            let next = best_effort
+                .pick(&mut grammar, |mask| {
+                    crate::sampling::sample(logits, history, cfg, rng, mask)
+                })
                 .map_err(|e| RunnerError::Internal(e.to_string()))?;
-            let finished = crate::constrained::commit(grammar.as_deref_mut(), next)
+            let finished = best_effort
+                .commit(&mut grammar, next)
                 .map_err(|e| RunnerError::Internal(e.to_string()))?;
             Ok::<_, RunnerError>((next, finished))
         };

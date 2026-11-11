@@ -2793,3 +2793,135 @@ fn a_new_connection_drops_the_owed_answer_and_the_latch() {
     assert_eq!(final_chunk(&out["j"]).error, None);
     assert_eq!(log.probes(), 1, "the new link was probed");
 }
+
+// ---- a best-effort grammar that fails while generating ----------------------
+
+fn too_complex() -> u64 {
+    cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+        .with_label_values(&[cascadia_metrics::UnenforcedReason::TooComplex.as_str()])
+        .get()
+}
+
+/// A json task whose grammar is best-effort (a forced tool call's).
+fn soft_task(id: &str, max_tokens: u32) -> GenerationTask {
+    GenerationTask::new(id, "hi")
+        .with_max_tokens(max_tokens)
+        .with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+            WEATHER,
+        ))
+}
+
+/// Puts every running json task's matcher in llguidance's error state, as a
+/// parser limit hit mid-generation leaves it: its next mask and commit fail.
+/// How many it broke.
+fn break_grammars(eng: &mut PipelineEngine<JsonStub>) -> usize {
+    let one = eng.active.iter_mut().filter_map(|a| a.grammar.as_mut());
+    let streams = eng.streams.iter_mut().filter_map(|s| s.grammar.as_mut());
+    one.chain(streams)
+        .map(|gm| assert!(gm.accept(0x01).is_err()))
+        .count()
+}
+
+/// [`drive`] for one task, breaking its grammar once it has produced
+/// `after` tokens.
+fn drive_breaking(eng: &mut PipelineEngine<JsonStub>, id: &str, after: usize) -> Outcome {
+    let mut o = Outcome::default();
+    let mut broken = false;
+    for _ in 0..10_000 {
+        if o.last.is_some() {
+            assert!(broken, "the task ended before its grammar was broken");
+            return o;
+        }
+        if !broken && o.tokens.len() >= after {
+            broken = break_grammars(eng) > 0;
+        }
+        for (_, c) in eng.step().unwrap().into_iter().filter(|(t, _)| t == id) {
+            o.tokens.extend(c.token_ids.iter().map(|&t| t as u32));
+            o.text.push_str(&c.text);
+            if c.is_final {
+                o.last = Some(c);
+            }
+        }
+    }
+    panic!("task did not finish: {o:?}");
+}
+
+/// The tokens before the break follow the schema; after it the model's own
+/// favourite (the control byte the schema forbids) runs to the budget.
+fn assert_ran_on_unconstrained(o: &Outcome, after: usize, max_tokens: usize) {
+    assert_eq!(final_chunk(o).error, None, "{o:?}");
+    assert_eq!(o.tokens.len(), max_tokens, "{o:?}");
+    let mut gm = test_env::mask(WEATHER);
+    for &t in &o.tokens[..after] {
+        assert!(gm.allowed(t), "token {t} before the break: {o:?}");
+        gm.accept(t).unwrap();
+    }
+    assert_eq!(*o.tokens.last().unwrap(), 0x01, "{o:?}");
+}
+
+#[test]
+fn a_best_effort_dead_end_runs_unconstrained_on_a_single_stage() {
+    for streams in [0, 2] {
+        let mut runner = JsonStub::new();
+        runner.width = usize::from(b'{');
+        let mut r = rig(runner, 1, streams);
+        let before = too_complex();
+        let t = soft_task("j", 6);
+        let dropped = t.grammar_dropped.clone();
+        r.eng.submit(t).unwrap();
+        let out = drive(&mut r.eng, &["j"]);
+        assert_eq!(final_chunk(&out["j"]).error, None, "streams={streams}");
+        assert_eq!(out["j"].tokens, vec![0x01; 6], "streams={streams}");
+        assert!(dropped.get(), "streams={streams}");
+        assert!(too_complex() > before, "streams={streams}");
+    }
+}
+
+#[test]
+fn a_best_effort_grammar_that_fails_mid_stream_runs_unconstrained() {
+    let mut r = rig(JsonStub::new(), 1, 2);
+    let before = too_complex();
+    let t = soft_task("j", 12);
+    let dropped = t.grammar_dropped.clone();
+    r.eng.submit(t).unwrap();
+    let o = drive_breaking(&mut r.eng, "j", 3);
+    assert_ran_on_unconstrained(&o, 3, 12);
+    assert!(dropped.get());
+    assert!(too_complex() > before);
+}
+
+#[test]
+fn a_strict_grammar_that_fails_mid_stream_still_fails_the_task() {
+    let mut r = rig(JsonStub::new(), 1, 2);
+    r.eng.submit(json_task("j", 12)).unwrap();
+    let o = drive_breaking(&mut r.eng, "j", 3);
+    assert!(final_chunk(&o).error.is_some(), "{o:?}");
+}
+
+#[test]
+fn a_best_effort_grammar_that_fails_mid_generation_on_a_chain_runs_unmasked() {
+    for streams in [0, 2] {
+        let mut c = chain(2, streams, JsonStub::new);
+        let before = too_complex();
+        let t = soft_task("j", 12);
+        let dropped = t.grammar_dropped.clone();
+        c.head.submit(t).unwrap();
+        let o = drive_breaking(&mut c.head, "j", 3);
+        assert_ran_on_unconstrained(&o, 3, 12);
+        assert!(dropped.get(), "streams={streams}");
+        assert!(too_complex() > before, "streams={streams}");
+        assert!(!c.head.stage_masks.latch.is_set(), "streams={streams}");
+        let _ = &c.rt;
+    }
+}
+
+#[test]
+fn a_strict_grammar_that_fails_mid_generation_on_a_chain_still_fails() {
+    for streams in [0, 2] {
+        let mut c = chain(2, streams, JsonStub::new);
+        c.head.submit(json_task("j", 12)).unwrap();
+        let o = drive_breaking(&mut c.head, "j", 3);
+        assert!(final_chunk(&o).error.is_some(), "streams={streams}: {o:?}");
+        let _ = &c.rt;
+    }
+}

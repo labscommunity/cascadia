@@ -46,7 +46,6 @@ use tracing::info;
 
 use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 
-use crate::constrained::commit;
 use crate::kv_prefix_cache::ModelFingerprint;
 use crate::manifest::{Manifest, ManifestError};
 use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvPrefixCache, OvMoeKvSnapshot};
@@ -888,8 +887,24 @@ impl OvMoeRunner {
         prompt_ids: &[u32],
         max_new: usize,
         cfg: &SamplingConfig,
+        cache: Option<&mut OvMoeKvPrefixCache>,
+        grammar: Option<&mut GrammarMask>,
+    ) -> Result<OvMoeGeneration, OvMoeError> {
+        let strict = &mut crate::constrained::BestEffort::default();
+        self.generate_with_cache_dropping(prompt_ids, max_new, cfg, cache, grammar, strict)
+    }
+
+    /// [`Self::generate_with_cache`], where a best-effort grammar that fails
+    /// mid-run is dropped ([`crate::constrained::BestEffort`]) and the run
+    /// carries on unconstrained.
+    pub(crate) fn generate_with_cache_dropping(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
         mut cache: Option<&mut OvMoeKvPrefixCache>,
         mut grammar: Option<&mut GrammarMask>,
+        best_effort: &mut crate::constrained::BestEffort,
     ) -> Result<OvMoeGeneration, OvMoeError> {
         if prompt_ids.is_empty() || max_new == 0 {
             return Ok(OvMoeGeneration::default());
@@ -956,9 +971,14 @@ impl OvMoeRunner {
         }
         let grammar_err = |e: cascadia_engine::EngineError| OvMoeError::Internal(e.to_string());
         let grammar_finished = loop {
-            let next = sample(&logits, &history, cfg, &mut rng, grammar.as_deref_mut())
+            let next = best_effort
+                .pick(&mut grammar, |mask| {
+                    sample(&logits, &history, cfg, &mut rng, mask)
+                })
                 .map_err(grammar_err)?;
-            let finished = commit(grammar.as_deref_mut(), next).map_err(grammar_err)?;
+            let finished = best_effort
+                .commit(&mut grammar, next)
+                .map_err(grammar_err)?;
             let next = next as u32;
             out.push(next);
             history.push(next as i64);

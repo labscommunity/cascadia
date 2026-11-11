@@ -315,6 +315,18 @@ fn round_kv(drafts_len: usize, d_advanced: usize, kept: usize, ended: bool) -> R
     }
 }
 
+/// The rewinds that undo a verify round whose grammar failed before any token
+/// of it was kept: the target back before `prev_correction` (the round fed
+/// it and the `drafts_len` drafts), the draft model back to just after it.
+/// The round then runs again from where it started.
+fn dropped_round_kv(drafts_len: usize, d_advanced: usize) -> RoundKv {
+    RoundKv {
+        target_rewind: drafts_len + 1,
+        draft_rewind: d_advanced,
+        draft_feed: DraftFeed::Nothing,
+    }
+}
+
 /// Picks the first generated token from the last prompt row: plain argmax for
 /// a task without a grammar, else the masked argmax (accepted into the matcher
 /// unless it is EOS). `Some(end)` when the grammar task ends on this token.
@@ -1884,7 +1896,7 @@ impl OvDistSpecEngine {
     /// the first round.
     fn start_task(
         &mut self,
-        task: GenerationTask,
+        mut task: GenerationTask,
         grammar: Option<CompiledGrammar>,
         prompt_ids: &[i64],
     ) -> Result<ActiveSpec, EngineError> {
@@ -1916,10 +1928,12 @@ impl OvDistSpecEngine {
         let (t_logits, t_shape) = self.target.feed(feed_ids)?;
         self.draft.feed(feed_ids)?;
         let vocab = t_shape[2];
-        let (first, first_end) = pick_first_token(
-            &t_logits[t_logits.len() - vocab..],
-            grammar.as_mut(),
-            &self.eos_token_ids,
+        // A best-effort grammar that fails here is dropped: the plain argmax.
+        let row = &t_logits[t_logits.len() - vocab..];
+        let (first, first_end) = structured::pick_or_drop(
+            &mut grammar,
+            |mask| pick_first_token(row, mask, &self.eos_token_ids),
+            |grammar, e| structured::drop_failed_grammar(&mut task, grammar, e),
         )?;
 
         let (d_logits, d_shape) = self.draft.feed(&[first])?;
@@ -2111,7 +2125,20 @@ impl OvDistSpecEngine {
         let rows: Vec<&[f32]> = t_logits.chunks_exact(v).take(verify.len()).collect();
         let mask = active.grammar.as_mut().expect("grammar task");
         let remaining = max_tokens.saturating_sub(active.out.len());
-        let round = masked_accept(mask, &rows, &drafts, &self.eos_token_ids, remaining)?;
+        let round = match masked_accept(mask, &rows, &drafts, &self.eos_token_ids, remaining) {
+            Ok(round) => round,
+            // A best-effort grammar that fails here is dropped, and the round
+            // is run again unmasked from where it started.
+            Err(e)
+                if structured::drop_failed_grammar(&mut active.task, &mut active.grammar, &e) =>
+            {
+                let undo = dropped_round_kv(drafts.len(), d_advanced);
+                self.target.rewind(undo.target_rewind);
+                self.draft.rewind(undo.draft_rewind);
+                return self.do_one_round(max_tokens);
+            }
+            Err(e) => return Err(e),
+        };
         active.stats.total_accepted += round.kept as u32;
 
         let out_len_before = active.out.len();
@@ -3935,6 +3962,23 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A round whose grammar failed is undone whole: both caches back where
+    /// the round started (target before `prev_correction`, draft one past it),
+    /// so the unmasked rerun verifies the same `prev_correction` again.
+    #[test]
+    fn a_round_whose_grammar_failed_is_undone_to_its_start() {
+        for drafts_len in 1..=5usize {
+            let d_advanced = drafts_len - 1;
+            let r = dropped_round_kv(drafts_len, d_advanced);
+            let t0 = 100usize;
+            // The round fed prev_correction + drafts to the target, d_advanced
+            // drafts to the draft model.
+            assert_eq!(t0 + 1 + drafts_len - r.target_rewind, t0);
+            assert_eq!(t0 + 1 + d_advanced - r.draft_rewind, t0 + 1);
+            assert_eq!(r.draft_feed, DraftFeed::Nothing);
         }
     }
 

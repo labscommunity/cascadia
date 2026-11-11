@@ -412,13 +412,21 @@ fn pick_packed_rows(
 ) -> EngineResult<Vec<(usize, EngineResult<i32>)>> {
     let mut picks = Vec::with_capacity(sampled.len());
     for &(row, slot) in sampled {
-        let grammar = slots
-            .get_mut(slot)
-            .and_then(|s| s.as_mut())
-            .and_then(|s| s.grammar.as_mut());
-        let pick = match grammar {
-            Some(mask) => masked_argmax(logits_row(logits, shape, row)?, mask),
-            None => Ok(argmax_logits_row(logits, shape, row)?),
+        let pick = match slots.get_mut(slot).and_then(|s| s.as_mut()) {
+            Some(s) if s.grammar.is_some() => {
+                let r = logits_row(logits, shape, row)?;
+                // A best-effort grammar that fails here is dropped: the plain argmax.
+                let task = &mut s.task;
+                structured::pick_or_drop(
+                    &mut s.grammar,
+                    |mask| match mask {
+                        Some(mask) => masked_argmax(r, mask),
+                        None => argmax_logits_row(logits, shape, row),
+                    },
+                    |grammar, e| structured::drop_failed_grammar(task, grammar, e),
+                )
+            }
+            _ => Ok(argmax_logits_row(logits, shape, row)?),
         };
         picks.push((slot, pick));
     }
@@ -451,6 +459,20 @@ fn commit_grammar_token(grammar: Option<&mut GrammarMask>, token: i32) -> Engine
     };
     mask.accept(token as u32)?;
     Ok(mask.finished())
+}
+
+/// [`commit_grammar_token`] for a running task: a best-effort grammar that
+/// fails on the token is dropped ([`structured::drop_failed_grammar`]) and
+/// the token commits unconstrained; a strict one's error is returned.
+fn commit_task_token(
+    task: &mut GenerationTask,
+    grammar: &mut Option<GrammarMask>,
+    token: i32,
+) -> EngineResult<bool> {
+    match commit_grammar_token(grammar.as_mut(), token) {
+        Err(e) if structured::drop_failed_grammar(task, grammar, &e) => Ok(false),
+        other => other,
+    }
 }
 
 /// Whether the task ends on the token just committed, and why. A grammar
@@ -489,7 +511,7 @@ fn commit_packed_token(
     token: i32,
     eos: &[u32],
 ) -> EngineResult<Option<cascadia_types::FinishReason>> {
-    let grammar_finished = commit_grammar_token(t.grammar.as_mut(), token)?;
+    let grammar_finished = commit_task_token(&mut t.task, &mut t.grammar, token)?;
     t.last_token = token;
     t.generated.push(token);
     let max_tokens = t.task.max_tokens.max(1) as usize;
@@ -2420,7 +2442,14 @@ fn step_mask_words(
             "structured output is not available for this model: {reason}"
         ))
     })?;
-    grammar_mask_words(grammar, width).map(Some)
+    match grammar_mask_words(grammar, width) {
+        // A best-effort grammar that fails here is dropped: the step goes
+        // unmasked, and so does every later one.
+        Err(e) if structured::drop_failed_grammar(&mut active.task, &mut active.grammar, &e) => {
+            Ok(None)
+        }
+        other => other.map(Some),
+    }
 }
 
 /// Whether the step just finished on a warm-resumed chain must ABORT it: the
@@ -2470,7 +2499,20 @@ fn packed_step_masks(
             Err(reason) => Err(EngineError::Backend(format!(
                 "structured output is not available for this model: {reason}"
             ))),
-            Ok(width) => grammar_mask_words(grammar, *width),
+            Ok(width) => match grammar_mask_words(grammar, *width) {
+                // A best-effort grammar that fails here is dropped: its row
+                // goes unmasked.
+                Err(e)
+                    if structured::drop_failed_grammar(
+                        &mut packed.task,
+                        &mut packed.grammar,
+                        &e,
+                    ) =>
+                {
+                    continue;
+                }
+                other => other,
+            },
         };
         match words {
             Ok(w) if row < rows => masks[row] = Some(w),
@@ -5319,12 +5361,20 @@ impl OvRuntimeEngine {
         chunk_start: i64,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
-            let prompt_len = self.active.as_ref().map_or(0, |a| a.prompt_ids.len());
-            let grammar = self.active.as_mut().and_then(|a| a.grammar.as_mut());
-            return Ok((
-                pick_chunk_token(out, shape, take, chunk_start, prompt_len, grammar)?,
-                std::time::Duration::ZERO,
-            ));
+            let Some(active) = self.active.as_mut() else {
+                return Ok((
+                    pick_chunk_token(out, shape, take, chunk_start, 0, None)?,
+                    std::time::Duration::ZERO,
+                ));
+            };
+            let prompt_len = active.prompt_ids.len();
+            let task = &mut active.task;
+            let token = structured::pick_or_drop(
+                &mut active.grammar,
+                |grammar| pick_chunk_token(out, shape, take, chunk_start, prompt_len, grammar),
+                |grammar, e| structured::drop_failed_grammar(task, grammar, e),
+            )?;
+            return Ok((token, std::time::Duration::ZERO));
         }
         let x = *shape.last().unwrap_or(&0);
         if x == 0 || out.len() != take * x {
@@ -5362,13 +5412,11 @@ impl OvRuntimeEngine {
             };
             let row = logits_row_count(out, shape)? - 1;
             let prompt_len = active.prompt_ids.len();
-            let token = pick_next_token(
-                out,
-                shape,
-                row,
-                last_row_position,
-                prompt_len,
-                active.grammar.as_mut(),
+            let task = &mut active.task;
+            let token = structured::pick_or_drop(
+                &mut active.grammar,
+                |grammar| pick_next_token(out, shape, row, last_row_position, prompt_len, grammar),
+                |grammar, e| structured::drop_failed_grammar(task, grammar, e),
             )?;
             Ok((token, std::time::Duration::ZERO))
         } else {
@@ -5389,7 +5437,8 @@ impl OvRuntimeEngine {
             .ok_or_else(|| EngineError::Backend("emit_token with no active task".into()))?;
         // Structured output: the matcher advances past the committed token; a
         // token it rejects fails the task (the caller attributes the error).
-        let grammar_finished = commit_grammar_token(active.grammar.as_mut(), next_token)?;
+        let grammar_finished =
+            commit_task_token(&mut active.task, &mut active.grammar, next_token)?;
         active.last_token = next_token;
         active.generated.push(next_token);
 
@@ -10693,6 +10742,101 @@ mod tests {
         let soft = slots[0].as_ref().unwrap();
         assert!(soft.grammar.is_none() && soft.task.grammar.is_none());
         assert!(dropped.get());
+    }
+
+    /// A matcher in llguidance's error state, as one is after a token commit
+    /// or a mask ran past a parser limit (`max_items_in_row`): every later
+    /// mask and commit fails.
+    fn failed_mask() -> GrammarMask {
+        let mut m = test_mask(OK_ENUM, "");
+        assert!(m.accept(BAD as u32).is_err());
+        assert!(m.mask_words().is_err());
+        m
+    }
+
+    fn too_complex_count() -> u64 {
+        cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+            .with_label_values(&[cascadia_metrics::UnenforcedReason::TooComplex.as_str()])
+            .get()
+    }
+
+    fn with_spec(task: &mut GenerationTask, best_effort: bool) {
+        task.grammar = Some(if best_effort {
+            cascadia_types::GrammarSpec::best_effort_json_schema(OK_ENUM)
+        } else {
+            json_spec(OK_ENUM)
+        });
+    }
+
+    /// The head's mask for a step whose best-effort grammar fails at run
+    /// time: the grammar is dropped (counted as too complex, recorded on the
+    /// task) and the step goes downstream unmasked. A strict one fails the
+    /// task, as before.
+    #[test]
+    fn a_best_effort_grammar_whose_mask_fails_mid_task_is_dropped_and_the_step_goes_unmasked() {
+        let gf = structured::LazyGrammarFactory::ready(Ok(test_factory()));
+        let now = std::time::Instant::now();
+        let link = MaskLink::default();
+        let before = too_complex_count();
+        let mut soft = active_task(4, Some(failed_mask()));
+        with_spec(&mut soft.task, true);
+        assert_eq!(
+            step_mask_words(Some(&mut soft), &gf, &link, 3, now).unwrap(),
+            None
+        );
+        assert!(soft.grammar.is_none() && soft.task.grammar.is_none());
+        assert!(soft.task.grammar_dropped.get());
+        assert!(too_complex_count() > before);
+        let mut strict = active_task(4, Some(failed_mask()));
+        with_spec(&mut strict.task, false);
+        assert!(step_mask_words(Some(&mut strict), &gf, &link, 3, now).is_err());
+        assert!(strict.grammar.is_some() && !strict.task.grammar_dropped.get());
+    }
+
+    /// Single-stage and packed picks and commits under a best-effort grammar
+    /// that fails at run time: the plain pick, the token committed, the
+    /// grammar dropped; the slot runs on. A strict slot fails alone, as
+    /// before.
+    #[test]
+    fn a_best_effort_grammar_that_fails_mid_task_lets_the_task_run_on_unconstrained() {
+        let w = test_factory().mask_width();
+        let before = too_complex_count();
+        // Packed commit: the token is kept, the slot is not failed.
+        let mut soft = packed_slot(Some(failed_mask()));
+        with_spec(&mut soft.task, true);
+        assert_eq!(
+            commit_packed_token(&mut soft, b'"' as i32, &[TEST_EOS]).unwrap(),
+            None
+        );
+        assert_eq!(soft.generated, vec![b'"' as i32]);
+        assert!(soft.grammar.is_none() && soft.task.grammar_dropped.get());
+        let mut strict = packed_slot(Some(failed_mask()));
+        with_spec(&mut strict.task, false);
+        assert!(commit_packed_token(&mut strict, b'"' as i32, &[TEST_EOS]).is_err());
+        // Packed mask: the soft slot's row goes unmasked, the strict one fails.
+        let width: Result<usize, String> = Ok(w);
+        let mut soft = packed_slot(Some(failed_mask()));
+        with_spec(&mut soft.task, true);
+        let mut strict = packed_slot(Some(failed_mask()));
+        with_spec(&mut strict.task, false);
+        let mut slots = vec![Some(soft), Some(strict)];
+        let (masks, failed) = packed_step_masks(&mut slots, &[(0, 0), (1, 1)], 2, &width, false);
+        assert_eq!(masks, None, "no row is masked");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].0, 1);
+        assert!(slots[0].as_ref().unwrap().grammar.is_none());
+        // Packed pick: the soft slot takes the plain argmax.
+        let mut soft = packed_slot(Some(failed_mask()));
+        with_spec(&mut soft.task, true);
+        let mut strict = packed_slot(Some(failed_mask()));
+        with_spec(&mut strict.task, false);
+        let mut slots = vec![Some(soft), Some(strict)];
+        let (out, shape) = rows(&[bad_then(w, b'"'), bad_then(w, b'"')]);
+        let picks = pick_packed_rows(&out, &shape, &[(0, 0), (1, 1)], &mut slots).unwrap();
+        assert_eq!(*picks[0].1.as_ref().unwrap(), BAD as i32);
+        assert!(picks[1].1.is_err());
+        assert!(slots[0].as_ref().unwrap().grammar.is_none());
+        assert!(too_complex_count() >= before + 3);
     }
 
     /// The relay side of a packed masked plan: `relay_downstream_answer`

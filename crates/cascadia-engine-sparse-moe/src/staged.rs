@@ -10,7 +10,7 @@
 use cascadia_engine::EngineResult;
 use cascadia_grammar::GrammarMask;
 
-use crate::constrained::commit;
+use crate::constrained::BestEffort;
 use crate::sampling::{init_rng, sample, SamplingConfig};
 
 /// Wall-clock split of one generation: the prompt forward plus the first
@@ -242,7 +242,7 @@ pub trait StagedRunner: Send + 'static {
         max_new: usize,
         cfg: &SamplingConfig,
     ) -> (Vec<u32>, bool, GenTiming) {
-        match run_generation(self, prompt, max_new, cfg, None) {
+        match run_generation(self, prompt, max_new, cfg, None, &mut BestEffort::default()) {
             Ok(g) => (g.tokens, g.hit_context_cap, g.timing),
             // Only the grammar mask can fail, and there is none.
             Err(e) => unreachable!("an unconstrained generation failed: {e}"),
@@ -261,7 +261,8 @@ pub trait StagedRunner: Send + 'static {
         cfg: &SamplingConfig,
         grammar: &mut GrammarMask,
     ) -> EngineResult<Generation> {
-        run_generation(self, prompt, max_new, cfg, Some(grammar))
+        let strict = &mut BestEffort::default();
+        run_generation(self, prompt, max_new, cfg, Some(grammar), strict)
     }
 
     /// Single-stage greedy convenience (warmup / tests).
@@ -285,13 +286,16 @@ pub struct Generation {
 /// The shared single-stage sampling loop. Prompt tokens drive the same
 /// per-token path as decode; sampling happens once after prefill (mirroring
 /// the pipeline). A prompt longer than the context budget is truncated to its
-/// first `max_seq` tokens. Without a grammar nothing here can fail.
-fn run_generation<R: StagedRunner + ?Sized>(
+/// first `max_seq` tokens. Without a grammar nothing here can fail. A
+/// best-effort grammar (see [`BestEffort`]) that fails is dropped, and the
+/// run carries on unconstrained.
+pub(crate) fn run_generation<R: StagedRunner + ?Sized>(
     r: &mut R,
     prompt: &[u32],
     max_new: usize,
     cfg: &SamplingConfig,
     mut grammar: Option<&mut GrammarMask>,
+    best_effort: &mut BestEffort,
 ) -> EngineResult<Generation> {
     let started = std::time::Instant::now();
     r.reset();
@@ -324,13 +328,9 @@ fn run_generation<R: StagedRunner + ?Sized>(
         }
         ll
     };
-    let mut next = sample(
-        &last_logits,
-        &history,
-        cfg,
-        &mut rng,
-        grammar.as_deref_mut(),
-    )?;
+    let mut next = best_effort.pick(&mut grammar, |mask| {
+        sample(&last_logits, &history, cfg, &mut rng, mask)
+    })?;
     let prefill_s = started.elapsed().as_secs_f64();
     let decode_started = std::time::Instant::now();
     let mut decode_steps = 0usize;
@@ -339,7 +339,7 @@ fn run_generation<R: StagedRunner + ?Sized>(
     let mut hit_context_cap = false;
     let grammar_finished = loop {
         let tok = next as u32;
-        let grammar_finished = commit(grammar.as_deref_mut(), next)?;
+        let grammar_finished = best_effort.commit(&mut grammar, next)?;
         out.push(tok);
         history.push(next);
         if grammar_finished || out.len() >= max_new || r.eos_token_ids().contains(&tok) {
@@ -357,7 +357,9 @@ fn run_generation<R: StagedRunner + ?Sized>(
         let h = r.embed_token(tok);
         let h = r.forward_layers(h, pos, Some(tok));
         let logits = r.head_logits(&h);
-        next = sample(&logits, &history, cfg, &mut rng, grammar.as_deref_mut())?;
+        next = best_effort.pick(&mut grammar, |mask| {
+            sample(&logits, &history, cfg, &mut rng, mask)
+        })?;
         pos += 1;
         decode_steps += 1;
     };

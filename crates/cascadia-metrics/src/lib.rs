@@ -149,7 +149,8 @@ pub enum UnenforcedReason {
     /// The backend refused the schema, or the schema recently failed to
     /// compile on this server.
     SchemaRejected,
-    /// The schema exceeds the build budget or the schema limits.
+    /// The schema exceeds the build budget or the schema limits, or its
+    /// grammar failed while generating (a parser limit, mid-answer).
     TooComplex,
     /// The schema compile pool was full.
     Busy,
