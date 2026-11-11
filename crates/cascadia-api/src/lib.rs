@@ -148,9 +148,12 @@ pub struct AppState {
     /// (Inkling). See [`MarkerDialect`].
     pub marker_dialect: Option<MarkerDialect>,
     /// The served model writes a reasoning block that ends in `</think>`
-    /// before its answer. Only then does a request with thinking on keep
-    /// tool calls drafted inside that block from counting, streamed or not.
+    /// before its answer. Only then are tool calls drafted inside that block
+    /// kept from counting, streamed or not (see [`AppState::thinking_applies`]).
     pub thinks: bool,
+    /// The chat template switches reasoning with `enable_thinking`, so a
+    /// request that turns it off gets a reply with no reasoning block.
+    pub thinking_switch: bool,
     /// Pipeline readiness for `/health`. Starts `true`; a completion that fails
     /// with a 5xx (e.g. the distributed pipeline dropped a peer link) flips it
     /// `false`, a success flips it back `true` — so `/health` reflects the real
@@ -168,6 +171,14 @@ pub struct AppState {
     /// The streams being sent, for telling a cancel from an engine that
     /// went away. See [`stream_shape::LiveStreams`].
     live_streams: stream_shape::LiveStreams,
+}
+
+impl AppState {
+    /// Whether a reply to a request with `requested` thinking may open with
+    /// reasoning, so a call counts only after its `</think>`.
+    fn thinking_applies(&self, requested: bool) -> bool {
+        tool_stream::thinking_applies(self.thinks, self.thinking_switch, requested)
+    }
 }
 
 /// How long a stream may go without sending anything before it sends the SSE
@@ -624,6 +635,9 @@ fn make_router_with_live(
         thinks: tool_stream::model_thinks(
             cfg.chat_template.template.as_deref(),
             cfg.marker_dialect.is_some(),
+        ),
+        thinking_switch: tool_stream::template_reads_thinking_flag(
+            cfg.chat_template.template.as_deref(),
         ),
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -3208,7 +3222,7 @@ async fn chat_completions(
         buf,
         &req.tool_choice,
         req.tools.as_ref().is_some_and(|t| !t.is_empty()),
-        enable_thinking && state.thinks,
+        state.thinking_applies(enable_thinking),
     );
     // A parsed tool call overrides `stop`. A generation cut at its limit
     // keeps `length` and still carries the calls that came out whole, as
@@ -3518,7 +3532,7 @@ async fn stream_completion(
     let task_id = task.task_id.clone();
     // Captured before `task` moves into `generate` below — arms the tool-call
     // scan the same way the non-streaming path does (see `tool_call_scan_text`).
-    let enable_thinking = task.enable_thinking && state.thinks;
+    let enable_thinking = state.thinking_applies(task.enable_thinking);
     let stop = StopMatcher::new(&task.sampling.stop);
 
     let chunk_stream = match generate_in_window(&state, task).await {
@@ -8377,6 +8391,12 @@ level={{ effort_map[eff] }}";
     const THINK_TEMPLATE: &str = "{% for m in messages %}{{ m.content }}{% endfor %}\
         {% if enable_thinking is defined and not enable_thinking %}<think>\n\n</think>{% endif %}";
 
+    /// A chat template whose model always reasons first, whatever the
+    /// request's `enable_thinking` (R1-distill, QwQ, Qwen3 Thinking-2507
+    /// style): it never reads the flag.
+    const FORCED_THINK_TEMPLATE: &str = "{% for m in messages %}{{ m.content }}{% endfor %}\
+        {# the reply's reasoning ends at </think> #}<think>\n";
+
     /// [`gated_app`] with chat template `template`.
     async fn gated_app_with(
         parts: &[&str],
@@ -8788,8 +8808,11 @@ level={{ effort_map[eff] }}";
         assert_eq!(finish_reasons(&events), ["tool_calls"], "{all}");
     }
 
-    /// Stream and non-stream decide the same calls for a model with a
-    /// reasoning block and one without, thinking left at its default.
+    /// Stream and non-stream decide the same calls for a model with no
+    /// reasoning block, one whose template switches reasoning with
+    /// `enable_thinking`, and one whose template forces it; thinking at its
+    /// default or turned off. Only where the reply cannot have reasoning
+    /// (no block, or a switch turned off) does a call count from the start.
     #[tokio::test]
     async fn streamed_and_non_streamed_replies_decide_tool_calls_alike() {
         let replies: [&[&str]; 4] = [
@@ -8798,17 +8821,26 @@ level={{ effort_map[eff] }}";
             &["<think>hmm</think>", "The answer ", "is 4"],
             &DRAFT_THEN_CALL[..2],
         ];
-        for (template, thinks) in [(PLAIN_TEMPLATE, false), (THINK_TEMPLATE, true)] {
+        for (template, thinking, thinks) in [
+            (PLAIN_TEMPLATE, None, false),
+            (THINK_TEMPLATE, None, true),
+            (THINK_TEMPLATE, Some(false), false),
+            (FORCED_THINK_TEMPLATE, None, true),
+            (FORCED_THINK_TEMPLATE, Some(false), true),
+        ] {
             for parts in replies {
-                let ctx = format!("thinks={thinks} parts={parts:?}");
+                let ctx = format!("template={template:?} thinking={thinking:?} parts={parts:?}");
                 let mut decided = Vec::new();
                 for stream in [false, true] {
                     let (app, release) = gated_app_with(parts, false, template).await;
                     release.store(true, Ordering::SeqCst);
-                    let payload = serde_json::json!({"model": "mock-model",
+                    let mut payload = serde_json::json!({"model": "mock-model",
                         "messages": [{"role": "user", "content": "hi"}], "stream": stream,
                         "tools": [{"type": "function", "function": {"name": "get_weather"}},
                                   {"type": "function", "function": {"name": "rm"}}]});
+                    if let Some(on) = thinking {
+                        payload["enable_thinking"] = on.into();
+                    }
                     let (status, text) = post_text(app, "/v1/chat/completions", &payload).await;
                     assert_eq!(status, StatusCode::OK, "{ctx}: {text}");
                     let (calls, finish, content) = if stream {

@@ -91,6 +91,23 @@ pub(crate) fn model_thinks(template: Option<&str>, marker_dialect: bool) -> bool
     marker_dialect || template.is_none_or(|t| t.contains(crate::THINK_CLOSE))
 }
 
+/// Whether the chat template switches reasoning with the request's
+/// `enable_thinking` (Qwen3's hybrid templates do). A template that never
+/// reads it (R1-distill, QwQ, Qwen3 Thinking-2507) reasons whatever the
+/// request says, and with no template the API cannot tell.
+pub(crate) fn template_reads_thinking_flag(template: Option<&str>) -> bool {
+    template.is_some_and(|t| t.contains("enable_thinking"))
+}
+
+/// Whether a reply may open with reasoning, so that only text after its
+/// `</think>` can hold a call: the model reasons, and the request did not
+/// turn reasoning off through a template that honours the switch. The one
+/// answer the stream emitter, the stream splitter and the non-streamed
+/// parse all use.
+pub(crate) fn thinking_applies(model_thinks: bool, reads_flag: bool, requested: bool) -> bool {
+    model_thinks && (requested || !reads_flag)
+}
+
 /// Turns the held text of a tools stream into call deltas. Driven with the
 /// splitter's whole buffer and where tool-call scanning starts (`None` while
 /// a reasoning block is still open: a call drafted there is not a call).
@@ -777,6 +794,34 @@ mod tests {
             .iter()
             .map(|c| json(&c.function.arguments))
             .collect()
+    }
+
+    /// Calls count only after `</think>` when the reply may reason: a model
+    /// that thinks, unless its template honours `enable_thinking` and the
+    /// request turned it off. A marker dialect thinks; with no template the
+    /// API assumes reasoning may come.
+    #[test]
+    fn thinking_applies_unless_a_honoured_switch_turns_it_off() {
+        let plain = Some("{{ m.content }}");
+        let hybrid = Some(
+            "{% if enable_thinking is defined and not enable_thinking %}<think></think>{% endif %}",
+        );
+        let forced = Some("{# reasoning ends at </think> #}<think>");
+        let applies = |template: Option<&str>, marker: bool, requested: bool| {
+            thinking_applies(
+                model_thinks(template, marker),
+                template_reads_thinking_flag(template),
+                requested,
+            )
+        };
+        for requested in [true, false] {
+            assert!(!applies(plain, false, requested));
+            assert!(applies(forced, false, requested));
+            assert!(applies(None, false, requested));
+            assert!(applies(plain, true, requested));
+        }
+        assert!(applies(hybrid, false, true));
+        assert!(!applies(hybrid, false, false));
     }
 
     const HERMES: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
