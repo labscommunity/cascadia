@@ -147,6 +147,28 @@ fn api_error_for(
     (status, Json(body)).into_response()
 }
 
+/// A non-streamed chat or completion that ended without finishing: its task
+/// was cancelled (`/v1/cancel`, which ends the stream with no final chunk,
+/// or the engine's own `Cancelled` end). Its partial text is not an answer,
+/// so it is not sent as a 200 with `finish_reason: "stop"`; a 400 is not
+/// retried by the OpenAI SDKs (408, 409, 429 and 5xx are) and says nothing
+/// about the pipeline's readiness. `/v1/responses` answers the same end as
+/// `status: "cancelled"`.
+fn cancelled_response() -> Response {
+    api_error_for(
+        StatusCode::BAD_REQUEST,
+        "The request was cancelled before it finished.",
+        None,
+        Some("request_cancelled"),
+    )
+}
+
+/// The task ended without finishing (see [`cancelled_response`]): no final
+/// chunk, or a final chunk that ends `Cancelled`.
+fn ended_cancelled(end: Option<cascadia_types::FinishReason>) -> bool {
+    matches!(end, None | Some(cascadia_types::FinishReason::Cancelled))
+}
+
 /// `Json<T>` whose rejections (bad JSON, wrong field types, unsupported
 /// content parts) come back as an OpenAI-shaped error instead of axum's
 /// plain-text 400/415/422.
@@ -4804,11 +4826,14 @@ async fn chat_completions(
         completion_tokens,
         mut finish_reason,
         logprobs: logprobs_content,
-        ..
+        end,
     } = match collect_generation(&state, admitted, &req.sampling_params().stop, "messages").await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    if ended_cancelled(end) {
+        return cancelled_response();
+    }
     let (message, choice_finish) = build_choice(
         buf,
         &req.tool_choice,
@@ -4968,6 +4993,7 @@ async fn completions(
     let mut prompt_tokens: u32 = 0;
     let mut finish_reason: &'static str = "stop";
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    let mut end = None;
     while let Some(chunk) = chunk_stream.next().await {
         if let Some(reason) = &chunk.error {
             let (status, message, param, code) = classify_chunk_error(reason, "prompt");
@@ -4992,12 +5018,20 @@ async fn completions(
             if let Some(fr) = chunk.finish_reason {
                 finish_reason = fr.as_openai_str();
             }
+            end = Some(
+                chunk
+                    .finish_reason
+                    .unwrap_or(cascadia_types::FinishReason::Stop),
+            );
         }
     }
     state
         .stats
         .tokens_total
         .fetch_add(completion_tokens as u64, Ordering::Relaxed);
+    if ended_cancelled(end) {
+        return cancelled_response();
+    }
 
     // Stop-sequence truncation (same as the chat path).
     let stops = req.sampling_params().stop;
@@ -13806,6 +13840,46 @@ level={{ effort_map[eff] }}";
                 StatusCode::SERVICE_UNAVAILABLE,
                 "{route}: a cancelled stream must not clear a pipeline failure"
             );
+        }
+    }
+
+    /// A non-streamed chat or completion whose task is cancelled before it
+    /// finishes (`/v1/cancel`, or the engine's own `Cancelled` end) is not
+    /// an answer: a 400 `request_cancelled` (not retried by the SDKs), never
+    /// a 200 whose empty content reads as the model's reply. Readiness is
+    /// untouched either way.
+    #[tokio::test]
+    async fn a_cancelled_non_streamed_request_is_not_an_empty_answer() {
+        for (uri, payload) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "__cancel__"}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "__cancel__"}),
+            ),
+        ] {
+            let (app, _release) = readiness_app().await;
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"], "request_cancelled", "{uri}: {body}");
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{uri}");
+            assert_eq!(health_status(app).await, StatusCode::OK, "{uri}");
         }
     }
 

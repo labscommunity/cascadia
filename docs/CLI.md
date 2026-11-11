@@ -587,6 +587,12 @@ same way: `code` is `context_length_exceeded` for an over-window prompt (with
 the message above), `invalid_prompt` for another refusal of the input, and
 `server_error` otherwise.
 
+**Cancelled requests.** A non-streamed chat or completion whose task is
+cancelled before it finishes (`POST /v1/cancel/<id>`) is a 400 with `code`
+`request_cancelled` and `param` `null`, not a 200 whose partial or empty text
+would read as the model's answer. `/v1/responses` answers it with `status`
+`"cancelled"`, and a cancelled stream simply ends.
+
 **Readiness.** `GET /health` answers 503 `{"status": "degraded"}` once a
 completion fails with a 5xx that points at the pipeline (a peer link dropped,
 the engine not loaded), or a stream ends with such an engine error (its 200
