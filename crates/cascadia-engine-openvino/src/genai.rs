@@ -1116,10 +1116,7 @@ impl SchemaBudget {
     /// running count. The caller answers the refusal with
     /// [`budget_full_error`].
     fn check(&mut self, task: &GenerationTask) -> Result<(), BudgetFull> {
-        let Some(schema) = counted_schema(task) else {
-            return Ok(());
-        };
-        if self.seen.contains(schema) || self.seen.len() < MAX_DISTINCT_SCHEMAS {
+        if self.has_room(task) {
             return Ok(());
         }
         self.refused += 1;
@@ -1142,24 +1139,29 @@ impl SchemaBudget {
         Err(BudgetFull)
     }
 
+    /// True when `task` can go to GenAI as far as the budget goes: it has no
+    /// counted schema (none, or json_object's), its schema was let through
+    /// already, or there is a slot left.
+    fn has_room(&self, task: &GenerationTask) -> bool {
+        counted_schema(task)
+            .is_none_or(|s| self.seen.contains(s) || self.seen.len() < MAX_DISTINCT_SCHEMAS)
+    }
+
     /// [`Self::check`] at submit: a best-effort grammar (a forced tool
     /// call's) the budget has no room for is dropped (counted as
     /// `too_complex`: the closest reason, as the schema is over a limit of
     /// this worker's, not refused by the backend and not a passing load) and
-    /// the task runs unconstrained; a strict one gets the refusal. Run before
-    /// [`Self::record`], which then counts nothing for a dropped grammar.
+    /// the task runs unconstrained; a strict one gets the refusal. A drop is
+    /// not a refusal: it neither counts in `refused` nor logs the budget-full
+    /// warning. Run before [`Self::record`], which then counts nothing for a
+    /// dropped grammar.
     fn admit(&mut self, task: &mut GenerationTask) -> Result<(), BudgetFull> {
-        match self.check(task) {
-            Err(_)
-                if crate::structured::drop_best_effort_grammar(
-                    task,
-                    UnenforcedReason::TooComplex,
-                ) =>
-            {
-                Ok(())
-            }
-            other => other,
+        if !self.has_room(task)
+            && crate::structured::drop_best_effort_grammar(task, UnenforcedReason::TooComplex)
+        {
+            return Ok(());
         }
+        self.check(task)
     }
 
     /// How many distinct schemas have been let through.
@@ -3983,24 +3985,105 @@ mod tests {
         assert_eq!(e.active.last().unwrap().grammar_hash, None);
         assert!(unenforced(UnenforcedReason::TooComplex) > before);
         assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
+        // A drop is not a budget refusal: not counted, no budget-full warning.
+        assert_eq!(
+            (e.schema_budget.refused, e.schema_budget.full_warnings),
+            (0, 0)
+        );
         // A schema already let through still runs constrained.
         e.submit(soft_schema_task("again", &forced_tool_schema(1)))
             .unwrap();
         assert!(st.lock().unwrap().last_added_grammar);
-        // The 65th, strict: the parent's 400 unchanged.
+        // json_object, strict or best-effort, never meets the budget: applied.
+        for t in [
+            schema_task("obj", JSON_OBJECT_PROBE),
+            soft_schema_task("soft-obj", JSON_OBJECT_PROBE),
+        ] {
+            e.submit(t).unwrap();
+            assert!(st.lock().unwrap().last_added_grammar, "json_object applied");
+        }
+        assert_eq!(
+            (e.schema_budget.refused, e.schema_budget.full_warnings),
+            (0, 0)
+        );
+        // The 65th, strict: the parent's 400, matched by its stable prefix.
         match e.submit(schema_task(
             "strict",
             &forced_tool_schema(MAX_DISTINCT_SCHEMAS + 1),
         )) {
             Err(EngineError::InvalidConfig(m)) => assert!(
-                m.starts_with(
-                    "structured output is not available for this model: this worker keeps"
-                ),
+                m.starts_with("structured output is not available for this model: "),
                 "{m}"
             ),
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+        assert_eq!(
+            (e.schema_budget.refused, e.schema_budget.full_warnings),
+            (1, 1)
+        );
         assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
+
+        // The budget as the stateful engine's submit uses it (admit, then record).
+        let mut budget = SchemaBudget::default();
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            let mut t = soft_schema_task("t", &forced_tool_schema(i + 1));
+            budget.admit(&mut t).unwrap();
+            budget.record(&t);
+        }
+        let mut over = soft_schema_task("over", &forced_tool_schema(MAX_DISTINCT_SCHEMAS + 1));
+        budget.admit(&mut over).unwrap();
+        assert_eq!(over.grammar, None, "dropped");
+        budget.record(&over);
+        assert_eq!(budget.len(), MAX_DISTINCT_SCHEMAS);
+        assert_eq!((budget.refused, budget.full_warnings), (0, 0));
+        let mut obj = soft_schema_task("obj", JSON_OBJECT_PROBE);
+        budget.admit(&mut obj).unwrap();
+        assert!(obj.grammar.is_some(), "json_object kept");
+        assert_eq!((budget.refused, budget.full_warnings), (0, 0));
+    }
+
+    /// A forced tool call whose parameters have an unbounded integer: GenAI
+    /// is sent the schema with it bounded, the xgrammar guard and the
+    /// validate call see that bounded text, and the grammar is applied (not
+    /// dropped); the budget counts the client's text.
+    #[test]
+    fn a_forced_tool_with_an_unbounded_integer_is_sent_bounded_and_enforced() {
+        let body = r##"{"type":"array","minItems":1,"maxItems":1,"items":{"anyOf":[{"type":"object","properties":{"name":{"type":"string","enum":["f"]},"parameters":{"type":"object","properties":{"n":{"type":"integer"},"m":{"$ref":"#/$defs/t0_M"}},"required":["n","m"]}},"required":["name","parameters"],"additionalProperties":false}]},"$defs":{"t0_M":{"type":"integer"}}}"##;
+        let (max, min) = (
+            cascadia_grammar::ADDED_INTEGER_MAXIMUM,
+            cascadia_grammar::ADDED_INTEGER_MINIMUM,
+        );
+        let t = soft_schema_task("f", body);
+        let sent = genai_json_schema(&t).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(
+            v["items"]["anyOf"][0]["properties"]["parameters"]["properties"]["n"],
+            serde_json::json!({"type":"integer","maximum":max,"minimum":min})
+        );
+        assert_eq!(
+            v["$defs"]["t0_M"],
+            serde_json::json!({"type":"integer","maximum":max,"minimum":min})
+        );
+        let mut validated = None;
+        assert_eq!(
+            check_grammar(&t, None, |s| {
+                validated = Some(s.to_owned());
+                Ok(())
+            })
+            .unwrap(),
+            GrammarVerdict::Apply
+        );
+        assert_eq!(validated.as_deref(), Some(sent.as_str()));
+
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.submit(soft_schema_task("f", body)).unwrap();
+        assert_eq!(
+            st.lock().unwrap().last_schema.as_deref(),
+            Some(sent.as_str())
+        );
+        assert!(e.active[0].grammar_hash.is_some(), "enforced, not dropped");
+        assert!(e.schema_budget.seen.contains(body));
     }
 
     #[test]
