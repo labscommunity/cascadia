@@ -437,8 +437,9 @@ fn genai_json_schema(task: &GenerationTask) -> Option<String> {
 }
 
 /// Most integers [`genai_json_schema`] bounds in one schema. xgrammar
-/// compiles each bounded integer's range on its own, a cost the xgrammar
-/// guard doesn't price: 1000 required ones took 1.37 s against 0.10 s
+/// compiles each bounded integer's range on its own (the xgrammar guard
+/// prices that, per digit of the bounds); the cap keeps the compile the
+/// bounds add small: 1000 required ones took 1.37 s against 0.10 s
 /// unbounded, 200 took 0.17 s against 0.02 s (xgrammar 0.1.31, Qwen2.5
 /// tokenizer, one thread). Past this the schema goes as the client wrote it,
 /// as the llguidance engines do for a schema with too many integers.
@@ -2581,8 +2582,8 @@ mod tests {
     fn a_schema_with_too_many_integers_goes_to_genai_as_written() {
         // Each bounded integer is a range xgrammar compiles on its own: 1000
         // of them took 1.37 s against 0.10 s unbounded (xgrammar 0.1.31,
-        // Qwen2.5 tokenizer, one thread), a cost the xgrammar guard doesn't
-        // price. Past the cap the client's schema goes as written.
+        // Qwen2.5 tokenizer, one thread). The cap keeps that extra compile
+        // small; past it the client's schema goes as written.
         let many = |n: usize| {
             let props: Vec<String> = (0..n)
                 .map(|i| format!(r#""p{i}":{{"type":"integer"}}"#))
