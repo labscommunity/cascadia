@@ -3853,6 +3853,10 @@ mod tests {
     struct Gate {
         open: AtomicBool,
         entered: std::sync::atomic::AtomicUsize,
+        /// While set, `submit()` parks after logging the task, still inside
+        /// the engine lock: the window between "the engine has the task" and
+        /// "the submit has returned and released the lock".
+        hold_submit: AtomicBool,
     }
 
     impl Gate {
@@ -3866,6 +3870,12 @@ mod tests {
         }
         fn release(&self) {
             self.open.store(true, Ordering::SeqCst);
+        }
+        fn hold_submits(&self) {
+            self.hold_submit.store(true, Ordering::SeqCst);
+        }
+        fn release_submits(&self) {
+            self.hold_submit.store(false, Ordering::SeqCst);
         }
         fn steps_entered(&self) -> usize {
             self.entered.load(Ordering::SeqCst)
@@ -3886,6 +3896,9 @@ mod tests {
         fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
             self.log.lock().submitted.push(task.task_id.clone());
             self.active.push((task, 0));
+            while self.gate.hold_submit.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
             Ok(())
         }
 
@@ -4063,6 +4076,11 @@ mod tests {
     /// The other half of (a): the submit LANDS, and only then is the caller's
     /// future dropped. Nothing refuses it, so the drop guard is the only
     /// thing that can retire the task — it must cancel it at the engine.
+    ///
+    /// "Landed" means the submit has returned and released the engine lock,
+    /// not merely that the engine has logged the task: the engine logs it
+    /// from inside the lock, and a drop in that gap finds the lock busy and
+    /// defers the engine cancel instead (the next test covers that order).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn generate_async_dropped_after_submit_landed_cancels_the_task() {
         let (runner, log) = recording_runner(Gate::opened()).await;
@@ -4074,6 +4092,12 @@ mod tests {
             assert!(futures::poll!(fut.as_mut()).is_pending());
             await_until("the detached submit to reach the engine", || {
                 log.lock().submitted.iter().any(|t| t == "ghost")
+            })
+            .await;
+            // Nothing else takes the engine lock here, so a free lock means
+            // the submit closure has returned and dropped its guard.
+            await_until("the detached submit to release the engine lock", || {
+                !runner.slot.engine.is_locked()
             })
             .await;
             // Dropped without ever being polled again — no stream is built.
@@ -4094,6 +4118,59 @@ mod tests {
             !log.lock().produced.iter().any(|t| t == "ghost"),
             "cancelled ghost still generated: {:?}",
             log.lock()
+        );
+    }
+
+    /// The gap the test above waits out: the engine has admitted the task,
+    /// but the submit still holds the engine lock when the caller's future is
+    /// dropped. The guard's cancel cannot take the lock, so it defers the
+    /// engine cancel; the next lock holder must apply it before the ghost
+    /// ever steps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generate_async_dropped_while_submit_holds_the_lock_defers_the_cancel() {
+        let gate = Gate::opened();
+        gate.hold_submits();
+        let (runner, log) = recording_runner(gate.clone()).await;
+
+        {
+            let fut = runner.generate_async(GenerationTask::new("ghost", "x").with_max_tokens(64));
+            futures::pin_mut!(fut);
+            assert!(futures::poll!(fut.as_mut()).is_pending());
+            await_until("the detached submit to reach the engine", || {
+                log.lock().submitted.iter().any(|t| t == "ghost")
+            })
+            .await;
+            // Dropped while the submit is parked inside the engine lock.
+        }
+        // Release BEFORE asserting: the held submit is on a blocking thread
+        // the runtime's teardown would wait on.
+        gate.release_submits();
+        {
+            let bufs = runner.slot.buffers.lock();
+            assert!(
+                bufs.cancelled.contains("ghost"),
+                "the drop guard must have tombstoned the abandoned task"
+            );
+            assert!(
+                bufs.deferred_cancels.iter().any(|t| t == "ghost"),
+                "a cancel that found the engine busy must be queued for the next holder"
+            );
+        }
+
+        // The next lock holder applies the queued cancel before its own work.
+        let mut s = runner
+            .generate_async(GenerationTask::new("after", "x").with_max_tokens(2))
+            .await
+            .unwrap();
+        while s.next().await.is_some() {}
+        let log = log.lock();
+        assert!(
+            log.cancelled.iter().any(|t| t == "ghost"),
+            "the deferred cancel never reached the engine: {log:?}"
+        );
+        assert!(
+            !log.produced.iter().any(|t| t == "ghost"),
+            "cancelled ghost still generated: {log:?}"
         );
     }
 
