@@ -355,6 +355,91 @@ Synthesised call ids look like `call_fn_0`. An assistant message with both
 `tool_calls` and `function_call` keeps `tool_calls`; the `function` reply after
 it answers the first of them.
 
+<a id="streaming"></a>
+**Response and stream shape.** `/v1/chat/completions` and `/v1/completions`
+answer in the OpenAI shape, streamed (`stream: true`, SSE `data:` events
+ending with `data: [DONE]`) or not:
+
+- Every response and every chunk carries `system_fingerprint`: `fp_` plus 10
+  hex digits, the same for every request to one server, and different when
+  the release, the engine or the served model changes.
+- `usage` (the non-streamed response, the `include_usage` chunk, and
+  continuous usage below) always has `prompt_tokens_details` and
+  `completion_tokens_details` objects. A count goes inside only when the server
+  measures it; it measures neither cached nor reasoning tokens yet, so both
+  objects are `{}` rather than a made-up `0`.
+- A chat stream sends `delta.role: "assistant"` on its first chunk only (with
+  `content: ""` when that chunk has nothing else to say). The last chunk with a
+  choice carries `finish_reason`; earlier chunks carry `finish_reason: null`.
+- `stream_options.include_usage: true` adds a closing chunk with
+  `choices: []` and the usage, and every chunk before it carries
+  `usage: null` (chat and completions alike). Without it no chunk has a
+  `usage` key. The usage chunk is sent only after a complete answer: not after
+  an error, an unexplained end or a `/v1/cancel` (below).
+- `stream_options.continuous_usage_stats: true` (vLLM's extension; it needs
+  `include_usage` and is ignored without it) puts the usage so far on every
+  chunk instead of `null`: the latest prompt count (0 until the engine reports
+  one) and the running completion count. The closing usage chunk carries the
+  engine's own final count, which can be lower than the last running value.
+  Use it to measure tokens per second; on speculative engines one chunk can
+  hold several tokens, so counting chunks is wrong there.
+- `logprobs` items are OpenAI's: `{token, logprob, bytes, top_logprobs}`,
+  `bytes` being the token's UTF-8 bytes, inside
+  `logprobs: {content: [...], refusal: null}`; the engine's token ids are not
+  sent. A logprob too small to represent is sent as `-9999.0`. A streamed
+  chunk carries the items of the tokens whose text it releases, else
+  `logprobs: null`. Items of text that is never sent (cut by a `stop` match,
+  streamed or not, or consumed as tool-call markup) are dropped with it. `/v1/completions` uses the same
+  item shape for now, not the legacy
+  `{tokens, token_logprobs, top_logprobs, text_offset}` one.
+- **Tool calls stream as they are generated.** With `tools` (or `functions`)
+  active, content goes out as it is generated, and each call goes out as a
+  header delta, `{index, id, type: "function", function: {name, arguments: ""}}`,
+  followed by `{index, function: {arguments: "..."}}` fragments to append in
+  order; each call has its own `index`, from 0. A call in the standard JSON
+  form (`<tool_call>{"name": ..., "arguments": {` ...) is sent, and committed,
+  as soon as its name and the start of its arguments arrive; its arguments are
+  then the model's own text as it writes it (same JSON as the non-streamed
+  `arguments`, not necessarily the same characters). A call in any other form
+  (XML `<function=...>`, string-valued arguments, and so on) goes out as a
+  header plus one fragment once its closing tag arrives; a bare-JSON reply is
+  decided at the end of the reply. On a model that reasons first, with
+  thinking on, calls are looked for only after `</think>`, so a call drafted
+  while reasoning is never sent, and a reply that never closes its reasoning
+  has its calls decided at the end. A committed call cannot be taken back: if
+  the model then breaks its JSON, the stream keeps it with the model's raw
+  arguments and ends `tool_calls` (the non-streamed reply returns that text as
+  content). A `stop` match or `/v1/cancel` inside a call's arguments ends
+  `stop`, the length limit `length`, with the arguments sent so far. A
+  `functions` request gets the same deltas under `delta.function_call`, first
+  call only.
+- **Errors after the stream started.** The 200 headers are already sent, so an
+  engine failure arrives as one event and then `[DONE]`, with no usage chunk:
+  `{"id": "<chunk id>", "object": "error", "error": {"message": "...",
+  "type": "server_error", "param": null, "code": "engine_error"}}`.
+  openai-python and openai-node raise `APIError` on it.
+- **A stream whose engine ends without a final chunk** sends the text it was
+  still holding, then that error event (message `engine stream ended without a
+  final chunk`) and `[DONE]`: the answer may be cut short, so it is not
+  reported as complete. On a tools stream, calls already streamed stay sent and
+  no others follow. A stream ended by `POST /v1/cancel/<task_id>` instead closes
+  its choice with `finish_reason: "stop"` and no usage chunk.
+
+**Breaking for scripts that read the old stream:**
+
+- Chunks no longer carry `n_tokens` or `completion_tokens`. Use
+  `stream_options: {"include_usage": true, "continuous_usage_stats": true}`
+  and read `usage.completion_tokens` (running count) instead. The engine-side
+  `Chunk.n_tokens` between stages is unchanged.
+- `delta.role` is on the first chunk only, no longer on every delta.
+- The error event's `error.type` is `server_error` (was `engine_error`, now in
+  `error.code`), and `error` also has `param: null`.
+- Tool calls arrive as a header delta and then argument fragments, one `index`
+  per call, instead of every call in one delta at the end; concatenate
+  `function.arguments` by `index`.
+- A tools stream whose engine ends without a final chunk (and was not
+  cancelled) ends with the error event instead of `finish_reason: "stop"`.
+
 **`--ov-config KEY=VALUE`** forwards any plugin property to OpenVINO verbatim,
 alongside the typed `--ov-*` flags — the escape hatch for knobs without a
 dedicated flag (`--ov-config KV_CACHE_PRECISION=u8`,

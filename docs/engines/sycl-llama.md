@@ -362,8 +362,9 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
 The API uses the child's final completion-token count when available, including
 reasoning and tool generation that does not appear as visible content. Tool-enabled
 streams send content as it is generated and emit the structured calls (re-assembled
-from the child's fragments) at the end; they include a final usage event when
-`stream_options.include_usage` is true.
+from the child's fragments) at the end, each as a header delta plus its
+arguments ([stream shape](../CLI.md#streaming)); they include a final usage
+event when `stream_options.include_usage` is true.
 
 
 ## Doctor
