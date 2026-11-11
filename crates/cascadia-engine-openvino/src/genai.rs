@@ -410,6 +410,24 @@ fn grammar_json_schema(task: &GenerationTask) -> Option<&str> {
     }
 }
 
+/// The schema text GenAI is sent for `task`: the client's, with every
+/// unbounded `integer` bounded to 18 digits
+/// ([`cascadia_grammar::bound_integers`]), since xgrammar, like llguidance,
+/// allows an integer of any length and a small model in JSON mode can repeat
+/// digits until max_tokens. Key order is kept. A schema that is not JSON, or
+/// has nothing to bound, goes as the client wrote it. The schema budget and
+/// quarantine still key on the client's text.
+fn genai_json_schema(task: &GenerationTask) -> Option<String> {
+    let schema = grammar_json_schema(task)?;
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(schema) else {
+        return Some(schema.to_owned());
+    };
+    if cascadia_grammar::bound_integers(&mut value) == 0 {
+        return Some(schema.to_owned());
+    }
+    Some(value.to_string())
+}
+
 /// The message inside a shim error, without the shim's own prefix.
 fn ov_message(err: OvError) -> String {
     match err {
@@ -428,9 +446,11 @@ fn check_grammar(
     unavailable: Option<&str>,
     validate: impl FnOnce(&str) -> Result<(), OvError>,
 ) -> EngineResult<()> {
-    let Some(schema) = grammar_json_schema(task) else {
+    // The text GenAI will compile: priced and validated as sent.
+    let Some(schema) = genai_json_schema(task) else {
         return Ok(());
     };
+    let schema = schema.as_str();
     if let Some(reason) = unavailable {
         return Err(EngineError::InvalidConfig(format!(
             "structured output is not available for this model: {reason}"
@@ -995,7 +1015,7 @@ impl Engine for OvGenaiEngine {
             task.temperature,
             task.enable_thinking,
             &task.sampling,
-            grammar_json_schema(&task).map(str::to_owned),
+            genai_json_schema(&task),
         );
 
         let started = Instant::now();
@@ -1392,7 +1412,7 @@ impl Engine for OvGenaiCbEngine {
             task.temperature,
             task.enable_thinking,
             &task.sampling,
-            schema.map(str::to_owned),
+            genai_json_schema(&task),
         );
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
@@ -2000,6 +2020,8 @@ mod tests {
         /// carries a schema: bad schemas on a healthy device.
         fail_only_with_grammar: bool,
         last_added_grammar: bool,
+        /// The schema text the last added request handed to GenAI.
+        last_schema: Option<String>,
         steps: usize,
         added: Vec<u64>,
         cancelled: Vec<u64>,
@@ -2027,6 +2049,7 @@ mod tests {
             let mut st = self.st.lock().unwrap();
             st.added.push(request_id);
             st.last_added_grammar = cfg.json_schema.is_some();
+            st.last_schema = cfg.json_schema.clone();
             let idx = st.added.len() - 1;
             while st.reads.len() <= idx {
                 st.reads.push(VecDeque::new());
@@ -2508,6 +2531,70 @@ mod tests {
         assert_eq!(cfg.max_new_tokens, 16);
     }
 
+    /// An integer with no bound goes to GenAI with ±(10^18 - 1), so a small
+    /// model can't repeat digits until max_tokens; a bound the client set is
+    /// kept, nested and `$ref`'d integers and `["integer","null"]` are bounded,
+    /// and key order stays the client's.
+    #[test]
+    fn the_schema_sent_to_genai_bounds_its_integers() {
+        let cap = cascadia_grammar::INTEGER_DIGITS_CAP;
+        let sent = genai_json_schema(&schema_task("s", SCHEMA_A)).unwrap();
+        assert_eq!(
+            sent,
+            format!(
+                r#"{{"type":"object","properties":{{"a":{{"type":"integer","maximum":{cap},"minimum":-{cap}}}}}}}"#
+            )
+        );
+        let body = r##"{"type":"object","properties":{"z":{"$ref":"#/$defs/N"},"y":{"type":["integer","null"]},"x":{"type":"array","items":{"type":"integer","minimum":0}},"w":{"type":"number"}},"$defs":{"N":{"type":"integer","maximum":7}}}"##;
+        let sent: serde_json::Value =
+            serde_json::from_str(&genai_json_schema(&schema_task("s", body)).unwrap()).unwrap();
+        assert_eq!(
+            sent["$defs"]["N"],
+            serde_json::json!({"type":"integer","maximum":7,"minimum":-cap})
+        );
+        assert_eq!(sent["properties"]["y"]["maximum"], cap);
+        assert_eq!(
+            sent["properties"]["x"]["items"],
+            serde_json::json!({"type":"integer","minimum":0,"maximum":cap})
+        );
+        assert_eq!(
+            sent["properties"]["w"],
+            serde_json::json!({"type":"number"})
+        );
+        let keys: Vec<&str> = sent["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["z", "y", "x", "w"]);
+        // Not JSON: sent as it is, for GenAI to report.
+        assert_eq!(
+            genai_json_schema(&schema_task("s", "{nope")).as_deref(),
+            Some("{nope")
+        );
+        assert_eq!(genai_json_schema(&task("p", 8)), None);
+    }
+
+    /// The CB engine hands GenAI the bounded schema and checks that text,
+    /// while its budget of distinct schemas counts the client's text.
+    #[test]
+    fn the_cb_engine_sends_and_checks_the_bounded_schema() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.submit(schema_task("s", SCHEMA_A)).unwrap();
+        let sent = st.lock().unwrap().last_schema.clone().unwrap();
+        assert!(sent.contains(r#""maximum":999999999999999999"#), "{sent}");
+        assert!(e.schema_budget.seen.contains(SCHEMA_A));
+        let mut validated = None;
+        check_grammar(&schema_task("s", SCHEMA_A), None, |s| {
+            validated = Some(s.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(validated.as_deref(), Some(sent.as_str()));
+    }
+
     #[test]
     fn check_grammar_paths() {
         // No grammar: validate must not run.
@@ -2539,7 +2626,11 @@ mod tests {
             Ok(())
         })
         .is_ok());
-        assert_eq!(seen.as_deref(), Some(SCHEMA_A));
+        assert_eq!(
+            seen.as_deref(),
+            genai_json_schema(&t).as_deref(),
+            "validates the schema GenAI is sent"
+        );
     }
 
     #[test]
