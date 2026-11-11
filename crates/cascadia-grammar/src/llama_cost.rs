@@ -104,6 +104,16 @@ pub fn llama_grammar_cost(schema: &Value) -> u64 {
     Walk::new(schema).run()
 }
 
+/// The work units a [`llama_grammar_cost`] walk of `schema` spends: what
+/// stopping early bounds, counted rather than timed so a loaded machine
+/// can't fail the test.
+#[cfg(test)]
+pub(crate) fn llama_grammar_cost_work(schema: &Value) -> u64 {
+    let mut walk = Walk::new(schema);
+    walk.run();
+    walk.work
+}
+
 /// `None` when [`llama_grammar_cost`] of `schema` is at most
 /// [`MAX_LLAMA_GRAMMAR_COST`]; otherwise why llama-server would take too
 /// long (or loop) building its grammar, naming the object with the most

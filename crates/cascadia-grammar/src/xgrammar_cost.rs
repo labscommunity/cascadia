@@ -165,6 +165,16 @@ pub fn xgrammar_cost(schema: &Value) -> u64 {
     Walk::new(schema).run()
 }
 
+/// The schemas a full [`xgrammar_cost`] walk of `schema` visits: what
+/// stopping early bounds, counted rather than timed so a loaded machine
+/// can't fail the test.
+#[cfg(test)]
+pub(crate) fn xgrammar_cost_visits(schema: &Value) -> u64 {
+    let mut walk = Walk::new(schema);
+    walk.run();
+    walk.visits
+}
+
 /// `None` when [`xgrammar_cost`] of `schema` is at most
 /// [`MAX_XGRAMMAR_COST`]; otherwise why it is refused: xgrammar would take
 /// too long to compile it (naming the largest part of the cost), would
@@ -252,6 +262,8 @@ struct Walk<'a> {
     over: bool,
     /// Why the walk stopped without a cost, when it did.
     stop: Option<Stop>,
+    /// Schemas visited: the walk's work past sizing the schema (tests pin it).
+    visits: u64,
 }
 
 /// Why the walk stopped without pricing the whole schema. Either way the
@@ -563,6 +575,7 @@ impl<'a> Walk<'a> {
             cap,
             over: false,
             stop: None,
+            visits: 0,
         }
     }
 
@@ -708,6 +721,7 @@ impl<'a> Walk<'a> {
         if !self.going() {
             return;
         }
+        self.visits += 1;
         if self.walk_depth >= MAX_WALK_DEPTH {
             self.unpriced(format!("schemas nested more than {MAX_WALK_DEPTH} deep"));
             return;

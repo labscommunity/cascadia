@@ -146,13 +146,11 @@ fn a_doubling_merge_chain_is_refused_in_linear_time() {
     // would be unresolved (null) for it.
     let schema =
         json!({"$defs": defs, "type": "object", "properties": {"r": {"$ref": "#/$defs/D40"}}});
-    let t0 = std::time::Instant::now();
     let e = llama_grammar_cost_error(&schema).expect("2^40 visits");
-    assert!(
-        t0.elapsed() < std::time::Duration::from_secs(1),
-        "{:?}",
-        t0.elapsed()
-    );
+    // Counted, not timed: a few thousand units of work for 2^40 converter
+    // visits (measured 1,948).
+    let work = llama_grammar_cost_work(&schema);
+    assert!(work < 10_000, "{work}");
     assert!(e.contains("its cost is"), "{e}");
 }
 
@@ -295,13 +293,15 @@ fn many_merges_of_a_wide_target_stop_early() {
     // collected in full.
     let members: Vec<Value> = (0..1600).map(|_| json!({"$ref": "#/$defs/a"})).collect();
     let schema = json!({"$defs": {"a": object(3000, 3000)}, "allOf": members});
-    let t0 = std::time::Instant::now();
     assert!(llama_grammar_cost_error(&schema).is_some());
-    assert!(
-        t0.elapsed() < std::time::Duration::from_secs(1),
-        "{:?}",
-        t0.elapsed()
-    );
+    // Counted, not timed: the walk's work is capped by the cost limit
+    // (about 1.34M units here), the same for 160 members as for 1600, not
+    // the millions of merged entries a full collection would touch.
+    let work = llama_grammar_cost_work(&schema);
+    let tenth: Vec<Value> = (0..160).map(|_| json!({"$ref": "#/$defs/a"})).collect();
+    let smaller = json!({"$defs": {"a": object(3000, 3000)}, "allOf": tenth});
+    assert!(work < 1_500_000, "{work}");
+    assert!(work <= llama_grammar_cost_work(&smaller) + 1_000, "{work}");
 }
 
 #[test]

@@ -111,13 +111,11 @@ fn nested_type_lists_multiply() {
 #[test]
 fn a_type_list_sixty_deep_is_refused_in_linear_time() {
     // 2^60 visits for the converter; one per schema for the walk.
-    let t0 = std::time::Instant::now();
     let e = xgrammar_cost_error(&type_nest(60, json!(["object", "object"]))).expect("2^60");
-    assert!(
-        t0.elapsed() < std::time::Duration::from_millis(100),
-        "{:?}",
-        t0.elapsed()
-    );
+    // Counted, not timed: tens of visits for 2^60 converter visits
+    // (measured 21).
+    let visits = xgrammar_cost_visits(&type_nest(60, json!(["object", "object"])));
+    assert!(visits < 200, "{visits}");
     assert!(e.contains("xgrammar would take too long"), "{e}");
 }
 
@@ -161,17 +159,15 @@ fn the_walk_bounds_its_depth() {
     }
     defs.insert("d5000".into(), json!({"type": "string"}));
     let chain = json!({"$defs": defs, "$ref": "#/$defs/d0"});
-    let t0 = std::time::Instant::now();
     assert_eq!(xgrammar_cost(&chain), u64::MAX);
+    // Counted, not timed: the walk stops at the depth limit (measured 257
+    // visits for the 5001-link chain).
+    let visits = xgrammar_cost_visits(&chain);
+    assert!(visits <= 300, "{visits}");
     let e = xgrammar_cost_error(&chain).unwrap();
     assert!(
         e.contains("can't be estimated (schemas nested more than 256 deep)"),
         "{e}"
-    );
-    assert!(
-        t0.elapsed() < std::time::Duration::from_millis(500),
-        "{:?}",
-        t0.elapsed()
     );
 }
 
@@ -503,31 +499,38 @@ fn a_realistic_extraction_schema_passes() {
 
 #[test]
 fn the_walk_stops_once_over_the_limit() {
-    // 200,000 optional properties: the run's cost passes the limit after a
-    // few hundred, and the walk stops there.
+    // 200,000 optional properties: the root's count alone passes the limit,
+    // and the walk stops before visiting them.
     let wide = object(200_000, []);
-    let t0 = std::time::Instant::now();
     assert!(refused(&wide));
-    assert!(
-        t0.elapsed() < std::time::Duration::from_millis(200),
-        "{:?}",
-        t0.elapsed()
-    );
+    // Counted, not timed: the root's optional properties price it past the
+    // limit, so the walk visits none of the 200,000 property schemas.
+    let visits = xgrammar_cost_visits(&wide);
+    assert!(visits <= 1, "{visits}");
 }
 
 #[test]
 fn long_patterns_and_type_lists_are_walked_in_linear_time() {
     // 60,000 unclosed `{`s, and 20,000 `type` entries.
-    let braces = "a{".repeat(30_000);
-    let types: Vec<Value> = (0..20_000).map(|i| json!(format!("t{i}"))).collect();
-    let t0 = std::time::Instant::now();
-    let _ = xgrammar_cost(&json!({"type": "string", "pattern": braces}));
-    let _ = xgrammar_cost(&json!({"type": types}));
-    assert!(
-        t0.elapsed() < std::time::Duration::from_millis(200),
-        "{:?}",
-        t0.elapsed()
-    );
+    // Timed as a ratio, so a loaded machine slows both sizes alike: 10x the
+    // input must cost well under the 100x a quadratic scan would (best of 3
+    // runs each, to drop scheduling noise).
+    fn best_of_3(n: usize) -> std::time::Duration {
+        let braces = "a{".repeat(n / 2);
+        let types: Vec<Value> = (0..n / 3).map(|i| json!(format!("t{i}"))).collect();
+        (0..3)
+            .map(|_| {
+                let t0 = std::time::Instant::now();
+                let _ = xgrammar_cost(&json!({"type": "string", "pattern": braces.clone()}));
+                let _ = xgrammar_cost(&json!({"type": types.clone()}));
+                t0.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+    let small = best_of_3(6_000).max(std::time::Duration::from_micros(200));
+    let large = best_of_3(60_000);
+    assert!(large < small * 40, "{large:?} vs {small:?}");
 }
 
 /// Prints the cost and verdict of each `*.json` schema in the directory
