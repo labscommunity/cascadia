@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
     clean_backend_message, CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus,
-    Error as OvError, GenConfig, LlmPipeline, PluginConfig,
+    Error as OvError, GenConfig, GenResult, LlmPipeline, PluginConfig,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, GrammarKind, LoadProgress, PeerLayout, SamplingParams,
@@ -56,6 +56,8 @@ pub struct OvGenaiBuilder {
     pub continuous_batching: Option<CbSchedulerConfig>,
     pipe: Option<LlmPipeline>,
     cb_pipe: Option<CbPipeline>,
+    /// How `load` built the pipeline, kept so the engine can build it again.
+    recipe: Option<PipelineRecipe>,
 }
 
 impl OvGenaiBuilder {
@@ -75,6 +77,7 @@ impl OvGenaiBuilder {
             continuous_batching: None,
             pipe: None,
             cb_pipe: None,
+            recipe: None,
         }
     }
 
@@ -138,6 +141,65 @@ impl OvGenaiBuilder {
             cfg = cfg.with(key, val);
         }
         cfg
+    }
+}
+
+/// Which GenAI pipeline [`PipelineRecipe`] builds.
+#[derive(Clone)]
+enum PipelineKind {
+    /// `ContinuousBatchingPipeline` with these scheduler knobs (`--cb`).
+    Cb(CbSchedulerConfig),
+    /// `VLMPipeline` for a VLM-layout export, served text-only.
+    Vlm { prompt_lookup: bool },
+    /// `LLMPipeline` with a draft model (speculative decoding).
+    Draft { path: String, device: String },
+    /// `LLMPipeline` with prompt lookup decoding.
+    PromptLookup,
+    /// Plain `LLMPipeline`.
+    Plain,
+}
+
+/// Everything needed to build the engine's pipeline: `load` builds it from
+/// this, and the engine keeps it to build the pipeline again (see
+/// [`MAX_DISTINCT_SCHEMAS`]), since `build` consumes the builder.
+#[derive(Clone)]
+struct PipelineRecipe {
+    model_path: String,
+    device: String,
+    plugin: PluginConfig,
+    kind: PipelineKind,
+}
+
+impl PipelineRecipe {
+    /// The stateful pipeline. Not for [`PipelineKind::Cb`].
+    fn build_stateful(&self) -> Result<LlmPipeline, OvError> {
+        let (model, device, plugin) = (&self.model_path, &self.device, &self.plugin);
+        match &self.kind {
+            PipelineKind::Vlm { prompt_lookup } => {
+                LlmPipeline::vlm(model, device, *prompt_lookup, plugin)
+            }
+            PipelineKind::Draft {
+                path,
+                device: draft_device,
+            } => LlmPipeline::with_draft(model, device, path, draft_device, plugin),
+            PipelineKind::PromptLookup => LlmPipeline::with_prompt_lookup(model, device, plugin),
+            PipelineKind::Plain => LlmPipeline::new(model, device, plugin),
+            PipelineKind::Cb(_) => Err(OvError::Native(
+                "a continuous-batching recipe builds no stateful pipeline".into(),
+            )),
+        }
+    }
+
+    /// The continuous-batching pipeline. Only for [`PipelineKind::Cb`].
+    fn build_cb(&self) -> Result<CbPipeline, OvError> {
+        match &self.kind {
+            PipelineKind::Cb(sched) => {
+                CbPipeline::new(&self.model_path, &self.device, sched, &self.plugin)
+            }
+            _ => Err(OvError::Native(
+                "a stateful recipe builds no continuous-batching pipeline".into(),
+            )),
+        }
     }
 }
 
@@ -251,7 +313,7 @@ impl Builder for OvGenaiBuilder {
         let model_dir = PathBuf::from(&self.model_path);
         let is_vlm_layout = model_dir.join("openvino_language_model.xml").exists()
             && !model_dir.join("openvino_model.xml").exists();
-        if let Some(sched) = &self.continuous_batching {
+        let kind = if let Some(sched) = &self.continuous_batching {
             if is_vlm_layout {
                 return Err(EngineError::InvalidConfig(
                     "--cb is not supported on VLM-layout exports; \
@@ -264,13 +326,8 @@ impl Builder for OvGenaiBuilder {
                  max_batched_tokens {})",
                 self.device, sched.cache_size_gb, sched.max_num_seqs, sched.max_num_batched_tokens,
             )));
-            let pipe = CbPipeline::new(&self.model_path, &self.device, sched, &plugin)
-                .map_err(map_ov_err)?;
-            progress.push(LoadProgress::ready());
-            self.cb_pipe = Some(pipe);
-            return Ok(Box::pin(stream::iter(progress)));
-        }
-        let pipe = if is_vlm_layout {
+            PipelineKind::Cb(sched.clone())
+        } else if is_vlm_layout {
             if self.draft_model_path.is_some() {
                 return Err(EngineError::InvalidConfig(
                     "--draft-model is not supported on VLM-layout exports; \
@@ -288,8 +345,7 @@ impl Builder for OvGenaiBuilder {
                 },
                 self.device
             )));
-            LlmPipeline::vlm(&self.model_path, &self.device, prompt_lookup, &plugin)
-                .map_err(map_ov_err)?
+            PipelineKind::Vlm { prompt_lookup }
         } else if let Some(dpath) = &self.draft_model_path {
             progress.push(LoadProgress::message(format!(
                 "loading draft model {dpath}"
@@ -298,31 +354,39 @@ impl Builder for OvGenaiBuilder {
                 "compiling LLMPipeline + draft on {}",
                 self.device
             )));
-            LlmPipeline::with_draft(
-                &self.model_path,
-                &self.device,
-                dpath,
-                self.draft_device.as_deref().unwrap_or(&self.device),
-                &plugin,
-            )
-            .map_err(map_ov_err)?
+            PipelineKind::Draft {
+                path: dpath.clone(),
+                device: self
+                    .draft_device
+                    .clone()
+                    .unwrap_or_else(|| self.device.clone()),
+            }
         } else if self.prompt_lookup_ngram > 0 {
             progress.push(LoadProgress::message(format!(
                 "compiling LLMPipeline + prompt_lookup (n={}) on {}",
                 self.prompt_lookup_ngram, self.device
             )));
-            LlmPipeline::with_prompt_lookup(&self.model_path, &self.device, &plugin)
-                .map_err(map_ov_err)?
+            PipelineKind::PromptLookup
         } else {
             progress.push(LoadProgress::message(format!(
                 "compiling LLMPipeline on {}",
                 self.device
             )));
-            LlmPipeline::new(&self.model_path, &self.device, &plugin).map_err(map_ov_err)?
+            PipelineKind::Plain
         };
+        let recipe = PipelineRecipe {
+            model_path: self.model_path.clone(),
+            device: self.device.clone(),
+            plugin,
+            kind,
+        };
+        if matches!(recipe.kind, PipelineKind::Cb(_)) {
+            self.cb_pipe = Some(recipe.build_cb().map_err(map_ov_err)?);
+        } else {
+            self.pipe = Some(recipe.build_stateful().map_err(map_ov_err)?);
+        }
         progress.push(LoadProgress::ready());
-
-        self.pipe = Some(pipe);
+        self.recipe = Some(recipe);
         Ok(Box::pin(stream::iter(progress)))
     }
 
@@ -351,7 +415,7 @@ impl Builder for OvGenaiBuilder {
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
-            pipe,
+            pipe: Box::new(pipe),
             device: self.device,
             draft_model: self.draft_model_path.is_some(),
             speculative_k: self.speculative_k,
@@ -933,8 +997,29 @@ impl SchemaBudget {
     }
 }
 
+/// The slice of [`LlmPipeline`] the stateful engine uses. Like [`CbPipe`],
+/// it exists so the engine's state machine (the schema budget's rebuild in
+/// particular) is testable without OpenVINO.
+trait StatefulPipe: Send {
+    fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError>;
+    fn count_tokens(&self, text: &str) -> Option<u32>;
+    fn validate_json_schema(&self, schema: &str) -> Result<(), OvError>;
+}
+
+impl StatefulPipe for LlmPipeline {
+    fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
+        LlmPipeline::generate(self, prompt, cfg)
+    }
+    fn count_tokens(&self, text: &str) -> Option<u32> {
+        LlmPipeline::count_tokens(self, text)
+    }
+    fn validate_json_schema(&self, schema: &str) -> Result<(), OvError> {
+        LlmPipeline::validate_json_schema(self, schema)
+    }
+}
+
 pub struct OvGenaiEngine {
-    pipe: LlmPipeline,
+    pipe: Box<dyn StatefulPipe>,
     /// The OpenVINO device string the pipeline was compiled for.
     device: String,
     /// Built with a draft model (speculative decoding), as opposed to prompt
