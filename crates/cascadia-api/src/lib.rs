@@ -7698,6 +7698,97 @@ level={{ effort_map[eff] }}";
         );
     }
 
+    /// Engine that refuses every request with a 5xx at submit, as ov-genai
+    /// does once a pipeline rebuild failed and it has no pipeline.
+    struct NoPipelineEngine;
+
+    impl cascadia_engine::Engine for NoPipelineEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            _task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Err(cascadia_engine::EngineError::Backend(
+                "ov-genai pipeline rebuild failed: device lost; this worker serves no requests \
+                 until it is restarted"
+                    .into(),
+            ))
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct NoPipelineBuilder;
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for NoPipelineBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(NoPipelineEngine))
+        }
+    }
+
+    /// A worker whose engine refuses every request at submit with a 5xx (an
+    /// ov-genai pipeline rebuild that failed) reports degraded on `/health`
+    /// from the first refused request on, and stays so: nothing succeeds to
+    /// clear it.
+    #[tokio::test]
+    async fn an_engine_refusing_every_submit_degrades_health_for_good() {
+        let runner = Runner::new(Box::new(NoPipelineBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("nopipe-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(Arc::new(runner), "nopipe-model");
+        let health = |app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+        assert_eq!(health(app.clone()).await, StatusCode::OK);
+        for _ in 0..2 {
+            let (status, body) = post_chat(
+                app.clone(),
+                serde_json::json!({
+                    "model": "nopipe-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                body.to_string().contains("pipeline rebuild failed"),
+                "{body}"
+            );
+            assert_eq!(health(app.clone()).await, StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
     /// Engine that emits a token every step and NEVER finishes. Only
     /// `Runner::close()` can end a generation from it, which is what makes
     /// the teardown test deterministic: the no-progress wedge guard trips
