@@ -4094,12 +4094,13 @@ fn usage_tail(
 }
 
 /// SSE `data:` frame for an engine error. The 200 headers are already on the
-/// wire, so the failure travels as an explicit error event, answered as a
-/// server fault.
-fn error_frame(task_id: &str, reason: &str) -> Bytes {
+/// wire, so the failure travels as an explicit error event: a prompt over the
+/// engine's window as the caller's fault on `prompt_param` (`messages` or
+/// `prompt`), anything else as a server fault.
+fn error_frame(task_id: &str, reason: &str, prompt_param: &str) -> Bytes {
     Bytes::from(stream_shape::error_frame(
         task_id,
-        &stream_shape::StreamError::server(reason),
+        &stream_shape::classify_chunk_error(reason, prompt_param),
     ))
 }
 
@@ -4192,7 +4193,11 @@ impl TextStream {
                 self.chunks = None;
                 self.phase = ToolStreamPhase::Tail;
                 tokio::task::yield_now().await;
-                return Some(error_frame(&self.meta.id, reason));
+                let param = match self.kind {
+                    TextStreamKind::Chat => "messages",
+                    TextStreamKind::Completion { .. } => "prompt",
+                };
+                return Some(error_frame(&self.meta.id, reason, param));
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             // Latest count from any chunk, before the stop check.
@@ -4422,7 +4427,7 @@ impl ToolStream {
                 warn!(task = %self.meta.id, reason = %reason, "engine failed tool task mid-stream; SSE error");
                 self.phase = ToolStreamPhase::Tail;
                 tokio::task::yield_now().await;
-                return Some(error_frame(&self.meta.id, reason));
+                return Some(error_frame(&self.meta.id, reason, "messages"));
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             // Latest count from any chunk, before the stop check.
@@ -8147,6 +8152,90 @@ level={{ effort_map[eff] }}";
             "expected SSE error event: {body}"
         );
         assert!(!body.contains("tool_calls"), "{body}");
+    }
+
+    /// The SSE body of a streamed POST to `uri`.
+    async fn stream_body(app: Router, uri: &str, payload: Value) -> String {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap()
+    }
+
+    /// A body whose last event is the over-window error object, then `[DONE]`.
+    fn assert_ends_over_window(body: &str, param: &str) {
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        let events = sse_events(body);
+        let last = events.last().unwrap();
+        assert_eq!(last["object"], "error", "{body}");
+        assert_eq!(
+            last["error"],
+            serde_json::json!({
+                "message": format!(
+                    "This model's maximum context length is 1024 tokens. However, your {param} \
+                     resulted in 6543 tokens. Please reduce the length of the {param}."
+                ),
+                "type": "invalid_request_error",
+                "param": param,
+                "code": "context_length_exceeded",
+            }),
+            "{body}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.get("usage").is_none_or(Value::is_null)),
+            "no usage after a failure: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_chat_over_npu_window_is_context_length_exceeded() {
+        let body = stream_body(
+            make_app().await,
+            "/v1/chat/completions",
+            serde_json::json!({"model":"mock-model",
+                "messages":[{"role":"user","content":"__engine_error_over_window__"}],
+                "stream":true,"stream_options":{"include_usage":true}}),
+        )
+        .await;
+        assert_ends_over_window(&body, "messages");
+    }
+
+    #[tokio::test]
+    async fn streamed_tools_chat_over_npu_window_is_context_length_exceeded() {
+        let body = stream_body(
+            make_tool_app().await,
+            "/v1/chat/completions",
+            serde_json::json!({"model":"mock-model",
+                "messages":[{"role":"user","content":"__engine_error_over_window__"}],
+                "tools":[{"type":"function","function":{"name":"x"}}],
+                "stream":true,"stream_options":{"include_usage":true}}),
+        )
+        .await;
+        assert_ends_over_window(&body, "messages");
+    }
+
+    #[tokio::test]
+    async fn streamed_completion_over_npu_window_is_context_length_exceeded() {
+        let body = stream_body(
+            make_app().await,
+            "/v1/completions",
+            serde_json::json!({"model":"mock-model",
+                "prompt":"__engine_error_over_window__","max_tokens":8,
+                "stream":true,"stream_options":{"include_usage":true}}),
+        )
+        .await;
+        assert_ends_over_window(&body, "prompt");
     }
 
     /// Feed every piece but the last, finish with the last. Returns each

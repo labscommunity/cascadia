@@ -1,6 +1,7 @@
 //! Shared pieces of the OpenAI response wire shape: the `system_fingerprint`
 //! value, the `usage` object and the streamed chunk frames.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -375,7 +376,7 @@ impl LogprobQueue {
 pub(crate) struct StreamError<'a> {
     /// The error object's `type`.
     pub(crate) kind: &'a str,
-    pub(crate) message: &'a str,
+    pub(crate) message: Cow<'a, str>,
     pub(crate) param: Option<&'a str>,
     pub(crate) code: Option<&'a str>,
 }
@@ -386,7 +387,7 @@ impl<'a> StreamError<'a> {
     pub(crate) fn server(message: &'a str) -> Self {
         Self {
             kind: "server_error",
-            message,
+            message: Cow::Borrowed(message),
             param: None,
             code: None,
         }
@@ -402,13 +403,73 @@ pub(crate) fn error_frame(id: &str, err: &StreamError<'_>) -> String {
         "id": id,
         "object": "error",
         "error": {
-            "message": err.message,
+            "message": &*err.message,
             "type": err.kind,
             "param": err.param,
             "code": err.code,
         },
     });
     format!("data: {payload}\n\n")
+}
+
+/// The error object for a chunk that failed its task mid-stream. A prompt
+/// over the engine's window is the caller's to fix, so it goes out as
+/// OpenAI's `invalid_request_error` / `context_length_exceeded` on
+/// `prompt_param` (`messages` for chat, `prompt` for `/v1/completions`),
+/// which clients do not retry; any other failure is a server error.
+///
+/// Two texts are over-window, wherever they sit in the reason (engines and
+/// the runner prefix `task <id>: ` and `backend error: `):
+/// - `EngineError::PromptTooLong`: `prompt too long: prompt is N tokens …`,
+///   with the window as `region holds W` or `window is W`;
+/// - openvino-genai's stateful NPU pipeline: `… may only process prompts or
+///   hold chat history up to W tokens. N is passed.`
+///
+/// With both numbers the message is OpenAI's wording; without them it is the
+/// engine's text.
+pub(crate) fn classify_chunk_error<'a>(reason: &'a str, prompt_param: &'a str) -> StreamError<'a> {
+    const NPU_CAP: &str = "may only process prompts or hold chat history up to ";
+    let numbers = if let Some(at) = reason.find("prompt too long: ") {
+        let typed = &reason[at..];
+        let window =
+            number_after(typed, "region holds ").or_else(|| number_after(typed, "window is "));
+        Some(window.zip(number_after(typed, "prompt is ")))
+    } else if let Some(at) = reason.find(NPU_CAP) {
+        let npu = &reason[at..];
+        let passed = npu.find(" is passed").and_then(|end| {
+            let digits = npu[..end].rsplit(|c: char| !c.is_ascii_digit()).next()?;
+            digits.parse::<u64>().ok()
+        });
+        Some(number_after(npu, NPU_CAP).zip(passed))
+    } else {
+        None
+    };
+    let Some(numbers) = numbers else {
+        return StreamError::server(reason);
+    };
+    let message = match numbers {
+        Some((window, prompt)) => Cow::Owned(format!(
+            "This model's maximum context length is {window} tokens. However, your \
+             {prompt_param} resulted in {prompt} tokens. Please reduce the length of the \
+             {prompt_param}."
+        )),
+        None => Cow::Borrowed(reason),
+    };
+    StreamError {
+        kind: "invalid_request_error",
+        message,
+        param: Some(prompt_param),
+        code: Some("context_length_exceeded"),
+    }
+}
+
+/// The run of digits right after the first `marker` in `text`.
+fn number_after(text: &str, marker: &str) -> Option<u64> {
+    let rest = &text[text.find(marker)? + marker.len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// The message of the error event sent when an engine stream ends with no
@@ -716,7 +777,7 @@ mod logprob_tests {
             "c2",
             &StreamError {
                 kind: "invalid_request_error",
-                message: "too long",
+                message: "too long".into(),
                 param: Some("messages"),
                 code: Some("context_length_exceeded"),
             },
@@ -727,5 +788,85 @@ mod logprob_tests {
                 "message": "too long", "type": "invalid_request_error",
                 "param": "messages", "code": "context_length_exceeded"}})
         );
+    }
+
+    /// The over-window text openvino-genai's stateful NPU pipeline fails a
+    /// task with, as captured live.
+    const NPU_OVER_WINDOW: &str = "openvino-genai error: Check 'data->input_ids.get_size() <= m_max_prompt_len' failed at src\\cpp\\src\\llm\\pipeline_stateful.cpp:364:\nStateful LLM pipeline on NPU may only process prompts or hold chat history up to 1024 tokens. 6543 is passed.\n Set the \"MAX_PROMPT_LEN\" config option to increase the limit.\n";
+
+    fn assert_over_window(err: &StreamError<'_>, param: &str, message: &str) {
+        assert_eq!(err.kind, "invalid_request_error");
+        assert_eq!(err.param, Some(param));
+        assert_eq!(err.code, Some("context_length_exceeded"));
+        assert_eq!(err.message, message);
+    }
+
+    #[test]
+    fn npu_over_window_text_is_context_length_exceeded() {
+        let chat = "This model's maximum context length is 1024 tokens. However, your messages \
+                    resulted in 6543 tokens. Please reduce the length of the messages.";
+        for reason in [
+            NPU_OVER_WINDOW.to_owned(),
+            format!("backend error: {NPU_OVER_WINDOW}"),
+            format!("task chatcmpl-1: backend error: {NPU_OVER_WINDOW}"),
+            format!("task chatcmpl-1: {NPU_OVER_WINDOW}"),
+        ] {
+            assert_over_window(&classify_chunk_error(&reason, "messages"), "messages", chat);
+        }
+        assert_over_window(
+            &classify_chunk_error(NPU_OVER_WINDOW, "prompt"),
+            "prompt",
+            "This model's maximum context length is 1024 tokens. However, your prompt \
+             resulted in 6543 tokens. Please reduce the length of the prompt.",
+        );
+    }
+
+    #[test]
+    fn typed_prompt_too_long_text_is_context_length_exceeded() {
+        // `EngineError::PromptTooLong` as a chunk's error string, with and
+        // without the task attribution.
+        assert_over_window(
+            &classify_chunk_error(
+                "prompt too long: prompt is 207 tokens but this worker's per-slot KV region \
+                 holds 127; raise --static-context or lower --packed-slots",
+                "messages",
+            ),
+            "messages",
+            "This model's maximum context length is 127 tokens. However, your messages \
+             resulted in 207 tokens. Please reduce the length of the messages.",
+        );
+        assert_over_window(
+            &classify_chunk_error(
+                "task cmpl-9: prompt too long: prompt is 5000 tokens; the model's window is \
+                 4096 (max_position_embeddings)",
+                "prompt",
+            ),
+            "prompt",
+            "This model's maximum context length is 4096 tokens. However, your prompt \
+             resulted in 5000 tokens. Please reduce the length of the prompt.",
+        );
+        // No numbers to quote: the engine's own text goes out, still
+        // classified as the caller's fault.
+        assert_over_window(
+            &classify_chunk_error("prompt too long: over the window", "messages"),
+            "messages",
+            "prompt too long: over the window",
+        );
+    }
+
+    #[test]
+    fn other_chunk_errors_stay_server_errors() {
+        for reason in [
+            "mock injected engine failure",
+            "backend error: openvino-genai error: Exception from plugin.cpp:54",
+            "batch aborted: stage 1 NACK",
+            UNEXPLAINED_END,
+        ] {
+            let err = classify_chunk_error(reason, "messages");
+            assert_eq!(err.kind, "server_error", "{reason}");
+            assert_eq!(err.message, reason);
+            assert_eq!(err.param, None);
+            assert_eq!(err.code, None);
+        }
     }
 }

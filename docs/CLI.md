@@ -431,6 +431,15 @@ ending with `data: [DONE]`) or not:
   engine failure arrives as one event and then `[DONE]`, with no usage chunk:
   `{"id": "<chunk id>", "object": "error", "error": {"message": "...",
   "type": "server_error", "param": null, "code": null}}`.
+  A prompt over the engine's window that the engine rejects only once
+  generation started (for example openvino-genai's NPU `MAX_PROMPT_LEN` cap)
+  is the caller's to fix, so its event says so as OpenAI does:
+  `"type": "invalid_request_error"`, `"param": "messages"` (`"prompt"` on
+  `/v1/completions`), `"code": "context_length_exceeded"`, and the message
+  `This model's maximum context length is N tokens. However, your messages
+  resulted in M tokens. Please reduce the length of the messages.` (the
+  engine's own text when it gives no counts). Shorten the prompt rather than
+  retry.
   openai-python and openai-node raise `APIError` on it.
 - **A stream whose engine ends without a final chunk** (chat, completions or
   tools) sends the text it was still holding, then that error event (message

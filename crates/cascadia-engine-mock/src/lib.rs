@@ -9,6 +9,10 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::stream;
 
+/// openvino-genai's stateful NPU pipeline's failure for a prompt over its
+/// `MAX_PROMPT_LEN`, as captured live: 1024-token cap, 6543-token prompt.
+pub const NPU_PROMPT_OVER_WINDOW: &str = "openvino-genai error: Check 'data->input_ids.get_size() <= m_max_prompt_len' failed at src\\cpp\\src\\llm\\pipeline_stateful.cpp:364:\nStateful LLM pipeline on NPU may only process prompts or hold chat history up to 1024 tokens. 6543 is passed.\n Set the \"MAX_PROMPT_LEN\" config option to increase the limit.\n";
+
 #[derive(Default)]
 pub struct MockEngine {
     /// Each task with its echo cursor and where that cursor started (the
@@ -74,6 +78,18 @@ impl Engine for MockEngine {
         // Test sentinel: a prompt containing `__engine_error__` fails the
         // task loud (emits an error chunk) so consumers' failure paths —
         // e.g. the API's 5xx mapping — can be exercised deterministically.
+        // `__engine_error_over_window__` fails it with the text openvino-genai's
+        // NPU pipeline sends for a prompt over its window, as an engine
+        // wraps it, so the API's over-window classification can be tested.
+        if task.prompt.contains("__engine_error_over_window__") {
+            return Ok(vec![(
+                task.task_id.clone(),
+                Chunk::error(
+                    task.task_id,
+                    format!("backend error: {NPU_PROMPT_OVER_WINDOW}"),
+                ),
+            )]);
+        }
         if task.prompt.contains("__engine_error__") {
             return Ok(vec![(
                 task.task_id.clone(),
