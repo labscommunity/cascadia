@@ -90,6 +90,18 @@ impl Engine for MockEngine {
                 ),
             )]);
         }
+        // `__engine_error_llama_over_window__` fails it as the llama.cpp
+        // engine does when llama-server refuses a prompt over its window
+        // (`exceed_context_size_error`, 6543 tokens into 1024).
+        if task.prompt.contains("__engine_error_llama_over_window__") {
+            let err = EngineError::PromptTooLong(
+                "prompt is 6543 tokens; the model's window is 1024".into(),
+            );
+            return Ok(vec![(
+                task.task_id.clone(),
+                Chunk::error(task.task_id, err.to_string()),
+            )]);
+        }
         if task.prompt.contains("__engine_error__") {
             return Ok(vec![(
                 task.task_id.clone(),

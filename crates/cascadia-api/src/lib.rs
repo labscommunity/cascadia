@@ -8265,6 +8265,43 @@ level={{ effort_map[eff] }}";
         assert_ends_over_window(&body, "prompt");
     }
 
+    /// llama.cpp / sycl-llama: llama-server refuses a prompt over its window
+    /// with a 400 the engine reads as `PromptTooLong`. Streamed, chat (plain
+    /// and with tools) and completions end on the over-window error object
+    /// with the child's counts.
+    #[tokio::test]
+    async fn streamed_llama_server_over_window_is_context_length_exceeded() {
+        let sentinel = "__engine_error_llama_over_window__";
+        let usage = serde_json::json!({"include_usage": true});
+        let body = stream_body(
+            make_app().await,
+            "/v1/chat/completions",
+            serde_json::json!({"model":"mock-model",
+                "messages":[{"role":"user","content":sentinel}],
+                "stream":true,"stream_options":usage}),
+        )
+        .await;
+        assert_ends_over_window(&body, "messages");
+        let body = stream_body(
+            make_tool_app().await,
+            "/v1/chat/completions",
+            serde_json::json!({"model":"mock-model",
+                "messages":[{"role":"user","content":sentinel}],
+                "tools":[{"type":"function","function":{"name":"x"}}],
+                "stream":true,"stream_options":usage}),
+        )
+        .await;
+        assert_ends_over_window(&body, "messages");
+        let body = stream_body(
+            make_app().await,
+            "/v1/completions",
+            serde_json::json!({"model":"mock-model","prompt":sentinel,"max_tokens":8,
+                "stream":true,"stream_options":usage}),
+        )
+        .await;
+        assert_ends_over_window(&body, "prompt");
+    }
+
     /// Feed every piece but the last, finish with the last. Returns each
     /// released content piece (the finish content last) and parsed calls.
     fn run_splitter(pieces: &[&str], thinking: bool) -> (Vec<String>, Option<Vec<ToolCall>>) {
