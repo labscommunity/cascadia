@@ -374,7 +374,16 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   (see [CLI.md § Tool calling](../CLI.md#tool-calling-tools-tool_choice)).
   If llama-server refuses that schema with a 4xx naming the grammar or
   schema, the bridge sends the request again once without it and answers
-  unconstrained (counted as `schema_rejected`). An unknown string,
+  unconstrained (counted as `schema_rejected`). Tools whose `parameters`
+  llama-server would take too long to build its own tool-call grammar from
+  (it builds one under any `tool_choice`, and its converter's work is cubic
+  in an object's optional properties: about 430 optional properties with
+  short names is the limit) are refused before the request is sent, with a
+  400 `invalid configuration: tools: llama-server would take too long to
+  build a grammar from the tools' parameters: … the costliest is
+  tools[<i>] (<name>)…`; a tool-call constraint that would push the total
+  over that limit is dropped instead (`too_complex`) (see
+  [CLI.md § Tool calling](../CLI.md#tool-calling-tools-tool_choice)). An unknown string,
   a malformed object, or a name absent from `tools` is rejected with a 400
   before the request reaches the engine. The child's streamed `delta.tool_calls` fragments
   are re-assembled and emitted as `<tool_call>` text before the final chunk,
