@@ -405,26 +405,28 @@ ending with `data: [DONE]`) or not:
   `arguments`, not necessarily the same characters). A call in any other form
   (XML `<function=...>`, string-valued arguments, and so on) goes out as a
   header plus one fragment once its closing tag arrives; a bare-JSON reply is
-  decided at the end of the reply. On a model that reasons first, with
-  thinking on, calls are looked for only after `</think>`, so a call drafted
-  while reasoning is never sent, and a reply that never closes its reasoning
-  has its calls decided at the end. A model whose chat template forces
-  reasoning (it never reads `enable_thinking`, as with R1-distill, QwQ or
-  Qwen3 Thinking-2507) is treated the same even with `enable_thinking: false`;
-  one whose template honours the switch (Qwen3) writes no reasoning when it is
-  off, so its calls count from the start. A committed call cannot be taken back: if
-  the model then breaks its JSON but closes the arguments object, the stream
-  keeps it with the model's raw arguments and ends `tool_calls` (the
-  non-streamed reply returns that text as content). A call whose arguments
-  object never closed (the reply ended, a `stop` matched, `/v1/cancel` came, or
-  the model wrote `</tool_call>` while it was being written) keeps the
-  arguments sent so far and ends `stop`, or `length` at the length limit, never
-  `tool_calls`. The result does not depend on how the engine chunks its
-  output: a reply that arrives in one piece streams exactly as it would token
-  by token. So a streamed call's arguments can be incomplete or invalid JSON: check `finish_reason` and
-  validate the arguments before parsing them. A `functions` request gets the
-  same deltas under `delta.function_call`, first call only, and
-  `function_call` in place of `tool_calls`.
+  decided at the end of the reply. On a model that reasons first, with thinking
+  on, calls are looked for only after `</think>`, so a call drafted while
+  reasoning is never sent, and a reply that never closes its reasoning has its
+  calls decided at the end. A model whose chat template forces reasoning (it
+  never reads `enable_thinking`, as with R1-distill, QwQ or Qwen3 Thinking-2507)
+  is treated the same even with `enable_thinking: false`; one whose template
+  honours the switch (Qwen3) writes no reasoning when it is off, so its calls
+  count from the start. On sycl-llama, whose GGUF template the API cannot see,
+  calls are looked for only after `</think>` whatever `enable_thinking` says, so
+  a reply that never reasons has its calls decided at the end. A committed call
+  cannot be taken back: if the model then breaks its JSON but closes the
+  arguments object, the stream keeps it with the model's raw arguments and ends
+  `tool_calls` (the non-streamed reply returns that text as content). A call
+  whose arguments object never closed (the reply ended, a `stop` matched,
+  `/v1/cancel` came, or the model wrote `</tool_call>` while it was being
+  written) keeps the arguments sent so far and ends `stop`, or `length` at the
+  length limit, never `tool_calls`. The result does not depend on how the engine
+  chunks its output: a reply that arrives in one piece streams exactly as it
+  would token by token. So a streamed call's arguments can be incomplete or
+  invalid JSON: check `finish_reason` and validate the arguments before parsing
+  them. A `functions` request gets the same deltas under `delta.function_call`,
+  first call only, and `function_call` in place of `tool_calls`.
 - **Errors after the stream started.** The 200 headers are already sent, so an
   engine failure arrives as one event and then `[DONE]`, with no usage chunk:
   `{"id": "<chunk id>", "object": "error", "error": {"message": "...",

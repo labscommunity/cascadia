@@ -822,6 +822,12 @@ mod tests {
         }
         assert!(applies(hybrid, false, true));
         assert!(!applies(hybrid, false, false));
+        // Reads the flag but writes no reasoning block: never applies.
+        assert!(!applies(
+            Some("{% if enable_thinking %}x{% endif %}"),
+            false,
+            true
+        ));
     }
 
     const HERMES: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
