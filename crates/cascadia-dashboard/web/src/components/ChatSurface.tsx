@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { type ChatMessage, chatStream } from "@/lib/sse";
+import { type ChatMessage, chatStream, countTokens, initialTokenCount } from "@/lib/sse";
 
 import { ClusterStrip } from "./ClusterStrip";
 import { ModelPicker } from "./ModelPicker";
@@ -41,8 +41,7 @@ export function ChatSurface() {
 
     const startedAt = performance.now();
     let firstChunkAt: number | null = null;
-    let totalTokens = 0;
-    let unknownTokenBoundaries = false;
+    let count = initialTokenCount;
     let assistantText = "";
 
     const controller = new AbortController();
@@ -58,12 +57,8 @@ export function ChatSurface() {
         }
         const delta = chunk.choices[0]?.delta.content ?? "";
         if (firstChunkAt === null && delta) firstChunkAt = performance.now();
-        if (delta && chunk.n_tokens === 0) unknownTokenBoundaries = true;
-        if (chunk.completion_tokens != null) {
-          totalTokens = chunk.completion_tokens;
-        } else {
-          totalTokens += chunk.n_tokens ?? (delta ? 1 : 0);
-        }
+        count = countTokens(count, chunk);
+        const { total: totalTokens, unknownTokenBoundaries } = count;
         assistantText += delta;
 
         setMessages((prev) => {
@@ -80,11 +75,14 @@ export function ChatSurface() {
         // so use whole-request throughput rather than inventing token timing.
         const decodeWindow = ttft != null ? elapsed - ttft : null;
         const decodeTokens = totalTokens - 1;
-        const tokensPerSecond = unknownTokenBoundaries
+        // The final authoritative count can drop below the running one; the
+        // positivity guards keep the rate from going negative or NaN.
+        const rate = unknownTokenBoundaries
           ? elapsed > 0.05 && totalTokens > 0 ? totalTokens / elapsed : null
           : decodeWindow != null && decodeWindow > 0.05 && decodeTokens > 0
             ? decodeTokens / decodeWindow
             : null;
+        const tokensPerSecond = rate != null && Number.isFinite(rate) && rate > 0 ? rate : null;
         setStats({
           tokens: totalTokens,
           ttftSeconds: ttft,

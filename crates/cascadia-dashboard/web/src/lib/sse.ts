@@ -2,9 +2,10 @@
 //
 // We hand-roll the parser rather than use EventSource because EventSource
 // is GET-only — and OpenAI-shaped completions are POST. The wire format
-// is "data: <json>\n\n", terminated by "data: [DONE]\n\n". Cascadia adds a
-// non-standard per-chunk `n_tokens` and authoritative final
-// `completion_tokens` fields; SSE event boundaries are not token boundaries.
+// is "data: <json>\n\n", terminated by "data: [DONE]\n\n". Token counts come
+// from `usage` (requested with `continuous_usage_stats`) because SSE event
+// boundaries are not token boundaries: speculative engines emit several
+// tokens per chunk.
 
 export type ChatRole = "user" | "assistant" | "system";
 
@@ -13,17 +14,28 @@ export type ChatMessage = {
   content: string;
 };
 
+export type ChatUsage = {
+  prompt_tokens: number;
+  /**
+   * Running count while streaming; the last content chunk and the final
+   * usage chunk carry the authoritative total, which can be lower.
+   */
+  completion_tokens: number;
+  total_tokens: number;
+};
+
 export type ChatCompletionChunk = {
   id: string;
   object: "chat.completion.chunk";
-  /** Cascadia extension: tokens condensed into this chunk (spec-decode emits 1..K+1). */
-  n_tokens?: number;
-  /** Whole-generation model-token total, only on successful final chunks. */
-  completion_tokens?: number | null;
+  system_fingerprint?: string | null;
+  /** Present on every chunk when `continuous_usage_stats` is requested. */
+  usage?: ChatUsage | null;
+  /** Empty on the final usage-only chunk. */
   choices: {
     index: number;
-    delta: { role?: string; content?: string };
-    finish_reason: "stop" | null;
+    /** `role` is only on the first delta. */
+    delta: { role?: string; content?: string | null };
+    finish_reason: string | null;
   }[];
 };
 
@@ -31,10 +43,51 @@ export type ChatCompletionChunk = {
 export type ChatErrorChunk = {
   id: string;
   object: "error";
-  error: { message: string; type?: string };
+  error: {
+    message: string;
+    type?: string;
+    param?: string | null;
+    code?: string | null;
+  };
 };
 
 export type ChatStreamChunk = ChatCompletionChunk | ChatErrorChunk;
+
+export type TokenCount = {
+  /** Completion tokens so far; the last usage seen wins. */
+  total: number;
+  /**
+   * The engine does not report per-chunk counts (a content chunk left the
+   * running count unchanged, or no usage arrived), so chunk timing says
+   * nothing about token timing.
+   */
+  unknownTokenBoundaries: boolean;
+};
+
+export const initialTokenCount: TokenCount = { total: 0, unknownTokenBoundaries: false };
+
+/** Fold one streamed chunk into the running completion-token count. */
+export function countTokens(prev: TokenCount, chunk: ChatCompletionChunk): TokenCount {
+  const choice = chunk.choices[0];
+  const hasContent = Boolean(choice?.delta.content);
+  const usage = chunk.usage;
+  if (usage == null || !Number.isFinite(usage.completion_tokens)) {
+    // No count from the server: one per content chunk is all we can say.
+    return hasContent
+      ? { total: prev.total + 1, unknownTokenBoundaries: true }
+      : prev;
+  }
+  const total = Math.max(0, usage.completion_tokens);
+  // A finishing chunk carries the authoritative total, which may equal or
+  // undercut the running count, so only mid-stream chunks reveal an engine
+  // that reports no per-chunk counts.
+  const isFinal = choice === undefined || choice.finish_reason != null;
+  const unchanged = hasContent && !isFinal && total === prev.total;
+  return {
+    total,
+    unknownTokenBoundaries: prev.unknownTokenBoundaries || unchanged,
+  };
+}
 
 export type ChatStreamArgs = {
   model: string;
@@ -56,6 +109,7 @@ export async function* chatStream(
       max_tokens: args.max_tokens ?? 256,
       temperature: args.temperature ?? 0,
       stream: true,
+      stream_options: { include_usage: true, continuous_usage_stats: true },
     }),
     signal,
   });
