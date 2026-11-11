@@ -12136,6 +12136,93 @@ mod tests {
         assert_eq!(streak, 0, "no token wait timed out");
     }
 
+    /// The best-effort side of the head failure above: the head commits the
+    /// tail's `{` through `commit_task_token` (as `emit_token` does), the
+    /// grammar fails on it and is dropped (counted, recorded on the task),
+    /// the token stands and the task runs on. Its next step carries no mask,
+    /// and goes down the same link at once as a plain step.
+    #[tokio::test]
+    async fn a_best_effort_grammar_failure_at_the_head_drops_it_and_the_next_step_goes_plain() {
+        let props: Vec<String> = (0..600).map(|i| format!("\"p{i}\":{{}}")).collect();
+        let wide = format!(
+            r#"{{"type":"object","properties":{{{}}}}}"#,
+            props.join(",")
+        );
+        let capped = GrammarFactory::byte_level_with_row_cap_for_tests(2000);
+        let w = capped.mask_width();
+        let spec = cascadia_types::GrammarSpec::best_effort_json_schema(wide.as_str());
+        let mut active = active_task(
+            4,
+            Some(start_grammar(&capped.compile(&spec).unwrap(), &[]).unwrap()),
+        );
+        active.task.grammar = Some(spec);
+        let words = grammar_mask_words(active.grammar.as_mut().unwrap(), w).unwrap();
+        let (picks_open, picks_plain) = (rows(&[bad_then(w, b'{')]), rows(&[bad_then(w, b'"')]));
+        let (client, server) = loopback().await;
+        let down = Arc::new(tokio::sync::Mutex::new(client));
+        let up = Arc::new(tokio::sync::Mutex::new(server));
+        let (mut link, mut recv, mut streak) = (MaskLink::default(), MaskRecvCache::default(), 0);
+        let (head, tail) = tokio::join!(
+            masked_exchange(
+                &down,
+                1,
+                None,
+                &words,
+                f16_hidden(1),
+                decode_budget(),
+                &mut streak,
+                &mut link,
+            ),
+            tail_step(&up, &mut recv, &picks_open)
+        );
+        assert_eq!(tail, (1, Some(Ok(words.clone()))));
+        let token = head.unwrap();
+        assert_eq!(token, b'{' as i32);
+        let before = too_complex_count();
+        assert!(!commit_task_token(&mut active.task, &mut active.grammar, token).unwrap());
+        assert!(active.grammar.is_none() && active.task.grammar.is_none());
+        assert!(active.task.grammar_dropped.get());
+        assert!(too_complex_count() > before);
+
+        // The task's next step: no mask, a plain step on the same link.
+        let gf = structured::LazyGrammarFactory::ready(Ok(capped));
+        let now = std::time::Instant::now();
+        assert_eq!(
+            step_mask_words(Some(&mut active), &gf, &link, 4, now).unwrap(),
+            None
+        );
+        let started = std::time::Instant::now();
+        let send = send_hidden_frames_cached(&down, 2, None, None, &mut link.send, f16_hidden(2));
+        let (sent, tail) = tokio::join!(send, tail_step(&up, &mut recv, &picks_plain));
+        sent.unwrap();
+        assert_eq!(tail, (2, None));
+        assert_eq!(
+            recv_token_seq_checked(&down, 2, false).await.unwrap(),
+            BAD as i32,
+            "the plain argmax"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(streak, 0, "no token wait timed out");
+
+        // Under the limits engines build with, the same grammar takes `{`
+        // and masks on: enforced, nothing dropped.
+        let gf = test_factory();
+        let mut enforced = active_task(
+            4,
+            Some(start_grammar(&gf.compile(&best_effort_spec(&wide)).unwrap(), &[]).unwrap()),
+        );
+        enforced.task.grammar = Some(best_effort_spec(&wide));
+        assert!(
+            !commit_task_token(&mut enforced.task, &mut enforced.grammar, b'{' as i32).unwrap()
+        );
+        assert!(enforced.grammar.is_some() && !enforced.task.grammar_dropped.get());
+        grammar_mask_words(enforced.grammar.as_mut().unwrap(), gf.mask_width()).unwrap();
+    }
+
+    fn best_effort_spec(body: &str) -> cascadia_types::GrammarSpec {
+        cascadia_types::GrammarSpec::best_effort_json_schema(body)
+    }
+
     /// A middle resolves the upstream's marker from its own receive cache and
     /// re-encodes for its downstream with its own send cache. When it fails a
     /// step it decoded without forwarding it, its downstream still holds the
