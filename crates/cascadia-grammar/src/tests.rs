@@ -1450,6 +1450,40 @@ fn an_integer_or_number_below_the_llguidance_floor_is_raised_to_build() {
 }
 
 #[test]
+fn a_forced_tool_calls_unbounded_integers_take_at_most_nineteen_digits() {
+    // The shape of a forced tool call's best-effort grammar (cascadia-api's
+    // `tool_grammar`): its parameters' unbounded integers, one under a
+    // property named like a keyword and one behind a moved `$ref`, are
+    // bounded like a response_format schema's: to the i64 range, so the
+    // digit after a 19-digit run is masked.
+    let gf = single_byte();
+    let body = r##"{"type":"array","minItems":1,"maxItems":1,"items":{"anyOf":[{"type":"object","properties":{"name":{"type":"string","enum":["f"]},"parameters":{"type":"object","properties":{"items":{"type":"integer"},"m":{"$ref":"#/$defs/t0_M"}},"required":["items","m"]}},"required":["name","parameters"],"additionalProperties":false}]},"$defs":{"t0_M":{"type":"integer"}}}"##;
+    let compiled = gf
+        .compile(&GrammarSpec::best_effort_json_schema(body))
+        .unwrap();
+    assert!(
+        !compiled
+            .warnings()
+            .iter()
+            .any(|w| w.contains("integer length")),
+        "{:?}",
+        compiled.warnings()
+    );
+    let mut gm = compiled.matcher().unwrap();
+    let call = r#"[{"name":"f","parameters":{"items":1234567890123456789"#;
+    assert_eq!(walk(&gf, &mut gm, &bytes(call)), Ok(()));
+    for d in b'0'..=b'9' {
+        assert!(!gm.allowed(u32::from(d)), "a 20th digit");
+    }
+    let rest = r#","m":-1234567890123456789"#;
+    assert_eq!(walk(&gf, &mut gm, &bytes(rest)), Ok(()));
+    for d in b'0'..=b'9' {
+        assert!(!gm.allowed(u32::from(d)), "a 20th digit behind $ref");
+    }
+    assert!(gm.allowed(u32::from(b'}')));
+}
+
+#[test]
 fn a_schema_with_too_many_integers_to_bound_builds_unbounded() {
     // Each bounded integer is a range regex of its own; 600 of them pass
     // llguidance's lexer budget, which the schema as written stays inside.

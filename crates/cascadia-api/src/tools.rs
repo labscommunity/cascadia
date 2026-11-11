@@ -2028,6 +2028,50 @@ mod tests {
         }
     }
 
+    /// A forced call's grammar goes through the same integer bounding as a
+    /// `response_format` schema: every unbounded integer in the tool's
+    /// parameters (direct, behind a moved `$ref`, under a property named like
+    /// a keyword) is reachable by `bound_integers`, and the grammar builds
+    /// with them bounded (no "integer length not bounded" fallback).
+    #[test]
+    fn a_forced_tool_with_unbounded_integers_builds_with_them_bounded() {
+        let params = json!({"type": "object",
+            "properties": {"n": {"type": "integer"}, "items": {"type": "integer"},
+                "m": {"$ref": "#/$defs/M"}},
+            "required": ["n", "items", "m"],
+            "$defs": {"M": {"type": "integer", "minimum": 0}}});
+        for choice in [
+            json!("required"),
+            json!({"type": "function", "function": {"name": "f"}}),
+        ] {
+            let p = pol(
+                json!([with_params("f", params.clone())]),
+                Some(choice),
+                None,
+            );
+            let spec = tool_grammar(&p, None).expect("a grammar");
+            assert!(spec.best_effort);
+            let mut b = body(&spec);
+            assert_eq!(cascadia_grammar::bound_integers(&mut b), 3, "{}", spec.body);
+            let max = cascadia_grammar::ADDED_INTEGER_MAXIMUM;
+            assert_eq!(
+                b["$defs"]["t0_M"],
+                json!({"type": "integer", "minimum": 0, "maximum": max})
+            );
+            let compiled = cascadia_grammar::GrammarFactory::byte_level()
+                .compile(&spec)
+                .unwrap();
+            assert!(
+                !compiled
+                    .warnings()
+                    .iter()
+                    .any(|w| w.contains("integer length")),
+                "{:?}",
+                compiled.warnings()
+            );
+        }
+    }
+
     #[test]
     fn object_allof_in_tool_params_is_merged() {
         // zod's `.and()`: an allOf of plain object schemas.
