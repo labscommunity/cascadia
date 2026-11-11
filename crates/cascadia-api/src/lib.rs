@@ -11036,6 +11036,84 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// The highest llguidance row cap, halving down from 2000, under which
+    /// `spec` builds but fails the check's first step, so the test doesn't
+    /// depend on one limit value.
+    fn row_cap_failing_the_first_step(spec: &cascadia_types::GrammarSpec) -> usize {
+        let mut cap = 2000;
+        while cap >= 4 {
+            let factory = cascadia_grammar::GrammarFactory::byte_level_with_row_cap_for_tests(cap);
+            if let Ok(grammar) = factory.compile(spec) {
+                let never = std::sync::atomic::AtomicBool::new(false);
+                if grammar.check_first_step(&never).is_err() {
+                    return cap;
+                }
+            }
+            cap /= 2;
+        }
+        panic!("no row cap makes this grammar fail its first step");
+    }
+
+    /// A schema check that finds a forced tool's grammar fails on its first
+    /// token drops that grammar (counted as too complex) and answers
+    /// unconstrained: never the 400 a strict `response_format` gets for the
+    /// same verdict.
+    #[tokio::test]
+    async fn a_forced_grammar_that_fails_on_its_first_token_runs_unconstrained() {
+        let props: serde_json::Map<String, Value> = (0..600)
+            .map(|i| (format!("p{i}"), serde_json::json!({})))
+            .collect();
+        let wide = serde_json::json!({"type": "object", "properties": props});
+        let tools = serde_json::json!([{"type": "function", "function": {
+            "name": "fill_form", "parameters": wide.clone()}}]);
+        let forced = tool_body(tools, serde_json::json!({"tool_choice": "required"}));
+
+        // The forced tool's grammar as the engine would get it.
+        let (app, seen) = mock_capture_app(Config::default(), TOOLS_TEMPLATE).await;
+        let (status, v) = post_chat(app, forced.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let spec = last_task(&seen).grammar.expect("a forced tool grammar");
+        assert!(spec.best_effort);
+
+        let cap = row_cap_failing_the_first_step(&spec);
+        let check = SchemaCompileCheck::default()
+            .with_factory(cascadia_grammar::GrammarFactory::byte_level_with_row_cap_for_tests(cap));
+        let cfg = Config {
+            schema_check: check,
+            schema_build_check: true,
+            ..Config::default()
+        };
+        let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+        let reason = cascadia_metrics::UnenforcedReason::TooComplex;
+        let count = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[reason.as_str()])
+                .get()
+        };
+        let before = count();
+        let (status, v) = post_chat(app, forced).await;
+        assert_eq!(status, StatusCode::OK, "cap {cap}: {v}");
+        assert_eq!(last_task(&seen).grammar, None, "cap {cap}");
+        assert!(count() > before, "cap {cap}");
+
+        // The same schema as a strict response_format, under a cap at which
+        // its own grammar fails its first token: the parent's 400.
+        let strict = cascadia_types::GrammarSpec::json_schema(wide.to_string());
+        let cap = row_cap_failing_the_first_step(&strict);
+        let check = SchemaCompileCheck::default()
+            .with_factory(cascadia_grammar::GrammarFactory::byte_level_with_row_cap_for_tests(cap));
+        let (status, v) = post_chat(
+            so_app_checked(check).await,
+            chat_with(Some(json_schema_format(wide))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "cap {cap}: {v}");
+        assert_eq!(
+            v["error"],
+            "invalid response_format: response_format schema is too complex to compile"
+        );
+    }
+
     /// Held by every test that asserts an exact `schema_rejected` delta:
     /// the counter is process-wide, and tests run in parallel. A test that
     /// only needs a rejection checks `tool_schema`, which counts nothing.
