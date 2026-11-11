@@ -138,6 +138,11 @@ const STEP_POLL: Duration = Duration::from_millis(50);
 /// No chunk from the child for this long (wall clock since the last one, or
 /// since the request started) fails the task.
 const STALL_LIMIT: Duration = Duration::from_secs(300);
+/// The request socket's read timeout. Longer than `STALL_LIMIT`, so a silent
+/// child is always caught by `step()`'s stall check, which kills it: were the
+/// reader's own timeout to fire first, it would end the task with a plain
+/// "no response" and leave the wedged child to swallow the next task too.
+const READ_TIMEOUT: Duration = Duration::from_secs(STALL_LIMIT.as_secs() + 60);
 
 /// Tie the child's life to cascadia's: a cascadia that is SIGKILLed or
 /// crashes must not leave a `llama-server` holding the model's VRAM and the
@@ -1274,7 +1279,7 @@ impl LlamaCppEngine {
                 return;
             }
         };
-        let _ = s.set_read_timeout(Some(Duration::from_secs(300)));
+        let _ = s.set_read_timeout(Some(READ_TIMEOUT));
         self.socket = s.try_clone().ok();
 
         std::thread::spawn(move || {
@@ -3296,6 +3301,44 @@ mod unix_tests {
         assert!(engine.proc.exited(), "the stalled child must be killed");
         drop(engine);
         server.join().unwrap();
+    }
+
+    /// A child that takes the request and answers nothing, not even headers
+    /// (llama-server converting a schema to a grammar), is the stall the
+    /// limit exists for: the task fails as stalled and the child is killed.
+    #[test]
+    fn a_child_silent_before_its_headers_is_killed_at_the_stall_limit() {
+        let (port, server) = mock_server(|_, s| {
+            // read the request, then answer nothing until the client goes away
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.read(&mut buf);
+        });
+        let mut engine = test_engine(port);
+        engine.submit(chat_task()).unwrap();
+        for _ in 0..5 {
+            let out = engine.step().unwrap();
+            assert!(out.iter().all(|(_, c)| c.is_progress()), "{out:?}");
+        }
+        engine.last_chunk_at = Instant::now() - STALL_LIMIT;
+        let out = engine.step().unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].1.is_final);
+        assert!(
+            out[0].1.error.as_deref().unwrap().contains("stalled"),
+            "{:?}",
+            out[0].1
+        );
+        assert!(engine.proc.exited(), "the silent child must be killed");
+        drop(engine);
+        server.join().unwrap();
+    }
+
+    /// The reader's own timeout must not beat the stall check: it would end
+    /// the task as "no response" without killing the wedged child.
+    #[test]
+    fn the_request_socket_outlasts_the_stall_limit() {
+        assert!(READ_TIMEOUT >= STALL_LIMIT + Duration::from_secs(30));
     }
 
     /// Linux: PDEATHSIG fires on the spawning *thread's* exit — the reason
