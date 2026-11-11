@@ -45,7 +45,8 @@ Modes:
   tool list, which the mock would echo ahead of the call.)
 * ``--tools --tool-model``: the same tool checks against a real model that can
   call tools (e.g. a Qwen2.5 Instruct). It is asked "What's the weather in
-  Paris? Use the tool." at temperature 0 instead of being fed the call.
+  Paris? Use the tool." at temperature 0 with ``"enable_thinking": false``
+  instead of being fed the call.
 
 ``--self-test`` needs no server: it feeds canned bad streams (``n_tokens`` on a
 chunk, the role on every delta, no ``[DONE]``, a changing fingerprint, a tool
@@ -472,6 +473,11 @@ def live(args):
     if args.tools:
         tool_msgs = [{"role": "user", "content": REAL_TOOL_PROMPT if args.tool_model else MOCK_TOOL_CALL}]
         base_req = {"model": model, "messages": tool_msgs, "temperature": 0, "max_tokens": 128}
+        if args.tool_model:
+            # Thinking off: a reasoning model (Qwen3) then answers with the call
+            # itself, and an engine that applies its own template for thinking
+            # requests (ov-genai) accepts the tools.
+            base_req["enable_thinking"] = False
         for legacy in (False, True):
             label = "functions (legacy)" if legacy else "tools"
             req = dict(base_req, functions=FUNCTIONS) if legacy else dict(base_req, tools=TOOLS)
