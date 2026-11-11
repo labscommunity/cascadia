@@ -9,6 +9,7 @@ mod generation_info;
 #[cfg(test)]
 mod spec_schema;
 mod stream_shape;
+mod tool_stream;
 pub use generation_info::{read_model_generation_info, ModelGenerationInfo};
 use stream_shape::Usage;
 
@@ -2349,6 +2350,17 @@ impl ToolStreamSplitter {
         self.lead += rest.len() - rest.trim_start().len();
     }
 
+    /// Everything fed so far.
+    fn text(&self) -> &str {
+        &self.buf
+    }
+
+    /// Where tool-call scanning starts, once it may: `None` while thinking
+    /// is on and `</think>` has not arrived.
+    fn scan_from(&self) -> Option<usize> {
+        self.think_from.is_none().then_some(self.scan_start)
+    }
+
     /// First byte that may still belong to a tool call.
     fn hold_point(&self) -> usize {
         let start = self.scan_start;
@@ -3437,6 +3449,7 @@ async fn stream_completion(
             marker: state.marker_dialect.clone().map(MarkerFilter::new),
             stop,
             splitter: ToolStreamSplitter::new(enable_thinking),
+            calls: tool_stream::ToolCallEmitter::new(legacy_functions),
             logprobs: stream_shape::LogprobQueue::new(logprobs_asked),
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
@@ -4193,6 +4206,8 @@ struct ToolStream {
     /// parsing.
     stop: StopMatcher,
     splitter: ToolStreamSplitter,
+    /// Sends each tool call from the splitter's held text as it arrives.
+    calls: tool_stream::ToolCallEmitter,
     /// Items wait here until the stop matcher and the splitter release
     /// their text.
     logprobs: stream_shape::LogprobQueue,
@@ -4240,16 +4255,22 @@ impl ToolStream {
                     // is a failure, so the content goes out unclosed (calls
                     // that may be cut short are not sent) and the error
                     // event follows.
+                    // A call already streamed stays sent (it cannot be
+                    // taken back); no more of it, or of any other, follows.
                     self.phase = ToolStreamPhase::Tail;
                     let rest = self.stop.finish();
                     if self.live.cancelled() {
-                        return Some(self.close_choice(&rest, "stop"));
+                        return Some(self.close_choice(&rest, "stop", true));
                     }
                     warn!(task = %self.meta.id, "engine stream ended without a final chunk; emitting SSE error");
                     let counts = self.counts();
-                    let content = match self.splitter.finish(&rest) {
-                        ToolStreamEnd::Content(content)
-                        | ToolStreamEnd::ToolCalls { content, .. } => content.to_owned(),
+                    let content = if self.calls.started() {
+                        self.splitter.feed(&rest).to_owned()
+                    } else {
+                        match self.splitter.finish(&rest) {
+                            ToolStreamEnd::Content(content)
+                            | ToolStreamEnd::ToolCalls { content, .. } => content.to_owned(),
+                        }
                     };
                     let logprobs = self.logprobs.finish(content.len());
                     let mut out = String::new();
@@ -4305,31 +4326,36 @@ impl ToolStream {
                     chunks.finish_early(cascadia_types::FinishReason::Stop);
                 }
                 self.phase = ToolStreamPhase::Tail;
-                Some(self.close_choice(&text, "stop"))
+                Some(self.close_choice(&text, "stop", true))
             } else if chunk.is_final {
                 text.push_str(&self.stop.finish());
-                self.finished =
-                    chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
+                let cancelled =
+                    chunk.finish_reason == Some(cascadia_types::FinishReason::Cancelled);
+                self.finished = !cancelled;
                 self.phase = ToolStreamPhase::Tail;
                 let reason = chunk
                     .finish_reason
                     .map(|f| f.as_openai_str())
                     .unwrap_or("stop");
-                Some(self.close_choice(&text, reason))
+                Some(self.close_choice(&text, reason, cancelled))
             } else {
                 let counts = self.counts();
-                let content = self.splitter.feed(&text);
-                if content.is_empty() {
-                    None
-                } else {
+                let content = self.splitter.feed(&text).to_owned();
+                let mut out = String::new();
+                if !content.is_empty() {
                     let logprobs = self.logprobs.release(content.len());
-                    Some(Bytes::from(self.meta.chat_chunk(
-                        stream_shape::content_delta(content),
+                    out.push_str(&self.meta.chat_chunk(
+                        stream_shape::content_delta(&content),
                         None,
                         logprobs,
                         counts,
-                    )))
+                    ));
                 }
+                let events = self
+                    .calls
+                    .advance(self.splitter.text(), self.splitter.scan_from());
+                self.push_call_events(&mut out, events, counts);
+                (!out.is_empty()).then(|| Bytes::from(out))
             };
             // Same per-chunk yield as the plain stream (see the comment
             // there): lets the body sink drain each frame to TCP.
@@ -4340,71 +4366,96 @@ impl ToolStream {
         }
     }
 
-    /// Close the choice: the rest as content with the engine's
-    /// finish_reason, or the still-releasable content, one indexed
-    /// tool_calls delta, and a `tool_calls` finish — for a `functions`
-    /// request, one `function_call` delta (the first call) and a
-    /// `function_call` finish instead. A `length` finish stays `length`,
-    /// after the calls that came out whole.
-    fn close_choice(&mut self, text: &str, finish_reason: &str) -> Bytes {
+    /// Close the choice on the reply's last `text`. `cut` is set when the
+    /// generation was ended from outside the model (a `stop` match or a
+    /// cancel).
+    ///
+    /// No call streamed yet: the rest as content with the engine's
+    /// finish_reason, or the still-releasable content, each call parsed at
+    /// the end (header, then its arguments) and a `tool_calls` finish
+    /// (`function_call` and the first call only for a `functions` request).
+    /// Calls already streamed: the rest of the reply's calls, never its
+    /// markup as content. A `length` finish stays `length`; a cut inside a
+    /// streamed call's arguments ends `stop`.
+    fn close_choice(&mut self, text: &str, finish_reason: &str, cut: bool) -> Bytes {
         let counts = self.counts();
-        let null = || serde_json::Value::Null;
-        let out = match self.splitter.finish(text) {
-            ToolStreamEnd::Content(content) => self.meta.chat_chunk(
-                stream_shape::content_delta(content),
-                Some(finish_reason),
-                self.logprobs.finish(content.len()),
-                counts,
-            ),
-            // Items of the call markup never go out: `finish` drops them.
-            ToolStreamEnd::ToolCalls { content, calls } => {
-                let logprobs = self.logprobs.finish(content.len());
-                let mut out = String::new();
-                if !content.is_empty() {
-                    out.push_str(&self.meta.chat_chunk(
-                        stream_shape::content_delta(content),
-                        None,
-                        logprobs,
-                        counts,
-                    ));
-                }
-                let mut call_delta = serde_json::Map::new();
-                let call_finish = if self.legacy_functions {
-                    let first = calls.into_iter().next().map(|c| c.function);
-                    call_delta.insert("function_call".into(), serde_json::json!(first));
-                    "function_call"
-                } else {
-                    let tool_calls: Vec<serde_json::Value> = calls
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, c)| {
-                            serde_json::json!({
-                                "index": i, "id": c.id, "type": c.r#type,
-                                "function": { "name": c.function.name, "arguments": c.function.arguments },
-                            })
-                        })
-                        .collect();
-                    call_delta.insert("tool_calls".into(), tool_calls.into());
-                    "tool_calls"
-                };
-                out.push_str(&self.meta.chat_chunk(call_delta, None, null(), counts));
-                // A generation cut at its limit keeps `length`, with the
-                // calls that came out whole above.
-                let finish_reason = if finish_reason == "length" {
-                    finish_reason
-                } else {
-                    call_finish
-                };
+        let mut out = String::new();
+        let events = if self.calls.started() {
+            let content = self.splitter.feed(text).to_owned();
+            if !content.is_empty() {
+                let logprobs = self.logprobs.release(content.len());
                 out.push_str(&self.meta.chat_chunk(
-                    serde_json::Map::new(),
-                    Some(finish_reason),
-                    null(),
+                    stream_shape::content_delta(&content),
+                    None,
+                    logprobs,
                     counts,
                 ));
-                out
+            }
+            // Markup items never go out.
+            self.logprobs.finish(0);
+            self.calls
+                .finish(self.splitter.text(), self.splitter.scan_from())
+        } else {
+            match self.splitter.finish(text) {
+                ToolStreamEnd::Content(content) => {
+                    out.push_str(&self.meta.chat_chunk(
+                        stream_shape::content_delta(content),
+                        Some(finish_reason),
+                        self.logprobs.finish(content.len()),
+                        counts,
+                    ));
+                    return Bytes::from(out);
+                }
+                // Items of the call markup never go out: `finish` drops them.
+                ToolStreamEnd::ToolCalls { content, calls } => {
+                    let logprobs = self.logprobs.finish(content.len());
+                    if !content.is_empty() {
+                        out.push_str(&self.meta.chat_chunk(
+                            stream_shape::content_delta(content),
+                            None,
+                            logprobs,
+                            counts,
+                        ));
+                    }
+                    tool_stream::whole_calls(calls, self.legacy_functions)
+                }
             }
         };
+        self.push_call_events(&mut out, events, counts);
+        let finish_reason = if finish_reason == "length" {
+            // A generation cut at its limit keeps `length`.
+            finish_reason
+        } else if cut && self.calls.inside_arguments() {
+            "stop"
+        } else if self.legacy_functions {
+            "function_call"
+        } else {
+            "tool_calls"
+        };
+        out.push_str(&self.meta.chat_chunk(
+            serde_json::Map::new(),
+            Some(finish_reason),
+            serde_json::Value::Null,
+            counts,
+        ));
         Bytes::from(out)
+    }
+
+    /// One chunk per tool-call delta, appended to `out`.
+    fn push_call_events(
+        &mut self,
+        out: &mut String,
+        events: Vec<tool_stream::CallEvent>,
+        counts: stream_shape::Counts,
+    ) {
+        for event in events {
+            out.push_str(&self.meta.chat_chunk(
+                event.delta(self.legacy_functions),
+                None,
+                serde_json::Value::Null,
+                counts,
+            ));
+        }
     }
 
     /// The latest prompt count and the running completion count.
@@ -7774,15 +7825,19 @@ level={{ effort_map[eff] }}";
         let body =
             String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
         let (mut saw_tool, mut saw_finish) = (false, false);
-        for (i, v) in sse_events(&body).iter().enumerate() {
+        let events = sse_events(&body);
+        for (i, v) in events.iter().enumerate() {
             let d = &v["choices"][0]["delta"];
             if d.get("tool_calls").is_some() {
-                saw_tool = true;
                 assert_eq!(d["tool_calls"][0]["index"], 0);
-                assert_eq!(d["tool_calls"][0]["function"]["name"], "get_weather");
-                // The call is the first chunk here, so it carries the role.
-                assert_eq!(i, 0, "{body}");
-                assert_eq!(d["role"], "assistant");
+                if !saw_tool {
+                    assert_eq!(d["tool_calls"][0]["function"]["name"], "get_weather");
+                    // The call's header is the first chunk here, so it
+                    // carries the role.
+                    assert_eq!(i, 0, "{body}");
+                    assert_eq!(d["role"], "assistant");
+                }
+                saw_tool = true;
             }
             if v["choices"][0]["finish_reason"] == "tool_calls" {
                 saw_finish = true;
@@ -7790,6 +7845,7 @@ level={{ effort_map[eff] }}";
         }
         assert!(saw_tool, "no tool_calls delta: {body}");
         assert!(saw_finish, "no tool_calls finish: {body}");
+        assert_eq!(stream_calls(&events)[0].2, r#"{"city":"Paris"}"#, "{body}");
         // The call's own text is withheld, never sent as content.
         assert!(!body.contains("<tool_call>"), "marker leaked: {body}");
     }
@@ -8188,17 +8244,11 @@ level={{ effort_map[eff] }}";
         sse_events(&format!("{first}{rest}"));
         let events = sse_events_partial(&rest);
         assert_eq!(streamed_content(&events), "the weather. ");
-        let call_events: Vec<_> = events
-            .iter()
-            .filter(|e| e["choices"][0]["delta"].get("tool_calls").is_some())
-            .collect();
-        assert_eq!(call_events.len(), 1, "{rest}");
-        let call = &call_events[0]["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(call["index"], 0);
-        assert_eq!(call["type"], "function");
-        assert_eq!(call["function"]["name"], "get_weather");
+        let calls = stream_calls(&events);
+        assert_eq!(calls.len(), 1, "{rest}");
+        assert_eq!(calls[0].1, "get_weather");
         assert_eq!(
-            serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(),
+            serde_json::from_str::<Value>(&calls[0].2).unwrap(),
             serde_json::json!({"city":"Paris"})
         );
         let finishes: Vec<_> = events
@@ -8258,8 +8308,59 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// The calls of a streamed reply, assembled by `index` as clients do:
+    /// (id, name, arguments). Indices must come in order.
+    fn stream_calls(events: &[Value]) -> Vec<(String, String, String)> {
+        let mut calls: Vec<(String, String, String)> = Vec::new();
+        for call in events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["tool_calls"].as_array())
+            .flatten()
+        {
+            let index = call["index"].as_u64().unwrap() as usize;
+            if index == calls.len() {
+                calls.push((
+                    call["id"].as_str().unwrap().to_owned(),
+                    call["function"]["name"].as_str().unwrap().to_owned(),
+                    String::new(),
+                ));
+            }
+            calls[index]
+                .2
+                .push_str(call["function"]["arguments"].as_str().unwrap_or_default());
+        }
+        calls
+    }
+
+    /// The `function_call` deltas of a streamed `functions` reply, joined:
+    /// (name, arguments).
+    fn stream_function_call(events: &[Value]) -> (String, String) {
+        let deltas: Vec<&Value> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"].get("function_call"))
+            .collect();
+        let name = deltas[0]["name"].as_str().unwrap().to_owned();
+        assert!(
+            deltas[1..].iter().all(|d| d.get("name").is_none()),
+            "{deltas:?}"
+        );
+        let arguments = deltas
+            .iter()
+            .filter_map(|d| d["arguments"].as_str())
+            .collect();
+        (name, arguments)
+    }
+
+    fn finish_reasons(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| e["choices"][0]["finish_reason"].as_str())
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[tokio::test]
-    async fn streaming_tools_sends_two_calls_in_one_indexed_delta() {
+    async fn streaming_tools_sends_each_call_with_its_own_index() {
         let second = r#"<tool_call>{"name":"get_time","arguments":{"tz":"CET"}}</tool_call>"#;
         let (app, release) = gated_app(&[WEATHER_CALL, "\n", second], false).await;
         release.store(true, Ordering::SeqCst);
@@ -8267,31 +8368,194 @@ level={{ effort_map[eff] }}";
         let body =
             String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
         let events = sse_events(&body);
-        let call_events: Vec<_> = events
-            .iter()
-            .filter(|e| e["choices"][0]["delta"].get("tool_calls").is_some())
-            .collect();
-        assert_eq!(call_events.len(), 1, "{body}");
-        let calls = call_events[0]["choices"][0]["delta"]["tool_calls"]
-            .as_array()
-            .unwrap();
+        let calls = stream_calls(&events);
         let summary: Vec<_> = calls
             .iter()
-            .map(|c| {
-                (
-                    c["index"].as_u64().unwrap(),
-                    c["function"]["name"].as_str().unwrap(),
-                )
-            })
+            .map(|c| (c.1.as_str(), serde_json::from_str::<Value>(&c.2).unwrap()))
             .collect();
-        assert_eq!(summary, [(0, "get_weather"), (1, "get_time")], "{body}");
-        assert_ne!(calls[0]["id"], calls[1]["id"], "{body}");
-        let finishes: Vec<_> = events
-            .iter()
-            .filter_map(|e| e["choices"][0]["finish_reason"].as_str())
-            .collect();
-        assert_eq!(finishes, ["tool_calls"], "{body}");
+        assert_eq!(
+            summary,
+            [
+                ("get_weather", serde_json::json!({"city": "Paris"})),
+                ("get_time", serde_json::json!({"tz": "CET"}))
+            ],
+            "{body}"
+        );
+        assert_ne!(calls[0].0, calls[1].0, "{body}");
+        assert_eq!(finish_reasons(&events), ["tool_calls"], "{body}");
         assert_eq!(streamed_content(&events), "", "{body}");
+    }
+
+    /// A Hermes call over four engine chunks: the header goes out with the
+    /// first, while the engine is held, and the arguments follow in pieces.
+    #[tokio::test]
+    async fn streaming_tool_call_arguments_arrive_as_they_are_generated() {
+        let parts = [
+            r#"<tool_call>{"name": "get_weather", "arguments": {"#,
+            r#""city": "#,
+            r#""Paris", "days": 3"#,
+            "}}</tool_call>",
+        ];
+        for legacy in [false, true] {
+            let (app, release) = gated_app(&parts, false).await;
+            // Thinking on, a call streams only after `</think>`.
+            let mut payload = serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}], "stream": true,
+                "enable_thinking": false});
+            if legacy {
+                payload["functions"] = serde_json::json!([{"name": "get_weather"}]);
+            } else {
+                payload["tools"] =
+                    serde_json::json!([{"type": "function", "function": {"name": "get_weather"}}]);
+            }
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut body = resp.into_body().into_data_stream();
+            // The engine is held after its first chunk: the header can only
+            // be here if it went out before the engine's later chunks.
+            let first = loop {
+                let frame = tokio::time::timeout(Duration::from_secs(10), body.next())
+                    .await
+                    .expect("header frame while generation is held")
+                    .expect("body still open")
+                    .unwrap();
+                if !frame.is_empty() {
+                    break String::from_utf8(frame.to_vec()).unwrap();
+                }
+            };
+            // The header, then the arguments' opening `{`.
+            let head = sse_events_partial(&first);
+            assert_eq!(head.len(), 2, "legacy={legacy}: {first}");
+            let delta = &head[0]["choices"][0]["delta"];
+            if legacy {
+                assert_eq!(
+                    delta["function_call"],
+                    serde_json::json!({"name": "get_weather", "arguments": ""}),
+                    "{first}"
+                );
+            } else {
+                let call = &delta["tool_calls"][0];
+                assert_eq!(call["index"], 0, "{first}");
+                assert!(call["id"].as_str().unwrap().starts_with("call_"), "{first}");
+                assert_eq!(call["type"], "function", "{first}");
+                assert_eq!(
+                    call["function"],
+                    serde_json::json!({"name": "get_weather", "arguments": ""}),
+                    "{first}"
+                );
+            }
+            release.store(true, Ordering::SeqCst);
+            let mut all = first.clone();
+            while let Some(frame) = body.next().await {
+                all.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+            }
+            let events = sse_events(&all);
+            assert!(!all.contains("<tool_call>"), "marker leaked: {all}");
+            let key = if legacy {
+                "function_call"
+            } else {
+                "tool_calls"
+            };
+            let later: Vec<&Value> = events[1..]
+                .iter()
+                .filter_map(|e| e["choices"][0]["delta"].get(key))
+                .collect();
+            assert!(later.len() >= 2, "arguments in pieces: {all}");
+            for d in &later {
+                let piece = if legacy { *d } else { &d[0] };
+                let mut keys: Vec<&String> = piece.as_object().unwrap().keys().collect();
+                keys.sort();
+                let want: &[&str] = if legacy {
+                    &["arguments"]
+                } else {
+                    &["function", "index"]
+                };
+                assert_eq!(keys, want, "{all}");
+            }
+            let (name, arguments) = if legacy {
+                stream_function_call(&events)
+            } else {
+                let calls = stream_calls(&events);
+                assert_eq!(calls.len(), 1, "{all}");
+                (calls[0].1.clone(), calls[0].2.clone())
+            };
+            assert_eq!(name, "get_weather");
+            assert_eq!(
+                serde_json::from_str::<Value>(&arguments).unwrap(),
+                serde_json::json!({"city": "Paris", "days": 3}),
+                "{all}"
+            );
+            let want = if legacy {
+                "function_call"
+            } else {
+                "tool_calls"
+            };
+            assert_eq!(finish_reasons(&events), [want], "{all}");
+        }
+    }
+
+    /// A cut inside a streamed call's arguments keeps the call as sent and
+    /// ends with what ended the generation: the window (`length`) or a
+    /// `stop` match (`stop`).
+    #[tokio::test]
+    async fn a_cut_inside_streamed_arguments_ends_with_its_own_reason() {
+        let parts = [
+            r#"<tool_call>{"name":"get_weather","arguments":{"city":"#,
+            r#""Pa"#,
+            r#"ris"}}</tool_call>"#,
+        ];
+        for legacy in [false, true] {
+            for (stop, want_args, want_finish) in [
+                (None, r#"{"city":"Pa"#, "length"),
+                (Some("Par"), r#"{"city":""#, "stop"),
+            ] {
+                let ctx = format!("legacy={legacy} stop={stop:?}");
+                let (app, _log, _) = script_app_opts(
+                    &script(&parts),
+                    ScriptOpts {
+                        // 5 prompt tokens + 2: the second part ends it.
+                        window: stop.is_none().then_some(7),
+                        ..ScriptOpts::default()
+                    },
+                )
+                .await;
+                let mut body = serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}], "stream": true,
+                    "enable_thinking": false});
+                if let Some(stop) = stop {
+                    body["stop"] = stop.into();
+                }
+                if legacy {
+                    body["functions"] = serde_json::json!([{"name": "get_weather"}]);
+                } else {
+                    body["tools"] = serde_json::json!([
+                        {"type": "function", "function": {"name": "get_weather"}}]);
+                }
+                let (status, text) = post_text(app, "/v1/chat/completions", &body).await;
+                assert_eq!(status, StatusCode::OK, "{ctx}: {text}");
+                let events = sse_events(&text);
+                let (name, arguments) = if legacy {
+                    stream_function_call(&events)
+                } else {
+                    let calls = stream_calls(&events);
+                    assert_eq!(calls.len(), 1, "{ctx}: {text}");
+                    (calls[0].1.clone(), calls[0].2.clone())
+                };
+                assert_eq!(name, "get_weather", "{ctx}");
+                assert_eq!(arguments, want_args, "{ctx}: {text}");
+                assert_eq!(finish_reasons(&events), [want_finish], "{ctx}: {text}");
+                assert_eq!(streamed_content(&events), "", "{ctx}: {text}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -9575,18 +9839,18 @@ level={{ effort_map[eff] }}";
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let events = sse_events(&body);
-        let deltas: Vec<&Value> = events
-            .iter()
-            .map(|e| &e["choices"][0]["delta"])
-            .filter(|d| d.get("function_call").is_some())
-            .collect();
-        assert_eq!(deltas.len(), 1, "one function_call delta: {body}");
-        // The call is the stream's first chunk, so it carries the role.
-        assert_eq!(&events[0]["choices"][0]["delta"], deltas[0], "{body}");
-        assert_eq!(deltas[0]["role"], "assistant");
+        // The call's header is the stream's first chunk, so it carries the
+        // role; the arguments follow without the name.
+        let first = &events[0]["choices"][0]["delta"];
+        assert_eq!(first["role"], "assistant", "{body}");
         assert_eq!(
-            deltas[0]["function_call"],
-            serde_json::json!({"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"})
+            first["function_call"],
+            serde_json::json!({"name": "get_weather", "arguments": ""})
+        );
+        assert_eq!(
+            stream_function_call(&events),
+            ("get_weather".to_owned(), "{\"city\":\"Paris\"}".to_owned()),
+            "{body}"
         );
         let finishes: Vec<&Value> = events
             .iter()
@@ -10159,31 +10423,35 @@ level={{ effort_map[eff] }}";
             .chain([Chunk::final_marker(id, "")])
             .collect()
         }
-        let payload = serde_json::json!({"model": "mock-model",
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-            "stream": true, "logprobs": true});
-        let (status, body) = post_text(
-            chunk_list_app(script).await,
-            "/v1/chat/completions",
-            &payload,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let mut content = String::new();
-        let mut tokens = Vec::new();
-        for e in sse_events(&body) {
-            let choice = &e["choices"][0];
-            let t = choice_text(choice);
-            if t.is_empty() {
-                assert!(choice["logprobs"].is_null(), "{body}");
+        // Thinking off, the call streams as it arrives; on, it is decided
+        // at the end. Either way its markup sends no items.
+        for thinking in [true, false] {
+            let payload = serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "stream": true, "logprobs": true, "enable_thinking": thinking});
+            let (status, body) = post_text(
+                chunk_list_app(script).await,
+                "/v1/chat/completions",
+                &payload,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let mut content = String::new();
+            let mut tokens = Vec::new();
+            for e in sse_events(&body) {
+                let choice = &e["choices"][0];
+                let t = choice_text(choice);
+                if t.is_empty() {
+                    assert!(choice["logprobs"].is_null(), "{body}");
+                }
+                content.push_str(t);
+                tokens.extend(lp_tokens(&choice["logprobs"]));
             }
-            content.push_str(t);
-            tokens.extend(lp_tokens(&choice["logprobs"]));
+            assert!(body.contains("tool_calls"), "{body}");
+            assert_eq!(content, "Checking <tool now ", "{body}");
+            assert_eq!(tokens, ["Checking <tool", " now "], "{body}");
         }
-        assert!(body.contains("tool_calls"), "{body}");
-        assert_eq!(content, "Checking <tool now ", "{body}");
-        assert_eq!(tokens, ["Checking <tool", " now "], "{body}");
     }
 
     /// Emits `parts` one per step (`gate` after the first holds the rest,
@@ -11260,6 +11528,7 @@ level={{ effort_map[eff] }}";
             marker: None,
             stop: StopMatcher::new(&["STOP".to_owned()]),
             splitter: ToolStreamSplitter::new(false),
+            calls: tool_stream::ToolCallEmitter::new(false),
             logprobs: stream_shape::LogprobQueue::new(false),
             stats: Arc::new(ApiStats::default()),
             completion: std::sync::atomic::AtomicU32::new(0),
@@ -11342,38 +11611,53 @@ level={{ effort_map[eff] }}";
         assert_eq!(live.len(), 0);
     }
 
-    /// A tools stream whose engine goes away after a whole call was parsed
-    /// (not cancelled) sends no call it cannot vouch for: the content before
-    /// the call, the error event, then `[DONE]`.
+    /// A tools stream whose engine goes away (not cancelled) sends no call
+    /// it has not sent yet: a whole-output call decided at the end is
+    /// dropped. A call already streamed was committed and cannot be taken
+    /// back, so its deltas stay, whole or cut, and the error event follows
+    /// them. Never a finish_reason, never the markup as content.
     #[tokio::test]
-    async fn unexplained_end_after_a_call_drops_the_call() {
+    async fn unexplained_end_after_a_call_keeps_only_what_was_streamed() {
+        let cases = [
+            (
+                r#"hi <tool_call>{"name":"f","arguments":{"a":1}}</tool_call>"#,
+                "hi ",
+                Some(r#"{"a":1}"#),
+            ),
+            (
+                r#"hi <tool_call>{"name":"f","arguments":{"a":"#,
+                "hi ",
+                Some(r#"{"a":"#),
+            ),
+            (r#"<|python_tag|>{"name":"f","parameters":{}}"#, "", None),
+        ];
         let live = stream_shape::LiveStreams::default();
-        let id = "task-tools-call";
-        let reply = r#"hi <tool_call>{"name":"f","arguments":{}}</tool_call>"#;
-        let mut s = unit_tool_stream(ended_channel(id, &[reply]), &live, id);
-        let mut body = String::new();
-        while let Some(frame) = s.next_frame().await {
-            push_frame(&mut body, &frame);
+        for (reply, want_content, want_args) in cases {
+            let id = "task-tools-call";
+            let mut s = unit_tool_stream(ended_channel(id, &[reply]), &live, id);
+            let mut body = String::new();
+            while let Some(frame) = s.next_frame().await {
+                push_frame(&mut body, &frame);
+            }
+            drop(s);
+            let events = sse_events(&body);
+            let calls = stream_calls(&events);
+            match want_args {
+                Some(args) => {
+                    assert_eq!(calls.len(), 1, "{body}");
+                    assert_eq!(calls[0].1, "f", "{body}");
+                    assert_eq!(calls[0].2, args, "{body}");
+                }
+                None => assert!(calls.is_empty(), "{body}"),
+            }
+            assert_eq!(streamed_content(&events), want_content, "{body}");
+            assert!(!body.contains("tool_call>"), "markup leaked: {body}");
+            let last = events.last().unwrap();
+            assert_eq!(last["object"], "error", "{body}");
+            assert_eq!(last["id"], id, "{body}");
+            assert!(finish_reasons(&events).is_empty(), "{body}");
+            assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
         }
-        drop(s);
-        let events = sse_events(&body);
-        assert!(
-            events
-                .iter()
-                .filter_map(|e| e["choices"].as_array())
-                .flatten()
-                .all(|c| c["delta"].get("tool_calls").is_none()),
-            "{body}"
-        );
-        let content: String = events
-            .iter()
-            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
-            .collect();
-        assert_eq!(content, "hi ", "{body}");
-        let last = events.last().unwrap();
-        assert_eq!(last["object"], "error", "{body}");
-        assert_eq!(last["id"], id, "{body}");
-        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
         assert_eq!(live.len(), 0);
     }
 
@@ -12124,17 +12408,19 @@ level={{ effort_map[eff] }}";
                         .filter(|f| !f.is_null())
                         .collect();
                     assert_eq!(finishes.len(), 1, "{ctx}: {text}");
-                    let key = if legacy {
-                        "function_call"
+                    let calls = if legacy {
+                        let (name, arguments) = stream_function_call(&events);
+                        serde_json::json!({"name": name, "arguments": arguments})
                     } else {
-                        "tool_calls"
+                        stream_calls(&events)
+                            .into_iter()
+                            .map(|(id, name, arguments)| {
+                                serde_json::json!({"id": id,
+                                    "function": {"name": name, "arguments": arguments}})
+                            })
+                            .collect()
                     };
-                    let deltas: Vec<Value> = events
-                        .iter()
-                        .filter_map(|e| e["choices"][0]["delta"].get(key).cloned())
-                        .collect();
-                    assert_eq!(deltas.len(), 1, "{ctx}: {text}");
-                    (finishes[0].clone(), deltas[0].clone())
+                    (finishes[0].clone(), calls)
                 } else {
                     let v: Value = serde_json::from_str(&text).unwrap();
                     crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);

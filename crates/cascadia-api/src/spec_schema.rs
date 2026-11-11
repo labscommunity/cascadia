@@ -189,6 +189,7 @@ pub(crate) fn assert_stream_spec(body: &str) {
             assert!(delta.get("role").is_none(), "role on a later delta: {body}");
         }
     }
+    check_call_deltas(&deltas, body);
     check_usage_placement(&events, body);
     let ends_in_error = events.last().is_some_and(|e| e["object"] == "error");
     assert!(
@@ -234,6 +235,47 @@ pub(crate) fn assert_stream_spec(body: &str) {
             ]
             .contains(&f.as_str().unwrap_or_default()),
             "finish_reason {f} is not a spec value: {body}"
+        );
+    }
+}
+
+/// Tool-call deltas: every `tool_calls` entry has an `index` and a
+/// `function` object (some clients read `function` unchecked); the first
+/// entry of an index introduces the call (`id`, `type`, `function.name`),
+/// later ones never repeat the `id`. The first `function_call` names the
+/// function.
+fn check_call_deltas(deltas: &[&Value], body: &str) {
+    let mut seen = std::collections::HashSet::new();
+    for call in deltas
+        .iter()
+        .filter_map(|d| d.get("tool_calls"))
+        .flat_map(|c| c.as_array().into_iter().flatten())
+    {
+        let index = call["index"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("tool call delta without an index: {body}"));
+        assert!(
+            call["function"].is_object(),
+            "tool call delta without a function object: {body}"
+        );
+        if seen.insert(index) {
+            assert!(
+                call["id"].is_string()
+                    && call["type"] == "function"
+                    && call["function"]["name"].is_string(),
+                "first delta of a tool call without id, type and name: {body}"
+            );
+        } else {
+            assert!(
+                call.get("id").is_none(),
+                "a later delta of a tool call repeats its id: {body}"
+            );
+        }
+    }
+    if let Some(first) = deltas.iter().find_map(|d| d.get("function_call")) {
+        assert!(
+            first["name"].is_string(),
+            "first function_call delta without a name: {body}"
         );
     }
 }
@@ -387,7 +429,7 @@ fn assert_stream_spec_rejects_extension_fields_and_repeated_roles() {
             "error event's id differs from the chunks' id",
         ),
     ];
-    for (body, rule) in bad {
+    for (body, rule) in bad.into_iter().chain(bad_call_deltas(&chunk)) {
         let panic = std::panic::catch_unwind(|| assert_stream_spec(&body))
             .expect_err("a bad stream must fail");
         let msg = panic
@@ -449,4 +491,57 @@ fn assert_stream_spec_checks_usage_placement() {
             .unwrap_or_default();
         assert!(msg.contains(rule), "want {rule:?}, got: {msg}");
     }
+}
+
+/// Streams whose tool-call deltas break a rule, with the rule's message.
+fn bad_call_deltas(chunk: &dyn Fn(&str, &str, &str) -> String) -> Vec<(String, &'static str)> {
+    let head = |call: &str| {
+        chunk(
+            "",
+            &format!(r#"{{"role":"assistant","tool_calls":[{call}]}}"#),
+            "null",
+        )
+    };
+    let more = |call: &str| chunk("", &format!(r#"{{"tool_calls":[{call}]}}"#), "null");
+    let end = chunk("", "{}", "\"tool_calls\"");
+    let header =
+        r#"{"index":0,"id":"call_1","type":"function","function":{"name":"f","arguments":""}}"#;
+    let good = format!(
+        "{}{}{end}data: [DONE]\n\n",
+        head(header),
+        more(r#"{"index":0,"function":{"arguments":"{}"}}"#)
+    );
+    assert_stream_spec(&good);
+    vec![
+        (
+            format!(
+                "{}{end}data: [DONE]\n\n",
+                head(r#"{"index":0,"function":{"arguments":""}}"#)
+            ),
+            "first delta of a tool call without id, type and name",
+        ),
+        (
+            format!(
+                "{}{}{end}data: [DONE]\n\n",
+                head(header),
+                more(r#"{"index":0}"#)
+            ),
+            "tool call delta without a function object",
+        ),
+        (
+            format!("{}{}{end}data: [DONE]\n\n", head(header), more(header)),
+            "a later delta of a tool call repeats its id",
+        ),
+        (
+            format!(
+                "{}{end}data: [DONE]\n\n",
+                chunk(
+                    "",
+                    r#"{"role":"assistant","function_call":{"arguments":"{}"}}"#,
+                    "null"
+                )
+            ),
+            "first function_call delta without a name",
+        ),
+    ]
 }
