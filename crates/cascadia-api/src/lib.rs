@@ -4317,7 +4317,7 @@ impl ToolStream {
                     self.phase = ToolStreamPhase::Tail;
                     let rest = self.stop.finish();
                     if self.live.cancelled() {
-                        return Some(self.close_choice(&rest, "stop", true));
+                        return Some(self.close_choice(&rest, "stop"));
                     }
                     warn!(task = %self.meta.id, "engine stream ended without a final chunk; emitting SSE error");
                     let counts = self.counts();
@@ -4389,7 +4389,7 @@ impl ToolStream {
                     chunks.finish_early(cascadia_types::FinishReason::Stop);
                 }
                 self.phase = ToolStreamPhase::Tail;
-                Some(self.close_choice(&text, "stop", true))
+                Some(self.close_choice(&text, "stop"))
             } else if chunk.is_final {
                 text.push_str(&self.stop.finish());
                 let cancelled =
@@ -4400,7 +4400,7 @@ impl ToolStream {
                     .finish_reason
                     .map(|f| f.as_openai_str())
                     .unwrap_or("stop");
-                Some(self.close_choice(&text, reason, cancelled))
+                Some(self.close_choice(&text, reason))
             } else {
                 let counts = self.counts();
                 let content = self.splitter.feed(&text).to_owned();
@@ -4433,18 +4433,17 @@ impl ToolStream {
         }
     }
 
-    /// Close the choice on the reply's last `text`. `cut` is set when the
-    /// generation was ended from outside the model (a `stop` match or a
-    /// cancel).
+    /// Close the choice on the reply's last `text`.
     ///
     /// No call streamed yet: the rest as content with the engine's
     /// finish_reason, or the still-releasable content, each call parsed at
     /// the end (header, then its arguments) and a `tool_calls` finish
     /// (`function_call` and the first call only for a `functions` request).
     /// Calls already streamed: the rest of the reply's calls, never its
-    /// markup as content. A `length` finish stays `length`; a cut inside a
-    /// streamed call's arguments ends `stop`.
-    fn close_choice(&mut self, text: &str, finish_reason: &str, cut: bool) -> Bytes {
+    /// markup as content. A `length` finish stays `length`; a reply that
+    /// ends inside a streamed call's arguments keeps its own reason (`stop`),
+    /// never a call finish.
+    fn close_choice(&mut self, text: &str, finish_reason: &str) -> Bytes {
         let counts = self.counts();
         let mut out = String::new();
         let events = if self.calls.started() {
@@ -4489,11 +4488,12 @@ impl ToolStream {
             }
         };
         self.push_call_events(&mut out, events, counts);
-        let finish_reason = if finish_reason == "length" {
-            // A generation cut at its limit keeps `length`.
+        let finish_reason = if finish_reason == "length" || self.calls.inside_arguments() {
+            // A generation cut at its limit keeps `length`. A call whose
+            // arguments never closed is cut short however the reply ended:
+            // a call finish would tell the client it is complete, so the
+            // reply keeps its own reason (`stop` for a natural end or a cut).
             finish_reason
-        } else if cut && self.calls.inside_arguments() {
-            "stop"
         } else if self.legacy_functions {
             "function_call"
         } else {
@@ -8797,6 +8797,71 @@ level={{ effort_map[eff] }}";
                 assert_eq!(arguments, want_args, "{ctx}: {text}");
                 assert_eq!(finish_reasons(&events), [want_finish], "{ctx}: {text}");
                 assert_eq!(streamed_content(&events), "", "{ctx}: {text}");
+            }
+        }
+    }
+
+    /// A reply that ends on its own while a streamed call's arguments are
+    /// still open does not finish `tool_calls` (or `function_call`): the
+    /// call is cut short, so the finish is the engine's own `stop`. A call
+    /// whose arguments closed finishes as a call, even when they are not
+    /// valid JSON.
+    #[tokio::test]
+    async fn a_reply_ending_inside_streamed_arguments_finishes_stop() {
+        const HEAD: &str = r#"<tool_call>{"name":"get_weather","arguments":{"city":"#;
+        fn ended(id: &cascadia_types::TaskId, tail: &str) -> Vec<Chunk> {
+            vec![
+                Chunk::token(id, 0, HEAD),
+                Chunk::token(id, 1, tail),
+                Chunk::final_marker(id, "").with_finish_reason(cascadia_types::FinishReason::Stop),
+            ]
+        }
+        fn open(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            ended(id, r#""Pa"#)
+        }
+        fn closed(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            ended(id, r#""Paris"}}</tool_call>"#)
+        }
+        fn closed_invalid(id: &cascadia_types::TaskId) -> Vec<Chunk> {
+            ended(id, r#"Paris}}</tool_call>"#)
+        }
+        type Script = fn(&cascadia_types::TaskId) -> Vec<Chunk>;
+        let cases: [(Script, &str, bool); 3] = [
+            (open, r#"{"city":"Pa"#, false),
+            (closed, r#"{"city":"Paris"}"#, true),
+            (closed_invalid, r#"{"city":Paris}"#, true),
+        ];
+        for legacy in [false, true] {
+            for (script, want_args, closed) in cases {
+                let ctx = format!("legacy={legacy} args={want_args}");
+                let app = chunk_list_app(script).await;
+                let mut body = serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}], "stream": true});
+                if legacy {
+                    body["functions"] = serde_json::json!([{"name": "get_weather"}]);
+                } else {
+                    body["tools"] = serde_json::json!([
+                        {"type": "function", "function": {"name": "get_weather"}}]);
+                }
+                let (status, text) = post_text(app, "/v1/chat/completions", &body).await;
+                assert_eq!(status, StatusCode::OK, "{ctx}: {text}");
+                let events = sse_events(&text);
+                let (name, arguments) = if legacy {
+                    stream_function_call(&events)
+                } else {
+                    let calls = stream_calls(&events);
+                    assert_eq!(calls.len(), 1, "{ctx}: {text}");
+                    (calls[0].1.clone(), calls[0].2.clone())
+                };
+                assert_eq!(name, "get_weather", "{ctx}");
+                assert_eq!(arguments, want_args, "{ctx}: {text}");
+                let want_finish = match (closed, legacy) {
+                    (false, _) => "stop",
+                    (true, false) => "tool_calls",
+                    (true, true) => "function_call",
+                };
+                assert_eq!(finish_reasons(&events), [want_finish], "{ctx}: {text}");
+                crate::spec_schema::assert_stream_spec(&text);
             }
         }
     }
