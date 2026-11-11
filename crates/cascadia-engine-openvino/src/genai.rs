@@ -1142,6 +1142,26 @@ impl SchemaBudget {
         Err(BudgetFull)
     }
 
+    /// [`Self::check`] at submit: a best-effort grammar (a forced tool
+    /// call's) the budget has no room for is dropped (counted as
+    /// `too_complex`: the closest reason, as the schema is over a limit of
+    /// this worker's, not refused by the backend and not a passing load) and
+    /// the task runs unconstrained; a strict one gets the refusal. Run before
+    /// [`Self::record`], which then counts nothing for a dropped grammar.
+    fn admit(&mut self, task: &mut GenerationTask) -> Result<(), BudgetFull> {
+        match self.check(task) {
+            Err(_)
+                if crate::structured::drop_best_effort_grammar(
+                    task,
+                    UnenforcedReason::TooComplex,
+                ) =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
     /// How many distinct schemas have been let through.
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -1537,7 +1557,7 @@ impl Engine for OvGenaiEngine {
         admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
-        if self.schema_budget.check(&task).is_err() {
+        if self.schema_budget.admit(&mut task).is_err() {
             if let Some(err) = self.budget_full() {
                 return Err(err);
             }
@@ -2036,11 +2056,7 @@ impl Engine for OvGenaiCbEngine {
         admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
-        let schema = grammar_json_schema(&task);
-        let grammar_hash = schema
-            .filter(|s| *s != JSON_OBJECT_PROBE)
-            .map(|s| self.schema_hash(s));
-        if self.schema_budget.check(&task).is_err() {
+        if self.schema_budget.admit(&mut task).is_err() {
             if let Some(err) = self.budget_full() {
                 return Err(err);
             }
@@ -2053,6 +2069,10 @@ impl Engine for OvGenaiCbEngine {
                 return Err(budget_full_error(RebuildNote::Rebuilt));
             }
         }
+        let schema = grammar_json_schema(&task);
+        let grammar_hash = schema
+            .filter(|s| *s != JSON_OBJECT_PROBE)
+            .map(|s| self.schema_hash(s));
         let max_tokens = if task.max_tokens > 0 {
             task.max_tokens
         } else {
@@ -3920,6 +3940,50 @@ mod tests {
             matches!(&err, EngineError::InvalidConfig(m) if m.contains("xgrammar would take too long")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_best_effort_grammar_past_the_schema_budget_is_dropped() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            e.submit(soft_schema_task(
+                &format!("t{i}"),
+                &forced_tool_schema(i + 1),
+            ))
+            .unwrap();
+        }
+        assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
+        // The 65th distinct forced-tool schema: dropped, not a 400, and the
+        // budget is unchanged.
+        let before = unenforced(UnenforcedReason::TooComplex);
+        e.submit(soft_schema_task(
+            "over",
+            &forced_tool_schema(MAX_DISTINCT_SCHEMAS + 1),
+        ))
+        .unwrap();
+        assert!(!st.lock().unwrap().last_added_grammar, "sent unconstrained");
+        assert_eq!(e.active.last().unwrap().grammar_hash, None);
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+        assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
+        // A schema already let through still runs constrained.
+        e.submit(soft_schema_task("again", &forced_tool_schema(1)))
+            .unwrap();
+        assert!(st.lock().unwrap().last_added_grammar);
+        // The 65th, strict: the parent's 400 unchanged.
+        match e.submit(schema_task(
+            "strict",
+            &forced_tool_schema(MAX_DISTINCT_SCHEMAS + 1),
+        )) {
+            Err(EngineError::InvalidConfig(m)) => assert!(
+                m.starts_with(
+                    "structured output is not available for this model: this worker keeps"
+                ),
+                "{m}"
+            ),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
     }
 
     #[test]
