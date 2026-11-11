@@ -8260,11 +8260,14 @@ mod tests {
         /// Once unstuck, fail the task for the server's fault (a peer's
         /// token wait timing out) instead of answering.
         fail_after: Arc<std::sync::atomic::AtomicBool>,
+        /// The id of the last task submitted, as `/v1/cancel` needs it.
+        seen: Arc<std::sync::Mutex<Option<cascadia_types::TaskId>>>,
     }
 
     impl cascadia_engine::Engine for StuckEngine {
         fn warmup(&mut self) {}
         fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            *self.seen.lock().unwrap() = Some(task.task_id.clone());
             self.pending = Some((task.task_id, 0));
             Ok(())
         }
@@ -8332,6 +8335,7 @@ mod tests {
             stuck: stuck.clone(),
             pending: None,
             fail_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seen: Arc::default(),
         }))));
         runner
             .start(layout, ShardSpec::single_stage("mock-model", "CPU"))
@@ -8506,6 +8510,7 @@ mod tests {
             stuck: stuck.clone(),
             pending: None,
             fail_after: fail_after.clone(),
+            seen: Arc::default(),
         }))));
         runner
             .start(first_of_two(), ShardSpec::single_stage("mock-model", "CPU"))
@@ -8533,6 +8538,60 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "the failed step must reach readiness"
         );
+    }
+
+    /// `/v1/cancel/<id>` on a running non-streamed chat: the runner
+    /// tombstones the task, its chunk stream ends with no final chunk, and
+    /// the waiting request answers the 400 `request_cancelled`, not a 200
+    /// with the text so far. Readiness is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_by_id_ends_a_running_non_streamed_chat_with_a_400() {
+        let stuck = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen: Arc<std::sync::Mutex<Option<cascadia_types::TaskId>>> = Arc::default();
+        let runner = Runner::new(Box::new(StuckBuilder(Some(StuckEngine {
+            stuck: stuck.clone(),
+            pending: None,
+            fail_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seen: seen.clone(),
+        }))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router_with_config(Arc::new(runner), "mock-model", Config::default());
+        stuck.store(true, Ordering::SeqCst);
+        let waiting = {
+            let app = app.clone();
+            tokio::spawn(async move { app.oneshot(stall_chat(false)).await.unwrap() })
+        };
+        let id = loop {
+            if let Some(id) = seen.lock().unwrap().clone() {
+                break id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let cancelled = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/cancel/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        stuck.store(false, Ordering::SeqCst);
+        let resp = waiting.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "request_cancelled", "{body}");
+        assert_eq!(stall_health(&app).await, StatusCode::OK);
     }
 
     /// How a [`PhaseEngine`] answers a step.
