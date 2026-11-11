@@ -1147,8 +1147,9 @@ impl SchemaBudget {
             .is_none_or(|s| self.seen.contains(s) || self.seen.len() < MAX_DISTINCT_SCHEMAS)
     }
 
-    /// [`Self::check`] at submit. While no rebuild may start
-    /// (`may_rebuild` false: [`REBUILD_FLOOR`] holds), a best-effort grammar
+    /// [`Self::check`] at submit. While no rebuild may start for it
+    /// (`may_rebuild` false: [`REBUILD_FLOOR`] holds, or a CB engine has
+    /// requests in flight and would need a drain), a best-effort grammar
     /// (a forced tool call's) the budget has no room for is dropped (counted
     /// as `too_complex`: the closest reason, as the schema is over a limit of
     /// this worker's, not refused by the backend and not a passing load) and
@@ -2101,7 +2102,11 @@ impl Engine for OvGenaiCbEngine {
         admit_grammar(&mut task, self.structured_unavailable.as_ref(), |s| {
             self.pipe.validate_json_schema(s)
         })?;
-        let may_rebuild = self.rebuild.wait().is_none();
+        // A best-effort grammar rebuilds only an idle pipeline: with
+        // requests in flight the rebuild needs a drain, which would refuse
+        // work for the forced tool's sake alone, so it is dropped instead.
+        // A strict schema still starts the drain (see `budget_full`).
+        let may_rebuild = self.rebuild.wait().is_none() && self.active.is_empty();
         if self.schema_budget.admit(&mut task, may_rebuild).is_err() {
             if !is_best_effort(&task) {
                 if let Some(err) = self.budget_full() {
@@ -2117,14 +2122,6 @@ impl Engine for OvGenaiCbEngine {
                     return Err(budget_full_error(RebuildNote::Rebuilt));
                 }
             } else {
-                if !self.active.is_empty() {
-                    // The rebuild waits for the requests in flight: this one
-                    // gets the drain's retryable 503, as any request would now.
-                    self.start_drain();
-                    return Err(EngineError::Unavailable(
-                        cascadia_engine::PIPELINE_REBUILDING.to_owned(),
-                    ));
-                }
                 self.rebuild_pipeline();
                 if let Some(err) = self.rebuild.refusal() {
                     return Err(err);
@@ -2514,13 +2511,6 @@ impl OvGenaiCbEngine {
             self.rebuild_pipeline();
             return self.rebuild.refusal();
         }
-        self.start_drain();
-        Some(budget_full_error(RebuildNote::AfterDrain))
-    }
-
-    /// Stop admitting work until the requests in flight finish (at most
-    /// [`REBUILD_DRAIN_CAP`]); the next request then rebuilds the pipeline.
-    fn start_drain(&mut self) {
         self.rebuild.draining_since = Some(self.rebuild.clock.now());
         warn!(
             in_flight = self.active.len(),
@@ -2528,6 +2518,7 @@ impl OvGenaiCbEngine {
             "ov-genai cb: the response_format schema budget is full; admitting nothing until \
              the requests in flight finish, then rebuilding the pipeline"
         );
+        Some(budget_full_error(RebuildNote::AfterDrain))
     }
 
     /// Once the drain for a rebuild has run [`REBUILD_DRAIN_CAP`], cut what
@@ -6335,34 +6326,40 @@ mod tests {
         assert_eq!(e.schema_budget.refused, 0);
     }
 
-    /// With requests in flight, a best-effort grammar past the budget starts
-    /// the drain as a strict one does, and takes the drain's retryable 503
-    /// (not the 400); once the drain is over its retry rebuilds and runs
-    /// constrained.
+    /// With requests in flight a rebuild would need a drain, which would
+    /// cost requests a 503 for the forced tool's sake alone: a best-effort
+    /// grammar past the budget is dropped (too_complex) and runs now,
+    /// unconstrained. No drain starts, no refusal is counted, nothing is
+    /// recorded. A strict schema in the same state still starts the drain.
     #[test]
-    fn cb_best_effort_past_the_budget_with_requests_in_flight_starts_the_drain() {
+    fn cb_best_effort_past_the_budget_with_requests_in_flight_is_dropped_and_runs_now() {
         let clock = FakeClock::new(Duration::ZERO);
         let (mut e, st) = cb_full_budget(&clock);
         st.lock().unwrap().default_read =
             Some(read_of(CbStatus::Running, 1, "x", CbFinish::Unknown));
         e.submit(task("a", 8)).unwrap();
         let body = full_budget_body(1000);
-        match e.submit(soft_schema_task("soft", &body)) {
-            Err(EngineError::Unavailable(m)) => {
-                assert_eq!(m, cascadia_engine::PIPELINE_REBUILDING)
-            }
-            other => panic!("expected the drain's 503, got {other:?}"),
-        }
-        assert!(e.rebuild.draining_since.is_some());
-        assert!(st.lock().unwrap().events.is_empty(), "nothing is cut");
-
-        st.lock().unwrap().default_read = Some(finished_read());
-        e.step().unwrap();
-        assert!(e.active.is_empty());
+        let before = unenforced(UnenforcedReason::TooComplex);
         e.submit(soft_schema_task("soft", &body)).unwrap();
-        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
-        assert!(st.lock().unwrap().last_added_grammar, "sent constrained");
-        assert!(e.schema_budget.seen.contains(&body));
+        assert_eq!(e.rebuild.draining_since, None, "no drain started");
+        assert!(!st.lock().unwrap().last_added_grammar, "sent unconstrained");
+        assert_eq!(e.active.last().unwrap().grammar_hash, None);
+        assert!(unenforced(UnenforcedReason::TooComplex) > before);
+        assert_eq!(
+            (e.schema_budget.refused, e.schema_budget.full_warnings),
+            (0, 0)
+        );
+        assert_eq!(e.schema_budget.len(), MAX_DISTINCT_SCHEMAS);
+        assert!(!e.schema_budget.seen.contains(&body));
+        assert!(st.lock().unwrap().events.is_empty(), "no rebuild");
+        assert_eq!(e.active.len(), 2);
+
+        // A strict schema in the same state: the parent's drain and 400.
+        assert_eq!(
+            refusal(e.submit(schema_task("strict", &full_budget_body(1001)))),
+            BUDGET_FULL_DRAIN_400
+        );
+        assert!(e.rebuild.draining_since.is_some());
     }
 
     /// During a drain every submit gets the retryable 503, a best-effort
