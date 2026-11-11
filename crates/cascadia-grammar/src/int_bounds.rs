@@ -124,17 +124,36 @@ fn has_integer(obj: &Map<String, Value>) -> bool {
     }
 }
 
-/// Calls `f` on every object in `v` reachable through schema keywords, maps
-/// (`properties`, `$defs`, ...) and lists (`anyOf`, `prefixItems`, ...).
-/// A map of schemas is visited like a schema; it holds no `type` string or
-/// list, so `f` leaves it alone.
+/// Keywords whose value maps names (property names, definition names, ...)
+/// to schemas. A name here is never a keyword: a property called `default`
+/// or `not` holds a schema like any other.
+const NAME_MAPS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+];
+
+/// Calls `f` on every schema object in `v`: through subschema keywords,
+/// lists (`anyOf`, `prefixItems`, ...) and the schemas of name maps
+/// (`properties`, `$defs`, ...), never into [`SKIP_KEYWORDS`].
 fn visit_schemas(v: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
     match v {
         Value::Object(obj) => {
             f(obj);
             for (k, child) in obj.iter_mut() {
-                if !SKIP_KEYWORDS.contains(&k.as_str()) {
-                    visit_schemas(child, f);
+                let k = k.as_str();
+                if SKIP_KEYWORDS.contains(&k) {
+                    continue;
+                }
+                match child {
+                    Value::Object(map) if NAME_MAPS.contains(&k) => {
+                        for schema in map.values_mut() {
+                            visit_schemas(schema, f);
+                        }
+                    }
+                    _ => visit_schemas(child, f),
                 }
             }
         }
@@ -248,6 +267,22 @@ mod tests {
             json!({"type": "integer", "minimum": 999999999999999360u64, "multipleOf": 1009});
         assert_eq!(bounded(schema.clone()), schema);
         let schema = json!({"type": "integer", "multipleOf": 2});
+        assert_eq!(bounded(schema.clone()), schema);
+    }
+
+    #[test]
+    fn a_property_named_like_a_skipped_keyword_is_still_bounded() {
+        let int = json!({"type": "integer"});
+        let both = json!({"type": "integer", "maximum": CAP, "minimum": -CAP});
+        let names = ["default", "enum", "const", "not", "if", "examples"];
+        let props = |v: &Value| -> Value {
+            Value::Object(names.iter().map(|n| (n.to_string(), v.clone())).collect())
+        };
+        let schema = json!({"type": "object", "properties": props(&int), "$defs": props(&int)});
+        let want = json!({"type": "object", "properties": props(&both), "$defs": props(&both)});
+        assert_eq!(bounded(schema), want);
+        // The keywords themselves are still skipped.
+        let schema = json!({"not": int, "if": int, "default": int, "examples": [int]});
         assert_eq!(bounded(schema.clone()), schema);
     }
 
