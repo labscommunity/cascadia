@@ -995,15 +995,19 @@ fn pipeline_stalled(state: &AppState) -> Option<u64> {
 /// [`AppState::ready`] which publishes it, happens under one lock
 /// ([`Health`]), so readiness changes form a sequence: no interleaving of a
 /// pipeline 5xx, a success, a stall and a `/health` heal can leave `ready`
-/// disagreeing with the cause, or let a heal undo a 5xx.
+/// disagreeing with the cause, or let a heal undo a 5xx before its time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ReadinessState {
     /// Ready.
     #[default]
     Ready,
-    /// A completion failed with a 5xx that points at the pipeline; only a
-    /// success clears it.
-    Pipeline,
+    /// A completion failed with a 5xx that points at the pipeline, most
+    /// recently at `since_ms` ([`cascadia_runner::monotonic_ms`]). A success
+    /// clears it; so does `/health` once nothing is in flight and
+    /// [`Config::stall_after`] has passed since the failure
+    /// ([`heal_unready`]), as no request is left to report the pipeline
+    /// either way.
+    Pipeline { since_ms: u64 },
     /// A capacity 503 met a stalled pipeline ([`pipeline_stalled`]);
     /// `evidence_ms` is the time the stall is measured from
     /// ([`cascadia_runner::monotonic_ms`]). `/health` clears it once the
@@ -1043,14 +1047,14 @@ impl<'a> Health<'a> {
 }
 
 /// A capacity 503 met a stalled pipeline: unready from a stall measured
-/// from `evidence`. A pipeline 5xx's unready state stays that kind: only the
-/// success it has always waited for clears it. An existing stall keeps the
+/// from `evidence`. A pipeline 5xx's unready state stays that kind, with its
+/// own heal ([`heal_unready`]). An existing stall keeps the
 /// newer evidence: requests measure it before taking the lock, so an older
 /// reading can arrive last, and output older than the newer reading must
 /// not clear the mark.
 fn note_stall(h: &Health, evidence: u64) {
     h.transition(|cause| match cause {
-        ReadinessState::Pipeline => ReadinessState::Pipeline,
+        ReadinessState::Pipeline { .. } => cause,
         ReadinessState::Ready => ReadinessState::Stall {
             evidence_ms: evidence,
         },
@@ -1065,10 +1069,11 @@ fn note_success(h: &Health) {
     h.transition(|_| ReadinessState::Ready);
 }
 
-/// A completion failed with a 5xx that points at the pipeline: unready
-/// until a success, whatever the cause was.
-fn note_failure(h: &Health) {
-    h.transition(|_| ReadinessState::Pipeline);
+/// A completion failed with a 5xx that points at the pipeline, at `now_ms`
+/// ([`cascadia_runner::monotonic_ms`]): unready, whatever the cause was,
+/// until a success or [`heal_unready`].
+fn note_failure(h: &Health, now_ms: u64) {
+    h.transition(|_| ReadinessState::Pipeline { since_ms: now_ms });
 }
 
 /// Readiness from one chunk of a streamed completion. Its 200 went out when
@@ -1084,7 +1089,7 @@ fn note_stream_chunk(state: &AppState, chunk: &cascadia_types::Chunk) {
     match &chunk.error {
         Some(reason) => {
             if classify_chunk_error(reason, "").0.is_server_error() {
-                note_failure(&Health::of(state));
+                note_failure(&Health::of(state), cascadia_runner::monotonic_ms());
             }
         }
         None if chunk.is_final
@@ -1096,19 +1101,28 @@ fn note_stream_chunk(state: &AppState, chunk: &cascadia_types::Chunk) {
     }
 }
 
-/// `/health`'s heal: unready from a stall, and either the engine has
-/// produced real output after the stall's evidence time (the pipeline is
-/// moving again) or nothing is in flight (the stall rule needs work in
-/// flight to see a stall; if the pipeline is still broken, the next capacity
-/// 503 under load marks it again). A drained server whose clients have
-/// given up their streams would otherwise stay unready with nothing left to
-/// step. A stream that ends with the pipeline's own failure marks
-/// [`ReadinessState::Pipeline`] instead, which this heal leaves alone: only
-/// a success clears it.
+/// `/health`'s heal, at `now_ms` with the stall bound `bound_ms` (both in
+/// [`cascadia_runner::monotonic_ms`]).
+///
+/// Unready from a stall, and either the engine has produced real output
+/// after the stall's evidence time (the pipeline is moving again) or nothing
+/// is in flight (the stall rule needs work in flight to see a stall; if the
+/// pipeline is still broken, the next capacity 503 under load marks it
+/// again). A drained server whose clients have given up their streams would
+/// otherwise stay unready with nothing left to step.
+///
+/// Unready from a pipeline 5xx (a non-streamed failure, or a stream that
+/// ended with the pipeline's own failure), nothing in flight, and more than
+/// `bound_ms` since the last such failure: ready again. A load balancer or a
+/// readiness probe that gates traffic on `/health` would otherwise never send
+/// the success that clears it, so one peer blip would drain the node for
+/// good. If the pipeline is still broken, the next request fails and marks
+/// it again; while requests are in flight they report it themselves.
+///
 /// `observe` reads the last real output time and the requests in flight; it
-/// runs under the lock, so both are read after any stall it could clear was
-/// noted. Any other cause is left as it is.
-fn heal_stall_mark(h: &Health, observe: impl FnOnce() -> (u64, u64)) {
+/// runs under the lock, so both are read after any mark it could clear was
+/// noted.
+fn heal_unready(h: &Health, now_ms: u64, bound_ms: u64, observe: impl FnOnce() -> (u64, u64)) {
     h.transition(|cause| match cause {
         ReadinessState::Stall { evidence_ms } => {
             let (last_output_ms, in_flight) = observe();
@@ -1118,7 +1132,15 @@ fn heal_stall_mark(h: &Health, observe: impl FnOnce() -> (u64, u64)) {
                 cause
             }
         }
-        ReadinessState::Ready | ReadinessState::Pipeline => cause,
+        ReadinessState::Pipeline { since_ms } => {
+            let (_, in_flight) = observe();
+            if in_flight == 0 && now_ms.saturating_sub(since_ms) > bound_ms {
+                ReadinessState::Ready
+            } else {
+                cause
+            }
+        }
+        ReadinessState::Ready => cause,
     });
 }
 
@@ -1148,7 +1170,7 @@ async fn track_pipeline_health(
         let s = resp.status();
         let ext = resp.extensions();
         if s.is_server_error() && ext.get::<PreEngineFailure>().is_none() {
-            note_failure(&Health::of(&state));
+            note_failure(&Health::of(&state), cascadia_runner::monotonic_ms());
         } else if s.is_server_error() && ext.get::<CapacityRefusal>().is_some() {
             if let Some(evidence) = pipeline_stalled(&state) {
                 note_stall(&Health::of(&state), evidence);
@@ -1177,13 +1199,20 @@ async fn health(
 ) -> (StatusCode, Json<HealthResponse>) {
     use std::sync::atomic::Ordering;
     // Unready from a stall, and the engine has produced output since or
-    // nothing is in flight any more.
-    heal_stall_mark(&Health::of(&state), || {
-        (
-            state.runner.last_output_ms(),
-            state.stats.requests_in_flight.load(Ordering::Relaxed),
-        )
-    });
+    // nothing is in flight any more; or from a pipeline 5xx, with nothing in
+    // flight for longer than the stall bound since.
+    let bound = u64::try_from(state.stall_after.as_millis()).unwrap_or(u64::MAX);
+    heal_unready(
+        &Health::of(&state),
+        cascadia_runner::monotonic_ms(),
+        bound,
+        || {
+            (
+                state.runner.last_output_ms(),
+                state.stats.requests_in_flight.load(Ordering::Relaxed),
+            )
+        },
+    );
     if state.ready.load(Ordering::Relaxed) {
         (StatusCode::OK, Json(HealthResponse { status: "ok" }))
     } else {
@@ -8682,6 +8711,54 @@ mod tests {
         cause
     }
 
+    /// `/health`'s heal at time 0 with a bound of 1000 ms: a pipeline 5xx
+    /// noted at time 0 is never past the bound here, so only a stall can
+    /// clear.
+    fn heal_within_bound(h: &Health, observe: impl FnOnce() -> (u64, u64)) {
+        heal_unready(h, 0, 1000, observe);
+    }
+
+    /// A pipeline 5xx heals through `/health` once nothing is in flight and
+    /// more than the bound has passed since the last failure: a node behind
+    /// a load balancer that gates on `/health` is not drained for good by
+    /// one blip. Not with a request in flight (it reports the pipeline
+    /// itself), not at the bound, and a newer failure restarts the wait.
+    #[test]
+    fn a_pipeline_mark_heals_with_no_traffic_after_the_bound() {
+        let (ready, cause) = readiness_words();
+        let h = Health {
+            ready: &ready,
+            cause: &cause,
+        };
+        let bound = 1000;
+        note_failure(&h, 5000);
+        heal_unready(&h, 9000, bound, || (0, 1));
+        assert_eq!(
+            cause_of(&h),
+            ReadinessState::Pipeline { since_ms: 5000 },
+            "a request in flight"
+        );
+        heal_unready(&h, 6000, bound, || (0, 0));
+        assert_eq!(
+            cause_of(&h),
+            ReadinessState::Pipeline { since_ms: 5000 },
+            "exactly the bound"
+        );
+        note_failure(&h, 5800);
+        heal_unready(&h, 6001, bound, || (0, 0));
+        assert_eq!(
+            cause_of(&h),
+            ReadinessState::Pipeline { since_ms: 5800 },
+            "a newer failure restarts the wait"
+        );
+        heal_unready(&h, 6801, bound, || (0, 0));
+        assert_eq!(cause_of(&h), ReadinessState::Ready, "idle past the bound");
+        // A stall noted over a pipeline mark keeps the mark and its time.
+        note_failure(&h, 7000);
+        note_stall(&h, 7500);
+        assert_eq!(cause_of(&h), ReadinessState::Pipeline { since_ms: 7000 });
+    }
+
     /// One readiness change, as the middleware and `/health` make them.
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Change {
@@ -8695,10 +8772,10 @@ mod tests {
 
     fn apply(h: &Health, change: Change) {
         match change {
-            Change::Failure => note_failure(h),
+            Change::Failure => note_failure(h, 0),
             Change::Stall => note_stall(h, 1000),
             Change::Success => note_success(h),
-            Change::Heal => heal_stall_mark(h, || (u64::MAX, 0)),
+            Change::Heal => heal_within_bound(h, || (u64::MAX, 0)),
         }
     }
 
@@ -8732,7 +8809,7 @@ mod tests {
         let evidence = stall_evidence(&activity(None, now - 1, 100, 1000), now, 1000).unwrap();
         note_stall(&h, evidence);
         assert_eq!(cause_of(&h), ReadinessState::Stall { evidence_ms: 1000 });
-        heal_stall_mark(&h, || (now, 1));
+        heal_within_bound(&h, || (now, 1));
         assert_eq!(
             cause_of(&h),
             ReadinessState::Ready,
@@ -8753,19 +8830,19 @@ mod tests {
         note_stall(&h, 2000);
         note_stall(&h, 1000);
         assert_eq!(cause_of(&h), ReadinessState::Stall { evidence_ms: 2000 });
-        heal_stall_mark(&h, || (1500, 1));
+        heal_within_bound(&h, || (1500, 1));
         assert_eq!(
             cause_of(&h),
             ReadinessState::Stall { evidence_ms: 2000 },
             "output at 1500 predates the newer stall evidence at 2000"
         );
-        heal_stall_mark(&h, || (2001, 1));
+        heal_within_bound(&h, || (2001, 1));
         assert_eq!(cause_of(&h), ReadinessState::Ready);
     }
 
     /// Pipeline 5xxs and stall marks in every order: after the first 5xx,
-    /// `/health` is 503 at every step, however often it tries to heal,
-    /// until a success.
+    /// `/health` is 503 at every step, however often it tries to heal within
+    /// the bound, until a success.
     #[test]
     fn a_stall_never_turns_a_5xx_into_one_health_heals() {
         use Change::{Failure, Heal, Stall, Success};
@@ -8786,9 +8863,13 @@ mod tests {
                 for &change in &order {
                     apply(&h, change);
                     failed |= change == Failure;
-                    heal_stall_mark(&h, || (u64::MAX, 0));
+                    heal_within_bound(&h, || (u64::MAX, 0));
                     if failed {
-                        assert_eq!(cause_of(&h), ReadinessState::Pipeline, "{order:?}");
+                        assert_eq!(
+                            cause_of(&h),
+                            ReadinessState::Pipeline { since_ms: 0 },
+                            "{order:?}"
+                        );
                     }
                 }
                 apply(&h, Success);
@@ -8819,7 +8900,11 @@ mod tests {
                     Heal | Change::Stall => {}
                 }
                 if failed {
-                    assert_eq!(cause_of(&h), ReadinessState::Pipeline, "{order:?}");
+                    assert_eq!(
+                        cause_of(&h),
+                        ReadinessState::Pipeline { since_ms: 0 },
+                        "{order:?}"
+                    );
                 }
             }
             let success_last = order.iter().rposition(|&c| c == Success)
@@ -8847,13 +8932,14 @@ mod tests {
             for &change in &order {
                 apply(&h, change);
             }
-            heal_stall_mark(&h, || (u64::MAX, 0));
+            heal_within_bound(&h, || (u64::MAX, 0));
             assert_eq!(cause_of(&h), ReadinessState::Ready, "{order:?}");
         }
     }
 
     /// Transitions racing on real threads: whatever the interleaving, a
-    /// round of 5xxs and stalls with no success ends unready for good, and
+    /// round of 5xxs and stalls with no success ends unready (within the
+    /// bound), and
     /// `ready` always agrees with the cause once the threads are done.
     #[test]
     fn racing_readiness_changes_stay_consistent() {
@@ -8868,7 +8954,7 @@ mod tests {
             std::thread::scope(|s| {
                 s.spawn(|| {
                     go.wait();
-                    note_failure(&h);
+                    note_failure(&h, 0);
                 });
                 s.spawn(|| {
                     go.wait();
@@ -8876,11 +8962,15 @@ mod tests {
                 });
                 s.spawn(|| {
                     go.wait();
-                    heal_stall_mark(&h, || (u64::MAX, 0));
+                    heal_within_bound(&h, || (u64::MAX, 0));
                 });
             });
-            heal_stall_mark(&h, || (u64::MAX, 0));
-            assert_eq!(cause_of(&h), ReadinessState::Pipeline, "round {round}");
+            heal_within_bound(&h, || (u64::MAX, 0));
+            assert_eq!(
+                cause_of(&h),
+                ReadinessState::Pipeline { since_ms: 0 },
+                "round {round}"
+            );
         }
     }
 
@@ -8893,7 +8983,7 @@ mod tests {
             ready: &ready,
             cause: &cause,
         };
-        note_failure(&h);
+        note_failure(&h, 0);
         let _ = std::thread::scope(|s| {
             s.spawn(|| {
                 let _held = cause.lock().unwrap();
@@ -8902,15 +8992,18 @@ mod tests {
             .join()
         });
         assert!(cause.is_poisoned());
-        heal_stall_mark(&h, || (u64::MAX, 0));
-        assert!(!ready.load(Ordering::SeqCst), "a 5xx waits for a success");
+        heal_within_bound(&h, || (u64::MAX, 0));
+        assert!(
+            !ready.load(Ordering::SeqCst),
+            "a 5xx waits (within the bound)"
+        );
         note_success(&h);
         assert!(ready.load(Ordering::SeqCst));
     }
 
     /// A stall mark with requests still in flight and no output since waits
     /// for output; with nothing left in flight it clears, as no stall can be
-    /// observed then. An unready state from a 5xx does not.
+    /// observed then. An unready state from a 5xx does not, within the bound.
     #[test]
     fn a_stall_mark_clears_once_nothing_is_in_flight() {
         let (ready, cause) = readiness_words();
@@ -8919,16 +9012,16 @@ mod tests {
             cause: &cause,
         };
         note_stall(&h, 1000);
-        heal_stall_mark(&h, || (500, 1));
+        heal_within_bound(&h, || (500, 1));
         assert!(!ready.load(Ordering::SeqCst), "in flight, no output since");
-        heal_stall_mark(&h, || (500, 0));
+        heal_within_bound(&h, || (500, 0));
         assert_eq!(cause_of(&h), ReadinessState::Ready, "nothing in flight");
-        note_failure(&h);
-        heal_stall_mark(&h, || (500, 0));
+        note_failure(&h, 0);
+        heal_within_bound(&h, || (500, 0));
         assert_eq!(
             cause_of(&h),
-            ReadinessState::Pipeline,
-            "a 5xx waits for a 2xx"
+            ReadinessState::Pipeline { since_ms: 0 },
+            "a 5xx waits (within the bound)"
         );
     }
 
@@ -8937,8 +9030,9 @@ mod tests {
     /// `/health` is ready again with no new request (the next capacity 503
     /// under load marks it again if the pipeline is still broken), when the
     /// client gave them up. A stream that ends with the pipeline's own
-    /// failure is a failed completion: it marks the server unready until a
-    /// success, as a non-streamed 5xx does.
+    /// failure is a failed completion: it marks the server unready, as a
+    /// non-streamed 5xx does, until a success or, with nothing in flight,
+    /// until the bound has passed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stall_mark_clears_when_the_failed_streams_end() {
         for abandoned in [true, false] {
@@ -8981,6 +9075,14 @@ mod tests {
                     stall_health(&app).await,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "the stream failed in the pipeline"
+                );
+                // No traffic: past the bound with nothing in flight,
+                // `/health` is ready again on its own.
+                tokio::time::sleep(STALL_TEST_BOUND * 3).await;
+                assert_eq!(
+                    stall_health(&app).await,
+                    StatusCode::OK,
+                    "nothing in flight past the bound"
                 );
             }
         }
