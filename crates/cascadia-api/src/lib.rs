@@ -2235,6 +2235,9 @@ fn tool_call_scan_text(buf: &str, enable_thinking: bool) -> &str {
 /// (Hermes/Qwen JSON, Qwen3 `<function=…>` XML, GLM arg-kv).
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 
+/// Closing marker of a `<tool_call>` block.
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+
 /// Llama-3.1's explicit whole-output tool-call marker.
 const PYTHON_TAG: &str = "<|python_tag|>";
 
@@ -2378,44 +2381,13 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     if text.contains("<tool_call>") {
         // Qwen/Hermes: each <tool_call>…</tool_call> block.
         let mut rest = text;
-        while let Some(start) = rest.find("<tool_call>") {
-            let after = &rest[start + "<tool_call>".len()..];
-            let inner = after.trim_start();
-            // JSON Hermes: scan a brace-balanced (string/escape-aware) object so a
-            // literal "</tool_call>" inside an argument value can't truncate the
-            // block. Fall back to the close-tag delimiter for the XML dialect.
-            if inner.starts_with('{') || inner.starts_with('[') {
-                let off = after.len() - inner.len();
-                if let Some(len) = balanced_json_end(&after[off..]) {
-                    if let Ok(v) =
-                        serde_json::from_str::<serde_json::Value>(after[off..off + len].trim())
-                    {
-                        if let Some(c) = call_from_value(&v) {
-                            calls.push(c);
-                        }
-                    }
-                    let tail = &after[off + len..];
-                    rest = match tail.find("</tool_call>") {
-                        Some(e) => &tail[e + "</tool_call>".len()..],
-                        None => tail,
-                    };
-                    continue;
-                }
-            }
-            let Some(end) = after.find("</tool_call>") else {
+        while let Some(start) = rest.find(TOOL_CALL_OPEN) {
+            let after = &rest[start + TOOL_CALL_OPEN.len()..];
+            let Some(block) = parse_tool_call_block(after) else {
                 break;
             };
-            // Two non-JSON dialects share this delimiter. Try the Qwen3/MoE
-            // `<function=…><parameter=…>` shape first, then GLM's bare-name +
-            // `<arg_key>`/`<arg_value>` shape. Order is irrelevant to
-            // correctness — each requires a marker the other never emits — but
-            // keeping the older one first leaves its behaviour untouched.
-            if let Some(c) = call_from_xml_function(&after[..end])
-                .or_else(|| call_from_glm_arg_kv(&after[..end]))
-            {
-                calls.push(c);
-            }
-            rest = &after[end + "</tool_call>".len()..];
+            calls.extend(block.call);
+            rest = &after[block.consumed..];
         }
     } else {
         // Llama-3.1: <|python_tag|> is an explicit tool-call marker. A BARE
@@ -2452,6 +2424,51 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         }
     }
     (!calls.is_empty()).then_some(calls)
+}
+
+/// One `<tool_call>` block, parsed from the text right after its opening
+/// tag: the call (`None` when the block is malformed and skipped) and how
+/// many bytes of that text the block used.
+pub(crate) struct ToolCallBlock {
+    pub(crate) call: Option<ToolCall>,
+    pub(crate) consumed: usize,
+}
+
+/// Parse the `<tool_call>` block whose opening tag ends just before `after`.
+/// `None` when the block can't end (a non-JSON block with no closing tag):
+/// nothing after it is a call either.
+pub(crate) fn parse_tool_call_block(after: &str) -> Option<ToolCallBlock> {
+    let inner = after.trim_start();
+    // JSON Hermes: scan a brace-balanced (string/escape-aware) object so a
+    // literal "</tool_call>" inside an argument value can't truncate the
+    // block. Fall back to the close-tag delimiter for the XML dialect.
+    if inner.starts_with('{') || inner.starts_with('[') {
+        let off = after.len() - inner.len();
+        if let Some(len) = balanced_json_end(&after[off..]) {
+            let call = serde_json::from_str::<serde_json::Value>(after[off..off + len].trim())
+                .ok()
+                .and_then(|v| call_from_value(&v));
+            let tail = &after[off + len..];
+            let consumed = off
+                + len
+                + tail
+                    .find(TOOL_CALL_CLOSE)
+                    .map_or(0, |e| e + TOOL_CALL_CLOSE.len());
+            return Some(ToolCallBlock { call, consumed });
+        }
+    }
+    let end = after.find(TOOL_CALL_CLOSE)?;
+    // Two non-JSON dialects share this delimiter. Try the Qwen3/MoE
+    // `<function=…><parameter=…>` shape first, then GLM's bare-name +
+    // `<arg_key>`/`<arg_value>` shape. Order is irrelevant to
+    // correctness — each requires a marker the other never emits — but
+    // keeping the older one first leaves its behaviour untouched.
+    let call =
+        call_from_xml_function(&after[..end]).or_else(|| call_from_glm_arg_kv(&after[..end]));
+    Some(ToolCallBlock {
+        call,
+        consumed: end + TOOL_CALL_CLOSE.len(),
+    })
 }
 
 /// Byte length of the balanced JSON value starting at `s[0]` (`{` or `[`),
