@@ -8066,6 +8066,46 @@ level={{ effort_map[eff] }}";
         );
     }
 
+    /// A schema whose grammar builds but fails on its first token (here a
+    /// parser row past a lowered cap) is a 400 at the API, not a failure
+    /// mid-generation.
+    #[tokio::test]
+    async fn schema_that_fails_on_its_first_token_is_400() {
+        let check = SchemaCompileCheck::default().with_factory(
+            cascadia_grammar::GrammarFactory::byte_level_with_row_cap_for_tests(2000),
+        );
+        let props: serde_json::Map<String, Value> = (0..600)
+            .map(|i| (format!("p{i}"), serde_json::json!({})))
+            .collect();
+        let schema = serde_json::json!({"type": "object", "properties": props});
+        let (status, v) = post_chat(
+            so_app_checked(check).await,
+            chat_with(Some(json_schema_format(schema))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["error"],
+            "invalid response_format: response_format schema is too complex to compile"
+        );
+    }
+
+    /// A schema llguidance can't build passes the check and reaches the
+    /// engine, whose refusal names the reason.
+    #[tokio::test]
+    async fn schema_that_does_not_build_reaches_the_engines_refusal() {
+        let refusal = "response_format schema: Unsatisfiable schema: incompatible types";
+        let cfg = Config {
+            schema_build_check: true,
+            ..minimal_cfg()
+        };
+        let (app, _) = capture_app_with(true, cfg, Some(refusal.to_owned())).await;
+        let schema = serde_json::json!({"type": "string", "enum": [1, 2]});
+        let (status, v) = post_chat(app, chat_with(Some(json_schema_format(schema)))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains(refusal), "{v}");
+    }
+
     #[tokio::test]
     async fn schema_within_the_compile_budget_passes() {
         let (status, v) = post_chat(

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -95,7 +96,8 @@ pub const SCHEMA_COMPILE_BUDGET: Duration = Duration::from_secs(2);
 pub enum SchemaCheckError {
     /// Every build slot stayed taken for the whole wait: a 503.
     Busy,
-    /// The build ran past the budget: a 400.
+    /// The build ran past the budget, or the grammar it built fails on its
+    /// first token: a 400.
     TooComplex,
 }
 
@@ -168,18 +170,32 @@ impl PassedSchemas {
 /// engine lock. A build past the budget is a 400; the request leaves, and
 /// the build keeps its slot until it ends, so abandoned builds hold at most
 /// `permits` cores. Whether the schema builds at all is left to the engine,
-/// whose backend may accept what llguidance doesn't.
+/// whose backend may accept what llguidance doesn't. A grammar that builds
+/// must also take its first token (see
+/// [`cascadia_grammar::CompiledGrammar::check_first_step`]) within the same
+/// budget, or it is a 400 too: it would fail every request mid-generation.
 ///
 /// `json_object`'s constant grammar is never built here, and a schema that
 /// passed is remembered ([`SCHEMA_PASS_CACHE`] of them, by schema text):
 /// agents resend the same schema every step, and it never waits for a slot
 /// again.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SchemaCompileCheck {
     permits: Arc<Semaphore>,
     wait: Duration,
     budget: Duration,
     passed: Arc<std::sync::Mutex<PassedSchemas>>,
+    factory: GrammarFactory,
+}
+
+impl std::fmt::Debug for SchemaCompileCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchemaCompileCheck")
+            .field("permits", &self.permits)
+            .field("wait", &self.wait)
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for SchemaCompileCheck {
@@ -201,7 +217,14 @@ impl SchemaCompileCheck {
             wait,
             budget,
             passed: Arc::new(std::sync::Mutex::new(PassedSchemas::new(SCHEMA_PASS_CACHE))),
+            factory: GrammarFactory::byte_level(),
         }
+    }
+
+    /// The same check over `factory` in place of the byte-level one.
+    #[cfg(test)]
+    pub(crate) fn with_factory(self, factory: GrammarFactory) -> Self {
+        Self { factory, ..self }
     }
 
     /// Builds `spec` within the budget, or says why not.
@@ -224,12 +247,28 @@ impl SchemaCompileCheck {
             };
         let spec = spec.clone();
         let body = spec.body.clone();
+        let factory = self.factory.clone();
+        // Set once the request stops waiting: the first-step check then ends
+        // before its next mask and frees the slot (the build itself can't be
+        // stopped).
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let stop = abandoned.clone();
         let build = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            // Errors are the engine's to report; only the time counts here.
-            let _ = GrammarFactory::byte_level().compile(&spec);
+            // A build error is the engine's to report (its backend may build
+            // what llguidance doesn't): only the time counts for it here. A
+            // grammar that builds but fails on its first token would fail
+            // every request mid-generation instead.
+            match factory.compile(&spec) {
+                Ok(grammar) => grammar.check_first_step(&stop).map_err(|e| e.to_string()),
+                Err(_) => Ok(()),
+            }
         });
-        let verdict = build_verdict(tokio::time::timeout(self.budget, build).await);
+        let joined = tokio::time::timeout(self.budget, build).await;
+        if joined.is_err() {
+            abandoned.store(true, Ordering::Relaxed);
+        }
+        let verdict = build_verdict(joined);
         if verdict.is_ok() {
             self.passed
                 .lock()
@@ -241,13 +280,18 @@ impl SchemaCompileCheck {
 }
 
 /// The check's verdict on one timed build: a pass only when the build ran to
-/// its end within the budget. A build that panicked proved nothing about the
-/// schema, so it is refused like one that ran too long, and never remembered.
+/// its end within the budget and the grammar took its first step. A build
+/// that panicked proved nothing about the schema, so it is refused like one
+/// that ran too long, and never remembered.
 fn build_verdict(
-    joined: Result<Result<(), tokio::task::JoinError>, tokio::time::error::Elapsed>,
+    joined: Result<Result<Result<(), String>, tokio::task::JoinError>, tokio::time::error::Elapsed>,
 ) -> Result<(), SchemaCheckError> {
     match joined {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "response_format schema check: the grammar fails on its first token");
+            Err(SchemaCheckError::TooComplex)
+        }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "response_format schema check: the grammar build failed");
             Err(SchemaCheckError::TooComplex)
@@ -2646,6 +2690,66 @@ mod tests {
         assert!(!check.passed.lock().unwrap().contains(&schema.body));
     }
 
+    /// 600 optional properties: past a row cap of 2000 (llguidance's
+    /// default) on the first token, though the schema builds and gives its
+    /// first mask.
+    fn wide_optional_object() -> GrammarSpec {
+        let props: Vec<String> = (0..600).map(|i| format!("\"p{i}\":{{}}")).collect();
+        spec_of(&format!(
+            r#"{{"type":"object","properties":{{{}}}}}"#,
+            props.join(",")
+        ))
+    }
+
+    /// A grammar that builds but fails on its first token is refused before
+    /// any engine sees it, and not remembered as a pass.
+    #[tokio::test]
+    async fn a_grammar_that_fails_on_its_first_token_is_refused() {
+        let check = SchemaCompileCheck::default()
+            .with_factory(GrammarFactory::byte_level_with_row_cap_for_tests(2000));
+        let schema = wide_optional_object();
+        assert_eq!(
+            check.check(&schema).await,
+            Err(SchemaCheckError::TooComplex)
+        );
+        assert!(!check.passed.lock().unwrap().contains(&schema.body));
+        // Under the limits engines use, it passes.
+        assert_eq!(SchemaCompileCheck::default().check(&schema).await, Ok(()));
+    }
+
+    /// A check the request stopped waiting for stops its first-step masks
+    /// and gives its slot back: the next schema gets it without waiting out
+    /// the abandoned one.
+    #[tokio::test]
+    async fn an_abandoned_check_gives_its_slot_back() {
+        let check = SchemaCompileCheck::new(1, Duration::from_secs(10), Duration::from_nanos(1));
+        let schema = wide_optional_object();
+        assert_eq!(
+            check.check(&schema).await,
+            Err(SchemaCheckError::TooComplex)
+        );
+        let freed = tokio::time::timeout(
+            Duration::from_secs(10),
+            check.permits.clone().acquire_owned(),
+        )
+        .await;
+        assert!(freed.is_ok(), "the abandoned check still holds its slot");
+    }
+
+    /// A schema llguidance can't build is still left to the engine, whose
+    /// refusal names the reason: the check passes it, as before, and the
+    /// first-token step never runs on it.
+    #[tokio::test]
+    async fn a_schema_that_does_not_build_is_left_to_the_engine() {
+        let body = r#"{"type":"string","enum":[1,2]}"#;
+        assert!(GrammarFactory::byte_level()
+            .compile(&spec_of(body))
+            .is_err());
+        let check = SchemaCompileCheck::default()
+            .with_factory(GrammarFactory::byte_level_with_row_cap_for_tests(2000));
+        assert_eq!(check.check(&spec_of(body)).await, Ok(()));
+    }
+
     /// A build that panicked proved nothing about the schema: it is neither
     /// a pass nor remembered as one, so the engine never compiles it on the
     /// strength of this check.
@@ -2654,8 +2758,11 @@ mod tests {
         let build = tokio::task::spawn_blocking(|| panic!("grammar build blew up"));
         let joined = tokio::time::timeout(Duration::from_secs(5), build).await;
         assert_eq!(build_verdict(joined), Err(SchemaCheckError::TooComplex));
-        let done =
-            tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| ())).await;
+        let done = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(|| Ok(())),
+        )
+        .await;
         assert_eq!(build_verdict(done), Ok(()));
     }
 

@@ -39,6 +39,7 @@ minijinja-contrib = { version = "2", default-features = false, features = ["pyco
 
 [dev-dependencies]
 tokio = { workspace = true }
+cascadia-grammar = { workspace = true, features = ["test-util"] }
 cascadia-engine-mock = { workspace = true }
 async-trait = { workspace = true }
 jsonschema = { version = "0.60", default-features = false }

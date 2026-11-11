@@ -1163,3 +1163,59 @@ fn a_wide_optional_object_masks_over_a_large_vocab() {
     assert!(most_items <= 110_000, "{most_items}");
     assert!(most_items * 3 / 2 <= STEP_MAX_ITEMS, "{most_items}");
 }
+
+/// 600 optional properties: about 2400 items in the row after `{`.
+fn six_hundred_optional() -> String {
+    let props: Vec<String> = (0..600).map(|i| format!("\"p{i}\":{{}}")).collect();
+    format!(
+        r#"{{"type":"object","properties":{{{}}}}}"#,
+        props.join(",")
+    )
+}
+
+#[test]
+fn the_first_step_check_finds_a_grammar_that_fails_on_its_first_token() {
+    let go = AtomicBool::new(false);
+    // Past a row cap of 2000 (llguidance's default) right after `{`, of the
+    // object or of an array's first item, though the schema builds and
+    // gives its first mask.
+    let wide = six_hundred_optional();
+    let capped = GrammarFactory::byte_level_with_row_cap_for_tests(2000);
+    for body in [
+        wide.clone(),
+        format!(r#"{{"type":"array","items":{wide}}}"#),
+        format!(r#"{{"anyOf":[{{"type":"string"}},{{"type":"array","items":{wide}}}]}}"#),
+    ] {
+        let grammar = capped.compile(&spec(&body)).unwrap();
+        grammar.matcher().unwrap().mask_words().unwrap();
+        assert!(grammar.check_first_step(&go).is_err(), "{body}");
+        // Under the limits engines use, it passes.
+        single_byte()
+            .compile(&spec(&body))
+            .unwrap()
+            .check_first_step(&go)
+            .unwrap_or_else(|e| panic!("{body}: {e}"));
+    }
+    for body in [
+        WEATHER,
+        r#"{}"#,
+        r#"{"type":"array","items":{"type":"string"}}"#,
+        r#"{"anyOf":[{"type":"string"},{"type":"number"},{"type":"null"}]}"#,
+    ] {
+        single_byte()
+            .compile(&spec(body))
+            .unwrap()
+            .check_first_step(&go)
+            .unwrap_or_else(|e| panic!("{body}: {e}"));
+    }
+}
+
+#[test]
+fn a_cancelled_first_step_check_stops_before_its_next_mask() {
+    let grammar = single_byte()
+        .compile(&spec(&six_hundred_optional()))
+        .unwrap();
+    let stop = AtomicBool::new(true);
+    let err = grammar.check_first_step(&stop).unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "{err}");
+}

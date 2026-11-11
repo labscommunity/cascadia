@@ -587,7 +587,8 @@ The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
   400 before the request queues. A client's own top-level `x-guidance`
   object is replaced by the server's settings. Before the request queues,
   the server also builds each new schema once off the engine, at most 2 at
-  a time and within 2 seconds (see the errors below); a schema that passed
+  a time and within 2 seconds (see the errors below), and feeds that
+  grammar the first token of an answer (`{`, `[` and a few others); a schema that passed
   is remembered (up to 256) and `json_object` is never built there.
 - Build their grammar factory from the model's tokenizer on the first JSON
   request, not at startup: that request pays for it once (about half a
@@ -716,7 +717,7 @@ the 400s below and `engine_error` for anything else):
 | 5xx | `… a later pipeline stage runs a build without structured-output support; upgrade every stage` | Multi-stage `ov-runtime`, `gemma4`, `qwen35` or `sparse-moe`: a later stage runs an older build (see above). |
 | 5xx | `structured output: the downstream pipeline link failed before the request started; retry it` | Multi-stage `sparse-moe`: the link to the next stage was found dead (or out of step) when a JSON request was about to start. Nothing is latched; on a multi-stream pipeline the head re-dials on its next step. Retry. |
 | 5xx | `structured output: a pipeline stage lost its token-mask state; retry the request` | Multi-stage `ov-runtime`, `gemma4`, `qwen35` or `sparse-moe`: a stage got a repeated-mask marker without the mask it repeats. Not expected in normal operation; only that request fails, and the next one sends full masks again. Retry. On a multi-stream `sparse-moe` pipeline, other JSON streams whose markers were already on their way when the last stage missed fail the same way, and a miss at a middle stage closes that link and fails every stream on it (neither is expected to happen). |
-| 400 | `invalid response_format: response_format schema is too complex to compile` | The llguidance engines: building the schema's grammar took longer than 2 seconds in the server's check before the request queues. |
+| 400 | `invalid response_format: response_format schema is too complex to compile` | The llguidance engines: building the schema's grammar took longer than 2 seconds in the server's check before the request queues, or the grammar it built failed on the first token of an answer (a parser limit). |
 | 503 | `busy compiling response_format schemas; retry shortly` | The llguidance engines: the server's schema check had no free slot (2 builds at once) within half a second. Retry. |
 | 5xx | `… grammar: no token of the … is allowed` | The llguidance engines: decoding hit a state the grammar allows no token from. The request ends with this error, never with unconstrained output. |
 | 5xx | `… structured output generation failed` | The llguidance engines: the grammar failed while generating, or a resumed request's earlier output does not match the grammar. The grammar's own reason is logged, not sent. The request ends with this error, never with unconstrained output. |

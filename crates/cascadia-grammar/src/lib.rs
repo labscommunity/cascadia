@@ -13,6 +13,7 @@
 //! at all (bad type, unresolvable `$ref`) is an error at
 //! [`GrammarFactory::compile`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cascadia_engine::{EngineError, EngineResult};
@@ -183,6 +184,23 @@ impl GrammarFactory {
         Self::byte_level()
     }
 
+    /// [`Self::byte_level`] with llguidance's row cap lowered to
+    /// `max_items_in_row`, so a test can build a schema that fails on its
+    /// first token without one past the API's size cap.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn byte_level_with_row_cap_for_tests(max_items_in_row: usize) -> Self {
+        let mut f = Self::from_tok_env(
+            llguidance::toktrie::ApproximateTokEnv::single_byte_env(),
+            vec![261].into(),
+        )
+        .expect("byte-level vocab builds");
+        Arc::get_mut(&mut f.factory)
+            .expect("a new factory is not shared")
+            .limits_mut()
+            .max_items_in_row = max_items_in_row;
+        f
+    }
+
     /// Number of real tokens the mask covers (the tokenizer vocab). A model's
     /// logits row may be longer; [`GrammarMask::apply`] masks the excess.
     pub fn mask_width(&self) -> usize {
@@ -294,6 +312,11 @@ pub(crate) const MAX_ITEMS_IN_ROW: usize = 46_500;
 /// the byte-level vocab never passes 62,000. Half again as many, rounded
 /// up. llguidance's default is 50,000.
 pub(crate) const STEP_MAX_ITEMS: usize = 325_000;
+
+/// Most first tokens [`CompiledGrammar::check_first_step`] tries: `{`, `[`
+/// and a couple of others (`"`, a digit, ...), whose rows don't grow with
+/// the schema's width.
+pub const FIRST_STEP_TOKENS: usize = 4;
 
 /// Stack for the thread that builds a grammar (see `compile_schema`). Only
 /// reserved address space: pages are committed as the build touches them.
@@ -431,6 +454,71 @@ impl CompiledGrammar {
         &self.warnings
     }
 
+    /// Takes the first step of an answer: the first mask, then up to
+    /// [`FIRST_STEP_TOKENS`] of the tokens it allows (`{` and `[` first, then
+    /// the lowest ids; never EOS), each on a copy of the matcher with the
+    /// mask after it, and after `[` the `{` of an object item too. A grammar
+    /// can build and give its first mask, then fail on its first token: the
+    /// parser row after an object's `{` holds about four items per optional
+    /// property, and llguidance refuses a row past its limit. That row comes
+    /// right after the `{`, of the top-level object or of an array's first
+    /// item, and no later row was larger at the API's size cap (30,883
+    /// items, see [`MAX_ITEMS_IN_ROW`]); this finds it before a request is
+    /// queued. At most `2 * FIRST_STEP_TOKENS` masks. `cancel` is read
+    /// between them: once set, this stops with an error.
+    pub fn check_first_step(&self, cancel: &AtomicBool) -> EngineResult<()> {
+        let cancelled = || {
+            if cancel.load(Ordering::Relaxed) {
+                Err(EngineError::Backend(
+                    "grammar: first-step check cancelled".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        cancelled()?;
+        let mut first = self.matcher()?;
+        let words = first.mask_words()?;
+        let trie = first.matcher.tok_env().map_err(generation_failed)?;
+        let id_of = |bytes: &[u8]| trie.tok_trie().token_id(bytes);
+        let (open_object, open_array) = (id_of(b"{"), id_of(b"["));
+        let allowed = |words: &[u32], t: u32| {
+            words
+                .get(t as usize / 32)
+                .is_some_and(|w| w & (1 << (t % 32)) != 0)
+        };
+        let mut tokens: Vec<u32> = [open_object, open_array]
+            .into_iter()
+            .flatten()
+            .filter(|&t| allowed(&words, t))
+            .collect();
+        let rest: Vec<u32> = (0..words.len() as u32 * 32)
+            .filter(|&t| allowed(&words, t) && !tokens.contains(&t) && !self.eos.contains(&t))
+            .take(FIRST_STEP_TOKENS.saturating_sub(tokens.len()))
+            .collect();
+        tokens.extend(rest);
+        for token in tokens {
+            cancelled()?;
+            let mut next = first.fork();
+            next.accept(token)?;
+            if next.finished() {
+                continue;
+            }
+            let after = next.mask_words()?;
+            if let Some(item) =
+                open_object.filter(|&o| Some(token) == open_array && allowed(&after, o))
+            {
+                cancelled()?;
+                let mut inner = next.fork();
+                inner.accept(item)?;
+                if !inner.finished() {
+                    inner.mask_words()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A fresh mask at the start of the output.
     /// Clones the compiled parser (lexer caches stay shared), no recompile.
     pub fn matcher(&self) -> EngineResult<GrammarMask> {
@@ -457,6 +545,16 @@ pub struct GrammarMask {
 }
 
 impl GrammarMask {
+    /// A copy at the same point, without the cached mask.
+    fn fork(&self) -> Self {
+        Self {
+            matcher: self.matcher.clone(),
+            mask_width: self.mask_width,
+            eos: self.eos.clone(),
+            current: None,
+        }
+    }
+
     /// Accepts tokens already in the output (a resumed sequence). The server
     /// produced those tokens, so one the grammar rejects is a server-side
     /// failure (`Backend`), not the client's.
