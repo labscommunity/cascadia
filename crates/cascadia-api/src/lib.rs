@@ -2448,14 +2448,15 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let mut calls = Vec::new();
     if text.contains("<tool_call>") {
         // Qwen/Hermes: each <tool_call>…</tool_call> block.
-        let mut rest = text;
-        while let Some(start) = rest.find(TOOL_CALL_OPEN) {
-            let after = &rest[start + TOOL_CALL_OPEN.len()..];
-            let Some(block) = parse_tool_call_block(after) else {
+        let mut tags = CloseTags::default();
+        let mut pos = 0;
+        while let Some(start) = text.get(pos..).and_then(|rest| rest.find(TOOL_CALL_OPEN)) {
+            let at = pos + start + TOOL_CALL_OPEN.len();
+            let Some(block) = parse_tool_call_block(text, at, &mut tags) else {
                 break;
             };
             calls.extend(block.call);
-            rest = &after[block.consumed..];
+            pos = at + block.consumed;
         }
     } else {
         // Llama-3.1: <|python_tag|> is an explicit tool-call marker. A BARE
@@ -2502,10 +2503,56 @@ pub(crate) struct ToolCallBlock {
     pub(crate) consumed: usize,
 }
 
-/// Parse the `<tool_call>` block whose opening tag ends just before `after`.
+/// The first `</tool_call>` at or after a position of one text, remembered
+/// between the blocks of a reply. A search from `p` that found the tag at
+/// `q` answers every search from `p..=q`, and one that found none answers
+/// every search from `p` on, so a reply of many blocks with no closing tag
+/// after them is searched once, not once per block.
+#[derive(Default)]
+pub(crate) struct CloseTags {
+    /// Length of the text the last answer is for: a text that grew may
+    /// hold a tag the last search could not see.
+    len: usize,
+    /// The last search: where it started and what it found.
+    last: Option<(usize, Option<usize>)>,
+    /// Bytes searched so far, for the linear-time tests.
+    #[cfg(test)]
+    pub(crate) work: usize,
+}
+
+impl CloseTags {
+    /// The position of the first closing tag in `text` at or after `from`.
+    fn find(&mut self, text: &str, from: usize) -> Option<usize> {
+        if self.len != text.len() {
+            self.len = text.len();
+            self.last = None;
+        }
+        if let Some((start, found)) = self.last {
+            if start <= from && found.is_none_or(|q| q >= from) {
+                return found;
+            }
+        }
+        let hay = text.get(from..)?;
+        let found = hay.find(TOOL_CALL_CLOSE).map(|i| from + i);
+        #[cfg(test)]
+        {
+            self.work += found.map_or(hay.len(), |q| q - from + TOOL_CALL_CLOSE.len());
+        }
+        self.last = Some((from, found));
+        found
+    }
+}
+
+/// Parse the `<tool_call>` block of `text` whose opening tag ends at `at`;
+/// `tags` remembers closing-tag searches across the blocks of one text.
 /// `None` when the block can't end (a non-JSON block with no closing tag):
 /// nothing after it is a call either.
-pub(crate) fn parse_tool_call_block(after: &str) -> Option<ToolCallBlock> {
+pub(crate) fn parse_tool_call_block(
+    text: &str,
+    at: usize,
+    tags: &mut CloseTags,
+) -> Option<ToolCallBlock> {
+    let after = text.get(at..)?;
     let inner = after.trim_start();
     // JSON Hermes: scan a brace-balanced (string/escape-aware) object so a
     // literal "</tool_call>" inside an argument value can't truncate the
@@ -2516,16 +2563,16 @@ pub(crate) fn parse_tool_call_block(after: &str) -> Option<ToolCallBlock> {
             let call = serde_json::from_str::<serde_json::Value>(after[off..off + len].trim())
                 .ok()
                 .and_then(|v| call_from_value(&v));
-            let tail = &after[off + len..];
+            let value_end = at + off + len;
             let consumed = off
                 + len
-                + tail
-                    .find(TOOL_CALL_CLOSE)
-                    .map_or(0, |e| e + TOOL_CALL_CLOSE.len());
+                + tags
+                    .find(text, value_end)
+                    .map_or(0, |e| e - value_end + TOOL_CALL_CLOSE.len());
             return Some(ToolCallBlock { call, consumed });
         }
     }
-    let end = after.find(TOOL_CALL_CLOSE)?;
+    let end = tags.find(text, at)? - at;
     // Two non-JSON dialects share this delimiter. Try the Qwen3/MoE
     // `<function=…><parameter=…>` shape first, then GLM's bare-name +
     // `<arg_key>`/`<arg_value>` shape. Order is irrelevant to
@@ -6566,21 +6613,90 @@ mod tests {
         assert_eq!(calls[0].function.name, "b");
     }
 
-    /// Many blocks that never balance: each is parsed up to its own closing
-    /// tag, so the whole reply parses in linear time.
+    /// Many blocks that never balance, or that have no closing tag after
+    /// them: each is parsed up to its own closing tag, and the search for a
+    /// missing one runs once, so the whole reply parses in linear time.
     #[test]
     fn parse_tool_calls_is_linear_in_unbalanced_blocks() {
         let call = r#"<tool_call>{"name":"f","arguments":{}}</tool_call>"#;
-        let text = format!("{call}{}", "<tool_call>{</tool_call>".repeat(8000));
-        let started = std::time::Instant::now();
-        let calls = parse_tool_calls(&text).expect("the first call");
-        let elapsed = started.elapsed();
-        assert_eq!(calls.len(), 1);
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "{elapsed:?} for {} bytes",
-            text.len()
-        );
+        for text in [
+            format!("{call}{}", "<tool_call>{</tool_call>".repeat(8000)),
+            format!("{call}{}", "<tool_call>{}".repeat(8000)),
+        ] {
+            let started = std::time::Instant::now();
+            let calls = parse_tool_calls(&text).expect("the first call");
+            let elapsed = started.elapsed();
+            assert_eq!(calls.len(), 1);
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "{elapsed:?} for {} bytes: {}",
+                text.len(),
+                &text[text.len() - 30..]
+            );
+        }
+    }
+
+    /// The remembered closing-tag search gives every block exactly what a
+    /// fresh search would: over random concatenations of tags, JSON values
+    /// and prose, each block of `text` parses to the same call and the same
+    /// length with a memo shared across blocks as with a new one per block.
+    #[test]
+    fn close_tag_memo_matches_a_fresh_search() {
+        const PIECES: [&str; 11] = [
+            "<tool_call>",
+            "</tool_call>",
+            "{}",
+            r#"{"name":"f","arguments":{}}"#,
+            r#"{"name":"g","arguments":{"s":"</tool_call>"}}"#,
+            "some prose ",
+            "{",
+            "}",
+            "\n",
+            "<function=h><parameter=a>1</parameter></function>",
+            "get_time",
+        ];
+        // Each block of `text` as (call name and arguments, bytes used).
+        fn blocks(text: &str, shared: bool) -> Vec<(Option<(String, String)>, usize)> {
+            let mut memo = CloseTags::default();
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while let Some(start) = text[pos..].find(TOOL_CALL_OPEN) {
+                let at = pos + start + TOOL_CALL_OPEN.len();
+                let mut fresh = CloseTags::default();
+                let tags = if shared { &mut memo } else { &mut fresh };
+                let Some(block) = parse_tool_call_block(text, at, tags) else {
+                    break;
+                };
+                let call = block.call.map(|c| (c.function.name, c.function.arguments));
+                out.push((call, block.consumed));
+                pos = at + block.consumed;
+            }
+            out
+        }
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..20_000 {
+            let n = next() % 14;
+            let text: String = (0..n).map(|_| PIECES[next() % PIECES.len()]).collect();
+            let shared = blocks(&text, true);
+            assert_eq!(shared, blocks(&text, false), "{text}");
+            let names = |calls: Option<Vec<ToolCall>>| -> Vec<(String, String)> {
+                calls
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|c| (c.function.name, c.function.arguments))
+                    .collect()
+            };
+            let want: Vec<(String, String)> = shared.into_iter().filter_map(|(c, _)| c).collect();
+            if text.contains(TOOL_CALL_OPEN) {
+                assert_eq!(names(parse_tool_calls(&text)), want, "{text}");
+            }
+        }
     }
 
     #[test]

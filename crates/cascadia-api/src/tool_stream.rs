@@ -8,7 +8,7 @@
 //! arrives. A call is committed once its header is out: later text never
 //! takes it back.
 
-use crate::{parse_tool_call_block, ToolCall, TOOL_CALL_CLOSE, TOOL_CALL_OPEN};
+use crate::{parse_tool_call_block, CloseTags, ToolCall, TOOL_CALL_CLOSE, TOOL_CALL_OPEN};
 
 /// One tool-call delta: a call's header, or the next piece of its arguments.
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +103,8 @@ pub(crate) struct ToolCallEmitter {
     /// Calls sent so far; the next call's index.
     sent: usize,
     state: State,
+    /// Closing-tag searches of the blocks parsed whole, shared between them.
+    tags: CloseTags,
     /// Bytes examined so far, for the linear-time test.
     #[cfg(test)]
     work: usize,
@@ -157,6 +159,7 @@ impl ToolCallEmitter {
             legacy,
             sent: 0,
             state: State::Waiting,
+            tags: CloseTags::default(),
             #[cfg(test)]
             work: 0,
         }
@@ -378,15 +381,23 @@ impl ToolCallEmitter {
             self.state = State::Block(block);
             return false;
         }
-        // Parsed once, whole, by the shared parser, which reads up to the
-        // block's closing tag, or to the end of the text when it has none.
+        // Parsed once, whole, by the shared parser: it reads the block, and
+        // searches for closing tags through `tags`, which counts its own
+        // bytes (a search within the block reads the same bytes again, so
+        // the larger of the two is charged); a block that cannot end may
+        // have read the rest of the text.
         let after = block.after;
-        let text = buf.get(after..).unwrap_or_default();
-        let parsed = parse_tool_call_block(text);
-        self.charge(match &parsed {
-            Some(p) if text[..p.consumed].ends_with(TOOL_CALL_CLOSE) => p.consumed,
-            _ => text.len(),
-        });
+        #[cfg(test)]
+        let searched = self.tags.work;
+        let parsed = parse_tool_call_block(buf, after, &mut self.tags);
+        #[cfg(test)]
+        {
+            let read = match &parsed {
+                Some(p) => p.consumed,
+                None => buf.len().saturating_sub(after),
+            };
+            self.charge(read.max(self.tags.work - searched));
+        }
         match parsed {
             Some(parsed) => {
                 if let Some(call) = parsed.call {
@@ -1116,6 +1127,7 @@ mod tests {
                 false,
                 1,
             ),
+            (format!("{call}{}", "<tool_call>{}".repeat(8000)), false, 1),
         ];
         for (text, thinking, want_calls) in &texts {
             let started = std::time::Instant::now();
@@ -1153,30 +1165,39 @@ mod tests {
         }
     }
 
-    /// Blocks that never balance, decided only when the reply ends: each is
-    /// parsed up to its own closing tag, not to the end of the reply.
+    /// Blocks decided only when the reply ends, each parsed once: blocks
+    /// that never balance read up to their own closing tag, and blocks with
+    /// no closing tag after them share one search for it.
     #[test]
-    fn unbalanced_blocks_decided_at_the_end_cost_linear_work() {
+    fn blocks_decided_at_the_end_cost_linear_work() {
         let call = r#"<tool_call>{"name":"f","arguments":{}}</tool_call>"#;
-        let text = format!("{call}{}", "<tool_call>{</tool_call>".repeat(4000));
-        let started = std::time::Instant::now();
-        let mut splitter = ToolStreamSplitter::new(false);
-        splitter.feed(&text);
-        let mut emitter = ToolCallEmitter::new(false);
-        let events: Vec<(usize, CallEvent)> = emitter
-            .finish(splitter.text(), splitter.scan_from())
-            .into_iter()
-            .map(|e| (text.len(), e))
-            .collect();
-        let elapsed = started.elapsed();
-        assert_eq!(assemble(&events).len(), 1);
-        assert!(
-            emitter.work < 8 * text.len(),
-            "work {} for {} bytes",
-            emitter.work,
-            text.len()
-        );
-        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        for text in [
+            format!("{call}{}", "<tool_call>{</tool_call>".repeat(4000)),
+            format!("{call}{}", "<tool_call>{}".repeat(8000)),
+        ] {
+            let started = std::time::Instant::now();
+            let mut splitter = ToolStreamSplitter::new(false);
+            splitter.feed(&text);
+            let mut emitter = ToolCallEmitter::new(false);
+            let events: Vec<(usize, CallEvent)> = emitter
+                .finish(splitter.text(), splitter.scan_from())
+                .into_iter()
+                .map(|e| (text.len(), e))
+                .collect();
+            let elapsed = started.elapsed();
+            let head = &text[text.len() - 30..];
+            assert_eq!(assemble(&events).len(), 1, "{head}");
+            assert!(
+                emitter.work < 8 * text.len(),
+                "work {} for {} bytes: {head}",
+                emitter.work,
+                text.len()
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "{elapsed:?}: {head}"
+            );
+        }
     }
 
     /// A call object that repeats a key: the stream has already sent the
