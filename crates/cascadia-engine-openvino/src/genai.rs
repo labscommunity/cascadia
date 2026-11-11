@@ -417,6 +417,7 @@ impl Builder for OvGenaiBuilder {
                     recipe.build_cb().map(|p| Box::new(p) as Box<dyn CbPipe>)
                 }),
                 rebuild,
+                cut: Vec::new(),
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -1343,6 +1344,18 @@ impl Engine for OvGenaiEngine {
                 .collect());
         }
         let task = self.pending.remove(0);
+        // Queued before a rebuild whose structured-output check failed: refused
+        // as a new one would be at submit.
+        if let (Some(_), Some(reason)) = (
+            grammar_json_schema(&task),
+            self.structured_unavailable.as_deref(),
+        ) {
+            let msg = format!("structured output is not available for this model: {reason}");
+            return Ok(vec![(
+                task.task_id.clone(),
+                Chunk::rejected(task.task_id, msg),
+            )]);
+        }
         let max_new = if task.max_tokens > 0 {
             task.max_tokens
         } else {
@@ -1625,6 +1638,9 @@ pub struct OvGenaiCbEngine {
     /// Builds the pipeline again when the schema budget is full.
     build_pipe: Rebuild<dyn CbPipe>,
     rebuild: RebuildState,
+    /// Error chunks for requests the rebuild's drain cut outside `step()`
+    /// (in `submit` or `cancel`); the next `step()` hands them out.
+    cut: Vec<(TaskId, Chunk)>,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -1714,6 +1730,9 @@ impl Engine for OvGenaiCbEngine {
         // until the requests in flight are gone, then rebuild before this
         // request. The refusal is a retryable 503.
         if self.rebuild.draining_since.is_some() {
+            // `step()` runs only while a stream reads, so the cap is held here
+            // too: a client that stopped reading must not hold the drain open.
+            self.end_drain_past_cap();
             if !self.active.is_empty() {
                 return Err(EngineError::Unavailable(
                     cascadia_engine::PIPELINE_REBUILDING.to_owned(),
@@ -1825,35 +1844,17 @@ impl Engine for OvGenaiCbEngine {
                 warn!(task = %task_id, error = %err, "cb cancel failed");
             }
         }
+        self.cut.retain(|(id, _)| id != task_id);
+        self.end_drain_past_cap();
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        self.end_drain_past_cap();
+        if !self.cut.is_empty() {
+            return Ok(std::mem::take(&mut self.cut));
+        }
         if self.active.is_empty() {
             return Ok(Vec::new());
-        }
-        if let Some(since) = self.rebuild.draining_since {
-            if self.rebuild.clock.now().saturating_duration_since(since) >= REBUILD_DRAIN_CAP {
-                // The drain for a rebuild is over: whatever still runs fails
-                // with a retryable error, and the next request rebuilds.
-                warn!(
-                    in_flight = self.active.len(),
-                    drain_cap_s = REBUILD_DRAIN_CAP.as_secs(),
-                    "ov-genai cb: requests still running when the drain for the pipeline \
-                     rebuild ended; failing them"
-                );
-                return Ok(self
-                    .active
-                    .drain(..)
-                    .map(|t| {
-                        let _ = t.handle.cancel();
-                        let chunk = Chunk::error(
-                            t.task_id.clone(),
-                            cascadia_engine::PIPELINE_REBUILD_INTERRUPTED,
-                        );
-                        (t.task_id, chunk)
-                    })
-                    .collect());
-            }
         }
         if let Err(err) = self.pipe.step() {
             // A failed scheduler iteration poisons every in-flight request:
@@ -2178,6 +2179,35 @@ impl OvGenaiCbEngine {
              the requests in flight finish, then rebuilding the pipeline"
         );
         budget_full_error(RebuildNote::AfterDrain)
+    }
+
+    /// Once the drain for a rebuild has run [`REBUILD_DRAIN_CAP`], cut what
+    /// still runs: abort each request (dropping its handle, which holds the
+    /// old pipeline alive) and queue its retryable error for the next
+    /// `step()`. The next request then rebuilds.
+    fn end_drain_past_cap(&mut self) {
+        let Some(since) = self.rebuild.draining_since else {
+            return;
+        };
+        if self.active.is_empty()
+            || self.rebuild.clock.now().saturating_duration_since(since) < REBUILD_DRAIN_CAP
+        {
+            return;
+        }
+        warn!(
+            in_flight = self.active.len(),
+            drain_cap_s = REBUILD_DRAIN_CAP.as_secs(),
+            "ov-genai cb: requests still running when the drain for the pipeline rebuild \
+             ended; failing them"
+        );
+        for t in self.active.drain(..) {
+            let _ = t.handle.cancel();
+            let chunk = Chunk::error(
+                t.task_id.clone(),
+                cascadia_engine::PIPELINE_REBUILD_INTERRUPTED,
+            );
+            self.cut.push((t.task_id, chunk));
+        }
     }
 
     /// Drop the pipeline, build it again from the recipe, and start over:
@@ -2729,6 +2759,7 @@ mod tests {
             schema_budget: SchemaBudget::default(),
             build_pipe: mock_rebuild(st),
             rebuild: RebuildState::new(Box::new(clock.clone())),
+            cut: Vec::new(),
         }
     }
 
@@ -4869,6 +4900,144 @@ mod tests {
         assert!(e.step().unwrap().is_empty());
     }
 
+    /// A CB engine whose budget is full and floor passed, with "a" and "b"
+    /// in flight (still running) and the drain for a rebuild started.
+    fn cb_draining(clock: &FakeClock) -> (OvGenaiCbEngine, Arc<Mutex<MockState>>, Vec<u64>) {
+        let (mut e, st) = cb_full_budget(clock);
+        st.lock().unwrap().default_read =
+            Some(read_of(CbStatus::Running, 1, "x", CbFinish::Unknown));
+        e.submit(task("a", 8)).unwrap();
+        e.submit(task("b", 8)).unwrap();
+        let ids = st.lock().unwrap().added[MAX_DISTINCT_SCHEMAS..].to_vec();
+        assert_eq!(
+            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
+            BUDGET_FULL_DRAIN_400
+        );
+        st.lock().unwrap().default_read = Some(finished_read());
+        (e, st, ids)
+    }
+
+    fn assert_interrupted(out: &[(TaskId, Chunk)], want: &[&str]) {
+        let mut got: Vec<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(got, want);
+        for (_, c) in out {
+            assert!(c.is_final && !c.invalid_request);
+            assert_eq!(
+                c.error.as_deref(),
+                Some(cascadia_engine::PIPELINE_REBUILD_INTERRUPTED)
+            );
+        }
+    }
+
+    /// `step()` runs only while some stream reads, so a client that stops
+    /// reading must not hold the drain open: the cap holds on the next
+    /// submit too, which cuts what still runs, rebuilds and is admitted.
+    /// The cut requests get their retryable error on the next step.
+    #[test]
+    fn cb_drain_cap_holds_on_submit_when_nothing_steps() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st, ids) = cb_draining(&clock);
+        clock.advance(REBUILD_DRAIN_CAP - Duration::from_secs(1));
+        assert!(matches!(
+            e.submit(task("early", 8)),
+            Err(EngineError::Unavailable(_))
+        ));
+        clock.advance(Duration::from_secs(1));
+        e.submit(schema_task("next", &full_budget_body(1000)))
+            .unwrap();
+        {
+            let s = st.lock().unwrap();
+            assert_eq!(s.events, vec!["drop", "build"]);
+            for id in &ids {
+                assert!(s.cancelled.contains(id), "request {id} not aborted");
+            }
+        }
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(e.active.len(), 1);
+        assert_interrupted(&e.step().unwrap(), &["a", "b"]);
+        // Then the new pipeline's request carries on.
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "next");
+    }
+
+    #[test]
+    fn cb_cancel_during_the_drain() {
+        // Cancelling what runs ends the drain: the next submit rebuilds.
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st, _) = cb_draining(&clock);
+        e.cancel(&"a".to_string());
+        assert!(matches!(
+            e.submit(task("early", 8)),
+            Err(EngineError::Unavailable(_))
+        ));
+        e.cancel(&"b".to_string());
+        e.submit(task("next", 8)).unwrap();
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+        assert_eq!(e.active.len(), 1);
+
+        // A cancel past the cap cuts the rest; the next step reports them.
+        let (mut e, st, _) = cb_draining(&clock);
+        clock.advance(REBUILD_DRAIN_CAP);
+        e.cancel(&"a".to_string());
+        assert!(e.active.is_empty());
+        assert_interrupted(&e.step().unwrap(), &["b"]);
+        assert!(e.step().unwrap().is_empty());
+        e.submit(task("next", 8)).unwrap();
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+    }
+
+    #[test]
+    fn cb_failed_rebuild_after_a_drain_refuses_everything() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st, _) = cb_draining(&clock);
+        let out = e.step().unwrap();
+        assert!(out.iter().all(|(_, c)| c.is_final && c.error.is_none()));
+        st.lock().unwrap().build_err = Some("device lost".into());
+        const FAILED: &str = "backend error: ov-genai pipeline rebuild failed: device lost; \
+            this worker serves no requests until it is restarted";
+        for t in [task("p", 8), schema_task("s", &full_budget_body(0))] {
+            assert_eq!(e.submit(t).unwrap_err().to_string(), FAILED);
+        }
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+        assert_eq!(e.rebuild.rebuilds, 0);
+    }
+
+    #[test]
+    fn cb_rebuild_whose_structured_check_fails_refuses_schemas_and_serves_plain() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = cb_full_budget(&clock);
+        {
+            // The rebuilt pipeline's warmup request finishes; its probe
+            // answers without the constraint.
+            let mut s = st.lock().unwrap();
+            let n = s.added.len();
+            s.reads.resize_with(n, VecDeque::new);
+            s.reads.push(VecDeque::from(vec![Ok(finished_read())]));
+            s.reads.push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Finished,
+                3,
+                "Hello there!",
+                CbFinish::Stop,
+            ))]));
+        }
+        assert_eq!(
+            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
+            BUDGET_FULL_REBUILT_400
+        );
+        assert_eq!(
+            e.structured_unavailable.as_deref(),
+            Some("the output constraint was not applied: Hello there!")
+        );
+        assert_eq!(
+            refusal(e.submit(schema_task("next", &full_budget_body(1001)))),
+            "structured output is not available for this model: the output constraint was \
+             not applied: Hello there!"
+        );
+        e.submit(task("plain", 8)).unwrap();
+    }
+
     // The stateful engine, through the StatefulPipe seam.
 
     #[derive(Default)]
@@ -5059,5 +5228,35 @@ mod tests {
             Err(EngineError::Backend(m)) if m == FAILED
         ));
         assert_eq!(st.lock().unwrap().events, vec!["drop p0", "build"]);
+    }
+
+    /// A rebuild whose structured-output check fails: schema tasks queued
+    /// before it are refused when their turn comes, as a new one would be at
+    /// submit; plain ones still run.
+    #[test]
+    fn stateful_queued_schema_tasks_are_refused_when_the_rebuilt_check_fails() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let (mut e, st) = stateful_full_budget(&clock);
+        e.submit(schema_task("q1", &full_budget_body(5))).unwrap();
+        e.submit(GenerationTask::new("q2", "second")).unwrap();
+        st.lock().unwrap().probe_answer = Some("Hello".into());
+        refusal(e.submit(schema_task("new", &full_budget_body(1000))));
+
+        let out = e.step().unwrap();
+        assert_eq!(out[0].0, "q1");
+        assert!(out[0].1.invalid_request, "a 400");
+        assert_eq!(
+            out[0].1.error.as_deref(),
+            Some(
+                "structured output is not available for this model: the output constraint \
+                 was not applied: Hello"
+            )
+        );
+        let out = e.step().unwrap();
+        assert_eq!(out[0].0, "q2");
+        assert!(out[0].1.error.is_none());
+        let events = st.lock().unwrap().events.clone();
+        assert_eq!(events.last().map(String::as_str), Some("p1: second"));
+        assert!(!events.iter().any(|e| e == "p1: hello"), "{events:?}");
     }
 }
