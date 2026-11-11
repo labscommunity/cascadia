@@ -390,7 +390,7 @@ fn assert_stream_spec_rejects_extension_fields_and_repeated_roles() {
     let good = format!("{first}: keep-alive\n\n{last}data: [DONE]\n\n");
     assert_stream_spec(&good);
     let err = "data: {\"id\":\"c\",\"object\":\"error\",\"error\":{\"message\":\"x\",\
-               \"type\":\"server_error\",\"param\":null,\"code\":\"engine_error\"}}\n\n";
+               \"type\":\"server_error\",\"param\":null,\"code\":null}}\n\n";
     assert_stream_spec(&format!("{first}{err}data: [DONE]\n\n"));
     // Each bad body and the rule's own message it must fail with.
     let bad = [

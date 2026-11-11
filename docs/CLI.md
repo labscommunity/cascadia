@@ -430,7 +430,7 @@ ending with `data: [DONE]`) or not:
 - **Errors after the stream started.** The 200 headers are already sent, so an
   engine failure arrives as one event and then `[DONE]`, with no usage chunk:
   `{"id": "<chunk id>", "object": "error", "error": {"message": "...",
-  "type": "server_error", "param": null, "code": "engine_error"}}`.
+  "type": "server_error", "param": null, "code": null}}`.
   openai-python and openai-node raise `APIError` on it.
 - **A stream whose engine ends without a final chunk** (chat, completions or
   tools) sends the text it was still holding, then that error event (message
@@ -449,8 +449,8 @@ ending with `data: [DONE]`) or not:
   and read `usage.completion_tokens` (running count) instead. The engine-side
   `Chunk.n_tokens` between stages is unchanged.
 - `delta.role` is on the first chunk only, no longer on every delta.
-- The error event's `error.type` is `server_error` (was `engine_error`, now in
-  `error.code`), and `error` also has `param: null`.
+- The error event's `error.type` is `server_error` (was `engine_error`), and
+  `error` also has `param` and `code`, both `null` for an engine failure.
 - Tool calls arrive as a header delta and then argument fragments, one `index`
   per call, instead of every call in one delta at the end; concatenate
   `function.arguments` by `index`.

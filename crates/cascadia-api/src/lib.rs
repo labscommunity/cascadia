@@ -4094,9 +4094,13 @@ fn usage_tail(
 }
 
 /// SSE `data:` frame for an engine error. The 200 headers are already on the
-/// wire, so the failure travels as an explicit error event.
+/// wire, so the failure travels as an explicit error event, answered as a
+/// server fault.
 fn error_frame(task_id: &str, reason: &str) -> Bytes {
-    Bytes::from(stream_shape::error_frame(task_id, reason))
+    Bytes::from(stream_shape::error_frame(
+        task_id,
+        &stream_shape::StreamError::server(reason),
+    ))
 }
 
 /// Which wire shape a [`TextStream`] sends.
@@ -4167,7 +4171,7 @@ impl TextStream {
                         }
                         out.push_str(&stream_shape::error_frame(
                             &self.meta.id,
-                            stream_shape::UNEXPLAINED_END,
+                            &stream_shape::StreamError::server(stream_shape::UNEXPLAINED_END),
                         ));
                     }
                     let mut out = out.into_bytes();
@@ -4402,7 +4406,7 @@ impl ToolStream {
                     }
                     out.push_str(&stream_shape::error_frame(
                         &self.meta.id,
-                        stream_shape::UNEXPLAINED_END,
+                        &stream_shape::StreamError::server(stream_shape::UNEXPLAINED_END),
                     ));
                     return Some(Bytes::from(out));
                 }
@@ -12343,7 +12347,7 @@ level={{ effort_map[eff] }}";
                 events.last().unwrap(),
                 &serde_json::json!({"id": id, "object": "error", "error": {
                     "message": "script engine failure", "type": "server_error",
-                    "param": null, "code": "engine_error"}}),
+                    "param": null, "code": null}}),
                 "{uri}: {body}"
             );
             assert!(
@@ -12526,7 +12530,7 @@ level={{ effort_map[eff] }}";
             assert_eq!(
                 events.last().unwrap()["error"],
                 serde_json::json!({"message": "engine stream ended without a final chunk",
-                    "type": "server_error", "param": null, "code": "engine_error"}),
+                    "type": "server_error", "param": null, "code": null}),
                 "{body}"
             );
             assert!(

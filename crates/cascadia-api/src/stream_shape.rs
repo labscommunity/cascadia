@@ -368,19 +368,44 @@ impl LogprobQueue {
     }
 }
 
+/// The OpenAI error object an error event carries, as the caller classified
+/// the failure: a prompt over the window is a client fault
+/// (`invalid_request_error`, the prompt's `param`, `context_length_exceeded`),
+/// an engine or pipeline failure is [`StreamError::server`].
+pub(crate) struct StreamError<'a> {
+    /// The error object's `type`.
+    pub(crate) kind: &'a str,
+    pub(crate) message: &'a str,
+    pub(crate) param: Option<&'a str>,
+    pub(crate) code: Option<&'a str>,
+}
+
+impl<'a> StreamError<'a> {
+    /// A failure of the server or its engine: `server_error`, with no
+    /// `param` and no `code`, as a 5xx error body has.
+    pub(crate) fn server(message: &'a str) -> Self {
+        Self {
+            kind: "server_error",
+            message,
+            param: None,
+            code: None,
+        }
+    }
+}
+
 /// The SSE event that ends a stream which failed after its 200 headers went
 /// out: the OpenAI error object under `error`, so openai-python and -node
 /// raise `APIError` on it. `id` and `object: "error"` stay for clients that
 /// key on them; no usage chunk follows it, only `[DONE]`.
-pub(crate) fn error_frame(id: &str, message: &str) -> String {
+pub(crate) fn error_frame(id: &str, err: &StreamError<'_>) -> String {
     let payload = serde_json::json!({
         "id": id,
         "object": "error",
         "error": {
-            "message": message,
-            "type": "server_error",
-            "param": null,
-            "code": "engine_error",
+            "message": err.message,
+            "type": err.kind,
+            "param": err.param,
+            "code": err.code,
         },
     });
     format!("data: {payload}\n\n")
@@ -674,5 +699,33 @@ mod logprob_tests {
         let mut off = LogprobQueue::new(None);
         off.push(1, Some(&item("c", -1.0)));
         assert!(off.release(1).is_null());
+    }
+    #[test]
+    fn error_frame_carries_the_classification_it_is_given() {
+        let parse = |frame: &str| -> serde_json::Value {
+            let json = frame.strip_prefix("data: ").unwrap();
+            assert!(json.ends_with("\n\n"), "{frame:?}");
+            serde_json::from_str(json.trim_end()).unwrap()
+        };
+        assert_eq!(
+            parse(&error_frame("c1", &StreamError::server("boom"))),
+            serde_json::json!({"id": "c1", "object": "error", "error": {
+                "message": "boom", "type": "server_error", "param": null, "code": null}})
+        );
+        let over = error_frame(
+            "c2",
+            &StreamError {
+                kind: "invalid_request_error",
+                message: "too long",
+                param: Some("messages"),
+                code: Some("context_length_exceeded"),
+            },
+        );
+        assert_eq!(
+            parse(&over),
+            serde_json::json!({"id": "c2", "object": "error", "error": {
+                "message": "too long", "type": "invalid_request_error",
+                "param": "messages", "code": "context_length_exceeded"}})
+        );
     }
 }
