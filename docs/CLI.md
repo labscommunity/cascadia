@@ -408,16 +408,20 @@ ending with `data: [DONE]`) or not:
   decided at the end of the reply. On a model that reasons first, with
   thinking on, calls are looked for only after `</think>`, so a call drafted
   while reasoning is never sent, and a reply that never closes its reasoning
-  has its calls decided at the end. A committed call cannot be taken back: if
+  has its calls decided at the end. A model whose chat template forces
+  reasoning (it never reads `enable_thinking`, as with R1-distill, QwQ or
+  Qwen3 Thinking-2507) is treated the same even with `enable_thinking: false`;
+  one whose template honours the switch (Qwen3) writes no reasoning when it is
+  off, so its calls count from the start. A committed call cannot be taken back: if
   the model then breaks its JSON but closes the arguments object, the stream
   keeps it with the model's raw arguments and ends `tool_calls` (the
   non-streamed reply returns that text as content). A call whose arguments
   object never closed (the reply ended, a `stop` matched, `/v1/cancel` came, or
   the model wrote `</tool_call>` while it was being written) keeps the
   arguments sent so far and ends `stop`, or `length` at the length limit, never
-  `tool_calls`. The result does not depend on how the engine chunks its output:
-  a reply that arrives in one piece streams exactly as it would token by token. So a streamed call's
-  arguments can be incomplete or invalid JSON: check `finish_reason` and
+  `tool_calls`. The result does not depend on how the engine chunks its
+  output: a reply that arrives in one piece streams exactly as it would token
+  by token. So a streamed call's arguments can be incomplete or invalid JSON: check `finish_reason` and
   validate the arguments before parsing them. A `functions` request gets the
   same deltas under `delta.function_call`, first call only, and
   `function_call` in place of `tool_calls`.
@@ -429,9 +433,12 @@ ending with `data: [DONE]`) or not:
 - **A stream whose engine ends without a final chunk** (chat, completions or
   tools) sends the text it was still holding, then that error event (message
   `engine stream ended without a final chunk`) and `[DONE]`: the answer may
-  be cut short, so it is not reported as complete. On a tools stream, calls already streamed stay sent and
-  no others follow. A stream ended by `POST /v1/cancel/<task_id>` instead closes
-  its choice with `finish_reason: "stop"` and no usage chunk.
+  be cut short, so it is not reported as complete. On a tools stream, calls
+  already streamed stay sent and no others follow. A stream ended by
+  `POST /v1/cancel/<task_id>` instead closes its choice, with no usage chunk:
+  `finish_reason: "stop"`, except on a tools stream whose calls had all
+  completed, which ends `tool_calls` (`function_call` for a `functions`
+  request).
 
 **Breaking for scripts that read the old stream:**
 
