@@ -31,12 +31,20 @@ Cases (`--cases` takes these names; "+stream" means a streamed variant runs too)
     plain_unchanged   tools without tool_choice → 200, content or a function call, no custom objects
     too_complex_forced  tool_choice "required" over one tool with 600 optional string
                       properties, above the ~499 where llguidance's row limit trips on the first
-                      token, yet a prompt a 2-stage chain prefills in time (max_tokens 32) → HTTP 200 within 300 s, any content or call,
-                      never a 400; the elapsed seconds are reported, not judged. Whether the node
-                      dropped the grammar or enforced it is INFO, from the rise of
-                      `cascadia_constraint_unenforced_total` (summed over reasons, read from /metrics
-                      before and after): ov-genai and sycl-llama drop it (cost limits), an engine
-                      that builds it within its budget enforces it. Then a plain request → 200
+                      token, yet a prompt a 2-stage chain prefills in time (max_tokens 32) → HTTP 200 within 300 s, any content or call;
+                      the elapsed seconds are reported, not judged. The one 400 accepted (PASS, with
+                      a note) is sycl-llama's documented refusal of the tools themselves:
+                      `error` (a string, or an object's `message`/`param`) names `tools`, says
+                      "llama-server would take too long to build a grammar from the tools'
+                      parameters" and names "tools[0] (fill_form)"; any other 400 or non-200
+                      FAILs. What a node does at 600 properties is engine-dependent and reported
+                      as INFO, from the rise of `cascadia_constraint_unenforced_total` (summed over
+                      reasons, read from /metrics before and after): a llguidance engine over its
+                      row limit drops the grammar (or, with that limit raised, may enforce it);
+                      ov-genai drops it only when its xgrammar compile-time estimate is over its
+                      limit, else enforces it; sycl-llama refuses the tools with that 400 under any
+                      tool_choice (llama-server builds a grammar from the tools itself). Then a
+                      plain request → 200
     schema_budget     65 sequential tool_choice "required" requests, each with one tool `f` whose
                       only (required) string property is `p<i>`, a distinct schema each time
                       (max_tokens 32) → all 65 answer 200, no 400; then a plain request → 200. The
@@ -62,7 +70,7 @@ without one answers every tools request with a 400, which fails the run.
 
 `--expect-fallback` is for a node that drops the forced-call grammar and answers unconstrained
 (ov-genai on NPU, or started with a draft model). Every request must still answer HTTP 200 (the
-bad-name 400 aside) and parse; a check that fails only because the output wasn't constrained
+bad-name 400 and sycl-llama's too_complex_forced tools refusal aside) and parse; a check that fails only because the output wasn't constrained
 (no call, a call count, a tool name or finish_reason the grammar would have fixed, content that
 isn't the schema's JSON) reports INFO "not enforced on this node (expected)". Malformed call
 objects, broken stream deltas, calls to a tool that allowed_tools left out and a second call
@@ -91,7 +99,13 @@ UNENFORCED_METRIC = "cascadia_constraint_unenforced_total"
 # too_complex_forced: optional properties on the one tool. Above the ~499 at which llguidance's
 # 2000-item row limit (`max_items_in_row`) trips on the first token, so the grammar path is hit;
 # not 2000, whose ~31k-token prompt takes a 2-stage chain over its 60 s per-stage prefill timeout.
+# Also above the ~430 optional properties llama.cpp's grammar cost limit allows, so sycl-llama
+# refuses the tool with a 400 (see tools_cost_refusal).
 WIDE_PROPS = 600
+WIDE_TOOL = "fill_form"
+# sycl-llama's refusal of tools llama-server would take too long to build a grammar from
+# (check_tools_cost in crates/cascadia-engine-llamacpp/src/lib.rs).
+TOOLS_COST_TEXT = "llama-server would take too long to build a grammar from the tools' parameters"
 SCHEMA_BUDGET_REQUESTS = 65  # schema_budget: one past ov-genai's 64-schema budget
 
 
@@ -257,7 +271,11 @@ def parse_stream(raw, dt):
 
 def send(case, body, timeout=900, shown=None):
     """Send, check HTTP 200 and parse. Returns a Resp, or None after a FAIL verdict."""
-    status, raw, dt = post(body, timeout, shown)
+    return answered(case, body, *post(body, timeout, shown))
+
+
+def answered(case, body, status, raw, dt):
+    """Check one reply is HTTP 200 and parse it. Returns a Resp, or None after a FAIL verdict."""
     if status != 200:
         hint = ""
         if MOCK and status == 400 and "no chat template" in raw:
@@ -635,13 +653,40 @@ def unenforced_delta(before, after):
     return a - (b or 0.0), None
 
 
+def tools_cost_refusal(status, raw, tool_index=0, tool_name=WIDE_TOOL):
+    """The error text when (status, raw) is exactly sycl-llama's refusal of tools whose grammar
+    llama-server would take too long to build, naming tools[tool_index] (tool_name); else None.
+
+    The worker answers `{"error": "invalid configuration: tools: <why>"}`; a gateway in front
+    may answer `{"error": {"message": …, "param": "tools"}}`. Either names the `tools` param."""
+    if status != 400:
+        return None
+    try:
+        err = json.loads(raw).get("error")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(err, dict):
+        msg, param = err.get("message"), err.get("param")
+    else:
+        msg, param = err, None
+    if not isinstance(msg, str):
+        return None
+    text = msg.removeprefix("invalid configuration: ")
+    names_tools = param == "tools" if param is not None else text.startswith("tools: ")
+    if not names_tools or TOOLS_COST_TEXT not in text:
+        return None
+    if f"tools[{tool_index}] ({tool_name})" not in text:
+        return None
+    return msg
+
+
 def case_too_complex_forced():
     case = "too_complex_forced"
     props = {f"p{i}": {"type": "string"} for i in range(WIDE_PROPS)}
     tool = {
         "type": "function",
         "function": {
-            "name": "fill_form",
+            "name": WIDE_TOOL,
             "description": "Fill in a form",
             "parameters": {"type": "object", "properties": props},
         },
@@ -654,7 +699,18 @@ def case_too_complex_forced():
     before = unenforced_total()
     # Generous: a cold CPU prefill of this prompt takes about 95 s on a 4-vCPU box. The time is
     # reported, never judged.
-    r = send(case, body, timeout=300, shown=shown)
+    status, raw, dt = post(body, 300, shown)
+    refusal = tools_cost_refusal(status, raw)
+    if refusal is not None:
+        # sycl-llama: llama-server would build a grammar from this tool under any tool_choice
+        # and stall on it, so the tools are refused before the request is sent. Documented.
+        verdict(case, "PASS", f"HTTP 400 in {dt:.3f}s, the documented tools cost refusal "
+                              f"(sycl-llama; expected for this tool): {refusal[:300]}")
+        verdict("too_complex_forced_unenforced", "INFO",
+                "refused: the tools were over llama.cpp's grammar cost limit, nothing was dropped")
+        plain_after("too_complex_forced_after")
+        return
+    r = answered(case, body, status, raw, dt)
     if r:
         verdict(case, "PASS", f"HTTP 200 in {r.dt:.1f}s (not judged) {summary(r)}")
         rise, why = unenforced_delta(before, unenforced_total())
@@ -664,8 +720,9 @@ def case_too_complex_forced():
         elif rise >= 1:
             verdict(metric, "INFO", f"dropped: {UNENFORCED_METRIC} rose by {rise:g}")
         else:
-            # An engine that builds this grammar in time (llguidance engines often do, and the
-            # mock constrains any schema) enforces it; either way the answer must be a 200.
+            # An engine that builds this grammar in time (ov-genai under its xgrammar estimate,
+            # a llguidance engine with its row limit raised, the mock, which constrains any
+            # schema) enforces it; either way the answer is a 200.
             verdict(metric, "INFO", f"enforced: {UNENFORCED_METRIC} rose by {rise:g}")
     plain_after("too_complex_forced_after")
 
