@@ -8,7 +8,9 @@
 mod generation_info;
 #[cfg(test)]
 mod spec_schema;
+mod stream_shape;
 pub use generation_info::{read_model_generation_info, ModelGenerationInfo};
+use stream_shape::Usage;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -155,6 +157,9 @@ pub struct AppState {
     /// Idle time after which a stream sends an SSE keep-alive comment. See
     /// [`SSE_KEEPALIVE_INTERVAL`].
     pub sse_keepalive: Duration,
+    /// OpenAI `system_fingerprint`, computed once from the release, the
+    /// engine and the served model id.
+    pub system_fingerprint: String,
 }
 
 /// How long a stream may go without sending anything before it sends the SSE
@@ -190,6 +195,9 @@ pub struct Config {
     pub generation_defaults: GenerationDefaults,
     /// See [`AppState::sse_keepalive`]; [`SSE_KEEPALIVE_INTERVAL`] by default.
     pub sse_keepalive: Duration,
+    /// The engine's CLI name (e.g. `ov-genai`); one input of
+    /// [`AppState::system_fingerprint`]. Empty by default.
+    pub engine_name: String,
 }
 
 /// Output-token limit for a request that sets none, when the model's context
@@ -253,6 +261,7 @@ impl Default for Config {
             marker_dialect: None,
             generation_defaults: GenerationDefaults::default(),
             sse_keepalive: SSE_KEEPALIVE_INTERVAL,
+            engine_name: String::new(),
         }
     }
 }
@@ -558,9 +567,15 @@ pub fn make_router_with_stats(
     cfg: Config,
     stats: Arc<ApiStats>,
 ) -> Router {
+    let model_id: String = model_id.into();
     let state = AppState {
         runner,
-        model_id: model_id.into(),
+        system_fingerprint: stream_shape::fingerprint(
+            env!("CARGO_PKG_VERSION"),
+            &cfg.engine_name,
+            &model_id,
+        ),
+        model_id,
         permits: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
         stats,
         max_prompt_bytes: cfg.max_prompt_bytes,
@@ -1240,18 +1255,12 @@ struct ChatChoice {
 }
 
 #[derive(Serialize)]
-struct Usage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
-}
-
-#[derive(Serialize)]
 struct ChatCompletionResponse {
     id: String,
     object: &'static str,
     created: i64,
     model: String,
+    system_fingerprint: String,
     choices: Vec<ChatChoice>,
     usage: Usage,
 }
@@ -1353,6 +1362,7 @@ struct CompletionResponse {
     object: &'static str,
     created: i64,
     model: String,
+    system_fingerprint: String,
     choices: Vec<CompletionChoice>,
     usage: Usage,
 }
@@ -3067,6 +3077,7 @@ async fn chat_completions(
         object: "chat.completion",
         created: now_unix(),
         model: req.model,
+        system_fingerprint: state.system_fingerprint.clone(),
         choices: vec![ChatChoice {
             index: 0,
             message,
@@ -3079,13 +3090,9 @@ async fn chat_completions(
                 })
             },
         }],
-        usage: Usage {
-            // From the engine's final chunk; 0 when the engine can't tell
-            // (e.g. an engine that reports no prompt-token count).
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-        },
+        // From the engine's final chunk; 0 when the engine can't tell
+        // (e.g. an engine that reports no prompt-token count).
+        usage: Usage::new(prompt_tokens, completion_tokens),
     })
     .into_response()
 }
@@ -3282,6 +3289,7 @@ async fn completions(
         object: "text_completion",
         created: now_unix(),
         model: req.model,
+        system_fingerprint: state.system_fingerprint.clone(),
         choices: vec![CompletionChoice {
             text,
             index: 0,
@@ -3294,11 +3302,7 @@ async fn completions(
                 })
             },
         }],
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-        },
+        usage: Usage::new(prompt_tokens, completion_tokens),
     })
     .into_response()
 }
@@ -3913,11 +3917,7 @@ fn usage_tail(task_id: &str, model: &str, object: &str, usage: Option<(u32, u32)
             "created": now_unix(),
             "model": model,
             "choices": [],
-            "usage": {
-                "prompt_tokens": prompt,
-                "completion_tokens": completion,
-                "total_tokens": prompt + completion,
-            },
+            "usage": stream_shape::usage_json(prompt, completion),
         });
         out.push_str(&format!("data: {usage}\n\n"));
     }
@@ -4962,10 +4962,7 @@ mod tests {
                 }
                 response["usage"].clone()
             };
-            assert_eq!(
-                usage,
-                serde_json::json!({"prompt_tokens":42,"completion_tokens":38,"total_tokens":80})
-            );
+            assert_eq!(usage, crate::stream_shape::usage_json(42, 38));
             assert_eq!(stats.tokens_total.load(Ordering::Relaxed), 38);
         }
     }
@@ -5372,6 +5369,124 @@ mod tests {
         let body = to_bytes(response.into_body(), 16384).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+    }
+
+    /// The fingerprint a default-config router serving `mock-model` reports.
+    fn mock_fingerprint() -> String {
+        crate::stream_shape::fingerprint(env!("CARGO_PKG_VERSION"), "", "mock-model")
+    }
+
+    /// Uncounted details are sent as empty objects, never as made-up zeros.
+    fn assert_usage_details(usage: &Value) {
+        assert_eq!(
+            usage["prompt_tokens_details"],
+            serde_json::json!({}),
+            "{usage}"
+        );
+        assert_eq!(
+            usage["completion_tokens_details"],
+            serde_json::json!({}),
+            "{usage}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_stream_chat_has_fingerprint_and_usage_details() {
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "alpha bravo charlie"}],
+                "max_tokens": 2,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["system_fingerprint"], mock_fingerprint(), "{v}");
+        assert_usage_details(&v["usage"]);
+        crate::spec_schema::assert_spec("CreateChatCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn non_stream_completions_has_fingerprint_and_usage_details() {
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "mock-model",
+                            "prompt": "alpha bravo charlie",
+                            "max_tokens": 2,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["system_fingerprint"], mock_fingerprint(), "{v}");
+        assert_usage_details(&v["usage"]);
+        crate::spec_schema::assert_spec("CreateCompletionResponse", &v);
+    }
+
+    #[tokio::test]
+    async fn usage_chunk_has_details() {
+        for (uri, payload) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": "mock-model", "stream": true, "max_tokens": 2,
+                    "stream_options": {"include_usage": true},
+                    "messages": [{"role": "user", "content": "alpha bravo charlie"}],
+                }),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({
+                    "model": "mock-model", "stream": true, "max_tokens": 2,
+                    "stream_options": {"include_usage": true},
+                    "prompt": "alpha bravo charlie",
+                }),
+            ),
+        ] {
+            let response = make_app()
+                .await
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            let tail: Value = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|line| *line != "[DONE]")
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|event| event.get("usage").is_some_and(|u| !u.is_null()))
+                .unwrap_or_else(|| panic!("no usage chunk: {body}"));
+            assert!(tail["choices"].as_array().unwrap().is_empty(), "{body}");
+            assert_eq!(
+                tail["usage"]["total_tokens"],
+                tail["usage"]["prompt_tokens"].as_u64().unwrap()
+                    + tail["usage"]["completion_tokens"].as_u64().unwrap(),
+                "{body}"
+            );
+            assert_usage_details(&tail["usage"]);
+        }
     }
 
     #[tokio::test]
@@ -8039,10 +8154,7 @@ level={{ effort_map[eff] }}";
         assert_eq!(finishes, ["tool_calls"], "{rest}");
         let usage = events.last().unwrap();
         assert!(usage["choices"].as_array().unwrap().is_empty(), "{rest}");
-        assert_eq!(
-            usage["usage"],
-            serde_json::json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8})
-        );
+        assert_eq!(usage["usage"], crate::stream_shape::usage_json(5, 3));
     }
 
     /// Sum of the custom per-frame `n_tokens` across an SSE body.
@@ -9464,13 +9576,13 @@ level={{ effort_map[eff] }}";
             "stream_options": {"include_usage": true}});
         let (status, body) = post_text(make_app().await, "/v1/chat/completions", &chat).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(normalize_sse(&body), "data: {\"choices\":[{\"delta\":{\"content\":\"alpha \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"bravo \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\",\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":0,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":2,\"total_tokens\":4}}\n\ndata: [DONE]\n\n", "chat");
+        assert_eq!(normalize_sse(&body), "data: {\"choices\":[{\"delta\":{\"content\":\"alpha \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"bravo \",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\",\"index\":0}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":0,\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"completion_tokens_details\":{},\"prompt_tokens\":2,\"prompt_tokens_details\":{},\"total_tokens\":4}}\n\ndata: [DONE]\n\n", "chat");
         let text = serde_json::json!({"model": "mock-model", "prompt": "alpha bravo",
             "max_tokens": 8, "stream": true, "echo": true,
             "stream_options": {"include_usage": true}});
         let (status, body) = post_text(make_app().await, "/v1/completions", &text).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(normalize_sse(&body), "data: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"alpha bravoalpha \"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"bravo \"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"text\":\"\"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":0,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"text_completion\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":2,\"total_tokens\":4}}\n\ndata: [DONE]\n\n", "completions");
+        assert_eq!(normalize_sse(&body), "data: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"alpha bravoalpha \"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"bravo \"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":1,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"text\":\"\"}],\"completion_tokens\":null,\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"n_tokens\":0,\"object\":\"text_completion\"}\n\ndata: {\"choices\":[],\"created\":0,\"id\":\"ID\",\"model\":\"mock-model\",\"object\":\"text_completion\",\"usage\":{\"completion_tokens\":2,\"completion_tokens_details\":{},\"prompt_tokens\":2,\"prompt_tokens_details\":{},\"total_tokens\":4}}\n\ndata: [DONE]\n\n", "completions");
     }
 
     /// Emits `parts` one per step (`gate` after the first holds the rest,
