@@ -14,8 +14,9 @@ Usage:
 plain request must still answer 200. It replaces the normal cases.
 
 `--mock` is for `cascadia run mock-model --engine mock`: the mock answers any schema with a
-minimal instance and has no chat template, so the two cases only a real backend can pass
-(a schema the backend can't build → 400; tools rendered by the model's template) report INFO.
+minimal instance and has no chat template, so the cases only a real backend can pass or
+exercise (a schema the backend can't build → 400; tools rendered by the model's template; a
+wide all-optional object, whose grammar the mock never builds) report INFO.
 
 Answers are validated with the `jsonschema` package (`pip install jsonschema`). Without it
 the run fails (`VERDICT jsonschema_installed FAIL`), except with `--mock`, where answers are
@@ -410,6 +411,30 @@ def case_optional_properties(base):
             f"HTTP {status} {dt:.2f}s {raw[:200]}; then plain HTTP {a_status} {a_dt:.2f}s")
 
 
+def case_wide_optional_object(base):
+    # 2000 optional string properties (about 50 KB, inside the size cap). After `{` every one of
+    # them may come next: the llguidance engines once built this grammar, gave its first mask,
+    # then failed on the first token (a 5xx, or a pipeline torn down after a timeout).
+    n = 2000
+    schema = {"type": "object", "properties": {f"p{i}": {"type": "string"} for i in range(n)}}
+    size = len(json.dumps(schema, separators=(",", ":")))
+    body = chat([{"role": "user", "content": "Fill in a few of the fields."}],
+                response_format=rf_schema(schema), max_tokens=48)
+    status, raw, dt = post(base, body, timeout=300)
+    if status != 200:
+        # A 5xx fails on every engine, the mock too.
+        return verdict("wide_optional_object", False, f"{n} props {size} B: HTTP {status}: {raw[:200]}",
+                       info=MOCK and status < 500)
+    text, finish = content_of(raw)
+    if finish == "length":
+        ok, detail = text.startswith("{"), f"cut at max_tokens: {text[:80]!r}"
+    else:
+        ok, detail = check_json(text, schema)
+        ok = ok and finish == "stop"
+    verdict("wide_optional_object", ok, f"{n} props {size} B {dt:.2f}s finish={finish} {detail}",
+            info=MOCK)
+
+
 def case_text(base):
     body = chat(
         [{"role": "user", "content": "Say hello."}],
@@ -486,6 +511,7 @@ CASES = {
     "ref_depth": case_ref_depth,
     "unsatisfiable_bounds": case_unsatisfiable_bounds,
     "optional_properties": case_optional_properties,
+    "wide_optional_object": case_wide_optional_object,
     "text": case_text,
     "tools": case_tools,
 }
