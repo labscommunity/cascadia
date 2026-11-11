@@ -4129,7 +4129,8 @@ struct TextStream {
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
     prompt_tokens: u32,
-    /// Completed normally (not failed, not cancelled): gates the usage frame.
+    /// The choice closed with a finish (a complete answer, a stop match or
+    /// a cancel), not a failure: gates the usage frame.
     finished: bool,
     phase: ToolStreamPhase,
     meta: stream_shape::StreamMeta,
@@ -4164,6 +4165,8 @@ impl TextStream {
                     let logprobs = self.logprobs.finish(rest.len());
                     let mut out = String::new();
                     if self.live.cancelled() {
+                        // The choice closes, so the usage so far is due.
+                        self.finished = true;
                         out.push_str(&self.frame(rest, Some("stop"), logprobs));
                     } else {
                         warn!(task = %self.meta.id, "engine stream ended without a final chunk; emitting SSE error");
@@ -4205,8 +4208,7 @@ impl TextStream {
                 self.prompt_tokens = n;
             }
             if chunk.is_final {
-                self.finished =
-                    chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
+                self.finished = true;
             }
             // Special-token framing (Inkling) → textual delimiters, same
             // translation as the non-streaming path.
@@ -4341,7 +4343,8 @@ struct ToolStream {
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
     prompt_tokens: u32,
-    /// Completed normally (not failed, not cancelled): gates the usage frame.
+    /// The choice closed with a finish (a complete answer, a stop match or
+    /// a cancel), not a failure: gates the usage frame.
     finished: bool,
     phase: ToolStreamPhase,
     meta: stream_shape::StreamMeta,
@@ -4387,6 +4390,8 @@ impl ToolStream {
                     self.phase = ToolStreamPhase::Tail;
                     let rest = self.stop.finish();
                     if self.live.cancelled() {
+                        // The choice closes, so the usage so far is due.
+                        self.finished = true;
                         return Some(self.close_choice(&rest, "stop"));
                     }
                     warn!(task = %self.meta.id, "engine stream ended without a final chunk; emitting SSE error");
@@ -4462,9 +4467,7 @@ impl ToolStream {
                 Some(self.close_choice(&text, "stop"))
             } else if chunk.is_final {
                 text.push_str(&self.stop.finish());
-                let cancelled =
-                    chunk.finish_reason == Some(cascadia_types::FinishReason::Cancelled);
-                self.finished = !cancelled;
+                self.finished = true;
                 self.phase = ToolStreamPhase::Tail;
                 let reason = chunk
                     .finish_reason
@@ -12237,18 +12240,21 @@ level={{ effort_map[eff] }}";
 
     /// A stream whose task is cancelled through `POST /v1/cancel/{id}` ends
     /// with no final chunk from the engine. It sends the text the stop
-    /// matcher was holding (it never matched), closes the choice with
-    /// `stop`, and sends no usage chunk: the answer did not complete. Its
-    /// live entry goes when the body ends, and cancelling it again or
-    /// cancelling an unknown id adds none.
+    /// matcher was holding (it never matched) and closes the choice with
+    /// `stop`; a client that asked for `include_usage` then gets the usage
+    /// chunk with the counts so far, last before `[DONE]`, and one that did
+    /// not gets no `usage` key at all. Its live entry goes when the body
+    /// ends, and cancelling it again or cancelling an unknown id adds none.
     #[tokio::test]
     async fn cancelled_stream_ends_with_stop() {
-        for tools in [false, true] {
+        for (tools, include_usage) in [(false, true), (true, true), (false, false), (true, false)] {
             let (app, log, gate) =
                 script_app(&["first ST", "never sent"], true, SSE_KEEPALIVE_INTERVAL).await;
             let mut payload = serde_json::json!({"model": "mock-model", "stream": true,
-                "messages": [{"role": "user", "content": "hi"}], "stop": "STOP",
-                "stream_options": {"include_usage": true}});
+                "messages": [{"role": "user", "content": "hi"}], "stop": "STOP"});
+            if include_usage {
+                payload["stream_options"] = serde_json::json!({"include_usage": true});
+            }
             if tools {
                 payload["tools"] =
                     serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
@@ -12296,17 +12302,43 @@ level={{ effort_map[eff] }}";
                 events.iter().all(|e| e["object"] != "error"),
                 "tools={tools}: {text}"
             );
-            assert_eq!(
-                events.last().unwrap()["choices"][0]["finish_reason"],
-                "stop",
-                "tools={tools}: {text}"
-            );
-            assert!(
-                events
-                    .iter()
-                    .all(|e| e["choices"].as_array().is_some_and(|c| !c.is_empty())),
-                "tools={tools}: no usage chunk after a cancel: {text}"
-            );
+            assert_eq!(finish_reasons(&events), ["stop"], "tools={tools}: {text}");
+            let (last, choices) = events.split_last().unwrap();
+            if include_usage {
+                assert_eq!(
+                    last["choices"],
+                    serde_json::json!([]),
+                    "tools={tools}: {text}"
+                );
+                let usage = &last["usage"];
+                assert!(
+                    usage["completion_tokens"].as_u64().is_some_and(|n| n > 0),
+                    "tools={tools}: counts so far: {text}"
+                );
+                assert_eq!(
+                    usage["total_tokens"].as_u64(),
+                    Some(
+                        usage["prompt_tokens"].as_u64().unwrap()
+                            + usage["completion_tokens"].as_u64().unwrap()
+                    ),
+                    "tools={tools}: {text}"
+                );
+                assert!(usage["prompt_tokens_details"].is_object(), "{text}");
+                assert!(usage["completion_tokens_details"].is_object(), "{text}");
+                assert!(
+                    choices.iter().all(|e| e["usage"].is_null()),
+                    "tools={tools}: {text}"
+                );
+            } else {
+                assert!(
+                    events.iter().all(|e| e.get("usage").is_none()),
+                    "tools={tools}: no usage key without include_usage: {text}"
+                );
+                assert_eq!(
+                    last["choices"][0]["finish_reason"], "stop",
+                    "tools={tools}: {text}"
+                );
+            }
             assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
             assert_eq!(log.live.len(), 0, "tools={tools}: entry left after the end");
             post_cancel(app.clone(), &id).await;

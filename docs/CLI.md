@@ -446,10 +446,11 @@ ending with `data: [DONE]`) or not:
   `engine stream ended without a final chunk`) and `[DONE]`: the answer may
   be cut short, so it is not reported as complete. On a tools stream, calls
   already streamed stay sent and no others follow. A stream ended by
-  `POST /v1/cancel/<task_id>` instead closes its choice, with no usage chunk:
+  `POST /v1/cancel/<task_id>` instead closes its choice:
   `finish_reason: "stop"`, except on a tools stream whose calls had all
   completed, which ends `tool_calls` (`function_call` for a `functions`
-  request).
+  request). With `stream_options.include_usage` the usage chunk follows,
+  with the counts so far, before `[DONE]`.
 
 **Breaking for scripts that read the old stream:**
 
