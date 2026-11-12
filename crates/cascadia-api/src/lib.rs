@@ -11098,6 +11098,20 @@ level={{ effort_map[eff] }}";
         (status, v, grammar)
     }
 
+    /// Every `$ref` string anywhere in `v`.
+    fn refs_in(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(o) => {
+                if let Some(Value::String(r)) = o.get("$ref") {
+                    out.push(r.clone());
+                }
+                o.values().for_each(|c| refs_in(c, out));
+            }
+            Value::Array(a) => a.iter().for_each(|c| refs_in(c, out)),
+            _ => {}
+        }
+    }
+
     /// The `parameters` schema of a forced call grammar's only call shape.
     fn call_parameters(grammar: &cascadia_types::GrammarSpec) -> (Value, Value) {
         let body: Value = serde_json::from_str(&grammar.body).unwrap();
@@ -11261,6 +11275,105 @@ level={{ effort_map[eff] }}";
             assert_eq!(grammar.is_some(), !std::ptr::eq(schema, &pointer));
             assert_eq!(grammar, tool_grammar(&policy_of(&body), None), "{schema}");
         }
+    }
+
+    /// A recursive forced tool on sycl-llama follows the rule for any tool
+    /// there: on the chat endpoint (`--jinja`) the cycle is hoisted to
+    /// reserved `$defs` copies, and the call grammar uses the same copies,
+    /// under the same names, as the tool llama-server is sent (it reads
+    /// both into one table of refs); without `--jinja` it is a 400.
+    #[tokio::test]
+    async fn a_forced_recursive_tool_on_sycl_llama_shares_its_hoisted_copies_or_is_400_without_jinja(
+    ) {
+        let list = serde_json::json!({
+            "type": "object", "properties": {"head": {"$ref": "#/$defs/Node"}},
+            "$defs": {"Node": {"type": "object", "properties": {
+                "v": {"type": "integer"},
+                "next": {"anyOf": [{"$ref": "#/$defs/Node"}, {"type": "null"}]},
+            }}},
+        });
+        let tools = serde_json::json!([{"type": "function", "function": {
+            "name": "get_weather", "parameters": list.clone()
+        }}]);
+        let (status, v, grammar) = post_forced(SYCL, tools.clone(), "required".into()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let grammar = grammar.expect("a call grammar");
+        let (params, body) = call_parameters(&grammar);
+        let (expected, copies) = inlined_tool_parameters(&list, 0);
+        assert!(!copies.is_empty());
+        assert_eq!(params, expected);
+        for (name, copy) in &copies {
+            assert_eq!(&body["$defs"][name], copy, "{name}: {body}");
+        }
+        let mut refs = Vec::new();
+        refs_in(&body, &mut refs);
+        assert!(!refs.is_empty());
+        for r in refs {
+            assert!(r.starts_with("#/$defs/__cascadia_t0r"), "{r}: {body}");
+            assert!(copies.contains_key(&r["#/$defs/".len()..]), "{r}");
+        }
+
+        let (status, v, _) = post_forced(SYCL_NO_JINJA, tools, "required".into()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.starts_with("invalid tools: tools[0].function.parameters: ")
+                && err.contains("recursive"),
+            "{err}"
+        );
+    }
+
+    /// A JSON `response_format` beside callable tools on sycl-llama goes
+    /// into the call grammar ("a call or the asked-for JSON"), inlined like
+    /// a `response_format` schema. llama-server is not sent the format on
+    /// its own, so a ref there that can't be inlined (a pointer into data
+    /// holding a ref that is not a pointer) is not a 400: the grammar,
+    /// best-effort, is dropped (200, `unsupported_ref`).
+    #[tokio::test]
+    async fn a_format_beside_tools_with_a_ref_it_cant_inline_drops_the_union_on_sycl_llama() {
+        use cascadia_metrics::UnenforcedReason;
+        let format = |r: &str| {
+            serde_json::json!({
+                "$defs": {"N": {"type": "integer"}},
+                "type": "object", "properties": {"n": {"$ref": r}}, "required": ["n"],
+            })
+        };
+        let post = |schema: Value| async move {
+            let cfg = Config {
+                ref_resolver: SYCL,
+                ..Config::default()
+            };
+            let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+            let body = tool_body(
+                serde_json::json!([city_tool("get_weather")]),
+                serde_json::json!({"tool_choice": "auto", "response_format": json_schema_format(schema)}),
+            );
+            let (status, v) = post_chat(app, body).await;
+            let grammar = seen.lock().unwrap().last().and_then(|t| t.grammar.clone());
+            (status, v, grammar)
+        };
+        let before = unenforced_total(UnenforcedReason::UnsupportedRef);
+        // A pointer into data holding a ref that is not a pointer: the
+        // format alone passes its own checks, but can't be inlined.
+        let into_data = serde_json::json!({
+            "type": "object",
+            "$defs": {"A": {"type": "object", "default": {"x": {"$ref": "T"}}}},
+            "properties": {"v": {"$ref": "#/$defs/A/default/x"}},
+        });
+        let (status, v, grammar) = post(into_data).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(grammar, None);
+        assert!(unenforced_total(UnenforcedReason::UnsupportedRef) > before);
+
+        let (status, v, grammar) = post(format("#/$defs/N")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let grammar = grammar.expect("a union grammar");
+        assert!(!grammar.body.contains("$ref"), "{}", grammar.body);
+        let body: Value = serde_json::from_str(&grammar.body).unwrap();
+        assert_eq!(
+            body["anyOf"][1]["properties"]["n"],
+            serde_json::json!({"type": "integer"})
+        );
     }
 
     /// A forced tool whose `#/$defs/A/...` pointer leads into instance data

@@ -4233,6 +4233,96 @@ mod unix_tests {
         assert!(engine.submit(task).is_err());
     }
 
+    /// A call grammar as the API builds it for sycl-llama: the call array
+    /// for tool `f`, its `parameters` inlined as `inline_tool_parameters`
+    /// inlines `params` for tool 0, the hoisted copies at the root.
+    fn call_grammar_for(params: &serde_json::Value) -> serde_json::Value {
+        let mut inlined = cascadia_grammar::inline_refs(params, "t0", true)
+            .unwrap()
+            .schema;
+        let copies = inlined
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("$defs")
+            .unwrap_or_else(|| serde_json::json!({}));
+        serde_json::json!({
+            "type": "array", "minItems": 1,
+            "items": {"anyOf": [{"type": "object", "properties": {
+                "name": {"type": "string", "enum": ["f"]}, "parameters": inlined,
+            }, "required": ["name", "parameters"], "additionalProperties": false}]},
+            "$defs": copies,
+        })
+    }
+
+    /// The tool-call grammar (best-effort) comes from the API built from
+    /// the tools' `parameters` inlined as here: its only refs point at the
+    /// tool's hoisted copies, under the names the tool is sent with
+    /// (llama-server reads both into one table of refs, so each name has
+    /// one target). It is sent as built, not inlined again.
+    #[test]
+    fn a_tool_call_grammar_is_sent_as_the_api_built_it() {
+        let body = call_grammar_for(&list_schema());
+        assert!(body["$defs"]["__cascadia_t0r0x"].is_object(), "{body}");
+        let mut task = chat_task().with_grammar(
+            cascadia_types::GrammarSpec::best_effort_json_schema(body.to_string()),
+        );
+        task.tools = Some(
+            serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": list_schema()}}]),
+        );
+        task.tool_choice = Some(serde_json::json!("required"));
+        let mut engine = test_engine(1);
+        engine.submit(task).unwrap();
+        let sent = &engine.pending[0];
+        let g = sent.grammar.as_ref().expect("the grammar is kept");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&g.body).unwrap(),
+            body
+        );
+        let params = &sent.tools.as_ref().unwrap()[0]["function"]["parameters"];
+        for (name, copy) in body["$defs"].as_object().unwrap() {
+            assert_eq!(&params["$defs"][name], copy, "{name}");
+        }
+    }
+
+    /// A best-effort grammar holding a client ref is inlined like any
+    /// schema; one that can't be inlined is dropped (counted as
+    /// `unsupported_ref`), not refused: the task runs unconstrained.
+    #[test]
+    fn a_best_effort_grammar_that_cannot_be_inlined_is_dropped() {
+        let unsupported = || {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[cascadia_metrics::UnenforcedReason::UnsupportedRef.as_str()])
+                .get()
+        };
+        let mut engine = test_engine(1);
+        let ok = serde_json::json!({"$defs": {"B": {"type": "integer"}}, "type": "object", "properties": {"b": {"$ref": "#/$defs/B"}}});
+        engine
+            .submit(
+                chat_task().with_grammar(cascadia_types::GrammarSpec::best_effort_json_schema(
+                    ok.to_string(),
+                )),
+            )
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&engine.pending[0].grammar.as_ref().unwrap().body).unwrap();
+        assert_eq!(
+            body["properties"]["b"],
+            serde_json::json!({"type": "integer"})
+        );
+
+        let remote = serde_json::json!({"type": "object", "properties": {"a": {"$ref": "https://example.com/a.json"}}});
+        let before = unsupported();
+        let mut task = chat_task().with_grammar(
+            cascadia_types::GrammarSpec::best_effort_json_schema(remote.to_string()),
+        );
+        task.task_id = "task-2".into();
+        engine.submit(task).unwrap();
+        let sent = &engine.pending[1];
+        assert!(sent.grammar.is_none());
+        assert!(sent.grammar_dropped.get());
+        assert!(unsupported() > before);
+    }
+
     #[test]
     fn the_last_jinja_flag_wins() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
