@@ -497,7 +497,10 @@ private:
                                                     m_ids.end());
                 tail = m_tokenizer.decode(tail_ids);
             }
-            if (m_stream_text && n_tokens > 0 && m_prefix_off < m_all_ids.size()) {
+            if (m_stream_text && n_tokens > 0 && m_prefix_off == 0) {
+                // Nothing confirmed: the window is every id, decoded in place.
+                window = m_tokenizer.decode(m_all_ids);
+            } else if (m_stream_text && n_tokens > 0 && m_prefix_off < m_all_ids.size()) {
                 const std::vector<int64_t> window_ids(
                     m_all_ids.begin() + static_cast<std::ptrdiff_t>(m_prefix_off),
                     m_all_ids.end());

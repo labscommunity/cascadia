@@ -306,13 +306,14 @@ context window still ends an answer where the prompt plus the answer fill it
   stream holds back only a tail that could begin a stop sequence, so without
   `stop` nothing is delayed. `usage` after a cut counts the completion tokens
   received up to the cut, and the prompt: the token-streaming engines
-  (ov-runtime, gemma4, qwen35, dist-spec, ov-genai `--cb`, sparse-moe) report
-  it on their first token, and the one-shot ones (default ov-genai,
-  single-stage sparse-moe) put everything on one final chunk. sycl-llama
+  (ov-runtime, gemma4, qwen35, dist-spec, ov-genai with or without `--cb`,
+  sparse-moe) report it on their first token, and single-stage sparse-moe
+  puts everything on one final chunk. sycl-llama
   learns the count only at the end, so a cut there reports a prompt of 0; that
   is rare, because `llama-server` applies `stop` itself.
 - **One-shot engines end early too.** Two engines make a whole answer in one
-  call: the default (non-`--cb`) ov-genai path and single-stage sparse-moe.
+  call: the default (non-`--cb`) ov-genai path (which streams each token's
+  text as that call writes it) and single-stage sparse-moe.
   That call now ends early when the client disconnects (streaming or not),
   on `/v1/cancel/{task_id}`, or when a `stop` sequence matches. It ends within one token,
   or within one decode round with ov-genai's `--draft-model` / `--prompt-lookup`
@@ -329,7 +330,8 @@ context window still ends an answer where the prompt plus the answer fill it
     models waits for the prefill to finish, because those models prefill the
     prompt as one batch.
   - On these paths every generated token now costs one extra check, plus a
-    short decode of the newest tokens while a `stop` is set.
+    short decode of the newest tokens while a `stop` is set (on ov-genai,
+    which streams, the check runs on the streamed text instead).
   - ov-genai prefills the prompt in one call that can't be interrupted, so a
     cancel during a long prompt's prefill waits for it to finish.
   - When ov-genai runs its streamer on a worker thread (the paged-attention /
@@ -337,8 +339,9 @@ context window still ends an answer where the prompt plus the answer fill it
     pipelines; the node logs `ov-genai streamer thread threaded_streamer=true`
     once), a cancel or stop lands one step later.
   - When the answer starts with text the server strips (an echoed prompt and
-    the whitespace after it; an empty prompt counts as echoed), the engine's
-    stop check starts one short window after that text: about the longest stop's length + 16 tokens, plus one
+    the whitespace after it; an empty prompt counts as echoed), ov-genai
+    checks the answer from its first visible character. On sparse-moe the
+    engine's stop check starts one short window after that text: about the longest stop's length + 16 tokens, plus one
     speculative round with draft / prompt-lookup. If the stripped text runs
     past that window, the check is skipped for the request. The API still
     cuts at the stop, so the answer is the same either way. A chat answer

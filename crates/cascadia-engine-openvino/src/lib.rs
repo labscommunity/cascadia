@@ -13,6 +13,8 @@
 pub mod dist_spec;
 pub mod gemma4;
 pub mod genai;
+mod genai_stream;
+mod genai_worker;
 #[cfg(feature = "kv_coord")]
 pub mod kv_coordination;
 pub mod packed;

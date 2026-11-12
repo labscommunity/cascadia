@@ -14,17 +14,17 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{
-    Builder, Engine, EngineError, EngineResult, InflightCancel, LoadStream, OneShotStop,
-    PendingLoad, SubmitAdmission, VisibleArm,
+    Builder, Engine, EngineError, EngineResult, InflightCancel, LoadStream, PendingLoad,
+    SubmitAdmission,
 };
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
-    GenConfig, GenResult, LlmPipeline, PluginConfig, PollAction, PollFn, PollReply, PollWrite,
+    GenConfig, GenResult, LlmPipeline, PluginConfig, PollFn,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
@@ -32,6 +32,11 @@ use cascadia_types::{
 };
 use futures::stream;
 use tracing::{info, warn};
+
+use crate::genai_worker::{
+    lock_pipe, run_job, Done, Event, GenJob, GenParams, Job, Outcome, Recv, SharedPipe,
+    StatefulWorker,
+};
 
 pub struct OvGenaiBuilder {
     pub model_path: String,
@@ -60,6 +65,9 @@ pub struct OvGenaiBuilder {
     /// true; off when the server has a marker dialect, whose filtered text is
     /// not what the engine sees (the CLI decides).
     pub engine_stop_check: bool,
+    /// Stream the stateful path: hand out each streamer write's text as it
+    /// is generated (see the `stream_writes` method). Off by default.
+    pub stream_writes: bool,
     pipe: Option<Box<dyn StatefulPipe>>,
     cb_pipe: Option<CbPipeline>,
 }
@@ -87,6 +95,7 @@ impl OvGenaiBuilder {
             continuous_batching: None,
             context_window: None,
             engine_stop_check: true,
+            stream_writes: false,
             pipe: None,
             cb_pipe: None,
         }
@@ -96,6 +105,19 @@ impl OvGenaiBuilder {
     /// match (see [`Self::engine_stop_check`]).
     pub fn with_engine_stop_check(mut self, on: bool) -> Self {
         self.engine_stop_check = on;
+        self
+    }
+
+    /// Stream the default (stateful) path. On, `step()` returns each
+    /// streamer write's text as a token chunk while the generation runs
+    /// (on a thread that owns the pipeline), a zero-token progress chunk
+    /// when nothing new came within [`STEP_POLL`], and a final chunk with
+    /// the rest of the answer and its `completion_tokens`. The deltas plus
+    /// the final's text are the answer the non-streamed path returns. Off,
+    /// the whole answer comes on one final chunk, as before. `--cb` streams
+    /// either way.
+    pub fn stream_writes(mut self, on: bool) -> Self {
+        self.stream_writes = on;
         self
     }
 
@@ -366,19 +388,16 @@ impl Builder for OvGenaiBuilder {
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
-        Ok(Box::new(OvGenaiEngine {
-            pipe,
+        let params = GenParams {
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
-            pending: Vec::new(),
-            pending_len: Arc::new(AtomicUsize::new(0)),
             max_tokens_default: 256,
             context_window: self.context_window,
-            inflight: Arc::new(InflightCancel::new()),
             engine_stop_check: self.engine_stop_check,
-            streamer_thread_logged: false,
-        }))
+            stream_text: self.stream_writes,
+        };
+        Ok(Box::new(OvGenaiEngine::new(pipe, params)?))
     }
 }
 
@@ -397,7 +416,11 @@ fn map_ov_err(err: OvError) -> EngineError {
 /// the prompt plus the answer never run past it. Unchanged when either count
 /// is unknown, or when the prompt alone reaches the window (the pipeline
 /// accepted it, so that window is not its real limit).
-fn stateful_max_new(max_new: u32, prompt_tokens: Option<u32>, window: Option<u32>) -> u32 {
+pub(crate) fn stateful_max_new(
+    max_new: u32,
+    prompt_tokens: Option<u32>,
+    window: Option<u32>,
+) -> u32 {
     match (prompt_tokens, window) {
         (Some(prompt), Some(window)) if prompt < window => max_new.min(window - prompt),
         _ => max_new,
@@ -406,7 +429,7 @@ fn stateful_max_new(max_new: u32, prompt_tokens: Option<u32>, window: Option<u32
 
 /// The slice of [`LlmPipeline`] the stateful engine uses: a test seam like
 /// [`CbPipe`], so `step()`'s cancel and stop handling runs without OpenVINO.
-trait StatefulPipe: Send {
+pub(crate) trait StatefulPipe: Send {
     fn count_tokens(&self, text: &str) -> Option<u32>;
     fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError>;
     fn generate_polled(
@@ -497,41 +520,369 @@ impl SubmitAdmission for StatefulAdmission {
     }
 }
 
+/// How long a streaming `step()` waits for the generation's next event before
+/// it returns a progress chunk, so the engine lock is free at least this
+/// often (a queued submit or a cancel gets in) and a long prefill still
+/// counts as progress for the runner.
+pub const STEP_POLL: Duration = Duration::from_millis(50);
+
 pub struct OvGenaiEngine {
-    pipe: Box<dyn StatefulPipe>,
-    speculative_k: u32,
-    prompt_lookup_ngram: u32,
-    prompt_pretemplated: bool,
+    pipe: SharedPipe,
+    params: GenParams,
     pending: Vec<GenerationTask>,
     /// `pending.len()`, kept current in `submit`, `step` and `cancel` for the
     /// [`StatefulAdmission`], which reads it without the engine lock.
     pending_len: Arc<AtomicUsize>,
-    max_tokens_default: u32,
-    /// The server's known context window: one `generate()` call makes the
-    /// whole answer, so its limit is cut to what the prompt leaves of it.
-    context_window: Option<u32>,
     /// The runner signals a cancel here while `step()` holds the engine
-    /// lock; the poll closure reads it once per streamer write.
+    /// lock (or, streaming, while the worker runs the generation); the poll
+    /// closure reads it once per streamer write.
     inflight: Arc<InflightCancel>,
-    /// End a running generation at a `stop` match.
-    engine_stop_check: bool,
     /// Set once the first poll of the engine's life has told which thread
     /// runs ov-genai's streamer (logged once, for the hardware check).
     streamer_thread_logged: bool,
+    /// With [`OvGenaiBuilder::stream_writes`]: the worker and its task.
+    stream: Option<Streaming>,
+}
+
+/// The streaming engine's worker and the task it runs.
+struct Streaming {
+    worker: StatefulWorker,
+    running: Option<Running>,
+}
+
+/// The task the worker is generating.
+struct Running {
+    task_id: TaskId,
+    prompt_tokens: Option<u32>,
+    prompt_reported: bool,
+    /// Ends the task on the inflight handle when the task is over.
+    _end: EndInflight,
+}
+
+impl OvGenaiEngine {
+    fn new(pipe: Box<dyn StatefulPipe>, params: GenParams) -> EngineResult<Self> {
+        let pipe: SharedPipe = Arc::new(Mutex::new(pipe));
+        let inflight = Arc::new(InflightCancel::new());
+        let stream = if params.stream_text {
+            Some(Streaming {
+                worker: spawn_worker(&pipe, &inflight)?,
+                running: None,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            pipe,
+            params,
+            pending: Vec::new(),
+            pending_len: Arc::new(AtomicUsize::new(0)),
+            inflight,
+            streamer_thread_logged: false,
+            stream,
+        })
+    }
+
+    /// Publish `pending.len()` to the [`StatefulAdmission`].
+    fn sync_pending_len(&self) {
+        self.pending_len.store(self.pending.len(), Ordering::SeqCst);
+    }
+
+    /// Take the next queued task and begin it on the inflight handle. `Err`
+    /// carries the final chunk of a task cancelled before it began.
+    #[allow(clippy::result_large_err)]
+    fn begin_next(&mut self) -> Option<Result<(GenerationTask, EndInflight), (TaskId, Chunk)>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let task = self.pending.remove(0);
+        self.sync_pending_len();
+        let end = EndInflight(self.inflight.clone());
+        if self.inflight.begin(&task.task_id) {
+            info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
+            let chunk = cancelled_chunk(&task.task_id, None);
+            return Some(Err((task.task_id, chunk)));
+        }
+        Some(Ok((task, end)))
+    }
+
+    /// The whole generation inside this call, one final chunk.
+    fn step_inline(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        let (task, _end) = match self.begin_next() {
+            None => return Ok(Vec::new()),
+            Some(Err(cancelled)) => return Ok(vec![cancelled]),
+            Some(Ok(begun)) => begun,
+        };
+        let done = {
+            let pipe = lock_pipe(&self.pipe);
+            run_job(
+                &**pipe,
+                &self.params,
+                &self.inflight,
+                &task,
+                !self.streamer_thread_logged,
+                &mut |_| {},
+            )
+        };
+        let chunk = final_chunk(
+            &self.inflight,
+            &mut self.streamer_thread_logged,
+            &task.task_id,
+            done,
+            None,
+        );
+        Ok(vec![(task.task_id, chunk)])
+    }
+
+    /// Start the next task on the worker if none runs, then return what it
+    /// produced within [`STEP_POLL`]: its deltas, its final, or a progress
+    /// chunk.
+    fn step_streaming(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        let idle = self.stream.as_ref().is_some_and(|s| s.running.is_none());
+        if idle {
+            let (task, end) = match self.begin_next() {
+                None => return Ok(Vec::new()),
+                Some(Err(cancelled)) => return Ok(vec![cancelled]),
+                Some(Ok(begun)) => begun,
+            };
+            let task_id = task.task_id.clone();
+            let job = Job::Generate(Box::new(GenJob {
+                task,
+                params: self.params.clone(),
+                probe_thread: !self.streamer_thread_logged,
+            }));
+            let Some(stream) = self.stream.as_mut() else {
+                return Ok(Vec::new());
+            };
+            if let Err(job) = stream.worker.send(job) {
+                // The thread is gone: a new one takes the job.
+                warn!(task = %task_id, "ov-genai worker thread is gone; starting a new one");
+                let sent = spawn_worker(&self.pipe, &self.inflight)
+                    .map_err(|e| e.to_string())
+                    .and_then(|worker| {
+                        stream.worker = worker;
+                        stream
+                            .worker
+                            .send(job)
+                            .map_err(|_| "the new worker thread is gone too".to_string())
+                    });
+                if let Err(err) = sent {
+                    let chunk = Chunk::error(
+                        task_id.clone(),
+                        format!("ov-genai worker thread unavailable: {err}"),
+                    );
+                    return Ok(vec![(task_id, chunk)]);
+                }
+            }
+            stream.running = Some(Running {
+                task_id,
+                prompt_tokens: None,
+                prompt_reported: false,
+                _end: end,
+            });
+        }
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let Some(running) = stream.running.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let task_id = running.task_id.clone();
+        let mut out = Vec::new();
+        let mut wait = Some(STEP_POLL);
+        loop {
+            match stream.worker.next(wait.take()) {
+                Recv::Idle => break,
+                Recv::Event(Event::Started { prompt_tokens }) => {
+                    running.prompt_tokens = prompt_tokens;
+                }
+                Recv::Event(Event::Delta { text, n_tokens }) => {
+                    let mut chunk =
+                        Chunk::token(task_id.clone(), 0, text).with_n_tokens(n_tokens as u32);
+                    if let Some(n) = running.prompt_tokens {
+                        chunk = chunk.with_first_prompt_tokens(&mut running.prompt_reported, n);
+                    }
+                    out.push((task_id.clone(), chunk));
+                }
+                Recv::Event(Event::Done(mut done)) => {
+                    done.prompt_tokens = done.prompt_tokens.or(running.prompt_tokens);
+                    let chunk = final_chunk(
+                        &self.inflight,
+                        &mut self.streamer_thread_logged,
+                        &task_id,
+                        *done,
+                        Some(&*running),
+                    );
+                    out.push((task_id.clone(), chunk));
+                    // Ends the task on the inflight handle.
+                    stream.running = None;
+                    break;
+                }
+                Recv::Gone => {
+                    warn!(task = %task_id, "ov-genai worker thread exited mid-generation");
+                    out.push((
+                        task_id.clone(),
+                        Chunk::error(task_id.clone(), "ov-genai worker thread exited"),
+                    ));
+                    stream.running = None;
+                    // The next task gets a new thread.
+                    match spawn_worker(&self.pipe, &self.inflight) {
+                        Ok(worker) => stream.worker = worker,
+                        Err(err) => warn!(error = %err, "ov-genai worker thread: respawn failed"),
+                    }
+                    break;
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push((task_id.clone(), Chunk::progress(task_id)));
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for OvGenaiEngine {
+    fn drop(&mut self) {
+        // A streaming generation still running ends at its next write; the
+        // worker is then joined.
+        if let Some(stream) = self.stream.as_ref() {
+            if stream.running.is_some() {
+                self.inflight.shutdown();
+            }
+        }
+    }
+}
+
+fn spawn_worker(pipe: &SharedPipe, inflight: &Arc<InflightCancel>) -> EngineResult<StatefulWorker> {
+    StatefulWorker::spawn(pipe.clone(), inflight.clone())
+        .map_err(|e| EngineError::Backend(format!("ov-genai worker thread: {e}")))
+}
+
+/// The final chunk of a generation that ran to `done`: cancelled, failed, or
+/// the answer. Inline (`running` is `None`) the answer is the whole text with
+/// its token count, as the non-streamed path always returned it; streaming,
+/// it is what the deltas did not carry, the carried tokens and the answer's
+/// `completion_tokens`.
+fn final_chunk(
+    inflight: &InflightCancel,
+    streamer_thread_logged: &mut bool,
+    task_id: &TaskId,
+    done: Done,
+    running: Option<&Running>,
+) -> Chunk {
+    if let Some(threaded_streamer) = done.threaded_streamer {
+        *streamer_thread_logged = true;
+        info!(threaded_streamer, "ov-genai streamer thread");
+    }
+    if matches!(done.outcome, Outcome::Cancelled) || inflight.cancelled() {
+        info!(
+            task = %task_id,
+            tokens = done.polled_tokens,
+            elapsed_s = done.elapsed_s,
+            "task cancelled"
+        );
+        return cancelled_chunk(task_id, done.prompt_tokens);
+    }
+    let f = match done.outcome {
+        Outcome::Cancelled => return cancelled_chunk(task_id, done.prompt_tokens),
+        Outcome::Failed(err) => {
+            warn!(task = %task_id, error = %err, "generate failed");
+            // Chunk::error, not an empty final_marker: the latter reads as
+            // a SUCCESSFUL empty completion, so the client got a 200 with
+            // no content and cascadia_tasks_failed_total never moved —
+            // the failure was booked as finish_reason="stop" with zero
+            // tokens. Same class as the poisoned-head bug guarded in
+            // qwen36.rs. This is the default engine, so it was the common
+            // failure that the failure metric could not see.
+            return Chunk::error(task_id.clone(), err.to_string());
+        }
+        Outcome::Finished(f) => f,
+    };
+    if f.stop_missing {
+        warn!(
+            task = %task_id,
+            "engine stopped on a stop the returned text lacks (stop-text invariant)"
+        );
+    }
+    let tokens = f.completion_tokens;
+    let elapsed = done.elapsed_s;
+    let tok_s = if elapsed > 0.0 {
+        tokens as f64 / elapsed
+    } else {
+        0.0
+    };
+    if f.stopped_on_match {
+        info!(
+            task = %task_id,
+            tokens,
+            elapsed_s = elapsed,
+            "task stopped at stop string"
+        );
+    } else {
+        info!(
+            task = %task_id,
+            tokens,
+            elapsed_s = elapsed,
+            tok_s,
+            ttft_ms = f.ttft_ms,
+            "task done"
+        );
+    }
+
+    // Carry the real token counts on the final chunk so the API's
+    // `usage` block is populated (issue #55). `prompt_tokens` is the
+    // rendered-prompt token count; it is exact when the API pre-templated
+    // the prompt (`skip_chat_template`) and a slight undercount when
+    // ov-genai applies its own template internally (the template wrapping
+    // isn't counted). None when the tokenizer is unavailable.
+    // finish_reason: ov-genai's GenResult doesn't report why it stopped,
+    // so infer — reaching the token cap is `length`, anything short of it
+    // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
+    // exactly at the cap reports `length` (OpenAI is also ambiguous here).
+    // A stop match ended it: `stop`, whatever the count. The text keeps
+    // the match; the API's StopMatcher makes the cut.
+    let finish = if !f.stopped_on_match && tokens >= f.max_new {
+        FinishReason::Length
+    } else {
+        FinishReason::Stop
+    };
+    let mut chunk = match (running, f.stream) {
+        (Some(_), Some(rest)) => {
+            if rest.diverged {
+                // The deltas already sent are not a prefix of the answer:
+                // nothing more is sent. The parity check on hardware fails
+                // on this line.
+                warn!(
+                    task = %task_id,
+                    emitted_bytes = rest.emitted_bytes,
+                    visible_bytes = f.visible.len(),
+                    "ov_genai_stream_divergence: the streamed text is not a prefix of the answer"
+                );
+            }
+            Chunk::final_marker(task_id.clone(), rest.rest)
+                .with_n_tokens(rest.carried_tokens as u32)
+                .with_completion_tokens(tokens)
+        }
+        _ => Chunk::final_marker(task_id.clone(), f.visible).with_n_tokens(tokens),
+    };
+    chunk = chunk.with_finish_reason(finish);
+    if let Some(prompt_tokens) = done.prompt_tokens {
+        chunk = chunk.with_prompt_tokens(prompt_tokens);
+    }
+    chunk
 }
 
 impl Engine for OvGenaiEngine {
     fn warmup(&mut self) {
-        let cfg = self.gen_config(
+        let cfg = self.params.gen_config(
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
             /*enable_thinking*/ false,
             &SamplingParams::default(),
         );
-        match self.pipe.generate("Hi", &cfg) {
+        match lock_pipe(&self.pipe).generate("Hi", &cfg) {
             Ok(_) => info!(
-                spec_k = self.speculative_k,
-                prompt_lookup = self.prompt_lookup_ngram,
+                spec_k = self.params.speculative_k,
+                prompt_lookup = self.params.prompt_lookup_ngram,
                 "ov-genai warmup ok"
             ),
             Err(err) => warn!(error = %err, "ov-genai warmup failed"),
@@ -560,11 +911,13 @@ impl Engine for OvGenaiEngine {
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
-        // A running generation holds the engine mutex for its whole step(), so
-        // this (&mut self) only runs between tasks and drops a queued one. A
-        // running one is ended through `inflight` instead, which the runner
-        // signals without the lock. The runner signalled it for this id too;
-        // the task will now never begin, so drop that early entry.
+        // Without streaming a running generation holds the engine mutex for
+        // its whole step(), so this (&mut self) only runs between tasks and
+        // drops a queued one. Streaming, it can run while the worker
+        // generates. Either way a running task is ended through `inflight`
+        // instead, which the runner signals without the lock (and has
+        // signalled for this id too); `forget` leaves a running task alone.
+        // A queued task will now never begin, so drop that early entry.
         self.pending.retain(|t| &t.task_id != task_id);
         self.sync_pending_len();
         self.inflight.forget(task_id);
@@ -581,212 +934,11 @@ impl Engine for OvGenaiEngine {
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
-        if self.pending.is_empty() {
-            return Ok(Vec::new());
-        }
-        let task = self.pending.remove(0);
-        self.sync_pending_len();
-        let _end = EndInflight(self.inflight.clone());
-        if self.inflight.begin(&task.task_id) {
-            info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
-            let chunk = cancelled_chunk(&task.task_id, None);
-            return Ok(vec![(task.task_id, chunk)]);
-        }
-        let max_new = if task.max_tokens > 0 {
-            task.max_tokens
+        if self.stream.is_some() {
+            self.step_streaming()
         } else {
-            self.max_tokens_default
-        };
-        let prompt_tokens = self.pipe.count_tokens(&task.prompt);
-        // The pipeline does not stop at the window itself; capped here, the
-        // `tokens >= max_new` inference below reports `length` there.
-        let max_new = stateful_max_new(max_new, prompt_tokens, self.context_window);
-        let cfg = self.gen_config(
-            max_new,
-            task.temperature,
-            task.enable_thinking,
-            &task.sampling,
-        );
-
-        let started = Instant::now();
-        // Always the polled generate, so a cancel always works (the A/B in the
-        // hardware check prices the per-token callback).
-        let inflight = self.inflight.clone();
-        let stop = if self.engine_stop_check {
-            OneShotStop::new(&task.sampling.stop)
-        } else {
-            OneShotStop::new(&[])
-        };
-        // The shim decodes the last `tail_tokens` generated ids per write and
-        // the check runs on that suffix decode: it is a substring of
-        // the returned text (OneShotStop's input contract), unlike streamer
-        // pieces. The +16 covers a run of 0-byte (special) tokens. A draft
-        // model or prompt-lookup writes a whole speculative round at once
-        // (up to `num_assistant_tokens` + 1 ids), so the window grows by that
-        // round too, as sparse-moe's `extra_slack` does. 0 = no decode at all
-        // when nothing is checked.
-        let round_slack = if cfg.num_assistant_tokens > 0 {
-            cfg.num_assistant_tokens as usize + 1
-        } else {
-            0
-        };
-        let tail_tokens = if stop.is_active() {
-            stop.max_stop_bytes() + 16 + round_slack
-        } else {
-            0
-        };
-        // Arm the check only on text the visible answer keeps: an
-        // engine stop inside a stripped prompt echo or leading whitespace
-        // would give a different answer than a run with the check off.
-        let mut arm = VisibleArm::new(&task.prompt, tail_tokens);
-        let mut polled_tokens: u64 = 0;
-        let mut stopped_on_match = false;
-        // Which thread ov-genai calls the streamer on, probed on the first
-        // poll of the engine's life only: inline (the stateful backend) or its
-        // own worker thread (the paged-attention / CB adapter, speculative
-        // pipelines). Logged after generate, on this thread.
-        let step_thread = std::thread::current().id();
-        let mut probe_thread = !self.streamer_thread_logged;
-        let mut threaded_streamer: Option<bool> = None;
-        let generated = {
-            // The answer the closure has given once it ended the generation:
-            // the shim polls once more at the end (n_tokens 0), and that call
-            // must not decide again.
-            let mut ended: Option<PollAction> = None;
-            let mut decide = |tail: &str, n_tokens: usize| -> PollAction {
-                if probe_thread {
-                    probe_thread = false;
-                    threaded_streamer = Some(std::thread::current().id() != step_thread);
-                }
-                polled_tokens += n_tokens as u64;
-                if let Some(action) = ended {
-                    return action;
-                }
-                if inflight.cancelled() {
-                    ended = Some(PollAction::Cancel);
-                    return PollAction::Cancel;
-                }
-                if tail_tokens > 0
-                    && n_tokens > 0
-                    && arm.armed(polled_tokens as usize, tail)
-                    && stop.matches_tail(tail)
-                {
-                    stopped_on_match = true;
-                    ended = Some(PollAction::Stop);
-                    return PollAction::Stop;
-                }
-                PollAction::Running
-            };
-            let mut poll = |w: PollWrite<'_>| PollReply::from(decide(w.tail, w.n_tokens));
-            self.pipe
-                .generate_polled(&task.prompt, &cfg, tail_tokens, false, &mut poll)
-        };
-        if let Some(threaded_streamer) = threaded_streamer {
-            self.streamer_thread_logged = true;
-            info!(threaded_streamer, "ov-genai streamer thread");
+            self.step_inline()
         }
-        if self.inflight.cancelled() {
-            // Also when generate failed after the CANCEL: the task ends as
-            // cancelled, never as an error or a partial success.
-            info!(
-                task = %task.task_id,
-                tokens = polled_tokens,
-                elapsed_s = started.elapsed().as_secs_f64(),
-                "task cancelled"
-            );
-            let chunk = cancelled_chunk(&task.task_id, prompt_tokens);
-            return Ok(vec![(task.task_id, chunk)]);
-        }
-        let result = match generated {
-            Ok(r) => r,
-            Err(err) => {
-                // A panic in the poll closure lands here too
-                // (`err.is_poll_panic()`): it cancelled the generation, and
-                // its partial text must not read as a success.
-                warn!(task = %task.task_id, error = %err, "generate failed");
-                // Chunk::error, not an empty final_marker: the latter reads as
-                // a SUCCESSFUL empty completion, so the client got a 200 with
-                // no content and cascadia_tasks_failed_total never moved —
-                // the failure was booked as finish_reason="stop" with zero
-                // tokens. Same class as the poisoned-head bug guarded in
-                // qwen36.rs. This is the default engine, so it was the common
-                // failure that the failure metric could not see.
-                let final_chunk = Chunk::error(task.task_id.clone(), err.to_string());
-                return Ok(vec![(task.task_id, final_chunk)]);
-            }
-        };
-        let elapsed = started.elapsed().as_secs_f64();
-
-        let raw = result.text;
-        let text = match raw.strip_prefix(&task.prompt) {
-            Some(stripped) => stripped.trim_start().to_string(),
-            None => raw,
-        };
-        // The check armed only on text this visible answer keeps,
-        // so it holds the stop. If it doesn't, the stop-text invariant (a window
-        // decode is a substring of the final decode) broke. That can rarely
-        // happen when a detokenizer cleanup rule (`clean_up_tokenization_spaces`)
-        // rewrites text based on later tokens. Keep the text and warn: the
-        // hardware check fails on that line.
-        if stopped_on_match && !OneShotStop::new(&task.sampling.stop).push(&text) {
-            warn!(
-                task = %task.task_id,
-                "engine stopped on a stop the returned text lacks (stop-text invariant)"
-            );
-        }
-        // Prefer tokenizer-based count; fall back to perf_metrics value.
-        let tokens = self
-            .pipe
-            .count_tokens(&text)
-            .unwrap_or(result.generated_tokens);
-        let tok_s = if elapsed > 0.0 {
-            tokens as f64 / elapsed
-        } else {
-            0.0
-        };
-        if stopped_on_match {
-            info!(
-                task = %task.task_id,
-                tokens,
-                elapsed_s = elapsed,
-                "task stopped at stop string"
-            );
-        } else {
-            info!(
-                task = %task.task_id,
-                tokens,
-                elapsed_s = elapsed,
-                tok_s,
-                "task done"
-            );
-        }
-
-        // Carry the real token counts on the final chunk so the API's
-        // `usage` block is populated (issue #55 — previously always 0 for
-        // this engine because the whole response lands on one chunk with no
-        // per-token count). `prompt_tokens` is the rendered-prompt token
-        // count; it is exact when the API pre-templated the prompt
-        // (`skip_chat_template`) and a slight undercount when ov-genai
-        // applies its own template internally (the template wrapping isn't
-        // counted). None when the tokenizer is unavailable.
-        // finish_reason: ov-genai's GenResult doesn't report why it stopped,
-        // so infer — reaching the token cap is `length`, anything short of it
-        // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
-        // exactly at the cap reports `length` (OpenAI is also ambiguous here).
-        // A stop match ended it: `stop`, whatever the count. The text keeps
-        // the match; the API's StopMatcher makes the cut.
-        let finish = if !stopped_on_match && tokens >= max_new {
-            FinishReason::Length
-        } else {
-            FinishReason::Stop
-        };
-        let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
-            .with_n_tokens(tokens)
-            .with_finish_reason(finish);
-        if let Some(prompt_tokens) = prompt_tokens {
-            chunk = chunk.with_prompt_tokens(prompt_tokens);
-        }
-        Ok(vec![(task.task_id, chunk)])
     }
 }
 
@@ -1260,7 +1412,7 @@ impl Engine for OvGenaiCbEngine {
 
 /// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
 /// passes 0 for the speculative knobs — the CB scheduler owns batching).
-fn build_gen_config(
+pub(crate) fn build_gen_config(
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -1307,46 +1459,6 @@ fn build_gen_config(
         cfg.max_ngram_size = prompt_lookup_ngram;
     }
     cfg
-}
-
-impl OvGenaiEngine {
-    /// Publish `pending.len()` to the [`StatefulAdmission`].
-    fn sync_pending_len(&self) {
-        self.pending_len.store(self.pending.len(), Ordering::SeqCst);
-    }
-
-    /// SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1; not re-checked on
-    /// the current 2026.2 floor): `seed` is forwarded to
-    /// `GenerationConfig.rng_seed`, but it does NOT make ov-genai reproducible
-    /// across requests on this reused `LLMPipeline`. OV-GenAI's
-    /// `StatefulLLMPipeline` only re-seeds when the seed VALUE CHANGES between
-    /// consecutive `generate()` calls (`if (m_sampler.get_seed() !=
-    /// config.rng_seed) set_seed(...)`) and never calls `clear_request_info`,
-    /// so two identical seeds in a row reuse the advanced RNG and diverge.
-    /// Different seeds DO change the output, and the Rust-sampler engines
-    /// (ov-runtime/sparse-moe) honor seed fully — they re-seed per request.
-    ///
-    /// This is a property of `StatefulLLMPipeline`, so it does not describe
-    /// [`OvGenaiCbEngine`]: `ContinuousBatchingPipeline` builds a fresh request
-    /// context per request. Whether that yields per-request reproducibility in
-    /// practice is untested here.
-    fn gen_config(
-        &self,
-        max_tokens: u32,
-        temperature: f32,
-        enable_thinking: bool,
-        sampling: &SamplingParams,
-    ) -> GenConfig {
-        build_gen_config(
-            self.speculative_k,
-            self.prompt_lookup_ngram,
-            self.prompt_pretemplated,
-            max_tokens,
-            temperature,
-            enable_thinking,
-            sampling,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -2065,7 +2177,7 @@ mod tests {
     // closure one scripted piece at a time, as the shim's streamer does.
 
     use cascadia_engine::InflightCancel;
-    use cascadia_ov_genai_shim::{GenResult, PollAction, POLL_PANICKED};
+    use cascadia_ov_genai_shim::{GenResult, PollAction, PollReply, PollWrite, POLL_PANICKED};
 
     #[derive(Default)]
     struct StatefulState {
@@ -2076,11 +2188,19 @@ mod tests {
         tail_tokens: Vec<usize>,
         /// The `stream_text` of every generate_polled call.
         stream_text: Vec<bool>,
-        /// Every poll call's (window, window_from); empty and 0 here, as the
-        /// shim passes without `stream_text`.
+        /// Every poll call's (window, window_from), as the closure received
+        /// them: with `stream_text` the decode of every token so far (the
+        /// engine never confirms), else empty.
         windows: Vec<(Vec<u8>, usize)>,
-        /// Panic in count_tokens (a panic inside step, after begin).
-        count_panics: bool,
+        /// Every reply the closure gave.
+        replies: Vec<PollReply>,
+        /// Panic in the next this-many count_tokens calls (a panic inside the
+        /// generation, after begin).
+        count_panics: usize,
+        /// Wait here before generating (the test holds the other side).
+        gate: Option<Arc<std::sync::Barrier>>,
+        /// Sleep this long before the first write (a long prefill).
+        prefill: Option<std::time::Duration>,
         /// Before piece i is polled, cancel the running task through this
         /// handle (what the runner does on a disconnect).
         cancel_before: Option<(usize, Arc<InflightCancel>, TaskId)>,
@@ -2112,8 +2232,13 @@ mod tests {
 
     impl StatefulPipe for MockStatefulPipe {
         fn count_tokens(&self, text: &str) -> Option<u32> {
-            if self.st.lock().unwrap().count_panics {
-                panic!("mock: count_tokens panicked");
+            {
+                let mut st = self.st.lock().unwrap();
+                if st.count_panics > 0 {
+                    st.count_panics -= 1;
+                    drop(st);
+                    panic!("mock: count_tokens panicked");
+                }
             }
             Some(text.split_whitespace().count() as u32)
         }
@@ -2135,27 +2260,42 @@ mod tests {
             stream_text: bool,
             poll: &mut PollFn<'_>,
         ) -> Result<GenResult, OvError> {
-            self.st.lock().unwrap().stream_text.push(stream_text);
-            // The mock streams no window: the closure sees what the shim
-            // passes without `stream_text`.
-            let mut poll = |tail: &str, n_tokens: usize| -> PollAction {
-                self.st.lock().unwrap().windows.push((Vec::new(), 0));
-                poll(PollWrite {
+            let (gate, prefill) = {
+                let mut st = self.st.lock().unwrap();
+                st.stream_text.push(stream_text);
+                (st.gate.clone(), st.prefill)
+            };
+            if let Some(gate) = gate {
+                gate.wait();
+            }
+            if let Some(prefill) = prefill {
+                std::thread::sleep(prefill);
+            }
+            // What the shim hands the closure, recorded as the closure got it.
+            let mut poll = |tail: &str, window: &[u8], n_tokens: usize| -> PollAction {
+                let w = PollWrite {
                     tail,
-                    window: &[],
+                    window,
                     window_from: 0,
                     n_tokens,
-                })
-                .action
+                };
+                self.st
+                    .lock()
+                    .unwrap()
+                    .windows
+                    .push((w.window.to_vec(), w.window_from));
+                let reply = poll(w);
+                self.st.lock().unwrap().replies.push(reply);
+                reply.action
             };
             if self.st.lock().unwrap().poll_from_thread {
                 return std::thread::scope(|sc| {
-                    sc.spawn(|| self.run_polled(prompt, cfg, tail_tokens, &mut poll))
+                    sc.spawn(|| self.run_polled(prompt, cfg, tail_tokens, stream_text, &mut poll))
                         .join()
                         .expect("mock streamer thread")
                 });
             }
-            self.run_polled(prompt, cfg, tail_tokens, &mut poll)
+            self.run_polled(prompt, cfg, tail_tokens, stream_text, &mut poll)
         }
     }
 
@@ -2165,7 +2305,8 @@ mod tests {
             _prompt: &str,
             cfg: &GenConfig,
             tail_tokens: usize,
-            poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
+            stream_text: bool,
+            poll: &mut (dyn FnMut(&str, &[u8], usize) -> PollAction + Send),
         ) -> Result<GenResult, OvError> {
             let tail_override = self.st.lock().unwrap().tail_override.clone();
             let (pieces, tokens, ends, cancel_before, err_after_cancel, poll_panic_at) = {
@@ -2227,7 +2368,13 @@ mod tests {
                     } else {
                         String::new()
                     };
-                let action = poll(&tail, *n);
+                // With `stream_text`: the decode of every token so far.
+                let window = if stream_text && *n > 0 {
+                    tokens[..ends[i]].concat()
+                } else {
+                    String::new()
+                };
+                let action = poll(&tail, window.as_bytes(), *n);
                 {
                     let mut st = self.st.lock().unwrap();
                     st.consumed += 1;
@@ -2235,7 +2382,7 @@ mod tests {
                 }
                 if action != PollAction::Running {
                     // The end flush comes after a STOP/CANCEL too.
-                    let flush = poll("", 0);
+                    let flush = poll("", &[], 0);
                     self.st
                         .lock()
                         .unwrap()
@@ -2251,7 +2398,7 @@ mod tests {
                     });
                 }
             }
-            let flush = poll("", 0);
+            let flush = poll("", &[], 0);
             self.st
                 .lock()
                 .unwrap()
@@ -2269,6 +2416,10 @@ mod tests {
         texts.iter().map(|t| (t.to_string(), 1)).collect()
     }
 
+    /// Both values of [`OvGenaiBuilder::stream_writes`]: every stateful
+    /// behaviour holds for the one-final-chunk path and the streaming one.
+    const MODES: [bool; 2] = [false, true];
+
     /// The stateful engine as `build()` makes it, over the mock pipe.
     fn stateful_engine_with(
         st: &Arc<Mutex<StatefulState>>,
@@ -2281,6 +2432,43 @@ mod tests {
 
     fn stateful_engine(st: &Arc<Mutex<StatefulState>>) -> Box<dyn Engine> {
         stateful_engine_with(st, |b| b)
+    }
+
+    /// The stateful engine, streaming or not.
+    fn stateful_engine_in(st: &Arc<Mutex<StatefulState>>, stream: bool) -> Box<dyn Engine> {
+        stateful_engine_with(st, |b| b.stream_writes(stream))
+    }
+
+    /// Step until a final chunk: every chunk but progress, the final last.
+    fn until_final(e: &mut Box<dyn Engine>) -> Vec<Chunk> {
+        let mut out = Vec::new();
+        for _ in 0..10_000 {
+            for (_, c) in e.step().unwrap() {
+                if c.is_progress() {
+                    continue;
+                }
+                let fin = c.is_final;
+                out.push(c);
+                if fin {
+                    return out;
+                }
+            }
+        }
+        panic!("no final chunk: {out:?}");
+    }
+
+    /// The answer as a client gets it: every chunk's text, joined.
+    fn joined(chunks: &[Chunk]) -> String {
+        chunks.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// The API's completion count over `chunks` (`accumulate_tokens`).
+    fn usage(chunks: &[Chunk]) -> u32 {
+        let mut total = 0;
+        for c in chunks {
+            c.accumulate_tokens(&mut total);
+        }
+        total
     }
 
     fn stop_task(id: &str, max_tokens: u32, stops: &[&str]) -> GenerationTask {
@@ -2345,34 +2533,53 @@ mod tests {
             && c.finish_reason == Some(FinishReason::Cancelled)
     }
 
+    /// A builder that hands the runner an engine built beforehand.
+    struct Prebuilt(Option<Box<dyn Engine>>);
+
+    #[async_trait::async_trait]
+    impl Builder for Prebuilt {
+        async fn connect(&mut self, _peers: PeerLayout) -> EngineResult<()> {
+            Ok(())
+        }
+        async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(mut self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+            Ok(self.0.take().unwrap())
+        }
+    }
+
     /// The first poll of the engine's life logs whether ov-genai runs the
     /// streamer inline (the stateful backend) or on its own worker thread
     /// (the CB adapter, speculative pipelines); later polls and steps don't.
+    /// Streaming, "inline" is the engine's own worker thread.
     #[test]
     fn stateful_engine_logs_the_streamer_thread_once() {
-        for (threaded, want) in [
-            (false, "threaded_streamer=false"),
-            (true, "threaded_streamer=true"),
-        ] {
-            let st = Arc::new(Mutex::new(StatefulState::default()));
-            {
-                let mut s = st.lock().unwrap();
-                s.pieces = pieces(&["one", " two", " three"]);
-                s.poll_from_thread = threaded;
+        for stream in MODES {
+            for (threaded, want) in [
+                (false, "threaded_streamer=false"),
+                (true, "threaded_streamer=true"),
+            ] {
+                let st = Arc::new(Mutex::new(StatefulState::default()));
+                {
+                    let mut s = st.lock().unwrap();
+                    s.pieces = pieces(&["one", " two", " three"]);
+                    s.poll_from_thread = threaded;
+                }
+                let mut e = stateful_engine_in(&st, stream);
+                e.submit(task("t1", 64)).unwrap();
+                e.submit(task("t2", 64)).unwrap();
+                let (_, logs) = capture_logs(|| {
+                    until_final(&mut e);
+                    until_final(&mut e);
+                });
+                assert!(logs.contains(want), "{stream} {threaded}: {logs}");
+                assert_eq!(
+                    logs.matches("ov-genai streamer thread").count(),
+                    1,
+                    "{stream} {threaded}: logged once for the engine's life: {logs}"
+                );
             }
-            let mut e = stateful_engine(&st);
-            e.submit(task("t1", 64)).unwrap();
-            e.submit(task("t2", 64)).unwrap();
-            let (_, logs) = capture_logs(|| {
-                e.step().unwrap();
-                e.step().unwrap();
-            });
-            assert!(logs.contains(want), "{threaded}: {logs}");
-            assert_eq!(
-                logs.matches("ov-genai streamer thread").count(),
-                1,
-                "{threaded}: logged once for the engine's life: {logs}"
-            );
         }
     }
 
@@ -2382,25 +2589,27 @@ mod tests {
     /// error, and pass everything else.
     #[test]
     fn stateful_admission_refuses_a_resumed_task_like_submit() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        let mut e = stateful_engine(&st);
-        let admission = e
-            .submit_admission()
-            .expect("the stateful engine hands out an admission");
-        let mut resumed = task("t1", 8);
-        resumed.resume_token_ids = Some(vec![1, 2]);
-        let checked = admission
-            .check(&resumed)
-            .expect_err("a resumed task is refused without the engine lock");
-        let submitted = e.submit(resumed).expect_err("and by submit");
-        assert!(
-            checked.to_string().contains("resume_unsupported:"),
-            "{checked}"
-        );
-        assert_eq!(checked.to_string(), submitted.to_string());
-        admission
-            .check(&task("t2", 8))
-            .expect("a plain task passes the admission");
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            let mut e = stateful_engine_in(&st, stream);
+            let admission = e
+                .submit_admission()
+                .expect("the stateful engine hands out an admission");
+            let mut resumed = task("t1", 8);
+            resumed.resume_token_ids = Some(vec![1, 2]);
+            let checked = admission
+                .check(&resumed)
+                .expect_err("a resumed task is refused without the engine lock");
+            let submitted = e.submit(resumed).expect_err("and by submit");
+            assert!(
+                checked.to_string().contains("resume_unsupported:"),
+                "{checked}"
+            );
+            assert_eq!(checked.to_string(), submitted.to_string());
+            admission
+                .check(&task("t2", 8))
+                .expect("a plain task passes the admission");
+        }
     }
 
     /// The runner refuses a queued submit past the engine's own pending cap
@@ -2408,369 +2617,436 @@ mod tests {
     /// must follow the engine's pending queue through submit, step and cancel.
     #[test]
     fn stateful_admission_tracks_the_pending_queue() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["a"]);
-        let mut e = stateful_engine(&st);
-        let admission = e.submit_admission().unwrap();
-        let load = |pending| {
-            Some(PendingLoad {
-                pending,
-                cap: crate::dist_spec::MAX_PENDING_TASKS,
-            })
-        };
-        assert_eq!(admission.pending_load(), load(0));
-        e.submit(task("t1", 8)).unwrap();
-        e.submit(task("t2", 8)).unwrap();
-        e.submit(task("t3", 8)).unwrap();
-        assert_eq!(admission.pending_load(), load(3));
-        e.submit(task("t1", 8)).unwrap();
-        assert_eq!(
-            admission.pending_load(),
-            load(3),
-            "a duplicate takes no place"
-        );
-        e.step().unwrap();
-        assert_eq!(admission.pending_load(), load(2), "a stepped task leaves");
-        e.cancel(&TaskId::from("t3"));
-        assert_eq!(admission.pending_load(), load(1), "a cancelled task leaves");
-        let mut resumed = task("t4", 8);
-        resumed.resume_token_ids = Some(vec![1]);
-        assert!(e.submit(resumed).is_err());
-        assert_eq!(
-            admission.pending_load(),
-            load(1),
-            "a refused task takes no place"
-        );
-        // An admission handed out later reads the same count.
-        assert_eq!(e.submit_admission().unwrap().pending_load(), load(1));
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a"]);
+            let mut e = stateful_engine_in(&st, stream);
+            let admission = e.submit_admission().unwrap();
+            let load = |pending| {
+                Some(PendingLoad {
+                    pending,
+                    cap: crate::dist_spec::MAX_PENDING_TASKS,
+                })
+            };
+            assert_eq!(admission.pending_load(), load(0));
+            e.submit(task("t1", 8)).unwrap();
+            e.submit(task("t2", 8)).unwrap();
+            e.submit(task("t3", 8)).unwrap();
+            assert_eq!(admission.pending_load(), load(3));
+            e.submit(task("t1", 8)).unwrap();
+            assert_eq!(
+                admission.pending_load(),
+                load(3),
+                "a duplicate takes no place"
+            );
+            until_final(&mut e);
+            assert_eq!(admission.pending_load(), load(2), "a stepped task leaves");
+            e.cancel(&TaskId::from("t3"));
+            assert_eq!(admission.pending_load(), load(1), "a cancelled task leaves");
+            let mut resumed = task("t4", 8);
+            resumed.resume_token_ids = Some(vec![1]);
+            assert!(e.submit(resumed).is_err());
+            assert_eq!(
+                admission.pending_load(),
+                load(1),
+                "a refused task takes no place"
+            );
+            // An admission handed out later reads the same count.
+            assert_eq!(e.submit_admission().unwrap().pending_load(), load(1));
+        }
     }
 
     #[test]
     fn stateful_engine_exposes_its_inflight_handle() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        let e = stateful_engine(&st);
-        let a = e.inflight_cancel().expect("stateful engine has a handle");
-        let b = e.inflight_cancel().expect("same handle again");
-        assert!(Arc::ptr_eq(&a, &b));
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            let e = stateful_engine_in(&st, stream);
+            let a = e.inflight_cancel().expect("stateful engine has a handle");
+            let b = e.inflight_cancel().expect("same handle again");
+            assert!(Arc::ptr_eq(&a, &b));
+        }
     }
 
     #[test]
     fn stateful_cancel_mid_generate_ends_within_one_piece_and_is_empty_cancelled() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        let mut e = stateful_engine(&st);
-        let h = e.inflight_cancel().unwrap();
-        {
-            let mut s = st.lock().unwrap();
-            s.pieces = pieces(&["one", " two", " three", " four", " five", " six"]);
-            s.cancel_before = Some((2, h.clone(), TaskId::from("t1")));
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            let mut e = stateful_engine_in(&st, stream);
+            let h = e.inflight_cancel().unwrap();
+            {
+                let mut s = st.lock().unwrap();
+                s.pieces = pieces(&["one", " two", " three", " four", " five", " six"]);
+                s.cancel_before = Some((2, h.clone(), TaskId::from("t1")));
+            }
+            e.submit(task("t1", 64)).unwrap();
+            let (out, logs) = capture_logs(|| until_final(&mut e));
+            let last = out.last().unwrap();
+            assert!(is_empty_cancelled(last), "{stream}: {last:?}");
+            // Streaming, the two writes before the cancel went out.
+            let want = if stream { "one two" } else { "" };
+            assert_eq!(joined(&out), want, "{stream}");
+            let s = st.lock().unwrap();
+            // The cancel landed before piece 2's poll: that poll answers Cancel.
+            assert_eq!(s.consumed, 3, "at most one more piece after the cancel");
+            assert_eq!(s.polls[2].2, PollAction::Cancel);
+            // Idempotent: the end flush after the Cancel also says Cancel.
+            assert_eq!(
+                s.polls.last().unwrap(),
+                &(String::new(), 0, PollAction::Cancel)
+            );
+            assert!(logs.contains("task cancelled"), "{logs}");
+            assert!(logs.contains("tokens=3"), "{logs}");
+            // end() ran: the handle is free for the next task.
+            assert!(!h.cancelled());
         }
-        e.submit(task("t1", 64)).unwrap();
-        let (out, logs) = capture_logs(|| e.step().unwrap());
-        assert_eq!(out.len(), 1);
-        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
-        let s = st.lock().unwrap();
-        // The cancel landed before piece 2's poll: that poll answers Cancel.
-        assert_eq!(s.consumed, 3, "at most one more piece after the cancel");
-        assert_eq!(s.polls[2].2, PollAction::Cancel);
-        // Idempotent: the end flush after the Cancel also says Cancel.
-        assert_eq!(
-            s.polls.last().unwrap(),
-            &(String::new(), 0, PollAction::Cancel)
-        );
-        assert!(logs.contains("task cancelled"), "{logs}");
-        assert!(logs.contains("tokens=3"), "{logs}");
-        // end() ran: the handle is free for the next task.
-        assert!(!h.cancelled());
     }
 
     /// An interrupted generation still books its prompt: the cancelled final
     /// carries `prompt_tokens` (counted before generate), with no text and no
-    /// `n_tokens`, so no TTFT sample and 0 generated tokens.
+    /// `n_tokens`, so no TTFT sample and 0 generated tokens when nothing went
+    /// out before the cancel.
     #[tokio::test]
     async fn stateful_interrupt_books_the_prompt_tokens() {
-        use cascadia_types::{PeerLayout, ShardSpec};
         use futures::StreamExt;
-        const MODEL: &str = "ov-genai-interrupt-prompt-model";
-
-        struct Prebuilt(Option<Box<dyn Engine>>);
-        #[async_trait::async_trait]
-        impl Builder for Prebuilt {
-            async fn connect(&mut self, _peers: PeerLayout) -> EngineResult<()> {
-                Ok(())
+        for (stream, model) in [
+            (false, "ov-genai-interrupt-prompt-model"),
+            (true, "ov-genai-interrupt-prompt-model-streaming"),
+        ] {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            let e = stateful_engine_in(&st, stream);
+            let h = e.inflight_cancel().unwrap();
+            {
+                let mut s = st.lock().unwrap();
+                s.pieces = pieces(&["one", " two", " three"]);
+                // What Runner::interrupt does: signal the handle, nothing else.
+                // Streaming, before the first write, so nothing went out.
+                let at = if stream { 0 } else { 1 };
+                s.cancel_before = Some((at, h, TaskId::from("t-intr")));
             }
-            async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
-                Ok(Box::pin(futures::stream::empty()))
+            let runner = Arc::new(cascadia_runner::Runner::new(Box::new(Prebuilt(Some(e)))));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage(model, "CPU"),
+                )
+                .await
+                .unwrap();
+            let prompt = || {
+                cascadia_metrics::TOKENS_PROMPT_TOTAL
+                    .with_label_values(&[model])
+                    .get()
+            };
+            let generated = || {
+                cascadia_metrics::TOKENS_GENERATED_TOTAL
+                    .with_label_values(&[model])
+                    .get()
+            };
+            let ttft = || {
+                cascadia_metrics::GENERATION_TTFT_SECONDS
+                    .with_label_values(&[model])
+                    .get_sample_count()
+            };
+            let (p0, g0, t0) = (prompt(), generated(), ttft());
+            let mut chunks = runner.generate_async(task("t-intr", 64)).await.unwrap();
+            let mut last = None;
+            while let Some(c) = chunks.next().await {
+                last = Some(c);
             }
-            fn build(mut self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
-                Ok(self.0.take().unwrap())
-            }
+            let last = last.expect("a final chunk");
+            assert!(is_empty_cancelled(&last), "{stream}: {last:?}");
+            assert_eq!(last.n_tokens, None);
+            // The mock counts the prompt "hello" as 1 token.
+            assert_eq!(prompt() - p0, 1, "{stream}: the prompt is booked");
+            assert_eq!(generated() - g0, 0, "{stream}");
+            assert_eq!(ttft() - t0, 0, "{stream}: no TTFT sample");
         }
-
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        let e = stateful_engine(&st);
-        let h = e.inflight_cancel().unwrap();
-        {
-            let mut s = st.lock().unwrap();
-            s.pieces = pieces(&["one", " two", " three"]);
-            // What Runner::interrupt does: signal the handle, nothing else.
-            s.cancel_before = Some((1, h, TaskId::from("t-intr")));
-        }
-        let runner = Arc::new(cascadia_runner::Runner::new(Box::new(Prebuilt(Some(e)))));
-        runner
-            .start(
-                PeerLayout::single_stage(),
-                ShardSpec::single_stage(MODEL, "CPU"),
-            )
-            .await
-            .unwrap();
-        let prompt = || {
-            cascadia_metrics::TOKENS_PROMPT_TOTAL
-                .with_label_values(&[MODEL])
-                .get()
-        };
-        let generated = || {
-            cascadia_metrics::TOKENS_GENERATED_TOTAL
-                .with_label_values(&[MODEL])
-                .get()
-        };
-        let ttft = || {
-            cascadia_metrics::GENERATION_TTFT_SECONDS
-                .with_label_values(&[MODEL])
-                .get_sample_count()
-        };
-        let (p0, g0, t0) = (prompt(), generated(), ttft());
-        let mut stream = runner.generate_async(task("t-intr", 64)).await.unwrap();
-        let mut last = None;
-        while let Some(c) = stream.next().await {
-            last = Some(c);
-        }
-        let last = last.expect("a final chunk");
-        assert!(is_empty_cancelled(&last), "{last:?}");
-        assert_eq!(last.n_tokens, None);
-        // The mock counts the prompt "hello" as 1 token.
-        assert_eq!(prompt() - p0, 1, "the prompt is booked");
-        assert_eq!(generated() - g0, 0);
-        assert_eq!(ttft() - t0, 0, "no TTFT sample");
     }
 
     #[test]
     fn stateful_cancel_before_begin_never_generates() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["a"]);
-        let mut e = stateful_engine(&st);
-        let h = e.inflight_cancel().unwrap();
-        e.submit(task("t1", 64)).unwrap();
-        // The runner signals the handle while the task is still queued.
-        h.cancel(&TaskId::from("t1"));
-        let out = e.step().unwrap();
-        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
-        let s = st.lock().unwrap();
-        assert_eq!((s.polled_calls, s.plain_calls), (0, 0));
-        drop(s);
-        // end() ran: a next task begins clean.
-        assert!(!h.begin(&TaskId::from("t2")));
-        h.end();
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a"]);
+            let mut e = stateful_engine_in(&st, stream);
+            let h = e.inflight_cancel().unwrap();
+            e.submit(task("t1", 64)).unwrap();
+            // The runner signals the handle while the task is still queued.
+            h.cancel(&TaskId::from("t1"));
+            let out = e.step().unwrap();
+            assert_eq!(out.len(), 1, "{stream}");
+            assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
+            let s = st.lock().unwrap();
+            assert_eq!((s.polled_calls, s.plain_calls), (0, 0));
+            drop(s);
+            // end() ran: a next task begins clean.
+            assert!(!h.begin(&TaskId::from("t2")));
+            h.end();
+        }
     }
 
     #[test]
     fn stateful_engine_cancel_forgets_a_queued_task() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["a"]);
-        let mut e = stateful_engine(&st);
-        let h = e.inflight_cancel().unwrap();
-        e.submit(task("t1", 64)).unwrap();
-        // Runner order: signal the handle (an early entry), then Engine::cancel.
-        h.cancel(&TaskId::from("t1"));
-        e.cancel(&TaskId::from("t1"));
-        // The early entry is gone: a resubmit of the same id runs.
-        e.submit(task("t1", 64)).unwrap();
-        let out = e.step().unwrap();
-        assert_eq!(out[0].1.text, "a");
-        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a"]);
+            let mut e = stateful_engine_in(&st, stream);
+            let h = e.inflight_cancel().unwrap();
+            e.submit(task("t1", 64)).unwrap();
+            // Runner order: signal the handle (an early entry), then Engine::cancel.
+            h.cancel(&TaskId::from("t1"));
+            e.cancel(&TaskId::from("t1"));
+            // The early entry is gone: a resubmit of the same id runs.
+            e.submit(task("t1", 64)).unwrap();
+            let out = until_final(&mut e);
+            assert_eq!(joined(&out), "a", "{stream}");
+            assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+        }
     }
 
     #[test]
     fn stateful_stop_match_stops_keeps_the_match_and_logs() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["one", " two", " tw", "enty", " more", " more"]);
-        let mut e = stateful_engine(&st);
-        e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
-        let (out, logs) = capture_logs(|| e.step().unwrap());
-        let c = &out[0].1;
-        assert!(c.error.is_none(), "{c:?}");
-        assert_eq!(c.text, "one two twenty");
-        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
-        let s = st.lock().unwrap();
-        assert_eq!(s.consumed, 4);
-        assert_eq!(s.polls[3].2, PollAction::Stop);
-        // Idempotent at the end flush.
-        assert_eq!(s.polls.last().unwrap().2, PollAction::Stop);
-        assert!(logs.contains("task stopped at stop string"), "{logs}");
-        assert!(logs.contains("tokens=3"), "{logs}");
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["one", " two", " tw", "enty", " more", " more"]);
+            let mut e = stateful_engine_in(&st, stream);
+            e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
+            let (out, logs) = capture_logs(|| until_final(&mut e));
+            let c = out.last().unwrap();
+            assert!(c.error.is_none(), "{c:?}");
+            assert_eq!(joined(&out), "one two twenty", "{stream}");
+            assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+            let s = st.lock().unwrap();
+            assert_eq!(s.consumed, 4, "{stream}");
+            assert_eq!(s.polls[3].2, PollAction::Stop);
+            // Idempotent at the end flush.
+            assert_eq!(s.polls.last().unwrap().2, PollAction::Stop);
+            assert!(logs.contains("task stopped at stop string"), "{logs}");
+            assert!(logs.contains("tokens=3"), "{logs}");
+        }
     }
 
     #[test]
     fn stateful_stop_check_off_runs_to_the_end() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["one", " twenty", " more"]);
-        let mut e = stateful_engine_with(&st, |b| b.with_engine_stop_check(false));
-        e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
-        let out = e.step().unwrap();
-        assert_eq!(out[0].1.text, "one twenty more");
-        let s = st.lock().unwrap();
-        assert_eq!(s.consumed, 3);
-        assert!(s.polls.iter().all(|p| p.2 == PollAction::Running));
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["one", " twenty", " more"]);
+            let mut e = stateful_engine_with(&st, |b| {
+                b.with_engine_stop_check(false).stream_writes(stream)
+            });
+            e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
+            let out = until_final(&mut e);
+            assert_eq!(joined(&out), "one twenty more", "{stream}");
+            let s = st.lock().unwrap();
+            assert_eq!(s.consumed, 3);
+            assert!(s.polls.iter().all(|p| p.2 == PollAction::Running));
+        }
     }
 
     #[test]
     fn stateful_poll_panic_is_a_chunk_error() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        {
-            let mut s = st.lock().unwrap();
-            s.pieces = pieces(&["a", " b", " c"]);
-            s.poll_panic_at = Some(1);
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            {
+                let mut s = st.lock().unwrap();
+                s.pieces = pieces(&["a", " b", " c"]);
+                s.poll_panic_at = Some(1);
+            }
+            let mut e = stateful_engine_in(&st, stream);
+            let h = e.inflight_cancel().unwrap();
+            e.submit(task("t1", 64)).unwrap();
+            let out = until_final(&mut e);
+            let c = out.last().unwrap();
+            assert!(c.is_final);
+            assert!(c.error.is_some(), "a poll panic must fail the task: {c:?}");
+            assert!(c.text.is_empty());
+            // end() ran on the error path too.
+            assert!(!h.begin(&TaskId::from("t2")));
+            h.end();
         }
-        let mut e = stateful_engine(&st);
-        let h = e.inflight_cancel().unwrap();
-        e.submit(task("t1", 64)).unwrap();
-        let out = e.step().unwrap();
-        let c = &out[0].1;
-        assert!(c.is_final);
-        assert!(c.error.is_some(), "a poll panic must fail the task: {c:?}");
-        assert!(c.text.is_empty());
-        // end() ran on the error path too.
-        assert!(!h.begin(&TaskId::from("t2")));
-        h.end();
     }
 
     #[test]
     fn stateful_err_after_cancel_is_cancelled_not_an_error() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        let mut e = stateful_engine(&st);
-        let h = e.inflight_cancel().unwrap();
-        {
-            let mut s = st.lock().unwrap();
-            s.pieces = pieces(&["a", " b", " c"]);
-            s.cancel_before = Some((1, h.clone(), TaskId::from("t1")));
-            s.err_after_cancel = true;
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            let mut e = stateful_engine_in(&st, stream);
+            let h = e.inflight_cancel().unwrap();
+            {
+                let mut s = st.lock().unwrap();
+                s.pieces = pieces(&["a", " b", " c"]);
+                s.cancel_before = Some((1, h.clone(), TaskId::from("t1")));
+                s.err_after_cancel = true;
+            }
+            e.submit(task("t1", 64)).unwrap();
+            let out = until_final(&mut e);
+            assert!(is_empty_cancelled(out.last().unwrap()), "{out:?}");
+            assert!(!h.cancelled());
         }
-        e.submit(task("t1", 64)).unwrap();
-        let out = e.step().unwrap();
-        assert!(is_empty_cancelled(&out[0].1), "{:?}", out[0].1);
-        assert!(!h.cancelled());
     }
 
     #[test]
     fn stateful_without_stop_keeps_text_finish_and_counts() {
-        for (max_tokens, want) in [(64u32, FinishReason::Stop), (3, FinishReason::Length)] {
-            let st = Arc::new(Mutex::new(StatefulState::default()));
-            st.lock().unwrap().pieces = pieces(&["alpha", " beta", " gamma"]);
-            let mut e = stateful_engine(&st);
-            e.submit(task("t1", max_tokens)).unwrap();
-            let (out, logs) = capture_logs(|| e.step().unwrap());
-            let c = &out[0].1;
-            assert!(c.is_final && c.error.is_none(), "{c:?}");
-            assert_eq!(c.text, "alpha beta gamma");
-            assert_eq!(c.n_tokens, Some(3));
-            // The mock's count of the prompt "hello".
-            assert_eq!(c.prompt_tokens, Some(1));
-            assert_eq!(c.finish_reason, Some(want), "max_tokens {max_tokens}");
-            assert!(logs.contains("task done"), "{logs}");
-            let s = st.lock().unwrap();
-            assert_eq!((s.polled_calls, s.plain_calls), (1, 0));
-            assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, max_tokens);
+        for stream in MODES {
+            for (max_tokens, want) in [(64u32, FinishReason::Stop), (3, FinishReason::Length)] {
+                let st = Arc::new(Mutex::new(StatefulState::default()));
+                st.lock().unwrap().pieces = pieces(&["alpha", " beta", " gamma"]);
+                let mut e = stateful_engine_in(&st, stream);
+                e.submit(task("t1", max_tokens)).unwrap();
+                let (out, logs) = capture_logs(|| until_final(&mut e));
+                let c = out.last().unwrap();
+                assert!(c.is_final && c.error.is_none(), "{c:?}");
+                assert_eq!(joined(&out), "alpha beta gamma");
+                assert_eq!(usage(&out), 3, "{stream}");
+                if stream {
+                    assert_eq!(c.completion_tokens, Some(3));
+                } else {
+                    assert_eq!(c.n_tokens, Some(3));
+                }
+                // The mock's count of the prompt "hello".
+                assert_eq!(c.prompt_tokens, Some(1));
+                assert_eq!(c.finish_reason, Some(want), "max_tokens {max_tokens}");
+                assert!(logs.contains("task done"), "{logs}");
+                let s = st.lock().unwrap();
+                assert_eq!((s.polled_calls, s.plain_calls), (1, 0));
+                assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, max_tokens);
+            }
         }
     }
 
-    /// A stop split over two tokens is found: the tail decode spans them.
+    /// A stop split over two tokens is found: without streaming the tail
+    /// decode spans them, streaming the check runs on the handed-out text.
     #[test]
     fn stateful_stop_across_a_token_boundary() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["a", " sto", "p!", " more"]);
-        let mut e = stateful_engine(&st);
-        e.submit(stop_task("t1", 64, &["stop"])).unwrap();
-        let out = e.step().unwrap();
-        assert_eq!(out[0].1.text, "a stop!");
-        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
-        let s = st.lock().unwrap();
-        assert_eq!(s.consumed, 3);
-        // The window covers the longest stop plus slack.
-        assert_eq!(s.tail_tokens, [4 + 16]);
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a", " sto", "p!", " more"]);
+            let mut e = stateful_engine_in(&st, stream);
+            e.submit(stop_task("t1", 64, &["stop"])).unwrap();
+            let out = until_final(&mut e);
+            assert_eq!(joined(&out), "a stop!");
+            assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+            let s = st.lock().unwrap();
+            assert_eq!(s.consumed, 3);
+            // The window covers the longest stop plus slack; streaming has none.
+            let want = if stream { 0 } else { 4 + 16 };
+            assert_eq!(s.tail_tokens, [want], "{stream}");
+        }
     }
 
     /// With nothing to match, the shim decodes nothing per token.
     #[test]
     fn stateful_tail_tokens_is_zero_without_an_active_stop_check() {
-        let cases: [(&str, bool, Vec<&str>); 3] = [
-            ("no stops", true, vec![]),
-            ("only empty stops", true, vec![""]),
-            ("check off", false, vec!["x"]),
-        ];
-        for (name, check, stops) in cases {
-            let st = Arc::new(Mutex::new(StatefulState::default()));
-            st.lock().unwrap().pieces = pieces(&["a", " x", " b"]);
-            let mut e = stateful_engine_with(&st, |b| b.with_engine_stop_check(check));
-            e.submit(stop_task("t1", 64, &stops)).unwrap();
-            let out = e.step().unwrap();
-            assert_eq!(out[0].1.text, "a x b", "{name}");
-            let s = st.lock().unwrap();
-            assert_eq!(s.tail_tokens, [0], "{name}");
-            assert!(s.polls.iter().all(|p| p.0.is_empty()), "{name}");
+        for stream in MODES {
+            let cases: [(&str, bool, Vec<&str>); 3] = [
+                ("no stops", true, vec![]),
+                ("only empty stops", true, vec![""]),
+                ("check off", false, vec!["x"]),
+            ];
+            for (name, check, stops) in cases {
+                let st = Arc::new(Mutex::new(StatefulState::default()));
+                st.lock().unwrap().pieces = pieces(&["a", " x", " b"]);
+                let mut e = stateful_engine_with(&st, |b| {
+                    b.with_engine_stop_check(check).stream_writes(stream)
+                });
+                e.submit(stop_task("t1", 64, &stops)).unwrap();
+                let out = until_final(&mut e);
+                assert_eq!(joined(&out), "a x b", "{name}");
+                let s = st.lock().unwrap();
+                assert_eq!(s.tail_tokens, [0], "{name}");
+                assert!(s.polls.iter().all(|p| p.0.is_empty()), "{name}");
+            }
         }
     }
 
-    /// Without the streaming switch the engine asks the shim for no window:
-    /// every write it sees carries an empty window from id 0, and the answer
-    /// is today's one final chunk.
+    /// The window the closure receives: without the streaming switch none
+    /// (an empty window from id 0, and the answer is today's one final
+    /// chunk); with it, every write's decode of all the ids so far, from id 0.
+    /// The engine never confirms a window either way.
     #[test]
-    fn stateful_polls_without_stream_text() {
-        for stops in [vec![], vec!["x"]] {
-            let st = Arc::new(Mutex::new(StatefulState::default()));
-            st.lock().unwrap().pieces = pieces(&["a", " b", " c"]);
-            let mut e = stateful_engine(&st);
-            e.submit(stop_task("t1", 64, &stops)).unwrap();
-            let out = e.step().unwrap();
-            assert_eq!(out.len(), 1);
-            assert!(out[0].1.is_final);
-            assert_eq!(out[0].1.text, "a b c");
-            let s = st.lock().unwrap();
-            assert_eq!(s.stream_text, [false], "{stops:?}");
-            assert_eq!(s.windows.len(), 4, "{stops:?}");
-            assert!(s.windows.iter().all(|w| w == &(Vec::new(), 0)), "{stops:?}");
+    fn stateful_polls_with_stream_text_only_when_streaming() {
+        for stream in MODES {
+            for stops in [vec![], vec!["x"]] {
+                let st = Arc::new(Mutex::new(StatefulState::default()));
+                st.lock().unwrap().pieces = pieces(&["a", " b", " c"]);
+                let mut e = stateful_engine_in(&st, stream);
+                e.submit(stop_task("t1", 64, &stops)).unwrap();
+                let out = until_final(&mut e);
+                assert_eq!(joined(&out), "a b c");
+                if !stream {
+                    assert_eq!(out.len(), 1);
+                }
+                let s = st.lock().unwrap();
+                assert_eq!(s.stream_text, [stream], "{stops:?}");
+                let want: Vec<(Vec<u8>, usize)> = if stream {
+                    ["a", "a b", "a b c", ""]
+                        .iter()
+                        .map(|w| (w.as_bytes().to_vec(), 0))
+                        .collect()
+                } else {
+                    vec![(Vec::new(), 0); 4]
+                };
+                assert_eq!(s.windows, want, "{stream} {stops:?}");
+                assert_eq!(s.replies.len(), 4);
+                assert!(
+                    s.replies.iter().all(|r| r.confirm_upto.is_none()),
+                    "never a confirm: {:?}",
+                    s.replies
+                );
+            }
         }
     }
 
-    /// One stateful step over `toks` (one token per write) with `stops`, with the
-    /// engine stop check on or off: (final chunk, writes consumed).
-    fn run_stateful(prompt: &str, toks: &[&str], stops: &[&str], check: bool) -> (Chunk, usize) {
+    /// One stateful generation over `toks` (one token per write) with
+    /// `stops`, with the engine stop check on or off, streaming or not:
+    /// (every chunk, writes consumed).
+    fn run_stateful(
+        prompt: &str,
+        toks: &[&str],
+        stops: &[&str],
+        check: bool,
+        stream: bool,
+    ) -> (Vec<Chunk>, usize) {
         let st = Arc::new(Mutex::new(StatefulState::default()));
         st.lock().unwrap().pieces = pieces(toks);
-        let mut e = stateful_engine_with(&st, |b| b.with_engine_stop_check(check));
+        let mut e = stateful_engine_with(&st, |b| {
+            b.with_engine_stop_check(check).stream_writes(stream)
+        });
         let mut t = stop_task("t1", 64, stops);
         t.prompt = prompt.into();
         e.submit(t).unwrap();
-        let out = e.step().unwrap();
+        let out = until_final(&mut e);
         let consumed = st.lock().unwrap().consumed;
-        (out[0].1.clone(), consumed)
+        (out, consumed)
     }
 
-    /// An empty prompt: step's strip_prefix + trim_start apply, and the
+    /// The text before the first `stop`: what the API's cut leaves.
+    fn cut_at<'a>(text: &'a str, stop: &str) -> &'a str {
+        text.split(stop).next().unwrap_or(text)
+    }
+
+    /// An empty prompt: the strip_prefix + trim_start apply, and the
     /// leading "\n"s are not part of the answer. The engine must not stop on
-    /// them: it returns the visible text, so the API cut gives "Hi",
-    /// the same as with the check off.
+    /// them, so the API cut gives "Hi", the same as with the check off.
+    /// Without streaming the tail check is not armed inside its window and
+    /// runs to the end; streaming, it stops at the first visible "\n".
     #[test]
     fn stateful_empty_prompt_does_not_stop_in_leading_whitespace() {
         let toks = ["\n", "\n", "Hi", "\n", "There"];
-        let (on, consumed) = run_stateful("", &toks, &["\n"], true);
-        let (off, _) = run_stateful("", &toks, &["\n"], false);
-        assert_eq!(on.text, "Hi\nThere");
-        assert_eq!(on.text, off.text);
-        assert_eq!(on.finish_reason, off.finish_reason);
+        let (off, _) = run_stateful("", &toks, &["\n"], false, false);
+        let off = joined(&off);
+        assert_eq!(off, "Hi\nThere");
+        let (on, consumed) = run_stateful("", &toks, &["\n"], true, false);
+        assert_eq!(joined(&on), off);
+        assert_eq!(on.last().unwrap().finish_reason, Some(FinishReason::Stop));
         assert_eq!(
             consumed,
             toks.len(),
             "not armed inside the window: no engine stop"
         );
+        let (streamed, consumed) = run_stateful("", &toks, &["\n"], true, true);
+        assert_eq!(joined(&streamed), "Hi\n");
+        assert_eq!(consumed, 4, "stopped at the first visible stop");
+        assert_eq!(cut_at(&joined(&streamed), "\n"), cut_at(&off, "\n"));
     }
 
     /// The model repeats the prompt: the strip removes it, so a stop inside
@@ -2779,30 +3055,37 @@ mod tests {
     #[test]
     fn stateful_stop_in_a_prompt_echo_keeps_the_visible_answer() {
         let toks = ["Hi", "\n", "There", "\n"];
-        let (on, _) = run_stateful("Hi", &toks, &["\n"], true);
-        let (off, _) = run_stateful("Hi", &toks, &["\n"], false);
-        assert_eq!(on.text, "There\n");
-        assert_eq!(on.text, off.text);
+        let (off, _) = run_stateful("Hi", &toks, &["\n"], false, false);
+        assert_eq!(joined(&off), "There\n");
+        for stream in MODES {
+            let (on, consumed) = run_stateful("Hi", &toks, &["\n"], true, stream);
+            assert_eq!(joined(&on), joined(&off), "{stream}");
+            assert_eq!(consumed, 4, "{stream}");
+        }
     }
 
     /// A chat-style prompt the output doesn't start with: no strip, so the
     /// check is armed from the first token.
     #[test]
     fn stateful_chat_prompt_arms_the_stop_at_once() {
-        let (c, consumed) = run_stateful(
-            "<|user|>count<|assistant|>",
-            &["one", "\n", "two", "\n"],
-            &["\n"],
-            true,
-        );
-        assert_eq!(consumed, 2);
-        assert_eq!(c.text, "one\n");
-        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+        for stream in MODES {
+            let (c, consumed) = run_stateful(
+                "<|user|>count<|assistant|>",
+                &["one", "\n", "two", "\n"],
+                &["\n"],
+                true,
+                stream,
+            );
+            assert_eq!(consumed, 2);
+            assert_eq!(joined(&c), "one\n");
+            assert_eq!(c.last().unwrap().finish_reason, Some(FinishReason::Stop));
+        }
     }
 
-    /// An echo longer than the window: the visible text starts after the
-    /// window decode stopped being the whole text, so the check never arms
-    /// (latency only; the answer equals the check-off run).
+    /// An echo longer than the tail window: without streaming the visible
+    /// text starts after the window decode stopped being the whole text, so
+    /// the check never arms (latency only; the answer equals the check-off
+    /// run). Streaming holds the echo and checks the answer after it.
     #[test]
     fn stateful_a_long_echo_never_arms() {
         // Stop "x": window 1 + 16 = 17 tokens; the echo is 20.
@@ -2810,15 +3093,20 @@ mod tests {
         let prompt = echo.concat();
         let mut toks: Vec<&str> = echo.iter().map(String::as_str).collect();
         toks.extend(["x", " y", " x", " z"]);
-        let (on, consumed) = run_stateful(&prompt, &toks, &["x"], true);
-        let (off, _) = run_stateful(&prompt, &toks, &["x"], false);
+        let (on, consumed) = run_stateful(&prompt, &toks, &["x"], true, false);
+        let (off, _) = run_stateful(&prompt, &toks, &["x"], false, false);
         assert_eq!(consumed, toks.len());
-        assert_eq!(on.text, "x y x z");
-        assert_eq!(on.text, off.text);
+        assert_eq!(joined(&on), "x y x z");
+        assert_eq!(joined(&on), joined(&off));
+        let (streamed, consumed) = run_stateful(&prompt, &toks, &["x"], true, true);
+        assert_eq!(joined(&streamed), "x");
+        assert_eq!(consumed, 21);
+        assert_eq!(cut_at(&joined(&streamed), "x"), cut_at(&joined(&off), "x"));
     }
 
     /// The window is the last `tail_tokens` tokens, not the whole history:
-    /// stop "x" asks for 1 + 16 = 17.
+    /// stop "x" asks for 1 + 16 = 17. (Without streaming only: streaming
+    /// decodes no tail.)
     #[test]
     fn stateful_tail_window_is_the_last_tail_tokens() {
         let st = Arc::new(Mutex::new(StatefulState::default()));
@@ -2838,9 +3126,10 @@ mod tests {
         assert_eq!(s.polls[30], (String::new(), 0, PollAction::Running));
     }
 
-    /// The stop-text invariant broken (a window decode that matched while the visible
-    /// text doesn't hold the stop): keep the visible text,
-    /// and say so in a warn the hardware check fails on.
+    /// The stop-text invariant broken (a window decode that matched while the
+    /// visible text doesn't hold the stop): keep the visible text, and say so
+    /// in a warn the hardware check fails on. (Without streaming only:
+    /// streaming checks the handed-out text itself, not a separate decode.)
     #[test]
     fn stateful_stop_missing_from_both_texts_keeps_visible_and_warns() {
         let st = Arc::new(Mutex::new(StatefulState::default()));
@@ -2864,7 +3153,7 @@ mod tests {
 
     /// A speculative round writes up to `num_assistant_tokens` + 1 ids at
     /// once, so the window grows by that much with a draft model or
-    /// prompt-lookup on.
+    /// prompt-lookup on. Streaming decodes no tail at all.
     #[test]
     fn stateful_tail_tokens_adds_the_round_with_draft_or_prompt_lookup() {
         type Configure = fn(OvGenaiBuilder) -> OvGenaiBuilder;
@@ -2874,58 +3163,69 @@ mod tests {
             // prompt-lookup proposes max(k, 5) candidates per round.
             ("prompt-lookup", |b| b.with_prompt_lookup(3), 4 + 16 + 6),
         ];
-        for (name, configure, want) in cases {
-            let st = Arc::new(Mutex::new(StatefulState::default()));
-            st.lock().unwrap().pieces = pieces(&["a", " b"]);
-            let mut e = stateful_engine_with(&st, configure);
-            e.submit(stop_task("t1", 64, &["stop"])).unwrap();
-            e.step().unwrap();
-            assert_eq!(st.lock().unwrap().tail_tokens, [want], "{name}");
+        for stream in MODES {
+            for (name, configure, want) in cases {
+                let st = Arc::new(Mutex::new(StatefulState::default()));
+                st.lock().unwrap().pieces = pieces(&["a", " b"]);
+                let mut e = stateful_engine_with(&st, |b| configure(b).stream_writes(stream));
+                e.submit(stop_task("t1", 64, &["stop"])).unwrap();
+                until_final(&mut e);
+                let want = if stream { 0 } else { want };
+                assert_eq!(st.lock().unwrap().tail_tokens, [want], "{name} {stream}");
+            }
         }
     }
 
     /// One write carries a whole speculative round of 23 ids, with the stop
     /// at its start: the window without the round slack (6 + 16 = 22 ids)
-    /// misses it, with the slack the engine stops on that write.
+    /// misses it, with the slack the engine stops on that write; streaming
+    /// finds it in that write's text.
     #[test]
     fn stateful_stop_at_the_start_of_a_long_round_is_found() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        {
-            let mut round = vec!["twenty".to_string()];
-            round.extend(std::iter::repeat_n(" a".to_string(), 22));
-            let mut s = st.lock().unwrap();
-            s.writes = vec![vec!["one ".into()], round, vec![" more".into()]];
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            {
+                let mut round = vec!["twenty".to_string()];
+                round.extend(std::iter::repeat_n(" a".to_string(), 22));
+                let mut s = st.lock().unwrap();
+                s.writes = vec![vec!["one ".into()], round, vec![" more".into()]];
+            }
+            let mut e =
+                stateful_engine_with(&st, |b| b.with_draft("/d", "CPU", 22).stream_writes(stream));
+            e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
+            let out = until_final(&mut e);
+            let s = st.lock().unwrap();
+            assert_eq!(s.polls[1].1, 23, "one write of 23 ids");
+            assert_eq!(s.consumed, 2, "stopped on the long write");
+            assert_eq!(s.polls[1].2, PollAction::Stop);
+            assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+            assert!(joined(&out).starts_with("one twenty"));
+            assert_eq!(usage(&out), 24, "{stream}");
         }
-        let mut e = stateful_engine_with(&st, |b| b.with_draft("/d", "CPU", 22));
-        e.submit(stop_task("t1", 64, &["twenty"])).unwrap();
-        let out = e.step().unwrap();
-        let s = st.lock().unwrap();
-        assert_eq!(s.polls[1].1, 23, "one write of 23 ids");
-        assert_eq!(s.consumed, 2, "stopped on the long write");
-        assert_eq!(s.polls[1].2, PollAction::Stop);
-        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
-        assert!(out[0].1.text.starts_with("one twenty"));
     }
 
     /// A match on the last allowed token is `stop`, not `length`.
     #[test]
     fn stateful_stop_beats_length() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["a", " b", " stop", " x"]);
-        let mut e = stateful_engine(&st);
-        e.submit(stop_task("t1", 3, &["stop"])).unwrap();
-        let out = e.step().unwrap();
-        let c = &out[0].1;
-        assert_eq!(c.text, "a b stop");
-        assert_eq!(c.n_tokens, Some(3));
-        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a", " b", " stop", " x"]);
+            let mut e = stateful_engine_in(&st, stream);
+            e.submit(stop_task("t1", 3, &["stop"])).unwrap();
+            let out = until_final(&mut e);
+            assert_eq!(joined(&out), "a b stop");
+            assert_eq!(usage(&out), 3);
+            assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+        }
     }
 
-    /// A panic inside step after begin still ends the handle's task.
+    /// Without streaming a panic inside step after begin still ends the
+    /// handle's task. (Streaming, the worker catches it:
+    /// `stateful_worker_panic_costs_one_task`.)
     #[test]
     fn stateful_panic_in_step_still_ends_the_inflight_task() {
         let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().count_panics = true;
+        st.lock().unwrap().count_panics = 1;
         let mut e = stateful_engine(&st);
         let h = e.inflight_cancel().unwrap();
         e.submit(task("t1", 64)).unwrap();
@@ -2943,26 +3243,32 @@ mod tests {
 
     #[test]
     fn stateful_warmup_uses_plain_generate() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        let mut e = stateful_engine(&st);
-        e.warmup();
-        let s = st.lock().unwrap();
-        assert_eq!((s.plain_calls, s.polled_calls), (1, 0));
-        assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, 4);
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            let mut e = stateful_engine_in(&st, stream);
+            e.warmup();
+            let s = st.lock().unwrap();
+            assert_eq!((s.plain_calls, s.polled_calls), (1, 0));
+            assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, 4);
+        }
     }
 
     #[test]
     fn stateful_window_still_caps_max_new() {
-        let st = Arc::new(Mutex::new(StatefulState::default()));
-        st.lock().unwrap().pieces = pieces(&["x"]);
-        let mut e = stateful_engine_with(&st, |b| b.with_context_window(Some(10)));
-        // The mock counts 3 prompt tokens: 10 - 3 = 7 left.
-        let mut t = task("t1", 4096);
-        t.prompt = "a b c".into();
-        e.submit(t).unwrap();
-        e.step().unwrap();
-        let s = st.lock().unwrap();
-        assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, 7);
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["x"]);
+            let mut e = stateful_engine_with(&st, |b| {
+                b.with_context_window(Some(10)).stream_writes(stream)
+            });
+            // The mock counts 3 prompt tokens: 10 - 3 = 7 left.
+            let mut t = task("t1", 4096);
+            t.prompt = "a b c".into();
+            e.submit(t).unwrap();
+            until_final(&mut e);
+            let s = st.lock().unwrap();
+            assert_eq!(s.last_cfg.as_ref().unwrap().max_new_tokens, 7);
+        }
     }
 
     #[test]
@@ -2972,21 +3278,411 @@ mod tests {
             ("draft", |b| b.with_draft("/d", "CPU", 5)),
             ("prompt-lookup", |b| b.with_prompt_lookup(3)),
         ];
-        for (name, configure) in cases {
-            let st = Arc::new(Mutex::new(StatefulState::default()));
-            st.lock().unwrap().pieces = pieces(&["a", " stop", " b"]);
-            let mut e = stateful_engine_with(&st, configure);
-            assert!(e.inflight_cancel().is_some(), "{name}");
-            e.submit(stop_task("t1", 64, &["stop"])).unwrap();
-            let out = e.step().unwrap();
-            assert_eq!(out[0].1.text, "a stop", "{name}");
-            let s = st.lock().unwrap();
-            assert_eq!(s.polled_calls, 1, "{name}");
-            let cfg = s.last_cfg.as_ref().unwrap();
-            match name {
-                "draft" => assert_eq!(cfg.num_assistant_tokens, 5),
-                _ => assert_eq!(cfg.max_ngram_size, 3),
+        for stream in MODES {
+            for (name, configure) in cases {
+                let st = Arc::new(Mutex::new(StatefulState::default()));
+                st.lock().unwrap().pieces = pieces(&["a", " stop", " b"]);
+                let mut e = stateful_engine_with(&st, |b| configure(b).stream_writes(stream));
+                assert!(e.inflight_cancel().is_some(), "{name}");
+                e.submit(stop_task("t1", 64, &["stop"])).unwrap();
+                let out = until_final(&mut e);
+                assert_eq!(joined(&out), "a stop", "{name}");
+                let s = st.lock().unwrap();
+                assert_eq!(s.polled_calls, 1, "{name}");
+                let cfg = s.last_cfg.as_ref().unwrap();
+                match name {
+                    "draft" => assert_eq!(cfg.num_assistant_tokens, 5),
+                    _ => assert_eq!(cfg.max_ngram_size, 3),
+                }
             }
         }
+    }
+
+    // ---- stateful engine: streaming ---------------------------------------
+
+    /// Each write's text is a token chunk carrying its token count (the first
+    /// with the prompt count); the final carries the rest of the answer (none
+    /// here), the answer's count, the prompt count and the finish reason.
+    #[test]
+    fn stateful_streams_one_chunk_per_write() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["one", " two", " three"]);
+        let mut e = stateful_engine_in(&st, true);
+        e.submit(task("t1", 64)).unwrap();
+        let out = until_final(&mut e);
+        assert_eq!(out.len(), 4, "{out:?}");
+        let deltas: Vec<(&str, Option<u32>, bool)> = out[..3]
+            .iter()
+            .map(|c| (c.text.as_str(), c.n_tokens, c.is_final))
+            .collect();
+        assert_eq!(
+            deltas,
+            [
+                ("one", Some(1), false),
+                (" two", Some(1), false),
+                (" three", Some(1), false)
+            ]
+        );
+        assert_eq!(
+            out[0].prompt_tokens,
+            Some(1),
+            "the first chunk books the prompt"
+        );
+        assert_eq!(out[1].prompt_tokens, None);
+        let fin = &out[3];
+        assert!(fin.is_final && fin.error.is_none(), "{fin:?}");
+        assert_eq!(fin.text, "");
+        assert_eq!(fin.n_tokens, Some(0));
+        assert_eq!(fin.completion_tokens, Some(3));
+        assert_eq!(fin.prompt_tokens, Some(1));
+        assert_eq!(fin.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(usage(&out), 3);
+    }
+
+    /// The default stays one final chunk with the whole answer and its count,
+    /// exactly what the non-streamed path always returned.
+    #[test]
+    fn stateful_stream_writes_off_keeps_one_final_chunk() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["one", " two", " three"]);
+        let mut e = stateful_engine(&st);
+        e.submit(task("t1", 64)).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let want = Chunk::final_marker("t1", "one two three")
+            .with_n_tokens(3)
+            .with_finish_reason(FinishReason::Stop)
+            .with_prompt_tokens(1);
+        assert_eq!(
+            serde_json::to_string(&out[0].1).unwrap(),
+            serde_json::to_string(&want).unwrap()
+        );
+        assert_eq!(st.lock().unwrap().stream_text, [false]);
+    }
+
+    /// One generation at a time: the second task's first chunk comes after
+    /// the first task's final.
+    #[test]
+    fn stateful_second_task_waits_for_the_first() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["a", " b"]);
+        let mut e = stateful_engine_in(&st, true);
+        e.submit(task("t1", 64)).unwrap();
+        e.submit(task("t2", 64)).unwrap();
+        let mut order = Vec::new();
+        for _ in 0..10_000 {
+            for (id, c) in e.step().unwrap() {
+                if !c.is_progress() {
+                    order.push((id.to_string(), c.text.clone(), c.is_final));
+                }
+            }
+            if order.iter().filter(|o| o.2).count() == 2 {
+                break;
+            }
+        }
+        let ids: Vec<&str> = order.iter().map(|o| o.0.as_str()).collect();
+        assert_eq!(ids, ["t1", "t1", "t1", "t2", "t2", "t2"], "{order:?}");
+        assert!(order[2].2 && order[5].2);
+        assert_eq!(st.lock().unwrap().polled_calls, 2);
+    }
+
+    /// While the generation has nothing new (a held prefill), `step()` returns
+    /// one progress chunk for the running task instead of blocking.
+    #[test]
+    fn stateful_step_returns_progress_while_the_generation_is_held() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["a", " b"]);
+            s.gate = Some(gate.clone());
+        }
+        let mut e = stateful_engine_in(&st, true);
+        e.submit(task("t1", 64)).unwrap();
+        for _ in 0..3 {
+            let out = e.step().unwrap();
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].0, TaskId::from("t1"));
+            assert!(out[0].1.is_progress(), "{:?}", out[0].1);
+        }
+        assert_eq!(st.lock().unwrap().consumed, 0);
+        gate.wait();
+        let out = until_final(&mut e);
+        assert_eq!(joined(&out), "a b");
+    }
+
+    /// Through the runner: a prefill of about 20 step waits is progress, not
+    /// a stall (the runner closes a stream after a few empty steps).
+    #[tokio::test]
+    async fn stateful_long_prefill_survives_the_no_progress_guard() {
+        use futures::StreamExt;
+        const MODEL: &str = "ov-genai-long-prefill-model";
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["one", " two"]);
+            s.prefill = Some(STEP_POLL * 20);
+        }
+        let e = stateful_engine_in(&st, true);
+        let runner = Arc::new(cascadia_runner::Runner::new(Box::new(Prebuilt(Some(e)))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut chunks = runner.generate_async(task("t-prefill", 64)).await.unwrap();
+        let mut all = Vec::new();
+        while let Some(c) = chunks.next().await {
+            all.push(c);
+        }
+        let progress = all.iter().filter(|c| c.is_progress()).count();
+        let out: Vec<Chunk> = all.into_iter().filter(|c| !c.is_progress()).collect();
+        let last = out.last().expect("a final chunk");
+        assert!(last.is_final && last.error.is_none(), "{last:?}");
+        assert_eq!(joined(&out), "one two");
+        assert!(progress >= 10, "about 20 progress chunks: {progress}");
+    }
+
+    /// The API's running sum of `n_tokens` is the tokens generated at every
+    /// chunk, held writes included, so a cut at a cancel, a stop or the
+    /// window counts what was generated; the final's count replaces the sum.
+    #[test]
+    fn stateful_usage_on_cancel_stop_and_window() {
+        /// The running sum after each chunk.
+        fn running(chunks: &[Chunk]) -> Vec<u32> {
+            let mut total = 0;
+            chunks
+                .iter()
+                .map(|c| {
+                    c.accumulate_tokens(&mut total);
+                    total
+                })
+                .collect()
+        }
+
+        // Stop, after an echo the stream holds: the held writes ride on the
+        // first delta.
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["Q", "\n", " one", " two", " stop", " x"]);
+        let mut e = stateful_engine_in(&st, true);
+        let mut t = stop_task("t1", 64, &["stop"]);
+        t.prompt = "Q".into();
+        e.submit(t).unwrap();
+        let out = until_final(&mut e);
+        assert_eq!(joined(&out), "one two stop");
+        assert_eq!(running(&out), [3, 4, 5, 3], "{out:?}");
+        assert_eq!(st.lock().unwrap().consumed, 5);
+
+        // Cancel: what went out is what was generated before it.
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let mut e = stateful_engine_in(&st, true);
+        let h = e.inflight_cancel().unwrap();
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["a", " b", " c", " d"]);
+            s.cancel_before = Some((3, h, TaskId::from("t1")));
+        }
+        e.submit(task("t1", 64)).unwrap();
+        let out = until_final(&mut e);
+        assert!(is_empty_cancelled(out.last().unwrap()));
+        assert_eq!(running(&out), [1, 2, 3, 3]);
+
+        // The window: the limit is cut to 7 - 3 = 4; each chunk's sum is the
+        // tokens so far, so the API's window guard cuts where the engine is.
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["a", " b", " c", " d"]);
+        let mut e =
+            stateful_engine_with(&st, |b| b.with_context_window(Some(7)).stream_writes(true));
+        let mut t = task("t1", 4096);
+        t.prompt = "p q r".into();
+        e.submit(t).unwrap();
+        let out = until_final(&mut e);
+        assert_eq!(
+            st.lock().unwrap().last_cfg.as_ref().unwrap().max_new_tokens,
+            4
+        );
+        assert_eq!(running(&out), [1, 2, 3, 4, 4]);
+        let fin = out.last().unwrap();
+        assert_eq!(fin.finish_reason, Some(FinishReason::Length));
+        assert_eq!(fin.prompt_tokens, Some(3));
+    }
+
+    /// A panic inside a streaming generation (here the prompt count) costs
+    /// that task an error chunk; the engine and its handle go on, and the
+    /// next task runs.
+    #[test]
+    fn stateful_worker_panic_costs_one_task() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["a", " b"]);
+            s.count_panics = 1;
+        }
+        let mut e = stateful_engine_in(&st, true);
+        let h = e.inflight_cancel().unwrap();
+        e.submit(task("t1", 64)).unwrap();
+        e.submit(task("t2", 64)).unwrap();
+        let first = until_final(&mut e);
+        let fail = first.last().unwrap();
+        assert!(
+            fail.error
+                .as_deref()
+                .is_some_and(|m| m.contains("panicked")),
+            "{fail:?}"
+        );
+        // t1 is over on the handle: its cancel sets nothing.
+        h.cancel(&TaskId::from("t1"));
+        assert!(!h.cancelled());
+        let second = until_final(&mut e);
+        assert_eq!(joined(&second), "a b");
+        assert!(second.last().unwrap().error.is_none());
+    }
+
+    /// The engine built directly, streaming, so a test can reach its worker.
+    fn streaming_engine(st: &Arc<Mutex<StatefulState>>) -> OvGenaiEngine {
+        let params = GenParams {
+            speculative_k: 0,
+            prompt_lookup_ngram: 0,
+            prompt_pretemplated: false,
+            max_tokens_default: 256,
+            context_window: None,
+            engine_stop_check: true,
+            stream_text: true,
+        };
+        OvGenaiEngine::new(Box::new(MockStatefulPipe { st: st.clone() }), params).unwrap()
+    }
+
+    /// A worker thread that is gone mid-generation fails that task with an
+    /// error chunk; the next task runs on a new thread.
+    #[test]
+    fn stateful_worker_exit_fails_the_running_task_and_respawns() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["a", " b"]);
+            s.gate = Some(gate.clone());
+        }
+        let mut e = streaming_engine(&st);
+        let h = e.inflight_cancel().unwrap();
+        e.submit(task("t1", 64)).unwrap();
+        let out = e.step().unwrap();
+        assert!(out[0].1.is_progress(), "{out:?}");
+        // The engine loses its thread while t1 generates.
+        let old = std::mem::replace(
+            &mut e.stream.as_mut().unwrap().worker,
+            StatefulWorker::gone(),
+        );
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let c = &out[0].1;
+        assert!(c.is_final, "{c:?}");
+        assert!(
+            c.error
+                .as_deref()
+                .is_some_and(|m| m.contains("worker thread exited")),
+            "{c:?}"
+        );
+        assert!(!h.cancelled(), "t1 is over on the handle");
+        // Let the lost thread finish and go.
+        st.lock().unwrap().gate = None;
+        gate.wait();
+        drop(old);
+        e.submit(task("t2", 64)).unwrap();
+        let mut boxed: Box<dyn Engine> = Box::new(e);
+        let out = until_final(&mut boxed);
+        assert_eq!(joined(&out), "a b");
+    }
+
+    /// A worker thread that is gone between tasks: the next task's job goes
+    /// to a new thread.
+    #[test]
+    fn stateful_worker_gone_before_a_task_is_replaced() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["a", " b"]);
+        let mut e = streaming_engine(&st);
+        e.stream.as_mut().unwrap().worker = StatefulWorker::gone();
+        e.submit(task("t1", 64)).unwrap();
+        let mut boxed: Box<dyn Engine> = Box::new(e);
+        let out = until_final(&mut boxed);
+        assert_eq!(joined(&out), "a b");
+        assert!(out.last().unwrap().error.is_none());
+    }
+
+    /// Dropping a streaming engine mid-generation ends the generation at its
+    /// next write and joins the worker.
+    #[test]
+    fn stateful_dropping_a_streaming_engine_mid_generation_ends_it() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            let many: Vec<String> = (0..1000).map(|i| format!(" w{i}")).collect();
+            s.pieces = many.into_iter().map(|w| (w, 1)).collect();
+            s.prefill = Some(std::time::Duration::from_millis(200));
+        }
+        let mut e = stateful_engine_in(&st, true);
+        e.submit(task("t1", 4096)).unwrap();
+        assert!(e.step().unwrap()[0].1.is_progress());
+        let t0 = std::time::Instant::now();
+        drop(e);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        let s = st.lock().unwrap();
+        assert_eq!(s.consumed, 1, "ended at its first write");
+        assert_eq!(s.polls[0].2, PollAction::Cancel);
+    }
+
+    /// A stop split across two and three writes is found on the handed-out
+    /// text, and the match stays in the answer for the API's cut.
+    #[test]
+    fn stateful_stream_stop_split_across_writes() {
+        for (toks, consumed) in [
+            (vec!["say ", "<e", "nd>", " more"], 3),
+            (vec!["say ", "<", "en", "d>", " more"], 4),
+        ] {
+            let (out, n) = run_stateful("<chat>", &toks, &["<end>"], true, true);
+            assert_eq!(joined(&out), "say <end>", "{toks:?}");
+            assert_eq!(n, consumed, "{toks:?}");
+            assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+        }
+    }
+
+    /// A stop inside the echoed prompt (held, never handed out) does not end
+    /// the generation; the same stop in the answer does.
+    #[test]
+    fn stateful_stream_stop_inside_the_prompt_echo_is_not_a_stop() {
+        let prompt = "Q: one;A:";
+        let toks = ["Q: ", "one", ";", "A:", " two", ";", " three"];
+        let (out, consumed) = run_stateful(prompt, &toks, &[";"], true, true);
+        assert_eq!(joined(&out), "two;");
+        assert_eq!(consumed, 6);
+        let (off, _) = run_stateful(prompt, &toks, &[";"], false, false);
+        assert_eq!(cut_at(&joined(&out), ";"), cut_at(&joined(&off), ";"));
+    }
+
+    /// Speculative rounds write several ids at once: each round's text goes
+    /// out with its id count, and the counts add up to the tokens generated.
+    #[test]
+    fn stateful_stream_speculative_multi_id_writes() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().writes = vec![
+            vec!["a".into(), " b".into(), " c".into()],
+            vec![" d".into()],
+            vec![" e".into(), " f".into()],
+        ];
+        let mut e = stateful_engine_with(&st, |b| b.with_prompt_lookup(3).stream_writes(true));
+        e.submit(task("t1", 64)).unwrap();
+        let out = until_final(&mut e);
+        let deltas: Vec<(&str, Option<u32>)> = out[..3]
+            .iter()
+            .map(|c| (c.text.as_str(), c.n_tokens))
+            .collect();
+        assert_eq!(
+            deltas,
+            [("a b c", Some(3)), (" d", Some(1)), (" e f", Some(2))]
+        );
+        assert_eq!(usage(&out), 6);
+        assert_eq!(joined(&out), "a b c d e f");
     }
 }

@@ -65,13 +65,17 @@ The `model` label is the shard's `model_id`.
 | `cascadia_tasks_failed_total` | counter | `model` | Generations that terminated with an engine error. |
 | `cascadia_kv_cache_exhausted_total` | counter | `outcome` | `ov-genai --cb` requests the OpenVINO scheduler dropped because the KV cache ran out. `outcome="length"`: the request had produced output, so it ended with `finish_reason: length` and its text (booked as `length` on the duration histogram, not as a failure). `outcome="error"`: nothing was produced and the request failed (also in `cascadia_tasks_failed_total`). Raise `--cb-cache-size` or lower `--cb-max-num-seqs` when it rises. |
 
-Modes that deliver the whole response on a single final chunk — `ov-genai`
-**without** `--cb`, which is the default worker configuration — produce one
-TTFT sample equal to the full generation and no inter-token samples. Read
-`cascadia_generation_ttft_seconds` as generation latency there, not as
-time-to-first-token. A cancelled task on these modes, and on single-stage
-sparse-moe, books no TTFT sample and 0 generated tokens. Per-token producers (`ov-genai --cb`, `ov-runtime`,
-sparse-moe, mock) populate both histograms as named.
+Modes that deliver the whole response on a single final chunk — single-stage
+sparse-moe, and `ov-genai` without `--cb` when an embedder builds it without
+`stream_writes` — produce one TTFT sample equal to the full generation and no
+inter-token samples. Read `cascadia_generation_ttft_seconds` as generation
+latency there, not as time-to-first-token. A cancelled task on these modes
+books no TTFT sample and 0 generated tokens. Per-token producers (`ov-genai`
+as the `cascadia worker` command runs it, with or without `--cb`,
+`ov-runtime`, sparse-moe, mock) populate both histograms as named; on the
+default ov-genai path one sample may cover a speculative round or a few tokens
+held back (an echoed prompt, a split character). There a request queued behind
+a running generation includes its wait in TTFT and duration, as it did before.
 
 `sycl-llama` SSE fragments are not necessarily individual model tokens. Its
 completion count is finalized from the child's usage; the first visible fragment

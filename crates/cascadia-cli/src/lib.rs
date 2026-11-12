@@ -2139,6 +2139,9 @@ fn ov_genai_builder(args: &WorkerArgs, engine_stop_check: bool) -> Result<OvGena
     let info = cascadia_api::read_model_generation_info(std::path::Path::new(&args.model));
     b = b.with_context_window(resolve_generation_defaults(args, &info).0.context_window);
     b = b.with_engine_stop_check(engine_stop_check);
+    // The default (stateful) path streams each write's text as it is
+    // generated; `--cb` streams on its own.
+    b = b.stream_writes(true);
     Ok(b)
 }
 
@@ -4273,6 +4276,31 @@ mod tests {
                 "{engine:?}: no template"
             );
         }
+    }
+
+    /// The community worker streams the default (stateful) ov-genai path;
+    /// the builder's own default stays one final chunk.
+    #[test]
+    fn ov_genai_worker_streams_the_stateful_path() {
+        let model = tempfile::tempdir().unwrap();
+        let argv = [
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--engine",
+            "ov-genai",
+            "--model",
+            model.path().to_str().unwrap(),
+        ];
+        let Command::Worker(args) = Cli::try_parse_from(argv).expect("parse worker argv").cmd
+        else {
+            panic!("expected worker subcommand");
+        };
+        assert!(ov_genai_builder(&args, true).unwrap().stream_writes);
+        assert!(!OvGenaiBuilder::new("/m", "GPU").stream_writes);
     }
 
     #[test]

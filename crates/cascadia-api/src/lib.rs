@@ -11357,6 +11357,224 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    // --- The streaming stateful ov-genai engine's chunk shape --------------
+
+    /// One step of a [`StatefulShapeEngine`] script.
+    #[derive(Clone)]
+    enum ShapeStep {
+        /// A zero-token progress chunk (the generation had nothing new).
+        Progress,
+        /// A delta and the tokens it stands for (held writes' included).
+        Delta(&'static str, u32),
+    }
+
+    /// Replays the chunks the streaming stateful ov-genai engine sends: deltas
+    /// with their token counts (the first one with the prompt count),
+    /// progress chunks while nothing is new, then a final with the rest of
+    /// the answer, the carried tokens, `completion_tokens`, the prompt count
+    /// and the finish reason.
+    struct StatefulShapeEngine {
+        steps: Vec<ShapeStep>,
+        rest: &'static str,
+        completion_tokens: u32,
+        prompt_tokens: u32,
+        pending: Option<(cascadia_types::TaskId, usize, bool)>,
+    }
+
+    impl cascadia_engine::Engine for StatefulShapeEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some((task.task_id, 0, false));
+            Ok(())
+        }
+        fn cancel(&mut self, task_id: &cascadia_types::TaskId) {
+            if self.pending.as_ref().is_some_and(|(id, ..)| id == task_id) {
+                self.pending = None;
+            }
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some((id, i, mut reported)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            let chunk = match self.steps.get(i).cloned() {
+                Some(ShapeStep::Progress) => Chunk::progress(id.clone()),
+                Some(ShapeStep::Delta(text, n)) => Chunk::token(&id, 0, text)
+                    .with_n_tokens(n)
+                    .with_first_prompt_tokens(&mut reported, self.prompt_tokens),
+                None => {
+                    return Ok(vec![(
+                        id.clone(),
+                        Chunk::final_marker(&id, self.rest)
+                            .with_n_tokens(0)
+                            .with_completion_tokens(self.completion_tokens)
+                            .with_finish_reason(cascadia_types::FinishReason::Stop)
+                            .with_prompt_tokens(self.prompt_tokens),
+                    )]);
+                }
+            };
+            self.pending = Some((id.clone(), i + 1, reported));
+            Ok(vec![(id, chunk)])
+        }
+    }
+
+    struct ShapeBuilder(Option<StatefulShapeEngine>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ShapeBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            mut self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0.take().unwrap()))
+        }
+    }
+
+    /// Router over a [`StatefulShapeEngine`] replaying `steps`.
+    async fn shape_app(
+        steps: Vec<ShapeStep>,
+        rest: &'static str,
+        completion_tokens: u32,
+        window: Option<u32>,
+    ) -> Router {
+        let runner = Runner::new(Box::new(ShapeBuilder(Some(StatefulShapeEngine {
+            steps,
+            rest,
+            completion_tokens,
+            prompt_tokens: 5,
+            pending: None,
+        }))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            generation_defaults: GenerationDefaults {
+                context_window: window,
+                ..GenerationDefaults::default()
+            },
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// The answer's deltas, with or without progress chunks between them.
+    fn shape_steps(progress: bool) -> Vec<ShapeStep> {
+        let deltas = [
+            ShapeStep::Delta("Hello", 3),
+            ShapeStep::Delta(" wor", 1),
+            ShapeStep::Delta("ld", 2),
+        ];
+        let mut steps = Vec::new();
+        for d in deltas {
+            if progress {
+                steps.extend([ShapeStep::Progress, ShapeStep::Progress]);
+            }
+            steps.push(d);
+        }
+        if progress {
+            steps.push(ShapeStep::Progress);
+        }
+        steps
+    }
+
+    /// Progress chunks are never a client frame, and change nothing a client
+    /// gets: the streamed frames and the non-streamed content and usage are
+    /// those of the same answer without them. The final's rest and its
+    /// `completion_tokens` (which replaces the deltas' sum) are honoured.
+    #[tokio::test]
+    async fn stateful_progress_never_reaches_the_client() {
+        let chat = serde_json::json!({"model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true, "stream_options": {"include_usage": true}});
+        let mut bodies = Vec::new();
+        for progress in [false, true] {
+            let app = shape_app(shape_steps(progress), "!", 7, None).await;
+            let (status, text) = post_text(app, "/v1/chat/completions", &chat).await;
+            assert_eq!(status, StatusCode::OK);
+            let events = sse_events(&text);
+            for event in &events {
+                crate::spec_schema::assert_spec("CreateChatCompletionStreamResponse", event);
+                let choice = &event["choices"][0];
+                assert!(
+                    !(choice["delta"]["content"] == "" && choice["finish_reason"].is_null()),
+                    "progress={progress}: an empty interior frame: {text}"
+                );
+            }
+            assert_eq!(streamed_content(&events), "Hello world!", "{text}");
+            assert_usage(&events.last().unwrap()["usage"], 5, 7, &text);
+            bodies.push(normalize_sse(&text));
+
+            let app = shape_app(shape_steps(progress), "!", 7, None).await;
+            let (status, v) = post_chat(
+                app,
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["choices"][0]["message"]["content"], "Hello world!", "{v}");
+            assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+            assert_usage(&v["usage"], 5, 7, &v.to_string());
+        }
+        assert_eq!(bodies[0], bodies[1], "progress changed the stream");
+    }
+
+    /// At the window the API ends a stream on the deltas' running sum, before
+    /// the engine's final: the answer is what went out, with `length`. A rest
+    /// the final would have carried (here a held U+FFFD whose token was
+    /// already counted) is not sent.
+    #[tokio::test]
+    async fn stateful_stream_at_the_window_ends_with_length() {
+        let steps = vec![
+            ShapeStep::Delta("a b", 2),
+            ShapeStep::Progress,
+            ShapeStep::Delta(" c d", 2),
+        ];
+        for stream in [false, true] {
+            // Prompt 5 + 4 answer tokens fill a window of 9.
+            let app = shape_app(steps.clone(), "\u{FFFD}", 4, Some(9)).await;
+            let mut body = serde_json::json!({"model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}], "stream": stream});
+            if stream {
+                body["stream_options"] = serde_json::json!({"include_usage": true});
+            }
+            let (status, text) = post_text(app, "/v1/chat/completions", &body).await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            if stream {
+                let events = sse_events(&text);
+                assert_eq!(streamed_content(&events), "a b c d", "{text}");
+                let finishes: Vec<&Value> = events
+                    .iter()
+                    .map(|e| &e["choices"][0]["finish_reason"])
+                    .filter(|f| !f.is_null())
+                    .collect();
+                assert_eq!(finishes, [&serde_json::json!("length")], "{text}");
+                assert_usage(&events.last().unwrap()["usage"], 5, 4, &text);
+            } else {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(v["choices"][0]["message"]["content"], "a b c d", "{v}");
+                assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+                assert_usage(&v["usage"], 5, 4, &v.to_string());
+            }
+        }
+    }
+
     // --- A length cut inside a tool call ------------------------------------
 
     /// A complete call, then a second one the window (5 prompt + 2) cuts in
