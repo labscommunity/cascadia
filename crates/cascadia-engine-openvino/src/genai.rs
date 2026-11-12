@@ -392,7 +392,8 @@ impl Builder for OvGenaiBuilder {
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
         let recipe = self.recipe.ok_or(EngineError::NotLoaded)?;
-        let rebuild = RebuildState::new(Box::new(SystemClock::new()));
+        let floor = rebuild_floor(std::env::var(REBUILD_FLOOR_ENV).ok().as_deref());
+        let rebuild = RebuildState::new(Box::new(SystemClock::new()), floor);
         if let Some(pipe) = self.cb_pipe {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
@@ -1022,6 +1023,52 @@ impl SchemaBudget {
 /// schemas costs the other clients at most that once per floor.
 const REBUILD_FLOOR: Duration = Duration::from_secs(10 * 60);
 
+/// Overrides [`REBUILD_FLOOR`] in whole seconds, at least
+/// [`REBUILD_FLOOR_MIN`]: a longer floor makes a client sending ever-new
+/// schemas cost fewer reloads, a shorter one lets a test drive many rebuilds.
+const REBUILD_FLOOR_ENV: &str = "CASCADIA_OV_GENAI_REBUILD_FLOOR_SECS";
+
+/// The shortest floor [`REBUILD_FLOOR_ENV`] may set.
+const REBUILD_FLOOR_MIN: Duration = Duration::from_secs(60);
+
+/// The rebuild floor for a raw [`REBUILD_FLOOR_ENV`] value: the default
+/// when unset, empty or not a whole number of seconds, and at least
+/// [`REBUILD_FLOOR_MIN`].
+fn rebuild_floor(raw: Option<&str>) -> Duration {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return REBUILD_FLOOR;
+    };
+    match raw.parse::<u64>() {
+        Ok(secs) if Duration::from_secs(secs) >= REBUILD_FLOOR_MIN => Duration::from_secs(secs),
+        Ok(secs) => {
+            warn!(
+                value = secs,
+                min_s = REBUILD_FLOOR_MIN.as_secs(),
+                "{REBUILD_FLOOR_ENV} is below the minimum; using the minimum"
+            );
+            REBUILD_FLOOR_MIN
+        }
+        Err(_) => {
+            warn!(
+                value = raw,
+                default_s = REBUILD_FLOOR.as_secs(),
+                "{REBUILD_FLOOR_ENV} is not a whole number of seconds; using the default"
+            );
+            REBUILD_FLOOR
+        }
+    }
+}
+
+/// "10 minutes", "1 minute", "90 s": a floor as a client reads it.
+fn floor_text(floor: Duration) -> String {
+    let secs = floor.as_secs();
+    match (secs % 60, secs / 60) {
+        (0, 1) => "1 minute".to_owned(),
+        (0, m) => format!("{m} minutes"),
+        _ => format!("{secs} s"),
+    }
+}
+
 /// Most random time added to [`REBUILD_FLOOR`], drawn for each pipeline, so
 /// workers whose budgets filled together do not all rebuild together.
 const REBUILD_JITTER_MAX: Duration = Duration::from_secs(60);
@@ -1040,8 +1087,8 @@ enum RebuildNote {
     Rebuilt,
     /// The CB engine rebuilds once the requests in flight finish.
     AfterDrain,
-    /// [`REBUILD_FLOOR`] holds: no rebuild may start for this long.
-    Wait(Duration),
+    /// The rebuild floor (`floor`) holds: no rebuild may start for `wait`.
+    Wait { wait: Duration, floor: Duration },
 }
 
 /// The 400 for a new schema refused by a full [`SchemaBudget`]. Starts with
@@ -1058,10 +1105,10 @@ fn budget_full_error(note: RebuildNote) -> EngineError {
              finish (within {} s); retry the request after that",
             REBUILD_DRAIN_CAP.as_secs()
         ),
-        RebuildNote::Wait(wait) => format!(
-            "the worker rebuilds its pipeline to clear the limit at most once every {} minutes; \
+        RebuildNote::Wait { wait, floor } => format!(
+            "the worker rebuilds its pipeline to clear the limit at most once every {}; \
              the next rebuild can start in {} s, on the first new schema after that",
-            REBUILD_FLOOR.as_secs() / 60,
+            floor_text(floor),
             wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
         ),
     };
@@ -1115,8 +1162,11 @@ type Rebuild<P> = Box<dyn FnMut() -> Result<Box<P>, OvError> + Send>;
 /// itself, at a point where nothing is in flight.
 struct RebuildState {
     clock: Box<dyn RebuildClock>,
+    /// The rebuild floor: [`REBUILD_FLOOR`] unless [`REBUILD_FLOOR_ENV`]
+    /// sets it.
+    floor: Duration,
     /// No rebuild starts before this: when the pipeline was built, plus
-    /// [`REBUILD_FLOOR`] and up to [`REBUILD_JITTER_MAX`].
+    /// `floor` and up to [`REBUILD_JITTER_MAX`].
     not_before: Instant,
     /// CB only: since when the engine admits nothing, draining for a rebuild.
     draining_since: Option<Instant>,
@@ -1129,10 +1179,11 @@ struct RebuildState {
 }
 
 impl RebuildState {
-    fn new(mut clock: Box<dyn RebuildClock>) -> Self {
-        let not_before = clock.now() + REBUILD_FLOOR + clock.jitter(REBUILD_JITTER_MAX);
+    fn new(mut clock: Box<dyn RebuildClock>, floor: Duration) -> Self {
+        let not_before = clock.now() + floor + clock.jitter(REBUILD_JITTER_MAX);
         Self {
             clock,
+            floor,
             not_before,
             draining_since: None,
             rebuilds: 0,
@@ -1149,7 +1200,7 @@ impl RebuildState {
     /// A new pipeline was built: count it, and start its floor.
     fn rebuilt(&mut self) {
         self.rebuilds += 1;
-        self.not_before = self.clock.now() + REBUILD_FLOOR + self.clock.jitter(REBUILD_JITTER_MAX);
+        self.not_before = self.clock.now() + self.floor + self.clock.jitter(REBUILD_JITTER_MAX);
     }
 
     /// The error every request gets once a rebuild failed: a 5xx, so the
@@ -2163,7 +2214,10 @@ impl OvGenaiCbEngine {
     /// 400; a failed rebuild answers it with the failure instead.
     fn budget_full(&mut self) -> EngineError {
         if let Some(wait) = self.rebuild.wait() {
-            return budget_full_error(RebuildNote::Wait(wait));
+            return budget_full_error(RebuildNote::Wait {
+                wait,
+                floor: self.rebuild.floor,
+            });
         }
         if self.active.is_empty() {
             self.rebuild_pipeline();
@@ -2446,7 +2500,10 @@ impl OvGenaiEngine {
     /// answers it with the failure instead.
     fn budget_full(&mut self) -> EngineError {
         if let Some(wait) = self.rebuild.wait() {
-            return budget_full_error(RebuildNote::Wait(wait));
+            return budget_full_error(RebuildNote::Wait {
+                wait,
+                floor: self.rebuild.floor,
+            });
         }
         self.rebuild_pipeline();
         self.rebuild
@@ -2759,7 +2816,7 @@ mod tests {
             schema_keys: RandomState::new(),
             schema_budget: SchemaBudget::default(),
             build_pipe: mock_rebuild(st),
-            rebuild: RebuildState::new(Box::new(clock.clone())),
+            rebuild: RebuildState::new(Box::new(clock.clone()), REBUILD_FLOOR),
             cut: Vec::new(),
         }
     }
@@ -4879,6 +4936,49 @@ mod tests {
     }
 
     #[test]
+    fn the_rebuild_floor_env_sets_whole_seconds_at_least_the_minimum() {
+        assert_eq!(rebuild_floor(None), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some("")), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some("  ")), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some("1800")), Duration::from_secs(1800));
+        assert_eq!(rebuild_floor(Some(" 90 ")), Duration::from_secs(90));
+        assert_eq!(rebuild_floor(Some("60")), REBUILD_FLOOR_MIN);
+        assert_eq!(rebuild_floor(Some("5")), REBUILD_FLOOR_MIN);
+        assert_eq!(rebuild_floor(Some("0")), REBUILD_FLOOR_MIN);
+        assert_eq!(rebuild_floor(Some("-5")), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some("1.5")), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some("ten")), REBUILD_FLOOR);
+        assert_eq!(floor_text(REBUILD_FLOOR), "10 minutes");
+        assert_eq!(floor_text(Duration::from_secs(60)), "1 minute");
+        assert_eq!(floor_text(Duration::from_secs(90)), "90 s");
+    }
+
+    #[test]
+    fn a_shorter_floor_rebuilds_sooner_and_names_itself_in_the_400() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine_at(&st, &clock);
+        let floor = Duration::from_secs(90);
+        e.rebuild = RebuildState::new(Box::new(clock.clone()), floor);
+        cb_fill_and_finish(&mut e, &st, 0);
+
+        let refused = refusal(e.submit(schema_task("early", &full_budget_body(1000))));
+        assert!(
+            refused.contains("at most once every 90 s; the next rebuild can start in 90 s"),
+            "{refused}"
+        );
+        assert_eq!(e.rebuild.rebuilds, 0);
+
+        clock.advance(floor);
+        assert_eq!(
+            refusal(e.submit(schema_task("due", &full_budget_body(1001)))),
+            BUDGET_FULL_REBUILT_400
+        );
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(e.rebuild.wait(), Some(floor));
+    }
+
+    #[test]
     fn a_failed_rebuild_refuses_every_request_with_a_clear_error() {
         let clock = FakeClock::new(Duration::ZERO);
         let (mut e, st) = cb_full_budget(&clock);
@@ -5117,7 +5217,7 @@ mod tests {
                     id: s.builds,
                 }) as Box<dyn StatefulPipe>)
             }),
-            rebuild: RebuildState::new(Box::new(clock.clone())),
+            rebuild: RebuildState::new(Box::new(clock.clone()), REBUILD_FLOOR),
         }
     }
 
