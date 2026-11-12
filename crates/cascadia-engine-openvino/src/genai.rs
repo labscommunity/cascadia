@@ -2294,6 +2294,12 @@ impl OvGenaiCbEngine {
              (GenAI frees compiled grammars only with the pipeline)"
         );
         self.rebuild.draining_since = None;
+        // GenAI frees a cut or cancelled request's KV blocks only on its next
+        // step; a pipeline dropped before one logs them as leaked
+        // ("BlockManager leaked sequence block tables"). One step with
+        // nothing running lets it release them first. Its failure changes
+        // nothing: the pipeline is dropped next either way.
+        let _ = self.pipe.step();
         // The old pipeline goes first: a GPU may not hold two.
         drop(std::mem::replace(&mut self.pipe, Box::new(NoPipe)));
         match (self.build_pipe)() {
@@ -2659,6 +2665,11 @@ mod tests {
         validate_calls: usize,
         /// Pipelines dropped and built, in order: "drop", "build".
         events: Vec<&'static str>,
+        /// `steps` when each request was cancelled, and when each pipeline
+        /// was dropped: GenAI frees a cancelled request's KV blocks only on a
+        /// later step.
+        steps_at_cancel: Vec<usize>,
+        steps_at_drop: Vec<usize>,
         /// The next rebuild fails with this.
         build_err: Option<String>,
     }
@@ -2723,6 +2734,8 @@ mod tests {
         fn drop(&mut self) {
             if let Ok(mut st) = self.st.lock() {
                 st.events.push("drop");
+                let steps = st.steps;
+                st.steps_at_drop.push(steps);
             }
         }
     }
@@ -2782,7 +2795,10 @@ mod tests {
             }
         }
         fn cancel(&self) -> Result<(), OvError> {
-            self.st.lock().unwrap().cancelled.push(self.id);
+            let mut st = self.st.lock().unwrap();
+            st.cancelled.push(self.id);
+            let steps = st.steps;
+            st.steps_at_cancel.push(steps);
             Ok(())
         }
     }
@@ -4904,6 +4920,16 @@ mod tests {
         assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
         assert_eq!(e.rebuild.rebuilds, 1);
         assert_eq!(e.active.len(), 1);
+        // GenAI frees a cancelled request's KV blocks on its next step; a
+        // pipeline dropped before one logs them as leaked. One step runs
+        // between the cut and the drop.
+        let s = st.lock().unwrap();
+        let last_cancel = *s.steps_at_cancel.iter().max().unwrap();
+        assert!(
+            s.steps_at_drop[0] > last_cancel,
+            "no step between the cancels (at step {last_cancel}) and the drop (at step {})",
+            s.steps_at_drop[0]
+        );
     }
 
     /// At most one rebuild per pipeline per floor (plus its jitter), counted
