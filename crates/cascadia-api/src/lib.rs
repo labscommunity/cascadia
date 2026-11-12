@@ -6065,7 +6065,7 @@ mod tests {
         assert_eq!(content.trim(), "effort=max thinking=on");
 
         let (status, v) = post_chat(
-            app,
+            app.clone(),
             serde_json::json!({
                 "model": "mock-model",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -6080,6 +6080,33 @@ mod tests {
             content.trim().ends_with("thinking=off"),
             "thinking.type disabled must render the thinking-off branch: {content}"
         );
+
+        // An explicit on-switch of any kind beats "none" on a template that
+        // speaks effort words: thinking stays on and the template gets the
+        // mapped word, not the off word.
+        for switch in [
+            serde_json::json!({"thinking": {"type": "enabled"}}),
+            serde_json::json!({"chat_template_kwargs": {"enable_thinking": true}}),
+            serde_json::json!({"reasoning": {"enabled": true}}),
+        ] {
+            let mut body = serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "none",
+                "stream": false,
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(switch.as_object().unwrap().clone());
+            let (status, v) = post_chat(app.clone(), body).await;
+            assert_eq!(status, StatusCode::OK, "body: {v}");
+            let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+            assert_eq!(
+                content.trim(),
+                "effort=high thinking=on",
+                "switch: {switch}"
+            );
+        }
     }
 
     /// The rejection match is a substring test against the template's own
