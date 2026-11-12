@@ -317,6 +317,14 @@ pub trait KvWarmHandoff: Send + Sync {
     fn clear(&self, epoch: u64) -> bool;
 }
 
+/// The synchronous refusals of an engine's [`Engine::submit`], checked without the engine lock.
+/// See [`Engine::submit_admission`].
+pub trait SubmitAdmission: Send + Sync {
+    /// `Err` exactly when [`Engine::submit`] would refuse `task` for the task itself (not for the
+    /// engine's queue being full, which the engine reports when the task reaches it).
+    fn check(&self, task: &GenerationTask) -> EngineResult<()>;
+}
+
 pub trait Engine: Send {
     /// One short forward to compile kernels and warm device caches.
     fn warmup(&mut self);
@@ -393,6 +401,16 @@ pub trait Engine: Send {
     /// [`InflightCancel::begin`] / [`InflightCancel::end`] and polls [`InflightCancel::cancelled`]
     /// in between. `&self` because the handle is shared, not engine state.
     fn inflight_cancel(&self) -> Option<std::sync::Arc<InflightCancel>> {
+        None
+    }
+
+    /// The checks [`Self::submit`] would refuse a task on, runnable without the engine lock.
+    /// Default `None`: the runner hands every submit to the engine under its lock, waiting out a
+    /// running `step()`, so each refusal reaches the caller before any response starts. An engine
+    /// that holds the lock for a whole generation returns one; the runner then queues a submit
+    /// that finds the engine busy, after `check` passes, and hands it to the engine at the next
+    /// lock acquisition. Grabbed once at engine load, like [`Self::inflight_cancel`].
+    fn submit_admission(&self) -> Option<std::sync::Arc<dyn SubmitAdmission>> {
         None
     }
 

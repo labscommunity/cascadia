@@ -18,7 +18,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use cascadia_engine::{
-    Builder, Engine, EngineError, EngineResult, InflightCancel, LoadStream, OneShotStop, VisibleArm,
+    Builder, Engine, EngineError, EngineResult, InflightCancel, LoadStream, OneShotStop,
+    SubmitAdmission, VisibleArm,
 };
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
@@ -453,6 +454,32 @@ fn cancelled_chunk(task_id: &TaskId, prompt_tokens: Option<u32>) -> Chunk {
     chunk
 }
 
+/// The stateful engine's refusals in `submit` that depend on the task alone.
+///
+/// No forced-prefix path in the ov-genai pipelines: accepting a resumed task would regenerate
+/// from scratch and report success on a corrupt "resume". The enterprise shard backend declines
+/// these pre-submit (its shard_is_ov_genai guard); this is the engine-side backstop for any caller
+/// that misses that guard.
+fn check_stateful_task(task: &GenerationTask) -> EngineResult<()> {
+    if task.resume_ids().is_some() {
+        return Err(EngineError::Backend(
+            "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_stateful_task`] without the engine lock. A generation holds that lock for the whole
+/// answer, so the runner checks a submit that finds the engine busy with this and queues it,
+/// instead of holding the caller (and its response headers) until the generation ends.
+struct StatefulAdmission;
+
+impl SubmitAdmission for StatefulAdmission {
+    fn check(&self, task: &GenerationTask) -> EngineResult<()> {
+        check_stateful_task(task)
+    }
+}
+
 pub struct OvGenaiEngine {
     pipe: Box<dyn StatefulPipe>,
     speculative_k: u32,
@@ -492,16 +519,7 @@ impl Engine for OvGenaiEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        // No forced-prefix path in the ov-genai pipelines: accepting a resumed task
-        // would regenerate from scratch and report success on a corrupt "resume".
-        // The enterprise shard backend declines these pre-submit (its
-        // shard_is_ov_genai guard); this is the engine-side backstop for any
-        // caller that misses that guard.
-        if task.resume_ids().is_some() {
-            return Err(EngineError::Backend(
-                "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
-            ));
-        }
+        check_stateful_task(&task)?;
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -532,6 +550,10 @@ impl Engine for OvGenaiEngine {
 
     fn inflight_cancel(&self) -> Option<Arc<InflightCancel>> {
         Some(self.inflight.clone())
+    }
+
+    fn submit_admission(&self) -> Option<Arc<dyn SubmitAdmission>> {
+        Some(Arc::new(StatefulAdmission))
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -2299,6 +2321,33 @@ mod tests {
                 "{threaded}: logged once for the engine's life: {logs}"
             );
         }
+    }
+
+    /// The stateful engine holds its lock for a whole generation, so the
+    /// runner queues a submit that finds it busy after checking this: it must
+    /// refuse exactly what `submit` refuses on the task alone, with the same
+    /// error, and pass everything else.
+    #[test]
+    fn stateful_admission_refuses_a_resumed_task_like_submit() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let mut e = stateful_engine(&st);
+        let admission = e
+            .submit_admission()
+            .expect("the stateful engine hands out an admission");
+        let mut resumed = task("t1", 8);
+        resumed.resume_token_ids = Some(vec![1, 2]);
+        let checked = admission
+            .check(&resumed)
+            .expect_err("a resumed task is refused without the engine lock");
+        let submitted = e.submit(resumed).expect_err("and by submit");
+        assert!(
+            checked.to_string().contains("resume_unsupported:"),
+            "{checked}"
+        );
+        assert_eq!(checked.to_string(), submitted.to_string());
+        admission
+            .check(&task("t2", 8))
+            .expect("a plain task passes the admission");
     }
 
     #[test]

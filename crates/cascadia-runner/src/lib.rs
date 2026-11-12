@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use cascadia_engine::{Builder, Engine, EngineError, InflightCancel};
+use cascadia_engine::{Builder, Engine, EngineError, InflightCancel, SubmitAdmission};
 use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
 use futures::Stream;
 use parking_lot::Mutex;
@@ -48,6 +48,15 @@ const RELAY_ERR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(
 /// cancels are moot anyway — but an unbounded vec on that path would grow
 /// for the life of the process.
 const MAX_DEFERRED_CANCELS: usize = 4096;
+
+/// Ceiling on [`Buffers::deferred_submits`]. A submit past it is refused at
+/// once with [`EngineError::QueueFull`]. Far above any API admission limit;
+/// the cap only keeps a caller that ignores those limits from growing the
+/// queue without bound while one generation holds the engine.
+#[cfg(not(test))]
+const MAX_DEFERRED_SUBMITS: usize = 1024;
+#[cfg(test)]
+const MAX_DEFERRED_SUBMITS: usize = 2;
 
 /// Why [`Runner::run_relay_loop`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +164,11 @@ struct Buffers {
     /// `cancelled` tombstone set, so a queue that is somehow not being
     /// drained cannot grow without bound.
     deferred_cancels: Vec<TaskId>,
+    /// Submits that found the engine busy, for an engine that hands out a
+    /// [`SubmitAdmission`]: its refusals were checked without the lock, and
+    /// the next engine-lock holder hands these to the engine, after the
+    /// deferred cancels, in arrival order. Capped at [`MAX_DEFERRED_SUBMITS`].
+    deferred_submits: VecDeque<GenerationTask>,
 }
 
 /// The engine, plus the state every release of it has to service: the
@@ -185,6 +199,14 @@ struct EngineSlot {
     /// engine parked in `step()` with that lock held. Its own short lock is a leaf: nothing else is
     /// taken while it is held.
     inflight: Mutex<Option<Arc<InflightCancel>>>,
+    /// The engine's [`SubmitAdmission`], if it hands one out: with one, a submit that finds the
+    /// engine busy is queued instead of waiting for the lock. Set and cleared with the engine, like
+    /// `inflight`; a leaf lock.
+    admission: Mutex<Option<Arc<dyn SubmitAdmission>>>,
+    /// An engine is in the slot. Read without the engine lock by a submit about to queue; written
+    /// with the engine, under the buffers lock, so a queued submit never lands after `close()`
+    /// emptied the queue.
+    loaded: AtomicBool,
 }
 
 /// An engine lock that cannot be released without paying what the release
@@ -226,7 +248,10 @@ impl EngineGuard<'_> {
     /// the outgoing engine is dropped under the lock.
     ///
     /// The engine's [`InflightCancel`] handle is stored first, so a cancel that arrives the moment
-    /// the engine is in place already finds it.
+    /// the engine is in place already finds it; its [`SubmitAdmission`] likewise.
+    ///
+    /// Emptying the slot also empties [`Buffers::deferred_submits`]: those tasks never reached an
+    /// engine, and each one's stream ends on the teardown error when it next polls the empty slot.
     fn set(&mut self, engine: Option<Box<dyn Engine>>) {
         if let Some(g) = self.guard.as_mut() {
             let handle = engine.as_ref().and_then(|e| e.inflight_cancel());
@@ -235,22 +260,65 @@ impl EngineGuard<'_> {
                 h.reopen();
             }
             *self.slot.inflight.lock() = handle;
+            *self.slot.admission.lock() = engine.as_ref().and_then(|e| e.submit_admission());
+            {
+                // Under the buffers lock, where a submit re-reads `loaded` before it queues: a
+                // submit that raced this either queued before the clear or sees the slot empty.
+                let mut bufs = self.slot.buffers.lock();
+                self.slot.loaded.store(engine.is_some(), Ordering::SeqCst);
+                if engine.is_none() {
+                    bufs.deferred_submits.clear();
+                }
+            }
             **g = engine;
         }
     }
 
-    /// Hand the engine the cancels that arrived while it was busy, before
-    /// this holder does anything else with it (see
-    /// [`Buffers::deferred_cancels`]). Draining an emptied slot's queue is
-    /// still correct: `close()` has run, so there is nothing left to cancel.
-    fn apply_deferred_cancels(&mut self) {
-        let deferred = std::mem::take(&mut self.slot.buffers.lock().deferred_cancels);
-        if deferred.is_empty() {
+    /// Hand the engine what arrived while it was busy, before this holder
+    /// does anything else with it: the cancels first (see
+    /// [`Buffers::deferred_cancels`]), which free the places their tasks
+    /// held, then the queued submits in arrival order (see
+    /// [`Buffers::deferred_submits`]). Draining an emptied slot's queues is
+    /// still correct: `close()` has run, so there is nothing left to cancel,
+    /// and a queued task's stream ends on the teardown error.
+    ///
+    /// A queued submit the engine refuses (its own pending cap, say) ends
+    /// that task's stream with a final error chunk: its caller already has
+    /// the stream, so there is no `Err` left to return.
+    fn apply_deferred(&mut self) {
+        let (cancels, submits) = {
+            let mut bufs = self.slot.buffers.lock();
+            (
+                std::mem::take(&mut bufs.deferred_cancels),
+                std::mem::take(&mut bufs.deferred_submits),
+            )
+        };
+        if cancels.is_empty() && submits.is_empty() {
             return;
         }
-        if let Some(engine) = self.engine() {
-            for tid in &deferred {
-                engine.cancel(tid);
+        let slot = self.slot;
+        let Some(engine) = self.engine() else {
+            return;
+        };
+        for tid in &cancels {
+            engine.cancel(tid);
+        }
+        for task in submits {
+            // Re-checked under the engine lock, as `Runner::submit` does: a
+            // cancel or drop that raced the take above has tombstoned it.
+            if slot.buffers.lock().cancelled.contains(&task.task_id) {
+                continue;
+            }
+            let task_id = task.task_id.clone();
+            if let Err(e) = engine.submit(task) {
+                warn!(task = %task_id, error = %e, "engine refused a queued task");
+                let mut bufs = slot.buffers.lock();
+                if !bufs.cancelled.contains(&task_id) {
+                    bufs.chunks
+                        .entry(task_id.clone())
+                        .or_default()
+                        .push_back(Chunk::error(task_id, e.to_string()));
+                }
             }
         }
     }
@@ -272,6 +340,8 @@ impl EngineSlot {
     fn new(engine: Option<Box<dyn Engine>>) -> Self {
         Self {
             inflight: Mutex::new(engine.as_ref().and_then(|e| e.inflight_cancel())),
+            admission: Mutex::new(engine.as_ref().and_then(|e| e.submit_admission())),
+            loaded: AtomicBool::new(engine.is_some()),
             engine: Mutex::new(engine),
             buffers: Mutex::new(Buffers::default()),
         }
@@ -316,20 +386,21 @@ impl EngineSlot {
     }
 
     /// [`lock`](Self::lock), then hand the engine everything queued in
-    /// [`Buffers::deferred_cancels`]. Every acquisition that can act on
-    /// that queue goes through this or its `try_` twin, which is what makes
-    /// the queue's contract ("applied by the next engine-lock holder") true
-    /// rather than "applied by the next stream poll, if one ever comes".
+    /// [`Buffers::deferred_cancels`] and [`Buffers::deferred_submits`].
+    /// Every acquisition that can act on those queues goes through this or
+    /// its `try_` twin, which is what makes their contract ("applied by the
+    /// next engine-lock holder") true rather than "applied by the next
+    /// stream poll, if one ever comes".
     fn lock_applying_cancels(&self) -> EngineGuard<'_> {
         let mut guard = self.lock();
-        guard.apply_deferred_cancels();
+        guard.apply_deferred();
         guard
     }
 
     /// [`try_lock`](Self::try_lock) + [`lock_applying_cancels`] semantics.
     fn try_lock_applying_cancels(&self) -> Option<EngineGuard<'_>> {
         let mut guard = self.try_lock()?;
-        guard.apply_deferred_cancels();
+        guard.apply_deferred();
         Some(guard)
     }
 
@@ -383,6 +454,55 @@ impl EngineSlot {
             return;
         }
         bufs.deferred_cancels.push(task_id.clone());
+    }
+
+    /// Queue `task` for the next engine-lock holder, for an engine with an
+    /// `admission` whose lock is busy: the engine's own refusals of the task
+    /// are checked here, without the lock, so they still reach the caller
+    /// as a typed `Err` before any response starts.
+    ///
+    /// Refuses with [`EngineError::NotLoaded`] once the slot is empty, and
+    /// with [`EngineError::QueueFull`] at [`MAX_DEFERRED_SUBMITS`]. A
+    /// tombstoned id, or one already queued, is a no-op `Ok`, as in the
+    /// locked path and [`Engine::submit`].
+    fn defer_submit(
+        &self,
+        admission: &dyn SubmitAdmission,
+        task: GenerationTask,
+    ) -> Result<(), EngineError> {
+        if !self.loaded.load(Ordering::SeqCst) {
+            return Err(EngineError::NotLoaded);
+        }
+        admission.check(&task)?;
+        {
+            let mut bufs = self.buffers.lock();
+            // Again under the lock `EngineGuard::set` writes it under: a slot
+            // emptied since the read above has emptied the queue too, and
+            // nothing would ever drain this task.
+            if !self.loaded.load(Ordering::SeqCst) {
+                return Err(EngineError::NotLoaded);
+            }
+            if bufs.cancelled.contains(&task.task_id)
+                || bufs
+                    .deferred_submits
+                    .iter()
+                    .any(|t| t.task_id == task.task_id)
+            {
+                return Ok(());
+            }
+            if bufs.deferred_submits.len() >= MAX_DEFERRED_SUBMITS {
+                return Err(EngineError::QueueFull {
+                    queued: bufs.deferred_submits.len(),
+                    cap: MAX_DEFERRED_SUBMITS,
+                });
+            }
+            bufs.deferred_submits.push_back(task);
+        }
+        // The holder may have released between the failed `try_lock` and the
+        // push, with no later holder coming: take the lock if it is free now,
+        // which hands the task over.
+        drop(self.try_lock_applying_cancels());
+        Ok(())
     }
 }
 
@@ -493,25 +613,46 @@ impl Runner {
     /// Enqueue a task with the engine.
     ///
     /// **Blocks the calling thread** for up to a full engine step when one is
-    /// in flight. Async contexts must not call this directly — use
+    /// in flight, unless the engine hands out a [`SubmitAdmission`]: then a
+    /// submit that finds the engine busy runs the admission's check (its
+    /// refusal is returned here, typed), joins the runner's queue and returns
+    /// at once; the next engine-lock holder hands it to the engine. Async
+    /// contexts must not call this directly — use
     /// [`Runner::generate_async`], which dispatches it via `spawn_blocking`.
     ///
     /// Refuses (as a benign no-op `Ok(())`) any task whose id already carries
-    /// a `cancelled` tombstone — see the comment in the lock region below.
+    /// a `cancelled` tombstone — see the comment in [`Self::submit_locked`].
     pub fn submit(&self, task: GenerationTask) -> Result<(), EngineError> {
-        // NOTE: the lock below is a hard `lock()`, not a `try_lock()` — this
-        // is the one engine-lock caller that must not give up, since there is
-        // nowhere to park a submit. A tokio worker thread blocked here counts
-        // toward the driver starvation that wedges the pipeline (#122), which
-        // is why the async entry point (`Runner::generate_async`) keeps this
-        // call off the runtime.
-        // Releasing the guard wakes the streams parked on contention, on
-        // the empty-slot path as much as the submitting one — an empty slot
-        // means `close()` already ran, so no later lock holder is coming to
-        // wake them instead. Taking the lock also flushes cancels deferred
-        // while the engine was busy, freeing their slots before this task
-        // asks for one.
-        let mut guard = self.slot.lock_applying_cancels();
+        let admission = self.slot.admission.lock().clone();
+        let Some(admission) = admission else {
+            // NOTE: a hard `lock()`, not a `try_lock()`: without an admission
+            // this is the one engine-lock caller that must not give up, since
+            // the engine's refusals (a 413 for an over-window prompt) must
+            // reach the caller before any response starts. A tokio worker
+            // thread blocked here counts toward the driver starvation that
+            // wedges the pipeline (#122), which is why the async entry point
+            // (`Runner::generate_async`) keeps this call off the runtime.
+            return self.submit_locked(self.slot.lock_applying_cancels(), task);
+        };
+        match self.slot.try_lock_applying_cancels() {
+            Some(guard) => self.submit_locked(guard, task),
+            None => self.slot.defer_submit(admission.as_ref(), task),
+        }
+    }
+
+    /// [`Self::submit`] with the engine lock held.
+    ///
+    /// Releasing the guard wakes the streams parked on contention, on the
+    /// empty-slot path as much as the submitting one — an empty slot means
+    /// `close()` already ran, so no later lock holder is coming to wake them
+    /// instead. Taking the lock also flushed the cancels deferred while the
+    /// engine was busy, freeing their slots before this task asks for one,
+    /// and handed over the submits queued before this one.
+    fn submit_locked(
+        &self,
+        mut guard: EngineGuard<'_>,
+        task: GenerationTask,
+    ) -> Result<(), EngineError> {
         // ==== BEGIN cancellation-safety check — keep INSIDE the lock ====
         // NEVER hand the engine a task that is already tombstoned
         // cancelled. `generate_async` arms a cancel guard BEFORE it
@@ -554,8 +695,14 @@ impl Runner {
         // tombstone is written and released before the engine is touched. A
         // chunk that lands in between is dropped by the cancelled-check on the
         // distribution path, which is the behaviour either way.
+        //
+        // A task still in the runner's submit queue leaves it in the same
+        // critical section that tombstones it, so no drain can hand it to
+        // the engine after this; the drain re-checks the tombstone for one
+        // it had already taken out.
         {
             let mut bufs = self.slot.buffers.lock();
+            bufs.deferred_submits.retain(|t| &t.task_id != task_id);
             bufs.cancelled.insert(task_id.clone());
             bufs.chunks.remove(task_id);
         }
@@ -567,9 +714,10 @@ impl Runner {
     /// MAX_CONSECUTIVE_EMPTY_STEPS empty engine polls (engine appears
     /// stuck).
     ///
-    /// **Blocks the calling thread** for up to a full engine step: the submit
-    /// runs inline via [`Runner::submit`], and only the returned stream is
-    /// async. Async contexts must use [`Runner::generate_async`] instead.
+    /// **Blocks the calling thread** for up to a full engine step (unless the
+    /// engine hands out a [`SubmitAdmission`]): the submit runs inline via
+    /// [`Runner::submit`], and only the returned stream is async. Async
+    /// contexts must use [`Runner::generate_async`] instead.
     pub fn generate(&self, task: GenerationTask) -> Result<ChunkStream, EngineError> {
         self.submit(task.clone())?;
         Ok(self.stream_for(task.task_id))
@@ -579,7 +727,10 @@ impl Runner {
     /// `spawn_blocking`. Async servers must use this — `submit` blocks on
     /// the engine mutex for up to a full engine step, and enough worker
     /// threads parked there starve the tokio I/O + timer drivers, which is
-    /// the #122 pipeline wedge.
+    /// the #122 pipeline wedge. For an engine with a [`SubmitAdmission`] a
+    /// busy engine queues the task instead, and this returns at once; the
+    /// queued task runs when the stream next takes the engine lock (or any
+    /// other holder does).
     ///
     /// **Cancellation-safe**: this future may be dropped at any await point
     /// (axum drops handler futures on client disconnect, and disconnects
@@ -1259,7 +1410,7 @@ impl Stream for ChunkStream {
                             // drops the appended error with the entry, which
                             // is deliberate (a post-completion failure is
                             // contract noise; the warn above records it).
-                            if !buf.back().is_some_and(|c| c.error.is_some()) {
+                            if buf.back().is_none_or(|c| c.error.is_none()) {
                                 buf.push_back(Chunk::error(failed.clone(), e.to_string()));
                             }
                         }
@@ -1370,6 +1521,26 @@ impl Drop for ChunkStream {
         // `Runner::cancel` uses, and the guard inside it handles the
         // release-then-wake ordering for both.
         //
+        // Tombstoned BEFORE the engine is told, and in the same critical
+        // section that takes the task out of the runner's submit queue: a
+        // lock holder draining that queue after this never hands the task
+        // to the engine (it re-checks the tombstone under the engine lock),
+        // where tombstoning after the cancel left a window in which a
+        // drained submit made a ghost nobody would cancel.
+        {
+            let mut bufs = self.slot.buffers.lock();
+            bufs.chunks.remove(&self.task_id);
+            bufs.deferred_submits.retain(|t| t.task_id != self.task_id);
+            // Tombstone rather than remove: an engine that defers its final
+            // chunk past cancel would re-buffer it for this dead stream via
+            // another caller's distribution pass, leaking the map entry until
+            // close(). Bounded: task ids are UUIDs (no reuse), so the rare
+            // wholesale clear only risks re-buffering one late chunk.
+            if bufs.cancelled.len() >= 4096 {
+                bufs.cancelled.clear();
+            }
+            bufs.cancelled.insert(self.task_id.clone());
+        }
         // An ended stream (its final chunk was delivered, its cancel
         // tombstone was seen, or the server tore down) skips the in-flight
         // handle signal: its task isn't running, so the signal would only
@@ -1381,17 +1552,6 @@ impl Drop for ChunkStream {
         } else {
             self.slot.cancel_or_defer(&self.task_id);
         }
-        let mut bufs = self.slot.buffers.lock();
-        bufs.chunks.remove(&self.task_id);
-        // Tombstone rather than remove: an engine that defers its final
-        // chunk past cancel would re-buffer it for this dead stream via
-        // another caller's distribution pass, leaking the map entry until
-        // close(). Bounded: task ids are UUIDs (no reuse), so the rare
-        // wholesale clear only risks re-buffering one late chunk.
-        if bufs.cancelled.len() >= 4096 {
-            bufs.cancelled.clear();
-        }
-        bufs.cancelled.insert(self.task_id.clone());
     }
 }
 
@@ -1461,7 +1621,7 @@ mod tests {
         while let Some(c) = stream.next().await {
             chunks.push(c);
         }
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
         assert!(chunks.last().unwrap().is_final);
     }
 
@@ -4420,5 +4580,578 @@ mod tests {
             .await
             .expect("the lock holder never finished after teardown")
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Submits that find the engine busy, for an engine that hands out a
+    // `SubmitAdmission`: queued in the runner and handed to the engine by
+    // the next lock holder, so the caller is not held for a whole step.
+    // -----------------------------------------------------------------
+
+    /// Refuses a task whose prompt is `refused`, as [`AdmitEngine::submit`] does.
+    struct RefuseByPrompt;
+
+    impl SubmitAdmission for RefuseByPrompt {
+        fn check(&self, task: &GenerationTask) -> Result<(), EngineError> {
+            if task.prompt == "refused" {
+                return Err(EngineError::PromptTooLong("refused by admission".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// Steps the front task of its queue, one token per `step()` and a final
+    /// at `max_tokens`, parking in `step()` while the gate is closed (10 s cap,
+    /// so a broken test fails instead of hanging). `submit` refuses what its
+    /// admission refuses, a task whose prompt is `engine-refuses`, and any task
+    /// past `cap` queued ones.
+    struct AdmitEngine {
+        log: Arc<Mutex<EngineLog>>,
+        gate: Arc<Gate>,
+        queue: VecDeque<(GenerationTask, u32)>,
+        cap: usize,
+        admission: Option<Arc<RefuseByPrompt>>,
+    }
+
+    impl Engine for AdmitEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            if let Some(admission) = &self.admission {
+                admission.check(&task)?;
+            }
+            if task.prompt == "engine-refuses" {
+                return Err(EngineError::Backend("engine refused".into()));
+            }
+            if self.queue.len() >= self.cap {
+                return Err(EngineError::QueueFull {
+                    queued: self.queue.len(),
+                    cap: self.cap,
+                });
+            }
+            self.log.lock().submitted.push(task.task_id.clone());
+            self.queue.push_back((task, 0));
+            Ok(())
+        }
+        fn cancel(&mut self, task_id: &TaskId) {
+            self.log.lock().cancelled.push(task_id.clone());
+            self.queue.retain(|(t, _)| &t.task_id != task_id);
+        }
+        fn submit_admission(&self) -> Option<Arc<dyn SubmitAdmission>> {
+            self.admission
+                .clone()
+                .map(|a| a as Arc<dyn SubmitAdmission>)
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.gate.entered.fetch_add(1, Ordering::SeqCst);
+            let start = Instant::now();
+            while !self.gate.open.load(Ordering::SeqCst)
+                && start.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let Some((task, emitted)) = self.queue.front_mut() else {
+                return Ok(Vec::new());
+            };
+            *emitted += 1;
+            let n = *emitted;
+            let id = task.task_id.clone();
+            let done = n >= task.max_tokens;
+            self.log.lock().produced.push(id.clone());
+            let mut out = vec![(id.clone(), Chunk::token(&id, n as i64, "x "))];
+            if done {
+                out.push((id.clone(), Chunk::final_marker(&id, "")));
+                self.queue.pop_front();
+            }
+            Ok(out)
+        }
+    }
+
+    struct AdmitBuilder(Option<AdmitEngine>);
+
+    #[async_trait::async_trait]
+    impl Builder for AdmitBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(mut self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(self.0.take().unwrap()))
+        }
+    }
+
+    /// A started runner over an [`AdmitEngine`] with a queue of `cap`, with or
+    /// without its admission.
+    async fn admit_runner(
+        gate: Arc<Gate>,
+        cap: usize,
+        admission: bool,
+    ) -> (Arc<Runner>, Arc<Mutex<EngineLog>>) {
+        let log = Arc::new(Mutex::new(EngineLog::default()));
+        let runner = Arc::new(Runner::new(Box::new(AdmitBuilder(Some(AdmitEngine {
+            log: log.clone(),
+            gate,
+            queue: VecDeque::new(),
+            cap,
+            admission: admission.then(|| Arc::new(RefuseByPrompt)),
+        })))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        (runner, log)
+    }
+
+    /// Polls `stream` once on a blocking thread, which parks inside `step()`
+    /// with the engine locked until the gate opens, and returns once it is
+    /// there. The stream is then kept alive (its drop takes the engine lock
+    /// too) until the sender is signalled or dropped; the handle returns it.
+    async fn hold_engine(
+        gate: &Gate,
+        stream: ChunkStream,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<ChunkStream>,
+    ) {
+        let before = gate.steps_entered();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut s = stream;
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let _ = Pin::new(&mut s).poll_next(&mut cx);
+            let _ = rx.recv();
+            s
+        });
+        await_until("the holder to enter step() with the engine locked", || {
+            gate.steps_entered() > before
+        })
+        .await;
+        (tx, handle)
+    }
+
+    /// [`hold_engine`] on a fresh one-token task `holder`.
+    async fn hold_with_holder(
+        runner: &Arc<Runner>,
+        gate: &Gate,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<ChunkStream>,
+    ) {
+        let stream = runner
+            .generate_async(GenerationTask::new("holder", "x").with_max_tokens(1))
+            .await
+            .unwrap();
+        hold_engine(gate, stream).await
+    }
+
+    async fn collect(mut stream: ChunkStream) -> Vec<Chunk> {
+        let mut chunks = Vec::new();
+        while let Some(c) = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("the stream must end, not hang")
+        {
+            chunks.push(c);
+        }
+        chunks
+    }
+
+    fn queued(runner: &Runner, id: &str) -> bool {
+        runner
+            .slot
+            .buffers
+            .lock()
+            .deferred_submits
+            .iter()
+            .any(|t| t.task_id == id)
+    }
+
+    /// A submit behind a running step returns at once instead of waiting the
+    /// step out, so the API can send its headers; the task runs once the
+    /// engine is free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_submit_returns_at_once_while_another_task_steps() {
+        let gate = Gate::closed();
+        let (runner, log) = admit_runner(gate.clone(), 256, true).await;
+        let (hold, holder) = hold_with_holder(&runner, &gate).await;
+
+        let b = tokio::time::timeout(
+            Duration::from_secs(5),
+            runner.generate_async(GenerationTask::new("queued", "x").with_max_tokens(2)),
+        )
+        .await;
+        let was_queued = queued(&runner, "queued");
+        // Release BEFORE asserting: the holder is parked inside `step()`.
+        gate.release();
+        let b = b
+            .expect("a submit behind a busy engine must return without waiting for it")
+            .unwrap();
+        assert!(was_queued, "the task must wait in the runner's queue");
+        drop(hold);
+        drop(holder.await.unwrap());
+
+        let chunks = collect(b).await;
+        assert!(chunks.iter().all(|c| c.error.is_none()), "{chunks:?}");
+        assert_eq!(chunks.len(), 3, "two tokens, then the final: {chunks:?}");
+        assert!(chunks.last().unwrap().is_final);
+        assert!(log.lock().submitted.iter().any(|t| t == "queued"));
+    }
+
+    /// An engine without an admission keeps today's submit: it waits for the
+    /// engine lock, so every refusal in its `submit` still reaches the caller
+    /// before any response starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn engine_without_admission_still_waits_for_the_lock() {
+        let gate = Gate::closed();
+        let (runner, log) = admit_runner(gate.clone(), 256, false).await;
+        let (hold, holder) = hold_with_holder(&runner, &gate).await;
+
+        let fut = runner.generate_async(GenerationTask::new("queued", "x").with_max_tokens(2));
+        futures::pin_mut!(fut);
+        let early = tokio::time::timeout(Duration::from_millis(200), fut.as_mut()).await;
+        let reached = log.lock().submitted.iter().any(|t| t == "queued");
+        let was_queued = queued(&runner, "queued");
+        gate.release();
+        assert!(
+            early.is_err(),
+            "without an admission the submit must wait for the engine lock"
+        );
+        assert!(!reached && !was_queued);
+        let b = fut.await.unwrap();
+        drop(hold);
+        drop(holder.await.unwrap());
+        let chunks = collect(b).await;
+        assert!(chunks.iter().all(|c| c.error.is_none()), "{chunks:?}");
+        assert!(chunks.last().unwrap().is_final, "{chunks:?}");
+    }
+
+    /// The admission's refusal comes back from the submit itself, typed, while
+    /// the engine is busy: nothing is queued and nothing tombstoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_submit_admission_refusal_is_synchronous() {
+        let gate = Gate::closed();
+        let (runner, log) = admit_runner(gate.clone(), 256, true).await;
+        let (hold, holder) = hold_with_holder(&runner, &gate).await;
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            runner.generate_async(GenerationTask::new("queued", "refused").with_max_tokens(2)),
+        )
+        .await;
+        let was_queued = queued(&runner, "queued");
+        gate.release();
+        match res {
+            Ok(Err(EngineError::PromptTooLong(m))) => assert_eq!(m, "refused by admission"),
+            Ok(Err(e)) => panic!("wrong refusal: {e}"),
+            Ok(Ok(_)) => panic!("the admission must refuse the task"),
+            Err(_) => panic!("an admission refusal must not wait for the engine"),
+        }
+        assert!(!was_queued);
+        assert!(!runner.slot.buffers.lock().cancelled.contains("queued"));
+        drop(hold);
+        drop(holder.await.unwrap());
+        assert!(!log.lock().submitted.iter().any(|t| t == "queued"));
+    }
+
+    /// Ends a queued task through `end` (a cancel, or dropping its stream)
+    /// before anything drains the queue: the engine never sees the task, and
+    /// its stream ends with no chunk.
+    async fn queued_task_ended_before_drain(
+        end: impl FnOnce(&Arc<Runner>, ChunkStream) -> Option<ChunkStream>,
+    ) {
+        let gate = Gate::closed();
+        let (runner, log) = admit_runner(gate.clone(), 256, true).await;
+        let (hold, holder) = hold_with_holder(&runner, &gate).await;
+
+        let b = tokio::time::timeout(
+            Duration::from_secs(5),
+            runner.generate_async(GenerationTask::new("queued", "x").with_max_tokens(2)),
+        )
+        .await;
+        let Ok(Ok(b)) = b else {
+            gate.release();
+            panic!("a submit behind a busy engine must return without waiting for it");
+        };
+        let b = end(&runner, b);
+        let still_queued = queued(&runner, "queued");
+        let tombstoned = runner.slot.buffers.lock().cancelled.contains("queued");
+        gate.release();
+        assert!(
+            !still_queued,
+            "ending the task must take it out of the queue"
+        );
+        assert!(tombstoned, "ending the task must tombstone it");
+        drop(hold);
+        drop(holder.await.unwrap());
+        if let Some(b) = b {
+            assert!(
+                collect(b).await.is_empty(),
+                "a cancelled queued task yields nothing"
+            );
+        }
+        // Churn the engine lock: a task still queued would be submitted here.
+        let after = runner
+            .generate_async(GenerationTask::new("after", "x").with_max_tokens(1))
+            .await
+            .unwrap();
+        collect(after).await;
+        assert!(
+            !log.lock().submitted.iter().any(|t| t == "queued"),
+            "{:?}",
+            log.lock()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_submit_cancelled_before_drain_never_reaches_the_engine() {
+        queued_task_ended_before_drain(|runner, b| {
+            runner.cancel(&"queued".to_string());
+            Some(b)
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_submit_dropped_stream_never_reaches_the_engine() {
+        queued_task_ended_before_drain(|_, b| {
+            drop(b);
+            None
+        })
+        .await;
+    }
+
+    /// The drain hands the engine its deferred cancels before the queued
+    /// submits: an engine at its cap frees the cancelled task's place first,
+    /// so the queued task is admitted rather than refused as over the cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drain_applies_cancels_before_submits() {
+        let gate = Gate::closed();
+        let (runner, log) = admit_runner(gate.clone(), 2, true).await;
+        // The engine's queue is full: the holder (64 tokens, so it stays
+        // queued after one step) and `victim`.
+        let holder_stream = runner
+            .generate_async(GenerationTask::new("holder", "x").with_max_tokens(64))
+            .await
+            .unwrap();
+        runner
+            .submit(GenerationTask::new("victim", "x").with_max_tokens(64))
+            .unwrap();
+        let (hold, holder) = hold_engine(&gate, holder_stream).await;
+
+        // Both while the holder steps: the cancel is deferred, the submit queued.
+        runner.cancel(&"victim".to_string());
+        let b = tokio::time::timeout(
+            Duration::from_secs(5),
+            runner.generate_async(GenerationTask::new("queued", "x").with_max_tokens(1)),
+        )
+        .await;
+        gate.release();
+        let b = b
+            .expect("a submit behind a busy engine must return without waiting for it")
+            .unwrap();
+        drop(hold);
+        let held = holder.await.unwrap();
+
+        // The next lock acquisition drains both queues.
+        runner.cancel(&"unrelated".to_string());
+        assert!(
+            log.lock().submitted.iter().any(|t| t == "queued"),
+            "the queued task must be admitted once the cancel freed a place: {:?}",
+            log.lock()
+        );
+        assert!(
+            !runner
+                .slot
+                .buffers
+                .lock()
+                .chunks
+                .get("queued")
+                .is_some_and(|b| b.iter().any(|c| c.error.is_some())),
+            "the queued task must not be refused as over the engine's cap"
+        );
+        drop(b);
+        drop(held);
+    }
+
+    /// A refusal the engine makes only when the queued task reaches it ends
+    /// that task's stream with a final error chunk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_submit_engine_refusal_is_an_error_chunk() {
+        let gate = Gate::closed();
+        let (runner, _log) = admit_runner(gate.clone(), 256, true).await;
+        let (hold, holder) = hold_with_holder(&runner, &gate).await;
+
+        let b = tokio::time::timeout(
+            Duration::from_secs(5),
+            runner
+                .generate_async(GenerationTask::new("queued", "engine-refuses").with_max_tokens(2)),
+        )
+        .await;
+        gate.release();
+        let b = b
+            .expect("a submit behind a busy engine must return without waiting for it")
+            .expect("the admission passes it; the engine refuses it later");
+        drop(hold);
+        drop(holder.await.unwrap());
+        let chunks = collect(b).await;
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        assert!(chunks[0].is_final);
+        assert_eq!(
+            chunks[0].error.as_deref(),
+            Some("backend error: engine refused")
+        );
+    }
+
+    /// Past the runner's queue cap a submit is refused at once with
+    /// `QueueFull`; the queued ones still run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_submit_over_the_cap_is_refused_at_once() {
+        let gate = Gate::closed();
+        let (runner, _log) = admit_runner(gate.clone(), 256, true).await;
+        let (hold, holder) = hold_with_holder(&runner, &gate).await;
+
+        let mut results = Vec::new();
+        for i in 0..=MAX_DEFERRED_SUBMITS {
+            results.push(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    runner.generate_async(
+                        GenerationTask::new(format!("q{i}"), "x").with_max_tokens(1),
+                    ),
+                )
+                .await,
+            );
+        }
+        gate.release();
+        let over = results.pop().unwrap();
+        match over {
+            Ok(Err(EngineError::QueueFull { queued, cap })) => {
+                assert_eq!((queued, cap), (MAX_DEFERRED_SUBMITS, MAX_DEFERRED_SUBMITS));
+            }
+            Ok(Err(e)) => panic!("wrong refusal: {e}"),
+            Ok(Ok(_)) => panic!("a submit past the queue cap must be refused"),
+            Err(_) => panic!("a submit past the queue cap must not wait for the engine"),
+        }
+        drop(hold);
+        drop(holder.await.unwrap());
+        for r in results {
+            let chunks = collect(r.expect("queued submits return at once").unwrap()).await;
+            assert!(chunks.iter().all(|c| c.error.is_none()), "{chunks:?}");
+            assert!(chunks.last().unwrap().is_final, "{chunks:?}");
+        }
+    }
+
+    /// A submit that read the admission just before `close()` emptied the
+    /// slot, and finds the lock still held, is refused as not loaded instead
+    /// of queueing behind an engine that is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_submit_with_no_engine_is_not_loaded() {
+        let (runner, log) = admit_runner(Gate::opened(), 256, true).await;
+        // Held as `close()` holds it while it empties the slot; the admission
+        // is still in place, as the submit that raced the close saw it.
+        let guard = runner.slot.lock();
+        runner.slot.loaded.store(false, Ordering::SeqCst);
+        let r = runner.clone();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || r.submit(GenerationTask::new("late", "x"))),
+        )
+        .await;
+        drop(guard);
+        match res {
+            Ok(Ok(Err(EngineError::NotLoaded))) => {}
+            other => panic!("expected NotLoaded at once, got {other:?}"),
+        }
+        assert!(!queued(&runner, "late"));
+        assert!(!log.lock().submitted.iter().any(|t| t == "late"));
+    }
+
+    /// `close()` empties the queue, and each queued stream ends on the
+    /// teardown error rather than hanging or reaching a torn-down engine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_ends_queued_streams_with_the_teardown_error() {
+        let gate = Gate::closed();
+        let (runner, log) = admit_runner(gate.clone(), 256, true).await;
+        let (hold, holder) = hold_with_holder(&runner, &gate).await;
+
+        let b = tokio::time::timeout(
+            Duration::from_secs(5),
+            runner.generate_async(GenerationTask::new("queued", "x").with_max_tokens(1_000_000)),
+        )
+        .await;
+        let closer = {
+            let runner = runner.clone();
+            tokio::task::spawn_blocking(move || runner.close())
+        };
+        await_until("close() to start tearing the runner down", || {
+            runner.closing.load(Ordering::SeqCst)
+        })
+        .await;
+        gate.release();
+        let b = b
+            .expect("a submit behind a busy engine must return without waiting for it")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), closer)
+            .await
+            .expect("close() never returned")
+            .unwrap();
+        assert!(
+            runner.slot.buffers.lock().deferred_submits.is_empty(),
+            "close() must empty the queue"
+        );
+
+        let chunks = collect(b).await;
+        let last = chunks
+            .last()
+            .expect("the queued stream ended with no chunk");
+        assert_eq!(
+            last.error.as_deref(),
+            Some("server is shutting down"),
+            "{chunks:?}"
+        );
+        assert!(!log.lock().submitted.iter().any(|t| t == "queued"));
+        drop(hold);
+        drop(holder.await.unwrap());
+    }
+
+    /// `submit_refuses_an_already_tombstoned_id` on the queued path: with an
+    /// admission and the engine busy, a tombstoned id is refused where it
+    /// would be queued, as a no-op `Ok`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_submit_refuses_an_already_tombstoned_id() {
+        let gate = Gate::closed();
+        let (runner, log) = admit_runner(gate.clone(), 256, true).await;
+        let (hold, holder) = hold_with_holder(&runner, &gate).await;
+
+        runner.cancel(&"ghost".to_string());
+        let r = runner.clone();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                r.submit(GenerationTask::new("ghost", "x").with_max_tokens(8))
+            }),
+        )
+        .await;
+        let was_queued = queued(&runner, "ghost");
+        gate.release();
+        res.expect("a submit behind a busy engine must not wait for it")
+            .unwrap()
+            .expect("a refused submit is a no-op Ok, not an error");
+        assert!(!was_queued, "a cancelled task must never be queued");
+        drop(hold);
+        drop(holder.await.unwrap());
+        let after = runner
+            .generate_async(GenerationTask::new("after", "x").with_max_tokens(1))
+            .await
+            .unwrap();
+        collect(after).await;
+        assert!(!log.lock().submitted.iter().any(|t| t == "ghost"));
     }
 }

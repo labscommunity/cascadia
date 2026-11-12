@@ -4884,7 +4884,7 @@ mod tests {
     }
 
     async fn make_app() -> Router {
-        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -5168,7 +5168,7 @@ mod tests {
         // pipeline health. Letting it flip `ready` drains a healthy node for
         // good: behind a load balancer gating on /health, the traffic that
         // would have produced the recovering 2xx never arrives.
-        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -9626,6 +9626,21 @@ level={{ effort_map[eff] }}";
         inflight: Option<Arc<cascadia_engine::InflightCancel>>,
         /// The pending task's slice count (its `max_tokens`).
         slices: u32,
+        /// Hand out a [`cascadia_engine::SubmitAdmission`] (accepting every
+        /// task), so a submit behind a running step is queued by the runner.
+        admission: bool,
+        /// `submit` refuses a task whose prompt contains this as too long for
+        /// the window, as a packed engine refuses an over-region prompt.
+        refuse_prompt: Option<&'static str>,
+    }
+
+    /// Accepts every task.
+    struct AdmitAll;
+
+    impl cascadia_engine::SubmitAdmission for AdmitAll {
+        fn check(&self, _task: &GenerationTask) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
     }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -9664,12 +9679,21 @@ level={{ effort_map[eff] }}";
             }
         }
         fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            if self.refuse_prompt.is_some_and(|p| task.prompt.contains(p)) {
+                return Err(cascadia_engine::EngineError::PromptTooLong(
+                    "prompt does not fit the window".into(),
+                ));
+            }
             self.slices = task.max_tokens;
             self.pending = Some((task.task_id, 0));
             Ok(())
         }
         fn inflight_cancel(&self) -> Option<Arc<cascadia_engine::InflightCancel>> {
             self.inflight.clone()
+        }
+        fn submit_admission(&self) -> Option<Arc<dyn cascadia_engine::SubmitAdmission>> {
+            self.admission
+                .then(|| Arc::new(AdmitAll) as Arc<dyn cascadia_engine::SubmitAdmission>)
         }
         fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
             let Some((id, i)) = self.pending.take() else {
@@ -9826,6 +9850,10 @@ level={{ effort_map[eff] }}";
         metrics_model: &'static str,
         /// One-shot mode (see [`ScriptEngine::inflight`]).
         inflight: bool,
+        /// See [`ScriptEngine::admission`].
+        admission: bool,
+        /// See [`ScriptEngine::refuse_prompt`].
+        refuse_prompt: Option<&'static str>,
     }
 
     impl Default for ScriptOpts<'_> {
@@ -9841,6 +9869,8 @@ level={{ effort_map[eff] }}";
                 window: None,
                 metrics_model: "mock-model",
                 inflight: false,
+                admission: false,
+                refuse_prompt: None,
             }
         }
     }
@@ -9860,6 +9890,8 @@ level={{ effort_map[eff] }}";
             window,
             metrics_model,
             inflight,
+            admission,
+            refuse_prompt,
         } = opts;
         let log = Arc::new(ScriptLog::default());
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -9874,6 +9906,8 @@ level={{ effort_map[eff] }}";
             pending: None,
             inflight: inflight.then(|| Arc::new(cascadia_engine::InflightCancel::new())),
             slices: 0,
+            admission,
+            refuse_prompt,
         }))));
         runner
             .start(
@@ -11814,6 +11848,8 @@ level={{ effort_map[eff] }}";
             pending: None,
             inflight: Some(handle.clone()),
             slices: 0,
+            admission: false,
+            refuse_prompt: None,
         })))));
         runner
             .start(
@@ -11879,6 +11915,8 @@ level={{ effort_map[eff] }}";
             pending: None,
             inflight: None,
             slices: 0,
+            admission: false,
+            refuse_prompt: None,
         })))));
         runner
             .start(
@@ -11931,6 +11969,8 @@ level={{ effort_map[eff] }}";
             pending: None,
             inflight: Some(handle.clone()),
             slices: 0,
+            admission: false,
+            refuse_prompt: None,
         })))));
         runner
             .start(
@@ -11965,5 +12005,145 @@ level={{ effort_map[eff] }}";
             "the finished task's id was parked in the early-cancel set"
         );
         handle.end();
+    }
+
+    // --- A request queued behind a one-shot generation --------------------
+
+    /// A streamed request that arrives while a one-shot generation holds the
+    /// engine (about 2 s here) gets its 200 and SSE headers at once, keep-alive
+    /// comments while it waits, and its content once that generation is done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_stream_gets_headers_while_a_stateful_generation_runs() {
+        const STEP: Duration = Duration::from_millis(100);
+        let (app, log, _) = script_app_opts(
+            &["queued "],
+            ScriptOpts {
+                step_delay: STEP,
+                inflight: true,
+                admission: true,
+                keepalive: Duration::from_millis(200),
+                ..ScriptOpts::default()
+            },
+        )
+        .await;
+        // A: non-streamed, 20 slices of 100 ms.
+        let a_app = app.clone();
+        let a = tokio::spawn(async move {
+            let payload =
+                serde_json::json!({"model": "mock-model", "prompt": "a", "max_tokens": 20});
+            post_text(a_app, "/v1/completions", &payload).await
+        });
+        wait_for(&log.step_starts, 1, Duration::from_secs(5))
+            .await
+            .expect("A's step never started");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model": "mock-model", "prompt": "b",
+                    "max_tokens": 1, "stream": true})
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(1), app.oneshot(request))
+            .await
+            .expect("the queued request's headers must come within 1 s")
+            .unwrap();
+        assert!(
+            log.step_ends.lock().unwrap().is_empty(),
+            "the headers must come while A still runs"
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            "text/event-stream",
+            "{:?}",
+            resp.headers()
+        );
+
+        let mut body = resp.into_body().into_data_stream();
+        let mut frames = Vec::new();
+        while let Some(frame) = tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .expect("the queued stream must end, not hang")
+        {
+            let text = String::from_utf8(frame.unwrap().to_vec()).unwrap();
+            if !text.is_empty() {
+                frames.push((std::time::Instant::now(), text));
+            }
+        }
+        let a_end = log.step_ends.lock().unwrap()[0].0;
+        assert!(
+            frames
+                .iter()
+                .any(|(t, f)| f == ": keep-alive\n\n" && *t < a_end),
+            "no keep-alive while the request was queued: {frames:?}"
+        );
+        let content = frames
+            .iter()
+            .find(|(_, f)| f.contains("\"queued \""))
+            .unwrap_or_else(|| panic!("no content: {frames:?}"))
+            .0;
+        assert!(
+            content > a_end,
+            "content came before A was done: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|(_, f)| f == "data: [DONE]\n\n"),
+            "{frames:?}"
+        );
+
+        let (status, a_body) = a.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{a_body}");
+    }
+
+    /// An engine without an admission keeps refusing an over-window prompt
+    /// before any response starts, even while another request holds the
+    /// engine: a 413, booked as a `prompt_over_window` rejection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn over_window_prompt_while_another_steps_is_still_413() {
+        let (app, log, _) = script_app_opts(
+            &["a "],
+            ScriptOpts {
+                step_delay: Duration::from_millis(100),
+                inflight: true,
+                refuse_prompt: Some("TOO-LONG"),
+                ..ScriptOpts::default()
+            },
+        )
+        .await;
+        let a_app = app.clone();
+        let a = tokio::spawn(async move {
+            let payload =
+                serde_json::json!({"model": "mock-model", "prompt": "a", "max_tokens": 10});
+            post_text(a_app, "/v1/completions", &payload).await
+        });
+        wait_for(&log.step_starts, 1, Duration::from_secs(5))
+            .await
+            .expect("A's step never started");
+
+        let before = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["prompt_over_window"])
+            .get();
+        let (status, body) = post_text(
+            app.clone(),
+            "/v1/completions",
+            &serde_json::json!({"model": "mock-model", "prompt": "TOO-LONG",
+                "max_tokens": 4, "stream": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let after = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["prompt_over_window"])
+            .get();
+        assert!(
+            after > before,
+            "not booked as a rejection ({before} -> {after})"
+        );
+
+        let (status, a_body) = a.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{a_body}");
     }
 }
