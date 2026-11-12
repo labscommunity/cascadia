@@ -89,7 +89,7 @@ PY="$(pybin "$ENV_DIR")"
 UV="$(uvbin)"
 
 shard
-check second-run-installs-nothing 'tree_ok && ! said "Downloading uv" && ! said "Exporting needs" && ! said "installed," && said "private"' \
+check second-run-installs-nothing 'tree_ok && ! said "Downloading uv" && ! said "Python packages" && ! said "installed," && said "private"' \
     "exit $RC; the second run should just export"
 
 # The default format: the tree must really hold compressed weights.
@@ -153,7 +153,7 @@ SAVED_ROOT="$ROOT"; SAVED_PATH="$RUN_PATH"
 ROOT="$WORK/home-unused"
 if [ "$WINDOWS" = 1 ]; then RUN_PATH="$VENV/Scripts"; else RUN_PATH="$VENV/bin"; fi
 shard
-check path-python-used-unasked 'tree_ok && said "meets the exporter" && ! said "Exporting needs" && [ -z "$(envdir)" ]' "exit $RC"
+check path-python-used-unasked 'tree_ok && said "meets the exporter" && ! said "Python packages" && [ -z "$(envdir)" ]' "exit $RC"
 
 env UV_CACHE_DIR="$SAVED_ROOT/uv-cache" PATH="$SAVED_PATH" "$UV" pip install --no-config --quiet \
     --python "$(pybin "$VENV")" --no-deps --only-binary :all: transformers==5.4.0

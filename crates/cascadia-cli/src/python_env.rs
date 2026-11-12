@@ -1043,12 +1043,49 @@ fn answer_is_yes(bytes_read: usize, answer: &str) -> bool {
 }
 
 /// The one question setup asks. How it gets there (which `uv`, which Python) is
-/// in the log line it prints when it finishes, not here.
-fn setup_question(install: usize) -> String {
+/// in the log line it prints when it finishes, not here. `install` is what the
+/// new environment needs beyond the system Python; `fetch`, what still has to be
+/// downloaded; `before`, whether Cascadia has set up Python here already.
+fn setup_question(install: usize, fetch: usize, before: bool) -> String {
+    if !before {
+        return format!(
+            "Exporting needs {install} Python packages. Install them in Cascadia's own folder \
+             (up to about 1.5 GB; nothing else on your system changes)?"
+        );
+    }
+    if fetch == 0 {
+        return format!(
+            "Cascadia's Python packages need setting up again, from the {install} it already \
+             downloaded. Do it now (nothing else on your system changes)?"
+        );
+    }
     format!(
-        "Exporting needs {install} Python packages. Install them in Cascadia's own folder \
-         (up to about 1.5 GB; nothing else on your system changes)?"
+        "Cascadia's Python packages changed: {fetch} to download, {} already here. Update them \
+         in Cascadia's own folder (nothing else on your system changes)?",
+        install.saturating_sub(fetch)
     )
+}
+
+/// The locked packages neither the system Python has nor an earlier environment of
+/// Cascadia's installed. What an earlier environment installed is still in uv's
+/// download cache, unless another holds a different version: clearing that
+/// version's leftovers clears the whole package (`forget_old_packages`).
+fn to_download(
+    lock: &[LockEntry],
+    system: &HashMap<String, String>,
+    earlier: &[(String, String)],
+) -> usize {
+    lock.iter()
+        .filter(|e| {
+            let from_system = system
+                .get(&e.name)
+                .is_some_and(|have| same_release(have, &e.version));
+            let mut versions = earlier.iter().filter(|(n, _)| *n == e.name).peekable();
+            let cached =
+                versions.peek().is_some() && versions.all(|(_, v)| same_release(v, &e.version));
+            !from_system && !cached
+        })
+        .count()
 }
 
 /// Windows ships without the Visual C++ runtime torch and OpenVINO load.
@@ -1165,7 +1202,15 @@ pub(crate) async fn setup_managed(yes: bool) -> Result<PythonEnv> {
         let reused = base.as_ref().map_or(0, |(_, info)| {
             lock.len() - packages_to_install(&lock, &info.dists).len()
         });
-        if !confirm_setup(&setup_question(lock.len() - reused), yes)? {
+        let earlier: Vec<(String, String)> = env_names(&managed.root)
+            .iter()
+            .flat_map(|name| installed_in(&managed.root.join(name)))
+            .collect();
+        let none = HashMap::new();
+        let seen = base.as_ref().map_or(&none, |(_, info)| &info.dists);
+        let fetch = to_download(&lock, seen, &earlier);
+        let question = setup_question(lock.len() - reused, fetch, !earlier.is_empty());
+        if !confirm_setup(&question, yes)? {
             bail!("Not installing. Use --python <path> to run with your own Python.");
         }
         check_free_space(&managed.root)?;
@@ -1625,6 +1670,44 @@ torch==2.15.0+cpu \\
             names(map(&[("foo-bar", "1.2.3"), ("torch", "2.15.0+cu124")])),
             Vec::<String>::new(),
             "a GPU build of the same torch serves"
+        );
+    }
+
+    #[test]
+    fn the_question_counts_only_what_still_downloads() {
+        let lock = parse_lock(LOCK);
+        let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect()
+        };
+        let old = pairs(&[("foo-bar", "1.2.2"), ("torch", "2.15.0+cpu")]);
+        assert_eq!(to_download(&lock, &map(&[]), &[]), 2, "first setup");
+        assert_eq!(to_download(&lock, &map(&[]), &old), 1, "one pin changed");
+        assert_eq!(
+            to_download(&lock, &map(&[("foo-bar", "1.2.3")]), &old),
+            0,
+            "the rest comes from the system Python"
+        );
+        let two = pairs(&[("torch", "2.15.0+cpu"), ("torch", "2.14.0+cpu")]);
+        assert_eq!(
+            to_download(&lock, &map(&[]), &two),
+            2,
+            "clearing the other torch clears this one too"
+        );
+
+        let first = setup_question(59, 59, false);
+        assert!(first.contains("59 Python packages") && first.contains("1.5 GB"));
+        let update = setup_question(59, 1, true);
+        assert!(
+            update.contains("1 to download, 58 already here"),
+            "{update}"
+        );
+        assert!(!update.contains("GB"), "{update}");
+        let repair = setup_question(59, 0, true);
+        assert!(
+            repair.contains("from the 59 it already downloaded"),
+            "{repair}"
         );
     }
 
