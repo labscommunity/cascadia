@@ -1493,6 +1493,12 @@ struct SseState {
     /// The answer (text or a tool call) has started: later reasoning is
     /// only a liveness ping, as a `<think>` block would land in the answer.
     answer_started: bool,
+    /// A trailing prefix of `</think>` from the reasoning sent as text,
+    /// held until the next delta shows whether it completes the tag.
+    held_reasoning: String,
+    /// Whitespace-only content that came while reasoning was open: it goes
+    /// out after `</think>` with the answer, not inside the reasoning.
+    held_blank: String,
 }
 
 /// One streaming tool call assembled from `delta.tool_calls` fragments.
@@ -1500,6 +1506,14 @@ struct SseState {
 struct ToolCallParts {
     name: String,
     arguments: String,
+}
+
+/// Length of the longest proper prefix of `tag` that `buf` ends with.
+fn partial_suffix(buf: &str, tag: &str) -> usize {
+    (1..tag.len().min(buf.len() + 1))
+        .rev()
+        .find(|&k| buf.is_char_boundary(buf.len() - k) && tag.starts_with(&buf[buf.len() - k..]))
+        .unwrap_or(0)
 }
 
 /// What opens and closes reasoning sent as text (`reasoning_as_text`): the
@@ -1522,10 +1536,43 @@ impl SseState {
     }
 
     /// Close reasoning sent as text, if it is open: before the answer or a
-    /// tool call.
+    /// tool call. A held partial tag is reasoning; held blank content goes
+    /// out after the close.
     fn close_reasoning(&mut self, tid: &TaskId, send: &dyn Fn(EngineResult<(TaskId, Chunk)>)) {
         if std::mem::take(&mut self.in_reasoning) {
+            self.flush_reasoning(tid, send);
             self.send_text(tid, THINK_CLOSE.to_owned(), send);
+        }
+        let blank = std::mem::take(&mut self.held_blank);
+        if !blank.is_empty() {
+            self.send_text(tid, blank, send);
+        }
+    }
+
+    /// Send a reasoning delta as text, with any literal `</think>` in it
+    /// broken up (a zero-width space after the `<` keeps it readable but no
+    /// longer a tag, which would end the reasoning early in the API's
+    /// split). A trailing prefix of the tag is held for the next delta.
+    fn send_reasoning(
+        &mut self,
+        tid: &TaskId,
+        r: &str,
+        send: &dyn Fn(EngineResult<(TaskId, Chunk)>),
+    ) {
+        let mut buf = std::mem::take(&mut self.held_reasoning) + r;
+        buf = buf.replace(THINK_CLOSE, "<\u{200B}/think>");
+        let keep = partial_suffix(&buf, THINK_CLOSE);
+        self.held_reasoning = buf.split_off(buf.len() - keep);
+        if !buf.is_empty() {
+            self.send_text(tid, buf, send);
+        }
+    }
+
+    /// Send the held partial tag as reasoning: it did not become a tag.
+    fn flush_reasoning(&mut self, tid: &TaskId, send: &dyn Fn(EngineResult<(TaskId, Chunk)>)) {
+        let held = std::mem::take(&mut self.held_reasoning);
+        if !held.is_empty() {
+            self.send_text(tid, held, send);
         }
     }
 
@@ -1534,6 +1581,10 @@ impl SseState {
     /// a stream cut short mid-reasoning reads as unfinished reasoning; a
     /// tool call already closed it when its first fragment came.
     fn end_text(&mut self, tid: &TaskId, send: &dyn Fn(EngineResult<(TaskId, Chunk)>)) {
+        // Still reasoning: the held partial tag is reasoning text; blank
+        // content held for an answer that never came is dropped.
+        self.flush_reasoning(tid, send);
+        self.held_blank.clear();
         for block in self.tool_call_blocks() {
             send(Ok((
                 tid.clone(),
@@ -1692,19 +1743,28 @@ fn handle_sse_line(
                 st.in_reasoning = true;
                 st.send_text(tid, THINK_OPEN.to_owned(), send);
             }
-            // A literal `</think>` in the reasoning would end it early in
-            // the API's split; a zero-width space after the `<` keeps it
-            // readable but no longer a tag.
-            st.send_text(tid, r.replace(THINK_CLOSE, "<\u{200B}/think>"), send);
+            st.send_reasoning(tid, r, send);
         } else {
             active = true;
         }
     }
     // The answer or a tool call ends reasoning sent as text; whitespace
     // alone (a newline before the reasoning) does not start the answer.
-    if !text.trim().is_empty() || v["choices"][0]["delta"]["tool_calls"].is_array() {
+    // An empty `tool_calls` array is not a call.
+    let tool_call = v["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .is_some_and(|calls| !calls.is_empty());
+    let mut text = text;
+    if !text.trim().is_empty() || tool_call {
         st.close_reasoning(tid, send);
         st.answer_started = true;
+    } else if st.in_reasoning && !text.is_empty() {
+        // Blank content while reasoning is open would land inside the
+        // reasoning: hold it for the answer (it still pings the stall
+        // clock).
+        st.held_blank.push_str(text);
+        text = "";
+        active = true;
     }
     let stop_str = v["choices"][0]["finish_reason"].as_str();
     if let Some(r) = stop_str {
@@ -2184,6 +2244,11 @@ mod tests {
         out.into_inner()
     }
 
+    /// [`texts`] without the progress pings.
+    fn texts_of(chunks: &[Chunk]) -> Vec<String> {
+        texts(chunks).into_iter().filter(|t| t != ".").collect()
+    }
+
     /// The text of every token chunk, in order, with each progress ping as
     /// `.` and the final as `|`.
     fn texts(chunks: &[Chunk]) -> Vec<String> {
@@ -2295,6 +2360,71 @@ mod tests {
         assert_eq!(
             texts(&chunks),
             ["<think>", "a <\u{200B}/think> b", "</think>", "51", "|"]
+        );
+    }
+
+    /// A `</think>` split across reasoning deltas is neutralised too: its
+    /// start is held until the next delta shows whether it is the tag.
+    #[test]
+    fn sse_reasoning_as_text_neutralises_a_split_closing_tag() {
+        let a = r#"data: {"choices":[{"delta":{"reasoning_content":"a </"}}]}"#;
+        let b = r#"data: {"choices":[{"delta":{"reasoning_content":"think> b"}}]}"#;
+        let chunks = stream(&mut as_text(), &[a, b, ANSWER, STOP], true);
+        let texts = texts(&chunks);
+        let close = texts.iter().position(|t| t == "</think>").unwrap();
+        assert_eq!(texts[0], "<think>");
+        assert_eq!(texts[1..close].concat(), "a <\u{200B}/think> b");
+        assert_eq!(texts[close + 1..], ["51", "|"]);
+        // A held partial tag that turns out not to be one is still sent,
+        // when the reasoning closes or the stream ends inside it.
+        let tail = r#"data: {"choices":[{"delta":{"reasoning_content":"x <"}}]}"#;
+        let chunks = stream(&mut as_text(), &[tail, ANSWER, STOP], true);
+        assert_eq!(texts_of(&chunks).concat(), "<think>x <</think>51|");
+        let chunks = stream(&mut as_text(), &[tail, STOP], true);
+        assert_eq!(texts_of(&chunks).concat(), "<think>x <|");
+    }
+
+    /// Blank content while reasoning is open does not land in the
+    /// reasoning: it is held and sent after `</think>` with the answer,
+    /// or dropped when the stream ends inside the reasoning.
+    #[test]
+    fn sse_reasoning_as_text_holds_blank_content_for_the_answer() {
+        let x = r#"data: {"choices":[{"delta":{"reasoning_content":"x"}}]}"#;
+        let blank = r#"data: {"choices":[{"delta":{"content":"\n\n"}}]}"#;
+        let chunks = stream(&mut as_text(), &[x, blank, ANSWER, STOP], true);
+        let joined = texts_of(&chunks).concat();
+        assert_eq!(joined, "<think>x</think>\n\n51|");
+        // before a tool call, the blank goes out after the close
+        let chunks = stream(&mut as_text(), &[x, blank, CALL, STOP], true);
+        let joined = texts_of(&chunks).concat();
+        assert!(joined.starts_with("<think>x</think>\n\n"), "{joined:?}");
+        // ending inside the reasoning drops it, and a finish riding the
+        // blank delta is kept
+        let chunks = stream(&mut as_text(), &[x, blank, STOP], true);
+        assert_eq!(texts_of(&chunks).concat(), "<think>x|");
+        let blank_stop =
+            r#"data: {"choices":[{"delta":{"content":"\n"},"finish_reason":"length"}]}"#;
+        let chunks = stream(&mut as_text(), &[x, blank_stop], true);
+        assert_eq!(texts_of(&chunks).concat(), "<think>x|");
+        assert_eq!(
+            chunks.last().unwrap().finish_reason,
+            Some(FinishReason::Length)
+        );
+    }
+
+    /// An empty `tool_calls` array is not a tool call: it does not close
+    /// the reasoning.
+    #[test]
+    fn sse_reasoning_as_text_ignores_an_empty_tool_calls_array() {
+        let empty = r#"data: {"choices":[{"delta":{"tool_calls":[]}}]}"#;
+        let chunks = stream(
+            &mut as_text(),
+            &[THINK_1, empty, THINK_2, ANSWER, STOP],
+            true,
+        );
+        assert_eq!(
+            texts_of(&chunks).concat(),
+            "<think>17 times 3 is 51</think>51|"
         );
     }
 
