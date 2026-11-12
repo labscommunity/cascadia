@@ -92,7 +92,10 @@ pub fn bound_integers(schema: &mut Value) -> usize {
 
 /// Raises an `integer` schema's `minimum`/`exclusiveMinimum` below what
 /// llguidance builds (about -2^63, e.g. C# `long.MinValue`) to the lowest it
-/// builds, when that leaves the range non-empty. Only narrows.
+/// builds, when that leaves the range non-empty. Only narrows. A type list
+/// holding `number` too is raised as well: llguidance builds each type on
+/// its own, and fails to build a `number` range that low either, so no
+/// number it could admit is lost.
 pub(crate) fn clamp_for_llguidance(schema: &mut Value) {
     visit_schemas_and_ref_targets(schema, &mut |obj| {
         if !has_integer(obj) {

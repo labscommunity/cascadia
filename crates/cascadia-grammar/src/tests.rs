@@ -1436,6 +1436,28 @@ fn an_integer_reached_by_a_ref_into_a_data_keyword_is_clamped_and_bounded() {
 }
 
 #[test]
+fn an_integer_or_number_below_the_llguidance_floor_is_raised_to_build() {
+    // llguidance builds each type of a list on its own and fails to build
+    // a range below about -2^63 for `number` as well as `integer` ("Failed
+    // to generate regex for float range: min=Some(-1e19)"), so raising the
+    // lower bound of a list holding `number` loses no number it could
+    // admit: without it the schema would not build at all.
+    let gf = single_byte();
+    for ty in [r#"["integer","number"]"#, r#"["number","integer","null"]"#] {
+        let body = with_n(&format!(r#"{{"type":{ty},"minimum":-1e300}}"#));
+        assert!(accepts(&gf, &body, r#"{"n":-12}"#), "{ty}");
+        assert!(accepts(&gf, &body, r#"{"n":1.5}"#), "{ty}");
+        assert!(accepts(&gf, &body, r#"{"n":-9223372036854774784}"#), "{ty}");
+    }
+    let number = with_n(r#"{"type":"number","minimum":-1e19}"#);
+    let err = gf
+        .compile(&spec(&number))
+        .err()
+        .expect("a number below -2^63");
+    assert!(err.to_string().contains("float range"), "{err}");
+}
+
+#[test]
 fn a_schema_with_too_many_integers_to_bound_builds_unbounded() {
     // Each bounded integer is a range regex of its own; 600 of them pass
     // llguidance's lexer budget, which the schema as written stays inside.
