@@ -607,7 +607,9 @@ or that the client closes before its end, does not count. Errors that are the cl
 or not. A peer that stops answering makes the step waiting on it time out
 (after 60 s) and fail, which marks the server unready. Capacity 503s do not
 mark it, unless requests are in flight and a multi-stage pipeline is stalled: the engine has
-been inside one call (a step, or a request's submit) for more than 60 s, or it
+been inside one call (a step, or a request's submit) for more than 10 minutes
+(ten times the 60 s bound: the longest a healthy cross-stage wait takes, such
+as the reply to a long prompt's prefill), or it
 keeps stepping but has produced no real output (a token, a final answer, or a
 refusal of a request for its own fault, such as a prompt over the window; a
 progress marker or a step that fails for the server's fault does not count) for
@@ -624,8 +626,9 @@ counted as stalled: it has no peer that could hold an engine call, so a long
 call is its own work, such as an answer that runs as one call (`ov-genai`
 without `--cb`, single-stage `sparse-moe`) or a long prompt's prefill, and a
 capacity 503 meanwhile leaves it ready. On a multi-stage pipeline, a first
-stage whose own part of a prefill runs longer than 60 s as one step, or as
-steps that only report progress, counts while every slot is full.
+stage whose own part of a prefill runs as one step counts only past the
+10 minutes above; one that runs as steps that only report progress counts after
+60 s while every slot is full.
 
 ---
 

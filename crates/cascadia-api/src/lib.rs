@@ -953,6 +953,13 @@ struct CapacityRefusal;
 /// slot. The engine steps only while a stream is read, so clients that open
 /// streams and never read them leave it idle, never stalled.
 pub const STALL_SECS: u64 = 60;
+/// How many stall bounds one engine call on a stage of a pipeline may take
+/// before it counts as stalled. The transport waits up to this many receive
+/// timeouts for a prefill's reply (`cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR`),
+/// and a first stage's own prefill of a long prompt can take minutes, so a
+/// call shorter than this is the pipeline working, not a wedged one.
+pub const IN_CALL_FACTOR: u32 = 10;
+
 /// The 503 for a request past the in-flight cap: `Retry-After` tells the
 /// client when to come back, and [`PreEngineFailure`] keeps it out of
 /// readiness. A busy node is not a broken one, and since a streamed request's
@@ -986,6 +993,10 @@ fn stepping_window_ms(bound_ms: u64) -> u64 {
 /// output and the start of the current run of steps, so time spent idle
 /// before a burst never counts.
 ///
+/// One call counts only past [`IN_CALL_FACTOR`] × `bound_ms`, the longest a
+/// healthy cross-stage wait takes; while a call runs longer than a step's gap
+/// the stretch-without-output rule doesn't count it either.
+///
 /// Only a stage of a multi-stage pipeline can stall this way: its calls wait
 /// on peers. On a single-stage server ([`cascadia_runner::EngineActivity::pipelined`]
 /// false) a long call is the engine's own work (a whole answer in one call,
@@ -996,8 +1007,15 @@ fn stall_evidence(a: &cascadia_runner::EngineActivity, now: u64, bound_ms: u64) 
         return None;
     }
     if let Some(since) = a.busy_since_ms {
-        if now.saturating_sub(since) > bound_ms {
+        let in_call = now.saturating_sub(since);
+        if in_call > bound_ms.saturating_mul(u64::from(IN_CALL_FACTOR)) {
             return Some(since);
+        }
+        // One call longer than a step's gap is the stage working on one
+        // thing (a prefill, or a wait the transport still bounds), not a run
+        // of steps that keep returning without output.
+        if in_call > stepping_window_ms(bound_ms) {
+            return None;
         }
     }
     let stepping = a.busy_since_ms.is_some()
@@ -8424,7 +8442,8 @@ mod tests {
         );
     }
 
-    /// An engine stuck inside a step past the stall bound, holding the only
+    /// An engine stuck inside a step past [`IN_CALL_FACTOR`] × the stall
+    /// bound (longer than any healthy cross-stage wait), holding the only
     /// slot: the next capacity 503 marks the server unready. Once the engine
     /// produces again `/health` is ready with no new request; and a stall
     /// mark is also healed by the next 2xx.
@@ -8441,7 +8460,7 @@ mod tests {
         // The reader's stream drives a step that blocks.
         stuck.store(true, Ordering::SeqCst);
         let reader = read_tokens();
-        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        tokio::time::sleep(STALL_TEST_BOUND * (IN_CALL_FACTOR + 2)).await;
         let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -8458,7 +8477,7 @@ mod tests {
         // Stuck again; this time a 2xx heals the mark.
         stuck.store(true, Ordering::SeqCst);
         let reader = read_tokens();
-        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        tokio::time::sleep(STALL_TEST_BOUND * (IN_CALL_FACTOR + 2)).await;
         let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(stall_health(&app).await, StatusCode::SERVICE_UNAVAILABLE);
@@ -8467,6 +8486,31 @@ mod tests {
         let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(stall_health(&app).await, StatusCode::OK, "healed by a 2xx");
+    }
+
+    /// A stage of a pipeline inside one long call (a first stage's prefill
+    /// can take minutes, and the transport waits up to ten receive timeouts
+    /// for its reply) is busy, not stalled: a capacity 503 past the stall
+    /// bound, but well inside that wait, leaves `/health` ready.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pipeline_stage_in_one_long_call_is_busy_not_stalled() {
+        let (app, stuck) = stall_app().await;
+        stuck.store(true, Ordering::SeqCst);
+        let reader = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+            })
+        };
+        tokio::time::sleep(STALL_TEST_BOUND * 4).await;
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        let health = stall_health(&app).await;
+        stuck.store(false, Ordering::SeqCst);
+        let body = reader.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health, StatusCode::OK, "a long call is not a stall");
+        assert!(String::from_utf8_lossy(&body).contains("tok"));
     }
 
     /// A single-stage server has no peer that could hold an engine call:
@@ -8837,9 +8881,22 @@ mod tests {
     #[test]
     fn stall_evidence_follows_the_rule() {
         let b = 1000;
-        // One call busy past the bound: evidence is its start.
+        // One call busy past the bound but not past the longest healthy
+        // cross-stage wait (a prefill's reply, IN_CALL_FACTOR × the bound):
+        // the stage is computing or waiting on a peer that may still answer.
         assert_eq!(
             stall_evidence(&activity(Some(500), 400, 100, 400), 2000, b),
+            None
+        );
+        // ...and a long call that follows a run of output-less steps is not
+        // counted as part of that quiet stretch either.
+        assert_eq!(
+            stall_evidence(&activity(Some(1000), 900, 100, 100), 2500, b),
+            None
+        );
+        // One call busy past IN_CALL_FACTOR × the bound: evidence is its start.
+        assert_eq!(
+            stall_evidence(&activity(Some(500), 400, 100, 400), 500 + 10 * b + 1, b),
             Some(500)
         );
         // Busy, but not for long, with output just now: not stalled.
@@ -13099,9 +13156,6 @@ level={{ effort_map[eff] }}";
         }
     }
 
-    // An engine-queue-full 503 must count toward the same capacity-rejection
-    // reason as the permit-gate 503 — engines cap pending tasks below the
-    // default permit count, so this path is reachable at default config.
     /// A burst that the engine's queue refuses (64 concurrent requests, each
     /// a `QueueFull` 503 with `Retry-After`) never flips `/health`: during the
     /// burst and after it, the node stays ready, so a load spike doesn't pull
@@ -13149,6 +13203,9 @@ level={{ effort_map[eff] }}";
         assert_eq!(stall_health(&app).await, StatusCode::OK, "after the burst");
     }
 
+    // An engine-queue-full 503 must count toward the same capacity-rejection
+    // reason as the permit-gate 503 — engines cap pending tasks below the
+    // default permit count, so this path is reachable at default config.
     #[tokio::test]
     async fn engine_queue_full_counts_capacity_rejection() {
         let capacity_before = cascadia_metrics::API_REJECTED_TOTAL
