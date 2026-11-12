@@ -6396,6 +6396,41 @@ mod tests {
         );
     }
 
+    /// A best-effort grammar goes by the floor the operator set, not the
+    /// default: under a 60 s floor it is dropped, and once the 60 s pass an
+    /// idle CB engine rebuilds and runs it constrained, long before the
+    /// default 10 minutes.
+    #[test]
+    fn a_best_effort_grammar_honours_a_non_default_rebuild_floor() {
+        let floor = rebuild_floor(Some("60"));
+        assert_eq!(floor, Duration::from_secs(60));
+        let clock = FakeClock::new(Duration::ZERO);
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine_at(&st, &clock);
+        e.rebuild = RebuildState::new(Box::new(clock.clone()), floor);
+        cb_fill_and_finish(&mut e, &st, 0);
+
+        clock.advance(floor - Duration::from_secs(1));
+        e.submit(soft_schema_task("under", &full_budget_body(1000)))
+            .unwrap();
+        assert!(!st.lock().unwrap().last_added_grammar, "sent unconstrained");
+        assert!(st.lock().unwrap().events.is_empty(), "no rebuild");
+        assert_eq!(e.rebuild.rebuilds, 0);
+        let out = e.step().unwrap();
+        assert!(out.iter().all(|(_, c)| c.is_final));
+        assert!(e.active.is_empty());
+
+        clock.advance(Duration::from_secs(1));
+        let body = full_budget_body(1001);
+        e.submit(soft_schema_task("past", &body)).unwrap();
+        assert_eq!(st.lock().unwrap().events, vec!["drop", "build"]);
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert!(st.lock().unwrap().last_added_grammar, "sent constrained");
+        assert!(e.schema_budget.seen.contains(&body));
+        assert_eq!(e.schema_budget.refused, 0);
+        assert!(REBUILD_FLOOR > floor);
+    }
+
     /// Every pipeline built from a recipe, a rebuilt one included, is
     /// handed the recipe's keep list.
     #[test]
