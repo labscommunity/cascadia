@@ -183,10 +183,12 @@ function Bubble({ message, pending }: { message: ChatMessage; pending: boolean }
     );
   }
   const answering = Boolean(message.content);
+  // Whitespace-only reasoning (an empty think block) is not shown.
+  const thought = Boolean(message.reasoning?.trim());
   return (
     <div className="flex flex-col gap-1">
       <div className="label-mono">Assistant</div>
-      {message.reasoning ? (
+      {thought ? (
         <details open={pending && !answering} className="border-l-2 border-rule-2 pl-3">
           <summary className="label-mono cursor-pointer select-none">
             {pending && !answering ? "Thinking…" : "Thinking"}
@@ -200,8 +202,8 @@ function Bubble({ message, pending }: { message: ChatMessage; pending: boolean }
         {answering ? (
           message.content
         ) : pending ? (
-          message.reasoning ? null : <span className="text-ink-low">thinking…</span>
-        ) : message.reasoning ? (
+          thought ? null : <span className="text-ink-low">thinking…</span>
+        ) : thought ? (
           <span className="text-ink-low italic">(stopped while thinking, before an answer)</span>
         ) : (
           <span className="text-ink-low italic">(empty)</span>
