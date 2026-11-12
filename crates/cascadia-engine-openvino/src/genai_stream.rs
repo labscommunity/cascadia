@@ -30,7 +30,9 @@
 //!   without the lag, so a `stop` ends the generation at the write that completes it, as without
 //!   streaming. It has no memory: it is cut from this write's decode alone (the text that changed
 //!   since the previous write, plus the longest stop's length before it), so text a later decode
-//!   rewrote can neither fake a stop nor hide one.
+//!   rewrote can neither fake a stop nor hide one. A write that ends inside a character is not
+//!   checked (its stop lands one id later, as without streaming), and a tail ending in U+FFFD,
+//!   which the check refuses, is checked again on the next write.
 
 use cascadia_ov_genai_shim::{advance_emitted, PollWrite};
 
@@ -44,6 +46,9 @@ pub(crate) struct StreamText {
     prev: Option<String>,
     /// The longest checked stop in bytes, 0 when none is checked (no stop tail is cut).
     stop_bytes: usize,
+    /// The visible text of the newest write whose stop tail was cut: the previous write's, unless
+    /// that one ended inside a character and was not checked.
+    stop_base: Option<String>,
     /// The visible bytes handed out (after a rewrite: the re-anchored text).
     emitted: Vec<u8>,
     /// Bytes the client got, deltas and rest (differs from `emitted` after a re-anchor).
@@ -76,7 +81,7 @@ pub(crate) struct Written {
     /// The end of this write's visible text a stop it completes must lie in, for a memoryless
     /// check (no lag): the text that differs from the previous write's, plus the `stop_bytes`
     /// before it, cut at a character boundary. Empty when no stop is checked, the rule is not
-    /// decided yet, or the text did not change.
+    /// decided yet, the text did not change, or the window ends inside a character.
     pub stop_tail: String,
     /// The text to hand out and the tokens it stands for.
     pub delta: Option<(String, usize)>,
@@ -142,6 +147,7 @@ impl StreamText {
             decided: false,
             prev: None,
             stop_bytes,
+            stop_base: None,
             emitted: Vec::new(),
             sent_bytes: 0,
             carried_tokens: 0,
@@ -169,7 +175,7 @@ impl StreamText {
             self.decided = true;
         }
         let visible = visible_text(&text, &self.prompt);
-        let stop_tail = self.stop_tail(visible);
+        let stop_tail = self.stop_tail(visible, cut < w.window.len());
         let Some(prev) = self.prev.replace(visible.to_string()) else {
             return Written {
                 stop_tail,
@@ -193,15 +199,25 @@ impl StreamText {
         }
     }
 
-    /// [`Written::stop_tail`] for this write's `visible` text, against the previous write's.
-    fn stop_tail(&self, visible: &str) -> String {
-        if self.stop_bytes == 0 || self.prev.as_deref() == Some(visible) {
+    /// [`Written::stop_tail`] for this write's `visible` text, against the newest checked one's.
+    ///
+    /// `held`: the window ends inside a character. That write is not checked (the non-streamed
+    /// tail ends in U+FFFD there, which the check refuses), and the next write's tail is cut
+    /// against the text before it, so it covers whatever this write completed.
+    ///
+    /// A base that ends in U+FFFD had its check refused; when those U+FFFD stay, the text before
+    /// them is checked again, so a stop that ends just before them is not missed for good.
+    fn stop_tail(&mut self, visible: &str, held: bool) -> String {
+        if self.stop_bytes == 0 || held {
             return String::new();
         }
-        let changed = self
-            .prev
-            .as_deref()
-            .map_or(0, |p| common_prefix(p, visible));
+        let Some(base) = self.stop_base.replace(visible.to_string()) else {
+            return visible.to_string();
+        };
+        if base == visible {
+            return String::new();
+        }
+        let changed = common_prefix(&base, visible).min(base.trim_end_matches('\u{FFFD}').len());
         let from = floor_char_boundary(visible, changed.saturating_sub(self.stop_bytes));
         visible[from..].to_string()
     }
@@ -582,6 +598,29 @@ mod tests {
             stop_tails(&mut s, &["x\u{2603}", "x\u{2603}y"]),
             ["x\u{2603}", "\u{2603}y"]
         );
+    }
+
+    /// A write whose tail ends in a U+FFFD that stays (a byte no character takes) is refused by
+    /// the check; the next write's tail still reaches back over the text before the U+FFFD, so a
+    /// stop there is not missed for good.
+    #[test]
+    fn the_stop_tail_reaches_back_past_a_lasting_replacement() {
+        let mut s = StreamText::new("<chat>", 1);
+        let tails = stop_tails(&mut s, &["a", "a\n\u{FFFD}", "a\n\u{FFFD}b"]);
+        assert!(tails[2].contains('\n'), "{tails:?}");
+    }
+
+    /// A write that ends inside a character is not checked (the non-streamed tail ends in U+FFFD
+    /// there and is refused); the next write's tail covers the stop it completed.
+    #[test]
+    fn a_write_ending_inside_a_character_is_checked_on_the_next() {
+        let mut s = StreamText::new("<chat>", "的".len());
+        let tails: Vec<String> = [&b"\xE6\x98\xAF\xE7\x9A\x84\xE4"[..], "是的中".as_bytes()]
+            .iter()
+            .map(|w| s.on_write(&write(w, 1)).stop_tail)
+            .collect();
+        assert_eq!(tails[0], "", "{tails:?}");
+        assert!(tails[1].contains("的"), "{tails:?}");
     }
 
     #[test]

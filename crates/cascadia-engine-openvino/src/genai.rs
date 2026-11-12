@@ -2233,8 +2233,9 @@ mod tests {
         writes: Vec<Vec<String>>,
         /// With `stream_text`: the window of write i instead of the decode
         /// of the pieces so far, and the last one is the answer's decode (a
-        /// detokenizer the pieces don't predict).
-        window_script: Vec<String>,
+        /// detokenizer the pieces don't predict); raw bytes, so a window can
+        /// end inside a character.
+        window_script: Vec<Vec<u8>>,
         /// At the n-th count_tokens call (1: the prompt, 2: the answer),
         /// cancel this task through this handle: a cancel that lands after
         /// the generation is over.
@@ -2405,11 +2406,11 @@ mod tests {
                 let window = if let Some(w) = script.get(i) {
                     w.clone()
                 } else if stream_text && *n > 0 {
-                    tokens[..ends[i]].concat()
+                    tokens[..ends[i]].concat().into_bytes()
                 } else {
-                    String::new()
+                    Vec::new()
                 };
-                let action = poll(&tail, window.as_bytes(), *n);
+                let action = poll(&tail, &window, *n);
                 {
                     let mut st = self.st.lock().unwrap();
                     st.consumed += 1;
@@ -2427,7 +2428,9 @@ mod tests {
                         return Err(OvError::Native("mock: generate failed after cancel".into()));
                     }
                     return Ok(GenResult {
-                        text: script.get(i).cloned().unwrap_or(text),
+                        text: script
+                            .get(i)
+                            .map_or(text, |w| String::from_utf8_lossy(w).into_owned()),
                         generated_tokens: n_total as u32,
                         ttft_ms: None,
                     });
@@ -2440,7 +2443,9 @@ mod tests {
                 .polls
                 .push((String::new(), 0, flush));
             Ok(GenResult {
-                text: script.last().cloned().unwrap_or(text),
+                text: script
+                    .last()
+                    .map_or(text, |w| String::from_utf8_lossy(w).into_owned()),
                 generated_tokens: n_total as u32,
                 ttft_ms: None,
             })
@@ -3796,11 +3801,18 @@ mod tests {
     /// One streamed generation over scripted window decodes (one id per
     /// write) with `stops`: (every chunk, writes consumed).
     fn run_stream_script(windows: &[&str], stops: &[&str]) -> (Vec<Chunk>, usize) {
+        let raw: Vec<&[u8]> = windows.iter().map(|w| w.as_bytes()).collect();
+        run_stream_script_raw(&raw, stops)
+    }
+
+    /// [`run_stream_script`] over raw window bytes (a window can end inside a
+    /// character, or hold a byte no character takes).
+    fn run_stream_script_raw(windows: &[&[u8]], stops: &[&str]) -> (Vec<Chunk>, usize) {
         let st = Arc::new(Mutex::new(StatefulState::default()));
         {
             let mut s = st.lock().unwrap();
             s.pieces = pieces(&vec!["x"; windows.len()]);
-            s.window_script = windows.iter().map(|w| w.to_string()).collect();
+            s.window_script = windows.iter().map(|w| w.to_vec()).collect();
         }
         let mut e = stateful_engine_in(&st, true);
         e.submit(stop_task("t1", 64, stops)).unwrap();
@@ -3827,6 +3839,50 @@ mod tests {
         assert_eq!(consumed, 2, "{out:?}");
         assert_eq!(joined(&out), "it's\n");
         assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// A U+FFFD that stays (a byte no character takes) refuses the check of
+    /// the write it ends; the next write's tail still reaches back over the
+    /// text before it, so a stop there is found at that write, not missed.
+    #[test]
+    fn stateful_stream_a_stop_before_a_lasting_replacement_is_found() {
+        let windows: [&[u8]; 4] = [b"a", b"a\n\x80", b"a\n\x80b", b"a\n\x80bc"];
+        let (out, consumed) = run_stream_script_raw(&windows, &["\n"]);
+        assert_eq!(consumed, 3, "{out:?}");
+        assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// A stop-completing id that also starts a multibyte character (`是的`
+    /// plus `\xE4`, stop `的`) stops one id later, once the character is
+    /// whole: the same write the non-streamed tail check (`是的\u{FFFD}`,
+    /// refused) stops at.
+    #[test]
+    fn stateful_stream_stops_on_the_same_id_as_without_streaming() {
+        let windows: [&[u8]; 3] = [
+            b"\xE6\x98\xAF\xE7\x9A\x84\xE4",
+            "是的中".as_bytes(),
+            "是的中x".as_bytes(),
+        ];
+        let (out, streamed) = run_stream_script_raw(&windows, &["的"]);
+        assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+
+        // Without streaming: the shim's lossy tail of the same ids.
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["是的", "中", "x"]);
+            s.tail_override = Some((0, "是的\u{FFFD}".into()));
+        }
+        let mut e = stateful_engine_in(&st, false);
+        e.submit(stop_task("t1", 64, &["的"])).unwrap();
+        let plain = until_final(&mut e);
+        assert_eq!(
+            plain.last().unwrap().finish_reason,
+            Some(FinishReason::Stop)
+        );
+        let plain_consumed = st.lock().unwrap().consumed;
+        assert_eq!(plain_consumed, 2, "{plain:?}");
+        assert_eq!(streamed, plain_consumed, "{out:?}");
     }
 
     /// A generation that fails while the cancel flag goes up ends as
