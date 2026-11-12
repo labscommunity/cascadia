@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
+import { applyChunk, emptyTally, rates } from "@/lib/chatStream";
 import { type ChatMessage, chatStream } from "@/lib/sse";
 
 import { ClusterStrip } from "./ClusterStrip";
@@ -40,10 +41,7 @@ export function ChatSurface() {
     setStats({ tokens: 0, ttftSeconds: null, elapsedSeconds: 0, tokensPerSecond: null });
 
     const startedAt = performance.now();
-    let firstChunkAt: number | null = null;
-    let totalTokens = 0;
-    let unknownTokenBoundaries = false;
-    let assistantText = "";
+    let tally = emptyTally();
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -56,41 +54,17 @@ export function ChatSurface() {
         if (chunk.object === "error") {
           throw new Error(chunk.error.message);
         }
-        const delta = chunk.choices[0]?.delta.content ?? "";
-        if (firstChunkAt === null && delta) firstChunkAt = performance.now();
-        if (delta && chunk.n_tokens === 0) unknownTokenBoundaries = true;
-        if (chunk.completion_tokens != null) {
-          totalTokens = chunk.completion_tokens;
-        } else {
-          totalTokens += chunk.n_tokens ?? (delta ? 1 : 0);
-        }
-        assistantText += delta;
+        const now = performance.now();
+        tally = applyChunk(tally, chunk, now);
+        const { content, reasoning } = tally;
 
         setMessages((prev) => {
           const next = prev.slice();
-          next[next.length - 1] = { role: "assistant", content: assistantText };
+          next[next.length - 1] = { role: "assistant", content, reasoning };
           return next;
         });
 
-        const now = performance.now();
-        const elapsed = (now - startedAt) / 1000;
-        const ttft = firstChunkAt != null ? (firstChunkAt - startedAt) / 1000 : null;
-        // Known per-token engines expose a decode rate after TTFT. A child
-        // SSE stream only exposes the final total (including hidden thinking),
-        // so use whole-request throughput rather than inventing token timing.
-        const decodeWindow = ttft != null ? elapsed - ttft : null;
-        const decodeTokens = totalTokens - 1;
-        const tokensPerSecond = unknownTokenBoundaries
-          ? elapsed > 0.05 && totalTokens > 0 ? totalTokens / elapsed : null
-          : decodeWindow != null && decodeWindow > 0.05 && decodeTokens > 0
-            ? decodeTokens / decodeWindow
-            : null;
-        setStats({
-          tokens: totalTokens,
-          ttftSeconds: ttft,
-          elapsedSeconds: elapsed,
-          tokensPerSecond,
-        });
+        setStats({ tokens: tally.tokens, ...rates(tally, startedAt, now) });
       }
     } catch (err) {
       if ((err as Error).name === "AbortError") return;
@@ -99,7 +73,7 @@ export function ChatSurface() {
         const last = next[next.length - 1];
         const errLine = `\n\n[stream error: ${(err as Error).message}]`;
         if (last && last.role === "assistant") {
-          next[next.length - 1] = { role: "assistant", content: last.content + errLine };
+          next[next.length - 1] = { ...last, content: last.content + errLine };
         }
         return next;
       });
@@ -208,14 +182,27 @@ function Bubble({ message, pending }: { message: ChatMessage; pending: boolean }
       </div>
     );
   }
+  const answering = Boolean(message.content);
   return (
     <div className="flex flex-col gap-1">
       <div className="label-mono">Assistant</div>
+      {message.reasoning ? (
+        <details open={pending && !answering} className="border-l-2 border-rule-2 pl-3">
+          <summary className="label-mono cursor-pointer select-none">
+            {pending && !answering ? "Thinking…" : "Thinking"}
+          </summary>
+          <div className="mt-1 font-sans text-[14px] text-ink-dim whitespace-pre-wrap leading-relaxed">
+            {message.reasoning}
+          </div>
+        </details>
+      ) : null}
       <div className="font-sans text-[15px] text-ink whitespace-pre-wrap leading-relaxed">
-        {message.content ? (
+        {answering ? (
           message.content
         ) : pending ? (
-          <span className="text-ink-low">thinking…</span>
+          message.reasoning ? null : <span className="text-ink-low">thinking…</span>
+        ) : message.reasoning ? (
+          <span className="text-ink-low italic">(stopped while thinking, before an answer)</span>
         ) : (
           <span className="text-ink-low italic">(empty)</span>
         )}

@@ -11,6 +11,8 @@ export type ChatRole = "user" | "assistant" | "system";
 export type ChatMessage = {
   role: ChatRole;
   content: string;
+  /** A thinking model's reasoning, shown in the chat only; never sent back. */
+  reasoning?: string;
 };
 
 export type ChatCompletionChunk = {
@@ -22,7 +24,8 @@ export type ChatCompletionChunk = {
   completion_tokens?: number | null;
   choices: {
     index: number;
-    delta: { role?: string; content?: string };
+    /** `reasoning_content`: a thinking model's reasoning, apart from the answer. */
+    delta: { role?: string; content?: string; reasoning_content?: string };
     finish_reason: "stop" | null;
   }[];
 };
@@ -52,7 +55,7 @@ export async function* chatStream(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: args.model,
-      messages: args.messages,
+      messages: args.messages.map(({ role, content }) => ({ role, content })),
       max_tokens: args.max_tokens ?? 256,
       temperature: args.temperature ?? 0,
       stream: true,
