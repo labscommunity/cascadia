@@ -22,7 +22,7 @@ use cascadia_types::{ChatTurn, GenerationTask};
 use chrono::Utc;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
-use reasoning::ReasoningFormat;
+use reasoning::{ReasoningCounter, ReasoningFormat, ReasoningSplit, Seg};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -1033,6 +1033,10 @@ struct ChatChoiceMessage {
     role: &'static str,
     /// `Option` so a tool-call turn emits `content: null` (OpenAI shape).
     content: Option<String>,
+    /// The model's reasoning (the text inside `<think>…</think>`), split
+    /// out of `content`. Omitted when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
 }
@@ -1059,6 +1063,16 @@ struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    /// Present only when the reasoning split was armed (thinking on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+/// OpenAI `usage.completion_tokens_details`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionTokensDetails {
+    /// Completion tokens spent inside `<think>…</think>`.
+    pub reasoning_tokens: u32,
 }
 
 #[derive(Serialize)]
@@ -1825,8 +1839,6 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 /// into the returned reasoning. That fold, not the probe, is what splits
 /// sycl-llama's reasoning: its API side loads no chat template (the GGUF one
 /// is rendered by llama-server), so its probe is always false.
-// The reply paths call this once the reasoning split is wired in.
-#[allow(dead_code)]
 pub(crate) fn opens_think(
     engine_applies_template: bool,
     defer_template_on_thinking: bool,
@@ -2023,6 +2035,7 @@ fn build_choice(
                 ChatChoiceMessage {
                     role: "assistant",
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(calls),
                 },
                 "tool_calls",
@@ -2033,6 +2046,7 @@ fn build_choice(
         ChatChoiceMessage {
             role: "assistant",
             content: Some(buf),
+            reasoning_content: None,
             tool_calls: None,
         },
         "stop",
@@ -2823,6 +2837,16 @@ async fn chat_completions(
     // until the task completes; drop frees the slot.
     let _permit = permit;
     let _inflight = inflight;
+    let opened = opens_think(
+        state.engine_applies_template,
+        state.defer_template_on_thinking,
+        enable_thinking,
+        state.template_opens_think,
+        &task,
+    );
+    // Counts the tokens spent on reasoning; the returned text is split again
+    // below, after stop-string trimming.
+    let mut counter = ReasoningCounter::new(enable_thinking, opened);
     let mut chunk_stream = match state.runner.generate_async(task.clone()).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
@@ -2851,15 +2875,21 @@ async fn chat_completions(
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
-        match marker.as_mut() {
+        let piece = match marker.as_mut() {
             Some(f) => {
-                buf.push_str(&f.feed(&chunk));
+                let mut piece = f.feed(&chunk);
                 if chunk.is_final {
-                    buf.push_str(&f.finish());
+                    piece.push_str(&f.finish());
                 }
+                piece
             }
-            None => buf.push_str(&chunk.text),
+            None => chunk.text.clone(),
+        };
+        counter.feed(&piece, chunk.token_count());
+        if chunk.is_final {
+            counter.finish();
         }
+        buf.push_str(&piece);
         chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
@@ -2893,12 +2923,30 @@ async fn chat_completions(
         }
     }
 
-    let (message, choice_finish) = build_choice(
-        buf,
-        &req.tool_choice,
-        req.tools.as_ref().is_some_and(|t| !t.is_empty()),
-        enable_thinking,
-    );
+    let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let (message, choice_finish) = if counter.armed()
+        && state.reasoning_format == ReasoningFormat::ReasoningContent
+    {
+        // Split the trimmed text (a stop cut inside reasoning is honoured)
+        // and scan only the answer for tool calls, so a call drafted while
+        // reasoning is never executed.
+        let mut split = ReasoningSplit::new(true, opened);
+        let (mut reasoning, mut answer) = (String::new(), String::new());
+        for seg in split.feed(&buf).into_iter().chain(split.finish()) {
+            match seg {
+                Seg::Reasoning(t) => reasoning.push_str(&t),
+                Seg::Answer(t) => answer.push_str(&t),
+            }
+        }
+        let (mut message, finish) = build_choice(answer, &req.tool_choice, tools_present, false);
+        message.reasoning_content = (!reasoning.is_empty()).then_some(reasoning);
+        (message, finish)
+    } else {
+        build_choice(buf, &req.tool_choice, tools_present, enable_thinking)
+    };
+    let completion_tokens_details = counter.armed().then(|| CompletionTokensDetails {
+        reasoning_tokens: counter.reasoning_tokens(completion_tokens),
+    });
     // A parsed tool call overrides the streamed length/stop detection;
     // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
     if choice_finish == "tool_calls" {
@@ -2927,6 +2975,7 @@ async fn chat_completions(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            completion_tokens_details,
         },
     })
     .into_response()
@@ -3122,6 +3171,7 @@ async fn completions(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            completion_tokens_details: None,
         },
     })
     .into_response()
@@ -4256,6 +4306,9 @@ mod tests {
                 request["prompt"] = serde_json::json!("hi");
             } else {
                 request["messages"] = serde_json::json!([{"role":"user","content":"hi"}]);
+                // Thinking on adds `completion_tokens_details`; this test is
+                // about the totals.
+                request["enable_thinking"] = serde_json::json!(false);
             }
             if tool {
                 request["tools"] =
@@ -5137,6 +5190,7 @@ mod tests {
         let msg = ChatChoiceMessage {
             role: "assistant",
             content: Some("hi".into()),
+            reasoning_content: None,
             tool_calls: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
@@ -7621,6 +7675,27 @@ level={{ effort_map[eff] }}";
     /// Router over a [`GatedEngine`] with a template that renders tools, so
     /// tool requests are accepted. Returns the gate.
     async fn gated_app(parts: &[&str], fail: bool) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        gated_app_with_config(
+            parts,
+            fail,
+            Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            },
+        )
+        .await
+    }
+
+    /// [`gated_app`] with the caller's config (its template, reasoning format).
+    async fn gated_app_with_config(
+        parts: &[&str],
+        fail: bool,
+        cfg: Config,
+    ) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runner = Runner::new(Box::new(GatedBuilder(GatedEngine {
             parts: parts.iter().map(|p| (*p).to_owned()).collect(),
@@ -7635,14 +7710,6 @@ level={{ effort_map[eff] }}";
             )
             .await
             .unwrap();
-        let cfg = Config {
-            chat_template: ChatTemplateConfig {
-                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
-                bos_token: None,
-                eos_token: None,
-            },
-            ..Config::default()
-        };
         (
             make_router_with_config(Arc::new(runner), "mock-model", cfg),
             release,
@@ -8163,6 +8230,226 @@ level={{ effort_map[eff] }}";
         assert!(
             text.contains("cascadia_api_rejected_total{reason=\"empty_prompt\"}"),
             "{text}"
+        );
+    }
+
+    // --- Reasoning split on non-streamed chat replies ----------------------
+
+    /// A router over the mock engine with `--reasoning-format none`.
+    async fn make_app_reasoning_none() -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            reasoning_format: ReasoningFormat::None,
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    #[tokio::test]
+    async fn thinking_reply_returns_reasoning_content_and_reasoning_tokens() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> plan </think> answer"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        // The mock appends a space per word.
+        assert_eq!(m["content"], "answer ");
+        // The bytes between the tags, verbatim.
+        assert_eq!(m["reasoning_content"], " plan ");
+        // "<think> ", "plan ", "</think> "
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_off_reply_is_unchanged_and_has_no_details() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> plan </think> answer"}],
+                   "enable_thinking": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["content"], "<think> plan </think> answer ");
+        assert!(m.get("reasoning_content").is_none(), "{body}");
+        assert!(
+            body["usage"].get("completion_tokens_details").is_none(),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_format_none_keeps_think_in_content_but_counts() {
+        let (status, body) = post_chat(
+            make_app_reasoning_none().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> plan </think> answer"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["content"], "<think> plan </think> answer ");
+        assert!(m.get("reasoning_content").is_none(), "{body}");
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_after_reasoning_is_parsed_and_draft_inside_reasoning_is_not() {
+        let draft = r#"<tool_call>{"name":"draft","arguments":{}}</tool_call>"#;
+        let (app, release) =
+            gated_app(&["<think>plan ", draft, "</think>", WEATHER_CALL], false).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                   "tools":[{"type":"function","function":{"name":"get_weather"}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let choice = &body["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{body}");
+        let calls = choice["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert!(choice["message"]["content"].is_null(), "{body}");
+        assert_eq!(
+            choice["message"]["reasoning_content"],
+            format!("plan {draft}")
+        );
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn length_cut_inside_reasoning_returns_reasoning_and_empty_content() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> a b c d </think> answer"}],
+                   "max_tokens": 3}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let choice = &body["choices"][0];
+        assert_eq!(choice["finish_reason"], "length", "{body}");
+        assert_eq!(choice["message"]["content"], "");
+        assert_eq!(choice["message"]["reasoning_content"], " a b ");
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn template_opened_think_starts_the_reply_inside_reasoning() {
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% for m in messages %}{{ m.content }}{% endfor %}\
+                     {% if add_generation_prompt %}<think>\n{% endif %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["reasoning_content"], "plan");
+        assert_eq!(m["content"], "answer");
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_on_reply_without_think_counts_zero_reasoning_tokens() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hello world"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["content"], "hello world ");
+        assert!(m.get("reasoning_content").is_none(), "{body}");
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            0
+        );
+    }
+
+    /// Inkling's special-token thinking framing reaches the split as
+    /// `<think>…</think>` text and separates like any other model's.
+    #[test]
+    fn marker_filter_thinking_splits_into_reasoning_and_answer() {
+        let d = MarkerDialect {
+            message_model: 200001,
+            content_text: 200004,
+            content_thinking: 200008,
+            end_message: 200010,
+            invoke_tool_json: 200049,
+        };
+        let tok = |id: i64, text: &str| {
+            let mut c = Chunk::token(String::from("t"), id, text.to_string());
+            c.token_ids = vec![id];
+            c
+        };
+        let mut f = MarkerFilter::new(d);
+        let mut counter = reasoning::ReasoningCounter::new(true, false);
+        let (mut reasoning, mut answer) = (String::new(), String::new());
+        for c in [
+            tok(200001, ""),
+            tok(200008, ""),
+            tok(7, "plan"),
+            tok(8, " more"),
+            tok(200010, ""),
+            tok(200001, ""),
+            tok(200004, ""),
+            tok(9, "Paris"),
+            tok(200010, ""),
+        ] {
+            let (r, a) = counter.feed(&f.feed(&c), 1);
+            reasoning.push_str(&r);
+            answer.push_str(&a);
+        }
+        let (r, a) = counter.feed(&f.finish(), 0);
+        reasoning.push_str(&r);
+        answer.push_str(&a);
+        let (r, a) = counter.finish();
+        reasoning.push_str(&r);
+        answer.push_str(&a);
+        assert_eq!(reasoning, "plan more");
+        assert_eq!(answer, "Paris");
+        assert!(counter.consumed_close());
+        let reasoning_tokens = counter.reasoning_tokens(9);
+        assert!(
+            (2..=8).contains(&reasoning_tokens),
+            "thinking tokens counted as reasoning: {reasoning_tokens}"
         );
     }
 }
