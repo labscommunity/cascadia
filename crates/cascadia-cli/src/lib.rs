@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use cascadia_api::reasoning::ReasoningFormat;
 use cascadia_engine::Builder;
 use cascadia_engine_llamacpp::{
     probe_stream_weights, resolve_llama_bin, validate_extra_args, ElasticVram, LlamaCppBuilder,
@@ -444,6 +445,12 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub keep_serving_on_engine_failure: bool,
 
+    /// deepseek: return a thinking model's reasoning in reasoning_content;
+    /// none: leave it in content as <think>…</think> (the output before this
+    /// release; kept for one release).
+    #[arg(long, value_name = "deepseek|none", default_value_t = ReasoningFormat::default())]
+    pub reasoning_format: ReasoningFormat,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -866,6 +873,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub keep_serving_on_engine_failure: bool,
 
+    /// deepseek: return a thinking model's reasoning in reasoning_content;
+    /// none: leave it in content as <think>…</think> (the output before this
+    /// release; kept for one release).
+    #[arg(long, value_name = "deepseek|none", default_value_t = ReasoningFormat::default())]
+    pub reasoning_format: ReasoningFormat,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -987,6 +1000,7 @@ impl WorkerArgs {
             decision_dump_max_bytes: None,
             max_decision_requests: cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS,
             keep_serving_on_engine_failure: false,
+            reasoning_format: ReasoningFormat::default(),
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1319,6 +1333,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.elastic_vram = args.elastic_vram;
     worker.elastic_share = args.elastic_share;
     worker.llama_mtp = args.llama_mtp;
+    worker.reasoning_format = args.reasoning_format;
     cmd_worker(worker).await
 }
 
@@ -2923,6 +2938,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
+        cfg.reasoning_format = args.reasoning_format;
         // Chat's pool and decision admission, sized and checked before the model load.
         cfg.max_concurrent_requests = max_concurrent_requests;
         cfg.max_concurrent_decisions = args.max_decision_requests;
@@ -5248,6 +5264,35 @@ mod sycl_llama_flag_tests {
             Command::Worker(args) => args,
             _ => panic!("expected worker subcommand"),
         }
+    }
+
+    #[test]
+    fn reasoning_format_parses_and_defaults_to_reasoning_content() {
+        use cascadia_api::reasoning::ReasoningFormat;
+        let r = run_args(&["cascadia", "run", "m", "--reasoning-format", "none"]);
+        assert_eq!(r.reasoning_format, ReasoningFormat::None);
+        let r = run_args(&["cascadia", "run", "m"]);
+        assert_eq!(r.reasoning_format, ReasoningFormat::ReasoningContent);
+        let w = worker_args(&[
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--reasoning-format",
+            "none",
+        ]);
+        assert_eq!(w.reasoning_format, ReasoningFormat::None);
+        let w = worker_args(&[
+            "cascadia", "worker", "--rank", "0", "--total", "1", "--model", "m",
+        ]);
+        assert_eq!(w.reasoning_format, ReasoningFormat::ReasoningContent);
+        let bad = Cli::try_parse_from(["cascadia", "run", "m", "--reasoning-format", "raw"]);
+        let err = bad.expect_err("an unknown format is a parse error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
