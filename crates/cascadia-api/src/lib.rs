@@ -869,8 +869,18 @@ pub struct ChatTemplateKwargs {
     pub enable_thinking: Option<bool>,
     /// Passed to the template as `preserve_thinking` when sent (Qwen3.6's
     /// template keeps replayed reasoning on earlier turns when it is set).
-    #[serde(default)]
+    /// Read leniently: a JSON bool is used, any other shape is ignored
+    /// rather than rejecting the request.
+    #[serde(default, deserialize_with = "lenient_bool")]
     pub preserve_thinking: Option<bool>,
+}
+
+/// `Some(b)` for a JSON bool, `None` for any other value.
+fn lenient_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?.as_bool())
 }
 
 impl ChatCompletionRequest {
@@ -8676,6 +8686,23 @@ level={{ effort_map[eff] }}";
                 "|false|true",
             ),
             (serde_json::json!({}), "|undefined|false"),
+            // A non-boolean value is ignored, never rejected.
+            (
+                serde_json::json!({"preserve_thinking": "true"}),
+                "|undefined|false",
+            ),
+            (
+                serde_json::json!({"preserve_thinking": 1}),
+                "|undefined|false",
+            ),
+            (
+                serde_json::json!({"preserve_thinking": {"on": true}}),
+                "|undefined|false",
+            ),
+            (
+                serde_json::json!({"preserve_thinking": null}),
+                "|undefined|false",
+            ),
         ] {
             let runner = Runner::new(Box::new(MockBuilder::new()));
             runner
