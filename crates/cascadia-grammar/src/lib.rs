@@ -250,6 +250,16 @@ impl GrammarFactory {
                               integers for the bounded grammar)"
                             .into()],
                     ),
+                    // The added bounds can leave no value where the schema
+                    // narrows an integer through a keyword the bounding
+                    // doesn't read (an `allOf` with a `const` past them):
+                    // built as the client wrote it.
+                    Err(e) if is_unsatisfiable(&e) => self.compile_with_patterns_dropped(
+                        schema,
+                        vec!["integer length not bounded (the bounded schema \
+                              admits no value)"
+                            .into()],
+                    ),
                     other => other,
                 }
             }
@@ -451,6 +461,10 @@ fn guidance_options() -> serde_json::Value {
 
 fn is_lexer_too_big(e: &EngineError) -> bool {
     matches!(e, EngineError::InvalidConfig(m) if m.contains("initial lexer configuration (grammar) too big"))
+}
+
+fn is_unsatisfiable(e: &EngineError) -> bool {
+    matches!(e, EngineError::InvalidConfig(m) if m.contains("Unsatisfiable schema"))
 }
 
 fn is_regex_error(e: &EngineError) -> bool {

@@ -1359,6 +1359,35 @@ fn an_integer_ending_at_or_below_i64_min_is_refused_not_built() {
 }
 
 #[test]
+fn an_integer_whose_bounded_form_is_unsatisfiable_builds_as_written() {
+    // The bounding skips only a schema's own enum/const/multipleOf, not one
+    // reached through `allOf`. Inside the added bounds that builds bounded;
+    // past them the added bounds leave no value ("Unsatisfiable schema"), and
+    // the schema is built as the client wrote it, with a warning.
+    let gf = single_byte();
+    let n = r#"{"type":"integer","allOf":[{"const":5000000000000000000}]}"#;
+    let grammar = gf.compile(&spec(&with_n(n))).unwrap();
+    assert!(grammar.warnings().is_empty(), "{:?}", grammar.warnings());
+    let mut gm = grammar.matcher().unwrap();
+    let doc = bytes(r#"{"n":5000000000000000000}"#);
+    assert_eq!(walk(&gf, &mut gm, &doc), Ok(()));
+    assert!(gm.finished());
+
+    let n = r#"{"type":"integer","allOf":[{"const":9300000000000000000}]}"#;
+    let grammar = gf
+        .compile(&spec(&with_n(n)))
+        .unwrap_or_else(|e| panic!("{n}: {e}"));
+    assert!(
+        grammar
+            .warnings()
+            .iter()
+            .any(|w| w.contains("integer length not bounded")),
+        "{:?}",
+        grammar.warnings()
+    );
+}
+
+#[test]
 fn a_schema_with_too_many_integers_to_bound_builds_unbounded() {
     // Each bounded integer is a range regex of its own; 600 of them pass
     // llguidance's lexer budget, which the schema as written stays inside.

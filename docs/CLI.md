@@ -591,7 +591,9 @@ The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
   bound past `i64`, so a `u64` above `i64::MAX` is not admitted where the
   schema sets no maximum. A schema with too many integers for that
   (several hundred) is built without the added bounds, and logged
-  (`integer length not bounded`). `number` is not bounded. A lower bound at or below -2^63 (C#'s `long.MinValue`, and the
+  (`integer length not bounded`); so is one the added bounds leave no
+  value for (an `allOf` with a `const` past them, say). `number` is not
+  bounded. A lower bound at or below -2^63 (C#'s `long.MinValue`, and the
   added minimum), which llguidance can't build, is raised to
   -9223372036854774784. A schema with a number at or below -2^63 as a
   `const` or `enum` value or an upper bound is a 400 (`a number at or
