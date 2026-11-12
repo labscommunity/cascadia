@@ -231,6 +231,8 @@ impl GrammarFactory {
                 if bound_integers(&mut bounded) == 0 {
                     return self.compile_with_patterns_dropped(schema, Vec::new());
                 }
+                // The added minimum is below what llguidance builds.
+                int_bounds::clamp_for_llguidance(&mut bounded);
                 match self.compile_with_patterns_dropped(bounded, Vec::new()) {
                     // Each bounded integer is a range regex of its own: a
                     // schema with hundreds of them can pass llguidance's
@@ -793,7 +795,7 @@ mod xgrammar_cost;
 pub use xgrammar_cost::{xgrammar_cost, xgrammar_cost_error, MAX_XGRAMMAR_COST};
 
 mod int_bounds;
-pub use int_bounds::{bound_integers, INTEGER_DIGITS_CAP};
+pub use int_bounds::{bound_integers, ADDED_INTEGER_MAXIMUM, ADDED_INTEGER_MINIMUM};
 
 mod stage_mask;
 pub use stage_mask::{

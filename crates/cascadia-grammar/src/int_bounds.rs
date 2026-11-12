@@ -3,8 +3,18 @@
 use crate::NAME_MAPS;
 use serde_json::{Map, Value};
 
-/// The largest magnitude an unbounded `integer` may take: 18 digits.
-pub const INTEGER_DIGITS_CAP: i64 = 999_999_999_999_999_999;
+/// The `maximum` given to an `integer` schema that sets no upper bound:
+/// `i64::MAX`, 19 digits. Neither backend builds an integer bound past it
+/// (llguidance reads bounds as f64 and saturates them to `i64`; xgrammar
+/// refuses a bound past `int64` with "Integer exceeds maximum limit"), so a
+/// non-negative integer is capped here too, not at `u64::MAX`.
+pub const ADDED_INTEGER_MAXIMUM: i64 = i64::MAX;
+
+/// The `minimum` given to an `integer` schema that sets no lower bound:
+/// `-i64::MAX`, one above `i64::MIN`, whose negation overflows in xgrammar's
+/// range builder. The llguidance build raises it further, to
+/// [`LLGUIDANCE_MIN_INTEGER`].
+pub const ADDED_INTEGER_MINIMUM: i64 = -i64::MAX;
 
 /// The lowest integer lower bound llguidance builds: it reads bounds as f64,
 /// and fails to build the range for a lower bound at or below -2^63.
@@ -24,10 +34,12 @@ const SKIP_KEYWORDS: &[&str] = &[
 ];
 
 /// Gives every `integer` schema in `schema` without an upper bound
-/// `maximum: 10^18 - 1`, and without a lower bound `minimum: -(10^18 - 1)`.
+/// `maximum:` [`ADDED_INTEGER_MAXIMUM`], and without a lower bound
+/// `minimum:` [`ADDED_INTEGER_MINIMUM`]: the `i64` range, 19 digits.
 /// Both JSON grammars (xgrammar, llguidance) allow an integer of any length,
 /// and a small model in JSON mode can repeat digits until it runs out of
-/// tokens; 18 digits are more than an `i64` id or a count needs.
+/// tokens; the `i64` range still admits every `i64` id (a Twitter/X or
+/// Discord snowflake, `i64::MAX`).
 ///
 /// Where a schema is used directly, this only narrows it. A `$defs` entry
 /// is bounded once for every place that names it, so a `$ref` reached from
@@ -42,7 +54,7 @@ const SKIP_KEYWORDS: &[&str] = &[
 /// holds `number` would bound its numbers too), a schema with `enum`,
 /// `const` or `multipleOf` (a bound can leave no multiple in range), one
 /// with a range keyword that is not a number (left for the backend to
-/// refuse), a side whose other bound is past the cap (it would leave no
+/// refuse), a side whose other bound is past the added one (it would leave no
 /// value), and anything under `not` or `if`.
 ///
 /// Returns how many schemas it bounded.
@@ -59,15 +71,15 @@ pub fn bound_integers(schema: &mut Value) -> usize {
         {
             return;
         }
-        let cap = INTEGER_DIGITS_CAP as f64;
+        let (max, min) = (ADDED_INTEGER_MAXIMUM as f64, ADDED_INTEGER_MINIMUM as f64);
         let (lower, upper) = (lower_bound(obj), upper_bound(obj));
         let mut changed = false;
-        if upper.is_none() && lower.is_none_or(|l| l < cap) {
-            obj.insert("maximum".into(), INTEGER_DIGITS_CAP.into());
+        if upper.is_none() && lower.is_none_or(|l| l < max) {
+            obj.insert("maximum".into(), ADDED_INTEGER_MAXIMUM.into());
             changed = true;
         }
-        if lower.is_none() && upper.is_none_or(|u| u > -cap) {
-            obj.insert("minimum".into(), (-INTEGER_DIGITS_CAP).into());
+        if lower.is_none() && upper.is_none_or(|u| u > min) {
+            obj.insert("minimum".into(), ADDED_INTEGER_MINIMUM.into());
             changed = true;
         }
         bounded += usize::from(changed);
@@ -177,7 +189,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const CAP: i64 = INTEGER_DIGITS_CAP;
+    const MAX: i64 = ADDED_INTEGER_MAXIMUM;
+    const MIN: i64 = ADDED_INTEGER_MINIMUM;
 
     fn bounded(mut v: Value) -> Value {
         bound_integers(&mut v);
@@ -194,7 +207,7 @@ mod tests {
     #[test]
     fn every_unbounded_integer_gets_both_bounds_wherever_it_sits() {
         let int = json!({"type": "integer"});
-        let both = json!({"type": "integer", "maximum": CAP, "minimum": -CAP});
+        let both = json!({"type": "integer", "maximum": MAX, "minimum": MIN});
         let schema = json!({
             "type": "object",
             "properties": {"a": int, "b": {"type": "array", "items": int}},
@@ -216,7 +229,7 @@ mod tests {
         assert_eq!(bounded(schema), want);
         assert_eq!(
             bounded(json!({"type": ["integer", "null"]})),
-            json!({"type": ["integer", "null"], "maximum": CAP, "minimum": -CAP})
+            json!({"type": ["integer", "null"], "maximum": MAX, "minimum": MIN})
         );
     }
 
@@ -225,11 +238,11 @@ mod tests {
         for (schema, want) in [
             (
                 json!({"type": "integer", "minimum": 0}),
-                json!({"type": "integer", "minimum": 0, "maximum": CAP}),
+                json!({"type": "integer", "minimum": 0, "maximum": MAX}),
             ),
             (
                 json!({"type": "integer", "exclusiveMaximum": 10}),
-                json!({"type": "integer", "exclusiveMaximum": 10, "minimum": -CAP}),
+                json!({"type": "integer", "exclusiveMaximum": 10, "minimum": MIN}),
             ),
             (
                 json!({"type": "integer", "minimum": -5, "maximum": 1e30}),
@@ -254,7 +267,7 @@ mod tests {
         ] {
             assert_eq!(bounded(schema.clone()), schema);
         }
-        // A lower bound past the cap: an upper bound at the cap would leave no value.
+        // A lower bound past i64::MAX: an added maximum would leave no value.
         assert_eq!(
             bounded(json!({"type": "integer", "minimum": 1e19})),
             json!({"type": "integer", "minimum": 1e19})
@@ -267,10 +280,10 @@ mod tests {
 
     #[test]
     fn an_integer_with_multiple_of_is_left_alone() {
-        // A bound at the cap can leave no multiple in range: this accepts
-        // 1000000000000000302 and nothing at or below the cap.
+        // An added bound can leave no multiple in range: this accepts
+        // 9223372036854776625 and nothing at or below i64::MAX.
         let schema =
-            json!({"type": "integer", "minimum": 999999999999999360u64, "multipleOf": 1009});
+            json!({"type": "integer", "minimum": 9223372036854775700u64, "multipleOf": 1009});
         assert_eq!(bounded(schema.clone()), schema);
         let schema = json!({"type": "integer", "multipleOf": 2});
         assert_eq!(bounded(schema.clone()), schema);
@@ -279,7 +292,7 @@ mod tests {
     #[test]
     fn a_property_named_like_a_skipped_keyword_is_still_bounded() {
         let int = json!({"type": "integer"});
-        let both = json!({"type": "integer", "maximum": CAP, "minimum": -CAP});
+        let both = json!({"type": "integer", "maximum": MAX, "minimum": MIN});
         let names = ["default", "enum", "const", "not", "if", "examples"];
         let props = |v: &Value| -> Value {
             Value::Object(names.iter().map(|n| (n.to_string(), v.clone())).collect())

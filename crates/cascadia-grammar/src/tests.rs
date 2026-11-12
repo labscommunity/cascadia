@@ -1242,35 +1242,80 @@ fn an_integer_bounded_at_the_ends_of_i64_builds() {
     }
 }
 
+/// An object with one required property `n` of schema `n`.
+fn with_n(n: &str) -> String {
+    format!(r#"{{"type":"object","properties":{{"n":{n}}},"required":["n"]}}"#)
+}
+
 #[test]
-fn an_unbounded_integer_takes_at_most_eighteen_digits() {
-    // A small model in JSON mode can repeat digits until max_tokens. Any
-    // integer with no bound gets ±(10^18 - 1): 18 digits at most.
+fn an_unbounded_integer_admits_every_i64_id() {
+    // A Twitter/X or Discord snowflake has 19 digits; so do i64::MAX and
+    // i64::MIN. Bounding an unbounded integer must not mask them.
     let gf = single_byte();
-    for (body, sign) in [
-        (
-            r#"{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}"#,
-            "",
-        ),
-        (
-            r#"{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}"#,
-            "-",
-        ),
-        (
-            r#"{"type":"object","properties":{"n":{"type":["integer","null"]}},"required":["n"]}"#,
-            "",
-        ),
-        (
-            r##"{"type":"object","properties":{"n":{"$ref":"#/$defs/N"}},"required":["n"],"$defs":{"N":{"type":"integer","minimum":0}}}"##,
-            "",
-        ),
-    ] {
-        let mut gm = mask_for(&gf, body);
-        let prefix = bytes(&format!(r#"{{"n":{sign}123456789012345678"#));
-        assert_eq!(walk(&gf, &mut gm, &prefix), Ok(()), "{body} {sign}");
-        assert!(!gm.allowed(u32::from(b'9')), "{body} {sign}: a 19th digit");
-        assert!(gm.allowed(u32::from(b'}')), "{body} {sign}");
+    for n in [r#"{"type":"integer"}"#, r#"{"type":["integer","null"]}"#] {
+        let body = with_n(n);
+        for doc in [
+            r#"{"n":1234567890123456789}"#,
+            r#"{"n":1999999999999999999}"#,
+            r#"{"n":9223372036854775807}"#,
+            r#"{"n":-1234567890123456789}"#,
+            // llguidance builds no lower bound at or below -2^63: its floor,
+            // -(2^63 - 1024), is the lowest it admits (i64::MIN is masked).
+            r#"{"n":-9223372036854774784}"#,
+        ] {
+            assert!(accepts(&gf, &body, doc), "{n}: {doc}");
+        }
     }
+}
+
+#[test]
+fn an_unbounded_integer_takes_at_most_nineteen_digits() {
+    // A small model in JSON mode can repeat digits until max_tokens: an
+    // integer with no bound is bounded to the i64 range, so the digit after
+    // a 19-digit run is masked.
+    let gf = single_byte();
+    for (n, sign) in [
+        (r#"{"type":"integer"}"#, ""),
+        (r#"{"type":"integer"}"#, "-"),
+        (r#"{"type":["integer","null"]}"#, ""),
+        (r#"{"type":"integer","minimum":0}"#, ""),
+        (r#"{"type":"integer","maximum":0}"#, "-"),
+    ] {
+        let body = with_n(n);
+        let mut gm = mask_for(&gf, &body);
+        let prefix = bytes(&format!(r#"{{"n":{sign}1234567890123456789"#));
+        assert_eq!(walk(&gf, &mut gm, &prefix), Ok(()), "{n} {sign}");
+        for d in b'0'..=b'9' {
+            assert!(!gm.allowed(u32::from(d)), "{n} {sign}: a 20th digit");
+        }
+        assert!(gm.allowed(u32::from(b'}')), "{n} {sign}");
+    }
+    let body = with_n(r##"{"$ref":"#/$defs/N"}"##).replace(
+        r#""required""#,
+        r#""$defs":{"N":{"type":"integer","minimum":0}},"required""#,
+    );
+    let mut gm = mask_for(&gf, &body);
+    assert_eq!(
+        walk(&gf, &mut gm, &bytes(r#"{"n":1234567890123456789"#)),
+        Ok(())
+    );
+    assert!(
+        !gm.allowed(u32::from(b'0')),
+        "a $ref'd integer: a 20th digit"
+    );
+}
+
+#[test]
+fn a_non_negative_integer_admits_i64_max_but_not_past_it() {
+    // Neither backend builds an integer bound past i64: llguidance reads a
+    // bound as f64 and saturates it to i64::MAX, and xgrammar refuses it
+    // ("Integer exceeds maximum limit"). So `minimum: 0` caps at i64::MAX
+    // too, and a u64 past it (up to u64::MAX) is masked.
+    let gf = single_byte();
+    let body = with_n(r#"{"type":"integer","minimum":0}"#);
+    assert!(accepts(&gf, &body, r#"{"n":9223372036854775807}"#));
+    assert!(accepts(&gf, &body, r#"{"n":1234567890123456789}"#));
+    assert!(!accepts(&gf, &body, r#"{"n":18446744073709551615}"#));
 }
 
 #[test]

@@ -489,7 +489,7 @@ fn grammar_json_schema(task: &GenerationTask) -> Option<&str> {
 }
 
 /// The schema text GenAI is sent for `task`: the client's, with every
-/// unbounded `integer` bounded to 18 digits
+/// unbounded `integer` bounded to the `i64` range
 /// ([`cascadia_grammar::bound_integers`]), since xgrammar, like llguidance,
 /// allows an integer of any length and a small model in JSON mode can repeat
 /// digits until max_tokens. Key order is kept. A schema that is not JSON, or
@@ -3238,8 +3238,8 @@ mod tests {
         assert_eq!(cfg.max_new_tokens, 16);
     }
 
-    /// An integer with no bound goes to GenAI with ±(10^18 - 1), so a small
-    /// model can't repeat digits until max_tokens; a bound the client set is
+    /// An integer with no bound goes to GenAI with the `i64` range, so a
+    /// small model can't repeat digits until max_tokens; a bound the client set is
     /// kept, nested and `$ref`'d integers and `["integer","null"]` are bounded,
     /// and key order stays the client's.
     #[test]
@@ -3269,25 +3269,26 @@ mod tests {
 
     #[test]
     fn the_schema_sent_to_genai_bounds_its_integers() {
-        let cap = cascadia_grammar::INTEGER_DIGITS_CAP;
+        let (max, min) = (
+            cascadia_grammar::ADDED_INTEGER_MAXIMUM,
+            cascadia_grammar::ADDED_INTEGER_MINIMUM,
+        );
         let sent = genai_json_schema(&schema_task("s", SCHEMA_A)).unwrap();
         assert_eq!(
             sent,
-            format!(
-                r#"{{"type":"object","properties":{{"a":{{"type":"integer","maximum":{cap},"minimum":-{cap}}}}}}}"#
-            )
+            r#"{"type":"object","properties":{"a":{"type":"integer","maximum":9223372036854775807,"minimum":-9223372036854775807}}}"#
         );
         let body = r##"{"type":"object","properties":{"z":{"$ref":"#/$defs/N"},"y":{"type":["integer","null"]},"x":{"type":"array","items":{"type":"integer","minimum":0}},"w":{"type":"number"}},"$defs":{"N":{"type":"integer","maximum":7}}}"##;
         let sent: serde_json::Value =
             serde_json::from_str(&genai_json_schema(&schema_task("s", body)).unwrap()).unwrap();
         assert_eq!(
             sent["$defs"]["N"],
-            serde_json::json!({"type":"integer","maximum":7,"minimum":-cap})
+            serde_json::json!({"type":"integer","maximum":7,"minimum":min})
         );
-        assert_eq!(sent["properties"]["y"]["maximum"], cap);
+        assert_eq!(sent["properties"]["y"]["maximum"], max);
         assert_eq!(
             sent["properties"]["x"]["items"],
-            serde_json::json!({"type":"integer","minimum":0,"maximum":cap})
+            serde_json::json!({"type":"integer","minimum":0,"maximum":max})
         );
         assert_eq!(
             sent["properties"]["w"],
@@ -3316,7 +3317,7 @@ mod tests {
         let mut e = mock_engine(&st);
         e.submit(schema_task("s", SCHEMA_A)).unwrap();
         let sent = st.lock().unwrap().last_schema.clone().unwrap();
-        assert!(sent.contains(r#""maximum":999999999999999999"#), "{sent}");
+        assert!(sent.contains(r#""maximum":9223372036854775807"#), "{sent}");
         assert!(e.schema_budget.seen.contains(SCHEMA_A));
         let mut validated = None;
         check_grammar(&schema_task("s", SCHEMA_A), None, |s| {
@@ -3325,6 +3326,30 @@ mod tests {
         })
         .unwrap();
         assert_eq!(validated.as_deref(), Some(sent.as_str()));
+    }
+
+    /// The xgrammar guard prices a bounded integer per digit of its bounds
+    /// and refuses a bound past `int64`: the `i64` range the bounding adds
+    /// passes it, for a signed and a non-negative integer.
+    #[test]
+    fn a_bounded_integer_passes_the_xgrammar_guard() {
+        for body in [
+            r#"{"type":"object","properties":{"id":{"type":"integer"}}}"#,
+            r#"{"type":"object","properties":{"id":{"type":"integer","minimum":0}}}"#,
+            r#"{"type":"object","properties":{"id":{"type":["integer","null"],"exclusiveMinimum":0}}}"#,
+        ] {
+            let mut validated = None;
+            check_grammar(&schema_task("s", body), None, |s| {
+                validated = Some(s.to_owned());
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("{body}: {e}"));
+            let sent: serde_json::Value = serde_json::from_str(&validated.unwrap()).unwrap();
+            assert_eq!(
+                sent["properties"]["id"]["maximum"], 9223372036854775807i64,
+                "{body}"
+            );
+        }
     }
 
     #[test]

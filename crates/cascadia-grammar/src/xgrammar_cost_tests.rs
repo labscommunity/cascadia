@@ -579,3 +579,17 @@ fn corpus() {
         );
     }
 }
+
+#[test]
+fn the_added_integer_bounds_pass_and_a_u64_bound_is_refused() {
+    // `bound_integers` adds the i64 range; xgrammar's converter reads an
+    // integer bound as int64 and refuses one past it ("Integer exceeds
+    // maximum limit"), which is why a non-negative integer is not capped at
+    // u64::MAX.
+    let mut v = json!({"type": "object", "properties": {"id": {"type": "integer"}, "n": {"type": "integer", "minimum": 0}}});
+    crate::bound_integers(&mut v);
+    assert_eq!(xgrammar_cost_error(&v), None);
+    let e = xgrammar_cost_error(&json!({"type": "integer", "minimum": 0, "maximum": u64::MAX}))
+        .expect("a bound past int64");
+    assert!(e.contains("not a whole 64-bit number"), "{e}");
+}
