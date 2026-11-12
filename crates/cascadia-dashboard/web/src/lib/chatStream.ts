@@ -18,7 +18,12 @@ export type StreamTally = {
   firstTokenAt: number | null;
   /** `tokens` as it stood right after that first chunk. */
   tokensAtFirst: number;
-  /** A text chunk reported `n_tokens: 0`: chunk boundaries are not token boundaries. */
+  /**
+   * A content chunk reported `n_tokens: 0`: chunk boundaries are not token
+   * boundaries. A reasoning-only chunk with `n_tokens: 0` does not count: the
+   * API sends one when a chunk crosses `</think>`, and the content chunk
+   * right after it carries that chunk's tokens.
+   */
   unknownTokenBoundaries: boolean;
 };
 
@@ -49,7 +54,7 @@ export function applyChunk(t: StreamTally, chunk: ChatCompletionChunk, now: numb
     tokens,
     firstTokenAt: first ? now : t.firstTokenAt,
     tokensAtFirst: first ? tokens : t.tokensAtFirst,
-    unknownTokenBoundaries: t.unknownTokenBoundaries || (hasText && chunk.n_tokens === 0),
+    unknownTokenBoundaries: t.unknownTokenBoundaries || (Boolean(content) && chunk.n_tokens === 0),
   };
 }
 
