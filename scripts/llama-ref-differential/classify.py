@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Joins the corpus, llama.cpp's verdicts (harness.cpp) and ours
-(`sycl_ref_verdicts`), tags each schema, and checks:
+"""Checks the sycl-llama engine's ref inlining against llama.cpp's own
+converter, and writes the fixture the Rust test pins our verdicts with.
 
-(a) every schema llama.cpp degrades (a `$ref` it turned into "any") is
-    refused by our sycl-llama check: no silent 200;
-(b) every schema we refuse that llama.cpp converts faithfully falls in a
-    documented conservative class.
+For every corpus schema the engine accepts (inlines) for llama-server's
+chat endpoint:
+(a) no `$ref` the client wrote reaches the converter: every `$ref` left in
+    a schema position names a hoisted copy (`#/$defs/__cascadia_...`);
+(b) the converter's grammar for it is the grammar of the ref-renamed
+    variant (every ref pointing at a copy under a name of its own, which the
+    converter resolves faithfully), up to rule names;
+(c) without `--jinja` (the root visited as ``): every schema that needed
+    hoisting is refused, and every other one gives the same grammar;
+(d) a response schema and a tool's, both hoisted, through one converter
+    and one table of refs, each give their own variant's grammar.
 
-Writes the tagged fixture (one JSON object per line: schema, llama, tag)
-to the path given, and exits 1 on any mismatch.
-
-Tags: `degraded`, `faithful`, `error` (llama.cpp refuses it: a 4xx, never
-silent, either verdict of ours is fine) or `conservative:<class>`:
-- `ref-beside-ref`: a `$ref` under a `$ref` object's siblings;
-- `https-ref-unreached`: a no-fragment `https://` `$ref` (in data, or
-  anywhere else the converter never reaches)."""
+Exits 1 on any failure."""
 
 import hashlib
 import json
@@ -22,10 +22,13 @@ import re
 import sys
 
 TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\[(?:\\.|[^\]\\])*\]|[A-Za-z0-9-]+|\{[0-9,]*\}|[()|*+?]|\S')
+CHAT = "response-format-schema"
+TOOL = "tool-f-schema"
+DATA = ("const", "enum", "default", "examples")
+NAME_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
 
 
 def parse_grammar(text):
-    """`name ::= body` rules from the harness's `--grammar` line."""
     rules = {}
     for part in text.split("\t"):
         if " ::= " in part:
@@ -34,126 +37,147 @@ def parse_grammar(text):
     return rules
 
 
-def same_language_shape(g1, g2, root):
-    """Whether the roots of two grammars are the same up to rule names:
-    partition refinement over both grammars together (a rule's class is
-    its previous class and its body with every rule name replaced by that
-    rule's class), run until no class splits, then the roots compared."""
+def without_aliases(rules):
+    """`rules` with every rule whose body is one other rule's name replaced
+    by that rule where it is used: the converter writes `name ::= other`
+    for a ref (or a reused schema) and inlines a built-in primitive, so the
+    same grammar can come with or without such a step."""
+    alias = {k: v[0] for k, v in rules.items() if len(v) == 1 and v[0] in rules and v[0] != k}
+
+    def final(name, seen=()):
+        while name in alias and name not in seen:
+            seen = seen + (name,)
+            name = alias[name]
+        return name
+
+    out = {}
+    for k, body in rules.items():
+        out[k] = [final(t) if t in rules else t for t in body]
+    return out
+
+
+def final_of(rules, name):
+    seen = set()
+    while name in rules and len(rules[name]) == 1 and rules[name][0] in rules and name not in seen:
+        seen.add(name)
+        name = rules[name][0]
+    return name
+
+
+def same_shape(g1, root1, g2, root2):
+    """Whether rule `root1` of `g1` and `root2` of `g2` are the same up to
+    rule names: partition refinement over both grammars together."""
+    if root1 not in g1 or root2 not in g2:
+        return False
+    root1, root2 = final_of(g1, root1), final_of(g2, root2)
+    g1, g2 = without_aliases(g1), without_aliases(g2)
     rules = {("a", k): v for k, v in g1.items()}
     rules.update({("b", k): v for k, v in g2.items()})
-    if ("a", root) not in rules or ("b", root) not in rules:
-        return False
     color = {k: "" for k in rules}
     while True:
         new = {}
         for (side, name), body in rules.items():
             toks = ["@" + color[(side, t)] if (side, t) in rules else t for t in body]
-            text = color[(side, name)] + "|" + " ".join(toks)
-            new[(side, name)] = hashlib.sha1(text.encode()).hexdigest()[:16]
+            new[(side, name)] = hashlib.sha1((color[(side, name)] + "|" + " ".join(toks)).encode()).hexdigest()[:16]
         done = len(set(new.values())) == len(set(color.values()))
         color = new
         if done:
             break
-    return color[("a", root)] == color[("b", root)]
+    return color[("a", root1)] == color[("b", root2)]
 
 
-def refs_beside_ref(v, beside=False):
-    """Whether a `$ref` sits under a `$ref` object's siblings."""
+def client_refs(v, out):
+    """`$ref`s in schema positions that don't name a hoisted copy."""
     if isinstance(v, list):
-        return any(refs_beside_ref(x, beside) for x in v)
-    if isinstance(v, dict):
-        own = v.get("$ref")
-        if isinstance(own, str) and beside:
-            return True
-        b = beside or "$ref" in v
-        return any(refs_beside_ref(c, b) for k, c in v.items() if k != "$ref")
-    return False
-
-
-def no_fragment_https_refs(v):
-    if isinstance(v, list):
-        return any(no_fragment_https_refs(x) for x in v)
-    if isinstance(v, dict):
+        for x in v:
+            client_refs(x, out)
+    elif isinstance(v, dict):
         r = v.get("$ref")
-        if isinstance(r, str) and r.startswith("https://") and r.split("#", 1)[1:] in ([], [""]):
-            return True
-        return any(no_fragment_https_refs(c) for c in v.values())
-    return False
+        if isinstance(r, str) and not r.startswith("#/$defs/__cascadia_"):
+            out.append(r)
+        for k, c in v.items():
+            if k in DATA:
+                continue
+            if k in NAME_MAPS and isinstance(c, dict):
+                for s in c.values():
+                    client_refs(s, out)
+            else:
+                client_refs(c, out)
 
 
-def conservative_class(schema):
-    if refs_beside_ref(schema):
-        return "ref-beside-ref"
-    if no_fragment_https_refs(schema):
-        return "https-ref-unreached"
-    return None
-
-
-def verdicts(llama, grammars, variant_grammars, root):
-    """One endpoint's verdicts: the harness's, with a faithful one turned
-    degraded where the grammar differs from the variant's (where every
-    ref has a rule name of its own), so a reused rule shows."""
-    out = [l.rstrip("\n") for l in open(llama)]
-    g_orig = [l.rstrip("\n") for l in open(grammars)]
-    g_var = [l.rstrip("\n") for l in open(variant_grammars)]
-    assert len(out) == len(g_orig) == len(g_var), "line counts differ"
-    for i, (a, b) in enumerate(zip(g_orig, g_var)):
-        if out[i] == "faithful" and a != "error" and b != "error":
-            if not same_language_shape(parse_grammar(a), parse_grammar(b), root):
-                out[i] = "degraded (a ref's rule name held another rule)"
-    return out
-
-
-def tag_of(schema, lv, refused):
-    """(tag, mismatch reason or None)."""
-    kind = lv.split(" ", 1)[0]
-    if kind == "degraded":
-        return "degraded", None if refused else "silent 200"
-    if kind == "error":
-        return "error", None
-    if refused:
-        cls = conservative_class(schema)
-        if cls is None:
-            return "faithful", "refused a faithful schema"
-        return f"conservative:{cls}", None
-    return "faithful", None
+def lines(path):
+    return [l.rstrip("\n") for l in open(path)]
 
 
 def main():
-    (corpus, ours, chat, chat_g, chat_vg, raw, raw_g, raw_vg, fixture) = sys.argv[1:10]
-    schemas = [json.loads(l) for l in open(corpus) if l.strip()]
-    ours_v = [l.strip() == "refused" for l in open(ours)]
-    # The chat endpoint (what sycl-llama uses) decides; the plain
-    # converter (`/completion`) is kept beside it for comparison.
-    chat_v = verdicts(chat, chat_g, chat_vg, "response-format-schema")
-    raw_v = verdicts(raw, raw_g, raw_vg, "root")
-    assert len(schemas) == len(ours_v) == len(chat_v) == len(raw_v), "line counts differ"
-    counts, raw_counts = {}, {}
-    mismatches, flips, entries = [], [], []
-    for i, (schema, refused, cv, rv) in enumerate(zip(schemas, ours_v, chat_v, raw_v)):
-        tag, why = tag_of(schema, cv, refused)
-        raw_tag, _ = tag_of(schema, rv, refused)
-        counts[tag] = counts.get(tag, 0) + 1
-        raw_counts[raw_tag] = raw_counts.get(raw_tag, 0) + 1
-        if why:
-            mismatches.append((why, schema, cv))
-        if rv.startswith("degraded") and not cv.startswith("degraded"):
-            flips.append((i, schema, rv, cv))
-        entries.append({"schema": schema, "llama": cv, "raw": rv, "tag": tag})
+    (corpus, inl, inl_nj, g_inl, g_var, g_inl_nj, pairs, g_pair_inl, g_pair_var, fixture) = sys.argv[1:11]
+    schemas = [json.loads(l) for l in lines(corpus) if l]
+    inl = [json.loads(l) for l in lines(inl)]
+    inl_nj = [json.loads(l) for l in lines(inl_nj)]
+    g_inl, g_var, g_inl_nj = lines(g_inl), lines(g_var), lines(g_inl_nj)
+    assert len(schemas) == len(inl) == len(inl_nj) == len(g_inl) == len(g_var) == len(g_inl_nj)
+    counts = {"accepted": 0, "hoisted": 0, "refused": 0, "(a) pass": 0, "(b) pass": 0,
+              "(b) original errors at llama.cpp": 0, "(c) refused (hoisting)": 0, "(c) same grammar": 0,
+              "(d) pairs pass": 0}
+    reasons = {}
+    failures = []
+    entries = []
+    for i, schema in enumerate(schemas):
+        r, rn = inl[i], inl_nj[i]
+        entry = {"schema": schema, "verdict": "inlined" if "inlined" in r else "refused",
+                 "hoisted": r.get("hoisted", 0), "no_jinja": "inlined" if "inlined" in rn else "refused"}
+        entries.append(entry)
+        if "refused" in r:
+            counts["refused"] += 1
+            reason = r["refused"].split(" is not supported")[0].split(" makes")[0]
+            msg = r["refused"]
+            kind = ("too big" if "bytes" in msg else "llama-server cost" if "llama-server" in msg
+                    else "recursive" if "recursive" in msg else "not inlinable")
+            reasons[kind] = reasons.get(kind, 0) + 1
+            continue
+        counts["accepted"] += 1
+        if r["hoisted"]:
+            counts["hoisted"] += 1
+        left = []
+        client_refs(r["inlined"], left)
+        if left:
+            failures.append(("(a) a client ref reaches the converter", i, left[:3]))
+        else:
+            counts["(a) pass"] += 1
+        if g_var[i] == "error":
+            counts["(b) original errors at llama.cpp"] += 1
+        elif g_inl[i] == "error" or not same_shape(parse_grammar(g_inl[i]), CHAT, parse_grammar(g_var[i]), CHAT):
+            failures.append(("(b) grammar differs from the faithful one", i, g_inl[i][:200]))
+        else:
+            counts["(b) pass"] += 1
+        if r["hoisted"]:
+            if "refused" in rn:
+                counts["(c) refused (hoisting)"] += 1
+            else:
+                failures.append(("(c) hoisted schema accepted without --jinja", i, ""))
+        elif "inlined" in rn and g_var[i] != "error":
+            if same_shape(parse_grammar(g_inl_nj[i]), "root", parse_grammar(g_var[i]), CHAT):
+                counts["(c) same grammar"] += 1
+            else:
+                failures.append(("(c) grammar without --jinja differs", i, g_inl_nj[i][:200]))
+    for meta, a, b in zip(lines(pairs), lines(g_pair_inl), lines(g_pair_var)):
+        if b == "error":
+            continue
+        ga, gb = parse_grammar(a), parse_grammar(b)
+        if a != "error" and same_shape(ga, CHAT, gb, CHAT) and same_shape(ga, TOOL, gb, TOOL):
+            counts["(d) pairs pass"] += 1
+        else:
+            failures.append(("(d) response + tool differ", meta, a[:200]))
     with open(fixture, "w") as f:
         for e in entries:
             f.write(json.dumps(e, separators=(",", ":")) + "\n")
-    fmt = lambda c: ", ".join(f"{k} {v}" for k, v in sorted(c.items()))
     print(f"corpus {len(schemas)}")
-    print(f"chat endpoint: {fmt(counts)}")
-    print(f"plain converter: {fmt(raw_counts)}")
-    print(f"degraded by the plain converter, not by the chat endpoint: {len(flips)}")
-    for i, schema, rv, cv in flips:
-        print(f"FLIP #{i}: {json.dumps(schema)[:160]} | plain: {rv} | chat: {cv}")
-    print(f"mismatches {len(mismatches)}")
-    for why, schema, lv in mismatches:
-        print(f"MISMATCH {why}: {json.dumps(schema)} | llama.cpp chat: {lv}")
-    sys.exit(1 if mismatches else 0)
+    print(", ".join(f"{k} {v}" for k, v in counts.items()))
+    print("refused: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items())))
+    print(f"failures {len(failures)}")
+    for why, i, detail in failures:
+        print(f"FAIL {why}: #{i}: {json.dumps(schemas[i])[:200] if isinstance(i, int) else i} | {detail}")
+    sys.exit(1 if failures else 0)
 
 
 if __name__ == "__main__":

@@ -120,19 +120,48 @@ static std::string grammar(const std::string & line, const std::string & root) {
     }
 }
 
-// `harness [--grammar] [--root NAME]`: a verdict (or the grammar) per line.
-// The root name is the one the root schema is visited under: llama-server's
-// chat endpoint builds a `response_format` grammar through its chat parser,
-// which adds the schema under `response-format-schema` (or
-// `response-format`, per template); its plain `/completion` endpoint and
-// `json_schema_to_grammar` under `` (the rule `root`).
+// The grammar llama-server's chat endpoint builds for a request with a
+// `response_format` schema and one tool: one converter, one table of refs
+// for both (chat-auto-parser-generator.cpp resolves the tools' refs and
+// the response's into the same converter), the response under
+// `response-format-schema`, the tool under `tool-f-schema`. `line` is
+// `{"response": <schema>, "tool": <schema>}`.
+static std::string pair_grammar(const std::string & line) {
+    common_schema_converter converter([](const std::string &) { return nlohmann::ordered_json(); }, false);
+    try {
+        auto both = nlohmann::ordered_json::parse(line);
+        auto tool = both["tool"];
+        auto response = both["response"];
+        converter.resolve_refs(tool, "");
+        converter.resolve_refs(response, "");
+        converter.visit(response, "response-format-schema");
+        converter.visit(tool, "tool-f-schema");
+        converter.check_errors();
+        std::string g = converter.format_grammar();
+        std::replace(g.begin(), g.end(), '\n', '\t');
+        return g;
+    } catch (const std::exception &) {
+        return "error";
+    }
+}
+
+// `harness [--grammar | --pair] [--root NAME]`: a verdict, the grammar, or
+// a pair's grammar, per line. The root name is the one the root schema is
+// visited under: llama-server's chat endpoint builds a `response_format`
+// grammar through its chat parser, which adds the schema under
+// `response-format-schema` (or `response-format`, per template); its plain
+// `/completion` endpoint and a `--no-jinja` server under `` (the rule
+// `root`).
 int main(int argc, char ** argv) {
     bool grammars = false;
+    bool pairs = false;
     std::string root;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--grammar") {
             grammars = true;
+        } else if (a == "--pair") {
+            pairs = true;
         } else if (a == "--root" && i + 1 < argc) {
             root = argv[++i];
         }
@@ -140,6 +169,6 @@ int main(int argc, char ** argv) {
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
-        std::cout << (grammars ? grammar(line, root) : verdict(line, root)) << "\n";
+        std::cout << (pairs ? pair_grammar(line) : grammars ? grammar(line, root) : verdict(line, root)) << "\n";
     }
 }

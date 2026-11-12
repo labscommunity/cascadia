@@ -184,9 +184,12 @@ pub enum RefResolver {
     /// OpenVINO GenAI's xgrammar: `#` and `#/...` only; any other ref the
     /// converter reaches becomes "any JSON".
     Xgrammar,
-    /// llama-server's converter: `#/...` only, reading every `$ref` in the
-    /// document; an `https://` ref becomes "any object", others fail.
-    LlamaServer,
+    /// llama-server's converter, which can give a ref the wrong shape
+    /// without failing: the engine sends it every schema with its refs
+    /// replaced by their targets (`cascadia_grammar::inline_refs`).
+    /// `no_jinja`: llama-server runs without `--jinja`, where a recursive
+    /// schema's hoisted copies could take another rule's name.
+    LlamaServer { no_jinja: bool },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2591,6 +2594,27 @@ async fn chat_completions(
                     Json(serde_json::json!({ "error": format!("invalid response_format: {msg}") })),
                 )
                     .into_response();
+            }
+        }
+    }
+    // sycl-llama sends each tool's `parameters` with its refs inlined too
+    // (`cascadia_grammar::inline_refs`): one it can't inline is refused here.
+    if let RefResolver::LlamaServer { no_jinja } = state.ref_resolver {
+        if let Some(serde_json::Value::Array(tools)) = chat_tools(&req) {
+            for (i, tool) in tools.iter().enumerate() {
+                let Some(params) = tool.pointer("/function/parameters") else {
+                    continue;
+                };
+                if let Err(e) = cascadia_grammar::inline_refs(params, &format!("t{i}"), !no_jinja) {
+                    count_rejected("invalid_request");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("invalid tools: tools[{i}].function.parameters: {e}")
+                        })),
+                    )
+                        .into_response();
+                }
             }
         }
     }
@@ -8518,7 +8542,7 @@ level={{ effort_map[eff] }}";
             .unwrap();
         let engine = match refs {
             RefResolver::Xgrammar => "ov-genai",
-            RefResolver::LlamaServer => "sycl-llama",
+            RefResolver::LlamaServer { .. } => "sycl-llama",
             RefResolver::Full => "mock",
         };
         let cfg = Config {
@@ -8550,11 +8574,25 @@ level={{ effort_map[eff] }}";
         );
     }
 
+    const SYCL: RefResolver = RefResolver::LlamaServer { no_jinja: false };
+    const SYCL_NO_JINJA: RefResolver = RefResolver::LlamaServer { no_jinja: true };
+
+    /// A 400 on sycl-llama for a ref the engine can't inline.
+    fn assert_not_inlinable(schema: &Value, status: StatusCode, v: &Value) {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.starts_with("invalid response_format: response_format.json_schema.schema: $ref ")
+                && err.contains("only a reference inside the schema (`#` or `#/...`)"),
+            "{err}"
+        );
+    }
+
     /// xgrammar (ov-genai) turns a `$ref` that is not `#` or `#/...` into
-    /// "any JSON", and llama-server (sycl-llama) one to an `https://`
-    /// document into "any object": on those engines such a ref is a 400,
-    /// never a dropped constraint. Elsewhere (llguidance resolves embedded
-    /// ids) they pass as before; a plain pointer passes everywhere.
+    /// "any JSON": on ov-genai such a ref is a 400, never a dropped
+    /// constraint. sycl-llama inlines every ref before llama-server sees
+    /// it, and refuses one it can't inline. Elsewhere (llguidance resolves
+    /// embedded ids) they pass as before; a plain pointer passes everywhere.
     #[tokio::test]
     async fn a_ref_the_backend_would_drop_is_400_on_pointer_only_engines() {
         let dropped = [
@@ -8570,13 +8608,10 @@ level={{ effort_map[eff] }}";
             }),
         ];
         for schema in &dropped {
-            for (refs, engine) in [
-                (RefResolver::Xgrammar, "ov-genai"),
-                (RefResolver::LlamaServer, "sycl-llama"),
-            ] {
-                let (status, v) = post_schema(refs, schema).await;
-                assert_ref_refusal(engine, schema, status, &v);
-            }
+            let (status, v) = post_schema(RefResolver::Xgrammar, schema).await;
+            assert_ref_refusal("ov-genai", schema, status, &v);
+            let (status, v) = post_schema(SYCL, schema).await;
+            assert_not_inlinable(schema, status, &v);
             let (status, v) = post_schema(RefResolver::Full, schema).await;
             assert_eq!(status, StatusCode::OK, "{schema}: {v}");
         }
@@ -8587,39 +8622,45 @@ level={{ effort_map[eff] }}";
         });
         for refs in [
             RefResolver::Xgrammar,
-            RefResolver::LlamaServer,
+            SYCL,
+            SYCL_NO_JINJA,
             RefResolver::Full,
         ] {
             let (status, v) = post_schema(refs, &plain).await;
             assert_eq!(status, StatusCode::OK, "{refs:?}: {v}");
         }
-        // `#` alone is the root to xgrammar and llguidance; llama-server
-        // refuses it ("Unsupported ref: #").
+        // `#` alone is the root to xgrammar and llguidance; sycl-llama
+        // sends a copy of the root under a reserved name, which needs
+        // llama-server's chat endpoint (`--jinja`).
         let root = serde_json::json!({
             "type": "object",
             "properties": {"r": {"anyOf": [{"$ref": "#"}, {"type": "null"}]}},
         });
-        for refs in [RefResolver::Xgrammar, RefResolver::Full] {
+        for refs in [RefResolver::Xgrammar, SYCL, RefResolver::Full] {
             let (status, v) = post_schema(refs, &root).await;
             assert_eq!(status, StatusCode::OK, "{refs:?}: {v}");
         }
-        let (status, v) = post_schema(RefResolver::LlamaServer, &root).await;
-        assert_ref_refusal("sycl-llama", &root, status, &v);
+        let (status, v) = post_schema(SYCL_NO_JINJA, &root).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("recursive")
+                && v["error"].as_str().unwrap().contains("--jinja"),
+            "{v}"
+        );
     }
 
-    /// llama-server's `resolve_refs` reads every `$ref` in the document,
-    /// where xgrammar's converter reaches fewer (it refuses a tuple
-    /// `items` and ignores `properties` beside `patternProperties`; an
-    /// object `allOf` the API has already merged): a remote ref there is a
-    /// 400 on sycl-llama, and on ov-genai where the converter reaches it.
+    /// llama-server reads `$ref`s in places xgrammar's converter never
+    /// reaches (a tuple `items`, every `allOf` member, `properties` beside
+    /// `patternProperties`): sycl-llama inlines them like any other, so one
+    /// it can't inline is a 400 there too. On ov-genai only where the
+    /// converter reaches it (an object `allOf` the API has merged). A ref
+    /// in data (`const`) is left as it is on sycl-llama: it is not a schema.
     #[tokio::test]
     async fn every_ref_llama_server_reads_is_checked_on_sycl_llama() {
         let remote = serde_json::json!({"$ref": "https://example.com/a.json"});
         for (i, schema) in sycl_probe_schemas(&remote).iter().enumerate() {
-            let (status, v) = post_schema(RefResolver::LlamaServer, schema).await;
-            assert_ref_refusal("sycl-llama", schema, status, &v);
-            // The API merges an object `allOf` into one schema before
-            // GenAI sees it, so xgrammar reaches that ref (case 1) too.
+            let (status, v) = post_schema(SYCL, schema).await;
+            assert_not_inlinable(schema, status, &v);
             let (status, v) = post_schema(RefResolver::Xgrammar, schema).await;
             if i == 1 {
                 assert_ref_refusal("ov-genai", schema, status, &v);
@@ -8630,71 +8671,27 @@ level={{ effort_map[eff] }}";
                 );
             }
         }
+        let data = serde_json::json!({
+            "$id": "urn:x", "type": "object",
+            "properties": {"k": {"const": {"$ref": "https://example.com/a.json"}}},
+        });
+        let (status, v) = post_schema(SYCL, &data).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
-    /// llama-server resolves a `#/...` pointer into a `$ref`'s sibling, and
-    /// a ref it never recorded there becomes "any object": the sycl-llama
-    /// scan reads `$ref` siblings too. xgrammar walks the same pointer to
-    /// `{"$ref": "#"}`, the root (constrained, recursive), and to the
-    /// `https://` one, which it would make "any JSON".
+    /// Shapes llama-server's own ref resolution got wrong (a ref beside
+    /// another `$ref`, refs whose rule names collide): sycl-llama inlines
+    /// them, so they pass with the right shape. A ref it can't inline is
+    /// still a 400, wherever a pointer reaches it.
     #[tokio::test]
-    async fn a_ref_beside_a_ref_is_checked() {
-        let input = |r: &str| {
+    async fn refs_llama_server_would_mix_up_pass_inlined_on_sycl_llama() {
+        let beside = |r: &str| {
             serde_json::json!({
-                "$defs": {"A": {"$ref": "#/$defs/B", "x": {"$ref": r}}, "B": {"type": "string"}},
+                "$defs": {"A": {"$ref": "#/$defs/B", "x": {"$ref": r}}, "B": {"type": "string"}, "C": {"type": "integer"}},
                 "type": "object", "properties": {"p": {"$ref": "#/$defs/A/x"}}, "required": ["p"],
             })
         };
-        let (a, b) = (input("#"), input("https://example.com/a.json"));
-        for schema in [&a, &b] {
-            let (status, v) = post_schema(RefResolver::LlamaServer, schema).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
-            assert!(
-                v["error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("beside another `$ref`"),
-                "{v}"
-            );
-        }
-        // Any form of ref there, `#/...` included: llama-server records none
-        // under a `$ref`'s siblings, so `C` becomes "any object", not an
-        // integer.
-        let pointer = serde_json::json!({
-            "$defs": {"A": {"$ref": "#/$defs/B", "x": {"$ref": "#/$defs/C"}}, "B": {"type": "string"}, "C": {"type": "integer"}},
-            "type": "object", "properties": {"p": {"$ref": "#/$defs/A/x"}}, "required": ["p"],
-        });
-        let (status, v) = post_schema(RefResolver::LlamaServer, &pointer).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
-        let err = v["error"].as_str().unwrap();
-        assert!(
-            err.contains(r##"$ref "#/$defs/C""##)
-                && err.contains("sycl-llama")
-                && err.contains("beside another `$ref`"),
-            "{err}"
-        );
-        // A `$ref` beside plain annotations is fine.
-        let annotated = serde_json::json!({
-            "$defs": {"C": {"type": "integer"}},
-            "type": "object",
-            "properties": {"p": {"$ref": "#/$defs/C", "description": "a count", "default": 1}},
-        });
-        let (status, v) = post_schema(RefResolver::LlamaServer, &annotated).await;
-        assert_eq!(status, StatusCode::OK, "{v}");
-        let (status, v) = post_schema(RefResolver::Xgrammar, &a).await;
-        assert_eq!(status, StatusCode::OK, "{v}");
-        let (status, v) = post_schema(RefResolver::Xgrammar, &b).await;
-        assert_ref_refusal("ov-genai", &b, status, &v);
-    }
-
-    /// llama-server names a ref's rule after its pointer (`ref` + the
-    /// pointer, every run of other characters than `[a-zA-Z0-9-]` made `-`)
-    /// and reuses any rule that already has the name, without visiting
-    /// the target: two refs that name the same rule get one shape for
-    /// both. A 400 on sycl-llama naming both.
-    #[tokio::test]
-    async fn refs_whose_llama_rule_names_collide_are_400_on_sycl_llama() {
-        let defs = serde_json::json!({
+        let collide = serde_json::json!({
             "$defs": {
                 "a_b": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]},
                 "a-b": {"type": "object", "properties": {"s": {"type": "string"}}, "required": ["s"]},
@@ -8704,31 +8701,63 @@ level={{ effort_map[eff] }}";
             "required": ["x", "y"],
         });
         let property = serde_json::json!({
-            "$defs": {"B": {"type": "object", "properties": {"s": {"type": "string"}}, "required": ["s"]}},
+            "$defs": {"B": {"enum": ["u", "v"]}},
             "type": "object",
-            "properties": {
-                "ref-defs-B": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]},
-                "b": {"$ref": "#/$defs/B"},
-            },
-            "required": ["ref-defs-B", "b"],
+            "properties": {"ref-defs-B": {"enum": [1, 2]}, "y": {"$ref": "#/$defs/B"}},
+            "required": ["ref-defs-B", "y"],
         });
-        for (schema, names) in [(&defs, [r##""#/$defs/a_b""##, r##""#/$defs/a-b""##])] {
-            let (status, v) = post_schema(RefResolver::LlamaServer, schema).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
-            let err = v["error"].as_str().unwrap();
-            assert!(
-                err.contains("sycl-llama")
-                    && err.contains("same grammar rule")
-                    && names.iter().all(|n| err.contains(n)),
-                "{err}"
-            );
-            let (status, v) = post_schema(RefResolver::Full, schema).await;
-            assert_eq!(status, StatusCode::OK, "{v}");
+        let pattern = serde_json::json!({
+            "$defs": {"A": {"type": "string", "pattern": "^[a-z]{3}$"}, "A-1": {"type": "object", "properties": {"s": {"type": "string"}}}},
+            "type": "object", "properties": {"a": {"$ref": "#/$defs/A"}, "b": {"$ref": "#/$defs/A-1"}},
+        });
+        for schema in [beside("#/$defs/C"), beside("#"), collide, property, pattern] {
+            for refs in [SYCL, SYCL_NO_JINJA] {
+                let (status, v) = post_schema(refs, &schema).await;
+                let recursive = schema.to_string().contains(r##""$ref":"#""##);
+                if refs == SYCL_NO_JINJA && recursive {
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+                } else {
+                    assert_eq!(status, StatusCode::OK, "{refs:?} {schema}: {v}");
+                }
+            }
         }
-        // A property named like a ref's rule: on the chat endpoint (the
-        // one sycl-llama uses) property rules are named under the schema's
-        // name, so it keeps its own shape (live at the pinned llama.cpp).
-        let (status, v) = post_schema(RefResolver::LlamaServer, &property).await;
+        let remote = beside("https://example.com/a.json");
+        let (status, v) = post_schema(SYCL, &remote).await;
+        assert_not_inlinable(&remote, status, &v);
+    }
+
+    /// A tool's `parameters` are inlined for sycl-llama too: one with a ref
+    /// it can't inline is a 400 naming the tool, and a recursive one is a
+    /// 400 without `--jinja`.
+    #[tokio::test]
+    async fn sycl_llama_tool_parameters_are_checked_like_response_format() {
+        let tool = |params: Value| serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);
+        let post = |refs: RefResolver, tools: Value| async move {
+            let mut body = chat_with(None);
+            body["tools"] = tools;
+            post_chat(so_app_refs(refs).await, body).await
+        };
+        let plain = serde_json::json!({"$defs": {"X": {"type": "integer"}}, "type": "object", "properties": {"x": {"$ref": "#/$defs/X"}}});
+        let remote = serde_json::json!({"type": "object", "properties": {"x": {"$ref": "https://example.com/x.json"}}});
+        let list = serde_json::json!({
+            "type": "object", "properties": {"head": {"$ref": "#/$defs/Node"}},
+            "$defs": {"Node": {"type": "object", "properties": {"next": {"anyOf": [{"$ref": "#/$defs/Node"}, {"type": "null"}]}}}},
+        });
+        let (status, v) = post(SYCL, tool(plain.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = post(SYCL, tool(list.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = post(SYCL, tool(remote.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.starts_with("invalid tools: tools[0].function.parameters: $ref "),
+            "{err}"
+        );
+        let (status, v) = post(SYCL_NO_JINJA, tool(list)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        // Other engines are not checked here.
+        let (status, v) = post(RefResolver::Full, tool(remote)).await;
         assert_eq!(status, StatusCode::OK, "{v}");
     }
 
@@ -8768,11 +8797,7 @@ level={{ effort_map[eff] }}";
                 "$schema": meta, "type": "object",
                 "properties": {"a": {"type": "string"}}, "required": ["a"],
             });
-            for refs in [
-                RefResolver::Xgrammar,
-                RefResolver::LlamaServer,
-                RefResolver::Full,
-            ] {
+            for refs in [RefResolver::Xgrammar, SYCL, RefResolver::Full] {
                 let (status, v) = post_schema(refs, &schema).await;
                 assert_eq!(status, StatusCode::OK, "{refs:?} {meta}: {v}");
             }

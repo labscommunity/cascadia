@@ -334,6 +334,17 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   f32 KV). cascadia always passes `--llama-ctx`. The router-aware MoE path
   uses the same positioned-read primitive and has not yet been exercised on
   Windows.
+- `response_format` schemas and each tool's `parameters` are sent with
+  every `$ref` replaced by a copy of its target: llama-server never resolves
+  a ref the client wrote (its converter can give one the wrong shape
+  without failing: a ref beside another `$ref`, two refs whose rule names
+  escape alike, tools and `response_format` sharing one table of refs). A
+  recursive schema keeps refs only to copies the engine names
+  (`$defs/__cascadia_r<N>x`), which needs llama-server's chat endpoint
+  (`--jinja`, the default); with `--no-jinja` a recursive schema gets a
+  400. A ref that can't be inlined (`https://…`, `urn:…`, a bare name, a
+  pointer to nothing) is a 400, as is a schema whose inlined form is over
+  1 MiB. See [CLI.md](../CLI.md), Structured output.
 - Chat turns carry `role` + `content` + tool-call fields (`tool_calls`,
   `tool_call_id`, `name`) and request-level `tools` in the OpenAI wire
   form; the child runs with `--jinja` so tool calls render through the
@@ -342,7 +353,8 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   through the GGUF's embedded jinja chat template, so a model whose template
   is broken fails at load or request time. `--llama-args "--no-jinja"` falls
   back to llama-server's built-in template detection (tool calls are then
-  unavailable). `tool_choice` is honored: `"auto"` / `"required"`
+  unavailable, and a recursive `response_format` schema is refused: see
+  below). `tool_choice` is honored: `"auto"` / `"required"`
   are forwarded verbatim; `"none"` sends the request without `tools`
   (llama-server would still render them into the prompt, and the model
   then writes a call as plain text); a named choice

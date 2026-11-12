@@ -564,7 +564,7 @@ Every engine enforces `json_object` and `json_schema`:
 | `gemma4` | In-engine token mask (llguidance). |
 | `qwen35` | In-engine token mask (llguidance). |
 | `sparse-moe` | In-engine token mask (llguidance), applied before sampling (temperature, top-p). n-gram speculative decoding (`--prompt-lookup`) is skipped for a JSON request; it decodes plainly. |
-| `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar. A `pattern` (or `patternProperties` key) the llguidance regex engine can't parse, such as zod's email regex with its look-aheads, is dropped first and logged (`response_format pattern not enforced`), as on the llguidance engines; llama-server would reject it with a 400. With thinking off (every JSON request without callable tools) the request also sets `reasoning_budget_tokens: 0`: llama-server's grammar for some chat templates (Gemma 4) allows a thought block before the JSON, and the budget closes one as soon as it opens. A schema llama-server would take too long to convert (too many optional properties, see the errors below) is refused before it is sent. |
+| `sycl-llama` | Forwarded to llama-server, which compiles the schema to its own grammar, with every `$ref` replaced by its target first (see the refs paragraph below). A `pattern` (or `patternProperties` key) the llguidance regex engine can't parse, such as zod's email regex with its look-aheads, is dropped first and logged (`response_format pattern not enforced`), as on the llguidance engines; llama-server would reject it with a 400. With thinking off (every JSON request without callable tools) the request also sets `reasoning_budget_tokens: 0`: llama-server's grammar for some chat templates (Gemma 4) allows a thought block before the JSON, and the budget closes one as soon as it opens. A schema llama-server would take too long to convert (too many optional properties, see the errors below) is refused before it is sent. |
 | `mock` | Answers with a minimal instance of the schema, best effort: not every keyword is honoured. |
 
 The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
@@ -746,37 +746,28 @@ reaches match any JSON) every such ref the grammar reaches (a TypeBox
 `"$ref": "T"`, a `urn:`, an `https://` document, also inside a ref target
 in `default`) gets `` $ref "<ref>" is not supported by this server's engine
 (<engine>): it enforces only references inside the schema written as `#`
-or `#/...` pointers … ``. On `sycl-llama` llama-server visits every value
-in the schema (data, tuple `items` and every `allOf` member included) and
-records the refs it meets, except under a `$ref` object's siblings; a
-`#/...` pointer can still reach a ref there, and a ref it never recorded,
-or one to an `https://` document (it never fetches), matches any object
-(or drops an `allOf` member). It fails on the other forms (`#` alone
-included). So on `sycl-llama` any `$ref` under a `$ref` object's siblings,
-whatever its form, gets `` $ref "<ref>" is not supported by this server's
-engine (sycl-llama): it does not resolve a `$ref` placed beside another
-`$ref` … ``, and any other `$ref` that is not `#/...`, data included, gets
-`` … written as `#/...` pointers … ``. `description`, `title` or `default`
-beside a `$ref` are fine when they hold no `$ref`. llama-server also names
-each ref's grammar rule after its pointer (`ref` + the pointer, every run
-of characters outside `[a-zA-Z0-9-]` made `-`) and uses a rule that
-already has that name without reading the ref's target, so two refs that
-name the same rule (`#/$defs/a_b` and `#/$defs/a-b`), or a ref and a
-schema inside another ref's target the converter named that way first (a
-property `x` of `#/$defs/A` before `#/$defs/A-x`), would get one shape for
-both (the chat endpoint sycl-llama uses names the schema's own properties
-under `response-format-schema`, so a property `ref-defs-B` is fine): on `sycl-llama` that is `` $ref "<ref>" and <the other>
-name the same grammar rule (<name>) on llama-server … ``. The check follows
-the converter's own naming and order; it could refuse a schema llama.cpp
-builds right only where two different schemas convert to identical rules
-(the converter then shares the name), and the differential found none.
-Two classes of these 400s are conservative (llama-server would convert the schema faithfully):
-a `$ref` under a `$ref`'s siblings that no pointer reaches, or whose
-target is also referenced elsewhere; and an `https://` `$ref` with no
-fragment that the converter never reaches (in `const`, `default`,
-`examples` or `enum` data, or an unused `$defs` entry). Telling those
-apart would mean mirroring the converter; `scripts/llama-ref-differential/`
-checks the rule against llama.cpp's own converter. An unknown `$schema`
+or `#/...` pointers … ``. On `sycl-llama` llama-server is never sent a
+`$ref` the client wrote: the engine replaces every `#` / `#/...` ref in
+the schema (and in each tool's `parameters`) with a copy of its target
+before forwarding (llama.cpp's own ref handling can give a ref the wrong
+shape without failing). Pointers are read as RFC 6901 (`~1` is `/`, `~0`
+is `~`). A `$ref`'s siblings are dropped, as llama-server ignores them;
+`default` and `examples` are sent as `null`; `const` and `enum` are sent
+as written. A recursive schema (a linked list, a tree, `"$ref": "#"`) is
+sent with each schema on the cycle copied to a reserved `$defs` entry
+(`__cascadia_r<N>x`, `__cascadia_t<i>r<N>x` for tool `i`) that the refs on
+the cycle point to; that needs llama-server's chat endpoint, so with
+`--llama-args "--no-jinja"` a recursive schema gets
+`` $ref "<ref>" makes the schema recursive, which this engine can't enforce
+when llama-server runs without --jinja ``. A ref that can't be inlined (a
+`$ref` that is not `#` or `#/...`, or one that names nothing) gets
+`` $ref "<ref>" is not supported: only a reference inside the schema (`#`
+or `#/...`) to an existing schema is `` (for a tool, `invalid tools:
+tools[<i>].function.parameters: …`). A schema whose inlined form is over
+1 MiB (definitions reused many times over) gets `` … the schema with every
+$ref replaced by its target is over 1048576 bytes ``. The 64 KiB cap
+applies to what the client sends; the llama-server cost guard (below)
+applies to the inlined schema. An unknown `$schema`
 (`http://json-schema.org/schema#`, an OpenAPI dialect) is not a ref:
 `ov-genai` and `sycl-llama` ignore it, and llguidance refuses to build
 the schema (`invalid configuration: response_format schema: Resource

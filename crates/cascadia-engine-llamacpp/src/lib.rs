@@ -706,6 +706,18 @@ pub fn validate_extra_args(extra_args: &[String], mtp: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// Whether llama-server runs without its jinja chat template: the engine
+/// passes `--jinja`, and a later `--no-jinja` in `--llama-args` wins (the
+/// last of the two applies).
+pub fn llama_args_disable_jinja(extra_args: &[String]) -> bool {
+    extra_args
+        .iter()
+        .rev()
+        .map(|a| a.replace('_', "-"))
+        .find(|a| a == "--jinja" || a == "--no-jinja")
+        .is_some_and(|a| a == "--no-jinja")
+}
+
 /// Pick a free loopback port by binding :0 and dropping the listener.
 fn pick_port() -> EngineResult<u16> {
     let l = TcpListener::bind("127.0.0.1:0")
@@ -1517,6 +1529,42 @@ fn check_grammar_body(body: &str) -> EngineResult<()> {
     }
 }
 
+/// The `response_format` schema `body` as llama-server is sent it: every
+/// `$ref` replaced by its target, a cycle by a ref to a hoisted copy (not
+/// allowed when llama-server runs without `--jinja`).
+fn inlined_schema(body: &str, no_jinja: bool) -> EngineResult<String> {
+    // Nothing to inline: forwarded as the client wrote it.
+    if !body.contains("$ref") {
+        return Ok(body.to_owned());
+    }
+    let schema = serde_json::from_str::<serde_json::Value>(body)
+        .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))?;
+    cascadia_grammar::inline_refs(&schema, "", !no_jinja)
+        .map(|i| i.schema.to_string())
+        .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))
+}
+
+/// Each tool's `parameters` in `tools` (OpenAI wire form) with its `$ref`s
+/// inlined like a `response_format` schema's; tool `i`'s hoisted copies are
+/// named apart from the others' (llama-server reads all of them into one
+/// table of refs).
+fn inline_tool_parameters(tools: &mut serde_json::Value, no_jinja: bool) -> EngineResult<()> {
+    let Some(tools) = tools.as_array_mut() else {
+        return Ok(());
+    };
+    for (i, tool) in tools.iter_mut().enumerate() {
+        let Some(params) = tool.pointer_mut("/function/parameters") else {
+            continue;
+        };
+        let inlined =
+            cascadia_grammar::inline_refs(params, &format!("t{i}"), !no_jinja).map_err(|e| {
+                EngineError::InvalidConfig(format!("tools[{i}].function.parameters: {e}"))
+            })?;
+        *params = inlined.schema;
+    }
+    Ok(())
+}
+
 /// `schema` without the `pattern`s and `patternProperties` keys the regex
 /// engine can't parse (look-around, ...), which llama-server's grammar
 /// converter rejects with a 400; the llguidance engines drop the same ones.
@@ -1822,14 +1870,22 @@ fn handle_sse_line(
 impl Engine for LlamaCppEngine {
     fn warmup(&mut self) {}
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+    fn submit(&mut self, mut task: GenerationTask) -> EngineResult<()> {
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self.active.as_ref() == Some(&task.task_id)
         {
             return Ok(());
         }
-        if let Some(g) = &task.grammar {
+        // llama-server is never sent a client's `$ref`: its converter can
+        // give one the wrong shape without failing (see
+        // `cascadia_grammar::inline_refs`).
+        let no_jinja = llama_args_disable_jinja(&self.cfg.extra_args);
+        if let Some(g) = &mut task.grammar {
+            g.body = inlined_schema(&g.body, no_jinja)?;
             check_grammar_body(&g.body)?;
+        }
+        if let Some(tools) = &mut task.tools {
+            inline_tool_parameters(tools, no_jinja)?;
         }
         self.pending.push(task);
         Ok(())
@@ -3090,6 +3146,96 @@ mod unix_tests {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+
+    fn grammar(body: serde_json::Value) -> cascadia_types::GrammarSpec {
+        cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: body.to_string(),
+        }
+    }
+
+    fn list_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object", "properties": {"head": {"$ref": "#/$defs/Node"}},
+            "$defs": {"Node": {"type": "object", "properties": {"next": {"anyOf": [{"$ref": "#/$defs/Node"}, {"type": "null"}]}}}},
+        })
+    }
+
+    /// llama-server is sent the schema and each tool's `parameters` with
+    /// every `$ref` replaced by its target (a cycle by a ref to a hoisted
+    /// copy), never a ref the client wrote.
+    #[test]
+    fn submit_sends_schemas_with_their_refs_inlined() {
+        let mut task = chat_task().with_grammar(grammar(serde_json::json!({
+            "$defs": {"B": {"type": "integer"}},
+            "type": "object", "properties": {"b": {"$ref": "#/$defs/B"}},
+        })));
+        task.tools = Some(serde_json::json!([
+            {"type": "function", "function": {"name": "f", "parameters": list_schema()}},
+            {"type": "function", "function": {"name": "g"}},
+        ]));
+        let mut engine = test_engine(1);
+        engine.submit(task).unwrap();
+        let sent = &engine.pending[0];
+        let body: serde_json::Value =
+            serde_json::from_str(&sent.grammar.as_ref().unwrap().body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"type": "object", "properties": {"b": {"type": "integer"}}})
+        );
+        let params = &sent.tools.as_ref().unwrap()[0]["function"]["parameters"];
+        assert_eq!(
+            params["properties"]["head"]["$ref"],
+            "#/$defs/__cascadia_t0r0x"
+        );
+        assert!(params["$defs"].get("Node").is_none(), "{params}");
+    }
+
+    /// A ref that can't be inlined, and (without `--jinja`) a recursive
+    /// schema, are refused at submit, in `response_format` and in tools.
+    #[test]
+    fn submit_refuses_a_schema_it_cannot_inline() {
+        let remote =
+            serde_json::json!({"properties": {"a": {"$ref": "https://example.com/a.json"}}});
+        let mut engine = test_engine(1);
+        match engine.submit(chat_task().with_grammar(grammar(remote.clone()))) {
+            Err(EngineError::InvalidConfig(m)) => assert!(
+                m.starts_with(r#"response_format json_schema: $ref "https://example.com/a.json""#),
+                "{m}"
+            ),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        let mut task = chat_task();
+        task.tools = Some(
+            serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": remote}}]),
+        );
+        match engine.submit(task) {
+            Err(EngineError::InvalidConfig(m)) => {
+                assert!(m.starts_with("tools[0].function.parameters: $ref "), "{m}")
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        let mut cfg = cfg_for(PathBuf::from("/bin/true"), 0);
+        cfg.extra_args = vec!["--no-jinja".into()];
+        engine.cfg = Arc::new(cfg);
+        match engine.submit(chat_task().with_grammar(grammar(list_schema()))) {
+            Err(EngineError::InvalidConfig(m)) => assert!(m.contains("recursive"), "{m}"),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_last_jinja_flag_wins() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!llama_args_disable_jinja(&args(&[])));
+        assert!(llama_args_disable_jinja(&args(&[
+            "-fa",
+            "on",
+            "--no-jinja"
+        ])));
+        assert!(llama_args_disable_jinja(&args(&["--no_jinja"])));
+        assert!(!llama_args_disable_jinja(&args(&["--no-jinja", "--jinja"])));
     }
 
     #[test]

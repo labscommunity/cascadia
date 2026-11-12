@@ -10,21 +10,24 @@ than its own target."""
 import json
 import sys
 
-PREFIX = "zqref"
+PREFIX = sys.argv[1] if len(sys.argv) > 1 else "zqref"
 
 
 def pointer_target(doc, ref):
-    """The target of `#/...` `ref` as llama-server reads it: split on `/`,
-    no unescaping, an array index read as a number."""
+    """The target of `#` / `#/...` `ref` as the JSON Schema spec reads it
+    (RFC 6901: `~1` is `/`, `~0` is `~`, an array index in decimal), which
+    is what the engine's inlining follows."""
+    if ref == "#":
+        return doc
+    if not ref.startswith("#/"):
+        return None
     cur = doc
-    for tok in ref[1:].split("/")[1:]:
+    for tok in ref[2:].split("/"):
+        tok = tok.replace("~1", "/").replace("~0", "~")
         if isinstance(cur, dict) and tok in cur:
             cur = cur[tok]
-        elif isinstance(cur, list):
-            try:
-                cur = cur[int(tok)]
-            except (ValueError, IndexError):
-                return None
+        elif isinstance(cur, list) and tok.isdigit() and (tok == "0" or not tok.startswith("0")) and int(tok) < len(cur):
+            cur = cur[int(tok)]
         else:
             return None
     return cur
@@ -37,7 +40,7 @@ def refs_in(v, out, in_literal=False):
             refs_in(x, out, in_literal)
     elif isinstance(v, dict):
         r = v.get("$ref")
-        if isinstance(r, str) and r.startswith("#/") and not in_literal:
+        if isinstance(r, str) and r.startswith("#") and not in_literal:
             out.append(r)
         for k, c in v.items():
             refs_in(c, out, in_literal or k in ("const", "enum"))

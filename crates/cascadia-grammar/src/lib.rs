@@ -815,9 +815,11 @@ pub fn argmax_allowed(row: &[f32], words: &[u32]) -> Option<usize> {
 mod tests;
 
 mod llama_cost;
+mod llama_inline;
 pub use llama_cost::{
     llama_grammar_cost, llama_grammar_cost_error, LLAMA_VISIT_COST, MAX_LLAMA_GRAMMAR_COST,
 };
+pub use llama_inline::{inline_refs, InlineError, Inlined, MAX_INLINED_BYTES};
 
 mod xgrammar_cost;
 pub use xgrammar_cost::{xgrammar_cost, xgrammar_cost_error, MAX_XGRAMMAR_COST};

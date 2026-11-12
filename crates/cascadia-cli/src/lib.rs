@@ -11,8 +11,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use cascadia_engine::Builder;
 use cascadia_engine_llamacpp::{
-    probe_stream_weights, resolve_llama_bin, validate_extra_args, ElasticVram, LlamaCppBuilder,
-    LlamaCppConfig, StreamWeightsSupport,
+    llama_args_disable_jinja, probe_stream_weights, resolve_llama_bin, validate_extra_args,
+    ElasticVram, LlamaCppBuilder, LlamaCppConfig, StreamWeightsSupport,
 };
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
@@ -89,13 +89,17 @@ fn schema_build_check_for(kind: EngineKind) -> bool {
 }
 
 /// How `kind`'s grammar backend resolves `$ref`s: OpenVINO GenAI's
-/// xgrammar and llama-server turn some into "any" rather than failing, so
-/// the API refuses those for them. llguidance resolves embedded ids and
-/// fails on the rest; the mock builds no grammar.
-fn ref_resolver_for(kind: EngineKind) -> cascadia_api::RefResolver {
+/// xgrammar turns some into "any" rather than failing, so the API refuses
+/// those; sycl-llama inlines every ref before llama-server sees it, and
+/// needs to know whether `llama_args` turn its jinja template off.
+/// llguidance resolves embedded ids and fails on the rest; the mock builds
+/// no grammar.
+fn ref_resolver_for(kind: EngineKind, llama_args: &[String]) -> cascadia_api::RefResolver {
     match kind {
         EngineKind::OvGenai => cascadia_api::RefResolver::Xgrammar,
-        EngineKind::SyclLlama => cascadia_api::RefResolver::LlamaServer,
+        EngineKind::SyclLlama => cascadia_api::RefResolver::LlamaServer {
+            no_jinja: llama_args_disable_jinja(llama_args),
+        },
         EngineKind::Mock
         | EngineKind::OvRuntime
         | EngineKind::OvDistSpec
@@ -2631,7 +2635,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         cfg.structured_output = structured_output_for(args.engine);
         cfg.engine_name = engine_name(args.engine).to_string();
         cfg.xgrammar_keyword_log = xgrammar_keyword_log_for(args.engine);
-        cfg.ref_resolver = ref_resolver_for(args.engine);
+        cfg.ref_resolver = ref_resolver_for(args.engine, &args.llama_args);
         cfg.schema_build_check = schema_build_check_for(args.engine);
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
@@ -3893,10 +3897,17 @@ mod tests {
     #[test]
     fn ref_resolver_per_engine() {
         use cascadia_api::RefResolver;
-        assert_eq!(ref_resolver_for(EngineKind::OvGenai), RefResolver::Xgrammar);
         assert_eq!(
-            ref_resolver_for(EngineKind::SyclLlama),
-            RefResolver::LlamaServer
+            ref_resolver_for(EngineKind::OvGenai, &[]),
+            RefResolver::Xgrammar
+        );
+        assert_eq!(
+            ref_resolver_for(EngineKind::SyclLlama, &[]),
+            RefResolver::LlamaServer { no_jinja: false }
+        );
+        assert_eq!(
+            ref_resolver_for(EngineKind::SyclLlama, &["--no-jinja".to_string()]),
+            RefResolver::LlamaServer { no_jinja: true }
         );
         for kind in [
             EngineKind::Mock,
@@ -3907,7 +3918,7 @@ mod tests {
             EngineKind::SparseMoe,
         ] {
             assert_eq!(
-                ref_resolver_for(kind),
+                ref_resolver_for(kind, &[]),
                 RefResolver::Full,
                 "{}",
                 engine_name(kind)
