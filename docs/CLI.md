@@ -606,10 +606,9 @@ The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
   `integer` builds. Every object in the schema is checked for this, data
   (`default`, `examples`) included, so a schema with an `integer` type
   and a data object such as `{"const": -1e20}` gets this 400 too.
-- Read a `#/...` pointer the way llguidance reads it when bounding and
-  clamping the integer it reaches: percent-decoded (`%25` is `%`, `%2F`
-  splits a key), `~1`/`~0` unescaped, and `01` or `+1` as array index 1,
-  against the root. A target inside `default` or `examples` reached only
+- Bound and clamp the integer a `#/...` ref reaches, read against the
+  root (the API accepts only plain pointers into objects; see the limits
+  below). A target inside `default` or `examples` reached only
   through a `$id` below the root is not bounded or clamped: its integers
   may take more than 19 digits, or llguidance refuses a lower bound it
   can't build with its own 400. Schemas in `$defs` and properties are
@@ -741,14 +740,21 @@ schema: Resource '<uri>' is not present in a registry …`. A ref the
 schema itself answers is fine, also through a `$id` (a root `$id`, a
 TypeBox-style `$id` in `$defs` named by `"$ref": "T"`, or the fragment
 `$id`s schema generators put on every subschema), as are properties named
-`id` or `$id`. That last applies to the llguidance engines: on `ov-genai`
-(xgrammar resolves only `#` and `#/...`, and makes any other ref match any
-JSON) and `sycl-llama` (llama-server makes an `https://` ref match any
-object), every `$ref` the grammar reaches that is not `#` or `#/...` (a
-TypeBox `"$ref": "T"`, a `urn:`, an `https://` document, also inside a ref
-target in `default`) gets `` $ref "<ref>" is not supported by this server's
-engine (<engine>): it enforces only references inside the schema written as
-`#` or `#/...` pointers … `` rather than an unconstrained answer. A schema whose walk
+`id` or `$id`. That last applies to the llguidance engines. On `ov-genai`
+(xgrammar resolves only `#` and `#/...`, and makes any other ref it
+reaches match any JSON) every such ref the grammar reaches (a TypeBox
+`"$ref": "T"`, a `urn:`, an `https://` document, also inside a ref target
+in `default`) gets `` $ref "<ref>" is not supported by this server's engine
+(<engine>): it enforces only references inside the schema written as `#`
+or `#/...` pointers … ``. On `sycl-llama` llama-server reads every `$ref`
+in the schema (data, tuple `items` and every `allOf` member included),
+makes an `https://` one match any object and fails on the other forms
+(`#` alone included), so every `$ref` there that is not `#/...` gets the
+same 400 (`` … written as `#/...` pointers … ``). An unknown `$schema`
+(`http://json-schema.org/schema#`, an OpenAPI dialect) is not a ref:
+`ov-genai` and `sycl-llama` ignore it, and llguidance refuses to build
+the schema (`invalid configuration: response_format schema: Resource
+'<uri>' is not present in a registry …`). A schema whose walk
 would take the converter too long gets `… schema is too complex`.
 
 Errors (`{"error": "<message>"}`; on a stream, after the SSE stream has

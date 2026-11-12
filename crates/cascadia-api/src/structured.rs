@@ -1374,18 +1374,62 @@ fn check_converter_depth(root: &Node) -> Result<(), String> {
     converter_walk(root, None)
 }
 
-/// Refuse, for an engine whose backend resolves only `#` and `#/...` refs
-/// (named `engine` in the message), any other `$ref` the grammar converter
-/// would reach: xgrammar 0.1.31's `URIToRule` turns it into "any JSON"
-/// (`json_schema_converter.cc`, "URI should either be '#' or start with
-/// '#/'"), and llama-server's converter turns an `https://` one into "any
-/// object" (it never fetches). Walks what [`check_converter_depth`] walks:
-/// the schemas the converter visits, ref targets included (inside data
-/// keywords too), not data.
-pub fn check_pointer_refs_only(raw: &str, engine: &str) -> Result<(), String> {
-    let raw: Box<RawValue> = serde_json::from_str(raw).map_err(|e| format!("{FIELD}: {e}"))?;
-    let root = Node::parse(raw).map_err(|e| format!("{FIELD}: {e}"))?;
-    converter_walk(&root, Some(engine))
+/// Refuse a `$ref` the engine's grammar backend would turn into "any"
+/// rather than fail on (named `engine` in the message):
+///
+/// - [`crate::RefResolver::Xgrammar`]: any ref but `#` and `#/...` that
+///   xgrammar 0.1.31's converter reaches: its `URIToRule` makes it "any
+///   JSON" (`json_schema_converter.cc`, "URI should either be '#' or start
+///   with '#/'"). Walks what [`check_converter_depth`] walks: the schemas
+///   the converter visits, ref targets included (inside data keywords too).
+/// - [`crate::RefResolver::LlamaServer`]: any ref but `#/...` anywhere in
+///   the document. llama-server's `resolve_refs` reads every `$ref` (data
+///   keywords, tuple `items`, every `allOf` member), not descending past
+///   an object holding one; it never fetches, so an `https://` ref becomes
+///   "any object", and it fails on the other forms (`#` alone included).
+pub fn check_pointer_refs_only(
+    raw: &str,
+    schema: &Value,
+    engine: &str,
+    resolver: crate::RefResolver,
+) -> Result<(), String> {
+    match resolver {
+        crate::RefResolver::Full => Ok(()),
+        crate::RefResolver::Xgrammar => {
+            let raw: Box<RawValue> =
+                serde_json::from_str(raw).map_err(|e| format!("{FIELD}: {e}"))?;
+            let root = Node::parse(raw).map_err(|e| format!("{FIELD}: {e}"))?;
+            converter_walk(&root, Some(engine))
+        }
+        crate::RefResolver::LlamaServer => {
+            let mut stack = vec![schema];
+            while let Some(v) = stack.pop() {
+                match v {
+                    Value::Array(items) => stack.extend(items),
+                    Value::Object(obj) => match obj.get("$ref") {
+                        Some(Value::String(r)) if !r.starts_with("#/") => {
+                            return Err(unenforced_ref(r, engine, "`#/...`"));
+                        }
+                        Some(_) => {}
+                        None => stack.extend(obj.values()),
+                    },
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The 400 for a `$ref` `engine` would leave unconstrained.
+fn unenforced_ref(r: &str, engine: &str, forms: &str) -> String {
+    let shown: String = r.chars().take(80).collect();
+    format!(
+        "{FIELD}: $ref {} is not supported by this server's engine ({engine}): it \
+         enforces only references inside the schema written as {forms} pointers, and \
+         would leave this one unconstrained",
+        Value::String(shown)
+    )
 }
 
 /// The walk of [`check_converter_depth`]; with `pointer_refs_only` (the
@@ -1503,14 +1547,7 @@ impl<'a> Walk<'a, '_> {
                 let r = &self.scalars.strings[id];
                 if let Some(engine) = self.pointer_refs_only {
                     if !r.starts_with('#') {
-                        let shown: String = r.chars().take(80).collect();
-                        return Err(format!(
-                            "{FIELD}: $ref {} is not supported by this server's engine \
-                             ({engine}): it enforces only references inside the schema \
-                             written as `#` or `#/...` pointers, and would leave this \
-                             one unconstrained",
-                            Value::String(shown)
-                        ));
+                        return Err(unenforced_ref(r, engine, "`#` or `#/...`"));
                     }
                 }
                 let (target, work) = local_ref_target(self.root, r)?;

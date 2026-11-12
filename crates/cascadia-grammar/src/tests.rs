@@ -1931,6 +1931,10 @@ fn the_outside_ref_refusal_never_refuses_what_llguidance_builds() {
         [
             r##"{"type":"object","properties":{"n":{"$ref":"https://example.com/s.json"}}}"##,
             r##"{"type":"object","properties":{"n":{"$ref":"urn:z"}}}"##,
+            // An unknown `$schema` is no ref: llguidance's own error.
+            r##"{"$schema":"http://json-schema.org/schema#","type":"object","properties":{"a":{"type":"string"}}}"##,
+            r##"{"$schema":"https://json-schema.org/draft-07/schema#","type":"object","properties":{"a":{"type":"string"}}}"##,
+            r##"{"$schema":"https://spec.openapis.org/oas/3.1/dialect/base","type":"object","properties":{"a":{"type":"string"}}}"##,
             r##"{"$id":"urn:x","type":"object","properties":{"n":{"$ref":"urn:z"}}}"##,
             r##"{"$id":"urn:r","type":"object","$defs":{"U":{"$ref":"https://example.com/u.json"}}}"##,
             r##"{"type":"object","not":{"$ref":"https://example.com/n.json"}}"##,

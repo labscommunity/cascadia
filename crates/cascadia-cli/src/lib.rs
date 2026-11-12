@@ -88,13 +88,21 @@ fn schema_build_check_for(kind: EngineKind) -> bool {
     }
 }
 
-/// Whether `kind`'s grammar backend resolves only `$ref`s written as `#` or
-/// `#/...` pointers and turns others into "any" rather than failing:
-/// OpenVINO GenAI's xgrammar (any other ref) and llama-server (an
-/// `https://` ref, which it never fetches). The API refuses such refs for
-/// these engines. llguidance resolves embedded ids and fails on the rest.
-fn pointer_refs_only_for(kind: EngineKind) -> bool {
-    matches!(kind, EngineKind::OvGenai | EngineKind::SyclLlama)
+/// How `kind`'s grammar backend resolves `$ref`s: OpenVINO GenAI's
+/// xgrammar and llama-server turn some into "any" rather than failing, so
+/// the API refuses those for them. llguidance resolves embedded ids and
+/// fails on the rest; the mock builds no grammar.
+fn ref_resolver_for(kind: EngineKind) -> cascadia_api::RefResolver {
+    match kind {
+        EngineKind::OvGenai => cascadia_api::RefResolver::Xgrammar,
+        EngineKind::SyclLlama => cascadia_api::RefResolver::LlamaServer,
+        EngineKind::Mock
+        | EngineKind::OvRuntime
+        | EngineKind::OvDistSpec
+        | EngineKind::Gemma4
+        | EngineKind::Qwen36Moe
+        | EngineKind::SparseMoe => cascadia_api::RefResolver::Full,
+    }
 }
 
 /// Whether `kind` constrains output with OpenVINO GenAI's xgrammar backend,
@@ -2623,7 +2631,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         cfg.structured_output = structured_output_for(args.engine);
         cfg.engine_name = engine_name(args.engine).to_string();
         cfg.xgrammar_keyword_log = xgrammar_keyword_log_for(args.engine);
-        cfg.pointer_refs_only = pointer_refs_only_for(args.engine);
+        cfg.ref_resolver = ref_resolver_for(args.engine);
         cfg.schema_build_check = schema_build_check_for(args.engine);
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
@@ -3883,12 +3891,13 @@ mod tests {
     }
 
     #[test]
-    fn pointer_refs_only_for_ov_genai_and_sycl_llama() {
-        // xgrammar and llama-server turn some refs into "any" instead of
-        // failing; llguidance resolves them and the mock builds no grammar.
-        for kind in [EngineKind::OvGenai, EngineKind::SyclLlama] {
-            assert!(pointer_refs_only_for(kind), "{}", engine_name(kind));
-        }
+    fn ref_resolver_per_engine() {
+        use cascadia_api::RefResolver;
+        assert_eq!(ref_resolver_for(EngineKind::OvGenai), RefResolver::Xgrammar);
+        assert_eq!(
+            ref_resolver_for(EngineKind::SyclLlama),
+            RefResolver::LlamaServer
+        );
         for kind in [
             EngineKind::Mock,
             EngineKind::OvRuntime,
@@ -3897,7 +3906,12 @@ mod tests {
             EngineKind::Qwen36Moe,
             EngineKind::SparseMoe,
         ] {
-            assert!(!pointer_refs_only_for(kind), "{}", engine_name(kind));
+            assert_eq!(
+                ref_resolver_for(kind),
+                RefResolver::Full,
+                "{}",
+                engine_name(kind)
+            );
         }
     }
 

@@ -160,11 +160,9 @@ pub struct AppState {
     /// The engine constrains output with OpenVINO GenAI's xgrammar backend:
     /// log the schema keywords that backend does not enforce.
     pub xgrammar_keyword_log: bool,
-    /// The engine's backend resolves only `$ref`s written as `#` or `#/...`
-    /// pointers and turns others into "any" instead of failing (ov-genai's
-    /// xgrammar; llama-server for sycl-llama, with an `https://` ref):
-    /// refuse every other ref with a 400.
-    pub pointer_refs_only: bool,
+    /// How the engine's grammar backend resolves a `$ref`; see
+    /// [`RefResolver`]. A ref it would turn into "any" is a 400.
+    pub ref_resolver: RefResolver,
     /// Builds every enforced `response_format` schema once, off the engine,
     /// before the request is queued; see [`SchemaCompileCheck`]. Runs only
     /// when [`AppState::schema_build_check`] is set.
@@ -174,6 +172,21 @@ pub struct AppState {
     /// engines whose backend builds grammars another way (ov-genai's
     /// xgrammar), where llguidance's time and verdict say nothing.
     pub schema_build_check: bool,
+}
+
+/// How an engine's grammar backend resolves a schema's `$ref`s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefResolver {
+    /// llguidance: resolves refs within the document, embedded `$id`s
+    /// included, and fails on one it can't (or the engine builds no grammar).
+    #[default]
+    Full,
+    /// OpenVINO GenAI's xgrammar: `#` and `#/...` only; any other ref the
+    /// converter reaches becomes "any JSON".
+    Xgrammar,
+    /// llama-server's converter: `#/...` only, reading every `$ref` in the
+    /// document; an `https://` ref becomes "any object", others fail.
+    LlamaServer,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -201,8 +214,8 @@ pub struct Config {
     pub engine_name: String,
     /// See [`AppState::xgrammar_keyword_log`]. Set by the CLI for ov-genai.
     pub xgrammar_keyword_log: bool,
-    /// See [`AppState::pointer_refs_only`]. Set by the CLI per engine.
-    pub pointer_refs_only: bool,
+    /// See [`AppState::ref_resolver`]. Set by the CLI per engine.
+    pub ref_resolver: RefResolver,
     /// See [`AppState::schema_check`].
     pub schema_check: SchemaCompileCheck,
     /// See [`AppState::schema_build_check`]. Set by the CLI per engine.
@@ -222,7 +235,7 @@ impl Default for Config {
             structured_output: false,
             engine_name: String::new(),
             xgrammar_keyword_log: false,
-            pointer_refs_only: false,
+            ref_resolver: RefResolver::Full,
             schema_check: SchemaCompileCheck::default(),
             schema_build_check: false,
         }
@@ -562,7 +575,7 @@ pub fn make_router_with_stats(
         structured_output: cfg.structured_output,
         engine_name: cfg.engine_name.clone(),
         xgrammar_keyword_log: cfg.xgrammar_keyword_log,
-        pointer_refs_only: cfg.pointer_refs_only,
+        ref_resolver: cfg.ref_resolver,
         schema_check: cfg.schema_check.clone(),
         schema_build_check: cfg.schema_build_check,
     };
@@ -2564,9 +2577,14 @@ async fn chat_completions(
                     .into_response();
             }
         };
-    if let ResponseFormat::JsonSchema { raw, .. } = &response_format {
-        if state.pointer_refs_only {
-            if let Err(msg) = structured::check_pointer_refs_only(raw, &state.engine_name) {
+    if let ResponseFormat::JsonSchema { raw, schema, .. } = &response_format {
+        if state.ref_resolver != RefResolver::Full {
+            if let Err(msg) = structured::check_pointer_refs_only(
+                raw,
+                schema,
+                &state.engine_name,
+                state.ref_resolver,
+            ) {
                 count_rejected("invalid_request");
                 return (
                     StatusCode::BAD_REQUEST,
@@ -8487,9 +8505,9 @@ level={{ effort_map[eff] }}";
         }
     }
 
-    /// An app over the mock engine configured as an engine whose backend
-    /// resolves only `#` and `#/...` refs (`pointer_refs_only`), or not.
-    async fn so_app_refs(pointer_refs_only: bool) -> Router {
+    /// An app over the mock engine configured as an engine whose grammar
+    /// backend resolves `$ref`s as `refs` says.
+    async fn so_app_refs(refs: RefResolver) -> Router {
         let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
@@ -8498,14 +8516,38 @@ level={{ effort_map[eff] }}";
             )
             .await
             .unwrap();
+        let engine = match refs {
+            RefResolver::Xgrammar => "ov-genai",
+            RefResolver::LlamaServer => "sycl-llama",
+            RefResolver::Full => "mock",
+        };
         let cfg = Config {
             structured_output: true,
-            engine_name: "ov-genai".into(),
+            engine_name: engine.into(),
             chat_template: template(MINIMAL_TEMPLATE),
-            pointer_refs_only,
+            ref_resolver: refs,
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    async fn post_schema(refs: RefResolver, schema: &Value) -> (StatusCode, Value) {
+        post_chat(
+            so_app_refs(refs).await,
+            chat_with(Some(json_schema_format(schema.clone()))),
+        )
+        .await
+    }
+
+    fn assert_ref_refusal(engine: &str, schema: &Value, status: StatusCode, v: &Value) {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{engine} {schema}: {v}");
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.starts_with("invalid response_format: response_format.json_schema.schema: $ref ")
+                && err.contains(engine)
+                && err.contains("`#/...`"),
+            "{err}"
+        );
     }
 
     /// xgrammar (ov-genai) turns a `$ref` that is not `#` or `#/...` into
@@ -8528,40 +8570,127 @@ level={{ effort_map[eff] }}";
             }),
         ];
         for schema in &dropped {
-            let (status, v) = post_chat(
-                so_app_refs(true).await,
-                chat_with(Some(json_schema_format(schema.clone()))),
-            )
-            .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
-            let err = v["error"].as_str().unwrap();
-            assert!(
-                err.starts_with(
-                    "invalid response_format: response_format.json_schema.schema: $ref "
-                ) && err.contains("ov-genai")
-                    && err.contains("`#/...`"),
-                "{err}"
-            );
-            let (status, v) = post_chat(
-                so_app_refs(false).await,
-                chat_with(Some(json_schema_format(schema.clone()))),
-            )
-            .await;
+            for (refs, engine) in [
+                (RefResolver::Xgrammar, "ov-genai"),
+                (RefResolver::LlamaServer, "sycl-llama"),
+            ] {
+                let (status, v) = post_schema(refs, schema).await;
+                assert_ref_refusal(engine, schema, status, &v);
+            }
+            let (status, v) = post_schema(RefResolver::Full, schema).await;
             assert_eq!(status, StatusCode::OK, "{schema}: {v}");
         }
         let plain = serde_json::json!({
             "$defs": {"X": {"type": "integer"}},
-            "type": "object", "properties": {"x": {"$ref": "#/$defs/X"}, "r": {"anyOf": [{"$ref": "#"}, {"type": "null"}]}},
+            "type": "object", "properties": {"x": {"$ref": "#/$defs/X"}},
             "required": ["x"],
         });
-        for on in [true, false] {
-            let (status, v) = post_chat(
-                so_app_refs(on).await,
-                chat_with(Some(json_schema_format(plain.clone()))),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "{on}: {v}");
+        for refs in [
+            RefResolver::Xgrammar,
+            RefResolver::LlamaServer,
+            RefResolver::Full,
+        ] {
+            let (status, v) = post_schema(refs, &plain).await;
+            assert_eq!(status, StatusCode::OK, "{refs:?}: {v}");
         }
+        // `#` alone is the root to xgrammar and llguidance; llama-server
+        // refuses it ("Unsupported ref: #").
+        let root = serde_json::json!({
+            "type": "object",
+            "properties": {"r": {"anyOf": [{"$ref": "#"}, {"type": "null"}]}},
+        });
+        for refs in [RefResolver::Xgrammar, RefResolver::Full] {
+            let (status, v) = post_schema(refs, &root).await;
+            assert_eq!(status, StatusCode::OK, "{refs:?}: {v}");
+        }
+        let (status, v) = post_schema(RefResolver::LlamaServer, &root).await;
+        assert_ref_refusal("sycl-llama", &root, status, &v);
+    }
+
+    /// llama-server's `resolve_refs` reads every `$ref` in the document,
+    /// where xgrammar's converter reaches fewer (it refuses a tuple
+    /// `items` and ignores `properties` beside `patternProperties`; an
+    /// object `allOf` the API has already merged): a remote ref there is a
+    /// 400 on sycl-llama, and on ov-genai where the converter reaches it.
+    #[tokio::test]
+    async fn every_ref_llama_server_reads_is_checked_on_sycl_llama() {
+        let remote = serde_json::json!({"$ref": "https://example.com/a.json"});
+        for (i, schema) in sycl_probe_schemas(&remote).iter().enumerate() {
+            let (status, v) = post_schema(RefResolver::LlamaServer, schema).await;
+            assert_ref_refusal("sycl-llama", schema, status, &v);
+            // The API merges an object `allOf` into one schema before
+            // GenAI sees it, so xgrammar reaches that ref (case 1) too.
+            let (status, v) = post_schema(RefResolver::Xgrammar, schema).await;
+            if i == 1 {
+                assert_ref_refusal("ov-genai", schema, status, &v);
+            } else {
+                assert!(
+                    !v["error"].as_str().unwrap_or("").contains("$ref"),
+                    "{schema}: {v}"
+                );
+            }
+        }
+    }
+
+    /// The three shapes where llama-server reads a `$ref` xgrammar's
+    /// converter never reaches, each holding `r`, under a `urn:` root id
+    /// (whose refs the outside-ref check leaves to the backend).
+    fn sycl_probe_schemas(r: &Value) -> Vec<Value> {
+        let mut schemas = vec![
+            serde_json::json!({"type": "array", "items": [r], "minItems": 1}),
+            serde_json::json!({
+                "type": "object",
+                "allOf": [{"properties": {"a": r}, "required": ["a"]}, {"properties": {"b": {"type": "string"}}}],
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"a": r}, "required": ["a"],
+                "patternProperties": {"^x": {"type": "string"}},
+            }),
+        ];
+        for s in &mut schemas {
+            s["$id"] = "urn:x".into();
+        }
+        schemas
+    }
+
+    /// An unknown `$schema` is no `$ref`: ov-genai and sycl-llama ignore it,
+    /// and the outside-ref check must not blame one (llguidance itself
+    /// refuses to build such a schema: its own error, at the engine).
+    #[tokio::test]
+    async fn an_unknown_dollar_schema_is_not_refused_as_a_ref() {
+        for meta in [
+            "http://json-schema.org/schema#",
+            "https://json-schema.org/draft-07/schema#",
+            "https://spec.openapis.org/oas/3.1/dialect/base",
+        ] {
+            let schema = serde_json::json!({
+                "$schema": meta, "type": "object",
+                "properties": {"a": {"type": "string"}}, "required": ["a"],
+            });
+            for refs in [
+                RefResolver::Xgrammar,
+                RefResolver::LlamaServer,
+                RefResolver::Full,
+            ] {
+                let (status, v) = post_schema(refs, &schema).await;
+                assert_eq!(status, StatusCode::OK, "{refs:?} {meta}: {v}");
+            }
+        }
+        // A real outside ref is still refused, next to an unknown `$schema` too.
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/schema#", "type": "object",
+            "properties": {"a": {"$ref": "https://example.com/a.json"}},
+        });
+        let (status, v) = post_schema(RefResolver::Full, &schema).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("$ref \"https://example.com/a.json\""),
+            "{v}"
+        );
     }
 
     #[tokio::test]

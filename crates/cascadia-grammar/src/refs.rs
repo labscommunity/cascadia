@@ -41,11 +41,18 @@ const DEFAULT_ROOT_URI: &str = "json-schema:///";
 /// later, at a build-time lookup (in a scope whose base is a `urn:`, which
 /// the registry doesn't check), get llguidance's own error.
 pub fn ref_outside_the_schema(schema: &Value) -> Option<String> {
+    // An unknown `$schema` (`http://json-schema.org/schema#`, an OpenAPI
+    // dialect) is no ref, but the registry treats it as one: llguidance
+    // refuses the schema with its own error, other backends ignore it.
+    // Read as the latest draft, which is how llguidance reads it, so only
+    // refs are judged here.
+    let mut schema = schema.clone();
+    known_dollar_schema_only(&mut schema);
     // As llguidance's `PreContext::new`.
     let draft = Draft::Draft202012
-        .detect(schema)
+        .detect(&schema)
         .unwrap_or(Draft::Draft202012);
-    let resource: Resource = draft.create_resource(schema.clone());
+    let resource: Resource = draft.create_resource(schema);
     let base = resource.id().unwrap_or(DEFAULT_ROOT_URI).to_string();
     let empty = Registry::try_from_resources(std::iter::empty::<(String, Resource)>()).ok()?;
     match empty.try_with_resources_and_retriever(
@@ -62,6 +69,28 @@ pub fn ref_outside_the_schema(schema: &Value) -> Option<String> {
             ))
         }
         _ => None,
+    }
+}
+
+/// Every `$schema` in `v` that names no draft `referencing` knows, set to
+/// the latest draft's URI: the draft llguidance reads it as, and one the
+/// registry never looks up.
+fn known_dollar_schema_only(v: &mut Value) {
+    let mut stack = vec![v];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(obj) => {
+                if let Some(Value::String(meta)) = obj.get_mut("$schema") {
+                    let probe = serde_json::json!({ "$schema": meta.as_str() });
+                    if Draft::Draft202012.detect(&probe).is_err() {
+                        *meta = "https://json-schema.org/draft/2020-12/schema".into();
+                    }
+                }
+                stack.extend(obj.values_mut());
+            }
+            Value::Array(items) => stack.extend(items.iter_mut()),
+            _ => {}
+        }
     }
 }
 
@@ -222,6 +251,9 @@ mod tests {
             // Inside a ref target in data: the registry doesn't look there,
             // llguidance's lookup fails when it builds the target.
             json!({"properties": {"n": {"$ref": "#/default/t"}}, "default": {"t": {"$ref": "https://example.com/t.json"}}}),
+            // An unknown `$schema` is not a ref.
+            json!({"$schema": "http://json-schema.org/schema#", "type": "object"}),
+            json!({"$schema": "https://spec.openapis.org/oas/3.1/dialect/base", "properties": {"a": {"$schema": "x:y"}}}),
             // A ref to nothing is llguidance's own error.
             json!({"properties": {"n": {"$ref": "#/nope"}}}),
         ] {
