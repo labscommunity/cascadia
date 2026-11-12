@@ -88,6 +88,15 @@ fn schema_build_check_for(kind: EngineKind) -> bool {
     }
 }
 
+/// Whether `kind`'s grammar backend resolves only `$ref`s written as `#` or
+/// `#/...` pointers and turns others into "any" rather than failing:
+/// OpenVINO GenAI's xgrammar (any other ref) and llama-server (an
+/// `https://` ref, which it never fetches). The API refuses such refs for
+/// these engines. llguidance resolves embedded ids and fails on the rest.
+fn pointer_refs_only_for(kind: EngineKind) -> bool {
+    matches!(kind, EngineKind::OvGenai | EngineKind::SyclLlama)
+}
+
 /// Whether `kind` constrains output with OpenVINO GenAI's xgrammar backend,
 /// whose unenforced schema keywords the API logs per request.
 fn xgrammar_keyword_log_for(kind: EngineKind) -> bool {
@@ -2614,6 +2623,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         cfg.structured_output = structured_output_for(args.engine);
         cfg.engine_name = engine_name(args.engine).to_string();
         cfg.xgrammar_keyword_log = xgrammar_keyword_log_for(args.engine);
+        cfg.pointer_refs_only = pointer_refs_only_for(args.engine);
         cfg.schema_build_check = schema_build_check_for(args.engine);
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
@@ -3869,6 +3879,25 @@ mod tests {
         }
         for kind in [EngineKind::OvGenai, EngineKind::SyclLlama, EngineKind::Mock] {
             assert!(!schema_build_check_for(kind), "{}", engine_name(kind));
+        }
+    }
+
+    #[test]
+    fn pointer_refs_only_for_ov_genai_and_sycl_llama() {
+        // xgrammar and llama-server turn some refs into "any" instead of
+        // failing; llguidance resolves them and the mock builds no grammar.
+        for kind in [EngineKind::OvGenai, EngineKind::SyclLlama] {
+            assert!(pointer_refs_only_for(kind), "{}", engine_name(kind));
+        }
+        for kind in [
+            EngineKind::Mock,
+            EngineKind::OvRuntime,
+            EngineKind::OvDistSpec,
+            EngineKind::Gemma4,
+            EngineKind::Qwen36Moe,
+            EngineKind::SparseMoe,
+        ] {
+            assert!(!pointer_refs_only_for(kind), "{}", engine_name(kind));
         }
     }
 

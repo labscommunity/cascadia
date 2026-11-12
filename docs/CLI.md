@@ -741,7 +741,14 @@ schema: Resource '<uri>' is not present in a registry …`. A ref the
 schema itself answers is fine, also through a `$id` (a root `$id`, a
 TypeBox-style `$id` in `$defs` named by `"$ref": "T"`, or the fragment
 `$id`s schema generators put on every subschema), as are properties named
-`id` or `$id`. A schema whose walk
+`id` or `$id`. That last applies to the llguidance engines: on `ov-genai`
+(xgrammar resolves only `#` and `#/...`, and makes any other ref match any
+JSON) and `sycl-llama` (llama-server makes an `https://` ref match any
+object), every `$ref` the grammar reaches that is not `#` or `#/...` (a
+TypeBox `"$ref": "T"`, a `urn:`, an `https://` document, also inside a ref
+target in `default`) gets `` $ref "<ref>" is not supported by this server's
+engine (<engine>): it enforces only references inside the schema written as
+`#` or `#/...` pointers … `` rather than an unconstrained answer. A schema whose walk
 would take the converter too long gets `… schema is too complex`.
 
 Errors (`{"error": "<message>"}`; on a stream, after the SSE stream has

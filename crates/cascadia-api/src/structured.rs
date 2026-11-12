@@ -1371,6 +1371,26 @@ struct Visit<'a> {
 /// depth-first visit in the converter's order with that same cache. It
 /// keeps its own stack, so it never recurses whatever the schema.
 fn check_converter_depth(root: &Node) -> Result<(), String> {
+    converter_walk(root, None)
+}
+
+/// Refuse, for an engine whose backend resolves only `#` and `#/...` refs
+/// (named `engine` in the message), any other `$ref` the grammar converter
+/// would reach: xgrammar 0.1.31's `URIToRule` turns it into "any JSON"
+/// (`json_schema_converter.cc`, "URI should either be '#' or start with
+/// '#/'"), and llama-server's converter turns an `https://` one into "any
+/// object" (it never fetches). Walks what [`check_converter_depth`] walks:
+/// the schemas the converter visits, ref targets included (inside data
+/// keywords too), not data.
+pub fn check_pointer_refs_only(raw: &str, engine: &str) -> Result<(), String> {
+    let raw: Box<RawValue> = serde_json::from_str(raw).map_err(|e| format!("{FIELD}: {e}"))?;
+    let root = Node::parse(raw).map_err(|e| format!("{FIELD}: {e}"))?;
+    converter_walk(&root, Some(engine))
+}
+
+/// The walk of [`check_converter_depth`]; with `pointer_refs_only` (the
+/// engine's name) it also refuses a ref that is not `#` or `#/...`.
+fn converter_walk(root: &Node, pointer_refs_only: Option<&str>) -> Result<(), String> {
     let scalars = Scalars::new(root);
     let mut walk = Walk {
         root,
@@ -1378,6 +1398,7 @@ fn check_converter_depth(root: &Node) -> Result<(), String> {
         entered: vec![false; scalars.strings.len()],
         scalars: &scalars,
         pattern_keys: 0,
+        pointer_refs_only,
     };
     let mut stack = vec![Visit {
         node: root,
@@ -1448,6 +1469,8 @@ struct Walk<'a, 's> {
     /// once per `allOf` member, which llguidance merges anew for each
     /// `allOf` (its ref cache doesn't cover merges).
     pattern_keys: usize,
+    /// See [`converter_walk`].
+    pointer_refs_only: Option<&'s str>,
 }
 
 impl<'a> Walk<'a, '_> {
@@ -1477,7 +1500,20 @@ impl<'a> Walk<'a, '_> {
                 if std::mem::replace(&mut self.entered[id], true) {
                     return Ok(());
                 }
-                let (target, work) = local_ref_target(self.root, &self.scalars.strings[id])?;
+                let r = &self.scalars.strings[id];
+                if let Some(engine) = self.pointer_refs_only {
+                    if !r.starts_with('#') {
+                        let shown: String = r.chars().take(80).collect();
+                        return Err(format!(
+                            "{FIELD}: $ref {} is not supported by this server's engine \
+                             ({engine}): it enforces only references inside the schema \
+                             written as `#` or `#/...` pointers, and would leave this \
+                             one unconstrained",
+                            Value::String(shown)
+                        ));
+                    }
+                }
+                let (target, work) = local_ref_target(self.root, r)?;
                 self.cost += work;
                 if let Some(target) = target {
                     out.push((target, TypeView::Own, false));

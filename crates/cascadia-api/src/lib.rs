@@ -160,6 +160,11 @@ pub struct AppState {
     /// The engine constrains output with OpenVINO GenAI's xgrammar backend:
     /// log the schema keywords that backend does not enforce.
     pub xgrammar_keyword_log: bool,
+    /// The engine's backend resolves only `$ref`s written as `#` or `#/...`
+    /// pointers and turns others into "any" instead of failing (ov-genai's
+    /// xgrammar; llama-server for sycl-llama, with an `https://` ref):
+    /// refuse every other ref with a 400.
+    pub pointer_refs_only: bool,
     /// Builds every enforced `response_format` schema once, off the engine,
     /// before the request is queued; see [`SchemaCompileCheck`]. Runs only
     /// when [`AppState::schema_build_check`] is set.
@@ -196,6 +201,8 @@ pub struct Config {
     pub engine_name: String,
     /// See [`AppState::xgrammar_keyword_log`]. Set by the CLI for ov-genai.
     pub xgrammar_keyword_log: bool,
+    /// See [`AppState::pointer_refs_only`]. Set by the CLI per engine.
+    pub pointer_refs_only: bool,
     /// See [`AppState::schema_check`].
     pub schema_check: SchemaCompileCheck,
     /// See [`AppState::schema_build_check`]. Set by the CLI per engine.
@@ -215,6 +222,7 @@ impl Default for Config {
             structured_output: false,
             engine_name: String::new(),
             xgrammar_keyword_log: false,
+            pointer_refs_only: false,
             schema_check: SchemaCompileCheck::default(),
             schema_build_check: false,
         }
@@ -554,6 +562,7 @@ pub fn make_router_with_stats(
         structured_output: cfg.structured_output,
         engine_name: cfg.engine_name.clone(),
         xgrammar_keyword_log: cfg.xgrammar_keyword_log,
+        pointer_refs_only: cfg.pointer_refs_only,
         schema_check: cfg.schema_check.clone(),
         schema_build_check: cfg.schema_build_check,
     };
@@ -2555,6 +2564,18 @@ async fn chat_completions(
                     .into_response();
             }
         };
+    if let ResponseFormat::JsonSchema { raw, .. } = &response_format {
+        if state.pointer_refs_only {
+            if let Err(msg) = structured::check_pointer_refs_only(raw, &state.engine_name) {
+                count_rejected("invalid_request");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid response_format: {msg}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
     let tools_callable = req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && req.tool_choice.as_ref().and_then(|c| c.as_str()) != Some("none");
     let json = response_format.is_json();
@@ -8463,6 +8484,83 @@ level={{ effort_map[eff] }}";
                 v["error"].as_str().unwrap().contains("response_format"),
                 "{v}"
             );
+        }
+    }
+
+    /// An app over the mock engine configured as an engine whose backend
+    /// resolves only `#` and `#/...` refs (`pointer_refs_only`), or not.
+    async fn so_app_refs(pointer_refs_only: bool) -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            structured_output: true,
+            engine_name: "ov-genai".into(),
+            chat_template: template(MINIMAL_TEMPLATE),
+            pointer_refs_only,
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// xgrammar (ov-genai) turns a `$ref` that is not `#` or `#/...` into
+    /// "any JSON", and llama-server (sycl-llama) one to an `https://`
+    /// document into "any object": on those engines such a ref is a 400,
+    /// never a dropped constraint. Elsewhere (llguidance resolves embedded
+    /// ids) they pass as before; a plain pointer passes everywhere.
+    #[tokio::test]
+    async fn a_ref_the_backend_would_drop_is_400_on_pointer_only_engines() {
+        let dropped = [
+            serde_json::json!({"$id": "urn:x", "type": "object", "properties": {"n": {"$ref": "urn:z"}}, "required": ["n"]}),
+            serde_json::json!({
+                "$id": "urn:x", "type": "object",
+                "properties": {"n": {"$ref": "#/default/t"}}, "required": ["n"],
+                "default": {"t": {"$ref": "https://example.com/t.json"}},
+            }),
+            serde_json::json!({
+                "$defs": {"T": {"$id": "T", "type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}},
+                "type": "object", "properties": {"t": {"$ref": "T"}}, "required": ["t"],
+            }),
+        ];
+        for schema in &dropped {
+            let (status, v) = post_chat(
+                so_app_refs(true).await,
+                chat_with(Some(json_schema_format(schema.clone()))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+            let err = v["error"].as_str().unwrap();
+            assert!(
+                err.starts_with(
+                    "invalid response_format: response_format.json_schema.schema: $ref "
+                ) && err.contains("ov-genai")
+                    && err.contains("`#/...`"),
+                "{err}"
+            );
+            let (status, v) = post_chat(
+                so_app_refs(false).await,
+                chat_with(Some(json_schema_format(schema.clone()))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{schema}: {v}");
+        }
+        let plain = serde_json::json!({
+            "$defs": {"X": {"type": "integer"}},
+            "type": "object", "properties": {"x": {"$ref": "#/$defs/X"}, "r": {"anyOf": [{"$ref": "#"}, {"type": "null"}]}},
+            "required": ["x"],
+        });
+        for on in [true, false] {
+            let (status, v) = post_chat(
+                so_app_refs(on).await,
+                chat_with(Some(json_schema_format(plain.clone()))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{on}: {v}");
         }
     }
 
