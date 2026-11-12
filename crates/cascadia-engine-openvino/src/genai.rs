@@ -1060,13 +1060,13 @@ fn rebuild_floor(raw: Option<&str>) -> Duration {
             );
             REBUILD_FLOOR_MIN
         }
-        // All digits but too big for u64: a whole number above the maximum.
+        // One or more digits but too big for u64: a whole number above the
+        // maximum. A bare sign has no digits and falls through to the default.
         Err(_)
-            if raw
-                .strip_prefix('+')
-                .unwrap_or(raw)
-                .bytes()
-                .all(|b| b.is_ascii_digit()) =>
+            if {
+                let digits = raw.strip_prefix('+').unwrap_or(raw);
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            } =>
         {
             warn!(
                 value = raw,
@@ -5049,6 +5049,11 @@ mod tests {
         assert_eq!(rebuild_floor(Some("-5")), REBUILD_FLOOR);
         assert_eq!(rebuild_floor(Some("1.5")), REBUILD_FLOOR);
         assert_eq!(rebuild_floor(Some("ten")), REBUILD_FLOOR);
+        // A sign with no digits is not a number: the default, not the maximum.
+        assert_eq!(rebuild_floor(Some("+")), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some(" + ")), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some("-")), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some("++5")), REBUILD_FLOOR);
         assert_eq!(rebuild_floor(Some("604800")), REBUILD_FLOOR_MAX);
         assert_eq!(rebuild_floor(Some("604801")), REBUILD_FLOOR_MAX);
         assert_eq!(
