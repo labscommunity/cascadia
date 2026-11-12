@@ -1077,6 +1077,11 @@ pub struct ActivationServer {
     listener: Option<ActivationListener>,
     client: Option<ActivationStream>,
     accepted_peer: Option<String>,
+    /// Part of an outbound message is on the wire: `send_raw` wrote a prefix
+    /// the peer has read or will read, and has not yet answered. A send-cap
+    /// refusal closes the link only while this is set (see `send_capped`).
+    /// Cleared by any recv and on a new connection.
+    frame_open: bool,
     actual_port: u16,
     /// Unix socket this server bound and therefore OWNS — unlinked on
     /// [`close`](Self::close) and on `Drop` so a crash-restart can re-bind.
@@ -1250,6 +1255,7 @@ impl ActivationServer {
             listener: None,
             client: None,
             accepted_peer: None,
+            frame_open: false,
             actual_port,
             #[cfg(unix)]
             owned_unix_path: None,
@@ -1338,10 +1344,12 @@ impl ActivationServer {
         info!(peer = %peer, "ActivationServer accepted connection");
         self.client = Some(stream);
         self.accepted_peer = Some(peer);
+        self.frame_open = false;
         Ok(())
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        self.frame_open = false;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor(sock).await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
@@ -1367,6 +1375,7 @@ impl ActivationServer {
     /// and later calls fail fast with `NotConnected`; recover with a
     /// fresh connection).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        self.frame_open = false;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_reply(sock).await;
         if res.is_err() {
@@ -1380,6 +1389,7 @@ impl ActivationServer {
     /// is dropped and later calls fail fast with `NotConnected`;
     /// recover with a fresh connection).
     pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        self.frame_open = false;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_reply_prefill(sock).await;
         if res.is_err() {
@@ -1405,11 +1415,15 @@ impl ActivationServer {
         self.send_capped(tensor, MAX_TENSOR_BYTES).await
     }
 
-    /// [`send`](Self::send) with the cap as a parameter (tests). A frame the
-    /// cap refuses closes the link: nothing of the tensor was written, but a
-    /// caller may already have sent its control prefix with `send_raw`, and a
-    /// peer left waiting for the missing tensor would sit out the frame-start
-    /// idle ceiling. Closing makes it read EOF now. Other errors are untouched.
+    /// [`send`](Self::send) with the cap as a parameter (tests). A refused
+    /// tensor writes nothing. If a `send_raw` prefix of the same message is
+    /// already out (`frame_open`), the peer would wait for the missing tensor
+    /// for the frame-start idle ceiling, so the link is closed and it reads
+    /// EOF now. With nothing of the message written (a bare-tensor message,
+    /// e.g. the ov-runtime head's RESTORE) the link stays open and aligned and
+    /// the caller gets `PayloadTooLarge` to fall back on. A tensor sent
+    /// after a prefix does not clear the flag: frames such as FORWARD carry
+    /// several tensors after one header. Other errors are untouched.
     async fn send_capped(
         &mut self,
         tensor: &Tensor,
@@ -1417,7 +1431,7 @@ impl ActivationServer {
     ) -> TransportResult<TransferStats> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let res = send_tensor_capped(sock, tensor, max_payload).await;
-        if let Err(TransportError::PayloadTooLarge(_)) = res {
+        if self.frame_open && matches!(res, Err(TransportError::PayloadTooLarge(_))) {
             self.poison().await;
         }
         res
@@ -1428,6 +1442,8 @@ impl ActivationServer {
     /// (kind + logical_pos_start).
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        // Set before the write: a partial write also leaves a prefix out.
+        self.frame_open = true;
         sock.write_all(bytes).await?;
         sock.flush().await?;
         cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
@@ -1443,6 +1459,7 @@ impl ActivationServer {
         if n > MAX_RAW_BYTES {
             return Err(TransportError::RawSizeTooLarge(n));
         }
+        self.frame_open = false;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
         let res = recv_exact_frame_start(sock, &mut buf).await;
@@ -1500,6 +1517,11 @@ impl Drop for ActivationServer {
 pub struct ActivationClient {
     target: TransportAddr,
     sock: Option<ActivationStream>,
+    /// Part of an outbound message is on the wire: `send_raw` wrote a prefix
+    /// the peer has read or will read, and has not yet answered. A send-cap
+    /// refusal closes the link only while this is set (see `send_capped`).
+    /// Cleared by any recv and on a new connection.
+    frame_open: bool,
 }
 
 impl ActivationClient {
@@ -1510,11 +1532,16 @@ impl ActivationClient {
         Self {
             target: TransportAddr::from_host_port(&host.into(), port),
             sock: None,
+            frame_open: false,
         }
     }
 
     pub fn for_addr(target: TransportAddr) -> Self {
-        Self { target, sock: None }
+        Self {
+            target,
+            sock: None,
+            frame_open: false,
+        }
     }
 
     /// One connect attempt for the configured target flavor.
@@ -1571,6 +1598,7 @@ impl ActivationClient {
                     sock.tune();
                     info!(target = %self.target, "ActivationClient connected");
                     self.sock = Some(sock);
+                    self.frame_open = false;
                     return Ok(());
                 }
                 Err(err) => {
@@ -1634,6 +1662,7 @@ impl ActivationClient {
         let sock = self.dial().await?;
         sock.tune();
         self.sock = Some(sock);
+        self.frame_open = false;
         Ok(())
     }
 
@@ -1641,11 +1670,15 @@ impl ActivationClient {
         self.send_capped(tensor, MAX_TENSOR_BYTES).await
     }
 
-    /// [`send`](Self::send) with the cap as a parameter (tests). A frame the
-    /// cap refuses closes the link: nothing of the tensor was written, but a
-    /// caller may already have sent its control prefix with `send_raw`, and a
-    /// peer left waiting for the missing tensor would sit out the frame-start
-    /// idle ceiling. Closing makes it read EOF now. Other errors are untouched.
+    /// [`send`](Self::send) with the cap as a parameter (tests). A refused
+    /// tensor writes nothing. If a `send_raw` prefix of the same message is
+    /// already out (`frame_open`), the peer would wait for the missing tensor
+    /// for the frame-start idle ceiling, so the link is closed and it reads
+    /// EOF now. With nothing of the message written (a bare-tensor message,
+    /// e.g. the ov-runtime head's RESTORE) the link stays open and aligned and
+    /// the caller gets `PayloadTooLarge` to fall back on. A tensor sent
+    /// after a prefix does not clear the flag: frames such as FORWARD carry
+    /// several tensors after one header. Other errors are untouched.
     async fn send_capped(
         &mut self,
         tensor: &Tensor,
@@ -1653,13 +1686,14 @@ impl ActivationClient {
     ) -> TransportResult<TransferStats> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = send_tensor_capped(sock, tensor, max_payload).await;
-        if let Err(TransportError::PayloadTooLarge(_)) = res {
+        if self.frame_open && matches!(res, Err(TransportError::PayloadTooLarge(_))) {
             self.poison().await;
         }
         res
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        self.frame_open = false;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor(sock).await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
@@ -1679,6 +1713,7 @@ impl ActivationClient {
         &mut self,
         frame_start_deadline: Duration,
     ) -> TransportResult<(Tensor, TransferStats)> {
+        self.frame_open = false;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_token(sock, frame_start_deadline).await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
@@ -1700,6 +1735,7 @@ impl ActivationClient {
     /// and later calls fail fast with `NotConnected`; recover with a
     /// fresh connection).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        self.frame_open = false;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_reply(sock).await;
         if res.is_err() {
@@ -1713,6 +1749,7 @@ impl ActivationClient {
     /// is dropped and later calls fail fast with `NotConnected`;
     /// recover with a fresh connection).
     pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        self.frame_open = false;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_reply_prefill(sock).await;
         if res.is_err() {
@@ -1731,6 +1768,8 @@ impl ActivationClient {
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        // Set before the write: a partial write also leaves a prefix out.
+        self.frame_open = true;
         sock.write_all(bytes).await?;
         sock.flush().await?;
         cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
@@ -1743,6 +1782,7 @@ impl ActivationClient {
         if n > MAX_RAW_BYTES {
             return Err(TransportError::RawSizeTooLarge(n));
         }
+        self.frame_open = false;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
         let res = recv_exact_frame_start(sock, &mut buf).await;
@@ -1795,8 +1835,9 @@ mod tests {
     /// next frame is read whole, as sent (the hardware failure kept reading
     /// the unread body of a refused frame as later replies). This pins the
     /// frame function writing nothing; `ActivationServer`/`ActivationClient`
-    /// additionally close the link on that refusal (see the tests below), so
-    /// over them the next frame never comes and the peer reads EOF instead.
+    /// additionally close the link when a `send_raw` prefix of the refused
+    /// message is already out (see the tests below), so the peer reads EOF
+    /// instead of waiting for the rest of the frame.
     #[tokio::test]
     async fn a_refused_oversize_send_leaves_the_link_aligned() {
         let (mut tx, mut rx) = tokio::io::duplex(1 << 16);
@@ -1809,7 +1850,7 @@ mod tests {
         assert_eq!(got.data, ok.data);
     }
 
-    /// A frame refused by the send cap closes the link at once: the kind
+    /// A frame refused by the send cap after its prefix closes the link at once: the kind
     /// header the dist-spec engines write with `send_raw` is already on the
     /// wire, so a peer left waiting for the tensor that never comes would sit
     /// out the frame-start idle ceiling (900 s) before failing. Instead it
@@ -1885,6 +1926,81 @@ mod tests {
         ));
         client.close().await;
         client.close().await;
+    }
+
+    /// A refusal with nothing of its message on the wire (the ov-runtime head's
+    /// RESTORE: one tensor, no raw prefix) keeps the link: the head cannot
+    /// redial, so closing here would fail every later request; it needs the
+    /// link for its ABORT + cold-reprefill fallback.
+    #[tokio::test]
+    async fn a_refused_send_with_no_prefix_keeps_the_link_usable() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        let (acc, conn) = tokio::join!(server.accept(), client.connect());
+        acc.unwrap();
+        conn.unwrap();
+
+        let big = Tensor::from_2d(DType::I8, 1, 18, vec![7u8; 18]);
+        let small = Tensor::from_2d(DType::I8, 1, 2, vec![1, 2]);
+        // A completed exchange before it: a raw message then its reply.
+        client.send_raw(&[9u8]).await.unwrap();
+        assert_eq!(server.recv_raw(1).await.unwrap(), vec![9u8]);
+        server.send(&small).await.unwrap();
+        client.recv().await.unwrap();
+
+        let err = client.send_capped(&big, 16).await.unwrap_err();
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(18)),
+            "got {err:?}"
+        );
+        // Same link, both ways: the next frame round-trips whole.
+        client.send(&small).await.unwrap();
+        let (got, _) = server.recv().await.unwrap();
+        assert_eq!(got.data, small.data);
+
+        let err = server.send_capped(&big, 16).await.unwrap_err();
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(18)),
+            "got {err:?}"
+        );
+        server.send(&small).await.unwrap();
+        let (got, _) = client.recv().await.unwrap();
+        assert_eq!(got.data, small.data);
+    }
+
+    /// A raw header then a first tensor that goes out, then a refused second
+    /// tensor (the FORWARD frames send header + attn + hidden): the peer has
+    /// part of the frame and waits for the rest, so the link still closes.
+    #[tokio::test]
+    async fn a_refusal_after_a_header_and_a_sent_tensor_still_closes() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        let (acc, conn) = tokio::join!(server.accept(), client.connect());
+        acc.unwrap();
+        conn.unwrap();
+
+        let small = Tensor::from_2d(DType::I8, 1, 2, vec![1, 2]);
+        let big = Tensor::from_2d(DType::I8, 1, 18, vec![7u8; 18]);
+        client.send_raw(&[3u8]).await.unwrap();
+        client.send(&small).await.unwrap();
+        assert!(matches!(
+            client.send_capped(&big, 16).await,
+            Err(TransportError::PayloadTooLarge(18))
+        ));
+
+        assert_eq!(server.recv_raw(1).await.unwrap(), vec![3u8]);
+        server.recv().await.unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(2), server.recv())
+            .await
+            .expect("peer must see the close within 2 s");
+        assert!(
+            matches!(next, Err(TransportError::SocketClosed)),
+            "got {next:?}"
+        );
     }
 
     /// A payload past `u32::MAX` would wrap the 4-byte length prefix and

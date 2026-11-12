@@ -10859,6 +10859,45 @@ mod tests {
         assert_eq!(frame_for(&encode_wire_tokens(&[4, 5])), packed_nack_frame());
     }
 
+    /// `send_restore_downstream` with a carried blob past the send cap: the
+    /// RESTORE tensor is refused with nothing written, and the head's fallback
+    /// (`Ok(false)` ⇒ `send_abort_downstream`) needs the same link, which it
+    /// cannot redial. The refusal must leave the link open, so the ABORT goes
+    /// out and is acknowledged on it.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn an_oversize_restore_is_refused_and_the_abort_still_goes_out_on_the_link() {
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        // Zeroed allocation: only the first page is touched.
+        let mut data = vec![0u8; cascadia_transport::MAX_TENSOR_BYTES + 1];
+        data[0] = OPCODE_RESTORE;
+        let len = data.len() as u32;
+        let restore = WireTensor::new(WireDType::I8, [1, 1, len], data);
+        let err = downstream.lock().await.send(&restore).await.unwrap_err();
+        assert!(
+            matches!(err, cascadia_transport::TransportError::PayloadTooLarge(_)),
+            "got {err:?}"
+        );
+        drop(restore);
+
+        let tail = async {
+            let (frame, _) = upstream.lock().await.recv().await.unwrap();
+            assert_eq!(
+                frame.data,
+                vec![OPCODE_ABORT],
+                "ABORT is the next frame whole"
+            );
+            let ack = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_ABORT_ACK]);
+            upstream.lock().await.send(&ack).await.unwrap();
+        };
+        let ((), sent) = tokio::join!(tail, send_abort_frame(&downstream, Duration::from_secs(5)));
+        let (ack, _) = sent.expect("ABORT goes out on the still-open link");
+        assert_eq!(ack.unwrap().data, vec![OPCODE_ABORT_ACK]);
+    }
+
     /// An older tail (the stage wire before masks: today's lead decoder and
     /// its RESTORE/ABORT arms) armed warm by RESTORE rejects the masked
     /// suffix-prefill lead without consuming its warm state. The head's
