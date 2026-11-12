@@ -161,6 +161,58 @@ are long, benchmark your own model. Raising `--cb-max-batched-tokens` above the
 prompt length recovers much of the GPU loss (Phi-3.5-mini went 0.6× → 1.1× at 4
 concurrent) because it stops splitting the prefill; it does nothing on CPU.
 
+## Checking streaming on hardware
+
+Two checks cover the streamed default path on a real device; neither runs in CI.
+
+**Engine parity test.** Runs the engine itself on a real IR, once with streaming
+off (twice, to see whether the device repeats itself at temperature 0) and once
+with it on, over six prompts (ASCII, code, CJK, emoji, a counting list, an
+answer that starts with whitespace), greedy, 256 new tokens. It fails when the
+streamed text plus the final chunk differs from the non-streamed answer by a
+single byte, when the engine logs `ov_genai_stream_divergence`, or when there
+is less than one delta per 8 tokens. It prints each prompt's first delta,
+total time, tok/s and the engine's `ttft_ms`.
+
+```bash
+CASCADIA_STREAM_PARITY_MODEL=./phi-3.5-mini-int4-ov CASCADIA_STREAM_PARITY_DEVICE=GPU \
+  cargo test -p cascadia-engine-openvino --features openvino \
+  --test stateful_stream_parity -- --nocapture
+```
+
+It skips when `CASCADIA_STREAM_PARITY_MODEL` is unset. `CASCADIA_STREAM_PARITY_DEVICE`
+defaults to `GPU`; `CASCADIA_STREAM_PARITY_DRAFT` (with `CASCADIA_STREAM_PARITY_SPEC_K`)
+or `CASCADIA_STREAM_PARITY_PROMPT_LOOKUP` test a speculative pipeline, and then
+`CASCADIA_STREAM_PARITY_TOKENS_PER_DELTA` should be k+1.
+
+**Live check against a running worker.** `scripts/ov-genai-stream-check.sh` needs
+only bash, curl and python3 and talks to the worker's OpenAI endpoint. Run it on
+the worker's own machine over loopback for the timing rows to mean anything:
+
+```bash
+cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
+              --model ./phi-3.5-mini-int4-ov --api 127.0.0.1:8000 > node.log 2>&1 &
+scripts/ov-genai-stream-check.sh --url http://127.0.0.1:8000 --node-log node.log
+```
+
+Each row prints PASS or FAIL, and the run ends with
+`OV-GENAI STREAM CHECK: ALL PASS` (exit 0) or `<n> FAILED` (exit 1):
+
+| Row | Passes when |
+|---|---|
+| `first-byte` | the median of 3 streamed 256-token runs reaches its first content delta within `--first-byte-max` (0.12 s); `--ttft-factor 2` compares with 2× the engine's logged `ttft_ms` instead (NPU) |
+| `deltas` | at least one content delta per 8 completion tokens (per k+1 with `--speculative k`) |
+| `tok-s` | completion tokens / total time ≥ `--tok-s-min` (41) |
+| `parity` | the streamed content equals the `stream: false` answer to the same request byte for byte |
+| `queued-headers` | a streamed request sent 0.5 s after a 1500-token one gets HTTP 200 and `text/event-stream` headers within 1 s |
+| `cb-gap` (`--cb-gap`) | a streamed request beside a running non-streamed one has no gap between deltas over 3× its median gap (`--cb` workers) |
+| `divergence` (`--node-log`) | the worker log gains no `ov_genai_stream_divergence` line during the run |
+
+`--node-log` also takes `ssh:HOST:PATH` to read a remote worker's log. `--dry-run`
+prints the plan and the full `reproduce:` command line without sending
+anything; `--help` lists every option. The helpers' unit tests run with
+`python3 -m unittest scripts/test_ov_genai_stream_check.py`.
+
 ## Limitations
 
 - **Single-stage only.** No pipeline parallelism (`--total 1` enforced).
