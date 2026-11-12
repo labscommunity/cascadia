@@ -160,6 +160,48 @@ Two stages on the **same host** (e.g. iGPU + dGPU in one box)? Link them over a 
 
 For distributed speculative decoding, run **every** rank with `--engine ov-dist-spec` (they share a wire protocol) and give rank 0 `--draft-model ~/models/llama-3.2-1b-int4-ov --spec-k 4` — the draft is a local OpenVINO IR directory, not an HF id. See ([docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
 
+### Reasoning (thinking) models
+
+Thinking models (Qwen3, DeepSeek R1 distills, and others whose output wraps the reasoning in `<think>…</think>`) get their reasoning back in its own field, the way DeepSeek, vLLM and llama-server return it. With thinking on (the default), `/v1/chat/completions` returns:
+
+```json
+{"choices": [{"message": {"role": "assistant",
+                          "reasoning_content": "17 × 23 = 340 + 51 = 391.",
+                          "content": "391"},
+              "finish_reason": "stop"}],
+ "usage": {"prompt_tokens": 18, "completion_tokens": 42, "total_tokens": 60,
+           "completion_tokens_details": {"reasoning_tokens": 30}}}
+```
+
+- **Streaming** sends the reasoning as `delta.reasoning_content` frames, before and separate from the `delta.content` frames.
+- **`usage.completion_tokens_details.reasoning_tokens`** is present whenever thinking is on, and is `0` for a model that did not reason (it is a counted value, not a guess). In a stream it is on the usage chunk sent with `stream_options.include_usage`. With thinking off, usage is unchanged and has no `completion_tokens_details`.
+- **Tool calls** are read from the answer only. A call the model drafted inside its reasoning is never returned as `tool_calls`.
+- **A reply cut by `max_tokens`** while still reasoning returns the reasoning in `reasoning_content` and an empty `content` (`finish_reason: "length"`).
+- **Templates that open `<think>` in the prompt** (R1 distills, Qwen3.5/3.6) are handled: the reply is known to start inside the reasoning, so the reasoning is split out even though the model never writes the opening tag.
+- With thinking off, replies are unchanged.
+
+**Turning thinking on or off.** Clients send different switches. All of them are read, the first one present wins, in this order:
+
+| Switch | Example |
+|---|---|
+| `chat_template_kwargs.enable_thinking` (vLLM / SGLang) | `"chat_template_kwargs": {"enable_thinking": false}` |
+| `enable_thinking` | `"enable_thinking": false` |
+| `thinking.type` (Anthropic shape) | `"thinking": {"type": "disabled"}` (or `"enabled"`) |
+| `reasoning.enabled` (OpenRouter shape) | `"reasoning": {"enabled": false}` |
+| effort `"none"`: `reasoning_effort`, else `reasoning.effort` | `"reasoning_effort": "none"` |
+
+With none of them, thinking is on. `reasoning.effort` works like `reasoning_effort`; when both are sent, `reasoning_effort` wins. Any explicit on/off switch above beats an effort of `"none"`, so `{"enable_thinking": true, "reasoning_effort": "none"}` thinks. A `thinking` or `reasoning` value of an unknown shape (say `"thinking": {"type": "adaptive"}` or `"reasoning": "high"`) is ignored, never rejected.
+
+**Sending reasoning back.** An assistant message in `messages` may carry its earlier reasoning as `reasoning_content` (or as `reasoning` when that is a string; `reasoning_content` wins when both are sent). It reaches the chat template, so a Qwen3-style template renders it inside the current tool-calling loop and drops it for turns before the last user message, as the model was trained. On `sycl-llama` it is forwarded to `llama-server` for the GGUF's template. Replayed reasoning counts toward the prompt size limit (`--api-max-body-mb`).
+
+```json
+{"role": "assistant", "content": "", "reasoning_content": "I need the weather first.",
+ "tool_calls": [{"id": "call_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]}
+```
+
+**The old shape.** Clients that read `<think>…</think>` out of `content` can start the server with `--reasoning-format none` ([docs/CLI.md](docs/CLI.md)) to get it back for one release. `reasoning_tokens` is still reported in that mode.
+
 ### Web dashboard
 
 Workers started with `--api` also serve a browser dashboard at `/` — cluster topology with per-link latency/bandwidth, live request/token counters, and a chat surface. **Release bundles newer than v0.1.8 include it.** Source builds don't by default: the UI is a Vite SPA embedded into the binary behind the `dashboard-embed` cargo feature, and cargo can't run npm for you, so a plain `cargo build` serves the API plus a pointer page at `/` instead. To embed it (needs Node 20+):

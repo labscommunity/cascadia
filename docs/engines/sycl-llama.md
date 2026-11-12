@@ -365,6 +365,18 @@ streams send content as it is generated and emit the structured calls (re-assemb
 from the child's fragments) at the end; they include a final usage event when
 `stream_options.include_usage` is true.
 
+**Reasoning.** `llama-server` returns a thinking model's reasoning on its own
+channel (`reasoning_content` deltas), which earlier releases dropped. With
+thinking on, the engine now passes it to the API as `<think>…</think>` text
+ahead of the answer, so the reply carries it like every other engine's: in
+`message.reasoning_content` / `delta.reasoning_content` by default, or as
+`<think>…</think>` text inside `content` under `--reasoning-format none`
+(earlier releases showed nothing there). A literal `</think>` inside the
+reasoning is sent with a zero-width space after the `<` so it cannot end the
+block early. An assistant turn's replayed `reasoning_content` is forwarded to
+`llama-server`, so the GGUF's template can place it. See
+[Reasoning models](../../README.md#reasoning-thinking-models).
+
 
 ## Doctor
 

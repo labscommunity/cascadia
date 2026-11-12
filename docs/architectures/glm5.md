@@ -138,6 +138,9 @@ deployment, never from `max_position` (1M would preallocate TB-scale KV).
   template level by default (previously undefined, which the template
   resolves to `"max"` — the most expensive setting, selected by omission).
   Only an explicit `reasoning_effort: "xhigh"` or `"max"` opts back into Max.
+- **Other vendors' switches**: `thinking: {"type": ...}`, `reasoning:
+  {"enabled": ...}` and `reasoning.effort` are read too; the full order is in
+  [Reasoning models](../../README.md#reasoning-thinking-models).
 
 ## Open risks
 
