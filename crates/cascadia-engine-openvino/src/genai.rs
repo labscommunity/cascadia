@@ -936,10 +936,11 @@ const QUARANTINE_STRIKES: u32 = 2;
 
 /// Most distinct `response_format` schemas one pipeline lets through to
 /// GenAI. Its xgrammar backend keeps every compiled grammar for the
-/// pipeline's life, with no size limit and no way to evict one: about
-/// 30–50 MB each with a 151k-token vocabulary (process RSS, xgrammar 0.1.31),
-/// so a client sending ever-new schemas would grow the worker until it runs
-/// out of memory. 64 of them is about 2–3 GB. Dropping the pipeline frees
+/// pipeline's life, with no size limit and no way to evict one: measured on
+/// an Arc 140V GPU with Qwen3-8B (worker host memory), about 3.4 MB for a
+/// small schema and about 30 MB for one with long strings, so a client
+/// sending ever-new schemas would grow the worker until it runs out of
+/// memory. 64 of them is about 0.2–1.9 GB. Dropping the pipeline frees
 /// them, so once the budget is full and a new schema is refused, the engine
 /// rebuilds the pipeline (see [`RebuildState`]).
 const MAX_DISTINCT_SCHEMAS: usize = 64;
@@ -1016,9 +1017,9 @@ impl SchemaBudget {
 
 /// How long a pipeline serves before the schema budget may rebuild it: at
 /// most one rebuild per this long (plus jitter), counted from when the
-/// pipeline was built. A rebuild takes seconds (about 6.5 s on CPU, 1.3–5.3 s
-/// on an Arc GPU for small models), so a client sending ever-new schemas
-/// costs the other clients at most that once per floor.
+/// pipeline was built. A rebuild reloads the model (about 6.5 s for a 1.5B
+/// model on a laptop CPU, 34 s on a 2-vCPU VM), so a client sending ever-new
+/// schemas costs the other clients at most that once per floor.
 const REBUILD_FLOOR: Duration = Duration::from_secs(10 * 60);
 
 /// Most random time added to [`REBUILD_FLOOR`], drawn for each pipeline, so
