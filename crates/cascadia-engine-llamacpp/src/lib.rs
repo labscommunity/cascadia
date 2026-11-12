@@ -2942,6 +2942,48 @@ mod unix_tests {
         );
     }
 
+    /// A chunked 4xx body (llama-server can send its error reply with
+    /// `Transfer-Encoding: chunked`) is read across chunk boundaries, so the
+    /// over-window refusal still reaches the API with the child's counts.
+    #[test]
+    fn child_over_window_400_chunked_is_prompt_too_long() {
+        const BODY: &str = r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":4100,"n_ctx":4096}}"#;
+        let (port, server) = mock_server(move |_, s| {
+            let (a, b) = BODY.split_at(40);
+            let reply = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{}{}0\r\n\r\n",
+                chunked(a),
+                chunked(b)
+            );
+            s.write_all(reply.as_bytes()).unwrap();
+        });
+        let mut engine = test_engine(port);
+        engine.submit(chat_task()).unwrap();
+        let chunks = drain(&mut engine);
+        server.join().unwrap();
+        let last = &chunks.last().unwrap().1;
+        assert!(last.is_final, "{last:?}");
+        assert_eq!(
+            last.error.as_deref(),
+            Some("prompt too long: prompt is 4100 tokens; the model's window is 4096")
+        );
+    }
+
+    /// `read_error_body`'s chunked branch: chunks are joined until the
+    /// zero-size chunk, and a body past [`MAX_CHILD_ERROR_BODY`] stops at the
+    /// last whole chunk that fits.
+    #[test]
+    fn read_error_body_joins_chunks_and_stops_at_the_cap() {
+        let two = format!("{}{}0\r\n\r\n", chunked("{\"error\":"), chunked("\"x\"}"));
+        let mut r = std::io::Cursor::new(two.into_bytes());
+        assert_eq!(read_error_body(&mut r, true, None), "{\"error\":\"x\"}");
+
+        let big = "a".repeat(MAX_CHILD_ERROR_BODY - 10);
+        let over = format!("{}{}0\r\n\r\n", chunked(&big), chunked(&"b".repeat(20)));
+        let mut r = std::io::Cursor::new(over.into_bytes());
+        assert_eq!(read_error_body(&mut r, true, None), big);
+    }
+
     /// Any other 4xx from the child is a request it refused: invalid
     /// configuration, with the child's own message.
     #[test]
