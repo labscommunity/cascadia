@@ -2180,13 +2180,12 @@ impl Engine for LlamaCppEngine {
         if let Some(tools) = &mut task.tools {
             inline_tool_parameters(tools, task.tool_choice.as_ref(), no_jinja, &mut budget)?;
         }
-        // Only a chat task forwards its tools (see `start_stream`); they are
-        // priced as llama-server receives them, inlined.
+        // Tools are priced whenever the task carries them, as llama-server
+        // receives them (inlined), even on a task that would not forward
+        // them (only a chat task does, see `start_stream`).
         let tools_cost = match &task.tools {
-            Some(tools) if !task.messages.is_empty() => {
-                check_tools_cost(tools, task.tool_choice.as_ref())?
-            }
-            _ => 0,
+            Some(tools) => check_tools_cost(tools, task.tool_choice.as_ref())?,
+            None => 0,
         };
         let mut uninlinable = None;
         if let Some(g) = &mut task.grammar {
@@ -4369,6 +4368,41 @@ mod unix_tests {
         serde_json::json!({"type": "function", "function": {"name": name, "parameters": parameters}})
     }
 
+    /// Tools are priced whenever a request carries them, with or without
+    /// chat messages: one tool just over llama-server's cost limit is a 400
+    /// on its own, and so are two tools each under it whose sum is over.
+    #[test]
+    fn tools_are_priced_whenever_a_request_carries_them() {
+        let over = (300..2000)
+            .find(|&n| cascadia_grammar::llama_grammar_cost_error(&optional_object(n)).is_some())
+            .expect("an object over the limit");
+        let under = optional_object(over - 1);
+        assert!(cascadia_grammar::llama_grammar_cost_error(&under).is_none());
+        let refused = |tools: serde_json::Value, chat: bool| {
+            let mut task = if chat {
+                chat_task()
+            } else {
+                GenerationTask::new("task-1", "ignored")
+            };
+            task.tools = Some(tools);
+            match test_engine(1).submit(task) {
+                Err(EngineError::InvalidConfig(m)) => {
+                    assert!(
+                        m.starts_with("tools: llama-server would take too long"),
+                        "{m}"
+                    )
+                }
+                other => panic!("expected InvalidConfig, got {other:?}"),
+            }
+        };
+        let one = serde_json::json!([tool("extract", optional_object(over))]);
+        refused(one.clone(), true);
+        refused(one, false);
+        let two = serde_json::json!([tool("a", under.clone()), tool("b", under)]);
+        refused(two.clone(), true);
+        refused(two, false);
+    }
+
     /// Held by the tests that read or move the `too_complex` counter.
     static TOO_COMPLEX_COUNTER: Mutex<()> = Mutex::new(());
 
@@ -4561,14 +4595,6 @@ mod unix_tests {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
-    }
-
-    /// A completion task never forwards tools, so its tools are not priced.
-    #[test]
-    fn a_completion_tasks_tools_are_not_priced() {
-        let mut task = GenerationTask::new("task-1", "a prompt");
-        task.tools = Some(serde_json::json!([tool("extract", optional_object(600))]));
-        assert!(test_engine(1).submit(task).is_ok());
     }
 
     #[test]
