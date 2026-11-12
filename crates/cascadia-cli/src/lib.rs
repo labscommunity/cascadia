@@ -922,6 +922,7 @@ impl WorkerArgs {
         api: String,
         prefix_cache_gb: Option<f64>,
         api_max_body_mb: f64,
+        reasoning_format: ReasoningFormat,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
     ) -> Self {
@@ -939,7 +940,7 @@ impl WorkerArgs {
             engine,
             prefix_cache_gb,
             api_max_body_mb,
-            reasoning_format: ReasoningFormat::default(),
+            reasoning_format,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1244,6 +1245,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
+    cmd_worker(run_worker_args(args)).await
+}
+
+/// The single-stage worker config `cascadia run` hands to `cmd_worker`.
+fn run_worker_args(args: RunArgs) -> WorkerArgs {
     let mut worker = WorkerArgs::single_node(
         args.model,
         args.device,
@@ -1251,6 +1257,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.api,
         args.prefix_cache_gb,
         args.api_max_body_mb,
+        args.reasoning_format,
         args.ep_workers,
         args.ep_placement,
     );
@@ -1268,8 +1275,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.elastic_vram = args.elastic_vram;
     worker.elastic_share = args.elastic_share;
     worker.llama_mtp = args.llama_mtp;
-    worker.reasoning_format = args.reasoning_format;
-    cmd_worker(worker).await
+    worker
 }
 
 fn cmd_completions(args: CompletionsArgs) -> Result<()> {
@@ -3174,6 +3180,7 @@ mod python_tests {
             ":8000".into(),
             None,
             1.0,
+            ReasoningFormat::default(),
             Vec::new(),
             None,
         );
@@ -3634,6 +3641,7 @@ mod ov_property_tests {
             "127.0.0.1:8080".into(),
             None,
             1.0,
+            ReasoningFormat::default(),
             Vec::new(),
             None,
         )
@@ -4155,6 +4163,7 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.reasoning_format,
             Vec::new(),
             args.ep_placement,
         );
@@ -4188,6 +4197,7 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.reasoning_format,
             args.ep_workers,
             args.ep_placement,
         );
@@ -4297,6 +4307,22 @@ mod sycl_llama_flag_tests {
             Command::Worker(args) => args,
             _ => panic!("expected worker subcommand"),
         }
+    }
+
+    /// `run --reasoning-format` reaches the worker args `cmd_worker` reads.
+    #[test]
+    fn run_passes_reasoning_format_to_the_worker() {
+        use cascadia_api::reasoning::ReasoningFormat;
+        let w = run_worker_args(run_args(&[
+            "cascadia",
+            "run",
+            "m",
+            "--reasoning-format",
+            "none",
+        ]));
+        assert_eq!(w.reasoning_format, ReasoningFormat::None);
+        let w = run_worker_args(run_args(&["cascadia", "run", "m"]));
+        assert_eq!(w.reasoning_format, ReasoningFormat::ReasoningContent);
     }
 
     #[test]
