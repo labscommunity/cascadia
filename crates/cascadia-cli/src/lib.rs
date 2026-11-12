@@ -1562,6 +1562,13 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
+/// ov-genai renders with the template inside its tokenizer IR, but the API
+/// reads the template files beside the model to tell whether the prompt
+/// opens `<think>`. With no such file that cannot be told (startup warns).
+fn ovgenai_template_unprobed(template: &cascadia_api::ChatTemplateConfig) -> bool {
+    template.template.is_none()
+}
+
 /// Warn when a performance flag the user explicitly set will be silently
 /// ignored for the chosen engine/device, so an ineffective flag is visible at
 /// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
@@ -2533,7 +2540,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             // ov-genai: render the template API-side so enable_thinking is
             // honored; the engine sets apply_chat_template=false so ov-genai
             // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
-            EngineKind::OvGenai => ovgenai_chat_template(&args.model),
+            EngineKind::OvGenai => {
+                let template = ovgenai_chat_template(&args.model);
+                if ovgenai_template_unprobed(&template) {
+                    warn!(
+                        model = %args.model,
+                        "no chat template file next to the model; a template that opens \
+                         <think> in the prompt can't be detected, so such a model's \
+                         reasoning stays in content"
+                    );
+                }
+                template
+            }
             // qwen36 surgery trees keep chat_template.jinja at the model
             // root with no tokenizer_config.json.
             EngineKind::Qwen36Moe => {
@@ -3333,6 +3351,21 @@ mod python_tests {
         a.cb = false;
         a.device = "CPU".to_string();
         assert!(!cb_on_plain_cpu(&a));
+    }
+
+    /// ov-genai with no template file beside the model is flagged: the API
+    /// cannot see whether the template opens `<think>` in the prompt.
+    #[test]
+    fn ovgenai_without_a_template_file_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().to_str().unwrap();
+        assert!(ovgenai_template_unprobed(&ovgenai_chat_template(model)));
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{% for m in messages %}{{ m.content }}{% endfor %}",
+        )
+        .unwrap();
+        assert!(!ovgenai_template_unprobed(&ovgenai_chat_template(model)));
     }
 
     /// `--cb` on an NPU device is rejected up front. The docs say paged

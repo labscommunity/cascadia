@@ -178,7 +178,7 @@ Thinking models (Qwen3, DeepSeek R1 distills, and others whose output wraps the 
 - **gemma4's thinking channel is not split yet**: its markers are not in the decoded text, so a gemma4 reply keeps its reasoning in `content` and has no `completion_tokens_details`.
 - **Tool calls** are read from the answer only. A call the model drafted inside its reasoning is never returned as `tool_calls`.
 - **A reply cut by `max_tokens`** while still reasoning returns the reasoning in `reasoning_content` and an empty `content` (`finish_reason: "length"`).
-- **Templates that open `<think>` in the prompt** (R1 distills, Qwen3.5/3.6) are handled: the reply is known to start inside the reasoning, so the reasoning is split out even though the model never writes the opening tag.
+- **Templates that open `<think>` in the prompt** (R1 distills, Qwen3.5/3.6) are handled: the reply is known to start inside the reasoning, so the reasoning is split out even though the model never writes the opening tag. The API learns this from the template file beside the model (`tokenizer_config.json` or `chat_template.jinja`); on `ov-genai` without one, startup warns and such a model's reasoning stays in `content`.
 - With thinking off, replies are unchanged.
 
 **Turning thinking on or off.** Clients send different switches. All of them are read, the first one present wins, in this order:
