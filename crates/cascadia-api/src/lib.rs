@@ -2930,26 +2930,34 @@ async fn chat_completions(
     }
 
     let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
-    let (message, choice_finish) = if counter.armed()
-        && state.reasoning_format == ReasoningFormat::ReasoningContent
-    {
-        // Split the trimmed text (a stop cut inside reasoning is honoured)
-        // and scan only the answer for tool calls, so a call drafted while
-        // reasoning is never executed.
-        let mut split = ReasoningSplit::new(true, opened);
-        let (mut reasoning, mut answer) = (String::new(), String::new());
-        for seg in split.feed(&buf).into_iter().chain(split.finish()) {
-            match seg {
-                Seg::Reasoning(t) => reasoning.push_str(&t),
-                Seg::Answer(t) => answer.push_str(&t),
+    let (message, choice_finish) =
+        if counter.armed() && state.reasoning_format == ReasoningFormat::ReasoningContent {
+            // Split the trimmed text (a stop cut inside reasoning is honoured)
+            // and scan only the answer for tool calls, so a call drafted while
+            // reasoning is never executed.
+            let mut split = ReasoningSplit::new(true, opened);
+            let (mut reasoning, mut answer) = (String::new(), String::new());
+            for seg in split.feed(&buf).into_iter().chain(split.finish()) {
+                match seg {
+                    Seg::Reasoning(t) => reasoning.push_str(&t),
+                    Seg::Answer(t) => answer.push_str(&t),
+                }
             }
-        }
-        let (mut message, finish) = build_choice(answer, &req.tool_choice, tools_present, false);
-        message.reasoning_content = (!reasoning.is_empty()).then_some(reasoning);
-        (message, finish)
-    } else {
-        build_choice(buf, &req.tool_choice, tools_present, enable_thinking)
-    };
+            // Once the split consumed a `</think>`, the answer holds no reasoning.
+            // When it never did (no `<think>` opened, e.g. a bare `</think>` from
+            // a template that opened the block unseen), keep the scan's own rule
+            // of reading only past the first `</think>`.
+            let (mut message, finish) = build_choice(
+                answer,
+                &req.tool_choice,
+                tools_present,
+                !split.consumed_close(),
+            );
+            message.reasoning_content = (!reasoning.is_empty()).then_some(reasoning);
+            (message, finish)
+        } else {
+            build_choice(buf, &req.tool_choice, tools_present, enable_thinking)
+        };
     let completion_tokens_details = counter.armed().then(|| CompletionTokensDetails {
         reasoning_tokens: counter.reasoning_tokens(completion_tokens),
     });
@@ -8359,6 +8367,46 @@ level={{ effort_map[eff] }}";
         );
     }
 
+    /// A reply with a bare `</think>` (the block was opened where the API
+    /// could not see it) is not split, and a call drafted before that close
+    /// still never runs: the scan reads only past the first `</think>`, as it
+    /// did before reasoning was split out.
+    #[tokio::test]
+    async fn bare_close_tag_keeps_a_drafted_call_out_of_tool_calls() {
+        let draft = r#"<tool_call>{"name":"draft","arguments":{}}</tool_call>"#;
+        let (app, release) = gated_app(&["plan ", draft, "</think>", WEATHER_CALL], false).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                   "tools":[{"type":"function","function":{"name":"get_weather"}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather", "{body}");
+    }
+
+    /// A stop string that matches inside the reasoning cuts the reply there:
+    /// the answer is empty and the reasoning ends at the cut.
+    #[tokio::test]
+    async fn stop_cut_inside_reasoning_ends_the_reasoning_there() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> plan more </think> answer"}],
+                   "stop": ["more"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], "", "{body}");
+        assert_eq!(message["reasoning_content"], " plan ", "{body}");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop", "{body}");
+    }
+
     #[tokio::test]
     async fn length_cut_inside_reasoning_returns_reasoning_and_empty_content() {
         let (status, body) = post_chat(
@@ -8469,10 +8517,10 @@ level={{ effort_map[eff] }}";
         assert_eq!(reasoning, "plan more");
         assert_eq!(answer, "Paris");
         assert!(counter.consumed_close());
-        let reasoning_tokens = counter.reasoning_tokens(9);
-        assert!(
-            (2..=8).contains(&reasoning_tokens),
-            "thinking tokens counted as reasoning: {reasoning_tokens}"
-        );
+        // Reasoning: the two marker tokens that open it (released with
+        // `<think>`), "plan", " more" and the closing marker = 5 of 9; the
+        // answer's two opening markers ride with "Paris", the last marker
+        // ends on the answer side.
+        assert_eq!(counter.reasoning_tokens(9), 5);
     }
 }
