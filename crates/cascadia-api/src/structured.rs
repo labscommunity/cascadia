@@ -1389,9 +1389,9 @@ fn check_converter_depth(root: &Node) -> Result<(), String> {
 ///   `$ref`; a `#/...` pointer can still reach a ref there, and a ref it
 ///   never recorded, or one to an `https://` document (it never fetches),
 ///   becomes "any object". It fails on the other forms (`#` alone
-///   included). A ref in data that no pointer reaches is refused too: a
-///   conservative 400, since telling which data a pointer reaches would
-///   mean mirroring the converter.
+///   included). A ref in data, or beside another `$ref`, that no pointer
+///   reaches is refused too: a conservative 400, since telling which data
+///   or siblings a pointer reaches would mean mirroring the converter.
 pub fn check_pointer_refs_only(
     raw: &str,
     schema: &Value,

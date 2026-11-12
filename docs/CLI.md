@@ -755,8 +755,10 @@ on the other forms (`#` alone included). So every `$ref` there that is not
 `#/...`, `$ref` siblings and data included, gets the same 400
 (`` … written as `#/...` pointers … ``). That includes a ref inside
 `const`, `default` or `examples` that llama-server would only copy as a
-literal: a known, conservative 400, since a `#/...` pointer can make such
-data a schema. An unknown `$schema`
+literal, and a ref such as `#` beside another `$ref` that no `#/...`
+pointer reaches (llama-server never visits it): known, conservative 400s,
+since a `#/...` pointer can make such data or siblings a schema and telling
+which ones it reaches would mean mirroring the converter. An unknown `$schema`
 (`http://json-schema.org/schema#`, an OpenAPI dialect) is not a ref:
 `ov-genai` and `sycl-llama` ignore it, and llguidance refuses to build
 the schema (`invalid configuration: response_format schema: Resource
