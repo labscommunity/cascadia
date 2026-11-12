@@ -4,8 +4,9 @@
 //! answer. [`ReasoningSplit`] routes the text inside the tags to reasoning and
 //! the rest to the answer, chunk by chunk, so a chat completion splits the
 //! same way whether it is streamed or not. It starts
-//! inside reasoning when the generation prompt already opened `<think>`;
-//! otherwise it holds leading whitespace and any prefix of `<think>` until the
+//! inside reasoning when the generation prompt already opened `<think>`, and
+//! then drops a `<think>` the model writes again (with the whitespace before
+//! it) at the start of its reply; otherwise it holds leading whitespace and any prefix of `<think>` until the
 //! first non-whitespace text decides. A reply that never opens `<think>` is
 //! released unchanged, so its text stays byte-identical to a reply with
 //! thinking off. Reasoning that is so far whitespace-only is held, released
@@ -48,11 +49,15 @@ enum State {
 pub struct ReasoningSplit {
     state: State,
     /// Undecided: the whitespace and `<think>` prefix seen so far.
-    /// Reasoning: the whitespace-only reasoning so far, or a trailing prefix
-    /// of `</think>` split across feeds.
+    /// Reasoning: the leading whitespace and `<think>` prefix while
+    /// `skip_open`, the whitespace-only reasoning so far, or a trailing
+    /// prefix of `</think>` split across feeds.
     held: String,
     /// Reasoning with non-whitespace text was released.
     reasoning_text: bool,
+    /// The prompt opened `<think>` and the reply has not yet shown whether
+    /// it repeats the tag: leading whitespace and a `<think>` prefix are held.
+    skip_open: bool,
     /// The answer's leading whitespace is still being dropped (right after
     /// `</think>`).
     trim_answer: bool,
@@ -75,6 +80,7 @@ impl ReasoningSplit {
             state,
             held: String::new(),
             reasoning_text: false,
+            skip_open: state == State::Reasoning,
             trim_answer: false,
             consumed_close: false,
             saw_open: state == State::Reasoning,
@@ -110,6 +116,24 @@ impl ReasoningSplit {
                         self.state = State::Answer;
                         push(&mut out, Seg::Answer, buf);
                         return out;
+                    }
+                }
+                State::Reasoning if self.skip_open => {
+                    let buf = std::mem::take(&mut self.held) + &rest;
+                    let body = buf.trim_start();
+                    if let Some(after) = body.strip_prefix(OPEN) {
+                        // The model repeated the prompt's `<think>`: the tag
+                        // and the whitespace before it are not text.
+                        self.skip_open = false;
+                        rest = after.to_owned();
+                    } else if OPEN.starts_with(body) {
+                        // Whitespace only, or a prefix of `<think>`: wait.
+                        self.held = buf;
+                        return out;
+                    } else {
+                        // Not the tag: everything held is reasoning.
+                        self.skip_open = false;
+                        rest = buf;
                     }
                 }
                 State::Reasoning => {
@@ -582,6 +606,52 @@ mod tests {
         // `<think>`, the dropped "\n\n" and `</think>` are reasoning, and so
         // is the whitespace dropped after `</think>`, as with any reply.
         assert_eq!(c.reasoning_tokens(5), 4);
+    }
+
+    /// The prompt opened `<think>` and the model writes it again: the
+    /// repeated tag and the whitespace before it are dropped.
+    #[test]
+    fn prompt_opened_skips_a_repeated_start_tag() {
+        let (segs, s) = run(true, true, &["<think>\n", "plan", "</think>", "answer"]);
+        assert_eq!(segs, vec![r("\nplan"), a("answer")]);
+        assert!(s.consumed_close());
+        // split across chunks, after whitespace
+        let (segs, _) = run(true, true, &["\n<thi", "nk>", "plan</think>answer"]);
+        assert_eq!(segs, vec![r("plan"), a("answer")]);
+        // the held prefix is still reasoning
+        let mut s = ReasoningSplit::new(true, true);
+        assert!(s.feed("<thi").is_empty());
+        assert!(s.in_reasoning());
+        assert_eq!(s.held_len(), 4);
+    }
+
+    /// Text that is not the tag stays reasoning, verbatim.
+    #[test]
+    fn prompt_opened_keeps_text_that_is_not_a_start_tag() {
+        let (segs, _) = run(true, true, &["<b>x", "</think>y"]);
+        assert_eq!(segs, vec![r("<b>x"), a("y")]);
+        let (segs, _) = run(true, true, &["\n<", "b>x</think>y"]);
+        assert_eq!(segs, vec![r("\n<b>x"), a("y")]);
+        // only one leading tag is skipped
+        let (segs, _) = run(true, true, &["<think>a<think>b</think>y"]);
+        assert_eq!(segs, vec![r("a<think>b"), a("y")]);
+        // a reply that ends on a held prefix releases it as reasoning
+        let (segs, _) = run(true, true, &["<thi"]);
+        assert_eq!(segs, vec![r("<thi")]);
+    }
+
+    #[test]
+    fn counter_counts_a_skipped_start_tag_as_reasoning() {
+        let mut c = ReasoningCounter::new(true, true);
+        assert_eq!(c.feed("<thi", 1), (String::new(), String::new()));
+        assert_eq!(c.feed("nk>plan", 1), ("plan".into(), String::new()));
+        assert_eq!(
+            c.feed("</think>answer", 2),
+            (String::new(), "answer".into())
+        );
+        c.finish();
+        // 15 of 15 bytes, then 8 of 14 bytes of 2 tokens: 3.14 -> 3
+        assert_eq!(c.reasoning_tokens(4), 3);
     }
 
     // ---- ReasoningCounter ----
