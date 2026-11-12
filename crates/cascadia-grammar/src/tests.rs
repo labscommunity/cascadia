@@ -1810,3 +1810,31 @@ fn the_low_integer_message_holds_for_a_value_just_above_i64_min() {
     assert!(msg.contains("64-bit float"), "{msg}");
     assert!(!msg.contains("-9223372036854775808"), "{msg}");
 }
+
+#[test]
+fn an_upper_bound_at_or_below_the_llguidance_floor_is_refused_clearly() {
+    // -9223372036854774784 (-2^63 + 1024) is the lowest integer bound
+    // llguidance builds; an upper bound at or below it (as an f64) leaves
+    // no room above the raised minimum, and llguidance's own error would
+    // reach the client. -9223372036854775295 and -9223372036854774783 round
+    // to it as f64; -9223372036854773760 is the next f64 above it.
+    let gf = single_byte();
+    for max in [
+        "-9223372036854774784",
+        "-9223372036854775295",
+        "-9223372036854774783",
+    ] {
+        for kw in ["maximum", "exclusiveMaximum"] {
+            let n = format!(r#"{{"type":"integer","{kw}":{max}}}"#);
+            let err = gf.compile(&spec(&with_n(&n))).err().expect(&n);
+            assert!(err.to_string().contains(LOW_INTEGER_MESSAGE), "{n}: {err}");
+        }
+    }
+    let n = r#"{"type":"integer","maximum":-9223372036854773760}"#;
+    assert!(accepts(&gf, &with_n(n), r#"{"n":-9223372036854773760}"#));
+    // A `const` at the floor still builds.
+    gf.compile(&spec(&with_n(
+        r#"{"type":"integer","const":-9223372036854774784}"#,
+    )))
+    .unwrap();
+}

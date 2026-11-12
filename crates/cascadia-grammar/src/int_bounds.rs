@@ -167,8 +167,15 @@ pub(crate) fn has_integer_llguidance_cannot_build(schema: &Value) -> bool {
                 for (k, child) in obj {
                     let low = match k.as_str() {
                         "const" | "enum" => at_or_below_min(child),
+                        // An upper bound at or below the lowest bound
+                        // llguidance builds leaves nothing above the
+                        // raised minimum (`clamp_for_llguidance` skips
+                        // it): refused here, not with llguidance's text.
                         "maximum" | "exclusiveMaximum" => {
-                            any_integer && child.as_f64().is_some_and(|m| m <= I64_MIN_F64)
+                            any_integer
+                                && child
+                                    .as_f64()
+                                    .is_some_and(|m| m <= LLGUIDANCE_MIN_INTEGER as f64)
                         }
                         _ => false,
                     };
