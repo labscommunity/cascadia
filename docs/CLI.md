@@ -756,7 +756,7 @@ as written. Pointers are read as RFC 6901 (`~1` is `/`, `~0` is `~`). A
 siblings dropped, as llama-server ignores them; `default` and `examples`
 are kept, unless a `$ref` sits inside one (then that keyword is left out);
 `const` and `enum` are sent as written. Every `$ref` left in what is sent
-(in `const` or `enum`, or carried in a `description`) must be one
+(in `const` or `enum`, or carried in a `description` or `title`) must be one
 llama-server's ref scan accepts (a `#/...` pointer that resolves, or an
 `https://` document without a fragment), else `` $ref "<ref>" at "<where>"
 is not supported: llama-server fails on it `` (`<where>` a JSON pointer

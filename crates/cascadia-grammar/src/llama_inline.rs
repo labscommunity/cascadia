@@ -550,15 +550,30 @@ pub fn inline_refs_with(
         let copy = inliner.schema(target)?;
         defs.insert(inliner.hoisted[r].clone(), copy);
     }
-    // A root that is itself a `$ref` to a hoisted target: the target's copy
-    // goes at the root (a tool's formats read `parameters.properties`).
-    if let Some(name) = schema
-        .get("$ref")
-        .and_then(Value::as_str)
-        .and_then(|r| inliner.hoisted.get(r))
-    {
-        if let Some(copy) = defs.get(name) {
+    // A root that is a `$ref` to a hoisted target: the target's copy goes at
+    // the root (a tool's formats read `parameters.properties`), following a
+    // copy that is itself such a `$ref` (at most once per copy), with the
+    // root ref's description and title.
+    if schema.get("$ref").is_some() {
+        for _ in 0..defs.len() {
+            let Some(copy) = out
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|r| r.strip_prefix("#/$defs/"))
+                .and_then(|name| defs.get(name))
+            else {
+                break;
+            };
             out = copy.clone();
+        }
+        if let Value::Object(o) = &mut out {
+            if !o.is_empty() && !o.contains_key("$ref") {
+                for key in CARRIED {
+                    if let Some(a) = schema.get(*key) {
+                        o.insert((*key).to_owned(), a.clone());
+                    }
+                }
+            }
         }
     }
     let ours: HashSet<String> = inliner
@@ -960,6 +975,27 @@ mod tests {
         let copy = &got["$defs"][x.strip_prefix("#/$defs/").unwrap()];
         assert!(copy.is_object(), "{got}");
         assert!(got.get("$ref").is_none(), "{got}");
+    }
+
+    #[test]
+    fn a_root_ref_chain_to_a_cycle_ends_at_a_schema_with_the_roots_annotations() {
+        // The root's target is itself a ref: follow it to a schema.
+        let chain = json!({
+            "$ref": "#/$defs/A",
+            "$defs": {"A": {"$ref": "#/$defs/B"}, "B": {"type": "object", "properties": {"x": {"$ref": "#/$defs/A"}}}},
+        });
+        let got = inline_refs(&chain, "t0", true).unwrap().schema;
+        assert!(got.get("$ref").is_none(), "{got}");
+        assert!(got["properties"]["x"]["$ref"].is_string(), "{got}");
+        // The root ref's description stays on the root.
+        let described = json!({
+            "$ref": "#/$defs/A",
+            "description": "ROOTDESC",
+            "$defs": {"A": {"type": "object", "properties": {"x": {"$ref": "#"}}}},
+        });
+        let got = inline_refs(&described, "", true).unwrap().schema;
+        assert_eq!(got["description"], "ROOTDESC", "{got}");
+        assert!(got["properties"]["x"]["$ref"].is_string(), "{got}");
     }
 
     #[test]
