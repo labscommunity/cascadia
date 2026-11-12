@@ -128,13 +128,9 @@ cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
 
 ### Two machines (pipeline parallel)
 
-Shard once, on whichever machine has the RAM and a Python install:
+Shard once, on whichever machine has the RAM. The first run offers to install the Python packages it needs (up to about 1.5 GB, export-time only, in Cascadia's own folder; `--yes` skips the question). To use your own Python instead, see [INSTALL.md](INSTALL.md#export-time-python-only-for-cascadia-shard-and-cascadia-export).
 
 ```bash
-# Export-time deps (~3 GB; not needed at runtime). From a source checkout:
-pip install -r tools/requirements.txt
-# From a release bundle there is no tools/ — `cascadia doctor` prints the pinned line.
-
 # Shard a HuggingFace model into 2 stages with INT4 weights:
 cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
              --output-dir ~/cascadia/llama-8b-2stage \
@@ -192,7 +188,7 @@ $ cascadia engines
   qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)
 ```
 
-`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/moe.md](docs/architectures/moe.md). In-repo exporters: `tools/export_minimax_m2.py`, `export_glm5.py`, `export_deepseek_v4.py`, `export_inkling.py` (per-family pages under `docs/architectures/`); the Kimi K2.6 artefacts come from an external pipeline that is not part of this repo. Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
+`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, see [docs/architectures/moe.md](docs/architectures/moe.md). `cascadia shard` writes it for GLM-5, DeepSeek-V4, MiniMax-M2 and Inkling by running the in-repo exporters: `tools/export_minimax_m2.py`, `export_glm5.py`, `export_deepseek_v4.py`, `export_inkling.py` (per-family pages under `docs/architectures/`); the Kimi K2.6 artefacts come from an external pipeline that is not part of this repo. Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
 
 ### Supported model families
 

@@ -289,7 +289,12 @@ fn check_python(r: &mut Report) {
     // is only a warning. Resolve the interpreter the same way `cascadia shard`
     // does — one that can import the deps, not the first that answers --version.
     // `resolve_python` already probed the imports; don't pay for that twice.
-    match crate::resolve_python(None, true) {
+    r.line(
+        Level::Info,
+        "Private Python",
+        &crate::python_env::managed_status(),
+    );
+    match crate::resolve_python(None, true, crate::Need::Imports) {
         Ok(env) => {
             let version = first_line_of(&env.path, "--version").unwrap_or_default();
             r.line(
@@ -309,9 +314,10 @@ fn check_python(r: &mut Report) {
                     r.line(
                         Level::Info,
                         "Export packages",
-                        "missing (only needed for `cascadia shard`)",
+                        "missing (only needed for `cascadia shard` and `cascadia export`)",
                     );
                     r.note(&crate::export_pip_install_line(&env.path));
+                    r.note("or let Cascadia install them: cascadia python setup");
                 }
             }
         }
@@ -319,11 +325,12 @@ fn check_python(r: &mut Report) {
             r.line(
                 Level::Info,
                 "Python (export-time)",
-                "no python3/python on PATH (only needed for `cascadia shard`)",
+                "no python3/python on PATH (only needed for `cascadia shard` and `cascadia export`)",
             );
             // Print the pins anyway: a bundle user has no tools/requirements.txt
             // to read, and this is the only place they can learn them.
-            r.note("Install Python 3.10-3.13 (the OpenVINO export does not run on 3.14), then:");
+            r.note("Cascadia can install what it needs: cascadia python setup");
+            r.note("Or install Python 3.10-3.13 (the OpenVINO export does not run on 3.14), then:");
             r.note(&crate::export_pip_install_line("python"));
         }
     }

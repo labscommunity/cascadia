@@ -58,4 +58,13 @@ anyhow = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
 dirs = "5"
+sha2 = "0.10"
+reqwest = { workspace = true }
 sysinfo = "0.33"
+
+[target.'cfg(unix)'.dependencies]
+flate2 = "1"
+tar = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }

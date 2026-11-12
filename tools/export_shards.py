@@ -65,10 +65,14 @@ import glob
 import json
 import math
 import os
+import pickle
 import shutil
 import sys
 
 import numpy as np
+
+from export_moe import exporter_for, run_export as run_moe_export
+from export_quant import compress_weights, require_compressor
 
 # torch is only needed by the dense/gemma4 export paths; the qwen3_5_moe
 # IR-surgery path runs on openvino + numpy alone (and its target env — an
@@ -1166,19 +1170,22 @@ def load_stage_weights(model_dir, layer_start, layer_end, has_embed, has_head, t
             f"in {model_dir}"
         )
     for bf in bin_files:
+        # Always weights_only: a full unpickle runs whatever the file's author put in it.
         try:
             # mmap=True lazy-maps the shard, so we materialize only the few
             # layers this stage keeps (via .clone()) instead of loading the
             # whole multi-GB shard into RAM.
             shard = torch.load(bf, map_location="cpu", weights_only=True, mmap=True)
-        except Exception as e:
-            # Older torch (no mmap kwarg) or a checkpoint weights_only can't
-            # unpickle — fall back loudly for trusted local/HF weights.
-            print(
-                f"  torch.load(weights_only,mmap) failed ({e}); retrying full unpickle",
-                flush=True,
-            )
-            shard = torch.load(bf, map_location="cpu", weights_only=False)
+        except Exception:
+            # Older torch (no mmap kwarg) or the legacy format, which can't be mapped.
+            try:
+                shard = torch.load(bf, map_location="cpu", weights_only=True)
+            except pickle.UnpicklingError as e:
+                raise SystemExit(
+                    f"{bf} holds more than plain weights, and loading it could run code "
+                    "its author put there, so Cascadia won't. Use a copy of this model "
+                    "with .safetensors weights."
+                ) from e
         for key, tensor in shard.items():
             if wanted(key):
                 state_dict[key] = tensor.clone() if hasattr(tensor, "clone") else tensor
@@ -1556,38 +1563,7 @@ def export_single_stage(
         )
 
     # 8. Compress weights.
-    if quantization in ("int4", "int4_asym"):
-        try:
-            import nncf
-
-            mode = (
-                nncf.CompressWeightsMode.INT4_SYM
-                if quantization == "int4"
-                else nncf.CompressWeightsMode.INT4_ASYM
-            )
-            print(f"  nncf {quantization} compression...", flush=True)
-            ov_model = nncf.compress_weights(
-                ov_model, mode=mode, group_size=128, ratio=1.0, all_layers=True
-            )
-            print("  Quantization OK", flush=True)
-        except Exception as e:
-            print(
-                f"  WARNING: INT4 compression failed ({e}); falling back to FP16",
-                flush=True,
-            )
-    elif quantization == "int8":
-        try:
-            import nncf
-
-            print("  nncf int8 compression...", flush=True)
-            ov_model = nncf.compress_weights(
-                ov_model, mode=nncf.CompressWeightsMode.INT8_ASYM
-            )
-        except Exception as e:
-            print(
-                f"  WARNING: INT8 compression failed ({e}); falling back to FP16",
-                flush=True,
-            )
+    ov_model = compress_weights(ov_model, quantization, lambda m: print(m, flush=True))
 
     # NPU: EVERY dim (inputs AND outputs) must be static or the compiler
     # rejects the IR (#37). Run this on the FINAL graph — after make_stateful is
@@ -2311,6 +2287,12 @@ def _shard():
     # falls through to the text tower below.
     from cascadia_export import shard_vlm
 
+    # Sparse-MoE families have their own exporters and on-disk layout.
+    _moe_exporter = exporter_for(_outer_mt, _inner_mt)
+    if _moe_exporter:
+        run_moe_export(args, _moe_exporter)
+        return args, None
+
     routed = shard_vlm(args, _raw_cfg)
     if routed:
         return args, routed
@@ -2324,6 +2306,7 @@ def _shard():
             "torch is required for this model's export path. "
             "Install: pip install -r tools/requirements.txt  (or run `cascadia doctor`, which prints the pins)"
         )
+    require_compressor(args.quantization)
     from transformers import AutoConfig
 
     moe_msg = (

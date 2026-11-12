@@ -95,6 +95,8 @@ def install_line() -> str:
                 line = line.split("#", 1)[0].strip()
                 if line:
                     pins.append(f'"{line}"')
+    if os.environ.get("CASCADIA_MANAGED_PYTHON"):
+        return "cascadia python setup"
     return f"{sys.executable} -m pip install {' '.join(pins) or 'optimum-intel'}"
 
 
@@ -221,8 +223,10 @@ def side_venv_recipe(model: str, pin: str, num_stages: int | None,
     out = f"{name}-{weight_format}-ov"
     venv = "cascadia-vlm-export"
     q = shlex.quote
+    # Someone on Cascadia's private environment may have no other Python.
+    python = q(sys.executable) if os.environ.get("CASCADIA_MANAGED_PYTHON") else "python"
     lines = [
-        f"  python -m venv {venv}",
+        f"  {python} -m venv {venv}",
         f"  {venv}/bin/python -m pip install " + " ".join(q(p) for p in pins),
         f"  {venv}/bin/optimum-cli export openvino --model {q(model)} --task {VLM_TASK} "
         f"--weight-format {weight_format}" + (" --sym" if sym else "") + f" {q(out)}",
@@ -309,6 +313,14 @@ def python_refusal(version_info=sys.version_info) -> str | None:
     return None
 
 
+# Runs optimum-cli with the working folder off sys.path: `python -m` searches it first, so a
+# torch.py in the folder someone runs from would be imported. -P needs Python 3.11.
+OPTIMUM_CLI = (
+    "import sys; sys.path[:] = [p for p in sys.path if p]; import runpy; "
+    "runpy.run_module('optimum.commands.optimum_cli', run_name='__main__', alter_sys=True)"
+)
+
+
 def optimum_export(model: str, out_dir: str, task: str, weight_format: str,
                    revision: str | None = None, sym: bool = False) -> None:
     """optimum-cli export openvino, run with this interpreter. A hub id with a known
@@ -318,31 +330,42 @@ def optimum_export(model: str, out_dir: str, task: str, weight_format: str,
         raise SystemExit(why)
     if revision and not os.path.isdir(model):
         model = download(model, revision)
-    cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "openvino",
+    cmd = [sys.executable, "-c", OPTIMUM_CLI, "export", "openvino",
            "--model", model, "--task", task, "--weight-format", weight_format]
     if sym:
         cmd.append("--sym")
     cmd.append(out_dir)
-    log("Running: " + " ".join(cmd))
+    log("Running: optimum-cli " + " ".join(cmd[3:]))
     rc = subprocess.call(cmd)
     if rc != 0:
         raise SystemExit(f"optimum-cli export exited with {rc}; see the output above")
 
 
+# manifest.json arch of the sparse-MoE layouts: one tree serves any stage count,
+# because the engine picks the split when it loads it.
+SPARSE_MOE_ARCHS = ("glm5", "deepseek_v4", "minimax_m2", "inkling")
+
+
 def tree_facts(out_dir: str) -> dict | None:
     """stages, numLayers and whether the tree carries vision, read from what
     the exporter wrote: pipeline_config.json (ov-runtime, gemma4 trees) or
-    manifest.json (qwen35 trees). None when neither is there."""
+    manifest.json (qwen35 and sparse-MoE trees). None when neither is there."""
     for name in ("pipeline_config.json", "manifest.json"):
         path = os.path.join(out_dir, name)
         if os.path.exists(path):
             with open(path) as f:
                 cfg = json.load(f)
-            stages = cfg.get("num_stages")
-            if stages is None:
-                stages = len(cfg.get("stages") or [])
+            quant = cfg.get("quantization")
+            if cfg.get("arch") in SPARSE_MOE_ARCHS:
+                stages = None
+                if cfg.get("experts_format") == "int4_bin":
+                    quant = "int4"
+            else:
+                stages = cfg.get("num_stages")
+                if stages is None:
+                    stages = len(cfg.get("stages") or [])
             return {"stages": stages, "numLayers": cfg.get("num_layers"),
-                    "vision": "vision" in cfg, "quant": cfg.get("quantization")}
+                    "vision": "vision" in cfg, "quant": quant}
     return None
 
 

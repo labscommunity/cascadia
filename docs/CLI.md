@@ -22,6 +22,8 @@ on every subcommand. `--version` is only accepted on the top-level command.
 | [`run`](#cascadia-run) | Serve a model on one machine (OpenAI API). |
 | [`worker`](#cascadia-worker) | Run one stage of a distributed pipeline. |
 | [`shard`](#cascadia-shard) | Export a model into per-stage OpenVINO IRs. |
+| [`export`](VLM.md#cascadia-shard-and-cascadia-export) | Export a model as one whole-model OpenVINO IR (ov-genai, OVMS). |
+| [`python`](#cascadia-python) | Install, repair or remove the Python that `shard` and `export` use. |
 | [`engines`](#cascadia-engines) | List registered inference engines. |
 | [`discover`](#cascadia-discover) | List Cascadia peers on the LAN. |
 | [`profile-devices`](#cascadia-profile-devices) | Benchmark each OV device against one model. |
@@ -327,8 +329,8 @@ All flags exist on both `cascadia run` and `cascadia worker`.
 ## `cascadia shard`
 
 Export a HuggingFace causal-LM into per-stage OpenVINO IRs. **The only command
-that downloads from HuggingFace.** Needs export-time Python deps (~3 GB); run
-`cascadia doctor` to see the exact pinned `pip install` line for your host.
+that downloads from HuggingFace.** The first run offers to install the Python
+packages it needs (see [INSTALL.md](../INSTALL.md#export-time-python-only-for-cascadia-shard-and-cascadia-export)).
 
 ```
 cascadia shard --model <MODEL> -o <DIR> --num-stages <N> [OPTIONS]
@@ -346,7 +348,9 @@ cascadia shard --model <MODEL> -o <DIR> --num-stages <N> [OPTIONS]
 | `--static-seq <N>` | `1` | NPU only: fixed query-window length. Must be 1. |
 | `--static-context <N>` | `1024` | NPU only: fixed total context length. |
 | `--stage <N>` | all | Export only this stage (debug) — re-export one stage without redoing the rest. |
-| `--python <PATH>` | auto | Override the interpreter running the bundled exporter. |
+| `--python <PATH>` | auto | Use this Python. By default: an activated environment, then Cascadia's own packages, then a Python on `PATH`. |
+| `--yes` | off | Install the Python packages without asking if they're missing. Required without a terminal. |
+| `--packed-slots <N>` | `0` | NPU only: also emit a packed multi-slot IR for `cascadia worker --packed-slots N`. |
 | `--skip-check` | off | Skip interpreter/dependency detection. Faster start if you know the env is good. |
 
 ```bash
@@ -358,6 +362,24 @@ Model-family dispatch happens inside the exporter. A Gemma-4 OpenVINO IR dir
 (with `openvino_language_model.xml`) routes to the text-surgery path; Gemma-4
 safetensors still use the torch exporter. Unsupported families are rejected up
 front — see [SHARDING.md](SHARDING.md) for the support table.
+
+---
+
+## `cascadia python`
+
+The Python packages `cascadia shard` and `cascadia export` need. Both commands
+offer to install them on first use, so you only need this to do it ahead of time
+or to clean up. See [INSTALL.md](../INSTALL.md#export-time-python-only-for-cascadia-shard-and-cascadia-export).
+
+| Command | What it does |
+|---|---|
+| `cascadia python setup` | Install what's missing, or repair a damaged install. Reuses `uv`, a Python 3.12 or 3.13 and packages already at the tested version. |
+| `cascadia python remove` | Delete everything `setup` installed. |
+
+Everything goes in one folder: `~/.local/share/cascadia/python` on Linux
+(`$XDG_DATA_HOME/cascadia/python` if that is set),
+`~/Library/Application Support/cascadia/python` on macOS,
+`%LOCALAPPDATA%\cascadia\python` on Windows.
 
 ---
 

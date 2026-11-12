@@ -4,7 +4,7 @@ Choose an installation path for your engine:
 
 | Goal | How | Needs |
 | --- | --- | --- |
-| Run it on Intel hardware | **Prebuilt bundle** (below) | an Intel driver; (Linux GPU) the runtime stack |
+| Run it on Intel hardware | **Prebuilt bundle** (below) | an Intel driver; (Linux GPU) the runtime stack; (Windows) the Visual C++ Redistributable |
 | Try it / develop / CI | **Stub mode** build | Rust only |
 | Build real inference yourself | **OpenVINO mode** build | Rust + C++ toolchain + OpenVINO GenAI SDK + (Linux) GPU runtime |
 | Run GGUF models on Intel GPUs | **SYCL llama.cpp build** (below) | Rust + Intel oneAPI + patched `llama-server` + Intel GPU driver |
@@ -17,7 +17,7 @@ After any install, run **`cascadia doctor`**. Its OpenVINO and sycl-llama sectio
 
 Each [GitHub Release](https://github.com/labscommunity/cascadia/releases) ships self-contained bundles with the OpenVINO runtime included — no SDK install, no `INTEL_OPENVINO_DIR`:
 
-- **Windows** — `cascadia-<ver>-windows-x86_64.zip`: unzip, run `cascadia.exe doctor`. Needs only a current Intel graphics driver (the OpenCL/GPU runtime ships inside it).
+- **Windows** — `cascadia-<ver>-windows-x86_64.zip`: unzip, run `cascadia.exe doctor`. Needs a current Intel graphics driver (the OpenCL/GPU runtime ships inside it) and the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe), which many PCs already have. Without the redistributable, `cascadia.exe` can't start: Windows reports `VCRUNTIME140.dll was not found`, or over SSH and in scripts it exits with no message (code `-1073741515`). Installing the redistributable fixes both.
 - **Linux** — `cascadia-<ver>-linux-x86_64.tar.gz`: untar, run `./cascadia doctor`. Bundled libraries load from `lib/` beside the binary. Needs glibc 2.35+ (Ubuntu 22.04 or newer), the OpenCL ICD loader even for CPU-only use (`sudo apt install ocl-icd-libopencl1` — `libopenvino_genai.so` imports `libOpenCL.so.1`, so without it the binary does not start) and, for GPU inference, the Intel GPU runtime stack below (the bundle has no scripts — use the `apt-get` block, or `scripts/setup-openvino.sh` from a source checkout).
 
 The binary is not installed on your PATH — run it as `./cascadia` from the unpacked directory, or add that directory to PATH.
@@ -34,7 +34,7 @@ Because OpenVINO's C++ ABI is not stable across releases, the runtime cannot be 
 
 Version strings are Intel's archive versions exactly as they appear in the file names on <https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/>: `2026.4.1.0`, `2026.5.0.0beta1`, `2026.5.0.0.dev20260925`.
 
-Python is not needed for inference. It is needed only for `cascadia shard` — which works from the prebuilt binary too: the Python exporters are compiled into it and extracted at run time (see "Export-time Python" below).
+Python is not needed for inference. To export a model, `cascadia shard` works from the prebuilt binary alone: it installs what it needs the first time (see "Export-time Python" below).
 
 ---
 
@@ -174,17 +174,25 @@ If cargo stops with "`embed-spa` is enabled, but the dashboard SPA has not been 
 
 ---
 
-## Export-time Python (only for `cascadia shard`)
+## Export-time Python (only for `cascadia shard` and `cascadia export`)
 
-Sharding a HuggingFace model into per-stage IRs runs a bundled Python exporter. This is needed **only** when you run `cascadia shard` — not at inference time, and not on workers. Install once, anywhere with the RAM:
+Python is needed only to export a model: not at inference time, and not on workers. You don't have to set it up. The first time you export, Cascadia asks once and installs what's missing:
 
-```bash
-pip install -r tools/requirements.txt   # from a source checkout
+```text
+$ cascadia shard --model Qwen/Qwen3-1.7B -o qwen3 --num-stages 2
+Exporting needs 59 Python packages. Install them in Cascadia's own folder (up to about 1.5 GB; nothing else on your system changes)? [Y/n]
 ```
 
-From a release bundle there is no `tools/` directory: run `cascadia doctor` (or `cascadia shard`) and it prints the exact pinned `pip install` line for the exporter compiled into that binary.
+Without a terminal to ask in (CI, scripts), pass `--yes`. Linux x86_64, Windows x86_64 and macOS arm64 are supported; setup needs PyPI, pytorch.org and GitHub.
 
-`nncf` is optional (INT4 quantization); without it, sharding falls back to FP16 — `cascadia shard` warns when it is missing. `cascadia doctor` reports whether the core export packages (torch / openvino / transformers) are present.
+- **Only what's missing is installed.** `uv`, a Python 3.12 or 3.13 and packages at exactly the tested version are reused if you have them. Your system Python is never changed.
+- **Your own Python still works.** An activated venv or conda environment, or a Python on `PATH` with the exporter's packages, is used as it is, with no question asked. `--python <path>` picks one explicitly. Each run prints which it chose.
+- **Repair and clean-up.** `cascadia python setup` installs ahead of time and repairs a damaged install. `cascadia python remove` deletes everything it installed.
+- **New Cascadia versions.** The install is kept until a release changes the tested package versions. You're then asked once, only the packages that changed are downloaded, and the old versions are deleted.
+- **Windows.** `cascadia.exe`, torch and OpenVINO all need the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). Installing it needs admin rights, so Cascadia doesn't do it for you.
+- **Company networks.** `HTTPS_PROXY` and uv's `UV_DEFAULT_INDEX`, `UV_INDEX`, `UV_NATIVE_TLS` and `UV_PYTHON_INSTALL_MIRROR` are honoured; every package is checked against the hash Cascadia ships with. If the download of `uv` itself fails, install `uv` yourself or use `--python`.
+
+To install into your own environment instead, `cascadia doctor` prints the pinned `pip install` line (`pip install -r tools/requirements.txt` from a source checkout). `nncf` is needed to compress weights to INT4 (the default) or INT8: without it, an export that compresses stops and tells you to install it or pass `--quantization fp16`.
 
 Exporting a **whole-model** IR for `--engine ov-genai` is a different job and uses Intel's exporter, not this one — `pip install "optimum-intel[openvino]"`, see [docs/engines/ov-genai.md](docs/engines/ov-genai.md).
 
