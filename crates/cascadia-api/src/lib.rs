@@ -784,6 +784,18 @@ pub struct ChatCompletionRequest {
     /// the template.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// The `reasoning` object other vendors' clients send (OpenRouter shape):
+    /// `{"effort": "...", "enabled": bool, "exclude": bool}`. `effort` stands
+    /// in for a missing top-level `reasoning_effort`; `enabled` is an on/off
+    /// switch; `exclude` and anything else are accepted and ignored. Kept as
+    /// raw JSON so an odd shape is ignored rather than rejected.
+    #[serde(default)]
+    pub reasoning: Option<serde_json::Value>,
+    /// The `thinking` object Anthropic-shaped clients send:
+    /// `{"type": "enabled" | "disabled", "budget_tokens": N}`. Only `type`
+    /// is read; other values and members are accepted and ignored.
+    #[serde(default)]
+    pub thinking: Option<serde_json::Value>,
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
@@ -868,19 +880,57 @@ impl ChatCompletionRequest {
         }
     }
 
-    /// Resolves `enable_thinking`, highest precedence first:
-    /// `chat_template_kwargs.enable_thinking` (the vLLM/SGLang convention),
-    /// then the legacy top-level `enable_thinking`, then `reasoning_effort:
-    /// "none"` turning thinking off; omission of all three means on. Both
-    /// explicit toggles must beat `"none"` for the same reason: `"none"`
-    /// exists to give clients *without* a toggle an off-switch, and must
-    /// never override a client that used one.
-    fn effective_enable_thinking(&self) -> bool {
+    /// The caller's effort word: top-level `reasoning_effort`, else
+    /// `reasoning.effort` when it is a string. The top-level field is
+    /// OpenAI's own, so it wins when a client sends both.
+    fn requested_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref().or_else(|| {
+            self.reasoning
+                .as_ref()
+                .and_then(|r| r.get("effort"))
+                .and_then(|e| e.as_str())
+        })
+    }
+
+    /// The first explicit on/off switch the caller sent, highest precedence
+    /// first: `chat_template_kwargs.enable_thinking` (the vLLM/SGLang
+    /// convention), the legacy top-level `enable_thinking`, `thinking.type`
+    /// (`"enabled"`/`"disabled"`; any other value is ignored), then
+    /// `reasoning.enabled` (a bool). `None` when the caller sent none.
+    fn thinking_switch(&self) -> Option<bool> {
+        let thinking_type = || match self
+            .thinking
+            .as_ref()
+            .and_then(|t| t.get("type"))
+            .and_then(|t| t.as_str())
+        {
+            Some("enabled") => Some(true),
+            Some("disabled") => Some(false),
+            _ => None,
+        };
+        let reasoning_enabled = || {
+            self.reasoning
+                .as_ref()
+                .and_then(|r| r.get("enabled"))
+                .and_then(|e| e.as_bool())
+        };
         self.chat_template_kwargs
             .as_ref()
             .and_then(|k| k.enable_thinking)
             .or(self.enable_thinking)
-            .unwrap_or_else(|| self.reasoning_effort.as_deref() != Some("none"))
+            .or_else(thinking_type)
+            .or_else(reasoning_enabled)
+    }
+
+    /// Resolves `enable_thinking`: an explicit switch
+    /// ([`thinking_switch`](Self::thinking_switch)) wins, then an effort of
+    /// `"none"` ([`requested_effort`](Self::requested_effort)) turns thinking
+    /// off; omission of all of them means on. Every explicit switch must beat
+    /// `"none"`: `"none"` exists to give clients *without* a toggle an
+    /// off-switch, and must never override a client that used one.
+    fn effective_enable_thinking(&self) -> bool {
+        self.thinking_switch()
+            .unwrap_or_else(|| self.requested_effort() != Some("none"))
     }
 
     /// Maps the OpenAI effort vocabulary onto what GLM-5's template can
@@ -909,7 +959,7 @@ impl ChatCompletionRequest {
     /// make "caller chose max" indistinguishable from "caller said nothing"
     /// at the Rust type level.
     fn effective_reasoning_effort(&self) -> &'static str {
-        match self.reasoning_effort.as_deref() {
+        match self.requested_effort() {
             Some("xhigh") | Some("max") => "max",
             _ => "high",
         }
@@ -1626,8 +1676,10 @@ pub struct EffortArgs<'a> {
     pub mapped: Option<&'a str>,
     /// The caller's own word, verbatim.
     pub raw: Option<&'a str>,
-    /// The caller set `enable_thinking` explicitly (a toggle beats an effort
-    /// word that would switch thinking off).
+    /// The caller sent an explicit thinking switch (`enable_thinking`,
+    /// `chat_template_kwargs.enable_thinking`, `thinking.type` or
+    /// `reasoning.enabled`); a switch beats an effort word that would turn
+    /// thinking off.
     pub explicit_thinking: bool,
     /// The template distinguishes the OpenAI words (see
     /// [`template_speaks_effort_words`]).
@@ -2473,8 +2525,8 @@ async fn chat_completions(
         enable_thinking,
         EffortArgs {
             mapped: Some(req.effective_reasoning_effort()),
-            raw: req.reasoning_effort.as_deref(),
-            explicit_thinking: req.enable_thinking.is_some(),
+            raw: req.requested_effort(),
+            explicit_thinking: req.thinking_switch().is_some(),
             template_words: state.effort_words,
         },
         req.tools.as_deref(),
@@ -5669,6 +5721,86 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// A one-user-message request with `extra` merged into its body.
+    fn with_extra(extra: serde_json::Value) -> ChatCompletionRequest {
+        let mut v = serde_json::json!({ "messages": [{"role": "user", "content": "hi"}] });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        chat_request(v)
+    }
+
+    #[test]
+    fn vendor_switches_turn_thinking_off_and_on() {
+        use serde_json::json;
+        let off = [
+            json!({"thinking": {"type": "disabled"}}),
+            json!({"reasoning": {"enabled": false}}),
+            json!({"reasoning": {"effort": "none"}}),
+        ];
+        for extra in off {
+            assert!(
+                !with_extra(extra.clone()).effective_enable_thinking(),
+                "{extra}"
+            );
+        }
+        let on = [
+            json!({"thinking": {"type": "enabled"}, "reasoning_effort": "none"}),
+            json!({"reasoning": {"enabled": true, "effort": "none"}}),
+        ];
+        for extra in on {
+            assert!(
+                with_extra(extra.clone()).effective_enable_thinking(),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_toggles_outrank_vendor_switches() {
+        use serde_json::json;
+        assert!(
+            with_extra(json!({"enable_thinking": true, "thinking": {"type": "disabled"}}))
+                .effective_enable_thinking()
+        );
+        assert!(!with_extra(json!({
+            "chat_template_kwargs": {"enable_thinking": false},
+            "reasoning": {"enabled": true}
+        }))
+        .effective_enable_thinking());
+    }
+
+    #[test]
+    fn reasoning_effort_object_reaches_the_effort_mapping_and_top_level_wins() {
+        use serde_json::json;
+        assert_eq!(
+            with_extra(json!({"reasoning": {"effort": "max"}})).effective_reasoning_effort(),
+            "max"
+        );
+        assert_eq!(
+            with_extra(json!({"reasoning_effort": "low", "reasoning": {"effort": "max"}}))
+                .effective_reasoning_effort(),
+            "high"
+        );
+    }
+
+    #[test]
+    fn odd_vendor_shapes_are_ignored_not_rejected() {
+        use serde_json::json;
+        for extra in [
+            json!({"reasoning": "high"}),
+            json!({"thinking": true}),
+            json!({"thinking": {"type": "adaptive"}}),
+            json!({"reasoning": {"effort": 7}}),
+            json!({"reasoning": {"exclude": true}, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+        ] {
+            assert!(
+                with_extra(extra.clone()).effective_enable_thinking(),
+                "{extra}"
+            );
+        }
+    }
+
     #[test]
     fn chat_turns_forward_tool_fields_as_wire_json() {
         let req = chat_request(serde_json::json!({
@@ -5889,6 +6021,64 @@ mod tests {
             content.trim(),
             "effort=low",
             "the template saw the mapped word, not the caller's"
+        );
+    }
+
+    /// End to end over HTTP: the `reasoning` and `thinking` objects other
+    /// vendors' clients send reach the template — `reasoning.effort` as the
+    /// caller's word, `thinking.type: "disabled"` as thinking off. The mock
+    /// engine echoes the prompt, so the completion text is the rendered prompt.
+    #[tokio::test]
+    async fn http_vendor_reasoning_and_thinking_objects_reach_the_template() {
+        const T: &str = "effort={{ reasoning_effort | default('unset') }} \
+{%- if enable_thinking %} thinking=on{% else %} thinking=off{% endif %}";
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(T.to_string()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+
+        let (status, v) = post_chat(
+            app.clone(),
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning": {"effort": "max", "exclude": true},
+                "stream": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(content.trim(), "effort=max thinking=on");
+
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "disabled", "budget_tokens": 1024},
+                "stream": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(
+            content.trim().ends_with("thinking=off"),
+            "thinking.type disabled must render the thinking-off branch: {content}"
         );
     }
 
