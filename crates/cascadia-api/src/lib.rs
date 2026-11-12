@@ -1872,11 +1872,14 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
     }
 }
 
-/// Did this request's generation prompt open `<think>`? When the API rendered
-/// the prompt it is read off `task.prompt` (per request, so a template whose
-/// generation prompt depends on the effort word is right); when the engine
-/// renders it (sycl-llama, or ov-genai with thinking on) `task.prompt` is a
-/// placeholder and the load-time `probe` stands in.
+/// Did this request's generation prompt open `<think>`? When the API's chat
+/// template rendered the prompt (`templated`) it is read off `task.prompt`
+/// (per request, so a template whose generation prompt depends on the effort
+/// word is right); when the engine renders it (sycl-llama, or ov-genai with
+/// thinking on) `task.prompt` is a placeholder and the load-time `probe`
+/// stands in. With no template, or after a render error fell back to the
+/// legacy formatter, the prompt is the user's own text, which may end in
+/// `<think>` without opening anything: not opened.
 ///
 /// Always false when `task.reasoning_as_text` is set: the engine folds its
 /// separate reasoning back in as `<think>…</think>` text and sends its own
@@ -1889,6 +1892,7 @@ pub(crate) fn opens_think(
     defer_template_on_thinking: bool,
     enable_thinking: bool,
     probe: bool,
+    templated: bool,
     task: &GenerationTask,
 ) -> bool {
     if task.reasoning_as_text {
@@ -1898,7 +1902,7 @@ pub(crate) fn opens_think(
     if engine_renders {
         probe
     } else {
-        task.prompt.trim_end().ends_with("<think>")
+        templated && task.prompt.trim_end().ends_with("<think>")
     }
 }
 
@@ -1911,6 +1915,30 @@ fn render_or_fallback(
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
+    render_or_fallback_templated(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        effort,
+        tools,
+    )
+    .map(|(prompt, _)| prompt)
+}
+
+/// [`render_or_fallback`], also telling whether the chat template rendered
+/// the prompt (`false`: no template, or the legacy fallback after a render
+/// error, so the prompt is the user's own text).
+fn render_or_fallback_templated(
+    env: Option<&minijinja::Environment<'static>>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: bool,
+    effort: EffortArgs<'_>,
+    tools: Option<&[Tool]>,
+) -> Result<(String, bool), PromptRenderError> {
     let has_tools = tools.is_some_and(|t| !t.is_empty());
     let Some(env) = env else {
         if has_tools {
@@ -1920,7 +1948,7 @@ fn render_or_fallback(
                 "this model has no chat template, so tool definitions cannot be rendered".into(),
             ));
         }
-        return Ok(render_prompt_legacy(messages));
+        return Ok((render_prompt_legacy(messages), false));
     };
     // Which `reasoning_effort` the template sees, in order of preference.
     //
@@ -2011,7 +2039,7 @@ fn render_or_fallback(
         }
     }
     match first {
-        Ok(s) => Ok(s),
+        Ok(s) => Ok((s, true)),
         // A raise_exception is the template validating its own input; other
         // engines surface it rather than papering over it.
         Err(e @ PromptRenderError::Rejected(_)) => Err(e),
@@ -2021,18 +2049,20 @@ fn render_or_fallback(
                 error = %e,
                 "chat_template render failed; falling back to legacy formatter — prompt will lack role markers"
             );
-            Ok(render_prompt_legacy(messages))
+            Ok((render_prompt_legacy(messages), false))
         }
     }
 }
 
+/// The prompt, and whether the API's chat template rendered it (see
+/// [`opens_think`]).
 fn render_prompt(
     state: &AppState,
     messages: &[ChatMessage],
     enable_thinking: bool,
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
-) -> Result<String, PromptRenderError> {
+) -> Result<(String, bool), PromptRenderError> {
     // ov-genai applies the model's own template, so the engine gets raw text.
     // Tools would be dropped on the floor here, so refuse rather than pretend.
     // `reasoning_effort` (the caller's parameter above) is also dropped on
@@ -2041,7 +2071,7 @@ fn render_prompt(
     if state.engine_applies_template {
         // the child renders the GGUF chat template on the forwarded turns;
         // the prompt is a fallback and must simply be non-empty
-        return Ok(render_prompt_legacy(messages));
+        return Ok((render_prompt_legacy(messages), false));
     }
     if state.defer_template_on_thinking && enable_thinking {
         if tools.is_some_and(|t| !t.is_empty()) {
@@ -2050,9 +2080,9 @@ fn render_prompt(
                     .into(),
             ));
         }
-        return Ok(render_prompt_legacy(messages));
+        return Ok((render_prompt_legacy(messages), false));
     }
-    render_or_fallback(
+    render_or_fallback_templated(
         state.chat_env.as_deref(),
         messages,
         &state.bos_token,
@@ -2708,7 +2738,7 @@ async fn chat_completions(
     // client's "low" reaches such a template unescalated — or, when the caller
     // sent nothing of their own, with the effort undefined (the template's
     // default). A caller word the template also rejects is a 400.
-    let prompt = match render_prompt(
+    let (prompt, templated) = match render_prompt(
         &state,
         &req.messages,
         enable_thinking,
@@ -2868,6 +2898,17 @@ async fn chat_completions(
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let inflight = InFlightGuard::new(state.stats.clone());
 
+    // Does the reply start inside reasoning? Streamed or not, the split
+    // starts from the same answer.
+    let opened = opens_think(
+        state.engine_applies_template,
+        state.defer_template_on_thinking,
+        enable_thinking,
+        state.template_opens_think,
+        templated,
+        &task,
+    );
+
     if req.stream {
         let include_usage = req
             .stream_options
@@ -2880,6 +2921,7 @@ async fn chat_completions(
             state,
             req.model,
             task,
+            opened,
             permit,
             inflight,
             include_usage,
@@ -2894,13 +2936,6 @@ async fn chat_completions(
     // until the task completes; drop frees the slot.
     let _permit = permit;
     let _inflight = inflight;
-    let opened = opens_think(
-        state.engine_applies_template,
-        state.defer_template_on_thinking,
-        enable_thinking,
-        state.template_opens_think,
-        &task,
-    );
     // Counts the tokens spent on reasoning; the returned text is split again
     // below, after stop-string trimming.
     let mut counter = ReasoningCounter::new(enable_thinking, opened);
@@ -3373,12 +3408,14 @@ async fn stream_text_completion(
 }
 
 // Streaming carries the usage handles (inflight/include_usage) and the tool
-// gate (tool_choice/tools_present) alongside the task plumbing.
+// gate (tool_choice/tools_present) alongside the task plumbing. `opened`: the
+// prompt opened `<think>` (see `opens_think`).
 #[allow(clippy::too_many_arguments)]
 async fn stream_completion(
     state: AppState,
     model: String,
     task: GenerationTask,
+    opened: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
     inflight: InFlightGuard,
     include_usage: bool,
@@ -3392,13 +3429,6 @@ async fn stream_completion(
     let _ = SystemTime::now();
     // Reasoning split, as on the non-streaming path: counted whenever thinking
     // is on, sent as `reasoning_content` unless `--reasoning-format none`.
-    let opened = opens_think(
-        state.engine_applies_template,
-        state.defer_template_on_thinking,
-        enable_thinking,
-        state.template_opens_think,
-        &task,
-    );
     let counter = ReasoningCounter::new(enable_thinking, opened);
     let split_out = enable_thinking && state.reasoning_format == ReasoningFormat::ReasoningContent;
 
@@ -6954,24 +6984,44 @@ level={{ effort_map[eff] }}";
         let opened = GenerationTask::new("t", "<|im_start|>assistant\n<think>\n");
         let closed = GenerationTask::new("t", "<|im_start|>assistant\n");
         // API rendered the prompt: read it, ignore the probe.
-        assert!(opens_think(false, false, true, false, &opened));
-        assert!(!opens_think(false, false, true, true, &closed));
+        assert!(opens_think(false, false, true, false, true, &opened));
+        assert!(!opens_think(false, false, true, true, true, &closed));
         // The engine renders (sycl-llama): the probe stands in.
-        assert!(opens_think(true, false, true, true, &closed));
-        assert!(!opens_think(true, false, true, false, &opened));
+        assert!(opens_think(true, false, true, true, true, &closed));
+        assert!(!opens_think(true, false, true, false, true, &opened));
         // ov-genai with thinking on: the engine's native render, so the probe.
-        assert!(opens_think(false, true, true, true, &closed));
-        assert!(!opens_think(false, true, true, false, &opened));
+        assert!(opens_think(false, true, true, true, true, &closed));
+        assert!(!opens_think(false, true, true, false, true, &opened));
         // ov-genai with thinking off: the API rendered it, read the prompt.
-        assert!(opens_think(false, true, false, false, &opened));
-        assert!(!opens_think(false, true, false, true, &closed));
+        assert!(opens_think(false, true, false, false, true, &opened));
+        assert!(!opens_think(false, true, false, true, true, &closed));
         // Reasoning folded in as text: the engine sends its own `<think>`.
         let folded = |prompt: &str| GenerationTask {
             reasoning_as_text: true,
             ..GenerationTask::new("t", prompt)
         };
-        assert!(!opens_think(true, false, true, true, &folded("<think>\n")));
-        assert!(!opens_think(false, false, true, true, &folded("<think>\n")));
+        assert!(!opens_think(
+            true,
+            false,
+            true,
+            true,
+            true,
+            &folded("<think>\n")
+        ));
+        assert!(!opens_think(
+            false,
+            false,
+            true,
+            true,
+            true,
+            &folded("<think>\n")
+        ));
+        // No template rendered the prompt (none loaded, or the legacy
+        // fallback after a render error): the user's own text, never opened.
+        assert!(!opens_think(false, false, true, false, false, &opened));
+        assert!(!opens_think(false, true, false, false, false, &opened));
+        // The engine renders: the probe still decides.
+        assert!(opens_think(true, false, true, true, false, &closed));
     }
 
     /// Records every task it is handed and answers each with a bare final.
@@ -8846,6 +8896,55 @@ level={{ effort_map[eff] }}";
             let usage = &events.last().unwrap()["usage"];
             assert!(usage["completion_tokens"].as_u64().is_some(), "{body}");
             assert!(usage.get("completion_tokens_details").is_none(), "{body}");
+        }
+    }
+
+    /// With no template (or one that fails to render), the prompt is the
+    /// user's own text: a message ending in `<think>` must not start the
+    /// reply inside reasoning.
+    #[tokio::test]
+    async fn untemplated_prompt_ending_in_think_is_not_an_opened_block() {
+        let broken = || {
+            let cfg = Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{{ nope.missing.deeper }}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            };
+            async move {
+                let runner = Runner::new(Box::new(MockBuilder::new()));
+                runner
+                    .start(
+                        PeerLayout::single_stage(),
+                        ShardSpec::single_stage("mock-model", "CPU"),
+                    )
+                    .await
+                    .unwrap();
+                make_router_with_config(Arc::new(runner), "mock-model", cfg)
+            }
+        };
+        let request = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"What does the tag <think>"}]});
+        for app in [make_app().await, broken().await] {
+            let (status, body) = post_chat(app, request.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let m = &body["choices"][0]["message"];
+            assert_eq!(m["content"], "What does the tag <think> ", "{body}");
+            assert!(m.get("reasoning_content").is_none(), "{body}");
+        }
+        for app in [make_app().await, broken().await] {
+            let mut payload = request.clone();
+            payload["stream"] = true.into();
+            let body = post_stream(app, payload).await;
+            let events = sse_events(&body);
+            assert_eq!(
+                streamed_content(&events),
+                "What does the tag <think> ",
+                "{body}"
+            );
+            assert_eq!(streamed_reasoning(&events), "", "{body}");
         }
     }
 
