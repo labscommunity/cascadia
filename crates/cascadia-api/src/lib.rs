@@ -2958,7 +2958,7 @@ async fn chat_completions(
         } else {
             build_choice(buf, &req.tool_choice, tools_present, enable_thinking)
         };
-    let completion_tokens_details = counter.armed().then(|| CompletionTokensDetails {
+    let completion_tokens_details = counter.saw_reasoning().then(|| CompletionTokensDetails {
         reasoning_tokens: counter.reasoning_tokens(completion_tokens),
     });
     // A parsed tool call overrides the streamed length/stop detection;
@@ -3895,13 +3895,13 @@ fn stream_delta(reasoning: &str, content: &str) -> serde_json::Value {
 }
 
 /// Add `completion_tokens_details` to a stream's usage object when the
-/// reasoning split was armed (thinking on).
+/// reply had a reasoning block.
 fn add_reasoning_details(
     usage: &mut serde_json::Value,
     counter: &ReasoningCounter,
     completion: u32,
 ) {
-    if counter.armed() {
+    if counter.saw_reasoning() {
         usage["completion_tokens_details"] = serde_json::json!(CompletionTokensDetails {
             reasoning_tokens: counter.reasoning_tokens(completion),
         });
@@ -4489,7 +4489,7 @@ mod tests {
                 request["prompt"] = serde_json::json!("hi");
             } else {
                 request["messages"] = serde_json::json!([{"role":"user","content":"hi"}]);
-                // Thinking on adds `completion_tokens_details`; this test is
+                // A reply that reasons adds `completion_tokens_details`; this test is
                 // about the totals.
                 request["enable_thinking"] = serde_json::json!(false);
             }
@@ -8020,11 +8020,10 @@ level={{ effort_map[eff] }}";
         assert_eq!(finishes, ["tool_calls"], "{rest}");
         let usage = events.last().unwrap();
         assert!(usage["choices"].as_array().unwrap().is_empty(), "{rest}");
-        // Thinking is on by default: the split counts, and there is none.
+        // Thinking is on by default, but the reply never reasoned: no details.
         assert_eq!(
             usage["usage"],
-            serde_json::json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,
-                "completion_tokens_details":{"reasoning_tokens":0}})
+            serde_json::json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8})
         );
     }
 
@@ -8650,20 +8649,38 @@ level={{ effort_map[eff] }}";
     }
 
     #[tokio::test]
-    async fn thinking_on_reply_without_think_counts_zero_reasoning_tokens() {
-        let (status, body) = post_chat(
-            make_app().await,
-            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hello world"}]}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let m = &body["choices"][0]["message"];
-        assert_eq!(m["content"], "hello world ");
-        assert!(m.get("reasoning_content").is_none(), "{body}");
-        assert_eq!(
-            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
-            0
-        );
+    async fn thinking_on_reply_without_think_has_no_details() {
+        for app in [make_app().await, make_app_reasoning_none().await] {
+            let (status, body) = post_chat(
+                app,
+                serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hello world"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let m = &body["choices"][0]["message"];
+            assert_eq!(m["content"], "hello world ");
+            assert!(m.get("reasoning_content").is_none(), "{body}");
+            assert!(
+                body["usage"].get("completion_tokens_details").is_none(),
+                "{body}"
+            );
+        }
+    }
+
+    /// A streamed reply that never reasoned carries no details either, in
+    /// both formats.
+    #[tokio::test]
+    async fn thinking_on_stream_without_think_has_no_details() {
+        for app in [
+            gated_app_released(&["hello ", "world"]).await,
+            gated_app_reasoning_none(&["hello ", "world"]).await,
+        ] {
+            let body = post_stream(app, plain_stream_body(None, true)).await;
+            let events = sse_events(&body);
+            let usage = &events.last().unwrap()["usage"];
+            assert!(usage["completion_tokens"].as_u64().is_some(), "{body}");
+            assert!(usage.get("completion_tokens_details").is_none(), "{body}");
+        }
     }
 
     /// Inkling's special-token thinking framing reaches the split as

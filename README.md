@@ -174,7 +174,8 @@ Thinking models (Qwen3, DeepSeek R1 distills, and others whose output wraps the 
 ```
 
 - **Streaming** sends the reasoning as `delta.reasoning_content` frames, before and separate from the `delta.content` frames.
-- **`usage.completion_tokens_details.reasoning_tokens`** is present whenever thinking is on, and is `0` for a model that did not reason (it is a counted value, not a guess). In a stream it is on the usage chunk sent with `stream_options.include_usage`. With thinking off, usage is unchanged and has no `completion_tokens_details`.
+- **`usage.completion_tokens_details.reasoning_tokens`** is present when the reply contained reasoning (a counted value, not a guess). In a stream it is on the usage chunk sent with `stream_options.include_usage`. A reply without reasoning, or any reply with thinking off, has usage unchanged and no `completion_tokens_details`.
+- **gemma4's thinking channel is not split yet**: its markers are not in the decoded text, so a gemma4 reply keeps its reasoning in `content` and has no `completion_tokens_details`.
 - **Tool calls** are read from the answer only. A call the model drafted inside its reasoning is never returned as `tool_calls`.
 - **A reply cut by `max_tokens`** while still reasoning returns the reasoning in `reasoning_content` and an empty `content` (`finish_reason: "length"`).
 - **Templates that open `<think>` in the prompt** (R1 distills, Qwen3.5/3.6) are handled: the reply is known to start inside the reasoning, so the reasoning is split out even though the model never writes the opening tag.
