@@ -3916,6 +3916,12 @@ fn add_reasoning_details(
 /// With both, a reasoning-only frame (`n_tokens` 0, no finish) goes first
 /// and the content frame carries the tokens and the finish, so per-frame
 /// token sums are unchanged.
+///
+/// A reasoning frame never carries `finish_reason` either: AnythingLLM
+/// skips every reasoning frame before its finish check, so a stream that
+/// finished on one would never complete. Reasoning with a finish and no
+/// content goes out as a reasoning-only frame, then an empty-content
+/// closing frame with the tokens and the finish.
 fn content_frame(
     task_id: &str,
     model: &str,
@@ -3925,7 +3931,7 @@ fn content_frame(
     completion_tokens: Option<u32>,
     finish_reason: Option<&str>,
 ) -> String {
-    if !reasoning.is_empty() && !content.is_empty() {
+    if !reasoning.is_empty() && (!content.is_empty() || finish_reason.is_some()) {
         let mut out = content_frame(task_id, model, reasoning, "", 0, None, None);
         out.push_str(&content_frame(
             task_id,
@@ -8969,6 +8975,77 @@ level={{ effort_map[eff] }}";
             }
         }
         assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    }
+
+    /// No frame carries both `reasoning_content` and `finish_reason`
+    /// (AnythingLLM skips any reasoning frame before its finish check, so it
+    /// would never finish); the last choice frame carries `finish`.
+    fn assert_finish_not_on_reasoning(body: &str, finish: &str) {
+        let events = sse_events(body);
+        for e in &events {
+            let choice = &e["choices"][0];
+            assert!(
+                choice["delta"].get("reasoning_content").is_none()
+                    || choice["finish_reason"].is_null(),
+                "reasoning frame with a finish: {body}"
+            );
+        }
+        let last = events
+            .iter()
+            .rev()
+            .find(|e| !e["choices"].as_array().unwrap().is_empty())
+            .unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], finish, "{body}");
+        assert_eq!(finish_reasons(&events), [finish], "{body}");
+    }
+
+    /// A stream cut by `max_tokens` inside the reasoning ends on a closing
+    /// frame, and `n_tokens` still sums to the reply's tokens.
+    #[tokio::test]
+    async fn length_cut_inside_reasoning_never_finishes_on_a_reasoning_frame() {
+        let mut payload = plain_stream_body(None, false);
+        payload["messages"] =
+            serde_json::json!([{"role":"user","content":"<think> a b c d </think> answer"}]);
+        payload["max_tokens"] = 3.into();
+        let body = post_stream(make_app().await, payload).await;
+        assert_finish_not_on_reasoning(&body, "length");
+        let events = sse_events(&body);
+        assert_eq!(streamed_reasoning(&events), " a b ", "{body}");
+        assert_eq!(frame_tokens(&events), 3, "{body}");
+    }
+
+    /// A stream whose final chunk carries reasoning text closes the same
+    /// way, plain and with tools.
+    #[tokio::test]
+    async fn final_chunk_inside_reasoning_never_finishes_on_a_reasoning_frame() {
+        for tools in [false, true] {
+            let (app, release, _) = start_gated(
+                &["<think>a ", "b"],
+                false,
+                true,
+                Config {
+                    chat_template: ChatTemplateConfig {
+                        template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                        bos_token: None,
+                        eos_token: None,
+                    },
+                    ..Config::default()
+                },
+            )
+            .await;
+            release.store(true, Ordering::SeqCst);
+            let payload = if tools {
+                tool_stream_body(None, false)
+            } else {
+                plain_stream_body(None, false)
+            };
+            let body = post_stream(app, payload).await;
+            assert_finish_not_on_reasoning(&body, "stop");
+            let events = sse_events(&body);
+            assert_eq!(streamed_reasoning(&events), "a b", "{body}");
+            // one per part, the last on the final chunk
+            assert_eq!(frame_tokens(&events), 2, "{body}");
+        }
     }
 
     #[tokio::test]
