@@ -1447,8 +1447,12 @@ pub fn check_pointer_refs_only(
                 }
             }
             match llama_rule_name_collision(schema) {
-                Some(why) => Err(format!(
+                Some(LlamaNamesVerdict::Collision(why)) => Err(format!(
                     "{FIELD}: {why} (this server's engine, {engine}, would give both one shape)"
+                )),
+                Some(LlamaNamesVerdict::TooComplex) => Err(format!(
+                    "{FIELD} is too complex to check against how this server's engine \
+                     ({engine}) names its grammar rules"
                 )),
                 None => Ok(()),
             }
@@ -1534,9 +1538,39 @@ struct LlamaNames<'a> {
     doc: &'a Value,
     rules: HashMap<String, LlamaRuleOwner>,
     resolving: HashSet<String>,
-    collision: Option<String>,
+    verdict: Option<LlamaNamesVerdict>,
     depth: usize,
+    /// Visits so far, against [`LLAMA_NAMES_BUDGET`].
+    work: usize,
+    /// (schema, its type when a type list picked one, its name) already
+    /// visited: a second visit makes the same rules, which the converter
+    /// keeps under the same names.
+    visited: HashSet<(*const Value, *const Value, String)>,
 }
+
+/// Why [`llama_rule_name_collision`] refuses a schema.
+enum LlamaNamesVerdict {
+    Collision(String),
+    /// Over [`LLAMA_NAMES_BUDGET`] or [`LLAMA_NAMES_MAX_DEPTH`]: refused
+    /// without an answer. Conservative: llama-server could build it, but
+    /// its converter's own walk is as long (a type list visits a schema
+    /// once per type, so nested ones multiply).
+    TooComplex,
+}
+
+/// Visits the walk may make. Without a type list, a schema visits each of
+/// its schemas about once, and the smallest property (`"a":{}`, 7 bytes)
+/// keeps a 64 KiB schema under 10 000; the differential corpus and the
+/// browser-use and pydantic schemas take at most a few dozen. At this many
+/// the walk answers in tens of milliseconds.
+const LLAMA_NAMES_BUDGET: usize = 20_000;
+
+/// Nested visits the walk may make (it recurses, on a server worker
+/// thread): the converter walk the API already bounds nests at most
+/// [`MAX_SCHEMA_DEPTH`] levels through refs. At this depth the walk needs
+/// well under 256 KiB of stack optimized (under 1 MiB unoptimized), against
+/// a worker thread's 2 MiB.
+const LLAMA_NAMES_MAX_DEPTH: usize = 2 * MAX_SCHEMA_DEPTH;
 
 impl LlamaNames<'_> {
     fn join(name: &str, part: &str) -> String {
@@ -1573,18 +1607,18 @@ impl LlamaNames<'_> {
                 (owner, target),
                 (LlamaRuleOwner::Target(p, _), Some(t)) if std::ptr::eq(*p, t)
             );
-            if !same_target && self.collision.is_none() {
+            if !same_target && self.verdict.is_none() {
                 let other = match owner {
                     LlamaRuleOwner::Target(_, other) => {
                         format!("$ref {}", Value::String(other.chars().take(80).collect()))
                     }
                     LlamaRuleOwner::Path(p) => format!("the schema llama.cpp names {p}"),
                 };
-                self.collision = Some(format!(
+                self.verdict = Some(LlamaNamesVerdict::Collision(format!(
                     "$ref {} and {other} name the same grammar rule ({n}) on llama-server, \
                      which keeps only the first one's shape; rename one of them",
                     Value::String(r.chars().take(80).collect())
-                ));
+                )));
             }
             return;
         }
@@ -1592,25 +1626,50 @@ impl LlamaNames<'_> {
             return;
         }
         if let Some(t) = target {
-            self.visit(t, &n, Some(LlamaRuleOwner::Target(t, r.to_owned())));
+            self.visit(t, None, &n, Some(LlamaRuleOwner::Target(t, r.to_owned())));
         }
         self.resolving.remove(r);
     }
 
     /// `visit`, for the rule names it creates. `owner` is set for a ref's
     /// target, whose rule is the ref's.
-    fn visit(&mut self, schema: &Value, name: &str, owner: Option<LlamaRuleOwner>) {
+    /// `ty`: the one type a type list picked for this visit (the
+    /// converter visits a copy of the schema with `type` set to it).
+    fn visit(
+        &mut self,
+        schema: &Value,
+        ty: Option<&Value>,
+        name: &str,
+        owner: Option<LlamaRuleOwner>,
+    ) {
+        if self.verdict.is_some() {
+            return;
+        }
+        let key = (
+            std::ptr::from_ref(schema),
+            ty.map_or(std::ptr::null(), std::ptr::from_ref),
+            name.to_owned(),
+        );
+        if !self.visited.insert(key) {
+            return;
+        }
+        self.work += 1;
+        if self.work > LLAMA_NAMES_BUDGET || self.depth >= LLAMA_NAMES_MAX_DEPTH {
+            self.verdict = Some(LlamaNamesVerdict::TooComplex);
+            return;
+        }
         self.depth += 1;
-        if self.depth > 4096 && self.collision.is_none() {
-            self.collision = Some("$ref chain too deep to check its grammar rule names".into());
-        }
-        if self.collision.is_none() {
-            self.visit_inner(schema, name, owner);
-        }
+        self.visit_inner(schema, ty, name, owner);
         self.depth -= 1;
     }
 
-    fn visit_inner(&mut self, schema: &Value, name: &str, owner: Option<LlamaRuleOwner>) {
+    fn visit_inner(
+        &mut self,
+        schema: &Value,
+        ty_override: Option<&Value>,
+        name: &str,
+        owner: Option<LlamaRuleOwner>,
+    ) {
         let Value::Object(o) = schema else {
             return;
         };
@@ -1622,7 +1681,7 @@ impl LlamaNames<'_> {
             name.to_owned()
         };
         let own = owner.unwrap_or_else(|| LlamaRuleOwner::Path(rule_name.clone()));
-        let ty = o.get("type");
+        let ty = ty_override.or_else(|| o.get("type"));
         let t = ty.and_then(Value::as_str);
         let ty_is = |x: &str| ty.is_none() || t == Some(x);
         let has = |k: &str| o.contains_key(k);
@@ -1640,16 +1699,14 @@ impl LlamaNames<'_> {
         }
         if let Some(Value::Array(alts)) = o.get("oneOf").or_else(|| o.get("anyOf")) {
             for (i, alt) in alts.iter().enumerate() {
-                self.visit(alt, &alt_name(i), None);
+                self.visit(alt, None, &alt_name(i), None);
             }
             self.add_rule(&rule_name, own);
             return;
         }
         if let Some(Value::Array(types)) = ty {
             for (i, each) in types.iter().enumerate() {
-                let mut copy = schema.clone();
-                copy["type"] = each.clone();
-                self.visit(&copy, &alt_name(i), None);
+                self.visit(schema, Some(each), &alt_name(i), None);
             }
             self.add_rule(&rule_name, own);
             return;
@@ -1712,10 +1769,10 @@ impl LlamaNames<'_> {
             match o.get("items").or_else(|| o.get("prefixItems")) {
                 Some(Value::Array(items)) => {
                     for (i, item) in items.iter().enumerate() {
-                        self.visit(item, &Self::join(name, &format!("tuple-{i}")), None);
+                        self.visit(item, None, &Self::join(name, &format!("tuple-{i}")), None);
                     }
                 }
-                Some(item) => self.visit(item, &Self::join(name, "item"), None),
+                Some(item) => self.visit(item, None, &Self::join(name, "item"), None),
                 None => {}
             }
             self.add_rule(&rule_name, own);
@@ -1756,7 +1813,7 @@ impl LlamaNames<'_> {
         let mut optional: Vec<String> = Vec::new();
         for (k, v) in props {
             let n = Self::join(name, k);
-            self.visit(v, &n, None);
+            self.visit(v, None, &n, None);
             let kv = format!("{n}-kv");
             self.add_rule(&kv, LlamaRuleOwner::Path(kv.clone()));
             if !required.contains(k.as_str()) {
@@ -1766,7 +1823,7 @@ impl LlamaNames<'_> {
         if let Some(ap) = additional.filter(|a| a.is_object() || **a == Value::Bool(true)) {
             let sub = Self::join(name, "additional");
             if ap.is_object() {
-                self.visit(ap, &format!("{sub}-value"), None);
+                self.visit(ap, None, &format!("{sub}-value"), None);
             }
             if !props.is_empty() {
                 let k = format!("{sub}-k");
@@ -1810,16 +1867,26 @@ fn required_names(o: &Map<String, Value>) -> HashSet<&str> {
 /// `allOf` merging, tuple, item and alternative names); a schema it
 /// inlines as a built-in primitive names no rule.
 /// `scripts/llama-ref-differential/` checks it against the converter.
-fn llama_rule_name_collision(schema: &Value) -> Option<String> {
+fn llama_rule_name_collision(schema: &Value) -> Option<LlamaNamesVerdict> {
     let mut names = LlamaNames {
         doc: schema,
         rules: HashMap::new(),
         resolving: HashSet::new(),
-        collision: None,
+        verdict: None,
         depth: 0,
+        work: 0,
+        visited: HashSet::new(),
     };
-    names.visit(schema, "", None);
-    names.collision
+    names.visit(schema, None, "", None);
+    #[cfg(test)]
+    LLAMA_NAMES_WORK.with(|w| w.set(names.work));
+    names.verdict
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Visits the last [`llama_rule_name_collision`] on this thread made.
+    static LLAMA_NAMES_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The 400 for a `$ref` `engine` would leave unconstrained.
@@ -2902,6 +2969,109 @@ fn has_constrained_siblings(obj: &Map<String, Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The llama-server rule-name walk on a schema built to blow it up: a
+    /// two-type list at every level (the converter visits each level once
+    /// per type, 2^30 visits here), and 30 `$defs` each merging the previous
+    /// one twice. Each answers at once with a refusal or a pass.
+    #[test]
+    fn the_llama_rule_name_walk_is_bounded() {
+        let mut nested = json!({"type": "string"});
+        for _ in 0..30 {
+            nested = json!({"type": ["object", "object"], "properties": {"a": nested, "b": {"type": "integer", "minimum": 0}}});
+        }
+        let mut defs = serde_json::Map::new();
+        defs.insert("d0".into(), json!({"type": ["object", "null"], "properties": {"a": {"type": ["object", "null"], "properties": {"z": {"type": "string", "minLength": 1}}}}}));
+        for i in 1..30 {
+            let prev = format!("#/$defs/d{}", i - 1);
+            defs.insert(
+                format!("d{i}"),
+                json!({"type": ["object", "null"], "allOf": [{"$ref": prev}, {"$ref": prev}], "properties": {"p": {"type": ["object", "null"], "allOf": [{"$ref": prev}]}}}),
+            );
+        }
+        let doubling =
+            json!({"$defs": defs, "type": "object", "properties": {"x": {"$ref": "#/$defs/d29"}}});
+        for schema in [nested, doubling] {
+            let text = schema.to_string();
+            assert!(text.len() < MAX_SCHEMA_BYTES, "{}", text.len());
+            let start = std::time::Instant::now();
+            let verdict = check_pointer_refs_only(
+                &text,
+                &schema,
+                "sycl-llama",
+                crate::RefResolver::LlamaServer,
+            );
+            let took = start.elapsed();
+            eprintln!("llama rule-name walk on an adversarial schema: {took:?}");
+            // Under 100 ms as served (release); an unoptimized test build
+            // is about ten times slower.
+            let bound = if cfg!(debug_assertions) { 2000 } else { 100 };
+            assert!(took < std::time::Duration::from_millis(bound), "{took:?}");
+            if let Err(e) = verdict {
+                assert!(e.starts_with(FIELD) && e.contains("too complex"), "{e}");
+            }
+        }
+    }
+
+    /// Real schemas use a small part of [`LLAMA_NAMES_BUDGET`]: browser-use's
+    /// and pydantic's, and every schema of the llama.cpp differential.
+    #[test]
+    fn real_schemas_fit_the_llama_rule_name_walk_budget() {
+        let mut most = 0;
+        let fixture = include_str!("../tests/fixtures/llama_ref_differential.jsonl");
+        let entries = fixture
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["schema"].clone());
+        let real = [
+            include_str!("../../cascadia-engine-mock/tests/fixtures/browser_use_schema.json"),
+            include_str!("../../cascadia-engine-mock/tests/fixtures/pydantic_output_schema.json"),
+        ]
+        .map(|t| serde_json::from_str::<Value>(t).unwrap());
+        for schema in real.into_iter().chain(entries) {
+            let _ = llama_rule_name_collision(&schema);
+            let work = LLAMA_NAMES_WORK.with(std::cell::Cell::get);
+            most = most.max(work);
+        }
+        eprintln!("most llama rule-name walk visits for a real schema: {most}");
+        assert!(most * 10 < LLAMA_NAMES_BUDGET, "{most}");
+        // The widest flat schema under the size cap passes too.
+        let props: serde_json::Map<String, Value> =
+            (0..7000).map(|i| (format!("p{i}"), json!({}))).collect();
+        let wide = json!({"type": "object", "properties": props});
+        assert!(wide.to_string().len() <= MAX_SCHEMA_BYTES + 16_000);
+        assert!(llama_rule_name_collision(&wide).is_none());
+        let work = LLAMA_NAMES_WORK.with(std::cell::Cell::get);
+        eprintln!("visits for 7000 properties: {work}");
+    }
+
+    /// A long `$ref` chain is refused before the walk's recursion can run a
+    /// small stack out (the check runs on a server worker thread).
+    #[test]
+    fn a_long_ref_chain_does_not_overflow_the_llama_rule_name_walk() {
+        let mut defs = serde_json::Map::new();
+        for i in 0..3000 {
+            defs.insert(
+                format!("d{i}"),
+                json!({"type": "object", "properties": {"x": {"$ref": format!("#/$defs/d{}", i + 1)}}}),
+            );
+        }
+        defs.insert("d3000".into(), json!({"type": "string"}));
+        let schema =
+            json!({"$defs": defs, "type": "object", "properties": {"r": {"$ref": "#/$defs/d0"}}});
+        let verdict = std::thread::Builder::new()
+            // Server worker threads have 2 MiB; the walk at its depth cap
+            // needs well under 256 KiB optimized, under 1 MiB unoptimized.
+            .stack_size(if cfg!(debug_assertions) { 1024 } else { 256 } * 1024)
+            .spawn(move || {
+                check_pointer_refs_only("", &schema, "sycl-llama", crate::RefResolver::LlamaServer)
+            })
+            .unwrap()
+            .join()
+            .expect("no stack overflow");
+        let e = verdict.expect_err("too deep");
+        assert!(e.contains("too complex"), "{e}");
+    }
     use cascadia_types::GrammarKind;
     use serde_json::json;
 
@@ -3673,7 +3843,9 @@ mod tests {
         let text = alias_chain(100_000).to_string();
         // Run on a small stack: the walk must not recurse per link.
         let result = std::thread::Builder::new()
-            .stack_size(256 * 1024)
+            // Server worker threads have 2 MiB; the walk at its depth cap
+            // needs well under 256 KiB optimized, under 1 MiB unoptimized.
+            .stack_size(if cfg!(debug_assertions) { 1024 } else { 256 } * 1024)
             .spawn(move || {
                 let root = Node::parse(serde_json::from_str(&text).unwrap()).unwrap();
                 check_converter_depth(&root)
