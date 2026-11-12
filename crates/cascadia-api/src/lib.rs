@@ -1696,7 +1696,13 @@ fn render_with_chat_env_kwargs(
             if let Some(name) = &m.name {
                 obj["name"] = serde_json::json!(name);
             }
-            if let Some(r) = &m.reasoning_content {
+            // Replayed reasoning on assistant turns only, as `chat_turns`
+            // forwards it to an engine's own template.
+            if let Some(r) = m
+                .reasoning_content
+                .as_ref()
+                .filter(|_| m.role == "assistant")
+            {
                 obj["reasoning_content"] = serde_json::json!(r);
             }
             Value::from_serialize(obj)
@@ -6476,6 +6482,24 @@ mod tests {
         let plain = render_test_template(QWEN3_TEMPLATE, &[msg("user", "q")]);
         let with = render_test_template(QWEN3_TEMPLATE, &[msg_with_reasoning("user", "q", "r")]);
         assert_eq!(plain, with);
+    }
+
+    /// Replayed reasoning reaches the template on assistant turns only, as
+    /// it reaches an engine's own template (`chat_turns`).
+    #[test]
+    fn template_sees_replayed_reasoning_on_assistant_turns_only() {
+        let t = "{% for m in messages %}{{ m.role }}={% if m.reasoning_content is defined %}\
+                 {{ m.reasoning_content }}{% else %}-{% endif %};{% endfor %}";
+        let out = render_test_template(
+            t,
+            &[
+                msg_with_reasoning("system", "s", "rs"),
+                msg_with_reasoning("user", "q", "ru"),
+                msg_with_reasoning("assistant", "a", "ra"),
+                msg_with_reasoning("tool", "t", "rt"),
+            ],
+        );
+        assert_eq!(out, "system=-;user=-;assistant=ra;tool=-;");
     }
 
     #[tokio::test]
