@@ -155,6 +155,13 @@ pub struct GenerationTask {
     /// `decision_unsupported:`-prefixed error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<crate::DecisionReadout>,
+    /// Return reasoning as text. An engine that receives the model's
+    /// reasoning on a separate channel (llama-server's
+    /// `delta.reasoning_content`) streams it as text framed by the model's
+    /// `<think>` / `</think>` markers instead of dropping it, so the API can
+    /// split it from the answer. Off the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_as_text: bool,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -232,6 +239,7 @@ impl GenerationTask {
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
             decision: None,
+            reasoning_as_text: false,
         }
     }
 
@@ -279,6 +287,7 @@ mod tests {
             tenant: String::new(),
             resume_token_ids: None,
             decision: None,
+            reasoning_as_text: false,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();
@@ -314,6 +323,26 @@ mod tests {
         });
         let back: GenerationTask = serde_json::from_value(payload).unwrap();
         assert_eq!(back.resume_token_ids, Some(vec![7, 8]));
+    }
+
+    /// `reasoning_as_text` is off the wire when false and defaults to false
+    /// on a payload that lacks it, so older peers see the same bytes.
+    #[test]
+    fn reasoning_as_text_is_off_the_wire_when_false() {
+        let t = GenerationTask::new("t1", "hello");
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json.get("reasoning_as_text").is_none(), "{json}");
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert!(!back.reasoning_as_text);
+
+        let t = GenerationTask {
+            reasoning_as_text: true,
+            ..GenerationTask::new("t1", "hello")
+        };
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["reasoning_as_text"], true);
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert!(back.reasoning_as_text);
     }
 
     #[test]

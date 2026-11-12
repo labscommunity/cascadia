@@ -3053,6 +3053,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             tenant: String::new(), // H.1b: single-tenant CLI path — LOCAL_NS
             resume_token_ids: None,
             decision: None,
+            reasoning_as_text: false,
         };
         // `generate_async`, not `generate`: this loop runs on the tokio
         // runtime, and the sync path would block a worker on the engine
