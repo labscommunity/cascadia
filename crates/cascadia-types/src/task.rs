@@ -155,6 +155,12 @@ pub struct GenerationTask {
     /// split it from the answer. Off the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reasoning_as_text: bool,
+    /// The caller's `chat_template_kwargs.preserve_thinking`, for an engine
+    /// that renders the chat template itself (llama-server's
+    /// `chat_template_kwargs`). Templates such as Qwen3.6's keep replayed
+    /// reasoning on earlier turns when it is set. Off the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_thinking: Option<bool>,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -232,6 +238,7 @@ impl GenerationTask {
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
             reasoning_as_text: false,
+            preserve_thinking: None,
         }
     }
 
@@ -262,6 +269,23 @@ impl GenerationTask {
 mod tests {
     use super::*;
 
+    /// `preserve_thinking` is off the wire when unset and round-trips when
+    /// set.
+    #[test]
+    fn preserve_thinking_is_off_the_wire_when_unset() {
+        let t = GenerationTask::new("t1", "hello");
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json.get("preserve_thinking").is_none(), "{json}");
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert_eq!(back.preserve_thinking, None);
+        let mut t = GenerationTask::new("t1", "hello");
+        t.preserve_thinking = Some(true);
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["preserve_thinking"], true);
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert_eq!(back.preserve_thinking, Some(true));
+    }
+
     #[test]
     fn resume_token_ids_defaults_none_and_is_additive() {
         let t = GenerationTask {
@@ -279,6 +303,7 @@ mod tests {
             tenant: String::new(),
             resume_token_ids: None,
             reasoning_as_text: false,
+            preserve_thinking: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();

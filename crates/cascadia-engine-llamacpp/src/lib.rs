@@ -1235,6 +1235,11 @@ impl LlamaCppEngine {
                 // others ignore the unused kwarg).
                 "chat_template_kwargs": {"enable_thinking": task.enable_thinking},
             });
+            // The caller's own choice, only when sent: Qwen3.6-style
+            // templates keep replayed reasoning on earlier turns with it.
+            if let Some(preserve) = task.preserve_thinking {
+                body["chat_template_kwargs"]["preserve_thinking"] = serde_json::json!(preserve);
+            }
             if let Some(tools) = &task.tools {
                 body["tools"] = tools.clone();
             }
@@ -3138,6 +3143,40 @@ mod unix_tests {
         engine.submit(task).unwrap();
         assert!(drain(&mut engine).last().unwrap().1.is_final);
         server.join().unwrap();
+    }
+
+    /// `preserve_thinking` reaches llama-server's `chat_template_kwargs`
+    /// when the caller set it, and is left out otherwise.
+    #[test]
+    fn engine_forwards_preserve_thinking_in_chat_template_kwargs() {
+        for preserve in [Some(true), Some(false), None] {
+            let (port, server) = mock_server(move |req, s| {
+                let req = String::from_utf8_lossy(req);
+                let body: serde_json::Value =
+                    serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                let kwargs = &body["chat_template_kwargs"];
+                assert_eq!(kwargs["enable_thinking"], false, "{body}");
+                match preserve {
+                    Some(p) => assert_eq!(kwargs["preserve_thinking"], p, "{body}"),
+                    None => assert!(kwargs.get("preserve_thinking").is_none(), "{body}"),
+                }
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                s.write_all(head.as_bytes()).unwrap();
+                for p in [
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+                    "data: [DONE]\n",
+                ] {
+                    s.write_all(chunked(p).as_bytes()).unwrap();
+                }
+                s.write_all(b"0\r\n\r\n").unwrap();
+            });
+            let mut task = chat_task();
+            task.preserve_thinking = preserve;
+            let mut engine = test_engine(port);
+            engine.submit(task).unwrap();
+            assert!(drain(&mut engine).last().unwrap().1.is_final);
+            server.join().unwrap();
+        }
     }
 
     #[test]

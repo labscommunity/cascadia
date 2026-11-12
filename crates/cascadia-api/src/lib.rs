@@ -838,8 +838,8 @@ pub struct ChatCompletionRequest {
     /// `enable_thinking` and the `reasoning_effort: "none"` off-switch — see
     /// [`ChatCompletionRequest::effective_enable_thinking`] for the full
     /// precedence chain. The map is free-form in the ecosystem; members other
-    /// than `enable_thinking` are accepted and ignored, never forwarded to
-    /// the template.
+    /// than `enable_thinking` and `preserve_thinking` are accepted and
+    /// ignored, never forwarded to the template.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// The `reasoning` object other vendors' clients send (OpenRouter shape):
@@ -861,15 +861,26 @@ pub struct ChatCompletionRequest {
 }
 
 /// `chat_template_kwargs` as sent by vLLM/SGLang-shaped clients. Only
-/// `enable_thinking` is consumed; unknown members deserialize to nothing and
-/// are silently dropped rather than erroring.
+/// `enable_thinking` and `preserve_thinking` are consumed; unknown members
+/// deserialize to nothing and are silently dropped rather than erroring.
 #[derive(Deserialize, Debug, Default)]
 pub struct ChatTemplateKwargs {
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Passed to the template as `preserve_thinking` when sent (Qwen3.6's
+    /// template keeps replayed reasoning on earlier turns when it is set).
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
 }
 
 impl ChatCompletionRequest {
+    /// `chat_template_kwargs.preserve_thinking`, when sent.
+    fn preserve_thinking(&self) -> Option<bool> {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.preserve_thinking)
+    }
+
     /// Build the engine-facing `SamplingParams`, applying OpenAI defaults
     /// (top_p=1.0, penalties=0.0) when a field is omitted.
     fn sampling_params(&self) -> cascadia_types::SamplingParams {
@@ -1624,6 +1635,31 @@ fn render_with_chat_env(
     reasoning_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
+    render_with_chat_env_kwargs(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        reasoning_effort,
+        None,
+        tools,
+    )
+}
+
+/// [`render_with_chat_env`] with the caller's `preserve_thinking`, which the
+/// template sees only when set.
+#[allow(clippy::too_many_arguments)]
+fn render_with_chat_env_kwargs(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
+    preserve_thinking: Option<bool>,
+    tools: Option<&[Tool]>,
+) -> Result<String, PromptRenderError> {
     use minijinja::context;
     use minijinja::value::Value;
     let tmpl = env
@@ -1682,6 +1718,11 @@ fn render_with_chat_env(
     // undefined to 'max'; Qwen3.8 to 'xhigh').
     let ctx = match reasoning_effort {
         Some(effort) => context! { reasoning_effort => effort, ..ctx },
+        None => ctx,
+    };
+    // Likewise only when sent, so the template's own default applies.
+    let ctx = match preserve_thinking {
+        Some(preserve) => context! { preserve_thinking => preserve, ..ctx },
         None => ctx,
     };
     tmpl.render(ctx).map_err(|e| classify_render_error(&e))
@@ -1760,6 +1801,10 @@ pub struct EffortArgs<'a> {
     /// The template distinguishes the OpenAI words (see
     /// [`template_speaks_effort_words`]).
     pub template_words: bool,
+    /// The caller's `chat_template_kwargs.preserve_thinking`, rendered as the
+    /// template's `preserve_thinking` when set. Rides with the effort, the
+    /// other per-request template input.
+    pub preserve_thinking: Option<bool>,
 }
 
 /// Does `env` treat OpenAI's `reasoning_effort` words as distinct levels?
@@ -1913,6 +1958,7 @@ fn render_or_fallback(
         raw,
         explicit_thinking,
         template_words,
+        preserve_thinking,
     } = effort;
     fn push<'a>(order: &mut Vec<Option<&'a str>>, w: Option<&'a str>) {
         if !order.contains(&w) {
@@ -1939,13 +1985,14 @@ fn render_or_fallback(
     let callers = raw.filter(|r| Some(*r) != mapped);
     let mut first = Err(PromptRenderError::Failed("no render attempted".into()));
     for (i, candidate) in order.iter().enumerate() {
-        first = render_with_chat_env(
+        first = render_with_chat_env_kwargs(
             env,
             messages,
             bos_token,
             eos_token,
             enable_thinking,
             *candidate,
+            preserve_thinking,
             tools,
         );
         if !rejects_effort(&first) {
@@ -2670,6 +2717,7 @@ async fn chat_completions(
             raw: req.requested_effort(),
             explicit_thinking: req.thinking_switch().is_some(),
             template_words: state.effort_words,
+            preserve_thinking: req.preserve_thinking(),
         },
         req.tools.as_deref(),
     ) {
@@ -2788,6 +2836,9 @@ async fn chat_completions(
         // returns it as `<think>…</think>` text for the reasoning split (or,
         // under `--reasoning-format none`, for the client to read in content).
         reasoning_as_text: enable_thinking && state.engine_applies_template,
+        // For an engine that renders the template itself (llama-server's
+        // `chat_template_kwargs`).
+        preserve_thinking: req.preserve_thinking(),
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -3059,6 +3110,7 @@ async fn completions(
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
         reasoning_as_text: false,
+        preserve_thinking: None,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
@@ -6846,6 +6898,7 @@ level={{ effort_map[eff] }}";
                 raw,
                 explicit_thinking: explicit,
                 template_words: true,
+                ..Default::default()
             };
             render_or_fallback(Some(&env), &msgs, "", "", thinking, effort, None)
         };
@@ -7020,6 +7073,41 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// `chat_template_kwargs.preserve_thinking` rides the task to an engine
+    /// that renders the template itself.
+    #[tokio::test]
+    async fn chat_task_carries_preserve_thinking() {
+        for (kwargs, want) in [
+            (serde_json::json!({"preserve_thinking": true}), Some(true)),
+            (serde_json::json!({"preserve_thinking": false}), Some(false)),
+            (serde_json::json!({"other": 1}), None),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                engine_applies_template: true,
+                ..Config::default()
+            };
+            let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+            let (status, body) = post_chat(
+                app,
+                serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                       "chat_template_kwargs": kwargs}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].preserve_thinking, want, "{kwargs}");
+        }
+    }
+
     /// GLM-5's template never rejects: anything but the literal "high" is
     /// Max. The probe must classify it as NOT word-speaking so the mapping
     /// keeps "low"/"none"/"medium" at High (the regression the review caught).
@@ -7041,6 +7129,7 @@ level={{ effort_map[eff] }}";
                 raw,
                 explicit_thinking: false,
                 template_words: false,
+                ..Default::default()
             };
             assert_eq!(
                 render_or_fallback(Some(&env), &msgs, "", "", true, effort, None).unwrap(),
@@ -8499,6 +8588,56 @@ level={{ effort_map[eff] }}";
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// `chat_template_kwargs.preserve_thinking` reaches the template as
+    /// `preserve_thinking` when sent, stays undefined otherwise, and reaches
+    /// the engine's task.
+    #[tokio::test]
+    async fn chat_template_kwargs_preserve_thinking_reaches_the_template() {
+        for (kwargs, want) in [
+            (serde_json::json!({"preserve_thinking": true}), "|true|true"),
+            (
+                serde_json::json!({"preserve_thinking": false}),
+                "|false|true",
+            ),
+            (serde_json::json!({}), "|undefined|false"),
+        ] {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some(
+                        "{% for m in messages %}{{ m.content }}{% endfor %}\
+                         |{% if preserve_thinking is defined %}{{ preserve_thinking }}\
+                         {% else %}undefined{% endif %}|{{ preserve_thinking is defined }}"
+                            .into(),
+                    ),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            };
+            let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+            let (status, body) = post_chat(
+                app,
+                serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                       "enable_thinking": false, "chat_template_kwargs": kwargs}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+            assert!(
+                content.trim_end().ends_with(want),
+                "{content:?} for {kwargs}"
+            );
+        }
     }
 
     #[tokio::test]
