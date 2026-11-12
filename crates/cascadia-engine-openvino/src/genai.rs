@@ -1110,7 +1110,8 @@ const REBUILD_DRAIN_CAP: Duration = Duration::from_secs(15);
 /// What a client of a refused new schema learns about the rebuild that
 /// clears the budget.
 enum RebuildNote {
-    /// The pipeline was rebuilt during this request: a retry is admitted.
+    /// The pipeline was rebuilt during this request, and the schemas still
+    /// queued filled the new budget at once.
     Rebuilt,
     /// The CB engine rebuilds once the requests in flight finish.
     AfterDrain,
@@ -1123,10 +1124,10 @@ enum RebuildNote {
 /// refusal by that prefix.
 fn budget_full_error(note: RebuildNote) -> EngineError {
     let next = match note {
-        RebuildNote::Rebuilt => {
-            "the worker has just rebuilt its pipeline to clear the limit; retry the request"
-                .to_owned()
-        }
+        RebuildNote::Rebuilt => "the worker has just rebuilt its pipeline to clear the limit, \
+             and the requests waiting their turn filled it again; retry the request once they \
+             finish"
+            .to_owned(),
         RebuildNote::AfterDrain => format!(
             "the worker rebuilds its pipeline to clear the limit once the requests in flight \
              finish (within {} s); retry the request after that",
@@ -1393,7 +1394,17 @@ impl Engine for OvGenaiEngine {
             self.pipe.validate_json_schema(s)
         })?;
         if self.schema_budget.check(&task).is_err() {
-            return Err(self.budget_full());
+            if let Some(err) = self.budget_full() {
+                return Err(err);
+            }
+            // Rebuilt: admitted on the new pipeline, whose check and budget
+            // (which counts the schemas still queued) it must pass too.
+            check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
+                self.pipe.validate_json_schema(s)
+            })?;
+            if self.schema_budget.check(&task).is_err() {
+                return Err(budget_full_error(RebuildNote::Rebuilt));
+            }
         }
         self.schema_budget.record(&task);
         self.pending.push(task);
@@ -1875,7 +1886,17 @@ impl Engine for OvGenaiCbEngine {
             self.pipe.validate_json_schema(s)
         })?;
         if self.schema_budget.check(&task).is_err() {
-            return Err(self.budget_full());
+            if let Some(err) = self.budget_full() {
+                return Err(err);
+            }
+            // Rebuilt: admitted on the new pipeline, whose check and budget
+            // (which counts the schemas still queued) it must pass too.
+            check_grammar(&task, self.structured_unavailable.as_deref(), |s| {
+                self.pipe.validate_json_schema(s)
+            })?;
+            if self.schema_budget.check(&task).is_err() {
+                return Err(budget_full_error(RebuildNote::Rebuilt));
+            }
         }
         let max_tokens = if task.max_tokens > 0 {
             task.max_tokens
@@ -2235,23 +2256,21 @@ impl Engine for OvGenaiCbEngine {
 }
 
 impl OvGenaiCbEngine {
-    /// The refusal of a new schema on a full budget. Past the rebuild floor
-    /// the pipeline is rebuilt: at once when nothing is in flight, else
-    /// after a drain (see [`REBUILD_DRAIN_CAP`]). The request still gets the
-    /// 400; a failed rebuild answers it with the failure instead.
-    fn budget_full(&mut self) -> EngineError {
+    /// A new schema on a full budget. Past the rebuild floor the pipeline
+    /// is rebuilt: at once when nothing is in flight (`None`: the caller
+    /// admits the request on the new pipeline if its check and budget
+    /// allow), else after a drain (see [`REBUILD_DRAIN_CAP`]), and the
+    /// request gets the 400. A failed rebuild answers it with the failure.
+    fn budget_full(&mut self) -> Option<EngineError> {
         if let Some(wait) = self.rebuild.wait() {
-            return budget_full_error(RebuildNote::Wait {
+            return Some(budget_full_error(RebuildNote::Wait {
                 wait,
                 floor: self.rebuild.floor,
-            });
+            }));
         }
         if self.active.is_empty() {
             self.rebuild_pipeline();
-            return self
-                .rebuild
-                .refusal()
-                .unwrap_or_else(|| budget_full_error(RebuildNote::Rebuilt));
+            return self.rebuild.refusal();
         }
         self.rebuild.draining_since = Some(self.rebuild.clock.now());
         warn!(
@@ -2260,7 +2279,7 @@ impl OvGenaiCbEngine {
             "ov-genai cb: the response_format schema budget is full; admitting nothing until \
              the requests in flight finish, then rebuilding the pipeline"
         );
-        budget_full_error(RebuildNote::AfterDrain)
+        Some(budget_full_error(RebuildNote::AfterDrain))
     }
 
     /// Once the drain for a rebuild has run [`REBUILD_DRAIN_CAP`], cut what
@@ -2526,22 +2545,21 @@ fn build_gen_config(
 }
 
 impl OvGenaiEngine {
-    /// The refusal of a new schema on a full budget. Past the rebuild floor
-    /// the pipeline is rebuilt first: nothing is in flight between steps
-    /// (one generation runs per `step()`, the rest wait in `pending`), so
-    /// no answer is cut. The request still gets the 400; a failed rebuild
-    /// answers it with the failure instead.
-    fn budget_full(&mut self) -> EngineError {
+    /// A new schema on a full budget. Past the rebuild floor the pipeline
+    /// is rebuilt (`None`: the caller admits the request on the new
+    /// pipeline if its check and budget allow): nothing is in flight
+    /// between steps (one generation runs per `step()`, the rest wait in
+    /// `pending`), so no answer is cut. A failed rebuild answers the
+    /// request with the failure.
+    fn budget_full(&mut self) -> Option<EngineError> {
         if let Some(wait) = self.rebuild.wait() {
-            return budget_full_error(RebuildNote::Wait {
+            return Some(budget_full_error(RebuildNote::Wait {
                 wait,
                 floor: self.rebuild.floor,
-            });
+            }));
         }
         self.rebuild_pipeline();
-        self.rebuild
-            .refusal()
-            .unwrap_or_else(|| budget_full_error(RebuildNote::Rebuilt))
+        self.rebuild.refusal()
     }
 
     /// Drop the pipeline, build it again from the recipe, start a new
@@ -3455,12 +3473,14 @@ mod tests {
         once every 10 minutes; the next rebuild can start in 600 s, on the first new schema \
         after that";
 
-    /// The 400 for the new schema whose refusal rebuilt an idle pipeline.
+    /// The 400 for a new schema that rebuilt the pipeline and found the
+    /// new budget already filled by the schemas still queued.
     const BUDGET_FULL_REBUILT_400: &str = "structured output is not available for this model: \
         this worker has reached its limit of 64 distinct response_format schemas per pipeline \
         (GenAI keeps each compiled grammar for the pipeline's life); schemas it has already \
-        served keep working, and the worker has just rebuilt its pipeline to clear the limit; \
-        retry the request";
+        served keep working, and the worker has just rebuilt its pipeline to clear the limit, \
+        and the requests waiting their turn filled it again; retry the request once they \
+        finish";
 
     /// The 400 for the new schema whose refusal starts a CB drain.
     const BUDGET_FULL_DRAIN_400: &str = "structured output is not available for this model: \
@@ -4835,7 +4855,7 @@ mod tests {
     }
 
     #[test]
-    fn cb_full_budget_on_an_idle_engine_rebuilds_at_once_and_admits_the_next_new_schema() {
+    fn cb_full_budget_on_an_idle_engine_rebuilds_at_once_and_admits_the_new_schema() {
         let clock = FakeClock::new(Duration::from_secs(30));
         let (mut e, st) = cb_full_budget(&clock);
         let now = Instant::now();
@@ -4844,21 +4864,23 @@ mod tests {
         assert_eq!(e.compiled.len(), MAX_DISTINCT_SCHEMAS);
         let added = st.lock().unwrap().added.len();
 
-        // The new schema that found the budget full is still refused...
-        assert_eq!(
-            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
-            BUDGET_FULL_REBUILT_400
-        );
-        // ...but the pipeline was rebuilt during it: the old one dropped
-        // before the new one was built, and the warmup ran again on it (the
-        // plain request, then the structured-output probe).
+        // The new schema that found the budget full rebuilds the pipeline
+        // and is admitted on the new one: the old one dropped before the new
+        // one was built, and the warmup ran again on it (the plain request,
+        // then the structured-output probe), before the request was added.
+        e.submit(schema_task("new", &full_budget_body(1000)))
+            .unwrap();
         {
             let s = st.lock().unwrap();
             assert_eq!(s.events, vec!["drop", "build"]);
-            assert_eq!(s.added[added..], [u64::MAX, PROBE_REQUEST_ID]);
+            assert_eq!(s.added[added..added + 2], [u64::MAX, PROBE_REQUEST_ID]);
+            assert_eq!(s.added.len(), added + 3);
         }
         assert_eq!(e.rebuild.rebuilds, 1);
-        assert!(e.schema_budget.seen.is_empty());
+        assert_eq!(e.active.len(), 1);
+        // It counts against the new budget.
+        assert_eq!(e.schema_budget.seen.len(), 1);
+        assert!(e.schema_budget.seen.contains(&full_budget_body(1000)));
         assert_eq!(e.schema_budget.refused, 0);
         assert_eq!(
             (e.quarantined.len(), e.strikes.len(), e.compiled.len()),
@@ -4869,8 +4891,8 @@ mod tests {
         // The next new schema is admitted.
         e.submit(schema_task("next", &full_budget_body(1001)))
             .unwrap();
-        assert_eq!(e.active.len(), 1);
-        assert_eq!(e.schema_budget.seen.len(), 1);
+        assert_eq!(e.active.len(), 2);
+        assert_eq!(e.schema_budget.seen.len(), 2);
     }
 
     /// With requests in flight, a full budget makes the CB engine stop
@@ -4980,11 +5002,15 @@ mod tests {
         let jitter = Duration::from_secs(30);
         let clock = FakeClock::new(jitter);
         let (mut e, st) = cb_full_budget(&clock);
-        assert_eq!(
-            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
-            BUDGET_FULL_REBUILT_400
-        );
-        cb_fill_and_finish(&mut e, &st, 2000);
+        e.submit(schema_task("new", &full_budget_body(1000)))
+            .unwrap();
+        // "new" holds one slot of the new budget: fill the rest, and finish.
+        st.lock().unwrap().default_read = Some(finished_read());
+        for i in 2000..2000 + MAX_DISTINCT_SCHEMAS - 1 {
+            e.submit(schema_task(&format!("t{i}"), &full_budget_body(i)))
+                .unwrap();
+        }
+        assert_eq!(e.step().unwrap().len(), MAX_DISTINCT_SCHEMAS);
 
         let wait_400 =
             |secs: u64| BUDGET_FULL_400.replace("start in 600 s", &format!("start in {secs} s"));
@@ -5002,10 +5028,7 @@ mod tests {
         assert_eq!(e.schema_budget.refused, 2);
 
         clock.advance(Duration::from_secs(1));
-        assert_eq!(
-            refusal(e.submit(schema_task("z", &full_budget_body(3002)))),
-            BUDGET_FULL_REBUILT_400
-        );
+        e.submit(schema_task("z", &full_budget_body(3002))).unwrap();
         assert_eq!(e.rebuild.rebuilds, 2);
         assert_eq!(
             st.lock().unwrap().events,
@@ -5065,10 +5088,8 @@ mod tests {
         assert_eq!(e.rebuild.rebuilds, 0);
 
         clock.advance(floor);
-        assert_eq!(
-            refusal(e.submit(schema_task("due", &full_budget_body(1001)))),
-            BUDGET_FULL_REBUILT_400
-        );
+        e.submit(schema_task("due", &full_budget_body(1001)))
+            .unwrap();
         assert_eq!(e.rebuild.rebuilds, 1);
         assert_eq!(e.rebuild.wait(), Some(floor));
     }
@@ -5218,10 +5239,14 @@ mod tests {
                 CbFinish::Stop,
             ))]));
         }
+        // Rebuilt, but the new pipeline's check failed: the request gets
+        // the check's 400.
         assert_eq!(
             refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
-            BUDGET_FULL_REBUILT_400
+            "structured output is not available for this model: the output constraint was \
+             not applied: Hello there!"
         );
+        assert_eq!(e.rebuild.rebuilds, 1);
         assert_eq!(
             e.structured_unavailable.as_deref(),
             Some("the output constraint was not applied: Hello there!")
@@ -5334,6 +5359,27 @@ mod tests {
         (e, st)
     }
 
+    /// A rebuild whose new budget the queued schemas fill at once: the new
+    /// schema that started it gets the 400, and the queue proceeds.
+    #[test]
+    fn stateful_rebuild_whose_queue_fills_the_new_budget_refuses_the_new_schema() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let st = Arc::new(Mutex::new(LlmState::default()));
+        let mut e = stateful_engine_at(&st, &clock);
+        for i in 0..MAX_DISTINCT_SCHEMAS {
+            e.submit(schema_task(&format!("t{i}"), &full_budget_body(i)))
+                .unwrap();
+        }
+        clock.advance(REBUILD_FLOOR + clock.jitter);
+        assert_eq!(
+            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
+            BUDGET_FULL_REBUILT_400
+        );
+        assert_eq!(e.rebuild.rebuilds, 1);
+        assert_eq!(e.pending.len(), MAX_DISTINCT_SCHEMAS);
+        assert_eq!(e.schema_budget.seen.len(), MAX_DISTINCT_SCHEMAS);
+    }
+
     /// The stateful engine runs one generation per step and queues the
     /// rest, so it rebuilds between two answers: nothing is cut, and the
     /// queue carries on on the new pipeline.
@@ -5347,16 +5393,16 @@ mod tests {
         let out = e.step().unwrap();
         assert_eq!(out[0].0, "q1");
 
-        assert_eq!(
-            refusal(e.submit(schema_task("new", &full_budget_body(1000)))),
-            BUDGET_FULL_REBUILT_400
-        );
+        // Rebuilt, and admitted on the new pipeline, behind the queue.
+        e.submit(schema_task("new", &full_budget_body(1000)))
+            .unwrap();
         assert_eq!(e.rebuild.rebuilds, 1);
-        // The schema still queued is counted against the new budget.
-        assert_eq!(e.schema_budget.seen.len(), 1);
+        // The schema still queued and the new one count against the new budget.
+        assert_eq!(e.schema_budget.seen.len(), 2);
         assert!(e.schema_budget.seen.contains(&full_budget_body(5)));
+        assert!(e.schema_budget.seen.contains(&full_budget_body(1000)));
 
-        for want in ["q2", "q3"] {
+        for want in ["q2", "q3", "new"] {
             let out = e.step().unwrap();
             assert_eq!(out[0].0, want);
             assert!(out[0].1.is_final && out[0].1.error.is_none());
@@ -5371,6 +5417,7 @@ mod tests {
                 "p1: Hi",
                 &format!("p1: {PROBE_PROMPT}"),
                 "p1: second",
+                "p1: hello",
                 "p1: hello",
             ]
         );
