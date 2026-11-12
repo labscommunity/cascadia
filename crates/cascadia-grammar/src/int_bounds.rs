@@ -122,7 +122,7 @@ pub(crate) fn clamp_for_llguidance(schema: &mut Value) {
 /// build: a `const` or `enum` number, or a `maximum`/`exclusiveMaximum`, at
 /// or below -2^63 as an f64 (so -9223372036854775807 counts: it rounds to
 /// -2^63). llguidance saturates integer bounds to `i64`, and building a
-/// range whose upper end is `i64::MIN` negates it and recurses until the
+/// range whose ends are both `i64::MIN` negates them and recurses until the
 /// build thread's stack overflows, aborting the process.
 ///
 /// llguidance builds such a number as an integer when it is an integer
@@ -131,9 +131,17 @@ pub(crate) fn clamp_for_llguidance(schema: &mut Value) {
 /// `allOf`, a `$ref` or properties merged from two schemas. That last can
 /// come from anywhere in the document, so a `number` this low (`-1e20`) is
 /// refused only when the document names the `integer` type somewhere; a
-/// `number` schema in a document without one builds as before. Data
-/// keywords (`default`, `examples`) are not read, except where a `$ref`
-/// points into them.
+/// `number` schema in a document without one builds as before.
+///
+/// Every object in the document is read, data keywords (`default`,
+/// `examples`, objects inside `const` and `enum`, unknown keywords)
+/// included, not only the schemas the ref and id resolution says
+/// llguidance builds: a backstop for a way to make llguidance build data as
+/// a schema that the resolution mirror (`refs`) misses. The cost is a false
+/// 400 for a document with an `integer` type (or an `i64` literal this low)
+/// and a data object shaped like such a schema (`{"const": ...}`,
+/// `{"maximum": ...}`), which no real client sends. A bare low number in
+/// data is not read.
 pub(crate) fn has_integer_llguidance_cannot_build(schema: &Value) -> bool {
     let any_integer = names_integer_type(schema);
     let at_or_below_min = |v: &Value| -> bool {
@@ -152,43 +160,29 @@ pub(crate) fn has_integer_llguidance_cannot_build(schema: &Value) -> bool {
         }
         false
     };
-    let scan = |root: &Value| -> bool {
-        let mut stack = vec![(root, false)];
-        while let Some((v, is_name_map)) = stack.pop() {
-            match v {
-                Value::Object(obj) => {
-                    for (k, child) in obj {
-                        if is_name_map {
-                            stack.push((child, false));
-                            continue;
+    let mut stack = vec![schema];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(obj) => {
+                for (k, child) in obj {
+                    let low = match k.as_str() {
+                        "const" | "enum" => at_or_below_min(child),
+                        "maximum" | "exclusiveMaximum" => {
+                            any_integer && child.as_f64().is_some_and(|m| m <= I64_MIN_F64)
                         }
-                        let found = match k.as_str() {
-                            "const" | "enum" => at_or_below_min(child),
-                            "maximum" | "exclusiveMaximum" => {
-                                any_integer && child.as_f64().is_some_and(|m| m <= I64_MIN_F64)
-                            }
-                            "default" | "examples" | "x-guidance" => false,
-                            k => {
-                                stack.push((child, NAME_MAPS.contains(&k) && child.is_object()));
-                                false
-                            }
-                        };
-                        if found {
-                            return true;
-                        }
+                        _ => false,
+                    };
+                    if low {
+                        return true;
                     }
+                    stack.push(child);
                 }
-                Value::Array(items) => stack.extend(items.iter().map(|c| (c, false))),
-                _ => {}
             }
+            Value::Array(items) => stack.extend(items),
+            _ => {}
         }
-        false
-    };
-    scan(schema)
-        || local_ref_pointers(schema)
-            .iter()
-            .filter_map(|p| schema.pointer(p))
-            .any(scan)
+    }
+    false
 }
 
 /// Whether any `type` in `v` is `"integer"` or a list holding it, data
@@ -462,6 +456,11 @@ mod tests {
         // -2^63 + 1024 is the first i64 above -2^63 as an f64.
         assert!(!low(json!({"const": -9223372036854774784i64})));
         assert!(!low(json!({"examples": [i64::MIN], "default": i64::MIN})));
+        // The backstop: an object in data shaped like a low integer schema.
+        assert!(low(json!({"default": {"x": {"const": i64::MIN}}})));
+        assert!(low(
+            json!({"type": "integer", "examples": [{"maximum": -1e20}]})
+        ));
         assert!(!low(
             json!({"properties": {"const": {"type": "integer"}, "maximum": {}}})
         ));

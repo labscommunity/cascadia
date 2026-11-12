@@ -603,7 +603,9 @@ The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
   schema has an `integer` type anywhere (llguidance can intersect it with
   that type through `allOf`, a `$ref` or merged properties); a `number`
   such as `{"type": "number", "const": -1e20}` in a schema with no
-  `integer` builds.
+  `integer` builds. Every object in the schema is checked for this, data
+  (`default`, `examples`) included, so a schema with an `integer` type
+  and a data object such as `{"const": -1e20}` gets this 400 too.
 - Refuse a `$ref` llguidance would resolve somewhere the server's checks
   don't read (a ref with a URI, an anchor `#name`, a ref under a non-root
   `$id`), with the 400 below (`… is not supported`). A `#/...` pointer is
@@ -731,7 +733,10 @@ and a `$id` in any schema below the root (or a draft-4 `id`,
 when the schema names draft 4) gets `` `$id` below the root is not supported
 (it changes what a `$ref` under it refers to) ``: either would make a `$ref`
 resolve against another base URI than the server's checks read. A root
-`$id` is fine, as are properties named `id` or `$id`. A schema whose walk
+`$id` is fine (`https://example.com/s.json`, or one ending in a bare `#`),
+as are properties named `id` or `$id`; a root `$id` with a fragment
+(`#/default/x`, `urn:x#foo`) gets `` `$id` with a fragment is not supported … ``:
+llguidance would build what the fragment points to as the whole schema. A schema whose walk
 would take the converter too long gets `… schema is too complex`.
 
 Errors (`{"error": "<message>"}`; on a stream, after the SSE stream has

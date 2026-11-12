@@ -28,7 +28,10 @@ const DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples", "x-guid
 /// - a `#` ref that is not a JSON pointer (`#name`): an anchor;
 /// - a `$id` below the root, or a draft-4 `id` (when the document names
 ///   draft 4 anywhere): it changes the base URI that every `#/...` ref under
-///   it resolves against.
+///   it resolves against;
+/// - a root `$id` (or draft-4 `id`) with a non-empty fragment: llguidance
+///   looks the root up by it, so `"$id": "#/default/x"` builds `default.x`
+///   as the whole schema.
 ///
 /// `$dynamicRef` and `$recursiveRef` are not resolved at all (llguidance
 /// does not implement them and ignores them), so they are left alone.
@@ -43,16 +46,29 @@ pub fn unfollowable_ref(schema: &Value) -> Option<String> {
     while let Some((v, is_root)) = stack.pop() {
         match v {
             Value::Object(obj) => {
-                if !is_root {
-                    if let Some(key) = id_keys
-                        .iter()
-                        .find(|k| obj.get(**k).is_some_and(Value::is_string))
-                    {
+                if is_root {
+                    // llguidance looks the root up by its id: a fragment
+                    // there (`#/default/x`) makes the value it points to,
+                    // data or not, the schema it builds.
+                    if let Some(key) = id_keys.iter().find(|k| {
+                        obj.get(**k)
+                            .and_then(Value::as_str)
+                            .and_then(|id| id.split_once('#'))
+                            .is_some_and(|(_, fragment)| !fragment.is_empty())
+                    }) {
                         return Some(format!(
-                            "`{key}` below the root is not supported (it changes what \
-                             a `$ref` under it refers to)"
+                            "`{key}` with a fragment is not supported (`#` followed by \
+                             anything changes what the schema is)"
                         ));
                     }
+                } else if let Some(key) = id_keys
+                    .iter()
+                    .find(|k| obj.get(**k).is_some_and(Value::is_string))
+                {
+                    return Some(format!(
+                        "`{key}` below the root is not supported (it changes what \
+                             a `$ref` under it refers to)"
+                    ));
                 }
                 if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
                     let shown = Value::String(r.chars().take(80).collect());
@@ -264,6 +280,8 @@ mod tests {
                 "`$id` below the root",
             ),
             (json!({"not": {"$id": "urn:y"}}), "`$id` below the root"),
+            (json!({"$id": "#/default/x"}), "`$id` with a fragment"),
+            (json!({"$id": "urn:x#foo"}), "`$id` with a fragment"),
             (
                 json!({"$defs": {"a": {"$id": "#foo"}}}),
                 "`$id` below the root",

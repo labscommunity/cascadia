@@ -1652,6 +1652,29 @@ fn a_ref_llguidance_resolves_where_the_guards_do_not_look_is_refused() {
     ] {
         refused_not_aborted(&body, want);
     }
+    // A root `$id` whose fragment is a pointer makes llguidance build the
+    // value it points to as the root, data or not.
+    for (id, schema, data) in [
+        (
+            "#/default/x",
+            "",
+            format!(r#""default":{{"x":{OVERFLOWS}}}"#),
+        ),
+        ("#/examples/0", "", format!(r#""examples":[{OVERFLOWS}]"#)),
+        (
+            "#/properties/a/default",
+            "",
+            format!(r#""properties":{{"a":{{"type":"string","default":{OVERFLOWS}}}}}"#),
+        ),
+        (
+            "#/default/x",
+            r#""$schema":"https://json-schema.org/draft/2019-09/schema","#,
+            format!(r#""default":{{"x":{OVERFLOWS}}}"#),
+        ),
+    ] {
+        let body = format!(r#"{{{schema}"$id":"{id}","type":"object",{data}}}"#);
+        refused_not_aborted(&body, "`$id` with a fragment is not supported");
+    }
     // An anchor is refused too, wherever it sits.
     let gf = single_byte();
     let anchor = r##"{"type":"object","properties":{"n":{"$ref":"#foo"}},"$defs":{"a":{"$anchor":"foo","type":"integer"}}}"##;
@@ -1702,6 +1725,31 @@ fn a_ref_pointer_is_read_the_way_llguidance_decodes_it() {
 }
 
 #[test]
+fn a_low_integer_in_data_no_guard_follows_is_refused() {
+    // The backstop: whatever llguidance resolves a ref or an id to, an
+    // object anywhere in the document that would build an integer range
+    // ending at or below -2^63 is refused, inside data keywords too.
+    let gf = single_byte();
+    for body in [
+        format!(r#"{{"type":"integer","default":{{"x":{OVERFLOWS}}}}}"#),
+        format!(r#"{{"type":"integer","examples":[{{"a":[{OVERFLOWS}]}}]}}"#),
+        format!(r#"{{"type":"integer","x-unknown":{OVERFLOWS}}}"#),
+        format!(r#"{{"type":"integer","enum":[1,{{"k":{OVERFLOWS}}}]}}"#),
+    ] {
+        let err = gf.compile(&spec(&body)).err().expect(&body);
+        assert!(
+            err.to_string().contains(LOW_INTEGER_MESSAGE),
+            "{body}: {err}"
+        );
+    }
+    // A bare low number in data is not a schema: it builds.
+    gf.compile(&spec(
+        r#"{"type":"integer","default":-9223372036854775808}"#,
+    ))
+    .unwrap();
+}
+
+#[test]
 fn refs_real_clients_write_still_build() {
     let gf = single_byte();
     for body in [
@@ -1711,6 +1759,7 @@ fn refs_real_clients_write_still_build() {
         r##"{"type":"object","properties":{"pet":{"$ref":"#/definitions/Pet"}},"required":["pet"],"additionalProperties":false,"definitions":{"Pet":{"type":"object","properties":{"age":{"type":"integer"}},"required":["age"]}},"$schema":"http://json-schema.org/draft-07/schema#"}"##,
         // A root `$id` with `#/...` refs, and a recursive `#` ref.
         r##"{"$id":"https://example.com/owner.json","type":"object","properties":{"pet":{"$ref":"#/$defs/Pet"},"next":{"anyOf":[{"$ref":"#"},{"type":"null"}]}},"required":["pet"],"$defs":{"Pet":{"type":"integer"}}}"##,
+        r##"{"$id":"https://example.com/owner.json#","type":"object","properties":{"pet":{"$ref":"#/$defs/Pet"}},"$defs":{"Pet":{"type":"integer"}}}"##,
         BROWSER_USE_SCHEMA,
         PYDANTIC_OUTPUT_SCHEMA,
     ] {

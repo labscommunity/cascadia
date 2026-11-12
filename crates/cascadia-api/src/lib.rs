@@ -8379,6 +8379,8 @@ level={{ effort_map[eff] }}";
                 "required": ["a"],
                 "default": {"x": {"type": "integer"}},
             }),
+            serde_json::json!({"$id": "#/default/x", "type": "object", "default": {"x": low}}),
+            serde_json::json!({"$id": "#/examples/0", "type": "object", "examples": [low]}),
         ]
     }
 
