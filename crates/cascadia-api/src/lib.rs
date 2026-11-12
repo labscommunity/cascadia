@@ -8915,6 +8915,48 @@ level={{ effort_map[eff] }}";
         );
     }
 
+    /// A template that opened `<think>`, and a model that writes it again:
+    /// the repeated tag is not reasoning text, streamed or not.
+    #[tokio::test]
+    async fn repeated_start_tag_after_a_template_opened_think_is_skipped() {
+        let cfg = || Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% for m in messages %}{{ m.content }}{% endfor %}\
+                     {% if add_generation_prompt %}<think>\n{% endif %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        for parts in [
+            &["<think>\n", "plan", "</think>", "answer"][..],
+            &["<thi", "nk>\n", "plan", "</think>", "answer"][..],
+        ] {
+            let (app, release) = gated_app_with_config(parts, false, cfg()).await;
+            release.store(true, Ordering::SeqCst);
+            let (status, body) = post_chat(
+                app,
+                serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let m = &body["choices"][0]["message"];
+            assert_eq!(m["reasoning_content"], "\nplan", "{parts:?}");
+            assert_eq!(m["content"], "answer", "{parts:?}");
+
+            let (app, release) = gated_app_with_config(parts, false, cfg()).await;
+            release.store(true, Ordering::SeqCst);
+            let body = post_stream(app, plain_stream_body(None, false)).await;
+            let events = sse_events(&body);
+            assert_eq!(streamed_reasoning(&events), "\nplan", "{body}");
+            assert_eq!(streamed_content(&events), "answer", "{body}");
+            assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+        }
+    }
+
     #[tokio::test]
     async fn thinking_on_reply_without_think_has_no_details() {
         for app in [make_app().await, make_app_reasoning_none().await] {
