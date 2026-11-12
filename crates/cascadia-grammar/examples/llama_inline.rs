@@ -22,8 +22,9 @@ fn main() {
             continue;
         }
         let schema: serde_json::Value = serde_json::from_str(&line).expect("a JSON schema");
-        // As the engine: a schema without a `$ref` is sent as written.
-        if !line.contains("$ref") {
+        // As the engine: a schema without a `$ref` (decided on the parsed
+        // value) is sent as written.
+        if !cascadia_grammar::has_ref(&schema) {
             match cascadia_grammar::llama_grammar_cost_error(&schema) {
                 Some(e) => println!("{}", serde_json::json!({"refused": e})),
                 None => println!(r#"{{"inlined":{line},"hoisted":0}}"#),

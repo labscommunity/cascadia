@@ -819,7 +819,10 @@ mod llama_inline;
 pub use llama_cost::{
     llama_grammar_cost, llama_grammar_cost_error, LLAMA_VISIT_COST, MAX_LLAMA_GRAMMAR_COST,
 };
-pub use llama_inline::{inline_refs, InlineError, Inlined, MAX_INLINED_BYTES};
+pub use llama_inline::{
+    has_ref, inline_refs, inline_refs_with, Budget, InlineError, Inlined, MAX_INLINED_BYTES,
+    RESERVED_PREFIX,
+};
 
 mod xgrammar_cost;
 pub use xgrammar_cost::{xgrammar_cost, xgrammar_cost_error, MAX_XGRAMMAR_COST};

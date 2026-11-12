@@ -1405,11 +1405,25 @@ pub fn check_pointer_refs_only(
             converter_walk(&root, Some(engine))
         }
         crate::RefResolver::LlamaServer { no_jinja } => {
-            cascadia_grammar::inline_refs(schema, "", !no_jinja)
-                .map(|_| ())
-                .map_err(|e| format!("{FIELD}: {e}"))
+            inline_for_llama_server(schema, no_jinja, &mut cascadia_grammar::Budget::default())
         }
     }
+}
+
+/// Whether sycl-llama can send `schema` to llama-server inlined, charging
+/// the request's `budget` (see `cascadia_grammar::inline_refs_with`). A
+/// schema without a `$ref` is sent as written.
+pub(crate) fn inline_for_llama_server(
+    schema: &Value,
+    no_jinja: bool,
+    budget: &mut cascadia_grammar::Budget,
+) -> Result<(), String> {
+    if !cascadia_grammar::has_ref(schema) {
+        return Ok(());
+    }
+    cascadia_grammar::inline_refs_with(schema, "", !no_jinja, budget)
+        .map(|_| ())
+        .map_err(|e| format!("{FIELD}: {e}"))
 }
 
 /// The 400 for a `$ref` `engine` would leave unconstrained.
@@ -2538,7 +2552,10 @@ mod tests {
                 .expect("no stack overflow");
             let (verdict, took) = verdict;
             let e = verdict.expect_err("over the budget");
-            assert!(e.starts_with(FIELD) && e.contains("bytes"), "{e}");
+            assert!(
+                e.starts_with(FIELD) && (e.contains("bytes") || e.contains("nests deeper")),
+                "{e}"
+            );
             let bound = if cfg!(debug_assertions) { 2000 } else { 200 };
             assert!(took < std::time::Duration::from_millis(bound), "{took:?}");
         }

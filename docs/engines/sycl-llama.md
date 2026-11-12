@@ -340,11 +340,14 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   without failing: a ref beside another `$ref`, two refs whose rule names
   escape alike, tools and `response_format` sharing one table of refs). A
   recursive schema keeps refs only to copies the engine names
-  (`$defs/__cascadia_r<N>x`), which needs llama-server's chat endpoint
-  (`--jinja`, the default); with `--no-jinja` a recursive schema gets a
-  400. A ref that can't be inlined (`https://…`, `urn:…`, a bare name, a
-  pointer to nothing) is a 400, as is a schema whose inlined form is over
-  1 MiB. See [CLI.md](../CLI.md), Structured output.
+  (`$defs/__cascadia_r<N>x`; the `__cascadia_` prefix is reserved), which
+  needs llama-server's chat endpoint (`--jinja`, the default); with
+  `--no-jinja` a recursive schema gets a 400. A schema or tool without a
+  `$ref` is sent as written. A ref that can't be inlined (`https://…`,
+  `urn:…`, a bare name, a pointer to nothing) is a 400, as is a request
+  whose schemas inline to over 1 MiB together; each tool's parameters get
+  the same cost guard as `response_format`. See [CLI.md](../CLI.md),
+  Structured output.
 - Chat turns carry `role` + `content` + tool-call fields (`tool_calls`,
   `tool_call_id`, `name`) and request-level `tools` in the OpenAI wire
   form; the child runs with `--jinja` so tool calls render through the

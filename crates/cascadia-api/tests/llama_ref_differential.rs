@@ -14,7 +14,7 @@ const FIXTURE: &str = include_str!("fixtures/llama_ref_differential.jsonl");
 /// hoisted copies) or `refused`, as `run.sh`'s `llama_inline` example
 /// reports it (inlining, then the llama-server cost guard).
 fn verdict(schema: &Value, no_jinja: bool) -> (&'static str, usize) {
-    if !schema.to_string().contains("$ref") {
+    if !cascadia_grammar::has_ref(schema) {
         return match cascadia_grammar::llama_grammar_cost_error(schema) {
             Some(_) => ("refused", 0),
             None => ("inlined", 0),

@@ -2581,7 +2581,7 @@ async fn chat_completions(
             }
         };
     if let ResponseFormat::JsonSchema { raw, schema, .. } = &response_format {
-        if state.ref_resolver != RefResolver::Full {
+        if state.ref_resolver == RefResolver::Xgrammar {
             if let Err(msg) = structured::check_pointer_refs_only(
                 raw,
                 schema,
@@ -2597,15 +2597,35 @@ async fn chat_completions(
             }
         }
     }
-    // sycl-llama sends each tool's `parameters` with its refs inlined too
-    // (`cascadia_grammar::inline_refs`): one it can't inline is refused here.
+    // sycl-llama sends the `response_format` schema and each tool's
+    // `parameters` with their refs inlined (`cascadia_grammar::inline_refs`),
+    // under one budget for the request: what it can't inline is refused here.
     if let RefResolver::LlamaServer { no_jinja } = state.ref_resolver {
+        let mut budget = cascadia_grammar::Budget::default();
+        if let ResponseFormat::JsonSchema { schema, .. } = &response_format {
+            if let Err(msg) = structured::inline_for_llama_server(schema, no_jinja, &mut budget) {
+                count_rejected("invalid_request");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid response_format: {msg}") })),
+                )
+                    .into_response();
+            }
+        }
         if let Some(serde_json::Value::Array(tools)) = chat_tools(&req) {
             for (i, tool) in tools.iter().enumerate() {
                 let Some(params) = tool.pointer("/function/parameters") else {
                     continue;
                 };
-                if let Err(e) = cascadia_grammar::inline_refs(params, &format!("t{i}"), !no_jinja) {
+                if !cascadia_grammar::has_ref(params) {
+                    continue;
+                }
+                if let Err(e) = cascadia_grammar::inline_refs_with(
+                    params,
+                    &format!("t{i}"),
+                    !no_jinja,
+                    &mut budget,
+                ) {
                     count_rejected("invalid_request");
                     return (
                         StatusCode::BAD_REQUEST,
@@ -8671,12 +8691,32 @@ level={{ effort_map[eff] }}";
                 );
             }
         }
-        let data = serde_json::json!({
-            "$id": "urn:x", "type": "object",
-            "properties": {"k": {"const": {"$ref": "https://example.com/a.json"}}},
-        });
-        let (status, v) = post_schema(SYCL, &data).await;
-        assert_eq!(status, StatusCode::OK, "{v}");
+        // A ref in `const` data reaches llama-server's ref scan as it is:
+        // one it accepts passes, one it would fail on is a 400 here.
+        for (r, ok) in [
+            (serde_json::json!("https://example.com/a.json"), true),
+            (serde_json::json!("#"), false),
+            (serde_json::json!(5), false),
+            (serde_json::json!("urn:z"), false),
+        ] {
+            let data = serde_json::json!({
+                "$id": "urn:x", "type": "object",
+                "properties": {"k": {"const": {"$ref": r}}},
+            });
+            let (status, v) = post_schema(SYCL, &data).await;
+            if ok {
+                assert_eq!(status, StatusCode::OK, "{r}: {v}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{r}: {v}");
+                assert!(
+                    v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("llama-server fails on it"),
+                    "{v}"
+                );
+            }
+        }
     }
 
     /// Shapes llama-server's own ref resolution got wrong (a ref beside
@@ -8729,6 +8769,45 @@ level={{ effort_map[eff] }}";
     /// A tool's `parameters` are inlined for sycl-llama too: one with a ref
     /// it can't inline is a 400 naming the tool, and a recursive one is a
     /// 400 without `--jinja`.
+    /// One inlining budget covers a request's `response_format` and its
+    /// tools, and no schema of the request may use a hoisted copy's
+    /// reserved name (llama-server reads them all into one table of refs).
+    #[tokio::test]
+    async fn sycl_llama_checks_a_request_as_a_whole() {
+        let mut defs = serde_json::Map::new();
+        defs.insert(
+            "d0".into(),
+            serde_json::json!({"type": "string", "description": "x".repeat(2000)}),
+        );
+        for i in 1..9 {
+            let prev = format!("#/$defs/d{}", i - 1);
+            defs.insert(format!("d{i}"), serde_json::json!({"type": "object", "properties": {"a": {"$ref": prev}, "b": {"$ref": prev}}}));
+        }
+        let big = serde_json::json!({"$defs": defs, "type": "object", "properties": {"x": {"$ref": "#/$defs/d8"}}});
+        let with_tool = |schema: &Value, params: Value| {
+            let mut body = chat_with(Some(json_schema_format(schema.clone())));
+            body["tools"] = serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);
+            body["tool_choice"] = "none".into();
+            body
+        };
+        let (status, v) = post_schema(SYCL, &big).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = post_chat(so_app_refs(SYCL).await, with_tool(&big, big.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("bytes"), "{v}");
+        let reserved = serde_json::json!({
+            "type": "object", "properties": {"k": {"const": {"$ref": "#/$defs/__cascadia_r0x"}}},
+            "$defs": {"__cascadia_r0x": {"type": "integer"}},
+        });
+        let plain = serde_json::json!({"type": "object"});
+        let (status, v) =
+            post_chat(so_app_refs(SYCL).await, with_tool(&plain, reserved.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("reserved"), "{v}");
+        let (status, v) = post_schema(SYCL, &reserved).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    }
+
     #[tokio::test]
     async fn sycl_llama_tool_parameters_are_checked_like_response_format() {
         let tool = |params: Value| serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);

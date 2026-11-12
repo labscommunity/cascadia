@@ -129,9 +129,12 @@ def main():
         entries.append(entry)
         if "refused" in r:
             counts["refused"] += 1
-            reason = r["refused"].split(" is not supported")[0].split(" makes")[0]
             msg = r["refused"]
-            kind = ("too big" if "bytes" in msg else "llama-server cost" if "llama-server" in msg
+            kind = ("llama-server cost" if "llama-server grammar check" in msg or "take too long" in msg
+                    else "too big" if "bytes" in msg else "too deep" if "nests deeper" in msg
+                    else "data ref llama-server fails on" if "fails on it" in msg
+                    else "reserved name" if "reserved" in msg
+                    else "llama-server cost" if "llama-server" in msg
                     else "recursive" if "recursive" in msg else "not inlinable")
             reasons[kind] = reasons.get(kind, 0) + 1
             continue

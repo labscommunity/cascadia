@@ -1531,24 +1531,35 @@ fn check_grammar_body(body: &str) -> EngineResult<()> {
 
 /// The `response_format` schema `body` as llama-server is sent it: every
 /// `$ref` replaced by its target, a cycle by a ref to a hoisted copy (not
-/// allowed when llama-server runs without `--jinja`).
-fn inlined_schema(body: &str, no_jinja: bool) -> EngineResult<String> {
-    // Nothing to inline: forwarded as the client wrote it.
-    if !body.contains("$ref") {
-        return Ok(body.to_owned());
-    }
+/// allowed when llama-server runs without `--jinja`), charging the request's
+/// `budget`. Decided on the parsed value: a schema without a `$ref` key is
+/// sent as the client wrote it.
+fn inlined_schema(
+    body: &str,
+    no_jinja: bool,
+    budget: &mut cascadia_grammar::Budget,
+) -> EngineResult<String> {
     let schema = serde_json::from_str::<serde_json::Value>(body)
         .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))?;
-    cascadia_grammar::inline_refs(&schema, "", !no_jinja)
+    if !cascadia_grammar::has_ref(&schema) {
+        return Ok(body.to_owned());
+    }
+    cascadia_grammar::inline_refs_with(&schema, "", !no_jinja, budget)
         .map(|i| i.schema.to_string())
         .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))
 }
 
 /// Each tool's `parameters` in `tools` (OpenAI wire form) with its `$ref`s
-/// inlined like a `response_format` schema's; tool `i`'s hoisted copies are
-/// named apart from the others' (llama-server reads all of them into one
-/// table of refs).
-fn inline_tool_parameters(tools: &mut serde_json::Value, no_jinja: bool) -> EngineResult<()> {
+/// inlined like a `response_format` schema's, charging the same `budget`;
+/// tool `i`'s hoisted copies are named apart from the others' (llama-server
+/// reads all of them into one table of refs). A tool without a `$ref` is
+/// left exactly as it is (the chat template shows it to the model). Each
+/// tool's parameters then get the llama-server cost guard.
+fn inline_tool_parameters(
+    tools: &mut serde_json::Value,
+    no_jinja: bool,
+    budget: &mut cascadia_grammar::Budget,
+) -> EngineResult<()> {
     let Some(tools) = tools.as_array_mut() else {
         return Ok(());
     };
@@ -1556,11 +1567,17 @@ fn inline_tool_parameters(tools: &mut serde_json::Value, no_jinja: bool) -> Engi
         let Some(params) = tool.pointer_mut("/function/parameters") else {
             continue;
         };
-        let inlined =
-            cascadia_grammar::inline_refs(params, &format!("t{i}"), !no_jinja).map_err(|e| {
-                EngineError::InvalidConfig(format!("tools[{i}].function.parameters: {e}"))
-            })?;
-        *params = inlined.schema;
+        let refused =
+            |e: String| EngineError::InvalidConfig(format!("tools[{i}].function.parameters: {e}"));
+        if cascadia_grammar::has_ref(params) {
+            let inlined =
+                cascadia_grammar::inline_refs_with(params, &format!("t{i}"), !no_jinja, budget)
+                    .map_err(|e| refused(e.to_string()))?;
+            *params = inlined.schema;
+        }
+        if let Some(e) = cascadia_grammar::llama_grammar_cost_error(params) {
+            return Err(refused(e));
+        }
     }
     Ok(())
 }
@@ -1880,12 +1897,14 @@ impl Engine for LlamaCppEngine {
         // give one the wrong shape without failing (see
         // `cascadia_grammar::inline_refs`).
         let no_jinja = llama_args_disable_jinja(&self.cfg.extra_args);
+        // One inlining budget for the whole request.
+        let mut budget = cascadia_grammar::Budget::default();
         if let Some(g) = &mut task.grammar {
-            g.body = inlined_schema(&g.body, no_jinja)?;
+            g.body = inlined_schema(&g.body, no_jinja, &mut budget)?;
             check_grammar_body(&g.body)?;
         }
         if let Some(tools) = &mut task.tools {
-            inline_tool_parameters(tools, no_jinja)?;
+            inline_tool_parameters(tools, no_jinja, &mut budget)?;
         }
         self.pending.push(task);
         Ok(())
@@ -3221,6 +3240,105 @@ mod unix_tests {
         engine.cfg = Arc::new(cfg);
         match engine.submit(chat_task().with_grammar(grammar(list_schema()))) {
             Err(EngineError::InvalidConfig(m)) => assert!(m.contains("recursive"), "{m}"),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// Inlining is decided on the parsed value: a key written `"\u0024ref"`
+    /// is a `$ref` too, in `response_format` and in a tool.
+    #[test]
+    fn an_escaped_ref_key_is_inlined_too() {
+        let escaped = r##"{"$defs":{"B":{"type":"integer"}},"type":"object","properties":{"b":{"\u0024ref":"#/$defs/B"}}}"##;
+        let mut task = chat_task().with_grammar(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: escaped.into(),
+        });
+        let params: serde_json::Value = serde_json::from_str(escaped).unwrap();
+        task.tools = Some(
+            serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": params}}]),
+        );
+        let mut engine = test_engine(1);
+        engine.submit(task).unwrap();
+        let sent = &engine.pending[0];
+        let body: serde_json::Value =
+            serde_json::from_str(&sent.grammar.as_ref().unwrap().body).unwrap();
+        assert_eq!(
+            body["properties"]["b"],
+            serde_json::json!({"type": "integer"})
+        );
+        let params = &sent.tools.as_ref().unwrap()[0]["function"]["parameters"];
+        assert_eq!(
+            params["properties"]["b"],
+            serde_json::json!({"type": "integer"})
+        );
+    }
+
+    /// A tool without a `$ref` is sent exactly as the client wrote it (the
+    /// chat template shows it to the model): annotations and all.
+    #[test]
+    fn a_tool_without_refs_is_sent_unchanged() {
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": {"n": {"type": "integer", "default": 3, "examples": [1], "description": "how many"}},
+        });
+        let mut task = chat_task();
+        task.tools = Some(
+            serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": params.clone()}}]),
+        );
+        let mut engine = test_engine(1);
+        engine.submit(task).unwrap();
+        assert_eq!(
+            engine.pending[0].tools.as_ref().unwrap()[0]["function"]["parameters"],
+            params
+        );
+    }
+
+    /// Tools get the llama-server cost guard too, and one inlining budget
+    /// covers a request's `response_format` and all its tools; a tool can't
+    /// use a hoisted copy's reserved name.
+    #[test]
+    fn tools_are_guarded_like_response_format() {
+        // About 600 KB inlined: one fits the budget, two don't.
+        let mut defs = serde_json::Map::new();
+        defs.insert(
+            "d0".into(),
+            serde_json::json!({"type": "string", "description": "x".repeat(2000)}),
+        );
+        for i in 1..9 {
+            let prev = format!("#/$defs/d{}", i - 1);
+            defs.insert(format!("d{i}"), serde_json::json!({"type": "object", "properties": {"a": {"$ref": prev}, "b": {"$ref": prev}}}));
+        }
+        let big = serde_json::json!({"$defs": defs, "type": "object", "properties": {"x": {"$ref": "#/$defs/d8"}}, "required": ["x"]});
+        let tool = |p: serde_json::Value| serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": p}}]);
+        let mut engine = test_engine(1);
+        let mut task = chat_task().with_grammar(grammar(big.clone()));
+        task.tools = Some(tool(big.clone()));
+        match engine.submit(task) {
+            Err(EngineError::InvalidConfig(m)) => assert!(m.contains("bytes"), "{m}"),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        // A tool too costly for llama-server's converter.
+        let props: serde_json::Map<String, serde_json::Value> = (0..600)
+            .map(|i| (format!("p{i}"), serde_json::json!({})))
+            .collect();
+        let mut task = chat_task();
+        task.tools = Some(tool(
+            serde_json::json!({"type": "object", "properties": props}),
+        ));
+        match engine.submit(task) {
+            Err(EngineError::InvalidConfig(m)) => assert!(
+                m.starts_with("tools[0].function.parameters: llama-server would take too long"),
+                "{m}"
+            ),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        let mut task = chat_task().with_grammar(grammar(list_schema()));
+        task.tools = Some(tool(serde_json::json!({
+            "type": "object", "properties": {"k": {"const": {"$ref": "#/$defs/__cascadia_r0x"}}},
+            "$defs": {"__cascadia_r0x": {"type": "integer"}},
+        })));
+        match engine.submit(task) {
+            Err(EngineError::InvalidConfig(m)) => assert!(m.contains("reserved"), "{m}"),
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
     }

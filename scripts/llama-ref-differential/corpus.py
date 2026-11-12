@@ -163,12 +163,23 @@ def generated():
         yield doc({"U": {"$ref": "#/$defs/B", "z": r}}, {"p": {"$ref": "#/$defs/U"}})
 
 
+# A tool that needs no hoisting but keeps a ref in `const` data (so its
+# `$defs` go to llama-server too): pairs.py sends it beside each hoisted
+# response schema, through one table of refs.
+DATA_REF_TOOL = {
+    "type": "object",
+    "properties": {"k": {"const": {"$ref": "#/$defs/X"}}, "n": {"type": "integer"}},
+    "required": ["n"],
+    "$defs": {"X": {"type": "integer"}},
+}
+
+
 def main():
     seen = set()
     lines = []
     with open(os.path.join(HERE, "seed.jsonl")) as f:
         seeds = [json.loads(l) for l in f if l.strip()]
-    for schema in itertools.chain(seeds, generated()):
+    for schema in itertools.chain(seeds, generated(), [DATA_REF_TOOL]):
         text = json.dumps(schema, separators=(",", ":"))
         if text not in seen:
             seen.add(text)

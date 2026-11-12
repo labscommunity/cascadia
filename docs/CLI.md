@@ -750,24 +750,37 @@ or `#/...` pointers … ``. On `sycl-llama` llama-server is never sent a
 `$ref` the client wrote: the engine replaces every `#` / `#/...` ref in
 the schema (and in each tool's `parameters`) with a copy of its target
 before forwarding (llama.cpp's own ref handling can give a ref the wrong
-shape without failing). Pointers are read as RFC 6901 (`~1` is `/`, `~0`
-is `~`). A `$ref`'s siblings are dropped, as llama-server ignores them;
-`default` and `examples` are sent as `null`; `const` and `enum` are sent
-as written. A recursive schema (a linked list, a tree, `"$ref": "#"`) is
-sent with each schema on the cycle copied to a reserved `$defs` entry
-(`__cascadia_r<N>x`, `__cascadia_t<i>r<N>x` for tool `i`) that the refs on
-the cycle point to; that needs llama-server's chat endpoint, so with
+shape without failing). A schema or tool without a `$ref` is sent exactly
+as written. Pointers are read as RFC 6901 (`~1` is `/`, `~0` is `~`). A
+`$ref`'s `description` and `title` are carried onto the copy and its other
+siblings dropped, as llama-server ignores them; `default` and `examples`
+are kept, unless a `$ref` sits inside one (then that keyword is left out);
+`const` and `enum` are sent as written, and a `$ref` inside them must be
+one llama-server's ref scan accepts (a `#/...` pointer that resolves, or an
+`https://` document without a fragment), else `` $ref "<ref>" in `const`
+or `enum` is not supported: llama-server fails on it ``. A recursive
+schema (a linked list, a tree, `"$ref": "#"`) is sent with each schema on
+the cycle copied to a reserved `$defs` entry (`__cascadia_r<N>x`,
+`__cascadia_t<i>r<N>x` for tool `i`) that the refs on the cycle point to
+(the root stays the root); names starting `__cascadia_` are reserved, so a
+`$defs` key or `$ref` using them gets `… names starting __cascadia_ are
+reserved`. Hoisting needs llama-server's chat endpoint, so with
 `--llama-args "--no-jinja"` a recursive schema gets
 `` $ref "<ref>" makes the schema recursive, which this engine can't enforce
-when llama-server runs without --jinja ``. A ref that can't be inlined (a
-`$ref` that is not `#` or `#/...`, or one that names nothing) gets
-`` $ref "<ref>" is not supported: only a reference inside the schema (`#`
-or `#/...`) to an existing schema is `` (for a tool, `invalid tools:
-tools[<i>].function.parameters: …`). A schema whose inlined form is over
-1 MiB (definitions reused many times over) gets `` … the schema with every
-$ref replaced by its target is over 1048576 bytes ``. The 64 KiB cap
-applies to what the client sends; the llama-server cost guard (below)
-applies to the inlined schema. An unknown `$schema`
+when llama-server runs without --jinja ``. (The engine reads `--no-jinja`
+from `--llama-args`, the last of `--jinja`/`--no-jinja` winning; a preset
+that turns jinja off, or `--no-jinja` given as another flag's value, also
+counts, which can refuse more than needed but never less.) A ref that
+can't be inlined (a `$ref` that is not `#` or `#/...`, or one that names
+nothing) gets `` $ref "<ref>" is not supported: only a reference inside the
+schema (`#` or `#/...`) to an existing schema is `` (for a tool, `invalid
+tools: tools[<i>].function.parameters: …`). One budget covers a request's
+`response_format` and all its tools: over 1 MiB once inlined (definitions
+reused many times over) gets `` … with every $ref replaced by its target
+are over 1048576 bytes ``, and nesting deeper than 256 levels `` … nests
+deeper than 256 levels ``. The 64 KiB cap applies to what the client
+sends; the llama-server cost guard (below) applies to the inlined
+`response_format` schema and to each tool's parameters. An unknown `$schema`
 (`http://json-schema.org/schema#`, an OpenAPI dialect) is not a ref:
 `ov-genai` and `sycl-llama` ignore it, and llguidance refuses to build
 the schema (`invalid configuration: response_format schema: Resource
