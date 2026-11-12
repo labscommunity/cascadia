@@ -794,8 +794,10 @@ fn final_chunk(
     };
     let f = match done.outcome {
         Outcome::Cancelled { held_tokens } => return cancelled(held_tokens),
-        Outcome::Failed(_) if inflight.cancelled() => return cancelled(0),
-        Outcome::Failed(err) => {
+        Outcome::Failed { held_tokens, .. } if inflight.cancelled() => {
+            return cancelled(held_tokens)
+        }
+        Outcome::Failed { error: err, .. } => {
             warn!(task = %task_id, error = %err, "generate failed");
             // Chunk::error, not an empty final_marker: the latter reads as
             // a SUCCESSFUL empty completion, so the client got a 200 with
@@ -3789,5 +3791,81 @@ mod tests {
                 assert_eq!(fin.completion_tokens, Some(2));
             }
         }
+    }
+
+    /// One streamed generation over scripted window decodes (one id per
+    /// write) with `stops`: (every chunk, writes consumed).
+    fn run_stream_script(windows: &[&str], stops: &[&str]) -> (Vec<Chunk>, usize) {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&vec!["x"; windows.len()]);
+            s.window_script = windows.iter().map(|w| w.to_string()).collect();
+        }
+        let mut e = stateful_engine_in(&st, true);
+        e.submit(stop_task("t1", 64, stops)).unwrap();
+        let out = until_final(&mut e);
+        let consumed = st.lock().unwrap().consumed;
+        (out, consumed)
+    }
+
+    /// A cleanup rule rewrites `it '` to `it's`: the stop `' ` is in no
+    /// later decode, so the generation must not stop on it (a running copy of
+    /// the pieces would still hold `it ' a`).
+    #[test]
+    fn stateful_stream_a_rewrite_does_not_fake_a_stop() {
+        let (out, consumed) = run_stream_script(&["it '", "it's", "it's a", "it's a b"], &["' "]);
+        assert_eq!(consumed, 4, "{out:?}");
+        assert_eq!(joined(&out), "it's a b");
+    }
+
+    /// A rewrite that completes a stop (`it '` to `it's\n`, stop `\n`) stops
+    /// at that write, as the non-streamed tail decode would.
+    #[test]
+    fn stateful_stream_a_rewrite_does_not_hide_a_stop() {
+        let (out, consumed) = run_stream_script(&["it '", "it's\n", "it's\nmore"], &["\n"]);
+        assert_eq!(consumed, 2, "{out:?}");
+        assert_eq!(joined(&out), "it's\n");
+        assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// A generation that fails while the cancel flag goes up ends as
+    /// cancelled, and still books the tokens of the writes whose text was
+    /// held (an echo and the whitespace after it), as a plain cancel does.
+    #[test]
+    fn stateful_failed_with_the_cancel_flag_up_books_the_held_tokens() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["Q", "\n", " one", " two"]);
+            s.poll_panic_at = Some(3);
+        }
+        let pipe = MockStatefulPipe { st: st.clone() };
+        let params = GenParams {
+            speculative_k: 0,
+            prompt_lookup_ngram: 0,
+            prompt_pretemplated: false,
+            max_tokens_default: 256,
+            context_window: None,
+            engine_stop_check: true,
+            stream_text: true,
+        };
+        let inflight = InflightCancel::new();
+        let id = TaskId::from("t1");
+        assert!(!inflight.begin(&id));
+        let mut t = task("t1", 64);
+        t.prompt = "Q".into();
+        let mut deltas = 0;
+        let done = run_job(&pipe, &params, &inflight, &t, false, &mut |ev| {
+            if matches!(ev, Event::Delta { .. }) {
+                deltas += 1;
+            }
+        });
+        assert_eq!(deltas, 0, "every write's text was still held");
+        // The flag goes up after the job looked at it.
+        inflight.cancel(&id);
+        let chunk = final_chunk(&inflight, &mut false, &id, done, None);
+        assert!(is_empty_cancelled(&chunk), "{chunk:?}");
+        assert_eq!(chunk.n_tokens, Some(3));
     }
 }

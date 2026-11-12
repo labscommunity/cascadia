@@ -23,10 +23,14 @@
 //!   the new decode, and the final still sends the answer's tail when it extends the re-anchored
 //!   text. [`Finish::diverged`] reports it, with the bytes the client got.
 //! - **Tokens.** A delta carries the tokens of the writes before the current one that have not
-//!   gone out yet (the writes whose text it can hold), so the running sum never runs ahead of the
-//!   text sent; the final carries the rest, and a cancel carries [`StreamText::held_tokens`].
-//! - **Stop check.** [`Written::fresh`] is each write's newest visible text, without the lag, so
-//!   a `stop` ends the generation at the write that completes it, as without streaming.
+//!   gone out yet, so the running sum can be at most one write ahead of the text sent; the total
+//!   is exact: the final carries the rest, and a cancelled final (also one after a failure)
+//!   carries [`StreamText::held_tokens`].
+//! - **Stop check.** [`Written::stop_tail`] is the end of each write's current visible text,
+//!   without the lag, so a `stop` ends the generation at the write that completes it, as without
+//!   streaming. It has no memory: it is cut from this write's decode alone (the text that changed
+//!   since the previous write, plus the longest stop's length before it), so text a later decode
+//!   rewrote can neither fake a stop nor hide one.
 
 use cascadia_ov_genai_shim::{advance_emitted, PollWrite};
 
@@ -38,8 +42,8 @@ pub(crate) struct StreamText {
     decided: bool,
     /// The previous write's visible text (after the holds), once the rule is decided.
     prev: Option<String>,
-    /// The newest visible bytes seen, for the stop check (no lag).
-    seen: Vec<u8>,
+    /// The longest checked stop in bytes, 0 when none is checked (no stop tail is cut).
+    stop_bytes: usize,
     /// The visible bytes handed out (after a rewrite: the re-anchored text).
     emitted: Vec<u8>,
     /// Bytes the client got, deltas and rest (differs from `emitted` after a re-anchor).
@@ -69,8 +73,11 @@ pub(crate) struct Finish {
 /// What one streamer write gives.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Written {
-    /// The newest visible text this write added, for the stop check (no lag).
-    pub fresh: String,
+    /// The end of this write's visible text a stop it completes must lie in, for a memoryless
+    /// check (no lag): the text that differs from the previous write's, plus the `stop_bytes`
+    /// before it, cut at a character boundary. Empty when no stop is checked, the rule is not
+    /// decided yet, or the text did not change.
+    pub stop_tail: String,
     /// The text to hand out and the tokens it stands for.
     pub delta: Option<(String, usize)>,
 }
@@ -109,6 +116,14 @@ fn incomplete_tail(bytes: &[u8]) -> usize {
     0
 }
 
+/// The largest char boundary of `s` at or below `i`.
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// The length of the longest common prefix of `a` and `b` that ends on a character boundary.
 fn common_prefix(a: &str, b: &str) -> usize {
     let mut n = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
@@ -119,12 +134,14 @@ fn common_prefix(a: &str, b: &str) -> usize {
 }
 
 impl StreamText {
-    pub(crate) fn new(prompt: &str) -> Self {
+    /// `stop_bytes`: the longest stop the caller checks, 0 for none
+    /// ([`cascadia_engine::OneShotStop::max_stop_bytes`]).
+    pub(crate) fn new(prompt: &str, stop_bytes: usize) -> Self {
         Self {
             prompt: prompt.to_string(),
             decided: false,
             prev: None,
-            seen: Vec::new(),
+            stop_bytes,
             emitted: Vec::new(),
             sent_bytes: 0,
             carried_tokens: 0,
@@ -133,8 +150,8 @@ impl StreamText {
         }
     }
 
-    /// Take one streamer write: the newest visible text for the stop check, and the text to hand
-    /// out with the tokens it stands for (`None` while held).
+    /// Take one streamer write: the end of the current visible text for the stop check, and the
+    /// text to hand out with the tokens it stands for (`None` while held).
     pub(crate) fn on_write(&mut self, w: &PollWrite<'_>) -> Written {
         debug_assert_eq!(w.window_from, 0, "the engine never confirms a window");
         if w.n_tokens == 0 {
@@ -152,22 +169,41 @@ impl StreamText {
             self.decided = true;
         }
         let visible = visible_text(&text, &self.prompt);
-        let (fresh, _) = advance_emitted(&mut self.seen, visible.as_bytes(), true);
+        let stop_tail = self.stop_tail(visible);
         let Some(prev) = self.prev.replace(visible.to_string()) else {
-            return Written { fresh, delta: None };
+            return Written {
+                stop_tail,
+                delta: None,
+            };
         };
         let agreed = &visible[..common_prefix(&prev, visible)];
         let (delta, diverged) = advance_emitted(&mut self.emitted, agreed.as_bytes(), true);
         self.diverged |= diverged;
         if delta.is_empty() {
-            return Written { fresh, delta: None };
+            return Written {
+                stop_tail,
+                delta: None,
+            };
         }
         self.sent_bytes += delta.len();
         let n_tokens = std::mem::take(&mut self.carried_tokens);
         Written {
-            fresh,
+            stop_tail,
             delta: Some((delta, n_tokens)),
         }
+    }
+
+    /// [`Written::stop_tail`] for this write's `visible` text, against the previous write's.
+    fn stop_tail(&self, visible: &str) -> String {
+        if self.stop_bytes == 0 || self.prev.as_deref() == Some(visible) {
+            return String::new();
+        }
+        let changed = self
+            .prev
+            .as_deref()
+            .map_or(0, |p| common_prefix(p, visible));
+        let from = floor_char_boundary(visible, changed.saturating_sub(self.stop_bytes));
+        visible[from..].to_string()
     }
 
     /// The tokens of every write whose text has not gone out: what a cancelled final carries.
@@ -219,7 +255,7 @@ mod tests {
     /// Feed the cumulative decodes of `tokens` (one write per entry, one token each) and finish on
     /// their whole decode: (each delta with its tokens, the finish).
     fn run(prompt: &str, tokens: &[&[u8]]) -> (Vec<(String, usize)>, Finish, String) {
-        let mut s = StreamText::new(prompt);
+        let mut s = StreamText::new(prompt, 0);
         let mut window = Vec::new();
         let mut sent = Vec::new();
         for t in tokens {
@@ -282,7 +318,7 @@ mod tests {
     /// decodes agree only on "it", so the wrong "'" before the "s" never goes out.
     #[test]
     fn a_cleanup_rewrite_of_the_newest_token_is_never_sent() {
-        let mut s = StreamText::new("<chat>");
+        let mut s = StreamText::new("<chat>", 0);
         assert_eq!(
             feed(&mut s, &["it '", "it's", "it's ok"]),
             [None, Some("it".into()), Some("'s".into())]
@@ -387,7 +423,7 @@ mod tests {
         assert_parity(&sent, &fin, &visible, 4);
 
         // Replace mode: the window shows U+FFFD until the character completes.
-        let mut s = StreamText::new("<chat>");
+        let mut s = StreamText::new("<chat>", 0);
         let done = "x\u{1F980}";
         assert_eq!(
             feed(&mut s, &["x", "x\u{FFFD}", "x\u{FFFD}\u{FFFD}", done]),
@@ -411,7 +447,7 @@ mod tests {
     /// which both decodes hold, goes out, and the stream stays a prefix of the answer.
     #[test]
     fn a_rewrite_by_the_newest_write_is_not_a_divergence() {
-        let mut s = StreamText::new("<chat>");
+        let mut s = StreamText::new("<chat>", 0);
         assert_eq!(
             feed(&mut s, &["abc", "abX d", "abX de"]),
             [None, Some("ab".into()), Some("X d".into())]
@@ -428,7 +464,7 @@ mod tests {
     /// that extends it, and the sent byte count is what the client got.
     #[test]
     fn a_rewrite_of_agreed_text_diverges_and_the_tail_still_goes() {
-        let mut s = StreamText::new("<chat>");
+        let mut s = StreamText::new("<chat>", 0);
         assert_eq!(
             feed(&mut s, &["ab", "abc", "abcd", "abXde", "abXdef"]),
             [
@@ -449,7 +485,7 @@ mod tests {
     /// A final decode that disagrees with what went out is a divergence too: nothing more is sent.
     #[test]
     fn a_final_that_disagrees_is_a_divergence() {
-        let mut s = StreamText::new("<chat>");
+        let mut s = StreamText::new("<chat>", 0);
         assert_eq!(feed(&mut s, &["abc", "abcd"]), [None, Some("abc".into())]);
         let fin = s.finish("abd");
         assert!(fin.diverged);
@@ -460,7 +496,7 @@ mod tests {
     /// A speculative round writes several ids at once: its count rides with its text.
     #[test]
     fn a_multi_id_write_carries_its_count() {
-        let mut s = StreamText::new("<chat>");
+        let mut s = StreamText::new("<chat>", 0);
         assert_eq!(s.on_write(&write(b"one two three", 3)).delta, None);
         assert_eq!(
             s.on_write(&write(b"one two three\xE2", 4)).delta,
@@ -480,7 +516,7 @@ mod tests {
     /// whitespace after it.
     #[test]
     fn held_tokens_counts_every_write_not_yet_sent() {
-        let mut s = StreamText::new("Q");
+        let mut s = StreamText::new("Q", 0);
         assert_eq!(feed(&mut s, &["Q", "Q\n"]), [None, None]);
         assert_eq!(s.held_tokens(), 2);
         assert_eq!(
@@ -490,16 +526,62 @@ mod tests {
         assert_eq!(s.held_tokens(), 1);
     }
 
+    /// The stop tail of each write of `windows` (whole decodes, one token each).
+    fn stop_tails(s: &mut StreamText, windows: &[&str]) -> Vec<String> {
+        windows
+            .iter()
+            .map(|w| s.on_write(&write(w.as_bytes(), 1)).stop_tail)
+            .collect()
+    }
+
     /// The stop check sees each write's newest visible text at once, not one write late: a stop
-    /// ends the generation at the write that completes it.
+    /// ends the generation at the write that completes it. A held echo has no tail; the visible
+    /// text's changed end comes with the longest stop's length before it.
     #[test]
     fn the_stop_check_text_is_not_lagged() {
-        let mut s = StreamText::new("Q");
-        let fresh: Vec<String> = ["Q", "Q\n", "Q\n one", "Q\n one two"]
-            .iter()
-            .map(|w| s.on_write(&write(w.as_bytes(), 1)).fresh)
-            .collect();
-        assert_eq!(fresh, ["", "", "one", " two"]);
+        let mut s = StreamText::new("Q", 2);
+        assert_eq!(
+            stop_tails(
+                &mut s,
+                &["Q", "Q\n", "Q\n one", "Q\n one two", "Q\n one two"]
+            ),
+            ["", "", "one", "ne two", ""]
+        );
+        // No stop checked: no tail is cut.
+        let mut s = StreamText::new("<chat>", 0);
+        assert_eq!(stop_tails(&mut s, &["a", "a b"]), ["", ""]);
+    }
+
+    /// A rewrite of text before the newest token: the tail is cut from the current decode, from
+    /// the first byte that changed, so the rewritten text is never checked.
+    #[test]
+    fn the_stop_tail_follows_a_rewrite() {
+        let mut s = StreamText::new("<chat>", 2);
+        assert_eq!(
+            stop_tails(&mut s, &["it '", "it's", "it's a"]),
+            ["it '", "it's", "'s a"]
+        );
+        let mut s = StreamText::new("<chat>", 1);
+        assert_eq!(
+            stop_tails(&mut s, &["it '", "it's\n", "it's\nmore"]),
+            ["it '", "t's\n", "\nmore"]
+        );
+        // Shorter than before (a U+FFFD gone): the end is checked again.
+        let mut s = StreamText::new("<chat>", 2);
+        assert_eq!(
+            stop_tails(&mut s, &["abc", "abc\u{FFFD}", "abc"]),
+            ["abc", "bc\u{FFFD}", "bc"]
+        );
+    }
+
+    /// The tail's start never falls inside a character.
+    #[test]
+    fn the_stop_tail_starts_on_a_char_boundary() {
+        let mut s = StreamText::new("<chat>", 2);
+        assert_eq!(
+            stop_tails(&mut s, &["x\u{2603}", "x\u{2603}y"]),
+            ["x\u{2603}", "\u{2603}y"]
+        );
     }
 
     #[test]

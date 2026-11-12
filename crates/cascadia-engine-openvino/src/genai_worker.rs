@@ -110,8 +110,13 @@ pub(crate) enum Outcome {
     Cancelled {
         held_tokens: usize,
     },
-    /// `generate()` failed, or the job panicked.
-    Failed(OvError),
+    /// `generate()` failed, or the job panicked. Streaming: `held_tokens` as for
+    /// [`Outcome::Cancelled`], for a failure that ends as cancelled because the flag went up after
+    /// the job looked (0 after a panic: the stream state is gone).
+    Failed {
+        error: OvError,
+        held_tokens: usize,
+    },
     Finished(Finished),
 }
 
@@ -138,9 +143,10 @@ impl Done {
             polled_tokens: 0,
             elapsed_s: 0.0,
             threaded_streamer: None,
-            outcome: Outcome::Failed(OvError::Native(format!(
-                "ov-genai generation panicked: {message}"
-            ))),
+            outcome: Outcome::Failed {
+                error: OvError::Native(format!("ov-genai generation panicked: {message}")),
+                held_tokens: 0,
+            },
         }
     }
 }
@@ -150,9 +156,10 @@ impl Done {
 ///
 /// The `stop` check runs on text the visible answer keeps. Without streaming the shim decodes
 /// the newest ids per write (`tail_tokens`) and [`VisibleArm`] arms the check once that decode lies
-/// inside the visible text. With streaming no tail is decoded: the check runs on each write's
-/// newest visible text ([`crate::genai_stream::Written::fresh`], without the delta's one write of
-/// lag), so a stop split across writes is found and a stop inside a stripped echo is not.
+/// inside the visible text. With streaming no tail is decoded: the check runs, with no memory, on
+/// the end of each write's current visible text ([`crate::genai_stream::Written::stop_tail`],
+/// without the delta's one write of lag), so a stop split across writes is found, a stop inside a
+/// stripped echo is not, and text a later decode rewrote can neither fake a stop nor hide one.
 pub(crate) fn run_job(
     pipe: &dyn StatefulPipe,
     params: &GenParams,
@@ -180,7 +187,7 @@ pub(crate) fn run_job(
 
     let started = Instant::now();
     // Always the polled generate, so a cancel always works.
-    let mut stop = if params.engine_stop_check {
+    let stop = if params.engine_stop_check {
         OneShotStop::new(&task.sampling.stop)
     } else {
         OneShotStop::new(&[])
@@ -193,7 +200,7 @@ pub(crate) fn run_job(
     // (up to `num_assistant_tokens` + 1 ids), so the window grows by that
     // round too, as sparse-moe's `extra_slack` does. 0 = no decode at all
     // when nothing is checked, and when streaming (the check runs on each
-    // write's newest visible text).
+    // write's current visible text).
     let round_slack = if cfg.num_assistant_tokens > 0 {
         cfg.num_assistant_tokens as usize + 1
     } else {
@@ -208,7 +215,9 @@ pub(crate) fn run_job(
     // engine stop inside a stripped prompt echo or leading whitespace
     // would give a different answer than a run with the check off.
     let mut arm = VisibleArm::new(&task.prompt, tail_tokens);
-    let mut stream = params.stream_text.then(|| StreamText::new(&task.prompt));
+    let mut stream = params
+        .stream_text
+        .then(|| StreamText::new(&task.prompt, stop.max_stop_bytes()));
     let mut polled_tokens: u64 = 0;
     let mut stopped_on_match = false;
     // Which thread ov-genai calls the streamer on, probed on the first
@@ -242,9 +251,11 @@ pub(crate) fn run_job(
                     if let Some((text, n_tokens)) = written.delta {
                         emit(Event::Delta { text, n_tokens });
                     }
-                    // On the newest text, not one write late: the stop ends
-                    // the generation at the write that completes it.
-                    stop.is_active() && !written.fresh.is_empty() && stop.push(&written.fresh)
+                    // On the current text, not one write late: the stop ends
+                    // the generation at the write that completes it. No
+                    // memory (no `push`): a decode can rewrite earlier text,
+                    // and a running copy would keep the rewritten text.
+                    !written.stop_tail.is_empty() && stop.matches_tail(&written.stop_tail)
                 }
                 None => {
                     tail_tokens > 0
@@ -278,10 +289,10 @@ pub(crate) fn run_job(
         threaded_streamer,
         outcome,
     };
+    let held_tokens = stream.as_ref().map_or(0, StreamText::held_tokens);
     if inflight.cancelled() {
         // Also when generate failed after the CANCEL: the task ends as
         // cancelled, never as an error or a partial success.
-        let held_tokens = stream.as_ref().map_or(0, StreamText::held_tokens);
         return done(Outcome::Cancelled { held_tokens });
     }
     let result = match generated {
@@ -289,7 +300,7 @@ pub(crate) fn run_job(
         // A panic in the poll closure lands here too (`err.is_poll_panic()`):
         // it cancelled the generation, and its partial text must not read as
         // a success.
-        Err(err) => return done(Outcome::Failed(err)),
+        Err(error) => return done(Outcome::Failed { error, held_tokens }),
     };
     let visible = visible_text(&result.text, &task.prompt).to_string();
     // The check ran only on text this visible answer keeps, so it holds the
