@@ -22,6 +22,7 @@ use cascadia_types::{ChatTurn, GenerationTask};
 use chrono::Utc;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
+use reasoning::ReasoningFormat;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -138,6 +139,12 @@ pub struct AppState {
     /// caller's own word reaches the template; when false the GLM high/max
     /// mapping applies. See [`EffortArgs`].
     pub effort_words: bool,
+    /// How a reply carries a thinking model's reasoning (`--reasoning-format`).
+    pub reasoning_format: ReasoningFormat,
+    /// The chat template's generation prompt opens `<think>` with thinking on
+    /// (probed at load, see [`template_opens_think`]). Stands in for the
+    /// prompt when the engine renders it itself (see [`opens_think`]).
+    pub template_opens_think: bool,
     /// Special-token message framing to translate back into text delimiters
     /// (Inkling). See [`MarkerDialect`].
     pub marker_dialect: Option<MarkerDialect>,
@@ -165,6 +172,8 @@ pub struct Config {
     pub defer_template_on_thinking: bool,
     /// See [`AppState::engine_applies_template`]. Set by the CLI for sycl-llama.
     pub engine_applies_template: bool,
+    /// See [`AppState::reasoning_format`]. Set by the CLI's `--reasoning-format`.
+    pub reasoning_format: ReasoningFormat,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
 }
@@ -178,6 +187,7 @@ impl Default for Config {
             chat_template: ChatTemplateConfig::default(),
             defer_template_on_thinking: false,
             engine_applies_template: false,
+            reasoning_format: ReasoningFormat::default(),
             marker_dialect: None,
         }
     }
@@ -511,6 +521,8 @@ pub fn make_router_with_stats(
         defer_template_on_thinking: cfg.defer_template_on_thinking,
         engine_applies_template: cfg.engine_applies_template,
         effort_words: false,
+        reasoning_format: cfg.reasoning_format,
+        template_opens_think: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
@@ -520,6 +532,10 @@ pub fn make_router_with_stats(
             .as_deref()
             .map(|env| template_speaks_effort_words(env, &state.bos_token, &state.eos_token))
             .unwrap_or(false),
+        template_opens_think: state
+            .chat_env
+            .as_deref()
+            .is_some_and(|env| template_opens_think(env, &state.bos_token, &state.eos_token)),
         ..state
     };
     if state.effort_words {
@@ -1768,6 +1784,63 @@ pub fn template_speaks_effort_words(
             );
             false
         }
+    }
+}
+
+/// Does `env`'s generation prompt open `<think>` with thinking on? Probed once
+/// at load by rendering one user message (no tools): R1-distill and
+/// Qwen3.5-style templates end the prompt in `<think>\n`, so the model's reply
+/// starts inside reasoning. A render error is a `false` with a warning, like
+/// the effort probe.
+pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eos: &str) -> bool {
+    let msgs = [ChatMessage {
+        role: "user".into(),
+        content: "probe".into(),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    match render_with_chat_env(env, &msgs, bos, eos, true, None, None) {
+        Ok(prompt) => prompt.trim_end().ends_with("<think>"),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "<think> probe could not render the chat template; assuming the generation prompt does not open reasoning"
+            );
+            false
+        }
+    }
+}
+
+/// Did this request's generation prompt open `<think>`? When the API rendered
+/// the prompt it is read off `task.prompt` (per request, so a template whose
+/// generation prompt depends on the effort word is right); when the engine
+/// renders it (sycl-llama, or ov-genai with thinking on) `task.prompt` is a
+/// placeholder and the load-time `probe` stands in.
+///
+/// Always false when `reasoning_as_text` is set: the engine folds its separate
+/// reasoning back in as `<think>…</think>` text and sends its own `<think>`
+/// first, so starting inside reasoning would put a literal `<think>` into the
+/// returned reasoning.
+// The reply paths call this once the reasoning split is wired in.
+#[allow(dead_code)]
+pub(crate) fn opens_think(
+    engine_applies_template: bool,
+    defer_template_on_thinking: bool,
+    enable_thinking: bool,
+    probe: bool,
+    reasoning_as_text: bool,
+    task: &GenerationTask,
+) -> bool {
+    if reasoning_as_text {
+        return false;
+    }
+    let engine_renders = engine_applies_template || (defer_template_on_thinking && enable_thinking);
+    if engine_renders {
+        probe
+    } else {
+        task.prompt.trim_end().ends_with("<think>")
     }
 }
 
@@ -6512,6 +6585,48 @@ level={{ effort_map[eff] }}";
             r(true, false, Some("high"), Some("bogus")),
             Err(PromptRenderError::Rejected(_))
         ));
+    }
+
+    /// A template whose generation prompt ends in `<think>\n` (R1-distill,
+    /// Qwen3.5-style) starts the reply inside reasoning: the probe says so.
+    #[test]
+    fn think_probe_sees_a_generation_prompt_that_opens_think() {
+        const T: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}\
+{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}";
+        let env = build_chat_env(T).unwrap();
+        assert!(template_opens_think(&env, "", ""));
+    }
+
+    /// Qwen3-8B's generation prompt stops at `<|im_start|>assistant\n`: the
+    /// model writes `<think>` itself, so the probe says no.
+    #[test]
+    fn think_probe_is_false_when_the_model_opens_the_tag() {
+        let env = build_chat_env(QWEN3_TEMPLATE).unwrap();
+        assert!(!template_opens_think(&env, "", ""));
+    }
+
+    /// Where the opened `<think>` is read from: the API's own render, or the
+    /// load-time probe when the engine renders the prompt itself; never when
+    /// the engine sends its reasoning as `<think>…</think>` text.
+    #[test]
+    fn opens_think_reads_the_prompt_or_the_probe() {
+        let opened = GenerationTask::new("t", "<|im_start|>assistant\n<think>\n");
+        let closed = GenerationTask::new("t", "<|im_start|>assistant\n");
+        // API rendered the prompt: read it, ignore the probe.
+        assert!(opens_think(false, false, true, false, false, &opened));
+        assert!(!opens_think(false, false, true, true, false, &closed));
+        // The engine renders (sycl-llama): the probe stands in.
+        assert!(opens_think(true, false, true, true, false, &closed));
+        assert!(!opens_think(true, false, true, false, false, &opened));
+        // ov-genai with thinking on: the engine's native render, so the probe.
+        assert!(opens_think(false, true, true, true, false, &closed));
+        assert!(!opens_think(false, true, true, false, false, &opened));
+        // ov-genai with thinking off: the API rendered it, read the prompt.
+        assert!(opens_think(false, true, false, false, false, &opened));
+        assert!(!opens_think(false, true, false, true, false, &closed));
+        // Reasoning folded in as text: the engine sends its own `<think>`.
+        assert!(!opens_think(true, false, true, true, true, &opened));
+        assert!(!opens_think(false, false, true, true, true, &opened));
     }
 
     /// GLM-5's template never rejects: anything but the literal "high" is

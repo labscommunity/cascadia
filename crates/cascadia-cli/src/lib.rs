@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use cascadia_api::reasoning::ReasoningFormat;
 use cascadia_engine::Builder;
 use cascadia_engine_llamacpp::{
     probe_stream_weights, resolve_llama_bin, validate_extra_args, ElasticVram, LlamaCppBuilder,
@@ -411,6 +412,12 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
+    /// deepseek: return a thinking model's reasoning in reasoning_content;
+    /// none: leave it in content as <think>…</think> (the output before this
+    /// release; kept for one release).
+    #[arg(long, value_name = "deepseek|none", default_value_t = ReasoningFormat::default())]
+    pub reasoning_format: ReasoningFormat,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -810,6 +817,12 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
+    /// deepseek: return a thinking model's reasoning in reasoning_content;
+    /// none: leave it in content as <think>…</think> (the output before this
+    /// release; kept for one release).
+    #[arg(long, value_name = "deepseek|none", default_value_t = ReasoningFormat::default())]
+    pub reasoning_format: ReasoningFormat,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -926,6 +939,7 @@ impl WorkerArgs {
             engine,
             prefix_cache_gb,
             api_max_body_mb,
+            reasoning_format: ReasoningFormat::default(),
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1254,6 +1268,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.elastic_vram = args.elastic_vram;
     worker.elastic_share = args.elastic_share;
     worker.llama_mtp = args.llama_mtp;
+    worker.reasoning_format = args.reasoning_format;
     cmd_worker(worker).await
 }
 
@@ -2575,6 +2590,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
+        cfg.reasoning_format = args.reasoning_format;
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
         // once, so a client that sends that many requests at once needs the
@@ -4246,6 +4262,35 @@ mod sycl_llama_flag_tests {
             Command::Worker(args) => args,
             _ => panic!("expected worker subcommand"),
         }
+    }
+
+    #[test]
+    fn reasoning_format_parses_and_defaults_to_reasoning_content() {
+        use cascadia_api::reasoning::ReasoningFormat;
+        let r = run_args(&["cascadia", "run", "m", "--reasoning-format", "none"]);
+        assert_eq!(r.reasoning_format, ReasoningFormat::None);
+        let r = run_args(&["cascadia", "run", "m"]);
+        assert_eq!(r.reasoning_format, ReasoningFormat::ReasoningContent);
+        let w = worker_args(&[
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--reasoning-format",
+            "none",
+        ]);
+        assert_eq!(w.reasoning_format, ReasoningFormat::None);
+        let w = worker_args(&[
+            "cascadia", "worker", "--rank", "0", "--total", "1", "--model", "m",
+        ]);
+        assert_eq!(w.reasoning_format, ReasoningFormat::ReasoningContent);
+        let bad = Cli::try_parse_from(["cascadia", "run", "m", "--reasoning-format", "raw"]);
+        let err = bad.expect_err("an unknown format is a parse error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
