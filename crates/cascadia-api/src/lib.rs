@@ -29,9 +29,9 @@ use uuid::Uuid;
 
 mod structured;
 pub use structured::{
-    grammar_for, parse_response_format, unenforced_keywords, unsatisfiable_bound, ResponseFormat,
-    SchemaCheckError, SchemaCompileCheck, JSON_OBJECT_SCHEMA, MAX_SCHEMA_BYTES, MAX_SCHEMA_COUNT,
-    MAX_SCHEMA_COUNT_TOTAL, MAX_SCHEMA_DEPTH,
+    check_pointer_refs_only, grammar_for, parse_response_format, unenforced_keywords,
+    unsatisfiable_bound, ResponseFormat, SchemaCheckError, SchemaCompileCheck, JSON_OBJECT_SCHEMA,
+    MAX_SCHEMA_BYTES, MAX_SCHEMA_COUNT, MAX_SCHEMA_COUNT_TOTAL, MAX_SCHEMA_DEPTH,
 };
 
 /// Maximum HTTP request body the chat-completions endpoint accepts. 64
@@ -8648,8 +8648,39 @@ level={{ effort_map[eff] }}";
         let (a, b) = (input("#"), input("https://example.com/a.json"));
         for schema in [&a, &b] {
             let (status, v) = post_schema(RefResolver::LlamaServer, schema).await;
-            assert_ref_refusal("sycl-llama", schema, status, &v);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("beside another `$ref`"),
+                "{v}"
+            );
         }
+        // Any form of ref there, `#/...` included: llama-server records none
+        // under a `$ref`'s siblings, so `C` becomes "any object", not an
+        // integer.
+        let pointer = serde_json::json!({
+            "$defs": {"A": {"$ref": "#/$defs/B", "x": {"$ref": "#/$defs/C"}}, "B": {"type": "string"}, "C": {"type": "integer"}},
+            "type": "object", "properties": {"p": {"$ref": "#/$defs/A/x"}}, "required": ["p"],
+        });
+        let (status, v) = post_schema(RefResolver::LlamaServer, &pointer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.contains(r##"$ref "#/$defs/C""##)
+                && err.contains("sycl-llama")
+                && err.contains("beside another `$ref`"),
+            "{err}"
+        );
+        // A `$ref` beside plain annotations is fine.
+        let annotated = serde_json::json!({
+            "$defs": {"C": {"type": "integer"}},
+            "type": "object",
+            "properties": {"p": {"$ref": "#/$defs/C", "description": "a count", "default": 1}},
+        });
+        let (status, v) = post_schema(RefResolver::LlamaServer, &annotated).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
         let (status, v) = post_schema(RefResolver::Xgrammar, &a).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         let (status, v) = post_schema(RefResolver::Xgrammar, &b).await;

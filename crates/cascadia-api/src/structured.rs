@@ -1382,16 +1382,20 @@ fn check_converter_depth(root: &Node) -> Result<(), String> {
 ///   JSON" (`json_schema_converter.cc`, "URI should either be '#' or start
 ///   with '#/'"). Walks what [`check_converter_depth`] walks: the schemas
 ///   the converter visits, ref targets included (inside data keywords too).
-/// - [`crate::RefResolver::LlamaServer`]: any ref but `#/...` anywhere in
-///   the document, data and `$ref` siblings included. llama-server's
-///   `resolve_refs` visits every value (data keywords, tuple `items`, every
-///   `allOf` member) and records the refs it meets, except beside another
-///   `$ref`; a `#/...` pointer can still reach a ref there, and a ref it
-///   never recorded, or one to an `https://` document (it never fetches),
-///   becomes "any object". It fails on the other forms (`#` alone
-///   included). A ref in data, or beside another `$ref`, that no pointer
-///   reaches is refused too: a conservative 400, since telling which data
-///   or siblings a pointer reaches would mean mirroring the converter.
+/// - [`crate::RefResolver::LlamaServer`]: any `$ref` under a `$ref`
+///   object's siblings, whatever its form, and anywhere else any ref but
+///   `#/...`, data included. llama-server's `resolve_refs` visits every
+///   value (data keywords, tuple `items`, every `allOf` member) and records
+///   the refs it meets, except under a `$ref` object's siblings; a `#/...`
+///   pointer can still reach a ref there, and a ref it never recorded, or
+///   one to an `https://` document (it never fetches), becomes "any
+///   object" (or drops an `allOf` member). It fails on the other forms
+///   (`#` alone included). Two conservative 400s follow, for schemas
+///   llama-server converts faithfully: a ref under a `$ref`'s siblings
+///   that no pointer reaches, or whose target is also referenced
+///   elsewhere; and a no-fragment `https://` ref the converter never
+///   reaches. Checked against llama.cpp's own converter by
+///   `scripts/llama-ref-differential/`.
 pub fn check_pointer_refs_only(
     raw: &str,
     schema: &Value,
@@ -1407,20 +1411,37 @@ pub fn check_pointer_refs_only(
             converter_walk(&root, Some(engine))
         }
         crate::RefResolver::LlamaServer => {
-            let mut stack = vec![schema];
-            while let Some(v) = stack.pop() {
+            // (value, under the siblings of a `$ref`)
+            let mut stack = vec![(schema, false)];
+            while let Some((v, beside_ref)) = stack.pop() {
                 match v {
-                    Value::Array(items) => stack.extend(items),
+                    Value::Array(items) => stack.extend(items.iter().map(|i| (i, beside_ref))),
                     Value::Object(obj) => {
-                        if let Some(Value::String(r)) = obj.get("$ref") {
+                        let own_ref = obj.get("$ref");
+                        if let Some(Value::String(r)) = own_ref {
+                            if beside_ref {
+                                let shown: String = r.chars().take(80).collect();
+                                return Err(format!(
+                                    "{FIELD}: $ref {} is not supported by this server's \
+                                     engine ({engine}): it does not resolve a `$ref` placed \
+                                     beside another `$ref` (inside that schema's other \
+                                     keywords), and would leave this one unconstrained",
+                                    Value::String(shown)
+                                ));
+                            }
                             if !r.starts_with("#/") {
                                 return Err(unenforced_ref(r, engine, "`#/...`"));
                             }
                         }
-                        // A `$ref`'s siblings too: llama-server records
-                        // none there, but a `#/...` pointer can reach one,
+                        // A `$ref`'s siblings too: llama-server records no
+                        // ref there, but a `#/...` pointer can reach one,
                         // and an unrecorded ref becomes "any object".
-                        stack.extend(obj.values());
+                        let beside = beside_ref || own_ref.is_some();
+                        stack.extend(
+                            obj.iter()
+                                .filter(|(k, _)| *k != "$ref")
+                                .map(|(_, c)| (c, beside)),
+                        );
                     }
                     _ => {}
                 }

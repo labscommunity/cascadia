@@ -748,17 +748,23 @@ in `default`) gets `` $ref "<ref>" is not supported by this server's engine
 (<engine>): it enforces only references inside the schema written as `#`
 or `#/...` pointers … ``. On `sycl-llama` llama-server visits every value
 in the schema (data, tuple `items` and every `allOf` member included) and
-records the refs it meets, except beside another `$ref`; a `#/...`
-pointer can still reach a ref there, and a ref it never recorded, or one
-to an `https://` document (it never fetches), matches any object. It fails
-on the other forms (`#` alone included). So every `$ref` there that is not
-`#/...`, `$ref` siblings and data included, gets the same 400
-(`` … written as `#/...` pointers … ``). That includes a ref inside
-`const`, `default` or `examples` that llama-server would only copy as a
-literal, and a ref such as `#` beside another `$ref` that no `#/...`
-pointer reaches (llama-server never visits it): known, conservative 400s,
-since a `#/...` pointer can make such data or siblings a schema and telling
-which ones it reaches would mean mirroring the converter. An unknown `$schema`
+records the refs it meets, except under a `$ref` object's siblings; a
+`#/...` pointer can still reach a ref there, and a ref it never recorded,
+or one to an `https://` document (it never fetches), matches any object
+(or drops an `allOf` member). It fails on the other forms (`#` alone
+included). So on `sycl-llama` any `$ref` under a `$ref` object's siblings,
+whatever its form, gets `` $ref "<ref>" is not supported by this server's
+engine (sycl-llama): it does not resolve a `$ref` placed beside another
+`$ref` … ``, and any other `$ref` that is not `#/...`, data included, gets
+`` … written as `#/...` pointers … ``. `description`, `title` or `default`
+beside a `$ref` are fine when they hold no `$ref`. Two classes of these
+400s are conservative (llama-server would convert the schema faithfully):
+a `$ref` under a `$ref`'s siblings that no pointer reaches, or whose
+target is also referenced elsewhere; and an `https://` `$ref` with no
+fragment that the converter never reaches (in `const`, `default`,
+`examples` or `enum` data, or an unused `$defs` entry). Telling those
+apart would mean mirroring the converter; `scripts/llama-ref-differential/`
+checks the rule against llama.cpp's own converter. An unknown `$schema`
 (`http://json-schema.org/schema#`, an OpenAPI dialect) is not a ref:
 `ov-genai` and `sycl-llama` ignore it, and llguidance refuses to build
 the schema (`invalid configuration: response_format schema: Resource
