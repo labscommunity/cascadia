@@ -1,5 +1,6 @@
 //! Integer bounds added to a schema before a grammar backend sees it.
 
+use crate::refs::local_ref_pointers;
 use crate::NAME_MAPS;
 use serde_json::{Map, Value};
 
@@ -117,46 +118,100 @@ pub(crate) fn clamp_for_llguidance(schema: &mut Value) {
     });
 }
 
-/// Whether `schema` has a number llguidance's build can't take: a `const`
-/// or `enum` number, or a `maximum`/`exclusiveMaximum`, at or below -2^63
-/// as an f64 (a `number` one too: an `allOf` or a type list can make it an
-/// integer's). llguidance saturates integer bounds to `i64`, and building a
+/// Whether `schema` has a number llguidance builds as an integer and can't
+/// build: a `const` or `enum` number, or a `maximum`/`exclusiveMaximum`, at
+/// or below -2^63 as an f64 (so -9223372036854775807 counts: it rounds to
+/// -2^63). llguidance saturates integer bounds to `i64`, and building a
 /// range whose upper end is `i64::MIN` negates it and recurses until the
-/// build thread's stack overflows, aborting the process. Data keywords
-/// (`default`, `examples`) are not read.
+/// build thread's stack overflows, aborting the process.
+///
+/// llguidance builds such a number as an integer when it is an integer
+/// literal that fits `i64`, or when it meets an `integer` type: its own, a
+/// type list holding `integer`, or one it is intersected with through
+/// `allOf`, a `$ref` or properties merged from two schemas. That last can
+/// come from anywhere in the document, so a `number` this low (`-1e20`) is
+/// refused only when the document names the `integer` type somewhere; a
+/// `number` schema in a document without one builds as before. Data
+/// keywords (`default`, `examples`) are not read, except where a `$ref`
+/// points into them.
 pub(crate) fn has_integer_llguidance_cannot_build(schema: &Value) -> bool {
-    fn at_or_below_min(v: &Value) -> bool {
-        match v {
-            Value::Number(n) => n.as_f64().is_some_and(|f| f <= I64_MIN_F64),
-            Value::Array(items) => items.iter().any(at_or_below_min),
-            Value::Object(obj) => obj.values().any(at_or_below_min),
-            _ => false,
-        }
-    }
-    fn scan(v: &Value, is_name_map: bool) -> bool {
-        match v {
-            Value::Object(obj) => obj.iter().any(|(k, child)| {
-                if is_name_map {
-                    return scan(child, false);
-                }
-                match k.as_str() {
-                    "const" | "enum" => at_or_below_min(child),
-                    "maximum" | "exclusiveMaximum" => {
-                        child.as_f64().is_some_and(|m| m <= I64_MIN_F64)
+    let any_integer = names_integer_type(schema);
+    let at_or_below_min = |v: &Value| -> bool {
+        let mut stack = vec![v];
+        while let Some(v) = stack.pop() {
+            match v {
+                Value::Number(n) => {
+                    if n.as_f64().is_some_and(|f| f <= I64_MIN_F64) && (any_integer || n.is_i64()) {
+                        return true;
                     }
-                    "default" | "examples" | "x-guidance" => false,
-                    k => scan(child, NAME_MAPS.contains(&k) && child.is_object()),
                 }
-            }),
-            Value::Array(items) => items.iter().any(|c| scan(c, false)),
-            _ => false,
+                Value::Array(items) => stack.extend(items),
+                Value::Object(obj) => stack.extend(obj.values()),
+                _ => {}
+            }
         }
-    }
-    scan(schema, false)
+        false
+    };
+    let scan = |root: &Value| -> bool {
+        let mut stack = vec![(root, false)];
+        while let Some((v, is_name_map)) = stack.pop() {
+            match v {
+                Value::Object(obj) => {
+                    for (k, child) in obj {
+                        if is_name_map {
+                            stack.push((child, false));
+                            continue;
+                        }
+                        let found = match k.as_str() {
+                            "const" | "enum" => at_or_below_min(child),
+                            "maximum" | "exclusiveMaximum" => {
+                                any_integer && child.as_f64().is_some_and(|m| m <= I64_MIN_F64)
+                            }
+                            "default" | "examples" | "x-guidance" => false,
+                            k => {
+                                stack.push((child, NAME_MAPS.contains(&k) && child.is_object()));
+                                false
+                            }
+                        };
+                        if found {
+                            return true;
+                        }
+                    }
+                }
+                Value::Array(items) => stack.extend(items.iter().map(|c| (c, false))),
+                _ => {}
+            }
+        }
+        false
+    };
+    scan(schema)
         || local_ref_pointers(schema)
             .iter()
             .filter_map(|p| schema.pointer(p))
-            .any(|target| scan(target, false))
+            .any(scan)
+}
+
+/// Whether any `type` in `v` is `"integer"` or a list holding it, data
+/// keywords included (a `$ref` can make one a schema).
+fn names_integer_type(v: &Value) -> bool {
+    let mut stack = vec![v];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(obj) => {
+                if obj.get("type").is_some_and(|t| match t {
+                    Value::String(t) => t == "integer",
+                    Value::Array(ts) => ts.iter().any(|t| t == "integer"),
+                    _ => false,
+                }) {
+                    return true;
+                }
+                stack.extend(obj.values());
+            }
+            Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `i64::MIN` as an f64: -2^63.
@@ -204,9 +259,12 @@ fn has_integer(obj: &Map<String, Value>) -> bool {
 /// to refuse: a bound added beside it would hide it.
 const BOUND_KEYWORDS: [&str; 4] = ["minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum"];
 
-/// [`visit_schemas`] on `schema`, then on the target of each local `$ref`
-/// in it. llguidance builds whatever a `$ref` points to as a schema, inside
-/// a data keyword (`default`, `examples`) too, which the walk skips. A
+/// [`visit_schemas`] on `schema`, then on the target of each `#/...` `$ref`
+/// in it, resolved the way llguidance resolves it ([`local_ref_pointers`]).
+/// llguidance builds whatever a `$ref` points to as a schema, inside a data
+/// keyword (`default`, `examples`) too, which the walk skips. Refs that could
+/// resolve elsewhere (another base URI, an anchor) are refused before this
+/// runs (`refs::unfollowable_ref`). A
 /// target the walk already visited is visited again: `f` must leave a
 /// schema it already changed as it is.
 fn visit_schemas_and_ref_targets(schema: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
@@ -216,31 +274,6 @@ fn visit_schemas_and_ref_targets(schema: &mut Value, f: &mut impl FnMut(&mut Map
             visit_schemas(target, f);
         }
     }
-}
-
-/// The JSON pointers of the local `$ref`s (`#/...`) anywhere in `v`, data
-/// keywords included, each once.
-fn local_ref_pointers(v: &Value) -> Vec<String> {
-    let mut pointers = std::collections::BTreeSet::new();
-    let mut stack = vec![v];
-    while let Some(v) = stack.pop() {
-        match v {
-            Value::Object(obj) => {
-                if let Some(p) = obj
-                    .get("$ref")
-                    .and_then(Value::as_str)
-                    .and_then(|r| r.strip_prefix('#'))
-                    .filter(|p| p.starts_with('/'))
-                {
-                    pointers.insert(p.to_owned());
-                }
-                stack.extend(obj.values());
-            }
-            Value::Array(items) => stack.extend(items),
-            _ => {}
-        }
-    }
-    pointers.into_iter().collect()
 }
 
 /// Calls `f` on every schema object in `v`: through subschema keywords,
@@ -416,14 +449,24 @@ mod tests {
         assert!(low(
             json!({"properties": {"a": {"enum": [[{"x": i64::MIN}]]}}})
         ));
-        assert!(low(json!({"items": {"exclusiveMaximum": -1e19}})));
+        assert!(low(
+            json!({"type": "integer", "items": {"exclusiveMaximum": -1e19}})
+        ));
+        // A number this low that no integer type meets builds as a float.
+        assert!(!low(json!({"items": {"exclusiveMaximum": -1e19}})));
+        assert!(!low(json!({"type": "number", "const": -1e20})));
+        // An i64 literal is an integer wherever it sits.
+        assert!(low(
+            json!({"type": "number", "const": -9223372036854775807i64})
+        ));
         // -2^63 + 1024 is the first i64 above -2^63 as an f64.
         assert!(!low(json!({"const": -9223372036854774784i64})));
         assert!(!low(json!({"examples": [i64::MIN], "default": i64::MIN})));
         assert!(!low(
             json!({"properties": {"const": {"type": "integer"}, "maximum": {}}})
         ));
-        assert!(low(json!({"allOf": [{"const": -1e19}]})));
+        assert!(low(json!({"type": "integer", "allOf": [{"const": -1e19}]})));
+        assert!(!low(json!({"allOf": [{"const": -1e19}]})));
         assert!(!low(json!({"const": -1e18})));
     }
 

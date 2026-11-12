@@ -31,6 +31,12 @@ use toktrie_hf_tokenizers::ByteTokenizer;
 pub const STAGE_UPGRADE_MESSAGE: &str =
     "a later pipeline stage runs a build without structured-output support; upgrade every stage";
 
+/// Why a schema with an integer llguidance can't build is refused. The
+/// value is compared as a 64-bit float, so a value the client wrote just
+/// above -2^63 (-9223372036854775807) is refused too.
+const LOW_INTEGER_MESSAGE: &str = "an integer `const`, `enum` value or upper bound at or below \
+     about -9.2e18 (-2^63, compared as a 64-bit float) is not supported";
+
 /// Longest error message handed back to the client.
 const MAX_ERROR_CHARS: usize = 300;
 
@@ -219,11 +225,13 @@ impl GrammarFactory {
                 // are generated in the order the client listed them.
                 let mut schema: serde_json::Value =
                     serde_json::from_str(&spec.body).map_err(invalid_schema)?;
+                // The integer guards below follow `#/...` refs only; a ref
+                // llguidance could resolve elsewhere is refused first.
+                if let Some(why) = refs::unfollowable_ref(&schema) {
+                    return Err(invalid_schema(why));
+                }
                 if int_bounds::has_integer_llguidance_cannot_build(&schema) {
-                    return Err(invalid_schema(
-                        "a number at or below -9223372036854775808 (a `const` or `enum` \
-                         value, or an upper bound) is not supported",
-                    ));
+                    return Err(invalid_schema(LOW_INTEGER_MESSAGE));
                 }
                 let obj = schema
                     .as_object_mut()
@@ -815,7 +823,9 @@ mod xgrammar_cost;
 pub use xgrammar_cost::{xgrammar_cost, xgrammar_cost_error, MAX_XGRAMMAR_COST};
 
 mod int_bounds;
+mod refs;
 pub use int_bounds::{bound_integers, ADDED_INTEGER_MAXIMUM, ADDED_INTEGER_MINIMUM};
+pub use refs::unfollowable_ref;
 
 mod stage_mask;
 pub use stage_mask::{

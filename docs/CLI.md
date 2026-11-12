@@ -595,10 +595,20 @@ The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
   value for (an `allOf` with a `const` past them, say). `number` is not
   bounded. A lower bound at or below -2^63 (C#'s `long.MinValue`, and the
   added minimum), which llguidance can't build, is raised to
-  -9223372036854774784. A schema with a number at or below -2^63 as a
-  `const` or `enum` value or an upper bound is a 400 (`a number at or
-  below -9223372036854775808 ... is not supported`): llguidance's build
-  can't take it.
+  -9223372036854774784. A schema with an integer at or below -2^63 as a
+  `const` or `enum` value or an upper bound is a 400
+  (`` an integer `const`, `enum` value or upper bound at or below about -9.2e18 (-2^63, compared as a 64-bit float) is not supported ``): llguidance's build can't take it.
+  The value is compared as a 64-bit float, so -9223372036854775807 counts
+  too. A value is an integer here when it is written as one, or when the
+  schema has an `integer` type anywhere (llguidance can intersect it with
+  that type through `allOf`, a `$ref` or merged properties); a `number`
+  such as `{"type": "number", "const": -1e20}` in a schema with no
+  `integer` builds.
+- Refuse a `$ref` llguidance would resolve somewhere the server's checks
+  don't read (a ref with a URI, an anchor `#name`, a ref under a non-root
+  `$id`), with the 400 below (`… is not supported`). A `#/...` pointer is
+  read the way llguidance reads it: percent-decoded (`%25` is `%`, `%2F`
+  splits a key), `~1`/`~0` unescaped, and `01` or `+1` as array index 1.
 - Compile the schema when the request is submitted: a schema llguidance
   cannot build (for example `{"type": 42}` or an unresolvable `$ref`) is a
   400 before the request queues. A client's own top-level `x-guidance`
@@ -715,7 +725,13 @@ objects, `#/key/key…`: no empty segment (`//`, a trailing `/`), no `~`
 escape, no `%` encoding, no array index, and it must name an existing
 schema (a JSON object or `true`/`false`, not a string, number or list such
 as `#/required`); otherwise the request gets `unsupported $ref "<ref>"`. A `$ref`
-that does not start with `#` is left to the backend. A schema whose walk
+that does not start with `#` (`urn:x#/…`, `https://…`, `other.json`) gets
+`` $ref "<ref>" is not supported: only a reference inside the schema (`#` or `#/...`) is ``,
+and a `$id` in any schema below the root (or a draft-4 `id`,
+when the schema names draft 4) gets `` `$id` below the root is not supported
+(it changes what a `$ref` under it refers to) ``: either would make a `$ref`
+resolve against another base URI than the server's checks read. A root
+`$id` is fine, as are properties named `id` or `$id`. A schema whose walk
 would take the converter too long gets `… schema is too complex`.
 
 Errors (`{"error": "<message>"}`; on a stream, after the SSE stream has

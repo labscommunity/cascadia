@@ -1340,11 +1340,7 @@ fn an_integer_ending_at_or_below_i64_min_is_refused_not_built() {
             .compile(&spec(&with_n(n)))
             .err()
             .unwrap_or_else(|| panic!("{n}"));
-        assert!(
-            err.to_string()
-                .contains("a number at or below -9223372036854775808"),
-            "{n}: {err}"
-        );
+        assert!(err.to_string().contains(LOW_INTEGER_MESSAGE), "{n}: {err}");
     }
     // Data, a property named like a keyword, and a value above it are fine.
     for n in [
@@ -1427,8 +1423,7 @@ fn an_integer_reached_by_a_ref_into_a_data_keyword_is_clamped_and_bounded() {
                 .err()
                 .unwrap_or_else(|| panic!("{body}"));
             assert!(
-                err.to_string()
-                    .contains("a number at or below -9223372036854775808"),
+                err.to_string().contains(LOW_INTEGER_MESSAGE),
                 "{body}: {err}"
             );
         }
@@ -1504,4 +1499,265 @@ fn a_pattern_under_a_property_named_like_a_keyword_is_dropped() {
             grammar.warnings()
         );
     }
+}
+
+/// The schema [`compile_child`] builds when this test binary is run again
+/// as a child; set only for the child.
+const CHILD_SCHEMA_ENV: &str = "CASCADIA_GRAMMAR_TEST_CHILD_SCHEMA";
+/// Set (to anything) for a child that builds the schema with llguidance as
+/// it is, past every guard of [`GrammarFactory::compile`].
+const CHILD_UNGUARDED_ENV: &str = "CASCADIA_GRAMMAR_TEST_CHILD_UNGUARDED";
+
+/// Not a test of its own: in a child run (see [`build_in_child`]) it builds
+/// one schema and prints the outcome. A build that aborts the process takes
+/// only the child down.
+#[test]
+fn compile_child() {
+    let Ok(body) = std::env::var(CHILD_SCHEMA_ENV) else {
+        return;
+    };
+    let gf = single_byte();
+    let built = if std::env::var_os(CHILD_UNGUARDED_ENV).is_some() {
+        let mut schema: serde_json::Value = serde_json::from_str(&body).unwrap();
+        schema["x-guidance"] = guidance_options();
+        gf.compile_schema(schema, Vec::new()).map(|_| ())
+    } else {
+        gf.compile(&spec(&body)).map(|_| ())
+    };
+    match built {
+        Ok(()) => println!("CHILD-OUTCOME built"),
+        Err(e) => println!("CHILD-OUTCOME refused {e}"),
+    }
+}
+
+/// How a schema build in a child process ended.
+#[derive(Debug)]
+enum ChildBuild {
+    Built,
+    Refused(String),
+    /// The child never reported: it aborted (a stack overflow) or crashed.
+    Died(String),
+}
+
+/// Builds `body` in a child run of this test binary, through
+/// [`GrammarFactory::compile`] or, `unguarded`, straight through llguidance.
+fn build_in_child(body: &str, unguarded: bool) -> ChildBuild {
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "tests::compile_child",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(CHILD_SCHEMA_ENV, body);
+    if unguarded {
+        cmd.env(CHILD_UNGUARDED_ENV, "1");
+    }
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    match stdout
+        .lines()
+        .find_map(|l| l.split_once("CHILD-OUTCOME ").map(|(_, r)| r))
+    {
+        Some("built") => ChildBuild::Built,
+        Some(r) => ChildBuild::Refused(r.strip_prefix("refused ").unwrap_or(r).to_owned()),
+        None => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+            ChildBuild::Died(format!("{}: {}", out.status, tail.join(" | ")))
+        }
+    }
+}
+
+/// A schema where `n` is `{"$ref": r}`, with `default: default`.
+fn n_ref(r: &str, default: &str) -> String {
+    format!(
+        r#"{{"type":"object","properties":{{"n":{{"$ref":"{r}"}}}},"required":["n"],"default":{default}}}"#
+    )
+}
+
+/// An integer llguidance's build overflows its stack on.
+const OVERFLOWS: &str = r#"{"type":"integer","const":-9223372036854775808}"#;
+/// An integer it builds.
+const BUILDS: &str = r#"{"type":"integer"}"#;
+
+/// `body` aborts the process when llguidance builds it as it is, and
+/// [`GrammarFactory::compile`] refuses it with a message naming
+/// `response_format` and holding `want`. Both builds run in a child process.
+/// In a release build (as served) llguidance's negation wraps and its
+/// recursion overflows the stack; in a debug build overflow checks stop it
+/// first, with a panic the build reports as an error.
+fn refused_not_aborted(body: &str, want: &str) {
+    match build_in_child(body, true) {
+        ChildBuild::Died(why) if !cfg!(debug_assertions) => {
+            assert!(why.contains("stack overflow"), "{body}: {why}")
+        }
+        ChildBuild::Refused(e) if cfg!(debug_assertions) => {
+            assert!(e.contains("attempt to negate with overflow"), "{body}: {e}")
+        }
+        other => panic!("{body}: llguidance as is: {other:?}"),
+    }
+    match build_in_child(body, false) {
+        ChildBuild::Refused(e) => assert!(
+            e.contains("response_format schema: ") && e.contains(want),
+            "{body}: {e}"
+        ),
+        other => panic!("{body}: {other:?}"),
+    }
+}
+
+#[test]
+fn a_ref_llguidance_resolves_where_the_guards_do_not_look_is_refused() {
+    // Each of these reaches the integer at `default.x` through a ref the
+    // guards did not follow: by another base URI (a `$ref` with a URI, a
+    // `$id` below the root, a draft-4 `id`), so the guards read the root's
+    // `default.x` (an integer that builds) or nothing.
+    let nested = |id_key: &str, schema: &str| {
+        format!(
+            r##"{{{schema}"type":"object","properties":{{"a":{{"{id_key}":"urn:y","type":"object","properties":{{"n":{{"$ref":"#/default/x"}}}},"required":["n"],"default":{{"x":{OVERFLOWS}}}}}}},"required":["a"],"default":{{"x":{BUILDS}}}}}"##
+        )
+    };
+    let reviewer = format!(
+        r#"{{"$id":"urn:x","type":"object","properties":{{"n":{{"$ref":"urn:x#/default/x"}}}},"required":["n"],"default":{{"x":{OVERFLOWS}}}}}"#
+    );
+    let no_id = n_ref(
+        "json-schema:///#/default/x",
+        &format!(r#"{{"x":{OVERFLOWS}}}"#),
+    );
+    let draft7_all_of = format!(
+        r##"{{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{{"a":{{"$id":"urn:y","allOf":[{{"$ref":"#/default/x"}}],"default":{{"x":{OVERFLOWS}}}}}}},"required":["a"],"default":{{"x":{BUILDS}}}}}"##
+    );
+    for (body, want) in [
+        (reviewer, r#"$ref "urn:x#/default/x" is not supported"#),
+        (
+            no_id,
+            r#"$ref "json-schema:///#/default/x" is not supported"#,
+        ),
+        (nested("$id", ""), "`$id` below the root is not supported"),
+        (
+            nested(
+                "$id",
+                r#""$schema":"http://json-schema.org/draft-06/schema#","#,
+            ),
+            "`$id` below the root is not supported",
+        ),
+        (
+            nested(
+                "id",
+                r#""$schema":"http://json-schema.org/draft-04/schema#","#,
+            ),
+            "`id` below the root is not supported",
+        ),
+        (draft7_all_of, "`$id` below the root is not supported"),
+    ] {
+        refused_not_aborted(&body, want);
+    }
+    // An anchor is refused too, wherever it sits.
+    let gf = single_byte();
+    let anchor = r##"{"type":"object","properties":{"n":{"$ref":"#foo"}},"$defs":{"a":{"$anchor":"foo","type":"integer"}}}"##;
+    let err = gf.compile(&spec(anchor)).err().expect("an anchor ref");
+    assert!(
+        err.to_string()
+            .contains(r##"response_format schema: $ref "#foo" is not supported: an anchor"##),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_ref_pointer_is_read_the_way_llguidance_decodes_it() {
+    // llguidance percent-decodes a ref's pointer before splitting it, and
+    // reads `01` and `+1` as array index 1; the guards read them as
+    // written and checked the integer that builds.
+    for (r, data) in [
+        (
+            "#/default/a%25b",
+            format!(r#"{{"a%b":{OVERFLOWS},"a%25b":{BUILDS}}}"#),
+        ),
+        (
+            "#/default/a%2Fb",
+            format!(r#"{{"a":{{"b":{OVERFLOWS}}},"a%2Fb":{BUILDS}}}"#),
+        ),
+        (
+            "#/default/a%7E1b",
+            format!(r#"{{"a/b":{OVERFLOWS},"a%7E1b":{BUILDS}}}"#),
+        ),
+        (
+            "#/default/x/01",
+            format!(r#"{{"x":[{BUILDS},{OVERFLOWS}]}}"#),
+        ),
+        (
+            "#/default/x/+1",
+            format!(r#"{{"x":[{BUILDS},{OVERFLOWS}]}}"#),
+        ),
+    ] {
+        refused_not_aborted(&n_ref(r, &data), LOW_INTEGER_MESSAGE);
+    }
+    // Followed, the target is clamped and bounded as well: no 20th digit.
+    let gf = single_byte();
+    let body = n_ref("#/default/a%2Fb", &format!(r#"{{"a":{{"b":{BUILDS}}}}}"#));
+    let mut gm = mask_for(&gf, &body);
+    let prefix = bytes(r#"{"n":1234567890123456789"#);
+    assert_eq!(walk(&gf, &mut gm, &prefix), Ok(()), "{body}");
+    assert!(!gm.allowed(u32::from(b'0')), "{body}: a 20th digit");
+}
+
+#[test]
+fn refs_real_clients_write_still_build() {
+    let gf = single_byte();
+    for body in [
+        // pydantic
+        r##"{"$defs":{"Pet":{"properties":{"name":{"title":"Name","type":"string"},"age":{"title":"Age","type":"integer"}},"required":["name","age"],"title":"Pet","type":"object"}},"properties":{"pets":{"items":{"$ref":"#/$defs/Pet"},"title":"Pets","type":"array"}},"required":["pets"],"title":"Owner","type":"object"}"##,
+        // zod-to-json-schema
+        r##"{"type":"object","properties":{"pet":{"$ref":"#/definitions/Pet"}},"required":["pet"],"additionalProperties":false,"definitions":{"Pet":{"type":"object","properties":{"age":{"type":"integer"}},"required":["age"]}},"$schema":"http://json-schema.org/draft-07/schema#"}"##,
+        // A root `$id` with `#/...` refs, and a recursive `#` ref.
+        r##"{"$id":"https://example.com/owner.json","type":"object","properties":{"pet":{"$ref":"#/$defs/Pet"},"next":{"anyOf":[{"$ref":"#"},{"type":"null"}]}},"required":["pet"],"$defs":{"Pet":{"type":"integer"}}}"##,
+        BROWSER_USE_SCHEMA,
+        PYDANTIC_OUTPUT_SCHEMA,
+    ] {
+        gf.compile(&spec(body))
+            .unwrap_or_else(|e| panic!("{body}: {e}"));
+    }
+}
+
+#[test]
+fn a_number_below_the_integer_floor_builds_where_no_integer_meets_it() {
+    // llguidance builds a `number` this low as a float, which it can; it
+    // overflows only where the value is an integer: an `i64` literal, or
+    // one an `integer` type reaches.
+    let gf = single_byte();
+    for n in [
+        r#"{"type":"number","const":-1e20}"#,
+        r#"{"type":"object","properties":{"t":{"type":"number","enum":[-1e20,1.5]}}}"#,
+        r#"{"const":-1e20}"#,
+    ] {
+        gf.compile(&spec(&with_n(n)))
+            .unwrap_or_else(|e| panic!("{n}: {e}"));
+    }
+    for n in [
+        r#"{"type":["integer","number"],"const":-1e20}"#,
+        r#"{"type":["integer","number"],"enum":[-1e20,1.5]}"#,
+        r#"{"allOf":[{"type":"integer"},{"type":"number","const":-1e20}]}"#,
+        r#"{"allOf":[{"type":"object","properties":{"t":{"type":"integer"}}},{"properties":{"t":{"const":-1e20}}}]}"#,
+        r#"{"type":"number","const":-9223372036854775807}"#,
+    ] {
+        refused_not_aborted(&with_n(n), LOW_INTEGER_MESSAGE);
+    }
+}
+
+#[test]
+fn the_low_integer_message_holds_for_a_value_just_above_i64_min() {
+    // -9223372036854775807 rounds to -2^63 as a 64-bit float: the message
+    // must not say the value is at or below -9223372036854775808.
+    let gf = single_byte();
+    let err = gf
+        .compile(&spec(&with_n(
+            r#"{"type":"integer","const":-9223372036854775807}"#,
+        )))
+        .err()
+        .expect("refused");
+    let msg = err.to_string();
+    assert!(msg.contains("response_format schema: "), "{msg}");
+    assert!(msg.contains("about -9.2e18"), "{msg}");
+    assert!(msg.contains("64-bit float"), "{msg}");
+    assert!(!msg.contains("-9223372036854775808"), "{msg}");
 }

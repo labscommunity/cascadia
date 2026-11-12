@@ -400,6 +400,12 @@ fn parse_json_schema(js: Option<&Value>, raw: &str) -> Result<ResponseFormat, St
                 serde_json::from_str(&text).map_err(|e| format!("{FIELD}: {e}"))?;
             check_converter_depth(&Node::parse(raw).map_err(|e| format!("{FIELD}: {e}"))?)?;
             check_ref_depth_bound(&schema)?;
+            // llguidance resolves a ref with a URI, or one under a `$id`
+            // below the root, against another base URI than the grammar
+            // crate's integer guards read: refused for every engine.
+            if let Some(why) = cascadia_grammar::unfollowable_ref(&schema) {
+                return Err(format!("{FIELD}: {why}"));
+            }
             Ok(ResponseFormat::JsonSchema {
                 name: js.get("name").and_then(Value::as_str).map(str::to_owned),
                 schema,
@@ -1688,9 +1694,11 @@ const SCHEMA_TYPES: [&str; 7] = [
 ];
 
 /// The schema a `$ref` points to, `None` for a ref that is not local (it
-/// does not start with `#`; the converter accepts any value there) or is
-/// `#` itself (the converter refers back to the root without visiting it),
-/// and the work resolving it took: the ref's length plus the keys scanned.
+/// does not start with `#`; the converter accepts any value there, and
+/// [`parse_json_schema`] refuses it afterwards, see
+/// `cascadia_grammar::unfollowable_ref`) or is `#` itself (the converter
+/// refers back to the root without visiting it), and the work resolving it
+/// took: the ref's length plus the keys scanned.
 ///
 /// A local ref must be a plain JSON pointer: `#/` and keys joined by `/`,
 /// with no empty key and no `~` or `%`. Where it is, it is read here the way
@@ -3455,7 +3463,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_local_and_remote_refs_pass() {
+    fn plain_local_refs_pass() {
         for (r, target) in [
             ("#/$defs/X", "$defs"),
             ("#/definitions/X", "definitions"),
@@ -3470,10 +3478,57 @@ mod tests {
             }
             assert!(parse_schema(schema).is_ok(), "{r}");
         }
-        for r in ["#", "https://example.com/s.json", "s.json#/$defs/x~0y"] {
-            let schema = json!({"type": "object", "properties": {"a": {"$ref": r}}});
-            assert!(parse_schema(schema).is_ok(), "{r}");
+        let schema = json!({"type": "object", "properties": {"a": {"$ref": "#"}}});
+        assert!(parse_schema(schema).is_ok());
+    }
+
+    /// llguidance resolves a ref with a URI, or one under a `$id` below the
+    /// root, against another base URI than the grammar crate's integer
+    /// guards read, which lets an integer whose build aborts the process
+    /// past them: refused here, for every engine.
+    #[test]
+    fn refs_resolved_against_another_base_uri_are_rejected() {
+        let low = json!({"type": "integer", "const": i64::MIN});
+        for (schema, want) in [
+            (
+                json!({"$id": "urn:x", "type": "object", "properties": {"n": {"$ref": "urn:x#/default/x"}}, "default": {"x": low}}),
+                r#"$ref "urn:x#/default/x" is not supported"#,
+            ),
+            (
+                json!({"type": "object", "properties": {"n": {"$ref": "json-schema:///#/default/x"}}, "default": {"x": low}}),
+                r#"$ref "json-schema:///#/default/x" is not supported"#,
+            ),
+            (
+                json!({"type": "object", "properties": {"a": {"$ref": "https://example.com/s.json"}}}),
+                r#"$ref "https://example.com/s.json" is not supported"#,
+            ),
+            (
+                json!({"type": "object", "properties": {"a": {"$ref": "s.json#/$defs/x~0y"}}}),
+                r#"$ref "s.json#/$defs/x~0y" is not supported"#,
+            ),
+            (
+                json!({"type": "object", "properties": {"a": {"$id": "urn:y", "type": "object", "properties": {"n": {"$ref": "#/default/x"}}, "default": {"x": low}}}, "default": {"x": {"type": "integer"}}}),
+                "`$id` below the root is not supported",
+            ),
+            (
+                json!({"$schema": "http://json-schema.org/draft-04/schema#", "type": "object", "properties": {"a": {"id": "urn:y", "type": "object"}}}),
+                "`id` below the root is not supported",
+            ),
+        ] {
+            let err = parse_schema(schema.clone()).expect_err(&schema.to_string());
+            assert!(
+                err.starts_with("response_format.json_schema.schema: ") && err.contains(want),
+                "{schema}: {err}"
+            );
         }
+        // A root `$id` with `#/...` refs (and properties named `$id`/`id`) passes.
+        let schema = json!({
+            "$id": "https://example.com/owner.json",
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "$id": {"type": "string"}, "pet": {"$ref": "#/$defs/Pet"}},
+            "$defs": {"Pet": {"type": "integer"}},
+        });
+        assert!(parse_schema(schema).is_ok());
     }
 
     /// A `$ref` into `default` passes the checks here, and llguidance builds

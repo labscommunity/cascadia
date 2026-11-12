@@ -8353,6 +8353,105 @@ level={{ effort_map[eff] }}";
         assert!(v["error"].as_str().unwrap().contains(refusal), "{v}");
     }
 
+    /// Schemas whose `$ref` llguidance resolves somewhere its integer guards
+    /// did not look, to an integer whose build overflows the stack and
+    /// aborts the process.
+    fn refs_the_guards_cannot_follow() -> Vec<Value> {
+        let low = serde_json::json!({"type": "integer", "const": i64::MIN});
+        vec![
+            serde_json::json!({
+                "$id": "urn:x", "type": "object",
+                "properties": {"n": {"$ref": "urn:x#/default/x"}}, "required": ["n"],
+                "default": {"x": low},
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"n": {"$ref": "json-schema:///#/default/x"}}, "required": ["n"],
+                "default": {"x": low},
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"a": {
+                    "$id": "urn:y", "type": "object",
+                    "properties": {"n": {"$ref": "#/default/x"}}, "required": ["n"],
+                    "default": {"x": low},
+                }},
+                "required": ["a"],
+                "default": {"x": {"type": "integer"}},
+            }),
+        ]
+    }
+
+    const REF_CHILD_ENV: &str = "CASCADIA_API_TEST_CHILD_SCHEMA";
+
+    /// Not a test of its own: in a child run it posts one schema to an app
+    /// whose schema check builds it with llguidance, and prints the answer.
+    /// A build that aborts takes only the child down.
+    #[tokio::test]
+    async fn ref_schema_child() {
+        let Ok(schema) = std::env::var(REF_CHILD_ENV) else {
+            return;
+        };
+        let schema: Value = serde_json::from_str(&schema).unwrap();
+        let (status, v) = post_chat(
+            so_app_checked(SchemaCompileCheck::default()).await,
+            chat_with(Some(json_schema_format(schema))),
+        )
+        .await;
+        println!("CHILD-OUTCOME {} {}", status.as_u16(), v["error"]);
+    }
+
+    /// A ref llguidance would resolve where the integer guards don't look is
+    /// a 400 naming `response_format`, with the llguidance build check on
+    /// (run in a child: before the fix the check's build aborted the
+    /// process) and off.
+    #[tokio::test]
+    async fn a_ref_the_integer_guards_cannot_follow_is_400_not_an_abort() {
+        for schema in refs_the_guards_cannot_follow() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::ref_schema_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(REF_CHILD_ENV, schema.to_string())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let outcome = stdout
+                .lines()
+                .find_map(|l| l.split_once("CHILD-OUTCOME ").map(|(_, r)| r.to_owned()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{schema}: the child died: {} {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr)
+                            .lines()
+                            .rev()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    )
+                });
+            assert!(
+                outcome.starts_with("400 ") && outcome.contains("response_format"),
+                "{schema}: {outcome}"
+            );
+
+            let (status, v) = post_chat(
+                so_app_with_check(SchemaCompileCheck::default(), false).await,
+                chat_with(Some(json_schema_format(schema.clone()))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+            assert!(
+                v["error"].as_str().unwrap().contains("response_format"),
+                "{v}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn schema_within_the_compile_budget_passes() {
         let (status, v) = post_chat(
