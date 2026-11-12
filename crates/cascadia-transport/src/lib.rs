@@ -1402,8 +1402,25 @@ impl ActivationServer {
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
+        self.send_capped(tensor, MAX_TENSOR_BYTES).await
+    }
+
+    /// [`send`](Self::send) with the cap as a parameter (tests). A frame the
+    /// cap refuses closes the link: nothing of the tensor was written, but a
+    /// caller may already have sent its control prefix with `send_raw`, and a
+    /// peer left waiting for the missing tensor would sit out the frame-start
+    /// idle ceiling. Closing makes it read EOF now. Other errors are untouched.
+    async fn send_capped(
+        &mut self,
+        tensor: &Tensor,
+        max_payload: usize,
+    ) -> TransportResult<TransferStats> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        let res = send_tensor_capped(sock, tensor, max_payload).await;
+        if let Err(TransportError::PayloadTooLarge(_)) = res {
+            self.poison().await;
+        }
+        res
     }
 
     /// Send raw bytes over the established connection. Used by the
@@ -1621,8 +1638,25 @@ impl ActivationClient {
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
+        self.send_capped(tensor, MAX_TENSOR_BYTES).await
+    }
+
+    /// [`send`](Self::send) with the cap as a parameter (tests). A frame the
+    /// cap refuses closes the link: nothing of the tensor was written, but a
+    /// caller may already have sent its control prefix with `send_raw`, and a
+    /// peer left waiting for the missing tensor would sit out the frame-start
+    /// idle ceiling. Closing makes it read EOF now. Other errors are untouched.
+    async fn send_capped(
+        &mut self,
+        tensor: &Tensor,
+        max_payload: usize,
+    ) -> TransportResult<TransferStats> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        let res = send_tensor_capped(sock, tensor, max_payload).await;
+        if let Err(TransportError::PayloadTooLarge(_)) = res {
+            self.poison().await;
+        }
+        res
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
@@ -1759,7 +1793,10 @@ mod tests {
 
     /// After a refused oversize send the link is still frame-aligned: the
     /// next frame is read whole, as sent (the hardware failure kept reading
-    /// the unread body of a refused frame as later replies).
+    /// the unread body of a refused frame as later replies). This pins the
+    /// frame function writing nothing; `ActivationServer`/`ActivationClient`
+    /// additionally close the link on that refusal (see the tests below), so
+    /// over them the next frame never comes and the peer reads EOF instead.
     #[tokio::test]
     async fn a_refused_oversize_send_leaves_the_link_aligned() {
         let (mut tx, mut rx) = tokio::io::duplex(1 << 16);
@@ -1770,6 +1807,84 @@ mod tests {
         let (got, _) = recv_tensor(&mut rx).await.unwrap();
         assert_eq!(got.shape, ok.shape);
         assert_eq!(got.data, ok.data);
+    }
+
+    /// A frame refused by the send cap closes the link at once: the kind
+    /// header the dist-spec engines write with `send_raw` is already on the
+    /// wire, so a peer left waiting for the tensor that never comes would sit
+    /// out the frame-start idle ceiling (900 s) before failing. Instead it
+    /// reads EOF promptly, and the refused tensor never reaches the wire.
+    #[tokio::test]
+    async fn a_refused_server_send_closes_the_link_so_the_peer_fails_fast() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        let (acc, conn) = tokio::join!(server.accept(), client.connect());
+        acc.unwrap();
+        conn.unwrap();
+
+        server.send_raw(&[3u8]).await.unwrap(); // kind header, as the engines do
+        let big = Tensor::from_2d(DType::F16, 1, 9, vec![7u8; 18]);
+        let err = server.send_capped(&big, 16).await.unwrap_err();
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(18)),
+            "got {err:?}"
+        );
+
+        assert_eq!(client.recv_raw(1).await.unwrap(), vec![3u8]);
+        let next = tokio::time::timeout(Duration::from_secs(2), client.recv())
+            .await
+            .expect("peer must see the close within 2 s, not wait out the idle ceiling");
+        assert!(
+            matches!(next, Err(TransportError::SocketClosed)),
+            "got {next:?}"
+        );
+
+        // The close is idempotent: later sends fail fast, close is harmless.
+        assert!(matches!(
+            server.send(&big).await,
+            Err(TransportError::NotConnected)
+        ));
+        server.close().await;
+        server.close().await;
+    }
+
+    /// Same on the dialing side: a refused `ActivationClient::send` closes
+    /// the link and the accepting peer reads EOF promptly.
+    #[tokio::test]
+    async fn a_refused_client_send_closes_the_link_so_the_peer_fails_fast() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        let (acc, conn) = tokio::join!(server.accept(), client.connect());
+        acc.unwrap();
+        conn.unwrap();
+
+        client.send_raw(&[3u8]).await.unwrap();
+        let big = Tensor::from_2d(DType::F16, 1, 9, vec![7u8; 18]);
+        let err = client.send_capped(&big, 16).await.unwrap_err();
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(18)),
+            "got {err:?}"
+        );
+
+        assert_eq!(server.recv_raw(1).await.unwrap(), vec![3u8]);
+        let next = tokio::time::timeout(Duration::from_secs(2), server.recv())
+            .await
+            .expect("peer must see the close within 2 s, not wait out the idle ceiling");
+        assert!(
+            matches!(next, Err(TransportError::SocketClosed)),
+            "got {next:?}"
+        );
+
+        assert!(matches!(
+            client.send(&big).await,
+            Err(TransportError::NotConnected)
+        ));
+        client.close().await;
+        client.close().await;
     }
 
     /// A payload past `u32::MAX` would wrap the 4-byte length prefix and
