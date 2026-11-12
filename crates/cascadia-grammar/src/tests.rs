@@ -1387,6 +1387,54 @@ fn an_integer_whose_bounded_form_is_unsatisfiable_builds_as_written() {
     );
 }
 
+/// An object whose required property `n` is `target` (a schema), reached
+/// by a `$ref` into the data keyword `kw`: `#/default/x` or `#/examples/0`.
+fn ref_into(kw: &str, target: &str) -> String {
+    let (r, data) = match kw {
+        "default" => ("#/default/x", format!(r#"{{"x":{target}}}"#)),
+        "examples" => ("#/examples/0", format!("[{target}]")),
+        _ => unreachable!(),
+    };
+    format!(
+        r#"{{"type":"object","properties":{{"n":{{"$ref":"{r}"}}}},"required":["n"],"{kw}":{data}}}"#
+    )
+}
+
+#[test]
+fn an_integer_reached_by_a_ref_into_a_data_keyword_is_clamped_and_bounded() {
+    // llguidance resolves a `$ref` into `default` or `examples` and builds
+    // what it finds as a schema; the bounding, the floor clamp and the
+    // overflow check skip data keywords, so they follow the ref there.
+    let gf = single_byte();
+    for kw in ["default", "examples"] {
+        // A minimum below the floor is raised, so it builds.
+        let body = ref_into(kw, r#"{"type":"integer","minimum":-1e300}"#);
+        assert!(accepts(&gf, &body, r#"{"n":-12}"#), "{body}");
+        // An unbounded integer is bounded: no 20th digit.
+        let body = ref_into(kw, r#"{"type":"integer"}"#);
+        let mut gm = mask_for(&gf, &body);
+        let prefix = bytes(r#"{"n":1234567890123456789"#);
+        assert_eq!(walk(&gf, &mut gm, &prefix), Ok(()), "{body}");
+        assert!(!gm.allowed(u32::from(b'0')), "{body}: a 20th digit");
+        // What would overflow the build is a 400, not an abort.
+        for target in [
+            r#"{"type":"integer","minimum":-1e20,"maximum":-1e19}"#,
+            r#"{"type":"integer","const":-9223372036854775808}"#,
+        ] {
+            let body = ref_into(kw, target);
+            let err = gf
+                .compile(&spec(&body))
+                .err()
+                .unwrap_or_else(|| panic!("{body}"));
+            assert!(
+                err.to_string()
+                    .contains("a number at or below -9223372036854775808"),
+                "{body}: {err}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_schema_with_too_many_integers_to_bound_builds_unbounded() {
     // Each bounded integer is a range regex of its own; 600 of them pass

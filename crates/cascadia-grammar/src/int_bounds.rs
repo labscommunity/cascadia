@@ -41,6 +41,9 @@ const SKIP_KEYWORDS: &[&str] = &[
 /// tokens; the `i64` range still admits every `i64` id (a Twitter/X or
 /// Discord snowflake, `i64::MAX`).
 ///
+/// The target of a local `$ref` is bounded too, inside a data keyword
+/// (`default`, `examples`) as well: llguidance builds it as a schema.
+///
 /// Where a schema is used directly, this only narrows it. A `$defs` entry
 /// is bounded once for every place that names it, so a `$ref` reached from
 /// under `not`, `if`, `contains` with `maxContains`, or one member of a
@@ -60,7 +63,7 @@ const SKIP_KEYWORDS: &[&str] = &[
 /// Returns how many schemas it bounded.
 pub fn bound_integers(schema: &mut Value) -> usize {
     let mut bounded = 0;
-    visit_schemas(schema, &mut |obj| {
+    visit_schemas_and_ref_targets(schema, &mut |obj| {
         if !is_integer_only(obj)
             || ["enum", "const", "multipleOf"]
                 .iter()
@@ -91,7 +94,7 @@ pub fn bound_integers(schema: &mut Value) -> usize {
 /// llguidance builds (about -2^63, e.g. C# `long.MinValue`) to the lowest it
 /// builds, when that leaves the range non-empty. Only narrows.
 pub(crate) fn clamp_for_llguidance(schema: &mut Value) {
-    visit_schemas(schema, &mut |obj| {
+    visit_schemas_and_ref_targets(schema, &mut |obj| {
         if !has_integer(obj) {
             return;
         }
@@ -147,6 +150,10 @@ pub(crate) fn has_integer_llguidance_cannot_build(schema: &Value) -> bool {
         }
     }
     scan(schema, false)
+        || local_ref_pointers(schema)
+            .iter()
+            .filter_map(|p| schema.pointer(p))
+            .any(|target| scan(target, false))
 }
 
 /// `i64::MIN` as an f64: -2^63.
@@ -193,6 +200,45 @@ fn has_integer(obj: &Map<String, Value>) -> bool {
 /// The numeric range keywords. One that is not a number is the backend's
 /// to refuse: a bound added beside it would hide it.
 const BOUND_KEYWORDS: [&str; 4] = ["minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum"];
+
+/// [`visit_schemas`] on `schema`, then on the target of each local `$ref`
+/// in it. llguidance builds whatever a `$ref` points to as a schema, inside
+/// a data keyword (`default`, `examples`) too, which the walk skips. A
+/// target the walk already visited is visited again: `f` must leave a
+/// schema it already changed as it is.
+fn visit_schemas_and_ref_targets(schema: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
+    visit_schemas(schema, f);
+    for pointer in local_ref_pointers(schema) {
+        if let Some(target) = schema.pointer_mut(&pointer) {
+            visit_schemas(target, f);
+        }
+    }
+}
+
+/// The JSON pointers of the local `$ref`s (`#/...`) anywhere in `v`, data
+/// keywords included, each once.
+fn local_ref_pointers(v: &Value) -> Vec<String> {
+    let mut pointers = std::collections::BTreeSet::new();
+    let mut stack = vec![v];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(obj) => {
+                if let Some(p) = obj
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .and_then(|r| r.strip_prefix('#'))
+                    .filter(|p| p.starts_with('/'))
+                {
+                    pointers.insert(p.to_owned());
+                }
+                stack.extend(obj.values());
+            }
+            Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    pointers.into_iter().collect()
+}
 
 /// Calls `f` on every schema object in `v`: through subschema keywords,
 /// lists (`anyOf`, `prefixItems`, ...) and the schemas of name maps

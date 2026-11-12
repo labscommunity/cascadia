@@ -3476,6 +3476,40 @@ mod tests {
         }
     }
 
+    /// A `$ref` into `default` passes the checks here, and llguidance builds
+    /// its target as a schema: the grammar crate clamps, bounds and checks
+    /// that target too, so the build is a result or a clean error, never an
+    /// abort. A `$ref` into `examples` is refused here.
+    #[test]
+    fn a_ref_into_a_data_keyword_reaches_the_build_and_ends_cleanly() {
+        let factory = GrammarFactory::byte_level();
+        for (kw, r) in [("default", "#/default/x"), ("examples", "#/examples/0")] {
+            for (target, builds) in [
+                (json!({"type": "integer", "minimum": -1e300}), true),
+                (json!({"type": "integer"}), true),
+                (
+                    json!({"type": "integer", "minimum": -1e20, "maximum": -1e19}),
+                    false,
+                ),
+                (json!({"type": "integer", "const": i64::MIN}), false),
+            ] {
+                let schema = json!({
+                    "type": "object",
+                    "properties": {"n": {"$ref": r}},
+                    "required": ["n"],
+                    kw: if kw == "default" { json!({"x": target}) } else { json!([target]) },
+                });
+                if kw == "examples" {
+                    assert_eq!(parse_schema(schema), unsupported_ref(r), "{target}");
+                    continue;
+                }
+                let rf = parse_schema(schema).unwrap_or_else(|e| panic!("{r} {target}: {e}"));
+                let built = factory.compile(&grammar_for(&rf).unwrap());
+                assert_eq!(built.is_ok(), builds, "{r} {target}: {:?}", built.err());
+            }
+        }
+    }
+
     #[test]
     fn refs_to_values_that_are_not_schemas_are_rejected() {
         for r in ["#/required", "#/properties/a/type"] {
