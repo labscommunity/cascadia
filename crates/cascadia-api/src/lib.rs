@@ -3436,6 +3436,7 @@ async fn stream_completion(
     let text_state = Arc::new(std::sync::Mutex::new(StreamText {
         marker: state.marker_dialect.clone().map(MarkerFilter::new),
         counter,
+        settled: false,
     }));
     let final_text_state = text_state.clone();
     let body_stream = permit_carrier
@@ -3468,6 +3469,8 @@ async fn stream_completion(
                 // SSE error event instead of a silent empty delta + [DONE].
                 if let Some(reason) = &chunk.error {
                     warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+                    // Nothing held is sent after the error event.
+                    text_state.lock().unwrap().settled = true;
                     let payload = serde_json::json!({
                         "id": task_id,
                         "object": "error",
@@ -3485,24 +3488,18 @@ async fn stream_completion(
                 // translation as the non-streaming path; withheld text (a
                 // tool call's name/JSON) surfaces on the closing marker.
                 let (reasoning, text) = text_state.lock().unwrap().route(&chunk, split_out);
-                let payload = serde_json::json!({
-                    "id": task_id,
-                    "object": "chat.completion.chunk",
-                    "created": now_unix(),
-                    "model": model,
-                    "n_tokens": chunk.token_count(),
-                    "completion_tokens": chunk.completion_tokens,
-                    "choices": [{
-                        "index": 0,
-                        "delta": stream_delta(&reasoning, &text),
-                        "finish_reason": if chunk.is_final {
-                            Some(chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"))
-                        } else {
-                            None
-                        },
-                    }],
-                });
-                let line = format!("data: {payload}\n\n");
+                let finish_reason = chunk
+                    .is_final
+                    .then(|| chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"));
+                let line = content_frame(
+                    &task_id,
+                    &model,
+                    &reasoning,
+                    &text,
+                    chunk.token_count(),
+                    chunk.completion_tokens,
+                    finish_reason,
+                );
                 // Yield between chunks so the body-sink task can drain
                 // this frame to TCP. cascadia_runner::ChunkStream::poll_next
                 // calls engine.step() inside a parking_lot::Mutex, which
@@ -3524,6 +3521,20 @@ async fn stream_completion(
             // Combined into a single HTTP frame with [DONE] (SSE events are
             // delimited by \n\n regardless of HTTP chunk boundaries).
             let mut out = String::new();
+            // Ended without a final chunk (cancelled): send what the split
+            // still holds instead of dropping it, as the tool stream does.
+            let (reasoning, text) = final_text_state.lock().unwrap().settle(split_out);
+            if !reasoning.is_empty() || !text.is_empty() {
+                out.push_str(&content_frame(
+                    &usage_task_id,
+                    &usage_model,
+                    &reasoning,
+                    &text,
+                    0,
+                    None,
+                    None,
+                ));
+            }
             if include_usage && final_finished.load(Ordering::Relaxed) {
                 let prompt = final_prompt.load(Ordering::Relaxed);
                 let completion = final_completion.load(Ordering::Relaxed);
@@ -3814,12 +3825,15 @@ impl ToolStream {
 struct StreamText {
     marker: Option<MarkerFilter>,
     counter: ReasoningCounter,
+    /// A final chunk (or an error) arrived: nothing is held any more.
+    settled: bool,
 }
 
 impl StreamText {
     /// One chunk's `(reasoning, content)`: split when `split_out`, else no
     /// reasoning and the whole translated text (still counted).
     fn route(&mut self, chunk: &cascadia_types::Chunk, split_out: bool) -> (String, String) {
+        self.settled |= chunk.is_final;
         let text = match self.marker.as_mut() {
             Some(f) => {
                 let mut t = f.feed(chunk);
@@ -3836,6 +3850,28 @@ impl StreamText {
             reasoning.push_str(&r);
             answer.push_str(&a);
         }
+        if split_out {
+            (reasoning, answer)
+        } else {
+            (String::new(), text)
+        }
+    }
+
+    /// The text still held when the stream ended without a final chunk,
+    /// routed like [`StreamText::route`]; empty once settled.
+    fn settle(&mut self, split_out: bool) -> (String, String) {
+        if std::mem::replace(&mut self.settled, true) {
+            return (String::new(), String::new());
+        }
+        let text = self
+            .marker
+            .as_mut()
+            .map(MarkerFilter::finish)
+            .unwrap_or_default();
+        let (mut reasoning, mut answer) = self.counter.feed(&text, 0);
+        let (r, a) = self.counter.finish();
+        reasoning.push_str(&r);
+        answer.push_str(&a);
         if split_out {
             (reasoning, answer)
         } else {
@@ -3872,8 +3908,14 @@ fn add_reasoning_details(
     }
 }
 
-/// One `chat.completion.chunk` delta (reasoning and/or content), in the
-/// plain stream's shape.
+/// One chunk's `chat.completion.chunk` frames, in the plain stream's shape.
+///
+/// Reasoning and content never share a delta: some clients (AnythingLLM)
+/// drop a frame's content once they see `reasoning_content`, and close
+/// their reasoning block only on a frame with content and no reasoning.
+/// With both, a reasoning-only frame (`n_tokens` 0, no finish) goes first
+/// and the content frame carries the tokens and the finish, so per-frame
+/// token sums are unchanged.
 fn content_frame(
     task_id: &str,
     model: &str,
@@ -3883,6 +3925,19 @@ fn content_frame(
     completion_tokens: Option<u32>,
     finish_reason: Option<&str>,
 ) -> String {
+    if !reasoning.is_empty() && !content.is_empty() {
+        let mut out = content_frame(task_id, model, reasoning, "", 0, None, None);
+        out.push_str(&content_frame(
+            task_id,
+            model,
+            "",
+            content,
+            n_tokens,
+            completion_tokens,
+            finish_reason,
+        ));
+        return out;
+    }
     let payload = serde_json::json!({
         "id": task_id,
         "object": "chat.completion.chunk",
@@ -7763,6 +7818,8 @@ level={{ effort_map[eff] }}";
         parts: Vec<String>,
         release: Arc<std::sync::atomic::AtomicBool>,
         fail: bool,
+        /// The last part rides on the final chunk instead of its own token.
+        last_on_final: bool,
         pending: Option<(cascadia_types::TaskId, usize)>,
     }
 
@@ -7780,7 +7837,8 @@ level={{ effort_map[eff] }}";
                 self.pending = Some((id, i));
                 return Ok(Vec::new());
             }
-            if let Some(part) = self.parts.get(i) {
+            let held_back = usize::from(self.last_on_final && !self.fail);
+            if let Some(part) = self.parts[..self.parts.len() - held_back].get(i) {
                 let chunk = Chunk::token(&id, i as i64, part.clone());
                 self.pending = Some((id.clone(), i + 1));
                 return Ok(vec![(id, chunk)]);
@@ -7788,7 +7846,12 @@ level={{ effort_map[eff] }}";
             let last = if self.fail {
                 Chunk::error(&id, "gated engine failure")
             } else {
-                Chunk::final_marker(&id, "")
+                let text = if held_back == 1 {
+                    self.parts.last().cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                Chunk::final_marker(&id, text)
                     .with_finish_reason(cascadia_types::FinishReason::Stop)
                     .with_prompt_tokens(5)
                     .with_completion_tokens(self.parts.len() as u32)
@@ -7841,13 +7904,25 @@ level={{ effort_map[eff] }}";
         fail: bool,
         cfg: Config,
     ) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        let (app, release, _) = start_gated(parts, fail, false, cfg).await;
+        (app, release)
+    }
+
+    /// Router, gate and runner over a [`GatedEngine`].
+    async fn start_gated(
+        parts: &[&str],
+        fail: bool,
+        last_on_final: bool,
+        cfg: Config,
+    ) -> (Router, Arc<std::sync::atomic::AtomicBool>, Arc<Runner>) {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let runner = Runner::new(Box::new(GatedBuilder(GatedEngine {
+        let runner = Arc::new(Runner::new(Box::new(GatedBuilder(GatedEngine {
             parts: parts.iter().map(|p| (*p).to_owned()).collect(),
             release: release.clone(),
             fail,
+            last_on_final,
             pending: None,
-        })));
+        }))));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -7856,8 +7931,9 @@ level={{ effort_map[eff] }}";
             .await
             .unwrap();
         (
-            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            make_router_with_config(runner.clone(), "mock-model", cfg),
             release,
+            runner,
         )
     }
 
@@ -9020,5 +9096,185 @@ level={{ effort_map[eff] }}";
         assert_eq!(streamed_content(&a), "one ");
         assert_eq!(streamed_reasoning(&b), " beta gamma ");
         assert_eq!(streamed_content(&b), "two ");
+    }
+
+    /// A released gated router (default reasoning format) whose last part
+    /// arrives on the final chunk when `last_on_final`.
+    async fn gated_app_final_text(parts: &[&str], last_on_final: bool) -> Router {
+        let (app, release, _) = start_gated(
+            parts,
+            false,
+            last_on_final,
+            Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            },
+        )
+        .await;
+        release.store(true, Ordering::SeqCst);
+        app
+    }
+
+    /// No delta carries both `reasoning_content` and `content`: a client
+    /// that drops a frame's content once it sees reasoning (or keeps one
+    /// open reasoning block until a content-only frame) loses nothing.
+    fn assert_kinds_apart(events: &[Value], body: &str) {
+        for e in events {
+            let delta = &e["choices"][0]["delta"];
+            assert!(
+                delta.get("reasoning_content").is_none() || delta.get("content").is_none(),
+                "reasoning and content in one delta: {body}"
+            );
+        }
+    }
+
+    /// The choice frame whose content holds `text`.
+    fn content_frame_with<'a>(events: &'a [Value], text: &str) -> &'a Value {
+        events
+            .iter()
+            .find(|e| {
+                e["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains(text))
+            })
+            .unwrap_or_else(|| panic!("no content frame with {text:?}"))
+    }
+
+    #[tokio::test]
+    async fn stream_sends_reasoning_and_answer_of_one_chunk_in_separate_frames() {
+        let cases: [(&[&str], bool, &str, &str, &str); 3] = [
+            (
+                &["<think>pl", "an</think>Hello", " world"],
+                false,
+                "plan",
+                "Hello world",
+                "Hello",
+            ),
+            (&["<think>x</think>Hi"], false, "x", "Hi", "Hi"),
+            (&["<think>x</think>Hi"], true, "x", "Hi", "Hi"),
+        ];
+        for (parts, last_on_final, reasoning, content, marker) in cases {
+            for tools in [false, true] {
+                let payload = if tools {
+                    tool_stream_body(None, true)
+                } else {
+                    plain_stream_body(None, true)
+                };
+                let body =
+                    post_stream(gated_app_final_text(parts, last_on_final).await, payload).await;
+                let events = sse_events(&body);
+                // One token per part, each counted in exactly one frame.
+                assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+                assert_kinds_apart(&events, &body);
+                assert_eq!(streamed_reasoning(&events), reasoning, "{body}");
+                assert_eq!(streamed_content(&events), content, "{body}");
+                let frame = content_frame_with(&events, marker);
+                assert!(
+                    frame["choices"][0]["delta"]
+                        .get("reasoning_content")
+                        .is_none(),
+                    "{body}"
+                );
+                assert_eq!(finish_reasons(&events), ["stop"], "{body}");
+                let choices: Vec<&Value> = events
+                    .iter()
+                    .filter(|e| !e["choices"].as_array().unwrap().is_empty())
+                    .collect();
+                assert_eq!(
+                    choices.last().unwrap()["choices"][0]["finish_reason"],
+                    "stop",
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    /// Reasoning, answer text and a call on one final chunk: the reasoning
+    /// and the text go out in separate frames ahead of the call.
+    #[tokio::test]
+    async fn tool_stream_sends_final_reasoning_and_text_apart_before_the_call() {
+        let last = format!("<think>plan</think>Checking. {WEATHER_CALL}");
+        let parts = [last.as_str()];
+        let body = post_stream(
+            gated_app_final_text(&parts, true).await,
+            tool_stream_body(None, true),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(frame_tokens(&events), 1, "{body}");
+        assert_kinds_apart(&events, &body);
+        assert_eq!(streamed_reasoning(&events), "plan", "{body}");
+        assert_eq!(streamed_content(&events), "Checking. ", "{body}");
+        let frame = content_frame_with(&events, "Checking.");
+        assert!(
+            frame["choices"][0]["delta"]
+                .get("reasoning_content")
+                .is_none(),
+            "{body}"
+        );
+        let calls = streamed_tool_calls(&events);
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0][0]["function"]["name"], "get_weather", "{body}");
+        assert_eq!(finish_reasons(&events), ["tool_calls"], "{body}");
+    }
+
+    /// A plain stream that ends without a final chunk (cancelled) sends the
+    /// text the split still held, as the tool stream does.
+    #[tokio::test]
+    async fn stream_ending_without_a_final_chunk_sends_the_held_text() {
+        let (app, _release, runner) = start_gated(
+            &["<think>a</thi", "nk>never"],
+            false,
+            false,
+            Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            },
+        )
+        .await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(plain_stream_body(None, true).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stream = resp.into_body().into_data_stream();
+        let first = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("first frame while generation is gated")
+                .expect("body still open")
+                .unwrap();
+            if !frame.is_empty() {
+                break String::from_utf8(frame.to_vec()).unwrap();
+            }
+        };
+        let events = sse_events(&first);
+        assert_eq!(streamed_reasoning(&events), "a", "{first}");
+        let task_id = events[0]["id"].as_str().unwrap().to_owned();
+        runner.cancel(&task_id);
+        let mut rest = String::new();
+        while let Some(frame) = stream.next().await {
+            rest.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+        assert!(rest.ends_with("data: [DONE]\n\n"), "{rest}");
+        let all = format!("{first}{rest}");
+        let events = sse_events(&all);
+        assert_eq!(streamed_reasoning(&events), "a</thi", "{all}");
+        assert_eq!(streamed_content(&events), "", "{all}");
     }
 }
