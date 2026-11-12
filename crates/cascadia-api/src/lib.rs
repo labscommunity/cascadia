@@ -11036,6 +11036,81 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// On ov-genai, which enforces only `#` and `#/...` refs, a forced tool
+    /// whose parameters hold any other `$ref` gets no call grammar: the turn
+    /// runs unconstrained (200), counted as `unsupported_ref`. sycl-llama
+    /// sends every tool llama-server receives with its refs inlined, and
+    /// one it can't inline is a 400 naming the tool. The same schema as a
+    /// strict `response_format` is a 400 on both.
+    #[tokio::test]
+    async fn a_forced_tool_with_a_non_pointer_ref_runs_unconstrained_on_pointer_only_engines() {
+        use cascadia_metrics::UnenforcedReason;
+        let unenforced = |r: UnenforcedReason| {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[r.as_str()])
+                .get()
+        };
+        let schemas = [
+            serde_json::json!({"$id": "urn:x", "type": "object", "properties": {"n": {"$ref": "urn:z"}}, "required": ["n"]}),
+            serde_json::json!({"type": "object", "properties": {"n": {"$ref": "https://example.com/t.json"}}, "required": ["n"]}),
+            serde_json::json!({
+                "$defs": {"T": {"$id": "T", "type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}},
+                "type": "object", "properties": {"t": {"$ref": "T"}}, "required": ["t"],
+            }),
+        ];
+        for schema in &schemas {
+            for refs in [RefResolver::Xgrammar, SYCL] {
+                let cfg = Config {
+                    ref_resolver: refs,
+                    ..Config::default()
+                };
+                let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+                let tool = serde_json::json!({"type": "function", "function": {
+                    "name": "get_weather", "parameters": schema.clone()
+                }});
+                let before = unenforced(UnenforcedReason::UnsupportedRef);
+                let (status, v) = post_chat(
+                    app,
+                    tool_body(
+                        serde_json::json!([tool]),
+                        serde_json::json!({"tool_choice": "required"}),
+                    ),
+                )
+                .await;
+                if refs == SYCL {
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+                    assert!(
+                        v["error"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("invalid tools: tools[0].function.parameters: $ref "),
+                        "{v}"
+                    );
+                } else {
+                    assert_eq!(status, StatusCode::OK, "{refs:?} {schema}: {v}");
+                    assert_eq!(last_task(&seen).grammar, None, "{refs:?} {schema}");
+                    assert!(
+                        unenforced(UnenforcedReason::UnsupportedRef) > before,
+                        "{refs:?} {schema}"
+                    );
+                }
+
+                let (status, v) = post_chat(
+                    so_app_refs(refs).await,
+                    chat_with(Some(json_schema_format(schema.clone()))),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{refs:?} {schema}: {v}");
+                assert!(
+                    v["error"].as_str().unwrap().starts_with(
+                        "invalid response_format: response_format.json_schema.schema: "
+                    ),
+                    "{v}"
+                );
+            }
+        }
+    }
+
     /// The highest llguidance row cap, halving down from 2000, under which
     /// `spec` builds but fails the check's first step, so the test doesn't
     /// depend on one limit value.
