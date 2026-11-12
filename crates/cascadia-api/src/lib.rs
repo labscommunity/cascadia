@@ -8632,6 +8632,30 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// llama-server resolves a `#/...` pointer into a `$ref`'s sibling, and
+    /// a ref it never recorded there becomes "any object": the sycl-llama
+    /// scan reads `$ref` siblings too. xgrammar walks the same pointer to
+    /// `{"$ref": "#"}`, the root (constrained, recursive), and to the
+    /// `https://` one, which it would make "any JSON".
+    #[tokio::test]
+    async fn a_ref_beside_a_ref_is_checked() {
+        let input = |r: &str| {
+            serde_json::json!({
+                "$defs": {"A": {"$ref": "#/$defs/B", "x": {"$ref": r}}, "B": {"type": "string"}},
+                "type": "object", "properties": {"p": {"$ref": "#/$defs/A/x"}}, "required": ["p"],
+            })
+        };
+        let (a, b) = (input("#"), input("https://example.com/a.json"));
+        for schema in [&a, &b] {
+            let (status, v) = post_schema(RefResolver::LlamaServer, schema).await;
+            assert_ref_refusal("sycl-llama", schema, status, &v);
+        }
+        let (status, v) = post_schema(RefResolver::Xgrammar, &a).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = post_schema(RefResolver::Xgrammar, &b).await;
+        assert_ref_refusal("ov-genai", &b, status, &v);
+    }
+
     /// The three shapes where llama-server reads a `$ref` xgrammar's
     /// converter never reaches, each holding `r`, under a `urn:` root id
     /// (whose refs the outside-ref check leaves to the backend).

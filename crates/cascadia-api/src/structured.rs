@@ -1383,10 +1383,15 @@ fn check_converter_depth(root: &Node) -> Result<(), String> {
 ///   with '#/'"). Walks what [`check_converter_depth`] walks: the schemas
 ///   the converter visits, ref targets included (inside data keywords too).
 /// - [`crate::RefResolver::LlamaServer`]: any ref but `#/...` anywhere in
-///   the document. llama-server's `resolve_refs` reads every `$ref` (data
-///   keywords, tuple `items`, every `allOf` member), not descending past
-///   an object holding one; it never fetches, so an `https://` ref becomes
-///   "any object", and it fails on the other forms (`#` alone included).
+///   the document, data and `$ref` siblings included. llama-server's
+///   `resolve_refs` visits every value (data keywords, tuple `items`, every
+///   `allOf` member) and records the refs it meets, except beside another
+///   `$ref`; a `#/...` pointer can still reach a ref there, and a ref it
+///   never recorded, or one to an `https://` document (it never fetches),
+///   becomes "any object". It fails on the other forms (`#` alone
+///   included). A ref in data that no pointer reaches is refused too: a
+///   conservative 400, since telling which data a pointer reaches would
+///   mean mirroring the converter.
 pub fn check_pointer_refs_only(
     raw: &str,
     schema: &Value,
@@ -1406,13 +1411,17 @@ pub fn check_pointer_refs_only(
             while let Some(v) = stack.pop() {
                 match v {
                     Value::Array(items) => stack.extend(items),
-                    Value::Object(obj) => match obj.get("$ref") {
-                        Some(Value::String(r)) if !r.starts_with("#/") => {
-                            return Err(unenforced_ref(r, engine, "`#/...`"));
+                    Value::Object(obj) => {
+                        if let Some(Value::String(r)) = obj.get("$ref") {
+                            if !r.starts_with("#/") {
+                                return Err(unenforced_ref(r, engine, "`#/...`"));
+                            }
                         }
-                        Some(_) => {}
-                        None => stack.extend(obj.values()),
-                    },
+                        // A `$ref`'s siblings too: llama-server records
+                        // none there, but a `#/...` pointer can reach one,
+                        // and an unrecorded ref becomes "any object".
+                        stack.extend(obj.values());
+                    }
                     _ => {}
                 }
             }

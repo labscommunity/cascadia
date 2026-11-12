@@ -746,11 +746,17 @@ reaches match any JSON) every such ref the grammar reaches (a TypeBox
 `"$ref": "T"`, a `urn:`, an `https://` document, also inside a ref target
 in `default`) gets `` $ref "<ref>" is not supported by this server's engine
 (<engine>): it enforces only references inside the schema written as `#`
-or `#/...` pointers … ``. On `sycl-llama` llama-server reads every `$ref`
-in the schema (data, tuple `items` and every `allOf` member included),
-makes an `https://` one match any object and fails on the other forms
-(`#` alone included), so every `$ref` there that is not `#/...` gets the
-same 400 (`` … written as `#/...` pointers … ``). An unknown `$schema`
+or `#/...` pointers … ``. On `sycl-llama` llama-server visits every value
+in the schema (data, tuple `items` and every `allOf` member included) and
+records the refs it meets, except beside another `$ref`; a `#/...`
+pointer can still reach a ref there, and a ref it never recorded, or one
+to an `https://` document (it never fetches), matches any object. It fails
+on the other forms (`#` alone included). So every `$ref` there that is not
+`#/...`, `$ref` siblings and data included, gets the same 400
+(`` … written as `#/...` pointers … ``). That includes a ref inside
+`const`, `default` or `examples` that llama-server would only copy as a
+literal: a known, conservative 400, since a `#/...` pointer can make such
+data a schema. An unknown `$schema`
 (`http://json-schema.org/schema#`, an OpenAPI dialect) is not a ref:
 `ov-genai` and `sycl-llama` ignore it, and llguidance refuses to build
 the schema (`invalid configuration: response_format schema: Resource
