@@ -1031,14 +1031,26 @@ const REBUILD_FLOOR_ENV: &str = "CASCADIA_OV_GENAI_REBUILD_FLOOR_SECS";
 /// The shortest floor [`REBUILD_FLOOR_ENV`] may set.
 const REBUILD_FLOOR_MIN: Duration = Duration::from_secs(60);
 
+/// The longest floor [`REBUILD_FLOOR_ENV`] may set: a week, so the floor
+/// added to the clock can never overflow it.
+const REBUILD_FLOOR_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// The rebuild floor for a raw [`REBUILD_FLOOR_ENV`] value: the default
-/// when unset, empty or not a whole number of seconds, and at least
-/// [`REBUILD_FLOOR_MIN`].
+/// when unset, empty or not a whole number of seconds, and between
+/// [`REBUILD_FLOOR_MIN`] and [`REBUILD_FLOOR_MAX`].
 fn rebuild_floor(raw: Option<&str>) -> Duration {
     let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
         return REBUILD_FLOOR;
     };
     match raw.parse::<u64>() {
+        Ok(secs) if Duration::from_secs(secs) > REBUILD_FLOOR_MAX => {
+            warn!(
+                value = secs,
+                max_s = REBUILD_FLOOR_MAX.as_secs(),
+                "{REBUILD_FLOOR_ENV} is above the maximum; using the maximum"
+            );
+            REBUILD_FLOOR_MAX
+        }
         Ok(secs) if Duration::from_secs(secs) >= REBUILD_FLOOR_MIN => Duration::from_secs(secs),
         Ok(secs) => {
             warn!(
@@ -4936,7 +4948,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rebuild_floor_env_sets_whole_seconds_at_least_the_minimum() {
+    fn the_rebuild_floor_env_sets_whole_seconds_between_the_minimum_and_the_maximum() {
         assert_eq!(rebuild_floor(None), REBUILD_FLOOR);
         assert_eq!(rebuild_floor(Some("")), REBUILD_FLOOR);
         assert_eq!(rebuild_floor(Some("  ")), REBUILD_FLOOR);
@@ -4948,6 +4960,14 @@ mod tests {
         assert_eq!(rebuild_floor(Some("-5")), REBUILD_FLOOR);
         assert_eq!(rebuild_floor(Some("1.5")), REBUILD_FLOOR);
         assert_eq!(rebuild_floor(Some("ten")), REBUILD_FLOOR);
+        assert_eq!(rebuild_floor(Some("604800")), REBUILD_FLOOR_MAX);
+        assert_eq!(rebuild_floor(Some("604801")), REBUILD_FLOOR_MAX);
+        assert_eq!(
+            rebuild_floor(Some("18446744073709551615")),
+            REBUILD_FLOOR_MAX
+        );
+        // The largest floor still adds to the clock without overflowing.
+        let _ = Instant::now() + REBUILD_FLOOR_MAX + REBUILD_JITTER_MAX;
         assert_eq!(floor_text(REBUILD_FLOOR), "10 minutes");
         assert_eq!(floor_text(Duration::from_secs(60)), "1 minute");
         assert_eq!(floor_text(Duration::from_secs(90)), "90 s");
