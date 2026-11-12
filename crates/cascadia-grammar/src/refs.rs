@@ -1,136 +1,102 @@
-//! Where llguidance resolves a schema's `$ref`s, so the integer guards
-//! (`int_bounds`) can follow them to the same place.
+//! Which `$ref`s llguidance can resolve, and where the integer guards
+//! (`int_bounds`) look for their targets.
 //!
 //! llguidance resolves a `$ref` with the `referencing` crate: against the
 //! base URI of the schema resource it is in (the root's `$id`, or any
-//! `$id` below it), through anchors (`$anchor`, a draft-6/7 `$id: "#name"`),
-//! and to any URI the document registers. The guards only read the
-//! document itself, so a schema is refused when one of its refs could land
-//! somewhere they don't look (see [`unfollowable_ref`]), and the refs left,
-//! `#` and `#/...`, are resolved here the way llguidance resolves them
-//! (see [`local_ref_pointers`]).
+//! `$id` below it), through anchors, and to any URI the document
+//! registers. It never fetches: a ref to a document the schema doesn't hold
+//! is refused here with a 400 ([`ref_outside_the_schema`]), for every
+//! engine, by asking `referencing` (the version llguidance builds with)
+//! the same question llguidance asks.
+//!
+//! The guards read `#/...` refs against the document root
+//! ([`local_ref_pointers`]), the way llguidance reads them when no `$id`
+//! below the root changes the base. Their abort check does not depend on
+//! it: it reads every object in the document. A target reached only
+//! through an embedded `$id` (a `#/...` ref under a non-root `$id`, or
+//! one named by that id) inside a data keyword (`default`, `examples`) is
+//! not bounded or clamped: no abort, but its integers may take more than
+//! 19 digits, or llguidance refuses a lower bound below what it builds
+//! with its own error. Targets in schema positions (`$defs`, properties)
+//! are bounded where they sit.
 
-use crate::NAME_MAPS;
+use referencing::{Draft, Error, Registry, Resolver, Resource, ResourceRef};
 use serde_json::Value;
 
-/// Keywords whose values are data: llguidance never builds them as schemas
-/// unless a `$ref` points into them.
-const DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples", "x-guidance"];
+/// The base URI llguidance gives a root without `$id`.
+const DEFAULT_ROOT_URI: &str = "json-schema:///";
 
-/// Why llguidance could resolve a `$ref` in `schema` somewhere other than
-/// where [`local_ref_pointers`] looks, if it could. Read in every schema
-/// llguidance can build: the root, its subschemas, and the target of each
-/// `$ref` (which may sit in a data keyword such as `default`). Refused:
-///
-/// - a `$ref` that does not start with `#` (`urn:x#/default/x`,
-///   `json-schema:///#/...`): it resolves against the registry, which holds
-///   the root under its `$id` or a default base URI;
-/// - a `#` ref that is not a JSON pointer (`#name`): an anchor;
-/// - a `$id` below the root, or a draft-4 `id` (when the document names
-///   draft 4 anywhere): it changes the base URI that every `#/...` ref under
-///   it resolves against;
-/// - a root `$id` (or draft-4 `id`) with a non-empty fragment: llguidance
-///   looks the root up by it, so `"$id": "#/default/x"` builds `default.x`
-///   as the whole schema.
-///
-/// `$dynamicRef` and `$recursiveRef` are not resolved at all (llguidance
-/// does not implement them and ignores them), so they are left alone.
-pub fn unfollowable_ref(schema: &Value) -> Option<String> {
-    let id_keys: &[&str] = if names_draft_4(schema) {
-        &["$id", "id"]
-    } else {
-        &["$id"]
+/// Why a `$ref` in `schema` names a document outside it, if one does: a
+/// URI no resource in the schema has (`https://example.com/s.json`,
+/// `other.json`, `urn:z`), which llguidance would have to fetch and never
+/// does. Every ref llguidance resolves while building is checked, from the
+/// same base URI: the refs in the root and its subschemas, and in the
+/// target of each ref (which may sit in a data keyword such as `default`),
+/// each target once. Refs llguidance can't resolve for another reason (a
+/// pointer to nothing, a missing anchor) are left to its own error.
+pub fn ref_outside_the_schema(schema: &Value) -> Option<String> {
+    let outside = |uri: &str| {
+        let shown: String = uri.chars().take(80).collect();
+        format!(
+            "$ref {} is not supported: it names a document outside the schema \
+             (only references to the schema itself, such as `#/$defs/...`, are)",
+            Value::String(shown)
+        )
     };
+    // As llguidance's `PreContext`: the draft from the root's `$schema`,
+    // the root registered under its `$id` or the default base URI.
+    let draft = Draft::Draft202012
+        .detect(schema)
+        .unwrap_or(Draft::Draft202012);
+    let resource: Resource = draft.create_resource(schema.clone());
+    let base = resource.id().unwrap_or(DEFAULT_ROOT_URI).to_string();
+    let empty = Registry::try_from_resources(std::iter::empty::<(String, Resource)>()).ok()?;
+    let registry = match empty.try_with_resources_and_retriever(
+        vec![(base.as_str(), resource)],
+        &referencing::DefaultRetriever,
+        draft,
+    ) {
+        Ok(r) => r,
+        Err(Error::Unretrievable { uri, .. }) => return Some(outside(&uri)),
+        Err(_) => return None,
+    };
+    let root_resolver = registry.try_resolver(&base).ok()?;
+    let root = root_resolver.lookup(&base).ok()?.contents();
+    // (schema, the resolver of the schema it sits in or is referenced from)
+    let mut stack: Vec<(ResourceRef<'_>, Resolver<'_>)> =
+        vec![(resource_ref(root, draft), root_resolver)];
     let mut entered = std::collections::HashSet::new();
-    let mut stack = vec![(schema, true)];
-    while let Some((v, is_root)) = stack.pop() {
-        match v {
-            Value::Object(obj) => {
-                if is_root {
-                    // llguidance looks the root up by its id: a fragment
-                    // there (`#/default/x`) makes the value it points to,
-                    // data or not, the schema it builds.
-                    if let Some(key) = id_keys.iter().find(|k| {
-                        obj.get(**k)
-                            .and_then(Value::as_str)
-                            .and_then(|id| id.split_once('#'))
-                            .is_some_and(|(_, fragment)| !fragment.is_empty())
-                    }) {
-                        return Some(format!(
-                            "`{key}` with a fragment is not supported (`#` followed by \
-                             anything changes what the schema is)"
-                        ));
-                    }
-                } else if let Some(key) = id_keys
-                    .iter()
-                    .find(|k| obj.get(**k).is_some_and(Value::is_string))
-                {
-                    return Some(format!(
-                        "`{key}` below the root is not supported (it changes what \
-                             a `$ref` under it refers to)"
-                    ));
-                }
-                if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
-                    let shown = Value::String(r.chars().take(80).collect());
-                    let Some(fragment) = r.strip_prefix('#') else {
-                        return Some(format!(
-                            "$ref {shown} is not supported: only a reference inside \
-                             the schema (`#` or `#/...`) is"
-                        ));
-                    };
-                    if !fragment.is_empty() && !fragment.starts_with('/') {
-                        return Some(format!(
-                            "$ref {shown} is not supported: an anchor; use a JSON \
-                             pointer (`#/...`)"
-                        ));
-                    }
-                    if let Some(p) = resolve_pointer(schema, fragment) {
-                        if !p.is_empty() && entered.insert(p.clone()) {
-                            if let Some(target) = schema.pointer(&p) {
-                                stack.push((target, false));
-                            }
-                        }
+    while let Some((res, parent)) = stack.pop() {
+        let Ok(resolver) = parent.in_subresource(res) else {
+            continue;
+        };
+        let contents = res.contents();
+        if let Some(r) = contents.get("$ref").and_then(Value::as_str) {
+            match resolver.lookup(r) {
+                Ok(target) => {
+                    let target = target.contents();
+                    if entered.insert(std::ptr::from_ref(target)) {
+                        stack.push((resource_ref(target, res.draft()), resolver.clone()));
                     }
                 }
-                for (k, child) in obj {
-                    let k = k.as_str();
-                    if DATA_KEYWORDS.contains(&k) {
-                        continue;
-                    }
-                    match child {
-                        Value::Object(map) if NAME_MAPS.contains(&k) => {
-                            stack.extend(map.values().map(|s| (s, false)));
-                        }
-                        _ => stack.push((child, false)),
-                    }
-                }
+                Err(Error::Unretrievable { .. }) => return Some(outside(r)),
+                Err(_) => {}
             }
-            Value::Array(items) => stack.extend(items.iter().map(|s| (s, false))),
-            _ => {}
+        }
+        for sub in res.draft().subresources_of(contents) {
+            stack.push((resource_ref(sub, res.draft()), resolver.clone()));
         }
     }
     None
 }
 
-/// Whether a `$schema` anywhere in `v` names draft 4, the draft whose
-/// resource id is `id` rather than `$id`.
-fn names_draft_4(v: &Value) -> bool {
-    let mut stack = vec![v];
-    while let Some(v) = stack.pop() {
-        match v {
-            Value::Object(obj) => {
-                if obj.get("$schema").and_then(Value::as_str).is_some_and(|s| {
-                    s.trim_end_matches('#') == "http://json-schema.org/draft-04/schema"
-                }) {
-                    return true;
-                }
-                stack.extend(obj.values());
-            }
-            Value::Array(items) => stack.extend(items),
-            _ => {}
-        }
-    }
-    false
+/// `contents` as a resource, its draft read as llguidance reads it: its own
+/// `$schema`, else `draft`, an unknown one the latest.
+fn resource_ref(contents: &Value, draft: Draft) -> ResourceRef<'_> {
+    draft
+        .detect(contents)
+        .unwrap_or(Draft::Draft202012)
+        .create_resource_ref(contents)
 }
 
 /// The value the `#/...` refs anywhere in `doc` (data keywords included)
@@ -255,62 +221,47 @@ mod tests {
     }
 
     #[test]
-    fn a_ref_the_guards_cannot_follow_is_named() {
-        let int = json!({"type": "integer"});
+    fn a_ref_to_a_document_outside_the_schema_is_named() {
         for (schema, want) in [
             (
-                json!({"properties": {"n": {"$ref": "urn:x#/default/x"}}}),
-                "$ref \"urn:x#/default/x\"",
+                json!({"properties": {"n": {"$ref": "https://example.com/s.json"}}}),
+                "https://example.com/s.json",
             ),
             (
-                json!({"properties": {"n": {"$ref": "json-schema:///#/default/x"}}}),
-                "$ref \"json-schema:///",
+                json!({"properties": {"n": {"$ref": "other.json#/x"}}}),
+                "json-schema:///other.json",
             ),
             (
-                json!({"properties": {"n": {"$ref": "other.json"}}}),
-                "$ref \"other.json\"",
+                json!({"$id": "urn:x", "properties": {"n": {"$ref": "urn:z"}}}),
+                "urn:z",
             ),
-            (json!({"properties": {"n": {"$ref": "#foo"}}}), "an anchor"),
+            // Inside a ref target in data, which llguidance builds.
             (
-                json!({"properties": {"n": {"$ref": "#%2Fdefault"}}}),
-                "an anchor",
-            ),
-            (
-                json!({"properties": {"a": {"$id": "urn:y"}}}),
-                "`$id` below the root",
-            ),
-            (json!({"not": {"$id": "urn:y"}}), "`$id` below the root"),
-            (json!({"$id": "#/default/x"}), "`$id` with a fragment"),
-            (json!({"$id": "urn:x#foo"}), "`$id` with a fragment"),
-            (
-                json!({"$defs": {"a": {"$id": "#foo"}}}),
-                "`$id` below the root",
-            ),
-            // A ref target in data is built as a schema: its `$id` counts.
-            (
-                json!({"properties": {"n": {"$ref": "#/default/t"}}, "default": {"t": {"$id": "urn:z"}}}),
-                "`$id` below the root",
-            ),
-            (
-                json!({"$schema": "http://json-schema.org/draft-04/schema#", "properties": {"a": {"id": "urn:y"}}}),
-                "`id` below the root",
+                json!({"properties": {"n": {"$ref": "#/default/t"}}, "default": {"t": {"$ref": "https://example.com/t.json"}}}),
+                "https://example.com/t.json",
             ),
         ] {
-            let got = unfollowable_ref(&schema).unwrap_or_else(|| panic!("{schema}"));
-            assert!(got.contains(want), "{schema}: {got}");
+            let got = ref_outside_the_schema(&schema).unwrap_or_else(|| panic!("{schema}"));
+            assert!(
+                got.contains(want) && got.contains("outside the schema"),
+                "{schema}: {got}"
+            );
         }
+        let int = json!({"type": "integer"});
         for schema in [
-            json!({"$id": "urn:x", "properties": {"n": {"$ref": "#/$defs/N"}}, "$defs": {"N": int}}),
+            json!({"$id": "urn:x", "properties": {"n": {"$ref": "urn:x#/$defs/N"}}, "$defs": {"N": int}}),
+            json!({"properties": {"n": {"$ref": "json-schema:///#/$defs/N"}}, "$defs": {"N": int}}),
             json!({"properties": {"n": {"$ref": "#"}, "m": {"$ref": "#/definitions/N"}}, "definitions": {"N": int}}),
-            // A property, a `$defs` entry or data named like the keyword.
-            json!({"properties": {"$id": int, "id": int, "$ref": int}, "$defs": {"$id": int}}),
-            json!({"default": {"$id": "urn:y", "$ref": "urn:y"}, "examples": [{"id": "abc"}]}),
-            // `id` is not an id outside draft 4.
-            json!({"properties": {"a": {"id": "urn:y"}}}),
-            // Not resolved by llguidance.
-            json!({"properties": {"a": {"$dynamicRef": "urn:y#/x", "$recursiveRef": "#"}}}),
+            json!({"$defs": {"T": {"$id": "T", "type": "string"}}, "properties": {"t": {"$ref": "T"}}}),
+            json!({"properties": {"a": {"$id": "urn:y", "properties": {"n": {"$ref": "#/default/x"}}, "default": {"x": int}}}}),
+            json!({"properties": {"n": {"$ref": "#foo"}}, "$defs": {"a": {"$anchor": "foo", "type": "integer"}}}),
+            json!({"$schema": "http://json-schema.org/draft-07/schema#", "$id": "#root", "properties": {"a": {"$id": "#/properties/a"}}}),
+            // Data and unknown keywords are not schemas.
+            json!({"x-meta": {"$ref": "https://example.com/x.json"}, "default": {"$ref": "urn:q"}}),
+            // A ref to nothing is llguidance's own error.
+            json!({"properties": {"n": {"$ref": "#/nope"}}}),
         ] {
-            assert_eq!(unfollowable_ref(&schema), None, "{schema}");
+            assert_eq!(ref_outside_the_schema(&schema), None, "{schema}");
         }
     }
 }

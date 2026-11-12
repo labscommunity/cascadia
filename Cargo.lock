@@ -521,6 +521,7 @@ dependencies = [
  "cascadia-engine",
  "cascadia-types",
  "llguidance",
+ "referencing 0.29.1",
  "serde_json",
  "tokenizers",
  "toktrie_hf_tokenizers",

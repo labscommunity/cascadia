@@ -263,9 +263,10 @@ const BOUND_KEYWORDS: [&str; 4] = ["minimum", "exclusiveMinimum", "maximum", "ex
 /// [`visit_schemas`] on `schema`, then on the target of each `#/...` `$ref`
 /// in it, resolved the way llguidance resolves it ([`local_ref_pointers`]).
 /// llguidance builds whatever a `$ref` points to as a schema, inside a data
-/// keyword (`default`, `examples`) too, which the walk skips. Refs that could
-/// resolve elsewhere (another base URI, an anchor) are refused before this
-/// runs (`refs::unfollowable_ref`). A
+/// keyword (`default`, `examples`) too, which the walk skips. A `#/...` ref
+/// under a non-root `$id` is read against the root here, so its real target
+/// may go unbounded (see the `refs` module: no abort, the abort check reads
+/// every object). A
 /// target the walk already visited is visited again: `f` must leave a
 /// schema it already changed as it is.
 fn visit_schemas_and_ref_targets(schema: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {

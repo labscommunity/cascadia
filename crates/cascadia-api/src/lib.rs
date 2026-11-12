@@ -8353,9 +8353,9 @@ level={{ effort_map[eff] }}";
         assert!(v["error"].as_str().unwrap().contains(refusal), "{v}");
     }
 
-    /// Schemas whose `$ref` llguidance resolves somewhere its integer guards
-    /// did not look, to an integer whose build overflows the stack and
-    /// aborts the process.
+    /// Schemas whose `$ref` or `$id` llguidance resolves somewhere the
+    /// grammar crate's ref mirror does not look, to an integer whose build
+    /// overflows the stack and aborts the process.
     fn refs_the_guards_cannot_follow() -> Vec<Value> {
         let low = serde_json::json!({"type": "integer", "const": i64::MIN});
         vec![
@@ -8403,13 +8403,22 @@ level={{ effort_map[eff] }}";
         println!("CHILD-OUTCOME {} {}", status.as_u16(), v["error"]);
     }
 
-    /// A ref llguidance would resolve where the integer guards don't look is
-    /// a 400 naming `response_format`, with the llguidance build check on
-    /// (run in a child: before the fix the check's build aborted the
-    /// process) and off.
+    /// A schema whose integer llguidance reaches where the guards' ref
+    /// mirror does not look never aborts the process: the llguidance build
+    /// check (run in a child: before the fix its build aborted it) ends
+    /// with an answer. The grammar crate refuses each of these builds (the
+    /// mock engine here doesn't build one, so the answer may be 200). A ref
+    /// to a document outside the schema is a 400 naming `response_format`,
+    /// with the check on and off.
     #[tokio::test]
     async fn a_ref_the_integer_guards_cannot_follow_is_400_not_an_abort() {
-        for schema in refs_the_guards_cannot_follow() {
+        let outside = serde_json::json!({
+            "type": "object",
+            "properties": {"n": {"$ref": "https://example.com/s.json"}},
+        });
+        let mut schemas = refs_the_guards_cannot_follow();
+        schemas.push(outside.clone());
+        for schema in schemas {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -8436,6 +8445,9 @@ level={{ effort_map[eff] }}";
                             .join(" | ")
                     )
                 });
+            if schema != outside {
+                continue;
+            }
             assert!(
                 outcome.starts_with("400 ") && outcome.contains("response_format"),
                 "{schema}: {outcome}"

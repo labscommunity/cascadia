@@ -225,9 +225,9 @@ impl GrammarFactory {
                 // are generated in the order the client listed them.
                 let mut schema: serde_json::Value =
                     serde_json::from_str(&spec.body).map_err(invalid_schema)?;
-                // The integer guards below follow `#/...` refs only; a ref
-                // llguidance could resolve elsewhere is refused first.
-                if let Some(why) = refs::unfollowable_ref(&schema) {
+                // llguidance never fetches: a ref to a document the schema
+                // doesn't hold is refused with a clear 400.
+                if let Some(why) = refs::ref_outside_the_schema(&schema) {
                     return Err(invalid_schema(why));
                 }
                 if int_bounds::has_integer_llguidance_cannot_build(&schema) {
@@ -825,7 +825,7 @@ pub use xgrammar_cost::{xgrammar_cost, xgrammar_cost_error, MAX_XGRAMMAR_COST};
 mod int_bounds;
 mod refs;
 pub use int_bounds::{bound_integers, ADDED_INTEGER_MAXIMUM, ADDED_INTEGER_MINIMUM};
-pub use refs::unfollowable_ref;
+pub use refs::ref_outside_the_schema;
 
 mod stage_mask;
 pub use stage_mask::{

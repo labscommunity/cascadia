@@ -1607,11 +1607,12 @@ fn refused_not_aborted(body: &str, want: &str) {
 }
 
 #[test]
-fn a_ref_llguidance_resolves_where_the_guards_do_not_look_is_refused() {
+fn an_integer_llguidance_reaches_where_the_guards_do_not_look_is_refused() {
     // Each of these reaches the integer at `default.x` through a ref the
-    // guards did not follow: by another base URI (a `$ref` with a URI, a
-    // `$id` below the root, a draft-4 `id`), so the guards read the root's
-    // `default.x` (an integer that builds) or nothing.
+    // guards' ref mirror does not follow (a `$ref` with a URI, a `$id`
+    // below the root, a draft-4 `id`, a root `$id` with a fragment): the
+    // abort check reads every object in the document, so each is refused
+    // whatever llguidance resolves.
     let nested = |id_key: &str, schema: &str| {
         format!(
             r##"{{{schema}"type":"object","properties":{{"a":{{"{id_key}":"urn:y","type":"object","properties":{{"n":{{"$ref":"#/default/x"}}}},"required":["n"],"default":{{"x":{OVERFLOWS}}}}}}},"required":["a"],"default":{{"x":{BUILDS}}}}}"##
@@ -1628,32 +1629,30 @@ fn a_ref_llguidance_resolves_where_the_guards_do_not_look_is_refused() {
         r##"{{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{{"a":{{"$id":"urn:y","allOf":[{{"$ref":"#/default/x"}}],"default":{{"x":{OVERFLOWS}}}}}}},"required":["a"],"default":{{"x":{BUILDS}}}}}"##
     );
     for (body, want) in [
-        (reviewer, r#"$ref "urn:x#/default/x" is not supported"#),
-        (
-            no_id,
-            r#"$ref "json-schema:///#/default/x" is not supported"#,
-        ),
-        (nested("$id", ""), "`$id` below the root is not supported"),
+        (reviewer, LOW_INTEGER_MESSAGE),
+        (no_id, LOW_INTEGER_MESSAGE),
+        (nested("$id", ""), LOW_INTEGER_MESSAGE),
         (
             nested(
                 "$id",
                 r#""$schema":"http://json-schema.org/draft-06/schema#","#,
             ),
-            "`$id` below the root is not supported",
+            LOW_INTEGER_MESSAGE,
         ),
         (
             nested(
                 "id",
                 r#""$schema":"http://json-schema.org/draft-04/schema#","#,
             ),
-            "`id` below the root is not supported",
+            LOW_INTEGER_MESSAGE,
         ),
-        (draft7_all_of, "`$id` below the root is not supported"),
+        (draft7_all_of, LOW_INTEGER_MESSAGE),
     ] {
         refused_not_aborted(&body, want);
     }
     // A root `$id` whose fragment is a pointer makes llguidance build the
-    // value it points to as the root, data or not.
+    // value it points to as the root, data or not (a 2019-09 or 2020-12
+    // schema; draft 7 ignores a `#...` `$id`).
     for (id, schema, data) in [
         (
             "#/default/x",
@@ -1673,17 +1672,12 @@ fn a_ref_llguidance_resolves_where_the_guards_do_not_look_is_refused() {
         ),
     ] {
         let body = format!(r#"{{{schema}"$id":"{id}","type":"object",{data}}}"#);
-        refused_not_aborted(&body, "`$id` with a fragment is not supported");
+        refused_not_aborted(&body, LOW_INTEGER_MESSAGE);
     }
-    // An anchor is refused too, wherever it sits.
+    // An anchor llguidance resolves builds.
     let gf = single_byte();
-    let anchor = r##"{"type":"object","properties":{"n":{"$ref":"#foo"}},"$defs":{"a":{"$anchor":"foo","type":"integer"}}}"##;
-    let err = gf.compile(&spec(anchor)).err().expect("an anchor ref");
-    assert!(
-        err.to_string()
-            .contains(r##"response_format schema: $ref "#foo" is not supported: an anchor"##),
-        "{err}"
-    );
+    let anchor = r##"{"type":"object","properties":{"n":{"$ref":"#foo"}},"required":["n"],"$defs":{"a":{"$anchor":"foo","type":"integer"}}}"##;
+    assert!(accepts(&gf, anchor, r#"{"n":5}"#));
 }
 
 #[test]
@@ -1760,11 +1754,71 @@ fn refs_real_clients_write_still_build() {
         // A root `$id` with `#/...` refs, and a recursive `#` ref.
         r##"{"$id":"https://example.com/owner.json","type":"object","properties":{"pet":{"$ref":"#/$defs/Pet"},"next":{"anyOf":[{"$ref":"#"},{"type":"null"}]}},"required":["pet"],"$defs":{"Pet":{"type":"integer"}}}"##,
         r##"{"$id":"https://example.com/owner.json#","type":"object","properties":{"pet":{"$ref":"#/$defs/Pet"}},"$defs":{"Pet":{"type":"integer"}}}"##,
+        // jsonschema.net / draft-07 generators: a fragment `$id` on every schema.
+        r##"{"$schema":"http://json-schema.org/draft-07/schema#","$id":"http://example.com/example.json","type":"object","properties":{"id":{"$id":"#/properties/id","type":"integer"}},"required":["id"]}"##,
+        r##"{"$schema":"http://json-schema.org/draft-07/schema#","$id":"#root","type":"object","properties":{"a":{"type":"string"}}}"##,
+        // TypeBox: an embedded `$id` named by a relative `$ref`.
+        r##"{"$defs":{"T":{"$id":"T","type":"string"}},"type":"object","properties":{"t":{"$ref":"T"}},"required":["t"]}"##,
+        // Data under an unknown keyword is not a schema.
+        r##"{"type":"object","x-meta":{"$id":"abc","$ref":"https://example.com/x.json"},"properties":{"a":{"type":"string"}}}"##,
         BROWSER_USE_SCHEMA,
         PYDANTIC_OUTPUT_SCHEMA,
     ] {
         gf.compile(&spec(body))
             .unwrap_or_else(|e| panic!("{body}: {e}"));
+    }
+}
+
+#[test]
+fn a_ref_to_a_document_outside_the_schema_is_refused() {
+    // llguidance never fetches: a ref no resource in the document answers
+    // is a 400 naming response_format, before any build.
+    let gf = single_byte();
+    for (r, schema, named) in [
+        (
+            "https://example.com/s.json",
+            r##""type":"object""##,
+            "https://example.com/s.json",
+        ),
+        (
+            "s.json#/$defs/x",
+            r##""type":"object""##,
+            "json-schema:///s.json",
+        ),
+        (
+            "urn:z#/default/x",
+            r##""$id":"urn:x","type":"object""##,
+            "urn:z#/default/x",
+        ),
+        ("urn:z", r##""type":"object""##, "urn:z"),
+    ] {
+        let body =
+            format!(r#"{{{schema},"properties":{{"n":{{"$ref":"{r}"}}}},"required":["n"]}}"#);
+        let err = gf.compile(&spec(&body)).err().expect(&body).to_string();
+        assert!(
+            err.contains("response_format schema: ")
+                && err.contains(&format!("$ref \"{named}"))
+                && err.contains("outside the schema"),
+            "{body}: {err}"
+        );
+    }
+}
+
+#[test]
+fn an_integer_reached_through_an_embedded_id_is_still_bounded() {
+    // The bounding walks every schema position, `$defs` and nested
+    // properties included, so a target named through an embedded `$id`
+    // (TypeBox) or carrying a fragment `$id` (jsonschema.net) is bounded
+    // without following the ref: no 20th digit.
+    let gf = single_byte();
+    for body in [
+        r##"{"$defs":{"T":{"$id":"T","type":"integer"}},"type":"object","properties":{"n":{"$ref":"T"}},"required":["n"]}"##,
+        r##"{"$schema":"http://json-schema.org/draft-07/schema#","$id":"http://example.com/example.json","type":"object","properties":{"n":{"$id":"#/properties/n","type":"integer"}},"required":["n"]}"##,
+    ] {
+        let mut gm = mask_for(&gf, body);
+        let prefix = bytes(r#"{"n":1234567890123456789"#);
+        assert_eq!(walk(&gf, &mut gm, &prefix), Ok(()), "{body}");
+        assert!(!gm.allowed(u32::from(b'0')), "{body}: a 20th digit");
     }
 }
 

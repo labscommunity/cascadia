@@ -606,11 +606,14 @@ The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
   `integer` builds. Every object in the schema is checked for this, data
   (`default`, `examples`) included, so a schema with an `integer` type
   and a data object such as `{"const": -1e20}` gets this 400 too.
-- Refuse a `$ref` llguidance would resolve somewhere the server's checks
-  don't read (a ref with a URI, an anchor `#name`, a ref under a non-root
-  `$id`), with the 400 below (`… is not supported`). A `#/...` pointer is
-  read the way llguidance reads it: percent-decoded (`%25` is `%`, `%2F`
-  splits a key), `~1`/`~0` unescaped, and `01` or `+1` as array index 1.
+- Read a `#/...` pointer the way llguidance reads it when bounding and
+  clamping the integer it reaches: percent-decoded (`%25` is `%`, `%2F`
+  splits a key), `~1`/`~0` unescaped, and `01` or `+1` as array index 1,
+  against the root. A target inside `default` or `examples` reached only
+  through a `$id` below the root is not bounded or clamped: its integers
+  may take more than 19 digits, or llguidance refuses a lower bound it
+  can't build with its own 400. Schemas in `$defs` and properties are
+  bounded where they sit.
 - Compile the schema when the request is submitted: a schema llguidance
   cannot build (for example `{"type": 42}` or an unresolvable `$ref`) is a
   400 before the request queues. A client's own top-level `x-guidance`
@@ -727,16 +730,13 @@ objects, `#/key/key…`: no empty segment (`//`, a trailing `/`), no `~`
 escape, no `%` encoding, no array index, and it must name an existing
 schema (a JSON object or `true`/`false`, not a string, number or list such
 as `#/required`); otherwise the request gets `unsupported $ref "<ref>"`. A `$ref`
-that does not start with `#` (`urn:x#/…`, `https://…`, `other.json`) gets
-`` $ref "<ref>" is not supported: only a reference inside the schema (`#` or `#/...`) is ``,
-and a `$id` in any schema below the root (or a draft-4 `id`,
-when the schema names draft 4) gets `` `$id` below the root is not supported
-(it changes what a `$ref` under it refers to) ``: either would make a `$ref`
-resolve against another base URI than the server's checks read. A root
-`$id` is fine (`https://example.com/s.json`, or one ending in a bare `#`),
-as are properties named `id` or `$id`; a root `$id` with a fragment
-(`#/default/x`, `urn:x#foo`) gets `` `$id` with a fragment is not supported … ``:
-llguidance would build what the fragment points to as the whole schema. A schema whose walk
+that names a document outside the schema (`https://…`, `other.json`, a
+`urn:` no `$id` in the schema has) gets `` $ref "<uri>" is not supported: it
+names a document outside the schema … ``: no backend fetches one. A ref the
+schema itself answers is fine, also through a `$id` (a root `$id`, a
+TypeBox-style `$id` in `$defs` named by `"$ref": "T"`, or the fragment
+`$id`s schema generators put on every subschema), as are properties named
+`id` or `$id`. A schema whose walk
 would take the converter too long gets `… schema is too complex`.
 
 Errors (`{"error": "<message>"}`; on a stream, after the SSE stream has
