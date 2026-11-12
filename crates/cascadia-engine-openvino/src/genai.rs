@@ -1060,6 +1060,21 @@ fn rebuild_floor(raw: Option<&str>) -> Duration {
             );
             REBUILD_FLOOR_MIN
         }
+        // All digits but too big for u64: a whole number above the maximum.
+        Err(_)
+            if raw
+                .strip_prefix('+')
+                .unwrap_or(raw)
+                .bytes()
+                .all(|b| b.is_ascii_digit()) =>
+        {
+            warn!(
+                value = raw,
+                max_s = REBUILD_FLOOR_MAX.as_secs(),
+                "{REBUILD_FLOOR_ENV} is above the maximum; using the maximum"
+            );
+            REBUILD_FLOOR_MAX
+        }
         Err(_) => {
             warn!(
                 value = raw,
@@ -5015,6 +5030,15 @@ mod tests {
         assert_eq!(rebuild_floor(Some("604801")), REBUILD_FLOOR_MAX);
         assert_eq!(
             rebuild_floor(Some("18446744073709551615")),
+            REBUILD_FLOOR_MAX
+        );
+        // Too big for u64: still a whole number, above the maximum.
+        assert_eq!(
+            rebuild_floor(Some("99999999999999999999999")),
+            REBUILD_FLOOR_MAX
+        );
+        assert_eq!(
+            rebuild_floor(Some("+99999999999999999999999")),
             REBUILD_FLOOR_MAX
         );
         // The largest floor still adds to the clock without overflowing.
