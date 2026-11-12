@@ -59,7 +59,7 @@ The `model` label is the shard's `model_id`.
 | `cascadia_generation_ttft_seconds` | histogram | `model` | Task submission → first token-bearing or nonempty text chunk delivered to the consumer. |
 | `cascadia_generation_inter_token_seconds` | histogram | `model` | Gap between consecutive token-bearing chunks of one generation, at delivery. |
 | `cascadia_generation_duration_seconds` | histogram | `model`, `finish_reason` | Submission → terminal outcome. `finish_reason`: `stop`, `length`, `cancelled` (client gone / explicit cancel), `error` (engine fault), `teardown` (server shut down mid-generation). Every admitted generation books exactly one sample, so `sum(rate(..._count))` reconciles with admissions — including across restarts. |
-| `cascadia_tokens_generated_total` | counter | `model` | Tokens counted once at the terminal outcome. A successful engine-reported `completion_tokens` total takes precedence, including reasoning/tool generation; otherwise the runner sums delivered `n_tokens`. On cancellation or error it records only the known partial count, without estimating unseen tokens. A cancelled task on a one-shot engine (default ov-genai, single-stage sparse-moe) books 0 here: its cancelled final carries no count (the node log's `task cancelled tokens=N` line has the real one). |
+| `cascadia_tokens_generated_total` | counter | `model` | Tokens counted once at the terminal outcome. A successful engine-reported `completion_tokens` total takes precedence, including reasoning/tool generation; otherwise the runner sums delivered `n_tokens`. On cancellation or error it records only the known partial count, without estimating unseen tokens. A cancelled task on a one-shot engine (single-stage sparse-moe, and ov-genai built without `stream_writes`) books 0 here: its cancelled final carries no count (the node log's `task cancelled tokens=N` line has the real one). The streaming default ov-genai path books the tokens it generated: its deltas carry their counts and the cancelled final carries the held ones. |
 | `cascadia_tokens_prompt_total` | counter | `model` | Prompt tokens, for engines that report them on the final chunk. A one-shot engine's cancelled final carries the prompt count too, once the prompt was counted. |
 | `cascadia_tasks_cancelled_total` | counter | `model` | Generations abandoned before completion: explicit `/v1/cancel` (including an engine acknowledging with a `Cancelled` final marker) or a client disconnect, streamed or not. On the one-shot engines (default ov-genai, single-stage sparse-moe) a disconnect or cancel now ends the running generation itself, and books here with the shorter duration. Server teardown is never counted here — a restart is not a client cancellation, and the suppression is deterministic (`close()` flags the shutdown before emptying the engine slot, so poll-first and drop-first orderings agree). Those generations land on `finish_reason="teardown"` instead. An answer the API ends itself — at the known context window or at a `stop` match — is not a cancel either: it books `finish_reason="length"` or `"stop"`. |
 | `cascadia_tasks_failed_total` | counter | `model` | Generations that terminated with an engine error. |
@@ -73,8 +73,10 @@ latency there, not as time-to-first-token. A cancelled task on these modes
 books no TTFT sample and 0 generated tokens. Per-token producers (`ov-genai`
 as the `cascadia worker` command runs it, with or without `--cb`,
 `ov-runtime`, sparse-moe, mock) populate both histograms as named; on the
-default ov-genai path one sample may cover a speculative round or a few tokens
-held back (an echoed prompt, a split character). There a request queued behind
+default ov-genai path each chunk comes one token late (it sends only text two
+consecutive decodes agree on), so TTFT includes the second token, and one
+sample may cover a speculative round or a few tokens held back (an echoed
+prompt, a split character). There a request queued behind
 a running generation includes its wait in TTFT and duration, as it did before.
 
 `sycl-llama` SSE fragments are not necessarily individual model tokens. Its

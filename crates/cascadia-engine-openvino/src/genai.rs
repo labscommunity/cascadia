@@ -108,8 +108,9 @@ impl OvGenaiBuilder {
         self
     }
 
-    /// Stream the default (stateful) path. On, `step()` returns each
-    /// streamer write's text as a token chunk while the generation runs
+    /// Stream the default (stateful) path. On, `step()` returns the text as
+    /// token chunks while the generation runs, one streamer write late (only
+    /// text two consecutive decodes agree on)
     /// (on a thread that owns the pipeline), a zero-token progress chunk
     /// when nothing new came within [`STEP_POLL`], and a final chunk with
     /// the rest of the answer and its `completion_tokens`. The deltas plus
@@ -773,17 +774,27 @@ fn final_chunk(
         *streamer_thread_logged = true;
         info!(threaded_streamer, "ov-genai streamer thread");
     }
-    if matches!(done.outcome, Outcome::Cancelled) || inflight.cancelled() {
+    // A generation the job finished stays finished when the flag went up
+    // after it; a failure with the flag up ends as cancelled.
+    let cancelled = |held_tokens: usize| {
         info!(
             task = %task_id,
             tokens = done.polled_tokens,
             elapsed_s = done.elapsed_s,
             "task cancelled"
         );
-        return cancelled_chunk(task_id, done.prompt_tokens);
-    }
+        let chunk = cancelled_chunk(task_id, done.prompt_tokens);
+        // Streaming: the held writes' tokens, so the API's running sum
+        // counts every token generated.
+        if held_tokens > 0 {
+            chunk.with_n_tokens(held_tokens as u32)
+        } else {
+            chunk
+        }
+    };
     let f = match done.outcome {
-        Outcome::Cancelled => return cancelled_chunk(task_id, done.prompt_tokens),
+        Outcome::Cancelled { held_tokens } => return cancelled(held_tokens),
+        Outcome::Failed(_) if inflight.cancelled() => return cancelled(0),
         Outcome::Failed(err) => {
             warn!(task = %task_id, error = %err, "generate failed");
             // Chunk::error, not an empty final_marker: the latter reads as
@@ -848,12 +859,13 @@ fn final_chunk(
     let mut chunk = match (running, f.stream) {
         (Some(_), Some(rest)) => {
             if rest.diverged {
-                // The deltas already sent are not a prefix of the answer:
-                // nothing more is sent. The parity check on hardware fails
-                // on this line.
+                // The text sent is not a prefix of the answer (a rewrite of
+                // text two decodes agreed on, or a final decode that
+                // disagrees). The parity check on hardware fails on this
+                // line.
                 warn!(
                     task = %task_id,
-                    emitted_bytes = rest.emitted_bytes,
+                    sent_bytes = rest.sent_bytes,
                     visible_bytes = f.visible.len(),
                     "ov_genai_stream_divergence: the streamed text is not a prefix of the answer"
                 );
@@ -2217,6 +2229,15 @@ mod tests {
         /// Instead of `pieces`: one entry per streamer write, each the token
         /// texts it carries (a speculative round writes several ids at once).
         writes: Vec<Vec<String>>,
+        /// With `stream_text`: the window of write i instead of the decode
+        /// of the pieces so far, and the last one is the answer's decode (a
+        /// detokenizer the pieces don't predict).
+        window_script: Vec<String>,
+        /// At the n-th count_tokens call (1: the prompt, 2: the answer),
+        /// cancel this task through this handle: a cancel that lands after
+        /// the generation is over.
+        cancel_at_count: Option<(usize, Arc<InflightCancel>, TaskId)>,
+        count_calls: usize,
         /// Pieces polled (the end flush not included).
         consumed: usize,
         /// Every poll call: (text, n_tokens, answer).
@@ -2234,6 +2255,12 @@ mod tests {
         fn count_tokens(&self, text: &str) -> Option<u32> {
             {
                 let mut st = self.st.lock().unwrap();
+                st.count_calls += 1;
+                if let Some((at, h, id)) = &st.cancel_at_count {
+                    if *at == st.count_calls {
+                        h.cancel(id);
+                    }
+                }
                 if st.count_panics > 0 {
                     st.count_panics -= 1;
                     drop(st);
@@ -2308,7 +2335,11 @@ mod tests {
             stream_text: bool,
             poll: &mut (dyn FnMut(&str, &[u8], usize) -> PollAction + Send),
         ) -> Result<GenResult, OvError> {
-            let tail_override = self.st.lock().unwrap().tail_override.clone();
+            let (tail_override, script) = {
+                let st = self.st.lock().unwrap();
+                (st.tail_override.clone(), st.window_script.clone())
+            };
+            let script = if stream_text { script } else { Vec::new() };
             let (pieces, tokens, ends, cancel_before, err_after_cancel, poll_panic_at) = {
                 let mut st = self.st.lock().unwrap();
                 // Per write: (text, n_tokens); per token: its text; per write:
@@ -2369,7 +2400,9 @@ mod tests {
                         String::new()
                     };
                 // With `stream_text`: the decode of every token so far.
-                let window = if stream_text && *n > 0 {
+                let window = if let Some(w) = script.get(i) {
+                    w.clone()
+                } else if stream_text && *n > 0 {
                     tokens[..ends[i]].concat()
                 } else {
                     String::new()
@@ -2392,7 +2425,7 @@ mod tests {
                         return Err(OvError::Native("mock: generate failed after cancel".into()));
                     }
                     return Ok(GenResult {
-                        text,
+                        text: script.get(i).cloned().unwrap_or(text),
                         generated_tokens: n_total as u32,
                         ttft_ms: None,
                     });
@@ -2405,7 +2438,7 @@ mod tests {
                 .polls
                 .push((String::new(), 0, flush));
             Ok(GenResult {
-                text,
+                text: script.last().cloned().unwrap_or(text),
                 generated_tokens: n_total as u32,
                 ttft_ms: None,
             })
@@ -2682,9 +2715,12 @@ mod tests {
             let (out, logs) = capture_logs(|| until_final(&mut e));
             let last = out.last().unwrap();
             assert!(is_empty_cancelled(last), "{stream}: {last:?}");
-            // Streaming, the two writes before the cancel went out.
-            let want = if stream { "one two" } else { "" };
+            // Streaming, one write late: the first write's text went out on
+            // the second; the second's is held, and its token is on the
+            // cancelled final, so the API counts both.
+            let want = if stream { "one" } else { "" };
             assert_eq!(joined(&out), want, "{stream}");
+            assert_eq!(usage(&out), if stream { 2 } else { 0 }, "{stream}");
             let s = st.lock().unwrap();
             // The cancel landed before piece 2's poll: that poll answers Cancel.
             assert_eq!(s.consumed, 3, "at most one more piece after the cancel");
@@ -2914,7 +2950,8 @@ mod tests {
     }
 
     /// A stop split over two tokens is found: without streaming the tail
-    /// decode spans them, streaming the check runs on the handed-out text.
+    /// decode spans them, streaming the check runs on each write's newest
+    /// visible text.
     #[test]
     fn stateful_stop_across_a_token_boundary() {
         for stream in MODES {
@@ -2958,34 +2995,46 @@ mod tests {
         }
     }
 
-    /// The window the closure receives: without the streaming switch none
-    /// (an empty window from id 0, and the answer is today's one final
-    /// chunk); with it, every write's decode of all the ids so far, from id 0.
-    /// The engine never confirms a window either way.
+    /// What the closure does with the window: without the streaming switch
+    /// it gets none (an empty window from id 0) and the answer is today's one
+    /// final chunk; with it, the chunks come from the scripted windows (a
+    /// decode the pieces don't predict), one write late. The engine never
+    /// confirms a window either way.
     #[test]
     fn stateful_polls_with_stream_text_only_when_streaming() {
         for stream in MODES {
             for stops in [vec![], vec!["x"]] {
                 let st = Arc::new(Mutex::new(StatefulState::default()));
-                st.lock().unwrap().pieces = pieces(&["a", " b", " c"]);
+                {
+                    let mut s = st.lock().unwrap();
+                    s.pieces = pieces(&["a", " b", " c"]);
+                    s.window_script = vec!["A".into(), "A B".into(), "A B C".into()];
+                }
                 let mut e = stateful_engine_in(&st, stream);
                 e.submit(stop_task("t1", 64, &stops)).unwrap();
                 let out = until_final(&mut e);
-                assert_eq!(joined(&out), "a b c");
-                if !stream {
-                    assert_eq!(out.len(), 1);
+                let got: Vec<(&str, Option<u32>, bool)> = out
+                    .iter()
+                    .map(|c| (c.text.as_str(), c.n_tokens, c.is_final))
+                    .collect();
+                if stream {
+                    assert_eq!(
+                        got,
+                        [
+                            ("A", Some(1), false),
+                            (" B", Some(1), false),
+                            (" C", Some(1), true)
+                        ],
+                        "{stops:?}"
+                    );
+                } else {
+                    assert_eq!(got, [("a b c", Some(3), true)], "{stops:?}");
                 }
                 let s = st.lock().unwrap();
                 assert_eq!(s.stream_text, [stream], "{stops:?}");
-                let want: Vec<(Vec<u8>, usize)> = if stream {
-                    ["a", "a b", "a b c", ""]
-                        .iter()
-                        .map(|w| (w.as_bytes().to_vec(), 0))
-                        .collect()
-                } else {
-                    vec![(Vec::new(), 0); 4]
-                };
-                assert_eq!(s.windows, want, "{stream} {stops:?}");
+                if !stream {
+                    assert!(s.windows.iter().all(|w| w == &(Vec::new(), 0)));
+                }
                 assert_eq!(s.replies.len(), 4);
                 assert!(
                     s.replies.iter().all(|r| r.confirm_upto.is_none()),
@@ -3129,7 +3178,7 @@ mod tests {
     /// The stop-text invariant broken (a window decode that matched while the
     /// visible text doesn't hold the stop): keep the visible text, and say so
     /// in a warn the hardware check fails on. (Without streaming only:
-    /// streaming checks the handed-out text itself, not a separate decode.)
+    /// streaming checks the visible text itself, not a separate decode.)
     #[test]
     fn stateful_stop_missing_from_both_texts_keeps_visible_and_warns() {
         let st = Arc::new(Mutex::new(StatefulState::default()));
@@ -3300,9 +3349,11 @@ mod tests {
 
     // ---- stateful engine: streaming ---------------------------------------
 
-    /// Each write's text is a token chunk carrying its token count (the first
-    /// with the prompt count); the final carries the rest of the answer (none
-    /// here), the answer's count, the prompt count and the finish reason.
+    /// One write late: each write sends, as a token chunk, the text the write
+    /// before it added (the text two decodes agree on), with that write's
+    /// token count; the first chunk books the prompt. The final carries the
+    /// last write's text and token, the answer's count, the prompt count and
+    /// the finish reason.
     #[test]
     fn stateful_streams_one_chunk_per_write() {
         let st = Arc::new(Mutex::new(StatefulState::default()));
@@ -3310,29 +3361,22 @@ mod tests {
         let mut e = stateful_engine_in(&st, true);
         e.submit(task("t1", 64)).unwrap();
         let out = until_final(&mut e);
-        assert_eq!(out.len(), 4, "{out:?}");
-        let deltas: Vec<(&str, Option<u32>, bool)> = out[..3]
+        assert_eq!(out.len(), 3, "{out:?}");
+        let deltas: Vec<(&str, Option<u32>, bool)> = out[..2]
             .iter()
             .map(|c| (c.text.as_str(), c.n_tokens, c.is_final))
             .collect();
-        assert_eq!(
-            deltas,
-            [
-                ("one", Some(1), false),
-                (" two", Some(1), false),
-                (" three", Some(1), false)
-            ]
-        );
+        assert_eq!(deltas, [("one", Some(1), false), (" two", Some(1), false)]);
         assert_eq!(
             out[0].prompt_tokens,
             Some(1),
             "the first chunk books the prompt"
         );
         assert_eq!(out[1].prompt_tokens, None);
-        let fin = &out[3];
+        let fin = &out[2];
         assert!(fin.is_final && fin.error.is_none(), "{fin:?}");
-        assert_eq!(fin.text, "");
-        assert_eq!(fin.n_tokens, Some(0));
+        assert_eq!(fin.text, " three");
+        assert_eq!(fin.n_tokens, Some(1));
         assert_eq!(fin.completion_tokens, Some(3));
         assert_eq!(fin.prompt_tokens, Some(1));
         assert_eq!(fin.finish_reason, Some(FinishReason::Stop));
@@ -3381,8 +3425,9 @@ mod tests {
             }
         }
         let ids: Vec<&str> = order.iter().map(|o| o.0.as_str()).collect();
-        assert_eq!(ids, ["t1", "t1", "t1", "t2", "t2", "t2"], "{order:?}");
-        assert!(order[2].2 && order[5].2);
+        // Each task: its first write's text on the second write, then the final.
+        assert_eq!(ids, ["t1", "t1", "t2", "t2"], "{order:?}");
+        assert!(order[1].2 && order[3].2);
         assert_eq!(st.lock().unwrap().polled_calls, 2);
     }
 
@@ -3463,7 +3508,8 @@ mod tests {
         }
 
         // Stop, after an echo the stream holds: the held writes ride on the
-        // first delta.
+        // first delta, which comes one write late; the stop is found at the
+        // write that completes it.
         let st = Arc::new(Mutex::new(StatefulState::default()));
         st.lock().unwrap().pieces = pieces(&["Q", "\n", " one", " two", " stop", " x"]);
         let mut e = stateful_engine_in(&st, true);
@@ -3472,7 +3518,7 @@ mod tests {
         e.submit(t).unwrap();
         let out = until_final(&mut e);
         assert_eq!(joined(&out), "one two stop");
-        assert_eq!(running(&out), [3, 4, 5, 3], "{out:?}");
+        assert_eq!(running(&out), [3, 4, 3], "{out:?}");
         assert_eq!(st.lock().unwrap().consumed, 5);
 
         // Cancel: what went out is what was generated before it.
@@ -3487,10 +3533,13 @@ mod tests {
         e.submit(task("t1", 64)).unwrap();
         let out = until_final(&mut e);
         assert!(is_empty_cancelled(out.last().unwrap()));
-        assert_eq!(running(&out), [1, 2, 3, 3]);
+        // " c" is held (one write late): its token is on the cancelled final.
+        assert_eq!(running(&out), [1, 2, 3]);
 
-        // The window: the limit is cut to 7 - 3 = 4; each chunk's sum is the
-        // tokens so far, so the API's window guard cuts where the engine is.
+        // The window: the limit is cut to 7 - 3 = 4; each delta's sum is the
+        // tokens of the text sent so far, so the sum reaches the window only
+        // on the final and the API's window guard never cuts off the held
+        // last write.
         let st = Arc::new(Mutex::new(StatefulState::default()));
         st.lock().unwrap().pieces = pieces(&["a", " b", " c", " d"]);
         let mut e =
@@ -3503,7 +3552,7 @@ mod tests {
             st.lock().unwrap().last_cfg.as_ref().unwrap().max_new_tokens,
             4
         );
-        assert_eq!(running(&out), [1, 2, 3, 4, 4]);
+        assert_eq!(running(&out), [1, 2, 3, 4]);
         let fin = out.last().unwrap();
         assert_eq!(fin.finish_reason, Some(FinishReason::Length));
         assert_eq!(fin.prompt_tokens, Some(3));
@@ -3633,8 +3682,9 @@ mod tests {
         assert_eq!(s.polls[0].2, PollAction::Cancel);
     }
 
-    /// A stop split across two and three writes is found on the handed-out
-    /// text, and the match stays in the answer for the API's cut.
+    /// A stop split across two and three writes is found on the newest
+    /// visible text (at the write that completes it, not one write late),
+    /// and the match stays in the answer for the API's cut.
     #[test]
     fn stateful_stream_stop_split_across_writes() {
         for (toks, consumed) in [
@@ -3662,7 +3712,8 @@ mod tests {
     }
 
     /// Speculative rounds write several ids at once: each round's text goes
-    /// out with its id count, and the counts add up to the tokens generated.
+    /// out (one write late) with its id count, and the counts add up to the
+    /// tokens generated.
     #[test]
     fn stateful_stream_speculative_multi_id_writes() {
         let st = Arc::new(Mutex::new(StatefulState::default()));
@@ -3674,15 +3725,69 @@ mod tests {
         let mut e = stateful_engine_with(&st, |b| b.with_prompt_lookup(3).stream_writes(true));
         e.submit(task("t1", 64)).unwrap();
         let out = until_final(&mut e);
-        let deltas: Vec<(&str, Option<u32>)> = out[..3]
-            .iter()
-            .map(|c| (c.text.as_str(), c.n_tokens))
-            .collect();
+        let got: Vec<(&str, Option<u32>)> =
+            out.iter().map(|c| (c.text.as_str(), c.n_tokens)).collect();
         assert_eq!(
-            deltas,
+            got,
             [("a b c", Some(3)), (" d", Some(1)), (" e f", Some(2))]
         );
+        assert!(out[2].is_final);
         assert_eq!(usage(&out), 6);
         assert_eq!(joined(&out), "a b c d e f");
+    }
+
+    /// A cancel while text is held (an echo and the whitespace after it):
+    /// the cancelled final carries the held writes' tokens, so the API's sum
+    /// counts every token generated.
+    #[test]
+    fn stateful_cancel_during_held_text_counts_the_held_tokens() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        let mut e = stateful_engine_in(&st, true);
+        let h = e.inflight_cancel().unwrap();
+        {
+            let mut s = st.lock().unwrap();
+            s.pieces = pieces(&["Q", "\n", " one", " two"]);
+            s.cancel_before = Some((2, h, TaskId::from("t1")));
+        }
+        let mut t = task("t1", 64);
+        t.prompt = "Q".into();
+        e.submit(t).unwrap();
+        let out = until_final(&mut e);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(is_empty_cancelled(&out[0]), "{out:?}");
+        assert_eq!(out[0].n_tokens, Some(2));
+        assert_eq!(usage(&out), 2);
+    }
+
+    /// A generation the worker finished stays finished when the cancel flag
+    /// goes up after it (a client gone just as the answer completed): the
+    /// final carries the rest, completion_tokens and the finish reason.
+    #[test]
+    fn stateful_finished_wins_over_a_later_cancel() {
+        for stream in MODES {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            let mut e = stateful_engine_in(&st, stream);
+            let h = e.inflight_cancel().unwrap();
+            {
+                let mut s = st.lock().unwrap();
+                s.pieces = pieces(&["a", " b"]);
+                // The answer's count runs after generate() returned and the
+                // job checked the flag.
+                s.cancel_at_count = Some((2, h.clone(), TaskId::from("t1")));
+            }
+            e.submit(task("t1", 64)).unwrap();
+            let out = until_final(&mut e);
+            // The cancel went in after the generation was over.
+            assert_eq!(st.lock().unwrap().count_calls, 2, "{stream}");
+            let fin = out.last().unwrap();
+            assert!(fin.error.is_none(), "{stream}: {fin:?}");
+            assert_eq!(fin.finish_reason, Some(FinishReason::Stop), "{stream}");
+            assert_eq!(joined(&out), "a b", "{stream}");
+            assert_eq!(usage(&out), 2, "{stream}");
+            if stream {
+                assert_eq!(fin.text, " b");
+                assert_eq!(fin.completion_tokens, Some(2));
+            }
+        }
     }
 }

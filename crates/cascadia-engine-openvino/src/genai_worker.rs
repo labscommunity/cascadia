@@ -4,7 +4,7 @@
 //! `generate()`, answers each streamer write (cancel, `stop`, and with streaming the text handed
 //! out), then counts the visible answer. The engine runs it inline inside `step()` when it does not
 //! stream (one final chunk, as before), or on a [`StatefulWorker`] thread when it does, so `step()`
-//! can return each write's text while the generation runs.
+//! can return the text while the generation runs (one write late, see [`crate::genai_stream`]).
 
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -41,7 +41,7 @@ pub(crate) struct GenParams {
     pub context_window: Option<u32>,
     /// End a running generation at a `stop` match.
     pub engine_stop_check: bool,
-    /// Hand out the answer's text per streamer write ([`Event::Delta`]).
+    /// Hand out the answer's text as it is written, one write late ([`Event::Delta`]).
     pub stream_text: bool,
 }
 
@@ -105,8 +105,11 @@ pub(crate) struct Done {
 
 #[derive(Debug)]
 pub(crate) enum Outcome {
-    /// The cancel flag was up when `generate()` returned (also after a failure).
-    Cancelled,
+    /// The cancel flag was up when `generate()` returned (also after a failure). Streaming: the
+    /// tokens of the writes whose text never went out, for the cancelled final.
+    Cancelled {
+        held_tokens: usize,
+    },
     /// `generate()` failed, or the job panicked.
     Failed(OvError),
     Finished(Finished),
@@ -147,9 +150,9 @@ impl Done {
 ///
 /// The `stop` check runs on text the visible answer keeps. Without streaming the shim decodes
 /// the newest ids per write (`tail_tokens`) and [`VisibleArm`] arms the check once that decode lies
-/// inside the visible text. With streaming no tail is decoded: the check runs on the handed-out
-/// text, which is visible text by construction, so a stop split across writes is found and a stop
-/// inside a stripped echo is not.
+/// inside the visible text. With streaming no tail is decoded: the check runs on each write's
+/// newest visible text ([`crate::genai_stream::Written::fresh`], without the delta's one write of
+/// lag), so a stop split across writes is found and a stop inside a stripped echo is not.
 pub(crate) fn run_job(
     pipe: &dyn StatefulPipe,
     params: &GenParams,
@@ -189,8 +192,8 @@ pub(crate) fn run_job(
     // model or prompt-lookup writes a whole speculative round at once
     // (up to `num_assistant_tokens` + 1 ids), so the window grows by that
     // round too, as sparse-moe's `extra_slack` does. 0 = no decode at all
-    // when nothing is checked, and when streaming (the check runs on the
-    // handed-out text).
+    // when nothing is checked, and when streaming (the check runs on each
+    // write's newest visible text).
     let round_slack = if cfg.num_assistant_tokens > 0 {
         cfg.num_assistant_tokens as usize + 1
     } else {
@@ -234,14 +237,15 @@ pub(crate) fn run_job(
                 return PollAction::Cancel.into();
             }
             let hit = match stream.as_mut() {
-                Some(s) => match s.on_write(&w) {
-                    Some((text, n_tokens)) => {
-                        let hit = stop.is_active() && stop.push(&text);
+                Some(s) => {
+                    let written = s.on_write(&w);
+                    if let Some((text, n_tokens)) = written.delta {
                         emit(Event::Delta { text, n_tokens });
-                        hit
                     }
-                    None => false,
-                },
+                    // On the newest text, not one write late: the stop ends
+                    // the generation at the write that completes it.
+                    stop.is_active() && !written.fresh.is_empty() && stop.push(&written.fresh)
+                }
                 None => {
                     tail_tokens > 0
                         && w.n_tokens > 0
@@ -277,7 +281,8 @@ pub(crate) fn run_job(
     if inflight.cancelled() {
         // Also when generate failed after the CANCEL: the task ends as
         // cancelled, never as an error or a partial success.
-        return done(Outcome::Cancelled);
+        let held_tokens = stream.as_ref().map_or(0, StreamText::held_tokens);
+        return done(Outcome::Cancelled { held_tokens });
     }
     let result = match generated {
         Ok(r) => r,
