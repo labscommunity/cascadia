@@ -8523,4 +8523,190 @@ level={{ effort_map[eff] }}";
         // ends on the answer side.
         assert_eq!(counter.reasoning_tokens(9), 5);
     }
+
+    // --- Reasoning split on streamed chat replies ---------------------------
+
+    /// Engine chunks that split `<think>` and `</think>` across chunks.
+    const SPLIT_TAG_PARTS: [&str; 5] = ["<thi", "nk>pl", "an</th", "ink>\n\nans", "wer"];
+
+    /// A gated router (released) with `--reasoning-format none`.
+    async fn gated_app_reasoning_none(parts: &[&str]) -> Router {
+        let (app, release) = gated_app_with_config(
+            parts,
+            false,
+            Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                reasoning_format: ReasoningFormat::None,
+                ..Config::default()
+            },
+        )
+        .await;
+        release.store(true, Ordering::SeqCst);
+        app
+    }
+
+    /// A released gated router with the default reasoning format.
+    async fn gated_app_released(parts: &[&str]) -> Router {
+        let (app, release) = gated_app(parts, false).await;
+        release.store(true, Ordering::SeqCst);
+        app
+    }
+
+    /// POST a streamed chat request; the raw SSE body.
+    async fn post_stream(app: Router, payload: Value) -> String {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap()
+    }
+
+    /// SSE events without the per-request `id`, `created` and tool call ids.
+    fn pinned_events(body: &str) -> Vec<Value> {
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        let mut events = sse_events(body);
+        for e in &mut events {
+            let obj = e.as_object_mut().unwrap();
+            obj.remove("id");
+            obj.remove("created");
+            if let Some(calls) = e
+                .pointer_mut("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array_mut)
+            {
+                for c in calls {
+                    c.as_object_mut().unwrap().remove("id");
+                }
+            }
+        }
+        events
+    }
+
+    fn plain_stream_body(thinking: Option<bool>, include_usage: bool) -> Value {
+        let mut body = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"hi"}],
+            "stream":true,"stream_options":{"include_usage":include_usage}});
+        if let Some(t) = thinking {
+            body["enable_thinking"] = t.into();
+        }
+        body
+    }
+
+    fn tool_stream_body(thinking: Option<bool>, include_usage: bool) -> Value {
+        let mut body = plain_stream_body(thinking, include_usage);
+        body["tools"] = serde_json::json!([{"type":"function","function":{"name":"get_weather"}}]);
+        body
+    }
+
+    const DRAFT_CALL: &str = r#"<tool_call>{"name":"draft","arguments":{}}</tool_call>"#;
+
+    fn draft_then_call_parts() -> [&'static str; 4] {
+        ["<think>plan ", DRAFT_CALL, "</think>", WEATHER_CALL]
+    }
+
+    /// One frame per non-blank line.
+    fn expected_frames(lines: &str) -> Vec<Value> {
+        lines
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Thinking off: the frames carry the text as it was generated, tags
+    /// included, with no reasoning field and no usage details.
+    #[tokio::test]
+    async fn thinking_off_stream_frames_are_unchanged() {
+        let body = post_stream(
+            gated_app_released(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(Some(false), true),
+        )
+        .await;
+        let expected = expected_frames(
+            r##"
+            {"choices":[{"delta":{"content":"<thi","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"nk>pl","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"an</th","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"ink>\n\nans","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"wer","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"stop","index":0}],"completion_tokens":5,"model":"mock-model","n_tokens":0,"object":"chat.completion.chunk"}
+            {"choices":[],"model":"mock-model","object":"chat.completion.chunk","usage":{"completion_tokens":5,"prompt_tokens":5,"total_tokens":10}}
+            "##,
+        );
+        assert_eq!(pinned_events(&body), expected, "{body}");
+    }
+
+    /// `--reasoning-format none`: the frames carry `<think>` in content, as
+    /// they did before reasoning was split out.
+    #[tokio::test]
+    async fn reasoning_format_none_stream_frames_are_unchanged() {
+        let body = post_stream(
+            gated_app_reasoning_none(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(None, false),
+        )
+        .await;
+        let expected = expected_frames(
+            r##"
+            {"choices":[{"delta":{"content":"<thi","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"nk>pl","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"an</th","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"ink>\n\nans","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"wer","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"stop","index":0}],"completion_tokens":5,"model":"mock-model","n_tokens":0,"object":"chat.completion.chunk"}
+            "##,
+        );
+        assert_eq!(pinned_events(&body), expected, "{body}");
+    }
+
+    /// Thinking off with tools: no scratchpad, so every call in the text is
+    /// returned, the drafted one included.
+    #[tokio::test]
+    async fn thinking_off_tool_stream_frames_are_unchanged() {
+        let body = post_stream(
+            gated_app_released(&draft_then_call_parts()).await,
+            tool_stream_body(Some(false), true),
+        )
+        .await;
+        let expected = expected_frames(
+            r##"
+            {"choices":[{"delta":{"content":"<think>plan ","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"arguments":"{}","name":"draft"},"index":0,"type":"function"},{"function":{"arguments":"{\"city\":\"Paris\"}","name":"get_weather"},"index":1,"type":"function"}]},"finish_reason":null,"index":0}],"completion_tokens":4,"model":"mock-model","n_tokens":3,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}],"model":"mock-model","object":"chat.completion.chunk"}
+            {"choices":[],"model":"mock-model","object":"chat.completion.chunk","usage":{"completion_tokens":4,"prompt_tokens":5,"total_tokens":9}}
+            "##,
+        );
+        assert_eq!(pinned_events(&body), expected, "{body}");
+    }
+
+    /// `--reasoning-format none` with tools: the reasoning streams as content
+    /// and only the call after `</think>` is returned.
+    #[tokio::test]
+    async fn reasoning_format_none_tool_stream_frames_are_unchanged() {
+        let body = post_stream(
+            gated_app_reasoning_none(&draft_then_call_parts()).await,
+            tool_stream_body(None, false),
+        )
+        .await;
+        let expected = expected_frames(
+            r##"
+            {"choices":[{"delta":{"content":"<think>plan ","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"<tool_call>{\"name\":\"draft\",\"arguments\":{}}</tool_call></think>","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":2,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"arguments":"{\"city\":\"Paris\"}","name":"get_weather"},"index":0,"type":"function"}]},"finish_reason":null,"index":0}],"completion_tokens":4,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}],"model":"mock-model","object":"chat.completion.chunk"}
+            "##,
+        );
+        assert_eq!(pinned_events(&body), expected, "{body}");
+    }
 }
