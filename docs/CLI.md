@@ -608,14 +608,19 @@ or not. A peer that stops answering makes the step waiting on it time out
 (after 60 s) and fail, which marks the server unready. Capacity 503s do not
 mark it, unless requests are in flight and a multi-stage pipeline is stalled: the engine has
 been inside one call (a step, or a request's submit) for longer than the
-transport waits for a prefill's reply (ten activation timeouts: 10 minutes at
+transport waits for one prefill reply (ten activation timeouts: 10 minutes at
 the default 60 s, 20 minutes with `CASCADIA_ACTIVATION_TIMEOUT_SECS=120`; never
-less than 10 minutes), the longest a healthy cross-stage wait takes, or it
+less than 10 minutes), or it
 keeps stepping (calls shorter than 5 s each) but has produced no real output (a token, a final answer, or a
 refusal of a request for its own fault, such as a prompt over the window; a
 progress marker or a step that fails for the server's fault does not count) for
 more than 60 s. This covers a step that hangs without failing while its
-requests hold every slot, so every new request is a capacity 503. The server
+requests hold every slot, so every new request is a capacity 503. That bound
+is one reply's wait, not a whole call's: a first stage's call also includes its
+own compute, and can chain several waits (a chunked prefill, or `sparse-moe`'s
+sync with the next stage every 256 prompt tokens), so a long prompt can keep a
+healthy call past it. Such a call is marked only while every slot is full, and
+the mark clears as soon as it produces output. The server
 is then ready again as soon as the engine produces real output, or once no
 request is left in flight (a load balancer that drained the node lets its
 clients give up their streams), with no new request needed; if the pipeline is
