@@ -599,18 +599,19 @@ the engine not loaded), or a stream ends with such an engine error (its 200
 was already sent, so the error arrives as an event in the stream: the error
 event, followed by `data: [DONE]`, on chat and completions; `response.failed`
 on responses). It is 200 again after the next completion that succeeds (for a
-stream, one that finishes), or once no request has been in flight for 60 s
-since the last such failure, so a load balancer or readiness probe that stopped
+stream, one that finishes), or, at a `/health` poll, once no request is in
+flight and more than 60 s have passed since the last such failure, so a load balancer or readiness probe that stopped
 sending traffic gets the node back; if the pipeline is still broken, the next
 request fails and marks it unready again. A stream that is still running, that is cancelled,
 or that the client closes before its end, does not count. Errors that are the client's fault never mark it unready, streamed
 or not. A peer that stops answering makes the step waiting on it time out
 (after 60 s) and fail, which marks the server unready. Capacity 503s do not
 mark it, unless requests are in flight and a multi-stage pipeline is stalled: the engine has
-been inside one call (a step, or a request's submit) for more than 10 minutes
-(ten times the 60 s bound: the longest a healthy cross-stage wait takes, such
-as the reply to a long prompt's prefill), or it
-keeps stepping but has produced no real output (a token, a final answer, or a
+been inside one call (a step, or a request's submit) for longer than the
+transport waits for a prefill's reply (ten activation timeouts: 10 minutes at
+the default 60 s, 20 minutes with `CASCADIA_ACTIVATION_TIMEOUT_SECS=120`; never
+less than 10 minutes), the longest a healthy cross-stage wait takes, or it
+keeps stepping (calls shorter than 5 s each) but has produced no real output (a token, a final answer, or a
 refusal of a request for its own fault, such as a prompt over the window; a
 progress marker or a step that fails for the server's fault does not count) for
 more than 60 s. This covers a step that hangs without failing while its
@@ -626,8 +627,8 @@ counted as stalled: it has no peer that could hold an engine call, so a long
 call is its own work, such as an answer that runs as one call (`ov-genai`
 without `--cb`, single-stage `sparse-moe`) or a long prompt's prefill, and a
 capacity 503 meanwhile leaves it ready. On a multi-stage pipeline, a first
-stage whose own part of a prefill runs as one step counts only past the
-10 minutes above; one that runs as steps that only report progress counts after
+stage whose own part of a prefill runs as one step counts only past that
+wait; one that runs as short steps that only report progress counts after
 60 s while every slot is full.
 
 ---

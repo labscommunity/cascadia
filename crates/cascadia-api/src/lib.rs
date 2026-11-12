@@ -312,6 +312,8 @@ pub struct AppState {
     pub decode_permits: Arc<Semaphore>,
     /// See [`Config::stall_after`].
     pub stall_after: std::time::Duration,
+    /// See [`Config::in_call_bound`].
+    pub in_call_bound: Option<std::time::Duration>,
     /// Why the server is unready, if it is; `ready` publishes it. See
     /// [`ReadinessState`].
     pub(crate) readiness: Arc<std::sync::Mutex<ReadinessState>>,
@@ -359,6 +361,11 @@ pub struct Config {
     /// server unready (see [`STALL_SECS`] and [`track_pipeline_health`]).
     /// [`STALL_SECS`] by default.
     pub stall_after: std::time::Duration,
+    /// How long one engine call on a pipeline stage may run before it counts
+    /// as stuck. `None` (the default): the longer of [`IN_CALL_FACTOR`] ×
+    /// `stall_after` and the transport's wait for a prefill's reply
+    /// ([`cascadia_runner::prefill_reply_wait`]), read at each check.
+    pub in_call_bound: Option<std::time::Duration>,
 }
 
 impl Default for Config {
@@ -375,6 +382,7 @@ impl Default for Config {
             no_media_reason: None,
             media_body_timeout: std::time::Duration::from_secs(30),
             stall_after: std::time::Duration::from_secs(STALL_SECS),
+            in_call_bound: None,
         }
     }
 }
@@ -723,6 +731,7 @@ pub fn make_router_with_stats(
         max_text_bytes: cfg.media.as_ref().map(|_| cfg.max_body_bytes),
         decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
         stall_after: cfg.stall_after,
+        in_call_bound: cfg.in_call_bound,
         readiness: Arc::new(std::sync::Mutex::new(ReadinessState::Ready)),
     };
     let state = AppState {
@@ -944,21 +953,37 @@ struct CapacityRefusal;
 
 /// Default [`Config::stall_after`]. With requests in flight on a multi-stage
 /// pipeline, the pipeline is stalled, and a capacity 503 marks the server
-/// unready, when one engine call
-/// (a step, or a task's submit) has run for longer than this, or when the
-/// engine keeps stepping but has produced no real output (a token or a final,
-/// not a progress marker or an error) for longer than this. A busy server
-/// returns from its steps with output; a wedged pipeline (a peer that stopped
-/// answering) sits in one call, or fails every step, while it holds every
-/// slot. The engine steps only while a stream is read, so clients that open
+/// unready, when the engine keeps stepping (calls shorter than
+/// [`cascadia_runner::STEP_GAP`]) but has produced no real output (a token or
+/// a final, not a progress marker or an error) for longer than this, or when
+/// one engine call (a step, or a task's submit) has run past the in-call
+/// bound ([`in_call_bound_ms`]: at least [`IN_CALL_FACTOR`] × this). A busy
+/// server returns from its steps with output; a wedged pipeline (a peer that
+/// stopped answering) sits in one call, or fails every step, while it holds
+/// every slot; a failed step's error also reaches its stream, which marks the
+/// server unready on its own. The engine steps only while a stream is read, so clients that open
 /// streams and never read them leave it idle, never stalled.
 pub const STALL_SECS: u64 = 60;
-/// How many stall bounds one engine call on a stage of a pipeline may take
-/// before it counts as stalled. The transport waits up to this many receive
-/// timeouts for a prefill's reply (`cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR`),
+/// How many stall bounds one engine call on a stage of a pipeline may take,
+/// at least, before it counts as stalled. The transport waits up to ten
+/// receive timeouts for a prefill's reply (`cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR`),
 /// and a first stage's own prefill of a long prompt can take minutes, so a
-/// call shorter than this is the pipeline working, not a wedged one.
+/// call shorter than this is the pipeline working, not a wedged one. When the
+/// transport's wait is longer (a raised `CASCADIA_ACTIVATION_TIMEOUT_SECS`),
+/// that wait is the bound instead ([`in_call_bound_ms`]).
 pub const IN_CALL_FACTOR: u32 = 10;
+
+/// How long one engine call on a pipeline stage may run before it counts as
+/// stuck, in ms: the longer of [`IN_CALL_FACTOR`] × `stall_after` and
+/// `prefill_wait`, the transport's own wait for a prefill's reply. A call
+/// inside that wait is one the transport still bounds; past it, the stage is
+/// held by something no timeout will end.
+fn in_call_bound_ms(stall_after: std::time::Duration, prefill_wait: std::time::Duration) -> u64 {
+    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    ms(stall_after)
+        .saturating_mul(u64::from(IN_CALL_FACTOR))
+        .max(ms(prefill_wait))
+}
 
 /// The 503 for a request past the in-flight cap: `Retry-After` tells the
 /// client when to come back, and [`PreEngineFailure`] keeps it out of
@@ -993,22 +1018,27 @@ fn stepping_window_ms(bound_ms: u64) -> u64 {
 /// output and the start of the current run of steps, so time spent idle
 /// before a burst never counts.
 ///
-/// One call counts only past [`IN_CALL_FACTOR`] × `bound_ms`, the longest a
-/// healthy cross-stage wait takes; while a call runs longer than a step's gap
-/// the stretch-without-output rule doesn't count it either.
+/// One call counts only past `in_call_ms` ([`in_call_bound_ms`]), the longest
+/// a healthy cross-stage wait takes; while a call runs longer than a step's
+/// gap the stretch-without-output rule doesn't count it either.
 ///
 /// Only a stage of a multi-stage pipeline can stall this way: its calls wait
 /// on peers. On a single-stage server ([`cascadia_runner::EngineActivity::pipelined`]
 /// false) a long call is the engine's own work (a whole answer in one call,
 /// as stateful `ov-genai` and single-stage `sparse-moe` run it, or a long
 /// prefill), so a capacity 503 there is a busy server, never a stalled one.
-fn stall_evidence(a: &cascadia_runner::EngineActivity, now: u64, bound_ms: u64) -> Option<u64> {
+fn stall_evidence(
+    a: &cascadia_runner::EngineActivity,
+    now: u64,
+    bound_ms: u64,
+    in_call_ms: u64,
+) -> Option<u64> {
     if !a.pipelined {
         return None;
     }
     if let Some(since) = a.busy_since_ms {
         let in_call = now.saturating_sub(since);
-        if in_call > bound_ms.saturating_mul(u64::from(IN_CALL_FACTOR)) {
+        if in_call > in_call_ms {
             return Some(since);
         }
         // One call longer than a step's gap is the stage working on one
@@ -1034,10 +1064,15 @@ fn pipeline_stalled(state: &AppState) -> Option<u64> {
         return None;
     }
     let bound = u64::try_from(state.stall_after.as_millis()).unwrap_or(u64::MAX);
+    let in_call = match state.in_call_bound {
+        Some(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+        None => in_call_bound_ms(state.stall_after, cascadia_runner::prefill_reply_wait()),
+    };
     stall_evidence(
         &state.runner.activity(),
         cascadia_runner::monotonic_ms(),
         bound,
+        in_call,
     )
 }
 
@@ -8348,6 +8383,15 @@ mod tests {
 
     /// [`stall_app`] on `layout`.
     async fn stall_app_on(layout: PeerLayout) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        stall_app_with(layout, Some(STALL_TEST_BOUND * IN_CALL_FACTOR)).await
+    }
+
+    /// [`stall_app_on`] with `in_call_bound` as given (`None`: the default,
+    /// which follows the transport's prefill wait).
+    async fn stall_app_with(
+        layout: PeerLayout,
+        in_call_bound: Option<std::time::Duration>,
+    ) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
         let stuck = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runner = Runner::new(Box::new(StuckBuilder(Some(StuckEngine {
             stuck: stuck.clone(),
@@ -8362,6 +8406,7 @@ mod tests {
         let cfg = Config {
             max_concurrent_requests: 1,
             stall_after: STALL_TEST_BOUND,
+            in_call_bound,
             ..Config::default()
         };
         (
@@ -8510,6 +8555,31 @@ mod tests {
         let body = reader.await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(health, StatusCode::OK, "a long call is not a stall");
+        assert!(String::from_utf8_lossy(&body).contains("tok"));
+    }
+
+    /// With the default in-call bound, one call on a pipeline stage counts as
+    /// stuck only past the transport's own wait for a prefill's reply (ten
+    /// receive timeouts, 600 s here), not past IN_CALL_FACTOR × a short stall
+    /// bound: a call 12 bounds in, every slot full, is busy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn by_default_a_call_inside_the_transports_prefill_wait_is_busy() {
+        let (app, stuck) = stall_app_with(first_of_two(), None).await;
+        stuck.store(true, Ordering::SeqCst);
+        let reader = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let resp = app.oneshot(stall_chat(true)).await.unwrap();
+                to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+            })
+        };
+        tokio::time::sleep(STALL_TEST_BOUND * (IN_CALL_FACTOR + 2)).await;
+        let resp = app.clone().oneshot(stall_chat(false)).await.unwrap();
+        let health = stall_health(&app).await;
+        stuck.store(false, Ordering::SeqCst);
+        let body = reader.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health, StatusCode::OK, "inside the transport's wait");
         assert!(String::from_utf8_lossy(&body).contains("tok"));
     }
 
@@ -8780,6 +8850,7 @@ mod tests {
         let cfg = Config {
             max_concurrent_requests: 1,
             stall_after: STALL_TEST_BOUND,
+            in_call_bound: Some(STALL_TEST_BOUND * IN_CALL_FACTOR),
             ..Config::default()
         };
         (
@@ -8877,6 +8948,40 @@ mod tests {
         }
     }
 
+    /// One call on a stage counts as stuck only past the longer of
+    /// IN_CALL_FACTOR × the stall bound and the transport's own wait for a
+    /// prefill's reply, which grows with `CASCADIA_ACTIVATION_TIMEOUT_SECS`
+    /// (ten 120 s receive timeouts on a rig set to 120 s).
+    #[test]
+    fn the_in_call_bound_follows_the_transports_prefill_wait() {
+        let stall = std::time::Duration::from_secs(60);
+        let at = |secs| std::time::Duration::from_secs(secs);
+        // The default receive timeout (60 s): ten of them, the same 600 s.
+        assert_eq!(in_call_bound_ms(stall, at(600)), 600_000);
+        // A rig at 120 s waits up to 1200 s for a prefill's reply.
+        assert_eq!(in_call_bound_ms(stall, at(1200)), 1_200_000);
+        // A caller's shorter first-token budget never lowers it below
+        // IN_CALL_FACTOR × the stall bound.
+        assert_eq!(in_call_bound_ms(stall, at(120)), 600_000);
+        // A call 11 minutes in, on a stage whose transport waits 20: busy.
+        let b = 60_000;
+        let call = activity(Some(1000), 900, 100, 900);
+        assert_eq!(
+            stall_evidence(&call, 1000 + 11 * b, b, in_call_bound_ms(stall, at(1200))),
+            None
+        );
+        // ...and past the transport's wait: stuck since the call began.
+        assert_eq!(
+            stall_evidence(
+                &call,
+                1000 + 20 * b + 1,
+                b,
+                in_call_bound_ms(stall, at(1200))
+            ),
+            Some(1000)
+        );
+    }
+
     /// The rule itself, on a fixed clock (bound 1000 ms).
     #[test]
     fn stall_evidence_follows_the_rule() {
@@ -8885,43 +8990,51 @@ mod tests {
         // cross-stage wait (a prefill's reply, IN_CALL_FACTOR × the bound):
         // the stage is computing or waiting on a peer that may still answer.
         assert_eq!(
-            stall_evidence(&activity(Some(500), 400, 100, 400), 2000, b),
+            stall_evidence(&activity(Some(500), 400, 100, 400), 2000, b, 10 * b),
             None
         );
         // ...and a long call that follows a run of output-less steps is not
         // counted as part of that quiet stretch either.
         assert_eq!(
-            stall_evidence(&activity(Some(1000), 900, 100, 100), 2500, b),
+            stall_evidence(&activity(Some(1000), 900, 100, 100), 2500, b, 10 * b),
             None
         );
         // One call busy past IN_CALL_FACTOR × the bound: evidence is its start.
         assert_eq!(
-            stall_evidence(&activity(Some(500), 400, 100, 400), 500 + 10 * b + 1, b),
+            stall_evidence(
+                &activity(Some(500), 400, 100, 400),
+                500 + 10 * b + 1,
+                b,
+                10 * b
+            ),
             Some(500)
         );
         // Busy, but not for long, with output just now: not stalled.
         assert_eq!(
-            stall_evidence(&activity(Some(1900), 1890, 100, 1890), 2000, b),
+            stall_evidence(&activity(Some(1900), 1890, 100, 1890), 2000, b, 10 * b),
             None
         );
         // Stepping (a step just ended), no output past the bound: evidence
         // is the last output.
         assert_eq!(
-            stall_evidence(&activity(None, 1999, 100, 600), 2000, b),
+            stall_evidence(&activity(None, 1999, 100, 600), 2000, b, 10 * b),
             Some(600)
         );
         // Inside a short call after a run of output-less steps: stalled too.
         assert_eq!(
-            stall_evidence(&activity(Some(1990), 1990, 100, 600), 2000, b),
+            stall_evidence(&activity(Some(1990), 1990, 100, 600), 2000, b, 10 * b),
             Some(600)
         );
         // Not stepping (the last call ended long ago, nobody reads): never.
         assert_eq!(
-            stall_evidence(&activity(None, 600, 100, 600), 9000, b),
+            stall_evidence(&activity(None, 600, 100, 600), 9000, b, 10 * b),
             None
         );
         // Never stepped at all.
-        assert_eq!(stall_evidence(&activity(None, 0, 0, 0), 9000, b), None);
+        assert_eq!(
+            stall_evidence(&activity(None, 0, 0, 0), 9000, b, 10 * b),
+            None
+        );
         // A single-stage server: neither a call past the bound nor steps
         // without output count, as no peer can hold the engine.
         let single = |a: cascadia_runner::EngineActivity| cascadia_runner::EngineActivity {
@@ -8929,22 +9042,22 @@ mod tests {
             ..a
         };
         assert_eq!(
-            stall_evidence(&single(activity(Some(500), 400, 100, 400)), 2000, b),
+            stall_evidence(&single(activity(Some(500), 400, 100, 400)), 2000, b, 10 * b),
             None
         );
         assert_eq!(
-            stall_evidence(&single(activity(None, 1999, 100, 600)), 2000, b),
+            stall_evidence(&single(activity(None, 1999, 100, 600)), 2000, b, 10 * b),
             None
         );
         // Idle for long, then a fresh run of steps that has not yet gone a
         // bound without output: the idle time does not count.
         assert_eq!(
-            stall_evidence(&activity(None, 9990, 9500, 600), 10_000, b),
+            stall_evidence(&activity(None, 9990, 9500, 600), 10_000, b, 10 * b),
             None
         );
         // ...but a fresh run that does go past the bound counts from its start.
         assert_eq!(
-            stall_evidence(&activity(None, 10_990, 9500, 600), 11_000, b),
+            stall_evidence(&activity(None, 10_990, 9500, 600), 11_000, b, 10 * b),
             Some(9500)
         );
     }
@@ -9067,7 +9180,8 @@ mod tests {
             cause: &cause,
         };
         let now = 5000;
-        let evidence = stall_evidence(&activity(None, now - 1, 100, 1000), now, 1000).unwrap();
+        let evidence =
+            stall_evidence(&activity(None, now - 1, 100, 1000), now, 1000, 10_000).unwrap();
         note_stall(&h, evidence);
         assert_eq!(cause_of(&h), ReadinessState::Stall { evidence_ms: 1000 });
         heal_within_bound(&h, || (now, 1));

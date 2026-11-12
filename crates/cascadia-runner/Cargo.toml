@@ -18,8 +18,8 @@ futures = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+cascadia-transport = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
-cascadia-transport = { workspace = true }
