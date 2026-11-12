@@ -27,6 +27,8 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+pub mod reasoning;
+
 /// Maximum HTTP request body the chat-completions endpoint accepts. 64
 /// KiB is plenty for any legitimate chat completion (prompt + system +
 /// few past turns); 1 MiB-class adversarial bodies are rejected with
