@@ -374,8 +374,14 @@ ending with `data: [DONE]`) or not:
 - `stream_options.include_usage: true` adds a closing chunk with
   `choices: []` and the usage, and every chunk before it carries
   `usage: null` (chat and completions alike). Without it no chunk has a
-  `usage` key. The usage chunk is sent only after a complete answer: not after
-  an error, an unexplained end or a `/v1/cancel` (below).
+  `usage` key. The usage chunk is sent once the choice has finished and the
+  engine has reported the prompt's token count; it is never sent after an
+  error or an unexplained end. A stream that finishes before any prompt count
+  arrived (a `/v1/cancel`, or a stop sequence matched, before an engine that
+  reports the count only on its final chunk, such as llama.cpp, sent it) ends
+  without a usage chunk rather than with `prompt_tokens: 0`. OpenAI's reference
+  allows the same: "If the stream is interrupted or cancelled, you may not
+  receive the final usage chunk".
 - `stream_options.continuous_usage_stats: true` (vLLM's extension; it needs
   `include_usage` and is ignored without it) puts the usage so far on every
   chunk instead of `null`: the latest prompt count (0 until the engine reports
@@ -450,7 +456,9 @@ ending with `data: [DONE]`) or not:
   `finish_reason: "stop"`, except on a tools stream whose calls had all
   completed, which ends `tool_calls` (`function_call` for a `functions`
   request). With `stream_options.include_usage` the usage chunk follows,
-  with the counts so far, before `[DONE]`.
+  with the counts so far, before `[DONE]` — when the engine had already
+  reported the prompt count; otherwise (on llama.cpp, any cancel before its
+  final chunk) no usage chunk is sent.
 
 **Breaking for scripts that read the old stream:**
 
