@@ -453,6 +453,23 @@ pub async fn send_tensor<W: AsyncWrite + Unpin>(
     sock: &mut W,
     tensor: &Tensor,
 ) -> TransportResult<TransferStats> {
+    send_tensor_capped(sock, tensor, MAX_TENSOR_BYTES).await
+}
+
+/// [`send_tensor`] with the payload cap as a parameter, so tests can exercise
+/// the refusal without a 256 MiB allocation.
+async fn send_tensor_capped<W: AsyncWrite + Unpin>(
+    sock: &mut W,
+    tensor: &Tensor,
+    max_payload: usize,
+) -> TransportResult<TransferStats> {
+    // Refuse before writing anything: the receiver checks the same cap only
+    // after it has read the header, so an oversize frame would leave its body
+    // in the stream and misalign every later frame on the link (and past
+    // `u32::MAX` the length prefix itself would wrap).
+    if tensor.data.len() > max_payload {
+        return Err(TransportError::PayloadTooLarge(tensor.data.len() as u64));
+    }
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
     header[0..4].copy_from_slice(&(tensor.data.len() as u32).to_be_bytes());
@@ -1720,6 +1737,47 @@ impl ActivationClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An oversize payload is refused before a single byte goes on the wire:
+    /// the receiver would reject its header and leave the body unread, which
+    /// misaligns every later frame on the link.
+    #[tokio::test]
+    async fn send_refuses_an_oversize_payload_before_writing() {
+        let t = Tensor::from_2d(DType::F16, 1, 9, vec![0u8; 18]);
+        let mut wire: Vec<u8> = Vec::new();
+        let err = send_tensor_capped(&mut wire, &t, 16).await.unwrap_err();
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(18)),
+            "got {err:?}"
+        );
+        assert!(wire.is_empty(), "{} bytes written", wire.len());
+        // At the cap it still goes out, header and body.
+        let mut wire: Vec<u8> = Vec::new();
+        send_tensor_capped(&mut wire, &t, 18).await.unwrap();
+        assert_eq!(wire.len(), HEADER_SIZE + 18);
+    }
+
+    /// After a refused oversize send the link is still frame-aligned: the
+    /// next frame is read whole, as sent (the hardware failure kept reading
+    /// the unread body of a refused frame as later replies).
+    #[tokio::test]
+    async fn a_refused_oversize_send_leaves_the_link_aligned() {
+        let (mut tx, mut rx) = tokio::io::duplex(1 << 16);
+        let big = Tensor::from_2d(DType::F16, 1, 9, vec![7u8; 18]);
+        assert!(send_tensor_capped(&mut tx, &big, 16).await.is_err());
+        let ok = Tensor::from_2d(DType::F16, 1, 2, vec![1, 2, 3, 4]);
+        send_tensor_capped(&mut tx, &ok, 16).await.unwrap();
+        let (got, _) = recv_tensor(&mut rx).await.unwrap();
+        assert_eq!(got.shape, ok.shape);
+        assert_eq!(got.data, ok.data);
+    }
+
+    /// A payload past `u32::MAX` would wrap the 4-byte length prefix and
+    /// desync the peer; the public sender's cap is far below that.
+    #[test]
+    fn the_send_cap_fits_the_length_prefix() {
+        assert!(MAX_TENSOR_BYTES <= u32::MAX as usize);
+    }
 
     #[test]
     fn parse_send_burst_clamp_table() {
