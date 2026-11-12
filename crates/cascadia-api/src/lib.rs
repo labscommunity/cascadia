@@ -3338,6 +3338,17 @@ async fn stream_completion(
     // scan the same way the non-streaming path does (see `tool_call_scan_text`).
     let enable_thinking = task.enable_thinking;
     let _ = SystemTime::now();
+    // Reasoning split, as on the non-streaming path: counted whenever thinking
+    // is on, sent as `reasoning_content` unless `--reasoning-format none`.
+    let opened = opens_think(
+        state.engine_applies_template,
+        state.defer_template_on_thinking,
+        enable_thinking,
+        state.template_opens_think,
+        &task,
+    );
+    let counter = ReasoningCounter::new(enable_thinking, opened);
+    let split_out = enable_thinking && state.reasoning_format == ReasoningFormat::ReasoningContent;
 
     let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
@@ -3359,7 +3370,10 @@ async fn stream_completion(
                 _inflight: inflight,
             },
             marker: state.marker_dialect.clone().map(MarkerFilter::new),
-            splitter: ToolStreamSplitter::new(enable_thinking),
+            // Split: built at the first answer text (see `next_frame`).
+            splitter: (!split_out).then(|| ToolStreamSplitter::new(enable_thinking)),
+            counter,
+            split_out,
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
             held_tokens: 0,
@@ -3419,9 +3433,11 @@ async fn stream_completion(
     // Hyper writes immediately (combined with TCP_NODELAY set on the
     // accepted connection in cascadia-cli's serve loop, this lands the
     // per-token chunk on the wire as a separate ~220 B packet).
-    let marker: Arc<std::sync::Mutex<Option<MarkerFilter>>> = Arc::new(std::sync::Mutex::new(
-        state.marker_dialect.clone().map(MarkerFilter::new),
-    ));
+    let text_state = Arc::new(std::sync::Mutex::new(StreamText {
+        marker: state.marker_dialect.clone().map(MarkerFilter::new),
+        counter,
+    }));
+    let final_text_state = text_state.clone();
     let body_stream = permit_carrier
         .then(move |chunk| {
             let model = model.clone();
@@ -3430,7 +3446,7 @@ async fn stream_completion(
             let usage_completion = usage_completion.clone();
             let usage_prompt = usage_prompt.clone();
             let usage_finished = usage_finished.clone();
-            let marker = marker.clone();
+            let text_state = text_state.clone();
             async move {
                 // Publish real per-chunk counts live; authoritative-only
                 // engines reconcile their full model count at completion.
@@ -3468,19 +3484,7 @@ async fn stream_completion(
                 // Special-token framing (Inkling) → textual delimiters, same
                 // translation as the non-streaming path; withheld text (a
                 // tool call's name/JSON) surfaces on the closing marker.
-                let text = {
-                    let mut guard = marker.lock().unwrap();
-                    match guard.as_mut() {
-                        Some(f) => {
-                            let mut t = f.feed(&chunk);
-                            if chunk.is_final {
-                                t.push_str(&f.finish());
-                            }
-                            t
-                        }
-                        None => chunk.text.clone(),
-                    }
-                };
+                let (reasoning, text) = text_state.lock().unwrap().route(&chunk, split_out);
                 let payload = serde_json::json!({
                     "id": task_id,
                     "object": "chat.completion.chunk",
@@ -3490,10 +3494,7 @@ async fn stream_completion(
                     "completion_tokens": chunk.completion_tokens,
                     "choices": [{
                         "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "content": text,
-                        },
+                        "delta": stream_delta(&reasoning, &text),
                         "finish_reason": if chunk.is_final {
                             Some(chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"))
                         } else {
@@ -3526,7 +3527,7 @@ async fn stream_completion(
             if include_usage && final_finished.load(Ordering::Relaxed) {
                 let prompt = final_prompt.load(Ordering::Relaxed);
                 let completion = final_completion.load(Ordering::Relaxed);
-                let usage = serde_json::json!({
+                let mut usage = serde_json::json!({
                     "id": usage_task_id,
                     "object": "chat.completion.chunk",
                     "created": now_unix(),
@@ -3538,6 +3539,11 @@ async fn stream_completion(
                         "total_tokens": prompt + completion,
                     },
                 });
+                add_reasoning_details(
+                    &mut usage["usage"],
+                    &final_text_state.lock().unwrap().counter,
+                    completion,
+                );
                 out.push_str(&format!("data: {usage}\n\n"));
             }
             out.push_str("data: [DONE]\n\n");
@@ -3580,7 +3586,14 @@ impl Stream for StreamWithPermit {
 struct ToolStream {
     chunks: StreamWithPermit,
     marker: Option<MarkerFilter>,
-    splitter: ToolStreamSplitter,
+    /// Fed the answer text only. With the reasoning split it is built at the
+    /// first answer text, once the split knows whether it consumed a
+    /// `</think>` (same scan rule as the non-streaming path).
+    splitter: Option<ToolStreamSplitter>,
+    counter: ReasoningCounter,
+    /// Reasoning goes out as `reasoning_content` (thinking on, format not
+    /// `none`); otherwise the counter only counts.
+    split_out: bool,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
     /// Model tokens not yet reported in a frame's `n_tokens` (their text is
@@ -3618,7 +3631,8 @@ impl ToolStream {
                 // Ended without a final chunk (cancelled): settle what is
                 // held instead of dropping it.
                 self.phase = ToolStreamPhase::Tail;
-                return Some(self.close_choice("", None, "stop"));
+                let (reasoning, answer) = self.route("", 0, true);
+                return Some(self.close_choice(&reasoning, &answer, None, "stop"));
             };
             // Progress chunks carry nothing to send or count.
             if chunk.is_progress() {
@@ -3647,6 +3661,7 @@ impl ToolStream {
                 t
             });
             let text = translated.as_deref().unwrap_or(&chunk.text);
+            let (reasoning, answer) = self.route(text, chunk.token_count(), chunk.is_final);
             let frame = if chunk.is_final {
                 self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
                 self.finished =
@@ -3656,16 +3671,24 @@ impl ToolStream {
                     .finish_reason
                     .map(|f| f.as_openai_str())
                     .unwrap_or("stop");
-                Some(self.close_choice(text, chunk.completion_tokens, reason))
+                Some(self.close_choice(&reasoning, &answer, chunk.completion_tokens, reason))
             } else {
-                let content = self.splitter.feed(text);
-                if content.is_empty() {
+                let content = if answer.is_empty() {
+                    ""
+                } else {
+                    let thinking = !self.counter.consumed_close();
+                    self.splitter
+                        .get_or_insert_with(|| ToolStreamSplitter::new(thinking))
+                        .feed(&answer)
+                };
+                if content.is_empty() && reasoning.is_empty() {
                     None
                 } else {
                     let n_tokens = std::mem::take(&mut self.held_tokens);
                     Some(Bytes::from(content_frame(
                         &self.task_id,
                         &self.model,
+                        &reasoning,
                         content,
                         n_tokens,
                         chunk.completion_tokens,
@@ -3682,21 +3705,44 @@ impl ToolStream {
         }
     }
 
+    /// Route one chunk's text: `(reasoning, answer)`, or with no split to
+    /// send, no reasoning and the whole text. `last` settles the split.
+    fn route(&mut self, text: &str, tokens: u32, last: bool) -> (String, String) {
+        let (mut reasoning, mut answer) = self.counter.feed(text, tokens);
+        if last {
+            let (r, a) = self.counter.finish();
+            reasoning.push_str(&r);
+            answer.push_str(&a);
+        }
+        if self.split_out {
+            (reasoning, answer)
+        } else {
+            (String::new(), text.to_owned())
+        }
+    }
+
     /// Close the choice: the rest as content with the engine's
     /// finish_reason, or the still-releasable content, one indexed
-    /// tool_calls delta, and a `tool_calls` finish.
+    /// tool_calls delta, and a `tool_calls` finish. `reasoning` (the split's
+    /// last reasoning text) rides the first frame.
     fn close_choice(
         &mut self,
+        reasoning: &str,
         text: &str,
         completion_tokens: Option<u32>,
         finish_reason: &str,
     ) -> Bytes {
         let n_tokens = std::mem::take(&mut self.held_tokens);
         let (task_id, model) = (&self.task_id, &self.model);
-        let out = match self.splitter.finish(text) {
+        let thinking = !self.counter.consumed_close();
+        let splitter = self
+            .splitter
+            .get_or_insert_with(|| ToolStreamSplitter::new(thinking));
+        let out = match splitter.finish(text) {
             ToolStreamEnd::Content(content) => content_frame(
                 task_id,
                 model,
+                reasoning,
                 content,
                 n_tokens,
                 completion_tokens,
@@ -3706,8 +3752,10 @@ impl ToolStream {
                 // The held tokens are the call's: they ride the tool_calls
                 // delta, so each model token is counted in exactly one frame.
                 let mut out = String::new();
-                if !content.is_empty() {
-                    out.push_str(&content_frame(task_id, model, content, 0, None, None));
+                if !content.is_empty() || !reasoning.is_empty() {
+                    out.push_str(&content_frame(
+                        task_id, model, reasoning, content, 0, None, None,
+                    ));
                 }
                 let tool_calls: Vec<serde_json::Value> = calls
                     .into_iter()
@@ -3744,7 +3792,7 @@ impl ToolStream {
         let mut out = String::new();
         if self.include_usage && self.finished {
             let completion = self.completion.load(Ordering::Relaxed);
-            let usage = serde_json::json!({
+            let mut usage = serde_json::json!({
                 "id": self.task_id, "object": "chat.completion.chunk",
                 "created": now_unix(), "model": self.model, "choices": [],
                 "usage": {
@@ -3753,6 +3801,7 @@ impl ToolStream {
                     "total_tokens": self.prompt_tokens + completion,
                 },
             });
+            add_reasoning_details(&mut usage["usage"], &self.counter, completion);
             out.push_str(&format!("data: {usage}\n\n"));
         }
         out.push_str("data: [DONE]\n\n");
@@ -3760,10 +3809,75 @@ impl ToolStream {
     }
 }
 
-/// One `chat.completion.chunk` content delta, in the plain stream's shape.
+/// Text state of a plain chat stream: the marker translation and the
+/// reasoning split, shared by the per-chunk formatter and the usage frame.
+struct StreamText {
+    marker: Option<MarkerFilter>,
+    counter: ReasoningCounter,
+}
+
+impl StreamText {
+    /// One chunk's `(reasoning, content)`: split when `split_out`, else no
+    /// reasoning and the whole translated text (still counted).
+    fn route(&mut self, chunk: &cascadia_types::Chunk, split_out: bool) -> (String, String) {
+        let text = match self.marker.as_mut() {
+            Some(f) => {
+                let mut t = f.feed(chunk);
+                if chunk.is_final {
+                    t.push_str(&f.finish());
+                }
+                t
+            }
+            None => chunk.text.clone(),
+        };
+        let (mut reasoning, mut answer) = self.counter.feed(&text, chunk.token_count());
+        if chunk.is_final {
+            let (r, a) = self.counter.finish();
+            reasoning.push_str(&r);
+            answer.push_str(&a);
+        }
+        if split_out {
+            (reasoning, answer)
+        } else {
+            (String::new(), text)
+        }
+    }
+}
+
+/// A stream frame's delta: `reasoning_content` only when there is some,
+/// `content` when there is some or no reasoning (so a frame without
+/// reasoning keeps its shape, empty `content` included).
+fn stream_delta(reasoning: &str, content: &str) -> serde_json::Value {
+    let mut delta = serde_json::json!({ "role": "assistant" });
+    if !reasoning.is_empty() {
+        delta["reasoning_content"] = reasoning.into();
+    }
+    if !content.is_empty() || reasoning.is_empty() {
+        delta["content"] = content.into();
+    }
+    delta
+}
+
+/// Add `completion_tokens_details` to a stream's usage object when the
+/// reasoning split was armed (thinking on).
+fn add_reasoning_details(
+    usage: &mut serde_json::Value,
+    counter: &ReasoningCounter,
+    completion: u32,
+) {
+    if counter.armed() {
+        usage["completion_tokens_details"] = serde_json::json!(CompletionTokensDetails {
+            reasoning_tokens: counter.reasoning_tokens(completion),
+        });
+    }
+}
+
+/// One `chat.completion.chunk` delta (reasoning and/or content), in the
+/// plain stream's shape.
 fn content_frame(
     task_id: &str,
     model: &str,
+    reasoning: &str,
     content: &str,
     n_tokens: u32,
     completion_tokens: Option<u32>,
@@ -3778,7 +3892,7 @@ fn content_frame(
         "completion_tokens": completion_tokens,
         "choices": [{
             "index": 0,
-            "delta": { "role": "assistant", "content": content },
+            "delta": stream_delta(reasoning, content),
             "finish_reason": finish_reason,
         }],
     });
@@ -7830,9 +7944,11 @@ level={{ effort_map[eff] }}";
         assert_eq!(finishes, ["tool_calls"], "{rest}");
         let usage = events.last().unwrap();
         assert!(usage["choices"].as_array().unwrap().is_empty(), "{rest}");
+        // Thinking is on by default: the split counts, and there is none.
         assert_eq!(
             usage["usage"],
-            serde_json::json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8})
+            serde_json::json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,
+                "completion_tokens_details":{"reasoning_tokens":0}})
         );
     }
 
@@ -8708,5 +8824,201 @@ level={{ effort_map[eff] }}";
             "##,
         );
         assert_eq!(pinned_events(&body), expected, "{body}");
+    }
+
+    fn streamed_reasoning(events: &[Value]) -> String {
+        events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["reasoning_content"].as_str())
+            .collect()
+    }
+
+    /// The `tool_calls` deltas of a stream.
+    fn streamed_tool_calls(events: &[Value]) -> Vec<Value> {
+        events
+            .iter()
+            .filter_map(|e| e.pointer("/choices/0/delta/tool_calls"))
+            .cloned()
+            .collect()
+    }
+
+    fn finish_reasons(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| e.pointer("/choices/0/finish_reason")?.as_str())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_splits_tags_across_chunks_into_reasoning_content() {
+        let body = post_stream(
+            gated_app_released(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(None, false),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(streamed_reasoning(&events), "plan", "{body}");
+        // The answer's leading whitespace after `</think>` is dropped.
+        assert_eq!(streamed_content(&events), "answer", "{body}");
+        let last_reasoning = events
+            .iter()
+            .rposition(|e| e["choices"][0]["delta"].get("reasoning_content").is_some())
+            .expect("a reasoning frame");
+        for e in &events[..=last_reasoning] {
+            let content = e["choices"][0]["delta"]["content"].as_str().unwrap_or("");
+            assert!(content.is_empty(), "content inside reasoning: {body}");
+        }
+        // A frame carries `reasoning_content` only when it has some.
+        for e in &events {
+            if let Some(r) = e["choices"][0]["delta"].get("reasoning_content") {
+                assert!(!r.as_str().unwrap().is_empty(), "{body}");
+            }
+        }
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn stream_usage_chunk_counts_reasoning_tokens_before_done() {
+        let body = post_stream(
+            gated_app_released(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(None, true),
+        )
+        .await;
+        let events = sse_events(&body);
+        let usage = &events.last().unwrap()["usage"];
+        let completion = usage["completion_tokens"].as_u64().unwrap();
+        let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no reasoning_tokens: {body}"));
+        assert!(reasoning > 0 && reasoning <= completion, "{body}");
+        let usage_line = body
+            .lines()
+            .filter(|l| l.starts_with("data: "))
+            .rev()
+            .nth(1)
+            .unwrap();
+        assert!(usage_line.contains("\"usage\""), "{body}");
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    }
+
+    /// `--reasoning-format none` leaves the frames alone but still counts
+    /// the reasoning tokens in the usage chunk.
+    #[tokio::test]
+    async fn reasoning_format_none_stream_usage_counts_reasoning_tokens() {
+        let body = post_stream(
+            gated_app_reasoning_none(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(None, true),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(
+            streamed_content(&events),
+            SPLIT_TAG_PARTS.concat(),
+            "{body}"
+        );
+        assert_eq!(streamed_reasoning(&events), "", "{body}");
+        let usage = &events.last().unwrap()["usage"];
+        let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no reasoning_tokens: {body}"));
+        assert!(reasoning > 0, "{body}");
+    }
+
+    #[tokio::test]
+    async fn tool_stream_sends_reasoning_and_only_the_answers_call() {
+        let body = post_stream(
+            gated_app_released(&draft_then_call_parts()).await,
+            tool_stream_body(None, true),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(
+            streamed_reasoning(&events),
+            format!("plan {DRAFT_CALL}"),
+            "{body}"
+        );
+        assert_eq!(streamed_content(&events), "", "{body}");
+        let calls = streamed_tool_calls(&events);
+        assert_eq!(calls.len(), 1, "{body}");
+        let calls = calls[0].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather", "{body}");
+        assert_eq!(finish_reasons(&events), ["tool_calls"], "{body}");
+        let usage = &events.last().unwrap()["usage"];
+        assert!(
+            usage["completion_tokens_details"]["reasoning_tokens"].as_u64() > Some(0),
+            "{body}"
+        );
+
+        // The same chunks, not streamed, return the same call.
+        let (status, reply) = post_chat(
+            gated_app_released(&draft_then_call_parts()).await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                   "tools":[{"type":"function","function":{"name":"get_weather"}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let replied = reply["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(replied.len(), 1, "{reply}");
+        assert_eq!(replied[0]["function"], calls[0]["function"], "{reply}");
+        assert_eq!(
+            reply["choices"][0]["message"]["reasoning_content"],
+            streamed_reasoning(&events)
+        );
+    }
+
+    /// Mirror of the non-streamed bare `</think>` case: a call drafted before
+    /// a close the API never saw opened is not returned.
+    #[tokio::test]
+    async fn tool_stream_bare_close_tag_keeps_a_drafted_call_out() {
+        let parts = ["plan ", DRAFT_CALL, "</think>", WEATHER_CALL];
+        let body = post_stream(
+            gated_app_released(&parts).await,
+            tool_stream_body(None, false),
+        )
+        .await;
+        let events = sse_events(&body);
+        let calls = streamed_tool_calls(&events);
+        assert_eq!(calls.len(), 1, "{body}");
+        let calls = calls[0].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather", "{body}");
+        assert_eq!(finish_reasons(&events), ["tool_calls"], "{body}");
+    }
+
+    #[tokio::test]
+    async fn stream_length_cut_inside_reasoning_sends_reasoning_only() {
+        let body = post_stream(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","stream":true,"max_tokens":3,
+                   "messages":[{"role":"user","content":"<think> a b c d </think> answer"}]}),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(streamed_reasoning(&events), " a b ", "{body}");
+        assert_eq!(streamed_content(&events), "", "{body}");
+        assert_eq!(finish_reasons(&events), ["length"], "{body}");
+    }
+
+    /// The split is per stream: two streams at once keep their own reasoning.
+    #[tokio::test]
+    async fn concurrent_streams_keep_their_own_reasoning() {
+        let app = make_app().await;
+        let req = |text: &str| {
+            serde_json::json!({"model":"mock-model","stream":true,
+                "messages":[{"role":"user","content":text}]})
+        };
+        let (a, b) = tokio::join!(
+            post_stream(app.clone(), req("<think> alpha </think> one")),
+            post_stream(app.clone(), req("<think> beta gamma </think> two"))
+        );
+        let (a, b) = (sse_events(&a), sse_events(&b));
+        assert_eq!(streamed_reasoning(&a), " alpha ");
+        assert_eq!(streamed_content(&a), "one ");
+        assert_eq!(streamed_reasoning(&b), " beta gamma ");
+        assert_eq!(streamed_content(&b), "two ");
     }
 }
