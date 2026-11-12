@@ -2,8 +2,8 @@
 //!
 //! A thinking model writes its reasoning inside `<think>…</think>` before the
 //! answer. [`ReasoningSplit`] routes the text inside the tags to reasoning and
-//! the rest to the answer, chunk by chunk, so the chat completions and the
-//! responses endpoints, streamed or not, split a reply the same way. It starts
+//! the rest to the answer, chunk by chunk, so a chat completion splits the
+//! same way whether it is streamed or not. It starts
 //! inside reasoning when the generation prompt already opened `<think>`;
 //! otherwise it holds leading whitespace and any prefix of `<think>` until the
 //! first non-whitespace text decides. A reply that never opens `<think>` is
@@ -51,6 +51,9 @@ pub struct ReasoningSplit {
     /// `</think>`).
     trim_answer: bool,
     consumed_close: bool,
+    /// A reasoning block was entered: the prompt opened `<think>`, or the
+    /// reply did.
+    saw_open: bool,
 }
 
 impl ReasoningSplit {
@@ -67,6 +70,7 @@ impl ReasoningSplit {
             held: String::new(),
             trim_answer: false,
             consumed_close: false,
+            saw_open: state == State::Reasoning,
         }
     }
 
@@ -88,6 +92,7 @@ impl ReasoningSplit {
                         // The model opened reasoning: the tag and the
                         // whitespace before it are not text.
                         self.state = State::Reasoning;
+                        self.saw_open = true;
                         rest = after.to_owned();
                     } else if OPEN.starts_with(body) {
                         // Whitespace only, or a prefix of `<think>`: wait.
@@ -153,6 +158,12 @@ impl ReasoningSplit {
     /// A `</think>` was consumed (even around empty reasoning).
     pub fn consumed_close(&self) -> bool {
         self.consumed_close
+    }
+
+    /// A reasoning block was entered (the prompt or the reply opened
+    /// `<think>`).
+    pub fn saw_reasoning(&self) -> bool {
+        self.saw_open
     }
 
     /// Bytes fed but not yet released or consumed.
@@ -247,6 +258,13 @@ impl ReasoningCounter {
     /// The split is inside `<think>`.
     pub fn in_reasoning(&self) -> bool {
         self.split.in_reasoning()
+    }
+
+    /// The reply had a reasoning block (the prompt or the reply opened
+    /// `<think>`): only then is `reasoning_tokens` a counted value worth
+    /// reporting.
+    pub fn saw_reasoning(&self) -> bool {
+        self.split.saw_reasoning()
     }
 
     /// A `</think>` was consumed (even around empty reasoning).
@@ -534,6 +552,31 @@ mod tests {
         let _ = c.feed("<think>never closes </thi", 3);
         assert_eq!(c.finish(), ("</thi".into(), String::new()));
         assert_eq!(c.reasoning_tokens(3), 3);
+    }
+
+    #[test]
+    fn counter_saw_reasoning_only_when_a_block_opened() {
+        // the prompt opened it
+        assert!(ReasoningCounter::new(true, true).saw_reasoning());
+        // thinking off never sees one, even with an opened prompt
+        let mut c = ReasoningCounter::new(false, true);
+        c.feed("<think>x</think>y", 1);
+        c.finish();
+        assert!(!c.saw_reasoning());
+        // the reply opened it, split across feeds
+        let mut c = ReasoningCounter::new(true, false);
+        c.feed(" <th", 1);
+        assert!(!c.saw_reasoning());
+        c.feed("ink>r", 1);
+        assert!(c.saw_reasoning());
+        c.feed("</think>a", 1);
+        c.finish();
+        assert!(c.saw_reasoning());
+        // a reply that never opened it
+        let mut c = ReasoningCounter::new(true, false);
+        c.feed("hello <think>", 1);
+        c.finish();
+        assert!(!c.saw_reasoning());
     }
 
     #[test]
