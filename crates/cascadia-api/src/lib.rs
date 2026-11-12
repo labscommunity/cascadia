@@ -9707,4 +9707,85 @@ level={{ effort_map[eff] }}";
         assert_eq!(streamed_reasoning(&events), "a</thi", "{all}");
         assert_eq!(streamed_content(&events), "", "{all}");
     }
+
+    /// Engine chunks of a Qwen3 `/no_think` reply: an empty reasoning block.
+    const NO_THINK_PARTS: [&str; 5] = ["<think>", "\n\n", "</think>", "\n\n", "Hi"];
+
+    /// A reply's reasoning and content, non-streamed and streamed (plain and
+    /// with tools), with the usage details each carried. Streamed frames must
+    /// carry every part's token.
+    async fn reasoning_three_ways(parts: &[&str]) -> Vec<(Option<String>, String, Value)> {
+        let mut out = Vec::new();
+        let (status, body) = post_chat(
+            gated_app_released(parts).await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        out.push((
+            m["reasoning_content"].as_str().map(str::to_owned),
+            m["content"].as_str().unwrap().to_owned(),
+            body["usage"]["completion_tokens_details"].clone(),
+        ));
+        for payload in [plain_stream_body(None, true), tool_stream_body(None, true)] {
+            let body = post_stream(gated_app_released(parts).await, payload).await;
+            let events = sse_events(&body);
+            assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+            let has_reasoning = events
+                .iter()
+                .any(|e| e["choices"][0]["delta"].get("reasoning_content").is_some());
+            let usage = events
+                .iter()
+                .find_map(|e| e.get("usage"))
+                .unwrap_or_else(|| panic!("no usage frame: {body}"));
+            out.push((
+                has_reasoning.then(|| streamed_reasoning(&events)),
+                streamed_content(&events),
+                usage["completion_tokens_details"].clone(),
+            ));
+        }
+        out
+    }
+
+    /// Whitespace-only reasoning (a `/no_think` reply) is not reasoning: no
+    /// `reasoning_content` anywhere, but the details stay, since a reasoning
+    /// block was seen.
+    #[tokio::test]
+    async fn whitespace_only_reasoning_is_not_reasoning() {
+        for (reasoning, content, details) in reasoning_three_ways(&NO_THINK_PARTS).await {
+            assert_eq!(reasoning, None);
+            assert_eq!(content, "Hi");
+            assert!(details.is_object(), "{details}");
+        }
+    }
+
+    /// Normal reasoning keeps its bytes verbatim, newlines included.
+    #[tokio::test]
+    async fn reasoning_keeps_its_leading_and_trailing_newlines() {
+        let parts = ["<think>", "\nplan\n", "</think>", "answer"];
+        for (reasoning, content, details) in reasoning_three_ways(&parts).await {
+            assert_eq!(reasoning.as_deref(), Some("\nplan\n"));
+            assert_eq!(content, "answer");
+            assert!(details.is_object(), "{details}");
+        }
+    }
+
+    /// Leading whitespace in reasoning is held, then released with the first
+    /// text, not sent as its own frame.
+    #[tokio::test]
+    async fn leading_reasoning_whitespace_goes_out_with_the_first_text() {
+        let body = post_stream(
+            gated_app_released(&["<think>", "\n", "\n", "plan", "</think>", "a"]).await,
+            plain_stream_body(None, false),
+        )
+        .await;
+        let events = sse_events(&body);
+        let first = events
+            .iter()
+            .find_map(|e| e["choices"][0]["delta"]["reasoning_content"].as_str())
+            .unwrap_or_else(|| panic!("no reasoning: {body}"));
+        assert_eq!(first, "\n\nplan", "{body}");
+        assert_eq!(frame_tokens(&events), 6, "{body}");
+    }
 }

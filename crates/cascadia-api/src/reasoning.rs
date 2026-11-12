@@ -8,7 +8,10 @@
 //! otherwise it holds leading whitespace and any prefix of `<think>` until the
 //! first non-whitespace text decides. A reply that never opens `<think>` is
 //! released unchanged, so its text stays byte-identical to a reply with
-//! thinking off.
+//! thinking off. Reasoning that is so far whitespace-only is held, released
+//! with its first non-whitespace text, and dropped if the block closes or
+//! the reply ends first: an empty reasoning block (Qwen3's `/no_think`) is
+//! no reasoning.
 //!
 //! [`ReasoningCounter`] drives a split and attributes each chunk's tokens to
 //! reasoning or answer, for `reasoning_tokens` in the usage block.
@@ -45,8 +48,11 @@ enum State {
 pub struct ReasoningSplit {
     state: State,
     /// Undecided: the whitespace and `<think>` prefix seen so far.
-    /// Reasoning: a trailing prefix of `</think>` split across feeds.
+    /// Reasoning: the whitespace-only reasoning so far, or a trailing prefix
+    /// of `</think>` split across feeds.
     held: String,
+    /// Reasoning with non-whitespace text was released.
+    reasoning_text: bool,
     /// The answer's leading whitespace is still being dropped (right after
     /// `</think>`).
     trim_answer: bool,
@@ -68,6 +74,7 @@ impl ReasoningSplit {
         Self {
             state,
             held: String::new(),
+            reasoning_text: false,
             trim_answer: false,
             consumed_close: false,
             saw_open: state == State::Reasoning,
@@ -108,15 +115,21 @@ impl ReasoningSplit {
                 State::Reasoning => {
                     let buf = std::mem::take(&mut self.held) + &rest;
                     if let Some(at) = buf.find(CLOSE) {
-                        push(&mut out, Seg::Reasoning, buf[..at].to_owned());
+                        self.push_reasoning(&mut out, &buf[..at]);
                         self.consumed_close = true;
                         self.trim_answer = true;
                         self.state = State::Answer;
                         rest = buf[at + CLOSE.len()..].to_owned();
                     } else {
                         let keep = partial_suffix(&buf, CLOSE);
-                        self.held = buf[buf.len() - keep..].to_owned();
-                        push(&mut out, Seg::Reasoning, buf[..buf.len() - keep].to_owned());
+                        let (text, tail) = buf.split_at(buf.len() - keep);
+                        if !self.reasoning_text && text.trim_start().is_empty() {
+                            // Whitespace-only so far: hold it all.
+                            self.held = buf;
+                        } else {
+                            self.held = tail.to_owned();
+                            self.push_reasoning(&mut out, text);
+                        }
                         return out;
                     }
                 }
@@ -144,10 +157,22 @@ impl ReasoningSplit {
         let mut out = Vec::new();
         match self.state {
             State::Undecided => push(&mut out, Seg::Answer, held),
-            State::Reasoning => push(&mut out, Seg::Reasoning, held),
+            State::Reasoning => self.push_reasoning(&mut out, &held),
             State::Off | State::Answer => {}
         }
         out
+    }
+
+    /// Release reasoning text, unless no non-whitespace reasoning was
+    /// released yet and `text` is whitespace-only (it is dropped).
+    fn push_reasoning(&mut self, out: &mut Vec<Seg>, text: &str) {
+        if !self.reasoning_text {
+            if text.trim_start().is_empty() {
+                return;
+            }
+            self.reasoning_text = true;
+        }
+        push(out, Seg::Reasoning, text.to_owned());
     }
 
     /// The split is inside `<think>`.
@@ -510,6 +535,53 @@ mod tests {
     fn multibyte_text_around_the_tags() {
         let (segs, _) = run(true, false, &["<think>é</", "think>ü"]);
         assert_eq!(segs, vec![r("é"), a("ü")]);
+    }
+
+    #[test]
+    fn whitespace_only_reasoning_is_dropped() {
+        let (segs, s) = run(true, false, &["<think>", "\n\n", "</think>", "\n\n", "Hi"]);
+        assert_eq!(segs, vec![a("Hi")]);
+        assert!(s.saw_reasoning());
+        assert!(s.consumed_close());
+        // the prompt opened it
+        let (segs, _) = run(true, true, &["\n", " ", "</think>answer"]);
+        assert_eq!(segs, vec![a("answer")]);
+        // the reply ends while it is still whitespace-only
+        let (segs, s) = run(true, false, &["<think>", " \n"]);
+        assert!(segs.is_empty(), "{segs:?}");
+        assert!(s.saw_reasoning());
+    }
+
+    #[test]
+    fn held_reasoning_whitespace_goes_out_with_the_first_text() {
+        let mut s = ReasoningSplit::new(true, false);
+        assert!(s.feed("<think>\n").is_empty());
+        assert!(s.feed("\n").is_empty());
+        assert_eq!(s.held_len(), 2);
+        assert_eq!(s.feed("plan\n"), vec![r("\n\nplan\n")]);
+        // whitespace after the first text is not held
+        assert_eq!(s.feed("\n"), vec![r("\n")]);
+    }
+
+    #[test]
+    fn reasoning_keeps_leading_and_trailing_newlines() {
+        let (segs, _) = run(true, false, &["<think>\nplan\n</think>answer"]);
+        assert_eq!(segs, vec![r("\nplan\n"), a("answer")]);
+    }
+
+    #[test]
+    fn counter_counts_dropped_whitespace_as_reasoning() {
+        let mut c = ReasoningCounter::new(true, false);
+        assert_eq!(c.feed("<think>", 1), (String::new(), String::new()));
+        assert_eq!(c.feed("\n\n", 1), (String::new(), String::new()));
+        assert_eq!(c.feed("</think>", 1), (String::new(), String::new()));
+        assert_eq!(c.feed("\n\n", 1), (String::new(), String::new()));
+        assert_eq!(c.feed("Hi", 1), (String::new(), "Hi".into()));
+        c.finish();
+        assert!(c.saw_reasoning());
+        // `<think>`, the dropped "\n\n" and `</think>` are reasoning, and so
+        // is the whitespace dropped after `</think>`, as with any reply.
+        assert_eq!(c.reasoning_tokens(5), 4);
     }
 
     // ---- ReasoningCounter ----
