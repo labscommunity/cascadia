@@ -169,6 +169,11 @@ struct Buffers {
     /// the next engine-lock holder hands these to the engine, after the
     /// deferred cancels, in arrival order. Capped at [`MAX_DEFERRED_SUBMITS`].
     deferred_submits: VecDeque<GenerationTask>,
+    /// Queued submits a drain has taken off [`Self::deferred_submits`] and not
+    /// yet handed to the engine: they hold a place against the engine's cap
+    /// (see [`SubmitAdmission::pending_load`]) that neither the queue nor the
+    /// engine's pending count shows in the meantime.
+    handing_over: usize,
 }
 
 /// The engine, plus the state every release of it has to service: the
@@ -207,6 +212,10 @@ struct EngineSlot {
     /// with the engine, under the buffers lock, so a queued submit never lands after `close()`
     /// emptied the queue.
     loaded: AtomicBool,
+    /// Test hook run once by [`EngineSlot::defer_submit`] between the admission check and
+    /// taking the buffers lock, to race a `close()` into that window.
+    #[cfg(test)]
+    before_queue: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// An engine lock that cannot be released without paying what the release
@@ -288,10 +297,11 @@ impl EngineGuard<'_> {
     fn apply_deferred(&mut self) {
         let (cancels, submits) = {
             let mut bufs = self.slot.buffers.lock();
-            (
-                std::mem::take(&mut bufs.deferred_cancels),
-                std::mem::take(&mut bufs.deferred_submits),
-            )
+            let submits = std::mem::take(&mut bufs.deferred_submits);
+            // Set, not added: one drain at a time (the engine lock), so this
+            // also clears what a drain that unwound out of `submit` left.
+            bufs.handing_over = submits.len();
+            (std::mem::take(&mut bufs.deferred_cancels), submits)
         };
         if cancels.is_empty() && submits.is_empty() {
             return;
@@ -306,13 +316,20 @@ impl EngineGuard<'_> {
         for task in submits {
             // Re-checked under the engine lock, as `Runner::submit` does: a
             // cancel or drop that raced the take above has tombstoned it.
-            if slot.buffers.lock().cancelled.contains(&task.task_id) {
-                continue;
+            {
+                let mut bufs = slot.buffers.lock();
+                if bufs.cancelled.contains(&task.task_id) {
+                    bufs.handing_over = bufs.handing_over.saturating_sub(1);
+                    continue;
+                }
             }
             let task_id = task.task_id.clone();
-            if let Err(e) = engine.submit(task) {
+            let res = engine.submit(task);
+            // The engine's pending count now holds the task's place, if it took it.
+            let mut bufs = slot.buffers.lock();
+            bufs.handing_over = bufs.handing_over.saturating_sub(1);
+            if let Err(e) = res {
                 warn!(task = %task_id, error = %e, "engine refused a queued task");
-                let mut bufs = slot.buffers.lock();
                 if !bufs.cancelled.contains(&task_id) {
                     bufs.chunks
                         .entry(task_id.clone())
@@ -344,6 +361,8 @@ impl EngineSlot {
             loaded: AtomicBool::new(engine.is_some()),
             engine: Mutex::new(engine),
             buffers: Mutex::new(Buffers::default()),
+            #[cfg(test)]
+            before_queue: Mutex::new(None),
         }
     }
 
@@ -462,7 +481,10 @@ impl EngineSlot {
     /// as a typed `Err` before any response starts.
     ///
     /// Refuses with [`EngineError::NotLoaded`] once the slot is empty, and
-    /// with [`EngineError::QueueFull`] at [`MAX_DEFERRED_SUBMITS`]. A
+    /// with [`EngineError::QueueFull`] at [`MAX_DEFERRED_SUBMITS`] or when the
+    /// engine's pending tasks plus the queued ones would reach the engine's
+    /// own cap ([`SubmitAdmission::pending_load`]), which the engine would
+    /// otherwise refuse only at drain, after the response started. A
     /// tombstoned id, or one already queued, is a no-op `Ok`, as in the
     /// locked path and [`Engine::submit`].
     fn defer_submit(
@@ -474,6 +496,13 @@ impl EngineSlot {
             return Err(EngineError::NotLoaded);
         }
         admission.check(&task)?;
+        #[cfg(test)]
+        {
+            let hook = self.before_queue.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         {
             let mut bufs = self.buffers.lock();
             // Again under the lock `EngineGuard::set` writes it under: a slot
@@ -489,6 +518,15 @@ impl EngineSlot {
                     .any(|t| t.task_id == task.task_id)
             {
                 return Ok(());
+            }
+            if let Some(load) = admission.pending_load() {
+                let queued = load.pending + bufs.deferred_submits.len() + bufs.handing_over;
+                if queued >= load.cap {
+                    return Err(EngineError::QueueFull {
+                        queued,
+                        cap: load.cap,
+                    });
+                }
             }
             if bufs.deferred_submits.len() >= MAX_DEFERRED_SUBMITS {
                 return Err(EngineError::QueueFull {
@@ -1560,6 +1598,7 @@ mod tests {
     use super::*;
     use cascadia_engine_mock::MockBuilder;
     use futures::StreamExt;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn blocking_context_guard_sets_and_restores_flag() {
@@ -4589,7 +4628,10 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// Refuses a task whose prompt is `refused`, as [`AdmitEngine::submit`] does.
-    struct RefuseByPrompt;
+    /// With `load`, also reports the engine's pending count and cap.
+    struct RefuseByPrompt {
+        load: Option<(Arc<AtomicUsize>, usize)>,
+    }
 
     impl SubmitAdmission for RefuseByPrompt {
         fn check(&self, task: &GenerationTask) -> Result<(), EngineError> {
@@ -4597,6 +4639,14 @@ mod tests {
                 return Err(EngineError::PromptTooLong("refused by admission".into()));
             }
             Ok(())
+        }
+        fn pending_load(&self) -> Option<cascadia_engine::PendingLoad> {
+            self.load
+                .as_ref()
+                .map(|(pending, cap)| cascadia_engine::PendingLoad {
+                    pending: pending.load(Ordering::SeqCst),
+                    cap: *cap,
+                })
         }
     }
 
@@ -4611,6 +4661,8 @@ mod tests {
         queue: VecDeque<(GenerationTask, u32)>,
         cap: usize,
         admission: Option<Arc<RefuseByPrompt>>,
+        /// `queue.len()`, kept current for the admission's `pending_load`.
+        pending: Arc<AtomicUsize>,
     }
 
     impl Engine for AdmitEngine {
@@ -4630,11 +4682,13 @@ mod tests {
             }
             self.log.lock().submitted.push(task.task_id.clone());
             self.queue.push_back((task, 0));
+            self.pending.store(self.queue.len(), Ordering::SeqCst);
             Ok(())
         }
         fn cancel(&mut self, task_id: &TaskId) {
             self.log.lock().cancelled.push(task_id.clone());
             self.queue.retain(|(t, _)| &t.task_id != task_id);
+            self.pending.store(self.queue.len(), Ordering::SeqCst);
         }
         fn submit_admission(&self) -> Option<Arc<dyn SubmitAdmission>> {
             self.admission
@@ -4661,6 +4715,7 @@ mod tests {
             if done {
                 out.push((id.clone(), Chunk::final_marker(&id, "")));
                 self.queue.pop_front();
+                self.pending.store(self.queue.len(), Ordering::SeqCst);
             }
             Ok(out)
         }
@@ -4691,13 +4746,27 @@ mod tests {
         cap: usize,
         admission: bool,
     ) -> (Arc<Runner>, Arc<Mutex<EngineLog>>) {
+        admit_runner_with(gate, cap, admission, false).await
+    }
+
+    /// [`admit_runner`], with the admission reporting the engine's pending
+    /// load when `report_load`.
+    async fn admit_runner_with(
+        gate: Arc<Gate>,
+        cap: usize,
+        admission: bool,
+        report_load: bool,
+    ) -> (Arc<Runner>, Arc<Mutex<EngineLog>>) {
         let log = Arc::new(Mutex::new(EngineLog::default()));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let load = report_load.then(|| (pending.clone(), cap));
         let runner = Arc::new(Runner::new(Box::new(AdmitBuilder(Some(AdmitEngine {
             log: log.clone(),
             gate,
             queue: VecDeque::new(),
             cap,
-            admission: admission.then(|| Arc::new(RefuseByPrompt)),
+            admission: admission.then(|| Arc::new(RefuseByPrompt { load })),
+            pending,
         })))));
         runner
             .start(
@@ -5046,6 +5115,90 @@ mod tests {
             assert!(chunks.iter().all(|c| c.error.is_none()), "{chunks:?}");
             assert!(chunks.last().unwrap().is_final, "{chunks:?}");
         }
+    }
+
+    /// An engine whose admission reports its pending cap: a submit that would
+    /// take the engine's pending tasks plus the runner's queued ones to that
+    /// cap is refused at once with `QueueFull`, before any response starts,
+    /// rather than queued and refused by the engine at drain as an error chunk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_submit_past_the_engine_cap_is_refused_at_once() {
+        let gate = Gate::closed();
+        // Engine cap 2: the holder takes one place, `q0` the other.
+        let (runner, log) = admit_runner_with(gate.clone(), 2, true, true).await;
+        let holder_stream = runner
+            .generate_async(GenerationTask::new("holder", "x").with_max_tokens(64))
+            .await
+            .unwrap();
+        let (hold, holder) = hold_engine(&gate, holder_stream).await;
+
+        let mut results = Vec::new();
+        for id in ["q0", "q1"] {
+            results.push(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    runner.generate_async(GenerationTask::new(id, "x").with_max_tokens(1)),
+                )
+                .await,
+            );
+        }
+        let q1_queued = queued(&runner, "q1");
+        gate.release();
+        let over = results.pop().unwrap();
+        let q0 = results
+            .pop()
+            .unwrap()
+            .expect("a submit behind a busy engine must return without waiting for it")
+            .expect("q0 fits under the engine's cap");
+        match over {
+            Ok(Err(EngineError::QueueFull { queued, cap })) => {
+                assert_eq!((queued, cap), (2, 2));
+            }
+            Ok(Err(e)) => panic!("wrong refusal: {e}"),
+            Ok(Ok(_)) => panic!("a submit past the engine's cap must be refused before queueing"),
+            Err(_) => panic!("a submit past the engine's cap must not wait for the engine"),
+        }
+        assert!(!q1_queued, "the refused task must not be queued");
+        drop(hold);
+        let held = holder.await.unwrap();
+        let chunks = collect(q0).await;
+        assert!(chunks.iter().all(|c| c.error.is_none()), "{chunks:?}");
+        assert!(chunks.last().unwrap().is_final, "{chunks:?}");
+        assert!(!log.lock().submitted.iter().any(|t| t == "q1"));
+        drop(held);
+    }
+
+    /// `close()` empties the slot between the submit's admission check and its
+    /// queueing: the re-check under the buffers lock refuses it as not loaded,
+    /// and nothing is queued behind an engine that is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_submit_racing_an_emptied_slot_is_not_loaded() {
+        let (runner, log) = admit_runner(Gate::opened(), 256, true).await;
+        // Held as `close()` holds it, so the submit goes to `defer_submit`.
+        let guard = runner.slot.lock();
+        let slot = runner.slot.clone();
+        *runner.slot.before_queue.lock() = Some(Box::new(move || {
+            // What `EngineGuard::set(None)` does, under the buffers lock.
+            let mut bufs = slot.buffers.lock();
+            slot.loaded.store(false, Ordering::SeqCst);
+            bufs.deferred_submits.clear();
+        }));
+        let r = runner.clone();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || r.submit(GenerationTask::new("late", "x"))),
+        )
+        .await;
+        let was_queued = queued(&runner, "late");
+        let hook_ran = runner.slot.before_queue.lock().is_none();
+        drop(guard);
+        assert!(hook_ran, "the submit must pass its first loaded check");
+        match res {
+            Ok(Ok(Err(EngineError::NotLoaded))) => {}
+            other => panic!("expected NotLoaded at once, got {other:?}"),
+        }
+        assert!(!was_queued, "nothing may be queued behind an emptied slot");
+        assert!(!log.lock().submitted.iter().any(|t| t == "late"));
     }
 
     /// A submit that read the admission just before `close()` emptied the

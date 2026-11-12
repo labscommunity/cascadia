@@ -13,13 +13,14 @@
 //! short greedy decodes, which inflates reported tok/s).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use cascadia_engine::{
     Builder, Engine, EngineError, EngineResult, InflightCancel, LoadStream, OneShotStop,
-    SubmitAdmission, VisibleArm,
+    PendingLoad, SubmitAdmission, VisibleArm,
 };
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
@@ -371,6 +372,7 @@ impl Builder for OvGenaiBuilder {
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
             pending: Vec::new(),
+            pending_len: Arc::new(AtomicUsize::new(0)),
             max_tokens_default: 256,
             context_window: self.context_window,
             inflight: Arc::new(InflightCancel::new()),
@@ -474,11 +476,24 @@ fn check_stateful_task(task: &GenerationTask) -> EngineResult<()> {
 /// [`check_stateful_task`] without the engine lock. A generation holds that lock for the whole
 /// answer, so the runner checks a submit that finds the engine busy with this and queues it,
 /// instead of holding the caller (and its response headers) until the generation ends.
-struct StatefulAdmission;
+///
+/// It also reports the engine's pending queue against [`crate::dist_spec::MAX_PENDING_TASKS`], so
+/// the runner refuses a submit that would only be refused at drain before any response starts.
+struct StatefulAdmission {
+    /// [`OvGenaiEngine::pending_len`].
+    pending: Arc<AtomicUsize>,
+}
 
 impl SubmitAdmission for StatefulAdmission {
     fn check(&self, task: &GenerationTask) -> EngineResult<()> {
         check_stateful_task(task)
+    }
+
+    fn pending_load(&self) -> Option<PendingLoad> {
+        Some(PendingLoad {
+            pending: self.pending.load(Ordering::SeqCst),
+            cap: crate::dist_spec::MAX_PENDING_TASKS,
+        })
     }
 }
 
@@ -488,6 +503,9 @@ pub struct OvGenaiEngine {
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
     pending: Vec<GenerationTask>,
+    /// `pending.len()`, kept current in `submit`, `step` and `cancel` for the
+    /// [`StatefulAdmission`], which reads it without the engine lock.
+    pending_len: Arc<AtomicUsize>,
     max_tokens_default: u32,
     /// The server's known context window: one `generate()` call makes the
     /// whole answer, so its limit is cut to what the prompt leaves of it.
@@ -537,6 +555,7 @@ impl Engine for OvGenaiEngine {
             });
         }
         self.pending.push(task);
+        self.sync_pending_len();
         Ok(())
     }
 
@@ -547,6 +566,7 @@ impl Engine for OvGenaiEngine {
         // signals without the lock. The runner signalled it for this id too;
         // the task will now never begin, so drop that early entry.
         self.pending.retain(|t| &t.task_id != task_id);
+        self.sync_pending_len();
         self.inflight.forget(task_id);
     }
 
@@ -555,7 +575,9 @@ impl Engine for OvGenaiEngine {
     }
 
     fn submit_admission(&self) -> Option<Arc<dyn SubmitAdmission>> {
-        Some(Arc::new(StatefulAdmission))
+        Some(Arc::new(StatefulAdmission {
+            pending: self.pending_len.clone(),
+        }))
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -563,6 +585,7 @@ impl Engine for OvGenaiEngine {
             return Ok(Vec::new());
         }
         let task = self.pending.remove(0);
+        self.sync_pending_len();
         let _end = EndInflight(self.inflight.clone());
         if self.inflight.begin(&task.task_id) {
             info!(task = %task.task_id, tokens = 0u64, elapsed_s = 0.0, "task cancelled");
@@ -1287,6 +1310,11 @@ fn build_gen_config(
 }
 
 impl OvGenaiEngine {
+    /// Publish `pending.len()` to the [`StatefulAdmission`].
+    fn sync_pending_len(&self) {
+        self.pending_len.store(self.pending.len(), Ordering::SeqCst);
+    }
+
     /// SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1; not re-checked on
     /// the current 2026.2 floor): `seed` is forwarded to
     /// `GenerationConfig.rng_seed`, but it does NOT make ov-genai reproducible
@@ -2373,6 +2401,48 @@ mod tests {
         admission
             .check(&task("t2", 8))
             .expect("a plain task passes the admission");
+    }
+
+    /// The runner refuses a queued submit past the engine's own pending cap
+    /// before any response starts, from the admission's `pending_load`: it
+    /// must follow the engine's pending queue through submit, step and cancel.
+    #[test]
+    fn stateful_admission_tracks_the_pending_queue() {
+        let st = Arc::new(Mutex::new(StatefulState::default()));
+        st.lock().unwrap().pieces = pieces(&["a"]);
+        let mut e = stateful_engine(&st);
+        let admission = e.submit_admission().unwrap();
+        let load = |pending| {
+            Some(PendingLoad {
+                pending,
+                cap: crate::dist_spec::MAX_PENDING_TASKS,
+            })
+        };
+        assert_eq!(admission.pending_load(), load(0));
+        e.submit(task("t1", 8)).unwrap();
+        e.submit(task("t2", 8)).unwrap();
+        e.submit(task("t3", 8)).unwrap();
+        assert_eq!(admission.pending_load(), load(3));
+        e.submit(task("t1", 8)).unwrap();
+        assert_eq!(
+            admission.pending_load(),
+            load(3),
+            "a duplicate takes no place"
+        );
+        e.step().unwrap();
+        assert_eq!(admission.pending_load(), load(2), "a stepped task leaves");
+        e.cancel(&TaskId::from("t3"));
+        assert_eq!(admission.pending_load(), load(1), "a cancelled task leaves");
+        let mut resumed = task("t4", 8);
+        resumed.resume_token_ids = Some(vec![1]);
+        assert!(e.submit(resumed).is_err());
+        assert_eq!(
+            admission.pending_load(),
+            load(1),
+            "a refused task takes no place"
+        );
+        // An admission handed out later reads the same count.
+        assert_eq!(e.submit_admission().unwrap().pending_load(), load(1));
     }
 
     #[test]

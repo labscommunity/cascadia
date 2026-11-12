@@ -323,6 +323,25 @@ pub trait SubmitAdmission: Send + Sync {
     /// `Err` exactly when [`Engine::submit`] would refuse `task` for the task itself (not for the
     /// engine's queue being full, which the engine reports when the task reaches it).
     fn check(&self, task: &GenerationTask) -> EngineResult<()>;
+
+    /// The engine's own pending cap and how many tasks hold a place against it now, if it has one.
+    /// The runner refuses a submit with [`EngineError::QueueFull`] before queueing it once the
+    /// engine's pending tasks plus the runner's queued ones would reach `cap`, so a refusal the
+    /// engine would make at drain time still reaches the caller before any response starts.
+    /// Default `None`: the runner's own queue bound is the only one checked. Read without the
+    /// engine lock, so the engine keeps it current in `submit`, `step` and `cancel`.
+    fn pending_load(&self) -> Option<PendingLoad> {
+        None
+    }
+}
+
+/// See [`SubmitAdmission::pending_load`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingLoad {
+    /// Tasks the engine holds against its cap now.
+    pub pending: usize,
+    /// The engine's pending cap: its `submit` refuses a task with this many pending.
+    pub cap: usize,
 }
 
 pub trait Engine: Send {
