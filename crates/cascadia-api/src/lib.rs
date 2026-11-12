@@ -688,6 +688,7 @@ pub struct ChatMessage {
 /// odd shape (OpenRouter's `reasoning` object, a null) is ignored rather
 /// than rejected.
 #[derive(Deserialize)]
+#[serde(rename = "ChatMessage", expecting = "struct ChatMessage")]
 struct RawChatMessage {
     role: String,
     #[serde(default, deserialize_with = "de_null_content")]
@@ -2654,7 +2655,8 @@ async fn chat_completions(
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
                 "error": format!(
-                    "messages are {messages_bytes} bytes (content + tool fields); \
+                    "messages are {messages_bytes} bytes (content, tool fields and \
+                     replayed reasoning); \
                      max allowed is {} (max_prompt_bytes)",
                     state.max_prompt_bytes,
                 )
@@ -6017,6 +6019,30 @@ mod tests {
             !without.contains("<think>"),
             "no reasoning sent, none rendered: {without}"
         );
+    }
+
+    /// A malformed message names the public type, as before the loose
+    /// reasoning reader was added.
+    #[test]
+    fn malformed_message_error_names_chat_message() {
+        let err = serde_json::from_value::<ChatMessage>(serde_json::json!(5)).unwrap_err();
+        assert!(err.to_string().contains("struct ChatMessage"), "{err}");
+    }
+
+    /// The other half of the template's rule: reasoning replayed on an
+    /// assistant turn before the last user message is dropped from the prompt.
+    #[test]
+    fn qwen3_drops_replayed_reasoning_before_the_last_user_message() {
+        let earlier = ChatMessage {
+            reasoning_content: Some("OLD-REASONING".into()),
+            ..msg("assistant", "4")
+        };
+        let out = render_test_template(
+            QWEN3_TEMPLATE,
+            &[msg("user", "2+2?"), earlier, msg("user", "and 3+3?")],
+        );
+        assert!(!out.contains("OLD-REASONING"), "{out}");
+        assert!(out.contains("<|im_start|>assistant\n4<|im_end|>"), "{out}");
     }
 
     #[test]
