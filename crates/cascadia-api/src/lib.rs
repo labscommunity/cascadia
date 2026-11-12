@@ -1819,10 +1819,12 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 /// renders it (sycl-llama, or ov-genai with thinking on) `task.prompt` is a
 /// placeholder and the load-time `probe` stands in.
 ///
-/// Always false when `reasoning_as_text` is set: the engine folds its separate
-/// reasoning back in as `<think>…</think>` text and sends its own `<think>`
-/// first, so starting inside reasoning would put a literal `<think>` into the
-/// returned reasoning.
+/// Always false when `task.reasoning_as_text` is set: the engine folds its
+/// separate reasoning back in as `<think>…</think>` text and sends its own
+/// `<think>` first, so starting inside reasoning would put a literal `<think>`
+/// into the returned reasoning. That fold, not the probe, is what splits
+/// sycl-llama's reasoning: its API side loads no chat template (the GGUF one
+/// is rendered by llama-server), so its probe is always false.
 // The reply paths call this once the reasoning split is wired in.
 #[allow(dead_code)]
 pub(crate) fn opens_think(
@@ -1830,10 +1832,9 @@ pub(crate) fn opens_think(
     defer_template_on_thinking: bool,
     enable_thinking: bool,
     probe: bool,
-    reasoning_as_text: bool,
     task: &GenerationTask,
 ) -> bool {
-    if reasoning_as_text {
+    if task.reasoning_as_text {
         return false;
     }
     let engine_renders = engine_applies_template || (defer_template_on_thinking && enable_thinking);
@@ -2762,6 +2763,11 @@ async fn chat_completions(
         // model's context PAST the rendered prompt. Only the scheduler's
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
+        // An engine that renders the template itself (sycl-llama) gets the
+        // model's reasoning back on a separate channel; with thinking on it
+        // returns it as `<think>…</think>` text for the reasoning split (or,
+        // under `--reasoning-format none`, for the client to read in content).
+        reasoning_as_text: enable_thinking && state.engine_applies_template,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -2989,6 +2995,7 @@ async fn completions(
         tenant: String::new(),
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
+        reasoning_as_text: false,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
@@ -6613,20 +6620,123 @@ level={{ effort_map[eff] }}";
         let opened = GenerationTask::new("t", "<|im_start|>assistant\n<think>\n");
         let closed = GenerationTask::new("t", "<|im_start|>assistant\n");
         // API rendered the prompt: read it, ignore the probe.
-        assert!(opens_think(false, false, true, false, false, &opened));
-        assert!(!opens_think(false, false, true, true, false, &closed));
+        assert!(opens_think(false, false, true, false, &opened));
+        assert!(!opens_think(false, false, true, true, &closed));
         // The engine renders (sycl-llama): the probe stands in.
-        assert!(opens_think(true, false, true, true, false, &closed));
-        assert!(!opens_think(true, false, true, false, false, &opened));
+        assert!(opens_think(true, false, true, true, &closed));
+        assert!(!opens_think(true, false, true, false, &opened));
         // ov-genai with thinking on: the engine's native render, so the probe.
-        assert!(opens_think(false, true, true, true, false, &closed));
-        assert!(!opens_think(false, true, true, false, false, &opened));
+        assert!(opens_think(false, true, true, true, &closed));
+        assert!(!opens_think(false, true, true, false, &opened));
         // ov-genai with thinking off: the API rendered it, read the prompt.
-        assert!(opens_think(false, true, false, false, false, &opened));
-        assert!(!opens_think(false, true, false, true, false, &closed));
+        assert!(opens_think(false, true, false, false, &opened));
+        assert!(!opens_think(false, true, false, true, &closed));
         // Reasoning folded in as text: the engine sends its own `<think>`.
-        assert!(!opens_think(true, false, true, true, true, &opened));
-        assert!(!opens_think(false, false, true, true, true, &opened));
+        let folded = |prompt: &str| GenerationTask {
+            reasoning_as_text: true,
+            ..GenerationTask::new("t", prompt)
+        };
+        assert!(!opens_think(true, false, true, true, &folded("<think>\n")));
+        assert!(!opens_think(false, false, true, true, &folded("<think>\n")));
+    }
+
+    /// Records every task it is handed and answers each with a bare final.
+    struct TaskCaptureEngine {
+        seen: Arc<std::sync::Mutex<Vec<GenerationTask>>>,
+        pending: Option<cascadia_types::TaskId>,
+    }
+
+    impl cascadia_engine::Engine for TaskCaptureEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some(task.task_id.clone());
+            self.seen.lock().unwrap().push(task);
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some(id) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![(
+                id.clone(),
+                Chunk::final_marker(&id, "").with_finish_reason(cascadia_types::FinishReason::Stop),
+            )])
+        }
+    }
+
+    struct TaskCaptureBuilder(Arc<std::sync::Mutex<Vec<GenerationTask>>>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for TaskCaptureBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(TaskCaptureEngine {
+                seen: self.0,
+                pending: None,
+            }))
+        }
+    }
+
+    /// A chat request asks the engine for its reasoning as `<think>` text
+    /// only when thinking is on and the engine renders the template itself
+    /// (sycl-llama, whose llama-server returns reasoning on its own channel).
+    #[tokio::test]
+    async fn chat_task_asks_for_reasoning_as_text_only_with_thinking_on_an_engine_template() {
+        for (engine_applies_template, thinking, want) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                engine_applies_template,
+                ..Config::default()
+            };
+            let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+            let request = serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "chat_template_kwargs": {"enable_thinking": thinking},
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].enable_thinking, thinking);
+            assert_eq!(
+                seen[0].reasoning_as_text, want,
+                "engine_applies_template: {engine_applies_template}, thinking: {thinking}"
+            );
+        }
     }
 
     /// GLM-5's template never rejects: anything but the literal "high" is

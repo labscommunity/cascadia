@@ -1218,6 +1218,9 @@ impl LlamaCppEngine {
                     if let Some(n) = &m.name {
                         v["name"] = serde_json::json!(n);
                     }
+                    if let Some(r) = &m.reasoning_content {
+                        v["reasoning_content"] = serde_json::json!(r);
+                    }
                     v
                 })
                 .collect();
@@ -1258,6 +1261,7 @@ impl LlamaCppEngine {
         };
         let _ = s.set_read_timeout(Some(Duration::from_secs(300)));
         self.socket = s.try_clone().ok();
+        let reasoning_as_text = task.reasoning_as_text;
 
         std::thread::spawn(move || {
             let send = |r: EngineResult<(TaskId, Chunk)>| {
@@ -1301,7 +1305,10 @@ impl LlamaCppEngine {
             }
             // Body is one byte stream of SSE `data: ...` lines, possibly
             // chunk-framed. Read chunk sizes as hex when chunked.
-            let mut st = SseState::default();
+            let mut st = SseState {
+                reasoning_as_text,
+                ..SseState::default()
+            };
             // byte buffer, decoded per complete line: a chunk boundary can
             // split a UTF-8 multibyte character, so never convert per chunk
             let mut leftover = Vec::<u8>::new();
@@ -1348,22 +1355,7 @@ impl LlamaCppEngine {
                     return;
                 }
             }
-            // Clean EOF without a [DONE] line: deliver a pending final so
-            // finish_reason/usage still reach the caller.
-            for block in st.tool_call_blocks() {
-                send(Ok((
-                    tid.clone(),
-                    Chunk::token(tid.clone(), st.token_id, block).with_n_tokens(0),
-                )));
-            }
-            if !st.sent_final && st.finish_reason.is_some() {
-                let mut c = Chunk::final_marker(tid.clone(), "").with_n_tokens(0);
-                c.token_id = st.token_id;
-                c.finish_reason = st.finish_reason;
-                c.prompt_tokens = st.prompt_tokens.or(st.timings_prompt_tokens);
-                c.completion_tokens = st.completion_tokens.or(st.predicted_tokens);
-                send(Ok((tid.clone(), c)));
-            }
+            finish_sse_stream(&tid, &mut st, &send);
         });
     }
 }
@@ -1493,6 +1485,14 @@ struct SseState {
     sent_final: bool,
     /// OpenAI `delta.tool_calls` fragments accumulated by call index.
     tool_calls: std::collections::BTreeMap<u64, ToolCallParts>,
+    /// The task's `reasoning_as_text`: stream reasoning deltas as text
+    /// inside `<think>` / `</think>` rather than only as liveness pings.
+    reasoning_as_text: bool,
+    /// A `<think>` was sent and its `</think>` not yet.
+    in_reasoning: bool,
+    /// The answer (text or a tool call) has started: later reasoning is
+    /// only a liveness ping, as a `<think>` block would land in the answer.
+    answer_started: bool,
 }
 
 /// One streaming tool call assembled from `delta.tool_calls` fragments.
@@ -1502,7 +1502,46 @@ struct ToolCallParts {
     arguments: String,
 }
 
+/// What opens and closes reasoning sent as text (`reasoning_as_text`): the
+/// markers the API's reasoning split reads.
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
 impl SseState {
+    /// Send `text` as one token chunk. A fragment, a marker included, is
+    /// not a model token (`n_tokens` 0): usage carries the count.
+    fn send_text(
+        &mut self,
+        tid: &TaskId,
+        text: String,
+        send: &dyn Fn(EngineResult<(TaskId, Chunk)>),
+    ) {
+        let c = Chunk::token(tid.clone(), self.token_id, text).with_n_tokens(0);
+        self.token_id += 1;
+        send(Ok((tid.clone(), c)));
+    }
+
+    /// Close reasoning sent as text, if it is open: before the answer or a
+    /// tool call.
+    fn close_reasoning(&mut self, tid: &TaskId, send: &dyn Fn(EngineResult<(TaskId, Chunk)>)) {
+        if std::mem::take(&mut self.in_reasoning) {
+            self.send_text(tid, THINK_CLOSE.to_owned(), send);
+        }
+    }
+
+    /// The stream's end: send the assembled tool calls, before the final
+    /// chunk. Reasoning still open stays open (no `</think>` is made up), so
+    /// a stream cut short mid-reasoning reads as unfinished reasoning; a
+    /// tool call already closed it when its first fragment came.
+    fn end_text(&mut self, tid: &TaskId, send: &dyn Fn(EngineResult<(TaskId, Chunk)>)) {
+        for block in self.tool_call_blocks() {
+            send(Ok((
+                tid.clone(),
+                Chunk::token(tid.clone(), self.token_id, block).with_n_tokens(0),
+            )));
+        }
+    }
+
     /// The accumulated calls re-encoded as `<tool_call>` text — the Hermes
     /// form the API's parse_tool_calls already understands — in call order.
     /// Drains the map: the stream-end paths ([DONE] and clean EOF) can both
@@ -1525,6 +1564,24 @@ impl SseState {
     }
 }
 
+/// A clean EOF without a `[DONE]` line: deliver a pending final so
+/// finish_reason/usage still reach the caller.
+fn finish_sse_stream(
+    tid: &TaskId,
+    st: &mut SseState,
+    send: &dyn Fn(EngineResult<(TaskId, Chunk)>),
+) {
+    st.end_text(tid, send);
+    if !st.sent_final && st.finish_reason.is_some() {
+        let mut c = Chunk::final_marker(tid.clone(), "").with_n_tokens(0);
+        c.token_id = st.token_id;
+        c.finish_reason = st.finish_reason;
+        c.prompt_tokens = st.prompt_tokens.or(st.timings_prompt_tokens);
+        c.completion_tokens = st.completion_tokens.or(st.predicted_tokens);
+        send(Ok((tid.clone(), c)));
+    }
+}
+
 /// Parse one SSE `data: ...` line; returns false when the stream is
 /// terminal (`[DONE]` was handled and the final chunk emitted).
 fn handle_sse_line(
@@ -1540,12 +1597,7 @@ fn handle_sse_line(
     if data.trim() == "[DONE]" {
         // Emit any assembled tool calls as text just before the final
         // chunk so the API's tool-call machinery sees them in-order.
-        for block in st.tool_call_blocks() {
-            send(Ok((
-                tid.clone(),
-                Chunk::token(tid.clone(), st.token_id, block).with_n_tokens(0),
-            )));
-        }
+        st.end_text(tid, send);
         let mut c = Chunk::final_marker(tid.clone(), "").with_n_tokens(0);
         c.token_id = st.token_id;
         c.finish_reason = st.finish_reason;
@@ -1625,15 +1677,34 @@ fn handle_sse_line(
     }
     // reasoning_content deltas carry no visible text but prove the child is
     // alive; the stall clock must hear them or a long reasoning-only stream
-    // gets killed at the limit while still generating
-    if v["choices"][0]["delta"]["reasoning_content"]
-        .as_str()
-        .is_some_and(|s| !s.is_empty())
-        || v["choices"][0]["delta"]["reasoning"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
-    {
-        active = true;
+    // gets killed at the limit while still generating. With
+    // `reasoning_as_text` they are sent as text inside <think>…</think>
+    // instead, which the stall clock hears as well.
+    let reasoning = [
+        &v["choices"][0]["delta"]["reasoning_content"],
+        &v["choices"][0]["delta"]["reasoning"],
+    ]
+    .into_iter()
+    .find_map(|r| r.as_str().filter(|s| !s.is_empty()));
+    if let Some(r) = reasoning {
+        if st.reasoning_as_text && !st.answer_started {
+            if !st.in_reasoning {
+                st.in_reasoning = true;
+                st.send_text(tid, THINK_OPEN.to_owned(), send);
+            }
+            // A literal `</think>` in the reasoning would end it early in
+            // the API's split; a zero-width space after the `<` keeps it
+            // readable but no longer a tag.
+            st.send_text(tid, r.replace(THINK_CLOSE, "<\u{200B}/think>"), send);
+        } else {
+            active = true;
+        }
+    }
+    // The answer or a tool call ends reasoning sent as text; whitespace
+    // alone (a newline before the reasoning) does not start the answer.
+    if !text.trim().is_empty() || v["choices"][0]["delta"]["tool_calls"].is_array() {
+        st.close_reasoning(tid, send);
+        st.answer_started = true;
     }
     let stop_str = v["choices"][0]["finish_reason"].as_str();
     if let Some(r) = stop_str {
@@ -1652,9 +1723,7 @@ fn handle_sse_line(
         }
         return true;
     }
-    let c = Chunk::token(tid.clone(), st.token_id, text.to_string()).with_n_tokens(0);
-    st.token_id += 1;
-    send(Ok((tid.clone(), c)));
+    st.send_text(tid, text.to_string(), send);
     true
 }
 
@@ -2096,6 +2165,160 @@ mod tests {
             chunk.accumulate_tokens(&mut total);
         }
         assert_eq!(total, 38);
+    }
+
+    /// Every chunk `lines` produce through one stream state, then `[DONE]`
+    /// (unless `done` is false: the stream just ends, as on a clean EOF).
+    fn stream(st: &mut SseState, lines: &[&str], done: bool) -> Vec<Chunk> {
+        let tid = "t".to_owned();
+        let out = std::cell::RefCell::new(Vec::new());
+        let send = |r: EngineResult<(TaskId, Chunk)>| out.borrow_mut().push(r.unwrap().1);
+        for line in lines {
+            handle_sse_line(line, &tid, st, &send);
+        }
+        if done {
+            handle_sse_line("data: [DONE]", &tid, st, &send);
+        } else {
+            finish_sse_stream(&tid, st, &send);
+        }
+        out.into_inner()
+    }
+
+    /// The text of every token chunk, in order, with each progress ping as
+    /// `.` and the final as `|`.
+    fn texts(chunks: &[Chunk]) -> Vec<String> {
+        chunks
+            .iter()
+            .map(|c| {
+                if c.is_final {
+                    "|".to_owned()
+                } else if c.text.is_empty() {
+                    ".".to_owned()
+                } else {
+                    c.text.clone()
+                }
+            })
+            .collect()
+    }
+
+    const THINK_1: &str = r#"data: {"choices":[{"delta":{"reasoning_content":"17 times 3"}}]}"#;
+    const THINK_2: &str = r#"data: {"choices":[{"delta":{"reasoning":" is 51"}}]}"#;
+    const ANSWER: &str = r#"data: {"choices":[{"delta":{"content":"51"}}]}"#;
+    const CALL: &str = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"calc","arguments":"{}"}}]}}]}"#;
+    const STOP: &str = r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":9}}"#;
+
+    fn as_text() -> SseState {
+        SseState {
+            reasoning_as_text: true,
+            ..SseState::default()
+        }
+    }
+
+    /// With `reasoning_as_text`, reasoning deltas stream as text inside
+    /// `<think>`…`</think>`, closed before the answer; the markers, like
+    /// every fragment, count no tokens.
+    #[test]
+    fn sse_reasoning_as_text_frames_reasoning_before_the_answer() {
+        let chunks = stream(&mut as_text(), &[THINK_1, THINK_2, ANSWER, STOP], true);
+        assert_eq!(
+            texts(&chunks),
+            ["<think>", "17 times 3", " is 51", "</think>", "51", "|"]
+        );
+        let mut total = 0;
+        for c in &chunks {
+            c.accumulate_tokens(&mut total);
+        }
+        assert_eq!(total, 9, "only the usage counts");
+    }
+
+    /// Reasoning then a tool call: `</think>` comes as the call starts,
+    /// before its block.
+    #[test]
+    fn sse_reasoning_as_text_closes_before_a_tool_call() {
+        let chunks = stream(&mut as_text(), &[THINK_1, CALL, STOP], true);
+        let texts = texts(&chunks);
+        // The call's fragment is a liveness ping (`.`); its block is sent
+        // at the end.
+        assert_eq!(texts[..4], ["<think>", "17 times 3", "</think>", "."]);
+        assert!(texts[4].starts_with("<tool_call>"), "{texts:?}");
+        assert_eq!(texts[5..], ["|"]);
+    }
+
+    /// A stream that ends while still reasoning is left open, at `[DONE]`
+    /// or at a clean EOF: a length stop mid-reasoning is then an incomplete
+    /// reasoning item, as on other engines.
+    #[test]
+    fn sse_reasoning_as_text_stays_open_at_the_end() {
+        for done in [true, false] {
+            let chunks = stream(&mut as_text(), &[THINK_1, STOP], done);
+            assert_eq!(
+                texts(&chunks),
+                ["<think>", "17 times 3", "|"],
+                "done: {done}"
+            );
+        }
+    }
+
+    /// Reasoning after the answer has started is only a liveness ping: a
+    /// second `<think>` would land in the answer.
+    #[test]
+    fn sse_reasoning_as_text_frames_one_block() {
+        let more = r#"data: {"choices":[{"delta":{"content":" exactly"}}]}"#;
+        let chunks = stream(
+            &mut as_text(),
+            &[THINK_1, ANSWER, THINK_2, more, STOP],
+            true,
+        );
+        assert_eq!(
+            texts(&chunks),
+            [
+                "<think>",
+                "17 times 3",
+                "</think>",
+                "51",
+                ".",
+                " exactly",
+                "|"
+            ]
+        );
+        // Nor does reasoning after an answer that started without any.
+        let chunks = stream(&mut as_text(), &[ANSWER, THINK_1, STOP], true);
+        assert_eq!(texts(&chunks), ["51", ".", "|"]);
+    }
+
+    /// A literal `</think>` inside the reasoning is broken up, so it cannot
+    /// end the reasoning early in the API's split.
+    #[test]
+    fn sse_reasoning_as_text_neutralises_a_closing_tag() {
+        let think = r#"data: {"choices":[{"delta":{"reasoning_content":"a </think> b"}}]}"#;
+        let chunks = stream(&mut as_text(), &[think, ANSWER, STOP], true);
+        assert_eq!(
+            texts(&chunks),
+            ["<think>", "a <\u{200B}/think> b", "</think>", "51", "|"]
+        );
+    }
+
+    /// Whitespace before the reasoning does not start the answer: it is
+    /// passed through and the reasoning is still framed.
+    #[test]
+    fn sse_reasoning_as_text_ignores_leading_whitespace() {
+        let blank = r#"data: {"choices":[{"delta":{"content":"\n"}}]}"#;
+        let chunks = stream(&mut as_text(), &[blank, THINK_1, ANSWER, STOP], true);
+        assert_eq!(
+            texts(&chunks),
+            ["\n", "<think>", "17 times 3", "</think>", "51", "|"]
+        );
+    }
+
+    /// Without the flag, reasoning is only a liveness ping, as before.
+    #[test]
+    fn sse_reasoning_without_the_flag_is_a_ping() {
+        let chunks = stream(
+            &mut SseState::default(),
+            &[THINK_1, THINK_2, ANSWER, STOP],
+            true,
+        );
+        assert_eq!(texts(&chunks), [".", ".", "51", "|"]);
     }
 
     #[test]
@@ -2738,6 +2961,52 @@ mod unix_tests {
             chunk.accumulate_tokens(&mut count);
         }
         assert_eq!(count, 2);
+        server.join().unwrap();
+    }
+
+    /// An assistant turn's replayed reasoning is forwarded as its
+    /// `reasoning_content`, for the GGUF template to place.
+    #[test]
+    fn engine_forwards_an_assistant_turns_reasoning_content() {
+        let (port, server) = mock_server(|req, s| {
+            let req = String::from_utf8_lossy(req);
+            let body: serde_json::Value =
+                serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body["messages"][1]["role"], "assistant", "{body}");
+            assert_eq!(body["messages"][1]["content"], "51", "{body}");
+            assert_eq!(
+                body["messages"][1]["reasoning_content"], "17 times 3",
+                "{body}"
+            );
+            assert!(
+                body["messages"][0].get("reasoning_content").is_none(),
+                "{body}"
+            );
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            s.write_all(head.as_bytes()).unwrap();
+            for p in [
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+                "data: [DONE]\n",
+            ] {
+                s.write_all(chunked(p).as_bytes()).unwrap();
+            }
+            s.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let mut task = chat_task();
+        task.messages.push(ChatTurn {
+            role: "assistant".into(),
+            content: "51".into(),
+            reasoning_content: Some("17 times 3".into()),
+            ..Default::default()
+        });
+        task.messages.push(ChatTurn {
+            role: "user".into(),
+            content: "and 18?".into(),
+            ..Default::default()
+        });
+        let mut engine = test_engine(port);
+        engine.submit(task).unwrap();
+        assert!(drain(&mut engine).last().unwrap().1.is_final);
         server.join().unwrap();
     }
 
