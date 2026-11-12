@@ -3437,6 +3437,7 @@ async fn stream_completion(
         marker: state.marker_dialect.clone().map(MarkerFilter::new),
         counter,
         settled: false,
+        held_tokens: 0,
     }));
     let final_text_state = text_state.clone();
     let body_stream = permit_carrier
@@ -3487,7 +3488,20 @@ async fn stream_completion(
                 // Special-token framing (Inkling) → textual delimiters, same
                 // translation as the non-streaming path; withheld text (a
                 // tool call's name/JSON) surfaces on the closing marker.
-                let (reasoning, text) = text_state.lock().unwrap().route(&chunk, split_out);
+                let (reasoning, text, n_tokens) = {
+                    let mut text_state = text_state.lock().unwrap();
+                    let (reasoning, text) = text_state.route(&chunk, split_out);
+                    // While the split holds text back (a partial tag), a
+                    // step that releases nothing sends no frame: an empty
+                    // `content` frame would sit in the middle of the
+                    // reasoning. Its tokens ride the next frame.
+                    text_state.held_tokens += chunk.token_count();
+                    if split_out && !chunk.is_final && reasoning.is_empty() && text.is_empty() {
+                        return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
+                    }
+                    let n_tokens = std::mem::take(&mut text_state.held_tokens);
+                    (reasoning, text, n_tokens)
+                };
                 let finish_reason = chunk
                     .is_final
                     .then(|| chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"));
@@ -3496,7 +3510,7 @@ async fn stream_completion(
                     &model,
                     &reasoning,
                     &text,
-                    chunk.token_count(),
+                    n_tokens,
                     chunk.completion_tokens,
                     finish_reason,
                 );
@@ -3523,14 +3537,18 @@ async fn stream_completion(
             let mut out = String::new();
             // Ended without a final chunk (cancelled): send what the split
             // still holds instead of dropping it, as the tool stream does.
-            let (reasoning, text) = final_text_state.lock().unwrap().settle(split_out);
+            let (reasoning, text, n_tokens) = {
+                let mut text_state = final_text_state.lock().unwrap();
+                let (reasoning, text) = text_state.settle(split_out);
+                (reasoning, text, std::mem::take(&mut text_state.held_tokens))
+            };
             if !reasoning.is_empty() || !text.is_empty() {
                 out.push_str(&content_frame(
                     &usage_task_id,
                     &usage_model,
                     &reasoning,
                     &text,
-                    0,
+                    n_tokens,
                     None,
                     None,
                 ));
@@ -3827,6 +3845,9 @@ struct StreamText {
     counter: ReasoningCounter,
     /// A final chunk (or an error) arrived: nothing is held any more.
     settled: bool,
+    /// Model tokens of skipped steps, not yet reported in a frame's
+    /// `n_tokens`.
+    held_tokens: u32,
 }
 
 impl StreamText {
@@ -9046,6 +9067,32 @@ level={{ effort_map[eff] }}";
             // one per part, the last on the final chunk
             assert_eq!(frame_tokens(&events), 2, "{body}");
         }
+    }
+
+    /// A chunk that releases nothing while reasoning (the split holds a
+    /// partial `</think>`) sends no empty frame; its tokens ride the next one.
+    #[tokio::test]
+    async fn held_chunk_inside_reasoning_sends_no_empty_frame() {
+        let body = post_stream(
+            gated_app_released(&["<think>a", "<", "/think>b"]).await,
+            plain_stream_body(None, false),
+        )
+        .await;
+        let events = sse_events(&body);
+        let answer = events
+            .iter()
+            .position(|e| e["choices"][0]["delta"]["content"] == "b")
+            .unwrap_or_else(|| panic!("no answer frame: {body}"));
+        for e in &events[..answer] {
+            let delta = &e["choices"][0]["delta"];
+            assert!(
+                delta.get("reasoning_content").is_some(),
+                "frame without reasoning inside the reasoning: {body}"
+            );
+        }
+        assert_eq!(streamed_reasoning(&events), "a", "{body}");
+        assert_eq!(streamed_content(&events), "b", "{body}");
+        assert_eq!(frame_tokens(&events), 3, "{body}");
     }
 
     #[tokio::test]
