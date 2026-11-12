@@ -11143,6 +11143,44 @@ level={{ effort_map[eff] }}";
         }
     }
 
+    /// Two `#/$defs/...` refs whose names llama-server folds into one
+    /// grammar rule (`a_b`, `a-b`) would get one shape there. sycl-llama
+    /// inlines every ref before llama-server sees it, so a forced tool
+    /// holding them keeps its call grammar (200), as on engines that
+    /// resolve refs in full.
+    #[tokio::test]
+    async fn a_forced_tool_whose_llama_rule_names_collide_keeps_its_grammar_on_sycl_llama() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "a_b": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]},
+                "a-b": {"type": "object", "properties": {"s": {"type": "string"}}, "required": ["s"]},
+            },
+            "type": "object",
+            "properties": {"x": {"$ref": "#/$defs/a_b"}, "y": {"$ref": "#/$defs/a-b"}},
+            "required": ["x", "y"],
+        });
+        let tool = serde_json::json!({"type": "function", "function": {
+            "name": "get_weather", "parameters": schema
+        }});
+        for refs in [SYCL, RefResolver::Full] {
+            let cfg = Config {
+                ref_resolver: refs,
+                ..Config::default()
+            };
+            let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+            let (status, v) = post_chat(
+                app,
+                tool_body(
+                    serde_json::json!([tool.clone()]),
+                    serde_json::json!({"tool_choice": "required"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{refs:?}: {v}");
+            assert!(last_task(&seen).grammar.is_some(), "{refs:?}");
+        }
+    }
+
     /// A forced tool whose `#/$defs/...` ref points into instance data that
     /// holds a non-pointer `$ref` passes the tool grammar's own ref rewrite
     /// (the def name is known, data is not walked), but the converter
