@@ -225,6 +225,13 @@ impl ReasoningCounter {
     pub fn finish(&mut self) -> (String, String) {
         let segs = self.split.finish();
         self.count(0, &segs, 0);
+        // Tokens of trailing feeds that released no text (an end-of-sequence
+        // token, text a marker filter removed) belong to the side the reply
+        // ended on.
+        let carried = std::mem::take(&mut self.carried);
+        if self.split.in_reasoning() {
+            self.reasoning += f64::from(carried);
+        }
         join(segs)
     }
 
@@ -529,5 +536,78 @@ mod tests {
             ReasoningFormat::None
         );
         assert!("auto2".parse::<ReasoningFormat>().is_err());
+    }
+
+    /// Chunks that carried no tokens, then an authoritative total: the
+    /// reasoning share of every released byte (tags included) splits it.
+    #[test]
+    fn counter_uncounted_chunks_split_the_total_by_bytes() {
+        let mut c = ReasoningCounter::new(true, false);
+        c.feed("<think>plan</think>", 0);
+        c.feed("answer", 0);
+        c.finish();
+        // 19 of 25 bytes are reasoning: 7.6 → 8
+        assert_eq!(c.reasoning_tokens(10), 8);
+        assert_eq!(c.reasoning_tokens(0), 0);
+        // nothing released at all: none
+        let mut c = ReasoningCounter::new(true, false);
+        c.finish();
+        assert_eq!(c.reasoning_tokens(3), 0);
+    }
+
+    /// Per-chunk counts that disagree with the authoritative total are
+    /// scaled to it.
+    #[test]
+    fn counter_counted_chunks_are_scaled_to_the_total() {
+        let mut c = ReasoningCounter::new(true, false);
+        // 1 token all reasoning, then 1 token 8 of 10 bytes reasoning: 1.8
+        c.feed("<think>ab", 1);
+        c.feed("</think>xy", 1);
+        c.finish();
+        assert_eq!(c.reasoning_tokens(2), 2);
+        // ×5: 9
+        assert_eq!(c.reasoning_tokens(10), 9);
+        // ×0.5: 0.9 → 1
+        assert_eq!(c.reasoning_tokens(1), 1);
+    }
+
+    #[test]
+    fn counter_held_tokens_are_carried_to_the_next_release() {
+        // the `<th` feed holds everything; its token goes with the next feed
+        let mut c = ReasoningCounter::new(true, false);
+        for (text, tokens) in [("<th", 1), ("ink>ab", 1), ("</think>x", 1)] {
+            c.feed(text, tokens);
+        }
+        c.finish();
+        // feed 2: 3 + 4 bytes all reasoning, 2 tokens; feed 3: 8 of 9 bytes
+        // of 1 token: 2.89 → 3
+        assert_eq!(c.reasoning_tokens(3), 3);
+        // finish attributes what is still carried
+        let mut c = ReasoningCounter::new(true, false);
+        c.feed("\n", 4);
+        c.finish();
+        assert_eq!(c.reasoning_tokens(4), 0);
+        let mut c = ReasoningCounter::new(true, true);
+        c.feed("ab</thi", 4);
+        c.finish();
+        assert_eq!(c.reasoning_tokens(4), 4);
+    }
+
+    /// A last chunk that carries tokens but no text (an end-of-sequence
+    /// token, or text a marker filter removed) counts on the side the
+    /// reply ended on.
+    #[test]
+    fn counter_tokens_of_a_final_empty_chunk_count_where_the_reply_ended() {
+        let mut c = ReasoningCounter::new(true, true);
+        c.feed("abc", 1);
+        c.feed("", 1);
+        c.finish();
+        assert_eq!(c.reasoning_tokens(2), 2);
+        let mut c = ReasoningCounter::new(true, false);
+        c.feed("<think>r</think>", 1);
+        c.feed("answer", 1);
+        c.feed("", 1);
+        c.finish();
+        assert_eq!(c.reasoning_tokens(3), 1);
     }
 }
