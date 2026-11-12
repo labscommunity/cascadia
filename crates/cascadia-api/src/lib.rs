@@ -2622,7 +2622,13 @@ fn chat_turns(req: &ChatCompletionRequest) -> Vec<ChatTurn> {
                 .and_then(|cs| serde_json::to_value(cs).ok()),
             tool_call_id: m.tool_call_id.clone(),
             name: m.name.clone(),
-            reasoning_content: m.reasoning_content.clone(),
+            // Templates read replayed reasoning on assistant turns only; an
+            // engine that applies its own template need not accept it elsewhere.
+            reasoning_content: if m.role == "assistant" {
+                m.reasoning_content.clone()
+            } else {
+                None
+            },
         })
         .collect()
 }
@@ -6222,6 +6228,23 @@ mod tests {
         let turns = chat_turns(&req);
         assert_eq!(turns[0].reasoning_content, None);
         assert_eq!(turns[1].reasoning_content.as_deref(), Some("why"));
+    }
+
+    /// Only an assistant turn's reasoning reaches an engine that applies its
+    /// own template (llama-server): templates read it on assistant turns only,
+    /// and a server need not accept it anywhere else.
+    #[test]
+    fn chat_turns_forward_replayed_reasoning_on_assistant_turns_only() {
+        let req = chat_request(serde_json::json!({"messages":[
+            {"role":"system","content":"s","reasoning_content":"r0"},
+            {"role":"user","content":"q","reasoning_content":"r1"},
+            {"role":"assistant","content":"a","reasoning_content":"r2"},
+            {"role":"tool","tool_call_id":"c","content":"t","reasoning_content":"r3"}]}));
+        let got: Vec<_> = chat_turns(&req)
+            .into_iter()
+            .map(|t| t.reasoning_content)
+            .collect();
+        assert_eq!(got, vec![None, None, Some("r2".into()), None]);
     }
 
     #[tokio::test]
