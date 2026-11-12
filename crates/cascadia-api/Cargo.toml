@@ -52,4 +52,5 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 cascadia-engine-mock = { workspace = true }
+cascadia-transport = { workspace = true }
 async-trait = { workspace = true }

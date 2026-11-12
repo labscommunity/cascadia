@@ -207,10 +207,11 @@ struct EngineSlot {
 /// back to back, so a longer gap means nobody was driving the engine.
 pub const STEP_GAP: Duration = Duration::from_secs(5);
 
-/// The longest the transport waits for a prefill's reply from the next stage
-/// (ten receive timeouts, `CASCADIA_ACTIVATION_TIMEOUT_SECS` or 60 s, unless
-/// a caller set a shorter first-token budget): one engine call on a stage can
-/// legitimately run this long. Read live, as both inputs can change at run time.
+/// The longest the transport waits for one prefill reply from the next stage:
+/// a caller's first-token budget when one is set (shorter or longer), else
+/// ten receive timeouts (`CASCADIA_ACTIVATION_TIMEOUT_SECS`, or 60 s). One
+/// wait of an engine call on a stage can legitimately run this long. Read
+/// live, as both inputs can change at run time.
 pub fn prefill_reply_wait() -> Duration {
     cascadia_transport::prefill_reply_timeout()
 }

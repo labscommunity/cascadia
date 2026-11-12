@@ -975,9 +975,15 @@ pub const IN_CALL_FACTOR: u32 = 10;
 
 /// How long one engine call on a pipeline stage may run before it counts as
 /// stuck, in ms: the longer of [`IN_CALL_FACTOR`] × `stall_after` and
-/// `prefill_wait`, the transport's own wait for a prefill's reply. A call
-/// inside that wait is one the transport still bounds; past it, the stage is
-/// held by something no timeout will end.
+/// `prefill_wait`, the transport's own wait for one prefill reply.
+///
+/// This bounds one wait, not a whole call: a call can also spend its own
+/// compute before a reply, or chain several bounded waits (a chunked prefill,
+/// or sparse-moe's sync every 256 prompt tokens), so a long prompt can keep a
+/// healthy call past it. Such a call is read as stalled only at a capacity
+/// 503 (every slot full), and the mark clears at the next `/health` once the
+/// call produces output. Telling a slow call from a stuck one exactly needs a
+/// progress signal from the stage, which the transport does not expose.
 fn in_call_bound_ms(stall_after: std::time::Duration, prefill_wait: std::time::Duration) -> u64 {
     let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     ms(stall_after)
@@ -8559,11 +8565,19 @@ mod tests {
     }
 
     /// With the default in-call bound, one call on a pipeline stage counts as
-    /// stuck only past the transport's own wait for a prefill's reply (ten
-    /// receive timeouts, 600 s here), not past IN_CALL_FACTOR × a short stall
-    /// bound: a call 12 bounds in, every slot full, is busy.
+    /// stuck only past the transport's own wait for a prefill's reply, not
+    /// past IN_CALL_FACTOR × a short stall bound: a call 12 bounds in, every
+    /// slot full, is busy. The wait is pinned through the transport's override,
+    /// which takes precedence over `CASCADIA_ACTIVATION_TIMEOUT_SECS`, so the
+    /// test doesn't depend on the environment. 600 s is the value the default
+    /// timeout gives, so other tests in this process see no change.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn by_default_a_call_inside_the_transports_prefill_wait_is_busy() {
+        cascadia_transport::set_prefill_reply_timeout_secs(600);
+        assert_eq!(
+            cascadia_runner::prefill_reply_wait(),
+            std::time::Duration::from_secs(600)
+        );
         let (app, stuck) = stall_app_with(first_of_two(), None).await;
         stuck.store(true, Ordering::SeqCst);
         let reader = {

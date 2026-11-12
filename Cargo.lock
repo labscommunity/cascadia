@@ -279,6 +279,7 @@ dependencies = [
  "cascadia-engine-mock",
  "cascadia-metrics",
  "cascadia-runner",
+ "cascadia-transport",
  "cascadia-types",
  "chrono",
  "futures",
