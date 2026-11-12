@@ -346,7 +346,8 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   `$ref` is sent as written. A ref that can't be inlined (`https://…`,
   `urn:…`, a bare name, a pointer to nothing) is a 400, as is a request
   whose schemas inline to over 1 MiB together; each tool's parameters get
-  the same cost guard as `response_format`. See [CLI.md](../CLI.md),
+  the same cost guard as `response_format`. Only the tools `tool_choice`
+  leaves are checked (and sent). See [CLI.md](../CLI.md),
   Structured output.
 - Chat turns carry `role` + `content` + tool-call fields (`tool_calls`,
   `tool_call_id`, `name`) and request-level `tools` in the OpenAI wire

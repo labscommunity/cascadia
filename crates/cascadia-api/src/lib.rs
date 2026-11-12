@@ -2602,7 +2602,13 @@ async fn chat_completions(
     // under one budget for the request: what it can't inline is refused here.
     if let RefResolver::LlamaServer { no_jinja } = state.ref_resolver {
         let mut budget = cascadia_grammar::Budget::default();
-        if let ResponseFormat::JsonSchema { schema, .. } = &response_format {
+        // Only what is sent counts: no response_format while tools are
+        // callable, and only the tools `tool_choice` leaves.
+        let tools_callable = req.tools.as_ref().is_some_and(|t| !t.is_empty())
+            && req.tool_choice.as_ref().and_then(|c| c.as_str()) != Some("none");
+        if let (ResponseFormat::JsonSchema { schema, .. }, false) =
+            (&response_format, tools_callable)
+        {
             if let Err(msg) = structured::inline_for_llama_server(schema, no_jinja, &mut budget) {
                 count_rejected("invalid_request");
                 return (
@@ -2613,8 +2619,10 @@ async fn chat_completions(
             }
         }
         if let Some(serde_json::Value::Array(tools)) = chat_tools(&req) {
-            for (i, tool) in tools.iter().enumerate() {
-                let Some(params) = tool.pointer("/function/parameters") else {
+            let sent =
+                cascadia_grammar::tools_llama_server_receives(&tools, req.tool_choice.as_ref());
+            for i in sent {
+                let Some(params) = tools[i].pointer("/function/parameters") else {
                     continue;
                 };
                 if !cascadia_grammar::has_ref(params) {
@@ -8769,9 +8777,11 @@ level={{ effort_map[eff] }}";
     /// A tool's `parameters` are inlined for sycl-llama too: one with a ref
     /// it can't inline is a 400 naming the tool, and a recursive one is a
     /// 400 without `--jinja`.
-    /// One inlining budget covers a request's `response_format` and its
-    /// tools, and no schema of the request may use a hoisted copy's
-    /// reserved name (llama-server reads them all into one table of refs).
+    /// One inlining budget covers what a request sends llama-server (its
+    /// `response_format`, or the tools `tool_choice` leaves it), and no
+    /// schema it sends may use a hoisted copy's reserved name (llama-server
+    /// reads them all into one table of refs). What is not sent is not
+    /// checked.
     #[tokio::test]
     async fn sycl_llama_checks_a_request_as_a_whole() {
         let mut defs = serde_json::Map::new();
@@ -8784,27 +8794,78 @@ level={{ effort_map[eff] }}";
             defs.insert(format!("d{i}"), serde_json::json!({"type": "object", "properties": {"a": {"$ref": prev}, "b": {"$ref": prev}}}));
         }
         let big = serde_json::json!({"$defs": defs, "type": "object", "properties": {"x": {"$ref": "#/$defs/d8"}}});
-        let with_tool = |schema: &Value, params: Value| {
+        let request = |schema: &Value, tools: Vec<(&str, Value)>, choice: Value| {
             let mut body = chat_with(Some(json_schema_format(schema.clone())));
-            body["tools"] = serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);
-            body["tool_choice"] = "none".into();
+            body["tools"] = tools
+                .into_iter()
+                .map(|(name, params)| serde_json::json!({"type": "function", "function": {"name": name, "parameters": params}}))
+                .collect();
+            body["tool_choice"] = choice;
             body
         };
+        let post = |body: Value, refs: RefResolver| async move {
+            post_chat(so_app_refs(refs).await, body).await
+        };
+        let plain = serde_json::json!({"type": "object"});
         let (status, v) = post_schema(SYCL, &big).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        let (status, v) = post_chat(so_app_refs(SYCL).await, with_tool(&big, big.clone())).await;
+        // Two tools llama-server receives share the budget.
+        let both = request(
+            &plain,
+            vec![("f", big.clone()), ("g", big.clone())],
+            "required".into(),
+        );
+        let (status, v) = post(both, SYCL).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
         assert!(v["error"].as_str().unwrap().contains("bytes"), "{v}");
+        // Only what is sent counts: no tools with "none", the named one
+        // only, and no response_format while tools are callable.
+        for (tools, choice) in [
+            (vec![("f", big.clone())], serde_json::json!("none")),
+            (
+                vec![("f", big.clone()), ("g", big.clone())],
+                serde_json::json!({"type": "function", "function": {"name": "f"}}),
+            ),
+            (vec![("f", big.clone())], serde_json::json!("auto")),
+        ] {
+            let (status, v) = post(request(&big, tools, choice.clone()), SYCL).await;
+            assert_eq!(status, StatusCode::OK, "{choice}: {v}");
+        }
         let reserved = serde_json::json!({
             "type": "object", "properties": {"k": {"const": {"$ref": "#/$defs/__cascadia_r0x"}}},
             "$defs": {"__cascadia_r0x": {"type": "integer"}},
         });
-        let plain = serde_json::json!({"type": "object"});
-        let (status, v) =
-            post_chat(so_app_refs(SYCL).await, with_tool(&plain, reserved.clone())).await;
+        let (status, v) = post(
+            request(&plain, vec![("f", reserved.clone())], "auto".into()),
+            SYCL,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
         assert!(v["error"].as_str().unwrap().contains("reserved"), "{v}");
+        let (status, v) = post(
+            request(&plain, vec![("f", reserved.clone())], "none".into()),
+            SYCL,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
         let (status, v) = post_schema(SYCL, &reserved).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        // A recursive tool that is not sent is fine without --jinja too.
+        let list = serde_json::json!({
+            "type": "object", "properties": {"head": {"$ref": "#/$defs/Node"}},
+            "$defs": {"Node": {"type": "object", "properties": {"next": {"anyOf": [{"$ref": "#/$defs/Node"}, {"type": "null"}]}}}},
+        });
+        let (status, v) = post(
+            request(&plain, vec![("f", list.clone())], "none".into()),
+            SYCL_NO_JINJA,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = post(
+            request(&plain, vec![("f", list)], "auto".into()),
+            SYCL_NO_JINJA,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     }
 

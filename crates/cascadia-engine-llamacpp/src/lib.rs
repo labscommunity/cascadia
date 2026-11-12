@@ -1549,22 +1549,25 @@ fn inlined_schema(
         .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))
 }
 
-/// Each tool's `parameters` in `tools` (OpenAI wire form) with its `$ref`s
-/// inlined like a `response_format` schema's, charging the same `budget`;
+/// Each tool's `parameters` in `tools` (OpenAI wire form) that llama-server
+/// receives under `tool_choice`, with its `$ref`s inlined like a
+/// `response_format` schema's, charging the same `budget`;
 /// tool `i`'s hoisted copies are named apart from the others' (llama-server
 /// reads all of them into one table of refs). A tool without a `$ref` is
 /// left exactly as it is (the chat template shows it to the model). Each
 /// tool's parameters then get the llama-server cost guard.
 fn inline_tool_parameters(
     tools: &mut serde_json::Value,
+    tool_choice: Option<&serde_json::Value>,
     no_jinja: bool,
     budget: &mut cascadia_grammar::Budget,
 ) -> EngineResult<()> {
     let Some(tools) = tools.as_array_mut() else {
         return Ok(());
     };
-    for (i, tool) in tools.iter_mut().enumerate() {
-        let Some(params) = tool.pointer_mut("/function/parameters") else {
+    // Only the tools `apply_tool_choice` leaves are sent.
+    for i in cascadia_grammar::tools_llama_server_receives(tools, tool_choice) {
+        let Some(params) = tools[i].pointer_mut("/function/parameters") else {
             continue;
         };
         let refused =
@@ -1904,7 +1907,7 @@ impl Engine for LlamaCppEngine {
             check_grammar_body(&g.body)?;
         }
         if let Some(tools) = &mut task.tools {
-            inline_tool_parameters(tools, no_jinja, &mut budget)?;
+            inline_tool_parameters(tools, task.tool_choice.as_ref(), no_jinja, &mut budget)?;
         }
         self.pending.push(task);
         Ok(())
@@ -3341,6 +3344,41 @@ mod unix_tests {
             Err(EngineError::InvalidConfig(m)) => assert!(m.contains("reserved"), "{m}"),
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+
+    /// Only the tools llama-server will receive are inlined and checked:
+    /// none with `tool_choice: "none"`, the named one with a named choice.
+    #[test]
+    fn tools_llama_server_wont_receive_are_not_checked() {
+        let remote =
+            serde_json::json!({"properties": {"a": {"$ref": "https://example.com/a.json"}}});
+        let ok = serde_json::json!({"$defs": {"B": {"type": "integer"}}, "properties": {"b": {"$ref": "#/$defs/B"}}});
+        let tools = |a: serde_json::Value, b: serde_json::Value| {
+            serde_json::json!([
+                {"type": "function", "function": {"name": "f", "parameters": a}},
+                {"type": "function", "function": {"name": "g", "parameters": b}},
+            ])
+        };
+        let mut engine = test_engine(1);
+        let mut task = chat_task();
+        task.tools = Some(tools(remote.clone(), remote.clone()));
+        task.tool_choice = Some(serde_json::json!("none"));
+        engine.submit(task).unwrap();
+        let mut task = chat_task();
+        task.task_id = "task-2".into();
+        task.tools = Some(tools(remote.clone(), ok.clone()));
+        task.tool_choice = Some(serde_json::json!({"type": "function", "function": {"name": "g"}}));
+        engine.submit(task).unwrap();
+        let sent = &engine.pending[1].tools.as_ref().unwrap()[1]["function"]["parameters"];
+        assert_eq!(
+            sent["properties"]["b"],
+            serde_json::json!({"type": "integer"})
+        );
+        let mut task = chat_task();
+        task.task_id = "task-3".into();
+        task.tools = Some(tools(remote, ok));
+        task.tool_choice = Some(serde_json::json!("auto"));
+        assert!(engine.submit(task).is_err());
     }
 
     #[test]

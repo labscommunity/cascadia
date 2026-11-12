@@ -820,8 +820,8 @@ pub use llama_cost::{
     llama_grammar_cost, llama_grammar_cost_error, LLAMA_VISIT_COST, MAX_LLAMA_GRAMMAR_COST,
 };
 pub use llama_inline::{
-    has_ref, inline_refs, inline_refs_with, Budget, InlineError, Inlined, MAX_INLINED_BYTES,
-    RESERVED_PREFIX,
+    has_ref, inline_refs, inline_refs_with, tools_llama_server_receives, Budget, InlineError,
+    Inlined, MAX_INLINED_BYTES, RESERVED_PREFIX,
 };
 
 mod xgrammar_cost;

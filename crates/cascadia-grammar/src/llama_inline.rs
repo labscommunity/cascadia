@@ -79,9 +79,10 @@ pub enum InlineError {
     TooDeep,
     /// A `$defs` key or `$ref` using [`RESERVED_PREFIX`].
     Reserved(String),
-    /// A `$ref` left in data (`const`, `enum`) that llama-server's ref scan
-    /// would fail on.
-    DataRef(String),
+    /// A `$ref` left in what is sent (in `const` or `enum`, or anywhere
+    /// llama-server's ref scan reads) that the scan would fail on, and
+    /// where it is (a JSON pointer into the sent schema).
+    DataRef(String, String),
 }
 
 impl std::fmt::Display for InlineError {
@@ -115,10 +116,11 @@ impl std::fmt::Display for InlineError {
                 "{} is not supported: names starting {RESERVED_PREFIX} are reserved",
                 shown(r)
             ),
-            InlineError::DataRef(r) => write!(
+            InlineError::DataRef(r, at) => write!(
                 f,
-                "$ref {} in `const` or `enum` is not supported: llama-server fails on it",
-                shown(r)
+                "$ref {} at {} is not supported: llama-server fails on it",
+                shown(r),
+                shown(at)
             ),
         }
     }
@@ -158,6 +160,22 @@ pub fn has_ref(v: &Value) -> bool {
         }
     }
     false
+}
+
+/// Which of `tools` (OpenAI wire form) llama-server receives under
+/// `tool_choice`, as the sycl-llama engine sends them: none for `"none"`,
+/// the named function's for a named choice, all of them otherwise.
+pub fn tools_llama_server_receives(tools: &[Value], tool_choice: Option<&Value>) -> Vec<usize> {
+    match tool_choice {
+        Some(Value::String(s)) if s == "none" => Vec::new(),
+        Some(choice @ Value::Object(_)) => {
+            let name = choice.pointer("/function/name").and_then(Value::as_str);
+            (0..tools.len())
+                .filter(|&i| tools[i].pointer("/function/name").and_then(Value::as_str) == name)
+                .collect()
+        }
+        _ => (0..tools.len()).collect(),
+    }
 }
 
 /// A `$defs`/`definitions` key or `$ref` string anywhere in `v` that uses
@@ -248,7 +266,7 @@ fn schema_refs<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
 /// not past an object holding one, and accepts a `#/...` pointer that
 /// resolves (split on `/`, no unescaping) and an `https://` document without
 /// a fragment (it doesn't fetch; one with a fragment fails).
-fn ref_llama_fails_on(doc: &Value) -> Option<String> {
+fn ref_llama_fails_on(doc: &Value) -> Option<(String, String)> {
     let resolves = |r: &str| {
         let mut cur = doc;
         for tok in r[2..].split('/') {
@@ -266,8 +284,10 @@ fn ref_llama_fails_on(doc: &Value) -> Option<String> {
         }
         true
     };
-    let mut stack = vec![doc];
-    while let Some(v) = stack.pop() {
+    let escape = |k: &str| k.replace('~', "~0").replace('/', "~1");
+    // (value, its JSON pointer in `doc`)
+    let mut stack = vec![(doc, String::from("#"))];
+    while let Some((v, at)) = stack.pop() {
         match v {
             Value::Object(o) => match o.get("$ref") {
                 Some(Value::String(r)) => {
@@ -279,13 +299,15 @@ fn ref_llama_fails_on(doc: &Value) -> Option<String> {
                         false
                     };
                     if !ok {
-                        return Some(r.clone());
+                        return Some((r.clone(), at));
                     }
                 }
-                Some(other) => return Some(other.to_string()),
-                None => stack.extend(o.values()),
+                Some(other) => return Some((other.to_string(), at)),
+                None => stack.extend(o.iter().map(|(k, c)| (c, format!("{at}/{}", escape(k))))),
             },
-            Value::Array(a) => stack.extend(a),
+            Value::Array(a) => {
+                stack.extend(a.iter().enumerate().map(|(i, c)| (c, format!("{at}/{i}"))))
+            }
             _ => {}
         }
     }
@@ -528,6 +550,17 @@ pub fn inline_refs_with(
         let copy = inliner.schema(target)?;
         defs.insert(inliner.hoisted[r].clone(), copy);
     }
+    // A root that is itself a `$ref` to a hoisted target: the target's copy
+    // goes at the root (a tool's formats read `parameters.properties`).
+    if let Some(name) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| inliner.hoisted.get(r))
+    {
+        if let Some(copy) = defs.get(name) {
+            out = copy.clone();
+        }
+    }
     let ours: HashSet<String> = inliner
         .hoisted
         .values()
@@ -562,8 +595,8 @@ pub fn inline_refs_with(
         };
         all.extend(defs);
     }
-    if let Some(r) = ref_llama_fails_on(&out) {
-        return Err(InlineError::DataRef(r));
+    if let Some((r, at)) = ref_llama_fails_on(&out) {
+        return Err(InlineError::DataRef(r, at));
     }
     Ok(Inlined {
         schema: out,
@@ -862,7 +895,7 @@ mod tests {
             let got = inline_refs(&schema, "", true);
             assert_eq!(got.is_ok(), ok, "{k}: {got:?}");
             if !ok {
-                assert!(matches!(got, Err(InlineError::DataRef(_))), "{k}: {got:?}");
+                assert!(matches!(got, Err(InlineError::DataRef(..))), "{k}: {got:?}");
             }
         }
     }
@@ -913,6 +946,57 @@ mod tests {
         }
         let deep = json!({"$defs": {"D": deep}, "properties": {"x": {"$ref": "#/$defs/D"}}});
         assert_eq!(inline_refs(&deep, "", true), Err(InlineError::TooDeep));
+    }
+
+    #[test]
+    fn a_root_that_is_a_ref_on_a_cycle_gets_the_target_at_the_root() {
+        let schema = json!({
+            "$ref": "#/$defs/A",
+            "$defs": {"A": {"type": "object", "properties": {"x": {"$ref": "#"}, "n": {"type": "string"}}}},
+        });
+        let got = inline_refs(&schema, "t0", true).unwrap().schema;
+        assert_eq!(got["properties"]["n"], json!({"type": "string"}));
+        let x = got["properties"]["x"]["$ref"].as_str().unwrap();
+        let copy = &got["$defs"][x.strip_prefix("#/$defs/").unwrap()];
+        assert!(copy.is_object(), "{got}");
+        assert!(got.get("$ref").is_none(), "{got}");
+    }
+
+    #[test]
+    fn a_ref_llama_server_fails_on_is_named_with_where_it_is() {
+        // A `$ref`'s description is carried onto the copy, ref and all.
+        let schema = json!({
+            "$defs": {"B": {"type": "string"}},
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/B", "description": {"$ref": "urn:z"}}},
+        });
+        let e = inline_refs(&schema, "", true).unwrap_err();
+        let msg = e.to_string();
+        assert!(!msg.contains("`const`"), "{msg}");
+        assert!(
+            msg.contains("urn:z") && msg.contains("#/properties/a/description"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn only_the_tools_tool_choice_leaves_are_sent() {
+        let tools = vec![
+            json!({"type": "function", "function": {"name": "f"}}),
+            json!({"type": "function", "function": {"name": "g"}}),
+        ];
+        assert_eq!(tools_llama_server_receives(&tools, None), vec![0, 1]);
+        assert_eq!(
+            tools_llama_server_receives(&tools, Some(&json!("auto"))),
+            vec![0, 1]
+        );
+        assert_eq!(
+            tools_llama_server_receives(&tools, Some(&json!("required"))),
+            vec![0, 1]
+        );
+        assert!(tools_llama_server_receives(&tools, Some(&json!("none"))).is_empty());
+        let named = json!({"type": "function", "function": {"name": "g"}});
+        assert_eq!(tools_llama_server_receives(&tools, Some(&named)), vec![1]);
     }
 
     #[test]
