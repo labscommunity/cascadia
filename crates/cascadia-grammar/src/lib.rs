@@ -219,6 +219,12 @@ impl GrammarFactory {
                 // are generated in the order the client listed them.
                 let mut schema: serde_json::Value =
                     serde_json::from_str(&spec.body).map_err(invalid_schema)?;
+                if int_bounds::has_integer_llguidance_cannot_build(&schema) {
+                    return Err(invalid_schema(
+                        "a number at or below -9223372036854775808 (a `const` or `enum` \
+                         value, or an upper bound) is not supported",
+                    ));
+                }
                 let obj = schema
                     .as_object_mut()
                     .ok_or_else(|| invalid_schema("must be a JSON object"))?;

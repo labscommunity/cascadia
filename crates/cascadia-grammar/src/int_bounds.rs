@@ -111,6 +111,47 @@ pub(crate) fn clamp_for_llguidance(schema: &mut Value) {
     });
 }
 
+/// Whether `schema` has a number llguidance's build can't take: a `const`
+/// or `enum` number, or a `maximum`/`exclusiveMaximum`, at or below -2^63
+/// as an f64 (a `number` one too: an `allOf` or a type list can make it an
+/// integer's). llguidance saturates integer bounds to `i64`, and building a
+/// range whose upper end is `i64::MIN` negates it and recurses until the
+/// build thread's stack overflows, aborting the process. Data keywords
+/// (`default`, `examples`) are not read.
+pub(crate) fn has_integer_llguidance_cannot_build(schema: &Value) -> bool {
+    fn at_or_below_min(v: &Value) -> bool {
+        match v {
+            Value::Number(n) => n.as_f64().is_some_and(|f| f <= I64_MIN_F64),
+            Value::Array(items) => items.iter().any(at_or_below_min),
+            Value::Object(obj) => obj.values().any(at_or_below_min),
+            _ => false,
+        }
+    }
+    fn scan(v: &Value, is_name_map: bool) -> bool {
+        match v {
+            Value::Object(obj) => obj.iter().any(|(k, child)| {
+                if is_name_map {
+                    return scan(child, false);
+                }
+                match k.as_str() {
+                    "const" | "enum" => at_or_below_min(child),
+                    "maximum" | "exclusiveMaximum" => {
+                        child.as_f64().is_some_and(|m| m <= I64_MIN_F64)
+                    }
+                    "default" | "examples" | "x-guidance" => false,
+                    k => scan(child, NAME_MAPS.contains(&k) && child.is_object()),
+                }
+            }),
+            Value::Array(items) => items.iter().any(|c| scan(c, false)),
+            _ => false,
+        }
+    }
+    scan(schema, false)
+}
+
+/// `i64::MIN` as an f64: -2^63.
+const I64_MIN_F64: f64 = i64::MIN as f64;
+
 /// The tighter of `minimum` and `exclusiveMinimum`, if either is a number.
 fn lower_bound(obj: &Map<String, Value>) -> Option<f64> {
     let get = |k: &str| obj.get(k).and_then(Value::as_f64);
@@ -318,6 +359,26 @@ mod tests {
     }
 
     #[test]
+    fn an_integer_at_or_below_i64_min_is_found_where_llguidance_builds_it() {
+        let low = |v: Value| has_integer_llguidance_cannot_build(&v);
+        assert!(low(
+            json!({"anyOf": [{"type": "integer", "const": i64::MIN}]})
+        ));
+        assert!(low(
+            json!({"properties": {"a": {"enum": [[{"x": i64::MIN}]]}}})
+        ));
+        assert!(low(json!({"items": {"exclusiveMaximum": -1e19}})));
+        // -2^63 + 1024 is the first i64 above -2^63 as an f64.
+        assert!(!low(json!({"const": -9223372036854774784i64})));
+        assert!(!low(json!({"examples": [i64::MIN], "default": i64::MIN})));
+        assert!(!low(
+            json!({"properties": {"const": {"type": "integer"}, "maximum": {}}})
+        ));
+        assert!(low(json!({"allOf": [{"const": -1e19}]})));
+        assert!(!low(json!({"const": -1e18})));
+    }
+
+    #[test]
     fn a_lower_bound_llguidance_cannot_build_is_raised() {
         let floor = LLGUIDANCE_MIN_INTEGER;
         let mut v = json!({"type": "integer", "minimum": i64::MIN, "maximum": i64::MAX});
@@ -332,7 +393,8 @@ mod tests {
             v,
             json!({"type": ["integer", "null"], "exclusiveMinimum": floor})
         );
-        // Nothing would be left: left for llguidance to refuse.
+        // Nothing would be left: not raised (the build refuses an upper
+        // bound this low; see `has_integer_llguidance_cannot_build`).
         let mut v = json!({"type": "integer", "minimum": -1e20, "maximum": -1e19});
         clamp_for_llguidance(&mut v);
         assert_eq!(

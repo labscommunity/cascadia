@@ -1319,6 +1319,46 @@ fn a_non_negative_integer_admits_i64_max_but_not_past_it() {
 }
 
 #[test]
+fn an_integer_ending_at_or_below_i64_min_is_refused_not_built() {
+    // llguidance reads integer bounds as f64 and saturates them to i64; a
+    // range whose upper end lands on i64::MIN negates it, overflows, and
+    // recurses until the build thread's stack runs out, which aborts the
+    // process. Such a schema is a 400.
+    let gf = single_byte();
+    for n in [
+        r#"{"type":"integer","const":-9223372036854775808}"#,
+        r#"{"type":"integer","enum":[1,-9223372036854775808]}"#,
+        r#"{"const":-9223372036854775808}"#,
+        r#"{"const":[1,{"b":-9223372036854775807}]}"#,
+        r#"{"type":"integer","minimum":-1e20,"maximum":-1e19}"#,
+        r#"{"type":"integer","allOf":[{"minimum":-1e20},{"exclusiveMaximum":-9223372036854775808}]}"#,
+        r#"{"type":"integer","allOf":[{"const":-9223372036854775807}]}"#,
+        r#"{"type":"integer","const":-9.3e18}"#,
+        r#"{"type":"integer","allOf":[{"enum":[-1e19]}]}"#,
+    ] {
+        let err = gf
+            .compile(&spec(&with_n(n)))
+            .err()
+            .unwrap_or_else(|| panic!("{n}"));
+        assert!(
+            err.to_string()
+                .contains("a number at or below -9223372036854775808"),
+            "{n}: {err}"
+        );
+    }
+    // Data, a property named like a keyword, and a value above it are fine.
+    for n in [
+        r#"{"type":"integer","default":-9223372036854775808}"#,
+        r#"{"type":"number","const":-1e18}"#,
+        r#"{"type":"object","properties":{"maximum":{"type":"integer"},"const":{"type":"string"}}}"#,
+        r#"{"type":"integer","const":-9223372036854774784}"#,
+    ] {
+        gf.compile(&spec(&with_n(n)))
+            .unwrap_or_else(|e| panic!("{n}: {e}"));
+    }
+}
+
+#[test]
 fn a_schema_with_too_many_integers_to_bound_builds_unbounded() {
     // Each bounded integer is a range regex of its own; 600 of them pass
     // llguidance's lexer budget, which the schema as written stays inside.

@@ -593,7 +593,10 @@ The llguidance engines (`ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`,
   (several hundred) is built without the added bounds, and logged
   (`integer length not bounded`). `number` is not bounded. A lower bound at or below -2^63 (C#'s `long.MinValue`, and the
   added minimum), which llguidance can't build, is raised to
-  -9223372036854774784.
+  -9223372036854774784. A schema with a number at or below -2^63 as a
+  `const` or `enum` value or an upper bound is a 400 (`a number at or
+  below -9223372036854775808 ... is not supported`): llguidance's build
+  can't take it.
 - Compile the schema when the request is submitted: a schema llguidance
   cannot build (for example `{"type": 42}` or an unresolvable `$ref`) is a
   400 before the request queues. A client's own top-level `x-guidance`
