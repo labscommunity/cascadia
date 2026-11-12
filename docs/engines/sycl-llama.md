@@ -372,6 +372,13 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   also sends its tool-call constraint, which the bridge forwards as a
   `json_schema` `response_format`; llama-server's grammar then enforces it
   (see [CLI.md § Tool calling](../CLI.md#tool-calling-tools-tool_choice)).
+  The API builds that constraint from the tools' `parameters` with their
+  refs inlined exactly as they are sent (a recursive tool's refs point at
+  the same `__cascadia_t<i>r<N>x` copies the tool is sent with), so the
+  bridge sends it as built; a client ref still in it is inlined like a
+  `response_format` schema's, and one that can't be is dropped rather than
+  refused (`unsupported_ref`, or `too_complex` when it is over the inlining
+  limits).
   If llama-server refuses that schema with a 4xx naming the grammar or
   schema, the bridge sends the request again once without it and answers
   unconstrained (counted as `schema_rejected`). Tools whose `parameters`

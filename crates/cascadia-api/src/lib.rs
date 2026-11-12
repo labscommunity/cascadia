@@ -3092,13 +3092,15 @@ async fn chat_completions(
             .then(|| grammar_for(&response_format))
             .flatten()
             .map(|g| g.body);
-        // A pointer-only engine's backend reads any other ref as "any".
-        // `tool_grammar` refuses those it sees, but a `#/$defs/A/...`
-        // pointer can lead into instance data holding one: run the same
-        // check `response_format` gets and, the grammar being best-effort,
-        // drop it rather than answer 400.
-        tool_grammar(&policy, format.as_deref()).filter(|spec| {
-            if state.ref_resolver == RefResolver::Full {
+        // On sycl-llama the grammar is built from the parameters inlined
+        // as the engine sends them (`tool_grammar_for`): no client ref is
+        // left to check. On ov-genai the backend reads any ref but `#` and
+        // `#/...` as "any". `tool_grammar` refuses those it sees, but a
+        // `#/$defs/A/...` pointer can lead into instance data holding one:
+        // run the same check `response_format` gets and, the grammar being
+        // best-effort, drop it rather than answer 400.
+        tools::tool_grammar_for(&policy, format.as_deref(), state.ref_resolver).filter(|spec| {
+            if state.ref_resolver != RefResolver::Xgrammar {
                 return true;
             }
             let checked = serde_json::from_str::<serde_json::Value>(&spec.body)
@@ -11068,20 +11070,73 @@ level={{ effort_map[eff] }}";
         }
     }
 
-    /// On ov-genai, which enforces only `#` and `#/...` refs, a forced tool
-    /// whose parameters hold any other `$ref` gets no call grammar: the turn
-    /// runs unconstrained (200), counted as `unsupported_ref`. sycl-llama
-    /// sends every tool llama-server receives with its refs inlined, and
-    /// one it can't inline is a 400 naming the tool. The same schema as a
-    /// strict `response_format` is a 400 on both.
-    #[tokio::test]
-    async fn a_forced_tool_with_a_non_pointer_ref_runs_unconstrained_on_pointer_only_engines() {
-        use cascadia_metrics::UnenforcedReason;
-        let unenforced = |r: UnenforcedReason| {
-            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
-                .with_label_values(&[r.as_str()])
-                .get()
+    /// The `CONSTRAINT_UNENFORCED_TOTAL` count for `r`.
+    fn unenforced_total(r: cascadia_metrics::UnenforcedReason) -> u64 {
+        cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+            .with_label_values(&[r.as_str()])
+            .get()
+    }
+
+    /// A forced call to `tools` under `choice` on an app with `refs`: the
+    /// status, the reply and the grammar the engine was given.
+    async fn post_forced(
+        refs: RefResolver,
+        tools: Value,
+        choice: Value,
+    ) -> (StatusCode, Value, Option<cascadia_types::GrammarSpec>) {
+        let cfg = Config {
+            ref_resolver: refs,
+            ..Config::default()
         };
+        let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+        let (status, v) = post_chat(
+            app,
+            tool_body(tools, serde_json::json!({"tool_choice": choice})),
+        )
+        .await;
+        let grammar = seen.lock().unwrap().last().and_then(|t| t.grammar.clone());
+        (status, v, grammar)
+    }
+
+    /// The `parameters` schema of a forced call grammar's only call shape.
+    fn call_parameters(grammar: &cascadia_types::GrammarSpec) -> (Value, Value) {
+        let body: Value = serde_json::from_str(&grammar.body).unwrap();
+        let items = body["items"]["anyOf"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{body}");
+        (items[0]["properties"]["parameters"].clone(), body)
+    }
+
+    /// `schema` as sycl-llama sends it as tool `i`'s `parameters`
+    /// (`cascadia_grammar::inline_refs`), split into the schema without its
+    /// hoisted copies and the copies; `type` defaults to `object` as in
+    /// the call grammar.
+    fn inlined_tool_parameters(
+        schema: &Value,
+        i: usize,
+    ) -> (Value, serde_json::Map<String, Value>) {
+        let mut inlined = cascadia_grammar::inline_refs(schema, &format!("t{i}"), true)
+            .unwrap()
+            .schema;
+        let o = inlined.as_object_mut().unwrap();
+        let copies = match o.shift_remove("$defs") {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        o.entry("type").or_insert_with(|| "object".into());
+        (inlined, copies)
+    }
+
+    /// On ov-genai, whose backend reads a `$ref` other than `#` and
+    /// `#/...` as "any", a forced tool holding one gets no call grammar:
+    /// the turn runs unconstrained (200), counted as `unsupported_ref`. On
+    /// sycl-llama every tool llama-server receives is sent with its refs
+    /// inlined, and one that can't be is a 400 naming the tool, as for any
+    /// tool there. The same schema as a strict `response_format` is a 400
+    /// on both.
+    #[tokio::test]
+    async fn a_forced_tool_with_a_non_pointer_ref_runs_unconstrained_on_ov_genai_and_is_400_on_sycl_llama(
+    ) {
+        use cascadia_metrics::UnenforcedReason;
         let schemas = [
             serde_json::json!({"$id": "urn:x", "type": "object", "properties": {"n": {"$ref": "urn:z"}}, "required": ["n"]}),
             serde_json::json!({"type": "object", "properties": {"n": {"$ref": "https://example.com/t.json"}}, "required": ["n"]}),
@@ -11091,42 +11146,28 @@ level={{ effort_map[eff] }}";
             }),
         ];
         for schema in &schemas {
-            for refs in [RefResolver::Xgrammar, SYCL] {
-                let cfg = Config {
-                    ref_resolver: refs,
-                    ..Config::default()
-                };
-                let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
-                let tool = serde_json::json!({"type": "function", "function": {
-                    "name": "get_weather", "parameters": schema.clone()
-                }});
-                let before = unenforced(UnenforcedReason::UnsupportedRef);
-                let (status, v) = post_chat(
-                    app,
-                    tool_body(
-                        serde_json::json!([tool]),
-                        serde_json::json!({"tool_choice": "required"}),
-                    ),
-                )
-                .await;
-                if refs == SYCL {
-                    assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
-                    assert!(
-                        v["error"]
-                            .as_str()
-                            .unwrap()
-                            .starts_with("invalid tools: tools[0].function.parameters: $ref "),
-                        "{v}"
-                    );
-                } else {
-                    assert_eq!(status, StatusCode::OK, "{refs:?} {schema}: {v}");
-                    assert_eq!(last_task(&seen).grammar, None, "{refs:?} {schema}");
-                    assert!(
-                        unenforced(UnenforcedReason::UnsupportedRef) > before,
-                        "{refs:?} {schema}"
-                    );
-                }
+            let tools = serde_json::json!([{"type": "function", "function": {
+                "name": "get_weather", "parameters": schema.clone()
+            }}]);
+            let before = unenforced_total(UnenforcedReason::UnsupportedRef);
+            let (status, v, grammar) =
+                post_forced(RefResolver::Xgrammar, tools.clone(), "required".into()).await;
+            assert_eq!(status, StatusCode::OK, "{schema}: {v}");
+            assert_eq!(grammar, None, "{schema}");
+            assert!(
+                unenforced_total(UnenforcedReason::UnsupportedRef) > before,
+                "{schema}"
+            );
 
+            let (status, v, _) = post_forced(SYCL, tools, "required".into()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+            let err = v["error"].as_str().unwrap();
+            assert!(
+                err.starts_with("invalid tools: tools[0].function.parameters: $ref "),
+                "{err}"
+            );
+
+            for refs in [RefResolver::Xgrammar, SYCL] {
                 let (status, v) = post_chat(
                     so_app_refs(refs).await,
                     chat_with(Some(json_schema_format(schema.clone()))),
@@ -11143,14 +11184,19 @@ level={{ effort_map[eff] }}";
         }
     }
 
-    /// Two `#/$defs/...` refs whose names llama-server folds into one
-    /// grammar rule (`a_b`, `a-b`) would get one shape there. sycl-llama
-    /// inlines every ref before llama-server sees it, so a forced tool
-    /// holding them keeps its call grammar (200), as on engines that
-    /// resolve refs in full.
+    /// On sycl-llama a forced tool whose refs can be inlined gets its call
+    /// grammar, built from the very `parameters` llama-server is sent (refs
+    /// inlined by `cascadia_grammar::inline_refs`, under the tool's own
+    /// index): no ref is left for llama-server to resolve, so refs whose
+    /// rule names it would fold together (`a_b`, `a-b`) or a pointer
+    /// outside `$defs` keep their shapes. A named choice inlines only the
+    /// named tool; another tool's ref is not checked. Engines that resolve
+    /// refs in full keep the grammar as before (none for a pointer outside
+    /// `$defs`, which that grammar can't move).
     #[tokio::test]
-    async fn a_forced_tool_whose_llama_rule_names_collide_keeps_its_grammar_on_sycl_llama() {
-        let schema = serde_json::json!({
+    async fn a_forced_tool_with_inlinable_refs_gets_a_grammar_from_its_inlined_parameters_on_sycl_llama(
+    ) {
+        let collide = serde_json::json!({
             "$defs": {
                 "a_b": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]},
                 "a-b": {"type": "object", "properties": {"s": {"type": "string"}}, "required": ["s"]},
@@ -11159,44 +11205,75 @@ level={{ effort_map[eff] }}";
             "properties": {"x": {"$ref": "#/$defs/a_b"}, "y": {"$ref": "#/$defs/a-b"}},
             "required": ["x", "y"],
         });
-        let tool = serde_json::json!({"type": "function", "function": {
-            "name": "get_weather", "parameters": schema
-        }});
-        for refs in [SYCL, RefResolver::Full] {
-            let cfg = Config {
-                ref_resolver: refs,
-                ..Config::default()
-            };
-            let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
-            let (status, v) = post_chat(
-                app,
-                tool_body(
-                    serde_json::json!([tool.clone()]),
-                    serde_json::json!({"tool_choice": "required"}),
-                ),
+        let chain = serde_json::json!({
+            "$defs": {"A": {"type": "array", "items": {"$ref": "#/$defs/B"}}, "B": {"enum": ["u", "v"]}},
+            "properties": {"a": {"$ref": "#/$defs/A", "description": "letters"}},
+            "required": ["a"],
+        });
+        let pointer = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer", "minimum": 2}, "b": {"$ref": "#/properties/a"}},
+            "required": ["a", "b"],
+        });
+        let tool = |name: &str, params: &Value| serde_json::json!({"type": "function", "function": {"name": name, "parameters": params}});
+        let remote =
+            serde_json::json!({"properties": {"r": {"$ref": "https://example.com/r.json"}}});
+        for schema in [&collide, &chain, &pointer] {
+            for refs in [SYCL, SYCL_NO_JINJA] {
+                let (status, v, grammar) = post_forced(
+                    refs,
+                    serde_json::json!([tool("get_weather", schema)]),
+                    "required".into(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{refs:?} {schema}: {v}");
+                let grammar = grammar.unwrap_or_else(|| panic!("{refs:?} {schema}: no grammar"));
+                assert!(!grammar.body.contains("$ref"), "{}", grammar.body);
+                let (params, _) = call_parameters(&grammar);
+                assert_eq!(params, inlined_tool_parameters(schema, 0).0, "{refs:?}");
+            }
+            // Named: only the named tool (index 1) is inlined and checked.
+            let tools = serde_json::json!([tool("f", &remote), tool("get_weather", schema)]);
+            let (status, v, grammar) = post_forced(
+                SYCL,
+                tools,
+                serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
             )
             .await;
-            assert_eq!(status, StatusCode::OK, "{refs:?}: {v}");
-            assert!(last_task(&seen).grammar.is_some(), "{refs:?}");
+            assert_eq!(status, StatusCode::OK, "{schema}: {v}");
+            let grammar = grammar.expect("a call grammar");
+            assert!(!grammar.body.contains("$ref"), "{}", grammar.body);
+            assert_eq!(
+                call_parameters(&grammar).0,
+                inlined_tool_parameters(schema, 1).0
+            );
+
+            let tools = serde_json::json!([tool("get_weather", schema)]);
+            let body = tool_body(
+                tools.clone(),
+                serde_json::json!({"tool_choice": "required"}),
+            );
+            let (status, v, grammar) =
+                post_forced(RefResolver::Full, tools, "required".into()).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            // There the grammar keeps the refs, moved with their `$defs`;
+            // a pointer outside `$defs` is not one it can move.
+            assert_eq!(grammar.is_some(), !std::ptr::eq(schema, &pointer));
+            assert_eq!(grammar, tool_grammar(&policy_of(&body), None), "{schema}");
         }
     }
 
-    /// A forced tool whose `#/$defs/...` ref points into instance data that
-    /// holds a non-pointer `$ref` passes the tool grammar's own ref rewrite
-    /// (the def name is known, data is not walked), but the converter
-    /// follows the pointer and meets the other ref. On ov-genai the grammar
-    /// is dropped: 200, unconstrained, `unsupported_ref` +1. On sycl-llama
-    /// the tool can't be inlined: a 400, as for any tool llama-server
-    /// receives. On any other engine the grammar is sent as before.
+    /// A forced tool whose `#/$defs/A/...` pointer leads into instance data
+    /// holding a non-pointer `$ref` passes the tool grammar's own ref
+    /// rewrite (the def name is known, data is not walked), but the
+    /// converter follows the pointer and meets the other ref. On ov-genai
+    /// the grammar is dropped: 200, unconstrained, `unsupported_ref` +1. On
+    /// sycl-llama the tool can't be inlined: a 400, as for any tool there.
+    /// On any other engine the grammar is sent as before.
     #[tokio::test]
-    async fn a_forced_tool_ref_into_data_holding_a_non_pointer_ref_is_dropped_on_pointer_only_engines(
+    async fn a_forced_tool_ref_into_data_holding_a_non_pointer_ref_is_dropped_on_ov_genai_and_400_on_sycl_llama(
     ) {
         use cascadia_metrics::UnenforcedReason;
-        let unenforced = |r: UnenforcedReason| {
-            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
-                .with_label_values(&[r.as_str()])
-                .get()
-        };
         let schema = |inner: &str| {
             serde_json::json!({
                 "type": "object",
@@ -11205,45 +11282,38 @@ level={{ effort_map[eff] }}";
             })
         };
         for schema in [schema("T"), schema("json-schema:///")] {
-            let tool = serde_json::json!({"type": "function", "function": {
+            let tools = serde_json::json!([{"type": "function", "function": {
                 "name": "get_weather", "parameters": schema.clone()
-            }});
+            }}]);
             let body = tool_body(
-                serde_json::json!([tool]),
+                tools.clone(),
                 serde_json::json!({"tool_choice": "required"}),
             );
-            for refs in [RefResolver::Xgrammar, SYCL, RefResolver::Full] {
-                let cfg = Config {
-                    ref_resolver: refs,
-                    ..Config::default()
-                };
-                let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
-                let before = unenforced(UnenforcedReason::UnsupportedRef);
-                let (status, v) = post_chat(app, body.clone()).await;
-                if refs == SYCL {
-                    assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
-                    assert!(
-                        v["error"]
-                            .as_str()
-                            .unwrap()
-                            .starts_with("invalid tools: tools[0].function.parameters: $ref "),
-                        "{v}"
-                    );
-                    continue;
-                }
-                assert_eq!(status, StatusCode::OK, "{schema}: {v}");
-                let grammar = last_task(&seen).grammar;
-                if refs != RefResolver::Full {
-                    assert_eq!(grammar, None, "{refs:?} {schema}");
-                    assert!(
-                        unenforced(UnenforcedReason::UnsupportedRef) > before,
-                        "{schema}"
-                    );
-                } else {
-                    assert_eq!(grammar, tool_grammar(&policy_of(&body), None), "{schema}");
-                    assert!(grammar.is_some(), "{schema}");
-                }
-            }
+            let before = unenforced_total(UnenforcedReason::UnsupportedRef);
+            let (status, v, grammar) =
+                post_forced(RefResolver::Xgrammar, tools.clone(), "required".into()).await;
+            assert_eq!(status, StatusCode::OK, "{schema}: {v}");
+            assert_eq!(grammar, None, "{schema}");
+            assert!(
+                unenforced_total(UnenforcedReason::UnsupportedRef) > before,
+                "{schema}"
+            );
+
+            let (status, v, _) = post_forced(SYCL, tools.clone(), "required".into()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("invalid tools: tools[0].function.parameters: $ref "),
+                "{v}"
+            );
+
+            let (status, v, grammar) =
+                post_forced(RefResolver::Full, tools, "required".into()).await;
+            assert_eq!(status, StatusCode::OK, "{schema}: {v}");
+            assert_eq!(grammar, tool_grammar(&policy_of(&body), None), "{schema}");
+            assert!(grammar.is_some(), "{schema}");
         }
     }
 

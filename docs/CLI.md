@@ -902,7 +902,18 @@ This runs on every engine with structured output: `ov-genai`, `ov-runtime`,
 llama-server as a `json_schema` `response_format`; llama-server's own
 `tool_choice` handling does not force a call). Each tool's `$defs` /
 `definitions` are kept (moved to the root of the combined schema, and its
-`$ref`s rewritten to match).
+`$ref`s rewritten to match). On `sycl-llama` the constraint is built from
+each tool's `parameters` as llama-server is sent them, every `$ref`
+replaced by its target (see the refs paragraph under Structured output),
+and the `response_format` schema beside tools is inlined the same way: the
+constraint holds no ref of the client's, so refs llama-server would give
+the wrong shape (two `$defs` names such as `a_b` and `a-b`, a pointer
+outside `$defs`) are enforced as written. A recursive tool keeps refs only
+to the hoisted copies (`$defs/__cascadia_t<i>r<N>x`) it is sent with, under
+the same names. A forced tool whose refs can't be inlined is a 400 there,
+as for any tool llama-server receives (`invalid tools:
+tools[<i>].function.parameters: …`), and so is a recursive one with
+`--no-jinja`.
 
 A tool whose `parameters` hold a bound pair no value can meet, such as
 `minLength` above `maxLength`, `minItems` above `maxItems`, or an integer
@@ -965,7 +976,7 @@ the process and at debug after; the counter counts every request. Reasons:
 | `schema_rejected` | The backend refused the combined schema (`ov-genai`, the llguidance engines, or llama-server on `sycl-llama`, which is then sent the request again once without it), or `ov-genai --cb` refuses the schema after a failed compile, or (`ov-genai`) xgrammar would reject it. Also counted, once the answer is in, when the constraint was applied without a tool's bound pair no value can meet (see above): the rest is enforced, that pair is not. A request that ends on an error or is cancelled before its final chunk is not counted. |
 | `too_complex` | The combined schema is over the [schema limits](#structured-output-response_format), or took longer than the 2 s build budget (llguidance engines). A schema over the build budget is remembered for 10 minutes (up to 256), so a later turn resending it runs unconstrained at once instead of waiting out the budget again; after that it is built again, in case the machine was only busy. On `ov-genai`, also a schema xgrammar would take too long to compile (the estimate behind that engine's 400 for `response_format`, made again for each request), and a new schema once the pipeline has let its 64 distinct schemas through to GenAI while the 10-minute floor between pipeline rebuilds holds (where a strict schema gets the budget-full 400); a dropped schema is not counted against those 64, nor as a refusal (it raises no budget-full warning). Past the floor, a forced tool's new schema rebuilds the pipeline as a strict one would and then runs constrained on it (unconstrained if the requests queued without `--cb`, which count against the new budget, fill it already). With `--cb` and requests in flight (a rebuild would need a drain) it is dropped instead and runs unconstrained at once, starting no drain; a strict schema there still starts it. During a drain another request started, it gets the drain's retryable 503 like any request. On the llguidance engines, also a grammar that fails while the answer is generated (a token or a mask runs past the parser's limits, such as an object with hundreds of optional properties): the constraint is dropped there and the rest of the answer is generated unconstrained, keeping what was already produced. On `sycl-llama`, also a constraint whose grammar cost, added to the tools' own (see below), is over llama.cpp's grammar cost limit. |
 | `busy` | The llguidance engines' schema check had no free slot. A tool constraint does not wait for one, so it never delays a `response_format` request queued for a slot. |
-| `unsupported_ref` | A tool schema (or the `response_format` schema beside it) has a `$ref` that can't be kept once nested: anything other than `#` or `#/$defs/…` / `#/definitions/…` naming its own definitions, or a `$ref` beside a nested `$id`. |
+| `unsupported_ref` | A tool schema (or the `response_format` schema beside it) has a `$ref` that can't be kept once nested: anything other than `#` or `#/$defs/…` / `#/definitions/…` naming its own definitions, or a `$ref` beside a nested `$id`. On `sycl-llama`, where schemas are inlined instead (see above), only a `response_format` schema beside callable tools whose refs can't be inlined (it is not sent on its own, so it is not a 400); a tool's are a 400. |
 | `no_tokenizer` | A llguidance engine could not build its grammar factory from the model's tokenizer. |
 | `stage_unsupported` | A later pipeline stage can't apply token masks (see below). |
 

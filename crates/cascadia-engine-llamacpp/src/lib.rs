@@ -1757,6 +1757,76 @@ fn inlined_schema(
         .map_err(|e| EngineError::InvalidConfig(format!("response_format json_schema: {e}")))
 }
 
+/// The tool-call grammar `body` (best-effort) as llama-server is sent it.
+/// On sycl-llama the API builds it from the tools' `parameters` inlined as
+/// [`inline_tool_parameters`] inlines them, so its only refs point at their
+/// hoisted copies, under the names and with the targets the tools are sent
+/// with: it is sent as built. A client ref in it is inlined as in a
+/// `response_format` schema; what can't be is the error, for the caller to
+/// drop the grammar rather than refuse the task.
+fn call_grammar_body(
+    body: &str,
+    no_jinja: bool,
+    budget: &mut cascadia_grammar::Budget,
+) -> Result<String, cascadia_grammar::InlineError> {
+    // Not JSON: `parse_grammar_body` refuses it.
+    let Ok(schema) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Ok(body.to_owned());
+    };
+    if only_hoisted_copy_refs(&schema) {
+        return Ok(body.to_owned());
+    }
+    cascadia_grammar::inline_refs_with(&schema, "", !no_jinja, budget).map(|i| i.schema.to_string())
+}
+
+/// Whether every `$ref` in `schema` (none at all included) points at a
+/// hoisted copy in its root `$defs` (`#/$defs/__cascadia_...`).
+fn only_hoisted_copy_refs(schema: &serde_json::Value) -> bool {
+    let mut stack = vec![schema];
+    while let Some(v) = stack.pop() {
+        match v {
+            serde_json::Value::Object(o) => {
+                if let Some(r) = o.get("$ref") {
+                    let copy = r
+                        .as_str()
+                        .and_then(|r| r.strip_prefix("#/$defs/"))
+                        .filter(|name| name.starts_with(cascadia_grammar::RESERVED_PREFIX))
+                        .and_then(|name| schema.get("$defs").and_then(|d| d.get(name)));
+                    if copy.is_none() {
+                        return false;
+                    }
+                }
+                stack.extend(o.values());
+            }
+            serde_json::Value::Array(a) => stack.extend(a),
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Drops `task`'s best-effort grammar that can't be sent inlined (`e`),
+/// logging and counting it (`too_complex` over the inlining limits,
+/// `unsupported_ref` otherwise); the drop is recorded on the task.
+fn drop_uninlinable_grammar(task: &mut GenerationTask, e: &cascadia_grammar::InlineError) {
+    if !task.drop_best_effort_grammar() {
+        return;
+    }
+    let reason = match e {
+        cascadia_grammar::InlineError::TooBig | cascadia_grammar::InlineError::TooDeep => {
+            UnenforcedReason::TooComplex
+        }
+        _ => UnenforcedReason::UnsupportedRef,
+    };
+    tracing::warn!(
+        task = %task.task_id,
+        reason = reason.as_str(),
+        error = %e,
+        "output constraint not enforced (its refs can't be inlined for llama-server); answering unconstrained"
+    );
+    count_constraint_unenforced(reason);
+}
+
 /// Each tool's `parameters` in `tools` (OpenAI wire form) that llama-server
 /// receives under `tool_choice`, with its `$ref`s inlined like a
 /// `response_format` schema's, charging the same `budget`;
@@ -2118,8 +2188,21 @@ impl Engine for LlamaCppEngine {
             }
             _ => 0,
         };
+        let mut uninlinable = None;
         if let Some(g) = &mut task.grammar {
-            g.body = inlined_schema(&g.body, no_jinja, &mut budget)?;
+            if g.best_effort {
+                match call_grammar_body(&g.body, no_jinja, &mut budget) {
+                    Ok(body) => g.body = body,
+                    Err(e) => uninlinable = Some(e),
+                }
+            } else {
+                g.body = inlined_schema(&g.body, no_jinja, &mut budget)?;
+            }
+        }
+        if let Some(e) = uninlinable {
+            drop_uninlinable_grammar(&mut task, &e);
+        }
+        if let Some(g) = &mut task.grammar {
             let schema = parse_grammar_body(&g.body)?;
             // llama-server may build its tool-call grammar and this one in
             // the same request, so they are priced together.

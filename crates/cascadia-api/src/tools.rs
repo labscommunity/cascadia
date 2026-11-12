@@ -651,14 +651,43 @@ fn empty_parameters() -> Value {
 /// `response_format` refuses it with a 400. One that relaxing leaves (split
 /// across `allOf` members, or under `not`/`if`) in a tool the grammar
 /// would cover gives `None`, logged and counted as a rejected schema.
+///
+/// This is the grammar for an engine whose backend resolves the refs
+/// itself; [`tool_grammar_for`] builds the one for the engine's
+/// [`crate::RefResolver`].
 pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<GrammarSpec> {
+    tool_grammar_for(policy, format_schema, crate::RefResolver::Full)
+}
+
+/// [`tool_grammar`] for an engine whose backend resolves refs as `refs`
+/// says. On sycl-llama ([`crate::RefResolver::LlamaServer`]) llama-server
+/// is never sent a client's `$ref`: the engine sends each tool's
+/// `parameters` with its refs inlined (`cascadia_grammar::inline_refs`,
+/// hoisted copies named after the tool's index). The call grammar is built
+/// from those same inlined `parameters`, and the format schema is inlined
+/// as the engine inlines a `response_format` schema, so the grammar holds
+/// no ref but those to hoisted copies, which are the tool's own (one table
+/// of refs in llama-server holds both). One that can't be inlined gives
+/// `None`, counted as `unsupported_ref` (`too_complex` when it is over the
+/// inlining limits).
+pub fn tool_grammar_for(
+    policy: &ToolPolicy,
+    format_schema: Option<&str>,
+    refs: crate::RefResolver,
+) -> Option<GrammarSpec> {
     // Under a forced choice the format is moot: the answer is the call.
     let format_schema = match (policy.forced(), format_schema) {
         (true, _) => None,
         (false, Some(format)) if policy.callable() => Some(format),
         (false, _) => return None,
     };
-    match tool_schema(policy, format_schema) {
+    let inline = match refs {
+        crate::RefResolver::LlamaServer { no_jinja } => Some(Inline {
+            allow_hoisting: !no_jinja,
+        }),
+        _ => None,
+    };
+    match tool_schema(policy, format_schema, inline) {
         Ok(body) => body.map(GrammarSpec::best_effort_json_schema),
         Err(reason) => {
             tracing::warn!(
@@ -671,17 +700,49 @@ pub fn tool_grammar(policy: &ToolPolicy, format_schema: Option<&str>) -> Option<
     }
 }
 
+/// How [`tool_schema`] inlines refs for llama-server (see
+/// [`tool_grammar_for`]).
+#[derive(Clone, Copy)]
+struct Inline {
+    /// A recursive schema may be sent with hoisted copies (`--jinja`).
+    allow_hoisting: bool,
+}
+
+impl Inline {
+    /// `schema` as the sycl-llama engine sends it under `prefix` (`t<i>`
+    /// for tool `i`, empty for a `response_format` schema).
+    fn apply(self, schema: Value, prefix: &str) -> Result<Value, UnenforcedReason> {
+        if !cascadia_grammar::has_ref(&schema) {
+            return Ok(schema);
+        }
+        cascadia_grammar::inline_refs(&schema, prefix, self.allow_hoisting)
+            .map(|inlined| inlined.schema)
+            .map_err(|e| {
+                tracing::debug!(error = %e, "tool grammar schema can't be inlined for llama-server");
+                match e {
+                    cascadia_grammar::InlineError::TooBig
+                    | cascadia_grammar::InlineError::TooDeep => UnenforcedReason::TooComplex,
+                    _ => UnenforcedReason::UnsupportedRef,
+                }
+            })
+    }
+}
+
 /// The text of [`tool_grammar`]'s schema; `Ok(None)` when no tool has a
 /// name to call.
 fn tool_schema(
     policy: &ToolPolicy,
     format_schema: Option<&str>,
+    inline: Option<Inline>,
 ) -> Result<Option<String>, UnenforcedReason> {
     let named = match &policy.mode {
         ToolMode::Named(name) => Some(name.as_str()),
         _ => None,
     };
-    let mut hoisted = Hoisted::default();
+    let mut hoisted = Hoisted {
+        keep_reserved: inline.is_some(),
+        ..Hoisted::default()
+    };
     let mut items = Vec::new();
     for (i, tool) in policy.tools.iter().enumerate() {
         let Some(name) = tool.function.get("name").and_then(Value::as_str) else {
@@ -706,10 +767,14 @@ fn tool_schema(
                     );
                     return Err(UnenforcedReason::SchemaRejected);
                 }
+                // On sycl-llama, the parameters as the engine sends them.
+                let mut p = match inline {
+                    Some(inline) => inline.apply(p.clone(), &format!("t{i}"))?,
+                    None => p.clone(),
+                };
                 // A call's `parameters` is an object: say so in the
                 // grammar's copy of a schema that names no type (the
                 // prompt shows the tool as sent).
-                let mut p = p.clone();
                 if let Value::Object(schema) = &mut p {
                     schema
                         .entry("type")
@@ -747,6 +812,10 @@ fn tool_schema(
             // The format schema was parsed once already; it can't fail here.
             let format: Value =
                 serde_json::from_str(text).map_err(|_| UnenforcedReason::SchemaRejected)?;
+            let format = match inline {
+                Some(inline) => inline.apply(format, "")?,
+                None => format,
+            };
             let format = hoisted.take(format, "rf_")?;
             let mut root = Map::new();
             root.insert("anyOf".into(), json!([Value::Object(calls), format]));
@@ -773,6 +842,12 @@ fn tool_schema(
 struct Hoisted {
     defs: Map<String, Value>,
     definitions: Map<String, Value>,
+    /// Schemas were inlined for llama-server: a `$defs` entry named with
+    /// [`cascadia_grammar::RESERVED_PREFIX`] is a hoisted copy whose name
+    /// already says where it is from, and the engine sends the same copy
+    /// under that name with the tool. It moves unrenamed, and refs to it
+    /// are kept.
+    keep_reserved: bool,
 }
 
 impl Hoisted {
@@ -783,6 +858,7 @@ impl Hoisted {
         let Value::Object(mut root) = schema else {
             return Ok(schema);
         };
+        let keep_reserved = self.keep_reserved;
         let own = |root: &Map<String, Value>, key: &str| -> HashSet<String> {
             match root.get(key) {
                 Some(Value::Object(m)) => m.keys().cloned().collect(),
@@ -801,7 +877,9 @@ impl Hoisted {
             nested_id |= obj.shift_remove("$id").is_some();
             if let Some(Value::String(r)) = obj.get_mut("$ref") {
                 has_ref = true;
-                *r = rewrite_ref(r, prefix, &names, &mut self_ref)?;
+                if !(keep_reserved && is_hoisted_copy_ref(r)) {
+                    *r = rewrite_ref(r, prefix, &names, &mut self_ref)?;
+                }
             }
             Ok(())
         })?;
@@ -820,7 +898,17 @@ impl Hoisted {
             }
             if let Some(Value::Object(defs)) = root.shift_remove(key) {
                 for (name, def) in defs {
-                    into.insert(format!("{prefix}{name}"), def);
+                    let kept = keep_reserved
+                        && key == "$defs"
+                        && name.starts_with(cascadia_grammar::RESERVED_PREFIX);
+                    into.insert(
+                        if kept {
+                            name
+                        } else {
+                            format!("{prefix}{name}")
+                        },
+                        def,
+                    );
                 }
             }
         }
@@ -835,6 +923,13 @@ impl Hoisted {
         self.defs.insert(name.clone(), Value::Object(root));
         Ok(json!({"$ref": format!("#/$defs/{name}")}))
     }
+}
+
+/// Whether `r` points at a hoisted copy `cascadia_grammar::inline_refs`
+/// made (`#/$defs/__cascadia_...`).
+fn is_hoisted_copy_ref(r: &str) -> bool {
+    r.strip_prefix("#/$defs/")
+        .is_some_and(|name| name.starts_with(cascadia_grammar::RESERVED_PREFIX))
 }
 
 /// `r` as it reads once its schema is nested and its definitions are moved
@@ -1804,11 +1899,14 @@ mod tests {
         assert!(p.relaxed.is_empty());
         // `tool_schema`, not `tool_grammar`: the latter counts
         // `schema_rejected`, which other tests assert exactly.
-        assert_eq!(tool_schema(&p, None), Err(UnenforcedReason::SchemaRejected));
+        assert_eq!(
+            tool_schema(&p, None, None),
+            Err(UnenforcedReason::SchemaRejected)
+        );
         // Beside a JSON format under auto, too.
         let p = pol(t.clone(), None, None);
         assert_eq!(
-            tool_schema(&p, Some(JSON_OBJECT_SCHEMA)),
+            tool_schema(&p, Some(JSON_OBJECT_SCHEMA), None),
             Err(UnenforcedReason::SchemaRejected)
         );
         // Left out by a named choice or allowed_tools: not checked.
