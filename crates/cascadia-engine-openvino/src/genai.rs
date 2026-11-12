@@ -23,7 +23,7 @@ use cascadia_engine::{
 };
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
-    GenConfig, GenResult, LlmPipeline, PluginConfig, PollAction,
+    GenConfig, GenResult, LlmPipeline, PluginConfig, PollAction, PollFn, PollReply, PollWrite,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
@@ -412,7 +412,8 @@ trait StatefulPipe: Send {
         prompt: &str,
         cfg: &GenConfig,
         tail_tokens: usize,
-        poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
+        stream_text: bool,
+        poll: &mut PollFn<'_>,
     ) -> Result<GenResult, OvError>;
 }
 
@@ -428,9 +429,10 @@ impl StatefulPipe for LlmPipeline {
         prompt: &str,
         cfg: &GenConfig,
         tail_tokens: usize,
-        poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
+        stream_text: bool,
+        poll: &mut PollFn<'_>,
     ) -> Result<GenResult, OvError> {
-        LlmPipeline::generate_polled(self, prompt, cfg, tail_tokens, poll)
+        LlmPipeline::generate_polled(self, prompt, cfg, tail_tokens, stream_text, poll)
     }
 }
 
@@ -628,7 +630,7 @@ impl Engine for OvGenaiEngine {
             // the shim polls once more at the end (n_tokens 0), and that call
             // must not decide again.
             let mut ended: Option<PollAction> = None;
-            let mut poll = |tail: &str, n_tokens: usize| -> PollAction {
+            let mut decide = |tail: &str, n_tokens: usize| -> PollAction {
                 if probe_thread {
                     probe_thread = false;
                     threaded_streamer = Some(std::thread::current().id() != step_thread);
@@ -652,8 +654,9 @@ impl Engine for OvGenaiEngine {
                 }
                 PollAction::Running
             };
+            let mut poll = |w: PollWrite<'_>| PollReply::from(decide(w.tail, w.n_tokens));
             self.pipe
-                .generate_polled(&task.prompt, &cfg, tail_tokens, &mut poll)
+                .generate_polled(&task.prompt, &cfg, tail_tokens, false, &mut poll)
         };
         if let Some(threaded_streamer) = threaded_streamer {
             self.streamer_thread_logged = true;
@@ -2043,6 +2046,11 @@ mod tests {
         pieces: Vec<(String, usize)>,
         /// The `tail_tokens` of every generate_polled call.
         tail_tokens: Vec<usize>,
+        /// The `stream_text` of every generate_polled call.
+        stream_text: Vec<bool>,
+        /// Every poll call's (window, window_from); empty and 0 here, as the
+        /// shim passes without `stream_text`.
+        windows: Vec<(Vec<u8>, usize)>,
         /// Panic in count_tokens (a panic inside step, after begin).
         count_panics: bool,
         /// Before piece i is polled, cancel the running task through this
@@ -2088,6 +2096,7 @@ mod tests {
             Ok(GenResult {
                 text: "warm".into(),
                 generated_tokens: 1,
+                ttft_ms: None,
             })
         }
         fn generate_polled(
@@ -2095,16 +2104,30 @@ mod tests {
             prompt: &str,
             cfg: &GenConfig,
             tail_tokens: usize,
-            poll: &mut (dyn FnMut(&str, usize) -> PollAction + Send),
+            stream_text: bool,
+            poll: &mut PollFn<'_>,
         ) -> Result<GenResult, OvError> {
+            self.st.lock().unwrap().stream_text.push(stream_text);
+            // The mock streams no window: the closure sees what the shim
+            // passes without `stream_text`.
+            let mut poll = |tail: &str, n_tokens: usize| -> PollAction {
+                self.st.lock().unwrap().windows.push((Vec::new(), 0));
+                poll(PollWrite {
+                    tail,
+                    window: &[],
+                    window_from: 0,
+                    n_tokens,
+                })
+                .action
+            };
             if self.st.lock().unwrap().poll_from_thread {
                 return std::thread::scope(|sc| {
-                    sc.spawn(|| self.run_polled(prompt, cfg, tail_tokens, poll))
+                    sc.spawn(|| self.run_polled(prompt, cfg, tail_tokens, &mut poll))
                         .join()
                         .expect("mock streamer thread")
                 });
             }
-            self.run_polled(prompt, cfg, tail_tokens, poll)
+            self.run_polled(prompt, cfg, tail_tokens, &mut poll)
         }
     }
 
@@ -2196,6 +2219,7 @@ mod tests {
                     return Ok(GenResult {
                         text,
                         generated_tokens: n_total as u32,
+                        ttft_ms: None,
                     });
                 }
             }
@@ -2208,6 +2232,7 @@ mod tests {
             Ok(GenResult {
                 text,
                 generated_tokens: n_total as u32,
+                ttft_ms: None,
             })
         }
     }
@@ -2621,6 +2646,27 @@ mod tests {
             let s = st.lock().unwrap();
             assert_eq!(s.tail_tokens, [0], "{name}");
             assert!(s.polls.iter().all(|p| p.0.is_empty()), "{name}");
+        }
+    }
+
+    /// Without the streaming switch the engine asks the shim for no window:
+    /// every write it sees carries an empty window from id 0, and the answer
+    /// is today's one final chunk.
+    #[test]
+    fn stateful_polls_without_stream_text() {
+        for stops in [vec![], vec!["x"]] {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            st.lock().unwrap().pieces = pieces(&["a", " b", " c"]);
+            let mut e = stateful_engine(&st);
+            e.submit(stop_task("t1", 64, &stops)).unwrap();
+            let out = e.step().unwrap();
+            assert_eq!(out.len(), 1);
+            assert!(out[0].1.is_final);
+            assert_eq!(out[0].1.text, "a b c");
+            let s = st.lock().unwrap();
+            assert_eq!(s.stream_text, [false], "{stops:?}");
+            assert_eq!(s.windows.len(), 4, "{stops:?}");
+            assert!(s.windows.iter().all(|w| w == &(Vec::new(), 0)), "{stops:?}");
         }
     }
 

@@ -123,24 +123,66 @@ int32_t cascadia_pipeline_generate(
 /// Per-token poll for cascadia_pipeline_generate_polled. Called with `n_tokens`,
 /// the number of tokens that write carried (1 for write(int64_t),
 /// tokens.size() for write(vector) on draft / prompt-lookup rounds, 0 for the
-/// end() call), and a text: a fresh decode of the last `tail_tokens` generated
-/// ids (a suffix decode, not an incremental piece; it may start with a
-/// U+FFFD or without a leading space the full decode has). `len` is 0, and
-/// `ptr` not to be read, when `tail_tokens` is 0 and on the end() call.
-/// Returns one of the CASCADIA_POLL_* values; anything else is CANCEL.
-typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len, size_t n_tokens);
+/// end() call), and two texts:
+///
+///   - `tail`: a fresh decode of the last `tail_tokens` generated ids (a
+///     suffix decode, not an incremental piece; it may start with a U+FFFD or
+///     without a leading space the full decode has). `tail_len` is 0, and
+///     `tail` not to be read, when `tail_tokens` is 0 and on the end() call.
+///   - `window` (only with `stream_text`): the raw decode of the generated ids
+///     from index `window_from` to the last one, bytes exactly as the
+///     tokenizer's decode gave them (no lossy step: a trailing incomplete
+///     UTF-8 sequence is passed as is). `window_from` is 0 until the poll
+///     confirms ids (below), then the largest confirmed count; a window that
+///     starts after id 0 has the tail's caveats at its start. Without
+///     `stream_text`, and on the end() call, `window_len` is 0 (`window` not
+///     to be read); without `stream_text` `window_from` is 0.
+///
+/// Returns one of the CASCADIA_POLL_* actions. With `stream_text` the return
+/// may also carry `confirm_upto`, packed:
+///
+///     rc = action | (confirm_upto << CASCADIA_POLL_CONFIRM_SHIFT)
+///
+/// action in the low byte (CASCADIA_POLL_ACTION_MASK), confirm_upto in bits
+/// 8..30 (at most CASCADIA_POLL_CONFIRM_MAX; rc stays non-negative), 0 = no
+/// confirm. confirm_upto is a count of generated ids the caller has emitted
+/// the text of; the streamer starts later windows there, never moving the
+/// start backwards nor past the ids it has. So the plain values 0/1/2 read
+/// the same with and without `stream_text`, and a caller that never confirms
+/// gets every window from id 0 (the full decode so far).
+///
+/// Packed rather than a second call so one poll stays one call: no re-entry
+/// into the streamer from inside its own poll, no handle to hand out, and a
+/// poll that panicked (answered with a bare CANCEL) confirms nothing.
+///
+/// Reading the return: without `stream_text`, 0 RUNNING, 1 STOP, anything
+/// else CANCEL (exactly as before the option existed). With it, a negative rc
+/// or an action byte other than 0/1 is CANCEL.
+typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* tail, size_t tail_len,
+                                    const char* window, size_t window_len,
+                                    size_t window_from, size_t n_tokens);
 
 #define CASCADIA_POLL_RUNNING 0  /* keep generating */
 #define CASCADIA_POLL_STOP 1     /* ov::genai::StreamingStatus::STOP */
 #define CASCADIA_POLL_CANCEL 2   /* ov::genai::StreamingStatus::CANCEL */
+#define CASCADIA_POLL_ACTION_MASK 0xFF      /* stream_text: action byte */
+#define CASCADIA_POLL_CONFIRM_SHIFT 8       /* stream_text: confirm_upto's shift */
+#define CASCADIA_POLL_CONFIRM_MAX 0x7FFFFF  /* stream_text: largest confirm_upto */
 
 /// cascadia_pipeline_generate with a streamer that calls `poll(ctx, ...)` once
 /// per token write (once per round on draft / prompt-lookup pipelines) with a
-/// decode of the last `tail_tokens` generated ids (0: no decode, len 0), and
-/// once more from the streamer's end() (n_tokens 0, len 0; this end call also
-/// comes after a STOP/CANCEL, and its answer is ignored).
+/// decode of the last `tail_tokens` generated ids (0: no decode, len 0), with
+/// `stream_text` non-zero also the raw window decode (see cascadia_poll_fn),
+/// and once more from the streamer's end() (n_tokens 0, both lengths 0; this
+/// end call also comes after a STOP/CANCEL, and its answer is ignored).
 /// STOP or CANCEL ends the generation. Works for LLMPipeline and VLMPipeline
 /// handles; `poll == NULL` is exactly cascadia_pipeline_generate (no streamer).
+///
+/// `stream_text` 0 is the streamer as it was before the option: no ids kept
+/// beyond the tail's, no window decode, the poll return read as 0/1/else.
+/// Non-zero keeps every generated id (8 bytes each) and decodes the window
+/// on every write: O(window) per write, so a caller that never confirms pays
+/// a full decode per write.
 ///
 /// Threads: `poll` may run on an ov-genai worker thread (its
 /// ThreadedStreamerWrapper), even for a plain LLMPipeline when ov-genai picks
@@ -152,15 +194,21 @@ typedef int32_t (*cascadia_poll_fn)(void* ctx, const char* ptr, size_t len, size
 /// `out_text` is decoded from all generated tokens: after a STOP it includes
 /// at least the token that completed the match (more under ov-genai's
 /// threaded streamer wrapper or in a multi-token draft/prompt-lookup round).
+///
+/// `out_ttft_ms` (may be NULL) receives ov-genai's time to the first token,
+/// `perf_metrics.get_ttft().mean`, in milliseconds; 0 when ov-genai measured
+/// none, -1 when reading the metrics threw. Written only on success.
 int32_t cascadia_pipeline_generate_polled(
     cascadia_pipeline_t* handle,
     const char* prompt,
     const cascadia_genconfig_t* cfg,
     size_t tail_tokens,
+    int32_t stream_text,
     cascadia_poll_fn poll,
     void* ctx,
     char** out_text,
-    uint32_t* out_token_count);
+    uint32_t* out_token_count,
+    double* out_ttft_ms);
 
 void cascadia_free_string(char* s);
 
