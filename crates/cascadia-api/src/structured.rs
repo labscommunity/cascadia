@@ -3498,8 +3498,8 @@ mod tests {
                 "json-schema:///s.json",
             ),
             (
-                json!({"$id": "urn:x", "type": "object", "properties": {"a": {"$ref": "urn:z#/default/x"}}}),
-                "urn:z#/default/x",
+                json!({"type": "object", "properties": {"a": {"$ref": "urn:z#/default/x"}}}),
+                "\"urn:z\"",
             ),
         ] {
             let err = parse_schema(schema.clone()).expect_err(&schema.to_string());

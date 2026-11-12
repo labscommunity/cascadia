@@ -8411,7 +8411,7 @@ level={{ effort_map[eff] }}";
     /// to a document outside the schema is a 400 naming `response_format`,
     /// with the check on and off.
     #[tokio::test]
-    async fn a_ref_the_integer_guards_cannot_follow_is_400_not_an_abort() {
+    async fn the_schema_check_never_aborts_and_an_outside_ref_is_400() {
         let outside = serde_json::json!({
             "type": "object",
             "properties": {"n": {"$ref": "https://example.com/s.json"}},

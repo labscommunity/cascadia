@@ -1785,11 +1785,6 @@ fn a_ref_to_a_document_outside_the_schema_is_refused() {
             r##""type":"object""##,
             "json-schema:///s.json",
         ),
-        (
-            "urn:z#/default/x",
-            r##""$id":"urn:x","type":"object""##,
-            "urn:z#/default/x",
-        ),
         ("urn:z", r##""type":"object""##, "urn:z"),
     ] {
         let body =
@@ -1802,6 +1797,14 @@ fn a_ref_to_a_document_outside_the_schema_is_refused() {
             "{body}: {err}"
         );
     }
+    // Under a `urn:` base the registry doesn't check refs: llguidance's own
+    // lookup refuses it while building, still a 400 naming response_format.
+    let body = r##"{"$id":"urn:x","type":"object","properties":{"n":{"$ref":"urn:z#/default/x"}},"required":["n"]}"##;
+    let err = gf.compile(&spec(body)).err().expect(body).to_string();
+    assert!(
+        err.contains("response_format schema: ") && err.contains("'urn:z'"),
+        "{body}: {err}"
+    );
 }
 
 #[test]
@@ -1891,4 +1894,62 @@ fn an_upper_bound_at_or_below_the_llguidance_floor_is_refused_clearly() {
         r#"{"type":"integer","const":-9223372036854774784}"#,
     )))
     .unwrap();
+}
+
+/// Two `$id` scopes reaching one target whose relative ref resolves only
+/// under the root's base (`https://r.com/x.json`); `p2_first` swaps the
+/// order of the two properties.
+fn two_scope_schema(p2_first: bool) -> String {
+    let p1 = r##""p1":{"$id":"https://a.com/s.json","$ref":"https://r.com/root.json#/$defs/T"}"##;
+    let p2 = r##""p2":{"$id":"https://b.com/s.json","$ref":"https://r.com/root.json#/$defs/T"}"##;
+    let props = if p2_first {
+        format!("{p2},{p1}")
+    } else {
+        format!("{p1},{p2}")
+    };
+    format!(
+        r##"{{"$id":"https://r.com/root.json","type":"object","properties":{{{props}}},"$defs":{{"T":{{"$ref":"x.json"}},"A":{{"$id":"https://a.com/x.json","type":"string"}},"R":{{"$id":"https://r.com/x.json","type":"string"}}}}}}"##
+    )
+}
+
+/// Built with llguidance as it is, past every guard (in-process: none of
+/// these schemas has an integer).
+fn builds_unguarded(gf: &GrammarFactory, body: &str) -> bool {
+    let mut schema: serde_json::Value = serde_json::from_str(body).unwrap();
+    schema["x-guidance"] = guidance_options();
+    gf.compile_schema(schema, Vec::new()).is_ok()
+}
+
+#[test]
+fn the_outside_ref_refusal_never_refuses_what_llguidance_builds() {
+    // The refusal asks the question llguidance asks first (can the
+    // registry be built without a fetch), so it refuses only schemas
+    // llguidance fails on too, in any key order or `$id` scope.
+    let gf = single_byte();
+    let mut corpus = vec![two_scope_schema(false), two_scope_schema(true)];
+    corpus.extend(
+        [
+            r##"{"type":"object","properties":{"n":{"$ref":"https://example.com/s.json"}}}"##,
+            r##"{"type":"object","properties":{"n":{"$ref":"urn:z"}}}"##,
+            r##"{"$id":"urn:x","type":"object","properties":{"n":{"$ref":"urn:z"}}}"##,
+            r##"{"$id":"urn:r","type":"object","$defs":{"U":{"$ref":"https://example.com/u.json"}}}"##,
+            r##"{"type":"object","not":{"$ref":"https://example.com/n.json"}}"##,
+            r##"{"type":"object","$defs":{"U":{"$ref":"https://example.com/u.json"}}}"##,
+            r##"{"$defs":{"T":{"$id":"T","type":"string"}},"type":"object","properties":{"t":{"$ref":"T"}}}"##,
+            r##"{"type":"object","properties":{"n":{"$ref":"#/default/t"}},"default":{"t":{"$ref":"https://example.com/t.json"}}}"##,
+            r##"{"$id":"https://r.com/root.json","type":"object","properties":{"a":{"$id":"https://a.com/s.json","properties":{"b":{"$ref":"x.json"}}}},"$defs":{"A":{"$id":"https://a.com/x.json","type":"string"}}}"##,
+        ]
+        .map(str::to_owned),
+    );
+    for body in &corpus {
+        let raw = builds_unguarded(&gf, body);
+        let refused_here = ref_outside_the_schema(&serde_json::from_str(body).unwrap()).is_some();
+        assert!(
+            !(refused_here && raw),
+            "refused what llguidance builds: {body}"
+        );
+        assert_eq!(gf.compile(&spec(body)).is_ok(), raw, "{body}");
+    }
+    // The review's case builds both ways.
+    assert!(builds_unguarded(&gf, &two_scope_schema(false)));
 }

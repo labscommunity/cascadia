@@ -732,7 +732,12 @@ schema (a JSON object or `true`/`false`, not a string, number or list such
 as `#/required`); otherwise the request gets `unsupported $ref "<ref>"`. A `$ref`
 that names a document outside the schema (`https://…`, `other.json`, a
 `urn:` no `$id` in the schema has) gets `` $ref "<uri>" is not supported: it
-names a document outside the schema … ``: no backend fetches one. A ref the
+names a document outside the schema … ``: no backend fetches one. The
+check is the one llguidance makes first, so it refuses only what
+llguidance can't build; under a `urn:` base `$id`, and inside a ref target
+in `default`/`examples`, such a ref is left to the backend, which on the
+llguidance engines answers `invalid configuration: response_format
+schema: Resource '<uri>' is not present in a registry …`. A ref the
 schema itself answers is fine, also through a `$id` (a root `$id`, a
 TypeBox-style `$id` in `$defs` named by `"$ref": "T"`, or the fragment
 `$id`s schema generators put on every subschema), as are properties named

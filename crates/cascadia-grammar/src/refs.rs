@@ -6,8 +6,8 @@
 //! `$id` below it), through anchors, and to any URI the document
 //! registers. It never fetches: a ref to a document the schema doesn't hold
 //! is refused here with a 400 ([`ref_outside_the_schema`]), for every
-//! engine, by asking `referencing` (the version llguidance builds with)
-//! the same question llguidance asks.
+//! engine, by building the same `referencing` registry llguidance builds
+//! first (same crate version, same root, same base URI).
 //!
 //! The guards read `#/...` refs against the document root
 //! ([`local_ref_pointers`]), the way llguidance reads them when no `$id`
@@ -20,7 +20,7 @@
 //! with its own error. Targets in schema positions (`$defs`, properties)
 //! are bounded where they sit.
 
-use referencing::{Draft, Error, Registry, Resolver, Resource, ResourceRef};
+use referencing::{Draft, Error, Registry, Resource};
 use serde_json::Value;
 
 /// The base URI llguidance gives a root without `$id`.
@@ -28,75 +28,41 @@ const DEFAULT_ROOT_URI: &str = "json-schema:///";
 
 /// Why a `$ref` in `schema` names a document outside it, if one does: a
 /// URI no resource in the schema has (`https://example.com/s.json`,
-/// `other.json`, `urn:z`), which llguidance would have to fetch and never
-/// does. Every ref llguidance resolves while building is checked, from the
-/// same base URI: the refs in the root and its subschemas, and in the
-/// target of each ref (which may sit in a data keyword such as `default`),
-/// each target once. Refs llguidance can't resolve for another reason (a
-/// pointer to nothing, a missing anchor) are left to its own error.
+/// `other.json`, `urn:z` under a non-`urn` base), which llguidance would
+/// have to fetch and never does.
+///
+/// This is the first thing llguidance does with a schema: build the
+/// `referencing` registry from the root (its draft, its `$id` or the
+/// default base URI) without a retriever. That build resolves every ref in
+/// every subresource, and in the target of each `#` ref, against its own
+/// scope's base URI, and fails when one names a document it doesn't hold.
+/// Asking the same question with the same crate refuses exactly the schemas
+/// llguidance fails on there, never one it builds. Refs that only fail
+/// later, at a build-time lookup (in a scope whose base is a `urn:`, which
+/// the registry doesn't check), get llguidance's own error.
 pub fn ref_outside_the_schema(schema: &Value) -> Option<String> {
-    let outside = |uri: &str| {
-        let shown: String = uri.chars().take(80).collect();
-        format!(
-            "$ref {} is not supported: it names a document outside the schema \
-             (only references to the schema itself, such as `#/$defs/...`, are)",
-            Value::String(shown)
-        )
-    };
-    // As llguidance's `PreContext`: the draft from the root's `$schema`,
-    // the root registered under its `$id` or the default base URI.
+    // As llguidance's `PreContext::new`.
     let draft = Draft::Draft202012
         .detect(schema)
         .unwrap_or(Draft::Draft202012);
     let resource: Resource = draft.create_resource(schema.clone());
     let base = resource.id().unwrap_or(DEFAULT_ROOT_URI).to_string();
     let empty = Registry::try_from_resources(std::iter::empty::<(String, Resource)>()).ok()?;
-    let registry = match empty.try_with_resources_and_retriever(
+    match empty.try_with_resources_and_retriever(
         vec![(base.as_str(), resource)],
         &referencing::DefaultRetriever,
         draft,
     ) {
-        Ok(r) => r,
-        Err(Error::Unretrievable { uri, .. }) => return Some(outside(&uri)),
-        Err(_) => return None,
-    };
-    let root_resolver = registry.try_resolver(&base).ok()?;
-    let root = root_resolver.lookup(&base).ok()?.contents();
-    // (schema, the resolver of the schema it sits in or is referenced from)
-    let mut stack: Vec<(ResourceRef<'_>, Resolver<'_>)> =
-        vec![(resource_ref(root, draft), root_resolver)];
-    let mut entered = std::collections::HashSet::new();
-    while let Some((res, parent)) = stack.pop() {
-        let Ok(resolver) = parent.in_subresource(res) else {
-            continue;
-        };
-        let contents = res.contents();
-        if let Some(r) = contents.get("$ref").and_then(Value::as_str) {
-            match resolver.lookup(r) {
-                Ok(target) => {
-                    let target = target.contents();
-                    if entered.insert(std::ptr::from_ref(target)) {
-                        stack.push((resource_ref(target, res.draft()), resolver.clone()));
-                    }
-                }
-                Err(Error::Unretrievable { .. }) => return Some(outside(r)),
-                Err(_) => {}
-            }
+        Err(Error::Unretrievable { uri, .. }) => {
+            let shown: String = uri.chars().take(80).collect();
+            Some(format!(
+                "$ref {} is not supported: it names a document outside the schema \
+                 (only references to the schema itself, such as `#/$defs/...`, are)",
+                Value::String(shown)
+            ))
         }
-        for sub in res.draft().subresources_of(contents) {
-            stack.push((resource_ref(sub, res.draft()), resolver.clone()));
-        }
+        _ => None,
     }
-    None
-}
-
-/// `contents` as a resource, its draft read as llguidance reads it: its own
-/// `$schema`, else `draft`, an unknown one the latest.
-fn resource_ref(contents: &Value, draft: Draft) -> ResourceRef<'_> {
-    draft
-        .detect(contents)
-        .unwrap_or(Draft::Draft202012)
-        .create_resource_ref(contents)
 }
 
 /// The value the `#/...` refs anywhere in `doc` (data keywords included)
@@ -231,15 +197,7 @@ mod tests {
                 json!({"properties": {"n": {"$ref": "other.json#/x"}}}),
                 "json-schema:///other.json",
             ),
-            (
-                json!({"$id": "urn:x", "properties": {"n": {"$ref": "urn:z"}}}),
-                "urn:z",
-            ),
-            // Inside a ref target in data, which llguidance builds.
-            (
-                json!({"properties": {"n": {"$ref": "#/default/t"}}, "default": {"t": {"$ref": "https://example.com/t.json"}}}),
-                "https://example.com/t.json",
-            ),
+            (json!({"properties": {"n": {"$ref": "urn:z"}}}), "urn:z"),
         ] {
             let got = ref_outside_the_schema(&schema).unwrap_or_else(|| panic!("{schema}"));
             assert!(
@@ -258,6 +216,12 @@ mod tests {
             json!({"$schema": "http://json-schema.org/draft-07/schema#", "$id": "#root", "properties": {"a": {"$id": "#/properties/a"}}}),
             // Data and unknown keywords are not schemas.
             json!({"x-meta": {"$ref": "https://example.com/x.json"}, "default": {"$ref": "urn:q"}}),
+            // Under a `urn:` base the registry doesn't check refs: left to
+            // llguidance's own lookup error.
+            json!({"$id": "urn:x", "properties": {"n": {"$ref": "urn:z"}}}),
+            // Inside a ref target in data: the registry doesn't look there,
+            // llguidance's lookup fails when it builds the target.
+            json!({"properties": {"n": {"$ref": "#/default/t"}}, "default": {"t": {"$ref": "https://example.com/t.json"}}}),
             // A ref to nothing is llguidance's own error.
             json!({"properties": {"n": {"$ref": "#/nope"}}}),
         ] {
