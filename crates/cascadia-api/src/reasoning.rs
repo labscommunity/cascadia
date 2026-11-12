@@ -190,6 +190,9 @@ pub struct ReasoningCounter {
     reasoning: f64,
     /// The per-chunk counts' sum.
     observed: u32,
+    /// A feed released bytes without a token count (its own or carried
+    /// from a held feed), so the per-chunk counts miss part of the reply.
+    uncounted: bool,
     /// Bytes released or consumed, and the reasoning share of them
     /// (`<think>`/`</think>` included).
     out_bytes: usize,
@@ -207,6 +210,7 @@ impl ReasoningCounter {
             carried: 0,
             reasoning: 0.0,
             observed: 0,
+            uncounted: false,
             out_bytes: 0,
             reasoning_bytes: 0,
         }
@@ -253,36 +257,43 @@ impl ReasoningCounter {
     /// `completion_tokens_details.reasoning_tokens` of a `completion_tokens`
     /// total, clamped to it. A total other than the per-chunk counts' sum
     /// (an engine's authoritative final count) scales the counted reasoning
-    /// to it; when the chunks counted nothing, the reasoning share of the
-    /// bytes splits it.
+    /// to it; when any feed released text without a count, the reasoning
+    /// share of all released bytes splits it.
     pub fn reasoning_tokens(&self, completion_tokens: u32) -> u32 {
         let total = f64::from(completion_tokens);
-        let reasoning = if self.observed == completion_tokens {
+        let reasoning = if self.uncounted || self.observed == 0 {
+            if self.out_bytes > 0 {
+                total * self.reasoning_bytes as f64 / self.out_bytes as f64
+            } else {
+                0.0
+            }
+        } else if self.observed == completion_tokens {
             self.reasoning
-        } else if self.observed > 0 {
-            self.reasoning * total / f64::from(self.observed)
-        } else if self.out_bytes > 0 {
-            total * self.reasoning_bytes as f64 / self.out_bytes as f64
         } else {
-            0.0
+            self.reasoning * total / f64::from(self.observed)
         };
         (reasoning.round() as u32).min(completion_tokens)
     }
 
     /// Split a feed's tokens by the share of the bytes it released or
     /// consumed that went to reasoning (`<think>`/`</think>` included); a
-    /// feed that only held text carries its tokens to the next one.
+    /// feed that only held text carries its tokens to the next one. The
+    /// end of the generation (`fed == 0`) releases text whose tokens its
+    /// feed already counted.
     fn count(&mut self, fed: usize, segs: &[Seg], tokens: u32) {
-        self.observed += tokens;
+        self.observed = self.observed.saturating_add(tokens);
         let pool = self.split_held + fed;
         self.split_held = self.split.held_len();
         let out = pool - self.split_held;
-        let tokens = self.carried + tokens;
+        let tokens = self.carried.saturating_add(tokens);
         if out == 0 {
             self.carried = tokens;
             return;
         }
         self.carried = 0;
+        if tokens == 0 && fed > 0 {
+            self.uncounted = true;
+        }
         let answer: usize = segs
             .iter()
             .map(|s| match s {
@@ -609,5 +620,30 @@ mod tests {
         c.feed("", 1);
         c.finish();
         assert_eq!(c.reasoning_tokens(3), 1);
+    }
+
+    /// A chunk that released text without a token count leaves the
+    /// per-chunk counts incomplete: the byte share of the whole reply
+    /// splits the total instead.
+    #[test]
+    fn counter_an_uncounted_chunk_switches_to_the_byte_share() {
+        let mut c = ReasoningCounter::new(true, false);
+        c.feed("<think>R</think>", 1);
+        c.feed("long answer text", 0);
+        c.finish();
+        // 16 of 32 bytes are reasoning
+        assert_eq!(c.reasoning_tokens(100), 50);
+    }
+
+    /// Every chunk that released text reported tokens: the per-chunk
+    /// counts decide, scaled to the total.
+    #[test]
+    fn counter_all_counted_chunks_use_the_per_chunk_counts() {
+        let mut c = ReasoningCounter::new(true, false);
+        c.feed("<think>R</think>", 1);
+        c.feed("long answer text", 3);
+        c.finish();
+        assert_eq!(c.reasoning_tokens(4), 1);
+        assert_eq!(c.reasoning_tokens(8), 2);
     }
 }
