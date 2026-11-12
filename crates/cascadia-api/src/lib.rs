@@ -671,16 +671,57 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(from = "RawChatMessage")]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default, deserialize_with = "de_null_content")]
     pub content: String,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Reasoning a client replays from an earlier assistant turn, read from
+    /// `reasoning_content`, else from `reasoning` when that is a string.
+    /// Templates (Qwen3, GLM) render it in place of splitting `content`.
+    pub reasoning_content: Option<String>,
+}
+
+/// Wire form of [`ChatMessage`]. Both reasoning keys are read loosely so an
+/// odd shape (OpenRouter's `reasoning` object, a null) is ignored rather
+/// than rejected.
+#[derive(Deserialize)]
+struct RawChatMessage {
+    role: String,
+    #[serde(default, deserialize_with = "de_null_content")]
+    content: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+}
+
+impl From<RawChatMessage> for ChatMessage {
+    fn from(raw: RawChatMessage) -> Self {
+        fn text(v: Option<serde_json::Value>) -> Option<String> {
+            match v {
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s),
+                _ => None,
+            }
+        }
+        let reasoning_content = text(raw.reasoning_content).or_else(|| text(raw.reasoning));
+        Self {
+            role: raw.role,
+            content: raw.content,
+            name: raw.name,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+            reasoning_content,
+        }
+    }
 }
 
 /// OpenAI tool spec (request input). `function` is opaque JSON (name,
@@ -1388,6 +1429,7 @@ fn chat_template_smoke_failures(
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
     let tools = [Tool {
@@ -1587,6 +1629,9 @@ fn render_with_chat_env(
             if let Some(name) = &m.name {
                 obj["name"] = serde_json::json!(name);
             }
+            if let Some(r) = &m.reasoning_content {
+                obj["reasoning_content"] = serde_json::json!(r);
+            }
             Value::from_serialize(obj)
         })
         .collect();
@@ -1703,6 +1748,7 @@ pub fn template_speaks_effort_words(
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }];
     let render =
         |w: &str| render_with_chat_env(env, &msgs, bos_token, eos_token, true, Some(w), None);
@@ -2487,6 +2533,7 @@ fn chat_turns(req: &ChatCompletionRequest) -> Vec<ChatTurn> {
                 .and_then(|cs| serde_json::to_value(cs).ok()),
             tool_call_id: m.tool_call_id.clone(),
             name: m.name.clone(),
+            reasoning_content: m.reasoning_content.clone(),
         })
         .collect()
 }
@@ -2598,6 +2645,7 @@ async fn chat_completions(
                     .map_or(0, |cs| serde_json::to_string(cs).map_or(0, |s| s.len()))
                 + m.tool_call_id.as_ref().map_or(0, String::len)
                 + m.name.as_ref().map_or(0, String::len)
+                + m.reasoning_content.as_ref().map_or(0, String::len)
         })
         .sum();
     if messages_bytes > state.max_prompt_bytes {
@@ -3824,8 +3872,26 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
+
+    fn msg_with_reasoning(role: &str, content: &str, reasoning: &str) -> ChatMessage {
+        ChatMessage {
+            reasoning_content: Some(reasoning.into()),
+            ..msg(role, content)
+        }
+    }
+
+    /// Render `msgs` through `tpl` with the production chat env, surfacing any
+    /// render error instead of falling back to the legacy formatter.
+    fn render_test_template(tpl: &str, msgs: &[ChatMessage]) -> String {
+        let env = build_chat_env(tpl).expect("template parses");
+        render_with_chat_env(&env, msgs, "", "", true, None, None).expect("template renders")
+    }
+
+    /// Qwen3-8B's chat template, as shipped in its `tokenizer_config.json`.
+    const QWEN3_TEMPLATE: &str = include_str!("../tests/fixtures/qwen3-8b-chat-template.jinja");
 
     // Qwen3.x templates group consecutive tool results into one user turn with
     // `loop.previtem` / `loop.nextitem`. Without minijinja's
@@ -4814,6 +4880,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
@@ -4843,6 +4910,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let on = renderer.render_with_tools(&msgs, None).unwrap();
         assert!(on.ends_with("<think>"), "thinking-on render: {on}");
@@ -4876,6 +4944,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let env = build_chat_env(T).expect("template parses");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
@@ -4892,6 +4961,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
 
         // Template present: renders through the parsed env (parsed once in `new`).
@@ -5386,6 +5456,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5411,6 +5482,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5567,6 +5639,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5633,6 +5706,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5696,6 +5770,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
 
         let unset = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
@@ -5830,6 +5905,197 @@ mod tests {
         let tools = chat_tools(&req).expect("tools forwarded");
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn replayed_reasoning_is_accepted_under_both_names() {
+        let r = chat_request(
+            serde_json::json!({"messages":[{"role":"user","content":"q"},
+            {"role":"assistant","content":"a","reasoning_content":"r1"},
+            {"role":"assistant","content":"b","reasoning":"r2"},
+            {"role":"assistant","content":"c","reasoning_content":"r3","reasoning":"other"},
+            {"role":"assistant","content":"d","reasoning":{"summary":[]}}]}),
+        );
+        let got: Vec<_> = r
+            .messages
+            .iter()
+            .map(|m| m.reasoning_content.clone())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                None,
+                Some("r1".into()),
+                Some("r2".into()),
+                Some("r3".into()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn null_or_blank_replayed_reasoning_is_none() {
+        let r = chat_request(serde_json::json!({"messages":[
+            {"role":"assistant","content":"a","reasoning_content":null},
+            {"role":"assistant","content":"b","reasoning_content":""},
+            {"role":"assistant","content":"c","reasoning_content":"  \n"},
+            {"role":"assistant","content":"d","reasoning":null},
+            {"role":"assistant","content":"e","reasoning":""},
+            {"role":"assistant","content":"f","reasoning_content":42},
+            {"role":"assistant","content":"g","reasoning_content":"","reasoning":"fallback"}]}));
+        let got: Vec<_> = r
+            .messages
+            .iter()
+            .map(|m| m.reasoning_content.clone())
+            .collect();
+        assert_eq!(
+            got,
+            vec![None, None, None, None, None, None, Some("fallback".into())]
+        );
+    }
+
+    #[test]
+    fn template_sees_reasoning_content_on_assistant_turns() {
+        // Qwen3's history branch: `{% if message.reasoning_content is string %}` renders it.
+        let tpl = "{% for m in messages %}{% if m.reasoning_content is string %}<think>{{ m.reasoning_content }}</think>{% endif %}{{ m.content }}|{% endfor %}";
+        let out = render_test_template(
+            tpl,
+            &[
+                msg("user", "q"),
+                msg_with_reasoning("assistant", "a", "why"),
+            ],
+        );
+        assert_eq!(out, "q|<think>why</think>a|");
+    }
+
+    #[test]
+    fn absent_reasoning_content_is_undefined_to_the_template() {
+        let tpl = "{% for m in messages %}{{ m.reasoning_content is defined }}|{% endfor %}";
+        let out = render_test_template(tpl, &[msg("assistant", "a")]);
+        assert_eq!(out, "false|");
+    }
+
+    #[test]
+    fn qwen3_renders_replayed_reasoning_inside_the_current_tool_loop() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: "{\"city\":\"Paris\"}".into(),
+            },
+        };
+        let assistant = |reasoning: Option<&str>| ChatMessage {
+            tool_calls: Some(vec![call.clone()]),
+            reasoning_content: reasoning.map(str::to_owned),
+            ..msg("assistant", "")
+        };
+        let tool = ChatMessage {
+            tool_call_id: Some("call_1".into()),
+            ..msg("tool", "18C")
+        };
+        let with = render_test_template(
+            QWEN3_TEMPLATE,
+            &[
+                msg("user", "weather in Paris?"),
+                assistant(Some("I should call the tool.")),
+                tool.clone(),
+            ],
+        );
+        assert!(
+            with.contains(
+                "<|im_start|>assistant\n<think>\nI should call the tool.\n</think>\n\n\
+                 <tool_call>\n{\"name\": \"get_weather\""
+            ),
+            "replayed reasoning missing from the tool loop: {with}"
+        );
+        let without = render_test_template(
+            QWEN3_TEMPLATE,
+            &[msg("user", "weather in Paris?"), assistant(None), tool],
+        );
+        assert!(
+            !without.contains("<think>"),
+            "no reasoning sent, none rendered: {without}"
+        );
+    }
+
+    #[test]
+    fn reasoning_on_a_user_turn_leaves_its_render_unchanged() {
+        let plain = render_test_template(QWEN3_TEMPLATE, &[msg("user", "q")]);
+        let with = render_test_template(QWEN3_TEMPLATE, &[msg_with_reasoning("user", "q", "r")]);
+        assert_eq!(plain, with);
+    }
+
+    #[tokio::test]
+    async fn reasoning_on_a_user_turn_is_accepted() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(QWEN3_TEMPLATE.into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "max_tokens": 4,
+            "messages": [{"role":"user","content":"hi","reasoning_content":"stray"}],
+        });
+        let (status, body) = post_chat(app, payload).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[test]
+    fn chat_turns_forward_replayed_reasoning() {
+        let req = chat_request(serde_json::json!({"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":"a","reasoning_content":"why"}]}));
+        let turns = chat_turns(&req);
+        assert_eq!(turns[0].reasoning_content, None);
+        assert_eq!(turns[1].reasoning_content.as_deref(), Some("why"));
+    }
+
+    #[tokio::test]
+    async fn replayed_reasoning_counts_toward_the_prompt_byte_limit() {
+        // Roles-only template keeps the rendered prompt tiny; only the
+        // replayed reasoning pushes the messages over the limit.
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_prompt_bytes: 128,
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.role }}\n{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"a","reasoning_content": "x".repeat(4096)},
+                {"role":"user","content":"more"},
+            ],
+        });
+        let (status, body) = post_chat(app, payload).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     }
 
     #[tokio::test]
@@ -6451,6 +6717,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -6504,6 +6771,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         match render_or_fallback(
             Some(&env),
@@ -6610,6 +6878,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools)).unwrap();
         assert_eq!(out, r#"{"description": "a", "name": "b"}"#);
@@ -6627,6 +6896,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
@@ -6656,6 +6926,7 @@ level={{ effort_map[eff] }}";
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "tool".into(),
@@ -6663,6 +6934,7 @@ level={{ effort_map[eff] }}";
                 name: Some("get_weather".into()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
+                reasoning_content: None,
             },
         ];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();

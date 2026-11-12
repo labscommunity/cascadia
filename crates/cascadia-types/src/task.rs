@@ -69,6 +69,10 @@ pub struct ChatTurn {
     /// Optional participant name (multi-agent / tool messages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Reasoning replayed by the client on an earlier assistant turn, for
+    /// downstream templates that render it (Qwen3, GLM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// One generation request, end-to-end.
