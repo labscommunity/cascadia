@@ -3092,7 +3092,39 @@ async fn chat_completions(
             .then(|| grammar_for(&response_format))
             .flatten()
             .map(|g| g.body);
-        tool_grammar(&policy, format.as_deref())
+        // A pointer-only engine's backend reads any other ref as "any".
+        // `tool_grammar` refuses those it sees, but a `#/$defs/A/...`
+        // pointer can lead into instance data holding one: run the same
+        // check `response_format` gets and, the grammar being best-effort,
+        // drop it rather than answer 400.
+        tool_grammar(&policy, format.as_deref()).filter(|spec| {
+            if state.ref_resolver == RefResolver::Full {
+                return true;
+            }
+            let checked = serde_json::from_str::<serde_json::Value>(&spec.body)
+                .map_err(|e| e.to_string())
+                .and_then(|schema| {
+                    structured::check_pointer_refs_only(
+                        &spec.body,
+                        &schema,
+                        &state.engine_name,
+                        state.ref_resolver,
+                    )
+                });
+            match checked {
+                Ok(()) => true,
+                Err(msg) => {
+                    let reason = cascadia_metrics::UnenforcedReason::UnsupportedRef;
+                    tracing::warn!(
+                        reason = reason.as_str(),
+                        detail = %msg,
+                        "tool-call output constraint not enforced; answering unconstrained"
+                    );
+                    cascadia_metrics::count_constraint_unenforced(reason);
+                    false
+                }
+            }
+        })
     } else if structured && !tools_callable {
         grammar_for(&response_format)
     } else {
@@ -11107,6 +11139,72 @@ level={{ effort_map[eff] }}";
                     ),
                     "{v}"
                 );
+            }
+        }
+    }
+
+    /// A forced tool whose `#/$defs/...` ref points into instance data that
+    /// holds a non-pointer `$ref` passes the tool grammar's own ref rewrite
+    /// (the def name is known, data is not walked), but the converter
+    /// follows the pointer and meets the other ref. On ov-genai the grammar
+    /// is dropped: 200, unconstrained, `unsupported_ref` +1. On sycl-llama
+    /// the tool can't be inlined: a 400, as for any tool llama-server
+    /// receives. On any other engine the grammar is sent as before.
+    #[tokio::test]
+    async fn a_forced_tool_ref_into_data_holding_a_non_pointer_ref_is_dropped_on_pointer_only_engines(
+    ) {
+        use cascadia_metrics::UnenforcedReason;
+        let unenforced = |r: UnenforcedReason| {
+            cascadia_metrics::CONSTRAINT_UNENFORCED_TOTAL
+                .with_label_values(&[r.as_str()])
+                .get()
+        };
+        let schema = |inner: &str| {
+            serde_json::json!({
+                "type": "object",
+                "$defs": {"A": {"type": "object", "default": {"x": {"$ref": inner}}}},
+                "properties": {"v": {"$ref": "#/$defs/A/default/x"}},
+            })
+        };
+        for schema in [schema("T"), schema("json-schema:///")] {
+            let tool = serde_json::json!({"type": "function", "function": {
+                "name": "get_weather", "parameters": schema.clone()
+            }});
+            let body = tool_body(
+                serde_json::json!([tool]),
+                serde_json::json!({"tool_choice": "required"}),
+            );
+            for refs in [RefResolver::Xgrammar, SYCL, RefResolver::Full] {
+                let cfg = Config {
+                    ref_resolver: refs,
+                    ..Config::default()
+                };
+                let (app, seen) = mock_capture_app(cfg, TOOLS_TEMPLATE).await;
+                let before = unenforced(UnenforcedReason::UnsupportedRef);
+                let (status, v) = post_chat(app, body.clone()).await;
+                if refs == SYCL {
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
+                    assert!(
+                        v["error"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("invalid tools: tools[0].function.parameters: $ref "),
+                        "{v}"
+                    );
+                    continue;
+                }
+                assert_eq!(status, StatusCode::OK, "{schema}: {v}");
+                let grammar = last_task(&seen).grammar;
+                if refs != RefResolver::Full {
+                    assert_eq!(grammar, None, "{refs:?} {schema}");
+                    assert!(
+                        unenforced(UnenforcedReason::UnsupportedRef) > before,
+                        "{schema}"
+                    );
+                } else {
+                    assert_eq!(grammar, tool_grammar(&policy_of(&body), None), "{schema}");
+                    assert!(grammar.is_some(), "{schema}");
+                }
             }
         }
     }
