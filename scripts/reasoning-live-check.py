@@ -224,7 +224,10 @@ def check_replayed_reasoning(cl, state):
              "tool_calls": [call]},
             {"role": "tool", "tool_call_id": "call_1", "content": '{"temp_c": 18, "sky": "clear"}'},
         ]
-        m = message(cl.chat({"tools": [WEATHER]}, msgs))
+        # The mock has no chat template, so it refuses tool definitions; the
+        # replayed turns alone still exercise the parse and the size check.
+        extra = {} if cl.mock else {"tools": [WEATHER]}
+        m = message(cl.chat(extra, msgs))
         if not (m.get("content") or m.get("tool_calls")):
             raise Fail(f"replay with `{key}`: empty answer and no tool call: {m}")
 
