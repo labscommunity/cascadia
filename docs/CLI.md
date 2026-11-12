@@ -762,9 +762,10 @@ each ref's grammar rule after its pointer (`ref` + the pointer, every run
 of characters outside `[a-zA-Z0-9-]` made `-`) and uses a rule that
 already has that name without reading the ref's target, so two refs that
 name the same rule (`#/$defs/a_b` and `#/$defs/a-b`), or a ref and a
-schema the converter named that way first (a property `ref-defs-B` before
-`#/$defs/B`, a property `x` of `#/$defs/A` before `#/$defs/A-x`), would get
-one shape for both: on `sycl-llama` that is `` $ref "<ref>" and <the other>
+schema inside another ref's target the converter named that way first (a
+property `x` of `#/$defs/A` before `#/$defs/A-x`), would get one shape for
+both (the chat endpoint sycl-llama uses names the schema's own properties
+under `response-format-schema`, so a property `ref-defs-B` is fine): on `sycl-llama` that is `` $ref "<ref>" and <the other>
 name the same grammar rule (<name>) on llama-server … ``. The check follows
 the converter's own naming and order; it could refuse a schema llama.cpp
 builds right only where two different schemas convert to identical rules

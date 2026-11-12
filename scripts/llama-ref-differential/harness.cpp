@@ -71,7 +71,7 @@ std::string string_repeat(const std::string & s, size_t n) {
 // A property name no schema uses: a null-recorded ref's stand-in.
 static const char * MARKER = "__llama_ref_unresolved__";
 
-static std::string verdict(const std::string & line) {
+static std::string verdict(const std::string & line, const std::string & root) {
     nlohmann::ordered_json schema = nlohmann::ordered_json::parse(line);
     common_schema_converter converter([](const std::string &) { return nlohmann::ordered_json(); }, false);
     try {
@@ -84,7 +84,7 @@ static std::string verdict(const std::string & line) {
                 kv.second = nlohmann::ordered_json{{"properties", {{MARKER, nlohmann::ordered_json::object()}}}};
             }
         }
-        converter.visit(copy, "");
+        converter.visit(copy, root);
         converter.check_errors();
         for (const auto & kv : converter._refs) {
             if (!recorded.count(kv.first)) {
@@ -102,11 +102,17 @@ static std::string verdict(const std::string & line) {
     }
 }
 
-// The grammar llama-server would build for `line`, on one line (each rule
-// `name ::= body` separated by a tab), or `error`.
-static std::string grammar(const std::string & line) {
+// The grammar llama-server would build for `line` with its root schema
+// visited under `root`, on one line (each rule `name ::= body` separated
+// by a tab), or `error`.
+static std::string grammar(const std::string & line, const std::string & root) {
+    common_schema_converter converter([](const std::string &) { return nlohmann::ordered_json(); }, false);
     try {
-        std::string g = json_schema_to_grammar(nlohmann::ordered_json::parse(line), true);
+        auto schema = nlohmann::ordered_json::parse(line);
+        converter.resolve_refs(schema, "");
+        converter.visit(schema, root);
+        converter.check_errors();
+        std::string g = converter.format_grammar();
         std::replace(g.begin(), g.end(), '\n', '\t');
         return g;
     } catch (const std::exception &) {
@@ -114,12 +120,26 @@ static std::string grammar(const std::string & line) {
     }
 }
 
-// `harness` prints a verdict per line; `harness --grammar` the grammar.
+// `harness [--grammar] [--root NAME]`: a verdict (or the grammar) per line.
+// The root name is the one the root schema is visited under: llama-server's
+// chat endpoint builds a `response_format` grammar through its chat parser,
+// which adds the schema under `response-format-schema` (or
+// `response-format`, per template); its plain `/completion` endpoint and
+// `json_schema_to_grammar` under `` (the rule `root`).
 int main(int argc, char ** argv) {
-    bool grammars = argc > 1 && std::string(argv[1]) == "--grammar";
+    bool grammars = false;
+    std::string root;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--grammar") {
+            grammars = true;
+        } else if (a == "--root" && i + 1 < argc) {
+            root = argv[++i];
+        }
+    }
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
-        std::cout << (grammars ? grammar(line) : verdict(line)) << "\n";
+        std::cout << (grammars ? grammar(line, root) : verdict(line, root)) << "\n";
     }
 }

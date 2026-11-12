@@ -8690,8 +8690,8 @@ level={{ effort_map[eff] }}";
     /// llama-server names a ref's rule after its pointer (`ref` + the
     /// pointer, every run of other characters than `[a-zA-Z0-9-]` made `-`)
     /// and reuses any rule that already has the name, without visiting
-    /// the target: two refs, or a ref and a property path, that name the
-    /// same rule get one shape for both. A 400 on sycl-llama naming both.
+    /// the target: two refs that name the same rule get one shape for
+    /// both. A 400 on sycl-llama naming both.
     #[tokio::test]
     async fn refs_whose_llama_rule_names_collide_are_400_on_sycl_llama() {
         let defs = serde_json::json!({
@@ -8712,10 +8712,7 @@ level={{ effort_map[eff] }}";
             },
             "required": ["ref-defs-B", "b"],
         });
-        for (schema, names) in [
-            (&defs, [r##""#/$defs/a_b""##, r##""#/$defs/a-b""##]),
-            (&property, [r##""#/$defs/B""##, "ref-defs-B"]),
-        ] {
+        for (schema, names) in [(&defs, [r##""#/$defs/a_b""##, r##""#/$defs/a-b""##])] {
             let (status, v) = post_schema(RefResolver::LlamaServer, schema).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{schema}: {v}");
             let err = v["error"].as_str().unwrap();
@@ -8728,6 +8725,11 @@ level={{ effort_map[eff] }}";
             let (status, v) = post_schema(RefResolver::Full, schema).await;
             assert_eq!(status, StatusCode::OK, "{v}");
         }
+        // A property named like a ref's rule: on the chat endpoint (the
+        // one sycl-llama uses) property rules are named under the schema's
+        // name, so it keeps its own shape (live at the pinned llama.cpp).
+        let (status, v) = post_schema(RefResolver::LlamaServer, &property).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
     /// The three shapes where llama-server reads a `$ref` xgrammar's

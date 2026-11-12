@@ -16,7 +16,10 @@
 #
 # Builds harness.cpp against the checkout and runs every schema corpus.py
 # prints through llama.cpp's converter and through our check
-# (`sycl_ref_verdicts`). llama.cpp degrades a schema when a `$ref` it uses
+# (`sycl_ref_verdicts`), as llama-server's chat endpoint builds it (the one
+# sycl-llama sends `response_format` to: the schema visited under
+# `response-format-schema`), with the plain converter (`/completion`) beside
+# it for comparison. llama.cpp degrades a schema when a `$ref` it uses
 # has no recorded target, or when its rule is one another rule already held
 # (seen by comparing the grammar with variants.py's, where every ref has a
 # rule name of its own). Fails when it degrades a schema our check passes,
@@ -55,11 +58,18 @@ fi
     "$HERE/harness.cpp" -o "$WORK/harness"
 python3 "$HERE/corpus.py" > "$WORK/corpus.jsonl"
 python3 "$HERE/variants.py" < "$WORK/corpus.jsonl" > "$WORK/variants.jsonl"
-"$WORK/harness" < "$WORK/corpus.jsonl" > "$WORK/llama.txt"
-"$WORK/harness" --grammar < "$WORK/corpus.jsonl" > "$WORK/grammars.txt"
-"$WORK/harness" --grammar < "$WORK/variants.jsonl" > "$WORK/variant-grammars.txt"
+# The chat endpoint (sycl-llama's) visits the root schema under
+# `response-format-schema`; the plain converter under the root rule.
+CHAT=(--root response-format-schema)
+"$WORK/harness" "${CHAT[@]}" < "$WORK/corpus.jsonl" > "$WORK/chat.txt"
+"$WORK/harness" "${CHAT[@]}" --grammar < "$WORK/corpus.jsonl" > "$WORK/chat-grammars.txt"
+"$WORK/harness" "${CHAT[@]}" --grammar < "$WORK/variants.jsonl" > "$WORK/chat-variant-grammars.txt"
+"$WORK/harness" < "$WORK/corpus.jsonl" > "$WORK/raw.txt"
+"$WORK/harness" --grammar < "$WORK/corpus.jsonl" > "$WORK/raw-grammars.txt"
+"$WORK/harness" --grammar < "$WORK/variants.jsonl" > "$WORK/raw-variant-grammars.txt"
 (cd "$ROOT" && $CARGO_CMD build -q -p cascadia-api --example sycl_ref_verdicts)
 "${CARGO_TARGET_DIR:-$ROOT/target}/debug/examples/sycl_ref_verdicts" < "$WORK/corpus.jsonl" > "$WORK/ours.txt"
-python3 "$HERE/classify.py" "$WORK/corpus.jsonl" "$WORK/llama.txt" "$WORK/ours.txt" \
-    "$WORK/grammars.txt" "$WORK/variant-grammars.txt" \
+python3 "$HERE/classify.py" "$WORK/corpus.jsonl" "$WORK/ours.txt" \
+    "$WORK/chat.txt" "$WORK/chat-grammars.txt" "$WORK/chat-variant-grammars.txt" \
+    "$WORK/raw.txt" "$WORK/raw-grammars.txt" "$WORK/raw-variant-grammars.txt" \
     "$ROOT/crates/cascadia-api/tests/fixtures/llama_ref_differential.jsonl"

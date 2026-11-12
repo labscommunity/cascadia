@@ -34,14 +34,14 @@ def parse_grammar(text):
     return rules
 
 
-def same_language_shape(g1, g2):
+def same_language_shape(g1, g2, root):
     """Whether the roots of two grammars are the same up to rule names:
     partition refinement over both grammars together (a rule's class is
     its previous class and its body with every rule name replaced by that
     rule's class), run until no class splits, then the roots compared."""
     rules = {("a", k): v for k, v in g1.items()}
     rules.update({("b", k): v for k, v in g2.items()})
-    if ("a", "root") not in rules or ("b", "root") not in rules:
+    if ("a", root) not in rules or ("b", root) not in rules:
         return False
     color = {k: "" for k in rules}
     while True:
@@ -54,7 +54,7 @@ def same_language_shape(g1, g2):
         color = new
         if done:
             break
-    return color[("a", "root")] == color[("b", "root")]
+    return color[("a", root)] == color[("b", root)]
 
 
 def refs_beside_ref(v, beside=False):
@@ -89,51 +89,70 @@ def conservative_class(schema):
     return None
 
 
-def main():
-    corpus, llama, ours, grammars, variant_grammars, fixture = sys.argv[1:7]
-    schemas = [json.loads(l) for l in open(corpus) if l.strip()]
-    llama_v = [l.rstrip("\n") for l in open(llama)]
-    ours_v = [l.strip() for l in open(ours)]
+def verdicts(llama, grammars, variant_grammars, root):
+    """One endpoint's verdicts: the harness's, with a faithful one turned
+    degraded where the grammar differs from the variant's (where every
+    ref has a rule name of its own), so a reused rule shows."""
+    out = [l.rstrip("\n") for l in open(llama)]
     g_orig = [l.rstrip("\n") for l in open(grammars)]
     g_var = [l.rstrip("\n") for l in open(variant_grammars)]
-    assert len(schemas) == len(llama_v) == len(ours_v) == len(g_orig) == len(g_var), "line counts differ"
-    # A faithful verdict still hides a ref whose rule was reused: compare
-    # the grammar with the one for the variant, where every ref has a rule
-    # name of its own.
-    for i, (lv, a, b) in enumerate(zip(llama_v, g_orig, g_var)):
-        if lv == "faithful" and a != "error" and b != "error":
-            if not same_language_shape(parse_grammar(a), parse_grammar(b)):
-                llama_v[i] = "degraded (a ref's rule name held another rule)"
-    counts = {}
-    mismatches = []
-    entries = []
-    for schema, lv, ov in zip(schemas, llama_v, ours_v):
-        kind = lv.split(" ", 1)[0]
-        refused = ov == "refused"
-        if kind == "degraded":
-            tag = "degraded"
-            if not refused:
-                mismatches.append(("silent 200", schema, lv))
-        elif kind == "error":
-            tag = "error"
-        elif refused:
-            cls = conservative_class(schema)
-            if cls is None:
-                mismatches.append(("refused a faithful schema", schema, lv))
-                tag = "faithful"
-            else:
-                tag = f"conservative:{cls}"
-        else:
-            tag = "faithful"
+    assert len(out) == len(g_orig) == len(g_var), "line counts differ"
+    for i, (a, b) in enumerate(zip(g_orig, g_var)):
+        if out[i] == "faithful" and a != "error" and b != "error":
+            if not same_language_shape(parse_grammar(a), parse_grammar(b), root):
+                out[i] = "degraded (a ref's rule name held another rule)"
+    return out
+
+
+def tag_of(schema, lv, refused):
+    """(tag, mismatch reason or None)."""
+    kind = lv.split(" ", 1)[0]
+    if kind == "degraded":
+        return "degraded", None if refused else "silent 200"
+    if kind == "error":
+        return "error", None
+    if refused:
+        cls = conservative_class(schema)
+        if cls is None:
+            return "faithful", "refused a faithful schema"
+        return f"conservative:{cls}", None
+    return "faithful", None
+
+
+def main():
+    (corpus, ours, chat, chat_g, chat_vg, raw, raw_g, raw_vg, fixture) = sys.argv[1:10]
+    schemas = [json.loads(l) for l in open(corpus) if l.strip()]
+    ours_v = [l.strip() == "refused" for l in open(ours)]
+    # The chat endpoint (what sycl-llama uses) decides; the plain
+    # converter (`/completion`) is kept beside it for comparison.
+    chat_v = verdicts(chat, chat_g, chat_vg, "response-format-schema")
+    raw_v = verdicts(raw, raw_g, raw_vg, "root")
+    assert len(schemas) == len(ours_v) == len(chat_v) == len(raw_v), "line counts differ"
+    counts, raw_counts = {}, {}
+    mismatches, flips, entries = [], [], []
+    for i, (schema, refused, cv, rv) in enumerate(zip(schemas, ours_v, chat_v, raw_v)):
+        tag, why = tag_of(schema, cv, refused)
+        raw_tag, _ = tag_of(schema, rv, refused)
         counts[tag] = counts.get(tag, 0) + 1
-        entries.append({"schema": schema, "llama": lv, "tag": tag})
+        raw_counts[raw_tag] = raw_counts.get(raw_tag, 0) + 1
+        if why:
+            mismatches.append((why, schema, cv))
+        if rv.startswith("degraded") and not cv.startswith("degraded"):
+            flips.append((i, schema, rv, cv))
+        entries.append({"schema": schema, "llama": cv, "raw": rv, "tag": tag})
     with open(fixture, "w") as f:
         for e in entries:
             f.write(json.dumps(e, separators=(",", ":")) + "\n")
-    print(f"corpus {len(schemas)}; " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    fmt = lambda c: ", ".join(f"{k} {v}" for k, v in sorted(c.items()))
+    print(f"corpus {len(schemas)}")
+    print(f"chat endpoint: {fmt(counts)}")
+    print(f"plain converter: {fmt(raw_counts)}")
+    print(f"degraded by the plain converter, not by the chat endpoint: {len(flips)}")
+    for i, schema, rv, cv in flips:
+        print(f"FLIP #{i}: {json.dumps(schema)[:160]} | plain: {rv} | chat: {cv}")
     print(f"mismatches {len(mismatches)}")
     for why, schema, lv in mismatches:
-        print(f"MISMATCH {why}: {json.dumps(schema)} | llama.cpp: {lv}")
+        print(f"MISMATCH {why}: {json.dumps(schema)} | llama.cpp chat: {lv}")
     sys.exit(1 if mismatches else 0)
 
 

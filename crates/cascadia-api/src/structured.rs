@@ -1499,6 +1499,13 @@ fn llama_pointer_target<'a>(doc: &'a Value, r: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
+/// The name llama-server's chat endpoint visits a `response_format` schema
+/// under (`common/chat-auto-parser-generator.cpp`, and the per-template
+/// handlers in `common/chat.cpp`: `p.schema(p.json(),
+/// "response-format-schema", ...)`, built by `peg-parser.cpp`'s
+/// `builder.add_schema(p.name, ...)`).
+const LLAMA_CHAT_SCHEMA_NAME: &str = "response-format-schema";
+
 /// Names llama.cpp's `visit` won't give a schema's rule as is (it appends
 /// `-`): `root` and its built-in rule names.
 const LLAMA_RESERVED_NAMES: [&str; 18] = [
@@ -1859,14 +1866,15 @@ fn required_names(o: &Map<String, Value>) -> HashSet<&str> {
 /// has them. Its `_resolve_ref` names a ref's rule after the ref
 /// ([`llama_ref_rule_name`]) and, when a rule of that name already exists,
 /// uses it without visiting the target. So two refs whose names escape
-/// alike (`#/$defs/a_b`, `#/$defs/a-b`), or a ref and a schema the
-/// converter names alike from its path (a property `ref-defs-B` before
-/// `#/$defs/B`, a property `x` of `#/$defs/A` before `#/$defs/A-x`, a rule
-/// `_add_rule` numbered `ref-defs-B0`), get the first one's shape. Walks
-/// the converter's `visit` in its order and names (`_build_object_rule`,
-/// `allOf` merging, tuple, item and alternative names); a schema it
-/// inlines as a built-in primitive names no rule.
-/// `scripts/llama-ref-differential/` checks it against the converter.
+/// alike (`#/$defs/a_b`, `#/$defs/a-b`), or a ref and a schema inside
+/// another ref's target that the converter names alike (a property `x` of
+/// `#/$defs/A` before `#/$defs/A-x`), get the first one's shape. The
+/// schema's own properties can't: on the chat endpoint their rules are
+/// named under [`LLAMA_CHAT_SCHEMA_NAME`]. Walks the converter's `visit` in
+/// its order and names (`_build_object_rule`, `allOf` merging, tuple, item
+/// and alternative names, `_add_rule` numbering); a schema it inlines as a
+/// built-in primitive names no rule. `scripts/llama-ref-differential/`
+/// checks it against the converter, as the chat endpoint runs it.
 fn llama_rule_name_collision(schema: &Value) -> Option<LlamaNamesVerdict> {
     let mut names = LlamaNames {
         doc: schema,
@@ -1877,7 +1885,11 @@ fn llama_rule_name_collision(schema: &Value) -> Option<LlamaNamesVerdict> {
         work: 0,
         visited: HashSet::new(),
     };
-    names.visit(schema, None, "", None);
+    // sycl-llama sends `response_format` to llama-server's chat endpoint,
+    // whose chat parser adds the schema under this name (the plain
+    // converter, `/completion`, visits it as the root rule `root`): its
+    // properties' rules are named under it, so none can take a ref's name.
+    names.visit(schema, None, LLAMA_CHAT_SCHEMA_NAME, None);
     #[cfg(test)]
     LLAMA_NAMES_WORK.with(|w| w.set(names.work));
     names.verdict
