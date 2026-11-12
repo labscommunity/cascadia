@@ -93,6 +93,7 @@ def http(base, path, body, timeout):
 class Client:
     def __init__(self, args):
         self.base, self.timeout, self.mock = args.url, args.timeout, args.mock
+        self.no_tools = args.mock or args.no_tools
         self.model = args.model
         self.max_tokens = 256 if args.mock else 2048
 
@@ -224,9 +225,10 @@ def check_replayed_reasoning(cl, state):
              "tool_calls": [call]},
             {"role": "tool", "tool_call_id": "call_1", "content": '{"temp_c": 18, "sky": "clear"}'},
         ]
-        # The mock has no chat template, so it refuses tool definitions; the
-        # replayed turns alone still exercise the parse and the size check.
-        extra = {} if cl.mock else {"tools": [WEATHER]}
+        # The mock has no chat template, and ov-genai with thinking on applies
+        # its own template, so both refuse tool definitions; there the replayed
+        # turns alone still exercise the parse and the size check.
+        extra = {} if cl.no_tools else {"tools": [WEATHER]}
         m = message(cl.chat(extra, msgs))
         if not (m.get("content") or m.get("tool_calls")):
             raise Fail(f"replay with `{key}`: empty answer and no tool call: {m}")
@@ -267,6 +269,8 @@ def reproduce(args):
         cmd.append("--mock")
     if args.format_none:
         cmd.append("--format-none")
+    if args.no_tools:
+        cmd.append("--no-tools")
     cmd += ["--timeout", str(args.timeout)]
     return " ".join(cmd)
 
@@ -329,6 +333,8 @@ def main():
     p.add_argument("--format-none", action="store_true",
                    help="server runs --reasoning-format none")
     p.add_argument("--timeout", type=int, default=600, help="seconds per request")
+    p.add_argument("--no-tools", action="store_true",
+                   help="send the replayed tool loop without tool definitions (ov-genai with thinking on refuses them)")
     sys.exit(run(p.parse_args()))
 
 
