@@ -38,22 +38,99 @@ def doc(defs, props, required=("p",), extra=None):
     return d
 
 
-def nested(ref, depth):
-    """`{"$ref": ref}` wrapped `depth - 1` levels deep under `y` keys,
-    with the pointer suffix that reaches it."""
+def nested(ref, depth, in_array=False):
+    """`{"$ref": ref}` wrapped `depth - 1` levels deep under `y` keys (and
+    then in a one-item array), with the pointer suffix that reaches it."""
     inner = {"$ref": ref}
     path = ""
+    if in_array:
+        inner = [inner]
+        path = "/0"
     for _ in range(depth - 1):
         inner = {"y": inner}
-        path += "/y"
+        path = "/y" + path
     return inner, path
 
 
+# Names llama-server's rule names can't tell apart: `ref` + the pointer,
+# every run of characters outside [a-zA-Z0-9-] made `-`.
+TWINS = [("a_b", "a-b"), ("a.b", "a b"), ("a__b", "a-b"), ("aéb", "a-b"), ("a/b", "a~1b")]
+OBJ_N = {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
+OBJ_S = {"type": "object", "properties": {"s": {"type": "string"}}, "required": ["s"]}
+
+
+def collisions():
+    for one, two in TWINS:
+        # Two `$defs` entries whose refs name the same rule, used both ways.
+        for order in ((one, two), (two, one)):
+            yield {
+                "$defs": {order[0]: OBJ_N, order[1]: OBJ_S},
+                "type": "object",
+                "properties": {"x": {"$ref": f"#/$defs/{order[0]}"}, "y": {"$ref": f"#/$defs/{order[1]}"}},
+                "required": ["x", "y"],
+            }
+        # Only one of them referenced: no collision.
+        yield {
+            "$defs": {one: OBJ_N, two: OBJ_S},
+            "type": "object",
+            "properties": {"x": {"$ref": f"#/$defs/{one}"}},
+            "required": ["x"],
+        }
+    # A property whose rule name is a ref's rule name, before and after it,
+    # object (a rule of its own) or primitive (inlined).
+    for value in (OBJ_N, {"type": "integer"}):
+        for first in ("prop", "ref"):
+            props = {"ref-defs-B": value, "b": {"$ref": "#/$defs/B"}}
+            if first == "ref":
+                props = {"b": {"$ref": "#/$defs/B"}, "ref-defs-B": value}
+            yield {"$defs": {"B": OBJ_S}, "type": "object", "properties": props, "required": list(props)}
+        yield {"$defs": {"B": OBJ_S}, "type": "object",
+               "properties": {"ref_defs_B": value, "b": {"$ref": "#/$defs/B"}}, "required": ["ref_defs_B", "b"]}
+    # The review's cases as written: an enum property named like the ref's
+    # rule, and the object one probed live.
+    yield {
+        "$defs": {"B": {"enum": ["u", "v"]}},
+        "type": "object",
+        "properties": {"ref-defs-B": {"enum": [1, 2]}, "y": {"$ref": "#/$defs/B"}},
+        "required": ["ref-defs-B", "y"],
+    }
+    yield {
+        "$defs": {"B": OBJ_N},
+        "type": "object",
+        "properties": {"ref-defs-B": OBJ_S, "z": {"$ref": "#/$defs/B"}},
+        "required": ["ref-defs-B", "z"],
+    }
+    # A ref's rule name equal to a rule inside another ref's target:
+    # `#/$defs/A-x` against A's property `x`, and `#/$defs/A/x` against it.
+    for ref in ("#/$defs/A-x", "#/$defs/A/x", "#/$defs/A/properties/x"):
+        yield {
+            "$defs": {"A": {"type": "object", "properties": {"x": OBJ_N}, "required": ["x"], "x": OBJ_S}, "A-x": OBJ_S},
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/A"}, "b": {"$ref": ref}},
+            "required": ["a", "b"],
+        }
+    # A ref name one suffix away from another rule (`_add_rule` numbers a
+    # second rule of the same name: `ref-defs-B0`).
+    yield {
+        "$defs": {"B": OBJ_S, "B0": OBJ_N},
+        "type": "object",
+        "properties": {"ref-defs-B": OBJ_N, "b": {"$ref": "#/$defs/B"}, "c": {"$ref": "#/$defs/B0"}},
+        "required": ["ref-defs-B", "b", "c"],
+    }
+    # Items and alternatives named like a ref's rule.
+    yield {
+        "$defs": {"B": OBJ_S}, "type": "object",
+        "properties": {"ref-defs-B": {"type": "array", "items": OBJ_N}, "b": {"$ref": "#/$defs/B"}},
+        "required": ["ref-defs-B", "b"],
+    }
+
+
 def generated():
-    for ref, depth, pointed, also_elsewhere in itertools.product(
-        REFS, (1, 2, 3), (True, False), (True, False)
+    yield from collisions()
+    for ref, depth, in_array, pointed, also_elsewhere in itertools.product(
+        REFS, (1, 2, 3), (False, True), (True, False), (True, False)
     ):
-        inner, path = nested(ref, depth)
+        inner, path = nested(ref, depth, in_array)
         a = {"$ref": "#/$defs/B", "x": inner}
         props = {"q": {"type": "string"}}
         if pointed:

@@ -53,18 +53,26 @@ fn the_sycl_llama_ref_check_matches_llama_cpp() {
         let entry: Value = serde_json::from_str(line).unwrap();
         let schema = &entry["schema"];
         let tag = entry["tag"].as_str().unwrap();
-        let refused =
-            check_pointer_refs_only("", schema, "sycl-llama", RefResolver::LlamaServer).is_err();
+        let verdict = check_pointer_refs_only("", schema, "sycl-llama", RefResolver::LlamaServer);
+        let reason = verdict.as_ref().err().map(String::as_str).unwrap_or("");
         match tag {
-            "degraded" => assert!(refused, "a silent 200: {schema}"),
-            "faithful" => assert!(!refused, "refused a faithful schema: {schema}"),
+            "degraded" => assert!(verdict.is_err(), "a silent 200: {schema}"),
+            "faithful" => assert!(
+                verdict.is_ok(),
+                "refused a faithful schema: {schema}: {reason}"
+            ),
             "error" => {}
-            "conservative:ref-beside-ref" => {
-                assert!(refused && ref_beside_ref(schema, false), "{schema}")
-            }
-            "conservative:https-ref-unreached" => {
-                assert!(refused && no_fragment_https_ref(schema), "{schema}")
-            }
+            // Each conservative class is refused for its own reason.
+            "conservative:ref-beside-ref" => assert!(
+                ref_beside_ref(schema, false) && reason.contains("beside another `$ref`"),
+                "{schema}: {reason}"
+            ),
+            "conservative:https-ref-unreached" => assert!(
+                no_fragment_https_ref(schema)
+                    && reason.contains("$ref \"https://")
+                    && reason.contains("written as `#/...` pointers"),
+                "{schema}: {reason}"
+            ),
             other => panic!("unknown tag {other}: {schema}"),
         }
         entries += 1;

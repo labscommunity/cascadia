@@ -7,6 +7,10 @@
 //                       it became "any object" (or an `allOf` member was dropped)
 //   faithful            every `$ref` it reached resolved to its target
 //
+// (A ref whose rule name another rule already holds is reused without its
+// target being visited; that shows only by comparing grammars, which
+// classify.py does with `--grammar` output.)
+//
 // A `$ref` with no recorded target shows in two ways: `_resolve_ref` and
 // `allOf` look it up with `operator[]`, which inserts a null entry while the
 // grammar is built; and a ref to an `https://` document is recorded as null
@@ -98,10 +102,24 @@ static std::string verdict(const std::string & line) {
     }
 }
 
-int main() {
+// The grammar llama-server would build for `line`, on one line (each rule
+// `name ::= body` separated by a tab), or `error`.
+static std::string grammar(const std::string & line) {
+    try {
+        std::string g = json_schema_to_grammar(nlohmann::ordered_json::parse(line), true);
+        std::replace(g.begin(), g.end(), '\n', '\t');
+        return g;
+    } catch (const std::exception &) {
+        return "error";
+    }
+}
+
+// `harness` prints a verdict per line; `harness --grammar` the grammar.
+int main(int argc, char ** argv) {
+    bool grammars = argc > 1 && std::string(argv[1]) == "--grammar";
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
-        std::cout << verdict(line) << "\n";
+        std::cout << (grammars ? grammar(line) : verdict(line)) << "\n";
     }
 }

@@ -1446,9 +1446,380 @@ pub fn check_pointer_refs_only(
                     _ => {}
                 }
             }
-            Ok(())
+            match llama_rule_name_collision(schema) {
+                Some(why) => Err(format!(
+                    "{FIELD}: {why} (this server's engine, {engine}, would give both one shape)"
+                )),
+                None => Ok(()),
+            }
         }
     }
+}
+
+/// llama.cpp's rule-name escaping (`INVALID_RULE_CHARS_RE` and the one
+/// `_resolve_ref` uses): every run of characters outside `[a-zA-Z0-9-]`
+/// becomes `-`.
+fn llama_rule_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut in_run = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            out.push(c);
+            in_run = false;
+        } else if !in_run {
+            out.push('-');
+            in_run = true;
+        }
+    }
+    out
+}
+
+/// The rule `_resolve_ref` names a ref's target: `ref` + the escaped
+/// fragment (the whole ref when it has none).
+fn llama_ref_rule_name(r: &str) -> String {
+    let fragment = r.split_once('#').map_or(r, |(_, f)| f);
+    format!("ref{}", llama_rule_name(fragment))
+}
+
+/// The target of a `#/...` ref as llama-server's `resolve_refs` reads it:
+/// split on `/`, no unescaping, an array index read as a number.
+fn llama_pointer_target<'a>(doc: &'a Value, r: &str) -> Option<&'a Value> {
+    let mut cur = doc;
+    for tok in r.strip_prefix("#/")?.split('/') {
+        cur = match cur {
+            Value::Object(o) => o.get(tok)?,
+            Value::Array(a) => a.get(tok.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+/// Names llama.cpp's `visit` won't give a schema's rule as is (it appends
+/// `-`): `root` and its built-in rule names.
+const LLAMA_RESERVED_NAMES: [&str; 18] = [
+    "root",
+    "boolean",
+    "decimal-part",
+    "integral-part",
+    "number",
+    "integer",
+    "value",
+    "object",
+    "array",
+    "uuid",
+    "char",
+    "string",
+    "null",
+    "date",
+    "time",
+    "date-time",
+    "date-string",
+    "time-string",
+];
+
+/// Who created a rule in [`LlamaNames`]: a ref's target (by its address in
+/// the schema, so two refs to one target share it, and the ref) or the
+/// schema at a path.
+#[derive(Clone, PartialEq)]
+enum LlamaRuleOwner {
+    Target(*const Value, String),
+    Path(String),
+}
+
+/// The rule names llama.cpp's converter creates for a schema, in its
+/// order, to find a ref whose rule it would take from another schema. See
+/// [`llama_rule_name_collision`].
+struct LlamaNames<'a> {
+    doc: &'a Value,
+    rules: HashMap<String, LlamaRuleOwner>,
+    resolving: HashSet<String>,
+    collision: Option<String>,
+    depth: usize,
+}
+
+impl LlamaNames<'_> {
+    fn join(name: &str, part: &str) -> String {
+        if name.is_empty() {
+            part.to_owned()
+        } else {
+            format!("{name}-{part}")
+        }
+    }
+
+    /// `_add_rule`: the escaped name, or the first free `name<i>` when a
+    /// rule already has it. (The converter keeps a taken name for an
+    /// identical body; counting it as taken only numbers a later rule one
+    /// higher, which is checked the same way.)
+    fn add_rule(&mut self, name: &str, owner: LlamaRuleOwner) {
+        let esc = llama_rule_name(name);
+        let key = if self.rules.contains_key(&esc) {
+            (0..)
+                .map(|i| format!("{esc}{i}"))
+                .find(|k| !self.rules.contains_key(k))
+                .expect("a free name")
+        } else {
+            esc
+        };
+        self.rules.insert(key, owner);
+    }
+
+    /// `_resolve_ref`: an existing rule of the ref's name is used as is.
+    fn resolve_ref(&mut self, r: &str) {
+        let n = llama_ref_rule_name(r);
+        let target = llama_pointer_target(self.doc, r);
+        if let Some(owner) = self.rules.get(&n) {
+            let same_target = matches!(
+                (owner, target),
+                (LlamaRuleOwner::Target(p, _), Some(t)) if std::ptr::eq(*p, t)
+            );
+            if !same_target && self.collision.is_none() {
+                let other = match owner {
+                    LlamaRuleOwner::Target(_, other) => {
+                        format!("$ref {}", Value::String(other.chars().take(80).collect()))
+                    }
+                    LlamaRuleOwner::Path(p) => format!("the schema llama.cpp names {p}"),
+                };
+                self.collision = Some(format!(
+                    "$ref {} and {other} name the same grammar rule ({n}) on llama-server, \
+                     which keeps only the first one's shape; rename one of them",
+                    Value::String(r.chars().take(80).collect())
+                ));
+            }
+            return;
+        }
+        if !self.resolving.insert(r.to_owned()) {
+            return;
+        }
+        if let Some(t) = target {
+            self.visit(t, &n, Some(LlamaRuleOwner::Target(t, r.to_owned())));
+        }
+        self.resolving.remove(r);
+    }
+
+    /// `visit`, for the rule names it creates. `owner` is set for a ref's
+    /// target, whose rule is the ref's.
+    fn visit(&mut self, schema: &Value, name: &str, owner: Option<LlamaRuleOwner>) {
+        self.depth += 1;
+        if self.depth > 4096 && self.collision.is_none() {
+            self.collision = Some("$ref chain too deep to check its grammar rule names".into());
+        }
+        if self.collision.is_none() {
+            self.visit_inner(schema, name, owner);
+        }
+        self.depth -= 1;
+    }
+
+    fn visit_inner(&mut self, schema: &Value, name: &str, owner: Option<LlamaRuleOwner>) {
+        let Value::Object(o) = schema else {
+            return;
+        };
+        let rule_name = if LLAMA_RESERVED_NAMES.contains(&name) {
+            format!("{name}-")
+        } else if name.is_empty() {
+            "root".to_owned()
+        } else {
+            name.to_owned()
+        };
+        let own = owner.unwrap_or_else(|| LlamaRuleOwner::Path(rule_name.clone()));
+        let ty = o.get("type");
+        let t = ty.and_then(Value::as_str);
+        let ty_is = |x: &str| ty.is_none() || t == Some(x);
+        let has = |k: &str| o.contains_key(k);
+        let alt_name = |i: usize| {
+            if name.is_empty() {
+                format!("alternative-{i}")
+            } else {
+                format!("{name}-{i}")
+            }
+        };
+        if let Some(r) = o.get("$ref").and_then(Value::as_str) {
+            self.resolve_ref(r);
+            self.add_rule(&rule_name, own);
+            return;
+        }
+        if let Some(Value::Array(alts)) = o.get("oneOf").or_else(|| o.get("anyOf")) {
+            for (i, alt) in alts.iter().enumerate() {
+                self.visit(alt, &alt_name(i), None);
+            }
+            self.add_rule(&rule_name, own);
+            return;
+        }
+        if let Some(Value::Array(types)) = ty {
+            for (i, each) in types.iter().enumerate() {
+                let mut copy = schema.clone();
+                copy["type"] = each.clone();
+                self.visit(&copy, &alt_name(i), None);
+            }
+            self.add_rule(&rule_name, own);
+            return;
+        }
+        if has("const") || has("enum") {
+            self.add_rule(&rule_name, own);
+            return;
+        }
+        if ty_is("object")
+            && (has("properties")
+                || o.get("additionalProperties")
+                    .is_some_and(|a| a != &Value::Bool(true)))
+        {
+            let props: Vec<(&String, &Value)> = match o.get("properties") {
+                Some(Value::Object(p)) => p.iter().collect(),
+                _ => Vec::new(),
+            };
+            let required = required_names(o);
+            self.object_rule(&props, &required, name, o.get("additionalProperties"));
+            self.add_rule(&rule_name, own);
+            return;
+        }
+        if (ty_is("object") || t == Some("string")) && has("allOf") {
+            let mut comps: Vec<(&Value, bool)> = Vec::new();
+            if let Some(Value::Array(members)) = o.get("allOf") {
+                for m in members {
+                    match m.get("anyOf") {
+                        Some(Value::Array(tt)) => comps.extend(tt.iter().map(|c| (c, false))),
+                        _ => comps.push((m, true)),
+                    }
+                }
+            }
+            let mut props: Vec<(&String, &Value)> = Vec::new();
+            let mut required: HashSet<&str> = HashSet::new();
+            let mut seen = HashSet::new();
+            let mut i = 0;
+            while i < comps.len() {
+                let (c, is_required) = comps[i];
+                i += 1;
+                if let Some(r) = c.get("$ref").and_then(Value::as_str) {
+                    if seen.insert(r) {
+                        if let Some(target) = llama_pointer_target(self.doc, r) {
+                            comps.insert(i, (target, is_required));
+                        }
+                    }
+                } else if let Some(Value::Object(p)) = c.get("properties") {
+                    for (k, v) in p {
+                        props.push((k, v));
+                        if is_required {
+                            required.insert(k);
+                        }
+                    }
+                }
+            }
+            self.object_rule(&props, &required, name, None);
+            self.add_rule(&rule_name, own);
+            return;
+        }
+        if ty_is("array") && (has("items") || has("prefixItems")) {
+            match o.get("items").or_else(|| o.get("prefixItems")) {
+                Some(Value::Array(items)) => {
+                    for (i, item) in items.iter().enumerate() {
+                        self.visit(item, &Self::join(name, &format!("tuple-{i}")), None);
+                    }
+                }
+                Some(item) => self.visit(item, &Self::join(name, "item"), None),
+                None => {}
+            }
+            self.add_rule(&rule_name, own);
+            return;
+        }
+        if ty_is("string") && has("pattern") {
+            self.add_rule(&rule_name, own);
+            return;
+        }
+        let format = o.get("format").and_then(Value::as_str).unwrap_or("");
+        if ty_is("string") && format.starts_with("uuid") {
+            return;
+        }
+        let named = (ty_is("string") && matches!(format, "date" | "time" | "date-time"))
+            || (t == Some("string") && (has("minLength") || has("maxLength")))
+            || (t == Some("integer")
+                && ["minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum"]
+                    .iter()
+                    .any(|k| has(k)))
+            || o.is_empty()
+            || t == Some("object")
+            || ty.is_none();
+        if named {
+            self.add_rule(&rule_name, own);
+        }
+    }
+
+    /// `_build_object_rule`: each property's rule, then its `-kv` rule; the
+    /// other properties' rules; and a `-rest` rule for each optional
+    /// property but the last of each run.
+    fn object_rule(
+        &mut self,
+        props: &[(&String, &Value)],
+        required: &HashSet<&str>,
+        name: &str,
+        additional: Option<&Value>,
+    ) {
+        let mut optional: Vec<String> = Vec::new();
+        for (k, v) in props {
+            let n = Self::join(name, k);
+            self.visit(v, &n, None);
+            let kv = format!("{n}-kv");
+            self.add_rule(&kv, LlamaRuleOwner::Path(kv.clone()));
+            if !required.contains(k.as_str()) {
+                optional.push((*k).clone());
+            }
+        }
+        if let Some(ap) = additional.filter(|a| a.is_object() || **a == Value::Bool(true)) {
+            let sub = Self::join(name, "additional");
+            if ap.is_object() {
+                self.visit(ap, &format!("{sub}-value"), None);
+            }
+            if !props.is_empty() {
+                let k = format!("{sub}-k");
+                self.add_rule(&k, LlamaRuleOwner::Path(k.clone()));
+            }
+            let kv = format!("{sub}-kv");
+            self.add_rule(&kv, LlamaRuleOwner::Path(kv.clone()));
+            optional.push("*".into());
+        }
+        // The same `-rest` rule is built for each run that holds it, with
+        // the same body: one name.
+        let mut rest_seen = HashSet::new();
+        for start in 0..optional.len() {
+            for k in &optional[start..optional.len().saturating_sub(1)] {
+                let n = format!("{}-rest", Self::join(name, k));
+                if rest_seen.insert(n.clone()) {
+                    self.add_rule(&n, LlamaRuleOwner::Path(n.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// A schema's `required` names.
+fn required_names(o: &Map<String, Value>) -> HashSet<&str> {
+    match o.get("required") {
+        Some(Value::Array(r)) => r.iter().filter_map(Value::as_str).collect(),
+        _ => HashSet::new(),
+    }
+}
+
+/// Two schemas for one grammar rule in llama.cpp's converter, if `schema`
+/// has them. Its `_resolve_ref` names a ref's rule after the ref
+/// ([`llama_ref_rule_name`]) and, when a rule of that name already exists,
+/// uses it without visiting the target. So two refs whose names escape
+/// alike (`#/$defs/a_b`, `#/$defs/a-b`), or a ref and a schema the
+/// converter names alike from its path (a property `ref-defs-B` before
+/// `#/$defs/B`, a property `x` of `#/$defs/A` before `#/$defs/A-x`, a rule
+/// `_add_rule` numbered `ref-defs-B0`), get the first one's shape. Walks
+/// the converter's `visit` in its order and names (`_build_object_rule`,
+/// `allOf` merging, tuple, item and alternative names); a schema it
+/// inlines as a built-in primitive names no rule.
+/// `scripts/llama-ref-differential/` checks it against the converter.
+fn llama_rule_name_collision(schema: &Value) -> Option<String> {
+    let mut names = LlamaNames {
+        doc: schema,
+        rules: HashMap::new(),
+        resolving: HashSet::new(),
+        collision: None,
+        depth: 0,
+    };
+    names.visit(schema, "", None);
+    names.collision
 }
 
 /// The 400 for a `$ref` `engine` would leave unconstrained.

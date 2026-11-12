@@ -16,8 +16,45 @@ silent, either verdict of ours is fine) or `conservative:<class>`:
 - `https-ref-unreached`: a no-fragment `https://` `$ref` (in data, or
   anywhere else the converter never reaches)."""
 
+import hashlib
 import json
+import re
 import sys
+
+TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\[(?:\\.|[^\]\\])*\]|[A-Za-z0-9-]+|\{[0-9,]*\}|[()|*+?]|\S')
+
+
+def parse_grammar(text):
+    """`name ::= body` rules from the harness's `--grammar` line."""
+    rules = {}
+    for part in text.split("\t"):
+        if " ::= " in part:
+            name, body = part.split(" ::= ", 1)
+            rules[name.strip()] = TOKEN.findall(body)
+    return rules
+
+
+def same_language_shape(g1, g2):
+    """Whether the roots of two grammars are the same up to rule names:
+    partition refinement over both grammars together (a rule's class is
+    its previous class and its body with every rule name replaced by that
+    rule's class), run until no class splits, then the roots compared."""
+    rules = {("a", k): v for k, v in g1.items()}
+    rules.update({("b", k): v for k, v in g2.items()})
+    if ("a", "root") not in rules or ("b", "root") not in rules:
+        return False
+    color = {k: "" for k in rules}
+    while True:
+        new = {}
+        for (side, name), body in rules.items():
+            toks = ["@" + color[(side, t)] if (side, t) in rules else t for t in body]
+            text = color[(side, name)] + "|" + " ".join(toks)
+            new[(side, name)] = hashlib.sha1(text.encode()).hexdigest()[:16]
+        done = len(set(new.values())) == len(set(color.values()))
+        color = new
+        if done:
+            break
+    return color[("a", "root")] == color[("b", "root")]
 
 
 def refs_beside_ref(v, beside=False):
@@ -53,11 +90,20 @@ def conservative_class(schema):
 
 
 def main():
-    corpus, llama, ours, fixture = sys.argv[1:5]
+    corpus, llama, ours, grammars, variant_grammars, fixture = sys.argv[1:7]
     schemas = [json.loads(l) for l in open(corpus) if l.strip()]
     llama_v = [l.rstrip("\n") for l in open(llama)]
     ours_v = [l.strip() for l in open(ours)]
-    assert len(schemas) == len(llama_v) == len(ours_v), "line counts differ"
+    g_orig = [l.rstrip("\n") for l in open(grammars)]
+    g_var = [l.rstrip("\n") for l in open(variant_grammars)]
+    assert len(schemas) == len(llama_v) == len(ours_v) == len(g_orig) == len(g_var), "line counts differ"
+    # A faithful verdict still hides a ref whose rule was reused: compare
+    # the grammar with the one for the variant, where every ref has a rule
+    # name of its own.
+    for i, (lv, a, b) in enumerate(zip(llama_v, g_orig, g_var)):
+        if lv == "faithful" and a != "error" and b != "error":
+            if not same_language_shape(parse_grammar(a), parse_grammar(b)):
+                llama_v[i] = "degraded (a ref's rule name held another rule)"
     counts = {}
     mismatches = []
     entries = []

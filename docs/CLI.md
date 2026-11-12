@@ -757,8 +757,19 @@ whatever its form, gets `` $ref "<ref>" is not supported by this server's
 engine (sycl-llama): it does not resolve a `$ref` placed beside another
 `$ref` … ``, and any other `$ref` that is not `#/...`, data included, gets
 `` … written as `#/...` pointers … ``. `description`, `title` or `default`
-beside a `$ref` are fine when they hold no `$ref`. Two classes of these
-400s are conservative (llama-server would convert the schema faithfully):
+beside a `$ref` are fine when they hold no `$ref`. llama-server also names
+each ref's grammar rule after its pointer (`ref` + the pointer, every run
+of characters outside `[a-zA-Z0-9-]` made `-`) and uses a rule that
+already has that name without reading the ref's target, so two refs that
+name the same rule (`#/$defs/a_b` and `#/$defs/a-b`), or a ref and a
+schema the converter named that way first (a property `ref-defs-B` before
+`#/$defs/B`, a property `x` of `#/$defs/A` before `#/$defs/A-x`), would get
+one shape for both: on `sycl-llama` that is `` $ref "<ref>" and <the other>
+name the same grammar rule (<name>) on llama-server … ``. The check follows
+the converter's own naming and order; it could refuse a schema llama.cpp
+builds right only where two different schemas convert to identical rules
+(the converter then shares the name), and the differential found none.
+Two classes of these 400s are conservative (llama-server would convert the schema faithfully):
 a `$ref` under a `$ref`'s siblings that no pointer reaches, or whose
 target is also referenced elsewhere; and an `https://` `$ref` with no
 fragment that the converter never reaches (in `const`, `default`,
