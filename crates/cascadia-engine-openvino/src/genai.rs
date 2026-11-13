@@ -512,7 +512,15 @@ impl Engine for OvGenaiEngine {
         // so infer — reaching the token cap is `length`, anything short of it
         // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
         // exactly at the cap reports `length` (OpenAI is also ambiguous here).
-        let finish = if tokens >= max_new {
+        // Judged on the tokens ov-genai generated: re-tokenizing the decoded
+        // text can merge differently and land one short of the cap. The
+        // re-tokenized count only stands in when the pipeline reports none.
+        let generated = if result.generated_tokens > 0 {
+            result.generated_tokens
+        } else {
+            tokens
+        };
+        let finish = if generated >= max_new {
             FinishReason::Length
         } else {
             FinishReason::Stop
