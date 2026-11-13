@@ -456,23 +456,41 @@ fn prefill_span_end(i: usize, chunk: usize, seed_split: usize) -> usize {
     }
 }
 
-/// Effective prefill span. Default `usize::MAX` = the whole span in ONE pass (unchanged, fastest).
+/// Prefill span per chain pass; bounds the last stage's transient `[1, T, vocab]` logits buffer
+/// (~268 MB f32 at 256 with the 262144 vocab, vs ~8.4 GB for an 8,000-token single pass) and each
+/// span's wire frame.
+const PREFILL_CHUNK: usize = 256;
+
+/// Effective prefill span. Default = `PREFILL_CHUNK`.
 ///
 /// `CASCADIA_GEMMA4_FORCE_T1_PREFILL=1` ⇒ 1: fold EVERY token through the same T=1 path. A warm-resumed
 /// SUFFIX prefill (e.g. 22 tokens at position 71) and a cold FULL prefill (93 tokens at 0) otherwise hit
 /// different GEMM batch shapes; over int4 weights the rounding delta flips a token, so cross-chain
 /// warm != cold byte-identical. Under T=1 both traverse the identical per-token kernel ⇒ bit-identical.
-/// Opt-in only — production keeps the single-pass prefill (warm-resume stays greedy-equivalent there,
-/// not bit-identical). Mirrors `qwen36::prefill_chunk`.
+/// Opt-in only — production keeps batched spans (warm-resume stays greedy-equivalent there, not
+/// bit-identical). Mirrors `qwen36::prefill_chunk`.
+///
+/// `CASCADIA_GEMMA4_PREFILL_CHUNK=n` overrides the span (`0` = whole prompt in one pass); test-only,
+/// so a hardware check can still send an oversized single frame. FORCE_T1 wins over it.
 fn prefill_chunk() -> usize {
-    if std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        1
-    } else {
-        usize::MAX
+    prefill_chunk_from(
+        std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL")
+            .ok()
+            .as_deref(),
+        std::env::var("CASCADIA_GEMMA4_PREFILL_CHUNK")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn prefill_chunk_from(force_t1: Option<&str>, chunk: Option<&str>) -> usize {
+    if force_t1 == Some("1") {
+        return 1;
+    }
+    match chunk.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => PREFILL_CHUNK,
     }
 }
 
@@ -1172,8 +1190,8 @@ impl Gemma4Engine {
         // multi-token inference; the IR keeps own KV internally. The absolute
         // start-position is sent downstream so relay stages align position_ids
         // and reset on 0.
-        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = whole span (one pass,
-        // unchanged/fastest). CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
+        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = PREFILL_CHUNK (256),
+        // bounding the last stage's logits buffer. CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
         // and a cold FULL prefill traverse the identical per-token kernel. Without it the two use
         // different GEMM batch shapes (e.g. 22 vs 93 tokens) over int4 weights, and the rounding delta
         // flips a token ⇒ cross-chain warm != cold. Mirrors qwen36's FORCE_T1_PREFILL.
@@ -2592,8 +2610,47 @@ mod tests {
     }
 
     #[test]
+    fn prefill_chunk_defaults_to_256() {
+        assert_eq!(prefill_chunk_from(None, None), 256);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_zero_is_one_pass() {
+        assert_eq!(prefill_chunk_from(None, Some("0")), usize::MAX);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_sets_the_span() {
+        assert_eq!(prefill_chunk_from(None, Some("512")), 512);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_garbage_keeps_the_default() {
+        assert_eq!(prefill_chunk_from(None, Some("lots")), 256);
+        assert_eq!(prefill_chunk_from(None, Some("")), 256);
+    }
+
+    #[test]
+    fn prefill_chunk_force_t1_wins_over_the_knob() {
+        assert_eq!(prefill_chunk_from(Some("1"), Some("512")), 1);
+        assert_eq!(prefill_chunk_from(Some("1"), Some("0")), 1);
+    }
+
+    #[test]
+    fn prefill_spans_default_chunk_splits_a_long_prompt() {
+        // 600-token cold prompt, no seed: 256 + 256 + 88.
+        let (mut i, mut spans) = (0, Vec::new());
+        while i < 600 {
+            let end = prefill_span_end(i, PREFILL_CHUNK, 600);
+            spans.push((i, end));
+            i = end;
+        }
+        assert_eq!(spans, vec![(0, 256), (256, 512), (512, 600)]);
+    }
+
+    #[test]
     fn prefill_spans_without_seed_match_the_old_folding() {
-        // chunk = usize::MAX (default single-pass): one span over everything.
+        // chunk = usize::MAX (CASCADIA_GEMMA4_PREFILL_CHUNK=0): one span over everything.
         assert_eq!(prefill_span_end(0, usize::MAX, 10), 10);
         // explicit chunking, no seed: plain min(i+chunk, len).
         assert_eq!(prefill_span_end(0, 4, 10), 4);
