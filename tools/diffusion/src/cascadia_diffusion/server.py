@@ -16,6 +16,11 @@ import urllib.request
 import uuid
 from .contracts import MAX_FRAME, exact, integer, parse_json, require
 
+# Two 16 KiB strings can each expand sixfold under JSON escaping, before the
+# coordinator adds its job envelope and normalized request fields. Keep a
+# finite bound above that maximum rather than reusing the public API body cap.
+MAX_GENERATE_BODY = 256 * 1024
+
 
 class BoundedServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads=False
@@ -102,7 +107,7 @@ def serve(config_path: Path):
             if not self.authorized():return self.respond(401,{'error':'unauthorized'})
             if self.path not in ('/execute','/generate'):return self.respond(404,{'error':'unknown route'})
             lengths=self.headers.get_all('Content-Length',[])
-            cap=MAX_FRAME if self.path=='/execute' else 65536
+            cap=MAX_FRAME if self.path=='/execute' else MAX_GENERATE_BODY
             if self.headers.get('Transfer-Encoding') or len(lengths)!=1 or not lengths[0].isascii() or not lengths[0].isdecimal():return self.respond(400,{'error':'invalid framing'})
             length=int(lengths[0])
             if not 0<length<=cap:return self.respond(413,{'error':'body exceeds limit'})

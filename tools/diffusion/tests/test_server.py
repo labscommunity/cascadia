@@ -30,6 +30,11 @@ class FakeEngine:
             time.sleep(.01)
         return raw
 runtime.Engine=FakeEngine
+class FakePipeline:
+    def __init__(self,*args):pass
+    def generate(self,body):
+        return {'prompt_bytes':len(body['prompt'].encode()),'negative_bytes':len(body.get('negative_prompt','').encode())}
+runtime.Pipeline=FakePipeline
 from cascadia_diffusion.server import serve
 serve(root/'config.json')
 '''
@@ -41,9 +46,10 @@ class Server(unittest.TestCase):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0))
             self.port=sock.getsockname()[1]
-        config={'artifact':str(self.root),'manifest':'a'*64,'components':['unet'],'device':'CPU','cache':str(self.root/'cache'),'port':self.port,'coordinator':None}
+        config={'artifact':str(self.root),'manifest':'a'*64,'components':['unet'],'device':'CPU','cache':str(self.root/'cache'),'port':self.port,
+                'coordinator':{'mode':'components','callback_url':'http://127.0.0.1:19045/invoke','callback_boot':'00000000-0000-0000-0000-000000000001'}}
         (self.root/'config.json').write_text(json.dumps(config))
-        env=os.environ|{'PYTHONPATH':str(SOURCE),'CASCADIA_DIFFUSION_TOKEN':TOKEN}
+        env=os.environ|{'PYTHONPATH':str(SOURCE),'CASCADIA_DIFFUSION_TOKEN':TOKEN,'CASCADIA_DIFFUSION_CALLBACK_TOKEN':TOKEN}
         self.process=subprocess.Popen([sys.executable,'-c',CHILD,str(self.root)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         self.wait(lambda:self.ready())
     def tearDown(self):
@@ -89,5 +95,19 @@ class Server(unittest.TestCase):
         self.assertEqual(self.request('POST','/execute',raw)[0],503)
         (self.root/'finish').write_text('1')
         self.wait(lambda:self.request('POST','/execute',raw)[0]==200)
+
+    def test_generation_envelope_accepts_a_maximum_public_request(self):
+        request={'model':'sdxl-layers-512','prompt':'"'*16384,'negative_prompt':''}
+        remaining=65536-len(json.dumps(request,separators=(',',':')).encode())
+        request['negative_prompt']='"'*(remaining//2)+'x'*(remaining%2)
+        self.assertEqual(len(json.dumps(request,separators=(',',':')).encode()),65536)
+        self.assertLessEqual(len(request['negative_prompt'].encode()),16384)
+        request.update(size='512x512',n=1,num_inference_steps=20,response_format='b64_json')
+        payload=json.dumps({'job':'00000000-0000-0000-0000-000000000001','request':request},separators=(',',':')).encode()
+        self.assertGreater(len(payload),65536)
+        status,body=self.request('POST','/generate',payload)
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body),{'prompt_bytes':16384,'negative_bytes':len(request['negative_prompt'])})
+        self.assertEqual(self.request('POST','/generate',b'x'*(256*1024+1))[0],413)
 
 if __name__=='__main__':unittest.main()
