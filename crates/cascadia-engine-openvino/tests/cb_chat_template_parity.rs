@@ -40,6 +40,7 @@ fn cfg(skip_chat_template: bool) -> GenConfig {
         num_assistant_tokens: 0,
         max_ngram_size: 0,
         skip_chat_template,
+        prompt_templated: false,
         top_p: 1.0,
         top_k: 0,
         frequency_penalty: 0.0,
