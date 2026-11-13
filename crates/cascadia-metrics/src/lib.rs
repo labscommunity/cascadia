@@ -238,6 +238,20 @@ pub static KV_CACHE_EXHAUSTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("register cascadia_kv_cache_exhausted_total")
 });
 
+/// Streamed generations on the default (stateful) `ov-genai` path whose
+/// streamed text is not a prefix of the final answer: a detokenizer rewrote
+/// text already sent. Each one also logs `ov_genai_stream_divergence` (byte
+/// counts only). Only streaming clients can see it; a non-streamed request
+/// gets the exact answer. It should stay at 0.
+pub static OV_GENAI_STREAM_DIVERGENCE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_ov_genai_stream_divergence_total",
+        "Streamed ov-genai generations whose streamed text is not a prefix of the answer.",
+        &["model"]
+    )
+    .expect("register cascadia_ov_genai_stream_divergence_total")
+});
+
 // --- Engine-level (bumped by cascadia-runner during start) ---------------
 
 /// Weight-load + engine-build duration at stage start (transport connect
@@ -340,6 +354,7 @@ pub fn init() {
     LazyLock::force(&TASKS_CANCELLED_TOTAL);
     LazyLock::force(&TASKS_FAILED_TOTAL);
     LazyLock::force(&KV_CACHE_EXHAUSTED_TOTAL);
+    LazyLock::force(&OV_GENAI_STREAM_DIVERGENCE_TOTAL);
     LazyLock::force(&ENGINE_LOAD_DURATION_SECONDS);
     LazyLock::force(&ENGINE_WARMUP_DURATION_SECONDS);
     LazyLock::force(&TRANSPORT_SENT_BYTES_TOTAL);

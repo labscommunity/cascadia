@@ -70,6 +70,9 @@ pub struct OvGenaiBuilder {
     pub stream_writes: bool,
     pipe: Option<Box<dyn StatefulPipe>>,
     cb_pipe: Option<CbPipeline>,
+    /// The shard's `model_id` from `load`: the `model` label of the engine's
+    /// own metrics.
+    model_id: String,
 }
 
 impl Default for OvGenaiBuilder {
@@ -98,6 +101,7 @@ impl OvGenaiBuilder {
             stream_writes: false,
             pipe: None,
             cb_pipe: None,
+            model_id: String::new(),
         }
     }
 
@@ -260,6 +264,7 @@ impl Builder for OvGenaiBuilder {
                 "ov-genai requires --total 1".into(),
             ));
         }
+        self.model_id = shard.model_id.clone();
         if self.draft_model_path.is_some() && self.prompt_lookup_ngram > 0 {
             return Err(EngineError::InvalidConfig(
                 "--draft-model and --prompt-lookup are mutually exclusive (both set \
@@ -401,7 +406,7 @@ impl Builder for OvGenaiBuilder {
             engine_stop_check: self.engine_stop_check,
             stream_text: self.stream_writes,
         };
-        Ok(Box::new(OvGenaiEngine::new(pipe, params)?))
+        Ok(Box::new(OvGenaiEngine::new(pipe, params, self.model_id)?))
     }
 }
 
@@ -546,6 +551,8 @@ pub struct OvGenaiEngine {
     streamer_thread_logged: bool,
     /// With [`OvGenaiBuilder::stream_writes`]: the worker and its task.
     stream: Option<Streaming>,
+    /// The `model` label of the engine's own metrics.
+    model_id: String,
 }
 
 /// The streaming engine's worker and the task it runs.
@@ -564,7 +571,7 @@ struct Running {
 }
 
 impl OvGenaiEngine {
-    fn new(pipe: Box<dyn StatefulPipe>, params: GenParams) -> EngineResult<Self> {
+    fn new(pipe: Box<dyn StatefulPipe>, params: GenParams, model_id: String) -> EngineResult<Self> {
         let pipe: SharedPipe = Arc::new(Mutex::new(pipe));
         let inflight = Arc::new(InflightCancel::new());
         let stream = if params.stream_text {
@@ -583,6 +590,7 @@ impl OvGenaiEngine {
             inflight,
             streamer_thread_logged: false,
             stream,
+            model_id,
         })
     }
 
@@ -630,6 +638,7 @@ impl OvGenaiEngine {
         let chunk = final_chunk(
             &self.inflight,
             &mut self.streamer_thread_logged,
+            &self.model_id,
             &task.task_id,
             done,
             None,
@@ -719,6 +728,7 @@ impl OvGenaiEngine {
                     let chunk = final_chunk(
                         &self.inflight,
                         &mut self.streamer_thread_logged,
+                        &self.model_id,
                         &task_id,
                         *done,
                         Some(&*running),
@@ -776,6 +786,7 @@ fn spawn_worker(pipe: &SharedPipe, inflight: &Arc<InflightCancel>) -> EngineResu
 fn final_chunk(
     inflight: &InflightCancel,
     streamer_thread_logged: &mut bool,
+    model_id: &str,
     task_id: &TaskId,
     done: Done,
     running: Option<&Running>,
@@ -881,6 +892,9 @@ fn final_chunk(
                     visible_bytes = f.visible.len(),
                     "ov_genai_stream_divergence: the streamed text is not a prefix of the answer"
                 );
+                cascadia_metrics::OV_GENAI_STREAM_DIVERGENCE_TOTAL
+                    .with_label_values(&[model_id])
+                    .inc();
             }
             Chunk::final_marker(task_id.clone(), rest.rest)
                 .with_n_tokens(rest.carried_tokens as u32)
@@ -3621,7 +3635,12 @@ mod tests {
             engine_stop_check: true,
             stream_text: true,
         };
-        OvGenaiEngine::new(Box::new(MockStatefulPipe { st: st.clone() }), params).unwrap()
+        OvGenaiEngine::new(
+            Box::new(MockStatefulPipe { st: st.clone() }),
+            params,
+            String::new(),
+        )
+        .unwrap()
     }
 
     /// A worker thread that is gone mid-generation fails that task with an
@@ -3873,7 +3892,10 @@ mod tests {
                 s.pieces = pieces(&["it", "'s", " a"]);
                 s.window_script = windows.iter().map(|w| w.as_bytes().to_vec()).collect();
             }
-            let mut e = stateful_engine_in(&st, true);
+            let mut e = stateful_engine_with(&st, |mut b| {
+                b.model_id = "divergence-model".into();
+                b.stream_writes(true)
+            });
             e.submit(task("t1", 64).with_client_streams(client_streams))
                 .unwrap();
             let (out, logs) = capture_logs(|| until_final(&mut e));
@@ -3881,6 +3903,11 @@ mod tests {
             (out, logs, stream_text)
         };
 
+        let diverged = || {
+            cascadia_metrics::OV_GENAI_STREAM_DIVERGENCE_TOTAL
+                .with_label_values(&["divergence-model"])
+                .get()
+        };
         let (plain, logs, stream_text) = run(false);
         assert_eq!(plain.len(), 1, "{plain:?}");
         assert!(plain[0].is_final && plain[0].error.is_none(), "{plain:?}");
@@ -3889,6 +3916,7 @@ mod tests {
         assert_eq!(plain[0].n_tokens, Some(2));
         assert_eq!(stream_text, [false], "no per-write decode");
         assert!(!logs.contains("ov_genai_stream_divergence"), "{logs}");
+        assert_eq!(diverged(), 0, "a non-streamed answer never diverges");
 
         let (streamed, logs, stream_text) = run(true);
         assert_eq!(stream_text, [true]);
@@ -3896,6 +3924,7 @@ mod tests {
         assert_eq!(joined(&streamed), "it ''s a", "{streamed:?}");
         assert_eq!(usage(&streamed), 2, "{streamed:?}");
         assert!(logs.contains("ov_genai_stream_divergence"), "{logs}");
+        assert_eq!(diverged(), 1, "the divergence is counted under its model");
     }
 
     /// A U+FFFD that stays (a byte no character takes) refuses the check of
@@ -3977,7 +4006,7 @@ mod tests {
         assert_eq!(deltas, 0, "every write's text was still held");
         // The flag goes up after the job looked at it.
         inflight.cancel(&id);
-        let chunk = final_chunk(&inflight, &mut false, &id, done, None);
+        let chunk = final_chunk(&inflight, &mut false, "m", &id, done, None);
         assert!(is_empty_cancelled(&chunk), "{chunk:?}");
         assert_eq!(chunk.n_tokens, Some(3));
     }
