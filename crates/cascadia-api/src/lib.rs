@@ -2862,6 +2862,7 @@ async fn chat_completions(
         // For an engine that renders the template itself (llama-server's
         // `chat_template_kwargs`).
         preserve_thinking: req.preserve_thinking(),
+        prompt_pretemplated: None,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -3137,6 +3138,8 @@ async fn completions(
         resume_token_ids: None,
         reasoning_as_text: false,
         preserve_thinking: None,
+        // A raw prompt: the engine keeps its own setting.
+        prompt_pretemplated: None,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
@@ -7153,6 +7156,15 @@ level={{ effort_map[eff] }}";
         cfg: Config,
         payload: serde_json::Value,
     ) -> (StatusCode, Value, String) {
+        let (status, body, task) = submitted_task(cfg, payload).await;
+        (status, body, task.map(|t| t.prompt).unwrap_or_default())
+    }
+
+    /// The task the engine is handed for `payload`, with the reply status.
+    async fn submitted_task(
+        cfg: Config,
+        payload: serde_json::Value,
+    ) -> (StatusCode, Value, Option<GenerationTask>) {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
         runner
@@ -7164,13 +7176,8 @@ level={{ effort_map[eff] }}";
             .unwrap();
         let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
         let (status, body) = post_chat(app, payload).await;
-        let prompt = seen
-            .lock()
-            .unwrap()
-            .first()
-            .map(|t| t.prompt.clone())
-            .unwrap_or_default();
-        (status, body, prompt)
+        let task = seen.lock().unwrap().first().cloned();
+        (status, body, task)
     }
 
     /// The API config the CLI builds for ov-genai: the model's chat template
@@ -7279,6 +7286,50 @@ level={{ effort_map[eff] }}";
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(prompt, "weather in Paris?", "thinking: {thinking}");
+        }
+    }
+
+    /// A prompt the model's template rendered is flagged as such, so
+    /// ov-genai skips its own apply for it.
+    #[tokio::test]
+    async fn a_template_rendered_prompt_is_flagged_pretemplated() {
+        for thinking in [true, false] {
+            let (status, body, task) = submitted_task(
+                ov_genai_config(Some(QWEN3_TEMPLATE)),
+                serde_json::json!({"model":"mock-model","messages": qwen3_tool_loop_messages(),
+                    "chat_template_kwargs":{"enable_thinking": thinking}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let task = task.unwrap();
+            assert!(
+                task.prompt.starts_with("<|im_start|>system"),
+                "{}",
+                task.prompt
+            );
+            assert_eq!(task.prompt_pretemplated, Some(true), "thinking: {thinking}");
+        }
+    }
+
+    /// The legacy last-user text is flagged as not templated: with no
+    /// template, with one that fails to parse at startup, and after a render
+    /// error at request time, so ov-genai applies its own template to it.
+    #[tokio::test]
+    async fn legacy_text_is_flagged_not_pretemplated() {
+        for (case, template) in [
+            ("no template", None),
+            ("fails to parse", Some("{% for m in %}")),
+            ("fails to render", Some("{{ nope.missing.deeper }}")),
+        ] {
+            let (status, body, task) = submitted_task(
+                ov_genai_config(template),
+                serde_json::json!({"model":"mock-model","messages": qwen3_tool_loop_messages()}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{case}: {body}");
+            let task = task.unwrap();
+            assert_eq!(task.prompt, "weather in Paris?", "{case}");
+            assert_eq!(task.prompt_pretemplated, Some(false), "{case}");
         }
     }
 

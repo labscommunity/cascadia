@@ -1031,6 +1031,8 @@ mod tests {
         step_fails: bool,
         steps: usize,
         added: Vec<u64>,
+        /// `skip_chat_template` of each added request's config, in order.
+        skips: Vec<bool>,
         cancelled: Vec<u64>,
     }
 
@@ -1048,10 +1050,11 @@ mod tests {
             &self,
             request_id: u64,
             _prompt: &str,
-            _cfg: &GenConfig,
+            cfg: &GenConfig,
         ) -> Result<Box<dyn CbReq>, OvError> {
             let mut st = self.st.lock().unwrap();
             st.added.push(request_id);
+            st.skips.push(cfg.skip_chat_template);
             let idx = st.added.len() - 1;
             while st.reads.len() <= idx {
                 st.reads.push(VecDeque::new());
@@ -1540,6 +1543,29 @@ mod tests {
         let b = Box::new(OvGenaiBuilder::new("/x", "CPU"));
         let res = b.build();
         assert!(matches!(res, Err(EngineError::NotLoaded)));
+    }
+
+    /// A task's own flag decides whether ov-genai applies its template; a
+    /// task without one keeps the engine's setting.
+    #[test]
+    fn cb_skip_chat_template_follows_the_task_over_the_engine() {
+        for engine_pretemplated in [true, false] {
+            let st = Arc::new(Mutex::new(MockState::default()));
+            let mut e = mock_engine(&st);
+            e.prompt_pretemplated = engine_pretemplated;
+            for (i, flag) in [None, Some(false), Some(true)].into_iter().enumerate() {
+                let t = GenerationTask {
+                    prompt_pretemplated: flag,
+                    ..task(&format!("t{i}"), 4)
+                };
+                e.submit(t).unwrap();
+            }
+            assert_eq!(
+                st.lock().unwrap().skips,
+                vec![engine_pretemplated, false, true],
+                "engine setting: {engine_pretemplated}"
+            );
+        }
     }
 
     /// ov-genai skips its own template exactly when the API rendered the

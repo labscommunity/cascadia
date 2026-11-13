@@ -1568,6 +1568,12 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
+/// Whether the API will render ov-genai's prompts through the model's chat
+/// template, so the engine should skip ov-genai's own apply by default.
+fn ovgenai_prompt_pretemplated(model: &str) -> bool {
+    ovgenai_chat_template(model).template.is_some()
+}
+
 /// ov-genai renders with the template inside its tokenizer IR, but the API
 /// reads the template files beside the model to tell whether the prompt
 /// opens `<think>`. With no such file that cannot be told (startup warns).
@@ -1786,7 +1792,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             // request (thinking on or off) and the engine tells ov-genai to
             // skip its own internal apply. No template → leave ov-genai's
             // apply on.
-            b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
+            b = b.with_prompt_pretemplated(ovgenai_prompt_pretemplated(&args.model));
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {
@@ -2757,6 +2763,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             resume_token_ids: None,
             reasoning_as_text: false,
             preserve_thinking: None,
+            prompt_pretemplated: None,
         };
         // `generate_async`, not `generate`: this loop runs on the tokio
         // runtime, and the sync path would block a worker on the engine
@@ -3372,6 +3379,24 @@ mod python_tests {
         )
         .unwrap();
         assert!(!ovgenai_template_unprobed(&ovgenai_chat_template(model)));
+    }
+
+    /// ov-genai skips its own template by default only when the API will
+    /// render one: a template file the API cannot parse leaves ov-genai's
+    /// own apply on, as does no file at all.
+    #[test]
+    fn ovgenai_skips_its_template_only_for_one_the_api_can_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().to_str().unwrap();
+        assert!(!ovgenai_prompt_pretemplated(model), "no template file");
+        std::fs::write(dir.path().join("chat_template.jinja"), "{% for m in %}").unwrap();
+        assert!(!ovgenai_prompt_pretemplated(model), "unparseable template");
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{% for m in messages %}{{ m.content }}{% endfor %}",
+        )
+        .unwrap();
+        assert!(ovgenai_prompt_pretemplated(model), "usable template");
     }
 
     /// `--cb` on an NPU device is rejected up front. The docs say paged

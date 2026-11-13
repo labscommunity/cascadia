@@ -161,6 +161,14 @@ pub struct GenerationTask {
     /// reasoning on earlier turns when it is set. Off the wire when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preserve_thinking: Option<bool>,
+    /// Whether `prompt` was rendered through the model's chat template for
+    /// this request. An engine that can apply the template itself (ov-genai)
+    /// skips its own apply when `Some(true)` and applies it when
+    /// `Some(false)` (no template, or the legacy text after a render error).
+    /// `None` leaves it to the engine's own setting, as before this field
+    /// existed. Off the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_pretemplated: Option<bool>,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -239,6 +247,7 @@ impl GenerationTask {
             resume_token_ids: None,
             reasoning_as_text: false,
             preserve_thinking: None,
+            prompt_pretemplated: None,
         }
     }
 
@@ -286,6 +295,28 @@ mod tests {
         assert_eq!(back.preserve_thinking, Some(true));
     }
 
+    /// `prompt_pretemplated` is off the wire when unset (older peers see the
+    /// same bytes and a payload without it decodes to `None`) and
+    /// round-trips when set.
+    #[test]
+    fn prompt_pretemplated_is_off_the_wire_when_unset() {
+        let t = GenerationTask::new("t1", "hello");
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json.get("prompt_pretemplated").is_none(), "{json}");
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert_eq!(back.prompt_pretemplated, None);
+        for v in [true, false] {
+            let t = GenerationTask {
+                prompt_pretemplated: Some(v),
+                ..GenerationTask::new("t1", "hello")
+            };
+            let json = serde_json::to_value(&t).unwrap();
+            assert_eq!(json["prompt_pretemplated"], v);
+            let back: GenerationTask = serde_json::from_value(json).unwrap();
+            assert_eq!(back.prompt_pretemplated, Some(v));
+        }
+    }
+
     #[test]
     fn resume_token_ids_defaults_none_and_is_additive() {
         let t = GenerationTask {
@@ -304,6 +335,7 @@ mod tests {
             resume_token_ids: None,
             reasoning_as_text: false,
             preserve_thinking: None,
+            prompt_pretemplated: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();
