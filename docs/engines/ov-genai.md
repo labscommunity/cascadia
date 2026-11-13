@@ -213,6 +213,12 @@ Before any row, the check sends two unmeasured warm-up requests: a short streame
 can differ from every later answer to the same request, streamed or not. Without the second warm-up,
 the `parity` row would compare that cold answer with warm ones.
 
+On an Intel GPU, OpenVINO's greedy answer to a request can also depend on the previous request's
+prompt: the same prompt sent right after itself gets a different text than after another prompt or
+first after a load. CPU does not show it, and it happens in plain OpenVINO GenAI too, so it does not
+come from Cascadia. To see it, run `python3 scripts/ov_genai_order_repro.py <model-dir> GPU` (needs
+`pip install openvino-genai`).
+
 `--node-log` also takes `ssh:HOST:PATH` to read a remote worker's log. `--dry-run`
 prints the plan and the full `reproduce:` command line without sending
 anything; `--help` lists every option. The helpers' unit tests run with
