@@ -1054,6 +1054,14 @@ pub struct ShardArgs {
     #[arg(long)]
     pub stage: Option<u32>,
 
+    /// Qwen3.5-family surgery only: keep the last stage's logits for EVERY position
+    /// ([1,T,vocab]) instead of slicing to the final row, and record
+    /// `last_logits_only: false` in the manifest. Required for `--prompt-lookup`
+    /// (speculative decoding) on `--engine qwen35`; costs ~1 MB/token of transient
+    /// logits during batched prefill. Ignored by the other exporters.
+    #[arg(long)]
+    pub full_logits: bool,
+
     /// Override the python interpreter used to run the bundled exporter.
     /// Defaults to `python3` then `python` on PATH.
     #[arg(long)]
@@ -1965,6 +1973,24 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 "qwen35 prefix-cache budget"
             );
             b = b.with_prefix_cache_bytes(prefix_cache_bytes);
+            // Greedy n-gram speculative decode (qwen36_spec): `--prompt-lookup N` is the opt-in
+            // (n-gram size), `--spec-k K` the draft length — the same two flags the ov-genai
+            // prompt-lookup path reads. Needs a `--full-logits` shard tree; the builder refuses
+            // a `last_logits_only` manifest at load with the re-export instructions.
+            if args.draft_model.is_some() {
+                return Err(anyhow!(
+                    "--draft-model is not supported by --engine qwen35; use --prompt-lookup N \
+                     (n-gram speculative decoding) instead"
+                ));
+            }
+            if args.prompt_lookup > 0 {
+                info!(
+                    ngram = args.prompt_lookup,
+                    k = args.spec_k,
+                    "qwen35 speculative decode (n-gram prompt lookup)"
+                );
+                b = b.with_spec(args.prompt_lookup as usize, args.spec_k as usize);
+            }
             Ok(Box::new(b))
         }
     }
@@ -2870,6 +2896,9 @@ fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
         flags.push("--stage".into());
         flags.push(s.to_string());
     }
+    if args.full_logits {
+        flags.push("--full-logits".into());
+    }
     Ok(flags)
 }
 
@@ -3762,6 +3791,23 @@ mod ov_property_tests {
         assert!(validate_ov_config("   =x").is_err());
     }
 
+    /// qwen35 has no draft-model path: the flag fails loud (pointing at --prompt-lookup) instead
+    /// of being ignored, while --prompt-lookup itself builds (the n-gram spec path).
+    #[test]
+    fn qwen35_rejects_draft_model_but_takes_prompt_lookup() {
+        let mut args = args_for_engine("CPU", EngineKind::Qwen36Moe);
+        args.draft_model = Some("draft".into());
+        let err = build_builder(&args, 0)
+            .err()
+            .expect("draft model rejected")
+            .to_string();
+        assert!(err.contains("--prompt-lookup"), "{err}");
+        args.draft_model = None;
+        args.prompt_lookup = 3;
+        args.spec_k = 4;
+        assert!(build_builder(&args, 0).is_ok());
+    }
+
     #[test]
     fn general_hints_apply_on_qwen35_engine() {
         // The qwen35 builder forwards these via `with_ov_properties`.
@@ -3874,6 +3920,26 @@ mod tests {
         assert!(has_pair(&flags, "--default-dtype", "fp16"));
         assert!(!flags.iter().any(|f| f == "--static-seq"));
         assert!(!flags.iter().any(|f| f == "--static-context"));
+        // Off by default: the exporter keeps slicing the last stage's logits to the final row.
+        assert!(!flags.iter().any(|f| f == "--full-logits"));
+    }
+
+    /// `--full-logits` reaches the exporter (the qwen35 speculative-decode tree needs it).
+    #[test]
+    fn shard_flags_forward_full_logits() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+            "--full-logits",
+        ]);
+        let flags = shard_exporter_flags(&args).expect("cpu-gpu flags");
+        assert!(flags.iter().any(|f| f == "--full-logits"));
     }
 
     /// `--static-prefill-seq` needs `--target npu` (chunked prefill is a
