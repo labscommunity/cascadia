@@ -656,9 +656,6 @@ impl LlmPipeline {
         }
     }
 
-    /// Best-effort token count via the pipeline's tokenizer. Returns
-    /// `None` when the underlying call fails (e.g. tokenizer not available
-    /// in stub builds).
     /// One user message rendered through the pipeline's own chat template,
     /// with the generation prompt: the text the pipeline itself would feed
     /// the model with `apply_chat_template` on.
@@ -686,14 +683,17 @@ impl LlmPipeline {
         }
     }
 
-    /// `add_special_tokens`: count as the tokenizer encodes plain text
-    /// (BOS added); false for text that already carries them (a rendered
-    /// chat template) or for generated text.
+    /// Best-effort token count via the pipeline's tokenizer. Returns
+    /// `None` when the underlying call fails (e.g. tokenizer not available
+    /// in stub builds). `add_special_tokens`: count as the tokenizer encodes
+    /// plain text (BOS added); false for text that already carries them (a
+    /// rendered chat template) or for generated text.
     #[cfg(not(feature = "openvino"))]
     pub fn count_tokens(&self, _text: &str, _add_special_tokens: bool) -> Option<u32> {
         None
     }
 
+    /// See the stub build's `count_tokens`.
     #[cfg(feature = "openvino")]
     pub fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
         let text_c = cstr(text).ok()?;
