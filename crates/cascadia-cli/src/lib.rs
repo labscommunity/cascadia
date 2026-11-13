@@ -5644,6 +5644,12 @@ mod generation_defaults_tests {
 /// ends. The engine is scripted like ov-genai's `--cb`: each `step()` blocks
 /// the calling thread for a whole batch step and emits one token per active
 /// task.
+///
+/// These tests pin the API's forwarder path: they fail on the code before the
+/// non-streamed handlers moved onto `spawn_engine_forwarder` (35302bb9d), and
+/// pass without the runner's `yield_before_step`, since the forwarders yield
+/// after each chunk. The runner test
+/// `a_parked_stream_gets_its_chunks_beside_a_tight_consumer` pins that one.
 #[cfg(test)]
 mod batching_stream_tests {
     use super::serve_with_nodelay;
@@ -5878,10 +5884,13 @@ mod batching_stream_tests {
             g.span,
             made_over
         );
+        // One step of slack: a single scheduling hiccup on a shared runner
+        // must not fail it (one worker already shows one two-step gap); the
+        // span check above is what catches a burst.
         assert!(
-            g.max <= g.median * 3,
+            g.max <= g.median * 3 + STEP,
             "{workers} workers: B's frames arrived in a burst: max gap {:?} > 3x median {:?} \
-             ({} frames over {:?})",
+             + one step ({} frames over {:?})",
             g.max,
             g.median,
             g.frames,
