@@ -1,0 +1,22 @@
+[package]
+name = "cascadia-diffusion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Verified diffusion stage contracts and execution lifecycle for Cascadia"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+
+[dependencies.tokio]
+workspace = true

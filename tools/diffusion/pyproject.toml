@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cascadia-diffusion"
+version = "0.1.0"
+description = "Verified OpenVINO diffusion stages for Cascadia"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = []
+
+[project.optional-dependencies]
+worker = ["numpy==2.4.6", "openvino==2026.4.1"]
+runtime = ["numpy==2.4.6", "openvino==2026.4.1", "optimum-intel==2.2.0", "diffusers==0.39.0", "transformers==5.5.4", "torch==2.15.0", "Pillow==13.0.0", "tokenizers==0.22.2", "optimum==2.3.0"]
+
+[project.scripts]
+cascadia-diffusion = "cascadia_diffusion.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
