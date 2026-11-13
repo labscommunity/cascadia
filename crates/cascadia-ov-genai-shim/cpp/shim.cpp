@@ -746,6 +746,32 @@ int32_t cascadia_tokenizer_count_tokens(
     }
 }
 
+int32_t cascadia_pipeline_apply_chat_template(
+    cascadia_pipeline_t* handle, const char* user, char** out_text) {
+    if (!handle || (!handle->pipe && !handle->vlm) || !user || !out_text) {
+        set_last_error("null arg in pipeline_apply_chat_template"); return 1;
+    }
+    try {
+        ov::genai::Tokenizer tok =
+            handle->vlm ? handle->vlm->get_tokenizer() : handle->pipe->get_tokenizer();
+        ov::genai::ChatHistory history(std::vector<ov::AnyMap>{
+            {{"role", std::string("user")}, {"content", std::string(user)}}});
+        const std::string rendered =
+            tok.apply_chat_template(history, /*add_generation_prompt=*/true);
+        char* buf = static_cast<char*>(std::malloc(rendered.size() + 1));
+        if (!buf) { set_last_error("malloc failure for rendered template"); return 1; }
+        std::memcpy(buf, rendered.data(), rendered.size());
+        buf[rendered.size()] = 0;
+        *out_text = buf;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in pipeline_apply_chat_template");
+        return 1;
+    }
+}
+
 // ===================== ov-runtime (Core/CompiledModel/InferRequest) =====================
 
 // Replace every Constant of a model read from an IR with a fresh in-memory

@@ -231,6 +231,14 @@ int32_t cascadia_tokenizer_count_tokens(
     const char* text,
     uint32_t* out_count);
 
+/// Render one user message through the pipeline's own chat template, with the
+/// generation prompt (what the pipeline does itself when
+/// apply_chat_template is on). `out_text` is freed via cascadia_free_string.
+int32_t cascadia_pipeline_apply_chat_template(
+    cascadia_pipeline_t* handle,
+    const char* user,
+    char** out_text);
+
 // ---- Lower-level OV runtime (Core + CompiledModel + InferRequest) ---------
 //
 // Used by the ov-runtime + ov-dist-spec engines. Wraps a single per-stage

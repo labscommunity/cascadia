@@ -196,6 +196,12 @@ mod sys {
             out_count: *mut u32,
         ) -> c_int;
 
+        pub fn cascadia_pipeline_apply_chat_template(
+            handle: *mut cascadia_pipeline_t,
+            user: *const c_char,
+            out_text: *mut *mut c_char,
+        ) -> c_int;
+
         pub fn cascadia_runtime_compile(
             model_xml_path: *const c_char,
             device: *const c_char,
@@ -433,6 +439,11 @@ pub struct GenConfig {
     /// the caller pre-rendered the template (e.g. to honor enable_thinking).
     /// Default false = apply (matches OV's `apply_chat_template = true`).
     pub skip_chat_template: bool,
+    /// The prompt is the model's chat template already rendered, so it
+    /// carries the template's own special tokens (BOS): encode it without
+    /// adding them again. Only meaningful with `skip_chat_template`. Default
+    /// false = the pipeline's own encoding (special tokens added).
+    pub prompt_templated: bool,
     /// OpenAI-compatible sampling knobs (#14). Forwarded to the matching
     /// `ov::genai::GenerationConfig` fields. Defaults (top_p=1.0 via the
     /// builder, penalties=0, top_k=0, seed=None) are no-ops.
@@ -467,6 +478,9 @@ impl PluginConfig {
 pub struct GenResult {
     pub text: String,
     pub generated_tokens: u32,
+    /// Prompt tokens the pipeline fed the model (its perf metrics), when it
+    /// reports them.
+    pub prompt_tokens: Option<u32>,
 }
 
 /// Owned LLMPipeline handle.
@@ -627,6 +641,7 @@ impl LlmPipeline {
             Ok(GenResult {
                 text,
                 generated_tokens: tok_count,
+                prompt_tokens: None,
             })
         }
     }
@@ -634,13 +649,44 @@ impl LlmPipeline {
     /// Best-effort token count via the pipeline's tokenizer. Returns
     /// `None` when the underlying call fails (e.g. tokenizer not available
     /// in stub builds).
+    /// One user message rendered through the pipeline's own chat template,
+    /// with the generation prompt: the text the pipeline itself would feed
+    /// the model with `apply_chat_template` on.
     #[cfg(not(feature = "openvino"))]
-    pub fn count_tokens(&self, _text: &str) -> Option<u32> {
+    pub fn apply_chat_template(&self, _user: &str) -> Result<String> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    pub fn apply_chat_template(&self, user: &str) -> Result<String> {
+        let user_c = cstr(user)?;
+        unsafe {
+            let mut text_p: *mut c_char = ptr::null_mut();
+            let rc = sys::cascadia_pipeline_apply_chat_template(
+                self.handle,
+                user_c.as_ptr(),
+                &mut text_p,
+            );
+            if rc != 0 || text_p.is_null() {
+                return Err(Error::Native(last_native_error()));
+            }
+            let text = CStr::from_ptr(text_p).to_string_lossy().into_owned();
+            sys::cascadia_free_string(text_p);
+            Ok(text)
+        }
+    }
+
+    /// `add_special_tokens`: count as the tokenizer encodes plain text
+    /// (BOS added); false for text that already carries them (a rendered
+    /// chat template) or for generated text.
+    #[cfg(not(feature = "openvino"))]
+    pub fn count_tokens(&self, _text: &str, _add_special_tokens: bool) -> Option<u32> {
         None
     }
 
     #[cfg(feature = "openvino")]
-    pub fn count_tokens(&self, text: &str) -> Option<u32> {
+    pub fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
+        let _ = add_special_tokens;
         let text_c = cstr(text).ok()?;
         unsafe {
             let tok = sys::cascadia_pipeline_get_tokenizer(self.handle);
@@ -967,13 +1013,15 @@ impl CbPipeline {
     }
 
     #[cfg(not(feature = "openvino"))]
-    pub fn count_tokens(&self, _text: &str) -> Option<u32> {
+    pub fn count_tokens(&self, _text: &str, _add_special_tokens: bool) -> Option<u32> {
         None
     }
 
-    /// Best-effort token count via the pipeline's tokenizer.
+    /// Best-effort token count via the pipeline's tokenizer; see
+    /// [`LlmPipeline::count_tokens`] for `add_special_tokens`.
     #[cfg(feature = "openvino")]
-    pub fn count_tokens(&self, text: &str) -> Option<u32> {
+    pub fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
+        let _ = add_special_tokens;
         let text_c = cstr(text).ok()?;
         let mut out: u32 = 0;
         let rc =

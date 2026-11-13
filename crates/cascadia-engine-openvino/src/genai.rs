@@ -462,7 +462,7 @@ impl Engine for OvGenaiEngine {
         // Prefer tokenizer-based count; fall back to perf_metrics value.
         let tokens = self
             .pipe
-            .count_tokens(&text)
+            .count_tokens(&text, true)
             .unwrap_or(result.generated_tokens);
         let tok_s = if elapsed > 0.0 {
             tokens as f64 / elapsed
@@ -498,7 +498,7 @@ impl Engine for OvGenaiEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
             .with_n_tokens(tokens)
             .with_finish_reason(finish);
-        if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt) {
+        if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt, true) {
             chunk = chunk.with_prompt_tokens(prompt_tokens);
         }
         Ok(vec![(task.task_id, chunk)])
@@ -546,7 +546,7 @@ trait CbPipe: Send {
         cfg: &GenConfig,
     ) -> Result<Box<dyn CbReq>, OvError>;
     fn step(&self) -> Result<(), OvError>;
-    fn count_tokens(&self, text: &str) -> Option<u32>;
+    fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32>;
 }
 
 /// One enrolled request, as the engine sees it.
@@ -569,8 +569,8 @@ impl CbPipe for CbPipeline {
     fn step(&self) -> Result<(), OvError> {
         CbPipeline::step(self)
     }
-    fn count_tokens(&self, text: &str) -> Option<u32> {
-        CbPipeline::count_tokens(self, text)
+    fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
+        CbPipeline::count_tokens(self, text, add_special_tokens)
     }
 }
 
@@ -726,7 +726,7 @@ impl Engine for OvGenaiCbEngine {
             .add_request(request_id, &task.prompt, &cfg)
             .map_err(map_ov_err)?;
         self.active.push(ActiveCbTask {
-            prompt_tokens: self.pipe.count_tokens(&task.prompt),
+            prompt_tokens: self.pipe.count_tokens(&task.prompt, true),
             task_id: task.task_id,
             handle,
             total_tokens: 0,
@@ -962,6 +962,7 @@ fn build_gen_config(
         // `prompt_pretemplated`), so ov-genai's own apply would wrap it
         // twice. Otherwise it is the raw user text and ov-genai wraps it.
         skip_chat_template: prompt_pretemplated,
+        prompt_templated: false,
         // OpenAI sampling knobs (#14). top_p/top_k take effect in the
         // sampling regime (do_sample, i.e. temperature > 0); penalties and
         // seed are forwarded regardless.
@@ -1049,6 +1050,10 @@ mod tests {
         added: Vec<u64>,
         /// `skip_chat_template` of each added request's config, in order.
         skips: Vec<bool>,
+        /// `prompt_templated` of each added request's config, in order.
+        templated: Vec<bool>,
+        /// `add_special_tokens` of each token count, in order.
+        counted_with_special: Vec<bool>,
         cancelled: Vec<u64>,
     }
 
@@ -1071,6 +1076,7 @@ mod tests {
             let mut st = self.st.lock().unwrap();
             st.added.push(request_id);
             st.skips.push(cfg.skip_chat_template);
+            st.templated.push(cfg.prompt_templated);
             let idx = st.added.len() - 1;
             while st.reads.len() <= idx {
                 st.reads.push(VecDeque::new());
@@ -1090,7 +1096,12 @@ mod tests {
                 Ok(())
             }
         }
-        fn count_tokens(&self, _text: &str) -> Option<u32> {
+        fn count_tokens(&self, _text: &str, add_special_tokens: bool) -> Option<u32> {
+            self.st
+                .lock()
+                .unwrap()
+                .counted_with_special
+                .push(add_special_tokens);
             Some(7)
         }
     }
@@ -1582,6 +1593,26 @@ mod tests {
                 "engine setting: {engine_pretemplated}"
             );
         }
+    }
+
+    /// A prompt the API's template rendered already carries the template's
+    /// BOS: it is encoded, and counted, without adding special tokens again.
+    /// Any other prompt keeps the pipeline's own encoding.
+    #[test]
+    fn cb_a_templated_prompt_is_encoded_without_special_tokens() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.prompt_pretemplated = true;
+        for (i, flag) in [None, Some(false), Some(true)].into_iter().enumerate() {
+            let t = GenerationTask {
+                prompt_pretemplated: flag,
+                ..task(&format!("t{i}"), 4)
+            };
+            e.submit(t).unwrap();
+        }
+        let st = st.lock().unwrap();
+        assert_eq!(st.templated, vec![false, false, true]);
+        assert_eq!(st.counted_with_special, vec![true, true, false]);
     }
 
     /// ov-genai skips its own template exactly when the API rendered the
