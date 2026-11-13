@@ -1902,9 +1902,12 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 /// template rendered the prompt (`templated`) it is read off `task.prompt`
 /// (per request, so a template whose generation prompt depends on the effort
 /// word is right); when the engine renders it (sycl-llama) `task.prompt` is a
-/// placeholder and the load-time `probe` stands in. With no template, or after a render error fell back to the
-/// legacy formatter, the prompt is the user's own text, which may end in
-/// `<think>` without opening anything: not opened.
+/// placeholder and the load-time `probe` stands in. With no template, or after
+/// a render error fell back to the legacy formatter, the prompt is the user's
+/// own text, which may end in `<think>` without opening anything: not opened.
+/// Unless the engine wraps that text in the model's own template
+/// (`engine_templates_raw_prompts`, ov-genai): then the probe stands in again
+/// (it is false when no template loaded).
 ///
 /// Always false when `task.reasoning_as_text` is set: the engine folds its
 /// separate reasoning back in as `<think>…</think>` text and sends its own
@@ -1914,6 +1917,7 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 /// is rendered by llama-server), so its probe is always false.
 pub(crate) fn opens_think(
     engine_applies_template: bool,
+    engine_templates_raw_prompts: bool,
     probe: bool,
     templated: bool,
     task: &GenerationTask,
@@ -1921,7 +1925,7 @@ pub(crate) fn opens_think(
     if task.reasoning_as_text {
         return false;
     }
-    if engine_applies_template {
+    if engine_applies_template || (!templated && engine_templates_raw_prompts) {
         probe
     } else {
         templated && task.prompt.trim_end().ends_with("<think>")
@@ -2918,6 +2922,7 @@ async fn chat_completions(
     // starts from the same answer.
     let opened = opens_think(
         state.engine_applies_template,
+        state.engine_templates_raw_prompts,
         state.template_opens_think,
         templated,
         &task,
@@ -7019,24 +7024,30 @@ level={{ effort_map[eff] }}";
         let closed = GenerationTask::new("t", "<|im_start|>assistant\n");
         // API rendered the prompt (ov-genai included, thinking on or off):
         // read it, ignore the probe.
-        assert!(opens_think(false, false, true, &opened));
-        assert!(!opens_think(false, true, true, &closed));
+        assert!(opens_think(false, false, false, true, &opened));
+        assert!(!opens_think(false, false, true, true, &closed));
         // The engine renders (sycl-llama): the probe stands in.
-        assert!(opens_think(true, true, true, &closed));
-        assert!(!opens_think(true, false, true, &opened));
+        assert!(opens_think(true, false, true, true, &closed));
+        assert!(!opens_think(true, false, false, true, &opened));
         // Reasoning folded in as text: the engine sends its own `<think>`.
         let folded = |prompt: &str| GenerationTask {
             reasoning_as_text: true,
             ..GenerationTask::new("t", prompt)
         };
-        assert!(!opens_think(true, true, true, &folded("<think>\n")));
-        assert!(!opens_think(false, true, true, &folded("<think>\n")));
+        assert!(!opens_think(true, false, true, true, &folded("<think>\n")));
+        assert!(!opens_think(false, false, true, true, &folded("<think>\n")));
         // No template rendered the prompt (none loaded, or the legacy
         // fallback after a render error): the user's own text, never opened.
-        assert!(!opens_think(false, false, false, &opened));
-        assert!(!opens_think(false, true, false, &opened));
+        assert!(!opens_think(false, false, false, false, &opened));
+        assert!(!opens_think(false, false, true, false, &opened));
+        // The engine wraps untemplated text in the model's template
+        // (ov-genai): the probe decides; a templated prompt is still read.
+        assert!(opens_think(false, true, true, false, &closed));
+        assert!(!opens_think(false, true, false, false, &opened));
+        assert!(!opens_think(false, true, true, true, &closed));
+        assert!(opens_think(false, true, false, true, &opened));
         // The engine renders: the probe still decides.
-        assert!(opens_think(true, true, false, &closed));
+        assert!(opens_think(true, false, true, false, &closed));
     }
 
     /// Records every task it is handed and answers each with a bare final.
