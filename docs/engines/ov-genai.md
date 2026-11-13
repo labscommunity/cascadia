@@ -208,6 +208,11 @@ Each row prints PASS or FAIL, and the run ends with
 | `cb-gap` (`--cb-gap`) | a streamed request beside a running non-streamed one has no gap between deltas over 3× its median gap (`--cb` workers) |
 | `divergence` (`--node-log`) | the worker log gains no `ov_genai_stream_divergence` line during the run |
 
+Before any row, the check sends two unmeasured warm-up requests: a short streamed chat, then the
+256-token count prompt with `stream: false`. On a GPU the first full-length answer after a worker loads
+can differ from every later answer to the same request, streamed or not. Without the second warm-up,
+the `parity` row would compare that cold answer with warm ones.
+
 `--node-log` also takes `ssh:HOST:PATH` to read a remote worker's log. `--dry-run`
 prints the plan and the full `reproduce:` command line without sending
 anything; `--help` lists every option. The helpers' unit tests run with

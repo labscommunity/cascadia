@@ -109,6 +109,8 @@ OV-GENAI STREAM CHECK plan (dry run; nothing is sent)
   worker: ${URL:-<--url unset>}  model: ${MODEL:-<first of /v1/models>}  log: ${NODE_LOG:-none}
   commit: $COMMIT  run: $STAMP
   COUNT = chat "Count from 1 to 100000 in words, separated by commas.", temperature 0
+  warm-up: a short streamed chat (8 tokens), then COUNT max_tokens $MAX_TOKENS stream:false once (not measured;
+           a GPU's first full-length answer after a load can differ from every later one).
   rows:
 EOF
   { want first-byte || want deltas || want tok-s; } && echo "   timed      COUNT streamed, max_tokens $MAX_TOKENS, $RUNS runs one after another; each run's first content
@@ -179,8 +181,12 @@ if [ -n "$NODE_LOG" ]; then
   [ "${L0:-0}" -gt 0 ] || echo "warning: the worker log ${NODE_LOG} is empty or unreadable"
 fi
 
-# A warm-up request, so the first timed run is not the first request of the worker's life.
+# Warm-up, so no measured run is the worker's first. A short prompt is not enough on a GPU: the first full COUNT
+# answer after a load can differ from every later one, streamed or not, which would fail parity for a reason
+# that has nothing to do with streaming. So the warm-up also runs COUNT itself once at full length.
 send warm short 8 1
+send warm-count count "$MAX_TOKENS" 0
+echo "warm-up: COUNT stream:false $(brief warm-count)"
 
 if want first-byte || want deltas || want tok-s; then
   recs=()
