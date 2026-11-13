@@ -290,6 +290,19 @@ def test_manifest_is_json_serialisable():
     assert json.loads(json.dumps(m)) == m
 
 
+def test_manifest_full_logits_flips_last_logits_only(monkeypatch):
+    """`--full-logits` (or CASCADIA_QWEN36_FULL_LOGITS=1) keeps every position's
+    logits on the last stage; the manifest must say so or the engine slices a
+    row it should not (and refuses --prompt-lookup it could serve)."""
+    m = sx.build_manifest(sx.spec_from_config(_qwen38_cfg()), "src", full_logits=True)
+    assert m["last_logits_only"] is False
+    assert set(m) == set(sx.build_manifest(sx.spec_from_config(_qwen38_cfg()), "src"))
+    monkeypatch.delenv("CASCADIA_QWEN36_FULL_LOGITS", raising=False)
+    assert sx.full_logits_default() is False
+    monkeypatch.setenv("CASCADIA_QWEN36_FULL_LOGITS", "1")
+    assert sx.full_logits_default() is True
+
+
 # ---------------------------------------------------------------------------
 # validate_verdict — the gate that decides whether a tree may be served
 # ---------------------------------------------------------------------------

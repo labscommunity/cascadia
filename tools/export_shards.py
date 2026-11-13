@@ -1813,6 +1813,15 @@ def main():
         "decode on CPU).",
     )
     parser.add_argument(
+        "--full-logits",
+        action="store_true",
+        help="Qwen3.5-family IR surgery only: keep the last stage's logits for "
+        "EVERY position ([1,T,vocab]; manifest last_logits_only=false) instead "
+        "of slicing to the final row. Required for `--engine qwen35 "
+        "--prompt-lookup N` (speculative decoding). Also honoured from "
+        "CASCADIA_QWEN36_FULL_LOGITS=1.",
+    )
+    parser.add_argument(
         "--packed-slots",
         type=int,
         default=0,
@@ -2087,6 +2096,8 @@ def main():
             num_stages=args.num_stages,
             validate=True,
             layer_split=args.layer_split,
+            # None = read CASCADIA_QWEN36_FULL_LOGITS; the flag forces it on.
+            full_logits=True if getattr(args, "full_logits", False) else None,
         )
         return
 
