@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
-    GenConfig, LlmPipeline, PluginConfig,
+    GenConfig, GenResult, LlmPipeline, PluginConfig,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
@@ -335,7 +335,7 @@ impl Builder for OvGenaiBuilder {
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
-            pipe,
+            pipe: Box::new(pipe),
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
@@ -355,8 +355,25 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+/// What [`OvGenaiEngine`] needs from an `LLMPipeline`, so its step can be
+/// driven by a scripted pipeline in tests (as [`CbPipe`] does for the
+/// continuous-batching engine).
+trait LlmPipe: Send {
+    fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError>;
+    fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32>;
+}
+
+impl LlmPipe for LlmPipeline {
+    fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
+        LlmPipeline::generate(self, prompt, cfg)
+    }
+    fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
+        LlmPipeline::count_tokens(self, text, add_special_tokens)
+    }
+}
+
 pub struct OvGenaiEngine {
-    pipe: LlmPipeline,
+    pipe: Box<dyn LlmPipe>,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -1617,6 +1634,131 @@ mod tests {
                 st.lock().unwrap().skips,
                 vec![engine_pretemplated, false, true],
                 "engine setting: {engine_pretemplated}"
+            );
+        }
+    }
+
+    /// Scripted `LLMPipeline`: answers every generate with `result` and every
+    /// count with `count`, recording what it was asked.
+    #[derive(Default)]
+    struct MockLlmState {
+        templated: Vec<bool>,
+        counted_with_special: Vec<bool>,
+    }
+
+    struct MockLlm {
+        st: Arc<Mutex<MockLlmState>>,
+        generated_tokens: u32,
+        count: u32,
+    }
+
+    impl LlmPipe for MockLlm {
+        fn generate(&self, _prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
+            self.st.lock().unwrap().templated.push(cfg.prompt_templated);
+            Ok(GenResult {
+                text: "an answer".into(),
+                generated_tokens: self.generated_tokens,
+                prompt_tokens: None,
+            })
+        }
+        fn count_tokens(&self, _text: &str, add_special_tokens: bool) -> Option<u32> {
+            self.st
+                .lock()
+                .unwrap()
+                .counted_with_special
+                .push(add_special_tokens);
+            Some(self.count)
+        }
+    }
+
+    fn mock_llm_engine(
+        st: &Arc<Mutex<MockLlmState>>,
+        generated_tokens: u32,
+        count: u32,
+    ) -> OvGenaiEngine {
+        OvGenaiEngine {
+            pipe: Box::new(MockLlm {
+                st: st.clone(),
+                generated_tokens,
+                count,
+            }),
+            speculative_k: 0,
+            prompt_lookup_ngram: 0,
+            prompt_pretemplated: true,
+            pending: Vec::new(),
+            max_tokens_default: 256,
+        }
+    }
+
+    fn final_chunk(e: &mut OvGenaiEngine, t: GenerationTask) -> Chunk {
+        e.submit(t).unwrap();
+        let mut out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        out.remove(0).1
+    }
+
+    /// Whether the reply hit the token cap comes from the tokens ov-genai
+    /// generated, not from re-tokenizing the decoded text (which can merge
+    /// differently); the re-tokenized count stays the usage figure.
+    #[test]
+    fn llm_finish_at_the_cap_follows_the_generated_tokens() {
+        let st = Arc::new(Mutex::new(MockLlmState::default()));
+        let mut e = mock_llm_engine(&st, 8, 7);
+        let chunk = final_chunk(&mut e, task("t1", 8));
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Length));
+        assert_eq!(chunk.n_tokens, Some(7));
+
+        // Short of the cap is a stop, whatever the re-tokenized count says.
+        let mut e = mock_llm_engine(&st, 5, 8);
+        let chunk = final_chunk(&mut e, task("t2", 8));
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
+
+        // No generated count from the pipeline: the re-tokenized one decides.
+        let mut e = mock_llm_engine(&st, 0, 8);
+        let chunk = final_chunk(&mut e, task("t3", 8));
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Length));
+    }
+
+    /// The LLM engine asks for a templated prompt to be encoded without
+    /// special tokens only when the task says the API templated it, and
+    /// counts the prompt the same way; generated text never gets them.
+    #[test]
+    fn llm_a_templated_prompt_is_encoded_and_counted_without_special_tokens() {
+        let st = Arc::new(Mutex::new(MockLlmState::default()));
+        let mut e = mock_llm_engine(&st, 3, 3);
+        for (i, flag) in [None, Some(false), Some(true)].into_iter().enumerate() {
+            let t = GenerationTask {
+                prompt_pretemplated: flag,
+                ..task(&format!("t{i}"), 8)
+            };
+            assert_eq!(final_chunk(&mut e, t).prompt_tokens, Some(3));
+        }
+        let st = st.lock().unwrap();
+        assert_eq!(st.templated, vec![false, false, true]);
+        // Per step: the generated text, then the prompt.
+        assert_eq!(
+            st.counted_with_special,
+            vec![false, true, false, true, false, false]
+        );
+    }
+
+    /// Skipping ov-genai's template and encoding without special tokens are
+    /// separate: a raw prompt the engine does not template (`/v1/completions`)
+    /// still gets its BOS, and a templated flag alone never skips the
+    /// template.
+    #[test]
+    fn prompt_templated_needs_the_template_skipped() {
+        for (skip, templated, want_skip, want_templated) in [
+            (false, false, false, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (true, true, true, true),
+        ] {
+            let cfg = build_gen_config(0, 0, skip, templated, 16, 0.0, &SamplingParams::default());
+            assert_eq!(
+                (cfg.skip_chat_template, cfg.prompt_templated),
+                (want_skip, want_templated),
+                "skip: {skip}, templated: {templated}"
             );
         }
     }
