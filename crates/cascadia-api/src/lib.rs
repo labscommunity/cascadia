@@ -9144,6 +9144,47 @@ level={{ effort_map[eff] }}";
         assert!(m.get("reasoning_content").is_none(), "raw engine: {body}");
     }
 
+    /// A template that opens `<think>` only when `enable_thinking` is set; a
+    /// message containing `BOOM` makes it fail at request time.
+    const SWITCHED_THINK_TEMPLATE: &str = "{% for m in messages %}\
+        {% if 'BOOM' in m.content %}{{ nope.missing.deeper }}{% endif %}\
+        {{ m.content }}{% endfor %}\
+        {% if add_generation_prompt and enable_thinking %}<think>\n{% endif %}";
+
+    /// ov-genai applies its own template with `enable_thinking` undefined, so
+    /// after a render-error fallback a template that opens `<think>` only on
+    /// that switch does not open it: the reply is all answer, not reasoning.
+    #[tokio::test]
+    async fn render_error_on_ov_genai_probes_without_the_thinking_switch() {
+        let cfg = ov_genai_config(Some(SWITCHED_THINK_TEMPLATE));
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model",
+                "messages":[{"role":"user","content":"BOOM"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert!(m.get("reasoning_content").is_none(), "{body}");
+
+        // Rendered by the API with thinking on, the same template opens it.
+        let cfg = ov_genai_config(Some(SWITCHED_THINK_TEMPLATE));
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_content"], "plan",
+            "{body}"
+        );
+    }
+
     /// `/v1/completions` sends a raw prompt: it leaves the task's
     /// pretemplated flag unset, so the engine keeps its own setting.
     #[tokio::test]
