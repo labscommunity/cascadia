@@ -214,7 +214,12 @@ impl Run {
 
 fn generate(engine: &mut dyn Engine, id: &str, prompt: &str) -> Run {
     let off = log_len();
-    let task = GenerationTask::new(id.to_string(), prompt).with_max_tokens(MAX_NEW);
+    // A streaming client: with `stream_writes(true)` only such a task takes
+    // the streamed route (a non-streamed one gets the one-shot answer). The
+    // reference engine ignores it.
+    let task = GenerationTask::new(id.to_string(), prompt)
+        .with_max_tokens(MAX_NEW)
+        .with_client_streams(true);
     let started = Instant::now();
     engine.submit(task).expect("submit");
     let mut deltas = Vec::new();
@@ -328,6 +333,15 @@ fn streamed_deltas_join_to_the_non_streamed_answer() {
             joined.chars().take(120).collect::<String>()
         );
 
+        // The stream-on run really streamed, so the comparison below is not
+        // one-shot against one-shot.
+        assert!(
+            s.completion_tokens <= 1 || s.deltas.len() > 1,
+            "{name}: stream_writes(true) sent {} content chunks before the final for {} tokens; \
+             the task took the one-shot route",
+            s.deltas.len(),
+            s.completion_tokens
+        );
         let (ra, rb) = (ref_a.joined(), ref_b.joined());
         if joined != ra && joined != rb {
             if ra == rb {
