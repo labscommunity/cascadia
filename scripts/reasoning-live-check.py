@@ -40,7 +40,7 @@ thinking-on replies carry reasoning and thinking-off replies keep the text as is
 
 Usage:
   python3 scripts/reasoning-live-check.py BASE_URL [--model M] [--mock]
-          [--format-none] [--timeout S]
+          [--format-none] [--no-tools] [--timeout S]
 
 Without `--model`, the first id from `/v1/models` is used. Every check prints
 `<name>: PASS` or `<name>: FAIL <why>`; the last line is
@@ -225,9 +225,9 @@ def check_replayed_reasoning(cl, state):
              "tool_calls": [call]},
             {"role": "tool", "tool_call_id": "call_1", "content": '{"temp_c": 18, "sky": "clear"}'},
         ]
-        # The mock has no chat template, and ov-genai with thinking on applies
-        # its own template, so both refuse tool definitions; there the replayed
-        # turns alone still exercise the parse and the size check.
+        # The mock has no chat template, so it refuses tool definitions (as
+        # does any model served without one); there, and under --no-tools, the
+        # replayed turns alone still exercise the parse and the size check.
         extra = {} if cl.no_tools else {"tools": [WEATHER]}
         m = message(cl.chat(extra, msgs))
         if not (m.get("content") or m.get("tool_calls")):
@@ -334,7 +334,8 @@ def main():
                    help="server runs --reasoning-format none")
     p.add_argument("--timeout", type=int, default=600, help="seconds per request")
     p.add_argument("--no-tools", action="store_true",
-                   help="send the replayed tool loop without tool definitions (ov-genai with thinking on refuses them)")
+                   help="optional: send the replayed tool loop without tool definitions "
+                        "(for a server or model that cannot take them)")
     sys.exit(run(p.parse_args()))
 
 

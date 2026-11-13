@@ -42,8 +42,8 @@ pub struct OvGenaiBuilder {
     pub draft_device: Option<String>,
     pub speculative_k: u32,
     pub prompt_lookup_ngram: u32,
-    /// True when the API pre-renders the model's chat template (so the engine
-    /// tells ov-genai to skip its internal apply — lets `enable_thinking` work).
+    /// True when the API pre-renders the model's chat template, so the engine
+    /// tells ov-genai to skip its internal apply (thinking on or off).
     pub prompt_pretemplated: bool,
     /// Continuous batching (#20): serve concurrent requests through one
     /// `ContinuousBatchingPipeline` instead of one-generation-per-`step()`.
@@ -368,7 +368,6 @@ impl Engine for OvGenaiEngine {
         let cfg = self.gen_config(
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
-            /*enable_thinking*/ false,
             &SamplingParams::default(),
         );
         match self.pipe.generate("Hi", &cfg) {
@@ -429,12 +428,7 @@ impl Engine for OvGenaiEngine {
         } else {
             self.max_tokens_default
         };
-        let cfg = self.gen_config(
-            max_new,
-            task.temperature,
-            task.enable_thinking,
-            &task.sampling,
-        );
+        let cfg = self.gen_config(max_new, task.temperature, &task.sampling);
 
         let started = Instant::now();
         let result = match self.pipe.generate(&task.prompt, &cfg) {
@@ -481,9 +475,10 @@ impl Engine for OvGenaiEngine {
         // this engine because the whole response lands on one chunk with no
         // per-token count). `prompt_tokens` is the rendered-prompt token
         // count; it is exact when the API pre-templated the prompt
-        // (`skip_chat_template`) and a slight undercount when ov-genai
-        // applies its own template internally (the template wrapping isn't
-        // counted). None when the tokenizer is unavailable.
+        // (`skip_chat_template`, whenever a template loaded) and a slight
+        // undercount when ov-genai applies its own template internally (no
+        // template beside the model: the wrapping isn't counted). None when
+        // the tokenizer is unavailable.
         // finish_reason: ov-genai's GenResult doesn't report why it stopped,
         // so infer — reaching the token cap is `length`, anything short of it
         // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
@@ -627,7 +622,6 @@ impl Engine for OvGenaiCbEngine {
             self.prompt_pretemplated,
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
-            /*enable_thinking*/ false,
             &SamplingParams::default(),
         );
         // u64::MAX cannot collide with the sequential request-id counter.
@@ -716,7 +710,6 @@ impl Engine for OvGenaiCbEngine {
             self.prompt_pretemplated,
             max_tokens,
             task.temperature,
-            task.enable_thinking,
             &task.sampling,
         );
         let request_id = self.next_request_id;
@@ -941,7 +934,6 @@ fn build_gen_config(
     prompt_pretemplated: bool,
     max_tokens: u32,
     temperature: f32,
-    enable_thinking: bool,
     sampling: &SamplingParams,
 ) -> GenConfig {
     let do_sample = temperature > 0.0;
@@ -951,11 +943,10 @@ fn build_gen_config(
         temperature: if do_sample { temperature } else { 0.0 },
         num_assistant_tokens: 0,
         max_ngram_size: 0,
-        // Hybrid: only when the API rendered the template for us — i.e. a
-        // template loaded AND this request is thinking-OFF — do we tell
-        // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
-        // native templating (the legacy join the API emitted), untouched.
-        skip_chat_template: prompt_pretemplated && !enable_thinking,
+        // The API renders the model's template whenever one loaded (thinking
+        // on or off), so ov-genai's own apply would wrap it twice. With no
+        // template the API sends the raw user text and ov-genai wraps it.
+        skip_chat_template: prompt_pretemplated,
         // OpenAI sampling knobs (#14). top_p/top_k take effect in the
         // sampling regime (do_sample, i.e. temperature > 0); penalties and
         // seed are forwarded regardless.
@@ -1004,7 +995,6 @@ impl OvGenaiEngine {
         &self,
         max_tokens: u32,
         temperature: f32,
-        enable_thinking: bool,
         sampling: &SamplingParams,
     ) -> GenConfig {
         build_gen_config(
@@ -1013,7 +1003,6 @@ impl OvGenaiEngine {
             self.prompt_pretemplated,
             max_tokens,
             temperature,
-            enable_thinking,
             sampling,
         )
     }
@@ -1551,6 +1540,20 @@ mod tests {
         let b = Box::new(OvGenaiBuilder::new("/x", "CPU"));
         let res = b.build();
         assert!(matches!(res, Err(EngineError::NotLoaded)));
+    }
+
+    /// ov-genai skips its own template exactly when the API rendered the
+    /// prompt (the config no longer depends on the request's thinking
+    /// switch); otherwise it wraps the raw text itself.
+    #[test]
+    fn skip_chat_template_follows_a_pretemplated_prompt() {
+        for pretemplated in [true, false] {
+            let cfg = build_gen_config(0, 0, pretemplated, 16, 0.0, &SamplingParams::default());
+            assert_eq!(
+                cfg.skip_chat_template, pretemplated,
+                "pretemplated: {pretemplated}"
+            );
+        }
     }
 
     #[test]

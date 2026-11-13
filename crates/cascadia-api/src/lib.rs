@@ -123,11 +123,6 @@ pub struct AppState {
     pub chat_env: Option<Arc<minijinja::Environment<'static>>>,
     pub bos_token: Arc<str>,
     pub eos_token: Arc<str>,
-    /// Engines that own their native chat templating (ov-genai): defer to the
-    /// engine for the thinking-ON path and only render here when thinking is
-    /// OFF (to inject the empty `<think></think>`). Keeps the working
-    /// thinking-on path byte-identical to the engine's native render.
-    pub defer_template_on_thinking: bool,
     /// The engine applies the model's chat template itself (sycl-llama: the
     /// llama-server child renders the GGUF template on the structured turns
     /// the task carries). Render here is a placeholder so the empty-prompt
@@ -168,8 +163,6 @@ pub struct Config {
     pub max_concurrent_requests: usize,
     pub max_prompt_bytes: usize,
     pub chat_template: ChatTemplateConfig,
-    /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
-    pub defer_template_on_thinking: bool,
     /// See [`AppState::engine_applies_template`]. Set by the CLI for sycl-llama.
     pub engine_applies_template: bool,
     /// See [`AppState::reasoning_format`]. Set by the CLI's `--reasoning-format`.
@@ -185,7 +178,6 @@ impl Default for Config {
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
-            defer_template_on_thinking: false,
             engine_applies_template: false,
             reasoning_format: ReasoningFormat::default(),
             marker_dialect: None,
@@ -518,7 +510,6 @@ pub fn make_router_with_stats(
             }),
         bos_token: Arc::from(cfg.chat_template.bos_token.clone().unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.clone().unwrap_or_default()),
-        defer_template_on_thinking: cfg.defer_template_on_thinking,
         engine_applies_template: cfg.engine_applies_template,
         effort_words: false,
         reasoning_format: cfg.reasoning_format,
@@ -1891,9 +1882,8 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 /// Did this request's generation prompt open `<think>`? When the API's chat
 /// template rendered the prompt (`templated`) it is read off `task.prompt`
 /// (per request, so a template whose generation prompt depends on the effort
-/// word is right); when the engine renders it (sycl-llama, or ov-genai with
-/// thinking on) `task.prompt` is a placeholder and the load-time `probe`
-/// stands in. With no template, or after a render error fell back to the
+/// word is right); when the engine renders it (sycl-llama) `task.prompt` is a
+/// placeholder and the load-time `probe` stands in. With no template, or after a render error fell back to the
 /// legacy formatter, the prompt is the user's own text, which may end in
 /// `<think>` without opening anything: not opened.
 ///
@@ -1905,8 +1895,6 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 /// is rendered by llama-server), so its probe is always false.
 pub(crate) fn opens_think(
     engine_applies_template: bool,
-    defer_template_on_thinking: bool,
-    enable_thinking: bool,
     probe: bool,
     templated: bool,
     task: &GenerationTask,
@@ -1914,8 +1902,7 @@ pub(crate) fn opens_think(
     if task.reasoning_as_text {
         return false;
     }
-    let engine_renders = engine_applies_template || (defer_template_on_thinking && enable_thinking);
-    if engine_renders {
+    if engine_applies_template {
         probe
     } else {
         templated && task.prompt.trim_end().ends_with("<think>")
@@ -2079,25 +2066,15 @@ fn render_prompt(
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
 ) -> Result<(String, bool), PromptRenderError> {
-    // ov-genai applies the model's own template, so the engine gets raw text.
-    // Tools would be dropped on the floor here, so refuse rather than pretend.
-    // `reasoning_effort` (the caller's parameter above) is also dropped on
-    // this branch, intentionally: ov-genai applies its own template with the
-    // effort undefined, so there is nowhere for the mapped value to go.
     if state.engine_applies_template {
         // the child renders the GGUF chat template on the forwarded turns;
         // the prompt is a fallback and must simply be non-empty
         return Ok((render_prompt_legacy(messages), false));
     }
-    if state.defer_template_on_thinking && enable_thinking {
-        if tools.is_some_and(|t| !t.is_empty()) {
-            return Err(PromptRenderError::Failed(
-                "engine-side templating is active for thinking requests; tools cannot be forwarded"
-                    .into(),
-            ));
-        }
-        return Ok((render_prompt_legacy(messages), false));
-    }
+    // Every other engine, ov-genai included, gets the prompt rendered here
+    // through the model's template, thinking on or off; ov-genai then skips
+    // its own apply. With no template loaded this is the legacy last-user
+    // text, which ov-genai wraps in its own template.
     render_or_fallback_templated(
         state.chat_env.as_deref(),
         messages,
@@ -2918,8 +2895,6 @@ async fn chat_completions(
     // starts from the same answer.
     let opened = opens_think(
         state.engine_applies_template,
-        state.defer_template_on_thinking,
-        enable_thinking,
         state.template_opens_think,
         templated,
         &task,
@@ -7017,45 +6992,26 @@ level={{ effort_map[eff] }}";
     fn opens_think_reads_the_prompt_or_the_probe() {
         let opened = GenerationTask::new("t", "<|im_start|>assistant\n<think>\n");
         let closed = GenerationTask::new("t", "<|im_start|>assistant\n");
-        // API rendered the prompt: read it, ignore the probe.
-        assert!(opens_think(false, false, true, false, true, &opened));
-        assert!(!opens_think(false, false, true, true, true, &closed));
+        // API rendered the prompt (ov-genai included, thinking on or off):
+        // read it, ignore the probe.
+        assert!(opens_think(false, false, true, &opened));
+        assert!(!opens_think(false, true, true, &closed));
         // The engine renders (sycl-llama): the probe stands in.
-        assert!(opens_think(true, false, true, true, true, &closed));
-        assert!(!opens_think(true, false, true, false, true, &opened));
-        // ov-genai with thinking on: the engine's native render, so the probe.
-        assert!(opens_think(false, true, true, true, true, &closed));
-        assert!(!opens_think(false, true, true, false, true, &opened));
-        // ov-genai with thinking off: the API rendered it, read the prompt.
-        assert!(opens_think(false, true, false, false, true, &opened));
-        assert!(!opens_think(false, true, false, true, true, &closed));
+        assert!(opens_think(true, true, true, &closed));
+        assert!(!opens_think(true, false, true, &opened));
         // Reasoning folded in as text: the engine sends its own `<think>`.
         let folded = |prompt: &str| GenerationTask {
             reasoning_as_text: true,
             ..GenerationTask::new("t", prompt)
         };
-        assert!(!opens_think(
-            true,
-            false,
-            true,
-            true,
-            true,
-            &folded("<think>\n")
-        ));
-        assert!(!opens_think(
-            false,
-            false,
-            true,
-            true,
-            true,
-            &folded("<think>\n")
-        ));
+        assert!(!opens_think(true, true, true, &folded("<think>\n")));
+        assert!(!opens_think(false, true, true, &folded("<think>\n")));
         // No template rendered the prompt (none loaded, or the legacy
         // fallback after a render error): the user's own text, never opened.
-        assert!(!opens_think(false, false, true, false, false, &opened));
-        assert!(!opens_think(false, true, false, false, false, &opened));
+        assert!(!opens_think(false, false, false, &opened));
+        assert!(!opens_think(false, true, false, &opened));
         // The engine renders: the probe still decides.
-        assert!(opens_think(true, false, true, true, false, &closed));
+        assert!(opens_think(true, true, false, &closed));
     }
 
     /// Records every task it is handed and answers each with a bare final.
@@ -7189,6 +7145,140 @@ level={{ effort_map[eff] }}";
             assert_eq!(status, StatusCode::OK, "{body}");
             let seen = seen.lock().unwrap();
             assert_eq!(seen[0].preserve_thinking, want, "{kwargs}");
+        }
+    }
+
+    /// The prompt the engine is handed for `payload`, with the reply status.
+    async fn submitted_prompt(
+        cfg: Config,
+        payload: serde_json::Value,
+    ) -> (StatusCode, Value, String) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, body) = post_chat(app, payload).await;
+        let prompt = seen
+            .lock()
+            .unwrap()
+            .first()
+            .map(|t| t.prompt.clone())
+            .unwrap_or_default();
+        (status, body, prompt)
+    }
+
+    /// The API config the CLI builds for ov-genai: the model's chat template
+    /// when one sits beside the model, nothing engine-specific otherwise.
+    fn ov_genai_config(template: Option<&str>) -> Config {
+        Config {
+            chat_template: ChatTemplateConfig {
+                template: template.map(str::to_owned),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        }
+    }
+
+    /// A Qwen3 tool loop with a system prompt and an earlier exchange.
+    fn qwen3_tool_loop_messages() -> serde_json::Value {
+        serde_json::json!([
+            {"role":"system","content":"You are terse."},
+            {"role":"user","content":"EARLIER-QUESTION"},
+            {"role":"assistant","content":"EARLIER-ANSWER"},
+            {"role":"user","content":"weather in Paris?"},
+            {"role":"assistant","content":"","reasoning_content":"I should call the tool.",
+             "tool_calls":[{"id":"call_1","type":"function",
+                "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+            {"role":"tool","tool_call_id":"call_1","content":"18C"}
+        ])
+    }
+
+    /// With the model's template loaded and thinking on (the default), the
+    /// system prompt, the history and the reasoning replayed inside the
+    /// current tool loop all reach the prompt ov-genai is handed.
+    #[tokio::test]
+    async fn ov_genai_thinking_on_renders_system_history_and_replayed_reasoning() {
+        let (status, body, prompt) = submitted_prompt(
+            ov_genai_config(Some(QWEN3_TEMPLATE)),
+            serde_json::json!({"model":"mock-model","messages": qwen3_tool_loop_messages()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            prompt.starts_with("<|im_start|>system\nYou are terse.<|im_end|>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("<|im_start|>user\nEARLIER-QUESTION<|im_end|>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("<|im_start|>assistant\nEARLIER-ANSWER<|im_end|>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "<|im_start|>assistant\n<think>\nI should call the tool.\n</think>\n\n<tool_call>"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("<|im_start|>assistant\n"), "{prompt}");
+    }
+
+    /// Tools reach the template with thinking on, instead of a 500.
+    #[tokio::test]
+    async fn ov_genai_thinking_on_renders_tools() {
+        let (status, body, prompt) = submitted_prompt(
+            ov_genai_config(Some(QWEN3_TEMPLATE)),
+            serde_json::json!({"model":"mock-model",
+                "messages":[{"role":"user","content":"weather in Paris?"}],
+                "tools":[{"type":"function","function":{"name":"get_weather",
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(prompt.contains("<tools>"), "{prompt}");
+        assert!(prompt.contains("\"get_weather\""), "{prompt}");
+    }
+
+    /// Thinking off renders as before: the template, with its empty think block.
+    #[tokio::test]
+    async fn ov_genai_thinking_off_render_is_unchanged() {
+        let messages = qwen3_tool_loop_messages();
+        let (status, body, prompt) = submitted_prompt(
+            ov_genai_config(Some(QWEN3_TEMPLATE)),
+            serde_json::json!({"model":"mock-model","messages": messages,
+                "chat_template_kwargs":{"enable_thinking":false}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let msgs: Vec<ChatMessage> = serde_json::from_value(messages).unwrap();
+        let env = build_chat_env(QWEN3_TEMPLATE).unwrap();
+        let want = render_with_chat_env(&env, &msgs, "", "", false, None, None).unwrap();
+        assert_eq!(prompt, want);
+        assert!(prompt.ends_with("<think>\n\n</think>\n\n"), "{prompt}");
+    }
+
+    /// No template beside the model: the last user message, as before, for
+    /// ov-genai to wrap in its own template (thinking on or off).
+    #[tokio::test]
+    async fn ov_genai_without_a_template_sends_the_last_user_message() {
+        for thinking in [true, false] {
+            let (status, body, prompt) = submitted_prompt(
+                ov_genai_config(None),
+                serde_json::json!({"model":"mock-model","messages": qwen3_tool_loop_messages(),
+                    "chat_template_kwargs":{"enable_thinking": thinking}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(prompt, "weather in Paris?", "thinking: {thinking}");
         }
     }
 

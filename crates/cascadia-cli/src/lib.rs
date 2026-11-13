@@ -1782,9 +1782,10 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             } else if args.prompt_lookup > 0 {
                 b = b.with_prompt_lookup(args.prompt_lookup);
             }
-            // If the model ships a chat template, the API renders it (honoring
-            // enable_thinking) and the engine tells ov-genai to skip its own
-            // internal apply. No template → leave ov-genai's apply on.
+            // If the model ships a chat template, the API renders it for every
+            // request (thinking on or off) and the engine tells ov-genai to
+            // skip its own internal apply. No template → leave ov-genai's
+            // apply on.
             b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
             Ok(Box::new(b))
         }
@@ -2543,9 +2544,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // to the legacy "role: content" join if the file or fields are
         // missing.
         let chat_template = match args.engine {
-            // ov-genai: render the template API-side so enable_thinking is
-            // honored; the engine sets apply_chat_template=false so ov-genai
-            // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
+            // ov-genai: render the template API-side for every request so the
+            // system prompt, history, tools and enable_thinking all reach it;
+            // the engine sets apply_chat_template=false so ov-genai doesn't
+            // double-wrap (build_builder mirrors via with_prompt_pretemplated).
             EngineKind::OvGenai => {
                 let template = ovgenai_chat_template(&args.model);
                 if ovgenai_template_unprobed(&template) {
@@ -2606,10 +2608,6 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // windows admit. Both caps follow one operator-facing knob.
         cfg.max_body_bytes = max_body;
         cfg.max_prompt_bytes = max_body;
-        // ov-genai owns native templating: render the template API-side only for
-        // the thinking-OFF path (engine sets apply_chat_template=false then);
-        // thinking-ON stays on ov-genai's native template, untouched.
-        cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
         // sycl-llama's child renders the GGUF template itself (the engine
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
