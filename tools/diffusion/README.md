@@ -31,7 +31,9 @@ The source must already contain `text_encoder`, `text_encoder_2`, `unet`, and
 metadata. Record the source repository and its license alongside the artifact;
 `--revision` must be its immutable 40-character commit. Fused adapters and
 quantized weights produce different artifact hashes. Runtime adapter injection
-and alternate schedulers are unsupported.
+and alternate schedulers are unsupported. Export and coordinator startup reject
+non-Euler schedulers, alternate conditioning flags, and tokenizers outside the
+77-token CLIP profile; they never silently substitute pipeline settings.
 
 Export prints a manifest digest. Pin that digest in deployment configuration;
 never accept the expected digest from a requesting peer. An export refuses to
