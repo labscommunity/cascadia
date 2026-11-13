@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 import tempfile
-from .contracts import canonical, file_hash, require, validate_manifest, verify_bundle
+from .contracts import canonical, file_hash, require, validate_manifest, validate_sdxl_metadata, verify_bundle
 
 
 def schema(model):
@@ -67,6 +67,7 @@ def partition(denoiser):
 
 
 def export_sdxl(source: Path, output: Path, revision: str, size: int):
+    validate_sdxl_metadata(source)
     import openvino as ov
     require(type(size) is int and 64 <= size <= 1024 and size % 8 == 0, 'invalid size')
     require(not output.exists(), 'output already exists')

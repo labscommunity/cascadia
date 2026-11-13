@@ -23,6 +23,31 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def validate_sdxl_metadata(root: Path):
+    """Reject pipeline settings this fixed implementation would otherwise ignore."""
+    def config(name):
+        path = root / name
+        require(path.stat().st_size <= 1024 * 1024, 'pipeline config exceeds limit')
+        value = parse_json(path.read_bytes())
+        require(isinstance(value, dict), 'pipeline config must be an object')
+        return value
+
+    index = config('model_index.json')
+    scheduler = config('scheduler/scheduler_config.json')
+    require(index.get('_class_name') in ('StableDiffusionXLPipeline', 'OVStableDiffusionXLPipeline'),
+            'only the SDXL text-to-image pipeline is supported')
+    require(index.get('scheduler') == ['diffusers', 'EulerDiscreteScheduler']
+            and scheduler.get('_class_name') == 'EulerDiscreteScheduler',
+            'only EulerDiscreteScheduler is supported; scheduler substitution is forbidden')
+    require(index.get('force_zeros_for_empty_prompt', True) is True
+            and index.get('requires_aesthetics_score', False) is False,
+            'unsupported SDXL conditioning configuration')
+    for name in ('tokenizer', 'tokenizer_2'):
+        require(index.get(name) == ['transformers', 'CLIPTokenizer']
+                and config(f'{name}/tokenizer_config.json').get('model_max_length') == 77,
+                'only the 77-token CLIP tokenizer profile is supported')
+
+
 def exact(value, keys):
     require(isinstance(value, dict) and set(value) == set(keys), 'invalid object fields')
 

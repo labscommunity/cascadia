@@ -5,7 +5,7 @@ import io
 import json
 from pathlib import Path
 import time
-from .contracts import decode, encode, require, verify_bundle
+from .contracts import decode, encode, require, validate_sdxl_metadata, verify_bundle
 
 DTYPES = {'f32':'<f4', 'f16':'<f2', 'i64':'<i8', 'i32':'<i4', 'u8':'u1'}
 VERSIONS = {'numpy':'2.4.6', 'openvino':'2026.4.1', 'optimum-intel':'2.2.0', 'diffusers':'0.39.0', 'transformers':'5.5.4', 'torch':'2.15.0', 'Pillow':'13.0.0', 'tokenizers':'0.22.2', 'optimum':'2.3.0'}
@@ -117,6 +117,7 @@ class Pipeline:
         from transformers import CLIPTokenizer
         require(mode in ('components','layers'), 'invalid placement mode')
         self.manifest=verify_bundle(root,manifest,[])
+        validate_sdxl_metadata(root)
         self.mode=mode
         self.invoke=invoke
         schemas=self.manifest['components']
