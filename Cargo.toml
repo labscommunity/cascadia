@@ -6,6 +6,7 @@ members = [
     "crates/cascadia-topology",
     "crates/cascadia-transport",
     "crates/cascadia-engine",
+    "crates/cascadia-diffusion",
     "crates/cascadia-engine-mock",
     "crates/cascadia-ov-genai-shim",
     "crates/cascadia-engine-openvino",
@@ -37,6 +38,7 @@ cascadia-types = { path = "crates/cascadia-types" }
 cascadia-topology = { path = "crates/cascadia-topology" }
 cascadia-transport = { path = "crates/cascadia-transport" }
 cascadia-engine = { path = "crates/cascadia-engine" }
+cascadia-diffusion = { path = "crates/cascadia-diffusion" }
 cascadia-engine-mock = { path = "crates/cascadia-engine-mock" }
 cascadia-ov-genai-shim = { path = "crates/cascadia-ov-genai-shim" }
 cascadia-engine-openvino = { path = "crates/cascadia-engine-openvino" }
