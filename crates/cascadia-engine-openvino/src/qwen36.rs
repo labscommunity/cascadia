@@ -45,6 +45,8 @@ use futures::stream;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
 
+use crate::qwen36_profile::{self as profile, ProfileState};
+
 /// Hidden width of shard trees exported before `manifest.hidden_size`
 /// existed (the Qwen3.6-35B-A3B surgery, hidden 2048). Newer manifests
 /// carry the width explicitly; the 27B dense export is 5120.
@@ -619,11 +621,20 @@ impl Builder for Qwen36Builder {
             );
             0
         };
+        // `--ov-config PERF_COUNT=YES` compiled the stages with per-op counters, which is what the
+        // profile's one-off per-stage OpenVINO dump reads (`Runtime::profiling()`).
+        let perf_count = self
+            .ov_properties
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("PERF_COUNT") && v.eq_ignore_ascii_case("YES"));
+        let profiling = profile::profile_enabled();
         info!(
             budget_gib = prefix_cache_bytes >> 30,
             im_start = ?self.im_start_id,
             max_ctx = ?self.max_ctx,
-            "qwen35 prefix cache"
+            profile = profiling,
+            perf_count,
+            "qwen35 prefix cache / profile"
         );
         Ok(Box::new(Qwen36Engine {
             emb: self.emb,
@@ -666,6 +677,8 @@ impl Builder for Qwen36Builder {
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
+            prof: profiling.then(ProfileState::default),
+            perf_count,
         }))
     }
 }
@@ -829,6 +842,12 @@ pub struct Qwen36Engine {
     /// Bytes of the parts restored by the latest prefix-cache hit: the size estimate for the
     /// state a refresh snapshot of this conversation would copy.
     last_restore_bytes: usize,
+    /// `CASCADIA_QWEN36_PROFILE=1` accumulators (`qwen36_profile`); `None` ⇒ no timing on the
+    /// hot path.
+    prof: Option<ProfileState>,
+    /// Stages compiled with `PERF_COUNT=YES` (`--ov-config PERF_COUNT=YES`), so the profile's
+    /// one-off dump after the 8th decode step can read `Runtime::profiling()`.
+    perf_count: bool,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -947,6 +966,7 @@ enum InFrame {
 impl Qwen36Engine {
     /// Embed a token span: [1, n] ids -> flattened [1, n, hidden] f32.
     fn embed_seq(&mut self, toks: &[u32]) -> EngineResult<Vec<f32>> {
+        let t_emb = self.prof.is_some().then(Instant::now);
         let emb = self
             .emb
             .as_mut()
@@ -976,6 +996,9 @@ impl Qwen36Engine {
                 self.hidden
             )));
         }
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), t_emb) {
+            p.embed_last_us = t.elapsed().as_micros() as u64;
+        }
         Ok(f32_from_le(&bytes))
     }
 
@@ -1000,8 +1023,11 @@ impl Qwen36Engine {
         let width = self.hidden;
         let zeros_embeds = vec![0f32; n * width];
         let first_global = self.rank == 0;
+        let profiling = self.prof.is_some();
+        let mut stage_times: Vec<(u64, u64, u64)> = Vec::new();
         let mut hidden: Vec<f32> = embeds.to_vec();
         for (j, st) in self.stages.iter_mut().enumerate() {
+            let t_set = profiling.then(Instant::now);
             let names = st.input_names().map_err(map_ov)?;
             for name in &names {
                 match name.as_str() {
@@ -1035,7 +1061,9 @@ impl Qwen36Engine {
                     }
                 }
             }
+            let t_inf = profiling.then(Instant::now);
             st.infer().map_err(map_ov)?;
+            let t_out = profiling.then(Instant::now);
             let (dtype, _shape, bytes) = st.output(0).map_err(map_ov)?;
             if !matches!(dtype, DType::F32) {
                 return Err(EngineError::Backend(format!(
@@ -1043,6 +1071,16 @@ impl Qwen36Engine {
                 )));
             }
             hidden = f32_from_le(&bytes);
+            if let (Some(a), Some(b), Some(c)) = (t_set, t_inf, t_out) {
+                stage_times.push((
+                    (b - a).as_micros() as u64,
+                    (c - b).as_micros() as u64,
+                    c.elapsed().as_micros() as u64,
+                ));
+            }
+        }
+        if let Some(p) = self.prof.as_mut() {
+            p.stage_last = stage_times;
         }
         Ok(hidden)
     }
@@ -1134,6 +1172,7 @@ impl Qwen36Engine {
         } else {
             0.0
         };
+        self.prof_task_end(&t.task_id);
         // Which branch `reset_all` will take, sampled before the call clears
         // `state_restored`. With the prefix cache always on, every warm turn
         // pays `recreate_request()` per stage — `reset_s` is what that costs.
@@ -1185,6 +1224,7 @@ impl Qwen36Engine {
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
+        self.prof_task_end(&t.task_id);
         self.reset_all();
         vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
     }
@@ -1284,7 +1324,8 @@ impl Qwen36Engine {
             [1, n as u32, self.hidden as u32],
             le_bytes_f32(hidden),
         );
-        run_async(
+        let t_rtt = self.prof.is_some().then(Instant::now);
+        let r = run_async(
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
@@ -1303,7 +1344,9 @@ impl Qwen36Engine {
                 ))
             }),
         )
-        .map_err(map_wire)
+        .map_err(map_wire);
+        self.prof_record_rtt(t_rtt, r.as_ref().ok().map(|(_, us)| *us));
+        r
     }
 
     /// Rank 0 wrapper: token + the round-trip's wire share in ms (RTT
@@ -1818,6 +1861,7 @@ impl Qwen36Engine {
                     if reanchored {
                         warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                     }
+                    self.prof_decode_step(&[("wire.net", wire_ms * 1000.0)]);
                     vec![(
                         task_id.clone(),
                         Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
@@ -1842,6 +1886,7 @@ impl Qwen36Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("last rank has no upstream".into()))?;
         let h = self.handle()?;
+        let t_wait = self.prof.is_some().then(Instant::now);
         let frame = run_async(&h, async move {
             let mut g = upstream.lock().await;
             let hb = g.recv_raw(12).await?;
@@ -1925,6 +1970,7 @@ impl Qwen36Engine {
             }
         })
         .map_err(map_wire)?;
+        let up_wait_us = t_wait.map(|t| t.elapsed().as_micros() as f64);
 
         let is_last = self.rank == self.total - 1;
         match frame {
@@ -1979,6 +2025,9 @@ impl Qwen36Engine {
                 // "everything downstream of you is at position 0". A
                 // failed downstream reset = no ack = task fails loud at
                 // rank 0 (reset protocol).
+                // A relay has no task boundary of its own: the span since the previous RESET is
+                // its "task" for the profile summary.
+                self.prof_task_end(&TaskId::from(format!("epoch-{epoch}")));
                 self.reset_all();
                 self.peer_epoch = epoch;
                 if !is_last {
@@ -2138,19 +2187,19 @@ impl Qwen36Engine {
                 // infer; they report their own share, so rank 0's
                 // RTT-minus-infer stays the chain's true wire share.
                 let own_us = infer_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                let mut sample_us = 0f64;
                 let (next, downstream_us) = if is_last {
+                    let t_sample = self.prof.is_some().then(Instant::now);
                     let logits = if self.last_logits_only {
                         out
                     } else {
                         let row = out.len() / n;
                         out[(n - 1) * row..].to_vec()
                     };
-                    let next = logits
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.total_cmp(b.1))
-                        .map(|(i, _)| i as i32)
-                        .unwrap_or(0);
+                    let next = argmax(&logits) as i32;
+                    if let Some(t) = t_sample {
+                        sample_us = t.elapsed().as_micros() as f64;
+                    }
                     (next, 0u32)
                 } else {
                     // Middle: pass the hidden span on; the chain end's
@@ -2166,7 +2215,13 @@ impl Qwen36Engine {
                     g.send_raw(&next.to_be_bytes()).await?;
                     g.send_raw(&infer_us.to_be_bytes()).await
                 })
-                .map_err(map_wire)
+                .map_err(map_wire)?;
+                // Decode frames only (T=1): a prefill chunk's timings would skew the per-token
+                // summary (its pass is overwritten by the next, never recorded).
+                if n == 1 {
+                    self.prof_relay_step(up_wait_us, sample_us);
+                }
+                Ok(())
             }
         }
     }
@@ -2509,13 +2564,11 @@ impl Qwen36Engine {
             if t.gen_ids.len() >= t.max_tokens {
                 return self.finalize(FinishReason::Length);
             }
-            let next = t
-                .logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            let t_sample = self.prof.is_some().then(Instant::now);
+            let next = argmax(&t.logits);
+            if let (Some(p), Some(ts)) = (self.prof.as_mut(), t_sample) {
+                p.acc.record("sample", ts.elapsed().as_micros() as f64);
+            }
             if Some(next) == self.eos {
                 return self.finalize(FinishReason::Stop);
             }
@@ -2545,6 +2598,7 @@ impl Qwen36Engine {
                     if reanchored {
                         warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                     }
+                    self.prof_decode_step(&[]);
                     vec![(
                         task_id.clone(),
                         Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
@@ -2554,6 +2608,100 @@ impl Qwen36Engine {
                     warn!(task = %task_id, error = %e, "decode failed");
                     self.finalize_error(format!("decode failed: {e}"))
                 }
+            }
+        }
+    }
+}
+
+/// Index of the largest value (first on ties; 0 for an empty row).
+fn argmax(row: &[f32]) -> u32 {
+    row.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
+// -------- per-token profiling (`CASCADIA_QWEN36_PROFILE=1`, see `qwen36_profile`) --------
+//
+// Every hook is a no-op when `prof` is `None`; the callers only take an `Instant` when it is
+// `Some`, so the unprofiled hot path runs no clock reads.
+impl Qwen36Engine {
+    /// A downstream FORWARD→TOKEN exchange returned: its round trip (`down.rtt`) and the wire
+    /// share, RTT minus the peer-reported infer time (`down.wire`).
+    fn prof_record_rtt(&mut self, started: Option<Instant>, infer_us: Option<u32>) {
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), started) {
+            let rtt_us = t.elapsed().as_micros() as f64;
+            p.acc.record("down.rtt", rtt_us);
+            if let Some(us) = infer_us {
+                p.acc.record("down.wire", (rtt_us - us as f64).max(0.0));
+            }
+        }
+    }
+
+    /// One decode step finished on this rank: fold the pass's embed / per-stage timings plus
+    /// `extra` samples in, log the periodic summary, and fire the one-off `PERF_COUNT` dump.
+    fn prof_decode_step(&mut self, extra: &[(&str, f64)]) {
+        let rank = self.rank;
+        let perf_count = self.perf_count;
+        let Some(p) = self.prof.as_mut() else {
+            return;
+        };
+        let (summary_due, dump_due) = p.end_step(extra, perf_count);
+        if summary_due {
+            info!(rank, steps = p.task_steps, summary = %p.acc.summary(), "qwen36 profile (p50/p95 per decode step)");
+        }
+        if dump_due {
+            self.dump_stage_profiles();
+        }
+    }
+
+    /// Relay-rank step hook for one decode frame: the wait for the upstream frame (`up.wait`)
+    /// and, on the last rank, the argmax time (`sample`), plus the pass's stage timings.
+    fn prof_relay_step(&mut self, up_wait_us: Option<f64>, sample_us: f64) {
+        if self.prof.is_none() {
+            return;
+        }
+        let mut extra: Vec<(&str, f64)> = Vec::with_capacity(2);
+        if let Some(w) = up_wait_us {
+            extra.push(("up.wait", w));
+        }
+        if sample_us > 0.0 {
+            extra.push(("sample", sample_us));
+        }
+        self.prof_decode_step(&extra);
+    }
+
+    /// Final summary for the task (rank 0 / single-box) or for the span since the last RESET
+    /// (relays), then clear the accumulators.
+    fn prof_task_end(&mut self, task_id: &TaskId) {
+        let rank = self.rank;
+        if let Some(p) = self.prof.as_mut() {
+            if !p.acc.is_empty() {
+                info!(task = %task_id, rank, steps = p.task_steps, summary = %p.acc.summary(), "qwen36 profile (task)");
+            }
+            p.reset();
+        }
+    }
+
+    /// Per-stage OpenVINO per-op profile of the LAST inference (`PERF_COUNT=YES`): total real
+    /// vs cpu time, executed node count, and the top node types by real time — the same
+    /// aggregation as `runtime.rs`'s `dump_decode_profile`, one block per local stage.
+    fn dump_stage_profiles(&mut self) {
+        let rank = self.rank;
+        for (j, st) in self.stages.iter().enumerate() {
+            match st.profiling() {
+                Ok(tsv) => {
+                    for line in profile::summarize_ov_profile(&tsv, profile::OV_PROFILE_TOP_TYPES) {
+                        info!(rank, stage = j, "qwen36 ov profile: {line}");
+                    }
+                }
+                Err(e) => warn!(
+                    rank,
+                    stage = j,
+                    error = %e,
+                    "qwen36 ov profile unavailable (stages need --ov-config PERF_COUNT=YES)"
+                ),
             }
         }
     }
@@ -2663,6 +2811,7 @@ impl Engine for Qwen36Engine {
         if self.active.as_ref().is_some_and(|t| &t.task_id == task_id) {
             info!(task = %task_id, "qwen36: cancelled; dropping active task");
             self.active = None;
+            self.prof_task_end(task_id);
             // A prefix-cache hit restores over the live requests without its own reset, so the
             // only certified restore sequence is reset → prime → set_state: reset here rather
             // than leaving the cancelled task's state in place.
@@ -3229,6 +3378,8 @@ mod tests {
             max_ctx: None,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
+            prof: None,
+            perf_count: false,
         }
     }
 
