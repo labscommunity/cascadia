@@ -35,6 +35,7 @@ pub mod placement;
 pub mod profile;
 pub mod profile_stage;
 pub mod run_placement;
+pub mod wddm;
 use discover::{cmd_discover, DiscoverArgs};
 use doctor::{cmd_doctor, DoctorArgs};
 use placement::{cmd_place, PlaceArgs};

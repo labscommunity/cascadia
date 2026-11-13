@@ -364,7 +364,7 @@ mod openvino_impl {
         };
         match shim::device_property(device, key) {
             Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(bytes) => bytes,
+                Ok(bytes) => cap_to_wddm_budget(device, bytes),
                 Err(_) => {
                     warn!(device, key, value = %raw.trim(),
                         "device memory property is not a bare byte count; using fallback budget");
@@ -377,6 +377,35 @@ mod openvino_impl {
                 fallback
             }
         }
+    }
+
+    /// Windows: an Intel iGPU's `GPU_DEVICE_TOTAL_MEM_SIZE` can exceed the WDDM per-process
+    /// video-memory budget, which is the real residency cap (`crate::wddm`); the placement
+    /// budget is the smaller of the two. NPU devices and other platforms keep the OV number.
+    #[cfg(windows)]
+    fn cap_to_wddm_budget(device: &str, ov_total: u64) -> u64 {
+        if !device.to_ascii_uppercase().starts_with("GPU") {
+            return ov_total;
+        }
+        let budget = crate::wddm::query_gpu_budgets()
+            .ok()
+            .and_then(|b| crate::wddm::largest_budget(&b));
+        let capped = crate::wddm::gpu_budget_cap(ov_total, budget);
+        if capped < ov_total {
+            warn!(
+                device,
+                ov_total_bytes = ov_total,
+                wddm_budget_bytes = budget.unwrap_or(0),
+                "GPU_DEVICE_TOTAL_MEM_SIZE exceeds the WDDM per-process budget; placing against \
+                 the budget (`cascadia doctor` prints the registry fix)"
+            );
+        }
+        capped
+    }
+
+    #[cfg(not(windows))]
+    fn cap_to_wddm_budget(_device: &str, ov_total: u64) -> u64 {
+        ov_total
     }
 
     /// Compile a stage on a device and time a forward pass with zeroed
