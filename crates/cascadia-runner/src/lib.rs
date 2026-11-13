@@ -308,6 +308,10 @@ impl EngineGuard<'_> {
         }
         let slot = self.slot;
         let Some(engine) = self.engine() else {
+            // `close()` emptied the slot: the taken submits never reach an
+            // engine (each stream ends on the teardown error), so they hold
+            // no place against a refilled slot's cap.
+            slot.buffers.lock().handing_over = 0;
             return;
         };
         for tid in &cancels {
@@ -5192,6 +5196,25 @@ mod tests {
         assert!(chunks.last().unwrap().is_final, "{chunks:?}");
         assert!(!log.lock().submitted.iter().any(|t| t == "q1"));
         drop(held);
+    }
+
+    /// A drain that finds the slot emptied counts no place for the submits it
+    /// took, so a refilled slot does not start with phantom places against
+    /// the engine's cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_of_an_emptied_slot_counts_no_handover() {
+        let (runner, _log) = admit_runner(Gate::opened(), 256, true).await;
+        runner.close();
+        runner
+            .slot
+            .buffers
+            .lock()
+            .deferred_submits
+            .push_back(GenerationTask::new("q", "x"));
+        drop(runner.slot.lock_applying_cancels());
+        let bufs = runner.slot.buffers.lock();
+        assert!(bufs.deferred_submits.is_empty());
+        assert_eq!(bufs.handing_over, 0);
     }
 
     /// `close()` empties the slot between the submit's admission check and its
