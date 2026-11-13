@@ -7087,6 +7087,12 @@ level={{ effort_map[eff] }}";
         // The engine renders (sycl-llama): the probe stands in.
         assert!(opens_think(true, false, true, true, true, &closed));
         assert!(!opens_think(true, false, false, false, true, &opened));
+        // ...the probe rendered with thinking on, never the unswitched one,
+        // even when the engine would also wrap a raw prompt.
+        assert!(opens_think(true, false, true, false, false, &closed));
+        assert!(!opens_think(true, false, false, true, false, &opened));
+        assert!(opens_think(true, true, true, false, false, &closed));
+        assert!(!opens_think(true, true, false, true, false, &opened));
         // Reasoning folded in as text: the engine sends its own `<think>`.
         let folded = |prompt: &str| GenerationTask {
             reasoning_as_text: true,
