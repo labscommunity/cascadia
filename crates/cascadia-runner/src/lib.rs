@@ -845,6 +845,7 @@ impl Runner {
             metrics_finalized: false,
             closing: self.closing.clone(),
             foreign_yield: None,
+            yield_before_step: false,
         }
     }
 
@@ -1053,6 +1054,16 @@ pub struct ChunkStream {
     /// Tokio worker then services timers and I/O only every few dozen polls
     /// (each poll may block in `step()`), so unrelated timers starve.
     foreign_yield: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// This stream's last step made chunks for other tasks or woke streams
+    /// parked on the engine lock. Their consumers have to run before the
+    /// next step: a consumer that gets a chunk on every poll never returns
+    /// `Pending`, so stepping again straight away would hold this worker for
+    /// the whole generation, and the tasks only it can run (a wake made from
+    /// this worker sits in its LIFO slot, which no other worker can take; a
+    /// task that yielded here waits in its deferred list) would get all
+    /// their chunks in one burst at the end. So the next step waits for one
+    /// yield first. A lone stream never sets it.
+    yield_before_step: bool,
 }
 
 impl ChunkStream {
@@ -1339,6 +1350,17 @@ impl Stream for ChunkStream {
                 return Poll::Pending;
             }
 
+            // Let the streams the previous step woke run before this one steps
+            // again (see `yield_before_step`). `yield_now` puts this task
+            // behind them; outside a Tokio runtime it is a plain wake.
+            if std::mem::take(&mut this.yield_before_step)
+                && std::pin::pin!(tokio::task::yield_now())
+                    .poll(cx)
+                    .is_pending()
+            {
+                return Poll::Pending;
+            }
+
             // 2) Drive the engine one step. An Err is terminal for the
             //    failed task: the engine has already abandoned it and reset
             //    its own state. If the error names a *different* task than
@@ -1360,6 +1382,7 @@ impl Stream for ChunkStream {
             //    the whole pipeline permanently wedged (#122). Contended =
             //    someone else is stepping; park with a registered waker and
             //    let their release wake us.
+            let mut fed_others = false;
             let step_result = {
                 //    Acquiring also applies the cancels deferred while the
                 //    engine was busy (Runner::cancel / stream Drop never
@@ -1400,6 +1423,7 @@ impl Stream for ChunkStream {
                                 if bufs.cancelled.contains(&tid) {
                                     continue;
                                 }
+                                fed_others |= tid != this.task_id;
                                 bufs.chunks.entry(tid).or_default().push_back(chunk);
                             }
                             Ok(empty)
@@ -1410,6 +1434,8 @@ impl Stream for ChunkStream {
                 // Releasing the guard is what drains + wakes every stream
                 // parked on contention — engine first, wake second, and on
                 // an unwind out of `step()` just the same.
+                this.yield_before_step =
+                    fed_others || !this.slot.buffers.lock().step_wakers.is_empty();
                 drop(guard);
                 result
             };
@@ -5306,5 +5332,133 @@ mod tests {
             .unwrap();
         collect(after).await;
         assert!(!log.lock().submitted.iter().any(|t| t == "ghost"));
+    }
+
+    /// A batching engine: every step blocks the calling thread for `step`
+    /// and emits one token for every active task (ov-genai's `--cb`).
+    struct BatchEngine {
+        step: Duration,
+        active: Vec<(TaskId, u32)>,
+        emitted: Arc<AtomicUsize>,
+    }
+
+    impl Engine for BatchEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            self.active.push((task.task_id, task.max_tokens));
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            if self.active.is_empty() {
+                return Ok(Vec::new());
+            }
+            std::thread::sleep(self.step);
+            let mut out = Vec::new();
+            for (id, left) in &mut self.active {
+                *left -= 1;
+                self.emitted.fetch_add(1, Ordering::SeqCst);
+                out.push((
+                    id.clone(),
+                    Chunk::token(id.clone(), 0, "x").with_n_tokens(1),
+                ));
+                if *left == 0 {
+                    out.push((id.clone(), Chunk::final_marker(id.clone(), "")));
+                }
+            }
+            self.active.retain(|(_, left)| *left > 0);
+            Ok(out)
+        }
+    }
+
+    /// A consumer that polls its stream in a tight loop (it never yields
+    /// between chunks of its own) steps the engine for every other stream
+    /// too; a stream parked behind it must still get each of its chunks as
+    /// the step that made it returns, not all of them when the tight
+    /// consumer's task ends. The parked stream's wake lands in the stepping
+    /// worker's LIFO slot, which no other worker can take, so the stepping
+    /// stream has to let that worker run it between steps.
+    #[test]
+    fn a_parked_stream_gets_its_chunks_beside_a_tight_consumer() {
+        let failed: Vec<String> = [1, 2, 4, 8]
+            .into_iter()
+            .filter_map(|workers| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(parked_beside_tight(workers))
+                    .err()
+            })
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// `Err` names how B's chunks came out of order with the engine's pace.
+    async fn parked_beside_tight(workers: usize) -> Result<(), String> {
+        const STEP: Duration = Duration::from_millis(20);
+        const B_TOKENS: u32 = 60;
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let engine: Box<dyn Engine> = Box::new(BatchEngine {
+            step: STEP,
+            active: Vec::new(),
+            emitted: emitted.clone(),
+        });
+        let runner = Arc::new(Runner {
+            builder: Mutex::new(None),
+            slot: Arc::new(EngineSlot::new(Some(engine))),
+            model: Mutex::new(None),
+            closing: Arc::new(AtomicBool::new(false)),
+        });
+        let mut a = runner
+            .generate_async(GenerationTask::new("tight-a", "x").with_max_tokens(150))
+            .await
+            .unwrap();
+        let tight = tokio::spawn(async move {
+            while let Some(chunk) = a.next().await {
+                if chunk.is_final {
+                    break;
+                }
+            }
+        });
+        while emitted.load(Ordering::SeqCst) < 10 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let mut b = runner
+            .generate_async(GenerationTask::new("parked-b", "y").with_max_tokens(B_TOKENS))
+            .await
+            .unwrap();
+        let arrivals = tokio::spawn(async move {
+            let mut at = Vec::new();
+            while let Some(chunk) = b.next().await {
+                if chunk.is_final {
+                    break;
+                }
+                at.push(Instant::now());
+            }
+            at
+        })
+        .await
+        .unwrap();
+        tight.await.unwrap();
+        assert_eq!(arrivals.len(), B_TOKENS as usize);
+        let span = *arrivals.last().unwrap() - arrivals[0];
+        let mut gaps: Vec<Duration> = arrivals.windows(2).map(|w| w[1] - w[0]).collect();
+        gaps.sort();
+        let (median, max) = (gaps[gaps.len() / 2], *gaps.last().unwrap());
+        let made_over = STEP * (B_TOKENS - 1);
+        eprintln!("workers={workers}: B over {span:?}, median gap {median:?}, max gap {max:?}");
+        if span < made_over / 2 {
+            return Err(format!(
+                "{workers} workers: B's {B_TOKENS} chunks arrived within {span:?}; \
+                 the engine took at least {made_over:?}"
+            ));
+        }
+        if max > median * 3 {
+            return Err(format!(
+                "{workers} workers: B's chunks came in a burst: max gap {max:?}, median {median:?}"
+            ));
+        }
+        Ok(())
     }
 }

@@ -5637,3 +5637,303 @@ mod generation_defaults_tests {
         assert!(file_sampling_warnings(&f, &info).is_empty());
     }
 }
+
+/// A streamed request served beside a non-streamed one on a continuous-batching
+/// engine, through the node's own server loop: the streamed one's frames must
+/// reach the client as they are made, not in one burst when the other request
+/// ends. The engine is scripted like ov-genai's `--cb`: each `step()` blocks
+/// the calling thread for a whole batch step and emits one token per active
+/// task.
+#[cfg(test)]
+mod batching_stream_tests {
+    use super::serve_with_nodelay;
+    use cascadia_api::{ChatTemplateConfig, Config};
+    use cascadia_engine::{Engine, EngineResult, LoadStream};
+    use cascadia_runner::Runner;
+    use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct Active {
+        id: TaskId,
+        left: u32,
+        sent: u32,
+    }
+
+    /// One token per active task per step; every step blocks for `step`.
+    struct BatchEngine {
+        step: Duration,
+        active: Vec<Active>,
+        /// Token chunks emitted so far, over all tasks.
+        emitted: Arc<AtomicUsize>,
+        /// (start, end) of every step that had work.
+        steps: Arc<std::sync::Mutex<Vec<(Instant, Instant)>>>,
+    }
+
+    impl Engine for BatchEngine {
+        fn warmup(&mut self) {}
+
+        fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+            if !self.active.iter().any(|t| t.id == task.task_id) {
+                self.active.push(Active {
+                    id: task.task_id,
+                    left: task.max_tokens,
+                    sent: 0,
+                });
+            }
+            Ok(())
+        }
+
+        fn cancel(&mut self, task_id: &TaskId) {
+            self.active.retain(|t| &t.id != task_id);
+        }
+
+        fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+            if self.active.is_empty() {
+                return Ok(Vec::new());
+            }
+            let started = Instant::now();
+            std::thread::sleep(self.step);
+            self.steps.lock().unwrap().push((started, Instant::now()));
+            let mut out = Vec::new();
+            for t in &mut self.active {
+                let chunk = Chunk::token(t.id.clone(), t.sent as i64, "x ").with_n_tokens(1);
+                out.push((t.id.clone(), chunk));
+                t.sent += 1;
+                t.left -= 1;
+                self.emitted.fetch_add(1, Ordering::SeqCst);
+                if t.left == 0 {
+                    let last = Chunk::final_marker(t.id.clone(), "")
+                        .with_finish_reason(FinishReason::Length)
+                        .with_completion_tokens(t.sent);
+                    out.push((t.id.clone(), last));
+                }
+            }
+            self.active.retain(|t| t.left > 0);
+            Ok(out)
+        }
+    }
+
+    struct BatchBuilder(Option<BatchEngine>);
+
+    #[async_trait::async_trait]
+    impl cascadia_engine::Builder for BatchBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> EngineResult<()> {
+            Ok(())
+        }
+        async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(mut self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+            Ok(Box::new(self.0.take().expect("built once")))
+        }
+    }
+
+    /// The node's server loop on a loopback port over a [`BatchEngine`].
+    type Steps = Arc<std::sync::Mutex<Vec<(Instant, Instant)>>>;
+
+    async fn serve(step: Duration) -> (std::net::SocketAddr, Arc<AtomicUsize>, Steps) {
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let steps: Steps = Arc::default();
+        let runner = Runner::new(Box::new(BatchBuilder(Some(BatchEngine {
+            step,
+            active: Vec::new(),
+            emitted: emitted.clone(),
+            steps: steps.clone(),
+        }))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("batch-model", "CPU"),
+            )
+            .await
+            .expect("start the runner");
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = cascadia_api::make_router_with_config(Arc::new(runner), "batch-model", cfg);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_with_nodelay(listener, app));
+        (addr, emitted, steps)
+    }
+
+    /// Mean time inside a step and between two steps.
+    fn step_times(steps: &Steps) -> (Duration, Duration) {
+        let s = steps.lock().unwrap();
+        let n = s.len().max(1) as u32;
+        let busy: Duration = s.iter().map(|(a, b)| *b - *a).sum();
+        let idle: Duration = s.windows(2).map(|w| w[1].0 - w[0].1).sum();
+        (busy / n, idle / n)
+    }
+
+    fn request(stream: bool, max_tokens: u32) -> Vec<u8> {
+        let body = serde_json::json!({
+            "model": "batch-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": max_tokens,
+            "stream": stream,
+        })
+        .to_string();
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\n\
+             content-type: application/json\r\nconnection: close\r\n\
+             content-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// Sends `req` and reads the response to its end; with `frames`, the
+    /// arrival time of every SSE `data:` frame that carries a token.
+    async fn exchange(addr: std::net::SocketAddr, req: Vec<u8>) -> (String, Vec<Instant>) {
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(&req).await.unwrap();
+        let mut all = Vec::new();
+        let mut arrivals = Vec::new();
+        let mut seen = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let now = Instant::now();
+            all.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&all);
+            let count = text.matches("\"content\":\"x \"").count();
+            for _ in seen..count {
+                arrivals.push(now);
+            }
+            seen = count;
+        }
+        (String::from_utf8_lossy(&all).into_owned(), arrivals)
+    }
+
+    struct Gaps {
+        frames: usize,
+        median: Duration,
+        max: Duration,
+        span: Duration,
+    }
+
+    fn gaps(arrivals: &[Instant]) -> Gaps {
+        let mut g: Vec<Duration> = arrivals.windows(2).map(|w| w[1] - w[0]).collect();
+        g.sort();
+        Gaps {
+            frames: arrivals.len(),
+            median: g[g.len() / 2],
+            max: *g.last().unwrap(),
+            span: *arrivals.last().unwrap() - arrivals[0],
+        }
+    }
+
+    const STEP: Duration = Duration::from_millis(20);
+    const A_TOKENS: u32 = 300;
+    const B_TOKENS: u32 = 150;
+
+    /// A non-streamed (300 tokens), then a streamed B (150 tokens) once A has
+    /// produced 10 chunks; B's frame arrival gaps.
+    fn beside_non_streamed(workers: usize) -> Gaps {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (addr, emitted, _) = serve(STEP).await;
+            let a = tokio::spawn(exchange(addr, request(false, A_TOKENS)));
+            while emitted.load(Ordering::SeqCst) < 10 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let (b_raw, b_frames) = exchange(addr, request(true, B_TOKENS)).await;
+            let (a_raw, _) = a.await.unwrap();
+            assert!(a_raw.starts_with("HTTP/1.1 200"), "A: {a_raw:.200}");
+            assert!(b_raw.contains("[DONE]"), "B did not finish: {b_raw:.400}");
+            assert_eq!(b_frames.len(), B_TOKENS as usize, "B's token frames");
+            gaps(&b_frames)
+        })
+    }
+
+    fn assert_streams(workers: usize) {
+        let g = beside_non_streamed(workers);
+        eprintln!(
+            "workers={workers}: B {} frames over {:?}, median gap {:?}, max gap {:?}",
+            g.frames, g.span, g.median, g.max
+        );
+        // A burst also has an even spacing, just a tiny one: B's frames must
+        // also cover most of the time the engine took to make them.
+        let made_over = STEP * (B_TOKENS - 1);
+        assert!(
+            g.span >= made_over / 2,
+            "{workers} workers: B's {} frames arrived within {:?}, the engine took at least {:?}",
+            g.frames,
+            g.span,
+            made_over
+        );
+        assert!(
+            g.max <= g.median * 3,
+            "{workers} workers: B's frames arrived in a burst: max gap {:?} > 3x median {:?} \
+             ({} frames over {:?})",
+            g.max,
+            g.median,
+            g.frames,
+            g.span
+        );
+    }
+
+    #[test]
+    fn a_stream_beside_a_non_streamed_request_streams_on_1_worker() {
+        assert_streams(1);
+    }
+
+    #[test]
+    fn a_stream_beside_a_non_streamed_request_streams_on_2_workers() {
+        assert_streams(2);
+    }
+
+    #[test]
+    fn a_stream_beside_a_non_streamed_request_streams_on_4_workers() {
+        assert_streams(4);
+    }
+
+    #[test]
+    fn a_stream_beside_a_non_streamed_request_streams_on_8_workers() {
+        assert_streams(8);
+    }
+
+    /// A lone stream keeps the engine's pace: the time between two of its
+    /// steps stays a small fraction of a step.
+    #[test]
+    fn a_lone_stream_keeps_the_engine_pace() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tok_s, step, between) = rt.block_on(async {
+            let (addr, _, steps) = serve(STEP).await;
+            let started = Instant::now();
+            let (raw, frames) = exchange(addr, request(true, B_TOKENS)).await;
+            let took = started.elapsed();
+            assert!(raw.contains("[DONE]"), "{raw:.400}");
+            assert_eq!(frames.len(), B_TOKENS as usize);
+            let (step, between) = step_times(&steps);
+            (B_TOKENS as f64 / took.as_secs_f64(), step, between)
+        });
+        eprintln!(
+            "lone stream: {tok_s:.2} tok/s; mean step {step:?}, mean between steps {between:?}"
+        );
+        assert!(
+            between * 20 <= step,
+            "a lone stream waits {between:?} between {step:?} steps"
+        );
+    }
+}
