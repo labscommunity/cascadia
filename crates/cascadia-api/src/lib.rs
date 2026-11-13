@@ -145,6 +145,11 @@ pub struct AppState {
     /// (probed at load, see [`template_opens_think`]). Stands in for the
     /// prompt when the engine renders it itself (see [`opens_think`]).
     pub template_opens_think: bool,
+    /// The same, rendered with `enable_thinking` undefined (see
+    /// [`template_opens_think_unswitched`]): how an engine that applies the
+    /// template itself without that switch (ov-genai) renders it. Stands in
+    /// after a render-error fallback on such an engine.
+    pub template_opens_think_unswitched: bool,
     /// Special-token message framing to translate back into text delimiters
     /// (Inkling). See [`MarkerDialect`].
     pub marker_dialect: Option<MarkerDialect>,
@@ -523,6 +528,7 @@ pub fn make_router_with_stats(
         effort_words: false,
         reasoning_format: cfg.reasoning_format,
         template_opens_think: false,
+        template_opens_think_unswitched: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
@@ -536,6 +542,9 @@ pub fn make_router_with_stats(
             .chat_env
             .as_deref()
             .is_some_and(|env| template_opens_think(env, &state.bos_token, &state.eos_token)),
+        template_opens_think_unswitched: state.chat_env.as_deref().is_some_and(|env| {
+            template_opens_think_unswitched(env, &state.bos_token, &state.eos_token)
+        }),
         ..state
     };
     if state.effort_words {
@@ -1898,6 +1907,36 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
     }
 }
 
+/// [`template_opens_think`] with `enable_thinking` left undefined, as
+/// ov-genai renders the template itself (it passes no such switch). A
+/// template that opens `<think>` only when the switch is set does not open it
+/// here; an R1-style one that always opens it does.
+pub fn template_opens_think_unswitched(
+    env: &minijinja::Environment<'static>,
+    bos: &str,
+    eos: &str,
+) -> bool {
+    use minijinja::context;
+    let rendered = env.get_template("chat").and_then(|tmpl| {
+        tmpl.render(context! {
+            messages => vec![context! { role => "user", content => "probe" }],
+            add_generation_prompt => true,
+            bos_token => bos,
+            eos_token => eos,
+        })
+    });
+    match rendered {
+        Ok(prompt) => prompt.trim_end().ends_with("<think>"),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "<think> probe without enable_thinking could not render the chat template; assuming the generation prompt does not open reasoning"
+            );
+            false
+        }
+    }
+}
+
 /// Did this request's generation prompt open `<think>`? When the API's chat
 /// template rendered the prompt (`templated`) it is read off `task.prompt`
 /// (per request, so a template whose generation prompt depends on the effort
@@ -1906,8 +1945,9 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 /// a render error fell back to the legacy formatter, the prompt is the user's
 /// own text, which may end in `<think>` without opening anything: not opened.
 /// Unless the engine wraps that text in the model's own template
-/// (`engine_templates_raw_prompts`, ov-genai): then the probe stands in again
-/// (it is false when no template loaded).
+/// (`engine_templates_raw_prompts`, ov-genai): then `unswitched_probe` stands
+/// in, the template probed with `enable_thinking` undefined as that engine
+/// renders it (false when no template loaded).
 ///
 /// Always false when `task.reasoning_as_text` is set: the engine folds its
 /// separate reasoning back in as `<think>…</think>` text and sends its own
@@ -1919,14 +1959,17 @@ pub(crate) fn opens_think(
     engine_applies_template: bool,
     engine_templates_raw_prompts: bool,
     probe: bool,
+    unswitched_probe: bool,
     templated: bool,
     task: &GenerationTask,
 ) -> bool {
     if task.reasoning_as_text {
         return false;
     }
-    if engine_applies_template || (!templated && engine_templates_raw_prompts) {
+    if engine_applies_template {
         probe
+    } else if !templated && engine_templates_raw_prompts {
+        unswitched_probe
     } else {
         templated && task.prompt.trim_end().ends_with("<think>")
     }
@@ -2924,6 +2967,7 @@ async fn chat_completions(
         state.engine_applies_template,
         state.engine_templates_raw_prompts,
         state.template_opens_think,
+        state.template_opens_think_unswitched,
         templated,
         &task,
     );
@@ -7007,6 +7051,20 @@ level={{ effort_map[eff] }}";
         assert!(template_opens_think(&env, "", ""));
     }
 
+    /// Probed without `enable_thinking`, an R1-style template still opens
+    /// `<think>`; one that opens it only on the switch does not.
+    #[test]
+    fn unswitched_think_probe_follows_the_template_default() {
+        let always = build_chat_env(OPENS_THINK_TEMPLATE).unwrap();
+        assert!(template_opens_think(&always, "", ""));
+        assert!(template_opens_think_unswitched(&always, "", ""));
+        let switched = build_chat_env(SWITCHED_THINK_TEMPLATE).unwrap();
+        assert!(template_opens_think(&switched, "", ""));
+        assert!(!template_opens_think_unswitched(&switched, "", ""));
+        let qwen3 = build_chat_env(QWEN3_TEMPLATE).unwrap();
+        assert!(!template_opens_think_unswitched(&qwen3, "", ""));
+    }
+
     /// Qwen3-8B's generation prompt stops at `<|im_start|>assistant\n`: the
     /// model writes `<think>` itself, so the probe says no.
     #[test]
@@ -7024,30 +7082,47 @@ level={{ effort_map[eff] }}";
         let closed = GenerationTask::new("t", "<|im_start|>assistant\n");
         // API rendered the prompt (ov-genai included, thinking on or off):
         // read it, ignore the probe.
-        assert!(opens_think(false, false, false, true, &opened));
-        assert!(!opens_think(false, false, true, true, &closed));
+        assert!(opens_think(false, false, false, false, true, &opened));
+        assert!(!opens_think(false, false, true, true, true, &closed));
         // The engine renders (sycl-llama): the probe stands in.
-        assert!(opens_think(true, false, true, true, &closed));
-        assert!(!opens_think(true, false, false, true, &opened));
+        assert!(opens_think(true, false, true, true, true, &closed));
+        assert!(!opens_think(true, false, false, false, true, &opened));
         // Reasoning folded in as text: the engine sends its own `<think>`.
         let folded = |prompt: &str| GenerationTask {
             reasoning_as_text: true,
             ..GenerationTask::new("t", prompt)
         };
-        assert!(!opens_think(true, false, true, true, &folded("<think>\n")));
-        assert!(!opens_think(false, false, true, true, &folded("<think>\n")));
+        assert!(!opens_think(
+            true,
+            false,
+            true,
+            true,
+            true,
+            &folded("<think>\n")
+        ));
+        assert!(!opens_think(
+            false,
+            false,
+            true,
+            true,
+            true,
+            &folded("<think>\n")
+        ));
         // No template rendered the prompt (none loaded, or the legacy
         // fallback after a render error): the user's own text, never opened.
-        assert!(!opens_think(false, false, false, false, &opened));
-        assert!(!opens_think(false, false, true, false, &opened));
+        assert!(!opens_think(false, false, false, false, false, &opened));
+        assert!(!opens_think(false, false, true, true, false, &opened));
         // The engine wraps untemplated text in the model's template
-        // (ov-genai): the probe decides; a templated prompt is still read.
-        assert!(opens_think(false, true, true, false, &closed));
-        assert!(!opens_think(false, true, false, false, &opened));
-        assert!(!opens_think(false, true, true, true, &closed));
-        assert!(opens_think(false, true, false, true, &opened));
+        // (ov-genai): the probe without the thinking switch decides; a
+        // templated prompt is still read.
+        assert!(opens_think(false, true, false, true, false, &closed));
+        assert!(!opens_think(false, true, true, false, false, &opened));
+        assert!(opens_think(false, true, true, true, false, &closed));
+        assert!(!opens_think(false, true, false, false, false, &opened));
+        assert!(!opens_think(false, true, true, true, true, &closed));
+        assert!(opens_think(false, true, false, false, true, &opened));
         // The engine renders: the probe still decides.
-        assert!(opens_think(true, false, true, false, &closed));
+        assert!(opens_think(true, false, true, true, false, &closed));
     }
 
     /// Records every task it is handed and answers each with a bare final.
