@@ -1669,7 +1669,7 @@ fn render_with_chat_env(
         messages,
         bos_token,
         eos_token,
-        enable_thinking,
+        Some(enable_thinking),
         reasoning_effort,
         None,
         tools,
@@ -1677,14 +1677,16 @@ fn render_with_chat_env(
 }
 
 /// [`render_with_chat_env`] with the caller's `preserve_thinking`, which the
-/// template sees only when set.
+/// template sees only when set. `enable_thinking` likewise reaches the
+/// template only when set (`None`: undefined, as an engine that applies the
+/// template without that switch renders it).
 #[allow(clippy::too_many_arguments)]
 fn render_with_chat_env_kwargs(
     env: &minijinja::Environment<'static>,
     messages: &[ChatMessage],
     bos_token: &str,
     eos_token: &str,
-    enable_thinking: bool,
+    enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
     preserve_thinking: Option<bool>,
     tools: Option<&[Tool]>,
@@ -1742,10 +1744,13 @@ fn render_with_chat_env_kwargs(
     let ctx = context! {
         messages => messages_value,
         add_generation_prompt => true,
-        enable_thinking => enable_thinking,
         bos_token => bos_token,
         eos_token => eos_token,
         tools => tools_value,
+    };
+    let ctx = match enable_thinking {
+        Some(on) => context! { enable_thinking => on, ..ctx },
+        None => ctx,
     };
     // `reasoning_effort` is added only when Some: a `None` value renders as
     // Jinja `none`, which `is defined` / `default()` treat as a caller's choice.
@@ -1887,6 +1892,18 @@ pub fn template_speaks_effort_words(
 /// starts inside reasoning. A render error is a `false` with a warning, like
 /// the effort probe.
 pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eos: &str) -> bool {
+    probe_opens_think(env, bos, eos, Some(true))
+}
+
+/// The `<think>` probe both [`template_opens_think`] and
+/// [`template_opens_think_unswitched`] run: one render context, differing
+/// only in `enable_thinking`.
+fn probe_opens_think(
+    env: &minijinja::Environment<'static>,
+    bos: &str,
+    eos: &str,
+    enable_thinking: Option<bool>,
+) -> bool {
     let msgs = [ChatMessage {
         role: "user".into(),
         content: "probe".into(),
@@ -1895,11 +1912,12 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
         tool_call_id: None,
         reasoning_content: None,
     }];
-    match render_with_chat_env(env, &msgs, bos, eos, true, None, None) {
+    match render_with_chat_env_kwargs(env, &msgs, bos, eos, enable_thinking, None, None, None) {
         Ok(prompt) => prompt.trim_end().ends_with("<think>"),
         Err(e) => {
             warn!(
                 error = %e,
+                enable_thinking = ?enable_thinking,
                 "<think> probe could not render the chat template; assuming the generation prompt does not open reasoning"
             );
             false
@@ -1916,25 +1934,7 @@ pub fn template_opens_think_unswitched(
     bos: &str,
     eos: &str,
 ) -> bool {
-    use minijinja::context;
-    let rendered = env.get_template("chat").and_then(|tmpl| {
-        tmpl.render(context! {
-            messages => vec![context! { role => "user", content => "probe" }],
-            add_generation_prompt => true,
-            bos_token => bos,
-            eos_token => eos,
-        })
-    });
-    match rendered {
-        Ok(prompt) => prompt.trim_end().ends_with("<think>"),
-        Err(e) => {
-            warn!(
-                error = %e,
-                "<think> probe without enable_thinking could not render the chat template; assuming the generation prompt does not open reasoning"
-            );
-            false
-        }
-    }
+    probe_opens_think(env, bos, eos, None)
 }
 
 /// Did this request's generation prompt open `<think>`? When the API's chat
@@ -2087,7 +2087,7 @@ fn render_or_fallback_templated(
             messages,
             bos_token,
             eos_token,
-            enable_thinking,
+            Some(enable_thinking),
             *candidate,
             preserve_thinking,
             tools,
