@@ -457,9 +457,13 @@ fn prefill_span_end(i: usize, chunk: usize, seed_split: usize) -> usize {
 }
 
 /// Prefill span per chain pass; bounds the last stage's transient `[1, T, vocab]` logits buffer
-/// (~268 MB f32 at 256 with the 262144 vocab, vs ~8.4 GB for an 8,000-token single pass) and each
+/// (~1.07 GB f32 at 1,024 with the 262144 vocab, vs ~8.4 GB for an 8,000-token single pass) and each
 /// span's wire frame.
-const PREFILL_CHUNK: usize = 256;
+///
+/// Not smaller: every span re-sends the shared KV gathered so far, so the wire cost grows with the
+/// number of spans. On a link of about 3.5 MB/s an 8,000-token prompt took ~180 s in one pass, ~380 s
+/// at 256 and ~215 s at 1,024.
+const PREFILL_CHUNK: usize = 1024;
 
 /// Effective prefill span. Default = `PREFILL_CHUNK`.
 ///
@@ -1190,7 +1194,7 @@ impl Gemma4Engine {
         // multi-token inference; the IR keeps own KV internally. The absolute
         // start-position is sent downstream so relay stages align position_ids
         // and reset on 0.
-        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = PREFILL_CHUNK (256),
+        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = PREFILL_CHUNK (1,024),
         // bounding the last stage's logits buffer. CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
         // and a cold FULL prefill traverse the identical per-token kernel. Without it the two use
         // different GEMM batch shapes (e.g. 22 vs 93 tokens) over int4 weights, and the rounding delta
@@ -2610,8 +2614,8 @@ mod tests {
     }
 
     #[test]
-    fn prefill_chunk_defaults_to_256() {
-        assert_eq!(prefill_chunk_from(None, None), 256);
+    fn prefill_chunk_defaults_to_1024() {
+        assert_eq!(prefill_chunk_from(None, None), 1024);
     }
 
     #[test]
@@ -2626,8 +2630,8 @@ mod tests {
 
     #[test]
     fn prefill_chunk_knob_garbage_keeps_the_default() {
-        assert_eq!(prefill_chunk_from(None, Some("lots")), 256);
-        assert_eq!(prefill_chunk_from(None, Some("")), 256);
+        assert_eq!(prefill_chunk_from(None, Some("lots")), 1024);
+        assert_eq!(prefill_chunk_from(None, Some("")), 1024);
     }
 
     #[test]
@@ -2638,14 +2642,14 @@ mod tests {
 
     #[test]
     fn prefill_spans_default_chunk_splits_a_long_prompt() {
-        // 600-token cold prompt, no seed: 256 + 256 + 88.
+        // 2,500-token cold prompt, no seed: 1,024 + 1,024 + 452.
         let (mut i, mut spans) = (0, Vec::new());
-        while i < 600 {
-            let end = prefill_span_end(i, PREFILL_CHUNK, 600);
+        while i < 2500 {
+            let end = prefill_span_end(i, PREFILL_CHUNK, 2500);
             spans.push((i, end));
             i = end;
         }
-        assert_eq!(spans, vec![(0, 256), (256, 512), (512, 600)]);
+        assert_eq!(spans, vec![(0, 1024), (1024, 2048), (2048, 2500)]);
     }
 
     #[test]
