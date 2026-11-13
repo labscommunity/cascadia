@@ -223,6 +223,70 @@ pub static TASKS_FAILED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cascadia_tasks_failed_total")
 });
 
+// --- Speculative decode (bumped by the qwen35 staged engine) ---------------
+
+/// Per-phase buckets for one speculative-decode step's bookkeeping (DeltaNet state snapshot and
+/// restore, the T=k+1 verify pass, the T=j+1 re-feed): sub-millisecond state copies up to a
+/// whole-chain verify pass on a big MoE.
+pub const SPEC_PHASE_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+];
+
+/// Speculative-decode steps run (a step that found an n-gram draft and verified it). Steps
+/// without a draft take the plain single-token path and are not counted here.
+pub static SPEC_STEPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_spec_steps_total",
+        "Speculative-decode verify steps run, by engine.",
+        &["engine"]
+    )
+    .expect("register cascadia_spec_steps_total")
+});
+
+/// Draft tokens proposed (k per spec step).
+pub static SPEC_DRAFTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_spec_drafted_total",
+        "Draft tokens proposed to the verifier, by engine.",
+        &["engine"]
+    )
+    .expect("register cascadia_spec_drafted_total")
+});
+
+/// Draft tokens the verifier accepted (0..=k per spec step). accepted/drafted is the
+/// acceptance rate; (accepted + steps) is the number of tokens the spec steps produced.
+pub static SPEC_ACCEPTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_spec_accepted_total",
+        "Draft tokens accepted by greedy verification, by engine.",
+        &["engine"]
+    )
+    .expect("register cascadia_spec_accepted_total")
+});
+
+/// Spec steps where every draft token was accepted (no state rollback needed).
+pub static SPEC_FULL_ACCEPT_STEPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_spec_full_accept_steps_total",
+        "Speculative-decode steps that accepted the whole draft, by engine.",
+        &["engine"]
+    )
+    .expect("register cascadia_spec_full_accept_steps_total")
+});
+
+/// Wall time of one spec-step phase: `snapshot` (DeltaNet state copy before the verify pass),
+/// `verify` (the T=k+1 chain pass incl. the pipeline round trip), `restore` (state write-back
+/// after a partial accept), `refeed` (the T=j+1 re-feed pass after a partial accept).
+pub static SPEC_PHASE_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "cascadia_spec_phase_seconds",
+        "Wall time of one speculative-decode step phase, by engine and phase.",
+        &["engine", "phase"],
+        SPEC_PHASE_BUCKETS.to_vec()
+    )
+    .expect("register cascadia_spec_phase_seconds")
+});
+
 // --- Engine-level (bumped by cascadia-runner during start) ---------------
 
 /// Weight-load + engine-build duration at stage start (transport connect
@@ -328,6 +392,11 @@ pub fn init() {
     LazyLock::force(&ENGINE_WARMUP_DURATION_SECONDS);
     LazyLock::force(&TRANSPORT_SENT_BYTES_TOTAL);
     LazyLock::force(&TRANSPORT_RECV_BYTES_TOTAL);
+    LazyLock::force(&SPEC_STEPS_TOTAL);
+    LazyLock::force(&SPEC_DRAFTED_TOTAL);
+    LazyLock::force(&SPEC_ACCEPTED_TOTAL);
+    LazyLock::force(&SPEC_FULL_ACCEPT_STEPS_TOTAL);
+    LazyLock::force(&SPEC_PHASE_SECONDS);
 }
 
 /// Gather the default registry into Prometheus text exposition format.
@@ -394,8 +463,46 @@ mod tests {
             INTER_TOKEN_BUCKETS,
             DURATION_BUCKETS,
             TRANSPORT_BUCKETS,
+            SPEC_PHASE_BUCKETS,
         ] {
             assert!(buckets.windows(2).all(|w| w[0] < w[1]));
         }
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    #[test]
+    fn spec_families_register_and_expose() {
+        init();
+        SPEC_STEPS_TOTAL.with_label_values(&["qwen35"]).inc_by(2);
+        SPEC_DRAFTED_TOTAL.with_label_values(&["qwen35"]).inc_by(10);
+        SPEC_ACCEPTED_TOTAL.with_label_values(&["qwen35"]).inc_by(7);
+        SPEC_FULL_ACCEPT_STEPS_TOTAL
+            .with_label_values(&["qwen35"])
+            .inc();
+        SPEC_PHASE_SECONDS
+            .with_label_values(&["qwen35", "verify"])
+            .observe(0.3);
+        let (_, body) = encode_text();
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            text.contains("cascadia_spec_steps_total{engine=\"qwen35\"} 2"),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("cascadia_spec_drafted_total{engine=\"qwen35\"} 10"),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("cascadia_spec_accepted_total{engine=\"qwen35\"} 7"),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("cascadia_spec_phase_seconds_bucket{engine=\"qwen35\",phase=\"verify\""),
+            "got:\n{text}"
+        );
     }
 }
