@@ -7065,6 +7065,23 @@ level={{ effort_map[eff] }}";
         assert!(!template_opens_think_unswitched(&qwen3, "", ""));
     }
 
+    /// Both probes render the same context apart from `enable_thinking`: a
+    /// template that branches on `tools is defined` around its generation
+    /// prompt gets the same answer from each.
+    #[test]
+    fn think_probes_share_the_render_context() {
+        let env = build_chat_env(
+            "{% for m in messages %}{{ m.content }}{% endfor %}\
+             {% if add_generation_prompt %}{% if tools is defined %}<think>\n{% endif %}{% endif %}",
+        )
+        .unwrap();
+        assert_eq!(
+            template_opens_think(&env, "", ""),
+            template_opens_think_unswitched(&env, "", "")
+        );
+        assert!(template_opens_think_unswitched(&env, "", ""));
+    }
+
     /// Qwen3-8B's generation prompt stops at `<|im_start|>assistant\n`: the
     /// model writes `<think>` itself, so the probe says no.
     #[test]
