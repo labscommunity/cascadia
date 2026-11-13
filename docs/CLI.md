@@ -53,6 +53,13 @@ cascadia doctor [--strict]
 Build-only checks (Rust, C++, export-time Python) report as informational, so
 `--strict` still passes on a release bundle, which ships no toolchain.
 
+On Windows the OpenVINO section also prints, per GPU, the WDDM shared segment
+and the per-process video-memory budget (`D3DKMTQueryVideoMemoryInfo`, the
+number Task Manager shows) next to OpenVINO's `GPU_DEVICE_TOTAL_MEM_SIZE`, and
+warns when the OpenVINO total exceeds the budget — on Intel iGPUs the budget is
+the real residency cap, and the warning names the registry value that raises it.
+See [INSTALL.md](../INSTALL.md#windows-gpu-memory-budget-on-32-gb-ai-pcs).
+
 ---
 
 ## `cascadia run`
@@ -197,6 +204,7 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~130 KB per context token as serialised (1.2 GB at 8 K, 4.45 GB at 32 K). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
+| `--gpu-keepalive-ms <N>` | `0` (off) | `qwen35` pipeline ranks only (`--total` ≥ 2): keep the GPU busy with a tiny model while this rank waits on other ranks; on Intel iGPUs an idle device holding a large stage is charged ~0.5 s on its next steps. `2` is the measured setting (122B 3-stage chain: 3.0 → 10.6 tok/s). `0` leaves the `CASCADIA_QWEN36_GPU_KEEPALIVE_MS` env var as the fallback. Never runs during the rank's own stage inference. See [qwen36-moe-support.md §6.1](architectures/qwen36-moe-support.md). |
 | `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. `qwen35` additionally rejects prompts at or past `max_position_embeddings` (413). A chat request is measured across **every** turn of `messages` plus the tool fields, for every engine (not just the last turn), so a long history can 413 where a last-turn-only check would have passed. |
 | `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers (each entry may also be a [unix socket](#unix-domain-sockets) `unix:/path.sock`); this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
 | `--ep-worker-index <N>` / `--ep-worker-count <W>` | — | `sparse-moe` (Inkling) expert-parallel **worker**: serve expert shard N of W (experts with `id % W == N`, shared experts included) for every MoE layer on `--listen`; no API, no attention, no sequence state. |
