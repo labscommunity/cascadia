@@ -291,6 +291,18 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle);
 /// `set_state_blob` whose residue `reset_state` does not clear.
 int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle);
 
+/// Snapshot/restore a SUBSET of the stateful variables (qwen35 speculative-decode
+/// rollback of the fixed-shape DeltaNet conv/ssm states). Same blob layout as
+/// `cascadia_runtime_get_state_blob`, restricted to states whose name contains
+/// any of the `|`-separated substrings in `filter` (NULL/empty = all). Two-call
+/// (buf=NULL sizes into *len_out). `set_state_vars` matches entries by exact
+/// state name and fails unless every entry applied (same-instance round trip).
+int32_t cascadia_runtime_get_state_vars(
+    cascadia_runtime_t* handle, const char* filter,
+    uint8_t* buf, size_t cap, size_t* len_out);
+int32_t cascadia_runtime_set_state_vars(
+    cascadia_runtime_t* handle, const uint8_t* buf, size_t len);
+
 size_t cascadia_runtime_input_count(cascadia_runtime_t* handle);
 size_t cascadia_runtime_output_count(cascadia_runtime_t* handle);
 

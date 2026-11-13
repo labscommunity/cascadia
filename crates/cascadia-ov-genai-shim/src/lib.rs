@@ -242,6 +242,19 @@ mod sys {
             buf: *const u8,
             len: usize,
         ) -> c_int;
+        // qwen35 spec-decode rollback: subset snapshot/restore (DeltaNet conv/ssm only).
+        pub fn cascadia_runtime_get_state_vars(
+            handle: *mut cascadia_runtime_t,
+            filter: *const c_char,
+            buf: *mut u8,
+            cap: usize,
+            len_out: *mut usize,
+        ) -> c_int;
+        pub fn cascadia_runtime_set_state_vars(
+            handle: *mut cascadia_runtime_t,
+            buf: *const u8,
+            len: usize,
+        ) -> c_int;
 
         pub fn cascadia_runtime_input_count(handle: *mut cascadia_runtime_t) -> usize;
         pub fn cascadia_runtime_output_count(handle: *mut cascadia_runtime_t) -> usize;
@@ -1402,6 +1415,68 @@ impl Runtime {
         }
     }
 
+    /// Snapshot the SUBSET of variable states whose name contains any of the `|`-separated
+    /// substrings in `filter` (empty = every state), as an opaque blob in the
+    /// [`Runtime::get_state_blob`] layout (parse with [`state_blob_entries`]). The qwen35
+    /// speculative-decode rollback uses this for the fixed-shape Gated DeltaNet `conv`/`ssm`
+    /// states only: the attention KV of a rejected draft is masked out instead of copied.
+    pub fn get_state_vars(&mut self, filter: &str) -> Result<Vec<u8>> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = filter;
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let flt = cstr(filter)?;
+            let mut needed: usize = 0;
+            let rc = sys::cascadia_runtime_get_state_vars(
+                self.handle,
+                flt.as_ptr(),
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut buf = vec![0u8; needed];
+            let rc = sys::cascadia_runtime_get_state_vars(
+                self.handle,
+                flt.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut needed,
+            );
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            buf.truncate(needed);
+            Ok(buf)
+        }
+    }
+
+    /// Restore the states carried by a [`Runtime::get_state_vars`] blob, matched by exact state
+    /// name on THIS request (same-instance round trip). Every entry must apply — name present,
+    /// byte size and element type equal — or the call returns `Err`; entries are applied as the
+    /// blob parses, so on `Err` the request is dirty and the caller must scrub it
+    /// ([`Runtime::recreate_request`]) before serving from it.
+    pub fn set_state_vars(&mut self, blob: &[u8]) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = blob;
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let rc = sys::cascadia_runtime_set_state_vars(self.handle, blob.as_ptr(), blob.len());
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
     pub fn input_count(&self) -> usize {
         #[cfg(not(feature = "openvino"))]
         return 0;
@@ -1635,6 +1710,109 @@ impl Drop for Runtime {
             unsafe { sys::cascadia_runtime_destroy(self.handle) };
             self.handle = ptr::null_mut();
         }
+    }
+}
+
+/// One entry of a [`Runtime::get_state_blob`] / [`Runtime::get_state_vars`] blob, header only
+/// (the payload is skipped). For logging and size accounting; the blob stays opaque to callers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateVarInfo {
+    pub name: String,
+    /// Shim element-type code (0 f32, 1 f16, 2 bf16, 3 i64, 4 i32, 5 u8, 6 i8, 7 f64).
+    pub dtype_code: u8,
+    pub shape: Vec<u64>,
+    pub nbytes: usize,
+}
+
+/// Parse the headers of a state blob (`u32 count`, then per state `u32 name_len, name, u8
+/// dtype, u8 rank, u64 dims[rank], u64 nbytes, data[nbytes]`, little-endian). `None` on a
+/// truncated or inconsistent blob.
+pub fn state_blob_entries(blob: &[u8]) -> Option<Vec<StateVarInfo>> {
+    fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+        b.get(at..at + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn u64_at(b: &[u8], at: usize) -> Option<u64> {
+        b.get(at..at + 8)
+            .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+    }
+    let count = u32_at(blob, 0)? as usize;
+    let mut p = 4usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let nl = u32_at(blob, p)? as usize;
+        p += 4;
+        let name = String::from_utf8_lossy(blob.get(p..p + nl)?).into_owned();
+        p += nl;
+        let dtype_code = *blob.get(p)?;
+        p += 1;
+        let rank = *blob.get(p)? as usize;
+        p += 1;
+        let mut shape = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            shape.push(u64_at(blob, p)?);
+            p += 8;
+        }
+        let nbytes = usize::try_from(u64_at(blob, p)?).ok()?;
+        p += 8;
+        blob.get(p..p.checked_add(nbytes)?)?;
+        p += nbytes;
+        out.push(StateVarInfo {
+            name,
+            dtype_code,
+            shape,
+            nbytes,
+        });
+    }
+    (p == blob.len()).then_some(out)
+}
+
+#[cfg(test)]
+mod state_blob_tests {
+    use super::*;
+
+    fn entry(name: &str, dtype: u8, shape: &[u64], data: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        v.extend_from_slice(name.as_bytes());
+        v.push(dtype);
+        v.push(shape.len() as u8);
+        for d in shape {
+            v.extend_from_slice(&d.to_le_bytes());
+        }
+        v.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        v.extend_from_slice(data);
+        v
+    }
+
+    #[test]
+    fn parses_headers_and_skips_payloads() {
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        blob.extend(entry("cache_params.past.conv.0", 1, &[1, 8, 3], &[0u8; 48]));
+        blob.extend(entry(
+            "cache_params.past.ssm.0",
+            0,
+            &[1, 2, 2, 2],
+            &[0u8; 32],
+        ));
+        let e = state_blob_entries(&blob).unwrap();
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0].name, "cache_params.past.conv.0");
+        assert_eq!(e[0].dtype_code, 1);
+        assert_eq!(e[0].shape, vec![1, 8, 3]);
+        assert_eq!(e[0].nbytes, 48);
+        assert_eq!(e[1].shape, vec![1, 2, 2, 2]);
+        assert_eq!(e[1].nbytes, 32);
+    }
+
+    #[test]
+    fn rejects_truncated_and_trailing_bytes() {
+        let mut blob = 1u32.to_le_bytes().to_vec();
+        blob.extend(entry("x", 0, &[4], &[0u8; 16]));
+        assert!(state_blob_entries(&blob[..blob.len() - 1]).is_none());
+        blob.push(0);
+        assert!(state_blob_entries(&blob).is_none());
+        assert!(state_blob_entries(&[]).is_none());
     }
 }
 

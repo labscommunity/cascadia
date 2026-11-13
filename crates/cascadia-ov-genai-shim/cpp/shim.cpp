@@ -29,6 +29,7 @@
 #include <openvino/genai/tokenizer.hpp>
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include <openvino/genai/continuous_batching_pipeline.hpp>
+#include <openvino/genai/scheduler_config.hpp>
 #include <openvino/genai/chat_history.hpp>
 #include <openvino/genai/version.hpp>
 #include <openvino/core/version.hpp>
@@ -248,6 +249,18 @@ int32_t cascadia_debug_property_int64_kind(
 
 // ===================== LLMPipeline (genai) =====================
 
+// GenAI 2026.4.1 asserts `!m_scheduler->get_config().enable_prefix_caching` inside its
+// speculative-decoding and prompt-lookup continuous-batching implementations, and the
+// LLMPipeline default SchedulerConfig has prefix caching ON — so the SECOND request with the
+// same prompt (a prefix-cache hit) died with that Check. An explicit SchedulerConfig with
+// prefix caching off (dynamic_split_fuse / cache_size left at their defaults) is what those two
+// pipeline kinds need.
+static ov::genai::SchedulerConfig speculative_scheduler_config() {
+    ov::genai::SchedulerConfig sched;
+    sched.enable_prefix_caching = false;
+    return sched;
+}
+
 int32_t cascadia_pipeline_create(
     const char* model_path, const char* device,
     const char* const* properties_kv, size_t properties_count,
@@ -284,6 +297,7 @@ int32_t cascadia_pipeline_create_with_draft(
         auto draft_kv = ov::genai::draft_model(
             std::filesystem::path(draft_model_path), draft_dev);
         props.emplace(draft_kv.first, draft_kv.second);
+        props[ov::genai::scheduler_config.name()] = speculative_scheduler_config();
         auto pipe = std::make_unique<ov::genai::LLMPipeline>(
             std::filesystem::path(model_path), std::string(device), props);
         *out_handle = new cascadia_pipeline_t{std::move(pipe)};
@@ -306,6 +320,7 @@ int32_t cascadia_pipeline_create_with_prompt_lookup(
     try {
         auto props = collect_properties(properties_kv, properties_count);
         props[ov::genai::prompt_lookup.name()] = true;
+        props[ov::genai::scheduler_config.name()] = speculative_scheduler_config();
         auto pipe = std::make_unique<ov::genai::LLMPipeline>(
             std::filesystem::path(model_path), std::string(device), props);
         *out_handle = new cascadia_pipeline_t{std::move(pipe)};
@@ -1368,6 +1383,171 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
     catch (...) { set_last_error("unknown C++ exception in set_state_blob"); return 1; }
+}
+
+
+// ───── Per-variable state snapshot/restore (qwen35 speculative decode rollback) ─────
+//
+// `get_state_blob` / `set_state_blob` move EVERY VariableState. A speculative-decode rollback on
+// the hybrid Qwen3.5 graphs needs only the fixed-shape Gated DeltaNet recurrent states
+// (`cache_params.past.{conv,ssm}.N`): the attention KV of a rejected draft is masked out via
+// `attention_mask` instead, so copying the (large, T-growing) key/value states would be pure
+// waste. These two calls reuse the blob layout of `get_state_blob` verbatim, restricted to the
+// states whose `get_name()` contains any of the `|`-separated substrings in `filter` (an empty
+// filter selects every state). Restore matches by EXACT state name — the snapshot and the
+// restore always target the same InferRequest here (same-instance round trip), so identity
+// re-alignment is unnecessary; a blob entry whose name, byte size or element type does not
+// match the live state fails the whole call (nothing is applied half-way... entries are applied
+// as parsed, so on `Err` the caller must treat the request as dirty).
+
+static bool state_name_selected(const std::string& name, const std::string& filter) {
+    if (filter.empty()) return true;
+    size_t start = 0;
+    while (start <= filter.size()) {
+        size_t bar = filter.find('|', start);
+        if (bar == std::string::npos) bar = filter.size();
+        if (bar > start && name.find(filter.substr(start, bar - start)) != std::string::npos)
+            return true;
+        start = bar + 1;
+    }
+    return false;
+}
+
+// Two-call (size then fill) like get_state_blob. `filter` may be NULL (= every state).
+int32_t cascadia_runtime_get_state_vars(cascadia_runtime_t* handle, const char* filter,
+                                        uint8_t* buf, size_t cap, size_t* len_out) {
+    if (!handle || !handle->request || !len_out) {
+        set_last_error("null runtime handle / len_out"); return 1;
+    }
+    try {
+        const std::string flt = filter ? filter : "";
+        auto states = handle->request->query_state();
+        std::vector<std::pair<std::string, ov::Tensor>> snaps;
+        size_t total = 4;
+        for (auto& s : states) {
+            std::string name = s.get_name();
+            if (!state_name_selected(name, flt)) continue;
+            ov::Tensor t = s.get_state();
+            if (ov_type_to_code(t.get_element_type()) == 255) {
+                std::ostringstream oss;
+                oss << "get_state_vars: unsupported element type " << t.get_element_type()
+                    << " for state " << name;
+                set_last_error(oss.str().c_str());
+                return 1;
+            }
+            handle->state_dtypes[name] = t.get_element_type();
+            total += 4 + name.size() + 1 + 1 + 8 * t.get_shape().size() + 8 + t.get_byte_size();
+            snaps.emplace_back(std::move(name), t);
+        }
+        *len_out = total;
+        if (!buf) return 0; // size query
+        if (cap < total) {
+            std::ostringstream oss;
+            oss << "get_state_vars: buffer of " << cap << " bytes < required " << total;
+            set_last_error(oss.str().c_str());
+            return 1;
+        }
+        uint8_t* p = buf;
+        auto put32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+        auto put64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+        put32(static_cast<uint32_t>(snaps.size()));
+        for (auto& kv : snaps) {
+            const std::string& name = kv.first;
+            ov::Tensor& t = kv.second;
+            put32(static_cast<uint32_t>(name.size()));
+            std::memcpy(p, name.data(), name.size()); p += name.size();
+            *p++ = ov_type_to_code(t.get_element_type());
+            auto shape = t.get_shape();
+            *p++ = static_cast<uint8_t>(shape.size());
+            for (size_t d : shape) put64(static_cast<uint64_t>(d));
+            size_t nb = t.get_byte_size();
+            put64(static_cast<uint64_t>(nb));
+            std::memcpy(p, t.data(), nb); p += nb;
+        }
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown C++ exception in get_state_vars"); return 1; }
+}
+
+// Restore the subset of states carried by a `get_state_vars` blob, matched by exact name.
+// Every entry must apply (name present, byte size + element type equal) or the call fails.
+int32_t cascadia_runtime_set_state_vars(cascadia_runtime_t* handle, const uint8_t* buf, size_t len) {
+    if (!handle || !handle->request) { set_last_error("null runtime handle"); return 1; }
+    if (!buf || len < 4) { set_last_error("set_state_vars: short buffer"); return 1; }
+    try {
+        auto states = handle->request->query_state();
+        std::unordered_map<std::string, size_t> by_name;
+        by_name.reserve(states.size());
+        for (size_t i = 0; i < states.size(); ++i) by_name.emplace(states[i].get_name(), i);
+        const uint8_t* p = buf;
+        const uint8_t* end = buf + len;
+        auto need = [&](size_t n) { if (static_cast<size_t>(end - p) < n) throw std::runtime_error("set_state_vars: truncated"); };
+        auto get32 = [&]() { need(4); uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+        auto get64 = [&]() { need(8); uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+        uint32_t count = get32();
+        if (count > states.size()) {
+            std::ostringstream oss;
+            oss << "set_state_vars: blob has " << count << " states, model has " << states.size();
+            set_last_error(oss.str().c_str());
+            return 1;
+        }
+        uint32_t applied = 0;
+        std::string first_miss;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t nl = get32(); need(nl);
+            std::string bname(reinterpret_cast<const char*>(p), nl); p += nl;
+            need(1); uint8_t dcode = *p++;
+            need(1); uint8_t rank = *p++;
+            ov::Shape shape; shape.reserve(rank);
+            for (uint8_t r = 0; r < rank; ++r) shape.push_back(static_cast<size_t>(get64()));
+            uint64_t nb = get64(); need(nb);
+            const ov::element::Type etype = code_to_ov_type(dcode);
+            bool ok = etype != ov::element::dynamic;
+            if (ok) {
+                const uint64_t esz = etype.size();
+                uint64_t elems = 1;
+                for (size_t d : shape) {
+                    if (d != 0 && elems > UINT64_MAX / d) { ok = false; break; }
+                    elems *= static_cast<uint64_t>(d);
+                }
+                ok = ok && esz != 0 && elems <= UINT64_MAX / esz && elems * esz == nb;
+            }
+            auto it = by_name.find(bname);
+            if (ok && it != by_name.end()) {
+                auto cached = handle->state_dtypes.find(bname);
+                if (cached == handle->state_dtypes.end()) {
+                    try {
+                        cached = handle->state_dtypes
+                                     .emplace(bname, states[it->second].get_state().get_element_type())
+                                     .first;
+                    } catch (const std::exception&) {
+                        // dynamic + unmaterialized: the snapshot came from a materialized read of
+                        // this very request, so this cannot happen for a selected state; apply on
+                        // the name + size guards.
+                    }
+                }
+                if (cached != handle->state_dtypes.end() && cached->second != etype) ok = false;
+                if (ok) {
+                    ov::Tensor t(etype, shape);
+                    std::memcpy(t.data(), p, nb);
+                    states[it->second].set_state(t);
+                    ++applied;
+                }
+            } else if (first_miss.empty()) {
+                first_miss = bname;
+            }
+            p += nb;
+        }
+        if (applied != count) {
+            std::ostringstream oss;
+            oss << "set_state_vars: applied " << applied << " of " << count << " states"
+                << " (first unmatched: " << first_miss << ")";
+            set_last_error(oss.str().c_str());
+            return 1;
+        }
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown C++ exception in set_state_vars"); return 1; }
 }
 
 size_t cascadia_runtime_input_count(cascadia_runtime_t* handle) {
