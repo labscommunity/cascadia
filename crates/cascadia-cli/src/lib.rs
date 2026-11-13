@@ -2969,6 +2969,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
+        // ov-genai wraps a prompt the API did not template (no template, or
+        // the legacy text after a render error) in the model's own template.
+        cfg.engine_templates_raw_prompts = matches!(args.engine, EngineKind::OvGenai);
         cfg.reasoning_format = args.reasoning_format;
         // Chat's pool and decision admission, sized and checked before the model load.
         cfg.max_concurrent_requests = max_concurrent_requests;
