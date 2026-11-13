@@ -144,6 +144,14 @@ pub struct GenerationTask {
     /// also covers tasks constructed in-process).
     #[serde(default, deserialize_with = "de_resume_ids")]
     pub resume_token_ids: Option<Vec<i32>>,
+    /// Whether the client reads this answer as a stream (`"stream": true`).
+    /// An engine that can stream its writes uses it to pick the route: a
+    /// client that does not stream gets the engine's exact final text in one
+    /// chunk, never text assembled from streamed pieces. Defaults to `false`
+    /// (not streaming) for callers that don't set it; an engine that does not
+    /// stream its writes ignores it.
+    #[serde(default)]
+    pub client_streams: bool,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -220,6 +228,7 @@ impl GenerationTask {
             trust_remote_code: false,
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
+            client_streams: false,
         }
     }
 
@@ -244,6 +253,13 @@ impl GenerationTask {
         self.sampling = sampling;
         self
     }
+
+    /// Set whether the client reads the answer as a stream.
+    #[must_use]
+    pub fn with_client_streams(mut self, client_streams: bool) -> Self {
+        self.client_streams = client_streams;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -266,6 +282,7 @@ mod tests {
             trust_remote_code: false,
             tenant: String::new(),
             resume_token_ids: None,
+            client_streams: false,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();

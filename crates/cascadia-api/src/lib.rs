@@ -2900,6 +2900,8 @@ async fn chat_completions(
         // model's context PAST the rendered prompt. Only the scheduler's
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
+        // A non-streamed client gets the engine's exact final text.
+        client_streams: req.stream,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -3172,6 +3174,8 @@ async fn completions(
         tenant: String::new(),
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
+        // A non-streamed client gets the engine's exact final text.
+        client_streams: req.stream,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
@@ -8852,12 +8856,15 @@ level={{ effort_map[eff] }}";
             post_completions_big(app, payload).await
         };
         assert_eq!(status, StatusCode::OK, "{extra}: {v}");
-        let schema = if chat {
-            "CreateChatCompletionResponse"
-        } else {
-            "CreateCompletionResponse"
-        };
-        crate::spec_schema::assert_spec(schema, &v);
+        // A streamed answer is SSE, not one JSON body.
+        if extra.get("stream") != Some(&serde_json::json!(true)) {
+            let schema = if chat {
+                "CreateChatCompletionResponse"
+            } else {
+                "CreateCompletionResponse"
+            };
+            crate::spec_schema::assert_spec(schema, &v);
+        }
         let tasks = seen.lock();
         assert_eq!(tasks.len(), 1, "{extra}");
         tasks[0].clone()
@@ -8892,6 +8899,24 @@ level={{ effort_map[eff] }}";
         assert_eq!(t.max_tokens, TEST_DEFAULTS.max_tokens);
         assert_eq!(t.temperature, TEST_DEFAULTS.temperature);
         assert_eq!(t.sampling.top_p, TEST_DEFAULTS.top_p);
+    }
+
+    /// The task says whether its client streams, from the request's
+    /// `stream` (unset = not streaming), on both endpoints: an engine that
+    /// streams its writes answers a non-streamed client with its exact final
+    /// text.
+    #[tokio::test]
+    async fn the_task_carries_whether_the_client_streams() {
+        for chat in [true, false] {
+            for (extra, want) in [
+                (serde_json::json!({}), false),
+                (serde_json::json!({"stream": false}), false),
+                (serde_json::json!({"stream": true}), true),
+            ] {
+                let t = captured_task(chat, extra.clone()).await;
+                assert_eq!(t.client_streams, want, "chat={chat} {extra}");
+            }
+        }
     }
 
     #[tokio::test]

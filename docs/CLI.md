@@ -313,7 +313,8 @@ context window still ends an answer where the prompt plus the answer fill it
   is rare, because `llama-server` applies `stop` itself.
 - **One-shot engines end early too.** Two engines make a whole answer in one
   call: the default (non-`--cb`) ov-genai path (which streams each token's
-  text as that call writes it) and single-stage sparse-moe.
+  text as that call writes it to a streaming client; a non-streamed request
+  gets the call's own answer in one piece) and single-stage sparse-moe.
   That call now ends early when the client disconnects (streaming or not),
   on `/v1/cancel/{task_id}`, or when a `stop` sequence matches. It ends within one token,
   or within one decode round with ov-genai's `--draft-model` / `--prompt-lookup`
@@ -350,9 +351,9 @@ context window still ends an answer where the prompt plus the answer fill it
     (`shutdown(SHUT_WR)`: raw sockets, `nc -N`, some proxies) counts as a
     disconnect, and the request is cancelled. curl and the OpenAI SDKs don't
     half-close.
-- **What still runs to the window.** On the two one-shot engines above, an
-  answer that never reaches end-of-sequence or a `stop` match holds the engine
-  for up to one context window instead of 256 tokens, unless the client
+- **What still runs to the window.** On default ov-genai (streaming or not)
+  and single-stage sparse-moe, an answer that never reaches end-of-sequence or
+  a `stop` match holds the engine for up to one context window instead of 256 tokens, unless the client
   disconnects or cancels. ov-runtime (CPU/GPU and NPU), dist-spec,
   `gemma4` and multi-stage `qwen35` have no window stop of their own; with a
   known window such an answer now runs until the prompt plus the answer fill
@@ -361,8 +362,9 @@ context window still ends an answer where the prompt plus the answer fill it
 - **Keep-alive.** A stream that has sent nothing for 15 s sends the SSE comment
   line `: keep-alive` (not a `data:` event; OpenAI clients skip it), so a proxy
   with an idle timeout does not cut a long silent generation. It keeps going
-  during a long one-shot step (the two engines above): the engine runs on its
-  own task, and the stream sends the comment from another worker.
+  during a long step on default ov-genai (streaming or not) and single-stage
+  sparse-moe: the engine runs on its own task, and the stream sends the
+  comment from another worker.
 - `null` on `stream` and `logprobs` (and on `/v1/completions`' `stream` and
   `echo`) means unset, i.e. `false`, as for the fields above.
 - Responses now always carry `choices[].logprobs` (`null` unless logprobs were

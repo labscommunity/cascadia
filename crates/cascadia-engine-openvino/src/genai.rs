@@ -116,7 +116,10 @@ impl OvGenaiBuilder {
     /// the rest of the answer and its `completion_tokens`. The deltas plus
     /// the final's text are the answer the non-streamed path returns. Off,
     /// the whole answer comes on one final chunk, as before. `--cb` streams
-    /// either way.
+    /// either way. A task whose client does not stream
+    /// ([`GenerationTask::client_streams`] false) gets that one final chunk
+    /// with the exact answer either way (it still runs on the worker, with
+    /// progress chunks while it waits).
     pub fn stream_writes(mut self, on: bool) -> Self {
         self.stream_writes = on;
         self
@@ -646,9 +649,16 @@ impl OvGenaiEngine {
                 Some(Ok(begun)) => begun,
             };
             let task_id = task.task_id.clone();
+            // A client that does not stream takes the one-shot route on the
+            // worker: no per-write decode, one final chunk with the exact
+            // visible text, whatever the stream would have sent.
+            let params = GenParams {
+                stream_text: task.client_streams,
+                ..self.params.clone()
+            };
             let job = Job::Generate(Box::new(GenJob {
                 task,
-                params: self.params.clone(),
+                params,
                 probe_thread: !self.streamer_thread_logged,
             }));
             let Some(stream) = self.stream.as_mut() else {
@@ -1614,8 +1624,12 @@ mod tests {
         }
     }
 
+    /// A task whose client streams: with `stream_writes` on, the streamed
+    /// route (a client that does not stream takes the one-shot route).
     fn task(id: &str, max_tokens: u32) -> GenerationTask {
-        GenerationTask::new(id, "hello").with_max_tokens(max_tokens)
+        GenerationTask::new(id, "hello")
+            .with_max_tokens(max_tokens)
+            .with_client_streams(true)
     }
 
     /// Option B: the CB engine has no forced-prefix path — a resumed submit
@@ -3839,6 +3853,49 @@ mod tests {
         assert_eq!(consumed, 2, "{out:?}");
         assert_eq!(joined(&out), "it's\n");
         assert_eq!(out.last().unwrap().finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// A detokenizer that rewrites text two decodes agreed on (`it 's` to
+    /// `it's`): a client that does not stream gets the final decode byte for
+    /// byte, in one chunk, with no per-write decode, although `stream_writes`
+    /// is on; a streaming client gets what the stream rules send (the agreed
+    /// text, then the answer past the re-anchored text) and the divergence is
+    /// logged.
+    #[test]
+    fn stateful_a_non_streamed_client_gets_the_exact_answer_past_a_rewrite() {
+        let windows = ["it '", "it 's", "it's a"];
+        let answer = "it's a";
+        let run = |client_streams: bool| {
+            let st = Arc::new(Mutex::new(StatefulState::default()));
+            {
+                let mut s = st.lock().unwrap();
+                // The pieces' concat is the final decode, as the shim returns it.
+                s.pieces = pieces(&["it", "'s", " a"]);
+                s.window_script = windows.iter().map(|w| w.as_bytes().to_vec()).collect();
+            }
+            let mut e = stateful_engine_in(&st, true);
+            e.submit(task("t1", 64).with_client_streams(client_streams))
+                .unwrap();
+            let (out, logs) = capture_logs(|| until_final(&mut e));
+            let stream_text = st.lock().unwrap().stream_text.clone();
+            (out, logs, stream_text)
+        };
+
+        let (plain, logs, stream_text) = run(false);
+        assert_eq!(plain.len(), 1, "{plain:?}");
+        assert!(plain[0].is_final && plain[0].error.is_none(), "{plain:?}");
+        assert_eq!(joined(&plain).as_bytes(), answer.as_bytes());
+        // The mock counts the answer's words.
+        assert_eq!(plain[0].n_tokens, Some(2));
+        assert_eq!(stream_text, [false], "no per-write decode");
+        assert!(!logs.contains("ov_genai_stream_divergence"), "{logs}");
+
+        let (streamed, logs, stream_text) = run(true);
+        assert_eq!(stream_text, [true]);
+        // The agreed `it '`, then the answer past the re-anchored text.
+        assert_eq!(joined(&streamed), "it ''s a", "{streamed:?}");
+        assert_eq!(usage(&streamed), 2, "{streamed:?}");
+        assert!(logs.contains("ov_genai_stream_divergence"), "{logs}");
     }
 
     /// A U+FFFD that stays (a byte no character takes) refuses the check of
