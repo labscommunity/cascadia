@@ -1,0 +1,14 @@
+{
+  "upstream": "a634089e5ede786a428a71ba4ce2ee8b036ff309",
+  "command": "python -m cascadia_diffusion generate",
+  "size": [
+    512,
+    512
+  ],
+  "mode": "components",
+  "steps": 4,
+  "seed": 120,
+  "sha256": "2d0fe45b06253122f0e998aa6ac98e9f8ee93edc2b560281e75fc08dd76960fb",
+  "bytes": 366226,
+  "variance": 9665.585519672823
+}

@@ -7,7 +7,7 @@ Arrow Lake machine (`cascadia-tate-02`, PDX88-HP0756, Core Ultra 7 265T,
 32 GB RAM, Windows). Existing fleet/monitoring services were left running.
 No tests used alpha, beta, charlie, delta, tate-08, or tate-07.
 
-Source OpenVINO SDXL INT8 revision:
+Source: [OpenVINO SDXL INT8](https://huggingface.co/OpenVINO/stable-diffusion-xl-base-1.0-int8-ov), revision:
 `d54e5b43fcb6b4b358f3a134269115d3fcb3eb25`.
 Export manifest:
 `c6dae31741b7816562a8bf65d27888814ab9a393321681cc606afda58b328243`.
@@ -50,6 +50,45 @@ Diffusers 0.39.0, Transformers 5.5.4, Torch 2.15.0, Pillow 13.0.0.
 The qualified environment's dependency constraints are checked in separately.
 The serving runtime rejects mismatched critical dependency versions.
 
+## Local 1024×1024 comparison
+
+The same host, checkpoint, prompt, seed, and 20-step settings were tested at
+1024×1024. The export manifest is
+`c76fec7fab018d17e59998f237006b189026bacf3815a2db436d7bcd8824e3fb`.
+The full graph used upstream `1cfc23be`; the partitioned run used `a634089e`,
+which adds rejection of unsupported pipeline metadata without changing inference.
+All three images within each mode were byte-identical.
+
+| Measurement | Full denoiser | Two local partitions |
+|---|---:|---:|
+| First generation | 355.309 s | 340.778 s |
+| Repeated generation | 345.891 / 341.267 s | 339.894 / 341.055 s |
+| Peak process working set | 17,577,885,696 B | 19,237,355,520 B |
+| Peak committed process bytes | 18,197,520,384 B | 20,544,475,136 B |
+| PNG bytes | 2,328,240 | 2,328,629 |
+
+Full-mode PNG SHA-256:
+`8631646be219c967b61bb4ae82bf30adf9270cf4c6dac5430f05412e96e62d25`.
+Partition-mode PNG SHA-256:
+`080d184d8282f9299cbb021b4709f058db9eb7226c502f655771772cb2b7a0de`.
+Pixel mean absolute error was **0.033209/255**, RMS **0.194450/255**, and maximum
+channel difference **12**. Visual review found the same composition and linework.
+These timings do not establish a speedup: there are only three runs per mode,
+and the first includes warm-up effects. Both partitions were resident on one
+host, and their combined memory peak was higher than the full graph at this size.
+
+Reports and selected PNGs are under `full-1024` and `layers-1024` in the evidence
+folder. Compilation caches persist between processes; a first generation means
+the first request in that process, not necessarily an empty compilation cache.
+Process working set, committed bytes, and shared iGPU memory describe overlapping
+resources and must not be added together as independent physical RAM.
+
+The documented `python -m cascadia_diffusion generate` command also passed on
+the same GPU with the reviewed `a634089e` package: 512×512, component mode,
+four steps, seed 120, and an adult manga portrait prompt. The decoded PNG had
+the requested dimensions and nonzero image variance; its digest is recorded
+in `cli-512.json`.
+
 ## Portable gates
 
 The initial upstream workspace gate passed 1,190 tests across 134 suites
@@ -60,8 +99,7 @@ execution, drain, absolute lease lifetime, and uncertain-execution quarantine.
 Python tests share the Rust golden manifest/frame and exercise actual loopback
 HTTP authentication, framing, and retaining capacity after a client disconnect.
 
-Multi-host placement, network fault injection, 1024-pixel operation, sustained
-load, and a model exceeding one host's usable memory require additional
+Multi-host placement, network fault injection, sustained load, and a model exceeding one host's usable memory require additional
 qualification through the enterprise integration. This local comparison alone
 must not be advertised as distributed production qualification, a speedup, or
 64 GB machine coverage.
