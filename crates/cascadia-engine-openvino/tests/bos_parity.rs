@@ -15,11 +15,12 @@
 //!     cargo test -p cascadia-engine-openvino --features openvino \
 //!     --test bos_parity -- --nocapture
 //!
-//! Designed for OpenVINO/Llama-3.2-1B-Instruct-int4-ov, whose template starts
-//! with `<|begin_of_text|>`. Any IR whose tokenizer adds special tokens works
-//! (TinyLlama-1.1B-Chat adds a BOS its template lacks); the test fails loudly
-//! on a tokenizer that adds none, so it cannot pass vacuously. Optional: CASCADIA_BOS_PARITY_DEVICE (default CPU) and
-//! CASCADIA_BOS_PARITY_VLM_MODEL=<vlm-ir-dir> to check the VLM path too.
+//! Works with any IR whose template starts with BOS (Llama-3.x such as
+//! OpenVINO/Llama-3.2-1B-Instruct-int4-ov, gemma-2b-it), and with any whose
+//! tokenizer adds special tokens at all (TinyLlama-1.1B-Chat adds a BOS its
+//! template lacks); it fails loudly on a tokenizer that adds none, so it
+//! cannot pass vacuously. Optional: CASCADIA_BOS_PARITY_DEVICE (default CPU)
+//! and CASCADIA_BOS_PARITY_VLM_MODEL=<vlm-ir-dir> to check the VLM path too.
 //! Skips when CASCADIA_BOS_PARITY_MODEL is unset.
 #![cfg(feature = "openvino")]
 
@@ -69,7 +70,7 @@ fn rendered_prompt(pipe: &LlmPipeline, model: &str) -> (String, u32, u32) {
     assert!(
         with > without,
         "{model}'s tokenizer adds no special tokens to its rendered template; \
-         pick a BOS model (e.g. Llama-3.2-1B-Instruct) or the check proves nothing"
+         pick a BOS-template model (Llama-3.x, gemma-2b-it) or the check proves nothing"
     );
     (rendered, without, with)
 }
