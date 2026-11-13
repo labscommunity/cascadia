@@ -45,6 +45,7 @@ use futures::stream;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, warn};
 
+use crate::qwen36_keepalive::{self as keepalive, KeepAlive};
 use crate::qwen36_spec::{self as spec, CacheMask, ProfileAcc, SpecStats};
 
 /// Hidden width of shard trees exported before `manifest.hidden_size`
@@ -393,6 +394,9 @@ pub struct Qwen36Builder {
     /// Greedy n-gram (prompt-lookup) speculative decode: n-gram size (0 = off) and draft length.
     spec_ngram: usize,
     spec_k: usize,
+    /// `CASCADIA_QWEN36_GPU_KEEPALIVE_MS`: started by `load` on pipeline ranks (see
+    /// `qwen36_keepalive`); `None` = off.
+    keepalive: Option<KeepAlive>,
 }
 
 impl Qwen36Builder {
@@ -442,6 +446,75 @@ impl Qwen36Builder {
         }
         plugin
     }
+    /// `CASCADIA_QWEN36_GPU_KEEPALIVE_MS=<n>` on a pipeline rank: compile the tiny synthetic IR
+    /// (`qwen36_keepalive::write_synthetic_ir`; fallback: the tree's embeddings IR with a `[1,1]`
+    /// lookup) on this rank's device with the same PluginConfig as the stages, run it once, and
+    /// start the worker that re-runs it every `n` ms while the rank waits on the network. `None`
+    /// when off, on `--total 1` (no network waits), or when neither model compiles (warned).
+    fn build_keepalive(&self, dir: &Path, plugin: &PluginConfig) -> Option<KeepAlive> {
+        let period = keepalive::keepalive_period()?;
+        if self.total <= 1 {
+            info!("qwen35: GPU keep-alive requested, but --total 1 has no network waits; off");
+            return None;
+        }
+        let compile_ready = |xml: &Path, dtype: DType, shape: &[usize], data: Vec<u8>| {
+            let mut rt = Runtime::compile(xml.to_str().unwrap_or_default(), &self.device, plugin)
+                .map_err(|e| e.to_string())?;
+            let name = rt
+                .input_names()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "model has no inputs".to_string())?;
+            rt.set_input(&name, dtype, shape, &data)
+                .map_err(|e| e.to_string())?;
+            // One real infer here so a model that compiles but cannot run fails at load,
+            // not on the worker thread mid-task.
+            rt.infer().map_err(|e| e.to_string())?;
+            Ok::<Runtime, String>(rt)
+        };
+        let tmp = std::env::temp_dir().join(format!(
+            "cascadia-qwen36-keepalive-{}-r{}",
+            std::process::id(),
+            self.rank
+        ));
+        let synthetic = keepalive::write_synthetic_ir(&tmp)
+            .map_err(|e| e.to_string())
+            .and_then(|xml| {
+                compile_ready(
+                    &xml,
+                    DType::F32,
+                    &[1, keepalive::SYNTHETIC_WIDTH],
+                    le_bytes_f32(&vec![0.5f32; keepalive::SYNTHETIC_WIDTH]),
+                )
+            });
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (rt, model) = match synthetic {
+            Ok(rt) => (rt, "synthetic"),
+            Err(e) => {
+                warn!(error = %e, "qwen35 keep-alive: synthetic IR failed; trying the embeddings IR");
+                let emb = dir.join("openvino_text_embeddings_model.xml");
+                match compile_ready(&emb, DType::I64, &[1, 1], le_bytes_i64(&[0])) {
+                    Ok(rt) => (rt, "embeddings"),
+                    Err(e) => {
+                        warn!(error = %e, "qwen35 keep-alive: no model compiled; keep-alive OFF");
+                        return None;
+                    }
+                }
+            }
+        };
+        info!(
+            period_ms = period.as_millis() as u64,
+            model,
+            device = %self.device,
+            rank = self.rank,
+            "qwen35 GPU keep-alive on"
+        );
+        let mut rt = rt;
+        Some(KeepAlive::spawn(period, profile_enabled(), move || {
+            rt.infer().map_err(|e| e.to_string())
+        }))
+    }
     pub fn new(shards_dir: impl Into<String>, device: impl Into<String>) -> Self {
         Self {
             shards_dir: shards_dir.into(),
@@ -470,6 +543,7 @@ impl Qwen36Builder {
             max_ctx: None,
             spec_ngram: 0,
             spec_k: 0,
+            keepalive: None,
         }
     }
 
@@ -629,6 +703,7 @@ impl Builder for Qwen36Builder {
             );
         }
 
+        self.keepalive = self.build_keepalive(&dir, &plugin);
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
         self.hidden = manifest.hidden();
@@ -711,6 +786,7 @@ impl Builder for Qwen36Builder {
             perf_count: self.ov_properties.iter().any(|(k, v)| {
                 k.eq_ignore_ascii_case("PERF_COUNT") && v.eq_ignore_ascii_case("YES")
             }),
+            keepalive: self.keepalive,
         }))
     }
 }
@@ -915,6 +991,8 @@ pub struct Qwen36Engine {
     /// Stages compiled with `PERF_COUNT=YES` (`--ov-config PERF_COUNT=YES`), so the profile dump
     /// after the 8th decode step can read `Runtime::profiling()`.
     perf_count: bool,
+    /// `CASCADIA_QWEN36_GPU_KEEPALIVE_MS` worker (pipeline ranks; see `qwen36_keepalive`).
+    keepalive: Option<KeepAlive>,
 }
 
 /// A relay rank's DeltaNet (`conv`/`ssm`) snapshot for an in-flight VERIFY span.
@@ -1316,7 +1394,8 @@ impl Qwen36Engine {
         } else {
             0.0
         };
-        self.prof_task_end(&t.task_id);
+        let keepalive_infers = self.ka_take_infers();
+        self.prof_task_end(&t.task_id, keepalive_infers);
         if t.spec.steps > 0 {
             let l = &["qwen35"];
             cascadia_metrics::SPEC_STEPS_TOTAL
@@ -1359,6 +1438,7 @@ impl Qwen36Engine {
             spec_verify_ms = t.spec.verify_us / 1000,
             spec_refeed_ms = t.spec.refeed_us / 1000,
             spec_disabled = ?t.spec.disabled,
+            keepalive_infers,
             "qwen36 task done"
         );
         if !t.wire_ms.is_empty() {
@@ -1394,7 +1474,8 @@ impl Qwen36Engine {
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
-        self.prof_task_end(&t.task_id);
+        let keepalive_infers = self.ka_take_infers();
+        self.prof_task_end(&t.task_id, keepalive_infers);
         self.reset_all();
         vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
     }
@@ -1495,6 +1576,7 @@ impl Qwen36Engine {
             le_bytes_f32(hidden),
         );
         let t_rtt = self.prof.is_some().then(Instant::now);
+        self.ka_begin();
         let r = run_async(
             &h,
             reply_bounded(async move {
@@ -1515,6 +1597,7 @@ impl Qwen36Engine {
             }),
         )
         .map_err(map_wire);
+        self.ka_end();
         self.prof_record_rtt(t_rtt, r.as_ref().ok().map(|(_, us)| *us));
         r
     }
@@ -1541,6 +1624,7 @@ impl Qwen36Engine {
             le_bytes_f32(hidden),
         );
         let t_rtt = self.prof.is_some().then(Instant::now);
+        self.ka_begin();
         let r = run_async(
             &h,
             reply_bounded(async move {
@@ -1563,6 +1647,7 @@ impl Qwen36Engine {
             }),
         )
         .map_err(map_wire);
+        self.ka_end();
         self.prof_record_rtt(t_rtt, r.as_ref().ok().map(|(_, us)| *us));
         r
     }
@@ -1581,7 +1666,8 @@ impl Qwen36Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
         let h = self.handle()?;
-        run_async(
+        self.ka_begin();
+        let r = run_async(
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
@@ -1597,7 +1683,9 @@ impl Qwen36Engine {
                 Ok(verdict == 1)
             }),
         )
-        .map_err(|e| EngineError::Backend(format!("qwen36 pipeline COMMIT not acked: {e}")))
+        .map_err(|e| EngineError::Backend(format!("qwen36 pipeline COMMIT not acked: {e}")));
+        self.ka_end();
+        r
     }
 
     /// Rank 0 wrapper: token + the round-trip's wire share in ms (RTT
@@ -2145,6 +2233,7 @@ impl Qwen36Engine {
                 if reanchored {
                     warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                 }
+                self.prof_decode_step(&[("wire.net", wire_ms * 1000.0)]);
                 vec![(
                     task_id.clone(),
                     Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
@@ -2289,6 +2378,7 @@ impl Qwen36Engine {
             .ok_or_else(|| EngineError::Backend("last rank has no upstream".into()))?;
         let h = self.handle()?;
         let t_wait = self.prof.is_some().then(Instant::now);
+        self.ka_begin();
         let frame = run_async(&h, async move {
             let mut g = upstream.lock().await;
             let hb = g.recv_raw(12).await?;
@@ -2392,7 +2482,9 @@ impl Qwen36Engine {
                 _ => Err(TransportError::SocketClosed),
             }
         })
-        .map_err(map_wire)?;
+        .map_err(map_wire);
+        self.ka_end();
+        let frame = frame?;
         let up_wait_us = t_wait.map(|t| t.elapsed().as_micros() as f64);
 
         let is_last = self.rank == self.total - 1;
@@ -2448,7 +2540,15 @@ impl Qwen36Engine {
                 // "everything downstream of you is at position 0". A
                 // failed downstream reset = no ack = task fails loud at
                 // rank 0 (reset protocol).
-                self.prof_task_end(&TaskId::from(format!("epoch-{epoch}")));
+                let keepalive_infers = self.ka_take_infers();
+                self.prof_task_end(&TaskId::from(format!("epoch-{epoch}")), keepalive_infers);
+                if keepalive_infers > 0 {
+                    info!(
+                        epoch,
+                        keepalive_infers,
+                        "qwen36 relay GPU keep-alive infers since the previous RESET"
+                    );
+                }
                 self.reset_all();
                 self.peer_epoch = epoch;
                 if !is_last {
@@ -3170,6 +3270,7 @@ impl Qwen36Engine {
                 if reanchored {
                     warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                 }
+                self.prof_decode_step(&[]);
                 vec![(
                     task_id.clone(),
                     Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
@@ -3480,6 +3581,11 @@ impl Qwen36Engine {
             for (k, v) in extra {
                 p.acc.record(k, *v);
             }
+            if let Some(ka) = self.keepalive.as_ref() {
+                for s in ka.take_samples() {
+                    p.acc.record("ka.infer", s);
+                }
+            }
             p.since_summary += 1;
             p.task_steps += 1;
             if p.since_summary >= PROFILE_SUMMARY_EVERY {
@@ -3495,6 +3601,25 @@ impl Qwen36Engine {
         if want_dump {
             self.dump_stage_profiles();
         }
+    }
+
+    /// A blocking network wait is about to start: let the GPU keep-alive fire until `ka_end`.
+    fn ka_begin(&self) {
+        if let Some(k) = &self.keepalive {
+            k.begin_wait();
+        }
+    }
+
+    /// The wait returned; the next stage infer follows, so the keep-alive stops first.
+    fn ka_end(&self) {
+        if let Some(k) = &self.keepalive {
+            k.end_wait();
+        }
+    }
+
+    /// Keep-alive infers since the last call (0 when off).
+    fn ka_take_infers(&self) -> u64 {
+        self.keepalive.as_ref().map_or(0, KeepAlive::take_infers)
     }
 
     /// Relay-rank profile hook for one decode frame: the wait for the upstream frame and (last
@@ -3515,11 +3640,11 @@ impl Qwen36Engine {
 
     /// Final profile summary for the task (rank 0 / single-box) or the span since the last RESET
     /// (relays), then clear the accumulators. No-op without `CASCADIA_QWEN36_PROFILE=1`.
-    fn prof_task_end(&mut self, task_id: &TaskId) {
+    fn prof_task_end(&mut self, task_id: &TaskId, keepalive_infers: u64) {
         let rank = self.rank;
         if let Some(p) = self.prof.as_mut() {
             if !p.acc.is_empty() {
-                info!(task = %task_id, rank, steps = p.task_steps, summary = %p.acc.summary(), "qwen36 profile (task)");
+                info!(task = %task_id, rank, steps = p.task_steps, keepalive_infers, summary = %p.acc.summary(), "qwen36 profile (task)");
             }
             p.acc.clear();
             p.since_summary = 0;
@@ -3656,7 +3781,8 @@ impl Engine for Qwen36Engine {
         if self.active.as_ref().is_some_and(|t| &t.task_id == task_id) {
             info!(task = %task_id, "qwen36: cancelled; dropping active task");
             self.active = None;
-            self.prof_task_end(task_id);
+            let keepalive_infers = self.ka_take_infers();
+            self.prof_task_end(task_id, keepalive_infers);
             // A prefix-cache hit restores over the live requests without its own reset, so the
             // only certified restore sequence is reset → prime → set_state: reset here rather
             // than leaving the cancelled task's state in place.
@@ -4323,6 +4449,7 @@ mod tests {
             pending_verify: None,
             prof: None,
             perf_count: false,
+            keepalive: None,
         }
     }
 

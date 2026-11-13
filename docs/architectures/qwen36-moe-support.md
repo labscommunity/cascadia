@@ -480,6 +480,22 @@ downstream RTT and wire share, upstream wait on relays, sampling), and with
 `--ov-config PERF_COUNT=YES` a one-off per-stage OpenVINO node profile after
 the 8th decode step of a task.
 
+GPU keep-alive (`CASCADIA_QWEN36_GPU_KEEPALIVE_MS=<n>`, default 0 = off;
+`qwen36_keepalive.rs`): on the 122B 3-rank iGPU pipeline a stage infer is
+p50 ~33 ms but p95 250-550 ms on every rank, because the device idles between
+pipeline steps and pays a wake-up penalty on the next infer (a standalone
+loop shows no gaps; a 70 ms sleep between infers reproduces the stalls; tiny
+infers every ~5 ms during the gap remove them). With `n > 0` every pipeline
+rank compiles a tiny synthetic IR (Parameter f32 [1,16] -> Add -> Result;
+fallback: the tree's embeddings IR with a [1,1] lookup) on its own device and
+PluginConfig and runs one worker thread that infers it every `n` ms while
+the rank is blocked on the network — a relay waiting for its next upstream
+frame or its downstream reply, rank 0 waiting for the downstream token(s) —
+and parks otherwise, so it never overlaps a stage infer. A wait longer than
+2 s (idle between tasks) stops the worker until the next wait. Counted as
+`keepalive_infers=` on `qwen36 task done` (rank 0) and on the relay RESET
+line; profile key `ka.infer` (p50/p95 of the synthetic infer).
+
 ## 7. Out of scope (v1, regardless of strategy)
 
 Vision tower; MTP/speculative decoding; batching/multi-stream (priced
