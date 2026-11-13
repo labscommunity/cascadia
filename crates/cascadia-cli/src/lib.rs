@@ -1569,9 +1569,12 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
 }
 
 /// Whether the API will render ov-genai's prompts through the model's chat
-/// template, so the engine should skip ov-genai's own apply by default.
+/// template, so the engine should skip ov-genai's own apply by default: a
+/// template file is present and builds, by the same build the API runs. Chat
+/// requests also carry their own flag (a render error at request time falls
+/// back to untemplated text); this default covers the rest.
 fn ovgenai_prompt_pretemplated(model: &str) -> bool {
-    ovgenai_chat_template(model).template.is_some()
+    cascadia_api::chat_template_builds(&ovgenai_chat_template(model))
 }
 
 /// ov-genai renders with the template inside its tokenizer IR, but the API
@@ -1788,10 +1791,10 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             } else if args.prompt_lookup > 0 {
                 b = b.with_prompt_lookup(args.prompt_lookup);
             }
-            // If the model ships a chat template, the API renders it for every
-            // request (thinking on or off) and the engine tells ov-genai to
-            // skip its own internal apply. No template → leave ov-genai's
-            // apply on.
+            // If the model ships a chat template the API can build, the API
+            // renders it for every request (thinking on or off) and the engine
+            // tells ov-genai to skip its own internal apply. No usable
+            // template → leave ov-genai's apply on.
             b = b.with_prompt_pretemplated(ovgenai_prompt_pretemplated(&args.model));
             Ok(Box::new(b))
         }

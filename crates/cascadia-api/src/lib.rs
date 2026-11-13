@@ -1531,6 +1531,16 @@ fn chat_template_smoke_failures(
         .collect()
 }
 
+/// Whether the API will render prompts through this chat template: one is
+/// present and builds. The same build [`make_router_with_config`] runs, so an
+/// engine that can apply the template itself (ov-genai) can be told up front
+/// whether the API will have done it.
+pub fn chat_template_builds(cfg: &ChatTemplateConfig) -> bool {
+    cfg.template
+        .as_deref()
+        .is_some_and(|src| build_chat_env(src).is_ok())
+}
+
 fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>, String> {
     use minijinja::value::Value;
     use minijinja::{Environment, Error, ErrorKind};
@@ -2862,7 +2872,10 @@ async fn chat_completions(
         // For an engine that renders the template itself (llama-server's
         // `chat_template_kwargs`).
         preserve_thinking: req.preserve_thinking(),
-        prompt_pretemplated: None,
+        // Whether the chat template rendered this prompt: false for the
+        // legacy text (no template, one that failed to build, or a render
+        // error), so an engine that can apply the template (ov-genai) does.
+        prompt_pretemplated: Some(templated),
     };
 
     // Acquire a request slot before touching the engine. Contended streams

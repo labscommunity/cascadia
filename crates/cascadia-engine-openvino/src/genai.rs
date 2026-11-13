@@ -43,7 +43,8 @@ pub struct OvGenaiBuilder {
     pub speculative_k: u32,
     pub prompt_lookup_ngram: u32,
     /// True when the API pre-renders the model's chat template, so the engine
-    /// tells ov-genai to skip its internal apply (thinking on or off).
+    /// tells ov-genai to skip its internal apply (thinking on or off). A
+    /// task's own `prompt_pretemplated` overrides it for that request.
     pub prompt_pretemplated: bool,
     /// Continuous batching (#20): serve concurrent requests through one
     /// `ContinuousBatchingPipeline` instead of one-generation-per-`step()`.
@@ -366,6 +367,7 @@ pub struct OvGenaiEngine {
 impl Engine for OvGenaiEngine {
     fn warmup(&mut self) {
         let cfg = self.gen_config(
+            self.prompt_pretemplated,
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
             &SamplingParams::default(),
@@ -428,7 +430,12 @@ impl Engine for OvGenaiEngine {
         } else {
             self.max_tokens_default
         };
-        let cfg = self.gen_config(max_new, task.temperature, &task.sampling);
+        let cfg = self.gen_config(
+            prompt_pretemplated(&task, self.prompt_pretemplated),
+            max_new,
+            task.temperature,
+            &task.sampling,
+        );
 
         let started = Instant::now();
         let result = match self.pipe.generate(&task.prompt, &cfg) {
@@ -707,7 +714,7 @@ impl Engine for OvGenaiCbEngine {
         let cfg = build_gen_config(
             0,
             0,
-            self.prompt_pretemplated,
+            prompt_pretemplated(&task, self.prompt_pretemplated),
             max_tokens,
             task.temperature,
             &task.sampling,
@@ -926,6 +933,14 @@ impl Engine for OvGenaiCbEngine {
     }
 }
 
+/// Whether `task.prompt` was rendered through the model's chat template, so
+/// ov-genai must not apply its own: the task's own flag when the API set one
+/// (it knows whether this request's render fell back to the legacy text),
+/// else the engine's setting.
+fn prompt_pretemplated(task: &GenerationTask, engine_default: bool) -> bool {
+    task.prompt_pretemplated.unwrap_or(engine_default)
+}
+
 /// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
 /// passes 0 for the speculative knobs — the CB scheduler owns batching).
 fn build_gen_config(
@@ -943,9 +958,9 @@ fn build_gen_config(
         temperature: if do_sample { temperature } else { 0.0 },
         num_assistant_tokens: 0,
         max_ngram_size: 0,
-        // The API renders the model's template whenever one loaded (thinking
-        // on or off), so ov-genai's own apply would wrap it twice. With no
-        // template the API sends the raw user text and ov-genai wraps it.
+        // The prompt already went through the model's template (see
+        // `prompt_pretemplated`), so ov-genai's own apply would wrap it
+        // twice. Otherwise it is the raw user text and ov-genai wraps it.
         skip_chat_template: prompt_pretemplated,
         // OpenAI sampling knobs (#14). top_p/top_k take effect in the
         // sampling regime (do_sample, i.e. temperature > 0); penalties and
@@ -993,6 +1008,7 @@ impl OvGenaiEngine {
     /// practice is untested here.
     fn gen_config(
         &self,
+        prompt_pretemplated: bool,
         max_tokens: u32,
         temperature: f32,
         sampling: &SamplingParams,
@@ -1000,7 +1016,7 @@ impl OvGenaiEngine {
         build_gen_config(
             self.speculative_k,
             self.prompt_lookup_ngram,
-            self.prompt_pretemplated,
+            prompt_pretemplated,
             max_tokens,
             temperature,
             sampling,
