@@ -403,6 +403,17 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub prefix_cache_gb: Option<f64>,
 
+    /// `qwen35` pipeline ranks only (`--total` ≥ 2): keep the GPU busy with a
+    /// tiny model while this rank waits on other ranks; on Intel iGPUs an idle
+    /// device holding a large stage is charged ~0.5 s on its next steps; 2 is
+    /// the measured setting (the 122B 3-stage chain went 3.0 → 10.6 tok/s).
+    /// Period in ms between the synthetic infers; 0 = off, then the
+    /// `CASCADIA_QWEN36_GPU_KEEPALIVE_MS` env var is the fallback. Never runs
+    /// during this rank's own stage inference, and a single-process worker
+    /// (`--total 1`) never starts it.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub gpu_keepalive_ms: u64,
+
     /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
     /// is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
     /// window of the largest served models. Only `qwen35` also bounds the
@@ -925,6 +936,8 @@ impl WorkerArgs {
             device,
             engine,
             prefix_cache_gb,
+            // `cascadia run` is single-process: the keep-alive only exists between pipeline ranks.
+            gpu_keepalive_ms: 0,
             api_max_body_mb,
             ep_workers,
             ep_worker_index: None,
@@ -1588,6 +1601,15 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
         );
     }
 
+    // Same shape for the GPU keep-alive: only the qwen35 staged engine has the
+    // network waits it fills, and only when it runs as a pipeline.
+    if args.gpu_keepalive_ms > 0 && !matches!(args.engine, EngineKind::Qwen36Moe) {
+        tracing::warn!(
+            engine = ?args.engine,
+            "ignoring --gpu-keepalive-ms: the GPU keep-alive is qwen35-only (pipeline ranks)"
+        );
+    }
+
     // --cb on CPU is a narrow win and has a severe failure mode. Measured on
     // Lunar Lake across Phi-3.5-mini and Qwen3-8B: short prompts at concurrency
     // gain 1.6-2.1x, but a ~1200-token prompt collapses to ~0.2x — a five-fold
@@ -1965,6 +1987,16 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 "qwen35 prefix-cache budget"
             );
             b = b.with_prefix_cache_bytes(prefix_cache_bytes);
+            // GPU keep-alive between pipeline steps (qwen36_keepalive). 0 here still lets the
+            // builder read the CASCADIA_QWEN36_GPU_KEEPALIVE_MS fallback; the builder itself
+            // declines to start it on --total 1.
+            if args.gpu_keepalive_ms > 0 {
+                info!(
+                    period_ms = args.gpu_keepalive_ms,
+                    "qwen35 GPU keep-alive requested"
+                );
+            }
+            b = b.with_gpu_keepalive_ms(args.gpu_keepalive_ms);
             Ok(Box::new(b))
         }
     }
@@ -4246,6 +4278,25 @@ mod sycl_llama_flag_tests {
             Command::Worker(args) => args,
             _ => panic!("expected worker subcommand"),
         }
+    }
+
+    /// `--gpu-keepalive-ms` is off (0) unless given, parses as a period in ms, and the qwen35
+    /// builder accepts it on a pipeline rank (the builder decides at load whether to start it).
+    #[test]
+    fn worker_gpu_keepalive_ms_defaults_off_and_parses() {
+        let base = [
+            "cascadia", "worker", "--rank", "1", "--total", "3", "--model", "m", "--engine",
+            "qwen35",
+        ];
+        let a = worker_args(&base);
+        assert_eq!(a.gpu_keepalive_ms, 0);
+        let mut argv = base.to_vec();
+        argv.extend(["--gpu-keepalive-ms", "2"]);
+        let a = worker_args(&argv);
+        assert_eq!(a.gpu_keepalive_ms, 2);
+        assert!(build_builder(&a, 0).is_ok());
+        let bad = Cli::try_parse_from(base.iter().copied().chain(["--gpu-keepalive-ms", "fast"]));
+        assert!(bad.is_err(), "the period is an integer number of ms");
     }
 
     #[test]
