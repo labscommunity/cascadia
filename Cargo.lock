@@ -336,6 +336,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascadia-diffusion"
+version = "0.2.7"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cascadia-discovery"
 version = "0.2.7"
 dependencies = [
