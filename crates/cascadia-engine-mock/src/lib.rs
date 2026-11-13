@@ -371,6 +371,7 @@ mod tests {
             resume_token_ids: None,
             reasoning_as_text: false,
             preserve_thinking: None,
+            prompt_pretemplated: None,
             decision: None,
         };
         t.decision = Some(cascadia_types::DecisionReadout {
@@ -411,6 +412,7 @@ mod tests {
             resume_token_ids: None,
             reasoning_as_text: false,
             preserve_thinking: None,
+            prompt_pretemplated: None,
             decision: Some(cascadia_types::DecisionReadout {
                 prompt_ids: vec![5, DECISION_FAIL_ID],
                 head: cascadia_types::ReadoutHead::Verbalizer { token_ids: vec![1] },
@@ -450,6 +452,7 @@ mod tests {
             resume_token_ids: None,
             reasoning_as_text: false,
             preserve_thinking: None,
+            prompt_pretemplated: None,
             decision: Some(cascadia_types::DecisionReadout {
                 prompt_ids: vec![5, DECISION_NON_FINITE_ID],
                 head: cascadia_types::ReadoutHead::Verbalizer {

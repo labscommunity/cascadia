@@ -497,6 +497,7 @@ async fn run_passes(
             resume_token_ids: None,
             reasoning_as_text: false,
             preserve_thinking: None,
+            prompt_pretemplated: None,
             decision: Some(pass.readout.clone()),
         };
         let started = std::time::Instant::now();
