@@ -129,6 +129,11 @@ pub struct AppState {
     /// guard stays honest; tools flow through GenerationTask, so the
     /// no-template refusal does not apply.
     pub engine_applies_template: bool,
+    /// The engine wraps a prompt the API did not template in the model's own
+    /// template (ov-genai). After a request-time render error the API sends
+    /// the legacy text, but the model still sees a templated prompt, so the
+    /// load-time probe says whether it opened `<think>` (see [`opens_think`]).
+    pub engine_templates_raw_prompts: bool,
     /// The chat template distinguishes OpenAI's `reasoning_effort` words
     /// (probed at load: "low" and "medium" render differently). When true the
     /// caller's own word reaches the template; when false the GLM high/max
@@ -165,6 +170,8 @@ pub struct Config {
     pub chat_template: ChatTemplateConfig,
     /// See [`AppState::engine_applies_template`]. Set by the CLI for sycl-llama.
     pub engine_applies_template: bool,
+    /// See [`AppState::engine_templates_raw_prompts`]. Set by the CLI for ov-genai.
+    pub engine_templates_raw_prompts: bool,
     /// See [`AppState::reasoning_format`]. Set by the CLI's `--reasoning-format`.
     pub reasoning_format: ReasoningFormat,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
@@ -179,6 +186,7 @@ impl Default for Config {
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
             engine_applies_template: false,
+            engine_templates_raw_prompts: false,
             reasoning_format: ReasoningFormat::default(),
             marker_dialect: None,
         }
@@ -511,6 +519,7 @@ pub fn make_router_with_stats(
         bos_token: Arc::from(cfg.chat_template.bos_token.clone().unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.clone().unwrap_or_default()),
         engine_applies_template: cfg.engine_applies_template,
+        engine_templates_raw_prompts: cfg.engine_templates_raw_prompts,
         effort_words: false,
         reasoning_format: cfg.reasoning_format,
         template_opens_think: false,
@@ -7202,6 +7211,7 @@ level={{ effort_map[eff] }}";
                 bos_token: None,
                 eos_token: None,
             },
+            engine_templates_raw_prompts: true,
             ..Config::default()
         }
     }
@@ -9067,6 +9077,97 @@ level={{ effort_map[eff] }}";
             body["usage"]["completion_tokens_details"]["reasoning_tokens"],
             1
         );
+    }
+
+    /// An R1-style template whose generation prompt opens `<think>`; a
+    /// message containing `BOOM` makes it fail at request time.
+    const OPENS_THINK_TEMPLATE: &str = "{% for m in messages %}\
+        {% if 'BOOM' in m.content %}{{ nope.missing.deeper }}{% endif %}\
+        {{ m.content }}{% endfor %}{% if add_generation_prompt %}<think>\n{% endif %}";
+
+    /// On ov-genai with thinking on, a template that opens `<think>` starts
+    /// the reply inside reasoning: the split arms and the reasoning reaches
+    /// `reasoning_content`.
+    #[tokio::test]
+    async fn ov_genai_thinking_on_template_opened_think_splits_reasoning() {
+        let cfg = ov_genai_config(Some(OPENS_THINK_TEMPLATE));
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["reasoning_content"], "plan", "{body}");
+        assert_eq!(m["content"], "answer", "{body}");
+    }
+
+    /// A request-time render error sends ov-genai the legacy text, which it
+    /// wraps in the model's own template: one that opens `<think>` still
+    /// starts the reply inside reasoning, so the load-time probe decides. An
+    /// engine that sends the legacy text as is does not.
+    #[tokio::test]
+    async fn render_error_on_ov_genai_falls_back_to_the_probe() {
+        let request = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"BOOM"}]});
+        let cfg = ov_genai_config(Some(OPENS_THINK_TEMPLATE));
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(app, request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["reasoning_content"], "plan", "ov-genai: {body}");
+        assert_eq!(m["content"], "answer", "ov-genai: {body}");
+
+        let cfg = Config {
+            engine_templates_raw_prompts: false,
+            ..ov_genai_config(Some(OPENS_THINK_TEMPLATE))
+        };
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(app, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert!(m.get("reasoning_content").is_none(), "raw engine: {body}");
+    }
+
+    /// `/v1/completions` sends a raw prompt: it leaves the task's
+    /// pretemplated flag unset, so the engine keeps its own setting.
+    #[tokio::test]
+    async fn completions_leave_prompt_pretemplated_unset() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router_with_config(
+            Arc::new(runner),
+            "mock-model",
+            ov_genai_config(Some(QWEN3_TEMPLATE)),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model":"mock-model","prompt":"hello"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].prompt, "hello");
+        assert_eq!(seen[0].prompt_pretemplated, None);
     }
 
     /// A template that opened `<think>`, and a model that writes it again:
