@@ -130,6 +130,10 @@ mod sys {
             cfg: *mut cascadia_genconfig_t,
             enabled: i32,
         );
+        pub fn cascadia_genconfig_set_prompt_templated(
+            cfg: *mut cascadia_genconfig_t,
+            enabled: i32,
+        );
         pub fn cascadia_genconfig_set_top_p(cfg: *mut cascadia_genconfig_t, v: f32);
         pub fn cascadia_genconfig_set_top_k(cfg: *mut cascadia_genconfig_t, v: u32);
         pub fn cascadia_genconfig_set_frequency_penalty(cfg: *mut cascadia_genconfig_t, v: f32);
@@ -142,6 +146,7 @@ mod sys {
             cfg: *const cascadia_genconfig_t,
             out_text: *mut *mut c_char,
             out_token_count: *mut u32,
+            out_prompt_tokens: *mut u32,
         ) -> c_int;
 
         pub fn cascadia_free_string(s: *mut c_char);
@@ -181,6 +186,7 @@ mod sys {
         pub fn cascadia_cb_count_tokens(
             handle: *mut cascadia_cb_pipeline_t,
             text: *const c_char,
+            add_special_tokens: i32,
             out_count: *mut u32,
         ) -> c_int;
 
@@ -193,6 +199,7 @@ mod sys {
         pub fn cascadia_tokenizer_count_tokens(
             tok: *mut cascadia_tokenizer_t,
             text: *const c_char,
+            add_special_tokens: i32,
             out_count: *mut u32,
         ) -> c_int;
 
@@ -384,6 +391,7 @@ unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconf
         raw_cfg,
         if cfg.skip_chat_template { 0 } else { 1 },
     );
+    sys::cascadia_genconfig_set_prompt_templated(raw_cfg, i32::from(cfg.prompt_templated));
     // OpenAI-compatible sampling knobs (#14). top_p / penalties take
     // their OV defaults (1.0 / 0.0) when unset, so setting them is a
     // no-op; top_k=0 and seed=None mean "disabled" so only forward
@@ -625,12 +633,14 @@ impl LlmPipeline {
             let raw_cfg = native_genconfig(cfg)?;
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
+            let mut prompt_tokens: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(
                 self.handle,
                 prompt_c.as_ptr(),
                 raw_cfg,
                 &mut text_p,
                 &mut tok_count,
+                &mut prompt_tokens,
             );
             sys::cascadia_genconfig_destroy(raw_cfg);
             if rc != 0 || text_p.is_null() {
@@ -641,7 +651,7 @@ impl LlmPipeline {
             Ok(GenResult {
                 text,
                 generated_tokens: tok_count,
-                prompt_tokens: None,
+                prompt_tokens: (prompt_tokens > 0).then_some(prompt_tokens),
             })
         }
     }
@@ -686,7 +696,6 @@ impl LlmPipeline {
 
     #[cfg(feature = "openvino")]
     pub fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
-        let _ = add_special_tokens;
         let text_c = cstr(text).ok()?;
         unsafe {
             let tok = sys::cascadia_pipeline_get_tokenizer(self.handle);
@@ -696,7 +705,12 @@ impl LlmPipeline {
             // Always destroy the borrowed tokenizer handle, even on
             // count failure — otherwise we leak heap on every call.
             let mut out: u32 = 0;
-            let rc = sys::cascadia_tokenizer_count_tokens(tok, text_c.as_ptr(), &mut out);
+            let rc = sys::cascadia_tokenizer_count_tokens(
+                tok,
+                text_c.as_ptr(),
+                i32::from(add_special_tokens),
+                &mut out,
+            );
             sys::cascadia_tokenizer_destroy(tok);
             if rc != 0 {
                 return None;
@@ -1021,11 +1035,16 @@ impl CbPipeline {
     /// [`LlmPipeline::count_tokens`] for `add_special_tokens`.
     #[cfg(feature = "openvino")]
     pub fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
-        let _ = add_special_tokens;
         let text_c = cstr(text).ok()?;
         let mut out: u32 = 0;
-        let rc =
-            unsafe { sys::cascadia_cb_count_tokens(self.inner.ptr, text_c.as_ptr(), &mut out) };
+        let rc = unsafe {
+            sys::cascadia_cb_count_tokens(
+                self.inner.ptr,
+                text_c.as_ptr(),
+                i32::from(add_special_tokens),
+                &mut out,
+            )
+        };
         if rc != 0 {
             None
         } else {

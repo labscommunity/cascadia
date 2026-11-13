@@ -368,6 +368,7 @@ impl Engine for OvGenaiEngine {
     fn warmup(&mut self) {
         let cfg = self.gen_config(
             self.prompt_pretemplated,
+            /*prompt_templated*/ false,
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
             &SamplingParams::default(),
@@ -430,8 +431,10 @@ impl Engine for OvGenaiEngine {
         } else {
             self.max_tokens_default
         };
+        let templated = prompt_templated(&task);
         let cfg = self.gen_config(
             prompt_pretemplated(&task, self.prompt_pretemplated),
+            templated,
             max_new,
             task.temperature,
             &task.sampling,
@@ -459,10 +462,11 @@ impl Engine for OvGenaiEngine {
         if let Some(stripped) = text.strip_prefix(&task.prompt) {
             text = stripped.trim_start().to_string();
         }
-        // Prefer tokenizer-based count; fall back to perf_metrics value.
+        // Prefer tokenizer-based count (generated text carries no BOS, so
+        // no special tokens are added); fall back to perf_metrics value.
         let tokens = self
             .pipe
-            .count_tokens(&text, true)
+            .count_tokens(&text, false)
             .unwrap_or(result.generated_tokens);
         let tok_s = if elapsed > 0.0 {
             tokens as f64 / elapsed
@@ -480,12 +484,13 @@ impl Engine for OvGenaiEngine {
         // Carry the real token counts on the final chunk so the API's
         // `usage` block is populated (issue #55 — previously always 0 for
         // this engine because the whole response lands on one chunk with no
-        // per-token count). `prompt_tokens` is the rendered-prompt token
-        // count; it is exact when the API pre-templated the prompt
-        // (`skip_chat_template`, whenever a template loaded) and a slight
-        // undercount when ov-genai applies its own template internally (no
-        // template beside the model: the wrapping isn't counted). None when
-        // the tokenizer is unavailable.
+        // per-token count). `prompt_tokens` is what ov-genai reports it fed
+        // the model (perf metrics), so its own template wrapping is counted
+        // too. Failing that, the tokenizer counts the prompt: exact when the
+        // API's template rendered this prompt (counted without special
+        // tokens, as it was encoded, so its BOS counts once), a slight
+        // undercount when ov-genai wraps a raw prompt in its own template.
+        // None when neither is available.
         // finish_reason: ov-genai's GenResult doesn't report why it stopped,
         // so infer — reaching the token cap is `length`, anything short of it
         // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
@@ -498,7 +503,10 @@ impl Engine for OvGenaiEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
             .with_n_tokens(tokens)
             .with_finish_reason(finish);
-        if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt, true) {
+        let prompt_tokens = result
+            .prompt_tokens
+            .or_else(|| self.pipe.count_tokens(&task.prompt, !templated));
+        if let Some(prompt_tokens) = prompt_tokens {
             chunk = chunk.with_prompt_tokens(prompt_tokens);
         }
         Ok(vec![(task.task_id, chunk)])
@@ -627,6 +635,7 @@ impl Engine for OvGenaiCbEngine {
             0,
             0,
             self.prompt_pretemplated,
+            /*prompt_templated*/ false,
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
             &SamplingParams::default(),
@@ -715,6 +724,7 @@ impl Engine for OvGenaiCbEngine {
             0,
             0,
             prompt_pretemplated(&task, self.prompt_pretemplated),
+            prompt_templated(&task),
             max_tokens,
             task.temperature,
             &task.sampling,
@@ -726,7 +736,9 @@ impl Engine for OvGenaiCbEngine {
             .add_request(request_id, &task.prompt, &cfg)
             .map_err(map_ov_err)?;
         self.active.push(ActiveCbTask {
-            prompt_tokens: self.pipe.count_tokens(&task.prompt, true),
+            prompt_tokens: self
+                .pipe
+                .count_tokens(&task.prompt, !prompt_templated(&task)),
             task_id: task.task_id,
             handle,
             total_tokens: 0,
@@ -941,12 +953,22 @@ fn prompt_pretemplated(task: &GenerationTask, engine_default: bool) -> bool {
     task.prompt_pretemplated.unwrap_or(engine_default)
 }
 
+/// Whether the API says it rendered `task.prompt` through the chat template,
+/// so it already carries the template's special tokens (BOS) and must be
+/// encoded, and counted, without adding them. Only an explicit `Some(true)`:
+/// a task without the flag (a raw `/v1/completions` prompt, an embedder)
+/// keeps ov-genai's own encoding, special tokens added.
+fn prompt_templated(task: &GenerationTask) -> bool {
+    task.prompt_pretemplated == Some(true)
+}
+
 /// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
 /// passes 0 for the speculative knobs — the CB scheduler owns batching).
 fn build_gen_config(
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
+    prompt_templated: bool,
     max_tokens: u32,
     temperature: f32,
     sampling: &SamplingParams,
@@ -962,7 +984,9 @@ fn build_gen_config(
         // `prompt_pretemplated`), so ov-genai's own apply would wrap it
         // twice. Otherwise it is the raw user text and ov-genai wraps it.
         skip_chat_template: prompt_pretemplated,
-        prompt_templated: false,
+        // Only a prompt the API's template rendered for this request carries
+        // the template's BOS; anything else keeps ov-genai's own encoding.
+        prompt_templated: prompt_pretemplated && prompt_templated,
         // OpenAI sampling knobs (#14). top_p/top_k take effect in the
         // sampling regime (do_sample, i.e. temperature > 0); penalties and
         // seed are forwarded regardless.
@@ -1010,6 +1034,7 @@ impl OvGenaiEngine {
     fn gen_config(
         &self,
         prompt_pretemplated: bool,
+        prompt_templated: bool,
         max_tokens: u32,
         temperature: f32,
         sampling: &SamplingParams,
@@ -1018,6 +1043,7 @@ impl OvGenaiEngine {
             self.speculative_k,
             self.prompt_lookup_ngram,
             prompt_pretemplated,
+            prompt_templated,
             max_tokens,
             temperature,
             sampling,
@@ -1621,7 +1647,15 @@ mod tests {
     #[test]
     fn skip_chat_template_follows_a_pretemplated_prompt() {
         for pretemplated in [true, false] {
-            let cfg = build_gen_config(0, 0, pretemplated, 16, 0.0, &SamplingParams::default());
+            let cfg = build_gen_config(
+                0,
+                0,
+                pretemplated,
+                pretemplated,
+                16,
+                0.0,
+                &SamplingParams::default(),
+            );
             assert_eq!(
                 cfg.skip_chat_template, pretemplated,
                 "pretemplated: {pretemplated}"

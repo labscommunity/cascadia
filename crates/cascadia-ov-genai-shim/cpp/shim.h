@@ -103,6 +103,9 @@ void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v
 // When enabled==0 the pipeline skips its internal chat-template apply (caller
 // pre-rendered the template, e.g. to honor enable_thinking). Default: apply.
 void cascadia_genconfig_set_apply_chat_template(cascadia_genconfig_t* cfg, int32_t enabled);
+/// The prompt is the model's chat template already rendered (it carries the
+/// template's BOS): encode it without adding special tokens. Default off.
+void cascadia_genconfig_set_prompt_templated(cascadia_genconfig_t* cfg, int32_t enabled);
 // OpenAI-compatible sampling knobs (#14): map to ov::genai::GenerationConfig
 // fields top_p / top_k / frequency_penalty / presence_penalty / rng_seed.
 void cascadia_genconfig_set_top_p(cascadia_genconfig_t* cfg, float v);
@@ -118,7 +121,8 @@ int32_t cascadia_pipeline_generate(
     const char* prompt,
     const cascadia_genconfig_t* cfg,
     char** out_text,
-    uint32_t* out_token_count);
+    uint32_t* out_token_count,
+    uint32_t* out_prompt_tokens);
 
 void cascadia_free_string(char* s);
 
@@ -212,8 +216,10 @@ int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle);
 void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle);
 
 /// Token count via the CB pipeline's tokenizer (usage reporting).
+/// `add_special_tokens` nonzero counts as plain text is encoded (BOS added).
 int32_t cascadia_cb_count_tokens(
-    cascadia_cb_pipeline_t* handle, const char* text, uint32_t* out_count);
+    cascadia_cb_pipeline_t* handle, const char* text, int32_t add_special_tokens,
+    uint32_t* out_count);
 
 // ---- Tokenizer (workaround for missing C API) -----------------------------
 
@@ -229,6 +235,7 @@ void cascadia_tokenizer_destroy(cascadia_tokenizer_t* tok);
 int32_t cascadia_tokenizer_count_tokens(
     cascadia_tokenizer_t* tok,
     const char* text,
+    int32_t add_special_tokens,
     uint32_t* out_count);
 
 /// Render one user message through the pipeline's own chat template, with the

@@ -195,6 +195,9 @@ struct cascadia_pipeline_t {
 };
 struct cascadia_genconfig_t {
     ov::genai::GenerationConfig cfg;
+    // The prompt is the model's chat template already rendered, carrying the
+    // template's own special tokens: encode it without adding them again.
+    bool prompt_templated = false;
 };
 struct cascadia_tokenizer_t {
     ov::genai::Tokenizer tok;
@@ -216,6 +219,45 @@ struct cascadia_runtime_t {
     // (and thus the plugin's KV precision) is retained, so the types cannot change.
     std::unordered_map<std::string, ov::element::Type> state_dtypes;
 };
+
+namespace {
+
+// A rendered chat template already starts with the model's BOS. GenAI's string
+// entry points encode their prompt with special tokens added, which prepends a
+// second one: a silently degraded prompt. Encode it the way GenAI encodes its
+// own rendered template instead.
+ov::genai::TokenizedInputs encode_templated(ov::genai::Tokenizer& tok, const std::string& prompt) {
+    return tok.encode(prompt, ov::AnyMap{{"add_special_tokens", false}});
+}
+
+// VLMPipeline (2026.4) takes only text, which it encodes with special tokens
+// added when apply_chat_template is off. So for a templated prompt drop the
+// leading BOS text, but only when that encoding demonstrably doubles it (two
+// BOS ids up front): a tokenizer that adds no BOS, or a template without one,
+// keeps the prompt untouched.
+std::string without_bos_the_tokenizer_adds(ov::genai::Tokenizer& tok, const std::string& prompt) {
+    const std::string bos = tok.get_bos_token();
+    const int64_t bos_id = tok.get_bos_token_id();
+    if (bos.empty() || bos_id < 0 || prompt.compare(0, bos.size(), bos) != 0) {
+        return prompt;
+    }
+    const ov::Tensor ids = tok.encode(prompt).input_ids;
+    if (ids.get_size() >= 2 && ids.get_element_type() == ov::element::i64) {
+        const int64_t* p = ids.data<const int64_t>();
+        if (p[0] == bos_id && p[1] == bos_id) return prompt.substr(bos.size());
+    }
+    return prompt;
+}
+
+uint32_t input_tokens(ov::genai::PerfMetrics& m) {
+    try {
+        return static_cast<uint32_t>(m.get_num_input_tokens());
+    } catch (...) {
+        return 0;
+    }
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -369,6 +411,9 @@ void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v
 void cascadia_genconfig_set_apply_chat_template(cascadia_genconfig_t* cfg, int32_t enabled) {
     if (cfg) cfg->cfg.apply_chat_template = enabled != 0;
 }
+void cascadia_genconfig_set_prompt_templated(cascadia_genconfig_t* cfg, int32_t enabled) {
+    if (cfg) cfg->prompt_templated = enabled != 0;
+}
 // OpenAI-compatible sampling knobs (#14). All map to standard public fields
 // of ov::genai::GenerationConfig; trivial assignments that cannot throw.
 void cascadia_genconfig_set_top_p(cascadia_genconfig_t* cfg, float v) {
@@ -389,28 +434,50 @@ void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v) {
 
 int32_t cascadia_pipeline_generate(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
-    char** out_text, uint32_t* out_token_count) {
+    char** out_text, uint32_t* out_token_count, uint32_t* out_prompt_tokens) {
     if (!handle || (!handle->pipe && !handle->vlm) || !prompt || !out_text) {
         set_last_error("null arg in pipeline_generate"); return 1;
     }
     try {
         std::string text;
         uint32_t generated = 0;
+        uint32_t prompt_tokens = 0;
+        const bool templated = cfg && cfg->prompt_templated;
         if (handle->vlm) {
             // Text-only generate on a VLM-layout export; no image tensors.
             ov::genai::GenerationConfig gen_cfg =
                 cfg ? cfg->cfg : ov::genai::GenerationConfig{};
+            std::string vlm_prompt(prompt);
+            if (templated) {
+                ov::genai::Tokenizer tok = handle->vlm->get_tokenizer();
+                vlm_prompt = without_bos_the_tokenizer_adds(tok, vlm_prompt);
+            }
             // StreamerVariant{} default-constructs its FIRST alternative —
             // an empty std::function — which fast-fails (0xc0000409) when
             // invoked. Pass monostate explicitly: "no streamer".
             ov::genai::VLMDecodedResults results = handle->vlm->generate(
-                std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg,
+                vlm_prompt, std::vector<ov::Tensor>{}, gen_cfg,
                 ov::genai::StreamerVariant{std::monostate{}});
             text = results.texts.empty() ? std::string{} : results.texts[0];
             try {
                 generated = static_cast<uint32_t>(
                     results.perf_metrics.get_num_generated_tokens());
             } catch (...) { generated = 0; }
+            prompt_tokens = input_tokens(results.perf_metrics);
+        } else if (templated) {
+            // Encode as GenAI encodes its own rendered template (no special
+            // tokens) and generate from the ids; decode as the string
+            // overload does.
+            ov::genai::Tokenizer tok = handle->pipe->get_tokenizer();
+            ov::genai::EncodedResults results = handle->pipe->generate(
+                ov::genai::EncodedInputs{encode_templated(tok, std::string(prompt))},
+                cfg->cfg, ov::genai::StreamerVariant{std::monostate{}});
+            text = results.tokens.empty() ? std::string{} : tok.decode(results.tokens[0]);
+            try {
+                generated = static_cast<uint32_t>(
+                    results.perf_metrics.get_num_generated_tokens());
+            } catch (...) { generated = 0; }
+            prompt_tokens = input_tokens(results.perf_metrics);
         } else {
             ov::genai::DecodedResults results = cfg
                 ? handle->pipe->generate(std::string(prompt), cfg->cfg)
@@ -420,6 +487,7 @@ int32_t cascadia_pipeline_generate(
                 generated = static_cast<uint32_t>(
                     results.perf_metrics.get_num_generated_tokens());
             } catch (...) { generated = 0; }
+            prompt_tokens = input_tokens(results.perf_metrics);
         }
         if (text.size() > MAX_GENERATED_TEXT_BYTES) {
             set_last_error(
@@ -434,6 +502,9 @@ int32_t cascadia_pipeline_generate(
         *out_text = buf;
         if (out_token_count) {
             *out_token_count = generated;
+        }
+        if (out_prompt_tokens) {
+            *out_prompt_tokens = prompt_tokens;
         }
         return 0;
     } catch (const std::exception& e) {
@@ -524,7 +595,12 @@ int32_t cascadia_cb_add_request(
         // otherwise the untouched string overload keeps its exact behaviour.
         const bool want_template =
             cfg->cfg.apply_chat_template && !handle->tok->get_chat_template().empty();
-        if (want_template) {
+        if (cfg->prompt_templated) {
+            // The caller rendered the template: same encoding as below, and
+            // for the same reason, without rendering it again.
+            auto enc = encode_templated(*handle->tok, std::string(prompt));
+            h->handle = handle->pipe->add_request(request_id, enc.input_ids, cfg->cfg);
+        } else if (want_template) {
             ov::genai::ChatHistory history(std::vector<ov::AnyMap>{
                 {{"role", std::string("user")}, {"content", std::string(prompt)}}});
             const std::string rendered =
@@ -689,13 +765,15 @@ int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle) {
 void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle) { delete handle; }
 
 int32_t cascadia_cb_count_tokens(
-    cascadia_cb_pipeline_t* handle, const char* text, uint32_t* out_count) {
+    cascadia_cb_pipeline_t* handle, const char* text, int32_t add_special_tokens,
+    uint32_t* out_count) {
     if (!handle || !handle->tok || !text || !out_count) {
         set_last_error("null arg in cb_count_tokens");
         return 1;
     }
     try {
-        auto enc = handle->tok->encode(std::string(text));
+        auto enc = handle->tok->encode(
+            std::string(text), ov::AnyMap{{"add_special_tokens", add_special_tokens != 0}});
         const auto& shape = enc.input_ids.get_shape();
         *out_count = shape.empty() ? 0 : static_cast<uint32_t>(shape.back());
         return 0;
@@ -729,12 +807,14 @@ cascadia_tokenizer_t* cascadia_pipeline_get_tokenizer(cascadia_pipeline_t* handl
 void cascadia_tokenizer_destroy(cascadia_tokenizer_t* tok) { delete tok; }
 
 int32_t cascadia_tokenizer_count_tokens(
-    cascadia_tokenizer_t* tok, const char* text, uint32_t* out_count) {
+    cascadia_tokenizer_t* tok, const char* text, int32_t add_special_tokens,
+    uint32_t* out_count) {
     if (!tok || !text || !out_count) {
         set_last_error("null arg in tokenizer_count_tokens"); return 1;
     }
     try {
-        auto enc = tok->tok.encode(std::string(text));
+        auto enc = tok->tok.encode(
+            std::string(text), ov::AnyMap{{"add_special_tokens", add_special_tokens != 0}});
         const auto& shape = enc.input_ids.get_shape();
         *out_count = shape.empty() ? 0 : static_cast<uint32_t>(shape.back());
         return 0;
