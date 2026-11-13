@@ -8,7 +8,7 @@
 //!
 //! * not templating at all — what upstream does, and what this test caught.
 //!   The engine relies on that flag whenever the API could not pre-render the
-//!   template, and for thinking-on requests; those got raw prompts.
+//!   template (no template file beside the model); those got raw prompts.
 //! * templating and then encoding with `add_special_tokens=true`, which
 //!   prepends a second BOS because the rendered template already carries one.
 //!   The output stays fluent, just quietly worse.
