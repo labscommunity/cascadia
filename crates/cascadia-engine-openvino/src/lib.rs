@@ -19,6 +19,7 @@ pub mod packed;
 mod packed_exec;
 pub mod prefix_cache;
 pub mod qwen36;
+pub mod qwen36_keepalive;
 pub mod qwen36_profile;
 pub mod rotary;
 pub mod runtime;

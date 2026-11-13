@@ -45,6 +45,7 @@ use futures::stream;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
 
+use crate::qwen36_keepalive::{self as keepalive, KeepAlive};
 use crate::qwen36_profile::{self as profile, ProfileState};
 
 /// Hidden width of shard trees exported before `manifest.hidden_size`
@@ -374,6 +375,11 @@ pub struct Qwen36Builder {
     im_start_id: Option<u32>,
     /// `max_position_embeddings` from the tree's config.json (`None` = unknown, no guard).
     max_ctx: Option<usize>,
+    /// `--gpu-keepalive-ms`: period of the synthetic keep-alive infer while a pipeline rank
+    /// waits on the network (0 = off, then `CASCADIA_QWEN36_GPU_KEEPALIVE_MS` is the fallback).
+    gpu_keepalive_ms: u64,
+    /// The keep-alive worker, started by `load` on pipeline ranks (see `qwen36_keepalive`).
+    keepalive: Option<KeepAlive>,
 }
 
 impl Qwen36Builder {
@@ -396,6 +402,12 @@ impl Qwen36Builder {
     /// Prefix-cache byte budget (0 = off). Default [`crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES`].
     pub fn with_prefix_cache_bytes(mut self, bytes: usize) -> Self {
         self.prefix_cache_bytes = bytes;
+        self
+    }
+    /// GPU keep-alive period in ms for pipeline ranks (0 = off / env fallback; see
+    /// `qwen36_keepalive`). Single-process (`--total 1`) never starts the worker.
+    pub fn with_gpu_keepalive_ms(mut self, ms: u64) -> Self {
+        self.gpu_keepalive_ms = ms;
         self
     }
     fn build_plugin_config(&self) -> PluginConfig {
@@ -440,6 +452,8 @@ impl Qwen36Builder {
             prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
             im_start_id: None,
             max_ctx: None,
+            gpu_keepalive_ms: 0,
+            keepalive: None,
         }
     }
 
@@ -447,6 +461,78 @@ impl Qwen36Builder {
         self.rank = rank;
         self.total = total;
         self
+    }
+
+    /// GPU keep-alive for a pipeline rank (`qwen36_keepalive`): compile the tiny synthetic IR
+    /// (fallback: the tree's text-embeddings IR with a `[1,1]` lookup) on this rank's device with
+    /// the same PluginConfig as the stages, run it once, and start the worker that re-runs it
+    /// every `period` while the rank waits on the network. `None` when the period is off, on
+    /// `--total 1` (no network waits), or when neither model compiles (warned, never fatal).
+    fn build_keepalive(&self, dir: &Path, plugin: &PluginConfig) -> Option<KeepAlive> {
+        let period = keepalive::resolve_period(self.gpu_keepalive_ms)?;
+        if self.total <= 1 {
+            info!("qwen35: GPU keep-alive requested, but --total 1 has no network waits; off");
+            return None;
+        }
+        let compile_ready = |xml: &Path, dtype: DType, shape: &[usize], data: Vec<u8>| {
+            let mut rt = Runtime::compile(xml.to_str().unwrap_or_default(), &self.device, plugin)
+                .map_err(|e| e.to_string())?;
+            let name = rt
+                .input_names()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "model has no inputs".to_string())?;
+            rt.set_input(&name, dtype, shape, &data)
+                .map_err(|e| e.to_string())?;
+            // One real infer here so a model that compiles but cannot run fails at load, not on
+            // the worker thread mid-task.
+            rt.infer().map_err(|e| e.to_string())?;
+            Ok::<Runtime, String>(rt)
+        };
+        let tmp = std::env::temp_dir().join(format!(
+            "cascadia-qwen36-keepalive-{}-r{}",
+            std::process::id(),
+            self.rank
+        ));
+        let synthetic = keepalive::write_synthetic_ir(&tmp)
+            .map_err(|e| e.to_string())
+            .and_then(|xml| {
+                compile_ready(
+                    &xml,
+                    DType::F32,
+                    &[1, keepalive::SYNTHETIC_WIDTH],
+                    le_bytes_f32(&vec![0.5f32; keepalive::SYNTHETIC_WIDTH]),
+                )
+            });
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (rt, model) = match synthetic {
+            Ok(rt) => (rt, "synthetic"),
+            Err(e) => {
+                warn!(error = %e, "qwen35 keep-alive: synthetic IR failed; trying the embeddings IR");
+                let emb = dir.join("openvino_text_embeddings_model.xml");
+                match compile_ready(&emb, DType::I64, &[1, 1], le_bytes_i64(&[0])) {
+                    Ok(rt) => (rt, "embeddings"),
+                    Err(e) => {
+                        warn!(error = %e, "qwen35 keep-alive: no model compiled; keep-alive OFF");
+                        return None;
+                    }
+                }
+            }
+        };
+        info!(
+            period_ms = period.as_millis() as u64,
+            model,
+            device = %self.device,
+            rank = self.rank,
+            "qwen35 GPU keep-alive on"
+        );
+        let mut rt = rt;
+        Some(KeepAlive::spawn(
+            period,
+            profile::profile_enabled(),
+            move || rt.infer().map_err(|e| e.to_string()),
+        ))
     }
 }
 
@@ -597,6 +683,9 @@ impl Builder for Qwen36Builder {
             );
         }
 
+        // After the stages, so the keep-alive never competes with their compile; a failure here
+        // only turns the keep-alive off.
+        self.keepalive = self.build_keepalive(&dir, &plugin);
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
         self.hidden = manifest.hidden();
@@ -679,6 +768,7 @@ impl Builder for Qwen36Builder {
             last_restore_bytes: 0,
             prof: profiling.then(ProfileState::default),
             perf_count,
+            keepalive: self.keepalive,
         }))
     }
 }
@@ -848,6 +938,10 @@ pub struct Qwen36Engine {
     /// Stages compiled with `PERF_COUNT=YES` (`--ov-config PERF_COUNT=YES`), so the profile's
     /// one-off dump after the 8th decode step can read `Runtime::profiling()`.
     perf_count: bool,
+    /// GPU keep-alive worker (`--gpu-keepalive-ms`; pipeline ranks only, see
+    /// `qwen36_keepalive`). Fires between `ka_begin` and `ka_end`, i.e. only while this rank is
+    /// blocked on the network, never during its own stage inference.
+    keepalive: Option<KeepAlive>,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -1172,7 +1266,8 @@ impl Qwen36Engine {
         } else {
             0.0
         };
-        self.prof_task_end(&t.task_id);
+        let keepalive_infers = self.ka_take_infers();
+        self.prof_task_end(&t.task_id, keepalive_infers);
         // Which branch `reset_all` will take, sampled before the call clears
         // `state_restored`. With the prefix cache always on, every warm turn
         // pays `recreate_request()` per stage — `reset_s` is what that costs.
@@ -1189,6 +1284,7 @@ impl Qwen36Engine {
             tok_s,
             reset_s,
             recreate,
+            keepalive_infers,
             "qwen36 task done"
         );
         if !t.wire_ms.is_empty() {
@@ -1224,7 +1320,8 @@ impl Qwen36Engine {
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
-        self.prof_task_end(&t.task_id);
+        let keepalive_infers = self.ka_take_infers();
+        self.prof_task_end(&t.task_id, keepalive_infers);
         self.reset_all();
         vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
     }
@@ -1325,6 +1422,9 @@ impl Qwen36Engine {
             le_bytes_f32(hidden),
         );
         let t_rtt = self.prof.is_some().then(Instant::now);
+        // The whole exchange is a network wait for this rank (its stage has run): let the GPU
+        // keep-alive fire until the token is back.
+        self.ka_begin();
         let r = run_async(
             &h,
             reply_bounded(async move {
@@ -1345,6 +1445,7 @@ impl Qwen36Engine {
             }),
         )
         .map_err(map_wire);
+        self.ka_end();
         self.prof_record_rtt(t_rtt, r.as_ref().ok().map(|(_, us)| *us));
         r
     }
@@ -1887,6 +1988,9 @@ impl Qwen36Engine {
             .ok_or_else(|| EngineError::Backend("last rank has no upstream".into()))?;
         let h = self.handle()?;
         let t_wait = self.prof.is_some().then(Instant::now);
+        // Blocked on the upstream frame: the GPU keep-alive may fire until it lands (a wait
+        // longer than its idle valve — between tasks — silences it; see `qwen36_keepalive`).
+        self.ka_begin();
         let frame = run_async(&h, async move {
             let mut g = upstream.lock().await;
             let hb = g.recv_raw(12).await?;
@@ -1969,7 +2073,9 @@ impl Qwen36Engine {
                 _ => Err(TransportError::SocketClosed),
             }
         })
-        .map_err(map_wire)?;
+        .map_err(map_wire);
+        self.ka_end();
+        let frame = frame?;
         let up_wait_us = t_wait.map(|t| t.elapsed().as_micros() as f64);
 
         let is_last = self.rank == self.total - 1;
@@ -2026,8 +2132,16 @@ impl Qwen36Engine {
                 // failed downstream reset = no ack = task fails loud at
                 // rank 0 (reset protocol).
                 // A relay has no task boundary of its own: the span since the previous RESET is
-                // its "task" for the profile summary.
-                self.prof_task_end(&TaskId::from(format!("epoch-{epoch}")));
+                // its "task" for the profile summary and the keep-alive count.
+                let keepalive_infers = self.ka_take_infers();
+                self.prof_task_end(&TaskId::from(format!("epoch-{epoch}")), keepalive_infers);
+                if keepalive_infers > 0 {
+                    info!(
+                        epoch,
+                        keepalive_infers,
+                        "qwen36 relay GPU keep-alive infers since the previous RESET"
+                    );
+                }
                 self.reset_all();
                 self.peer_epoch = epoch;
                 if !is_last {
@@ -2647,6 +2761,11 @@ impl Qwen36Engine {
         let Some(p) = self.prof.as_mut() else {
             return;
         };
+        if let Some(ka) = self.keepalive.as_ref() {
+            for s in ka.take_samples() {
+                p.acc.record("ka.infer", s);
+            }
+        }
         let (summary_due, dump_due) = p.end_step(extra, perf_count);
         if summary_due {
             info!(rank, steps = p.task_steps, summary = %p.acc.summary(), "qwen36 profile (p50/p95 per decode step)");
@@ -2673,15 +2792,35 @@ impl Qwen36Engine {
     }
 
     /// Final summary for the task (rank 0 / single-box) or for the span since the last RESET
-    /// (relays), then clear the accumulators.
-    fn prof_task_end(&mut self, task_id: &TaskId) {
+    /// (relays), then clear the accumulators. `keepalive_infers` is the span's keep-alive count
+    /// (0 when off), reported alongside.
+    fn prof_task_end(&mut self, task_id: &TaskId, keepalive_infers: u64) {
         let rank = self.rank;
         if let Some(p) = self.prof.as_mut() {
             if !p.acc.is_empty() {
-                info!(task = %task_id, rank, steps = p.task_steps, summary = %p.acc.summary(), "qwen36 profile (task)");
+                info!(task = %task_id, rank, steps = p.task_steps, keepalive_infers, summary = %p.acc.summary(), "qwen36 profile (task)");
             }
             p.reset();
         }
+    }
+
+    /// A blocking network wait is about to start: let the GPU keep-alive fire until `ka_end`.
+    fn ka_begin(&self) {
+        if let Some(k) = &self.keepalive {
+            k.begin_wait();
+        }
+    }
+
+    /// The wait returned; this rank's next stage infer follows, so the keep-alive stops first.
+    fn ka_end(&self) {
+        if let Some(k) = &self.keepalive {
+            k.end_wait();
+        }
+    }
+
+    /// Keep-alive infers since the last call (0 when off).
+    fn ka_take_infers(&self) -> u64 {
+        self.keepalive.as_ref().map_or(0, KeepAlive::take_infers)
     }
 
     /// Per-stage OpenVINO per-op profile of the LAST inference (`PERF_COUNT=YES`): total real
@@ -2811,7 +2950,8 @@ impl Engine for Qwen36Engine {
         if self.active.as_ref().is_some_and(|t| &t.task_id == task_id) {
             info!(task = %task_id, "qwen36: cancelled; dropping active task");
             self.active = None;
-            self.prof_task_end(task_id);
+            let keepalive_infers = self.ka_take_infers();
+            self.prof_task_end(task_id, keepalive_infers);
             // A prefix-cache hit restores over the live requests without its own reset, so the
             // only certified restore sequence is reset → prime → set_state: reset here rather
             // than leaving the cancelled task's state in place.
@@ -3380,6 +3520,7 @@ mod tests {
             last_restore_bytes: 0,
             prof: None,
             perf_count: false,
+            keepalive: None,
         }
     }
 
