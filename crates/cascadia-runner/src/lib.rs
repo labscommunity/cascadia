@@ -176,6 +176,44 @@ struct Buffers {
     /// same buffers section as the engine's submit of its task, so a cap check
     /// counts the task exactly once.
     handing_over: usize,
+    /// Submits to an engine with a [`SubmitAdmission`] that may take the
+    /// engine lock and hand their task to the engine directly: each holds a
+    /// [`SubmitPlace`] from before it tries the lock until the engine's submit
+    /// of its task (lowered in the same buffers section), so a submit queueing
+    /// meanwhile counts it against the engine's cap.
+    locked_submits: usize,
+}
+
+/// One [`Buffers::locked_submits`] place, held by a submit on its way to the
+/// engine lock. Released under the buffers lock with the engine's submit
+/// ([`Self::release`]), or on drop (a submit that queues instead, or one that
+/// unwound).
+struct SubmitPlace<'a> {
+    slot: &'a EngineSlot,
+    held: bool,
+}
+
+impl<'a> SubmitPlace<'a> {
+    fn take(slot: &'a EngineSlot) -> Self {
+        slot.buffers.lock().locked_submits += 1;
+        Self { slot, held: true }
+    }
+
+    /// Give the place back inside a buffers section the caller holds.
+    fn release(&mut self, bufs: &mut Buffers) {
+        if std::mem::take(&mut self.held) {
+            bufs.locked_submits = bufs.locked_submits.saturating_sub(1);
+        }
+    }
+}
+
+impl Drop for SubmitPlace<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            let mut bufs = self.slot.buffers.lock();
+            self.release(&mut bufs);
+        }
+    }
 }
 
 /// The engine, plus the state every release of it has to service: the
@@ -488,7 +526,8 @@ impl EngineSlot {
     /// with [`EngineError::QueueFull`] at [`MAX_DEFERRED_SUBMITS`] or when the
     /// engine's pending tasks plus the queued ones would reach the engine's
     /// own cap ([`SubmitAdmission::pending_load`]), which the engine would
-    /// otherwise refuse only at drain, after the response started. A
+    /// otherwise refuse only at drain, after the response started (submits
+    /// on their way to the engine lock count too: [`Buffers::locked_submits`]). A
     /// tombstoned id, or one already queued, is a no-op `Ok`, as in the
     /// locked path and [`Engine::submit`].
     fn defer_submit(
@@ -524,7 +563,10 @@ impl EngineSlot {
                 return Ok(());
             }
             if let Some(load) = admission.pending_load() {
-                let queued = load.pending + bufs.deferred_submits.len() + bufs.handing_over;
+                let queued = load.pending
+                    + bufs.deferred_submits.len()
+                    + bufs.handing_over
+                    + bufs.locked_submits;
                 if queued >= load.cap {
                     return Err(EngineError::QueueFull {
                         queued,
@@ -674,11 +716,19 @@ impl Runner {
             // thread blocked here counts toward the driver starvation that
             // wedges the pipeline (#122), which is why the async entry point
             // (`Runner::generate_async`) keeps this call off the runtime.
-            return self.submit_locked(self.slot.lock_applying_cancels(), task);
+            return self.submit_locked(self.slot.lock_applying_cancels(), task, None);
         };
+        // Taken before the lock, so a submit that queues while this one holds
+        // the lock (applying the deferred work, or inside the engine's submit)
+        // counts this task against the engine's cap.
+        let place = SubmitPlace::take(&self.slot);
         match self.slot.try_lock_applying_cancels() {
-            Some(guard) => self.submit_locked(guard, task),
-            None => self.slot.defer_submit(admission.as_ref(), task),
+            Some(guard) => self.submit_locked(guard, task, Some(place)),
+            None => {
+                // Queued instead: the queue holds its place from here on.
+                drop(place);
+                self.slot.defer_submit(admission.as_ref(), task)
+            }
         }
     }
 
@@ -690,11 +740,30 @@ impl Runner {
     /// instead. Taking the lock also flushed the cancels deferred while the
     /// engine was busy, freeing their slots before this task asks for one,
     /// and handed over the submits queued before this one.
+    ///
+    /// With a `place` (an engine with a [`SubmitAdmission`]), the tombstone
+    /// check, the engine's submit and the place's release run in one buffers
+    /// section, so a cap check sees the task either as a locked submit or in
+    /// the engine's pending count, never both or neither. The deferring
+    /// engine's submit is a cheap push.
     fn submit_locked(
         &self,
         mut guard: EngineGuard<'_>,
         task: GenerationTask,
+        place: Option<SubmitPlace<'_>>,
     ) -> Result<(), EngineError> {
+        if let Some(mut place) = place {
+            let mut bufs = self.slot.buffers.lock();
+            place.release(&mut bufs);
+            // The cancellation-safety check below, in the same section.
+            if bufs.cancelled.contains(&task.task_id) {
+                return Ok(());
+            }
+            return match guard.engine() {
+                Some(engine) => engine.submit(task),
+                None => Err(EngineError::NotLoaded),
+            };
+        }
         // ==== BEGIN cancellation-safety check — keep INSIDE the lock ====
         // NEVER hand the engine a task that is already tombstoned
         // cancelled. `generate_async` arms a cancel guard BEFORE it
@@ -4683,6 +4752,10 @@ mod tests {
     /// Where an [`AdmitEngine`] parks, with the engine lock held.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ParkAt {
+        /// In `cancel` of the task.
+        Cancel,
+        /// In `submit` of the task, before the engine counts it.
+        BeforeCount,
         /// In `submit` of the task, after the engine counts it.
         AfterCount,
     }
@@ -4720,7 +4793,7 @@ mod tests {
     /// at `max_tokens`, parking in `step()` while the gate is closed (10 s cap,
     /// so a broken test fails instead of hanging). `submit` refuses what its
     /// admission refuses, a task whose prompt is `engine-refuses`, and any task
-    /// past `cap` queued ones. `park` can hold it inside `submit`.
+    /// past `cap` queued ones. `park` can hold it inside `submit` or `cancel`.
     struct AdmitEngine {
         log: Arc<Mutex<EngineLog>>,
         gate: Arc<Gate>,
@@ -4747,6 +4820,7 @@ mod tests {
                     cap: self.cap,
                 });
             }
+            self.park.here(&task.task_id, ParkAt::BeforeCount);
             let task_id = task.task_id.clone();
             self.log.lock().submitted.push(task.task_id.clone());
             self.queue.push_back((task, 0));
@@ -4755,6 +4829,7 @@ mod tests {
             Ok(())
         }
         fn cancel(&mut self, task_id: &TaskId) {
+            self.park.here(task_id, ParkAt::Cancel);
             self.log.lock().cancelled.push(task_id.clone());
             self.queue.retain(|(t, _)| &t.task_id != task_id);
             self.pending.store(self.queue.len(), Ordering::SeqCst);
@@ -5247,6 +5322,60 @@ mod tests {
         assert!(chunks.last().unwrap().is_final, "{chunks:?}");
         assert!(!log.lock().submitted.iter().any(|t| t == "q1"));
         drop(held);
+    }
+
+    /// A submit that holds the engine lock but has not handed its task to the
+    /// engine yet holds its place against the engine's cap: a submit queueing
+    /// meanwhile for the last free place is refused at once with `QueueFull`,
+    /// not queued and then refused at drain after its response started. Both
+    /// windows: the holder still applying deferred cancels, and inside the
+    /// engine's submit before the engine counts the task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_locked_submit_holds_its_place_against_the_engine_cap() {
+        for at in [ParkAt::Cancel, ParkAt::BeforeCount] {
+            let park = Arc::new(Park::default());
+            // Engine cap 2: `a` takes one place, the locked submit `l` the other.
+            let (runner, log) =
+                admit_runner_parked(Gate::opened(), 2, true, true, park.clone()).await;
+            runner.submit(GenerationTask::new("a", "x")).unwrap();
+            let park_id = if at == ParkAt::Cancel {
+                runner
+                    .slot
+                    .buffers
+                    .lock()
+                    .deferred_cancels
+                    .push(TaskId::from("gone"));
+                "gone"
+            } else {
+                "l"
+            };
+            *park.at.lock() = Some((TaskId::from(park_id), at));
+            let r = runner.clone();
+            let locked =
+                tokio::task::spawn_blocking(move || r.submit(GenerationTask::new("l", "x")));
+            await_until(
+                "the locked submit to park with the engine lock held",
+                || park.is_parked(),
+            )
+            .await;
+            let r = runner.clone();
+            let late = tokio::task::spawn_blocking(move || r.submit(GenerationTask::new("d", "x")));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            park.release();
+            let res = tokio::time::timeout(Duration::from_secs(5), late)
+                .await
+                .expect("the late submit must not wait for the engine")
+                .unwrap();
+            match res {
+                Err(EngineError::QueueFull { queued, cap }) => {
+                    assert_eq!((queued, cap), (2, 2), "{at:?}");
+                }
+                other => panic!("{at:?}: expected QueueFull, got {other:?}"),
+            }
+            locked.await.unwrap().unwrap();
+            assert!(!queued(&runner, "d"), "{at:?}");
+            assert_eq!(log.lock().submitted, ["a", "l"], "{at:?}");
+        }
     }
 
     /// A queued submit that a drain is handing to the engine counts once
