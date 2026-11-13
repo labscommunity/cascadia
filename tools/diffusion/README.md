@@ -20,8 +20,22 @@ the worker extra installs only the dependencies needed to execute stages.
 ```sh
 python -m venv .venv
 .venv/bin/python -m pip install './tools/diffusion[runtime]'
-# For the qualified Windows/Python 3.14 environment, also pass:
-# -c tools/diffusion/constraints-windows-py314.txt
+```
+
+For the qualified Windows/Python 3.14 environment, run from the repository root
+with Python 3.14 selected:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -c tools\diffusion\constraints-windows-py314.txt '.\tools\diffusion[runtime]'
+```
+
+The following examples use the installed `cascadia-diffusion` entry point.
+Activate the environment first, or replace that command with
+`.venv/bin/python -m cascadia_diffusion` (Windows:
+`.\.venv\Scripts\python.exe -m cascadia_diffusion`).
+
+```sh
 cascadia-diffusion export-sdxl --source /models/sdxl-openvino \
   --revision MODEL_REPOSITORY_COMMIT --size 512 --output /models/sdxl-stages-512
 ```
@@ -39,8 +53,9 @@ Export prints a manifest digest. Pin that digest in deployment configuration;
 never accept the expected digest from a requesting peer. An export refuses to
 replace an existing output directory and only publishes a complete verified
 bundle. The two denoiser partitions preserve every live tensor crossing the
-cut, including residual connections. The exporter minimizes transfer within a
-45–55% weight-balance window. This is a memory partition, not a speedup promise.
+cut, including residual connections. The exporter selects the lowest-transfer
+candidate among 21 cuts near a 45–55% weight balance. This is a memory partition,
+not a speedup promise.
 
 ```sh
 cascadia-diffusion verify --source /models/sdxl-stages-512 \
