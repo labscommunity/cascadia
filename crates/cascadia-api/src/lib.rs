@@ -145,7 +145,7 @@ pub struct AppState {
     /// (probed at load, see [`template_opens_think`]). Stands in for the
     /// prompt when the engine renders it itself (see [`opens_think`]).
     pub template_opens_think: bool,
-    /// The same, rendered with `enable_thinking` undefined (see
+    /// The same, rendered with no `enable_thinking` and no `tools` key (see
     /// [`template_opens_think_unswitched`]): how an engine that applies the
     /// template itself without that switch (ov-genai) renders it. Stands in
     /// after a render-error fallback on such an engine.
@@ -1691,6 +1691,35 @@ fn render_with_chat_env_kwargs(
     preserve_thinking: Option<bool>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
+    render_chat_context(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        reasoning_effort,
+        preserve_thinking,
+        tools,
+        true,
+    )
+}
+
+/// [`render_with_chat_env_kwargs`], with `define_tools` saying whether the
+/// template sees a `tools` key at all. The API always sets it (`none` without
+/// tools); `false` leaves it undefined, as OpenVINO GenAI does when a request
+/// sends no tools.
+#[allow(clippy::too_many_arguments)]
+fn render_chat_context(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+    preserve_thinking: Option<bool>,
+    tools: Option<&[Tool]>,
+    define_tools: bool,
+) -> Result<String, PromptRenderError> {
     use minijinja::context;
     use minijinja::value::Value;
     let tmpl = env
@@ -1746,7 +1775,11 @@ fn render_with_chat_env_kwargs(
         add_generation_prompt => true,
         bos_token => bos_token,
         eos_token => eos_token,
-        tools => tools_value,
+    };
+    let ctx = if define_tools {
+        context! { tools => tools_value, ..ctx }
+    } else {
+        ctx
     };
     let ctx = match enable_thinking {
         Some(on) => context! { enable_thinking => on, ..ctx },
@@ -1896,8 +1929,10 @@ pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eo
 }
 
 /// The `<think>` probe both [`template_opens_think`] and
-/// [`template_opens_think_unswitched`] run: one render context, differing
-/// only in `enable_thinking`.
+/// [`template_opens_think_unswitched`] run. With `enable_thinking` set it
+/// renders the API's own context (`tools` set to `none`); with it `None` it
+/// renders the context GenAI gives a raw prompt: no `enable_thinking` and no
+/// `tools` key.
 fn probe_opens_think(
     env: &minijinja::Environment<'static>,
     bos: &str,
@@ -1912,7 +1947,18 @@ fn probe_opens_think(
         tool_call_id: None,
         reasoning_content: None,
     }];
-    match render_with_chat_env_kwargs(env, &msgs, bos, eos, enable_thinking, None, None, None) {
+    let define_tools = enable_thinking.is_some();
+    match render_chat_context(
+        env,
+        &msgs,
+        bos,
+        eos,
+        enable_thinking,
+        None,
+        None,
+        None,
+        define_tools,
+    ) {
         Ok(prompt) => prompt.trim_end().ends_with("<think>"),
         Err(e) => {
             warn!(
@@ -1925,8 +1971,9 @@ fn probe_opens_think(
     }
 }
 
-/// [`template_opens_think`] with `enable_thinking` left undefined, as
-/// ov-genai renders the template itself (it passes no such switch). A
+/// [`template_opens_think`] rendered as ov-genai renders the template itself
+/// for a raw prompt: no `enable_thinking` key (it passes no such switch) and
+/// no `tools` key (it sets `tools` only when a request sends some). A
 /// template that opens `<think>` only when the switch is set does not open it
 /// here; an R1-style one that always opens it does.
 pub fn template_opens_think_unswitched(
@@ -7065,21 +7112,20 @@ level={{ effort_map[eff] }}";
         assert!(!template_opens_think_unswitched(&qwen3, "", ""));
     }
 
-    /// Both probes render the same context apart from `enable_thinking`: a
-    /// template that branches on `tools is defined` around its generation
-    /// prompt gets the same answer from each.
+    /// The unswitched probe leaves `tools` undefined, as GenAI renders a raw
+    /// prompt (it sets `tools` only when a request sends some), so a template
+    /// that opens `<think>` only when `tools is defined` does not open it
+    /// there. The switched probe keeps the API's own context, where `tools`
+    /// is always set (`none` without tools).
     #[test]
-    fn think_probes_share_the_render_context() {
+    fn unswitched_think_probe_leaves_tools_undefined() {
         let env = build_chat_env(
             "{% for m in messages %}{{ m.content }}{% endfor %}\
              {% if add_generation_prompt %}{% if tools is defined %}<think>\n{% endif %}{% endif %}",
         )
         .unwrap();
-        assert_eq!(
-            template_opens_think(&env, "", ""),
-            template_opens_think_unswitched(&env, "", "")
-        );
-        assert!(template_opens_think_unswitched(&env, "", ""));
+        assert!(!template_opens_think_unswitched(&env, "", ""));
+        assert!(template_opens_think(&env, "", ""));
     }
 
     /// Qwen3-8B's generation prompt stops at `<|im_start|>assistant\n`: the
