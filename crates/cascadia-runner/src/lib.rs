@@ -172,7 +172,9 @@ struct Buffers {
     /// Queued submits a drain has taken off [`Self::deferred_submits`] and not
     /// yet handed to the engine: they hold a place against the engine's cap
     /// (see [`SubmitAdmission::pending_load`]) that neither the queue nor the
-    /// engine's pending count shows in the meantime.
+    /// engine's pending count shows in the meantime. Each is lowered in the
+    /// same buffers section as the engine's submit of its task, so a cap check
+    /// counts the task exactly once.
     handing_over: usize,
 }
 
@@ -318,28 +320,26 @@ impl EngineGuard<'_> {
             engine.cancel(tid);
         }
         for task in submits {
-            // Re-checked under the engine lock, as `Runner::submit` does: a
-            // cancel or drop that raced the take above has tombstoned it.
-            {
-                let mut bufs = slot.buffers.lock();
-                if bufs.cancelled.contains(&task.task_id) {
-                    bufs.handing_over = bufs.handing_over.saturating_sub(1);
-                    continue;
-                }
-            }
-            let task_id = task.task_id.clone();
-            let res = engine.submit(task);
-            // The engine's pending count now holds the task's place, if it took it.
+            // One buffers section (engine before buffers, the lock order) for
+            // the tombstone re-check, the engine's submit and the handover
+            // count: a submit checking the engine's cap then sees the task
+            // either here or in the engine's pending count, never in both
+            // (a spurious refusal one place below the cap) or in neither.
+            // The deferring engine's submit is a cheap push.
             let mut bufs = slot.buffers.lock();
             bufs.handing_over = bufs.handing_over.saturating_sub(1);
-            if let Err(e) = res {
+            // Re-checked under the engine lock, as `Runner::submit` does: a
+            // cancel or drop that raced the take above has tombstoned it.
+            if bufs.cancelled.contains(&task.task_id) {
+                continue;
+            }
+            let task_id = task.task_id.clone();
+            if let Err(e) = engine.submit(task) {
                 warn!(task = %task_id, error = %e, "engine refused a queued task");
-                if !bufs.cancelled.contains(&task_id) {
-                    bufs.chunks
-                        .entry(task_id.clone())
-                        .or_default()
-                        .push_back(Chunk::error(task_id, e.to_string()));
-                }
+                bufs.chunks
+                    .entry(task_id.clone())
+                    .or_default()
+                    .push_back(Chunk::error(task_id, e.to_string()));
             }
         }
     }
@@ -4680,11 +4680,47 @@ mod tests {
         }
     }
 
+    /// Where an [`AdmitEngine`] parks, with the engine lock held.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ParkAt {
+        /// In `submit` of the task, after the engine counts it.
+        AfterCount,
+    }
+
+    /// Parks an [`AdmitEngine`] at one point for one task until released
+    /// (10 s cap, so a broken test fails instead of hanging).
+    #[derive(Default)]
+    struct Park {
+        at: Mutex<Option<(TaskId, ParkAt)>>,
+        parked: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl Park {
+        fn here(&self, task_id: &TaskId, at: ParkAt) {
+            if self.at.lock().as_ref() != Some(&(task_id.clone(), at)) {
+                return;
+            }
+            self.parked.store(true, Ordering::SeqCst);
+            let start = Instant::now();
+            while !self.released.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        fn is_parked(&self) -> bool {
+            self.parked.load(Ordering::SeqCst)
+        }
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Steps the front task of its queue, one token per `step()` and a final
     /// at `max_tokens`, parking in `step()` while the gate is closed (10 s cap,
     /// so a broken test fails instead of hanging). `submit` refuses what its
     /// admission refuses, a task whose prompt is `engine-refuses`, and any task
-    /// past `cap` queued ones.
+    /// past `cap` queued ones. `park` can hold it inside `submit`.
     struct AdmitEngine {
         log: Arc<Mutex<EngineLog>>,
         gate: Arc<Gate>,
@@ -4693,6 +4729,7 @@ mod tests {
         admission: Option<Arc<RefuseByPrompt>>,
         /// `queue.len()`, kept current for the admission's `pending_load`.
         pending: Arc<AtomicUsize>,
+        park: Arc<Park>,
     }
 
     impl Engine for AdmitEngine {
@@ -4710,9 +4747,11 @@ mod tests {
                     cap: self.cap,
                 });
             }
+            let task_id = task.task_id.clone();
             self.log.lock().submitted.push(task.task_id.clone());
             self.queue.push_back((task, 0));
             self.pending.store(self.queue.len(), Ordering::SeqCst);
+            self.park.here(&task_id, ParkAt::AfterCount);
             Ok(())
         }
         fn cancel(&mut self, task_id: &TaskId) {
@@ -4787,6 +4826,17 @@ mod tests {
         admission: bool,
         report_load: bool,
     ) -> (Arc<Runner>, Arc<Mutex<EngineLog>>) {
+        admit_runner_parked(gate, cap, admission, report_load, Arc::default()).await
+    }
+
+    /// [`admit_runner_with`], the engine parking where `park` says.
+    async fn admit_runner_parked(
+        gate: Arc<Gate>,
+        cap: usize,
+        admission: bool,
+        report_load: bool,
+        park: Arc<Park>,
+    ) -> (Arc<Runner>, Arc<Mutex<EngineLog>>) {
         let log = Arc::new(Mutex::new(EngineLog::default()));
         let pending = Arc::new(AtomicUsize::new(0));
         let load = report_load.then(|| (pending.clone(), cap));
@@ -4797,6 +4847,7 @@ mod tests {
             cap,
             admission: admission.then(|| Arc::new(RefuseByPrompt { load })),
             pending,
+            park,
         })))));
         runner
             .start(
@@ -5196,6 +5247,49 @@ mod tests {
         assert!(chunks.last().unwrap().is_final, "{chunks:?}");
         assert!(!log.lock().submitted.iter().any(|t| t == "q1"));
         drop(held);
+    }
+
+    /// A queued submit that a drain is handing to the engine counts once
+    /// against the engine's cap: once the engine counts it, the drain's count
+    /// of it is gone, so a submit for the last free place queues instead of a
+    /// spurious `QueueFull`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handed_over_submit_counts_once_against_the_engine_cap() {
+        let park = Arc::new(Park::default());
+        // Engine cap 3: `a` and the queued `q` take two places, `d` the last.
+        let (runner, log) = admit_runner_parked(Gate::opened(), 3, true, true, park.clone()).await;
+        runner.submit(GenerationTask::new("a", "x")).unwrap();
+        {
+            // A busy engine: `q` queues.
+            let _held = runner.slot.lock();
+            let r = runner.clone();
+            tokio::task::spawn_blocking(move || r.submit(GenerationTask::new("q", "x")))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(queued(&runner, "q"));
+        *park.at.lock() = Some((TaskId::from("q"), ParkAt::AfterCount));
+        // A cancel of another task takes the engine lock and hands `q` over.
+        let r = runner.clone();
+        let drain = tokio::task::spawn_blocking(move || r.cancel(&TaskId::from("other")));
+        await_until("the drain to park after the engine counted q", || {
+            park.is_parked()
+        })
+        .await;
+        let r = runner.clone();
+        let late = tokio::task::spawn_blocking(move || r.submit(GenerationTask::new("d", "x")));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        park.release();
+        let res = tokio::time::timeout(Duration::from_secs(5), late)
+            .await
+            .expect("the late submit must not wait for the engine")
+            .unwrap();
+        assert!(res.is_ok(), "d fits under the engine's cap: {res:?}");
+        drain.await.unwrap();
+        drop(runner.slot.lock_applying_cancels());
+        assert_eq!(log.lock().submitted, ["a", "q", "d"]);
+        assert_eq!(runner.slot.buffers.lock().handing_over, 0);
     }
 
     /// A drain that finds the slot emptied counts no place for the submits it
