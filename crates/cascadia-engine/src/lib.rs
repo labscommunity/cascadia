@@ -429,6 +429,10 @@ pub trait Engine: Send {
     /// that holds the lock for a whole generation returns one; the runner then queues a submit
     /// that finds the engine busy, after `check` passes, and hands it to the engine at the next
     /// lock acquisition. Grabbed once at engine load, like [`Self::inflight_cancel`].
+    ///
+    /// An engine that returns one must keep [`Self::submit`] cheap and non-blocking (a push onto
+    /// its queue): the runner calls it under its buffers lock, so that a cap check sees each task
+    /// exactly once, and a slow submit there would stall chunk delivery to every stream.
     fn submit_admission(&self) -> Option<std::sync::Arc<dyn SubmitAdmission>> {
         None
     }

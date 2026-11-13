@@ -5364,7 +5364,7 @@ mod tests {
             park.release();
             let res = tokio::time::timeout(Duration::from_secs(5), late)
                 .await
-                .expect("the late submit must not wait for the engine")
+                .expect("the late submit must return: refused, not queued behind the engine")
                 .unwrap();
             match res {
                 Err(EngineError::QueueFull { queued, cap }) => {
@@ -5412,7 +5412,7 @@ mod tests {
         park.release();
         let res = tokio::time::timeout(Duration::from_secs(5), late)
             .await
-            .expect("the late submit must not wait for the engine")
+            .expect("the late submit must return: queued, not refused")
             .unwrap();
         assert!(res.is_ok(), "d fits under the engine's cap: {res:?}");
         drain.await.unwrap();

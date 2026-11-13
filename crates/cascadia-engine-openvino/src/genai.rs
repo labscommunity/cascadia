@@ -3908,6 +3908,7 @@ mod tests {
                 .with_label_values(&["divergence-model"])
                 .get()
         };
+        let before = diverged();
         let (plain, logs, stream_text) = run(false);
         assert_eq!(plain.len(), 1, "{plain:?}");
         assert!(plain[0].is_final && plain[0].error.is_none(), "{plain:?}");
@@ -3916,7 +3917,7 @@ mod tests {
         assert_eq!(plain[0].n_tokens, Some(2));
         assert_eq!(stream_text, [false], "no per-write decode");
         assert!(!logs.contains("ov_genai_stream_divergence"), "{logs}");
-        assert_eq!(diverged(), 0, "a non-streamed answer never diverges");
+        assert_eq!(diverged(), before, "a non-streamed answer never diverges");
 
         let (streamed, logs, stream_text) = run(true);
         assert_eq!(stream_text, [true]);
@@ -3924,7 +3925,11 @@ mod tests {
         assert_eq!(joined(&streamed), "it ''s a", "{streamed:?}");
         assert_eq!(usage(&streamed), 2, "{streamed:?}");
         assert!(logs.contains("ov_genai_stream_divergence"), "{logs}");
-        assert_eq!(diverged(), 1, "the divergence is counted under its model");
+        assert_eq!(
+            diverged(),
+            before + 1,
+            "the divergence is counted once under its model"
+        );
     }
 
     /// A U+FFFD that stays (a byte no character takes) refuses the check of
