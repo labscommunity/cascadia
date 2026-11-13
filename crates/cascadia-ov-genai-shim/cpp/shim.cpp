@@ -344,6 +344,8 @@ int32_t cascadia_pipeline_create_vlm(
         auto props = collect_properties(properties_kv, properties_count);
         if (enable_prompt_lookup) {
             props[ov::genai::prompt_lookup.name()] = true;
+            // Same GenAI 2026.4.1 assertion as the LLM path: prompt lookup refuses prefix caching.
+            props[ov::genai::scheduler_config.name()] = speculative_scheduler_config();
         }
         auto vlm = std::make_unique<ov::genai::VLMPipeline>(
             std::filesystem::path(model_path), std::string(device), props);
