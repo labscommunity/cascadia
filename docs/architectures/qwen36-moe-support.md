@@ -430,6 +430,56 @@ single-box envelope, wire p50 ~21 ms / p95 ~24 ms. A 3-stage chain
 with a real middle rank measured per-hop-additive wire (~2× single
 hop) and parity exact — 2-node remains the perf-reference config.
 
+### 6.1 Greedy n-gram speculative decoding (`--prompt-lookup N --spec-k K`)
+
+Single-box and pipeline (`crates/cascadia-engine-openvino/src/qwen36_spec.rs`
+holds the pure parts). Per decode step the driver looks the trailing `N`
+tokens of the sequence up in the sequence itself (prompt + generated); the
+up-to-`K` tokens that followed the most recent earlier occurrence are the
+draft. `[pending, d_1..d_K]` runs as ONE `T = K+1` span; the last stage must
+emit logits for every position, so the tree has to be exported with
+`cascadia shard --full-logits` (manifest `last_logits_only: false`; the
+engine refuses `--prompt-lookup` on a sliced tree). `j` = leading agreement
+between the per-row argmaxes and the draft; `pending, d_1..d_j` are emitted
+and the row after the last accepted position is the next pending token. No
+match ⇒ a plain T=1 step.
+
+Rollback on a partial accept (`j < K`): the attention KV of the whole span
+is masked out of every later pass (per-rank `attention_mask` with zeros at
+the dead cache slots; logical `position_ids` continue from the accepted
+count), the Gated DeltaNet `conv`/`ssm` states — fixed shape, not maskable —
+are restored from a snapshot every rank takes right before the span (shim
+`get_state_vars("past.conv.|past.ssm.")` / `set_state_vars`), and the
+accepted `j+1` tokens are re-fed as a `T = j+1` pass whose logits are
+discarded. Each rollback leaves `K+1` dead slots in the cache for the rest
+of the task.
+
+Pipeline frames (append-only kinds, HELLO unchanged — every rank must run a
+build that knows them):
+
+| kind | dir | header `pos` | body |
+|---|---|---|---|
+| `VERIFY` (13) | down | logical span start | `[1,T,hidden]` f32 (as FORWARD); every rank snapshots DeltaNet first |
+| `TOKENS` (14) | up | echoed | `[u32 count][i32 token]*count[u32 infer_us]` BE — argmax of every row (last rank), relayed unchanged by middles (+ their infer µs) |
+| `COMMIT` (15) | down | accepted positions `j+1` | `[u32 span_len]` BE — only after a partial accept; each rank restores + masks, then relays |
+| `COMMIT_ACK` (16) | up | 1 = whole chain rolled back / 0 = a rank failed (task fails loud) | — |
+
+A VERIFY followed by any frame other than COMMIT was fully accepted (the
+snapshot is dropped); after COMMIT the head re-feeds the accepted tokens as
+a plain FORWARD at the same logical `pos` and discards its TOKEN.
+
+Observability: `qwen36 task done` carries `spec_steps / spec_drafted /
+spec_accepted / spec_full_accept_steps / spec_rollbacks / spec_acceptance`
+and the per-phase ms (`snapshot`, `verify`, `restore`, `refeed`); the same
+land on `cascadia_spec_steps_total`, `cascadia_spec_drafted_total`,
+`cascadia_spec_accepted_total`, `cascadia_spec_full_accept_steps_total` and
+`cascadia_spec_phase_seconds{phase}`; per-step detail at `debug` ("qwen36
+spec step"). `CASCADIA_QWEN36_PROFILE=1` adds a per-decode-step timing
+summary every 32 steps and at task end (embed, per-stage set/infer/out,
+downstream RTT and wire share, upstream wait on relays, sampling), and with
+`--ov-config PERF_COUNT=YES` a one-off per-stage OpenVINO node profile after
+the 8th decode step of a task.
+
 ## 7. Out of scope (v1, regardless of strategy)
 
 Vision tower; MTP/speculative decoding; batching/multi-stream (priced

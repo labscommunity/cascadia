@@ -43,7 +43,9 @@ use cascadia_types::{
 };
 use futures::stream;
 use tokenizers::Tokenizer;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+use crate::qwen36_spec::{self as spec, CacheMask, ProfileAcc, SpecStats};
 
 /// Hidden width of shard trees exported before `manifest.hidden_size`
 /// existed (the Qwen3.6-35B-A3B surgery, hidden 2048). Newer manifests
@@ -196,6 +198,22 @@ const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
 /// degrading. Only emitted for a non-empty tenant AND a chain that advertised support at HELLO.
 #[cfg(feature = "kv_coord")]
 const FRAME_CAPTURE_V2: u32 = 12;
+/// Greedy n-gram speculative decode (`qwen36_spec`). VERIFY carries the FORWARD body
+/// ([1,T,hidden] f32 at logical `pos`); every rank snapshots its DeltaNet `conv`/`ssm` states
+/// before running it and the LAST rank answers TOKENS — `[u32 count][i32 token]*count
+/// [u32 infer_us]`, the argmax of EVERY row — which middles relay upstream, adding their infer
+/// share like TOKEN. COMMIT (downstream; header `pos` = accepted positions, body `[u32
+/// span_len]`) is sent only after a PARTIAL accept: each rank restores its snapshot, marks the
+/// span's cache slots dead in its own `kv_mask`, relays, and the last rank answers COMMIT_ACK
+/// (header `pos` = 1 every rank rolled back / 0 some rank failed) back through the middles; rank
+/// 0 then re-feeds the accepted tokens as a plain FORWARD at the same logical `pos`. A VERIFY
+/// followed by anything but COMMIT was fully accepted and the snapshot is dropped. Append-only
+/// kinds; the HELLO payload is unchanged, so `PROTO_VERSION` stays — every rank must run a build
+/// that knows these kinds (an older peer fails loud on the unknown frame).
+const FRAME_VERIFY: u32 = 13;
+const FRAME_TOKENS: u32 = 14;
+const FRAME_COMMIT: u32 = 15;
+const FRAME_COMMIT_ACK: u32 = 16;
 /// Handshake schema version (spec §3.4).
 const PROTO_VERSION: u32 = 1;
 /// H.1b (R2) HELLO capability level for `FRAME_CAPTURE_V2`. Advertised in the payload (downstream
@@ -372,9 +390,21 @@ pub struct Qwen36Builder {
     im_start_id: Option<u32>,
     /// `max_position_embeddings` from the tree's config.json (`None` = unknown, no guard).
     max_ctx: Option<usize>,
+    /// Greedy n-gram (prompt-lookup) speculative decode: n-gram size (0 = off) and draft length.
+    spec_ngram: usize,
+    spec_k: usize,
 }
 
 impl Qwen36Builder {
+    /// Greedy n-gram (prompt-lookup) speculative decoding — `--prompt-lookup N --spec-k K`:
+    /// `ngram` = n-gram size (0 = off), `k` = draft tokens verified per span (clamped to
+    /// `1..=MAX_SPEC_K`). Needs a shard tree whose last stage emits logits for EVERY position
+    /// (`cascadia shard --full-logits`); `load` refuses a `last_logits_only` tree.
+    pub fn with_spec(mut self, ngram: usize, k: usize) -> Self {
+        self.spec_ngram = ngram;
+        self.spec_k = k.clamp(1, spec::MAX_SPEC_K);
+        self
+    }
     pub fn with_cache_dir(mut self, dir: impl Into<String>) -> Self {
         self.cache_dir = Some(dir.into());
         self
@@ -438,6 +468,8 @@ impl Qwen36Builder {
             prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
             im_start_id: None,
             max_ctx: None,
+            spec_ngram: 0,
+            spec_k: 0,
         }
     }
 
@@ -527,6 +559,8 @@ impl Builder for Qwen36Builder {
                 manifest.stages.len()
             )));
         }
+        spec_requires_full_logits(self.spec_ngram, manifest.last_logits_only)
+            .map_err(EngineError::InvalidConfig)?;
 
         let mut progress = vec![LoadProgress::message(format!(
             "qwen35 ({}, hidden {}): {} stages from {} (rank {}/{})",
@@ -623,7 +657,10 @@ impl Builder for Qwen36Builder {
             budget_gib = prefix_cache_bytes >> 30,
             im_start = ?self.im_start_id,
             max_ctx = ?self.max_ctx,
-            "qwen35 prefix cache"
+            spec_ngram = self.spec_ngram,
+            spec_k = self.spec_k,
+            profile = profile_enabled(),
+            "qwen35 prefix cache / spec / profile"
         );
         Ok(Box::new(Qwen36Engine {
             emb: self.emb,
@@ -666,8 +703,41 @@ impl Builder for Qwen36Builder {
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
+            spec_ngram: self.spec_ngram,
+            spec_k: self.spec_k,
+            kv_mask: CacheMask::new(),
+            pending_verify: None,
+            prof: profile_enabled().then(ProfileState::default),
+            perf_count: self.ov_properties.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("PERF_COUNT") && v.eq_ignore_ascii_case("YES")
+            }),
         }))
     }
+}
+
+/// Speculation verifies `k+1` positions in one span and needs the argmax of EVERY row, but the
+/// exporter's default slices the last stage's logits to the final position.
+fn spec_requires_full_logits(ngram: usize, last_logits_only: bool) -> Result<(), String> {
+    if ngram > 0 && last_logits_only {
+        return Err(
+            "speculative decoding (--prompt-lookup) needs logits for every position, but this \
+                    shard tree was exported with last_logits_only=true (the last stage slices to \
+                    the final row). Re-export it with full logits — `cascadia shard ... \
+                    --full-logits` (or `export_qwen36_moe.py --full-logits` / \
+                    CASCADIA_QWEN36_FULL_LOGITS=1) — or drop --prompt-lookup."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// `CASCADIA_QWEN36_PROFILE=1` ⇒ per-token timing instrumentation (section B): embed / per-stage
+/// set_input-infer-output / transport wait / sampling µs per decode step, summarised every
+/// `PROFILE_SUMMARY_EVERY` steps and at task end, plus a one-off `Runtime::profiling()` dump per
+/// task when the stages were compiled with `PERF_COUNT=YES`. Read once at build; unset ⇒ `None`
+/// and no `Instant::now()` on the hot path.
+fn profile_enabled() -> bool {
+    std::env::var("CASCADIA_QWEN36_PROFILE").ok().as_deref() == Some("1")
 }
 
 fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
@@ -829,7 +899,52 @@ pub struct Qwen36Engine {
     /// Bytes of the parts restored by the latest prefix-cache hit: the size estimate for the
     /// state a refresh snapshot of this conversation would copy.
     last_restore_bytes: usize,
+    /// Greedy n-gram speculative decode (`qwen36_spec`; 0 = off). Rank 0 / single-box drive it;
+    /// relay ranks only need the VERIFY/COMMIT handlers.
+    spec_ngram: usize,
+    spec_k: usize,
+    /// Validity of THIS rank's attention-KV cache slots (zeros at rolled-back verify spans), fed
+    /// as `attention_mask` on every pass; reset with the stages. Every rank applies the same
+    /// append/rollback operations in lockstep, so the masks agree chain-wide.
+    kv_mask: CacheMask,
+    /// Relay ranks: the DeltaNet snapshot taken for the last VERIFY, awaiting COMMIT (any other
+    /// frame next means the span was fully accepted and the snapshot is dropped).
+    pending_verify: Option<PendingVerify>,
+    /// `CASCADIA_QWEN36_PROFILE=1` accumulators; `None` ⇒ no timing on the hot path.
+    prof: Option<ProfileState>,
+    /// Stages compiled with `PERF_COUNT=YES` (`--ov-config PERF_COUNT=YES`), so the profile dump
+    /// after the 8th decode step can read `Runtime::profiling()`.
+    perf_count: bool,
 }
+
+/// A relay rank's DeltaNet (`conv`/`ssm`) snapshot for an in-flight VERIFY span.
+struct PendingVerify {
+    /// Logical position the span started at.
+    pos: usize,
+    span_len: usize,
+    /// One `Runtime::get_state_vars` blob per local stage.
+    parts: Vec<Vec<u8>>,
+}
+
+/// Per-step timing state behind `CASCADIA_QWEN36_PROFILE=1`.
+#[derive(Default)]
+struct ProfileState {
+    acc: ProfileAcc,
+    /// Decode steps since the last summary line.
+    since_summary: usize,
+    /// Decode steps of the current task (rank 0 / single-box) or since the last RESET (relays).
+    task_steps: usize,
+    /// The last chain pass's per-local-stage (set_input, infer, output) µs.
+    stage_last: Vec<(u64, u64, u64)>,
+    /// The last `embed_seq` µs (rank 0 / single-box).
+    embed_last_us: u64,
+    /// The PERF_COUNT dump already ran for this task.
+    perf_dumped: bool,
+}
+
+/// Profile summary cadence (decode steps) and the step after which the PERF_COUNT dump fires.
+const PROFILE_SUMMARY_EVERY: usize = 32;
+const PERF_DUMP_AFTER_STEPS: usize = 8;
 
 /// In-flight task state. `step()` advances one token per call so the
 /// runner can interleave cancel() between steps (a monolithic step()
@@ -876,6 +991,12 @@ struct ActiveTask {
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
     /// decode frames (n=1), for the pipeline gate-4 wire histogram.
     wire_ms: Vec<f64>,
+    /// Speculation on: every token of the sequence so far — the prompt (resume prefix
+    /// included) plus every token fed since, the pending one once it is about to be fed. The
+    /// n-gram draft's lookup table. Empty when speculation is off.
+    history: Vec<u32>,
+    /// Speculative-decode counters for the task-done line and the `cascadia_spec_*` metrics.
+    spec: SpecStats,
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -923,6 +1044,20 @@ enum InFrame {
         hidden: Vec<f32>,
         n: usize,
     },
+    /// Speculative verify span (FORWARD body at logical `pos`): snapshot DeltaNet first, answer
+    /// with every row's argmax (`FRAME_TOKENS`).
+    Verify {
+        epoch: u32,
+        pos: u32,
+        hidden: Vec<f32>,
+        n: usize,
+    },
+    /// Rollback of the last VERIFY: only `accepted` of its `span_len` positions stand.
+    Commit {
+        epoch: u32,
+        accepted: u32,
+        span_len: u32,
+    },
     /// Issue-34 §8 CAPTURE: snapshot local KV under the head's content `kv_epoch` (body-carried).
     /// `partner` is `Some` only for `FRAME_CAPTURE_V2` (H.1b R2); `None` keeps the v1 frame's
     /// un-namespaced stash.
@@ -947,6 +1082,7 @@ enum InFrame {
 impl Qwen36Engine {
     /// Embed a token span: [1, n] ids -> flattened [1, n, hidden] f32.
     fn embed_seq(&mut self, toks: &[u32]) -> EngineResult<Vec<f32>> {
+        let t_emb = self.prof.is_some().then(Instant::now);
         let emb = self
             .emb
             .as_mut()
@@ -976,32 +1112,49 @@ impl Qwen36Engine {
                 self.hidden
             )));
         }
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), t_emb) {
+            p.embed_last_us = t.elapsed().as_micros() as u64;
+        }
         Ok(f32_from_le(&bytes))
     }
 
-    /// One pass through the local stage chain covering absolute positions
-    /// [t0, t1) (T = t1-t0; the stage IRs are dynamic in T). `hidden` is
-    /// real embeddings on the global first stage, the upstream stage's
-    /// output otherwise. Returns the last stage's full first output,
-    /// flattened [1, T, width].
+    /// One pass through the local stage chain for `n = t1 - t0` new tokens at LOGICAL
+    /// positions `[t0, t1)` (the stage IRs are dynamic in T). `embeds` is real embeddings on the
+    /// global first stage, the upstream stage's output otherwise. The attention mask comes from
+    /// `kv_mask` — all ones of length `t1` until a speculative rollback has left dead slots in
+    /// the cache, zeros at those slots after — and the pass appends its `n` slots as valid.
+    /// Returns the last local stage's full first output, flattened `[1, T, width]`.
     fn chain_pass(&mut self, embeds: &[f32], t0: usize, t1: usize) -> EngineResult<Vec<f32>> {
-        let out = self.chain_pass_inner(embeds, t0, t1)?;
+        let n = t1 - t0;
+        let mask = self.kv_mask.mask_for(t0, n);
+        let out = self.chain_pass_inner(embeds, t0, n, &mask)?;
         // Only a pass that ran every local stage counts as priming (see `primed`).
         self.primed = true;
+        self.kv_mask.append(n);
         Ok(out)
     }
 
-    fn chain_pass_inner(&mut self, embeds: &[f32], t0: usize, t1: usize) -> EngineResult<Vec<f32>> {
-        let n = t1 - t0;
-        let mask = vec![1i64; t1];
+    /// `mask` is the full `attention_mask` row: one entry per cached slot (1 live / 0 rolled
+    /// back) followed by `n` ones for the new tokens; position ids are the logical `t0..t0+n`.
+    fn chain_pass_inner(
+        &mut self,
+        embeds: &[f32],
+        t0: usize,
+        n: usize,
+        mask: &[i64],
+    ) -> EngineResult<Vec<f32>> {
+        let t1 = t0 + n;
         let pos: Vec<i64> = (0..MROPE_ROWS)
             .flat_map(|_| (t0 as i64)..(t1 as i64))
             .collect();
         let width = self.hidden;
         let zeros_embeds = vec![0f32; n * width];
         let first_global = self.rank == 0;
+        let profiling = self.prof.is_some();
+        let mut stage_times: Vec<(u64, u64, u64)> = Vec::new();
         let mut hidden: Vec<f32> = embeds.to_vec();
         for (j, st) in self.stages.iter_mut().enumerate() {
+            let t_set = profiling.then(Instant::now);
             let names = st.input_names().map_err(map_ov)?;
             for name in &names {
                 match name.as_str() {
@@ -1020,7 +1173,7 @@ impl Qwen36Engine {
                             .map_err(map_ov)?;
                     }
                     s if s.contains("attention_mask") => st
-                        .set_input(name, DType::I64, &[1, t1], &le_bytes_i64(&mask))
+                        .set_input(name, DType::I64, &[1, mask.len()], &le_bytes_i64(mask))
                         .map_err(map_ov)?,
                     s if s.contains("position") => st
                         .set_input(name, DType::I64, &[MROPE_ROWS, 1, n], &le_bytes_i64(&pos))
@@ -1035,7 +1188,9 @@ impl Qwen36Engine {
                     }
                 }
             }
+            let t_inf = profiling.then(Instant::now);
             st.infer().map_err(map_ov)?;
+            let t_out = profiling.then(Instant::now);
             let (dtype, _shape, bytes) = st.output(0).map_err(map_ov)?;
             if !matches!(dtype, DType::F32) {
                 return Err(EngineError::Backend(format!(
@@ -1043,16 +1198,34 @@ impl Qwen36Engine {
                 )));
             }
             hidden = f32_from_le(&bytes);
+            if let (Some(a), Some(b), Some(c)) = (t_set, t_inf, t_out) {
+                stage_times.push((
+                    (b - a).as_micros() as u64,
+                    (c - b).as_micros() as u64,
+                    c.elapsed().as_micros() as u64,
+                ));
+            }
+        }
+        if let Some(p) = self.prof.as_mut() {
+            p.stage_last = stage_times;
         }
         Ok(hidden)
+    }
+
+    /// Run a token span at logical position `t0` through embeddings + the whole local chain;
+    /// returns the last stage's raw output — every row (`[1, T, vocab]` flattened), or the
+    /// single last row on a `last_logits_only` tree. Single-box only (needs the full chain).
+    fn run_span_out(&mut self, toks: &[u32], t0: usize) -> EngineResult<Vec<f32>> {
+        let n = toks.len();
+        let e = self.embed_seq(toks)?;
+        self.chain_pass(&e, t0, t0 + n)
     }
 
     /// Run a token span starting at absolute position `t0`; returns the
     /// LAST position's logits row. Single-box only (needs the full chain).
     fn run_span(&mut self, toks: &[u32], t0: usize) -> EngineResult<Vec<f32>> {
         let n = toks.len();
-        let e = self.embed_seq(toks)?;
-        let out = self.chain_pass(&e, t0, t0 + n)?;
+        let out = self.run_span_out(toks, t0)?;
         if self.last_logits_only {
             // Exporter already sliced the last stage to the final
             // position; the output IS the last row.
@@ -1064,6 +1237,10 @@ impl Qwen36Engine {
 
     fn reset_all(&mut self) {
         self.primed = false;
+        // Both are per-task: the mask tracks the cache the reset is about to drop, and a parked
+        // VERIFY snapshot belongs to the span the next frame will never COMMIT.
+        self.kv_mask.reset();
+        self.pending_verify = None;
         // After a restore, `reset_state` leaves residue on this model, so rebuild the request
         // instead. With the prefix cache always on that is every WARM turn — `state_restored` is
         // set by each hit — and the cheap reset is what a cold turn (no hit, nothing restored)
@@ -1104,8 +1281,13 @@ impl Qwen36Engine {
         };
         // Issue-34: capture this rank's local KV under (prompt + generated) BEFORE reset_all wipes
         // it. Keyed by the full sequence (session-resume). Gated + best-effort (stub ⇒ no-op).
+        // A task that rolled a verify span back has dead slots in its attention KV: the blob
+        // would report a depth the token count does not match, and `kv_seq_from_framed_blob`
+        // would resume the next turn at the wrong position. No capture from such a state.
         #[cfg(feature = "kv_coord")]
-        {
+        if !self.kv_mask.is_clean() {
+            debug!(task = %t.task_id, rejected_slots = self.kv_mask.rejected(), "qwen36: KV capture skipped (speculative rollbacks left dead cache slots)");
+        } else {
             // Skip the resume seed: `prompt_ids` already carries those ids, so
             // counting them again keys the blob at a depth that never matches
             // the fed sequence (same defect dist_spec fixed).
@@ -1134,6 +1316,22 @@ impl Qwen36Engine {
         } else {
             0.0
         };
+        self.prof_task_end(&t.task_id);
+        if t.spec.steps > 0 {
+            let l = &["qwen35"];
+            cascadia_metrics::SPEC_STEPS_TOTAL
+                .with_label_values(l)
+                .inc_by(t.spec.steps);
+            cascadia_metrics::SPEC_DRAFTED_TOTAL
+                .with_label_values(l)
+                .inc_by(t.spec.drafted);
+            cascadia_metrics::SPEC_ACCEPTED_TOTAL
+                .with_label_values(l)
+                .inc_by(t.spec.accepted);
+            cascadia_metrics::SPEC_FULL_ACCEPT_STEPS_TOTAL
+                .with_label_values(l)
+                .inc_by(t.spec.full_accepts);
+        }
         // Which branch `reset_all` will take, sampled before the call clears
         // `state_restored`. With the prefix cache always on, every warm turn
         // pays `recreate_request()` per stage — `reset_s` is what that costs.
@@ -1150,6 +1348,17 @@ impl Qwen36Engine {
             tok_s,
             reset_s,
             recreate,
+            spec_steps = t.spec.steps,
+            spec_drafted = t.spec.drafted,
+            spec_accepted = t.spec.accepted,
+            spec_full_accept_steps = t.spec.full_accepts,
+            spec_rollbacks = t.spec.rollbacks,
+            spec_acceptance = t.spec.acceptance(),
+            spec_snapshot_ms = t.spec.snapshot_us / 1000,
+            spec_restore_ms = t.spec.restore_us / 1000,
+            spec_verify_ms = t.spec.verify_us / 1000,
+            spec_refeed_ms = t.spec.refeed_us / 1000,
+            spec_disabled = ?t.spec.disabled,
             "qwen36 task done"
         );
         if !t.wire_ms.is_empty() {
@@ -1185,6 +1394,7 @@ impl Qwen36Engine {
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
+        self.prof_task_end(&t.task_id);
         self.reset_all();
         vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
     }
@@ -1284,7 +1494,8 @@ impl Qwen36Engine {
             [1, n as u32, self.hidden as u32],
             le_bytes_f32(hidden),
         );
-        run_async(
+        let t_rtt = self.prof.is_some().then(Instant::now);
+        let r = run_async(
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
@@ -1303,7 +1514,90 @@ impl Qwen36Engine {
                 ))
             }),
         )
-        .map_err(map_wire)
+        .map_err(map_wire);
+        self.prof_record_rtt(t_rtt, r.as_ref().ok().map(|(_, us)| *us));
+        r
+    }
+
+    /// One lockstep VERIFY([1,n,hidden] f32 at logical `t0`) → TOKENS exchange with the
+    /// downstream peer: the chain end's argmax for EVERY one of the `n` rows, plus the
+    /// accumulated downstream infer time (µs). A reply with a row count other than `n`
+    /// desyncs the stream and is reported as a closed socket, like any other framing fault.
+    fn forward_verify_downstream(
+        &mut self,
+        epoch: u32,
+        hidden: &[f32],
+        n: usize,
+        t0: usize,
+    ) -> EngineResult<(Vec<i32>, u32)> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let h = self.handle()?;
+        let tensor = WireTensor::new(
+            WireDType::F32,
+            [1, n as u32, self.hidden as u32],
+            le_bytes_f32(hidden),
+        );
+        let t_rtt = self.prof.is_some().then(Instant::now);
+        let r = run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_VERIFY, epoch, t0 as u32))
+                    .await?;
+                g.send(&tensor).await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, e, _) = parse_header(&hb);
+                if kind != FRAME_TOKENS || e != epoch {
+                    return Err(TransportError::SocketClosed);
+                }
+                let cb = g.recv_raw(4).await?;
+                let count = u32::from_be_bytes([cb[0], cb[1], cb[2], cb[3]]) as usize;
+                if count != n || count > spec::MAX_TOKENS_FRAME {
+                    return Err(TransportError::SocketClosed);
+                }
+                let tail = g.recv_raw(4 * count + 4).await?;
+                spec::parse_tokens_tail(count, &tail).ok_or(TransportError::SocketClosed)
+            }),
+        )
+        .map_err(map_wire);
+        self.prof_record_rtt(t_rtt, r.as_ref().ok().map(|(_, us)| *us));
+        r
+    }
+
+    /// COMMIT(`accepted` of `span_len`) → COMMIT_ACK with the downstream peer. `Ok(true)` ⇔
+    /// every rank below rolled back (or had nothing to roll back); `Ok(false)` ⇒ some rank's
+    /// state is unknown and the task must fail loud (the next admission's RESET rebuilds it).
+    fn forward_commit_downstream(
+        &mut self,
+        epoch: u32,
+        accepted: usize,
+        span_len: usize,
+    ) -> EngineResult<bool> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let h = self.handle()?;
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_COMMIT, epoch, accepted as u32))
+                    .await?;
+                g.send_raw(&spec::encode_commit_body(span_len as u32))
+                    .await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, e, verdict) = parse_header(&hb);
+                if kind != FRAME_COMMIT_ACK || e != epoch {
+                    return Err(TransportError::SocketClosed);
+                }
+                Ok(verdict == 1)
+            }),
+        )
+        .map_err(|e| EngineError::Backend(format!("qwen36 pipeline COMMIT not acked: {e}")))
     }
 
     /// Rank 0 wrapper: token + the round-trip's wire share in ms (RTT
@@ -1321,6 +1615,21 @@ impl Qwen36Engine {
         let wire_ms =
             (started.elapsed().as_secs_f64() * 1000.0 - infer_us as f64 / 1000.0).max(0.0);
         Ok((token as u32, wire_ms))
+    }
+
+    /// Rank 0 wrapper for a VERIFY span: every row's argmax (as u32) + the wire share in ms.
+    fn send_verify_recv_tokens(
+        &mut self,
+        hidden: Vec<f32>,
+        n: usize,
+        t0: usize,
+    ) -> EngineResult<(Vec<u32>, f64)> {
+        let epoch = self.epoch;
+        let started = Instant::now();
+        let (tokens, infer_us) = self.forward_verify_downstream(epoch, &hidden, n, t0)?;
+        let wire_ms =
+            (started.elapsed().as_secs_f64() * 1000.0 - infer_us as f64 / 1000.0).max(0.0);
+        Ok((tokens.into_iter().map(|t| t as u32).collect(), wire_ms))
     }
 
     /// Middle/last shared: forward the rank-0 HELLO payload downstream and return
@@ -1649,6 +1958,11 @@ impl Qwen36Engine {
                     0
                 }
             };
+            let history = if self.spec_ngram > 0 {
+                prompt_ids.clone()
+            } else {
+                Vec::new()
+            };
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -1666,6 +1980,8 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
+                history,
+                spec: SpecStats::default(),
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -1763,72 +2079,202 @@ impl Qwen36Engine {
                 return self.finalize(FinishReason::Stop);
             }
             let step = t.step;
-            let res = self
-                .embed_seq(&[next])
-                .and_then(|e| self.chain_pass(&e, step, step + 1))
-                .and_then(|h| self.send_forward_recv_token(h, 1, step));
-            match res {
-                Ok((tok, wire_ms)) => {
-                    let t = self.active.as_mut().unwrap();
-                    t.next_token = Some(tok);
-                    t.wire_ms.push(wire_ms);
-                    t.gen_ids.push(next);
-                    t.step += 1;
-                    let step_now = t.step;
-                    let gen_n = t.gen_ids.len();
-                    // Multi-stage path only: this is the topology bar #1 fails on. See decode_fp.
-                    #[cfg(feature = "kv_coord")]
-                    if decode_fp() {
-                        let mut fps: Vec<u64> = Vec::with_capacity(self.stages.len());
-                        for st in self.stages.iter_mut() {
-                            match st.get_state_blob() {
-                                Ok(b) => {
-                                    fps.push(crate::kv_coordination::fnv1a64(&b));
-                                    // Per-stage fps says THAT the state drifted at the first decode
-                                    // fold; it cannot say WHICH tensors. Attention-only would point at
-                                    // positional/layout handling, conv/ssm-only at the DeltaNet
-                                    // recurrent state. Capped at the first few steps: 40 tensors x 48
-                                    // steps is noise, and the drift is already known to start at fold 1.
-                                    // Self-gated on CASCADIA_KV_TENSOR_DUMP.
-                                    if gen_n <= 3 {
-                                        crate::kv_coordination::log_blob_tensors(
-                                            "qwen36_decode",
-                                            step_now as u64,
-                                            &b,
-                                        );
-                                    }
+            let draft = self.plan_draft(next, step);
+            if !draft.is_empty() {
+                return self.spec_step_pipe_first(next, draft, step);
+            }
+            self.decode_plain_pipe_first(next, step)
+        }
+    }
+
+    /// Rank 0 plain decode step: feed the pending token (T=1) through the local stage and the
+    /// chain; the downstream argmax is the next pending token.
+    fn decode_plain_pipe_first(&mut self, next: u32, step: usize) -> Vec<(TaskId, Chunk)> {
+        let task_id = self.active.as_ref().unwrap().task_id.clone();
+        let res = self
+            .embed_seq(&[next])
+            .and_then(|e| self.chain_pass(&e, step, step + 1))
+            .and_then(|h| self.send_forward_recv_token(h, 1, step));
+        match res {
+            Ok((tok, wire_ms)) => {
+                let t = self.active.as_mut().unwrap();
+                t.next_token = Some(tok);
+                t.wire_ms.push(wire_ms);
+                t.gen_ids.push(next);
+                t.step += 1;
+                let step_now = t.step;
+                let gen_n = t.gen_ids.len();
+                // Multi-stage path only: this is the topology bar #1 fails on. See decode_fp.
+                #[cfg(feature = "kv_coord")]
+                if decode_fp() {
+                    let mut fps: Vec<u64> = Vec::with_capacity(self.stages.len());
+                    for st in self.stages.iter_mut() {
+                        match st.get_state_blob() {
+                            Ok(b) => {
+                                fps.push(crate::kv_coordination::fnv1a64(&b));
+                                // Per-stage fps says THAT the state drifted at the first decode
+                                // fold; it cannot say WHICH tensors. Attention-only would point at
+                                // positional/layout handling, conv/ssm-only at the DeltaNet
+                                // recurrent state. Capped at the first few steps: 40 tensors x 48
+                                // steps is noise, and the drift is already known to start at fold 1.
+                                // Self-gated on CASCADIA_KV_TENSOR_DUMP.
+                                if gen_n <= 3 {
+                                    crate::kv_coordination::log_blob_tensors(
+                                        "qwen36_decode",
+                                        step_now as u64,
+                                        &b,
+                                    );
                                 }
-                                Err(_) => fps.push(0),
                             }
+                            Err(_) => fps.push(0),
                         }
-                        info!(task = %task_id, pos = step_now, tok, ?fps, "qwen36_decode_fp");
                     }
-                    let full = self
-                        .tokenizer
-                        .as_ref()
-                        .expect("rank 0 has tokenizer")
-                        .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
-                        .unwrap_or_default();
-                    let t = self.active.as_mut().unwrap();
-                    // Shim `advance_emitted`: FFFD-run holdback + starts_with
-                    // re-anchor, one implementation shared with ov-runtime so
-                    // the two cannot drift.
-                    let (delta, reanchored) =
-                        advance_emitted(&mut t.emitted, full.as_bytes(), true);
-                    if reanchored {
-                        warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
-                    }
-                    vec![(
-                        task_id.clone(),
-                        Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
-                    )]
+                    info!(task = %task_id, pos = step_now, tok, ?fps, "qwen36_decode_fp");
                 }
-                Err(e) => {
-                    warn!(task = %task_id, error = %e, "pipeline decode failed");
-                    self.finalize_error(format!("pipeline decode failed: {e}"))
+                let full = self
+                    .tokenizer
+                    .as_ref()
+                    .expect("rank 0 has tokenizer")
+                    .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
+                    .unwrap_or_default();
+                let t = self.active.as_mut().unwrap();
+                // Shim `advance_emitted`: FFFD-run holdback + starts_with
+                // re-anchor, one implementation shared with ov-runtime so
+                // the two cannot drift.
+                let (delta, reanchored) = advance_emitted(&mut t.emitted, full.as_bytes(), true);
+                if reanchored {
+                    warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                 }
+                vec![(
+                    task_id.clone(),
+                    Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
+                )]
+            }
+            Err(e) => {
+                warn!(task = %task_id, error = %e, "pipeline decode failed");
+                self.finalize_error(format!("pipeline decode failed: {e}"))
             }
         }
+    }
+
+    /// Rank 0 speculative step (`qwen36_spec` module doc): snapshot the local DeltaNet states,
+    /// send `[next, draft..]` as one VERIFY span (every rank snapshots too), accept the leading
+    /// agreement of the returned argmaxes, and on a partial accept roll back — restore the local
+    /// snapshot, broadcast COMMIT so every rank restores and masks the span's slots, then
+    /// re-feed the accepted tokens as a plain FORWARD at the same logical position (its token
+    /// is discarded). The next pending token is the verify argmax after the last accepted one.
+    fn spec_step_pipe_first(
+        &mut self,
+        next: u32,
+        draft: Vec<u32>,
+        p: usize,
+    ) -> Vec<(TaskId, Chunk)> {
+        let task_id = self.active.as_ref().unwrap().task_id.clone();
+        let k = draft.len();
+        let mut span = Vec::with_capacity(k + 1);
+        span.push(next);
+        span.extend_from_slice(&draft);
+        let epoch = self.epoch;
+
+        let t_snap = Instant::now();
+        let snap = match self.snapshot_deltanet() {
+            Ok(s) => s,
+            Err(e) => {
+                self.disable_spec(&task_id, e);
+                return self.decode_plain_pipe_first(next, p);
+            }
+        };
+        let snapshot_us = t_snap.elapsed().as_micros() as u64;
+
+        let t_ver = Instant::now();
+        let res = self
+            .embed_seq(&span)
+            .and_then(|e| self.chain_pass(&e, p, p + k + 1))
+            .and_then(|h| self.send_verify_recv_tokens(h, k + 1, p));
+        let (outs, wire_ms) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(task = %task_id, error = %e, "pipeline verify failed");
+                return self.finalize_error(format!("pipeline verify failed: {e}"));
+            }
+        };
+        let verify_us = t_ver.elapsed().as_micros() as u64;
+        let Some(oc) = spec::spec_outcome(&draft, &outs) else {
+            return self.finalize_error(format!(
+                "verify returned {} rows for a span of {}",
+                outs.len(),
+                k + 1
+            ));
+        };
+
+        let (mut restore_us, mut refeed_us) = (0u64, 0u64);
+        if !oc.full {
+            let t_res = Instant::now();
+            if let Err(e) = self.restore_deltanet(&snap) {
+                error!(task = %task_id, error = %e, "qwen36: DeltaNet restore failed");
+                return self.finalize_error(format!("spec rollback failed: {e}"));
+            }
+            self.kv_mask.rollback(p, k + 1);
+            match self.forward_commit_downstream(epoch, oc.accepted, k + 1) {
+                Ok(true) => {}
+                Ok(false) => {
+                    error!(task = %task_id, "qwen36: a downstream rank failed its spec rollback");
+                    return self.finalize_error("spec rollback failed on a downstream rank".into());
+                }
+                Err(e) => {
+                    warn!(task = %task_id, error = %e, "pipeline COMMIT failed");
+                    return self.finalize_error(format!("pipeline COMMIT failed: {e}"));
+                }
+            }
+            restore_us = t_res.elapsed().as_micros() as u64;
+            let t_ref = Instant::now();
+            let refeed = self
+                .embed_seq(&span[..oc.accepted])
+                .and_then(|e| self.chain_pass(&e, p, p + oc.accepted))
+                .and_then(|h| self.send_forward_recv_token(h, oc.accepted, p));
+            if let Err(e) = refeed {
+                warn!(task = %task_id, error = %e, "pipeline re-feed failed");
+                return self.finalize_error(format!("pipeline re-feed failed: {e}"));
+            }
+            refeed_us = t_ref.elapsed().as_micros() as u64;
+        }
+        drop(snap);
+
+        {
+            let t = self.active.as_mut().unwrap();
+            t.next_token = Some(oc.next);
+            t.wire_ms.push(wire_ms);
+            t.step += oc.accepted;
+        }
+        self.record_spec_step(
+            k,
+            oc.accepted,
+            oc.full,
+            [snapshot_us, verify_us, restore_us, refeed_us],
+        );
+        debug!(
+            task = %task_id,
+            pos = p,
+            k,
+            accepted = oc.accepted - 1,
+            full = oc.full,
+            snapshot_us,
+            verify_us,
+            restore_us,
+            refeed_us,
+            wire_ms,
+            "qwen36 spec step"
+        );
+        self.prof_decode_step(&[
+            ("spec.snapshot", snapshot_us as f64),
+            ("spec.verify", verify_us as f64),
+            ("wire.net", wire_ms * 1000.0),
+        ]);
+        let (mut chunks, finish) = self.emit_accepted(&span, oc.accepted);
+        if let Some(reason) = finish {
+            chunks.extend(self.finalize(reason));
+        }
+        chunks
     }
 
     /// Middle/last ranks: serve one inbound frame per step (relay
@@ -1842,6 +2288,7 @@ impl Qwen36Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("last rank has no upstream".into()))?;
         let h = self.handle()?;
+        let t_wait = self.prof.is_some().then(Instant::now);
         let frame = run_async(&h, async move {
             let mut g = upstream.lock().await;
             let hb = g.recv_raw(12).await?;
@@ -1921,10 +2368,32 @@ impl Qwen36Engine {
                         n,
                     })
                 }
+                FRAME_VERIFY => {
+                    let (t, _) = g.recv().await?;
+                    if !matches!(t.dtype, WireDType::F32) {
+                        return Err(TransportError::SocketClosed);
+                    }
+                    let n = t.shape[1] as usize;
+                    Ok(InFrame::Verify {
+                        epoch,
+                        pos,
+                        hidden: f32_from_le(&t.data),
+                        n,
+                    })
+                }
+                FRAME_COMMIT => {
+                    let lb = g.recv_raw(4).await?;
+                    Ok(InFrame::Commit {
+                        epoch,
+                        accepted: pos,
+                        span_len: u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]),
+                    })
+                }
                 _ => Err(TransportError::SocketClosed),
             }
         })
         .map_err(map_wire)?;
+        let up_wait_us = t_wait.map(|t| t.elapsed().as_micros() as f64);
 
         let is_last = self.rank == self.total - 1;
         match frame {
@@ -1979,6 +2448,7 @@ impl Qwen36Engine {
                 // "everything downstream of you is at position 0". A
                 // failed downstream reset = no ack = task fails loud at
                 // rank 0 (reset protocol).
+                self.prof_task_end(&TaskId::from(format!("epoch-{epoch}")));
                 self.reset_all();
                 self.peer_epoch = epoch;
                 if !is_last {
@@ -2113,6 +2583,9 @@ impl Qwen36Engine {
                         self.hidden
                     )));
                 }
+                // A VERIFY that was not followed by COMMIT was fully accepted: its snapshot is
+                // moot. (Any frame but COMMIT means that; RESET clears it via reset_all.)
+                self.pending_verify = None;
                 let infer_started = Instant::now();
                 let t0 = pos as usize;
                 let out = self.chain_pass(&hidden, t0, t0 + n)?;
@@ -2138,19 +2611,17 @@ impl Qwen36Engine {
                 // infer; they report their own share, so rank 0's
                 // RTT-minus-infer stays the chain's true wire share.
                 let own_us = infer_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                let mut sample_us = 0f64;
                 let (next, downstream_us) = if is_last {
+                    let t_sample = Instant::now();
                     let logits = if self.last_logits_only {
                         out
                     } else {
                         let row = out.len() / n;
                         out[(n - 1) * row..].to_vec()
                     };
-                    let next = logits
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.total_cmp(b.1))
-                        .map(|(i, _)| i as i32)
-                        .unwrap_or(0);
+                    let next = argmax(&logits) as i32;
+                    sample_us = t_sample.elapsed().as_micros() as f64;
                     (next, 0u32)
                 } else {
                     // Middle: pass the hidden span on; the chain end's
@@ -2165,6 +2636,144 @@ impl Qwen36Engine {
                     g.send_raw(&frame_header(FRAME_TOKEN, epoch, pos)).await?;
                     g.send_raw(&next.to_be_bytes()).await?;
                     g.send_raw(&infer_us.to_be_bytes()).await
+                })
+                .map_err(map_wire)?;
+                // Decode steps only (T=1); prefill chunks would skew the per-token summary.
+                if n == 1 {
+                    self.prof_relay_step(up_wait_us, sample_us);
+                }
+                Ok(())
+            }
+            InFrame::Verify {
+                epoch,
+                pos,
+                hidden,
+                n,
+            } => {
+                if self.poisoned.is_some() {
+                    return Err(EngineError::Backend(
+                        "qwen36 pipeline poisoned by handshake mismatch".into(),
+                    ));
+                }
+                if epoch != self.peer_epoch {
+                    warn!(
+                        epoch,
+                        current = self.peer_epoch,
+                        "qwen36: dropping stale VERIFY frame"
+                    );
+                    return Ok(());
+                }
+                if hidden.len() != n * self.hidden {
+                    return Err(EngineError::Backend(format!(
+                        "verify frame size {} != n({n}) * hidden({})",
+                        hidden.len(),
+                        self.hidden
+                    )));
+                }
+                if is_last && self.last_logits_only {
+                    return Err(EngineError::Backend(
+                        "VERIFY needs logits for every position, but this tree has \
+                         last_logits_only=true (re-export with --full-logits)"
+                            .into(),
+                    ));
+                }
+                let t0 = pos as usize;
+                // Snapshot BEFORE the span runs: COMMIT restores exactly this state.
+                let parts = self.snapshot_deltanet().map_err(|e| {
+                    EngineError::Backend(format!("qwen36 VERIFY: DeltaNet snapshot failed: {e}"))
+                })?;
+                self.pending_verify = Some(PendingVerify {
+                    pos: t0,
+                    span_len: n,
+                    parts,
+                });
+                let infer_started = Instant::now();
+                let out = self.chain_pass(&hidden, t0, t0 + n)?;
+                let own_us = infer_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                let mut sample_us = 0f64;
+                let (tokens, downstream_us) = if is_last {
+                    let t_sample = Instant::now();
+                    let row = out.len() / n;
+                    let toks: Vec<i32> = (0..n)
+                        .map(|i| argmax(&out[i * row..(i + 1) * row]) as i32)
+                        .collect();
+                    sample_us = t_sample.elapsed().as_micros() as f64;
+                    (toks, 0u32)
+                } else {
+                    self.forward_verify_downstream(epoch, &out, n, t0)?
+                };
+                let infer_us = own_us.saturating_add(downstream_us);
+                let body = spec::encode_tokens_body(&tokens, infer_us);
+                let h = self.handle()?;
+                let upstream = self.upstream.clone().unwrap();
+                run_async(&h, async move {
+                    let mut g = upstream.lock().await;
+                    g.send_raw(&frame_header(FRAME_TOKENS, epoch, pos)).await?;
+                    g.send_raw(&body).await
+                })
+                .map_err(map_wire)?;
+                self.prof_relay_step(up_wait_us, sample_us);
+                Ok(())
+            }
+            InFrame::Commit {
+                epoch,
+                accepted,
+                span_len,
+            } => {
+                if epoch != self.peer_epoch {
+                    warn!(
+                        epoch,
+                        current = self.peer_epoch,
+                        "qwen36: dropping stale COMMIT frame"
+                    );
+                    return Ok(());
+                }
+                // Roll THIS rank back first, then chain COMMIT down; the ACK's verdict is the
+                // AND over the chain, so a failure anywhere fails the head's task loud instead of
+                // serving from a rank whose state is unknown.
+                let local_ok = match self.pending_verify.take() {
+                    Some(pv) if pv.span_len == span_len as usize => {
+                        if (accepted as usize) < pv.span_len {
+                            match self.restore_deltanet(&pv.parts) {
+                                Ok(()) => {
+                                    self.kv_mask.rollback(pv.pos, pv.span_len);
+                                    true
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "qwen36: COMMIT rollback failed; state unknown");
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        }
+                    }
+                    Some(pv) => {
+                        warn!(
+                            expected = pv.span_len,
+                            got = span_len,
+                            "qwen36: COMMIT span length does not match the pending VERIFY"
+                        );
+                        false
+                    }
+                    None => {
+                        warn!("qwen36: COMMIT without a pending VERIFY");
+                        false
+                    }
+                };
+                let down_ok = if is_last {
+                    true
+                } else {
+                    self.forward_commit_downstream(epoch, accepted as usize, span_len as usize)
+                        .unwrap_or(false)
+                };
+                let verdict = u32::from(local_ok && down_ok);
+                let h = self.handle()?;
+                let upstream = self.upstream.clone().unwrap();
+                run_async(&h, async move {
+                    let mut g = upstream.lock().await;
+                    g.send_raw(&frame_header(FRAME_COMMIT_ACK, epoch, verdict))
+                        .await
                 })
                 .map_err(map_wire)
             }
@@ -2381,6 +2990,11 @@ impl Qwen36Engine {
                     "qwen35 prefix-cache snapshot plan"
                 );
             }
+            let history = if self.spec_ngram > 0 {
+                prompt_ids.clone()
+            } else {
+                Vec::new()
+            };
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -2398,6 +3012,8 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
+                history,
+                spec: SpecStats::default(),
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -2509,51 +3125,428 @@ impl Qwen36Engine {
             if t.gen_ids.len() >= t.max_tokens {
                 return self.finalize(FinishReason::Length);
             }
-            let next = t
-                .logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            let t_sample = self.prof.is_some().then(Instant::now);
+            let next = argmax(&t.logits);
+            if let (Some(p), Some(ts)) = (self.prof.as_mut(), t_sample) {
+                p.acc.record("sample", ts.elapsed().as_micros() as f64);
+            }
             if Some(next) == self.eos {
                 return self.finalize(FinishReason::Stop);
             }
             let step = t.step;
-            match self.run_span(&[next], step) {
-                Ok(l) => {
-                    let t = self.active.as_mut().unwrap();
-                    t.gen_ids.push(next);
-                    t.logits = l;
-                    t.step += 1;
-                    // Delta detokenization: decode the full sequence and
-                    // emit the unseen suffix. A trailing U+FFFD means a
-                    // multi-token UTF-8 char is still incomplete — hold
-                    // the suffix back until the next token completes it.
-                    let full = self
-                        .tokenizer
-                        .as_ref()
-                        .expect("single-box has tokenizer")
-                        .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
-                        .unwrap_or_default();
-                    let t = self.active.as_mut().unwrap();
-                    // Shim `advance_emitted`: FFFD-run holdback + starts_with
-                    // re-anchor, one implementation shared with ov-runtime so
-                    // the two cannot drift.
-                    let (delta, reanchored) =
-                        advance_emitted(&mut t.emitted, full.as_bytes(), true);
-                    if reanchored {
-                        warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
+            let draft = self.plan_draft(next, step);
+            if !draft.is_empty() {
+                return self.spec_step_local(next, draft, step);
+            }
+            self.decode_plain_local(next, step)
+        }
+    }
+
+    /// Single-box plain decode step: feed the pending token as a T=1 span; its last row is the
+    /// next step's logits.
+    fn decode_plain_local(&mut self, next: u32, step: usize) -> Vec<(TaskId, Chunk)> {
+        let task_id = self.active.as_ref().unwrap().task_id.clone();
+        match self.run_span(&[next], step) {
+            Ok(l) => {
+                let t = self.active.as_mut().unwrap();
+                t.gen_ids.push(next);
+                t.logits = l;
+                t.step += 1;
+                // Delta detokenization: decode the full sequence and
+                // emit the unseen suffix. A trailing U+FFFD means a
+                // multi-token UTF-8 char is still incomplete — hold
+                // the suffix back until the next token completes it.
+                let full = self
+                    .tokenizer
+                    .as_ref()
+                    .expect("single-box has tokenizer")
+                    .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
+                    .unwrap_or_default();
+                let t = self.active.as_mut().unwrap();
+                // Shim `advance_emitted`: FFFD-run holdback + starts_with
+                // re-anchor, one implementation shared with ov-runtime so
+                // the two cannot drift.
+                let (delta, reanchored) = advance_emitted(&mut t.emitted, full.as_bytes(), true);
+                if reanchored {
+                    warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
+                }
+                vec![(
+                    task_id.clone(),
+                    Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
+                )]
+            }
+            Err(e) => {
+                warn!(task = %task_id, error = %e, "decode failed");
+                self.finalize_error(format!("decode failed: {e}"))
+            }
+        }
+    }
+
+    /// Single-box speculative step (`qwen36_spec` module doc): snapshot the DeltaNet states,
+    /// run `[next, draft..]` as one `T = k+1` span, take the argmax of every row, accept the
+    /// leading agreement, and on a partial accept restore the snapshot, mask the span's cache
+    /// slots out, and re-feed the accepted tokens (logits discarded). The next step's logits
+    /// are the verify row after the last accepted position.
+    fn spec_step_local(&mut self, next: u32, draft: Vec<u32>, p: usize) -> Vec<(TaskId, Chunk)> {
+        let task_id = self.active.as_ref().unwrap().task_id.clone();
+        let k = draft.len();
+        let mut span = Vec::with_capacity(k + 1);
+        span.push(next);
+        span.extend_from_slice(&draft);
+
+        let t_snap = Instant::now();
+        let snap = match self.snapshot_deltanet() {
+            Ok(s) => s,
+            Err(e) => {
+                self.disable_spec(&task_id, e);
+                return self.decode_plain_local(next, p);
+            }
+        };
+        let snapshot_us = t_snap.elapsed().as_micros() as u64;
+
+        let t_ver = Instant::now();
+        let out = match self.run_span_out(&span, p) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(task = %task_id, error = %e, "verify failed");
+                return self.finalize_error(format!("verify failed: {e}"));
+            }
+        };
+        let rows = k + 1;
+        if out.is_empty() || out.len() % rows != 0 {
+            return self.finalize_error(format!(
+                "verify output of {} floats is not {rows} logits rows",
+                out.len()
+            ));
+        }
+        let row = out.len() / rows;
+        let t_sample = Instant::now();
+        let outs: Vec<u32> = (0..rows)
+            .map(|i| argmax(&out[i * row..(i + 1) * row]))
+            .collect();
+        let sample_us = t_sample.elapsed().as_micros() as f64;
+        let verify_us = t_ver.elapsed().as_micros() as u64;
+        let Some(oc) = spec::spec_outcome(&draft, &outs) else {
+            return self.finalize_error("verify produced the wrong number of rows".into());
+        };
+
+        let (mut restore_us, mut refeed_us) = (0u64, 0u64);
+        if !oc.full {
+            let t_res = Instant::now();
+            if let Err(e) = self.restore_deltanet(&snap) {
+                error!(task = %task_id, error = %e, "qwen36: DeltaNet restore failed");
+                return self.finalize_error(format!("spec rollback failed: {e}"));
+            }
+            self.kv_mask.rollback(p, k + 1);
+            restore_us = t_res.elapsed().as_micros() as u64;
+            let t_ref = Instant::now();
+            if let Err(e) = self.run_span_out(&span[..oc.accepted], p) {
+                warn!(task = %task_id, error = %e, "spec re-feed failed");
+                return self.finalize_error(format!("spec re-feed failed: {e}"));
+            }
+            refeed_us = t_ref.elapsed().as_micros() as u64;
+        }
+        drop(snap);
+
+        {
+            let j = oc.accepted - 1;
+            let t = self.active.as_mut().unwrap();
+            t.logits = out[j * row..(j + 1) * row].to_vec();
+            t.step += oc.accepted;
+        }
+        self.record_spec_step(
+            k,
+            oc.accepted,
+            oc.full,
+            [snapshot_us, verify_us, restore_us, refeed_us],
+        );
+        debug!(
+            task = %task_id,
+            pos = p,
+            k,
+            accepted = oc.accepted - 1,
+            full = oc.full,
+            snapshot_us,
+            verify_us,
+            restore_us,
+            refeed_us,
+            "qwen36 spec step"
+        );
+        self.prof_decode_step(&[
+            ("spec.snapshot", snapshot_us as f64),
+            ("spec.verify", verify_us as f64),
+            ("sample", sample_us),
+        ]);
+        let (mut chunks, finish) = self.emit_accepted(&span, oc.accepted);
+        if let Some(reason) = finish {
+            chunks.extend(self.finalize(reason));
+        }
+        chunks
+    }
+}
+
+/// Index of the largest value (first on ties; 0 for an empty row).
+fn argmax(row: &[f32]) -> u32 {
+    row.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
+// -------- speculative decode (qwen36_spec) + profiling helpers --------
+impl Qwen36Engine {
+    /// Snapshot every local stage's Gated DeltaNet recurrent states (`conv`/`ssm` ONLY — the
+    /// attention KV of a rejected draft is masked out via `kv_mask`, never copied). One blob per
+    /// stage, same layout as `get_state_blob`. Taken immediately before a verify span.
+    fn snapshot_deltanet(&mut self) -> Result<Vec<Vec<u8>>, String> {
+        let mut parts = Vec::with_capacity(self.stages.len());
+        for (j, st) in self.stages.iter_mut().enumerate() {
+            parts.push(
+                st.get_state_vars(spec::DELTANET_STATE_FILTER)
+                    .map_err(|e| format!("stage{j} get_state_vars: {e}"))?,
+            );
+        }
+        if parts.is_empty() {
+            return Err("no local stages".into());
+        }
+        Ok(parts)
+    }
+
+    /// Write a `snapshot_deltanet` snapshot back over the live requests. Entries apply as they
+    /// parse, so an `Err` leaves the stages dirty — callers fail the task and the next reset
+    /// rebuilds the requests (`state_restored` is set either way: a restored fixed-shape state
+    /// is exactly the residue `reset_state` cannot clear).
+    fn restore_deltanet(&mut self, parts: &[Vec<u8>]) -> Result<(), String> {
+        if parts.len() != self.stages.len() {
+            return Err(format!(
+                "snapshot has {} parts for {} stages",
+                parts.len(),
+                self.stages.len()
+            ));
+        }
+        self.state_restored = true;
+        for (j, (st, part)) in self.stages.iter_mut().zip(parts).enumerate() {
+            st.set_state_vars(part)
+                .map_err(|e| format!("stage{j} set_state_vars: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Switch speculation off for the rest of the active task (the step that hit this runs the
+    /// plain path). Logged once; the reason rides the task-done line.
+    fn disable_spec(&mut self, task_id: &TaskId, reason: String) {
+        warn!(task = %task_id, reason = %reason, "qwen36: speculative decoding disabled for this task");
+        if let Some(t) = self.active.as_mut() {
+            t.spec.disabled = Some(reason);
+        }
+    }
+
+    /// Rank 0 / single-box, at the top of a decode step: push the pending token onto the task
+    /// history (it is fed this step on either path) and propose a draft for it. Empty when
+    /// speculation is off, disabled for the task, out of budget/window, or the n-gram has no
+    /// earlier occurrence — the caller then takes the plain single-token path.
+    fn plan_draft(&mut self, next: u32, pos: usize) -> Vec<u32> {
+        if self.spec_ngram == 0 {
+            return Vec::new();
+        }
+        let (ngram, k, max_ctx, sliced) = (
+            self.spec_ngram,
+            self.spec_k,
+            self.max_ctx,
+            self.last_logits_only,
+        );
+        let Some(t) = self.active.as_mut() else {
+            return Vec::new();
+        };
+        t.history.push(next);
+        if t.spec.disabled.is_some() || sliced {
+            return Vec::new();
+        }
+        let k = spec::effective_k(k, t.gen_ids.len(), t.max_tokens, pos, max_ctx);
+        spec::draft_ngram(&t.history, ngram, k)
+    }
+
+    /// Emit the `accepted` leading tokens of a verified span — `span[0]` is the pending token
+    /// that was fed, `span[1..accepted]` the drafts the verifier agreed with — applying the plain
+    /// path's per-token stop rules in order (budget, then EOS). Returns the token chunks and, when
+    /// one of the tokens ended the task, the reason (the caller finalizes; the state the span
+    /// consumed past that point is discarded by the reset).
+    fn emit_accepted(
+        &mut self,
+        span: &[u32],
+        accepted: usize,
+    ) -> (Vec<(TaskId, Chunk)>, Option<FinishReason>) {
+        let mut out = Vec::with_capacity(accepted);
+        for (i, &tok) in span[..accepted].iter().enumerate() {
+            let eos = self.eos;
+            let t = self
+                .active
+                .as_mut()
+                .expect("emit_accepted with an active task");
+            if t.gen_ids.len() >= t.max_tokens {
+                return (out, Some(FinishReason::Length));
+            }
+            if Some(tok) == eos {
+                return (out, Some(FinishReason::Stop));
+            }
+            t.gen_ids.push(tok);
+            if i > 0 {
+                // `span[0]` went onto the history in `plan_draft`.
+                t.history.push(tok);
+            }
+            let task_id = t.task_id.clone();
+            let full = self
+                .tokenizer
+                .as_ref()
+                .expect("decode driver has tokenizer")
+                .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
+                .unwrap_or_default();
+            let t = self.active.as_mut().unwrap();
+            let (delta, reanchored) = advance_emitted(&mut t.emitted, full.as_bytes(), true);
+            if reanchored {
+                warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
+            }
+            out.push((
+                task_id.clone(),
+                Chunk::token(task_id, tok as i64, delta).with_token_ids(vec![tok as i64]),
+            ));
+        }
+        (out, None)
+    }
+
+    /// Book one verified span into the task's counters + the phase histograms.
+    fn record_spec_step(
+        &mut self,
+        k: usize,
+        accepted: usize,
+        full: bool,
+        us: [u64; 4], // snapshot, verify, restore, refeed
+    ) {
+        let [snapshot_us, verify_us, restore_us, refeed_us] = us;
+        if let Some(t) = self.active.as_mut() {
+            t.spec.record(k, accepted - 1, full);
+            t.spec.snapshot_us += snapshot_us;
+            t.spec.verify_us += verify_us;
+            t.spec.restore_us += restore_us;
+            t.spec.refeed_us += refeed_us;
+        }
+        let obs = |phase: &str, us: u64| {
+            cascadia_metrics::SPEC_PHASE_SECONDS
+                .with_label_values(&["qwen35", phase])
+                .observe(us as f64 / 1e6);
+        };
+        obs("snapshot", snapshot_us);
+        obs("verify", verify_us);
+        if !full {
+            obs("restore", restore_us);
+            obs("refeed", refeed_us);
+        }
+    }
+
+    /// Profile hook for a downstream exchange: RTT and its wire share (RTT minus the peer's
+    /// reported infer time). No-op without `CASCADIA_QWEN36_PROFILE=1`.
+    fn prof_record_rtt(&mut self, started: Option<Instant>, infer_us: Option<u32>) {
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), started) {
+            let rtt_us = t.elapsed().as_micros() as f64;
+            p.acc.record("down.rtt", rtt_us);
+            if let Some(us) = infer_us {
+                p.acc.record("down.wire", (rtt_us - us as f64).max(0.0));
+            }
+        }
+    }
+
+    /// Profile hook at the end of one decode step: fold the last chain pass's per-stage timings
+    /// (and the embed time) plus `extra` samples into the accumulator, print the summary every
+    /// `PROFILE_SUMMARY_EVERY` steps, and fire the one-off `PERF_COUNT` dump after the 8th step
+    /// of the task. No-op without `CASCADIA_QWEN36_PROFILE=1`.
+    fn prof_decode_step(&mut self, extra: &[(&str, f64)]) {
+        let rank = self.rank;
+        let perf_count = self.perf_count;
+        let want_dump = {
+            let Some(p) = self.prof.as_mut() else {
+                return;
+            };
+            if p.embed_last_us > 0 {
+                p.acc.record("embed", p.embed_last_us as f64);
+                p.embed_last_us = 0;
+            }
+            let stages = std::mem::take(&mut p.stage_last);
+            for (j, (set, infer, out)) in stages.iter().enumerate() {
+                p.acc.record(&format!("s{j}.set"), *set as f64);
+                p.acc.record(&format!("s{j}.infer"), *infer as f64);
+                p.acc.record(&format!("s{j}.out"), *out as f64);
+            }
+            for (k, v) in extra {
+                p.acc.record(k, *v);
+            }
+            p.since_summary += 1;
+            p.task_steps += 1;
+            if p.since_summary >= PROFILE_SUMMARY_EVERY {
+                info!(rank, steps = p.task_steps, summary = %p.acc.summary(), "qwen36 profile (p50/p95 per decode step)");
+                p.since_summary = 0;
+            }
+            let dump = perf_count && !p.perf_dumped && p.task_steps >= PERF_DUMP_AFTER_STEPS;
+            if dump {
+                p.perf_dumped = true;
+            }
+            dump
+        };
+        if want_dump {
+            self.dump_stage_profiles();
+        }
+    }
+
+    /// Relay-rank profile hook for one decode frame: the wait for the upstream frame and (last
+    /// rank) the argmax time, plus the stage timings of the pass just run.
+    fn prof_relay_step(&mut self, up_wait_us: Option<f64>, sample_us: f64) {
+        if self.prof.is_none() {
+            return;
+        }
+        let mut extra: Vec<(&str, f64)> = Vec::with_capacity(2);
+        if let Some(w) = up_wait_us {
+            extra.push(("up.wait", w));
+        }
+        if sample_us > 0.0 {
+            extra.push(("sample", sample_us));
+        }
+        self.prof_decode_step(&extra);
+    }
+
+    /// Final profile summary for the task (rank 0 / single-box) or the span since the last RESET
+    /// (relays), then clear the accumulators. No-op without `CASCADIA_QWEN36_PROFILE=1`.
+    fn prof_task_end(&mut self, task_id: &TaskId) {
+        let rank = self.rank;
+        if let Some(p) = self.prof.as_mut() {
+            if !p.acc.is_empty() {
+                info!(task = %task_id, rank, steps = p.task_steps, summary = %p.acc.summary(), "qwen36 profile (task)");
+            }
+            p.acc.clear();
+            p.since_summary = 0;
+            p.task_steps = 0;
+            p.perf_dumped = false;
+            p.stage_last.clear();
+            p.embed_last_us = 0;
+        }
+    }
+
+    /// Per-stage OpenVINO node profile of the LAST inference (`PERF_COUNT=YES`): total real vs
+    /// cpu time, executed node count, top 12 node types by real time.
+    fn dump_stage_profiles(&mut self) {
+        let rank = self.rank;
+        for (j, st) in self.stages.iter().enumerate() {
+            match st.profiling() {
+                Ok(tsv) => {
+                    for line in spec::summarize_ov_profile(&tsv, 12) {
+                        info!(rank, stage = j, "qwen36 ov profile: {line}");
                     }
-                    vec![(
-                        task_id.clone(),
-                        Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
-                    )]
                 }
-                Err(e) => {
-                    warn!(task = %task_id, error = %e, "decode failed");
-                    self.finalize_error(format!("decode failed: {e}"))
-                }
+                Err(e) => warn!(
+                    rank,
+                    stage = j,
+                    error = %e,
+                    "qwen36 ov profile unavailable (stages need --ov-config PERF_COUNT=YES)"
+                ),
             }
         }
     }
@@ -2663,6 +3656,7 @@ impl Engine for Qwen36Engine {
         if self.active.as_ref().is_some_and(|t| &t.task_id == task_id) {
             info!(task = %task_id, "qwen36: cancelled; dropping active task");
             self.active = None;
+            self.prof_task_end(task_id);
             // A prefix-cache hit restores over the live requests without its own reset, so the
             // only certified restore sequence is reset → prime → set_state: reset here rather
             // than leaving the cancelled task's state in place.
@@ -3114,6 +4108,100 @@ mod tests {
         assert_eq!(parse_header(&h), (FRAME_FORWARD, 7, 4096));
     }
 
+    /// The spec frame kinds extend the existing numbering without colliding with the
+    /// `kv_coord` CAPTURE/RESTORE codes (8..=12); a reused code would be parsed as the wrong
+    /// frame by a peer and desync the stream.
+    #[test]
+    fn spec_frame_kinds_are_fresh() {
+        let kinds = [
+            FRAME_HELLO,
+            FRAME_HELLO_ACK,
+            FRAME_HELLO_NAK,
+            FRAME_RESET,
+            FRAME_RESET_ACK,
+            FRAME_FORWARD,
+            FRAME_TOKEN,
+            FRAME_VERIFY,
+            FRAME_TOKENS,
+            FRAME_COMMIT,
+            FRAME_COMMIT_ACK,
+        ];
+        let mut sorted = kinds.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), kinds.len());
+        assert!(FRAME_VERIFY > 12 && FRAME_COMMIT_ACK > FRAME_COMMIT);
+    }
+
+    /// Speculation needs every row's logits; a tree exported with the default last-row slice
+    /// must be refused at load with the re-export instructions, and only when speculation is on.
+    #[test]
+    fn spec_requires_full_logits_gates_sliced_trees() {
+        assert!(spec_requires_full_logits(0, true).is_ok());
+        assert!(spec_requires_full_logits(3, false).is_ok());
+        let err = spec_requires_full_logits(3, true).unwrap_err();
+        assert!(err.contains("--full-logits"), "{err}");
+        assert!(err.contains("last_logits_only"), "{err}");
+    }
+
+    #[test]
+    fn with_spec_clamps_the_draft_length() {
+        let b = Qwen36Builder::new("/x", "CPU").with_spec(3, 0);
+        assert_eq!((b.spec_ngram, b.spec_k), (3, 1));
+        let b = Qwen36Builder::new("/x", "CPU").with_spec(2, 10_000);
+        assert_eq!((b.spec_ngram, b.spec_k), (2, spec::MAX_SPEC_K));
+        let b = Qwen36Builder::new("/x", "CPU");
+        assert_eq!((b.spec_ngram, b.spec_k), (0, 0));
+    }
+
+    /// The task-done path books the spec counters into the metric families and still emits the
+    /// final marker; a zero-step task touches no counter (the family may stay absent).
+    #[test]
+    fn finalize_books_spec_stats() {
+        let before = cascadia_metrics::SPEC_ACCEPTED_TOTAL
+            .with_label_values(&["qwen35"])
+            .get();
+        let mut e = bare_engine(1, "{}");
+        let mut t = finalizable_task(8, 4);
+        t.spec.record(4, 4, true);
+        t.spec.record(4, 1, false);
+        e.active = Some(t);
+        let out = e.finalize(FinishReason::Stop);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_final);
+        let after = cascadia_metrics::SPEC_ACCEPTED_TOTAL
+            .with_label_values(&["qwen35"])
+            .get();
+        assert_eq!(after - before, 5);
+        assert!(e.active.is_none());
+    }
+
+    /// `plan_draft` keeps the history (the n-gram table) in step with what is fed, proposes from
+    /// it, and stays silent when speculation is off or out of budget.
+    #[test]
+    fn plan_draft_tracks_history_and_budget() {
+        let mut e = bare_engine(1, "{}");
+        e.spec_ngram = 2;
+        e.spec_k = 4;
+        let mut t = finalizable_task(100, 0);
+        // prompt 1 2 3 and generated 1 2 — pending 3 completes the 2-gram [2, 3], whose earlier
+        // occurrence (index 1) is followed by nothing: the first proposal is empty...
+        t.prompt_ids = vec![1, 2, 3, 7, 8];
+        t.history = vec![1, 2, 3, 7, 8, 1, 2];
+        t.gen_ids = vec![1, 2];
+        e.active = Some(t);
+        assert_eq!(e.plan_draft(3, 7), vec![7, 8, 1, 2]);
+        assert_eq!(e.active.as_ref().unwrap().history.last(), Some(&3));
+        // ...budget exhausted ⇒ no draft, but the pending token still joins the history.
+        e.active.as_mut().unwrap().max_tokens = 3;
+        assert!(e.plan_draft(7, 8).is_empty());
+        assert_eq!(e.active.as_ref().unwrap().history.len(), 9);
+        // Speculation off ⇒ no history bookkeeping at all.
+        e.spec_ngram = 0;
+        assert!(e.plan_draft(8, 9).is_empty());
+        assert_eq!(e.active.as_ref().unwrap().history.len(), 9);
+    }
+
     /// A Qwen3.6-era tree (no hidden_size) keeps the 2048 width; a dense
     /// Qwen3.8 tree carries 5120 and the `qwen3_5` arch.
     #[test]
@@ -3229,6 +4317,12 @@ mod tests {
             max_ctx: None,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
+            spec_ngram: 0,
+            spec_k: 0,
+            kv_mask: CacheMask::new(),
+            pending_verify: None,
+            prof: None,
+            perf_count: false,
         }
     }
 
@@ -3472,6 +4566,8 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            history: Vec::new(),
+            spec: SpecStats::default(),
         });
 
         let out = e.finalize_error("pipeline decode failed: wire closed".into());
@@ -3504,6 +4600,8 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            history: Vec::new(),
+            spec: SpecStats::default(),
         }
     }
 
@@ -3587,6 +4685,8 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            history: Vec::new(),
+            spec: SpecStats::default(),
         });
 
         let id: TaskId = "t0".into();
