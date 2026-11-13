@@ -5,11 +5,41 @@ import shutil
 import struct
 import tempfile
 import unittest
-from cascadia_diffusion.contracts import decode, encode, parse_json, validate_manifest, verify_bundle
+from cascadia_diffusion.contracts import decode, encode, parse_json, validate_manifest, validate_sdxl_metadata, verify_bundle
 
 FIXTURES = Path(__file__).resolve().parents[3] / 'crates/cascadia-diffusion/tests/fixtures'
 
 class Contracts(unittest.TestCase):
+    def test_unsupported_pipeline_settings_fail_before_export_or_engine_import(self):
+        from cascadia_diffusion.export import export_sdxl
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            index = {
+                '_class_name': 'StableDiffusionXLPipeline',
+                'scheduler': ['diffusers', 'EulerDiscreteScheduler'],
+                'tokenizer': ['transformers', 'CLIPTokenizer'],
+                'tokenizer_2': ['transformers', 'CLIPTokenizer'],
+            }
+            for name in ('tokenizer', 'tokenizer_2'):
+                (root/name).mkdir()
+                (root/name/'tokenizer_config.json').write_text('{"model_max_length":77}')
+            (root/'scheduler').mkdir()
+            (root/'model_index.json').write_text(json.dumps(index))
+            scheduler = root/'scheduler/scheduler_config.json'
+            scheduler.write_text('{"_class_name":"EulerDiscreteScheduler"}')
+            validate_sdxl_metadata(root)
+            for changed in (index | {'force_zeros_for_empty_prompt': False},
+                            index | {'requires_aesthetics_score': True},
+                            index | {'tokenizer': ['transformers', 'CLIPTokenizerFast']}):
+                (root/'model_index.json').write_text(json.dumps(changed))
+                with self.assertRaises(ValueError):
+                    validate_sdxl_metadata(root)
+            (root/'model_index.json').write_text(json.dumps(index))
+            scheduler.write_text('{"_class_name":"DPMSolverMultistepScheduler"}')
+            with self.assertRaisesRegex(ValueError, 'scheduler substitution'):
+                export_sdxl(root, root/'output', 'a'*40, 512)
+            self.assertFalse((root/'output').exists())
+
     def test_rust_shared_fixture_and_truncation(self):
         manifest = parse_json((FIXTURES/'manifest.json').read_bytes())
         mid = validate_manifest(manifest)
