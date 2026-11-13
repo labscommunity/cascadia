@@ -108,6 +108,17 @@ class Server(unittest.TestCase):
         status,body=self.request('POST','/generate',payload)
         self.assertEqual(status,200)
         self.assertEqual(json.loads(body),{'prompt_bytes':16384,'negative_bytes':len(request['negative_prompt'])})
-        self.assertEqual(self.request('POST','/generate',b'x'*(256*1024+1))[0],413)
+        # Reject the advertised size before reading a body. Sending a large
+        # body here would race the server's early close against client writes.
+        conn=http.client.HTTPConnection('127.0.0.1',self.port,timeout=2)
+        try:
+            conn.putrequest('POST','/generate')
+            conn.putheader('Authorization','Bearer '+TOKEN)
+            conn.putheader('Content-Length',str(256*1024+1))
+            conn.endheaders()
+            response=conn.getresponse()
+            self.assertEqual(response.status,413)
+            response.read()
+        finally:conn.close()
 
 if __name__=='__main__':unittest.main()
