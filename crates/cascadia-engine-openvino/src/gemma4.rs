@@ -456,23 +456,45 @@ fn prefill_span_end(i: usize, chunk: usize, seed_split: usize) -> usize {
     }
 }
 
-/// Effective prefill span. Default `usize::MAX` = the whole span in ONE pass (unchanged, fastest).
+/// Prefill span per chain pass; bounds the last stage's transient `[1, T, vocab]` logits buffer
+/// (~1.07 GB f32 at 1,024 with the 262144 vocab, vs ~8.4 GB for an 8,000-token single pass) and each
+/// span's wire frame.
+///
+/// Not smaller: every span re-sends the shared KV gathered so far, so the wire cost grows with the
+/// number of spans. On a link of about 3.5 MB/s an 8,000-token prompt took ~180 s in one pass, ~380 s
+/// at 256 and ~215 s at 1,024.
+const PREFILL_CHUNK: usize = 1024;
+
+/// Effective prefill span. Default = `PREFILL_CHUNK`.
 ///
 /// `CASCADIA_GEMMA4_FORCE_T1_PREFILL=1` ⇒ 1: fold EVERY token through the same T=1 path. A warm-resumed
 /// SUFFIX prefill (e.g. 22 tokens at position 71) and a cold FULL prefill (93 tokens at 0) otherwise hit
 /// different GEMM batch shapes; over int4 weights the rounding delta flips a token, so cross-chain
 /// warm != cold byte-identical. Under T=1 both traverse the identical per-token kernel ⇒ bit-identical.
-/// Opt-in only — production keeps the single-pass prefill (warm-resume stays greedy-equivalent there,
-/// not bit-identical). Mirrors `qwen36::prefill_chunk`.
+/// Opt-in only — production keeps batched spans (warm-resume stays greedy-equivalent there, not
+/// bit-identical). Mirrors `qwen36::prefill_chunk`.
+///
+/// `CASCADIA_GEMMA4_PREFILL_CHUNK=n` overrides the span (`0` = whole prompt in one pass); test-only,
+/// so a hardware check can still send an oversized single frame. FORCE_T1 wins over it.
 fn prefill_chunk() -> usize {
-    if std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        1
-    } else {
-        usize::MAX
+    prefill_chunk_from(
+        std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL")
+            .ok()
+            .as_deref(),
+        std::env::var("CASCADIA_GEMMA4_PREFILL_CHUNK")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn prefill_chunk_from(force_t1: Option<&str>, chunk: Option<&str>) -> usize {
+    if force_t1 == Some("1") {
+        return 1;
+    }
+    match chunk.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => PREFILL_CHUNK,
     }
 }
 
@@ -774,41 +796,28 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let (tensor, _) = self
-            .block_on(async move {
-                let mut guard = downstream.lock().await;
-                // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
-                // A prefill reply waits on every remaining stage's
-                // whole-prompt compute — widened budget (see
-                // `recv_tensor_reply_prefill`), CEILINGED here: the transport
-                // budget multiplies the operator's frame-transfer knob
-                // (recv_timeout × 10 — the rig's 600 s made it 6000 s), and the
-                // waiting head holds its admission slot the whole time, so one
-                // dead downstream turned the node into a refuse-everything wall
-                // for 100 minutes (2026-08-17 incident). ov-runtime ceilings
-                // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
-                // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
-                // leaves ~6x headroom for deeper pipelines / longer prompts.
-                if prefill {
-                    recv_prefill_reply_ceilinged(&mut guard).await
-                } else {
-                    guard.recv_reply().await
-                }
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
-        if tensor.data.len() < 4 {
-            return Err(EngineError::Backend(format!(
-                "downstream sent {}-byte token tensor; need at least 4",
-                tensor.data.len()
-            )));
-        }
-        let token = i32::from_le_bytes([
-            tensor.data[0],
-            tensor.data[1],
-            tensor.data[2],
-            tensor.data[3],
-        ]);
-        Ok(token)
+        self.block_on(async move {
+            let mut guard = downstream.lock().await;
+            // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
+            // A prefill reply waits on every remaining stage's
+            // whole-prompt compute — widened budget (see
+            // `recv_tensor_reply_prefill`), CEILINGED here: the transport
+            // budget multiplies the operator's frame-transfer knob
+            // (recv_timeout × 10 — the rig's 600 s made it 6000 s), and the
+            // waiting head holds its admission slot the whole time, so one
+            // dead downstream turned the node into a refuse-everything wall
+            // for 100 minutes (2026-08-17 incident). ov-runtime ceilings
+            // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
+            // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
+            // leaves ~6x headroom for deeper pipelines / longer prompts.
+            let (tensor, _) = if prefill {
+                recv_prefill_reply_ceilinged(&mut guard).await
+            } else {
+                guard.recv_reply().await
+            }?;
+            token_from_reply(&mut guard, &tensor.data).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64)> {
@@ -1185,8 +1194,8 @@ impl Gemma4Engine {
         // multi-token inference; the IR keeps own KV internally. The absolute
         // start-position is sent downstream so relay stages align position_ids
         // and reset on 0.
-        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = whole span (one pass,
-        // unchanged/fastest). CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
+        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = PREFILL_CHUNK (1,024),
+        // bounding the last stage's logits buffer. CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
         // and a cold FULL prefill traverse the identical per-token kernel. Without it the two use
         // different GEMM batch shapes (e.g. 22 vs 93 tokens) over int4 weights, and the rounding delta
         // flips a token ⇒ cross-chain warm != cold. Mirrors qwen36's FORCE_T1_PREFILL.
@@ -1599,6 +1608,19 @@ const G_OPCODE_ABORT_ACK: u8 = 6;
 /// H.1b (R2): CAPTURE whose body also carries the turn's TENANT (`capture_body_bytes_v2`). Separate
 /// opcode, not a wider v1 body — the v1 codec enforces an exact length and hard-errors mid-chain on
 /// a mismatch. Emitted only for a non-empty tenant, so a chain that names none stays on v1.
+/// A reply too short to be a token is a control ack that arrived after its exchange gave up. This
+/// frame's real reply is still coming and would answer the next one, so the connection goes too.
+async fn token_from_reply(
+    g: &mut cascadia_transport::ActivationClient,
+    data: &[u8],
+) -> Result<i32, cascadia_transport::TransportError> {
+    let Some(token) = data.first_chunk::<4>() else {
+        g.close().await;
+        return Err(cascadia_transport::TransportError::SocketClosed);
+    };
+    Ok(i32::from_le_bytes(*token))
+}
+
 /// Ceiling on the widened prefill-reply wait (transport budget = recv_timeout × 10, which is
 /// operator-frame-knob-coupled, not compute-coupled). Measured legit worst: 51 s. See the call site.
 const G_PREFILL_REPLY_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1617,7 +1639,11 @@ async fn recv_prefill_reply_ceilinged(
 > {
     match tokio::time::timeout(G_PREFILL_REPLY_CEILING, g.recv_reply_prefill()).await {
         Ok(r) => r,
-        Err(_) => Err(cascadia_transport::TransportError::SocketClosed),
+        Err(_) => {
+            // Replies carry no sequence number: left open, the late one answers the next request.
+            g.close().await;
+            Err(cascadia_transport::TransportError::SocketClosed)
+        }
     }
 }
 #[cfg(feature = "kv_coord")]
@@ -1634,6 +1660,8 @@ const G_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 async fn recv_control_ack_bounded(
     g: &mut cascadia_transport::ActivationClient,
 ) -> Result<WireTensor, cascadia_transport::TransportError> {
+    // Left open on purpose, unlike a token reply: capture is best-effort, and a peer that never
+    // acks must not cost the connection. A late ack ends it at `token_from_reply`.
     let (ack, _) = tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, g.recv())
         .await
         .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
@@ -2414,6 +2442,55 @@ mod tests {
         );
     }
 
+    /// #244: a late reply has no sequence number, so a connection left open after the ceiling hands
+    /// it to the next request as that request's answer. Measured on a real chain: HTTP 200 with
+    /// the previous prompt's token spliced into the text.
+    #[tokio::test]
+    async fn prefill_ceiling_closes_the_connection_so_a_late_reply_cannot_answer_the_next_request()
+    {
+        let _knob = crate::timeout_knob_lock();
+        let (mut client, mut peer) = connected_pair().await;
+        tokio::time::pause();
+        assert!(super::recv_prefill_reply_ceilinged(&mut client)
+            .await
+            .is_err());
+        tokio::time::resume();
+        crate::assert_closed(&mut client, &mut peer).await;
+    }
+
+    /// A late control ack read as a token: the frame's real reply is still owed, so keeping the
+    /// connection would shift every later reply by one.
+    #[tokio::test]
+    async fn a_reply_too_short_for_a_token_closes_the_connection() {
+        let (mut client, mut peer) = connected_pair().await;
+        assert!(super::token_from_reply(&mut client, &[7u8]).await.is_err());
+        crate::assert_closed(&mut client, &mut peer).await;
+    }
+
+    /// The mirror: a peer on an older build never acks a CAPTURE it can't parse. That costs one
+    /// turn its cache, and must not cost the connection, or every such turn reloads the chain.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_control_ack_timeout_keeps_the_connection() {
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        assert!(super::recv_control_ack_bounded(&mut client).await.is_err());
+        tokio::time::resume();
+        assert!(
+            client.send_raw(b"x").await.is_ok(),
+            "the connection must survive a missing ack"
+        );
+    }
+
+    async fn connected_pair() -> (cascadia_transport::ActivationClient, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = cascadia_transport::ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        (client, accept.await.unwrap())
+    }
+
     #[tokio::test]
     async fn rejects_missing_pipeline_config() {
         let mut b = Gemma4Builder::new("/non/existent", 0, 1, "CPU");
@@ -2537,8 +2614,47 @@ mod tests {
     }
 
     #[test]
+    fn prefill_chunk_defaults_to_1024() {
+        assert_eq!(prefill_chunk_from(None, None), 1024);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_zero_is_one_pass() {
+        assert_eq!(prefill_chunk_from(None, Some("0")), usize::MAX);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_sets_the_span() {
+        assert_eq!(prefill_chunk_from(None, Some("512")), 512);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_garbage_keeps_the_default() {
+        assert_eq!(prefill_chunk_from(None, Some("lots")), 1024);
+        assert_eq!(prefill_chunk_from(None, Some("")), 1024);
+    }
+
+    #[test]
+    fn prefill_chunk_force_t1_wins_over_the_knob() {
+        assert_eq!(prefill_chunk_from(Some("1"), Some("512")), 1);
+        assert_eq!(prefill_chunk_from(Some("1"), Some("0")), 1);
+    }
+
+    #[test]
+    fn prefill_spans_default_chunk_splits_a_long_prompt() {
+        // 2,500-token cold prompt, no seed: 1,024 + 1,024 + 452.
+        let (mut i, mut spans) = (0, Vec::new());
+        while i < 2500 {
+            let end = prefill_span_end(i, PREFILL_CHUNK, 2500);
+            spans.push((i, end));
+            i = end;
+        }
+        assert_eq!(spans, vec![(0, 1024), (1024, 2048), (2048, 2500)]);
+    }
+
+    #[test]
     fn prefill_spans_without_seed_match_the_old_folding() {
-        // chunk = usize::MAX (default single-pass): one span over everything.
+        // chunk = usize::MAX (CASCADIA_GEMMA4_PREFILL_CHUNK=0): one span over everything.
         assert_eq!(prefill_span_end(0, usize::MAX, 10), 10);
         // explicit chunking, no seed: plain min(i+chunk, len).
         assert_eq!(prefill_span_end(0, 4, 10), 4);

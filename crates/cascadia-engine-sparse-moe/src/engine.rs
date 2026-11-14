@@ -1154,6 +1154,7 @@ impl Builder for SparseMoEBuilder {
             tokenizer: self.tokenizer,
             pending: VecDeque::new(),
             peer_disconnected: false,
+            upstream_seen: false,
             disconnect_reported: false,
             transport: self.transport,
             runtime_handle,
@@ -1357,6 +1358,35 @@ pub(crate) fn worker_recv_failure_is_fatal(
     }
 }
 
+/// What a worker does with one upstream `recv_kind_server` result.
+#[derive(Debug)]
+enum WorkerRecv {
+    Frame(FrameKind),
+    /// Clean upstream close.
+    Closed,
+    /// Fatal per [`worker_recv_failure_is_fatal`]: latch `peer_disconnected`.
+    LinkLost(cascadia_transport::TransportError),
+    /// Transient: back off and receive again.
+    Retry(cascadia_transport::TransportError),
+}
+
+/// Classify a worker's upstream receive, marking `upstream_seen` on the first
+/// frame. Pure, so the workers that cannot be built in a unit test share it.
+fn classify_worker_recv(
+    res: cascadia_transport::TransportResult<Option<FrameKind>>,
+    upstream_seen: &mut bool,
+) -> WorkerRecv {
+    match res {
+        Ok(Some(k)) => {
+            *upstream_seen = true;
+            WorkerRecv::Frame(k)
+        }
+        Ok(None) => WorkerRecv::Closed,
+        Err(e) if worker_recv_failure_is_fatal(&e, *upstream_seen) => WorkerRecv::LinkLost(e),
+        Err(e) => WorkerRecv::Retry(e),
+    }
+}
+
 /// Whether a worker-rank `step()` should surface its latched upstream
 /// disconnect as a connection-fatal `Err` this call: yes exactly once, on the
 /// first step after the link drops. After that the one-shot is spent so a
@@ -1507,10 +1537,12 @@ pub struct SparseMoEEngine {
     runtime_handle: tokio::runtime::Handle,
     rank: u32,
     total: u32,
-    /// Set on a worker rank when the upstream socket closes cleanly. Keeps
-    /// step_worker from hot-spinning on `recv_kind_server` returning
-    /// `Ok(None)` over and over.
+    /// Set on a worker rank when the upstream socket closes cleanly or a
+    /// once-seen upstream link is lost, since only a rebuild re-accepts it.
     peer_disconnected: bool,
+    /// Set once a frame has arrived from the previous rank: after that, a
+    /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
+    upstream_seen: bool,
     /// Worker rank one-shot: true after `step()` has surfaced the latched
     /// disconnect as a connection-fatal `Err` to the relay loop. Stops the
     /// fatal Err from being re-emitted if `step()` is somehow polled again
@@ -3352,16 +3384,28 @@ impl SparseMoEEngine {
         upstream: &Arc<TokioMutex<ActivationServer>>,
     ) -> Result<(), String> {
         let downstream = self.transport.downstream.clone();
-        let kind = self
-            .block_on(recv_kind_server(upstream))
-            .map_err(|e| format!("recv_kind: {e}"))?;
-        let Some(kind) = kind else {
-            // Clean upstream close — the driver finished its session.
-            // Latch the flag so subsequent step()s back off without
-            // re-entering the (now-doomed) recv loop.
-            info!(rank = self.rank, "upstream closed cleanly; worker idling");
-            self.peer_disconnected = true;
-            return Ok(());
+        let recv = self.block_on(recv_kind_server(upstream));
+        let kind = match classify_worker_recv(recv, &mut self.upstream_seen) {
+            WorkerRecv::Frame(k) => k,
+            WorkerRecv::Closed => {
+                // Clean upstream close — the driver finished its session.
+                // Latch the flag so subsequent step()s back off without
+                // re-entering the (now-doomed) recv loop.
+                info!(rank = self.rank, "upstream closed cleanly; worker idling");
+                self.peer_disconnected = true;
+                return Ok(());
+            }
+            WorkerRecv::LinkLost(e) => {
+                // The listener accepted exactly once, so nothing reconnects:
+                // latch, and the next step() exits for the supervisor to rebuild.
+                warn!(
+                    rank = self.rank,
+                    "worker upstream link lost: {e}; exiting for supervisor rebuild"
+                );
+                self.peer_disconnected = true;
+                return Ok(());
+            }
+            WorkerRecv::Retry(e) => return Err(format!("recv_kind: {e}")),
         };
         match kind {
             FrameKind::Reset => {
@@ -3850,9 +3894,14 @@ pub struct OvMoeEngine {
     runtime_handle: tokio::runtime::Handle,
     rank: u32,
     total: u32,
-    /// Set on a worker rank when the upstream socket closes cleanly, so
-    /// `step_worker` doesn't hot-spin on `recv_kind_server` → `Ok(None)`.
+    /// Set on a worker rank when the upstream socket closes cleanly or a
+    /// once-seen upstream link is lost, since only a rebuild re-accepts it.
     peer_disconnected: bool,
+    /// Set once a frame has arrived from the previous rank: after that, a
+    /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
+    upstream_seen: bool,
+    /// One-shot: the latched disconnect has been surfaced from `step()`.
+    disconnect_reported: bool,
     /// Last-rank only: tokens this rank has sampled since the last `Reset`,
     /// used as the repetition-penalty `history`. Like the K2.6 path, prompt
     /// tokens are not mirrored here (they flow only as hidden states), so
@@ -3926,6 +3975,8 @@ impl OvMoeEngine {
             rank,
             total,
             peer_disconnected: false,
+            upstream_seen: false,
+            disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
@@ -4861,17 +4912,26 @@ impl OvMoeEngine {
         }
         let Some(upstream) = self.transport.upstream.clone() else {
             warn!("worker rank has no upstream socket");
+            self.peer_disconnected = true;
             std::thread::sleep(WORKER_BACKOFF);
             return Vec::new();
         };
         let downstream = self.transport.downstream.clone();
-        let kind = match self.block_on(recv_kind_server(&upstream)) {
-            Ok(Some(k)) => k,
-            Ok(None) => {
+        let recv = self.block_on(recv_kind_server(&upstream));
+        let kind = match classify_worker_recv(recv, &mut self.upstream_seen) {
+            WorkerRecv::Frame(k) => k,
+            WorkerRecv::Closed => {
                 self.peer_disconnected = true;
                 return Vec::new();
             }
-            Err(e) => {
+            WorkerRecv::LinkLost(e) => {
+                // The listener accepted exactly once, so nothing reconnects:
+                // latch, and the next step() exits for the supervisor to rebuild.
+                warn!("worker upstream link lost: {e}; exiting for supervisor rebuild");
+                self.peer_disconnected = true;
+                return Vec::new();
+            }
+            WorkerRecv::Retry(e) => {
                 warn!("worker recv_kind failed: {e}");
                 std::thread::sleep(WORKER_BACKOFF);
                 return Vec::new();
@@ -5066,18 +5126,22 @@ impl Engine for OvMoeEngine {
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
-        // Behavior-preserving migration to EngineResult: step_single_stage /
-        // step_first / step_worker handle their own errors terminally (the
-        // driver emits a final-marker chunk; the worker latches), so there is
-        // nothing to surface as Err here.
+        // step_single_stage / step_first handle their own errors terminally
+        // (the driver emits a final-marker chunk), so they never surface Err.
         if self.total <= 1 {
             return Ok(self.step_single_stage());
         }
-        Ok(if self.rank == 0 {
-            self.step_first()
-        } else {
-            self.step_worker()
-        })
+        if self.rank == 0 {
+            return Ok(self.step_first());
+        }
+        // A latched upstream disconnect can only be cleared by a rebuild, so
+        // surface it to run_relay_loop once, as SparseMoEEngine::step does.
+        let produced = self.step_worker();
+        if worker_should_report_disconnect(self.peer_disconnected, self.disconnect_reported) {
+            self.disconnect_reported = true;
+            return Err(EngineError::NotConnected);
+        }
+        Ok(produced)
     }
 
     #[cfg(feature = "kv_coord")]
@@ -8642,6 +8706,74 @@ mod tests {
         ));
         assert!(worker_recv_failure_is_fatal(&reset(), false));
         assert!(worker_recv_failure_is_fatal(&reset(), true));
+    }
+
+    /// Feeds receive results through the latch / one-shot report that
+    /// SparseMoEEngine and OvMoeEngine `step()` use (neither engine can be
+    /// built without a model); `true` is a step that returned the fatal Err.
+    fn worker_step_errs(
+        recvs: Vec<cascadia_transport::TransportResult<Option<FrameKind>>>,
+    ) -> Vec<bool> {
+        let (mut seen, mut latched, mut reported) = (false, false, false);
+        recvs
+            .into_iter()
+            .map(|r| {
+                if !latched
+                    && matches!(
+                        classify_worker_recv(r, &mut seen),
+                        WorkerRecv::Closed | WorkerRecv::LinkLost(_)
+                    )
+                {
+                    latched = true;
+                }
+                let err = worker_should_report_disconnect(latched, reported);
+                reported |= err;
+                err
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moe_worker_exits_once_when_live_upstream_drops() {
+        use cascadia_transport::TransportError;
+        let errs = worker_step_errs(vec![
+            Ok(Some(FrameKind::Reset)),
+            Err(TransportError::NotConnected),
+            Err(TransportError::NotConnected),
+            Err(TransportError::NotConnected),
+        ]);
+        assert_eq!(errs, [false, true, false, false]);
+        let mut seen = false;
+        assert!(matches!(
+            classify_worker_recv(Ok(Some(FrameKind::Reset)), &mut seen),
+            WorkerRecv::Frame(FrameKind::Reset)
+        ));
+        assert!(seen);
+        assert!(matches!(
+            classify_worker_recv(Err(TransportError::NotConnected), &mut seen),
+            WorkerRecv::LinkLost(TransportError::NotConnected)
+        ));
+    }
+
+    #[test]
+    fn moe_worker_keeps_waiting_before_upstream_dials_and_on_frame_start_timeout() {
+        use cascadia_transport::TransportError;
+        let timeout = || TransportError::FrameStartTimeout(std::time::Duration::from_secs(1));
+        let errs = worker_step_errs(vec![
+            Err(TransportError::NotConnected),
+            Err(TransportError::NotConnected),
+            Ok(Some(FrameKind::Reset)),
+            Err(timeout()),
+            Err(timeout()),
+            Ok(Some(FrameKind::Reset)),
+        ]);
+        assert!(errs.iter().all(|e| !e), "{errs:?}");
+        let mut seen = false;
+        assert!(matches!(
+            classify_worker_recv(Err(TransportError::NotConnected), &mut seen),
+            WorkerRecv::Retry(TransportError::NotConnected)
+        ));
+        assert!(!seen);
     }
 
     // -------- batched-prefill reply deadline (regression for the unbounded
