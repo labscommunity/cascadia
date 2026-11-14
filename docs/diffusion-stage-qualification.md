@@ -99,7 +99,51 @@ execution, drain, absolute lease lifetime, and uncertain-execution quarantine.
 Python tests share the Rust golden manifest/frame and exercise actual loopback
 HTTP authentication, framing, and retaining capacity after a client disconnect.
 
-Multi-host placement, network fault injection, sustained load, and a model exceeding one host's usable memory require additional
-qualification through the enterprise integration. This local comparison alone
-must not be advertised as distributed production qualification, a speedup, or
-64 GB machine coverage.
+## Distributed release qualification — 2026-11-13
+
+Report date uses America/Chicago; evidence timestamps use UTC.
+
+The same SDXL artifacts were served through the enterprise admitted QUIC mesh on two
+idle older Tiber Arrow Lake PCs, each Core Ultra 7 265T / 32 GB RAM, Windows, Intel GPU
+driver `32.0.101.8132`. The final production-feature release binary used enterprise
+`c3da10f98b6c84dd12f1478b651a7cc989a24e6b` and upstream
+`450520bbc7c2ee69c174ffbbdc32b80c261a95ea`. Its SHA-256 was
+`3e39f0b7e235bb69f026324ac9acfdd4821d23be5a072de9aaacaf353e5397fd`. The packaged Python
+source was verified against that upstream revision.
+
+| Placement | Resolution | First 20-step image | Result |
+|---|---|---:|---|
+| layers | 512x512 | 484.360 s | Exact local reference PNG |
+| layers | 1024x1024 | 1929.589 s | Exact local reference PNG |
+| components | 512x512 | 76.174 s | Exact local reference PNG |
+
+The complete 512 layer suite also passed two seeded repeats, two additional manga
+prompts, capacity exclusion, disconnected-client ownership, signed operator
+drain/restart, worker boot rediscovery, worker-loss quarantine, explicit recovery,
+stage-placement checks, and owned-process cleanup. The 1024 layer run was a single-image
+smoke test. Component placement also accepted a maximum 64 KiB public request and
+rejected a request one byte larger without quarantining healthy workers.
+
+A legal public request can grow when normalized and wrapped for the internal sidecar.
+The internal `/generate` bound is 256 KiB while the public limit remains 64 KiB; an
+actual loopback HTTP regression verifies this boundary. Seven portable Python
+contract/HTTP tests and the upstream workspace CI passed.
+
+The two hosts used a Tailscale relay. A layer request sends about 55 MB per denoising
+step at 512 pixels and about 217 MB at 1024 pixels. These results establish the tested
+placement and lifecycle behavior, not a network speedup. Whole-image replicas remain the
+preferred throughput strategy when the pipeline fits. No tested model exceeded one
+host's usable memory.
+
+Sanitized per-run summaries and first-image metrics are under
+[`evidence/diffusion-20261113/distributed`](evidence/diffusion-20261113/distributed).
+The complete [enterprise qualification
+report](https://github.com/labscommunity/cascadia-enterprise/blob/7c787b16271374a77dd6f68624ba558eea3e9fa7/docs/operator/diffusion-stage-qualification.md)
+records images, memory, failure injection, and two earlier interrupted attempts caused
+by a scheduled demo process kill. Final tests used a hash-identical executable with an
+isolated filename, leaving that host-management job unchanged.
+
+This is a bounded SDXL deployment profile. Sustained multi-user load, 64 GB hardware,
+larger-than-one-host capacity, other diffusion architectures, CFG parallelism, and
+tensor/sequence parallelism remain separate qualification work. The prompt samples do
+not establish specialized manga quality or panel consistency.

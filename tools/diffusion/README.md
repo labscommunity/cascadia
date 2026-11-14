@@ -111,6 +111,11 @@ executor. The sidecar is not an unauthenticated network service: enterprise
 wraps it in admitted QUIC, reserves all stages before dispatch, and binds every
 execution to the caller, manifest, worker boot, lease, and sequence.
 
+The internal `/generate` JSON envelope has a 256 KiB limit. This includes the
+normalized request and coordinator metadata; the enterprise public image API
+keeps its separate 64 KiB limit. The larger internal bound accommodates JSON
+escaping and normalization of requests accepted by the public API.
+
 A dropped caller does not release a running execution. Expired/cancelled leases
 retain running work until confirmed completion. An ambiguous engine failure
 quarantines the worker until restart; restarting changes the boot identity.
