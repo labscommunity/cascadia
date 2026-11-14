@@ -151,6 +151,9 @@ impl EngineError {
                     || msg.contains("connection reset")
                     || msg.contains("broken pipe")
                     || msg.contains("connection aborted")
+                    // Windows WSAECONNABORTED (10053) words it "An established
+                    // connection was aborted by the software in your host machine."
+                    || msg.contains("connection was aborted")
                     // Mid-frame deadline (recv_exact wall-clock bound).
                     || msg.contains("recv_exact timed out")
             }
@@ -455,6 +458,9 @@ mod tests {
             "io error: connection reset by peer",
             "io error: broken pipe",
             "io error: connection aborted",
+            // Windows 10053 (WSAECONNABORTED) as Rust renders it.
+            "io error: An established connection was aborted by the software in your host \
+             machine. (os error 10053)",
             // Mid-frame stall surfaced by recv_exact's wall-clock bound.
             "io error: recv_exact timed out after 60s",
         ] {
