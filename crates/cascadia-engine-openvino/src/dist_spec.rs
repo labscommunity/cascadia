@@ -183,6 +183,91 @@ fn map_ov_err(err: OvError) -> EngineError {
 /// see.
 pub const MAX_PENDING_TASKS: usize = 256;
 
+/// Most logits rows a verify reply carries (k drafts + the correction). A last stage
+/// sends only the final row of a wider, prefill reply, so the driver refuses k + 1 above it.
+pub const MAX_VERIFY_ROWS: usize = 16;
+
+/// Prompt tokens per prefill FORWARD. Bounds each frame and the draft's f32 output copy:
+/// an older worker still replies `[1, span, vocab]` f16, ~131 MB at the 128,256 Llama-3
+/// vocab, half of `MAX_TENSOR_BYTES`; 1,024 would sit 2% under it.
+const PREFILL_SPAN: usize = 512;
+
+/// Re-dial budget for a dropped downstream; short because it runs under the engine lock.
+const REDIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A worker waits this long per step for a re-dialing upstream, then releases the engine lock.
+const REACCEPT_WAIT: Duration = Duration::from_millis(500);
+
+fn validate_k(k: u32) -> EngineResult<()> {
+    // A verify is max(k, 1) drafts plus the correction.
+    let rows = k.max(1) as usize + 1;
+    if rows > MAX_VERIFY_ROWS {
+        return Err(EngineError::InvalidConfig(format!(
+            "spec k={k} needs {rows} verify rows; the most a last stage returns is {MAX_VERIFY_ROWS}"
+        )));
+    }
+    Ok(())
+}
+
+/// `[start, end)` prefill spans of at most `span` tokens.
+fn prefill_spans(len: usize, span: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..len)
+        .step_by(span.max(1))
+        .map(move |s| s..s.saturating_add(span).min(len))
+}
+
+/// The last stage's LOGITS_RESPONSE body. A prefill (more rows than any verify) keeps only its
+/// final row: the driver reads no other, and `[1, T, vocab]` passes `MAX_TENSOR_BYTES` on long
+/// prompts. Older drivers already take the last `vocab` values of a prefill reply.
+fn last_stage_reply(bytes: Vec<u8>, shape: [u32; MAX_RANK]) -> (Vec<u8>, [u32; MAX_RANK]) {
+    let rows = shape[1] as usize;
+    if shape[0] != 1 || rows <= MAX_VERIFY_ROWS || !bytes.len().is_multiple_of(rows) {
+        return (bytes, shape);
+    }
+    let row = bytes.len() / rows;
+    (bytes[bytes.len() - row..].to_vec(), [1, 1, shape[2]])
+}
+
+/// A verify needs one logits row per verified token.
+fn check_verify_rows(shape: [usize; 3], logits_len: usize, need: usize) -> Result<(), EngineError> {
+    if shape[1] < need || logits_len < need * shape[2] {
+        return Err(EngineError::Backend(format!(
+            "ov-dist-spec: verify reply has {} logits rows for {need} tokens (shape {shape:?})",
+            shape[1]
+        )));
+    }
+    Ok(())
+}
+
+/// Re-dial `link` if its socket was dropped. `Ok(true)` when it dialed a new one.
+async fn redial_if_disconnected(
+    link: &mut ActivationClient,
+    timeout: Duration,
+) -> Result<bool, cascadia_transport::TransportError> {
+    if link.is_connected() {
+        return Ok(false);
+    }
+    link.close().await;
+    match tokio::time::timeout(timeout, link.try_connect()).await {
+        Ok(r) => r.map(|()| {
+            info!("ov-dist-spec: re-dialed downstream");
+            true
+        }),
+        Err(_) => Err(cascadia_transport::TransportError::ConnectTimeout(timeout)),
+    }
+}
+
+/// Send RESET down `link`, re-dialing it first if it was dropped. `Ok(true)` when it re-dialed.
+async fn send_reset_downstream(
+    link: &mut ActivationClient,
+    timeout: Duration,
+) -> Result<bool, cascadia_transport::TransportError> {
+    let redialed = redial_if_disconnected(link, timeout).await?;
+    link.send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+        .await?;
+    Ok(redialed)
+}
+
 /// Bridge sync code to an async future.
 ///
 /// Two contexts hit this path:
@@ -825,8 +910,7 @@ impl DistributedMaskedReq {
         let downstream = self.downstream.clone();
         run_async(&self.runtime_handle, async move {
             let mut g = downstream.lock().await;
-            let raw = (FrameKind::Reset as u32).to_be_bytes();
-            g.send_raw(&raw).await
+            send_reset_downstream(&mut g, REDIAL_TIMEOUT).await
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
         for v in self.valid_mask.iter_mut() {
@@ -835,6 +919,32 @@ impl DistributedMaskedReq {
         self.cache_len = 0;
         self.logical_pos = 0;
         Ok(())
+    }
+
+    /// Re-dial the downstream if a failed round dropped it. `Ok(true)` when it dialed.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn redial_downstream(&mut self) -> Result<bool, EngineError> {
+        let downstream = self.downstream.clone();
+        run_async(&self.runtime_handle, async move {
+            let mut g = downstream.lock().await;
+            redial_if_disconnected(&mut g, REDIAL_TIMEOUT).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
+    /// A failed round leaves the link's framing unknown, and a clean EOF still holds the socket,
+    /// so drop it: the next task's `reset` re-dials.
+    fn drop_link_on_err<T>(
+        &self,
+        res: Result<T, cascadia_transport::TransportError>,
+    ) -> Result<T, cascadia_transport::TransportError> {
+        if res.is_err() {
+            let downstream = self.downstream.clone();
+            run_async(&self.runtime_handle, async move {
+                downstream.lock().await.close().await;
+            });
+        }
+        res
     }
 
     /// Async-split: does sync rank-0-side stage_0 work then spawns the network
@@ -976,7 +1086,8 @@ impl DistributedMaskedReq {
         });
         let wire_us = _ts.elapsed().as_micros();
         self.t_wire += std::time::Duration::from_micros(wire_us as u64);
-        result.map_err(|e| EngineError::Backend(e.to_string()))
+        self.drop_link_on_err(result)
+            .map_err(|e| EngineError::Backend(e.to_string()))
     }
 
     pub fn feed(&mut self, input_ids: &[i64]) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
@@ -1052,7 +1163,7 @@ impl DistributedMaskedReq {
         let mut t_recv = std::time::Duration::ZERO;
         let mut t_lock = std::time::Duration::ZERO;
         let _ts_lock = std::time::Instant::now();
-        let (logits, _logits_shape, send_d, recv_d) = run_async(&self.runtime_handle, async move {
+        let round = run_async(&self.runtime_handle, async move {
             let mut g = downstream.lock().await;
             // We need raw socket access. The ActivationClient exposes
             // send_raw/recv_raw + send_tensor/recv_tensor; build the
@@ -1114,8 +1225,10 @@ impl DistributedMaskedReq {
                 send_dur,
                 recv_dur,
             ))
-        })
-        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        });
+        let (logits, _logits_shape, send_d, recv_d) = self
+            .drop_link_on_err(round)
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
         t_lock = _ts_lock.elapsed();
         let wire_us = _ts.elapsed().as_micros();
         t_send = send_d;
@@ -1189,6 +1302,34 @@ impl SpecDecodeStats {
     }
 }
 
+/// Feed `ids` through the target chain in `PREFILL_SPAN` pieces; returns the last logits row.
+fn target_prefill(target: &mut DistributedMaskedReq, ids: &[i64]) -> Result<Vec<f32>, EngineError> {
+    let mut last = Vec::new();
+    for span in prefill_spans(ids.len(), PREFILL_SPAN) {
+        let (logits, shape) = target.feed(&ids[span])?;
+        let vocab = shape[2];
+        if vocab == 0 || logits.len() < vocab {
+            return Err(EngineError::Backend(format!(
+                "ov-dist-spec: prefill reply has {} logits for vocab {vocab}",
+                logits.len()
+            )));
+        }
+        last = logits[logits.len() - vocab..].to_vec();
+    }
+    if last.is_empty() {
+        return Err(EngineError::Backend("ov-dist-spec: empty prefill".into()));
+    }
+    Ok(last)
+}
+
+/// Feed `ids` to the draft in `PREFILL_SPAN` pieces (bounds its f32 output copy).
+fn draft_prefill(draft: &mut MaskedReq, ids: &[i64]) -> Result<(), EngineError> {
+    for span in prefill_spans(ids.len(), PREFILL_SPAN) {
+        draft.feed(&ids[span])?;
+    }
+    Ok(())
+}
+
 /// Run greedy speculative decoding to completion, accumulating tokens.
 /// Mirrors `spec_decode_greedy_stream` from the Python port. Returns the
 /// list of generated token ids.
@@ -1212,15 +1353,13 @@ pub fn spec_decode_greedy(
     draft.reset()?;
 
     let _ts = std::time::Instant::now();
-    let (t_logits, t_shape) = target.feed(prompt_ids)?;
+    let last_row = target_prefill(target, prompt_ids)?;
     t_target += _ts.elapsed();
     let _ts = std::time::Instant::now();
-    draft.feed(prompt_ids)?;
+    draft_prefill(draft, prompt_ids)?;
     t_draft += _ts.elapsed();
 
-    let vocab = t_shape[2];
-    let last_row = &t_logits[t_logits.len() - vocab..];
-    let first = argmax(last_row) as i64;
+    let first = argmax(&last_row) as i64;
     out.push(first);
     if out.len() >= max_tokens {
         return Ok(out);
@@ -1282,6 +1421,7 @@ pub fn spec_decode_greedy(
         // Now block on target.
         let (t_logits, t_shape) = target.feed_recv_async(target_handle)?;
         t_target += _ts.elapsed();
+        check_verify_rows(t_shape, t_logits.len(), verify.len())?;
         let v = t_shape[2];
         let mut t_greedy = Vec::with_capacity(verify.len());
         for i in 0..verify.len() {
@@ -1680,8 +1820,13 @@ impl OvDistSpecEngine {
     ) -> Result<ActiveSpec, EngineError> {
         // Issue-34: warm-resume a cached strict prefix (restores draft+target+chain, all-or-nothing)
         // and feed only the suffix; else cold-reset + feed the full prompt. 0 on the default build.
+        // A re-dialed link means the chain dropped its last peer: start this task cold.
         #[cfg(feature = "kv_coord")]
-        let warm_len = self.kv_try_warm_resume(&task.tenant, prompt_ids);
+        let warm_len = if self.target.redial_downstream()? {
+            0
+        } else {
+            self.kv_try_warm_resume(&task.tenant, prompt_ids)
+        };
         #[cfg(not(feature = "kv_coord"))]
         let warm_len = 0usize;
         if warm_len == 0 {
@@ -1694,10 +1839,9 @@ impl OvDistSpecEngine {
         self.target.t_wire = std::time::Duration::ZERO;
 
         let feed_ids = &prompt_ids[warm_len..];
-        let (t_logits, t_shape) = self.target.feed(feed_ids)?;
-        self.draft.feed(feed_ids)?;
-        let vocab = t_shape[2];
-        let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
+        let last_row = target_prefill(&mut self.target, feed_ids)?;
+        draft_prefill(&mut self.draft, feed_ids)?;
+        let first = argmax(&last_row) as i64;
 
         let (d_logits, d_shape) = self.draft.feed(&[first])?;
         let dv = d_shape[2];
@@ -1765,6 +1909,7 @@ impl OvDistSpecEngine {
         verify.push(active.prev_correction);
         verify.extend_from_slice(&drafts);
         let (t_logits, t_shape) = self.target.feed(&verify)?;
+        check_verify_rows(t_shape, t_logits.len(), verify.len())?;
         let v = t_shape[2];
         let mut t_greedy = Vec::with_capacity(verify.len());
         for i in 0..verify.len() {
@@ -2020,6 +2165,7 @@ impl OvDistSpecBuilder {
 #[async_trait]
 impl Builder for OvDistSpecBuilder {
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()> {
+        validate_k(self.k)?;
         if peers.upstream.is_some() {
             return Err(EngineError::PeerRejected(
                 "driver should not have an upstream".into(),
@@ -2183,44 +2329,60 @@ impl Engine for OvDistSpecWorkerEngine {
         // value on drop, preventing stale state if the spawn_blocking
         // pool ever migrates this thread to non-blocking work.
         let _guard = BlockingContextGuard::enter();
+        // The upstream re-dials after a dropped link. The wait is bounded so an idle worker
+        // still releases the engine lock between steps.
+        let upstream = self.upstream.clone();
+        let accepted = run_async(&self.runtime_handle, async move {
+            let mut g = upstream.lock().await;
+            if g.is_connected() {
+                return Ok(true);
+            }
+            match tokio::time::timeout(REACCEPT_WAIT, g.accept()).await {
+                Ok(r) => r.map(|()| true),
+                Err(_) => Ok(false),
+            }
+        });
+        match accepted {
+            Ok(true) => {}
+            Ok(false) => return Ok(Vec::new()),
+            // The listener is gone: only a rebuild can serve again.
+            Err(cascadia_transport::TransportError::NotStarted) => {
+                return Err(EngineError::NotConnected)
+            }
+            Err(e) => {
+                warn!(error = %e, "ov-dist-spec worker: re-accept failed");
+                std::thread::sleep(REACCEPT_WAIT);
+                return Ok(Vec::new());
+            }
+        }
         let result = self.handle_one_frame();
         if let Err(ref e) = result {
-            // Transport-closed errors signal the driver disconnected; don't
-            // spam the log. Drop the upstream/downstream so subsequent steps
-            // fail fast with NotConnected; the relay loop exits ConnectionFatal
-            // on this Err (clean supervisor rebuild), and the sleep below only
-            // throttles the single round before the loop observes the drop.
             // Fatal-classification is delegated to EngineError::is_connection_fatal
             // (single source of truth) — clean teardown, black-holed peer (idle
             // ceiling), peer crash (RST/broken pipe/aborted), mid-frame stall.
             if e.is_connection_fatal() {
-                warn!(error = %e, "ov-dist-spec worker: connection-fatal transport error, dropping links");
-                // Mark engine as drained by clearing connections.
-                let _ = self.runtime_handle.clone().block_on(async {
-                    let mut g = self.upstream.lock().await;
-                    g.close().await;
-                    Ok::<_, cascadia_transport::TransportError>(())
+                // Drop both peers but keep listening: the in-flight request is lost either
+                // way, the upstream sees EOF instead of waiting out its idle ceiling, and its
+                // re-dial is accepted on the next step. A middle stage re-dials its downstream
+                // on the next RESET. Ok, so the relay loop keeps stepping.
+                warn!(error = %e, "ov-dist-spec worker: connection-fatal transport error, dropping links and re-accepting");
+                let upstream = self.upstream.clone();
+                let downstream = self.downstream.clone();
+                run_async(&self.runtime_handle, async move {
+                    upstream.lock().await.disconnect().await;
+                    if let Some(d) = downstream {
+                        d.lock().await.close().await;
+                    }
                 });
-                if let Some(d) = &self.downstream {
-                    let _ = self.runtime_handle.clone().block_on(async {
-                        let mut g = d.lock().await;
-                        g.close().await;
-                        Ok::<_, cascadia_transport::TransportError>(())
-                    });
-                }
-                // Sleep a tick so the relay loop's busy spin doesn't
-                // hot-loop until the runner notices.
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            } else {
-                // Non-connection-fatal error (bad frame kind, stray
-                // LOGITS_RESPONSE, reset/inference failure). recv_raw keeps
-                // succeeding on a connected-but-misbehaving peer, so without
-                // a cool-off a bad-frame flood hot-spins the worker loop and
-                // floods the log. Same 200 ms cadence as the fatal branch;
-                // the sleep also caps the warn rate to ~5/s.
-                warn!(error = %e, "ov-dist-spec worker step error");
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                return Ok(Vec::new());
             }
+            // Non-connection-fatal error (bad frame kind, stray
+            // LOGITS_RESPONSE, reset/inference failure). recv_raw keeps
+            // succeeding on a connected-but-misbehaving peer, so without
+            // a cool-off a bad-frame flood hot-spins the worker loop and
+            // floods the log. The sleep also caps the warn rate to ~5/s.
+            warn!(error = %e, "ov-dist-spec worker step error");
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
         result.map(|_| Vec::new())
     }
@@ -2271,7 +2433,7 @@ impl OvDistSpecWorkerEngine {
                 if let Some(d) = downstream {
                     run_async(&self.runtime_handle, async move {
                         let mut dg = d.lock().await;
-                        dg.send_raw(&(FrameKind::Reset as u32).to_be_bytes()).await
+                        send_reset_downstream(&mut dg, REDIAL_TIMEOUT).await
                     })
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
                 }
@@ -2590,6 +2752,8 @@ impl OvDistSpecWorkerEngine {
 
                 if self.is_last {
                     // Send LOGITS_RESPONSE back to upstream
+                    let (out_f16_bytes, out_shape_wire) =
+                        last_stage_reply(out_f16_bytes, out_shape_wire);
                     let upstream3 = upstream.clone();
                     let _ts_send = std::time::Instant::now();
                     run_async(&self.runtime_handle, async move {
@@ -3447,6 +3611,131 @@ mod tests {
         let raw = (FrameKind::Reset as u32).to_be_bytes();
         client.send_raw(&raw).await.unwrap();
         assert_eq!(h.await.unwrap(), FrameKind::Reset);
+    }
+
+    /// The driver's RESET path after the chain dropped its link: the old
+    /// socket is gone, the worker kept listening, and the RESET lands on a
+    /// freshly dialed socket.
+    #[tokio::test]
+    async fn reset_redials_a_dropped_downstream() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let mut client = ActivationClient::new("127.0.0.1", server.port());
+        client.connect().await.unwrap();
+        server.accept().await.unwrap();
+
+        // Connected: no re-dial, RESET on the same socket.
+        assert!(!send_reset_downstream(&mut client, REDIAL_TIMEOUT)
+            .await
+            .unwrap());
+        let kb = server.recv_raw(4).await.unwrap();
+        assert_eq!(
+            FrameKind::from_u32(u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]])),
+            Some(FrameKind::Reset)
+        );
+
+        // An oversized reply drops the driver's socket; the worker drops its peer.
+        let elems = (cascadia_transport::MAX_TENSOR_BYTES / 2 + 1) as u32;
+        let mut header = [0u8; 20];
+        header[0..4].copy_from_slice(&(elems * 2).to_be_bytes());
+        header[4..8].copy_from_slice(&(WireDType::F16 as u32).to_be_bytes());
+        header[8..12].copy_from_slice(&1u32.to_be_bytes());
+        header[12..16].copy_from_slice(&1u32.to_be_bytes());
+        header[16..20].copy_from_slice(&elems.to_be_bytes());
+        server.send_raw(&header).await.unwrap();
+        assert!(client.recv().await.is_err());
+        assert!(!client.is_connected());
+        server.disconnect().await;
+
+        assert!(send_reset_downstream(&mut client, REDIAL_TIMEOUT)
+            .await
+            .unwrap());
+        server.accept().await.unwrap();
+        let kb = server.recv_raw(4).await.unwrap();
+        assert_eq!(
+            FrameKind::from_u32(u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]])),
+            Some(FrameKind::Reset)
+        );
+    }
+
+    /// No listener: the re-dial fails the task instead of hanging it.
+    #[tokio::test]
+    async fn reset_fails_when_the_downstream_is_gone() {
+        let port = {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            server.port()
+        };
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        assert!(send_reset_downstream(&mut client, REDIAL_TIMEOUT)
+            .await
+            .is_err());
+    }
+
+    fn f16_rows(rows: u32, vocab: u32) -> Vec<u8> {
+        (0..rows * vocab * 2).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn last_stage_reply_trims_only_a_prefill() {
+        let vocab = 8u32;
+        for (rows, trimmed) in [
+            (1u32, false),
+            (4, false),
+            (16, false),
+            (17, true),
+            (6181, true),
+        ] {
+            let bytes = f16_rows(rows, vocab);
+            let (out, shape) = last_stage_reply(bytes.clone(), [1, rows, vocab]);
+            if trimmed {
+                assert_eq!(shape, [1, 1, vocab], "rows={rows}");
+                let row = (vocab * 2) as usize;
+                assert_eq!(out, bytes[bytes.len() - row..], "rows={rows}");
+            } else {
+                assert_eq!(shape, [1, rows, vocab], "rows={rows}");
+                assert_eq!(out, bytes, "rows={rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_spans_cover_the_prompt_in_order() {
+        let spans = |len| prefill_spans(len, PREFILL_SPAN).collect::<Vec<_>>();
+        assert!(spans(0).is_empty());
+        assert_eq!(spans(1), vec![0..1]);
+        assert_eq!(spans(512), vec![0..512]);
+        assert_eq!(spans(513), vec![0..512, 512..513]);
+        let long = spans(6181);
+        assert_eq!(long.len(), 13);
+        assert_eq!(long.last(), Some(&(6144..6181)));
+        assert!(long.windows(2).all(|w| w[0].end == w[1].start));
+    }
+
+    // An older worker's full reply to one prefill span stays well under the frame cap.
+    const _: () = assert!(PREFILL_SPAN * 128_256 * 2 < cascadia_transport::MAX_TENSOR_BYTES / 2);
+
+    #[test]
+    fn spec_k_is_capped_by_the_verify_rows() {
+        for k in [0u32, 1, 4, 15] {
+            assert!(validate_k(k).is_ok(), "k={k}");
+        }
+        for k in [16u32, 100] {
+            assert!(
+                matches!(validate_k(k), Err(EngineError::InvalidConfig(_))),
+                "k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_verify_reply_fails_loudly() {
+        assert!(check_verify_rows([1, 4, 8], 32, 4).is_ok());
+        assert!(check_verify_rows([1, 5, 8], 40, 4).is_ok());
+        // A trimmed (prefill-shaped) reply to a verify.
+        let err = check_verify_rows([1, 1, 8], 8, 4).unwrap_err();
+        assert!(!err.is_connection_fatal(), "{err}");
+        assert!(check_verify_rows([1, 4, 8], 24, 4).is_err());
     }
 
     #[tokio::test]

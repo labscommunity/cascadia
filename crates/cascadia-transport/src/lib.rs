@@ -1540,6 +1540,17 @@ impl ActivationServer {
         Ok(buf)
     }
 
+    /// Whether an upstream peer is accepted (a fatal recv or a failed send drops it).
+    pub fn is_connected(&self) -> bool {
+        self.client.is_some()
+    }
+
+    /// Drop the accepted peer but keep listening, so the next [`accept`](Self::accept)
+    /// takes a re-dialed upstream. [`close`](Self::close) is for shutdown.
+    pub async fn disconnect(&mut self) {
+        self.poison().await;
+    }
+
     pub async fn close(&mut self) {
         if let Some(mut sock) = self.client.take() {
             let _ = sock.shutdown().await;
@@ -1601,6 +1612,11 @@ impl ActivationClient {
 
     pub fn for_addr(target: TransportAddr) -> Self {
         Self { target, sock: None }
+    }
+
+    /// Whether a socket is held (a fatal recv or a failed send drops it).
+    pub fn is_connected(&self) -> bool {
+        self.sock.is_some()
     }
 
     /// One connect attempt for the configured target flavor.
@@ -3308,6 +3324,70 @@ mod tests {
             matches!(err, TransportError::PayloadTooLarge(_)),
             "got {err:?}"
         );
+    }
+
+    /// The chain recovers from an oversized reply: the client drops on the
+    /// reject, re-dials, and the server, which kept its listener, accepts it.
+    #[tokio::test]
+    async fn oversized_reply_then_redial_round_trips_a_frame() {
+        let (mut server, mut client) = connected_pair(None).await;
+        let elems = (MAX_TENSOR_BYTES / 4 + 1) as u32;
+        server.send_raw(&f32_header(elems)).await.unwrap();
+        server.send_raw(&[0xAB; 4096]).await.unwrap();
+        let err = client
+            .recv()
+            .await
+            .expect_err("oversized frame must be rejected");
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(_)),
+            "got {err:?}"
+        );
+        assert!(!client.is_connected(), "a rejected frame drops the client");
+        server.disconnect().await;
+        assert!(!server.is_connected());
+
+        client.try_connect().await.unwrap();
+        server.accept().await.unwrap();
+        let t = Tensor::from_2d(DType::F32, 1, 2, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        client.send(&t).await.unwrap();
+        let (got, _) = server.recv().await.unwrap();
+        assert_eq!(got.data, t.data);
+        server.send(&t).await.unwrap();
+        let (back, _) = client.recv().await.unwrap();
+        assert_eq!(back.data, t.data);
+    }
+
+    /// A fatal recv drops only the accepted peer; the listener stays bound
+    /// until `close()`.
+    #[tokio::test]
+    async fn after_a_fatal_recv_the_server_still_accepts_until_close() {
+        let (mut server, addr) = started_server(None).await;
+        let TransportAddr::Tcp { host, port } = addr else {
+            unreachable!("tcp server")
+        };
+        let mut peer = TcpStream::connect((host.as_str(), port)).await.unwrap();
+        server.accept().await.unwrap();
+        let elems = (MAX_TENSOR_BYTES / 4 + 1) as u32;
+        peer.write_all(&f32_header(elems)).await.unwrap();
+        peer.flush().await.unwrap();
+        assert!(matches!(
+            server.recv().await,
+            Err(TransportError::PayloadTooLarge(_))
+        ));
+        assert!(!server.is_connected());
+
+        let _peer2 = TcpStream::connect((host.as_str(), port)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("accept must not hang")
+            .unwrap();
+        assert!(server.is_connected());
+
+        server.close().await;
+        assert!(matches!(
+            server.accept().await,
+            Err(TransportError::NotStarted)
+        ));
     }
 
     #[test]
