@@ -1,0 +1,43 @@
+# TYPE cascadia_diffusion_stage_output_bytes_total counter
+cascadia_diffusion_stage_output_bytes_total{target="peer"} 1426364
+cascadia_diffusion_stage_output_bytes_total{target="local"} 7361254
+# TYPE cascadia_diffusion_stage_input_bytes_total counter
+cascadia_diffusion_stage_input_bytes_total{target="peer"} 1810
+cascadia_diffusion_stage_input_bytes_total{target="local"} 28136341
+# TYPE cascadia_diffusion_stage_seconds summary
+cascadia_diffusion_stage_seconds{component="text_encoder_2",target="local",outcome="ok",quantile="0"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder_2",target="local",outcome="ok",quantile="0.5"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder_2",target="local",outcome="ok",quantile="0.9"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder_2",target="local",outcome="ok",quantile="0.95"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder_2",target="local",outcome="ok",quantile="0.99"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder_2",target="local",outcome="ok",quantile="0.999"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder_2",target="local",outcome="ok",quantile="1"} 0
+cascadia_diffusion_stage_seconds_sum{component="text_encoder_2",target="local",outcome="ok"} 0.2306128
+cascadia_diffusion_stage_seconds_count{component="text_encoder_2",target="local",outcome="ok"} 2
+cascadia_diffusion_stage_seconds{component="text_encoder",target="peer",outcome="ok",quantile="0"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder",target="peer",outcome="ok",quantile="0.5"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder",target="peer",outcome="ok",quantile="0.9"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder",target="peer",outcome="ok",quantile="0.95"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder",target="peer",outcome="ok",quantile="0.99"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder",target="peer",outcome="ok",quantile="0.999"} 0
+cascadia_diffusion_stage_seconds{component="text_encoder",target="peer",outcome="ok",quantile="1"} 0
+cascadia_diffusion_stage_seconds_sum{component="text_encoder",target="peer",outcome="ok"} 0.6492253
+cascadia_diffusion_stage_seconds_count{component="text_encoder",target="peer",outcome="ok"} 2
+cascadia_diffusion_stage_seconds{component="vae_decoder",target="local",outcome="ok",quantile="0"} 1.9671368999999999
+cascadia_diffusion_stage_seconds{component="vae_decoder",target="local",outcome="ok",quantile="0.5"} 1.9669812306767192
+cascadia_diffusion_stage_seconds{component="vae_decoder",target="local",outcome="ok",quantile="0.9"} 1.9669812306767192
+cascadia_diffusion_stage_seconds{component="vae_decoder",target="local",outcome="ok",quantile="0.95"} 1.9669812306767192
+cascadia_diffusion_stage_seconds{component="vae_decoder",target="local",outcome="ok",quantile="0.99"} 1.9669812306767192
+cascadia_diffusion_stage_seconds{component="vae_decoder",target="local",outcome="ok",quantile="0.999"} 1.9669812306767192
+cascadia_diffusion_stage_seconds{component="vae_decoder",target="local",outcome="ok",quantile="1"} 1.9671368999999999
+cascadia_diffusion_stage_seconds_sum{component="vae_decoder",target="local",outcome="ok"} 1.9671368999999999
+cascadia_diffusion_stage_seconds_count{component="vae_decoder",target="local",outcome="ok"} 1
+cascadia_diffusion_stage_seconds{component="unet",target="local",outcome="ok",quantile="0"} 3.5133571999999997
+cascadia_diffusion_stage_seconds{component="unet",target="local",outcome="ok",quantile="0.5"} 3.539905384385107
+cascadia_diffusion_stage_seconds{component="unet",target="local",outcome="ok",quantile="0.9"} 3.7363156269768765
+cascadia_diffusion_stage_seconds{component="unet",target="local",outcome="ok",quantile="0.95"} 3.7723569788076223
+cascadia_diffusion_stage_seconds{component="unet",target="local",outcome="ok",quantile="0.99"} 3.7723569788076223
+cascadia_diffusion_stage_seconds{component="unet",target="local",outcome="ok",quantile="0.999"} 3.7723569788076223
+cascadia_diffusion_stage_seconds{component="unet",target="local",outcome="ok",quantile="1"} 3.8650189
+cascadia_diffusion_stage_seconds_sum{component="unet",target="local",outcome="ok"} 72.3138716
+cascadia_diffusion_stage_seconds_count{component="unet",target="local",outcome="ok"} 20

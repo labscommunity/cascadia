@@ -1,0 +1,283 @@
+{
+  "started_unix": 1794609608.280311,
+  "node_executable_names": [
+    "cascadia-image-stage-e2e.exe",
+    "cascadia-image-stage-e2e.exe"
+  ],
+  "configuration": {
+    "source_commit": "c3da10f98b6c84dd12f1478b651a7cc989a24e6b",
+    "runtime_source": "git+https://github.com/labscommunity/cascadia?rev=450520bbc7c2ee69c174ffbbdc32b80c261a95ea#450520bbc7c2ee69c174ffbbdc32b80c261a95ea",
+    "node_sha256": "3e39f0b7e235bb69f026324ac9acfdd4821d23be5a072de9aaacaf353e5397fd",
+    "profile": "release",
+    "manifest": "c6dae31741b7816562a8bf65d27888814ab9a393321681cc606afda58b328243",
+    "model": "sdxl-layers-512",
+    "size": "512x512",
+    "mode": "layers",
+    "routes": {
+      "text_encoder": "local",
+      "text_encoder_2": "local",
+      "vae_decoder": "local",
+      "unet_first": "local",
+      "unet_second": "1"
+    },
+    "expected_image_sha256": "c0cb7f93fad147bfb5bd8d3e1328ae09c1b338848594087cf2784ba1289ba680"
+  },
+  "harness_sha256": "ed819abf295162e746b50e277a0358373a412b3373dbaeaee136f0759c7bb650",
+  "suite": "qualification",
+  "checks": [
+    "worker_preflight",
+    "worker_preflight",
+    "both_workers_ready_with_ca_admission",
+    "authentication_and_invalid_requests_rejected",
+    "image_generated",
+    "distributed_output_matches_local_reference",
+    "production_stage_metrics_exported",
+    "image_generated",
+    "image_generated",
+    "image_generated",
+    "image_generated",
+    "image_generated",
+    "capacity_remains_exclusive",
+    "image_generated",
+    "disconnected_client_retains_capacity_until_execution_finishes",
+    "operator_restart_drains_real_execution_and_lease",
+    "image_generated",
+    "new_worker_boot_is_rediscovered_without_stale_lease",
+    "worker_loss_quarantines_coordinator",
+    "image_generated",
+    "explicit_restart_recovers_both_workers",
+    "stage_execution_evidence",
+    "stage_execution_evidence",
+    "passed"
+  ],
+  "check_details": [
+    {
+      "check": "both_workers_ready_with_ca_admission",
+      "source_commit": "c3da10f98b6c84dd12f1478b651a7cc989a24e6b",
+      "runtime": "git+https://github.com/labscommunity/cascadia?rev=450520bbc7c2ee69c174ffbbdc32b80c261a95ea#450520bbc7c2ee69c174ffbbdc32b80c261a95ea"
+    },
+    {
+      "check": "authentication_and_invalid_requests_rejected"
+    },
+    {
+      "check": "distributed_output_matches_local_reference",
+      "sha256": "c0cb7f93fad147bfb5bd8d3e1328ae09c1b338848594087cf2784ba1289ba680"
+    },
+    {
+      "check": "production_stage_metrics_exported"
+    },
+    {
+      "check": "capacity_remains_exclusive",
+      "rejected_status": 503,
+      "reject_seconds": 0.1259712502360344
+    },
+    {
+      "check": "disconnected_client_retains_capacity_until_execution_finishes"
+    },
+    {
+      "check": "operator_restart_drains_real_execution_and_lease",
+      "image_seconds": 97.29476124979556
+    },
+    {
+      "check": "new_worker_boot_is_rediscovered_without_stale_lease"
+    },
+    {
+      "check": "worker_loss_quarantines_coordinator",
+      "status": 503,
+      "seconds": 35.212116374634206
+    },
+    {
+      "check": "explicit_restart_recovers_both_workers"
+    },
+    {
+      "check": "stage_execution_evidence",
+      "worker": 0,
+      "calls": 194,
+      "components": [
+        "text_encoder",
+        "text_encoder_2",
+        "unet_first",
+        "vae_decoder"
+      ],
+      "input_bytes": 183284388,
+      "output_bytes": 7064553556
+    },
+    {
+      "check": "stage_execution_evidence",
+      "worker": 1,
+      "calls": 129,
+      "components": [
+        "unet_second"
+      ],
+      "input_bytes": 7114876504,
+      "output_bytes": 16946269
+    },
+    {
+      "check": "passed",
+      "suite": "qualification"
+    }
+  ],
+  "cleanup_errors": [],
+  "log_collection_errors": [],
+  "images": [
+    {
+      "label": "cold",
+      "seconds": 484.36025108303875,
+      "sha256": "c0cb7f93fad147bfb5bd8d3e1328ae09c1b338848594087cf2784ba1289ba680",
+      "request_id": "342a1a66-48a8-4b15-937e-3e800af7421b",
+      "bytes": 367150,
+      "variance": 7341.229015598481
+    },
+    {
+      "label": "warm-1",
+      "seconds": 474.92138258274645,
+      "sha256": "c0cb7f93fad147bfb5bd8d3e1328ae09c1b338848594087cf2784ba1289ba680",
+      "request_id": "71a845a8-bc63-46af-a28b-5e0461b58a78",
+      "bytes": 367150,
+      "variance": 7341.229015598481
+    },
+    {
+      "label": "warm-2",
+      "seconds": 474.8606454571709,
+      "sha256": "c0cb7f93fad147bfb5bd8d3e1328ae09c1b338848594087cf2784ba1289ba680",
+      "request_id": "1c70c88d-5051-4899-8b04-fb22392f93f3",
+      "bytes": 367150,
+      "variance": 7341.229015598481
+    },
+    {
+      "label": "manga-street",
+      "seconds": 481.98787812516093,
+      "sha256": "f8ac796dc1c82ca012e4a419f9b0b973fc28d73910f20dbdd5190291d238fab7",
+      "request_id": "71836791-8309-46d6-8ffb-c5a3b385121a",
+      "bytes": 437088,
+      "variance": 10298.162824591607
+    },
+    {
+      "label": "manga-portrait",
+      "seconds": 476.08226000051945,
+      "sha256": "32e3bcdc7648af82e6ff09619e1c592f675339582a2eb66ffc873b35cd7fd229",
+      "request_id": "32e5f072-5ab8-46aa-b014-2252f648188f",
+      "bytes": 270853,
+      "variance": 8806.994678338
+    },
+    {
+      "label": "fault-reference",
+      "seconds": 97.39252904150635,
+      "sha256": "b7742122fa3ab6503b958646c14b8324f77bc2810937472a39c5c795ffa222b1",
+      "request_id": "dff2f471-3562-467a-b6d8-1fe870e675cb",
+      "bytes": 405865,
+      "variance": 7013.433462321627
+    },
+    {
+      "label": "capacity-owner",
+      "seconds": 97.8535322919488,
+      "sha256": "b7742122fa3ab6503b958646c14b8324f77bc2810937472a39c5c795ffa222b1",
+      "request_id": "da44b16f-036c-49c6-b83c-08baedcd999e",
+      "bytes": 405865,
+      "variance": 7013.433462321627
+    },
+    {
+      "label": "after-disconnected-client",
+      "seconds": 99.67394612450153,
+      "sha256": "b7742122fa3ab6503b958646c14b8324f77bc2810937472a39c5c795ffa222b1",
+      "request_id": "8951b3ea-c8ed-4ee2-8f38-fd6641601cf5",
+      "bytes": 405865,
+      "variance": 7013.433462321627
+    },
+    {
+      "label": "operator-drain-owner",
+      "seconds": 97.29476124979556,
+      "sha256": "b7742122fa3ab6503b958646c14b8324f77bc2810937472a39c5c795ffa222b1",
+      "request_id": "870c9497-3047-45e4-9fdc-a05e29f9a087",
+      "bytes": 405865,
+      "variance": 7013.433462321627
+    },
+    {
+      "label": "after-worker-restart",
+      "seconds": 98.33071220759302,
+      "sha256": "b7742122fa3ab6503b958646c14b8324f77bc2810937472a39c5c795ffa222b1",
+      "request_id": "55290445-76bf-484e-ae4c-9065e3d7d937",
+      "bytes": 405865,
+      "variance": 7013.433462321627
+    },
+    {
+      "label": "after-explicit-recovery",
+      "seconds": 97.83986145816743,
+      "sha256": "b7742122fa3ab6503b958646c14b8324f77bc2810937472a39c5c795ffa222b1",
+      "request_id": "83bb8e87-4948-4ada-8634-3270937b8c1e",
+      "bytes": 405865,
+      "variance": 7013.433462321627
+    }
+  ],
+  "workers": [
+    {
+      "cpu": "Intel(R) Core(TM) Ultra 7 265T",
+      "ram_bytes": 33752002560,
+      "gpu": [
+        {
+          "Name": "Intel(R) Graphics",
+          "DriverVersion": "32.0.101.8132"
+        }
+      ],
+      "components": [
+        "text_encoder",
+        "text_encoder_2",
+        "vae_decoder",
+        "unet_first"
+      ],
+      "memory": {
+        "WorkingSet64": 5822189568,
+        "PrivateMemorySize64": 7069003776,
+        "sampled_gpu_shared_bytes": 4617207808,
+        "samples": 245,
+        "sample_errors": 0
+      }
+    },
+    {
+      "cpu": "Intel(R) Core(TM) Ultra 7 265T",
+      "ram_bytes": 33779265536,
+      "gpu": [
+        {
+          "Name": "Intel(R) Graphics",
+          "DriverVersion": "32.0.101.8132"
+        }
+      ],
+      "components": [
+        "unet_second"
+      ],
+      "memory": {
+        "WorkingSet64": 3510423552,
+        "PrivateMemorySize64": 3856277504,
+        "sampled_gpu_shared_bytes": 2713264128,
+        "samples": 245,
+        "sample_errors": 0
+      }
+    }
+  ],
+  "stage_execution": [
+    {
+      "check": "stage_execution_evidence",
+      "worker": 0,
+      "calls": 194,
+      "components": [
+        "text_encoder",
+        "text_encoder_2",
+        "unet_first",
+        "vae_decoder"
+      ],
+      "input_bytes": 183284388,
+      "output_bytes": 7064553556
+    },
+    {
+      "check": "stage_execution_evidence",
+      "worker": 1,
+      "calls": 129,
+      "components": [
+        "unet_second"
+      ],
+      "input_bytes": 7114876504,
+      "output_bytes": 16946269
+    }
+  ],
+  "memory_note": "Maximum of summed sampled owned-process values per host; shared iGPU allocations overlap system RAM. Compilation caches were reused. These are not independent physical-memory totals or an empty-cache benchmark."
+}

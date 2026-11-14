@@ -98,6 +98,11 @@ jobs:
         # are tagged with `#[allow(dead_code)]` or actually used.
         run: cargo clippy --workspace --all-targets
 
+      - name: Diffusion Python contract tests
+        env:
+          PYTHONPATH: tools/diffusion/src
+        run: python3 -m unittest discover -s tools/diffusion/tests -v
+
       - name: OpenVINO SDK pin consistency + resolver unit tests
         # release.yml and this file each carry OV_VERSION; a drift would
         # ship bundles against one SDK while CI pre-flights another.
