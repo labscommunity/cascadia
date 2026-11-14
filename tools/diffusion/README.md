@@ -111,6 +111,11 @@ executor. The sidecar is not an unauthenticated network service: the embedding
 server must authenticate callers, reserve all stages before dispatch, and bind
 every execution to the caller, manifest, worker boot, lease, and sequence.
 
+The internal `/generate` JSON envelope has a 256 KiB limit. This includes the
+normalized request and coordinator metadata; an embedding server's public API
+may set a smaller limit, such as 64 KiB. The larger internal bound accommodates
+JSON escaping and normalization of requests accepted by a public API.
+
 A dropped caller does not release a running execution. Expired/cancelled leases
 retain running work until confirmed completion. An ambiguous engine failure
 quarantines the worker until restart; restarting changes the boot identity.

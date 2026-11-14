@@ -98,7 +98,17 @@ execution, drain, absolute lease lifetime, and uncertain-execution quarantine.
 Python tests share the Rust golden manifest/frame and exercise actual loopback
 HTTP authentication, framing, and retaining capacity after a client disconnect.
 
-Multi-host placement, network fault injection, sustained load, and a model exceeding one host's usable memory require additional
-qualification. This local comparison alone
-must not be advertised as distributed production qualification, a speedup, or
-64 GB machine coverage.
+## Activation transfer between U-Net partitions
+
+A layer split sends the first U-Net partition's output to the second partition
+on every denoising step. In the local reports above, the second partition
+received 1,103,055,760 bytes over 20 steps at 512×512 (about 55 MB per step) and
+4,335,291,280 bytes at 1024×1024 (about 217 MB per step). Placing the partitions
+on separate machines adds that transfer to every step, so layer placement is for
+pipelines that do not fit on one host, not a speedup. Whole-image replicas remain
+the preferred throughput strategy when the pipeline fits.
+
+This is a bounded SDXL deployment profile. Sustained multi-user load, 64 GB hardware,
+larger-than-one-host capacity, other diffusion architectures, CFG parallelism, and
+tensor/sequence parallelism remain separate qualification work. The prompt samples do
+not establish specialized manga quality or panel consistency.
