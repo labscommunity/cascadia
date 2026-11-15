@@ -154,6 +154,9 @@ impl EngineError {
                     // Windows WSAECONNABORTED (10053) words it "An established
                     // connection was aborted by the software in your host machine."
                     || msg.contains("connection was aborted")
+                    // Windows WSAECONNRESET (10054): "An existing connection was
+                    // forcibly closed by the remote host."
+                    || msg.contains("forcibly closed")
                     // Mid-frame deadline (recv_exact wall-clock bound).
                     || msg.contains("recv_exact timed out")
             }
@@ -461,6 +464,9 @@ mod tests {
             // Windows 10053 (WSAECONNABORTED) as Rust renders it.
             "io error: An established connection was aborted by the software in your host \
              machine. (os error 10053)",
+            // Windows 10054 (WSAECONNRESET) as Rust renders it.
+            "io error: An existing connection was forcibly closed by the remote host. \
+             (os error 10054)",
             // Mid-frame stall surfaced by recv_exact's wall-clock bound.
             "io error: recv_exact timed out after 60s",
         ] {
