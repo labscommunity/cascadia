@@ -907,7 +907,7 @@ fn area_taps(size_in: usize, size_out: usize) -> Vec<(usize, Vec<f32>)> {
 /// `f64` and rounded to `f32` once, the row pass rounded before the column pass.
 fn separable(
     src: &[f32],
-    (sh, sw): (usize, usize),
+    sw: usize,
     rows: &[(usize, Vec<f32>)],
     cols: &[(usize, Vec<f32>)],
 ) -> Vec<f32> {
@@ -946,7 +946,7 @@ pub fn area_frame_f32(img: &Image, height: u32, width: u32) -> Vec<f32> {
     let src: Vec<f32> = img.data.iter().map(|&b| f32::from(b) / 255.0).collect();
     let rows = area_taps(sh, height as usize);
     let cols = area_taps(sw, width as usize);
-    separable(&src, (sh, sw), &rows, &cols)
+    separable(&src, sw, &rows, &cols)
         .into_iter()
         .map(|v| v * 255.0)
         .collect()
@@ -1077,7 +1077,7 @@ pub fn cubic_frame(img: &Image, height: u32, width: u32) -> Image {
     for &(sy, b) in &ys {
         let r: [&Vec<i64>; 4] = std::array::from_fn(|k| &rows[clamp(sy - 1 + k as i64, sh)]);
         let bf = b.map(|v| v as f32 * (1.0 / (COEF_SCALE * COEF_SCALE)));
-        for x in 0..w * 3 {
+        data.extend((0..w * 3).map(|x| {
             let px = if x < vector_end {
                 let s = |k: usize| r[k][x] as f32;
                 let f = muladd(
@@ -1091,8 +1091,8 @@ pub fn cubic_frame(img: &Image, height: u32, width: u32) -> Image {
                 let shift = 2 * COEF_BITS;
                 ((v + (1 << (shift - 1))) >> shift).clamp(0, 255)
             };
-            data.push(px as u8);
-        }
+            px as u8
+        }));
     }
     Image {
         height,
