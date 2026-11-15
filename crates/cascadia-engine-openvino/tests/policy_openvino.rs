@@ -3,8 +3,9 @@
 //! directory is unset:
 //! - `CASCADIA_POLICY_PACKAGE`: `HuggingFaceVLA/smolvla_libero` (physical-ai-studio `8f132416`);
 //! - `CASCADIA_POLICY_PACKAGE_PI0`: `lerobot/pi0_libero_finetuned_v044`;
+//! - `CASCADIA_POLICY_PACKAGE_XVLA`: `lerobot/xvla-libero`, cameras flipped on the host.
 //!
-//! The π0 reference is the exporter's PyTorch f32 outputs in the
+//! The π0 and X-VLA references are the exporters' PyTorch f32 outputs, in the
 //! package's `ref.npz` (or `<dir>.ref.npz` beside it).
 #![cfg(feature = "openvino")]
 
@@ -452,4 +453,167 @@ fn pi0_ir_on_cpu_matches_the_pytorch_reference() {
         max_abs_diff(&got, &got2) > 1e-2,
         "the noise input must move the output"
     );
+}
+
+fn xvla(test: &str) -> Option<PathBuf> {
+    package_from("CASCADIA_POLICY_PACKAGE_XVLA", test)
+}
+
+#[test]
+fn xvla_package_spec() {
+    let Some(dir) = xvla("xvla_package_spec") else {
+        return;
+    };
+    let engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let spec = engine.spec();
+    assert_eq!(spec.cameras, vec!["image", "image2"]);
+    assert_eq!((spec.height, spec.width), (224, 224));
+    assert_eq!(spec.resize, ResizeConvention::TopLeft);
+    assert_eq!(spec.state_len, 8);
+    assert_eq!(spec.chunk, [30, 7], "served width, not the IR's 20");
+    assert_eq!(
+        (spec.noise, spec.noise_shape.clone()),
+        (NoiseMode::Input, Some(vec![30, 20]))
+    );
+}
+
+/// The BART tokenizer IR has the `truncation` variable (on by default in the
+/// IR), so the engine holds it off and refuses only past the port: an exact
+/// fit of 50 tokens is served, 51 is refused.
+#[test]
+fn xvla_tokenizer_matches_the_reference_and_the_limit_is_the_port() {
+    let Some(dir) = xvla("xvla_tokenizer_matches_the_reference_and_the_limit_is_the_port") else {
+        return;
+    };
+    let z = reference(&dir);
+    let mut tok = OvTokenizer::load(&dir.join("tokenizer.xml")).unwrap();
+    assert!(tok.has_truncation_state());
+    let t = tok.tokenize(&npz(&z, "task").string()).unwrap();
+    assert_eq!(t.ids, npz(&z, "in_tokenized_prompt").i64s());
+    assert_eq!(t.mask, npz(&z, "in_tokenized_prompt_mask").bools());
+    // <s> + one token per word + </s>.
+    let words = |n: usize| vec!["word"; n].join(" ");
+    let fit = tok.tokenize(&words(48)).unwrap();
+    assert_eq!(
+        (fit.ids.len(), fit.mask.iter().filter(|&&m| m).count()),
+        (50, 50)
+    );
+    let over = tok.tokenize(&words(49)).unwrap();
+    assert_eq!(
+        over.ids.len(),
+        51,
+        "held-off truncation leaves it wider than the port"
+    );
+
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let mut obs = xvla_observation(&z);
+    obs.prompt = words(48);
+    engine.infer(&obs).unwrap();
+    obs.prompt = words(49);
+    let e = engine.infer(&obs).unwrap_err();
+    assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+    let m = e.to_string();
+    assert!(
+        m.contains("needs 51 tokens") && m.contains("limit is 50"),
+        "{m}"
+    );
+}
+
+/// The reference's raw inputs, recovered: its images are uint8 frames scaled
+/// to [-1, 1] with `image2` already flipped for the IR, so they are scaled
+/// back and `image2` is rotated back for the engine to flip again.
+fn xvla_observation(z: &[u8]) -> Observation {
+    let images = npz(z, "in_images");
+    assert_eq!(images.shape, vec![2, 1, 3, 224, 224]);
+    let px = images.f32s();
+    let n = 224 * 224;
+    let frame = |slot: usize, rot180: bool| {
+        let chw = &px[slot * 3 * n..(slot + 1) * 3 * n];
+        let mut hwc = vec![0u8; 3 * n];
+        for c in 0..3 {
+            for p in 0..n {
+                let v = ((chw[c * n + p] + 1.0) / 2.0 * 255.0).round() as u8;
+                let at = if rot180 { n - 1 - p } else { p };
+                hwc[at * 3 + c] = v;
+            }
+        }
+        Image {
+            height: 224,
+            width: 224,
+            data: hwc,
+        }
+    };
+    Observation {
+        images: vec![
+            ("image".into(), frame(0, false)),
+            ("image2".into(), frame(1, true)),
+        ],
+        state: npz(z, "in_state").f32s(),
+        prompt: npz(z, "task").string(),
+        seed: None,
+        noise: Some(npz(z, "in_noise").f32s()),
+    }
+}
+
+#[test]
+fn xvla_cpu_infer_matches_the_pytorch_reference() {
+    let Some(dir) = xvla("xvla_cpu_infer_matches_the_pytorch_reference") else {
+        return;
+    };
+    let z = reference(&dir);
+    // The IR alone on the reference's processed inputs, against LeRobot's 20-wide output.
+    let feeds: Vec<_> = [
+        "state",
+        "tokenized_prompt",
+        "tokenized_prompt_mask",
+        "images",
+        "image_masks",
+        "noise",
+    ]
+    .iter()
+    .map(|k| feed(&z, k, &format!("in_{k}")))
+    .collect();
+    let (shape, raw) = ir_on_cpu(&dir.join("xvla.xml"), &feeds);
+    assert_eq!(shape, vec![1, 30, 20]);
+    let raw_diff = max_abs_diff(&raw, &npz(&z, "ref20").f32s());
+    eprintln!("xvla ir cpu f32 vs pytorch f32 (20-wide): max abs {raw_diff}");
+    assert!(raw_diff <= 5e-4, "max abs diff {raw_diff}");
+
+    // The engine end to end on the raw inputs, against LeRobot's served 7-wide actions.
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let a = engine.infer(&xvla_observation(&z)).unwrap();
+    assert_eq!((a.steps, a.dim, a.actions.len()), (30, 7, 210));
+    let want = npz(&z, "ref7").f32s();
+    let diff = max_abs_diff(&a.actions, &want);
+    eprintln!(
+        "xvla engine cpu f32 vs pytorch f32 (served 7-wide): max abs {diff} infer_ms={:.0}",
+        a.infer_ms
+    );
+    assert!(
+        diff <= 5e-4,
+        "max abs diff {diff}: {:?} vs {:?}",
+        &a.actions[..7],
+        &want[..7]
+    );
+}
+
+/// A compile that fails (here: a device the host lacks) is a load error, not a panic.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_compile_is_a_load_error() {
+    let Some(dir) = xvla("a_failed_compile_is_a_load_error") else {
+        return;
+    };
+    let opts = OvPolicyOptions {
+        device: "GPU".into(),
+        precision: Some(Precision::F32),
+        ..OvPolicyOptions::default()
+    };
+    let e = OvPolicyEngine::load(&dir, &opts)
+        .err()
+        .expect("macOS has no OpenVINO GPU");
+    assert!(matches!(e, EngineError::Backend(_)), "{e}");
+    let m = e.to_string();
+    eprintln!("{m}");
+    assert!(m.contains("xvla.xml on GPU failed"), "{m}");
 }

@@ -8,7 +8,7 @@
 
 use cascadia_engine::{EngineError, EngineResult};
 
-use super::manifest::{FeatureStats, NormMode, StatsStep};
+use super::manifest::{FeatureStats, NormMode, StatsStep, XVLA_ACTION_DIM};
 
 /// `stats_normalizer.py` / `stats_denormalizer.py` `_EPS`.
 pub const EPS: f64 = 1e-8;
@@ -149,6 +149,146 @@ pub fn image_to_chw(hwc: &[u8], height: usize, width: usize, out: &mut Vec<f32>)
             out.push(hwc[px * 3 + c] as f32 / 255.0 * 2.0 - 1.0);
         }
     }
+}
+
+/// [`image_to_chw`] of the frame rotated by 180 degrees (`image_flip`;
+/// `torch.flip(x, dims=[H, W])`): pixel `p` of `h*w` reads pixel `h*w - 1 - p`.
+pub fn image_to_chw_rot180(hwc: &[u8], height: usize, width: usize, out: &mut Vec<f32>) {
+    debug_assert_eq!(hwc.len(), height * width * 3);
+    let n = height * width;
+    for c in 0..3 {
+        for px in 0..n {
+            out.push(hwc[(n - 1 - px) * 3 + c] as f32 / 255.0 * 2.0 - 1.0);
+        }
+    }
+}
+
+/// `xvla_rotation_6d_to_axis_angle` on `steps` rows of `dim` values: each row
+/// becomes position (0..3), [`rotate6d_to_axis_angle`] of 3..9, and the
+/// gripper (9) as 1 above 0.5, else -1. The manifest load checked `dim >= 10`.
+pub fn xvla_rotation_6d_to_axis_angle(actions: &[f64], steps: usize, dim: usize) -> Vec<f64> {
+    let mut out = Vec::with_capacity(steps * XVLA_ACTION_DIM);
+    for row in actions.chunks_exact(dim).take(steps) {
+        out.extend_from_slice(&row[..3]);
+        let r6d: [f64; 6] = row[3..9].try_into().expect("six values");
+        out.extend_from_slice(&rotate6d_to_axis_angle(&r6d));
+        out.push(if row[9] > 0.5 { 1.0 } else { -1.0 });
+    }
+    out
+}
+
+/// LeRobot's X-VLA `rotate6d_to_axis_angle` (`utils.py`) for one row, in f64:
+/// Gram-Schmidt with its `1e-6` eps, `mat2quat` (the top eigenvector of
+/// Bar-Itzhack's K, sign fixed to `w >= 0`), then `quat2axisangle`.
+pub fn rotate6d_to_axis_angle(r6d: &[f64; 6]) -> [f64; 3] {
+    let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let a1 = [r6d[0], r6d[1], r6d[2]];
+    let a2 = [r6d[3], r6d[4], r6d[5]];
+    let n1 = norm(a1) + 1e-6;
+    let b1 = a1.map(|x| x / n1);
+    let dot = b1[0] * a2[0] + b1[1] * a2[1] + b1[2] * a2[2];
+    let orth = [
+        a2[0] - dot * b1[0],
+        a2[1] - dot * b1[1],
+        a2[2] - dot * b1[2],
+    ];
+    let n2 = norm(orth) + 1e-6;
+    let b2 = orth.map(|x| x / n2);
+    let b3 = [
+        b1[1] * b2[2] - b1[2] * b2[1],
+        b1[2] * b2[0] - b1[0] * b2[2],
+        b1[0] * b2[1] - b1[1] * b2[0],
+    ];
+    // np.stack([b1, b2, b3], axis=-1): b1, b2, b3 are the columns.
+    let m = |r: usize, c: usize| [b1, b2, b3][c][r];
+    quat2axisangle(mat2quat(m))
+}
+
+/// `mat2quat`: `(x, y, z, w)`.
+fn mat2quat(m: impl Fn(usize, usize) -> f64) -> [f64; 4] {
+    let (m00, m01, m02) = (m(0, 0), m(0, 1), m(0, 2));
+    let (m10, m11, m12) = (m(1, 0), m(1, 1), m(1, 2));
+    let (m20, m21, m22) = (m(2, 0), m(2, 1), m(2, 2));
+    // np.linalg.eigh reads the lower triangle.
+    let lower = [
+        [m00 - m11 - m22, 0.0, 0.0, 0.0],
+        [m01 + m10, m11 - m00 - m22, 0.0, 0.0],
+        [m02 + m20, m12 + m21, m22 - m00 - m11, 0.0],
+        [m21 - m12, m02 - m20, m10 - m01, m00 + m11 + m22],
+    ];
+    let mut k = [[0.0f64; 4]; 4];
+    for i in 0..4 {
+        for j in 0..=i {
+            k[i][j] = lower[i][j] / 3.0;
+            k[j][i] = k[i][j];
+        }
+    }
+    let (values, vectors) = jacobi_eigen(k);
+    let top = (0..4).fold(0, |b, i| if values[i] > values[b] { i } else { b });
+    let mut q = [0.0; 4];
+    for (i, qi) in q.iter_mut().enumerate() {
+        *qi = vectors[i][top];
+    }
+    // K's rows are (x, y, z, w); LeRobot negates when w < 0.
+    if q[3] < 0.0 {
+        q = q.map(|x| -x);
+    }
+    q
+}
+
+/// Eigenvalues and eigenvectors (columns) of a symmetric 4x4, by cyclic Jacobi.
+fn jacobi_eigen(mut a: [[f64; 4]; 4]) -> ([f64; 4], [[f64; 4]; 4]) {
+    let mut v = [[0.0; 4]; 4];
+    for (i, row) in v.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    for _ in 0..64 {
+        let off: f64 = (0..4)
+            .flat_map(|i| (0..4).filter(move |&j| j != i).map(move |j| (i, j)))
+            .map(|(i, j)| a[i][j] * a[i][j])
+            .sum();
+        if off < 1e-30 {
+            break;
+        }
+        for p in 0..3 {
+            for q in p + 1..4 {
+                if a[p][q] == 0.0 {
+                    continue;
+                }
+                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let t = if theta == 0.0 { 1.0 } else { t };
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for row in a.iter_mut() {
+                    let (akp, akq) = (row[p], row[q]);
+                    row[p] = c * akp - s * akq;
+                    row[q] = s * akp + c * akq;
+                }
+                let (rp, rq) = (a[p], a[q]);
+                a[p] = std::array::from_fn(|k| c * rp[k] - s * rq[k]);
+                a[q] = std::array::from_fn(|k| s * rp[k] + c * rq[k]);
+                for row in v.iter_mut() {
+                    let (vp, vq) = (row[p], row[q]);
+                    row[p] = c * vp - s * vq;
+                    row[q] = s * vp + c * vq;
+                }
+            }
+        }
+    }
+    ([a[0][0], a[1][1], a[2][2], a[3][3]], v)
+}
+
+/// `quat2axisangle`: the unit axis scaled by the angle; zero for no rotation.
+fn quat2axisangle(q: [f64; 4]) -> [f64; 3] {
+    let w = q[3].clamp(-1.0, 1.0);
+    let den = (1.0 - w * w).sqrt();
+    // math.isclose(den, 0.0) with its defaults is true only at exactly 0.
+    if den == 0.0 {
+        return [0.0; 3];
+    }
+    let scale = 2.0 * w.acos() / den;
+    [q[0] * scale, q[1] * scale, q[2] * scale]
 }
 
 /// `action_chunk_trimmer`: keep the first `n` of `steps` rows of `dim` values.
@@ -307,6 +447,61 @@ mod tests {
         image_to_chw(&[0, 255, 51, 102, 204, 255], 1, 2, &mut out);
         let f = |v: u8| v as f32 / 255.0 * 2.0 - 1.0;
         assert_eq!(out, vec![-1.0, f(102), 1.0, f(204), f(51), 1.0]);
+    }
+
+    #[test]
+    fn rot180_reverses_the_pixel_order_per_channel() {
+        // 1x3 frame, pixels (0,1,2) (3,4,5) (6,7,8).
+        let mut out = Vec::new();
+        image_to_chw_rot180(&[0, 1, 2, 3, 4, 5, 6, 7, 8], 1, 3, &mut out);
+        let f = |v: u8| v as f32 / 255.0 * 2.0 - 1.0;
+        let want: Vec<f32> = [6, 3, 0, 7, 4, 1, 8, 5, 2].into_iter().map(f).collect();
+        assert_eq!(out, want);
+    }
+
+    /// Rows of LeRobot's `rotate6d_to_axis_angle`, mostly near pi where the
+    /// axis sign is most fragile, plus scaled and non-orthogonal rows.
+    #[test]
+    fn rotation_6d_matches_lerobot() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/policy/xvla-rotation-reference.json"
+        ))
+        .unwrap();
+        let rows: Vec<[f64; 6]> = serde_json::from_value(v["r6d"].clone()).unwrap();
+        let want: Vec<[f64; 3]> = serde_json::from_value(v["axis_angle"].clone()).unwrap();
+        assert_eq!(rows.len(), want.len());
+        for (r, w) in rows.iter().zip(&want) {
+            let got = rotate6d_to_axis_angle(r);
+            for (g, w) in got.iter().zip(w) {
+                // LeRobot's mat2quat runs in f32; the port runs in f64.
+                assert!((g - w).abs() <= 1e-5, "{r:?}: {got:?} vs {w:?}");
+            }
+        }
+        assert!(
+            want.iter()
+                .any(
+                    |w| (w.iter().map(|x| x * x).sum::<f64>().sqrt() - std::f64::consts::PI).abs()
+                        < 2e-3
+                ),
+            "the fixture covers angles near pi"
+        );
+    }
+
+    #[test]
+    fn xvla_rows_become_position_axis_angle_and_a_binary_gripper() {
+        // Two 12-wide rows: identity rotation, gripper at 0.6 then at 0.5.
+        let row = |g: f64| {
+            let mut r = vec![0.1, -0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, g, 9.0, 9.0];
+            r.truncate(12);
+            r
+        };
+        let a: Vec<f64> = [row(0.6), row(0.5)].concat();
+        let out = xvla_rotation_6d_to_axis_angle(&a, 2, 12);
+        assert_eq!(out.len(), 14);
+        assert_eq!(&out[..3], &[0.1, -0.2, 0.3]);
+        assert_eq!(&out[3..6], &[0.0, 0.0, 0.0]);
+        // np.where(x > 0.5, 1, -1): 0.5 itself is -1.
+        assert_eq!((out[6], out[13]), (1.0, -1.0));
     }
 
     #[test]

@@ -13,8 +13,16 @@ Copied, unmodified:
 - `pi0-libero-manifest.json`: our export of `lerobot/pi0_libero_finetuned_v044` (Intel's π0.5
   exporter at physical-ai-studio `8f132416`, patched with LeRobot's π0 action expert), f32 with
   fp16 weights, `noise` as an input, `policy.name` set to `pi0`.
+- `xvla-libero-manifest.json`: our export of `lerobot/xvla-libero` (LeRobot 0.7.0 modules in
+  Intel's manifest format), f32 with fp16 weights, `noise` as an input, `image2` flipped on the
+  host by `image_flip`, actions served 7 wide by `xvla_rotation_6d_to_axis_angle`.
 
 Generated:
+
+- `xvla-rotation-reference.json`: rows of LeRobot 0.7.0's X-VLA `rotate6d_to_axis_angle`
+  (`lerobot/policies/xvla/utils.py`, numpy 1.26.4) on float32 6-D rotations built from
+  axis-angles near π and below, plus a scaled non-orthogonal row, the identity and a near-identity
+  row.
 
 - `smolvla-libero-noise-reference-actions.json`: the served actions for the fixed inputs of
   `tests/policy_openvino.rs`, from an independent numpy + OpenVINO Python pipeline (own

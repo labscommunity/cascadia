@@ -10,10 +10,11 @@ use cascadia_ov_genai_shim::{DType, PluginConfig, PortInfo};
 use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec};
 
 use super::cameras::{images_tensor, CameraLayout};
-use super::manifest::{PolicyManifest, PostStep, PreStep};
+use super::manifest::{PolicyManifest, PostStep, PreStep, XVLA_ACTION_DIM};
 use super::spec::{derive_spec, IrFacts, ServerFacts};
 use super::steps::{
-    denormalize, new_line, normalize, pi05_bins, pi05_prompt, trim_actions, NUM_BINS,
+    denormalize, new_line, normalize, pi05_bins, pi05_prompt, trim_actions,
+    xvla_rotation_6d_to_axis_angle, NUM_BINS,
 };
 
 /// Longest prompt a request may carry, in UTF-8 bytes.
@@ -123,7 +124,8 @@ pub fn compile_config(
         ("GPU", Some(Precision::F32)) => Ok(f32_hint),
         ("GPU", _) => Ok(PluginConfig::new()),
         ("NPU", _) => Err(EngineError::InvalidConfig(
-            "NPU is not supported for policies: SmolVLA and pi0.5 fail NPU compilation as exported"
+            "NPU is not supported for policies: the exported packages fail NPU compilation or \
+             return wrong actions there"
                 .into(),
         )),
         _ => Err(EngineError::InvalidConfig(format!(
@@ -364,7 +366,10 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
                 text = pi05_prompt(&text, &bins);
             }
             PreStep::OvTokenizer { .. } => break,
-            PreStep::Pi0(_) | PreStep::SmolVlaResize(_) | PreStep::Noise { .. } => {}
+            PreStep::Pi0(_)
+            | PreStep::SmolVlaResize(_)
+            | PreStep::Noise { .. }
+            | PreStep::ImageFlip { .. } => {}
         }
     }
     Ok(text)
@@ -375,6 +380,8 @@ pub struct PolicyPipeline {
     manifest: PolicyManifest,
     spec: PolicySpec,
     layout: CameraLayout,
+    /// Per `layout.names`: rotate that camera by 180 degrees.
+    flip: Vec<bool>,
     binding: PortBinding,
     action_shape: [usize; 2],
     model: Option<Box<dyn PolicyModel>>,
@@ -415,10 +422,16 @@ impl PolicyPipeline {
             ));
         }
         let (spec, layout) = derive_spec(&manifest, &ir, server)?;
+        let flip = layout
+            .names
+            .iter()
+            .map(|n| manifest.flipped_cameras().contains(n))
+            .collect();
         Ok(Self {
             manifest,
             spec,
             layout,
+            flip,
             binding,
             action_shape: ir.action_shape,
             model: Some(model),
@@ -476,8 +489,13 @@ impl PolicyPipeline {
         for step in self.manifest.normalize() {
             state = normalize(step, STATE, &state)?;
         }
-        let (images, image_masks) =
-            images_tensor(&self.layout, &obs.images, self.spec.height, self.spec.width)?;
+        let (images, image_masks) = images_tensor(
+            &self.layout,
+            &obs.images,
+            self.spec.height,
+            self.spec.width,
+            &self.flip,
+        )?;
 
         let limit = self.binding.prompt_len;
         let tokens = self
@@ -574,12 +592,16 @@ impl PolicyPipeline {
         }
 
         let mut actions: Vec<f64> = out.iter().map(|&x| f64::from(x)).collect();
-        let mut steps = steps;
+        let (mut steps, mut dim) = (steps, dim);
         for step in &self.manifest.postprocessors {
             match step {
                 PostStep::Denormalize(s) => actions = denormalize(s, ACTION, &actions)?,
                 PostStep::ActionChunkTrimmer { n_action_steps } => {
                     (actions, steps) = trim_actions(actions, steps, dim, *n_action_steps);
+                }
+                PostStep::XvlaRotation6dToAxisAngle { .. } => {
+                    actions = xvla_rotation_6d_to_axis_angle(&actions, steps, dim);
+                    dim = XVLA_ACTION_DIM;
                 }
             }
         }
@@ -647,6 +669,7 @@ mod tests {
     const SMOLVLA_NOISE: &str =
         include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
     const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
+    const XVLA_LIBERO: &str = include_str!("../../tests/fixtures/policy/xvla-libero-manifest.json");
 
     #[derive(Default)]
     struct Log {
@@ -758,6 +781,21 @@ mod tests {
                 port(IMAGE_MASKS, DType::Bool, &[3, 1]),
             ],
             vec![port(ACTION, DType::F32, &[1, 50, 7])],
+        )
+    }
+
+    /// The real ports of our xvla-libero export.
+    fn xvla_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+        (
+            vec![
+                port(STATE, DType::F32, &[1, 8]),
+                port(PROMPT, DType::I64, &[1, 50]),
+                port(PROMPT_MASK, DType::Bool, &[1, 50]),
+                port(IMAGES, DType::F32, &[2, 1, 3, 224, 224]),
+                port(IMAGE_MASKS, DType::Bool, &[2, 1]),
+                port(NOISE, DType::F32, &[1, 30, 20]),
+            ],
+            vec![port(ACTION, DType::F32, &[1, 30, 20])],
         )
     }
 
@@ -1016,6 +1054,47 @@ mod tests {
         let texts = r.log.lock().unwrap().texts.clone();
         assert_eq!(texts, vec![" pick_up\n", " pick_up\n"]);
         assert_eq!(input(&r.log, NOISE).shape, vec![1, 50, 32]);
+    }
+
+    #[test]
+    fn xvla_flips_image2_and_serves_seven_wide_actions() {
+        // Each 20-wide row: position, identity 6-D rotation, gripper, a second arm.
+        let row: Vec<f32> = [0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.9]
+            .into_iter()
+            .chain([0.7; 10])
+            .collect();
+        let out: Vec<f32> = (0..30).flat_map(|_| row.clone()).collect();
+        let mut r = rig_with(XVLA_LIBERO, xvla_ports(), false, true, out);
+        let spec = r.engine.spec().clone();
+        assert_eq!(spec.chunk, [30, 7]);
+        // Pixels that differ, so a rotation shows.
+        let mut o = obs(&spec, "pick up the bowl");
+        let side = 224 * 224;
+        for (_, img) in o.images.iter_mut() {
+            img.data = (0..side).flat_map(|p| [(p % 251) as u8; 3]).collect();
+        }
+        let a = r.engine.infer(&o).unwrap();
+        assert_eq!((a.steps, a.dim, a.actions.len()), (30, 7, 210));
+        let want = [0.1f32, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0];
+        for (i, &w) in want.iter().enumerate() {
+            assert!(
+                (a.actions[i] - w).abs() <= 1e-6,
+                "{i}: {:?}",
+                &a.actions[..7]
+            );
+        }
+        assert_eq!(&a.actions[203..], &a.actions[..7], "every row converted");
+        let images = input(&r.log, IMAGES);
+        let px = |p: usize| (p % 251) as u8 as f32 / 255.0 * 2.0 - 1.0;
+        let img = f32s(&images);
+        assert_eq!(img[0], px(0), "image is as sent");
+        assert_eq!(img[3 * side], px(side - 1), "image2 is rotated 180 degrees");
+        assert_eq!(img[3 * side + side - 1], px(0));
+        // No new_line: the tokenizer sees the task as sent.
+        assert_eq!(
+            r.log.lock().unwrap().texts.last().unwrap(),
+            "pick up the bowl"
+        );
     }
 
     #[test]

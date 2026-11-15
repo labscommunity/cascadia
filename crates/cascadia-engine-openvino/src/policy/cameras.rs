@@ -10,7 +10,7 @@ use cascadia_engine::{EngineError, EngineResult};
 use cascadia_types::Image;
 
 use super::manifest::{FeatureType, ImageStep, PolicyManifest};
-use super::steps::image_to_chw;
+use super::steps::{image_to_chw, image_to_chw_rot180};
 
 /// Advertised camera names and, per model slot, the camera in it (`None`: a masked dummy).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,11 +178,13 @@ impl CameraPlan {
 ///
 /// Dummy slots are all `-1` with mask false (`pi05.py` `empty_cameras`,
 /// `smolvla.py` unassigned slots). Frames must already be `height x width`.
+/// `flip[i]` rotates camera `layout.names[i]` by 180 degrees (`image_flip`).
 pub fn images_tensor(
     layout: &CameraLayout,
     images: &[(String, Image)],
     height: u32,
     width: u32,
+    flip: &[bool],
 ) -> EngineResult<(Vec<f32>, Vec<bool>)> {
     let bad = |msg: String| Err(EngineError::InvalidConfig(msg));
     if images.len() != layout.names.len() {
@@ -211,7 +213,11 @@ pub fn images_tensor(
                 "camera {name:?} must be {height}x{width} RGB ({per_slot} bytes)"
             ));
         }
-        image_to_chw(&img.data, h, w, &mut data);
+        if flip.get(*i).copied().unwrap_or(false) {
+            image_to_chw_rot180(&img.data, h, w, &mut data);
+        } else {
+            image_to_chw(&img.data, h, w, &mut data);
+        }
         masks.push(true);
     }
     Ok((data, masks))
@@ -405,18 +411,45 @@ mod tests {
             data: vec![v, v, v],
         };
         let images = vec![("top".to_string(), img(255)), ("wrist".to_string(), img(0))];
-        let (data, masks) = images_tensor(&layout, &images, 1, 1).unwrap();
+        let (data, masks) = images_tensor(&layout, &images, 1, 1, &[]).unwrap();
         assert_eq!(
             data,
             vec![-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
         );
         assert_eq!(masks, vec![true, false, true]);
-        assert!(images_tensor(&layout, &images[..1], 1, 1).is_err());
+        assert!(images_tensor(&layout, &images[..1], 1, 1, &[]).is_err());
         let wrong = vec![("top".to_string(), img(1)), ("side".to_string(), img(1))];
-        assert!(images_tensor(&layout, &wrong, 1, 1)
+        assert!(images_tensor(&layout, &wrong, 1, 1, &[])
             .unwrap_err()
             .to_string()
             .contains("missing camera \"wrist\""));
-        assert!(images_tensor(&layout, &images, 2, 1).is_err());
+        assert!(images_tensor(&layout, &images, 2, 1, &[]).is_err());
+    }
+
+    #[test]
+    fn image_flip_rotates_only_the_named_camera() {
+        let layout = CameraLayout {
+            names: vec!["image".into(), "image2".into()],
+            slots: vec![Some(0), Some(1)],
+        };
+        // 2x2 frames; pixel p has value 10*p + channel.
+        let frame = Image {
+            height: 2,
+            width: 2,
+            data: (0..4u8)
+                .flat_map(|p| [10 * p, 10 * p + 1, 10 * p + 2])
+                .collect(),
+        };
+        let images = vec![
+            ("image".to_string(), frame.clone()),
+            ("image2".to_string(), frame),
+        ];
+        let f = |v: u8| v as f32 / 255.0 * 2.0 - 1.0;
+        let (data, _) = images_tensor(&layout, &images, 2, 2, &[false, true]).unwrap();
+        let red = |slot: usize| data[slot * 12..slot * 12 + 4].to_vec();
+        assert_eq!(red(0), vec![f(0), f(10), f(20), f(30)]);
+        // 180 degrees: (y, x) reads (1 - y, 1 - x), so the pixel order reverses.
+        assert_eq!(red(1), vec![f(30), f(20), f(10), f(0)]);
+        assert_eq!(data[12 + 4], f(31), "green plane of the flipped slot");
     }
 }

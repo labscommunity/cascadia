@@ -59,10 +59,15 @@ claims until a stats source is settled (open question 3).
 
 v1:
 - Packages with `"format": "policy_package"`, version `1.x`, runner `SinglePass`, artifact
-  `openvino`, policies `smolvla`, `pi05` and `pi0`. Anything else is refused at load with a clear
-  error.
-- Devices: GPU (default, f16 unless `--precision f32`) and CPU (always f32). NPU is refused: both
-  models fail NPU compilation as exported.
+  `openvino`, policies `smolvla`, `pi05`, `pi0` and `xvla`. Anything else is refused at load with a
+  clear error. The π0 and X-VLA packages are our exports (Intel's runtime has neither policy);
+  `xvla` takes its cameras and prompt like `smolvla`.
+- Devices: GPU (default, f16 unless `--precision f32`) and CPU (always f32). NPU is refused:
+  SmolVLA and π0.5 fail NPU compilation as exported, and X-VLA compiles but returns wrong actions.
+- X-VLA's LIBERO packages flip `image2` on the host (`image_flip`), not in the graph: on the Arc
+  140V GPU plugin (OpenVINO 2026.4.1) a flip inside the graph, which exports as a negative-stride
+  `Slice`, gives wrong `image2` features even at f32, while the CPU is exact. An exporter must keep
+  flips and negative-stride slices out of a GPU graph.
 - π0 on a 16 GB integrated GPU (Arc 140V) runs at f16 only: at `--precision f32` its weights
   (about 12.5 GB in f32) fail GPU compilation. A failed compile is a load error naming the IR and
   the device, with a hint to drop `--precision f32` on the GPU; nothing is special-cased per model.
@@ -100,11 +105,17 @@ Loading rules:
 | `pi05` | Images: uint8 → `/255` → `x·2 − 1`, CHW. Slots in `input_features` order (see "Cameras"); `empty_cameras` extra slots filled with `−1`, mask false; stacked `images [n_slots, 1, 3, H, W]` f32 and `image_masks [n_slots, 1]` bool. Prompt: the normalized state is binned with `bin = digitize(x, linspace(−1, 1, 257)[:−1]) − 1`, which gives **−1 for x < −1** and 255 for x ≥ 1 − 2/256; text `"Task: {task}, State: {bins joined by ' '};\nAction: "`, task stripped with `_` and `\n` replaced by spaces. If `noise_shape` is set and the call carries no noise: `noise ~ N(0,1)` of `[1, *noise_shape]` f32. |
 | `pi0` | Ours (Intel's runtime dropped π0). The `pi05` parameters and image handling (dummy slots, centred padding, optional `noise_shape`); the prompt is left alone, so with `new_line` the tokenizer sees the task plus `"\n"` and no state bins. |
 | `smolvla_resize` | Images as in `pi05` at `image_resolution` (512). With a non-empty `image_key_reorder_map`, each value is a **slot index**. When `num_cameras` > 0, camera `name` goes to slot `map[name]`, every index below `num_cameras` that no camera takes is a masked dummy of `−1` in that position, and a value ≥ `num_cameras` refuses the load. When `num_cameras` ≤ 0 (the default), cameras are ordered by their slot values with no dummies. A duplicate or negative value always refuses the load. |
+| `image_flip` | Ours. `cameras`: advertised camera names whose frames are rotated 180° (both H and W flipped) before the CHW conversion; a name that is not one of the package's cameras, a duplicate or an empty list refuses the load. Clients send frames as the environment gives them. The flip applies to the frame as sent, so it matches a flip-then-resize only when no padding is needed (a square frame to a square model input, as in LIBERO). |
 | `new_line` | Append `"\n"` to the task if missing. |
 | `noise` | `noise ~ N(0,1)` of `[1, *shape]` f32, unless the call carries noise. |
-| `ov_tokenizer` | Run `tokenizer.xml` **on CPU, always** (its string ops are CPU-only; only the policy IR follows `--device`) → `tokenized_prompt` i64, `tokenized_prompt_mask` bool. Padding side, `max_length` and truncation live in the tokenizer IR and differ by package: Intel's π0.5 LIBERO pads left to 64 with a `truncation` state variable defaulting on; Intel's SmolVLA pads right to 48 with an always-on `Truncate` op; packages from our exporter (8f132416) carry the same `truncation` state variable, defaulting off, so an overlong prompt comes out wider than the port. See "Prompt length". |
+| `ov_tokenizer` | Run `tokenizer.xml` **on CPU, always** (its string ops are CPU-only; only the policy IR follows `--device`) → `tokenized_prompt` i64, `tokenized_prompt_mask` bool. Padding side, `max_length` and truncation live in the tokenizer IR and differ by package: Intel's π0.5 LIBERO pads left to 64 with a `truncation` state variable defaulting on; Intel's SmolVLA pads right to 48 with an always-on `Truncate` op; packages from our exporter (8f132416) carry the same `truncation` state variable, defaulting off, so an overlong prompt comes out wider than the port. Our X-VLA package's BART tokenizer pads right to 50 and also has the variable (defaulting on). See "Prompt length". |
 | `denormalize` | On `action`, not an exact inverse: `mean_std`: `x·std + mean`; `min_max`: `(x + 1)/2·(max − min) + min` (no eps in either); `quantiles`: `(x + 1)/2·d + q01`, `d` as in `normalize`. |
 | `action_chunk_trimmer` | Keep the first `n_action_steps` actions. |
+| `xvla_rotation_6d_to_axis_angle` | Ours, ported from LeRobot's step of that name. Each action row (at least `max(expected_action_dim, 10)` wide, checked at load) becomes 7 values: position `[0:3]` as is; the 6-D rotation `[3:9]` to axis-angle (Gram-Schmidt with LeRobot's `1e-6` eps, the quaternion as the top eigenvector of Bar-Itzhack's K with `w ≥ 0`, then axis × angle), in f64; the gripper `[9]` as 1 above 0.5, else −1. Near π the axis-angle sign follows `w ≥ 0`, as in LeRobot. |
+
+A postprocessor can change the action width; the served `[T, D]` (spec, metadata, replies) is
+the width the postprocessors leave, and `denormalize` stats are checked against the width at
+their step.
 
 ### Prompt length
 
@@ -112,8 +123,8 @@ A prompt is checked once per distinct task text, at the first request that uses 
 never changes inside an episode: π0.5 writes the state bins into the prompt and their token count
 moves with the state (Gemma splits digits, so a 3-digit bin costs more than a 1-digit one). The
 check tokenizes the task with the worst-case state (every bin `255`) and the real token count:
-- Where the IR has the `truncation` state variable (Intel's π0.5 LIBERO, and every package from our
-  exporter), it is set to false for the check through the infer request's state, and the task is
+- Where the IR has the `truncation` state variable (Intel's π0.5 LIBERO, every package from our
+  exporter, and our π0 and X-VLA packages), it is set to false for the check through the infer request's state, and the task is
   refused only when the count exceeds the port length; an exact fit is accepted.
 - Where truncation is an always-on `Truncate` op (Intel's SmolVLA), a full mask is the only signal:
   the task is refused when the mask is full.
@@ -212,10 +223,10 @@ Limits, all checked before work is queued:
 | `cameras` (names) | as in "Cameras" |
 | `height`, `width` | the image step's `image_resolution`, else the IR `images` port |
 | `state_len` | the IR `state` port |
-| `chunk` `[T, D]` | T from `action_chunk_trimmer.n_action_steps` when present, else the IR output; D from the IR output |
+| `chunk` `[T, D]` | T from `action_chunk_trimmer.n_action_steps` when present, else the IR output; D from the IR output after the postprocessors (7 for `xvla_rotation_6d_to_axis_angle`) |
 | `noise` | the mode above |
 | `noise_shape` | the IR `noise` port, `input` mode only (the decode rule and the message cap need it) |
-| `resize` | the image step: `center` (`pi05`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling |
+| `resize` | the image step: `center` (`pi05`, `pi0`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling |
 | `device`, `model`, `prompt_max_bytes` | the server |
 
 `WS /v1/policy/ws` uses openpi's framing, so `openpi_client.WebsocketClientPolicy` can drive it:

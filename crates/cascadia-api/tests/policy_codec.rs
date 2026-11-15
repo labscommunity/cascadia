@@ -325,3 +325,40 @@ fn max_payload_bytes_follows_the_formula() {
     big.width = 2048;
     assert_eq!(max_payload_bytes(&big), cascadia_engine::PAYLOAD_MAX_BYTES);
 }
+
+/// X-VLA: the model emits 20-wide ee6d actions and noise; a postprocessor
+/// serves 7. Metadata and replies carry the served width; the message cap
+/// counts the 20-wide noise a request sends.
+#[test]
+fn served_action_width_is_independent_of_the_noise_width() {
+    let s = PolicySpec {
+        cameras: vec!["image".into(), "image2".into()],
+        height: 224,
+        width: 224,
+        state_len: 8,
+        chunk: [30, 7],
+        noise_shape: Some(vec![30, 20]),
+        ..spec()
+    };
+    let json: serde_json::Value = serde_json::from_str(&metadata_json(&s)).unwrap();
+    assert_eq!(json["chunk"], serde_json::json!([30, 7]));
+    assert_eq!(json["noise_shape"], serde_json::json!([30, 20]));
+    assert_eq!(
+        max_payload_bytes(&s),
+        2 * 224 * 224 * 3 + 8 * 8 + 30 * 20 * 4 + 64 + 65536
+    );
+    let mut c = ActionChunk {
+        actions: vec![0.5; 210],
+        steps: 30,
+        dim: 7,
+        infer_ms: 1.0,
+    };
+    check_reply(&c).unwrap();
+    // The ndarray header's shape: fixarray of 2, then 30 and 7.
+    assert!(encode_reply(&c).windows(3).any(|w| w == [0x92, 30, 7]));
+    c.actions = vec![0.5; 600];
+    assert!(check_reply(&c)
+        .unwrap_err()
+        .0
+        .contains("600 actions for a [30, 7] chunk"));
+}

@@ -19,6 +19,7 @@ pub enum PolicyKind {
     Pi05,
     Pi0,
     SmolVla,
+    Xvla,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,12 +88,49 @@ pub enum PreStep {
     OvTokenizer {
         artifact: String,
     },
+    /// Rotate the named cameras' frames by 180 degrees before the model.
+    ImageFlip {
+        cameras: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PostStep {
     Denormalize(StatsStep),
-    ActionChunkTrimmer { n_action_steps: usize },
+    ActionChunkTrimmer {
+        n_action_steps: usize,
+    },
+    /// X-VLA's ee6d action to LIBERO's 7-D one (LeRobot `XVLARotation6DToAxisAngleProcessorStep`).
+    XvlaRotation6dToAxisAngle {
+        expected_action_dim: usize,
+    },
+}
+
+/// Width of the X-VLA rotation step's output: position, axis-angle, gripper.
+pub const XVLA_ACTION_DIM: usize = 7;
+
+/// Values of an action row the X-VLA rotation step reads: position (3), 6-D rotation (6), gripper (1).
+pub const XVLA_ROW_READ: usize = 10;
+
+impl PostStep {
+    /// The action width after this step, for an input `dim` wide.
+    pub fn out_dim(&self, dim: usize) -> EngineResult<usize> {
+        match self {
+            Self::Denormalize(_) | Self::ActionChunkTrimmer { .. } => Ok(dim),
+            Self::XvlaRotation6dToAxisAngle {
+                expected_action_dim,
+            } => {
+                let need = (*expected_action_dim).max(XVLA_ROW_READ);
+                if dim < need {
+                    return refuse(format!(
+                        "xvla_rotation_6d_to_axis_angle needs actions at least {need} wide; \
+                         they are {dim}"
+                    ));
+                }
+                Ok(XVLA_ACTION_DIM)
+            }
+        }
+    }
 }
 
 /// The step that turns frames into the `images` tensor.
@@ -254,6 +292,17 @@ impl PolicyManifest {
         })
     }
 
+    /// Cameras the `image_flip` step rotates; empty without one.
+    pub fn flipped_cameras(&self) -> &[String] {
+        self.preprocessors
+            .iter()
+            .find_map(|s| match s {
+                PreStep::ImageFlip { cameras } => Some(cameras.as_slice()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     pub fn normalize(&self) -> impl Iterator<Item = &StatsStep> {
         self.preprocessors.iter().filter_map(|s| match s {
             PreStep::Normalize(n) => Some(n),
@@ -287,6 +336,9 @@ impl PolicyManifest {
                 "{tokenizers} ov_tokenizer steps; expected exactly one"
             ));
         }
+        if count(|s| matches!(s, PreStep::ImageFlip { .. })) > 1 {
+            return refuse("more than one image_flip");
+        }
         let trimmers = self
             .postprocessors
             .iter()
@@ -294,6 +346,14 @@ impl PolicyManifest {
             .count();
         if trimmers > 1 {
             return refuse("more than one action_chunk_trimmer");
+        }
+        let rotations = self
+            .postprocessors
+            .iter()
+            .filter(|s| matches!(s, PostStep::XvlaRotation6dToAxisAngle { .. }))
+            .count();
+        if rotations > 1 {
+            return refuse("more than one xvla_rotation_6d_to_axis_angle");
         }
         Ok(())
     }
@@ -373,8 +433,9 @@ fn policy_kind(policy: Option<&Value>) -> EngineResult<PolicyKind> {
         Some("pi05") => Ok(PolicyKind::Pi05),
         Some("pi0") => Ok(PolicyKind::Pi0),
         Some("smolvla") => Ok(PolicyKind::SmolVla),
+        Some("xvla") => Ok(PolicyKind::Xvla),
         other => refuse(format!(
-            "policy.name {other:?}; supported: pi05, pi0, smolvla"
+            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla"
         )),
     }
 }
@@ -393,6 +454,8 @@ const COMPONENTS: &[(&str, Option<&str>)] = &[
     ("ov_tokenizer", Some("OVTokenizer")),
     ("denormalize", Some("StatsDenormalizer")),
     ("action_chunk_trimmer", Some("ActionChunkTrimmer")),
+    ("image_flip", None),
+    ("xvla_rotation_6d_to_axis_angle", None),
 ];
 
 fn short_name(class_path: &str) -> Option<&'static str> {
@@ -547,6 +610,23 @@ struct TrimmerParams {
     n_action_steps: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageFlipParams {
+    cameras: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XvlaRotationParams {
+    #[serde(default = "xvla_row_read")]
+    expected_action_dim: i64,
+}
+
+fn xvla_row_read() -> i64 {
+    XVLA_ROW_READ as i64
+}
+
 fn pre_step(v: &Value) -> EngineResult<PreStep> {
     let ctx = "model.preprocessors";
     let (name, params) = component(v, ctx)?;
@@ -593,6 +673,18 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
                 artifact: confine_artifact(&p.artifact)?,
             }
         }
+        "image_flip" => {
+            let p: ImageFlipParams = typed(params, &ctx)?;
+            if p.cameras.is_empty() {
+                return refuse(format!("{ctx}: cameras is empty"));
+            }
+            for (i, c) in p.cameras.iter().enumerate() {
+                if p.cameras[..i].contains(c) {
+                    return refuse(format!("{ctx}: camera {c:?} listed twice"));
+                }
+            }
+            PreStep::ImageFlip { cameras: p.cameras }
+        }
         other => return refuse(format!("{ctx}: {other} is not a preprocessor")),
     })
 }
@@ -624,6 +716,15 @@ fn post_step(v: &Value) -> EngineResult<PostStep> {
             }
             PostStep::ActionChunkTrimmer {
                 n_action_steps: p.n_action_steps as usize,
+            }
+        }
+        "xvla_rotation_6d_to_axis_angle" => {
+            let p: XvlaRotationParams = typed(params, &ctx)?;
+            if p.expected_action_dim < 0 {
+                return refuse(format!("{ctx}: expected_action_dim is negative"));
+            }
+            PostStep::XvlaRotation6dToAxisAngle {
+                expected_action_dim: p.expected_action_dim as usize,
             }
         }
         other => return refuse(format!("{ctx}: {other} is not a postprocessor")),
@@ -781,6 +882,7 @@ mod tests {
     const DROID: &str =
         include_str!("../../tests/fixtures/policy/pi05-droid-placeholder-manifest.json");
     const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
+    const XVLA_LIBERO: &str = include_str!("../../tests/fixtures/policy/xvla-libero-manifest.json");
 
     fn parse(v: &Value) -> EngineResult<PolicyManifest> {
         PolicyManifest::parse(&v.to_string(), LoadOptions::default())
@@ -920,6 +1022,132 @@ mod tests {
         assert!(err(&v).contains("unsupported component class_path"));
         v["model"]["preprocessors"][1] = json!({"class_path": "pi0"});
         assert!(err(&v).contains("unsupported component class_path"));
+    }
+
+    #[test]
+    fn xvla_libero_manifest_parses() {
+        let m = PolicyManifest::parse(XVLA_LIBERO, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::Xvla);
+        assert_eq!(m.model_artifact, "xvla.xml");
+        assert_eq!(m.flipped_cameras(), ["image2"]);
+        assert!(matches!(m.image_step(), ImageStep::SmolVlaResize(_)));
+        assert_eq!(
+            m.postprocessors,
+            vec![PostStep::XvlaRotation6dToAxisAngle {
+                expected_action_dim: 10
+            }]
+        );
+        assert_eq!(m.normalize().count(), 0);
+        assert_eq!(m.output_features[0].shape, vec![30, 7]);
+    }
+
+    #[test]
+    fn image_flip_and_rotation_steps_are_validated() {
+        let xvla = |pre: Option<Value>, post: Value| {
+            let mut v = base();
+            v["policy"] = json!({"name": "xvla"});
+            if let Some(p) = pre {
+                v["model"]["preprocessors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, p);
+            }
+            v["model"]["postprocessors"]
+                .as_array_mut()
+                .unwrap()
+                .push(post);
+            parse(&v)
+        };
+        let rot = json!({"type": "xvla_rotation_6d_to_axis_angle"});
+        let m = xvla(
+            Some(json!({"type": "image_flip", "cameras": ["image"]})),
+            rot.clone(),
+        )
+        .unwrap();
+        assert_eq!(m.flipped_cameras(), ["image"]);
+        // LeRobot's default.
+        assert!(m
+            .postprocessors
+            .contains(&PostStep::XvlaRotation6dToAxisAngle {
+                expected_action_dim: 10
+            }));
+        let e = |pre, post| xvla(pre, post).unwrap_err().to_string();
+        assert!(e(
+            Some(json!({"type": "image_flip", "cameras": []})),
+            rot.clone()
+        )
+        .contains("cameras is empty"));
+        assert!(e(
+            Some(json!({"type": "image_flip", "cameras": ["a", "a"]})),
+            rot.clone()
+        )
+        .contains("\"a\" listed twice"));
+        assert!(
+            e(Some(json!({"type": "image_flip"})), rot.clone()).contains("missing field `cameras`")
+        );
+        assert!(e(
+            Some(json!({"type": "image_flip", "cameras": ["a"], "axis": 0})),
+            rot.clone()
+        )
+        .contains("unknown field `axis`"));
+        assert!(e(
+            None,
+            json!({"type": "xvla_rotation_6d_to_axis_angle", "expected_action_dim": -1})
+        )
+        .contains("negative"));
+        assert!(e(
+            None,
+            json!({"type": "xvla_rotation_6d_to_axis_angle", "order": "xyz"})
+        )
+        .contains("unknown field `order`"));
+        // Ours, not Intel's: type form only.
+        assert!(e(
+            None,
+            json!({"class_path": "xvla_rotation_6d_to_axis_angle"})
+        )
+        .contains("unsupported component class_path"));
+        let mut v = base();
+        for _ in 0..2 {
+            v["model"]["preprocessors"]
+                .as_array_mut()
+                .unwrap()
+                .insert(0, json!({"type": "image_flip", "cameras": ["image"]}));
+        }
+        assert!(err(&v).contains("more than one image_flip"));
+        let mut v = base();
+        for _ in 0..2 {
+            v["model"]["postprocessors"]
+                .as_array_mut()
+                .unwrap()
+                .push(rot.clone());
+        }
+        assert!(err(&v).contains("more than one xvla_rotation"));
+    }
+
+    #[test]
+    fn rotation_width_is_seven_from_at_least_ten() {
+        let step = |n| PostStep::XvlaRotation6dToAxisAngle {
+            expected_action_dim: n,
+        };
+        assert_eq!(step(10).out_dim(20).unwrap(), XVLA_ACTION_DIM);
+        assert_eq!(step(10).out_dim(10).unwrap(), 7);
+        // LeRobot slices 0..10 whatever the expected dim says.
+        assert!(step(4)
+            .out_dim(9)
+            .unwrap_err()
+            .to_string()
+            .contains("at least 10 wide"));
+        assert!(step(12)
+            .out_dim(11)
+            .unwrap_err()
+            .to_string()
+            .contains("at least 12 wide"));
+        assert_eq!(
+            PostStep::ActionChunkTrimmer { n_action_steps: 3 }
+                .out_dim(20)
+                .unwrap(),
+            20
+        );
     }
 
     #[test]

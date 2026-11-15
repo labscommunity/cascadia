@@ -5,7 +5,7 @@ use cascadia_engine::{EngineError, EngineResult};
 use cascadia_types::{NoiseMode, PolicySpec, ResizeConvention};
 
 use super::cameras::{CameraLayout, CameraPlan};
-use super::manifest::{ImageStep, PolicyManifest, PreStep, StatsStep};
+use super::manifest::{ImageStep, PolicyManifest, PostStep, PreStep, StatsStep};
 
 /// Facts only the compiled model can give.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,7 +99,15 @@ pub fn derive_spec(
         (Some(hw), _) | (None, Some(hw)) => hw,
         (None, None) => return refuse("no image_resolution and a dynamic images input"),
     };
-    let [ir_steps, dim] = ir.action_shape;
+    for cam in m.flipped_cameras() {
+        if !layout.names.contains(cam) {
+            return refuse(format!(
+                "image_flip camera {cam:?} is not one of the package's cameras {:?}",
+                layout.names
+            ));
+        }
+    }
+    let [ir_steps, ir_dim] = ir.action_shape;
     let check_len = |steps: &mut dyn Iterator<Item = &StatsStep>, key, want: usize| {
         for step in steps {
             if let Some(s) = step.stats_for(key) {
@@ -118,7 +126,14 @@ pub fn derive_spec(
         Ok(())
     };
     check_len(&mut m.normalize(), "state", ir.state_len)?;
-    check_len(&mut m.denormalize(), "action", dim)?;
+    // The served width is what the postprocessors leave, not the IR's.
+    let mut dim = ir_dim;
+    for step in &m.postprocessors {
+        if let PostStep::Denormalize(s) = step {
+            check_len(&mut std::iter::once(s), "action", dim)?;
+        }
+        dim = step.out_dim(dim)?;
+    }
     if (ir.noise == NoiseMode::Input) != ir.noise_shape.is_some() {
         return refuse(format!(
             "IR facts disagree: noise mode {:?} with noise shape {:?}",
@@ -177,6 +192,19 @@ mod tests {
         include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
 
     const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
+    const XVLA_LIBERO: &str = include_str!("../../tests/fixtures/policy/xvla-libero-manifest.json");
+
+    /// The real IR ports of our xvla-libero export.
+    fn xvla_ir() -> IrFacts {
+        IrFacts {
+            image_slots: 2,
+            image_hw: Some([224, 224]),
+            state_len: 8,
+            action_shape: [30, 20],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![30, 20]),
+        }
+    }
 
     fn server() -> ServerFacts {
         ServerFacts {
@@ -229,6 +257,74 @@ mod tests {
         assert_eq!(spec.chunk, [50, 7]);
         assert_eq!(spec.resize, ResizeConvention::Center);
         assert_eq!(spec.noise_shape, Some(vec![50, 32]));
+    }
+
+    #[test]
+    fn xvla_spec_serves_the_rotation_steps_width() {
+        let m = PolicyManifest::parse(XVLA_LIBERO, LoadOptions::default()).unwrap();
+        let (spec, layout) = derive_spec(&m, &xvla_ir(), server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1)]);
+        assert_eq!(spec.resize, ResizeConvention::TopLeft);
+        assert_eq!(spec.chunk, [30, 7], "the IR's 20-wide ee6d becomes 7");
+        assert_eq!(spec.noise_shape, Some(vec![30, 20]));
+        // The metadata JSON carries the same width.
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["chunk"], serde_json::json!([30, 7]));
+
+        let mut narrow = xvla_ir();
+        narrow.action_shape = [30, 9];
+        narrow.noise_shape = Some(vec![30, 9]);
+        let mut v: serde_json::Value = serde_json::from_str(XVLA_LIBERO).unwrap();
+        v["model"]["preprocessors"][2]["shape"] = serde_json::json!([30, 9]);
+        let m9 = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let e = derive_spec(&m9, &narrow, server()).unwrap_err().to_string();
+        assert!(e.contains("at least 10 wide; they are 9"), "{e}");
+    }
+
+    #[test]
+    fn image_flip_names_must_be_cameras_of_the_package() {
+        let mut v: serde_json::Value = serde_json::from_str(XVLA_LIBERO).unwrap();
+        v["model"]["preprocessors"][0]["cameras"] = serde_json::json!(["wrist"]);
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let e = derive_spec(&m, &xvla_ir(), server())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(
+                "image_flip camera \"wrist\" is not one of the package's cameras [\"image\", \"image2\"]"
+            ),
+            "{e}"
+        );
+        // The feature key is not the advertised name.
+        v["model"]["preprocessors"][0]["cameras"] = serde_json::json!(["images.image2"]);
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        assert!(derive_spec(&m, &xvla_ir(), server()).is_err());
+    }
+
+    #[test]
+    fn denormalize_stats_are_checked_against_the_width_at_that_step() {
+        let with_post = |post: serde_json::Value| {
+            let mut v: serde_json::Value = serde_json::from_str(XVLA_LIBERO).unwrap();
+            v["model"]["postprocessors"] = post;
+            PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap()
+        };
+        let denorm = |n: usize| {
+            serde_json::json!({"type": "denormalize", "mode": "mean_std",
+                "stats": {"action": {"mean": vec![0.5; n], "std": vec![2.0; n]}}})
+        };
+        let rot = serde_json::json!({"type": "xvla_rotation_6d_to_axis_angle"});
+        let spec = |post| derive_spec(&with_post(post), &xvla_ir(), server());
+        // Before the rotation the actions are 20 wide, after it 7.
+        spec(serde_json::json!([denorm(20), rot])).unwrap();
+        spec(serde_json::json!([rot, denorm(7)])).unwrap();
+        let e = spec(serde_json::json!([rot, denorm(20)]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("action stats have 20 values; the model has 7"),
+            "{e}"
+        );
     }
 
     #[test]
