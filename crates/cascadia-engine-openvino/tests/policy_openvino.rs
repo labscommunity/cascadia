@@ -4,12 +4,14 @@
 //! - `CASCADIA_POLICY_PACKAGE`: `HuggingFaceVLA/smolvla_libero` (physical-ai-studio `8f132416`);
 //! - `CASCADIA_POLICY_PACKAGE_PI0`: `lerobot/pi0_libero_finetuned_v044`;
 //! - `CASCADIA_POLICY_PACKAGE_XVLA`: `lerobot/xvla-libero`, cameras flipped on the host;
-//! - `CASCADIA_POLICY_PACKAGE_VLAJEPA`: `lerobot/VLA-JEPA-LIBERO`, prompt padded to 288.
+//! - `CASCADIA_POLICY_PACKAGE_VLAJEPA`: `lerobot/VLA-JEPA-LIBERO`, prompt padded to 288;
+//! - `CASCADIA_POLICY_PACKAGE_EVO1`: `zuoxingdong/evo1_libero`, cameras flipped on the host.
 //!
 //! The π0 and X-VLA references are the exporters' PyTorch f32 outputs, in the
 //! package's `ref.npz` (or `<dir>.ref.npz` beside it). VLA-JEPA's are LeRobot's
 //! f32 inputs and actions, `torch_ref.npz`, for the raw `inputs.npz` (each in
-//! the package, or `<dir>.<name>` beside it).
+//! the package, or `<dir>.<name>` beside it). EVO1's are LeRobot's served
+//! actions in `ref.npz`, for the raw LIBERO frames in `frames.npz` (same rule).
 #![cfg(feature = "openvino")]
 
 use std::path::{Path, PathBuf};
@@ -1326,5 +1328,138 @@ fn vlajepa_gpu_infer_f16_and_f32() {
             worst <= bound,
             "gpu vlajepa {label} max abs diff {worst} > {bound}"
         );
+    }
+}
+
+fn evo1(test: &str) -> Option<PathBuf> {
+    package_from("CASCADIA_POLICY_PACKAGE_EVO1", test)
+}
+
+/// EVO1's binarized gripper column.
+const EVO1_GRIPPER: usize = 6;
+
+/// The two real LIBERO cases of `ref.npz` and their raw frames, as a client sends them.
+fn evo1_cases(dir: &Path) -> Vec<(Observation, Vec<f32>)> {
+    let z = beside(dir, "ref.npz");
+    let fr = beside(dir, "frames.npz");
+    let task = npz(&fr, "task").string();
+    let states = npz(&fr, "state").f32s();
+    let n = 448 * 448 * 3;
+    ["real0", "real1"]
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let frame = |cam: &str| {
+                let a = npz(&fr, &format!("env_{cam}"));
+                assert_eq!(a.shape, vec![2, 448, 448, 3]);
+                Image {
+                    height: 448,
+                    width: 448,
+                    data: a.data[i * n..(i + 1) * n].to_vec(),
+                }
+            };
+            let obs = Observation {
+                images: vec![
+                    ("image".into(), frame("image")),
+                    ("image2".into(), frame("image2")),
+                ],
+                state: states[i * 8..(i + 1) * 8].to_vec(),
+                prompt: task.clone(),
+                seed: None,
+                noise: Some(npz(&z, &format!("{case}_in_noise")).f32s()),
+            };
+            // LeRobot's 50 postprocessed rows; the engine serves the first 14.
+            let want = npz(&z, &format!("{case}_final")).f32s()[..14 * 7].to_vec();
+            (obs, want)
+        })
+        .collect()
+}
+
+/// Max abs over the non-gripper columns, and the rows whose gripper differs.
+fn evo1_diff(got: &[f32], want: &[f32]) -> (f32, usize) {
+    let mut max = 0f32;
+    let mut flips = 0;
+    for (g, w) in got.chunks(7).zip(want.chunks(7)) {
+        for c in (0..7).filter(|&c| c != EVO1_GRIPPER) {
+            max = max.max((g[c] - w[c]).abs());
+        }
+        flips += usize::from(g[EVO1_GRIPPER] != w[EVO1_GRIPPER]);
+    }
+    (max, flips)
+}
+
+#[test]
+fn evo1_spec_tokenizer_and_cpu_parity() {
+    let Some(dir) = evo1("evo1_spec_tokenizer_and_cpu_parity") else {
+        return;
+    };
+    let z = beside(&dir, "ref.npz");
+    let mut tok = OvTokenizer::load(&dir.join("tokenizer.xml")).unwrap();
+    assert!(tok.has_truncation_state());
+    let task = npz(&z, "real0_task").string();
+    let t = tok.tokenize(task.trim()).unwrap();
+    assert_eq!(t.ids, npz(&z, "real0_in_tokenized_prompt").i64s());
+    assert_eq!(t.mask, npz(&z, "real0_in_tokenized_prompt_mask").bools());
+
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let spec = engine.spec().clone();
+    assert_eq!(spec.cameras, vec!["image", "image2"]);
+    assert_eq!((spec.height, spec.width), (448, 448));
+    assert_eq!(spec.resize, ResizeConvention::Stretch);
+    assert_eq!(spec.state_len, 8);
+    assert_eq!(spec.chunk, [14, 7]);
+    assert_eq!(
+        (spec.noise, spec.noise_shape.clone()),
+        (NoiseMode::Input, Some(vec![50, 7]))
+    );
+    for (i, (mut obs, want)) in evo1_cases(&dir).into_iter().enumerate() {
+        // LeRobot strips the task; so does the engine.
+        obs.prompt = format!("  {}\n", obs.prompt);
+        let a = engine.infer(&obs).unwrap();
+        assert_eq!((a.steps, a.dim, a.actions.len()), (14, 7, 98));
+        let (d, flips) = evo1_diff(&a.actions, &want);
+        eprintln!(
+            "evo1 engine cpu f32 vs lerobot served case real{i}: max abs excl gripper {d} \
+             gripper flips {flips} infer_ms={:.0}",
+            a.infer_ms
+        );
+        assert_eq!(flips, 0, "real{i} gripper flips");
+        assert!(d <= 2e-3, "real{i} max abs diff {d}");
+    }
+}
+
+/// f16 is the GPU default only because the exporter splits the 44,800-input
+/// pooling FC: unsplit, every flow step after the first is wrong at f16.
+#[test]
+fn evo1_gpu_infer_f16_and_f32() {
+    let test = "evo1_gpu_infer_f16_and_f32";
+    let Some(dir) = evo1(test) else {
+        return;
+    };
+    if !gpu_enabled(test) {
+        return;
+    }
+    let cases = evo1_cases(&dir);
+    for (precision, label) in [(None, "f16"), (Some(Precision::F32), "f32")] {
+        let opts = OvPolicyOptions {
+            device: "GPU".into(),
+            precision,
+            ..OvPolicyOptions::default()
+        };
+        let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+        let warm = engine.warmup().unwrap();
+        assert_eq!(warm.len(), WARMUP_CALLS);
+        for (i, (obs, want)) in cases.iter().enumerate() {
+            let a = engine.infer(obs).unwrap();
+            assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
+            let (d, flips) = evo1_diff(&a.actions, want);
+            eprintln!(
+                "gpu evo1 {label} case real{i}: max abs excl gripper {d} gripper flips {flips} \
+                 infer_ms={:.1} warmup={warm:?}",
+                a.infer_ms
+            );
+            assert_eq!(flips, 0, "gpu evo1 {label} real{i} gripper flips");
+            assert!(d <= 2e-3, "gpu evo1 {label} real{i} max abs diff {d}");
+        }
     }
 }

@@ -119,6 +119,25 @@ fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
+/// Python `str.strip()`.
+pub fn py_strip(s: &str) -> &str {
+    s.trim_matches(py_space)
+}
+
+/// `gripper_binarize` on row-major `[steps, dim]` actions; NaN goes below, as in numpy.
+pub fn gripper_binarize(
+    actions: &mut [f64],
+    dim: usize,
+    index: usize,
+    threshold: f64,
+    above: f64,
+    below: f64,
+) {
+    for row in actions.chunks_mut(dim) {
+        row[index] = if row[index] > threshold { above } else { below };
+    }
+}
+
 /// π0.5 prompt text (`pi05.py` `__call__`).
 pub fn pi05_prompt(task: &str, bins: &[i32]) -> String {
     let cleaned = task.trim_matches(py_space).replace(['_', '\n'], " ");
@@ -304,6 +323,23 @@ pub fn trim_actions<T>(mut actions: Vec<T>, steps: usize, dim: usize, n: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gripper_binarize_is_strictly_above_and_nan_goes_below() {
+        let mut a = vec![0.1, 0.5, -0.2, 0.0, 0.9, 1e-9, 3.0, f64::NAN];
+        gripper_binarize(&mut a, 2, 1, 0.0, 1.0, -1.0);
+        assert_eq!(a[..7], [0.1, 1.0, -0.2, -1.0, 0.9, 1.0, 3.0]);
+        assert_eq!(a[7], -1.0, "NaN > threshold is false");
+        let mut b = vec![0.5, 0.4];
+        gripper_binarize(&mut b, 1, 0, 0.5, 2.0, 0.0);
+        assert_eq!(b, [0.0, 0.0], "equal to the threshold is below");
+    }
+
+    #[test]
+    fn py_strip_is_pythons_strip() {
+        assert_eq!(py_strip(" \t pick up the bowl\n\u{1f}"), "pick up the bowl");
+        assert_eq!(py_strip("a b"), "a b");
+    }
 
     fn step(mode: NormMode, s: FeatureStats) -> StatsStep {
         StatsStep {

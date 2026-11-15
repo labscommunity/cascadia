@@ -15,8 +15,8 @@ use super::manifest::{
 };
 use super::spec::{derive_spec, IrFacts, ServerFacts};
 use super::steps::{
-    denormalize, new_line, normalize, pi05_bins, pi05_prompt, trim_actions,
-    xvla_rotation_6d_to_axis_angle, NUM_BINS,
+    denormalize, gripper_binarize, new_line, normalize, pi05_bins, pi05_prompt, py_strip,
+    trim_actions, xvla_rotation_6d_to_axis_angle, NUM_BINS,
 };
 use super::vla_jepa::VlaJepaHost;
 
@@ -163,9 +163,11 @@ pub enum PortLayout {
 impl PortLayout {
     pub fn of(kind: PolicyKind) -> Self {
         match kind {
-            PolicyKind::Pi05 | PolicyKind::Pi0 | PolicyKind::SmolVla | PolicyKind::Xvla => {
-                Self::ImageSlots
-            }
+            PolicyKind::Pi05
+            | PolicyKind::Pi0
+            | PolicyKind::SmolVla
+            | PolicyKind::Xvla
+            | PolicyKind::Evo1 => Self::ImageSlots,
             PolicyKind::VlaJepa => Self::VlaJepa,
         }
     }
@@ -507,7 +509,11 @@ impl NoiseRng {
 /// manifest order. `worst` puts every π0.5 bin at 255, the longest digits.
 fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> EngineResult<String> {
     let mut state = state.to_vec();
-    let mut text = task.to_string();
+    let mut text = match m.policy {
+        // LeRobot's EVO1 embedder tokenizes `text_prompt.strip()`.
+        PolicyKind::Evo1 => py_strip(task).to_string(),
+        _ => task.to_string(),
+    };
     for step in &m.preprocessors {
         match step {
             PreStep::Normalize(s) => state = normalize(s, STATE, &state)?,
@@ -866,6 +872,12 @@ impl PolicyPipeline {
                     actions = xvla_rotation_6d_to_axis_angle(&actions, steps, dim);
                     dim = XVLA_ACTION_DIM;
                 }
+                PostStep::GripperBinarize {
+                    index,
+                    threshold,
+                    above,
+                    below,
+                } => gripper_binarize(&mut actions, dim, *index, *threshold, *above, *below),
             }
         }
         let actions: Vec<f32> = actions.iter().map(|&x| x as f32).collect();
@@ -1528,6 +1540,54 @@ mod tests {
             let e = load(&m, ports);
             assert!(e.contains(want), "{want}: {e}");
         }
+    }
+
+    const EVO1_LIBERO: &str = include_str!("../../tests/fixtures/policy/evo1-libero-manifest.json");
+
+    /// The real ports of our EVO1 LIBERO export.
+    fn evo1_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+        (
+            vec![
+                port(STATE, DType::F32, &[1, 8]),
+                port(PROMPT, DType::I64, &[1, 64]),
+                port(PROMPT_MASK, DType::Bool, &[1, 64]),
+                port(IMAGES, DType::F32, &[2, 1, 3, 448, 448]),
+                port(IMAGE_MASKS, DType::Bool, &[2, 1]),
+                port(NOISE, DType::F32, &[1, 50, 7]),
+            ],
+            vec![port(ACTION, DType::F32, &[1, 50, 7])],
+        )
+    }
+
+    #[test]
+    fn evo1_strips_the_task_flips_both_cameras_and_binarizes_the_gripper() {
+        // Normalized actions in [-1, 1]; the gripper alternates around the 0.0 threshold.
+        let out: Vec<f32> = (0..350)
+            .map(|i| {
+                if i % 7 == 6 {
+                    [0.3, 0.0, -0.4][i / 7 % 3]
+                } else {
+                    0.5
+                }
+            })
+            .collect();
+        let mut r = rig_with(EVO1_LIBERO, evo1_ports(), false, true, out);
+        let spec = r.engine.spec().clone();
+        assert_eq!(spec.chunk, [14, 7]);
+        assert_eq!(spec.resize, cascadia_types::ResizeConvention::Stretch);
+        let a = r.engine.infer(&obs(&spec, "  pick up the bowl\n")).unwrap();
+        assert_eq!((a.steps, a.dim, a.actions.len()), (14, 7, 98));
+        // Denormalized min_max: (0.5 + 1) / 2 * (max - min) + min, then the gripper to ±1.
+        let want0 = (1.5 / 2.0 * (0.9375 + 0.9375) - 0.9375) as f32;
+        assert!((a.actions[0] - want0).abs() <= 1e-6, "{}", a.actions[0]);
+        let grippers: Vec<f32> = a.actions.chunks(7).map(|r| r[6]).collect();
+        // Rows 0, 1, 2: denormalized 0.3, 0.0 (not above), -0.4.
+        assert_eq!(&grippers[..3], &[1.0, -1.0, -1.0]);
+        assert!(grippers.iter().all(|g| g.abs() == 1.0));
+        assert_eq!(
+            r.log.lock().unwrap().texts.last().unwrap(),
+            "pick up the bowl"
+        );
     }
 
     #[test]

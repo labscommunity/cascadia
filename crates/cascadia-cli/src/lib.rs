@@ -235,8 +235,8 @@ pub enum EngineKind {
     /// weight streaming (disk-tier O1), orthogonal to the host interposer.
     #[value(name = "sycl-llama")]
     SyclLlama,
-    /// Robot policy (VLA) engine: serves a `policy_package` (SmolVLA, pi0.5, pi0, X-VLA, VLA-JEPA)
-    /// over an openpi-compatible WebSocket. `cascadia run` only.
+    /// Robot policy (VLA) engine: serves a `policy_package` (SmolVLA, pi0.5, pi0, X-VLA, EVO1,
+    /// VLA-JEPA) over an openpi-compatible WebSocket. `cascadia run` only.
     #[value(name = "ov-policy")]
     OvPolicy,
 }

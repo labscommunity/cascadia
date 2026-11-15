@@ -19,6 +19,10 @@ Copied, unmodified:
 - `vlajepa-libero-manifest.json`: our export of `lerobot/VLA-JEPA-LIBERO` (Intel's draft VLA-JEPA
   exporter, physical-ai-studio PR 1416), f32 with fp16 weights, the prompt padded right to 288
   tokens for a static graph; state normalization and action denormalization are graph constants.
+- `evo1-libero-manifest.json`: our export of `zuoxingdong/evo1_libero` (LeRobot `e40b58a8` modules
+  in Intel's manifest format), f32 with fp16 weights, `noise` as an input, both cameras flipped on
+  the host, the action head's pooling FC split for the GPU at f16; `"resize": "stretch"` added to
+  its `smolvla_resize` step.
 
 Generated:
 

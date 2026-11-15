@@ -1,0 +1,290 @@
+{
+  "policy": {
+    "name": "evo1",
+    "source": {
+      "class_path": "lerobot.policies.evo1.modeling_evo1.Evo1Policy",
+      "hf_id": "zuoxingdong/evo1_libero",
+      "eval_overrides": {
+        "n_action_steps": 14,
+        "num_inference_timesteps": 32,
+        "postprocess_action_dim": 7,
+        "binarize_gripper": true,
+        "gripper_threshold": 0.0,
+        "gripper_below_threshold_value": -1.0,
+        "gripper_above_threshold_value": 1.0,
+        "use_flash_attn": false,
+        "vlm_dtype": "float32",
+        "enable_gradient_checkpointing": false
+      }
+    }
+  },
+  "model": {
+    "runner": {
+      "class_path": "physicalai.inference.runners.single_pass.SinglePass"
+    },
+    "artifacts": {
+      "openvino": "evo1.xml"
+    },
+    "preprocessors": [
+      {
+        "type": "normalize",
+        "mode": "min_max",
+        "stats": {
+          "state": {
+            "name": "observation.state",
+            "shape": [
+              8
+            ],
+            "type": "STATE",
+            "mean": [
+              -0.04651878401637077,
+              0.034409068524837494,
+              0.7645524740219116,
+              2.9722094535827637,
+              -0.22046978771686554,
+              -0.12557940185070038,
+              0.02691425383090973,
+              -0.027190783992409706
+            ],
+            "std": [
+              0.10494395345449448,
+              0.15176619589328766,
+              0.3785167336463928,
+              0.34427371621131897,
+              0.9069468379020691,
+              0.3253919184207916,
+              0.014175903052091599,
+              0.014058894477784634
+            ],
+            "min": [
+              -0.4828203022480011,
+              -0.3255046010017395,
+              0.008128180168569088,
+              0.35277295112609863,
+              -3.641430377960205,
+              -1.842738389968872,
+              -0.0013586411951109767,
+              -0.042040832340717316
+            ],
+            "max": [
+              0.21031762659549713,
+              0.39128610491752625,
+              1.3660105466842651,
+              3.6714255809783936,
+              3.560650587081909,
+              1.386339545249939,
+              0.04233968257904053,
+              0.0013633022317662835
+            ],
+            "q01": [
+              -0.18941794335842133,
+              -0.13594238460063934,
+              0.6360146403312683,
+              2.7590622901916504,
+              -0.7064821720123291,
+              -0.4149194657802582,
+              0.010922795161604881,
+              -0.039982475340366364
+            ],
+            "q99": [
+              0.047856543213129044,
+              0.22236329317092896,
+              0.8834885358810425,
+              3.1921188831329346,
+              0.3581669330596924,
+              0.1767505705356598,
+              0.039975881576538086,
+              -0.011350016109645367
+            ]
+          }
+        }
+      },
+      {
+        "type": "image_flip",
+        "cameras": [
+          "image",
+          "image2"
+        ]
+      },
+      {
+        "type": "smolvla_resize",
+        "image_resolution": [
+          448,
+          448
+        ],
+        "image_key_reorder_map": {},
+        "num_cameras": 0,
+        "resize": "stretch"
+      },
+      {
+        "type": "noise",
+        "shape": [
+          50,
+          7
+        ]
+      },
+      {
+        "type": "ov_tokenizer",
+        "artifact": "tokenizer.xml"
+      }
+    ],
+    "postprocessors": [
+      {
+        "type": "denormalize",
+        "mode": "min_max",
+        "stats": {
+          "action": {
+            "name": "action",
+            "shape": [
+              7
+            ],
+            "type": "ACTION",
+            "mean": [
+              0.06278156489133835,
+              0.08684080839157104,
+              -0.09037306159734726,
+              0.0005407430580817163,
+              0.005643379874527454,
+              -0.0052290987223386765,
+              -0.0496407225728035
+            ],
+            "std": [
+              0.33552372455596924,
+              0.3784469962120056,
+              0.4447286128997803,
+              0.03924354165792465,
+              0.06339296698570251,
+              0.07797027379274368,
+              0.9987671375274658
+            ],
+            "min": [
+              -0.9375,
+              -0.9375,
+              -0.9375,
+              -0.2582142949104309,
+              -0.375,
+              -0.3675000071525574,
+              -1.0
+            ],
+            "max": [
+              0.9375,
+              0.9375,
+              0.9375,
+              0.3557142913341522,
+              0.375,
+              0.375,
+              1.0
+            ],
+            "q01": [
+              -0.5351995825767517,
+              -0.6038939952850342,
+              -0.7783527374267578,
+              -0.0740940049290657,
+              -0.11625244468450546,
+              -0.12600179016590118,
+              -1.0
+            ],
+            "q99": [
+              0.7094643712043762,
+              0.7320647835731506,
+              0.8014754056930542,
+              0.08395454287528992,
+              0.1392757147550583,
+              0.10880500823259354,
+              0.9194769859313965
+            ]
+          }
+        }
+      },
+      {
+        "type": "action_chunk_trimmer",
+        "n_action_steps": 14
+      },
+      {
+        "type": "gripper_binarize",
+        "index": 6,
+        "threshold": 0.0,
+        "above": 1.0,
+        "below": -1.0
+      }
+    ],
+    "input_features": [
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "VISUAL",
+          "shape": [
+            3,
+            448,
+            448
+          ],
+          "name": "images.image",
+          "dtype": "float32"
+        }
+      },
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "VISUAL",
+          "shape": [
+            3,
+            448,
+            448
+          ],
+          "name": "images.image2",
+          "dtype": "float32"
+        }
+      },
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "STATE",
+          "shape": [
+            8
+          ],
+          "name": "state",
+          "dtype": "float32"
+        }
+      },
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "LANGUAGE",
+          "shape": [
+            64
+          ],
+          "name": "task",
+          "dtype": "string"
+        }
+      },
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "COMMON",
+          "shape": [
+            50,
+            7
+          ],
+          "name": "noise",
+          "dtype": "float32"
+        }
+      }
+    ],
+    "output_features": [
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "ACTION",
+          "shape": [
+            14,
+            7
+          ],
+          "name": "action",
+          "dtype": "float32"
+        }
+      }
+    ]
+  },
+  "format": "policy_package",
+  "version": "1.0"
+}

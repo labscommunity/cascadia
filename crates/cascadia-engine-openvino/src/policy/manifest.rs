@@ -20,6 +20,8 @@ pub enum PolicyKind {
     Pi0,
     SmolVla,
     Xvla,
+    /// EVO1: SmolVLA's ports, cameras and prompt; the task is stripped as LeRobot does.
+    Evo1,
     VlaJepa,
 }
 
@@ -73,6 +75,9 @@ pub struct SmolVlaResizeStep {
     /// Image key as written in the manifest to camera slot index.
     pub image_key_reorder_map: Vec<(String, i64)>,
     pub num_cameras: i64,
+    /// Ours: clients stretch frames to `image_resolution` (`"resize": "stretch"`)
+    /// instead of letterboxing them top-left.
+    pub stretch: bool,
 }
 
 /// VLA-JEPA's host inputs (Intel's `VLAJEPAPreprocessor` without the
@@ -130,6 +135,13 @@ pub enum PostStep {
     XvlaRotation6dToAxisAngle {
         expected_action_dim: usize,
     },
+    /// Ours: `a[.., index] = above if a > threshold else below` (LeRobot EVO1's LIBERO gripper).
+    GripperBinarize {
+        index: usize,
+        threshold: f64,
+        above: f64,
+        below: f64,
+    },
 }
 
 /// Width of the X-VLA rotation step's output: position, axis-angle, gripper.
@@ -143,6 +155,14 @@ impl PostStep {
     pub fn out_dim(&self, dim: usize) -> EngineResult<usize> {
         match self {
             Self::Denormalize(_) | Self::ActionChunkTrimmer { .. } => Ok(dim),
+            Self::GripperBinarize { index, .. } => {
+                if *index >= dim {
+                    return refuse(format!(
+                        "gripper_binarize index {index} is outside actions {dim} wide"
+                    ));
+                }
+                Ok(dim)
+            }
             Self::XvlaRotation6dToAxisAngle {
                 expected_action_dim,
             } => {
@@ -478,6 +498,7 @@ fn post_name(s: &PostStep) -> &'static str {
         PostStep::Denormalize(_) => "denormalize",
         PostStep::ActionChunkTrimmer { .. } => "action_chunk_trimmer",
         PostStep::XvlaRotation6dToAxisAngle { .. } => "xvla_rotation_6d_to_axis_angle",
+        PostStep::GripperBinarize { .. } => "gripper_binarize",
     }
 }
 
@@ -537,9 +558,10 @@ fn policy_kind(policy: Option<&Value>) -> EngineResult<PolicyKind> {
         Some("pi0") => Ok(PolicyKind::Pi0),
         Some("smolvla") => Ok(PolicyKind::SmolVla),
         Some("xvla") => Ok(PolicyKind::Xvla),
+        Some("evo1") => Ok(PolicyKind::Evo1),
         Some("vlajepa") => Ok(PolicyKind::VlaJepa),
         other => refuse(format!(
-            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla, vlajepa"
+            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla, evo1, vlajepa"
         )),
     }
 }
@@ -560,6 +582,7 @@ const COMPONENTS: &[(&str, Option<&str>)] = &[
     ("action_chunk_trimmer", Some("ActionChunkTrimmer")),
     ("image_flip", None),
     ("xvla_rotation_6d_to_axis_angle", None),
+    ("gripper_binarize", None),
     ("vla_jepa_prompt", None),
     ("vla_jepa_inputs", None),
 ];
@@ -693,6 +716,17 @@ struct SmolVlaParams {
     // The wire format fixes HWC, so the package's input layout does not apply.
     #[serde(default)]
     image_layout: Option<String>,
+    #[serde(default)]
+    resize: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GripperBinarizeParams {
+    index: i64,
+    threshold: f64,
+    above: f64,
+    below: f64,
 }
 
 #[derive(Deserialize)]
@@ -779,10 +813,18 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
                 };
                 map.push((k, slot));
             }
+            let stretch = match p.resize.as_deref() {
+                None | Some("top_left") => false,
+                Some("stretch") => true,
+                Some(r) => {
+                    return refuse(format!("{ctx}: resize {r:?}; expected top_left or stretch"))
+                }
+            };
             PreStep::SmolVlaResize(SmolVlaResizeStep {
                 image_resolution: p.image_resolution,
                 image_key_reorder_map: map,
                 num_cameras: p.num_cameras,
+                stretch,
             })
         }
         "new_line" => {
@@ -912,6 +954,24 @@ fn post_step(v: &Value) -> EngineResult<PostStep> {
             }
             PostStep::XvlaRotation6dToAxisAngle {
                 expected_action_dim: p.expected_action_dim as usize,
+            }
+        }
+        "gripper_binarize" => {
+            let p: GripperBinarizeParams = typed(params, &ctx)?;
+            if p.index < 0 {
+                return refuse(format!("{ctx}: index is negative"));
+            }
+            if ![p.threshold, p.above, p.below]
+                .iter()
+                .all(|x| x.is_finite())
+            {
+                return refuse(format!("{ctx}: threshold, above and below must be finite"));
+            }
+            PostStep::GripperBinarize {
+                index: p.index as usize,
+                threshold: p.threshold,
+                above: p.above,
+                below: p.below,
             }
         }
         other => return refuse(format!("{ctx}: {other} is not a postprocessor")),
@@ -1072,6 +1132,7 @@ mod tests {
     const XVLA_LIBERO: &str = include_str!("../../tests/fixtures/policy/xvla-libero-manifest.json");
     const VLAJEPA_LIBERO: &str =
         include_str!("../../tests/fixtures/policy/vlajepa-libero-manifest.json");
+    const EVO1_LIBERO: &str = include_str!("../../tests/fixtures/policy/evo1-libero-manifest.json");
 
     fn parse(v: &Value) -> EngineResult<PolicyManifest> {
         PolicyManifest::parse(&v.to_string(), LoadOptions::default())
@@ -1264,6 +1325,72 @@ mod tests {
             .contains(&PreStep::Noise { shape: vec![7, 7] }));
         assert!(m.postprocessors.is_empty());
         assert_eq!(m.normalize().count(), 0, "stats are graph constants");
+    }
+
+    #[test]
+    fn evo1_libero_manifest_parses() {
+        let m = PolicyManifest::parse(EVO1_LIBERO, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::Evo1);
+        assert_eq!(m.model_artifact, "evo1.xml");
+        assert_eq!(m.flipped_cameras(), ["image", "image2"]);
+        let ImageStep::SmolVlaResize(s) = m.image_step() else {
+            panic!("smolvla image step")
+        };
+        assert_eq!(s.image_resolution, Some([448, 448]));
+        assert!(s.stretch);
+        assert!(!m.preprocessors.contains(&PreStep::NewLine));
+        assert_eq!(m.n_action_steps(), Some(14));
+        assert_eq!(
+            m.postprocessors.last(),
+            Some(&PostStep::GripperBinarize {
+                index: 6,
+                threshold: 0.0,
+                above: 1.0,
+                below: -1.0
+            })
+        );
+    }
+
+    #[test]
+    fn gripper_binarize_and_the_resize_param_are_validated() {
+        let evo1 = || -> Value { serde_json::from_str(EVO1_LIBERO).unwrap() };
+        let mut v = evo1();
+        v["model"]["postprocessors"][2]["index"] = json!(-1);
+        assert!(err(&v).contains("index is negative"));
+        let mut v = evo1();
+        v["model"]["postprocessors"][2]["axis"] = json!(0);
+        assert!(err(&v).contains("unknown field `axis`"));
+        let mut v = evo1();
+        v["model"]["postprocessors"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("threshold");
+        assert!(err(&v).contains("missing field `threshold`"));
+        // Ours: type form only.
+        let mut v = evo1();
+        v["model"]["postprocessors"][2] = json!({"class_path": "gripper_binarize"});
+        assert!(err(&v).contains("unsupported component class_path"));
+        let mut v = evo1();
+        v["model"]["preprocessors"][2]["resize"] = json!("center");
+        assert!(err(&v).contains("resize \"center\"; expected top_left or stretch"));
+        v["model"]["preprocessors"][2]["resize"] = json!("top_left");
+        let m = parse(&v).unwrap();
+        let ImageStep::SmolVlaResize(s) = m.image_step() else {
+            panic!("smolvla image step")
+        };
+        assert!(!s.stretch);
+        assert_eq!(
+            PostStep::GripperBinarize {
+                index: 7,
+                threshold: 0.0,
+                above: 1.0,
+                below: -1.0
+            }
+            .out_dim(7)
+            .unwrap_err()
+            .to_string(),
+            "invalid configuration: policy manifest: gripper_binarize index 7 is outside actions 7 wide"
+        );
     }
 
     #[test]
@@ -1588,7 +1715,7 @@ mod tests {
         let mut v = base();
         v["policy"] = json!({"name": "pi0_fast"});
         assert!(err(&v).contains("policy.name Some(\"pi0_fast\")"));
-        assert!(err(&v).contains("xvla, vlajepa"));
+        assert!(err(&v).contains("xvla, evo1, vlajepa"));
         let mut v = base();
         v["policy"] =
             json!({"source": {"class_path": "physicalai.policies.smolvla.policy.SmolVLA"}});

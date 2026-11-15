@@ -50,6 +50,9 @@ impl ManifestSpec {
     pub fn from_manifest(m: &PolicyManifest) -> EngineResult<Self> {
         let (image_hw, resize) = match m.image_step() {
             ImageStep::Pi05(p) => (p.image_resolution, ResizeConvention::Center),
+            ImageStep::SmolVlaResize(s) if s.stretch => {
+                (s.image_resolution, ResizeConvention::Stretch)
+            }
             ImageStep::SmolVlaResize(s) => (s.image_resolution, ResizeConvention::TopLeft),
             ImageStep::VlaJepa(j) => (Some(j.image_resolution), ResizeConvention::Stretch),
         };
@@ -281,6 +284,31 @@ mod tests {
         let m9 = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
         let e = derive_spec(&m9, &narrow, server()).unwrap_err().to_string();
         assert!(e.contains("at least 10 wide; they are 9"), "{e}");
+    }
+
+    #[test]
+    fn evo1_spec_is_a_stretch_with_a_binarized_gripper() {
+        const EVO1: &str = include_str!("../../tests/fixtures/policy/evo1-libero-manifest.json");
+        let m = PolicyManifest::parse(EVO1, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            image_slots: 2,
+            image_hw: Some([448, 448]),
+            state_len: 8,
+            action_shape: [50, 7],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![50, 7]),
+        };
+        let (spec, _) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!((spec.height, spec.width), (448, 448));
+        assert_eq!(spec.resize, ResizeConvention::Stretch);
+        assert_eq!(spec.chunk, [14, 7]);
+        // The gripper index is checked against the width at its step, at load.
+        let mut v: serde_json::Value = serde_json::from_str(EVO1).unwrap();
+        v["model"]["postprocessors"][2]["index"] = serde_json::json!(7);
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let e = derive_spec(&m, &ir, server()).unwrap_err().to_string();
+        assert!(e.contains("index 7 is outside actions 7 wide"), "{e}");
     }
 
     #[test]
