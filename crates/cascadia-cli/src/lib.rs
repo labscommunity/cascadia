@@ -828,6 +828,24 @@ pub struct RunArgs {
     #[arg(long)]
     pub allow_identity_stats: bool,
 
+    /// `--engine ov-policy` only: also serve physicalai's remote-inference
+    /// protocol over Zenoh, so `physicalai.inference.RemoteInferenceModel`
+    /// can drive the policy. `HOST:PORT`, or `HOST` for physicalai's
+    /// name-derived port. Unauthenticated: loopback only unless
+    /// `--zenoh-allow-all-interfaces`. Needs a build with `--features zenoh`.
+    #[arg(long, value_name = "HOST[:PORT]")]
+    pub zenoh: Option<String>,
+
+    /// `--engine ov-policy` only: the slot name physicalai clients are given
+    /// (`RemoteInferenceModel(name=...)`); defaults to the manifest's policy name.
+    #[arg(long, value_name = "NAME")]
+    pub zenoh_name: Option<String>,
+
+    /// `--engine ov-policy` only: let `--zenoh` bind a non-loopback host.
+    /// Anything that reaches the port can drive the robot.
+    #[arg(long)]
+    pub zenoh_allow_all_interfaces: bool,
+
     /// `--engine qwen35` only: prefix-cache budget in GiB (0 disables; default
     /// min(16 GiB, RAM/4)). See `cascadia worker --help`.
     #[arg(long)]
@@ -1294,6 +1312,12 @@ fn check_policy_flags(args: &RunArgs) -> Result<()> {
             args.policy_max_connections.is_some(),
         ),
         ("--allow-identity-stats", args.allow_identity_stats),
+        ("--zenoh", args.zenoh.is_some()),
+        ("--zenoh-name", args.zenoh_name.is_some()),
+        (
+            "--zenoh-allow-all-interfaces",
+            args.zenoh_allow_all_interfaces,
+        ),
     ];
     match used.iter().find(|(_, set)| *set) {
         Some((flag, _)) => Err(anyhow!("{flag} applies to --engine ov-policy only")),
@@ -1361,6 +1385,9 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
             args.model
         ));
     }
+    let mut identity = cascadia_api::policy::PackageIdentity::from_package_dir(&dir)
+        .with_context(|| format!("reading {}", dir.join("manifest.json").display()))?;
+    let zenoh = zenoh_plan(&args, &identity)?;
     let opts = OvPolicyOptions {
         device: args.device.clone(),
         precision,
@@ -1368,21 +1395,90 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
             allow_identity_stats: args.allow_identity_stats,
         },
     };
-    let engine = tokio::task::spawn_blocking(move || -> Result<Box<dyn PolicyEngine>> {
-        let mut engine = OvPolicyEngine::load(&dir, &opts)
-            .with_context(|| format!("loading policy package {}", dir.display()))?;
-        let ms = engine.warmup().context("policy warmup")?;
-        info!(warmup_ms = ?ms, "policy warmed");
-        Ok(Box::new(engine))
-    })
-    .await
-    .context("policy load task")??;
-    let cfg = policy_server_config(&args);
+    let (engine, ms) =
+        tokio::task::spawn_blocking(move || -> Result<(Box<dyn PolicyEngine>, Vec<u32>)> {
+            let mut engine = OvPolicyEngine::load(&dir, &opts)
+                .with_context(|| format!("loading policy package {}", dir.display()))?;
+            let ms = engine.warmup().context("policy warmup")?;
+            info!(warmup_ms = ?ms, "policy warmed");
+            Ok((Box::new(engine), ms))
+        })
+        .await
+        .context("policy load task")??;
+    identity.warmup_ms = ms.iter().copied().max();
+    let mut cfg = policy_server_config(&args);
+    cfg.identity = identity;
     let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("bind {host}:{port}"))?;
     let shutdown = install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
-    serve_policy_engine(listener, engine, cfg, shutdown).await
+    serve_policy_engine(listener, engine, cfg, zenoh, shutdown).await
+}
+
+/// Where `--zenoh` listens and under which slot name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ZenohPlan {
+    name: String,
+    host: String,
+    port: Option<u16>,
+    allow_all_interfaces: bool,
+}
+
+/// `HOST:PORT`, `[V6]:PORT`, `HOST`, `[V6]` or a bare IPv6 address.
+fn parse_zenoh_addr(s: &str) -> Result<(String, Option<u16>)> {
+    let bad = || anyhow!("--zenoh takes HOST[:PORT], got {s:?}");
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let (h, after) = rest.split_once(']').ok_or_else(bad)?;
+        match after {
+            "" => (h, None),
+            p => (h, Some(p.strip_prefix(':').ok_or_else(bad)?)),
+        }
+    } else if s.matches(':').count() == 1 {
+        let (h, p) = s.split_once(':').expect("one colon");
+        (h, Some(p))
+    } else {
+        (s, None)
+    };
+    let port = port
+        .map(|p| p.parse::<u16>().ok().filter(|&p| p > 0).ok_or_else(bad))
+        .transpose()?;
+    if host.is_empty() {
+        return Err(bad());
+    }
+    Ok((host.to_string(), port))
+}
+
+fn zenoh_plan(
+    args: &RunArgs,
+    identity: &cascadia_api::policy::PackageIdentity,
+) -> Result<Option<ZenohPlan>> {
+    let Some(addr) = &args.zenoh else {
+        if args.zenoh_name.is_some() || args.zenoh_allow_all_interfaces {
+            return Err(anyhow!(
+                "--zenoh-name and --zenoh-allow-all-interfaces need --zenoh"
+            ));
+        }
+        return Ok(None);
+    };
+    if !cfg!(feature = "zenoh") {
+        return Err(anyhow!(
+            "--zenoh needs a cascadia built with `--features zenoh`"
+        ));
+    }
+    let (host, port) = parse_zenoh_addr(addr)?;
+    let name = match &args.zenoh_name {
+        Some(n) => n.clone(),
+        None if !identity.policy_name.is_empty() => identity.policy_name.clone(),
+        None => return Err(anyhow!("the manifest names no policy; pass --zenoh-name")),
+    };
+    cascadia_api::policy::physicalai::check_name(&name)
+        .map_err(|e| anyhow!("--zenoh-name {name:?}: {e}"))?;
+    Ok(Some(ZenohPlan {
+        name,
+        host,
+        port,
+        allow_all_interfaces: args.zenoh_allow_all_interfaces,
+    }))
 }
 
 fn policy_server_config(args: &RunArgs) -> cascadia_api::policy::server::PolicyServerConfig {
@@ -1396,17 +1492,45 @@ fn policy_server_config(args: &RunArgs) -> cascadia_api::policy::server::PolicyS
     }
 }
 
-/// Serve a loaded policy engine on `listener` until `shutdown` resolves.
+/// Serve a loaded policy engine on `listener`, and over Zenoh when planned,
+/// until `shutdown` resolves. Both front ends share the engine and its slots.
 async fn serve_policy_engine(
     listener: tokio::net::TcpListener,
     engine: Box<dyn cascadia_engine::PolicyEngine>,
     cfg: cascadia_api::policy::server::PolicyServerConfig,
+    zenoh: Option<ZenohPlan>,
     shutdown: impl std::future::Future<Output = ShutdownSignal>,
 ) -> Result<()> {
-    use cascadia_api::policy::server::{policy_router, serve_policy, HEADER_READ_TIMEOUT};
+    use cascadia_api::policy::server::{
+        serve_policy, shared_policy_router, SharedPolicy, HEADER_READ_TIMEOUT,
+    };
 
     let spec = engine.spec().clone();
-    let app = policy_router(engine, cfg)?;
+    let policy = SharedPolicy::new(engine, cfg.max_connections)?;
+    #[cfg(feature = "zenoh")]
+    let zenoh = match zenoh {
+        Some(plan) => Some(
+            cascadia_api::policy::zenoh_server::ZenohFrontEnd::serve_local(
+                policy.clone(),
+                &cascadia_api::policy::zenoh_server::ZenohListen {
+                    name: plan.name,
+                    host: plan.host,
+                    port: plan.port,
+                    allow_all_interfaces: plan.allow_all_interfaces,
+                },
+                cfg.identity.clone(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    #[cfg(not(feature = "zenoh"))]
+    if zenoh.is_some() {
+        return Err(anyhow!(
+            "--zenoh needs a cascadia built with `--features zenoh`"
+        ));
+    }
+    let app = shared_policy_router(policy, cfg);
     let addr = listener.local_addr()?;
     info!(
         model = %spec.model,
@@ -1415,11 +1539,18 @@ async fn serve_policy_engine(
         chunk = ?spec.chunk,
         "serving policy at ws://{addr}/v1/policy/ws (metadata: http://{addr}/v1/policy/metadata)"
     );
-    tokio::select! {
-        res = serve_policy(listener, app, HEADER_READ_TIMEOUT) => res.context("serve_policy")?,
-        sig = shutdown => info!(signal = %sig, "shutdown signal received"),
+    let res = tokio::select! {
+        res = serve_policy(listener, app, HEADER_READ_TIMEOUT) => res.context("serve_policy"),
+        sig = shutdown => {
+            info!(signal = %sig, "shutdown signal received");
+            Ok(())
+        }
+    };
+    #[cfg(feature = "zenoh")]
+    if let Some(z) = zenoh {
+        z.stop().await;
     }
-    Ok(())
+    res
 }
 
 fn cmd_completions(args: CompletionsArgs) -> Result<()> {
@@ -4351,6 +4482,9 @@ mod tests {
             &["--precision", "f32"][..],
             &["--policy-allow-origin", "http://x"],
             &["--policy-max-connections", "2"],
+            &["--zenoh", "127.0.0.1"],
+            &["--zenoh-name", "x"],
+            &["--zenoh-allow-all-interfaces"],
             // The default value itself is still an explicit flag.
             &["--policy-max-connections", "4"],
             &["--allow-identity-stats"],
@@ -4467,6 +4601,7 @@ mod tests {
             listener,
             Box::new(cascadia_engine::MockPolicyEngine::new(spec.clone())),
             Default::default(),
+            None,
             async move {
                 let _ = stop_rx.await;
                 ShutdownSignal::Sigint
@@ -4508,6 +4643,52 @@ mod tests {
 
     /// --listen/--next/--api address forms (#17). `unix:/tmp/x.sock` is the
     /// case a plain last-colon split used to break.
+    #[test]
+    fn zenoh_addresses_parse() {
+        let cases = [
+            ("127.0.0.1:7447", "127.0.0.1", Some(7447)),
+            ("localhost", "localhost", None),
+            ("[::1]:7447", "::1", Some(7447)),
+            ("[::1]", "::1", None),
+            ("::1", "::1", None),
+        ];
+        for (input, host, port) in cases {
+            let got = parse_zenoh_addr(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(got, (host.to_string(), port), "{input}");
+        }
+        for bad in ["", ":7447", "h:0", "h:x", "[::1]x", "[::1"] {
+            assert!(parse_zenoh_addr(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn zenoh_flags_need_zenoh_and_default_the_name() {
+        let id = cascadia_api::policy::PackageIdentity {
+            policy_name: "smolvla".into(),
+            ..Default::default()
+        };
+        let plan = |argv: &[&str]| {
+            let mut a = vec!["pkg", "--engine", "ov-policy"];
+            a.extend(argv);
+            zenoh_plan(&run_args(&a), &id)
+        };
+        assert_eq!(plan(&[]).unwrap(), None);
+        assert!(plan(&["--zenoh-name", "x"]).is_err());
+        assert!(plan(&["--zenoh-allow-all-interfaces"]).is_err());
+        let got = plan(&["--zenoh", "127.0.0.1"]);
+        if cfg!(feature = "zenoh") {
+            let p = got.unwrap().unwrap();
+            assert_eq!((p.name.as_str(), p.port), ("smolvla", None));
+            let p = plan(&["--zenoh", "127.0.0.1:9", "--zenoh-name", "cell1"])
+                .unwrap()
+                .unwrap();
+            assert_eq!((p.name.as_str(), p.port), ("cell1", Some(9)));
+            assert!(plan(&["--zenoh", "127.0.0.1", "--zenoh-name", "a/b"]).is_err());
+        } else {
+            assert!(got.unwrap_err().to_string().contains("--features zenoh"));
+        }
+    }
+
     #[test]
     fn parse_addr_accepts_tcp_and_unix_forms() {
         let cases = [

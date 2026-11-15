@@ -27,6 +27,8 @@ kv_coord = [
 # to have been run first. With this on, `cascadia worker --api` serves the
 # UI at `/`.
 dashboard-embed = ["cascadia-dashboard/embed-spa"]
+# physicalai remote inference over Zenoh (`run --zenoh`).
+zenoh = ["cascadia-api/zenoh"]
 
 [dependencies]
 cascadia-types = { workspace = true }
