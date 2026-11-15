@@ -42,7 +42,12 @@ MAX_STEPS = {  # openpi's limits: the longest training demo of each suite, plus 
     "libero_90": 400,
 }
 # Camera names the server advertises for LIBERO packages, and the simulator image behind each.
-CAMERA_SOURCES = {"image": "agentview_image", "image2": "robot0_eye_in_hand_image"}
+CAMERA_SOURCES = {
+    "image": "agentview_image",
+    "image2": "robot0_eye_in_hand_image",
+    "base": "agentview_image",  # XR0
+    "wrist_left": "robot0_eye_in_hand_image",
+}
 
 
 def quat2axisangle(quat):
@@ -75,10 +80,13 @@ def resize_with_pad(img, height, width, convention):
     return out
 
 
-def observation(obs, task, meta, seed):
+def observation(obs, task, meta, seed, flip=True):
+    """`flip=False` sends the frames as the simulator renders them, for packages that rotate
+    them on the server (an `image_flip` step)."""
     images = {}
     for cam in meta["cameras"]:
-        img = np.ascontiguousarray(obs[CAMERA_SOURCES[cam]][::-1, ::-1])
+        img = obs[CAMERA_SOURCES[cam]]
+        img = np.ascontiguousarray(img[::-1, ::-1] if flip else img)
         images[cam] = resize_with_pad(img, meta["height"], meta["width"], meta["resize"])
     state = np.concatenate(
         (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
@@ -96,7 +104,7 @@ def check_metadata(meta):
         sys.exit(f"server action dim {meta['chunk'][1]}, LIBERO actions are 7")
 
 
-def run_episode(client, env, init_state, task, meta, max_steps, seed_base):
+def run_episode(client, env, init_state, task, meta, max_steps, seed_base, flip=True, replan=None):
     env.reset()
     obs = env.set_init_state(init_state)
     plan, infer_ms, rtt_ms, done, t, error = [], [], [], False, 0, None
@@ -107,7 +115,7 @@ def run_episode(client, env, init_state, task, meta, max_steps, seed_base):
             continue
         if not plan:
             # A per-call seed makes both precisions draw the same noise on the same call.
-            req = observation(obs, task, meta, seed_base + t)
+            req = observation(obs, task, meta, seed_base + t, flip)
             t0 = time.perf_counter()
             try:
                 reply = client.infer(req)
@@ -116,7 +124,7 @@ def run_episode(client, env, init_state, task, meta, max_steps, seed_base):
                 break
             rtt_ms.append((time.perf_counter() - t0) * 1000)
             infer_ms.append(float(reply["server_timing"]["infer_ms"]))
-            plan.extend(np.asarray(reply["actions"]))
+            plan.extend(np.asarray(reply["actions"])[:replan])
         obs, _, done, _ = env.step(plan.pop(0).tolist())
         if done:
             break
@@ -133,6 +141,11 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--max-steps", type=int, default=None, help="default: the suite's limit")
     ap.add_argument("--out", type=pathlib.Path, default=None, help="JSONL, one line per episode")
+    ap.add_argument("--flip", choices=["both", "none"], default="both",
+                    help="rotate both cameras 180 degrees (openpi, LeRobot), or send them as rendered "
+                         "(packages whose manifest flips on the server)")
+    ap.add_argument("--replan", type=int, default=None,
+                    help="execute at most this many actions of each chunk (default: all)")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -149,7 +162,7 @@ def main():
     check_metadata(meta)
     print(f"server model={meta['model']} device={meta['device']} cameras={meta['cameras']} "
           f"{meta['height']}x{meta['width']} resize={meta['resize']} chunk={meta['chunk']} "
-          f"noise={meta['noise']}", flush=True)
+          f"noise={meta['noise']} flip={args.flip} replan={args.replan}", flush=True)
 
     out = args.out.open("w") if args.out else None
     n = k = errors = 0
@@ -171,7 +184,8 @@ def main():
             t0 = time.perf_counter()
             seed_base = args.seed * 1_000_000 + task_id * 10_000 + ep * 1_000
             done, steps, infer_ms, rtt_ms, error = run_episode(
-                client, env, init_states[ep], task.language, meta, max_steps, seed_base
+                client, env, init_states[ep], task.language, meta, max_steps, seed_base,
+                args.flip == "both", args.replan,
             )
             wall = time.perf_counter() - t0
             n += 1
