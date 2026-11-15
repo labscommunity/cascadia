@@ -1200,6 +1200,17 @@ type ResolveFut =
     Pin<Box<dyn std::future::Future<Output = io::Result<Vec<std::net::IpAddr>>> + Send>>;
 type Resolver = std::sync::Arc<dyn Fn(String, u16) -> ResolveFut + Send + Sync>;
 
+/// Most refused addresses remembered for per-address logging; beyond it one summary line.
+const REFUSED_LOG_CAP: usize = 256;
+
+#[derive(Debug, PartialEq, Eq)]
+enum RefusedLog {
+    Address,
+    /// The address table is full: this many refusals since the last summary.
+    Others(u64),
+    Quiet,
+}
+
 /// Which TCP peers an [`ActivationServer`] accepts. Empty (no host, no addresses) takes any.
 #[derive(Default)]
 struct PeerAllow {
@@ -1211,6 +1222,9 @@ struct PeerAllow {
     ips: Vec<std::net::IpAddr>,
     resolved_at: Option<Instant>,
     refused_logged: std::collections::HashMap<std::net::IpAddr, Instant>,
+    /// Refusals not logged by address since the last summary (the table was full).
+    refused_unlogged: u64,
+    refused_summary_at: Option<Instant>,
     #[cfg(test)]
     resolver: Option<Resolver>,
     #[cfg(test)]
@@ -1287,21 +1301,30 @@ impl PeerAllow {
         false
     }
 
-    /// Whether a refusal of `ip` at `now` should be logged (once per address per window).
-    fn should_log_refused(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
-        if self
-            .refused_logged
-            .get(&ip)
-            .is_some_and(|t| now.duration_since(*t) < REFUSED_LOG_EVERY)
-        {
-            return false;
+    /// What to log for a refusal of `ip` at `now`: the address once per window, and once the
+    /// per-address table is full (a flood of distinct sources) one summary per window instead.
+    fn refused_log(&mut self, ip: std::net::IpAddr, now: Instant) -> RefusedLog {
+        let fresh = |t: &Instant| now.duration_since(*t) < REFUSED_LOG_EVERY;
+        if let Some(t) = self.refused_logged.get_mut(&ip) {
+            if fresh(t) {
+                return RefusedLog::Quiet;
+            }
+            *t = now;
+            return RefusedLog::Address;
         }
-        if self.refused_logged.len() >= 256 {
-            self.refused_logged
-                .retain(|_, t| now.duration_since(*t) < REFUSED_LOG_EVERY);
+        if self.refused_logged.len() >= REFUSED_LOG_CAP {
+            self.refused_logged.retain(|_, t| fresh(t));
         }
-        self.refused_logged.insert(ip, now);
-        true
+        if self.refused_logged.len() < REFUSED_LOG_CAP {
+            self.refused_logged.insert(ip, now);
+            return RefusedLog::Address;
+        }
+        self.refused_unlogged += 1;
+        if self.refused_summary_at.is_some_and(|t| fresh(&t)) {
+            return RefusedLog::Quiet;
+        }
+        self.refused_summary_at = Some(now);
+        RefusedLog::Others(std::mem::take(&mut self.refused_unlogged))
     }
 }
 
@@ -1584,8 +1607,14 @@ impl ActivationServer {
                 if allow.admit(ip).await {
                     break (ActivationStream::Tcp(sock), addr.to_string());
                 }
-                if allow.should_log_refused(ip, Instant::now()) {
-                    warn!(refused = %addr, upstream = ?allow.host.as_ref().map(|h| &h.0), allowed = ?allow.ips, "ActivationServer refused a connection from an unexpected peer");
+                match allow.refused_log(ip, Instant::now()) {
+                    RefusedLog::Address => {
+                        warn!(refused = %addr, upstream = ?allow.host.as_ref().map(|h| &h.0), allowed = ?allow.ips, "ActivationServer refused a connection from an unexpected peer")
+                    }
+                    RefusedLog::Others(n) => {
+                        warn!(refused = n, upstream = ?allow.host.as_ref().map(|h| &h.0), "ActivationServer refused connections from other unexpected peers")
+                    }
+                    RefusedLog::Quiet => {}
                 }
                 drop(sock);
             },
@@ -3618,11 +3647,36 @@ mod tests {
         let a: std::net::IpAddr = "192.0.2.7".parse().unwrap();
         let b: std::net::IpAddr = "192.0.2.8".parse().unwrap();
         let t0 = Instant::now();
-        assert!(allow.should_log_refused(a, t0));
-        assert!(!allow.should_log_refused(a, t0 + Duration::from_secs(2)));
-        assert!(!allow.should_log_refused(a, t0 + Duration::from_secs(59)));
-        assert!(allow.should_log_refused(b, t0 + Duration::from_secs(2)));
-        assert!(allow.should_log_refused(a, t0 + Duration::from_secs(61)));
+        let at = |s| t0 + Duration::from_secs(s);
+        assert_eq!(allow.refused_log(a, t0), RefusedLog::Address);
+        assert_eq!(allow.refused_log(a, at(2)), RefusedLog::Quiet);
+        assert_eq!(allow.refused_log(a, at(59)), RefusedLog::Quiet);
+        assert_eq!(allow.refused_log(b, at(2)), RefusedLog::Address);
+        assert_eq!(allow.refused_log(a, at(61)), RefusedLog::Address);
+    }
+
+    /// A flood of distinct sources inside one window keeps the table bounded
+    /// and logs at most one line per remembered address plus one summary.
+    #[test]
+    fn a_refusal_flood_is_bounded() {
+        let mut allow = PeerAllow::default();
+        let t0 = Instant::now();
+        let mut lines = 0;
+        for i in 0..1000u32 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i));
+            let now = t0 + Duration::from_millis(u64::from(i));
+            if allow.refused_log(ip, now) != RefusedLog::Quiet {
+                lines += 1;
+            }
+            assert!(allow.refused_logged.len() <= REFUSED_LOG_CAP);
+        }
+        assert!(lines <= REFUSED_LOG_CAP + 1, "{lines} log lines");
+        // The next window summarises the refusals the table had no room for.
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 99));
+        assert!(matches!(
+            allow.refused_log(ip, t0 + Duration::from_secs(61)),
+            RefusedLog::Address
+        ));
     }
 
     #[test]
