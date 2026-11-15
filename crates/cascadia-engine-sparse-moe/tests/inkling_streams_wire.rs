@@ -766,8 +766,10 @@ impl Tail {
     async fn cut(&mut self) {
         if let Some(f) = self.fwd.take() {
             f.abort();
-            // Wait for the listener and the spliced links to be dropped.
+            // Wait for the listener to be dropped; the spliced link tasks are
+            // cancelled just after it.
             let _ = f.await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 
@@ -1009,6 +1011,161 @@ async fn link_loss_mid_round_fails_each_stream_once() {
 
     drop(e0);
     tail.stop().await;
+}
+
+/// One-task (Forward) pipeline: the wire between rank 1 and rank 2 drops during
+/// a decode. The next Forward fails at rank 1, which owes rank 0 a Token:
+/// rank 1 must drop its links so rank 0 ends the task at once, well under its
+/// reply deadline, and once the wire is back the chain serves the next task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mid_rank_downstream_loss_fails_rank0_fast() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let load = |rank, lo, hi| {
+        InklingRunner::load_staged(&dir, 64, rank, 3, lo, hi, Some("eager".into()), None).unwrap()
+    };
+
+    // Rank 2's listener, reached by rank 1 through a forwarder that stands in
+    // for the wire between them.
+    let mut s12 = ActivationServer::new("127.0.0.1", 0);
+    s12.start().await.unwrap();
+    let p2 = s12.port();
+    let s12 = Arc::new(Mutex::new(s12));
+    let sc = s12.clone();
+    tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
+    let wire = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let pw = wire.local_addr().unwrap().port();
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let fwd = forward(wire, p2, tx);
+    let mut c12 = ActivationClient::new("127.0.0.1", pw);
+    c12.connect_with_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let (s01, c01) = link().await;
+
+    let e1 = PipelineEngine::new(
+        load(1, 2, 3),
+        None,
+        StageTransport {
+            upstream: Some(s01),
+            downstream: Some(Arc::new(Mutex::new(c12))),
+        },
+        handle.clone(),
+        1,
+        3,
+        None,
+    );
+    let e2 = PipelineEngine::new(
+        load(2, 3, 4),
+        None,
+        StageTransport {
+            upstream: Some(s12),
+            downstream: None,
+        },
+        handle.clone(),
+        2,
+        3,
+        None,
+    );
+    let e0 = PipelineEngine::new(
+        load(0, 0, 2),
+        Some(tok),
+        StageTransport {
+            upstream: None,
+            downstream: Some(c01),
+        },
+        handle.clone(),
+        0,
+        3,
+        None,
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = [Box::new(e1) as Box<dyn Engine>, Box::new(e2)]
+        .into_iter()
+        .map(|e| spawn_worker(e, stop.clone()))
+        .collect();
+    async fn round(
+        e0: PipelineEngine<InklingRunner>,
+        tag: &'static str,
+    ) -> (PipelineEngine<InklingRunner>, Vec<Result<Vec<i64>, String>>) {
+        tokio::task::spawn_blocking(move || {
+            let mut e0 = e0;
+            let got = run_round(&mut e0, tag, 1);
+            (e0, got)
+        })
+        .await
+        .unwrap()
+    }
+
+    let (e0, healthy) = round(e0, "healthy").await;
+    let expected = healthy[0].clone().expect("healthy round");
+
+    // Cut the wire after the first decoded token, so the next decode Forward
+    // is the frame rank 1 cannot answer (the prefill frames latch already).
+    let (in_flight_tx, in_flight_rx) = std::sync::mpsc::channel::<()>();
+    let (cut_tx, cut_rx) = std::sync::mpsc::channel::<std::time::Instant>();
+    let cut = tokio::task::spawn_blocking(move || {
+        let mut e0 = e0;
+        let mut t = GenerationTask::new("cut".to_string(), PROMPTS[0]);
+        t.max_tokens = MAX_TOKENS[0];
+        t.temperature = 0.0;
+        e0.submit(t).unwrap();
+        let mut cut_at = None;
+        for _ in 0..500 {
+            let Ok(chunks) = e0.step() else { continue };
+            for (_, c) in chunks {
+                // Rank 0 ends a task whose decode lost the wire with its
+                // partial output (an error chunk on other paths); either way
+                // it must end now, not at the reply deadline.
+                if c.error.is_some() || c.is_final {
+                    let at = cut_at.expect("the task ended before the cut");
+                    return (e0, Ok(std::time::Instant::now() - at));
+                }
+                if cut_at.is_none() {
+                    in_flight_tx.send(()).unwrap();
+                    cut_at = Some(cut_rx.recv().unwrap());
+                }
+            }
+        }
+        (e0, Err("the task never ended".to_string()))
+    });
+    tokio::task::spawn_blocking(move || in_flight_rx.recv().unwrap())
+        .await
+        .unwrap();
+    fwd.abort();
+    let _ = fwd.await;
+    // The spliced link tasks are cancelled after the forwarder itself.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    cut_tx.send(std::time::Instant::now()).unwrap();
+    let (e0, failed_after) = cut.await.unwrap();
+    let failed_after = failed_after.expect("the task over the cut wire must end");
+    assert!(
+        failed_after < std::time::Duration::from_secs(10),
+        "rank 0 waited {failed_after:?} for a Token rank 1 could never send"
+    );
+
+    // The wire comes back on the same port; the chain re-links and serves.
+    let wire = tokio::net::TcpListener::bind(("127.0.0.1", pw))
+        .await
+        .unwrap();
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let fwd = forward(wire, p2, tx);
+    let (e0, back) = round(e0, "back").await;
+    assert_eq!(
+        back[0].as_ref(),
+        Ok(&expected),
+        "the task after the wire came back"
+    );
+
+    drop(e0);
+    fwd.abort();
+    stop.store(true, Ordering::Relaxed);
+    for (w, rank) in workers.into_iter().zip(["rank 1", "rank 2"]) {
+        join_worker(w, rank).await;
+    }
 }
 
 /// Submit t0-t2, cancel t1 after its second token while t0 and t2 decode,
