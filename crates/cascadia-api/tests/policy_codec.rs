@@ -314,12 +314,13 @@ fn metadata_has_every_spec_field() {
     assert_eq!(json["noise_shape"], serde_json::json!([2, 3]));
     assert_eq!(json["resize"], "top_left");
     let packed = encode_metadata(&s);
-    // A map16 of the 13 spec fields (`attribution` omitted when absent) plus
+    // A map16 of the 14 spec fields (`attribution` omitted when absent) plus
     // policy_name, chunk_size and rtc_chunk_size; keys are msgpack str, as
     // Python dicts pack.
-    assert_eq!(packed[..3], [0xde, 0, 16]);
+    assert_eq!(packed[..3], [0xde, 0, 17]);
     assert_eq!(json["manifest_sha256"], "");
     assert_eq!(json["precision"], "");
+    assert_eq!(json["server_resize"], false);
     assert_eq!(json["chunk_size"], s.chunk[0]);
     assert!(packed.windows(8).any(|w| w == b"top_left"));
 }
