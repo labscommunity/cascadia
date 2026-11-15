@@ -71,6 +71,21 @@ pub enum ResizeConvention {
     Stretch,
 }
 
+/// A package's own first image resize, as the server can run it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ServerResize {
+    /// Bilinear (OpenCV `INTER_LINEAR`, torch `align_corners=False`) to the
+    /// aspect-kept size, padded with 0 as `resize` says (`pi05`, `pi0`,
+    /// `smolvla_resize`).
+    Letterbox,
+    /// Average pooling, torch `interpolate(mode="area")` (VLA-JEPA's first step).
+    Area,
+    /// Qwen `smart_resize` to multiples of `factor` within `max_pixels`, then
+    /// OpenCV `INTER_CUBIC` on `u8` (XR0); only frames it sends to `height x width`.
+    SmartResizeCubic { factor: u32, max_pixels: u32 },
+}
+
 /// What a loaded policy accepts and returns; served as `GET /v1/policy/metadata`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicySpec {
@@ -99,12 +114,11 @@ pub struct PolicySpec {
     /// The precision the model was compiled at (`f16` or `f32`).
     #[serde(default)]
     pub precision: String,
-    /// Whether a frame of another size may be resized to `height x width`
-    /// with `resize` (OpenCV `INTER_LINEAR` letterbox) on the server, because
-    /// that is exactly this package's own preprocessor resize. When false, a
-    /// client must send `height x width`.
+    /// How the server may resize a frame of another size to `height x width`:
+    /// this package's own preprocessor resize, ported exactly. `None`: a client
+    /// must send `height x width`.
     #[serde(default)]
-    pub server_resize: bool,
+    pub server_resize: Option<ServerResize>,
 }
 
 #[cfg(test)]
@@ -128,7 +142,7 @@ mod tests {
             attribution: None,
             manifest_sha256: String::new(),
             precision: String::new(),
-            server_resize: false,
+            server_resize: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["noise"], "in_graph_random");

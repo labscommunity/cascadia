@@ -2,12 +2,13 @@
 //! (`tests/fixtures/physicalai/generate.py`), and every refusal.
 
 use cascadia_api::policy::physicalai::{
-    decode_control, decode_predict, encode_error, encode_metadata, encode_predict_reply,
-    encode_reset_ok, read_seq, resize_frame, resize_frame_f32, ControlError, ErrorCode,
-    ServerIdentity, Timings, MAX_REQUEST_BYTES, NO_SEQ,
+    area_frame, area_frame_f32, cubic_frame, decode_control, decode_predict, encode_error,
+    encode_metadata, encode_predict_reply, encode_reset_ok, read_seq, resize_frame,
+    resize_frame_f32, smart_resize, ControlError, ErrorCode, ServerIdentity, Timings,
+    MAX_REQUEST_BYTES, NO_SEQ,
 };
 use cascadia_api::policy::{max_payload_bytes, metadata_json_for, PackageIdentity};
-use cascadia_types::{ActionChunk, Image, NoiseMode, PolicySpec, ResizeConvention};
+use cascadia_types::{ActionChunk, Image, NoiseMode, PolicySpec, ResizeConvention, ServerResize};
 
 macro_rules! fixture {
     ($name:literal) => {
@@ -33,7 +34,7 @@ fn spec() -> PolicySpec {
         attribution: None,
         manifest_sha256: "ab".repeat(32),
         precision: "f32".into(),
-        server_resize: true,
+        server_resize: Some(cascadia_types::ServerResize::Letterbox),
     }
 }
 
@@ -682,7 +683,7 @@ fn a_native_480x640_jpeg_passes_through() {
 #[test]
 fn packages_without_a_ported_resize_refuse_other_sizes() {
     let mut s = spec();
-    s.server_resize = false;
+    s.server_resize = None;
     let e = decode_predict(
         fixture!("predict-native-480x640.msgpack"),
         &s,
@@ -705,4 +706,140 @@ fn packages_without_a_ported_resize_refuse_other_sizes() {
     assert!(e.message().contains("or set max_image_side=16"), "{e}");
     // Frames at the model size need no resize.
     decode_predict(fixture!("predict-raw.msgpack"), &s, max()).unwrap();
+}
+
+fn read_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/tests/fixtures/physicalai/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+fn native_frames() -> [(&'static str, u32, u32); 3] {
+    [("down", 48, 64), ("tall", 40, 18), ("up", 6, 10)]
+}
+
+/// LeRobot's pi0 `resize_with_pad` (torch bilinear, `align_corners=False`,
+/// centred pad) is the same letterbox as physicalai's `pi05`.
+#[test]
+fn pi0_frames_match_lerobots_resize_with_pad() {
+    for (name, h, w) in native_frames() {
+        let img = Image {
+            height: h,
+            width: w,
+            data: read_fixture(&format!("resize-{name}.rgb")),
+        };
+        let want = f32s_of(&read_fixture(&format!("resize-{name}-pi0.f32")));
+        let d = worst(
+            &resize_frame_f32(&img, 16, 16, ResizeConvention::Center),
+            &want,
+        );
+        eprintln!("pi0 {name} {h}x{w}: worst |ours - LeRobot| = {d} (of 255)");
+        assert!(d < 1e-3, "{name}: {d}");
+    }
+}
+
+#[test]
+fn vla_jepa_area_frames_match_physicalai() {
+    for (name, h, w) in native_frames() {
+        let img = Image {
+            height: h,
+            width: w,
+            data: read_fixture(&format!("resize-{name}.rgb")),
+        };
+        let want = f32s_of(&read_fixture(&format!("resize-{name}-area.f32")));
+        let d = worst(&area_frame_f32(&img, 16, 16), &want);
+        eprintln!("area {name} {h}x{w}: worst |ours - physicalai| = {d} (of 255)");
+        assert!(d < 1e-3, "{name}: {d}");
+        let u8s: Vec<f32> = area_frame(&img, 16, 16)
+            .data
+            .iter()
+            .map(|&b| f32::from(b))
+            .collect();
+        assert!(worst(&u8s, &want) <= 0.5 + 1e-3, "{name} u8");
+    }
+}
+
+/// physicalai's `xr0._resize_image` (factor 8, 300 pixels in the fixtures):
+/// the target size, and OpenCV's `INTER_CUBIC` pixels byte for byte.
+#[test]
+fn xr0_frames_match_physicalai_byte_for_byte() {
+    for (h, w, out) in [
+        (20, 20, (16, 16)),
+        (40, 40, (16, 16)),
+        (12, 12, (16, 16)),
+        (44, 52, (8, 16)),
+        (30, 20, (16, 8)),
+    ] {
+        assert_eq!(smart_resize(h, w, 8, 300), Some(out), "{h}x{w}");
+        let img = Image {
+            height: h,
+            width: w,
+            data: read_fixture(&format!("xr0-{h}x{w}.rgb")),
+        };
+        let want = read_fixture(&format!("xr0-{h}x{w}.out-{}x{}.rgb", out.0, out.1));
+        let ours = cubic_frame(&img, out.0, out.1).data;
+        let differ = ours.iter().zip(&want).filter(|(a, b)| a != b).count();
+        eprintln!(
+            "xr0 {h}x{w} -> {}x{}: {differ} of {} bytes differ from OpenCV",
+            out.0,
+            out.1,
+            want.len()
+        );
+        assert_eq!(differ, 0, "{h}x{w}");
+    }
+    assert_eq!(smart_resize(70, 90, 8, 3000), Some((48, 56)));
+    let img = Image {
+        height: 70,
+        width: 90,
+        data: read_fixture("xr0-70x90.rgb"),
+    };
+    assert_eq!(
+        cubic_frame(&img, 48, 56).data,
+        read_fixture("xr0-70x90.out-48x56.rgb")
+    );
+    // LIBERO's 256x256 is left alone; a 480x640 camera becomes 256x320.
+    assert_eq!(smart_resize(256, 256, 32, 90000), Some((256, 256)));
+    assert_eq!(smart_resize(480, 640, 32, 90000), Some((256, 320)));
+    assert_eq!(smart_resize(1, 300, 32, 90000), None);
+}
+
+#[test]
+fn xr0_takes_frames_its_resize_sends_to_the_export_size() {
+    let mut s = spec();
+    s.server_resize = Some(ServerResize::SmartResizeCubic {
+        factor: 8,
+        max_pixels: 300,
+    });
+    let raw = |h: u64, w: u64, data: Vec<u8>| {
+        let mut r = good();
+        r.images.clear();
+        r = r.image(
+            "images.image",
+            val(|b| mp::image(b, "raw", "uint8", &[h, w, 3], &data)),
+        );
+        r.image(
+            "images.wrist",
+            val(|b| mp::image(b, "raw", "uint8", &[h, w, 3], &data)),
+        )
+    };
+    let ok = decode_predict(
+        &raw(20, 20, read_fixture("xr0-20x20.rgb")).pack(),
+        &s,
+        MAX_REQUEST_BYTES,
+    )
+    .unwrap();
+    assert_eq!(
+        ok.observation.images[0].1.data,
+        read_fixture("xr0-20x20.out-16x16.rgb")
+    );
+    let e = decode_predict(
+        &raw(30, 20, read_fixture("xr0-30x20.rgb")).pack(),
+        &s,
+        MAX_REQUEST_BYTES,
+    )
+    .unwrap_err();
+    assert!(e.message().contains("turns into 16x8"), "{e}");
+    assert!(e.message().contains("send frames at 16x16"), "{e}");
 }

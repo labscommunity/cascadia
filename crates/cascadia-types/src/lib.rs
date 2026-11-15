@@ -18,7 +18,9 @@ pub use chunk::{Chunk, FinishReason, TokenLogprobs, TopLogprob};
 pub use error::Error;
 pub use load::LoadProgress;
 pub use peer::{PeerEndpoint, PeerLayout};
-pub use policy::{ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention};
+pub use policy::{
+    ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention, ServerResize,
+};
 pub use shard::{ShardPlan, ShardSpec};
 pub use stats::ApiStats;
 pub use task::{

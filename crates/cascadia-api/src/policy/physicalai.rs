@@ -10,7 +10,9 @@
 //! request. The transport (Zenoh) lives in `zenoh_server`.
 
 use cascadia_engine::{check_observation, EngineError};
-use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention};
+use cascadia_types::{
+    ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention, ServerResize,
+};
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
@@ -521,10 +523,8 @@ fn observation(
             };
             let img = if (img.height, img.width) == (spec.height, spec.width) {
                 img
-            } else if spec.server_resize {
-                resize_frame(&img, spec.height, spec.width, spec.resize)
             } else {
-                return refuse(not_resizable(&cam, &img, spec));
+                server_resize(&cam, &img, spec)?
             };
             Ok((cam, img))
         })
@@ -857,5 +857,216 @@ pub fn resize_frame(img: &Image, height: u32, width: u32, conv: ResizeConvention
             .into_iter()
             .map(|v| v.round().clamp(0.0, 255.0) as u8)
             .collect(),
+    }
+}
+
+/// A frame of another size through the package's own first resize, or the
+/// reason it cannot be.
+fn server_resize(cam: &str, img: &Image, spec: &PolicySpec) -> Result<Image, RequestError> {
+    match spec.server_resize {
+        Some(ServerResize::Letterbox) => {
+            Ok(resize_frame(img, spec.height, spec.width, spec.resize))
+        }
+        Some(ServerResize::Area) => Ok(area_frame(img, spec.height, spec.width)),
+        Some(ServerResize::SmartResizeCubic { factor, max_pixels }) => {
+            match smart_resize(img.height, img.width, factor, max_pixels) {
+                Some(hw) if hw == (spec.height, spec.width) => {
+                    Ok(cubic_frame(img, spec.height, spec.width))
+                }
+                Some((th, tw)) => refuse(format!(
+                    "camera {cam:?} is {}x{}, which this package's resize turns into {th}x{tw}; \
+                     its export takes {}x{}, so send frames at {}x{}",
+                    img.height, img.width, spec.height, spec.width, spec.height, spec.width
+                )),
+                None => refuse(format!(
+                    "camera {cam:?} is {}x{}: an aspect ratio over 200",
+                    img.height, img.width
+                )),
+            }
+        }
+        None => refuse(not_resizable(cam, img, spec)),
+    }
+}
+
+// ---- VLA-JEPA: torch `interpolate(mode="area")` ----
+
+/// physicalai's `vla_jepa._area_weights`: adaptive average pooling, each
+/// output averaging `[i*in/out, ceil((i+1)*in/out))`, weights stored `f32`.
+fn area_taps(size_in: usize, size_out: usize) -> Vec<(usize, Vec<f32>)> {
+    (0..size_out)
+        .map(|i| {
+            let start = i * size_in / size_out;
+            let end = ((i + 1) * size_in).div_ceil(size_out);
+            let w = (1.0f64 / (end - start) as f64) as f32;
+            (start, vec![w; end - start])
+        })
+        .collect()
+}
+
+/// `rows @ image @ cols.T` on `[0, 1]` `f32` values, each product summed in
+/// `f64` and rounded to `f32` once, the row pass rounded before the column pass.
+fn separable(
+    src: &[f32],
+    (sh, sw): (usize, usize),
+    rows: &[(usize, Vec<f32>)],
+    cols: &[(usize, Vec<f32>)],
+) -> Vec<f32> {
+    let dh = rows.len();
+    let dw = cols.len();
+    let mut tmp = vec![0f32; dh * sw * 3];
+    for (i, (start, ws)) in rows.iter().enumerate() {
+        for x in 0..sw * 3 {
+            let acc: f64 = ws
+                .iter()
+                .enumerate()
+                .map(|(k, &w)| f64::from(w) * f64::from(src[(start + k) * sw * 3 + x]))
+                .sum();
+            tmp[i * sw * 3 + x] = acc as f32;
+        }
+    }
+    let mut out = vec![0f32; dh * dw * 3];
+    for y in 0..dh {
+        for (j, (start, ws)) in cols.iter().enumerate() {
+            for c in 0..3 {
+                let acc: f64 = ws
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &w)| f64::from(w) * f64::from(tmp[(y * sw + start + k) * 3 + c]))
+                    .sum();
+                out[(y * dw + j) * 3 + c] = acc as f32;
+            }
+        }
+    }
+    out
+}
+
+/// VLA-JEPA's first step, in `f32` on `[0, 255]`; exposed for tests.
+pub fn area_frame_f32(img: &Image, height: u32, width: u32) -> Vec<f32> {
+    let (sh, sw) = (img.height as usize, img.width as usize);
+    let src: Vec<f32> = img.data.iter().map(|&b| f32::from(b) / 255.0).collect();
+    let rows = area_taps(sh, height as usize);
+    let cols = area_taps(sw, width as usize);
+    separable(&src, (sh, sw), &rows, &cols)
+        .into_iter()
+        .map(|v| v * 255.0)
+        .collect()
+}
+
+/// [`area_frame_f32`] rounded to the `u8` frame the engine takes.
+pub fn area_frame(img: &Image, height: u32, width: u32) -> Image {
+    Image {
+        height,
+        width,
+        data: area_frame_f32(img, height, width)
+            .into_iter()
+            .map(|v| v.round().clamp(0.0, 255.0) as u8)
+            .collect(),
+    }
+}
+
+// ---- XR0: Qwen `smart_resize`, OpenCV `INTER_CUBIC` on u8 ----
+
+/// Python's `round()`: half to even.
+fn round_half_even(x: f64) -> f64 {
+    let r = x.round();
+    if (x - x.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
+        r - x.signum()
+    } else {
+        r
+    }
+}
+
+/// physicalai's `xr0._resize_image` target `(height, width)`; `None` past its
+/// aspect-ratio limit of 200.
+pub fn smart_resize(height: u32, width: u32, factor: u32, max_pixels: u32) -> Option<(u32, u32)> {
+    let (h, w, f) = (f64::from(height), f64::from(width), f64::from(factor));
+    if h.max(w) / h.min(w) > 200.0 {
+        return None;
+    }
+    let min_pixels = f * f;
+    let mut nh = f.max(round_half_even(h / f) * f);
+    let mut nw = f.max(round_half_even(w / f) * f);
+    if nh * nw > f64::from(max_pixels) {
+        let scale = (h * w / f64::from(max_pixels)).sqrt();
+        nh = f.max((h / scale / f).floor() * f);
+        nw = f.max((w / scale / f).floor() * f);
+    } else if nh * nw < min_pixels {
+        let scale = (min_pixels / (h * w)).sqrt();
+        nh = f.max((h * scale / f).ceil() * f);
+        nw = f.max((w * scale / f).ceil() * f);
+    }
+    Some((nh as u32, nw as u32))
+}
+
+const COEF_BITS: u32 = 11;
+const COEF_SCALE: f32 = (1 << COEF_BITS) as f32;
+
+/// OpenCV's `interpolateCubic` (A = -0.75), in `f32` as it computes it.
+fn cubic_coeffs(x: f32) -> [f32; 4] {
+    const A: f32 = -0.75;
+    let c0 = ((A * (x + 1.0) - 5.0 * A) * (x + 1.0) + 8.0 * A) * (x + 1.0) - 4.0 * A;
+    let c1 = ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0;
+    let c2 = ((A + 2.0) * (1.0 - x) - (A + 3.0)) * (1.0 - x) * (1.0 - x) + 1.0;
+    [c0, c1, c2, 1.0 - c0 - c1 - c2]
+}
+
+/// One axis: the first source index (before the `-1` tap) and the fixed-point
+/// weights, `saturate_cast<short>(c * 2048)` (round half to even).
+fn cubic_taps(src: usize, dst: usize) -> Vec<(i64, [i32; 4])> {
+    let scale = 1.0 / (dst as f64 / src as f64);
+    (0..dst)
+        .map(|d| {
+            let f = ((d as f64 + 0.5) * scale - 0.5) as f32;
+            let s = f.floor();
+            let c = cubic_coeffs(f - s);
+            (
+                s as i64,
+                c.map(|v| (v * COEF_SCALE).round_ties_even() as i32),
+            )
+        })
+        .collect()
+}
+
+/// `cv2.resize(img, (width, height), interpolation=cv2.INTER_CUBIC)` on a `u8`
+/// RGB frame: OpenCV's fixed-point path, edges replicated. Exposed for tests.
+pub fn cubic_frame(img: &Image, height: u32, width: u32) -> Image {
+    let (sh, sw) = (img.height as usize, img.width as usize);
+    let (h, w) = (height as usize, width as usize);
+    if (sh, sw) == (h, w) {
+        return img.clone();
+    }
+    let xs = cubic_taps(sw, w);
+    let ys = cubic_taps(sh, h);
+    let clamp = |i: i64, n: usize| i.clamp(0, n as i64 - 1) as usize;
+    // Horizontal pass per source row, into ints scaled by 2048.
+    let hrow = |y: usize| -> Vec<i64> {
+        let line = &img.data[y * sw * 3..(y + 1) * sw * 3];
+        let mut out = Vec::with_capacity(w * 3);
+        for &(sx, a) in &xs {
+            for c in 0..3 {
+                let v: i64 = (0..4)
+                    .map(|k| {
+                        i64::from(line[clamp(sx - 1 + k as i64, sw) * 3 + c]) * i64::from(a[k])
+                    })
+                    .sum();
+                out.push(v);
+            }
+        }
+        out
+    };
+    let rows: Vec<Vec<i64>> = (0..sh).map(hrow).collect();
+    let mut data = Vec::with_capacity(h * w * 3);
+    for &(sy, b) in &ys {
+        let r: [&Vec<i64>; 4] = std::array::from_fn(|k| &rows[clamp(sy - 1 + k as i64, sh)]);
+        for x in 0..w * 3 {
+            let v: i64 = (0..4).map(|k| r[k][x] * i64::from(b[k])).sum();
+            let shift = 2 * COEF_BITS;
+            data.push(((v + (1 << (shift - 1))) >> shift).clamp(0, 255) as u8);
+        }
+    }
+    Image {
+        height,
+        width,
+        data,
     }
 }

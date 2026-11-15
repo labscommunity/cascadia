@@ -26,7 +26,7 @@ fn spec() -> PolicySpec {
         attribution: None,
         manifest_sha256: String::new(),
         precision: String::new(),
-        server_resize: false,
+        server_resize: None,
     }
 }
 
@@ -320,7 +320,7 @@ fn metadata_has_every_spec_field() {
     assert_eq!(packed[..3], [0xde, 0, 17]);
     assert_eq!(json["manifest_sha256"], "");
     assert_eq!(json["precision"], "");
-    assert_eq!(json["server_resize"], false);
+    assert!(json["server_resize"].is_null());
     assert_eq!(json["chunk_size"], s.chunk[0]);
     assert!(packed.windows(8).any(|w| w == b"top_left"));
 }

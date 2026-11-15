@@ -20,6 +20,8 @@ import cv2
 import numpy as np
 from physicalai.inference.preprocessors.pi05 import Pi05Preprocessor
 from physicalai.inference.preprocessors.smolvla import ResizeSmolVLA
+from physicalai.inference.preprocessors.vla_jepa import _area_weights, _resize
+from physicalai.inference.preprocessors.xr0 import _resize_image
 from physicalai.inference.remote import _protocol as p
 from physicalai.transport import derive_port
 
@@ -123,6 +125,54 @@ def resizes():
             yield f"resize-{name}-{conv}.f32", (out.astype(np.float32) * 255.0).astype("<f4").tobytes()
 
 
+def lerobot_resize_with_pad(images, height, width):
+    """LeRobot 0.6.0 `policies/pi0/modeling_pi0.py` `resize_with_pad_torch` (openpi's), float32
+    channels-last path, as LeRobot's pi0 runs it on [0, 1] frames. Copied, since importing LeRobot
+    pulls its whole stack."""
+    import torch
+    import torch.nn.functional as F
+
+    images = torch.from_numpy(images).permute(0, 3, 1, 2)
+    _, _, cur_height, cur_width = images.shape
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized = F.interpolate(images, size=(resized_height, resized_width), mode="bilinear", align_corners=False)
+    resized = resized.clamp(0.0, 1.0)
+    pad_h0, remainder_h = divmod(height - resized_height, 2)
+    pad_w0, remainder_w = divmod(width - resized_width, 2)
+    padded = F.pad(resized, (pad_w0, pad_w0 + remainder_w, pad_h0, pad_h0 + remainder_h), mode="constant", value=0.0)
+    return padded.permute(0, 2, 3, 1).numpy()
+
+
+def kernels():
+    """Package-specific resizes, from the preprocessors that run them.
+
+    pi0: LeRobot's resize_with_pad (above). VLA-JEPA: physicalai's first, area step
+    (`vla_jepa._area_weights` / `_resize`). XR0: physicalai's `xr0._resize_image` (Qwen
+    smart_resize, OpenCV INTER_CUBIC on uint8), with factor 8 and 300 max pixels so small
+    frames reach 16x16.
+    """
+    for name, (h, w) in {"down": (48, 64), "tall": (40, 18), "up": (6, 10)}.items():
+        img = native(h, w, len(name))
+        f = img.astype(np.float32)[np.newaxis] / 255.0
+        pi0 = lerobot_resize_with_pad(f, H, W)[0]
+        yield f"resize-{name}-pi0.f32", (pi0.astype(np.float32) * 255.0).astype("<f4").tobytes()
+        chw = np.transpose(img, (2, 0, 1)).astype(np.float32) / 255
+        area = _resize(chw, (_area_weights(h, H), _area_weights(w, W))).astype(np.float32)
+        yield f"resize-{name}-area.f32", (np.transpose(area, (1, 2, 0)) * 255.0).astype("<f4").tobytes()
+    for h, w in ((20, 20), (40, 40), (12, 12), (44, 52), (30, 20)):
+        img = native(h, w, h + w)
+        out = _resize_image(img, 8, 300)
+        yield f"xr0-{h}x{w}.rgb", img.tobytes()
+        yield f"xr0-{h}x{w}.out-{out.shape[0]}x{out.shape[1]}.rgb", np.ascontiguousarray(out).tobytes()
+    # Rows wide enough for OpenCV's vector paths: 70x90 with 3000 max pixels.
+    img = native(70, 90, 160)
+    out = _resize_image(img, 8, 3000)
+    yield "xr0-70x90.rgb", img.tobytes()
+    yield f"xr0-70x90.out-{out.shape[0]}x{out.shape[1]}.rgb", np.ascontiguousarray(out).tobytes()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, required=True)
@@ -130,6 +180,8 @@ def main():
     for name, data in cases():
         (out / name).write_bytes(data)
     for name, data in resizes():
+        (out / name).write_bytes(data)
+    for name, data in kernels():
         (out / name).write_bytes(data)
     # An unchanged client at a camera's native 480x640, JPEG.
     big = inputs()

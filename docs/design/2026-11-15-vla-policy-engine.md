@@ -396,20 +396,28 @@ server is the proof of wire compatibility, not the version numbers.
   input-mode packages.
 - Frames: physicalai's client sends them at the camera's native resolution (unless it is given
   `max_image_side`) and physicalai's server resizes them in the model's preprocessor, so this front
-  end does the same, where it can do it exactly, before the observation is checked: at most 4096 pixels a side, decoded bytes
-  within `max_request_bytes`, then OpenCV's `INTER_LINEAR` arithmetic in `f32` (no antialiasing)
-  to the package's `resize`: the aspect-kept size padded with 0 on the top and left
-  (`smolvla_resize`) or centred (`pi05`), or a plain stretch. The result is rounded to the `u8`
-  frame the engine takes, within 0.5/255 of physicalai's own float frame; the golden pixels come
-  from physicalai's `ResizeSmolVLA` and `Pi05Preprocessor` resize functions and `cv2.resize`.
-  Only packages whose own preprocessor is one of those two letterboxes (physicalai's `pi05` and
-  `smolvla_resize` steps, with no `image_flip` before them) are resized; the spec says so as
-  `server_resize`. Every other package refuses a frame of another size with a message naming the
-  size to send (and `max_image_side` when the aspect ratio already matches), rather than feed the
-  robot an approximation: `pi0` (LeRobot's resize, not physicalai's), X-VLA (a flip, then a padded
-  letterbox), EVO1 (an antialiased bicubic stretch), VLA-JEPA (antialiased bicubic), XR0 (Qwen's
-  `smart_resize`, cubic), GR00T (`INTER_AREA` to a square `shortest_edge`) and MolmoAct2 (its own
-  processor). The WebSocket keeps its exact-size rule: openpi clients resize on the robot.
+  end runs the package's own first resize, where it is ported exactly, before the observation is
+  checked. Frames are at most 4096 pixels a side, with decoded bytes within `max_request_bytes`.
+  The spec names the resize as `server_resize`:
+  - `letterbox` (physicalai's `pi05` and `smolvla_resize`, LeRobot's `pi0`): OpenCV `INTER_LINEAR`
+    arithmetic in `f32` (torch `align_corners=False`, no antialiasing) to the aspect-kept size,
+    padded with 0 on the top and left or centred as `resize` says.
+  - `area` (VLA-JEPA): physicalai's first step, average pooling as torch `interpolate(mode="area")`,
+    to `image_resolution`; the engine then runs its antialiased bicubic step as before.
+  - `smart_resize_cubic` (XR0): Qwen's `smart_resize` target and OpenCV `INTER_CUBIC` on `u8`, byte
+    for byte. The export takes one frame size, so only frames that resize lands on it are taken;
+    others are refused naming the size they would become (a 480x640 camera becomes 256x320, which
+    a 256x256 LIBERO export cannot take, on physicalai's own server too).
+
+  Float results are rounded to the engine's `u8` frame, within 0.5/255 of the preprocessor's own
+  float frame. Golden pixels come from the preprocessors themselves: physicalai's
+  `ResizeSmolVLA`, `Pi05Preprocessor`, `vla_jepa._area_weights` and `xr0._resize_image`, and
+  LeRobot's `resize_with_pad_torch` for pi0. Packages with an `image_flip` before their resize
+  (X-VLA) and packages physicalai's runtime does not serve (EVO1's antialiased bicubic stretch,
+  GR00T's `INTER_AREA` square, MolmoAct2's processor) refuse a frame of another size with a message
+  naming the size to send (and `max_image_side` when the aspect ratio already matches), rather
+  than feed the robot an approximation. The WebSocket keeps its exact-size rule: openpi clients
+  resize on the robot.
 - Reply: `outputs.action` as float32 `[1, T, D]` (the shape Intel's own models return), `seq`,
   `server_id` and the server's queue, compute and decode seconds. Reset replies `{ok: true}`;
   policies keep no state between calls, so it only orders with the queue.

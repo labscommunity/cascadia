@@ -2,7 +2,7 @@
 //! OpenVINO loader reads from the compiled model's ports.
 
 use cascadia_engine::{EngineError, EngineResult};
-use cascadia_types::{NoiseMode, PolicySpec, ResizeConvention};
+use cascadia_types::{NoiseMode, PolicySpec, ResizeConvention, ServerResize};
 
 use super::cameras::{CameraLayout, CameraPlan};
 use super::manifest::{ImageStep, PolicyManifest, PostStep, PreStep, StatsStep};
@@ -40,11 +40,10 @@ pub struct ManifestSpec {
     pub n_action_steps: Option<usize>,
     /// The noise the manifest draws (`noise.shape` or `pi05`/`pi0` `noise_shape`), batch excluded.
     pub noise_shape: Option<Vec<usize>>,
-    /// Frames of another size can be resized by the API with `resize`: only
-    /// physicalai's own `pi05` and `smolvla_resize` (letterbox) steps, whose
-    /// bilinear arithmetic is ported there, and only with no `image_flip`
-    /// before them (a flip then a padded letterbox is not a letterbox then a flip).
-    pub server_resize: bool,
+    /// The package's own first resize, when the API runs it exactly for frames
+    /// of another size; never with an `image_flip` before it (a flip then a
+    /// padded letterbox is not a letterbox then a flip).
+    pub server_resize: Option<ServerResize>,
 }
 
 fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
@@ -91,17 +90,26 @@ impl ManifestSpec {
                 _ => noise_shape = Some(shape.clone()),
             }
         }
-        let ported = m.preprocessors.iter().any(|s| match s {
-            PreStep::Pi05(_) => true,
-            PreStep::SmolVlaResize(r) => !r.stretch,
-            _ => false,
-        });
+        let ported = match m.image_step() {
+            // physicalai's `pi05`, LeRobot's `pi0` (openpi's `resize_with_pad`):
+            // the same bilinear letterbox.
+            ImageStep::Pi05(_) => Some(ServerResize::Letterbox),
+            ImageStep::SmolVlaResize(r) if !r.stretch => Some(ServerResize::Letterbox),
+            ImageStep::VlaJepa(_) => Some(ServerResize::Area),
+            ImageStep::Xr0(x) => Some(ServerResize::SmartResizeCubic {
+                factor: x.image_factor as u32,
+                max_pixels: x.image_max_pixels as u32,
+            }),
+            // EVO1's antialiased bicubic stretch, GR00T's INTER_AREA square and
+            // MolmoAct2's processor are not ported.
+            _ => None,
+        };
         let flips = m
             .preprocessors
             .iter()
             .any(|s| matches!(s, PreStep::ImageFlip { .. }));
         Ok(Self {
-            server_resize: ported && !flips,
+            server_resize: ported.filter(|_| !flips),
             cameras: CameraPlan::from_manifest(m)?,
             image_hw,
             resize,
@@ -251,21 +259,27 @@ mod tests {
         }
     }
 
-    /// The server resizes other frame sizes only for physicalai's own `pi05`
-    /// and `smolvla_resize` letterboxes, never after an `image_flip`.
+    /// Which packages' own first resize the server runs, never after an `image_flip`.
     #[test]
     fn only_ported_letterboxes_are_resized_on_the_server() {
+        let letterbox = Some(ServerResize::Letterbox);
         let cases = [
-            ("intel-pi05-libero-manifest.json", true),
-            ("intel-smolvla-libero-manifest.json", true),
-            ("smolvla-libero-noise-manifest.json", true),
-            ("pi0-libero-manifest.json", false),
-            ("xvla-libero-manifest.json", false),
-            ("evo1-libero-manifest.json", false),
-            ("vlajepa-libero-manifest.json", false),
-            ("xr0-libero-manifest.json", false),
-            ("gr00t-libero-spatial-manifest.json", false),
-            ("molmoact2-libero-manifest.json", false),
+            ("intel-pi05-libero-manifest.json", letterbox),
+            ("intel-smolvla-libero-manifest.json", letterbox),
+            ("smolvla-libero-noise-manifest.json", letterbox),
+            ("pi0-libero-manifest.json", letterbox),
+            ("vlajepa-libero-manifest.json", Some(ServerResize::Area)),
+            (
+                "xr0-libero-manifest.json",
+                Some(ServerResize::SmartResizeCubic {
+                    factor: 32,
+                    max_pixels: 90000,
+                }),
+            ),
+            ("xvla-libero-manifest.json", None),
+            ("evo1-libero-manifest.json", None),
+            ("gr00t-libero-spatial-manifest.json", None),
+            ("molmoact2-libero-manifest.json", None),
         ];
         let opts = LoadOptions {
             allow_identity_stats: true,
