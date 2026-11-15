@@ -102,16 +102,20 @@ pub enum Precision {
     F32,
 }
 
-/// The plugin config for the policy IR on `device`.
+/// The upper-cased device (`gpu.1` is `GPU.1`) and the plugin config for the
+/// policy IR on it.
 ///
 /// CPU always gets `INFERENCE_PRECISION_HINT=f32`: its bf16 compute is off by
 /// up to 0.66 normalized units, and a bf16 export with a padded mask is
 /// all-NaN on bf16 CPUs. The GPU keeps its f16 default unless `F32` is asked.
-pub fn compile_config(device: &str, precision: Option<Precision>) -> EngineResult<PluginConfig> {
+pub fn compile_config(
+    device: &str,
+    precision: Option<Precision>,
+) -> EngineResult<(String, PluginConfig)> {
     let dev = device.to_ascii_uppercase();
     let family = dev.split('.').next().unwrap_or_default();
     let f32_hint = PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f32");
-    match (family, precision) {
+    let config = match (family, precision) {
         ("CPU", Some(Precision::F16)) => Err(EngineError::InvalidConfig(
             "--precision f16 is not available on CPU, which always runs f32".into(),
         )),
@@ -125,7 +129,8 @@ pub fn compile_config(device: &str, precision: Option<Precision>) -> EngineResul
         _ => Err(EngineError::InvalidConfig(format!(
             "device {device:?} is not supported for policies; use GPU or CPU"
         ))),
-    }
+    }?;
+    Ok((dev, config))
 }
 
 /// Tensor names the pipeline binds, plus the prompt port's length.
@@ -386,7 +391,7 @@ impl PolicyPipeline {
         inputs: &[PortInfo],
         outputs: &[PortInfo],
         has_random_uniform: bool,
-        tokenizer: Box<dyn PromptTokenizer>,
+        mut tokenizer: Box<dyn PromptTokenizer>,
     ) -> EngineResult<Self> {
         let tok_at = manifest
             .preprocessors
@@ -400,6 +405,15 @@ impl PolicyPipeline {
             return refuse("a text step (new_line / pi05) comes after ov_tokenizer");
         }
         let (binding, ir) = bind_ports(inputs, outputs, has_random_uniform)?;
+        // Otherwise a tokenizer padded for another port loads and every infer fails.
+        let empty = tokenizer.tokenize("")?;
+        if empty.ids.len() != binding.prompt_len || empty.mask.len() != binding.prompt_len {
+            return refuse(format!(
+                "the tokenizer pads to {} tokens; the model's tokenized_prompt port takes {}",
+                empty.ids.len(),
+                binding.prompt_len
+            ));
+        }
         let (spec, layout) = derive_spec(&manifest, &ir, server)?;
         Ok(Self {
             manifest,
@@ -741,10 +755,24 @@ mod tests {
 
     fn rig(manifest: &str, pi05: bool, truncation_state: bool, output: Vec<f32>) -> Rig {
         let log = Arc::new(Mutex::new(Log::default()));
-        let (inputs, outputs) = if pi05 { pi05_ports() } else { smolvla_ports() };
         let port_len = if pi05 { 64 } else { 48 };
+        let engine = pipeline(manifest, pi05, truncation_state, port_len, &log, output).unwrap();
+        // Drop the load-time width probe so tests see only infer texts.
+        log.lock().unwrap().texts.clear();
+        Rig { engine, log }
+    }
+
+    fn pipeline(
+        manifest: &str,
+        pi05: bool,
+        truncation_state: bool,
+        tokenizer_port: usize,
+        log: &Arc<Mutex<Log>>,
+        output: Vec<f32>,
+    ) -> EngineResult<PolicyPipeline> {
+        let (inputs, outputs) = if pi05 { pi05_ports() } else { smolvla_ports() };
         let m = PolicyManifest::parse(manifest, LoadOptions::default()).unwrap();
-        let engine = PolicyPipeline::new(
+        PolicyPipeline::new(
             m,
             server("CPU"),
             Box::new(FakeModel {
@@ -757,11 +785,9 @@ mod tests {
             Box::new(FakeTokenizer {
                 log: log.clone(),
                 truncation_state,
-                port: port_len,
+                port: tokenizer_port,
             }),
         )
-        .unwrap();
-        Rig { engine, log }
     }
 
     fn smolvla(truncation_state: bool) -> Rig {
@@ -937,6 +963,23 @@ mod tests {
     }
 
     #[test]
+    fn a_tokenizer_padded_for_another_port_is_refused_at_load() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        for width in [40, 64] {
+            let e = pipeline(SMOLVLA_NOISE, false, true, width, &log, vec![0.5; 350])
+                .err()
+                .expect("a mismatched tokenizer must not load");
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{e}");
+            assert!(
+                e.to_string().contains(&format!(
+                    "pads to {width} tokens; the model's tokenized_prompt port takes 48"
+                )),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
     fn a_tokenizer_wider_than_the_port_is_an_error_not_a_silent_cut() {
         let mut r = smolvla(true);
         r.engine.binding.prompt_len = 40;
@@ -1047,13 +1090,13 @@ mod tests {
 
     #[test]
     fn precision_follows_the_device() {
-        let hint = |c: &PluginConfig| c.entries.clone();
+        let hint = |c: &(String, PluginConfig)| c.1.entries.clone();
         let f32_hint = vec![("INFERENCE_PRECISION_HINT".to_string(), "f32".to_string())];
         assert_eq!(hint(&compile_config("CPU", None).unwrap()), f32_hint);
-        assert_eq!(
-            hint(&compile_config("cpu", Some(Precision::F32)).unwrap()),
-            f32_hint
-        );
+        let cpu = compile_config("cpu", Some(Precision::F32)).unwrap();
+        assert_eq!(cpu.0, "CPU", "compile and the spec get the normalized name");
+        assert_eq!(hint(&cpu), f32_hint);
+        assert_eq!(compile_config("gpu.1", None).unwrap().0, "GPU.1");
         assert!(compile_config("CPU", Some(Precision::F16)).is_err());
         assert!(hint(&compile_config("GPU", None).unwrap()).is_empty());
         assert!(hint(&compile_config("GPU", Some(Precision::F16)).unwrap()).is_empty());

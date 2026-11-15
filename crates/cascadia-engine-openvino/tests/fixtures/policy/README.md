@@ -11,4 +11,10 @@ Copied, unmodified:
   weights. New style: `noise` is a model input (`[1, 50, 32]`) and cameras are named
   `images.images.<name>`.
 
+Generated:
+
+- `smolvla-libero-noise-reference-actions.json`: the served actions for the fixed inputs of
+  `tests/policy_openvino.rs`, from an independent numpy + OpenVINO Python pipeline (own
+  tokenizer call, image scaling, normalize, xoshiro noise and denormalize) on CPU at f32.
+
 Fixtures generated from Intel's `physicalai` runtime by `tools/vla_reference.py` land here too.

@@ -114,8 +114,8 @@ fn smolvla_prompt_length_is_refused_past_the_port() {
 }
 
 #[test]
-fn smolvla_cpu_infer_with_fixed_noise_is_finite_and_repeatable() {
-    let Some(dir) = package("smolvla_cpu_infer_with_fixed_noise_is_finite_and_repeatable") else {
+fn smolvla_cpu_infer_with_fixed_noise_matches_the_reference() {
+    let Some(dir) = package("smolvla_cpu_infer_with_fixed_noise_matches_the_reference") else {
         return;
     };
     let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
@@ -123,8 +123,26 @@ fn smolvla_cpu_infer_with_fixed_noise_is_finite_and_repeatable() {
     let obs = observation(&engine, "pick up the black bowl and place it on the plate");
     let a = engine.infer(&obs).unwrap();
     assert_eq!((a.steps, a.dim, a.actions.len()), (1, 7, 7));
-    assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
     eprintln!("actions {:?} in {:.1} ms", a.actions, a.infer_ms);
+    // The fixture is for exactly `observation`'s inputs, computed by an
+    // independent numpy + OpenVINO Python pipeline (see the fixtures README).
+    let reference: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/policy/smolvla-libero-noise-reference-actions.json"
+    ))
+    .unwrap();
+    let want: Vec<f32> = serde_json::from_value(reference["actions"].clone()).unwrap();
+    assert_eq!(want.len(), a.actions.len());
+    let diff = a
+        .actions
+        .iter()
+        .zip(&want)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        diff <= 1e-4,
+        "max abs diff {diff}: {:?} vs {want:?}",
+        a.actions
+    );
     // CPU runs f32, so the same inputs give the same actions.
     let b = engine.infer(&obs).unwrap();
     for (x, y) in a.actions.iter().zip(&b.actions) {

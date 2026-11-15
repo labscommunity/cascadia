@@ -56,9 +56,9 @@ impl OvPolicyEngine {
         use cascadia_ov_genai_shim::Runtime;
 
         let manifest = PolicyManifest::load(dir, opts.manifest)?;
-        let config = compile_config(&opts.device, opts.precision)?;
+        let (device, config) = compile_config(&opts.device, opts.precision)?;
         let xml = dir.join(&manifest.model_artifact);
-        let rt = Runtime::compile_inspected(utf8(&xml)?, &opts.device, None, &config)
+        let rt = Runtime::compile_inspected(utf8(&xml)?, &device, None, &config)
             .map_err(|e| context(&xml, map_ov_err(e)))?;
         let inputs = (0..rt.input_count())
             .map(|i| rt.input_port(i))
@@ -78,7 +78,7 @@ impl OvPolicyEngine {
             manifest,
             ServerFacts {
                 model,
-                device: opts.device.clone(),
+                device,
                 prompt_max_bytes: PROMPT_MAX_BYTES,
             },
             Box::new(native::OvModel {
