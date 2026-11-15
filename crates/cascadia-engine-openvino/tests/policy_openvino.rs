@@ -2242,7 +2242,8 @@ fn molmoact2_engine_binds_intels_stages() {
         manifest,
         ServerFacts {
             model: "molmoact2".into(),
-            device: "CPU".into(),
+            // No model runs; on CPU an ARM host would refuse the package.
+            device: "GPU".into(),
             prompt_max_bytes: 1024,
         },
         Box::new(JepaRecorder {
@@ -2373,6 +2374,17 @@ fn molmoact2_spec_prompt_limit_and_cpu_parity() {
     let ir_diff = max_abs_diff(&raw, &npz(&z, "norm_actions").f32s());
     eprintln!("molmoact2 IR cpu f32 vs pytorch f32 (normalized): max abs {ir_diff:.3e}");
 
+    // OpenVINO 2026.4.1's ARM CPU plugin computes this graph wrong (the IR alone is
+    // 0.61 off on macOS, x86 within 1e-3), so the engine refuses it there.
+    if cfg!(target_arch = "aarch64") {
+        eprintln!("molmoact2 IR on the ARM CPU: {ir_diff:.3e} off; the engine must refuse it");
+        let e = OvPolicyEngine::load(&dir, &cpu())
+            .err()
+            .expect("an ARM CPU load is refused");
+        assert!(e.to_string().contains("use an x86 CPU or the GPU"), "{e}");
+        return;
+    }
+    assert!(ir_diff <= 1e-3, "IR max abs diff {ir_diff}");
     let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
     let spec = engine.spec().clone();
     assert_eq!(spec.cameras, ["image", "wrist_image"]);
@@ -2391,17 +2403,7 @@ fn molmoact2_spec_prompt_limit_and_cpu_parity() {
         "molmoact2 engine cpu f32 vs pytorch f32: max abs {d:.3e} infer_ms={:.0}",
         a.infer_ms
     );
-    // OpenVINO 2026.4.1's ARM CPU plugin computes this graph wrong: on macOS the IR
-    // alone is 0.61 off PyTorch on PyTorch's own inputs, while x86 is within 1e-3.
-    if cfg!(target_arch = "aarch64") {
-        eprintln!(
-            "skip the molmoact2 cpu parity bound on aarch64: the IR alone is {ir_diff:.3e} off \
-             (an ARM CPU plugin fault, not the host steps); x86 holds it"
-        );
-    } else {
-        assert!(ir_diff <= 1e-3, "IR max abs diff {ir_diff}");
-        assert!(d <= 1e-3, "max abs diff {d}");
-    }
+    assert!(d <= 1e-3, "max abs diff {d}");
     let mut long = obs.clone();
     long.prompt = words(fit + 1);
     let e = engine.infer(&long).unwrap_err();

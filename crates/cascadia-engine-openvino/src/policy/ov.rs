@@ -58,6 +58,8 @@ impl OvPolicyEngine {
 
         let manifest = PolicyManifest::load(dir, opts.manifest)?;
         let (device, config) = compile_config(&opts.device, opts.precision)?;
+        // Before the compile, which for MolmoAct2 on CPU takes about 20 GB.
+        super::pipeline::refuse_known_bad_device(manifest.policy, &device, std::env::consts::ARCH)?;
         let xml = dir.join(&manifest.model_artifact);
         let rt = Runtime::compile_inspected(utf8(&xml)?, &device, None, &config)
             .map_err(|e| compile_failed(&xml, &device, opts.precision, map_ov_err(e)))?;

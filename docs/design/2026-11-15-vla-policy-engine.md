@@ -103,8 +103,8 @@ v1:
   about 10 GB; at `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for
   π0. The x86 CPU at f32 is within 1e-3 of PyTorch; OpenVINO 2026.4.1's ARM CPU plugin computes the
   graph wrong (the IR alone is 0.61 off PyTorch on PyTorch's own inputs on macOS), so MolmoAct2 on
-  an ARM CPU is refused at load, before the compile (use an x86 CPU or the GPU). Its noise is `constant`: the graph starts from zeros, so calls are
-  deterministic. The weights' licence is unstated on the model card (the code is Apache-2.0).
+  an ARM CPU is refused at load, before the compile (use an x86 CPU or the GPU). Its noise is
+  `constant`: the graph starts from zeros, so calls are deterministic. The weights' licence is unstated on the model card (the code is Apache-2.0).
 - A single-box metadata endpoint and WebSocket, served by `cascadia run --engine ov-policy`.
 - `cascadia export-policy`: LeRobot checkpoints (Hugging Face) to a `policy_package`.
 

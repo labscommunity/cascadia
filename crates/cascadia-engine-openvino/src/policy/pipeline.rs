@@ -276,6 +276,21 @@ pub fn compiled_precision(device: &str, precision: Option<Precision>) -> &'stati
     }
 }
 
+/// Refuse a kind on a device whose plugin is known to compute it wrongly, so
+/// a robot never gets wrong actions quietly. `arch` is the build's
+/// `target_arch`.
+pub fn refuse_known_bad_device(kind: PolicyKind, device: &str, arch: &str) -> EngineResult<()> {
+    let family = device.split('.').next().unwrap_or_default();
+    if kind == PolicyKind::MolmoAct2 && family.eq_ignore_ascii_case("CPU") && arch == "aarch64" {
+        return Err(EngineError::InvalidConfig(
+            "molmoact2 on an ARM CPU is refused: OpenVINO's ARM CPU plugin computes this graph \
+             wrongly (6.1e-1 off PyTorch on PyTorch's own inputs); use an x86 CPU or the GPU"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The input ports a policy kind's IR takes. Each layout has its own binder
 /// and its own feeds; the prompt, noise and postprocessing are shared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1081,6 +1096,7 @@ impl PolicyPipeline {
                 ));
             }
         }
+        refuse_known_bad_device(manifest.policy, &server.device, std::env::consts::ARCH)?;
         let (binding, ir) = bind(&manifest, inputs, outputs, has_random_uniform)?;
         // Otherwise a tokenizer padded for another port loads and every infer fails.
         // GR00T's tokenizer does not pad: its ids are expanded and padded after it.
@@ -2031,9 +2047,15 @@ mod tests {
         output: Vec<f32>,
     ) -> EngineResult<PolicyPipeline> {
         let m = PolicyManifest::parse(manifest, LoadOptions::default()).unwrap();
+        // MolmoAct2 on CPU is refused on ARM hosts; its rigs stand in for the GPU.
+        let device = if m.policy == PolicyKind::MolmoAct2 {
+            "GPU"
+        } else {
+            "CPU"
+        };
         PolicyPipeline::new(
             m,
-            server("CPU"),
+            server(device),
             Box::new(FakeModel {
                 log: log.clone(),
                 output: (port_dims(outputs, ACTION), output),
@@ -2803,6 +2825,47 @@ mod tests {
             panic!()
         };
         assert_eq!(pad.iter().filter(|&&p| !p).count(), 7);
+    }
+
+    #[test]
+    fn molmoact2_on_an_arm_cpu_is_refused() {
+        for (device, arch) in [("CPU", "aarch64"), ("cpu", "aarch64")] {
+            let e = refuse_known_bad_device(PolicyKind::MolmoAct2, device, arch).unwrap_err();
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{e}");
+            assert!(e.to_string().contains("use an x86 CPU or the GPU"), "{e}");
+        }
+        for (kind, device, arch) in [
+            (PolicyKind::MolmoAct2, "CPU", "x86_64"),
+            (PolicyKind::MolmoAct2, "GPU", "aarch64"),
+            (PolicyKind::Gr00tN1d7, "CPU", "aarch64"),
+        ] {
+            refuse_known_bad_device(kind, device, arch).unwrap();
+        }
+        // The pipeline applies it on CPU with the build's own arch.
+        let log = Arc::new(Mutex::new(Log::default()));
+        let manifest = MOLMOACT2_LIBERO.replace(
+            "\"image_placeholder_token_id\": 154629",
+            "\"image_placeholder_token_id\": 1006",
+        );
+        let (inputs, outputs) = molmoact2_ports_of(1395);
+        let r = PolicyPipeline::new(
+            PolicyManifest::parse(&manifest, LoadOptions::default()).unwrap(),
+            server("CPU"),
+            Box::new(FakeModel {
+                log: log.clone(),
+                output: (vec![1, 10, 7], vec![0.0; 70]),
+                action: ACTION,
+            }),
+            &inputs,
+            &outputs,
+            false,
+            Box::new(FakeTokenizer {
+                log: log.clone(),
+                truncation_state: true,
+                port: 1000,
+            }),
+        );
+        assert_eq!(r.is_err(), cfg!(target_arch = "aarch64"));
     }
 
     #[test]
