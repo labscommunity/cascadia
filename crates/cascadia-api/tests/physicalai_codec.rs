@@ -799,6 +799,20 @@ fn xr0_frames_match_physicalai_byte_for_byte() {
         cubic_frame(&img, 48, 56).data,
         read_fixture("xr0-70x90.out-48x56.rgb")
     );
+    assert_eq!(smart_resize(250, 260, 32, 90000), Some((256, 256)));
+    let img = Image {
+        height: 250,
+        width: 260,
+        data: read_fixture("xr0-250x260.rgb"),
+    };
+    let ours = cubic_frame(&img, 256, 256).data;
+    let want = read_fixture("xr0-250x260.out-256x256.rgb");
+    let differ = ours.iter().zip(&want).filter(|(a, b)| a != b).count();
+    eprintln!(
+        "xr0 250x260 -> 256x256: {differ} of {} bytes differ from OpenCV",
+        want.len()
+    );
+    assert_eq!(differ, 0);
     // LIBERO's 256x256 is left alone; a 480x640 camera becomes 256x320.
     assert_eq!(smart_resize(256, 256, 32, 90000), Some((256, 256)));
     assert_eq!(smart_resize(480, 640, 32, 90000), Some((256, 320)));

@@ -171,6 +171,12 @@ def kernels():
     out = _resize_image(img, 8, 3000)
     yield "xr0-70x90.rgb", img.tobytes()
     yield f"xr0-70x90.out-{out.shape[0]}x{out.shape[1]}.rgb", np.ascontiguousarray(out).tobytes()
+    # A LIBERO-sized camera XR0's export takes, at the real factor and budget: OpenCV rounds a
+    # few pixels differently in its vector loop than in fixed point.
+    img = native(250, 260, 510)
+    out = _resize_image(img, 32, 90000)
+    yield "xr0-250x260.rgb", img.tobytes()
+    yield f"xr0-250x260.out-{out.shape[0]}x{out.shape[1]}.rgb", np.ascontiguousarray(out).tobytes()
 
 
 def main():

@@ -998,6 +998,21 @@ pub fn smart_resize(height: u32, width: u32, factor: u32, max_pixels: u32) -> Op
     Some((nh as u32, nw as u32))
 }
 
+/// Bytes OpenCV's 128-bit vector loops process at once.
+const VLANES: usize = 16;
+
+/// OpenCV's `v_muladd`: fused on AArch64 (NEON `vfmaq`), a product then a sum
+/// on x86 builds without FMA in the baseline. Only the AArch64 path is checked
+/// against OpenCV here.
+#[inline]
+fn muladd(a: f32, b: f32, c: f32) -> f32 {
+    if cfg!(target_arch = "aarch64") {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
+    }
+}
+
 const COEF_BITS: u32 = 11;
 const COEF_SCALE: f32 = (1 << COEF_BITS) as f32;
 
@@ -1056,12 +1071,27 @@ pub fn cubic_frame(img: &Image, height: u32, width: u32) -> Image {
     };
     let rows: Vec<Vec<i64>> = (0..sh).map(hrow).collect();
     let mut data = Vec::with_capacity(h * w * 3);
+    // OpenCV's vertical pass runs 16 bytes at a time in f32 (`VResizeCubicVec_32s8u`)
+    // and finishes the row in fixed point.
+    let vector_end = (w * 3) / VLANES * VLANES;
     for &(sy, b) in &ys {
         let r: [&Vec<i64>; 4] = std::array::from_fn(|k| &rows[clamp(sy - 1 + k as i64, sh)]);
+        let bf = b.map(|v| v as f32 * (1.0 / (COEF_SCALE * COEF_SCALE)));
         for x in 0..w * 3 {
-            let v: i64 = (0..4).map(|k| r[k][x] * i64::from(b[k])).sum();
-            let shift = 2 * COEF_BITS;
-            data.push(((v + (1 << (shift - 1))) >> shift).clamp(0, 255) as u8);
+            let px = if x < vector_end {
+                let s = |k: usize| r[k][x] as f32;
+                let f = muladd(
+                    s(0),
+                    bf[0],
+                    muladd(s(1), bf[1], muladd(s(2), bf[2], s(3) * bf[3])),
+                );
+                (f.round_ties_even() as i64).clamp(0, 255)
+            } else {
+                let v: i64 = (0..4).map(|k| r[k][x] * i64::from(b[k])).sum();
+                let shift = 2 * COEF_BITS;
+                ((v + (1 << (shift - 1))) >> shift).clamp(0, 255)
+            };
+            data.push(px as u8);
         }
     }
     Image {
