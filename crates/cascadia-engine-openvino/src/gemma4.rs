@@ -122,6 +122,9 @@ struct StageConfig {
     /// pre-v1.1 exports, which let those layers attend to the whole prefix.
     #[serde(default)]
     sliding_window: Option<u32>,
+    /// KV heads of the model's (sliding) layers, as exported.
+    #[serde(default)]
+    num_kv_heads: Option<u32>,
 }
 
 /// One entry of `external_shared_sources` in stage_config.json. Only the global
@@ -130,6 +133,12 @@ struct StageConfig {
 struct ExternalSrc {
     #[serde(default)]
     src_global_layer: u32,
+    /// The source layer's attention type and head width, as exported; they fix
+    /// the `[kvh, *, hd]` shape a frame for this source may have.
+    #[serde(default)]
+    layer_type: Option<String>,
+    #[serde(default)]
+    head_dim: Option<u32>,
 }
 
 fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
@@ -524,20 +533,82 @@ struct KvTensor {
 /// missing config never rejects a real context.
 const SHARED_KV_MAX_CTX_FALLBACK: usize = 262_144;
 
-/// `max_position_embeddings` from the config the exporter copies next to the
+/// The model's text config, from the copy the exporter puts next to the
 /// tokenizer (`text_config` when nested), or the pipeline dir's own config.json.
-fn read_max_ctx(pipeline_dir: &Path) -> Option<usize> {
+fn read_text_config(pipeline_dir: &Path) -> Option<serde_json::Value> {
     ["tokenizer/config.json", "config.json"]
         .iter()
         .find_map(|f| {
-            let v: serde_json::Value =
+            let mut v: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(pipeline_dir.join(f)).ok()?).ok()?;
-            let cfg = v.get("text_config").unwrap_or(&v);
-            cfg.get("max_position_embeddings")?
-                .as_u64()
-                .filter(|&m| m > 0)
-                .and_then(|m| usize::try_from(m).ok())
+            Some(match v.get_mut("text_config") {
+                Some(t) => t.take(),
+                None => v,
+            })
         })
+}
+
+/// A positive integer field of a config object.
+fn cfg_usize(cfg: &serde_json::Value, key: &str) -> Option<usize> {
+    cfg.get(key)?
+        .as_u64()
+        .filter(|&m| m > 0)
+        .and_then(|m| usize::try_from(m).ok())
+}
+
+/// `max_position_embeddings` from the model's text config.
+fn read_max_ctx(pipeline_dir: &Path) -> Option<usize> {
+    cfg_usize(&read_text_config(pipeline_dir)?, "max_position_embeddings")
+}
+
+/// The `(kvh, hd)` each consumed source's frames must have, in
+/// `external_shared_sources` order — the same rule the exporter sizes the
+/// `external_kv.*` ports by: full-attention layers use the global head count and
+/// width where the model has them. A source whose shape cannot be worked out is
+/// a load error, since the consumer could not bound what it holds.
+fn external_kv_dims(
+    stage: &StageConfig,
+    text: Option<&serde_json::Value>,
+) -> EngineResult<Vec<(usize, usize)>> {
+    stage
+        .external_shared_sources
+        .iter()
+        .map(|e| {
+            let src = e.src_global_layer;
+            let layer_type = e.layer_type.clone().or_else(|| {
+                text?
+                    .get("layer_types")?
+                    .get(src as usize)?
+                    .as_str()
+                    .map(str::to_string)
+            });
+            let full = layer_type.as_deref() == Some("full_attention");
+            let local_kvh = text
+                .and_then(|t| cfg_usize(t, "num_key_value_heads"))
+                .or(stage.num_kv_heads.map(|k| k as usize));
+            let kvh = if full {
+                text.and_then(|t| cfg_usize(t, "num_global_key_value_heads"))
+                    .or(local_kvh)
+            } else {
+                local_kvh
+            };
+            let local_hd = text.and_then(|t| cfg_usize(t, "head_dim"));
+            let hd = e.head_dim.map(|h| h as usize).or(if full {
+                text.and_then(|t| cfg_usize(t, "global_head_dim"))
+                    .or(local_hd)
+            } else {
+                local_hd
+            });
+            match (layer_type, kvh, hd) {
+                (Some(_), Some(kvh), Some(hd)) => Ok((kvh, hd)),
+                _ => Err(EngineError::ShardRejected(format!(
+                    "cannot tell the shape of cross-stage KV from source layer {src}: \
+                     stage_config.json and the model config give no layer type, KV head count \
+                     or head width for it"
+                ))),
+            }
+        })
+        .collect()
 }
 
 /// Bytes of a `[kvh, ctx, hd]` f32 tensor, or None if that overflows.
@@ -553,13 +624,17 @@ struct SharedKvBuf {
     /// frame is bounded by the transport, but appends are not, so a peer (or a
     /// bug) could otherwise grow a tensor without limit.
     max_ctx: usize,
+    /// `(kvh, hd)` each consumed tag's frames must have. With `max_ctx` this
+    /// bounds a held tensor at `kvh * max_ctx * hd * 4` bytes.
+    expected: std::collections::HashMap<i64, (usize, usize)>,
     tensors: std::collections::HashMap<i64, KvTensor>,
 }
 
 impl SharedKvBuf {
-    fn new(max_ctx: usize) -> Self {
+    fn new(max_ctx: usize, expected: std::collections::HashMap<i64, (usize, usize)>) -> Self {
         Self {
             max_ctx,
+            expected,
             tensors: std::collections::HashMap::new(),
         }
     }
@@ -583,6 +658,13 @@ impl SharedKvBuf {
         data: Vec<u8>,
     ) -> EngineResult<()> {
         let [kvh, n, hd] = shape.map(|d| d as usize);
+        if self.expected.get(&tag) != Some(&(kvh, hd)) {
+            return Err(EngineError::Backend(format!(
+                "cross-KV frame (tag {tag}) has shape {shape:?}, but this stage's input for it \
+                 takes [kvh, hd] = {:?}",
+                self.expected.get(&tag)
+            )));
+        }
         if kv_bytes(kvh, n, hd) != Some(data.len()) {
             return Err(EngineError::Backend(format!(
                 "cross-KV frame (tag {tag}) carries {} bytes for shape {shape:?}",
@@ -2353,6 +2435,8 @@ pub struct Gemma4Builder {
     frame_bytes_per_token: usize,
     /// Model context window, read in load() for the shared-KV cap.
     max_ctx: usize,
+    /// `(kvh, hd)` per `external_src_ids` entry, read in load().
+    external_kv_dims: Vec<(usize, usize)>,
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -2571,6 +2655,8 @@ impl Builder for Gemma4Builder {
         self.num_kv_shared_layers = pipeline_cfg.num_kv_shared_layers;
         self.frame_bytes_per_token =
             hidden_frame_bytes_per_token(&pipeline_cfg, stage_cfg.layer_end);
+        let text_cfg = read_text_config(&self.pipeline_dir);
+        self.external_kv_dims = external_kv_dims(&stage_cfg, text_cfg.as_ref())?;
         self.max_ctx = read_max_ctx(&self.pipeline_dir).unwrap_or_else(|| {
             warn!(
                 fallback = SHARED_KV_MAX_CTX_FALLBACK,
@@ -2697,6 +2783,16 @@ impl Builder for Gemma4Builder {
                 });
             }
         }
+        let mut external_kv_expected = std::collections::HashMap::new();
+        for e in &external_kv_in {
+            let dims = self
+                .external_src_ids
+                .iter()
+                .position(|&s| s == e.tag / 2)
+                .and_then(|i| self.external_kv_dims.get(i))
+                .ok_or_else(|| EngineError::Backend(format!("{}: no expected shape", e.name)))?;
+            external_kv_expected.insert(e.tag, *dims);
+        }
         if !cross_kv_out.is_empty() || !external_kv_in.is_empty() {
             info!(
                 cross_kv_out = cross_kv_out.len(),
@@ -2730,7 +2826,7 @@ impl Builder for Gemma4Builder {
             active: None,
             cross_kv_out,
             external_kv_in,
-            external_kv: SharedKvBuf::new(self.max_ctx),
+            external_kv: SharedKvBuf::new(self.max_ctx, external_kv_expected),
             cross_kv_tx: CrossKvSender::new(kv_deltas),
             step_warn: StepWarnLimiter::default(),
             #[cfg(feature = "kv_coord")]
@@ -3269,7 +3365,7 @@ mod tests {
 
     #[test]
     fn shared_kv_buf_appends_rows_per_head() {
-        let mut b = SharedKvBuf::new(SHARED_KV_MAX_CTX_FALLBACK);
+        let mut b = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, 2, 2)]);
         b.apply(9, 0, 26, 0, [2, 3, 2], kv_tensor(1, 2, 0, 3, 2))
             .unwrap();
         b.apply(9, 3, 26, 3, [2, 2, 2], kv_tensor(1, 2, 3, 2, 2))
@@ -3283,7 +3379,7 @@ mod tests {
 
     #[test]
     fn shared_kv_buf_rejects_an_append_it_cannot_line_up() {
-        let mut b = SharedKvBuf::new(SHARED_KV_MAX_CTX_FALLBACK);
+        let mut b = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, 2, 2)]);
         let d = |p, n, kvh, hd| kv_tensor(1, kvh, p, n, hd);
         // Nothing held yet.
         assert!(b.apply(9, 4, 26, 4, [2, 1, 2], d(4, 1, 2, 2)).is_err());
@@ -3310,7 +3406,7 @@ mod tests {
     /// the held tensor is left as it was.
     #[test]
     fn shared_kv_buf_caps_the_context_and_rejects_overflow() {
-        let mut b = SharedKvBuf::new(8);
+        let mut b = kv_buf(8, &[(26, 2, 2), (27, 2, 2)]);
         let d = |p, n| kv_tensor(1, 2, p, n, 2);
         assert!(
             b.apply(9, 0, 26, 0, [2, 9, 2], d(0, 9)).is_err(),
@@ -3357,11 +3453,90 @@ mod tests {
         assert_eq!(read_max_ctx(dir.path()), Some(131072));
     }
 
+    fn kv_buf(max_ctx: usize, dims: &[(i64, usize, usize)]) -> SharedKvBuf {
+        SharedKvBuf::new(max_ctx, dims.iter().map(|&(t, k, h)| (t, (k, h))).collect())
+    }
+
+    /// The row cap alone would let a first frame with a huge `kvh * hd` and few
+    /// rows set a row width that appends then multiply by the whole window.
+    #[test]
+    fn shared_kv_buf_takes_only_the_shape_its_input_expects() {
+        let mut b = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, 2, 2)]);
+        let wide = WireTensor::new(WireDType::F32, [1024, 1, 1024], vec![0; 1024 * 1024 * 4]);
+        assert!(
+            b.apply(9, 0, 26, 0, wide.shape, wide.data).is_err(),
+            "huge kvh * hd"
+        );
+        assert!(
+            b.apply(9, 0, 26, 0, [3, 1, 2], kv_tensor(1, 3, 0, 1, 2))
+                .is_err(),
+            "kvh"
+        );
+        assert!(
+            b.apply(9, 0, 26, 0, [2, 1, 3], kv_tensor(1, 2, 0, 1, 3))
+                .is_err(),
+            "hd"
+        );
+        assert!(
+            b.apply(9, 0, 30, 0, [2, 1, 2], kv_tensor(1, 2, 0, 1, 2))
+                .is_err(),
+            "unknown tag"
+        );
+        assert!(b.tensors.is_empty(), "a rejected frame holds nothing");
+        b.apply(9, 0, 26, 0, [2, 1, 2], kv_tensor(1, 2, 0, 1, 2))
+            .unwrap();
+    }
+
+    #[test]
+    fn external_kv_dims_follow_the_exporter_rule() {
+        let src = |l: u32, lt: Option<&str>, hd: Option<u32>| ExternalSrc {
+            src_global_layer: l,
+            layer_type: lt.map(str::to_string),
+            head_dim: hd,
+        };
+        let stage = StageConfig {
+            num_kv_heads: Some(1),
+            external_shared_sources: vec![
+                src(13, Some("sliding_attention"), Some(256)),
+                src(14, Some("full_attention"), Some(512)),
+            ],
+            ..Default::default()
+        };
+        let e2b =
+            serde_json::json!({"num_key_value_heads": 1, "head_dim": 256, "global_head_dim": 512});
+        assert_eq!(
+            external_kv_dims(&stage, Some(&e2b)).unwrap(),
+            [(1, 256), (1, 512)]
+        );
+        let global = serde_json::json!({"num_key_value_heads": 8, "num_global_key_value_heads": 2});
+        assert_eq!(
+            external_kv_dims(&stage, Some(&global)).unwrap(),
+            [(8, 256), (2, 512)]
+        );
+        // Stage config alone is enough.
+        assert_eq!(
+            external_kv_dims(&stage, None).unwrap(),
+            [(1, 256), (1, 512)]
+        );
+        // Layer type and width from the model config when the stage lacks them.
+        let bare = StageConfig {
+            external_shared_sources: vec![src(1, None, None)],
+            ..Default::default()
+        };
+        let types = serde_json::json!({"layer_types": ["sliding_attention", "full_attention"],
+            "num_key_value_heads": 1, "head_dim": 256, "global_head_dim": 512});
+        assert_eq!(external_kv_dims(&bare, Some(&types)).unwrap(), [(1, 512)]);
+        assert!(external_kv_dims(&bare, None).is_err());
+        assert!(external_kv_dims(&StageConfig::default(), None)
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn ingest_requires_each_consumed_tag_once_per_step() {
         let inputs = ext_in(&[26, 27]);
         let f = || WireTensor::new(WireDType::F32, [1, 1, 1], f32_to_bytes(&[1.0]));
-        let mut b = SharedKvBuf::new(SHARED_KV_MAX_CTX_FALLBACK);
+        let mut b = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, 1, 1), (27, 1, 1)]);
         let ing = |b: &mut SharedKvBuf, pos, seq, e: &[(i64, i64)], fr| {
             ingest_cross_kv(b, &inputs, pos, seq, e, fr)
         };
@@ -3432,7 +3607,7 @@ mod tests {
         for ((fresh_seq, lossy, deltas), want) in modes {
             let mode = format!("fresh_seq={fresh_seq} lossy={lossy} deltas={deltas}");
             let mut tx = CrossKvSender::new(deltas);
-            let mut buf = SharedKvBuf::new(SHARED_KV_MAX_CTX_FALLBACK);
+            let mut buf = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, KVH, HD), (28, KVH, HD)]);
             let (mut pos, mut seed, mut seq) = (0i64, 0u32, 1u64);
             let mut delta_rows = std::collections::HashMap::<i64, usize>::new();
             for step in &script {
