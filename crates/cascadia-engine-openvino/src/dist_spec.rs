@@ -2994,16 +2994,14 @@ impl Builder for OvDistSpecWorkerBuilder {
         let port = self
             .listen_port
             .ok_or_else(|| EngineError::PeerRejected("configure_listen() required".into()))?;
-        // The listener re-accepts after every drop, so take only the configured upstream.
-        let allowed =
-            cascadia_transport::expected_peer_ips(&up.host, up.port, &self.listen_host, port)
-                .await
-                .map_err(|e| EngineError::PeerRejected(format!("upstream {up}: {e}")))?;
-        if !allowed.is_empty() {
-            info!(upstream = %up, ?allowed, "ov-dist-spec worker accepts only its upstream");
-        }
         let mut server = ActivationServer::new(self.listen_host.clone(), port);
-        server.allow_peers(allowed);
+        // The listener re-accepts after every drop, so take only the configured upstream.
+        if let Some(host) =
+            cascadia_transport::upstream_identity(&up.host, up.port, &self.listen_host, port)
+        {
+            info!(upstream = %up, "ov-dist-spec worker accepts only its upstream");
+            server.allow_upstream(&host, up.port).await;
+        }
         server
             .start()
             .await
