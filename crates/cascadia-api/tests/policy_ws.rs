@@ -3,6 +3,8 @@
 //! `MockPolicyEngine`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cascadia_api::policy::server::{policy_router, serve_policy, PolicyServerConfig};
@@ -49,6 +51,60 @@ impl PolicyEngine for Slow {
         std::thread::sleep(self.1);
         self.0.infer(obs)
     }
+}
+
+/// Counts calls that reach the engine, takes `delay` each, and panics on the
+/// prompt "panic".
+struct Probe {
+    inner: MockPolicyEngine,
+    delay: Duration,
+    calls: Arc<AtomicUsize>,
+}
+
+impl PolicyEngine for Probe {
+    fn spec(&self) -> &PolicySpec {
+        self.inner.spec()
+    }
+    fn warmup(&mut self) -> EngineResult<Vec<u32>> {
+        self.inner.warmup()
+    }
+    fn infer(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            obs.prompt.trim() != "panic",
+            "probe engine panics on request"
+        );
+        std::thread::sleep(self.delay);
+        self.inner.infer(obs)
+    }
+}
+
+fn probe(delay: Duration) -> (Box<Probe>, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = Probe {
+        inner: MockPolicyEngine::new(spec()),
+        delay,
+        calls: calls.clone(),
+    };
+    (Box::new(engine), calls)
+}
+
+async fn start_engine(engine: Box<dyn PolicyEngine>, cfg: PolicyServerConfig) -> SocketAddr {
+    let app = policy_router(engine, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_policy(listener, app, Duration::from_secs(10)));
+    addr
+}
+
+/// `REQUEST` with its prompt replaced.
+fn request_with_prompt(prompt: &str) -> Vec<u8> {
+    let old = b"pick up the cube";
+    assert_eq!(prompt.len(), old.len());
+    let at = REQUEST.windows(old.len()).position(|w| w == old).unwrap();
+    let mut r = REQUEST.to_vec();
+    r[at..at + old.len()].copy_from_slice(prompt.as_bytes());
+    r
 }
 
 async fn start(delay: Duration, cfg: PolicyServerConfig, header_timeout: Duration) -> SocketAddr {
@@ -275,6 +331,51 @@ async fn a_client_that_disconnects_mid_call_keeps_its_slot_until_the_call_ends()
         }
     }
     assert!(sent.elapsed() >= Duration::from_millis(1500));
+}
+
+#[tokio::test]
+async fn an_engine_panic_gets_an_error_frame_and_the_socket_keeps_serving() {
+    let (engine, calls) = probe(Duration::ZERO);
+    let addr = start_engine(engine, PolicyServerConfig::default()).await;
+    let mut ws = connect(addr).await;
+    // Padded to the fixture prompt's length; the probe trims it.
+    ws.send(Message::Binary(request_with_prompt("panic           ")))
+        .await
+        .unwrap();
+    match next_data(&mut ws).await {
+        Message::Text(t) => assert!(t.contains("internal error"), "{t}"),
+        other => panic!("expected a text error, got {other:?}"),
+    }
+    ws.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
+    assert_eq!(next_data(&mut ws).await, Message::Binary(expected_reply()));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_queued_call_whose_client_left_never_runs() {
+    let cfg = PolicyServerConfig {
+        max_connections: 2,
+        ..Default::default()
+    };
+    let call = Duration::from_millis(800);
+    let (engine, calls) = probe(call);
+    let addr = start_engine(engine, cfg).await;
+    let mut a = connect(addr).await;
+    a.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // B queues behind A's call for the engine lock, then leaves.
+    let mut b = connect(addr).await;
+    b.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    b.close(None).await.unwrap();
+    drop(b);
+    assert_eq!(next_data(&mut a).await, Message::Binary(expected_reply()));
+    // A's next call starts at once instead of waiting out B's.
+    let sent = Instant::now();
+    a.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
+    assert_eq!(next_data(&mut a).await, Message::Binary(expected_reply()));
+    assert!(sent.elapsed() < call * 3 / 2, "{:?}", sent.elapsed());
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "B's abandoned call ran");
 }
 
 #[tokio::test]

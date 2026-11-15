@@ -818,11 +818,10 @@ pub struct RunArgs {
     #[arg(long, value_name = "ORIGIN")]
     pub policy_allow_origin: Vec<String>,
 
-    /// `--engine ov-policy` only: concurrent WebSocket connections; one more
-    /// is refused with HTTP 503.
-    #[arg(long, default_value_t = cascadia_api::policy::server::DEFAULT_MAX_CONNECTIONS as u32,
-          value_parser = clap::value_parser!(u32).range(1..))]
-    pub policy_max_connections: u32,
+    /// `--engine ov-policy` only: concurrent WebSocket connections (default
+    /// 4); one more is refused with HTTP 503.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub policy_max_connections: Option<u32>,
 
     /// `--engine ov-policy` only: serve a package whose normalization stats
     /// are identity placeholders. For testing; actions from it are not usable.
@@ -1292,8 +1291,7 @@ fn check_policy_flags(args: &RunArgs) -> Result<()> {
         ),
         (
             "--policy-max-connections",
-            args.policy_max_connections as usize
-                != cascadia_api::policy::server::DEFAULT_MAX_CONNECTIONS,
+            args.policy_max_connections.is_some(),
         ),
         ("--allow-identity-stats", args.allow_identity_stats),
     ];
@@ -1357,8 +1355,9 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     let dir = PathBuf::from(&args.model);
     if !dir.is_dir() {
         return Err(anyhow!(
-            "no policy package directory at {}
-             --engine ov-policy takes a local policy_package directory (manifest.json,              the policy IR and the tokenizer IR); see docs/engines/ov-policy.md",
+            "no policy package directory at {}\n\
+             --engine ov-policy takes a local policy_package directory (manifest.json, \
+             the policy IR and the tokenizer IR); see docs/engines/ov-policy.md",
             args.model
         ));
     }
@@ -1378,16 +1377,23 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     })
     .await
     .context("policy load task")??;
-    let cfg = cascadia_api::policy::server::PolicyServerConfig {
-        allow_origins: args.policy_allow_origin,
-        max_connections: args.policy_max_connections as usize,
-        ..Default::default()
-    };
+    let cfg = policy_server_config(&args);
     let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("bind {host}:{port}"))?;
     let shutdown = install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
     serve_policy_engine(listener, engine, cfg, shutdown).await
+}
+
+fn policy_server_config(args: &RunArgs) -> cascadia_api::policy::server::PolicyServerConfig {
+    use cascadia_api::policy::server::{PolicyServerConfig, DEFAULT_MAX_CONNECTIONS};
+    PolicyServerConfig {
+        allow_origins: args.policy_allow_origin.clone(),
+        max_connections: args
+            .policy_max_connections
+            .map_or(DEFAULT_MAX_CONNECTIONS, |n| n as usize),
+        ..Default::default()
+    }
 }
 
 /// Serve a loaded policy engine on `listener` until `shutdown` resolves.
@@ -4345,6 +4351,8 @@ mod tests {
             &["--precision", "f32"][..],
             &["--policy-allow-origin", "http://x"],
             &["--policy-max-connections", "2"],
+            // The default value itself is still an explicit flag.
+            &["--policy-max-connections", "4"],
             &["--allow-identity-stats"],
         ] {
             let mut argv = vec!["m"];
@@ -4359,6 +4367,17 @@ mod tests {
         assert!(
             Cli::try_parse_from(["cascadia", "run", "m", "--policy-max-connections", "0"]).is_err()
         );
+        let default = run_args(&["pkg", "--engine", "ov-policy"]);
+        assert_eq!(default.policy_max_connections, None);
+        assert_eq!(policy_server_config(&default).max_connections, 4);
+        let two = run_args(&[
+            "pkg",
+            "--engine",
+            "ov-policy",
+            "--policy-max-connections",
+            "2",
+        ]);
+        assert_eq!(policy_server_config(&two).max_connections, 2);
     }
 
     #[tokio::test]
@@ -4389,6 +4408,7 @@ mod tests {
         ] {
             let e = format!("{:#}", cmd_run(run_args(&argv)).await.unwrap_err());
             assert!(e.contains(want), "{e}");
+            assert!(!e.contains("\n "), "stray indentation in {e:?}");
         }
     }
 

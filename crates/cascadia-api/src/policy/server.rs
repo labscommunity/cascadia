@@ -188,7 +188,16 @@ async fn serve_socket(socket: WebSocket, st: PolicyState, slot: OwnedSemaphorePe
                             if done.is_closed() {
                                 return;
                             }
-                            let res = engine.infer(&obs).map_err(client_message);
+                            // A panicking engine must still answer, or the client
+                            // (openpi has no receive timeout) waits forever.
+                            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                engine.infer(&obs)
+                            }))
+                            .unwrap_or_else(|_| {
+                                tracing::error!("policy engine panicked during infer");
+                                Err(EngineError::Backend("internal error".into()))
+                            })
+                            .map_err(client_message);
                             drop(engine);
                             let _ = done.blocking_send(res);
                         });
