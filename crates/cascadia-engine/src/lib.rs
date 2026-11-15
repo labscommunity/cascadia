@@ -110,12 +110,14 @@ impl EngineError {
         }
     }
 
-    /// Whether this error means the engine's peer link is dead and cannot
-    /// recover in-process — a worker stage whose upstream socket is dropped
-    /// can only get a fresh connection by being rebuilt (re-`accept()` only
-    /// happens at startup). The relay loop exits on this so the supervisor
-    /// (systemd `Restart=on-failure`) rebuilds the stage, rather than
-    /// spin-and-flood at the backoff rate forever.
+    /// Whether this error means the engine's peer link is dead. A step that
+    /// returns it ends the relay loop (`Runner::run_relay_loop` in
+    /// `cascadia-runner`), and the CLI then exits non-zero for its supervisor
+    /// (systemd `Restart=on-failure`) to rebuild the stage. Workers that
+    /// re-link in place (ov-dist-spec and sparse-moe re-accept their upstream
+    /// and re-dial their downstream) classify their transport errors with
+    /// this but do not return them from `step()`, since an embedded stage has
+    /// no supervisor; the ov-runtime relay ranks still exit on it.
     ///
     /// Transport errors reach the engine flattened to strings via
     /// [`EngineError::Backend`] (the worker calls `e.to_string()`), so this
