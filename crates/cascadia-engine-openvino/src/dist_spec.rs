@@ -239,12 +239,20 @@ fn check_verify_rows(shape: [usize; 3], logits_len: usize, need: usize) -> Resul
     Ok(())
 }
 
-/// Re-dial `link` if its socket was dropped. `Ok(true)` when it dialed a new one.
+/// Re-dial `link` if its socket was dropped, or if it is dead while idle (the next stage
+/// dropped its side, e.g. at its idle ceiling). Call only when no reply is owed: the next
+/// stage never sends unsolicited bytes, so a readable idle link is EOF, a reset or a stale
+/// reply. `Ok(true)` when it dialed a new one.
 async fn redial_if_disconnected(
     link: &mut ActivationClient,
     timeout: Duration,
 ) -> Result<bool, cascadia_transport::TransportError> {
-    if link.is_connected() {
+    // Timing out means nothing to read: idle and alive.
+    let dead = !link.is_connected()
+        || tokio::time::timeout(Duration::from_millis(1), link.wait_readable())
+            .await
+            .is_ok();
+    if !dead {
         return Ok(false);
     }
     link.close().await;
@@ -254,6 +262,67 @@ async fn redial_if_disconnected(
             true
         }),
         Err(_) => Err(cascadia_transport::TransportError::ConnectTimeout(timeout)),
+    }
+}
+
+/// A failed round leaves the link's framing unknown, and a clean EOF still holds the socket,
+/// so close it: the next task's RESET re-dials.
+async fn close_link_on_err<T>(
+    link: &tokio::sync::Mutex<ActivationClient>,
+    res: Result<T, cascadia_transport::TransportError>,
+) -> Result<T, cascadia_transport::TransportError> {
+    if res.is_err() {
+        link.lock().await.close().await;
+    }
+    res
+}
+
+/// Worker: if the upstream has no peer, wait up to `wait` for one to dial in.
+/// `Ok(true)` when a peer is connected.
+async fn accept_upstream_within(
+    up: &tokio::sync::Mutex<ActivationServer>,
+    wait: Duration,
+) -> Result<bool, cascadia_transport::TransportError> {
+    let mut g = up.lock().await;
+    if g.is_connected() {
+        return Ok(true);
+    }
+    match tokio::time::timeout(wait, g.accept()).await {
+        Ok(r) => r.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Whether a worker frame error must drop both peers: a link-fatal transport error, a peer
+/// the transport already dropped (a rejected frame reads as no fatal text), or a FORWARD whose
+/// reply the upstream is still waiting for.
+fn frame_error_drops_links(fatal_text: bool, links_lost: bool, reply_owed: bool) -> bool {
+    fatal_text || links_lost || reply_owed
+}
+
+/// Whether the transport has dropped either of a worker's peers.
+async fn worker_links_lost(
+    up: &tokio::sync::Mutex<ActivationServer>,
+    down: Option<&tokio::sync::Mutex<ActivationClient>>,
+) -> bool {
+    if !up.lock().await.is_connected() {
+        return true;
+    }
+    match down {
+        Some(d) => !d.lock().await.is_connected(),
+        None => false,
+    }
+}
+
+/// Worker: drop both peers but keep listening. The upstream reads EOF at once instead of
+/// waiting out its idle ceiling; it re-dials and is accepted on a later step.
+async fn drop_worker_peers(
+    up: &tokio::sync::Mutex<ActivationServer>,
+    down: Option<&tokio::sync::Mutex<ActivationClient>>,
+) {
+    up.lock().await.disconnect().await;
+    if let Some(d) = down {
+        d.lock().await.close().await;
     }
 }
 
@@ -932,19 +1001,15 @@ impl DistributedMaskedReq {
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
 
-    /// A failed round leaves the link's framing unknown, and a clean EOF still holds the socket,
-    /// so drop it: the next task's `reset` re-dials.
+    /// See [`close_link_on_err`].
     fn drop_link_on_err<T>(
         &self,
         res: Result<T, cascadia_transport::TransportError>,
     ) -> Result<T, cascadia_transport::TransportError> {
-        if res.is_err() {
-            let downstream = self.downstream.clone();
-            run_async(&self.runtime_handle, async move {
-                downstream.lock().await.close().await;
-            });
-        }
-        res
+        let downstream = self.downstream.clone();
+        run_async(&self.runtime_handle, async move {
+            close_link_on_err(&downstream, res).await
+        })
     }
 
     /// Async-split: does sync rank-0-side stage_0 work then spawns the network
@@ -2315,6 +2380,8 @@ pub struct OvDistSpecWorkerEngine {
     upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
+    /// A FORWARD was read and its LOGITS_RESPONSE is not sent yet (see `step`).
+    reply_owed: bool,
     /// Issue-34: opaque KV blob cache + a model-level id for the coordination-plane fingerprint.
     /// `kv_coord` only.
     #[cfg(feature = "kv_coord")]
@@ -2354,14 +2421,7 @@ impl Engine for OvDistSpecWorkerEngine {
         // still releases the engine lock between steps.
         let upstream = self.upstream.clone();
         let accepted = run_async(&self.runtime_handle, async move {
-            let mut g = upstream.lock().await;
-            if g.is_connected() {
-                return Ok(true);
-            }
-            match tokio::time::timeout(REACCEPT_WAIT, g.accept()).await {
-                Ok(r) => r.map(|()| true),
-                Err(_) => Ok(false),
-            }
+            accept_upstream_within(&upstream, REACCEPT_WAIT).await
         });
         match accepted {
             Ok(true) => {}
@@ -2377,23 +2437,19 @@ impl Engine for OvDistSpecWorkerEngine {
             }
         }
         let result = self.handle_one_frame();
+        let reply_owed = std::mem::take(&mut self.reply_owed);
         if let Err(ref e) = result {
-            // Fatal-classification is delegated to EngineError::is_connection_fatal
-            // (single source of truth) — clean teardown, black-holed peer (idle
-            // ceiling), peer crash (RST/broken pipe/aborted), mid-frame stall.
-            if e.is_connection_fatal() {
-                // Drop both peers but keep listening: the in-flight request is lost either
-                // way, the upstream sees EOF instead of waiting out its idle ceiling, and its
-                // re-dial is accepted on the next step. A middle stage re-dials its downstream
-                // on the next RESET. Ok, so the relay loop keeps stepping.
-                warn!(error = %e, "ov-dist-spec worker: connection-fatal transport error, dropping links and re-accepting");
-                let upstream = self.upstream.clone();
-                let downstream = self.downstream.clone();
-                run_async(&self.runtime_handle, async move {
-                    upstream.lock().await.disconnect().await;
-                    if let Some(d) = downstream {
-                        d.lock().await.close().await;
-                    }
+            let upstream = self.upstream.clone();
+            let downstream = self.downstream.clone();
+            let links_lost = run_async(&self.runtime_handle, async {
+                worker_links_lost(&upstream, downstream.as_deref()).await
+            });
+            if frame_error_drops_links(e.is_connection_fatal(), links_lost, reply_owed) {
+                // The in-flight request is lost either way. A middle stage re-dials its
+                // downstream on the next RESET. Ok, so the relay loop keeps stepping.
+                warn!(error = %e, reply_owed, links_lost, "ov-dist-spec worker: frame failed on the link, dropping links and re-accepting");
+                run_async(&self.runtime_handle, async {
+                    drop_worker_peers(&upstream, downstream.as_deref()).await
                 });
                 return Ok(Vec::new());
             }
@@ -2676,6 +2732,7 @@ impl OvDistSpecWorkerEngine {
                     })
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
                 let recv_body_us = _ts_recv_body.elapsed().as_micros();
+                self.reply_owed = true;
 
                 // 3. Run inference on this stage.
                 let new_tokens = hidden_shape[1];
@@ -2837,6 +2894,7 @@ impl OvDistSpecWorkerEngine {
                     })
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
                 }
+                self.reply_owed = false;
                 Ok(())
             }
         }
@@ -3028,6 +3086,7 @@ impl Builder for OvDistSpecWorkerBuilder {
             upstream,
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
+            reply_owed: false,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
@@ -3691,6 +3750,168 @@ mod tests {
         assert!(send_reset_downstream(&mut client, REDIAL_TIMEOUT)
             .await
             .is_err());
+    }
+
+    fn kind_of(b: &[u8]) -> Option<FrameKind> {
+        FrameKind::from_u32(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// A server plus a client dialed into it and accepted.
+    async fn linked() -> (ActivationServer, ActivationClient) {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let mut client = ActivationClient::new("127.0.0.1", server.port());
+        client.connect().await.unwrap();
+        server.accept().await.unwrap();
+        (server, client)
+    }
+
+    /// The worker dropped its side of an idle link (its idle ceiling, or a lost
+    /// downstream): the driver still holds a socket that reads as connected, and
+    /// the next task's RESET must re-dial on the first try instead of failing
+    /// that task.
+    #[tokio::test]
+    async fn reset_redials_a_link_the_worker_dropped_while_idle() {
+        let (mut server, mut client) = linked().await;
+        server.disconnect().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            client.is_connected(),
+            "the driver cannot see the drop by state"
+        );
+        assert!(send_reset_downstream(&mut client, REDIAL_TIMEOUT)
+            .await
+            .unwrap());
+        tokio::time::timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("the RESET went into the dead socket instead of a new one")
+            .unwrap();
+        assert_eq!(
+            kind_of(&server.recv_raw(4).await.unwrap()),
+            Some(FrameKind::Reset)
+        );
+    }
+
+    /// A middle stage on RESET: its downstream dropped its side while idle, so
+    /// it re-dials before relaying, and the last stage gets the RESET.
+    #[tokio::test]
+    async fn middle_stage_redials_its_downstream_on_reset() {
+        let (mut middle_up, mut driver) = linked().await;
+        let (mut last, mut middle_down) = linked().await;
+        last.disconnect().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        send_reset_downstream(&mut driver, REDIAL_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            kind_of(&middle_up.recv_raw(4).await.unwrap()),
+            Some(FrameKind::Reset)
+        );
+        assert!(send_reset_downstream(&mut middle_down, REDIAL_TIMEOUT)
+            .await
+            .unwrap());
+        tokio::time::timeout(Duration::from_secs(5), last.accept())
+            .await
+            .expect("the middle stage did not re-dial its downstream")
+            .unwrap();
+        assert_eq!(
+            kind_of(&last.recv_raw(4).await.unwrap()),
+            Some(FrameKind::Reset)
+        );
+    }
+
+    /// The worker's re-accept seam: no dialer is a bounded wait, a dialer is
+    /// accepted, and a held peer is kept.
+    #[tokio::test]
+    async fn worker_reaccepts_a_redialed_upstream() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let up = tokio::sync::Mutex::new(server);
+        let started = std::time::Instant::now();
+        assert!(!accept_upstream_within(&up, Duration::from_millis(100))
+            .await
+            .unwrap());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.try_connect().await.unwrap();
+        assert!(accept_upstream_within(&up, Duration::from_millis(100))
+            .await
+            .unwrap());
+        assert!(accept_upstream_within(&up, Duration::ZERO).await.unwrap());
+        up.lock().await.close().await;
+        up.lock().await.disconnect().await;
+        assert!(matches!(
+            accept_upstream_within(&up, Duration::from_millis(100)).await,
+            Err(cascadia_transport::TransportError::NotStarted)
+        ));
+    }
+
+    #[test]
+    fn frame_error_drops_links_when_any_cause_holds() {
+        assert!(!frame_error_drops_links(false, false, false));
+        assert!(frame_error_drops_links(true, false, false));
+        assert!(frame_error_drops_links(false, true, false));
+        assert!(frame_error_drops_links(false, false, true));
+    }
+
+    /// A middle stage whose downstream sends an oversized reply: the transport
+    /// drops that socket, but the error's text is not connection-fatal, so only
+    /// the state check sees it. Dropping the peers then lets the driver read EOF
+    /// at once instead of waiting out its idle ceiling.
+    #[tokio::test]
+    async fn worker_drops_its_peers_when_the_transport_dropped_one() {
+        let (middle_up, mut driver) = linked().await;
+        let (mut last, middle_down) = linked().await;
+        let up = tokio::sync::Mutex::new(middle_up);
+        let down = tokio::sync::Mutex::new(middle_down);
+        assert!(!worker_links_lost(&up, Some(&down)).await);
+
+        let elems = (cascadia_transport::MAX_TENSOR_BYTES / 2 + 1) as u32;
+        let mut header = [0u8; 20];
+        header[0..4].copy_from_slice(&(elems * 2).to_be_bytes());
+        header[4..8].copy_from_slice(&(WireDType::F16 as u32).to_be_bytes());
+        header[8..12].copy_from_slice(&1u32.to_be_bytes());
+        header[12..16].copy_from_slice(&1u32.to_be_bytes());
+        header[16..20].copy_from_slice(&elems.to_be_bytes());
+        last.send_raw(&header).await.unwrap();
+        let err = down.lock().await.recv().await.unwrap_err();
+        assert!(
+            !EngineError::Backend(err.to_string()).is_connection_fatal(),
+            "{err}: the text alone would keep the links"
+        );
+        assert!(worker_links_lost(&up, Some(&down)).await);
+
+        drop_worker_peers(&up, Some(&down)).await;
+        assert!(!up.lock().await.is_connected());
+        let eof = tokio::time::timeout(Duration::from_secs(5), driver.recv_raw(4))
+            .await
+            .expect("the driver kept waiting on a dropped worker");
+        assert!(matches!(
+            eof,
+            Err(cascadia_transport::TransportError::SocketClosed)
+        ));
+    }
+
+    /// The driver closes its link after a failed round and keeps it after a good one.
+    #[tokio::test]
+    async fn driver_closes_the_link_only_after_a_failed_round() {
+        let (_server, client) = linked().await;
+        let link = tokio::sync::Mutex::new(client);
+        assert!(
+            close_link_on_err(&link, Ok::<_, cascadia_transport::TransportError>(1))
+                .await
+                .is_ok()
+        );
+        assert!(link.lock().await.is_connected());
+        assert!(close_link_on_err::<()>(
+            &link,
+            Err(cascadia_transport::TransportError::SocketClosed)
+        )
+        .await
+        .is_err());
+        assert!(!link.lock().await.is_connected());
     }
 
     fn f16_rows(rows: u32, vocab: u32) -> Vec<u8> {
