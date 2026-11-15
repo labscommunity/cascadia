@@ -495,7 +495,17 @@ impl Builder for SparseMoEBuilder {
                     "non-first rank requires configure_listen() before connect()".into(),
                 )
             })?;
+            // The listener re-accepts after every drop, so take only the configured upstream.
+            let up = peers.upstream.as_ref().expect("has_upstream");
+            let allowed =
+                cascadia_transport::expected_peer_ips(&up.host, up.port, &self.listen_host, port)
+                    .await
+                    .map_err(|e| EngineError::PeerRejected(format!("upstream {up}: {e}")))?;
+            if !allowed.is_empty() {
+                info!(upstream = %up, ?allowed, "sparse-moe worker accepts only its upstream");
+            }
             let mut server = ActivationServer::new(self.listen_host.clone(), port);
+            server.allow_peers(allowed);
             server.start().await.map_err(|e| {
                 EngineError::Backend(format!("listen {}:{}: {}", self.listen_host, port, e))
             })?;

@@ -1168,6 +1168,39 @@ async fn recv_exact_within<R: AsyncRead + Unpin>(
     }
 }
 
+/// Addresses a stage listening on `listen_host:listen_port` should accept its upstream from,
+/// given the configured upstream `peer_host:peer_port`; empty means any. Empty when the
+/// endpoint carries no peer identity: it is the stage's own listen address (a command line
+/// that knows only `--listen`), an unspecified address, or a unix socket. A hostname is
+/// resolved once, here.
+pub async fn expected_peer_ips(
+    peer_host: &str,
+    peer_port: u16,
+    listen_host: &str,
+    listen_port: u16,
+) -> TransportResult<Vec<std::net::IpAddr>> {
+    let own = peer_host == listen_host && peer_port == listen_port;
+    let unspecified = peer_host
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified());
+    if own || unspecified || TransportAddr::from_host_port(peer_host, peer_port).is_unix() {
+        return Ok(Vec::new());
+    }
+    let mut ips: Vec<std::net::IpAddr> = tokio::net::lookup_host((peer_host, peer_port))
+        .await?
+        .map(|a| a.ip().to_canonical())
+        .collect();
+    ips.sort();
+    ips.dedup();
+    if ips.is_empty() {
+        return Err(TransportError::InvalidAddr(format!(
+            "upstream {peer_host} resolved to no address"
+        )));
+    }
+    Ok(ips)
+}
+
 /// Server side of an activation link: receives activations from upstream.
 /// Binds TCP (`host:port`) or a Unix domain socket (`unix:/path.sock`,
 /// in-host stages) — the frame protocol on top is identical.
@@ -1177,6 +1210,8 @@ pub struct ActivationServer {
     client: Option<ActivationStream>,
     accepted_peer: Option<String>,
     actual_port: u16,
+    /// TCP peers `accept` takes (canonical form); empty takes any.
+    allowed_peers: Vec<std::net::IpAddr>,
     /// Unix socket this server bound and therefore OWNS — unlinked on
     /// [`close`](Self::close) and on `Drop` so a crash-restart can re-bind.
     #[cfg(unix)]
@@ -1350,6 +1385,7 @@ impl ActivationServer {
             client: None,
             accepted_peer: None,
             actual_port,
+            allowed_peers: Vec::new(),
             #[cfg(unix)]
             owned_unix_path: None,
         }
@@ -1419,13 +1455,29 @@ impl ActivationServer {
         self.actual_port
     }
 
+    /// Take TCP connections only from these addresses (empty takes any). The listener is
+    /// unauthenticated, so a stage that knows its upstream refuses every other host.
+    /// Unix sockets are owner-only already and are not filtered.
+    pub fn allow_peers(&mut self, peers: Vec<std::net::IpAddr>) {
+        self.allowed_peers = peers.into_iter().map(|ip| ip.to_canonical()).collect();
+    }
+
+    /// Accept the next connection. A TCP peer outside [`allow_peers`](Self::allow_peers) is
+    /// closed with a warning and the wait goes on, so a caller's timeout bounds the whole wait.
     pub async fn accept(&mut self) -> TransportResult<()> {
         let listener = self.listener.as_ref().ok_or(TransportError::NotStarted)?;
         let (stream, peer) = match listener {
-            ActivationListener::Tcp(l) => {
+            ActivationListener::Tcp(l) => loop {
                 let (sock, addr) = l.accept().await?;
-                (ActivationStream::Tcp(sock), addr.to_string())
-            }
+                if !self.allowed_peers.is_empty()
+                    && !self.allowed_peers.contains(&addr.ip().to_canonical())
+                {
+                    warn!(rejected = %addr, allowed = ?self.allowed_peers, "ActivationServer refused a connection from an unexpected peer");
+                    drop(sock);
+                    continue;
+                }
+                break (ActivationStream::Tcp(sock), addr.to_string());
+            },
             #[cfg(unix)]
             ActivationListener::Unix(l) => {
                 let (sock, _addr) = l.accept().await?;
@@ -3355,6 +3407,68 @@ mod tests {
         server.send(&t).await.unwrap();
         let (back, _) = client.recv().await.unwrap();
         assert_eq!(back.data, t.data);
+    }
+
+    /// A stage that knows its upstream refuses every other host: the wrong
+    /// peer is closed and the wait goes on, the right one is taken.
+    #[tokio::test]
+    async fn accept_takes_only_an_allowed_peer() {
+        let (mut server, addr) = started_server(None).await;
+        let TransportAddr::Tcp { host, port } = addr else {
+            unreachable!("tcp server")
+        };
+        server.allow_peers(vec!["192.0.2.1".parse().unwrap()]);
+        let mut stranger = TcpStream::connect((host.as_str(), port)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), server.accept())
+                .await
+                .is_err(),
+            "a peer outside the allowed set was accepted"
+        );
+        assert!(!server.is_connected());
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), stranger.read(&mut buf))
+            .await
+            .expect("the refused peer was left open")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the refused peer must read EOF");
+
+        server.allow_peers(vec!["::ffff:127.0.0.1".parse().unwrap()]);
+        let _upstream = TcpStream::connect((host.as_str(), port)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("the allowed peer was refused")
+            .unwrap();
+        assert!(server.is_connected());
+    }
+
+    #[tokio::test]
+    async fn expected_peer_ips_only_for_a_real_upstream() {
+        let ips = |h: &'static str, p: u16| async move {
+            expected_peer_ips(h, p, "0.0.0.0", 9100).await.unwrap()
+        };
+        // No peer identity: the stage's own listen address, an unspecified
+        // address, a unix socket.
+        assert!(ips("0.0.0.0", 9100).await.is_empty());
+        assert!(expected_peer_ips("10.0.0.5", 9100, "10.0.0.5", 9100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(ips("::", 9200).await.is_empty());
+        assert!(ips("unix:/tmp/x.sock", 0).await.is_empty());
+        // A real upstream, canonical.
+        assert_eq!(
+            ips("127.0.0.1", 9200).await,
+            vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            ips("::ffff:10.1.2.3", 9200).await,
+            vec!["10.1.2.3".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert!(ips("localhost", 9200)
+            .await
+            .iter()
+            .all(|ip| ip.is_loopback()));
     }
 
     /// A fatal recv drops only the accepted peer; the listener stays bound
