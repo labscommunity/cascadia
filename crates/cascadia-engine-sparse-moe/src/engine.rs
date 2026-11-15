@@ -1155,7 +1155,6 @@ impl Builder for SparseMoEBuilder {
             pending: VecDeque::new(),
             peer_disconnected: false,
             upstream_seen: false,
-            disconnect_reported: false,
             transport: self.transport,
             runtime_handle,
             rank,
@@ -1343,8 +1342,8 @@ fn even_moe_split(total_moe: u32, rank: u32, total: u32) -> (u32, u32) {
 /// Whether a failed upstream receive on a pipeline worker means the link is
 /// gone for good. The server reports `NotConnected` both before the previous
 /// rank has dialed in (keep waiting) and after a once-live socket was dropped
-/// (fatal: the listener accepts exactly once, so nothing reconnects — exit so
-/// the supervisor rebuilds the rank). A frame-start timeout consumed nothing
+/// (fatal: the worker drops its links and re-accepts, see `relink_worker`).
+/// A frame-start timeout consumed nothing
 /// and is retried; every other error comes off a live socket the transport
 /// has already dropped, or leaves it unusable.
 pub(crate) fn worker_recv_failure_is_fatal(
@@ -1387,13 +1386,104 @@ fn classify_worker_recv(
     }
 }
 
-/// Whether a worker-rank `step()` should surface its latched upstream
+/// Whether rank 0's stream path should surface its latched downstream
 /// disconnect as a connection-fatal `Err` this call: yes exactly once, on the
 /// first step after the link drops. After that the one-shot is spent so a
 /// re-poll (the relay loop has already exited on the first one) doesn't flood.
-/// Pure, for testing.
+/// Workers never report: they re-link in place. Pure, for testing.
 fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bool) -> bool {
     peer_disconnected && !already_reported
+}
+
+/// A worker waits this long per step for the previous rank to re-dial, then
+/// releases the engine lock.
+const REACCEPT_WAIT: Duration = Duration::from_millis(500);
+
+/// Re-link a worker whose disconnect is latched, in place: drop both peers so
+/// the next rank sees EOF and re-links too and no stale reply reaches the new
+/// session, keep the listener, and wait up to `wait` for the previous rank to
+/// dial in; then re-dial the downstream. `Ok(true)` once both links are up.
+/// Idempotent while nobody dials in.
+async fn relink_worker(
+    up: &TokioMutex<ActivationServer>,
+    down: Option<&TokioMutex<ActivationClient>>,
+    wait: Duration,
+) -> cascadia_transport::TransportResult<bool> {
+    let mut srv = up.lock().await;
+    srv.disconnect().await;
+    if let Some(d) = down {
+        d.lock().await.close().await;
+    }
+    match tokio::time::timeout(wait, srv.accept()).await {
+        Err(_) => return Ok(false),
+        Ok(r) => r?,
+    }
+    if let Some(d) = down {
+        let mut cli = d.lock().await;
+        let dialed = match tokio::time::timeout(REDIAL_BUDGET, cli.try_connect()).await {
+            Ok(r) => r,
+            Err(_) => Err(cascadia_transport::TransportError::ConnectTimeout(
+                REDIAL_BUDGET,
+            )),
+        };
+        if let Err(e) = dialed {
+            // Half a chain serves nothing: drop the new upstream so it re-dials later.
+            srv.disconnect().await;
+            return Err(e);
+        }
+    }
+    Ok(true)
+}
+
+/// One step of a latched worker: try [`relink_worker`]. `true` once re-linked
+/// (clear the latch and serve); `false` means return empty this step.
+fn relink_worker_step(
+    transport: &StageTransport,
+    handle: &tokio::runtime::Handle,
+    rank: u32,
+) -> bool {
+    let Some(up) = transport.upstream.clone() else {
+        // Closed by the engine's own teardown.
+        std::thread::sleep(WORKER_BACKOFF);
+        return false;
+    };
+    let down = transport.downstream.clone();
+    match cascadia_runner::run_async(handle, relink_worker(&up, down.as_deref(), REACCEPT_WAIT)) {
+        Ok(true) => {
+            info!(rank, "worker re-linked to its neighbours; resuming");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!(rank, error = %e, "worker re-link failed; retrying");
+            std::thread::sleep(WORKER_BACKOFF);
+            false
+        }
+    }
+}
+
+/// Rank 0, before a task's RESET: re-dial a downstream that was dropped, or
+/// that reads EOF or data while idle (the next rank re-linked or restarted;
+/// it never sends unsolicited bytes). `Ok(true)` when it dialed.
+async fn relink_idle_downstream(
+    down: &TokioMutex<ActivationClient>,
+) -> cascadia_transport::TransportResult<bool> {
+    let mut cli = down.lock().await;
+    // Timing out means nothing to read: idle and alive.
+    let dead = !cli.is_connected()
+        || tokio::time::timeout(Duration::from_millis(1), cli.wait_readable())
+            .await
+            .is_ok();
+    if !dead {
+        return Ok(false);
+    }
+    cli.close().await;
+    match tokio::time::timeout(REDIAL_BUDGET, cli.try_connect()).await {
+        Ok(r) => r.map(|()| true),
+        Err(_) => Err(cascadia_transport::TransportError::ConnectTimeout(
+            REDIAL_BUDGET,
+        )),
+    }
 }
 
 /// Per-token reply budget: no widening. Mirrors `reply_deadline`'s body
@@ -1538,16 +1628,11 @@ pub struct SparseMoEEngine {
     rank: u32,
     total: u32,
     /// Set on a worker rank when the upstream socket closes cleanly or a
-    /// once-seen upstream link is lost, since only a rebuild re-accepts it.
+    /// once-seen upstream link is lost; the next step re-links in place.
     peer_disconnected: bool,
     /// Set once a frame has arrived from the previous rank: after that, a
     /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
     upstream_seen: bool,
-    /// Worker rank one-shot: true after `step()` has surfaced the latched
-    /// disconnect as a connection-fatal `Err` to the relay loop. Stops the
-    /// fatal Err from being re-emitted if `step()` is somehow polled again
-    /// before the stage is rebuilt (the relay loop exits on the first one).
-    disconnect_reported: bool,
     /// Last-rank only: tokens this rank has sampled since the last
     /// `Reset`. Used as the `history` argument to `sampling::sample` so
     /// the repetition penalty has the recent local emit-stream to
@@ -1744,19 +1829,11 @@ impl Engine for SparseMoEEngine {
         if self.rank == 0 {
             return Ok(self.step_first());
         }
-        // Worker rank. step_worker returns empty on a latched upstream
-        // disconnect. The worker's upstream socket can only be re-accepted by
-        // a rebuild, so once disconnected, surface a connection-fatal Err to
-        // run_relay_loop (its ONLY driver — rank-0/single-stage go through
-        // generate()) so it exits and systemd rebuilds the stage, instead of
-        // backing off Ok(empty) forever. Emit it exactly once; the loop bails
-        // on the first fatal Err.
-        let produced = self.step_worker();
-        if worker_should_report_disconnect(self.peer_disconnected, self.disconnect_reported) {
-            self.disconnect_reported = true;
-            return Err(EngineError::NotConnected);
-        }
-        Ok(produced)
+        // Worker rank: a latched disconnect re-links in place (see
+        // `relink_worker`), so it is never surfaced as a connection-fatal
+        // Err: that would end run_relay_loop, and nothing rebuilds an
+        // embedded stage.
+        Ok(self.step_worker())
     }
 
     #[cfg(feature = "kv_coord")]
@@ -2165,6 +2242,15 @@ impl SparseMoEEngine {
             }
         };
 
+        // The next rank may have re-linked since the last task (it drops its
+        // links on a lost upstream); a dead link here would fail this task.
+        if let Err(e) = self.block_on(relink_idle_downstream(&downstream)) {
+            warn!(task = %task.task_id, "downstream re-dial: {e}");
+            return Some(vec![(
+                task.task_id.clone(),
+                Chunk::error(task.task_id, format!("downstream re-dial: {e}")),
+            )]);
+        }
         // RESET downstream so workers clear their KV caches.
         self.runner.reset_kv();
         if let Err(e) = self.block_on(send_reset(&downstream)) {
@@ -3197,8 +3283,10 @@ impl SparseMoEEngine {
     /// while the runner is being torn down by the operator.
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
         if self.peer_disconnected {
-            std::thread::sleep(WORKER_BACKOFF);
-            return Vec::new();
+            if !relink_worker_step(&self.transport, &self.runtime_handle, self.rank) {
+                return Vec::new();
+            }
+            self.peer_disconnected = false;
         }
         let upstream = match self.transport.upstream.clone() {
             Some(u) => u,
@@ -3396,11 +3484,10 @@ impl SparseMoEEngine {
                 return Ok(());
             }
             WorkerRecv::LinkLost(e) => {
-                // The listener accepted exactly once, so nothing reconnects:
-                // latch, and the next step() exits for the supervisor to rebuild.
+                // Latch: the next step() drops both links and re-accepts.
                 warn!(
                     rank = self.rank,
-                    "worker upstream link lost: {e}; exiting for supervisor rebuild"
+                    "worker upstream link lost: {e}; re-linking"
                 );
                 self.peer_disconnected = true;
                 return Ok(());
@@ -3426,8 +3513,8 @@ impl SparseMoEEngine {
                 // here has no return path: left recoverable it would be
                 // silently skipped, leaving a KV hole (wrong output for the
                 // whole generation) or hanging rank 0's final recv. Make any
-                // error fatal — latch peer_disconnected so the stage tears down
-                // and rebuilds, and rank 0's final Forward surfaces the failure
+                // error fatal — latch peer_disconnected so the stage drops its
+                // links and re-links, and rank 0's final Forward surfaces the failure
                 // instead of the run completing with corrupt state.
                 let res = self.handle_forward_prefill(upstream, downstream);
                 if res.is_err() {
@@ -3895,13 +3982,11 @@ pub struct OvMoeEngine {
     rank: u32,
     total: u32,
     /// Set on a worker rank when the upstream socket closes cleanly or a
-    /// once-seen upstream link is lost, since only a rebuild re-accepts it.
+    /// once-seen upstream link is lost; the next step re-links in place.
     peer_disconnected: bool,
     /// Set once a frame has arrived from the previous rank: after that, a
     /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
     upstream_seen: bool,
-    /// One-shot: the latched disconnect has been surfaced from `step()`.
-    disconnect_reported: bool,
     /// Last-rank only: tokens this rank has sampled since the last `Reset`,
     /// used as the repetition-penalty `history`. Like the K2.6 path, prompt
     /// tokens are not mirrored here (they flow only as hidden states), so
@@ -3976,7 +4061,6 @@ impl OvMoeEngine {
             total,
             peer_disconnected: false,
             upstream_seen: false,
-            disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
@@ -4289,6 +4373,15 @@ impl OvMoeEngine {
         }
         let eos = self.runner.eos_token_ids().to_vec();
 
+        // The next rank may have re-linked since the last task (it drops its
+        // links on a lost upstream); a dead link here would fail this task.
+        if let Err(e) = self.block_on(relink_idle_downstream(&downstream)) {
+            warn!(task = %id, "downstream re-dial: {e}");
+            return Some(vec![(
+                id.clone(),
+                Chunk::error(id, format!("downstream re-dial: {e}")),
+            )]);
+        }
         // Reset KV across the whole pipeline before the new generation.
         self.runner.reset();
         if let Err(e) = self.block_on(send_reset(&downstream)) {
@@ -4907,8 +5000,10 @@ impl OvMoeEngine {
     /// Worker rank (rank > 0): service one frame from upstream per call.
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
         if self.peer_disconnected {
-            std::thread::sleep(WORKER_BACKOFF);
-            return Vec::new();
+            if !relink_worker_step(&self.transport, &self.runtime_handle, self.rank) {
+                return Vec::new();
+            }
+            self.peer_disconnected = false;
         }
         let Some(upstream) = self.transport.upstream.clone() else {
             warn!("worker rank has no upstream socket");
@@ -4925,9 +5020,8 @@ impl OvMoeEngine {
                 return Vec::new();
             }
             WorkerRecv::LinkLost(e) => {
-                // The listener accepted exactly once, so nothing reconnects:
-                // latch, and the next step() exits for the supervisor to rebuild.
-                warn!("worker upstream link lost: {e}; exiting for supervisor rebuild");
+                // Latch: the next step() drops both links and re-accepts.
+                warn!("worker upstream link lost: {e}; re-linking");
                 self.peer_disconnected = true;
                 return Vec::new();
             }
@@ -5134,14 +5228,8 @@ impl Engine for OvMoeEngine {
         if self.rank == 0 {
             return Ok(self.step_first());
         }
-        // A latched upstream disconnect can only be cleared by a rebuild, so
-        // surface it to run_relay_loop once, as SparseMoEEngine::step does.
-        let produced = self.step_worker();
-        if worker_should_report_disconnect(self.peer_disconnected, self.disconnect_reported) {
-            self.disconnect_reported = true;
-            return Err(EngineError::NotConnected);
-        }
-        Ok(produced)
+        // A latched disconnect re-links in place, as SparseMoEEngine::step's does.
+        Ok(self.step_worker())
     }
 
     #[cfg(feature = "kv_coord")]
@@ -6529,9 +6617,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
     }
 
     /// Rank 0 only. The downstream link dropped: a neighbour restarted, or the
-    /// connect raced a rank that was exiting. Workers rebuild by exiting for
-    /// their supervisor because their listener accepts exactly once; the
-    /// driver is a client, so it dials again in place and the API stays up
+    /// connect raced a rank that was exiting. Workers re-accept in place (see
+    /// `relink_worker`); the driver is a client, so it dials again and the API stays up
     /// (requests made while the link is down fail fast with `not connected`).
     /// Streams still open belonged to the old connection and are aborted with
     /// an error chunk. Returns true once the link is back.
@@ -6573,9 +6660,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// does not match its frame, so the reply FIFO is out of sync); only then
     /// is `peer_disconnected` latched so rank 0 re-dials the downstream rank
     /// in place on a later step (see [`Self::redial_downstream`]). A local
-    /// failure (a panic inside the forward) must NOT re-dial: the worker's
-    /// listener accepts once, so a re-dial into a healthy neighbour tears the
-    /// whole chain down and every rank reloads its slice for what was one bad
+    /// failure (a panic inside the forward) must NOT re-dial: a re-dial into a
+    /// healthy neighbour re-links the whole chain for what was one bad
     /// request. A local failure first reads and drops the reply that the
     /// downstream still owes for each in-flight frame, then sends
     /// `StreamClose` for each aborted slot, so no stale reply stays on the
@@ -7201,6 +7287,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let cfg = sampling_from_task(&task);
         let eos = self.runner.eos_token_ids().to_vec();
 
+        // The next rank may have re-linked since the last task (it drops its
+        // links on a lost upstream); a dead link here would fail this task.
+        if let Err(e) = self.block_on(relink_idle_downstream(&downstream)) {
+            warn!(task = %id, "downstream re-dial: {e}");
+            return Some(vec![(
+                id.clone(),
+                Chunk::error(id, format!("downstream re-dial: {e}")),
+            )]);
+        }
         self.runner.reset();
         if let Err(e) = self.block_on(send_reset(&downstream)) {
             warn!(task = %id, "send_reset failed: {e}");
@@ -7515,8 +7610,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
 
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
         if self.peer_disconnected {
-            std::thread::sleep(WORKER_BACKOFF);
-            return Vec::new();
+            if !relink_worker_step(&self.transport, &self.runtime_handle, self.rank) {
+                return Vec::new();
+            }
+            self.peer_disconnected = false;
         }
         let Some(upstream) = self.transport.upstream.clone() else {
             warn!("worker rank has no upstream socket");
@@ -7611,11 +7708,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 return Vec::new();
             }
             Err(e) if worker_recv_failure_is_fatal(&e, self.upstream_seen) => {
-                // The listener accepted exactly once, so nothing reconnects:
-                // latch, and the next step() exits the relay loop for the
-                // supervisor to rebuild this rank (the last rank has no
-                // downstream select to notice the drop any other way).
-                warn!("worker upstream link lost: {e}; exiting for supervisor rebuild");
+                // Latch: the next step() drops both links and re-accepts.
+                warn!("worker upstream link lost: {e}; re-linking");
                 self.peer_disconnected = true;
                 return Vec::new();
             }
@@ -7668,7 +7762,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     // prefills from the reused length, which trips the batch
                     // position assert one frame later with a generic message.
                     // Latch instead, the same way a malformed frame does, so the
-                    // stage tears down at the point of divergence. Don't relay: the
+                    // stage drops its links at the point of divergence. Don't relay: the
                     // ranks below us must not restore either.
                     if self.runner.restore_prefix(key).is_none() {
                         self.peer_disconnected = true;
@@ -8036,9 +8130,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // A malformed or over-range frame is a protocol violation we cannot
         // serve: forwarding a wrong-width hidden, or one at a position the
         // caches can't hold, would panic (OOB) mid-pipeline. Latch the peer as
-        // disconnected and return Err so step() surfaces a connection-fatal
-        // error — the relay loop tears the stage down and rebuilds, and rank 0
-        // unblocks on the closed socket. Do NOT reply a token here: an ack of
+        // disconnected and return Err: the next step() drops both links and
+        // re-links (see `relink_worker`), and rank 0 unblocks on the closed
+        // socket. Do NOT reply a token here: an ack of
         // -1 would OOB-panic rank 0's embed, and staying silent would hang it.
         let expect_w = self.runner.hidden_size();
         if hidden_f32.len() != expect_w {
@@ -8427,18 +8521,10 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
             }
             return Ok(self.step_first());
         }
-        // Worker rank. step_worker returns empty once an upstream disconnect (or
-        // a protocol violation escalated to one in handle_forward) latches
-        // peer_disconnected. The upstream socket can only be re-accepted by a
-        // rebuild, so surface a connection-fatal Err to run_relay_loop (its only
-        // driver) exactly once — mirroring SparseMoEEngine::step — so the stage
-        // tears down and rebuilds instead of backing off Ok(empty) forever.
-        let produced = self.step_worker();
-        if worker_should_report_disconnect(self.peer_disconnected, self.disconnect_reported) {
-            self.disconnect_reported = true;
-            return Err(EngineError::NotConnected);
-        }
-        Ok(produced)
+        // Worker rank: a latched disconnect (a dropped upstream, or a protocol
+        // violation escalated to one in handle_forward) re-links in place (see
+        // `relink_worker`), so it is never surfaced as a connection-fatal Err.
+        Ok(self.step_worker())
     }
 }
 
@@ -8663,10 +8749,9 @@ mod tests {
         assert_eq!((p.frames, p.wait), (0, Duration::ZERO));
     }
 
-    /// A latched worker disconnect must surface a connection-fatal Err to the
-    /// relay loop — exactly once — so run_relay_loop exits and systemd
-    /// rebuilds the stage instead of backing off Ok(empty) forever. The Err
-    /// step() emits (EngineError::NotConnected) must be recognized as fatal.
+    /// Rank 0's latched stream-path disconnect surfaces a connection-fatal Err
+    /// exactly once. The Err step() emits (EngineError::NotConnected) must be
+    /// recognized as fatal.
     #[test]
     fn worker_disconnect_reports_fatal_once() {
         // Connected: nothing to report.
@@ -8708,41 +8793,33 @@ mod tests {
         assert!(worker_recv_failure_is_fatal(&reset(), true));
     }
 
-    /// Feeds receive results through the latch / one-shot report that
-    /// SparseMoEEngine and OvMoeEngine `step()` use (neither engine can be
-    /// built without a model); `true` is a step that returned the fatal Err.
-    fn worker_step_errs(
+    /// Feeds receive results through the latch the SparseMoEEngine,
+    /// OvMoeEngine and PipelineEngine workers use (none can be built without a
+    /// model); `true` is a step that latched a re-link.
+    fn worker_step_latches(
         recvs: Vec<cascadia_transport::TransportResult<Option<FrameKind>>>,
     ) -> Vec<bool> {
-        let (mut seen, mut latched, mut reported) = (false, false, false);
+        let mut seen = false;
         recvs
             .into_iter()
             .map(|r| {
-                if !latched
-                    && matches!(
-                        classify_worker_recv(r, &mut seen),
-                        WorkerRecv::Closed | WorkerRecv::LinkLost(_)
-                    )
-                {
-                    latched = true;
-                }
-                let err = worker_should_report_disconnect(latched, reported);
-                reported |= err;
-                err
+                matches!(
+                    classify_worker_recv(r, &mut seen),
+                    WorkerRecv::Closed | WorkerRecv::LinkLost(_)
+                )
             })
             .collect()
     }
 
     #[test]
-    fn moe_worker_exits_once_when_live_upstream_drops() {
+    fn moe_worker_latches_a_relink_when_live_upstream_drops() {
         use cascadia_transport::TransportError;
-        let errs = worker_step_errs(vec![
+        let latches = worker_step_latches(vec![
             Ok(Some(FrameKind::Reset)),
             Err(TransportError::NotConnected),
-            Err(TransportError::NotConnected),
-            Err(TransportError::NotConnected),
+            Ok(None),
         ]);
-        assert_eq!(errs, [false, true, false, false]);
+        assert_eq!(latches, [false, true, true]);
         let mut seen = false;
         assert!(matches!(
             classify_worker_recv(Ok(Some(FrameKind::Reset)), &mut seen),
@@ -8759,7 +8836,7 @@ mod tests {
     fn moe_worker_keeps_waiting_before_upstream_dials_and_on_frame_start_timeout() {
         use cascadia_transport::TransportError;
         let timeout = || TransportError::FrameStartTimeout(std::time::Duration::from_secs(1));
-        let errs = worker_step_errs(vec![
+        let latches = worker_step_latches(vec![
             Err(TransportError::NotConnected),
             Err(TransportError::NotConnected),
             Ok(Some(FrameKind::Reset)),
@@ -8767,13 +8844,119 @@ mod tests {
             Err(timeout()),
             Ok(Some(FrameKind::Reset)),
         ]);
-        assert!(errs.iter().all(|e| !e), "{errs:?}");
+        assert!(latches.iter().all(|l| !l), "{latches:?}");
         let mut seen = false;
         assert!(matches!(
             classify_worker_recv(Err(TransportError::NotConnected), &mut seen),
             WorkerRecv::Retry(TransportError::NotConnected)
         ));
         assert!(!seen);
+    }
+
+    async fn listening() -> (ActivationServer, u16) {
+        let mut srv = ActivationServer::new("127.0.0.1", 0);
+        srv.start().await.unwrap();
+        let port = srv.port();
+        (srv, port)
+    }
+
+    /// A middle worker whose upstream (rank 0) drops: it keeps its listener,
+    /// drops its downstream so the next rank re-links too, re-accepts rank 0's
+    /// re-dial, re-dials the next rank, and relays a RESET over the new links.
+    #[tokio::test]
+    async fn moe_worker_relinks_in_place_after_its_upstream_drops() {
+        let (worker_srv, worker_port) = listening().await;
+        let (mut next, next_port) = listening().await;
+        let up = TokioMutex::new(worker_srv);
+        let mut down_cli = ActivationClient::new("127.0.0.1", next_port);
+        down_cli.connect().await.unwrap();
+        next.accept().await.unwrap();
+        let down = TokioMutex::new(down_cli);
+        let mut rank0 = ActivationClient::new("127.0.0.1", worker_port);
+        rank0.connect().await.unwrap();
+        up.lock().await.accept().await.unwrap();
+
+        // Rank 0 goes away: the worker reads a clean close and latches.
+        rank0.close().await;
+        let mut seen = true;
+        assert!(matches!(
+            classify_worker_recv(recv_kind_server(&up).await, &mut seen),
+            WorkerRecv::Closed
+        ));
+
+        // Nobody dials yet: the step returns, and the next rank sees EOF.
+        let wait = Duration::from_millis(100);
+        assert!(!relink_worker(&up, Some(&down), wait).await.unwrap());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), next.recv_raw(4)).await,
+            Ok(Err(cascadia_transport::TransportError::SocketClosed))
+        ));
+
+        // Rank 0 re-dials: the worker re-accepts and re-dials the next rank.
+        let mut rank0 = ActivationClient::new("127.0.0.1", worker_port);
+        rank0.try_connect().await.unwrap();
+        assert!(relink_worker(&up, Some(&down), wait).await.unwrap());
+        next.accept().await.unwrap();
+
+        let rank0 = TokioMutex::new(rank0);
+        send_reset(&rank0).await.unwrap();
+        let mut seen = true;
+        assert!(matches!(
+            classify_worker_recv(recv_kind_server(&up).await, &mut seen),
+            WorkerRecv::Frame(FrameKind::Reset)
+        ));
+        forward_reset(&down).await.unwrap();
+        let kb = next.recv_raw(4).await.unwrap();
+        assert_eq!(
+            u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+            FrameKind::Reset as u32
+        );
+    }
+
+    /// The next rank is gone: a half chain serves nothing, so the re-accepted
+    /// upstream is dropped again and rank 0 re-dials later.
+    #[tokio::test]
+    async fn moe_worker_relink_drops_the_upstream_when_the_next_rank_is_gone() {
+        let (worker_srv, worker_port) = listening().await;
+        let next_port = listening().await.1; // bound, then dropped
+        let up = TokioMutex::new(worker_srv);
+        let down = TokioMutex::new(ActivationClient::new("127.0.0.1", next_port));
+        let rank0 = TokioMutex::new(ActivationClient::new("127.0.0.1", worker_port));
+        rank0.lock().await.try_connect().await.unwrap();
+        assert!(relink_worker(&up, Some(&down), Duration::from_secs(1))
+            .await
+            .is_err());
+        assert!(!up.lock().await.is_connected());
+        assert!(matches!(
+            rank0.lock().await.recv_raw(4).await,
+            Err(cascadia_transport::TransportError::SocketClosed)
+        ));
+    }
+
+    /// Rank 0 before a task: an idle live link is kept; one whose peer
+    /// re-linked (EOF) or that was dropped is re-dialed.
+    #[tokio::test]
+    async fn rank0_redials_a_downstream_that_died_while_idle() {
+        let (mut worker, port) = listening().await;
+        let down = TokioMutex::new(ActivationClient::new("127.0.0.1", port));
+        down.lock().await.connect().await.unwrap();
+        worker.accept().await.unwrap();
+        assert!(!relink_idle_downstream(&down).await.unwrap());
+
+        worker.disconnect().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(relink_idle_downstream(&down).await.unwrap());
+        worker.accept().await.unwrap();
+        send_reset(&down).await.unwrap();
+        let kb = worker.recv_raw(4).await.unwrap();
+        assert_eq!(
+            u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+            FrameKind::Reset as u32
+        );
+
+        down.lock().await.close().await;
+        assert!(relink_idle_downstream(&down).await.unwrap());
+        assert!(down.lock().await.is_connected());
     }
 
     // -------- batched-prefill reply deadline (regression for the unbounded
