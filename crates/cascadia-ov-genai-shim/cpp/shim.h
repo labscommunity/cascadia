@@ -288,6 +288,13 @@ int32_t cascadia_runtime_compile_inspected(
     size_t properties_count,
     cascadia_runtime_t** out_handle);
 
+/// Bytes the GPU plugin currently holds for this handle's Core, summed over
+/// allocation types (ov::intel_gpu::memory_statistics). Fails off GPU.
+int32_t cascadia_runtime_gpu_memory_bytes(
+    cascadia_runtime_t* handle,
+    const char* device,
+    uint64_t* out_bytes);
+
 /// 1 when the model read by cascadia_runtime_compile_inspected contains an op
 /// of type `type_name` (e.g. "RandomUniform"), 0 when not, -1 on a null
 /// argument or a handle compiled another way.

@@ -1422,6 +1422,7 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
         manifest: LoadOptions {
             allow_identity_stats: args.allow_identity_stats,
         },
+        ..OvPolicyOptions::default()
     };
     let (engine, ms) =
         tokio::task::spawn_blocking(move || -> Result<(Box<dyn PolicyEngine>, Vec<u32>)> {

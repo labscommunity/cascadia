@@ -86,6 +86,15 @@ pub enum ServerResize {
     SmartResizeCubic { factor: u32, max_pixels: u32 },
 }
 
+/// The policy name rule: a non-empty key segment that starts with a letter or
+/// digit and holds only letters, digits, `.`, `_` or `-` (physicalai's
+/// `model_key_prefix` rule). A served model id and a Zenoh slot name both follow it.
+pub fn is_valid_policy_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+}
+
 /// What a loaded policy accepts and returns; served as `GET /v1/policy/metadata`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicySpec {
@@ -124,6 +133,16 @@ pub struct PolicySpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_names_are_key_segments() {
+        for ok in ["smolvla-libero", "pi0.5_droid", "A1"] {
+            assert!(is_valid_policy_name(ok), "{ok}");
+        }
+        for bad in ["", "-x", ".x", "a/b", "a b", "a:b", "é"] {
+            assert!(!is_valid_policy_name(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn spec_serializes_with_snake_case_enums() {

@@ -337,6 +337,26 @@ Limits, all checked before work is queued:
 | `resize` | the image step: `center` (`pi05`, `pi0`, `gr00t_image`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling; `stretch` (`vla_jepa_inputs`, `xr0`, `molmoact2`, `smolvla_resize` with `"resize": "stretch"`), no padding |
 | `device`, `model`, `prompt_max_bytes` | the server |
 
+`model` is the package directory name unless the embedder sets `OvPolicyOptions.model_id`; then
+it is that id, in both the HTTP and the socket metadata. The id must follow the same rule as a
+Zenoh slot name: it starts with a letter or digit and holds only letters, digits, `.`, `_` and `-`.
+Anything else is a load error.
+
+Two more load options and one reading, for a program that embeds the engine:
+
+- `OvPolicyOptions.cache_dir: Option<PathBuf>`. When set, the policy compile passes it to
+  OpenVINO as `CACHE_DIR`, so a restart loads the compiled model from the cache instead of
+  compiling again (SmolVLA on an Apple CPU: 9.9 s uncached, 3.3 s from the cache). The cache never
+  changes outputs: a test loads the package without a cache, then twice from one cache directory,
+  and checks that the CPU actions are bit-identical all three times. The tokenizer is not cached.
+- `OvPolicyEngine::gpu_memory_bytes() -> Option<u64>`. The GPU memory the compiled policy holds
+  now: OpenVINO's `GPU_MEMORY_STATISTICS` (`ov::intel_gpu::memory_statistics`), summed over the
+  allocation types. Each engine compiles in its own OpenVINO `Core`, so the figure counts only this
+  policy. Read it after `warmup` for the serving figure. It is `None` on CPU, when the plugin
+  cannot answer, and after `close`.
+
+NPU stays refused for every policy.
+
 `WS /v1/policy/ws` uses openpi's framing, so `openpi_client.WebsocketClientPolicy` can drive it:
 - **Connecting.** openpi uses `host` as the full URI when it starts with `ws`, so the client passes
   `host="ws://<box>:<port>/v1/policy/ws"` and `port=None` (a port argument would be appended after

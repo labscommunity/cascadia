@@ -233,6 +233,11 @@ mod sys {
             handle: *mut cascadia_runtime_t,
             type_name: *const c_char,
         ) -> c_int;
+        pub fn cascadia_runtime_gpu_memory_bytes(
+            handle: *mut cascadia_runtime_t,
+            device: *const c_char,
+            out_bytes: *mut u64,
+        ) -> c_int;
         pub fn cascadia_runtime_set_state_bool(
             handle: *mut cascadia_runtime_t,
             name: *const c_char,
@@ -1279,6 +1284,29 @@ impl Runtime {
                 return Err(Error::Native(last_native_error()));
             }
             Ok(Self { handle })
+        }
+    }
+
+    /// GPU memory this handle's model holds now: OpenVINO's
+    /// `GPU_MEMORY_STATISTICS` for `device` on the handle's own Core, summed over
+    /// allocation types. An error off GPU or where the plugin has no such property.
+    pub fn gpu_memory_bytes(&self, device: &str) -> Result<u64> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = device;
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        {
+            let dev = cstr(device)?;
+            let mut out = 0u64;
+            let rc = unsafe {
+                sys::cascadia_runtime_gpu_memory_bytes(self.handle, dev.as_ptr(), &mut out)
+            };
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(out)
         }
     }
 

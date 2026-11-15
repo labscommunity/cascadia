@@ -19,7 +19,8 @@ pub use error::Error;
 pub use load::LoadProgress;
 pub use peer::{PeerEndpoint, PeerLayout};
 pub use policy::{
-    ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention, ServerResize,
+    is_valid_policy_name, ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention,
+    ServerResize,
 };
 pub use shard::{ShardPlan, ShardSpec};
 pub use stats::ApiStats;

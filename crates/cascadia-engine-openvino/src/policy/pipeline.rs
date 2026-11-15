@@ -102,6 +102,11 @@ pub trait PolicyModel: Send {
     fn infer(&mut self) -> EngineResult<()>;
     /// An output by tensor name, as f32.
     fn output_f32(&mut self, name: &str) -> EngineResult<(Vec<usize>, Vec<f32>)>;
+    /// GPU memory the compiled model holds now; `None` off GPU or when the
+    /// device cannot say.
+    fn gpu_memory_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The package's tokenizer IR.
@@ -1741,6 +1746,11 @@ impl PolicyPipeline {
     pub fn set_identity(&mut self, manifest_sha256: String, precision: &str) {
         self.spec.manifest_sha256 = manifest_sha256;
         self.spec.precision = precision.to_string();
+    }
+
+    /// The model's [`PolicyModel::gpu_memory_bytes`]; `None` once closed.
+    pub fn gpu_memory_bytes(&self) -> Option<u64> {
+        self.model.as_ref()?.gpu_memory_bytes()
     }
 }
 

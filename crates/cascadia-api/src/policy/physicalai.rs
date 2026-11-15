@@ -100,9 +100,7 @@ fn refuse<T>(msg: impl Into<String>) -> Result<T, RequestError> {
 
 /// Whether `name` is a valid slot name: physicalai's `model_key_prefix` rule.
 pub fn check_name(name: &str) -> Result<(), RequestError> {
-    let mut chars = name.chars();
-    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
-    if first_ok && chars.all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)) {
+    if cascadia_types::is_valid_policy_name(name) {
         Ok(())
     } else {
         refuse("model_name must be a non-empty key segment containing only letters, digits, '.', '_' or '-'")

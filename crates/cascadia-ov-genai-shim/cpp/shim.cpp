@@ -24,6 +24,7 @@
 
 #include <openvino/openvino.hpp>
 #include <openvino/runtime/infer_request.hpp>
+#include <openvino/runtime/intel_gpu/properties.hpp>
 #include <openvino/runtime/variable_state.hpp>
 #include <openvino/genai/llm_pipeline.hpp>
 #include <openvino/genai/generation_config.hpp>
@@ -1027,6 +1028,26 @@ int32_t cascadia_runtime_compile_inspected(
         set_last_error(e); return 1;
     } catch (...) {
         set_last_error("unknown C++ exception in runtime_compile_inspected"); return 1;
+    }
+}
+
+int32_t cascadia_runtime_gpu_memory_bytes(
+    cascadia_runtime_t* handle, const char* device, uint64_t* out_bytes) {
+    if (!handle || !device || !out_bytes) {
+        set_last_error("null arg in runtime_gpu_memory_bytes"); return 1;
+    }
+    try {
+        // The handle owns its Core, so the GPU plugin's engine (and these
+        // counters) hold only what this handle's model allocated.
+        auto stats = handle->core.get_property(std::string(device), ov::intel_gpu::memory_statistics);
+        uint64_t total = 0;
+        for (const auto& kv : stats) total += kv.second;
+        *out_bytes = total;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_gpu_memory_bytes"); return 1;
     }
 }
 

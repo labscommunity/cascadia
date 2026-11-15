@@ -2,7 +2,7 @@
 //! IR follows the device; the tokenizer always runs on CPU, in its own
 //! runtime handle, because its string ops are CPU-only.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cascadia_engine::{EngineError, EngineResult, PolicyEngine};
 use cascadia_types::{ActionChunk, Observation, PolicySpec};
@@ -18,6 +18,13 @@ pub struct OvPolicyOptions {
     /// GPU compute precision; `None` keeps the device default (f16 on GPU).
     pub precision: Option<Precision>,
     pub manifest: LoadOptions,
+    /// `PolicySpec.model`, and so the metadata's `model`; `None` keeps the
+    /// package directory name. Must be a valid policy name
+    /// ([`cascadia_types::is_valid_policy_name`]).
+    pub model_id: Option<String>,
+    /// OpenVINO `CACHE_DIR` for the policy compile, so a restart loads the
+    /// compiled model from there. The cache never changes outputs.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for OvPolicyOptions {
@@ -26,6 +33,8 @@ impl Default for OvPolicyOptions {
             device: "GPU".into(),
             precision: None,
             manifest: LoadOptions::default(),
+            model_id: None,
+            cache_dir: None,
         }
     }
 }
@@ -35,6 +44,14 @@ pub struct OvPolicyEngine {
 }
 
 impl OvPolicyEngine {
+    /// GPU memory the compiled policy holds now, from OpenVINO's
+    /// `GPU_MEMORY_STATISTICS` for this engine's own runtime. Read it after
+    /// [`PolicyEngine::warmup`] for the serving figure. `None` off GPU, when
+    /// the plugin cannot say, or after `close`.
+    pub fn gpu_memory_bytes(&self) -> Option<u64> {
+        self.pipeline.gpu_memory_bytes()
+    }
+
     /// Load, compile and check a package directory. Nothing is served from a
     /// package whose manifest, ports or tokenizer disagree.
     #[cfg(not(feature = "openvino"))]
@@ -56,8 +73,12 @@ impl OvPolicyEngine {
         use cascadia_ov_genai_shim::Runtime;
         use sha2::Digest;
 
+        let model = served_model(dir, opts.model_id.as_deref())?;
         let manifest = PolicyManifest::load(dir, opts.manifest)?;
-        let (device, config) = compile_config(&opts.device, opts.precision)?;
+        let (device, mut config) = compile_config(&opts.device, opts.precision)?;
+        if let Some(cache) = &opts.cache_dir {
+            config = config.with("CACHE_DIR", utf8(cache)?);
+        }
         // Before the compile, which for MolmoAct2 on CPU takes about 20 GB.
         super::pipeline::refuse_known_bad_device(manifest.policy, &device, std::env::consts::ARCH)?;
         let xml = dir.join(&manifest.model_artifact);
@@ -73,10 +94,6 @@ impl OvPolicyEngine {
             .map_err(map_ov_err)?;
         let has_random_uniform = rt.has_op_type(RANDOM_UNIFORM).map_err(map_ov_err)?;
         let tokenizer = native::OvTokenizer::load(&dir.join(manifest.tokenizer_artifact()))?;
-        let model = dir.file_name().map_or_else(
-            || dir.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
         let manifest_bytes = std::fs::read(dir.join("manifest.json"))
             .map_err(|e| EngineError::InvalidConfig(format!("read manifest.json: {e}")))?;
         let manifest_sha256 = sha2::Sha256::digest(&manifest_bytes)
@@ -88,12 +105,13 @@ impl OvPolicyEngine {
             manifest,
             ServerFacts {
                 model,
-                device,
+                device: device.clone(),
                 prompt_max_bytes: PROMPT_MAX_BYTES,
             },
             Box::new(native::OvModel {
                 rt,
                 outputs: outputs.clone(),
+                device,
             }),
             &inputs,
             &outputs,
@@ -120,6 +138,23 @@ impl PolicyEngine for OvPolicyEngine {
 
     fn close(&mut self) {
         self.pipeline.close();
+    }
+}
+
+/// `PolicySpec.model`: `model_id` when given (refused unless a valid policy
+/// name), else the package directory name.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+fn served_model(dir: &Path, model_id: Option<&str>) -> EngineResult<String> {
+    match model_id {
+        Some(id) if cascadia_types::is_valid_policy_name(id) => Ok(id.to_string()),
+        Some(id) => Err(EngineError::InvalidConfig(format!(
+            "policy model id {id:?} is not valid: it must start with a letter or digit and \
+             contain only letters, digits, '.', '_' or '-'"
+        ))),
+        None => Ok(dir.file_name().map_or_else(
+            || dir.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )),
     }
 }
 
@@ -169,6 +204,18 @@ pub use native::OvTokenizer;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_served_model_is_the_model_id_else_the_directory_name() {
+        let dir = Path::new("models/smolvla-libero");
+        assert_eq!(served_model(dir, None).unwrap(), "smolvla-libero");
+        assert_eq!(served_model(dir, Some("arm-1.v2")).unwrap(), "arm-1.v2");
+        for bad in ["", "a/b", "a b", ".x", "a\\b"] {
+            let e = served_model(dir, Some(bad)).unwrap_err();
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{bad:?}");
+            assert!(e.to_string().contains("model id"), "{e}");
+        }
+    }
 
     #[test]
     fn a_compile_failure_is_a_load_error_with_a_gpu_f32_hint() {
@@ -223,6 +270,8 @@ mod native {
     pub struct OvModel {
         pub rt: Runtime,
         pub outputs: Vec<PortInfo>,
+        /// The compile device, as `compile_config` normalised it.
+        pub device: String,
     }
 
     impl PolicyModel for OvModel {
@@ -234,6 +283,13 @@ mod native {
 
         fn infer(&mut self) -> EngineResult<()> {
             self.rt.infer().map_err(map_ov_err)
+        }
+
+        fn gpu_memory_bytes(&self) -> Option<u64> {
+            if !self.device.starts_with("GPU") {
+                return None;
+            }
+            self.rt.gpu_memory_bytes(&self.device).ok()
         }
 
         fn output_f32(&mut self, name: &str) -> EngineResult<(Vec<usize>, Vec<f32>)> {

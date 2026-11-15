@@ -358,6 +358,124 @@ fn smolvla_cpu_infer_with_fixed_noise_matches_the_reference() {
     }
 }
 
+#[test]
+fn smolvla_model_id_replaces_the_directory_name() {
+    let Some(dir) = package("smolvla_model_id_replaces_the_directory_name") else {
+        return;
+    };
+    let dir_name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    let engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    assert_eq!(engine.spec().model, dir_name);
+    let opts = OvPolicyOptions {
+        model_id: Some("smolvla-libero.v1".into()),
+        ..cpu()
+    };
+    let engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+    assert_eq!(engine.spec().model, "smolvla-libero.v1");
+    let json = serde_json::to_value(engine.spec()).unwrap();
+    assert_eq!(json["model"], "smolvla-libero.v1");
+    for bad in ["", "a/b", "a b", "-x"] {
+        let opts = OvPolicyOptions {
+            model_id: Some(bad.into()),
+            ..cpu()
+        };
+        let e = OvPolicyEngine::load(&dir, &opts).err().expect(bad);
+        assert!(matches!(e, EngineError::InvalidConfig(_)), "{bad:?}: {e}");
+        assert!(e.to_string().contains("model id"), "{e}");
+    }
+}
+
+/// A second load from the same `cache_dir` compiles from the cache and must
+/// give the same bits as an uncached load.
+#[test]
+fn smolvla_cpu_cache_dir_gives_bit_identical_actions() {
+    let Some(dir) = package("smolvla_cpu_cache_dir_gives_bit_identical_actions") else {
+        return;
+    };
+    let cache = tempfile::tempdir().unwrap();
+    let cached = OvPolicyOptions {
+        cache_dir: Some(cache.path().to_path_buf()),
+        ..cpu()
+    };
+    let run = |opts: &OvPolicyOptions| {
+        let started = std::time::Instant::now();
+        let mut engine = OvPolicyEngine::load(&dir, opts).unwrap();
+        let load_ms = started.elapsed().as_millis();
+        let obs = observation(&engine, PICK_BOWL);
+        let bits: Vec<u32> = engine
+            .infer(&obs)
+            .unwrap()
+            .actions
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        (bits, load_ms)
+    };
+    let (plain, plain_ms) = run(&cpu());
+    let (cold, cold_ms) = run(&cached);
+    let blobs = std::fs::read_dir(cache.path()).unwrap().count();
+    assert!(
+        blobs > 0,
+        "the first cached load wrote nothing to the cache"
+    );
+    let (warm, warm_ms) = run(&cached);
+    eprintln!("load ms: uncached {plain_ms}, cold cache {cold_ms}, warm cache {warm_ms}; {blobs} cache files");
+    assert_eq!(cold, plain, "a cold cache changed the actions");
+    assert_eq!(warm, plain, "a load from the cache changed the actions");
+}
+
+#[test]
+fn smolvla_gpu_memory_bytes_is_none_on_cpu() {
+    let Some(dir) = package("smolvla_gpu_memory_bytes_is_none_on_cpu") else {
+        return;
+    };
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    engine.warmup().unwrap();
+    assert_eq!(engine.gpu_memory_bytes(), None);
+}
+
+/// The measured GPU claim, next to the package's weight file. Needs an Intel
+/// GPU and `CASCADIA_POLICY_GPU=1`.
+#[test]
+fn smolvla_gpu_memory_bytes_is_measured_on_gpu() {
+    let Some(dir) = package("smolvla_gpu_memory_bytes_is_measured_on_gpu") else {
+        return;
+    };
+    if !gpu_enabled("smolvla_gpu_memory_bytes_is_measured_on_gpu") {
+        return;
+    }
+    let bin: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "bin") && !p.ends_with("tokenizer.bin"))
+        .map(|p| std::fs::metadata(p).unwrap().len())
+        .sum();
+    for (precision, label) in [(None, "f16"), (Some(Precision::F32), "f32")] {
+        let opts = OvPolicyOptions {
+            device: "GPU".into(),
+            precision,
+            ..OvPolicyOptions::default()
+        };
+        let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+        let loaded = engine
+            .gpu_memory_bytes()
+            .expect("a GPU load reports its memory");
+        engine.warmup().unwrap();
+        let warm = engine
+            .gpu_memory_bytes()
+            .expect("a GPU load reports its memory");
+        eprintln!(
+            "gpu {label} memory: {loaded} bytes after load, {warm} after warmup; policy weights {bin} bytes"
+        );
+        assert!(
+            warm >= bin / 2,
+            "{warm} bytes is less than half the {bin}-byte weights"
+        );
+        engine.close();
+        assert_eq!(engine.gpu_memory_bytes(), None);
+    }
+}
+
 /// Needs an Intel GPU, so it also waits for `CASCADIA_POLICY_GPU=1`. The
 /// boolean mask ports are not reachable from here; `bind_ports` refuses a
 /// non-Bool one at load, so a GPU load passing covers them.
