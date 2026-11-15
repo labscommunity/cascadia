@@ -23,7 +23,7 @@ pub mod kv_handoff;
 pub mod policy;
 #[cfg(feature = "kv_coord")]
 pub use kv_handoff::{KvHandoffMailbox, KvHandoffSlot};
-pub use policy::{check_observation, MockPolicyEngine, PolicyEngine};
+pub use policy::{check_observation, MockPolicyEngine, PolicyEngine, WARMUP_CALLS};
 
 #[derive(Debug, Error)]
 pub enum EngineError {

@@ -12,12 +12,22 @@ use crate::{EngineError, EngineResult};
 /// Bound on `|noise|` a caller may send; `N(0,1)` never gets near it.
 pub const NOISE_ABS_MAX: f32 = 10.0;
 
+/// Calls [`PolicyEngine::warmup`] makes; the first compiles kernels, the rest
+/// show the steady-state time.
+pub const WARMUP_CALLS: usize = 3;
+
 /// A loaded robot policy. Held behind a mutex by the server, so it must be `Send`.
 pub trait PolicyEngine: Send {
     fn spec(&self) -> &PolicySpec;
 
-    /// One call on synthetic inputs to compile kernels and warm device caches.
-    fn warmup(&mut self);
+    /// [`WARMUP_CALLS`] calls on synthetic inputs to compile kernels and warm
+    /// device caches.
+    ///
+    /// Returns each call's time in whole milliseconds, rounded up (the
+    /// [`ActionChunk::infer_ms`] measurement), so a caller can size a deadline
+    /// from the slowest. Any failed call fails the warmup: a package that
+    /// cannot infer must fail its load rather than serve errors.
+    fn warmup(&mut self) -> EngineResult<Vec<u32>>;
 
     fn infer(&mut self, obs: &Observation) -> EngineResult<ActionChunk>;
 
@@ -115,6 +125,7 @@ pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<(
 pub struct MockPolicyEngine {
     spec: PolicySpec,
     warmed: bool,
+    warmup_ms: Vec<u32>,
     calls: u64,
     closed: bool,
 }
@@ -124,9 +135,16 @@ impl MockPolicyEngine {
         Self {
             spec,
             warmed: false,
+            warmup_ms: vec![0; WARMUP_CALLS],
             calls: 0,
             closed: false,
         }
+    }
+
+    /// Timings `warmup` returns; [`WARMUP_CALLS`] zeros by default.
+    pub fn with_warmup_ms(mut self, ms: Vec<u32>) -> Self {
+        self.warmup_ms = ms;
+        self
     }
 
     pub fn warmed(&self) -> bool {
@@ -144,8 +162,9 @@ impl PolicyEngine for MockPolicyEngine {
         &self.spec
     }
 
-    fn warmup(&mut self) {
+    fn warmup(&mut self) -> EngineResult<Vec<u32>> {
         self.warmed = true;
+        Ok(self.warmup_ms.clone())
     }
 
     fn infer(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
@@ -284,7 +303,7 @@ mod tests {
     #[test]
     fn mock_is_deterministic_and_uses_noise() {
         let mut e = MockPolicyEngine::new(spec(NoiseMode::Input));
-        e.warmup();
+        assert_eq!(e.warmup().unwrap(), vec![0; WARMUP_CALLS]);
         assert!(e.warmed());
         let a = e.infer(&obs()).unwrap();
         assert_eq!((a.steps, a.dim), (2, 3));
@@ -301,6 +320,12 @@ mod tests {
         assert_eq!(e.calls(), 3);
         e.close();
         assert!(matches!(e.infer(&obs()), Err(EngineError::NotLoaded)));
+    }
+
+    #[test]
+    fn mock_returns_its_warmup_timings() {
+        let mut e = MockPolicyEngine::new(spec(NoiseMode::Constant)).with_warmup_ms(vec![40, 9, 8]);
+        assert_eq!(e.warmup().unwrap(), vec![40, 9, 8]);
     }
 
     #[test]

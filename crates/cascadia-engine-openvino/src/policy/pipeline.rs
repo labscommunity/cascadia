@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use cascadia_engine::{check_observation, EngineError, EngineResult, PolicyEngine};
+use cascadia_engine::{check_observation, EngineError, EngineResult, PolicyEngine, WARMUP_CALLS};
 use cascadia_ov_genai_shim::{DType, PluginConfig, PortInfo};
 use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec};
 
@@ -603,7 +603,7 @@ impl PolicyEngine for PolicyPipeline {
         &self.spec
     }
 
-    fn warmup(&mut self) {
+    fn warmup(&mut self) -> EngineResult<Vec<u32>> {
         let frame = Image {
             height: self.spec.height,
             width: self.spec.width,
@@ -621,9 +621,9 @@ impl PolicyEngine for PolicyPipeline {
             seed: Some(0),
             noise: None,
         };
-        if let Err(e) = self.run(&obs) {
-            tracing::warn!(error = %e, "policy warmup failed");
-        }
+        (0..WARMUP_CALLS)
+            .map(|_| Ok(self.run(&obs)?.infer_ms.ceil() as u32))
+            .collect()
     }
 
     fn infer(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
@@ -651,6 +651,7 @@ mod tests {
     struct Log {
         inputs: Vec<(String, HostTensor)>,
         infers: usize,
+        fail_infer: bool,
         texts: Vec<String>,
     }
 
@@ -669,7 +670,11 @@ mod tests {
             Ok(())
         }
         fn infer(&mut self) -> EngineResult<()> {
-            self.log.lock().unwrap().infers += 1;
+            let mut log = self.log.lock().unwrap();
+            log.infers += 1;
+            if log.fail_infer {
+                return Err(EngineError::Backend("fake infer failed".into()));
+            }
             Ok(())
         }
         fn output_f32(&mut self, name: &str) -> EngineResult<(Vec<usize>, Vec<f32>)> {
@@ -1078,14 +1083,28 @@ mod tests {
             .to_string()
             .contains("missing camera"));
         assert_eq!(r.log.lock().unwrap().infers, 0);
-        r.engine.warmup();
-        assert_eq!(r.log.lock().unwrap().infers, 1);
+        let ms = r.engine.warmup().unwrap();
+        assert_eq!(ms.len(), WARMUP_CALLS);
+        assert_eq!(r.log.lock().unwrap().infers, WARMUP_CALLS);
         r.engine.close();
         r.engine.close();
         assert!(matches!(
             r.engine.infer(&obs(&spec, "go")),
             Err(EngineError::NotLoaded)
         ));
+    }
+
+    #[test]
+    fn warmup_fails_when_a_call_fails() {
+        let mut r = smolvla(true);
+        r.log.lock().unwrap().fail_infer = true;
+        let e = r.engine.warmup().unwrap_err();
+        assert!(e.to_string().contains("fake infer failed"), "{e}");
+        assert_eq!(
+            r.log.lock().unwrap().infers,
+            1,
+            "stops at the first failure"
+        );
     }
 
     #[test]

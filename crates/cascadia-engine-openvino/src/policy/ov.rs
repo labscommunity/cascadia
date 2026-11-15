@@ -99,8 +99,8 @@ impl PolicyEngine for OvPolicyEngine {
         self.pipeline.spec()
     }
 
-    fn warmup(&mut self) {
-        self.pipeline.warmup();
+    fn warmup(&mut self) -> EngineResult<Vec<u32>> {
+        self.pipeline.warmup()
     }
 
     fn infer(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {

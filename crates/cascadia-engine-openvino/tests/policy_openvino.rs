@@ -119,7 +119,9 @@ fn smolvla_cpu_infer_with_fixed_noise_matches_the_reference() {
         return;
     };
     let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
-    engine.warmup();
+    let warm = engine.warmup().unwrap();
+    assert_eq!(warm.len(), 3);
+    eprintln!("warmup ms {warm:?}");
     let obs = observation(&engine, "pick up the black bowl and place it on the plate");
     let a = engine.infer(&obs).unwrap();
     assert_eq!((a.steps, a.dim, a.actions.len()), (1, 7, 7));
