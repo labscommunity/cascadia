@@ -59,7 +59,7 @@ impl OvPolicyEngine {
         let (device, config) = compile_config(&opts.device, opts.precision)?;
         let xml = dir.join(&manifest.model_artifact);
         let rt = Runtime::compile_inspected(utf8(&xml)?, &device, None, &config)
-            .map_err(|e| context(&xml, map_ov_err(e)))?;
+            .map_err(|e| compile_failed(&xml, &device, opts.precision, map_ov_err(e)))?;
         let inputs = (0..rt.input_count())
             .map(|i| rt.input_port(i))
             .collect::<Result<Vec<_>, _>>()
@@ -118,6 +118,32 @@ fn utf8(p: &Path) -> EngineResult<&str> {
         .ok_or_else(|| EngineError::InvalidConfig(format!("path is not UTF-8: {}", p.display())))
 }
 
+/// A failed policy compile as a load error; on the GPU at f32 it says that
+/// f32 needs about twice the device memory of the f16 default.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+fn compile_failed(
+    xml: &Path,
+    device: &str,
+    precision: Option<Precision>,
+    e: EngineError,
+) -> EngineError {
+    match e {
+        EngineError::Backend(m) => {
+            let hint = if device.starts_with("GPU") && precision == Some(Precision::F32) {
+                "; --precision f32 needs about twice the GPU memory of the f16 default, \
+                 which may not fit an integrated GPU: try without --precision f32"
+            } else {
+                ""
+            };
+            EngineError::Backend(format!(
+                "compiling {} on {device} failed: {m}{hint}",
+                xml.display()
+            ))
+        }
+        other => other,
+    }
+}
+
 #[cfg(feature = "openvino")]
 fn context(path: &Path, e: EngineError) -> EngineError {
     match e {
@@ -128,6 +154,36 @@ fn context(path: &Path, e: EngineError) -> EngineError {
 
 #[cfg(feature = "openvino")]
 pub use native::OvTokenizer;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_compile_failure_is_a_load_error_with_a_gpu_f32_hint() {
+        let xml = Path::new("pkg/pi0.xml");
+        let e = || EngineError::Backend("[GPU] ProgramBuilder build failed!".into());
+        let m = compile_failed(xml, "GPU", Some(Precision::F32), e()).to_string();
+        assert!(
+            m.contains("compiling pkg/pi0.xml on GPU failed: [GPU] ProgramBuilder"),
+            "{m}"
+        );
+        assert!(m.contains("try without --precision f32"), "{m}");
+        for (device, precision) in [
+            ("GPU", None),
+            ("CPU", None),
+            ("GPU.1", Some(Precision::F16)),
+        ] {
+            let m = compile_failed(xml, device, precision, e()).to_string();
+            assert!(m.contains(&format!("on {device} failed")), "{m}");
+            assert!(!m.contains("--precision"), "{m}");
+        }
+        assert!(matches!(
+            compile_failed(xml, "GPU", None, EngineError::InvalidConfig("x".into())),
+            EngineError::InvalidConfig(_)
+        ));
+    }
+}
 
 #[cfg(feature = "openvino")]
 mod native {

@@ -17,6 +17,7 @@ pub const FORMAT: &str = "policy_package";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyKind {
     Pi05,
+    Pi0,
     SmolVla,
 }
 
@@ -76,10 +77,16 @@ pub struct SmolVlaResizeStep {
 pub enum PreStep {
     Normalize(StatsStep),
     Pi05(Pi05Step),
+    /// π0: π0.5's image handling; the prompt stays the task (no state bins).
+    Pi0(Pi05Step),
     SmolVlaResize(SmolVlaResizeStep),
     NewLine,
-    Noise { shape: Vec<usize> },
-    OvTokenizer { artifact: String },
+    Noise {
+        shape: Vec<usize>,
+    },
+    OvTokenizer {
+        artifact: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +98,7 @@ pub enum PostStep {
 /// The step that turns frames into the `images` tensor.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ImageStep<'a> {
+    /// `pi05` or `pi0`: centre padding, `empty_cameras` dummy slots.
     Pi05(&'a Pi05Step),
     SmolVlaResize(&'a SmolVlaResizeStep),
 }
@@ -222,7 +230,7 @@ impl PolicyManifest {
         self.preprocessors
             .iter()
             .find_map(|s| match s {
-                PreStep::Pi05(p) => Some(ImageStep::Pi05(p)),
+                PreStep::Pi05(p) | PreStep::Pi0(p) => Some(ImageStep::Pi05(p)),
                 PreStep::SmolVlaResize(p) => Some(ImageStep::SmolVlaResize(p)),
                 _ => None,
             })
@@ -262,10 +270,15 @@ impl PolicyManifest {
 
     fn check_pipeline(&self) -> EngineResult<()> {
         let count = |f: fn(&PreStep) -> bool| self.preprocessors.iter().filter(|s| f(s)).count();
-        let images = count(|s| matches!(s, PreStep::Pi05(_) | PreStep::SmolVlaResize(_)));
+        let images = count(|s| {
+            matches!(
+                s,
+                PreStep::Pi05(_) | PreStep::Pi0(_) | PreStep::SmolVlaResize(_)
+            )
+        });
         if images != 1 {
             return refuse(format!(
-                "{images} image steps (pi05 / smolvla_resize); expected exactly one"
+                "{images} image steps (pi05 / pi0 / smolvla_resize); expected exactly one"
             ));
         }
         let tokenizers = count(|s| matches!(s, PreStep::OvTokenizer { .. }));
@@ -358,26 +371,35 @@ pub fn confine_artifact(path: &str) -> EngineResult<String> {
 fn policy_kind(policy: Option<&Value>) -> EngineResult<PolicyKind> {
     match policy.and_then(|p| p.get("name")).and_then(Value::as_str) {
         Some("pi05") => Ok(PolicyKind::Pi05),
+        Some("pi0") => Ok(PolicyKind::Pi0),
         Some("smolvla") => Ok(PolicyKind::SmolVla),
-        other => refuse(format!("policy.name {other:?}; supported: pi05, smolvla")),
+        other => refuse(format!(
+            "policy.name {other:?}; supported: pi05, pi0, smolvla"
+        )),
     }
 }
 
-/// Intel's class names for the components this engine implements, by short name.
-const COMPONENTS: &[(&str, &str)] = &[
-    ("single_pass", "SinglePass"),
-    ("normalize", "StatsNormalizer"),
-    ("pi05", "Pi05Preprocessor"),
-    ("smolvla_resize", "ResizeSmolVLA"),
-    ("new_line", "NewLinePreprocessor"),
-    ("noise", "NoisePreprocessor"),
-    ("ov_tokenizer", "OVTokenizer"),
-    ("denormalize", "StatsDenormalizer"),
-    ("action_chunk_trimmer", "ActionChunkTrimmer"),
+/// Intel's class names for the components this engine implements, by short
+/// name. `None`: a step of ours with no Intel class, accepted in the `type`
+/// form only, so an Intel class of another meaning never maps to it.
+const COMPONENTS: &[(&str, Option<&str>)] = &[
+    ("single_pass", Some("SinglePass")),
+    ("normalize", Some("StatsNormalizer")),
+    ("pi05", Some("Pi05Preprocessor")),
+    ("pi0", None),
+    ("smolvla_resize", Some("ResizeSmolVLA")),
+    ("new_line", Some("NewLinePreprocessor")),
+    ("noise", Some("NoisePreprocessor")),
+    ("ov_tokenizer", Some("OVTokenizer")),
+    ("denormalize", Some("StatsDenormalizer")),
+    ("action_chunk_trimmer", Some("ActionChunkTrimmer")),
 ];
 
 fn short_name(class_path: &str) -> Option<&'static str> {
-    if let Some((short, _)) = COMPONENTS.iter().find(|(s, _)| *s == class_path) {
+    if let Some((short, _)) = COMPONENTS
+        .iter()
+        .find(|(s, c)| c.is_some() && *s == class_path)
+    {
         return Some(short);
     }
     // Manifests use both the package re-export (`...preprocessors.StatsNormalizer`)
@@ -388,7 +410,7 @@ fn short_name(class_path: &str) -> Option<&'static str> {
         .next()?;
     COMPONENTS
         .iter()
-        .find(|(_, c)| *c == class)
+        .find(|(_, c)| *c == Some(class))
         .map(|(s, _)| *s)
 }
 
@@ -531,19 +553,8 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
     let ctx = format!("{ctx}: {name}");
     Ok(match name {
         "normalize" => PreStep::Normalize(stats_step(params, &ctx, "state")?),
-        "pi05" => {
-            let p: Pi05Params = typed(params, &ctx)?;
-            if p.empty_cameras < 0 {
-                return refuse(format!("{ctx}: empty_cameras is negative"));
-            }
-            check_resolution(p.image_resolution, &ctx)?;
-            check_shape(p.noise_shape.as_deref(), &ctx)?;
-            PreStep::Pi05(Pi05Step {
-                image_resolution: p.image_resolution,
-                empty_cameras: p.empty_cameras as usize,
-                noise_shape: p.noise_shape,
-            })
-        }
+        "pi05" => PreStep::Pi05(pi05_step(params, &ctx)?),
+        "pi0" => PreStep::Pi0(pi05_step(params, &ctx)?),
         "smolvla_resize" => {
             let p: SmolVlaParams = typed(params, &ctx)?;
             check_resolution(p.image_resolution, &ctx)?;
@@ -583,6 +594,20 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
             }
         }
         other => return refuse(format!("{ctx}: {other} is not a preprocessor")),
+    })
+}
+
+fn pi05_step(params: Map<String, Value>, ctx: &str) -> EngineResult<Pi05Step> {
+    let p: Pi05Params = typed(params, ctx)?;
+    if p.empty_cameras < 0 {
+        return refuse(format!("{ctx}: empty_cameras is negative"));
+    }
+    check_resolution(p.image_resolution, ctx)?;
+    check_shape(p.noise_shape.as_deref(), ctx)?;
+    Ok(Pi05Step {
+        image_resolution: p.image_resolution,
+        empty_cameras: p.empty_cameras as usize,
+        noise_shape: p.noise_shape,
     })
 }
 
@@ -755,6 +780,7 @@ mod tests {
         include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
     const DROID: &str =
         include_str!("../../tests/fixtures/policy/pi05-droid-placeholder-manifest.json");
+    const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
 
     fn parse(v: &Value) -> EngineResult<PolicyManifest> {
         PolicyManifest::parse(&v.to_string(), LoadOptions::default())
@@ -841,6 +867,59 @@ mod tests {
         assert_eq!(s.num_cameras, 0);
         let noise = m.input_features.iter().find(|f| f.name == "noise").unwrap();
         assert_eq!(noise.ftype, FeatureType::Common);
+    }
+
+    #[test]
+    fn pi0_libero_manifest_parses() {
+        let m = PolicyManifest::parse(PI0_LIBERO, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::Pi0);
+        assert_eq!(m.model_artifact, "pi0.xml");
+        assert_eq!(m.n_action_steps(), None);
+        let ImageStep::Pi05(p) = m.image_step() else {
+            panic!("pi0 uses the pi05 image handling")
+        };
+        assert_eq!(
+            (p.image_resolution, p.empty_cameras, p.noise_shape.as_ref()),
+            (Some([224, 224]), 1, None)
+        );
+        assert!(matches!(m.preprocessors[1], PreStep::Pi0(_)));
+        assert!(m.preprocessors.contains(&PreStep::NewLine));
+        assert_eq!(m.output_features[0].shape, vec![50, 7]);
+    }
+
+    #[test]
+    fn pi0_step_takes_the_pi05_params_and_counts_as_the_image_step() {
+        let mut v = base();
+        v["policy"] = json!({"name": "pi0"});
+        v["model"]["preprocessors"][1] = json!({"type": "pi0", "image_resolution": [224, 224],
+                                                "empty_cameras": 2, "noise_shape": [50, 32]});
+        let m = parse(&v).unwrap();
+        assert_eq!(
+            m.preprocessors[1],
+            PreStep::Pi0(Pi05Step {
+                image_resolution: Some([224, 224]),
+                empty_cameras: 2,
+                noise_shape: Some(vec![50, 32]),
+            })
+        );
+        v["model"]["preprocessors"][1]["empty_cameras"] = json!(-1);
+        assert!(err(&v).contains("pi0: empty_cameras is negative"));
+        v["model"]["preprocessors"][1] = json!({"type": "pi0", "state_bins": true});
+        assert!(err(&v).contains("unknown field `state_bins`"));
+        // A pi0 next to a pi05 is two image steps.
+        let mut v = base();
+        v["model"]["preprocessors"]
+            .as_array_mut()
+            .unwrap()
+            .insert(2, json!({"type": "pi0"}));
+        assert!(err(&v).contains("2 image steps"));
+        // Ours, not Intel's: no class_path maps to it.
+        let mut v = base();
+        v["model"]["preprocessors"][1] =
+            json!({"class_path": "physicalai.inference.preprocessors.Pi0Preprocessor"});
+        assert!(err(&v).contains("unsupported component class_path"));
+        v["model"]["preprocessors"][1] = json!({"class_path": "pi0"});
+        assert!(err(&v).contains("unsupported component class_path"));
     }
 
     #[test]
@@ -986,8 +1065,8 @@ mod tests {
         v["model"].as_object_mut().unwrap().remove("runner");
         parse(&v).unwrap();
         let mut v = base();
-        v["policy"] = json!({"name": "pi0"});
-        assert!(err(&v).contains("policy.name Some(\"pi0\")"));
+        v["policy"] = json!({"name": "pi0_fast"});
+        assert!(err(&v).contains("policy.name Some(\"pi0_fast\")"));
         let mut v = base();
         v["policy"] =
             json!({"source": {"class_path": "physicalai.policies.smolvla.policy.SmolVLA"}});

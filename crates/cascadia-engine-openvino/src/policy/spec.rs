@@ -38,7 +38,7 @@ pub struct ManifestSpec {
     pub image_hw: Option<[u32; 2]>,
     pub resize: ResizeConvention,
     pub n_action_steps: Option<usize>,
-    /// The noise the manifest draws (`noise.shape` or `pi05.noise_shape`), batch excluded.
+    /// The noise the manifest draws (`noise.shape` or `pi05`/`pi0` `noise_shape`), batch excluded.
     pub noise_shape: Option<Vec<usize>>,
 }
 
@@ -56,7 +56,7 @@ impl ManifestSpec {
         for step in &m.preprocessors {
             let shape = match step {
                 PreStep::Noise { shape } => shape,
-                PreStep::Pi05(p) => match &p.noise_shape {
+                PreStep::Pi05(p) | PreStep::Pi0(p) => match &p.noise_shape {
                     Some(s) => s,
                     None => continue,
                 },
@@ -176,6 +176,8 @@ mod tests {
     const SMOLVLA_NOISE: &str =
         include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
 
+    const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
+
     fn server() -> ServerFacts {
         ServerFacts {
             model: "pkg".into(),
@@ -210,6 +212,23 @@ mod tests {
         assert_eq!(spec.resize, ResizeConvention::Center);
         assert_eq!((spec.model.as_str(), spec.device.as_str()), ("pkg", "GPU"));
         assert_eq!(layout.slots, vec![Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn pi0_libero_spec() {
+        let m = PolicyManifest::parse(PI0_LIBERO, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![50, 32]),
+            ..pi05_ir()
+        };
+        let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1), None]);
+        assert_eq!((spec.height, spec.width), (224, 224));
+        assert_eq!(spec.chunk, [50, 7]);
+        assert_eq!(spec.resize, ResizeConvention::Center);
+        assert_eq!(spec.noise_shape, Some(vec![50, 32]));
     }
 
     #[test]

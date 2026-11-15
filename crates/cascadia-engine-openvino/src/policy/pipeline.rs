@@ -364,7 +364,7 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
                 text = pi05_prompt(&text, &bins);
             }
             PreStep::OvTokenizer { .. } => break,
-            PreStep::SmolVlaResize(_) | PreStep::Noise { .. } => {}
+            PreStep::Pi0(_) | PreStep::SmolVlaResize(_) | PreStep::Noise { .. } => {}
         }
     }
     Ok(text)
@@ -400,9 +400,9 @@ impl PolicyPipeline {
             .expect("parse guarantees one ov_tokenizer");
         if manifest.preprocessors[tok_at..]
             .iter()
-            .any(|s| matches!(s, PreStep::NewLine | PreStep::Pi05(_)))
+            .any(|s| matches!(s, PreStep::NewLine | PreStep::Pi05(_) | PreStep::Pi0(_)))
         {
-            return refuse("a text step (new_line / pi05) comes after ov_tokenizer");
+            return refuse("a prompt step (new_line / pi05 / pi0) comes after ov_tokenizer");
         }
         let (binding, ir) = bind_ports(inputs, outputs, has_random_uniform)?;
         // Otherwise a tokenizer padded for another port loads and every infer fails.
@@ -646,6 +646,7 @@ mod tests {
         include_str!("../../tests/fixtures/policy/intel-pi05-libero-manifest.json");
     const SMOLVLA_NOISE: &str =
         include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
+    const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
 
     #[derive(Default)]
     struct Log {
@@ -745,6 +746,21 @@ mod tests {
         )
     }
 
+    /// The real ports of our pi0_libero export.
+    fn pi0_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+        (
+            vec![
+                port(STATE, DType::F32, &[1, 8]),
+                port(NOISE, DType::F32, &[1, 50, 32]),
+                port(PROMPT, DType::I64, &[1, 48]),
+                port(PROMPT_MASK, DType::Bool, &[1, 48]),
+                port(IMAGES, DType::F32, &[3, 1, 3, 224, 224]),
+                port(IMAGE_MASKS, DType::Bool, &[3, 1]),
+            ],
+            vec![port(ACTION, DType::F32, &[1, 50, 7])],
+        )
+    }
+
     fn server(device: &str) -> ServerFacts {
         ServerFacts {
             model: "pkg".into(),
@@ -759,12 +775,42 @@ mod tests {
     }
 
     fn rig(manifest: &str, pi05: bool, truncation_state: bool, output: Vec<f32>) -> Rig {
+        let ports = if pi05 { pi05_ports() } else { smolvla_ports() };
+        rig_with(manifest, ports, pi05, truncation_state, output)
+    }
+
+    /// A rig on any ports; the fake model returns `output` in the action port's shape.
+    fn rig_with(
+        manifest: &str,
+        (inputs, outputs): (Vec<PortInfo>, Vec<PortInfo>),
+        has_random_uniform: bool,
+        truncation_state: bool,
+        output: Vec<f32>,
+    ) -> Rig {
         let log = Arc::new(Mutex::new(Log::default()));
-        let port_len = if pi05 { 64 } else { 48 };
-        let engine = pipeline(manifest, pi05, truncation_state, port_len, &log, output).unwrap();
+        let port_len = port_dims(&inputs, PROMPT)[1];
+        let engine = pipeline_with(
+            manifest,
+            (&inputs, &outputs),
+            has_random_uniform,
+            truncation_state,
+            port_len,
+            &log,
+            output,
+        )
+        .unwrap();
         // Drop the load-time width probe so tests see only infer texts.
         log.lock().unwrap().texts.clear();
         Rig { engine, log }
+    }
+
+    fn port_dims(ports: &[PortInfo], name: &str) -> Vec<usize> {
+        super::port(ports, name)
+            .unwrap()
+            .dims
+            .iter()
+            .map(|d| d.unwrap())
+            .collect()
     }
 
     fn pipeline(
@@ -776,17 +822,37 @@ mod tests {
         output: Vec<f32>,
     ) -> EngineResult<PolicyPipeline> {
         let (inputs, outputs) = if pi05 { pi05_ports() } else { smolvla_ports() };
+        pipeline_with(
+            manifest,
+            (&inputs, &outputs),
+            pi05,
+            truncation_state,
+            tokenizer_port,
+            log,
+            output,
+        )
+    }
+
+    fn pipeline_with(
+        manifest: &str,
+        (inputs, outputs): (&[PortInfo], &[PortInfo]),
+        has_random_uniform: bool,
+        truncation_state: bool,
+        tokenizer_port: usize,
+        log: &Arc<Mutex<Log>>,
+        output: Vec<f32>,
+    ) -> EngineResult<PolicyPipeline> {
         let m = PolicyManifest::parse(manifest, LoadOptions::default()).unwrap();
         PolicyPipeline::new(
             m,
             server("CPU"),
             Box::new(FakeModel {
                 log: log.clone(),
-                output: (vec![1, 50, 7], output),
+                output: (port_dims(outputs, ACTION), output),
             }),
-            &inputs,
-            &outputs,
-            pi05,
+            inputs,
+            outputs,
+            has_random_uniform,
             Box::new(FakeTokenizer {
                 log: log.clone(),
                 truncation_state,
@@ -919,6 +985,59 @@ mod tests {
         assert_ne!(texts[0], texts[1]);
         // No noise port, so nothing is drawn.
         assert!(!r.log.lock().unwrap().inputs.iter().any(|(n, _)| n == NOISE));
+    }
+
+    #[test]
+    fn pi0_fills_the_dummy_slot_and_leaves_the_prompt_as_the_task() {
+        let mut r = rig_with(PI0_LIBERO, pi0_ports(), false, true, vec![0.5; 350]);
+        let spec = r.engine.spec().clone();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(spec.resize, cascadia_types::ResizeConvention::Center);
+        assert_eq!(
+            (spec.noise, spec.noise_shape.clone()),
+            (NoiseMode::Input, Some(vec![50, 32]))
+        );
+        assert_eq!(spec.chunk, [50, 7]);
+        let a = r.engine.infer(&obs(&spec, " pick_up")).unwrap();
+        assert_eq!((a.steps, a.dim), (50, 7));
+        let images = input(&r.log, IMAGES);
+        assert_eq!(images.shape, vec![3, 1, 3, 224, 224]);
+        let per = 3 * 224 * 224;
+        let px = |v: u8| v as f32 / 255.0 * 2.0 - 1.0;
+        assert_eq!(f32s(&images)[0], px(10));
+        assert_eq!(f32s(&images)[per], px(20));
+        assert!(f32s(&images)[2 * per..].iter().all(|&x| x == -1.0));
+        assert_eq!(
+            input(&r.log, IMAGE_MASKS).data,
+            TensorData::Bool(vec![true, true, false])
+        );
+        // No state bins, no cleaning: the worst-case check and the call both
+        // tokenize the task plus new_line's "\n".
+        let texts = r.log.lock().unwrap().texts.clone();
+        assert_eq!(texts, vec![" pick_up\n", " pick_up\n"]);
+        assert_eq!(input(&r.log, NOISE).shape, vec![1, 50, 32]);
+    }
+
+    #[test]
+    fn a_prompt_step_after_the_tokenizer_is_refused() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut v: serde_json::Value = serde_json::from_str(PI0_LIBERO).unwrap();
+        let steps = v["model"]["preprocessors"].as_array_mut().unwrap();
+        let pi0 = steps.remove(1);
+        steps.push(pi0);
+        let (inputs, outputs) = pi0_ports();
+        let e = pipeline_with(
+            &v.to_string(),
+            (&inputs, &outputs),
+            false,
+            true,
+            48,
+            &log,
+            vec![0.5; 350],
+        )
+        .err()
+        .expect("pi0 after ov_tokenizer must not load");
+        assert!(e.to_string().contains("comes after ov_tokenizer"), "{e}");
     }
 
     #[test]

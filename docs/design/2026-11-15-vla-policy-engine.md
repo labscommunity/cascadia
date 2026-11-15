@@ -59,13 +59,17 @@ claims until a stats source is settled (open question 3).
 
 v1:
 - Packages with `"format": "policy_package"`, version `1.x`, runner `SinglePass`, artifact
-  `openvino`, policies `smolvla` and `pi05`. Anything else is refused at load with a clear error.
+  `openvino`, policies `smolvla`, `pi05` and `pi0`. Anything else is refused at load with a clear
+  error.
 - Devices: GPU (default, f16 unless `--precision f32`) and CPU (always f32). NPU is refused: both
   models fail NPU compilation as exported.
+- π0 on a 16 GB integrated GPU (Arc 140V) runs at f16 only: at `--precision f32` its weights
+  (about 12.5 GB in f32) fail GPU compilation. A failed compile is a load error naming the IR and
+  the device, with a hint to drop `--precision f32` on the GPU; nothing is special-cased per model.
 - A single-box metadata endpoint and WebSocket, served by `cascadia run --engine ov-policy`.
 - `cascadia export-policy`: LeRobot checkpoints (Hugging Face) to a `policy_package`.
 
-Not in v1: π0, π0-FAST, GR00T and other policies until each export is checked; NPU; multi-stage
+Not in v1: π0-FAST, GR00T and other policies until each export is checked; NPU; multi-stage
 sharding; per-robot key mappings for existing openpi clients; real-time chunking (RTC) server side;
 server-side image resize; routing across machines.
 
@@ -94,6 +98,7 @@ Loading rules:
 |---|---|
 | `normalize` | per feature on `state`, in f64 like Intel's numpy promotion. `mean_std`: `(x − mean) / (std + eps)`. `min_max`: `2(x − min)/(max − min + eps) − 1`. `quantiles`: `2(x − q01)/d − 1` with `d = q99 − q01`, replaced by eps only where it is 0. `identity`. |
 | `pi05` | Images: uint8 → `/255` → `x·2 − 1`, CHW. Slots in `input_features` order (see "Cameras"); `empty_cameras` extra slots filled with `−1`, mask false; stacked `images [n_slots, 1, 3, H, W]` f32 and `image_masks [n_slots, 1]` bool. Prompt: the normalized state is binned with `bin = digitize(x, linspace(−1, 1, 257)[:−1]) − 1`, which gives **−1 for x < −1** and 255 for x ≥ 1 − 2/256; text `"Task: {task}, State: {bins joined by ' '};\nAction: "`, task stripped with `_` and `\n` replaced by spaces. If `noise_shape` is set and the call carries no noise: `noise ~ N(0,1)` of `[1, *noise_shape]` f32. |
+| `pi0` | Ours (Intel's runtime dropped π0). The `pi05` parameters and image handling (dummy slots, centred padding, optional `noise_shape`); the prompt is left alone, so with `new_line` the tokenizer sees the task plus `"\n"` and no state bins. |
 | `smolvla_resize` | Images as in `pi05` at `image_resolution` (512). With a non-empty `image_key_reorder_map`, each value is a **slot index**. When `num_cameras` > 0, camera `name` goes to slot `map[name]`, every index below `num_cameras` that no camera takes is a masked dummy of `−1` in that position, and a value ≥ `num_cameras` refuses the load. When `num_cameras` ≤ 0 (the default), cameras are ordered by their slot values with no dummies. A duplicate or negative value always refuses the load. |
 | `new_line` | Append `"\n"` to the task if missing. |
 | `noise` | `noise ~ N(0,1)` of `[1, *shape]` f32, unless the call carries noise. |
