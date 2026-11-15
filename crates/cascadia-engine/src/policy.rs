@@ -29,8 +29,7 @@ pub trait PolicyEngine: Send {
 ///
 /// Covers what the spec alone settles: camera names (exactly the advertised
 /// set), frame sizes, state length and finiteness, prompt size, and whether
-/// noise is allowed. Noise length is the engine's to check, since the spec
-/// does not carry the noise shape.
+/// noise is allowed and its length.
 pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<()> {
     let bad = |msg: String| Err(EngineError::InvalidConfig(msg));
     let mut seen = HashSet::new();
@@ -85,6 +84,19 @@ pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<(
         if spec.noise != NoiseMode::Input {
             return bad("this package takes no noise input".into());
         }
+        let Some(shape) = spec.noise_shape.as_deref() else {
+            return bad("the spec has no noise shape for an input-mode package".into());
+        };
+        let want = shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d));
+        if want != Some(noise.len()) {
+            let dims: Vec<String> = shape.iter().map(usize::to_string).collect();
+            return bad(format!(
+                "noise has {} values; expected {} for shape [1, {}]",
+                noise.len(),
+                want.map_or_else(|| "an overflowing count".into(), |w| w.to_string()),
+                dims.join(", ")
+            ));
+        }
         if noise
             .iter()
             .any(|x| !x.is_finite() || x.abs() > NOISE_ABS_MAX)
@@ -98,8 +110,8 @@ pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<(
 /// Deterministic [`PolicyEngine`] for API and CLI tests without OpenVINO.
 ///
 /// The same observation always gives the same chunk: action `[t, d]` is
-/// `state[d % state_len] + 0.01 * t`, plus `noise[t * D + d]` when the call
-/// carries noise of exactly `T * D` values.
+/// `state[d % state_len] + 0.01 * t`, plus the call's noise value at the same
+/// flat index when it carries noise.
 pub struct MockPolicyEngine {
     spec: PolicySpec,
     warmed: bool,
@@ -142,7 +154,7 @@ impl PolicyEngine for MockPolicyEngine {
         }
         check_observation(&self.spec, obs)?;
         let [steps, dim] = self.spec.chunk;
-        let noise = obs.noise.as_deref().filter(|n| n.len() == steps * dim);
+        let noise = obs.noise.as_deref();
         let mut actions = Vec::with_capacity(steps * dim);
         for t in 0..steps {
             for d in 0..dim {
@@ -151,7 +163,10 @@ impl PolicyEngine for MockPolicyEngine {
                 } else {
                     obs.state[d % obs.state.len()]
                 };
-                let n = noise.map_or(0.0, |n| n[t * dim + d]);
+                let n = noise
+                    .and_then(|n| n.get(t * dim + d))
+                    .copied()
+                    .unwrap_or(0.0);
                 actions.push(base + 0.01 * t as f32 + n);
             }
         }
@@ -183,6 +198,7 @@ mod tests {
             width: 2,
             state_len: 3,
             chunk: [2, 3],
+            noise_shape: (noise == NoiseMode::Input).then(|| vec![2, 3]),
             noise,
             resize: ResizeConvention::Center,
             prompt_max_bytes: 16,
@@ -259,6 +275,10 @@ mod tests {
         let s = spec(NoiseMode::Input);
         o.noise = Some(vec![0.0, 10.5, 0.0, 0.0, 0.0, 0.0]);
         assert!(err_of(&s, &o).contains("|x| <= 10"));
+        o.noise = Some(vec![0.0; 5]);
+        assert!(err_of(&s, &o).contains("5 values; expected 6 for shape [1, 2, 3]"));
+        o.noise = Some(vec![0.0; 6]);
+        check_observation(&s, &o).unwrap();
     }
 
     #[test]
@@ -274,6 +294,10 @@ mod tests {
         o.noise = Some(vec![1.0; 6]);
         let b = e.infer(&o).unwrap();
         assert_eq!(b.actions[0], 2.0);
+        assert_eq!(e.calls(), 3);
+        // A wrong-length noise is refused, not ignored.
+        o.noise = Some(vec![1.0; 7]);
+        assert!(e.infer(&o).is_err());
         assert_eq!(e.calls(), 3);
         e.close();
         assert!(matches!(e.infer(&obs()), Err(EngineError::NotLoaded)));

@@ -5,7 +5,7 @@ use cascadia_engine::{EngineError, EngineResult};
 use cascadia_types::{NoiseMode, PolicySpec, ResizeConvention};
 
 use super::cameras::{CameraLayout, CameraPlan};
-use super::manifest::{ImageStep, PolicyManifest, StatsStep};
+use super::manifest::{ImageStep, PolicyManifest, PreStep, StatsStep};
 
 /// Facts only the compiled model can give.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +19,8 @@ pub struct IrFacts {
     /// `[T, D]` of the action output, batch dimension removed.
     pub action_shape: [usize; 2],
     pub noise: NoiseMode,
+    /// Dims of the `noise` input after its batch of 1; `Some` exactly when the model has one.
+    pub noise_shape: Option<Vec<usize>>,
 }
 
 /// Facts the server decides.
@@ -36,6 +38,8 @@ pub struct ManifestSpec {
     pub image_hw: Option<[u32; 2]>,
     pub resize: ResizeConvention,
     pub n_action_steps: Option<usize>,
+    /// The noise the manifest draws (`noise.shape` or `pi05.noise_shape`), batch excluded.
+    pub noise_shape: Option<Vec<usize>>,
 }
 
 fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
@@ -48,11 +52,29 @@ impl ManifestSpec {
             ImageStep::Pi05(p) => (p.image_resolution, ResizeConvention::Center),
             ImageStep::SmolVlaResize(s) => (s.image_resolution, ResizeConvention::TopLeft),
         };
+        let mut noise_shape: Option<Vec<usize>> = None;
+        for step in &m.preprocessors {
+            let shape = match step {
+                PreStep::Noise { shape } => shape,
+                PreStep::Pi05(p) => match &p.noise_shape {
+                    Some(s) => s,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            match &noise_shape {
+                Some(prev) if prev != shape => {
+                    return refuse(format!("noise shapes {prev:?} and {shape:?} disagree"))
+                }
+                _ => noise_shape = Some(shape.clone()),
+            }
+        }
         Ok(Self {
             cameras: CameraPlan::from_manifest(m)?,
             image_hw,
             resize,
             n_action_steps: m.n_action_steps(),
+            noise_shape,
         })
     }
 }
@@ -60,7 +82,7 @@ impl ManifestSpec {
 /// Combine the manifest, IR and server facts into the served spec.
 ///
 /// Refuses a manifest that disagrees with the IR (resolution, slot count,
-/// stats length) at load, not at the first call.
+/// stats length, noise) at load, not at the first call.
 pub fn derive_spec(
     m: &PolicyManifest,
     ir: &IrFacts,
@@ -97,6 +119,30 @@ pub fn derive_spec(
     };
     check_len(&mut m.normalize(), "state", ir.state_len)?;
     check_len(&mut m.denormalize(), "action", dim)?;
+    if (ir.noise == NoiseMode::Input) != ir.noise_shape.is_some() {
+        return refuse(format!(
+            "IR facts disagree: noise mode {:?} with noise shape {:?}",
+            ir.noise, ir.noise_shape
+        ));
+    }
+    match (&ms.noise_shape, &ir.noise_shape) {
+        (Some(m), None) => {
+            return refuse(format!(
+                "the manifest draws noise {m:?}, but the model has no noise input"
+            ))
+        }
+        (None, Some(i)) => {
+            return refuse(format!(
+                "the model takes noise {i:?}, but the manifest draws none"
+            ))
+        }
+        (Some(m), Some(i)) if m != i => {
+            return refuse(format!(
+                "the manifest's noise shape {m:?} does not match the model's {i:?}"
+            ))
+        }
+        _ => {}
+    }
     // The trimmer only shortens (action_chunk_trimmer.py: `shape[1] > n`).
     let steps = ms.n_action_steps.map_or(ir_steps, |n| n.min(ir_steps));
     let spec = PolicySpec {
@@ -108,6 +154,7 @@ pub fn derive_spec(
         state_len: ir.state_len,
         chunk: [steps, dim],
         noise: ir.noise,
+        noise_shape: ir.noise_shape.clone(),
         resize: ms.resize,
         prompt_max_bytes: server.prompt_max_bytes,
     };
@@ -123,6 +170,8 @@ mod tests {
         include_str!("../../tests/fixtures/policy/intel-pi05-libero-manifest.json");
     const SMOLVLA_LIBERO: &str =
         include_str!("../../tests/fixtures/policy/intel-smolvla-libero-manifest.json");
+    const SMOLVLA_NOISE: &str =
+        include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
 
     fn server() -> ServerFacts {
         ServerFacts {
@@ -143,6 +192,7 @@ mod tests {
             state_len: 8,
             action_shape: [50, 7],
             noise: NoiseMode::InGraphRandom,
+            noise_shape: None,
         }
     }
 
@@ -168,11 +218,91 @@ mod tests {
             state_len: 8,
             action_shape: [50, 7],
             noise: NoiseMode::Constant,
+            noise_shape: None,
         };
         let (spec, _) = derive_spec(&m, &ir, server()).unwrap();
         assert_eq!(spec.cameras, vec!["camera_0", "camera_1"]);
         assert_eq!(spec.chunk, [1, 7]);
         assert_eq!(spec.resize, ResizeConvention::TopLeft);
+    }
+
+    /// The real IR ports of our smolvla_libero export (noise is `[1, 50, 32]`).
+    fn smolvla_noise_ir() -> IrFacts {
+        IrFacts {
+            image_slots: 2,
+            image_hw: Some([512, 512]),
+            state_len: 8,
+            action_shape: [50, 7],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![50, 32]),
+        }
+    }
+
+    fn smolvla_noise() -> PolicyManifest {
+        PolicyManifest::parse(SMOLVLA_NOISE, LoadOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn new_style_smolvla_spec() {
+        let (spec, layout) = derive_spec(&smolvla_noise(), &smolvla_noise_ir(), server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1)]);
+        assert_eq!((spec.height, spec.width), (512, 512));
+        assert_eq!(spec.chunk, [1, 7]);
+        assert_eq!(spec.noise, NoiseMode::Input);
+        assert_eq!(spec.noise_shape, Some(vec![50, 32]));
+        assert_eq!(spec.resize, ResizeConvention::TopLeft);
+    }
+
+    #[test]
+    fn noise_disagreements_are_refused() {
+        let e = |m: &PolicyManifest, ir: &IrFacts| {
+            derive_spec(m, ir, server()).unwrap_err().to_string()
+        };
+        // A noise step over a model without a noise input.
+        let mut ir = smolvla_noise_ir();
+        ir.noise = NoiseMode::Constant;
+        ir.noise_shape = None;
+        assert!(e(&smolvla_noise(), &ir).contains("no noise input"));
+        // A model noise input with no noise in the manifest.
+        let mut ir = pi05_ir();
+        ir.noise = NoiseMode::Input;
+        ir.noise_shape = Some(vec![50, 32]);
+        assert!(e(&pi05(), &ir).contains("the manifest draws none"));
+        // The manifest's noise.shape disagrees with the port.
+        let mut ir = smolvla_noise_ir();
+        ir.noise_shape = Some(vec![50, 16]);
+        assert!(e(&smolvla_noise(), &ir).contains("does not match the model's [50, 16]"));
+        // IR facts that contradict themselves.
+        let mut ir = smolvla_noise_ir();
+        ir.noise = NoiseMode::InGraphRandom;
+        assert!(e(&smolvla_noise(), &ir).contains("IR facts disagree"));
+        // pi05.noise_shape: matched, mismatched, and disagreeing with a noise step.
+        let with_shape = |extra: Option<serde_json::Value>| {
+            let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+            v["model"]["preprocessors"][1]["noise_shape"] = serde_json::json!([50, 32]);
+            if let Some(step) = extra {
+                v["model"]["preprocessors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(2, step);
+            }
+            PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap()
+        };
+        let mut ir = pi05_ir();
+        ir.noise = NoiseMode::Input;
+        ir.noise_shape = Some(vec![50, 32]);
+        let spec = derive_spec(&with_shape(None), &ir, server()).unwrap().0;
+        assert_eq!(spec.noise_shape, Some(vec![50, 32]));
+        ir.noise_shape = Some(vec![10, 32]);
+        assert!(e(&with_shape(None), &ir).contains("does not match"));
+        let mut no_noise = pi05_ir();
+        no_noise.noise = NoiseMode::Constant;
+        assert!(e(&with_shape(None), &no_noise).contains("no noise input"));
+        let both = with_shape(Some(
+            serde_json::json!({"type": "noise", "shape": [50, 16]}),
+        ));
+        assert!(e(&both, &ir).contains("disagree"));
     }
 
     #[test]

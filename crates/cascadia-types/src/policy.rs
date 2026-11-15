@@ -80,6 +80,9 @@ pub struct PolicySpec {
     /// `[T, D]` of the returned action chunk.
     pub chunk: [usize; 2],
     pub noise: NoiseMode,
+    /// Noise dims after the batch of 1 (a request sends `[1, *noise_shape]`);
+    /// `Some` only in [`NoiseMode::Input`].
+    pub noise_shape: Option<Vec<usize>>,
     pub resize: ResizeConvention,
     pub prompt_max_bytes: usize,
 }
@@ -99,6 +102,7 @@ mod tests {
             state_len: 8,
             chunk: [10, 7],
             noise: NoiseMode::InGraphRandom,
+            noise_shape: None,
             resize: ResizeConvention::TopLeft,
             prompt_max_bytes: 1024,
         };
@@ -106,6 +110,7 @@ mod tests {
         assert_eq!(v["noise"], "in_graph_random");
         assert_eq!(v["resize"], "top_left");
         assert_eq!(v["chunk"], serde_json::json!([10, 7]));
+        assert!(v["noise_shape"].is_null());
         assert_eq!(serde_json::from_value::<PolicySpec>(v).unwrap(), spec);
     }
 
