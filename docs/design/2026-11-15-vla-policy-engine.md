@@ -33,6 +33,22 @@ constant zero start) matched PyTorch on the traced input on the OpenVINO **CPU d
 abs diff 0.0047, mean 0.0013, against a mean output magnitude of 0.78. Not yet measured: GPU f16
 parity, and any task success.
 
+Step 0 (2026-11-15) settled what the build depends on:
+- The pinned GenAI SDK ships the tokenizer extension
+  (`runtime\bin\intel64\Release\openvino_tokenizers.dll`, 2026.4.1.0). OpenVINO 2026.4.1 loads it
+  and runs Intel's π0.5 and SmolVLA tokenizers on CPU (`[1, 64]` and `[1, 48]`).
+- `physical-ai-studio` `8f132416` and runtime `e3dd944` install together only with a uv override:
+  the studio names its own runtime revision in `[tool.uv.sources]`, and uv refuses two URLs for one
+  package.
+- An export of `HuggingFaceVLA/smolvla_libero` there takes `noise` as an input with no
+  `RandomUniform` left, and Intel's runtime draws fresh noise per call. In float32, the IR matches
+  PyTorch on the same noise to 4.1e-6 (max) on CPU f32.
+- The exporter's default dtype (bf16) is unsafe: with a padded prompt mask and bf16 inference
+  precision (the CPU default on bf16-capable hosts, here a Ryzen 9950X), every action is NaN (350 of
+  350). A float32 export saved with fp16 weights (1,097 MB against 1,293 MB for bf16) is finite under
+  both precisions and within 2.8e-3 of float32 PyTorch on CPU f32; bf16 compute on it is off by up to
+  0.66 normalized units.
+
 **That DROID package is not usable for a robot.** Its `normalize`/`denormalize` stats are identity
 (mean 0, std 1, q01 −1, q99 1 over all 32 dimensions): `lerobot/pi05_droid` ships no normalization
 stats (`policy_preprocessor.json` has `"features": {}`), and the export filled in placeholders. Its
@@ -61,6 +77,8 @@ Each step is ported from Intel's `physicalai` runtime (`openvinotoolkit/physical
 Loading rules:
 - A component is either `{"type": ..., <params>}` or `{"class_path": ..., "init_args": {...}}`;
   `class_path` wins, mapped to the short names below. An unknown component refuses the load.
+- `policy.name` is required: Intel's fallback that derives it from `policy.source.class_path` takes
+  the wrong path segment (`policy` for `physicalai.policies.pi05.policy.Pi05`).
 - Artifact paths (`model.artifacts.openvino`, `ov_tokenizer.artifact`) must be plain relative names
   inside the package directory: no `..`, no absolute, drive or UNC paths. Anything else refuses the
   load.
@@ -73,13 +91,13 @@ Loading rules:
 
 | Step | Behaviour |
 |---|---|
-| `normalize` | per feature on `state`. `mean_std`: `(x − mean) / (std + eps)`. `min_max`: `2(x − min)/(max − min + eps) − 1`. `quantiles`: `2(x − q01)/(q99 − q01 + eps) − 1`. `identity`. |
+| `normalize` | per feature on `state`, in f64 like Intel's numpy promotion. `mean_std`: `(x − mean) / (std + eps)`. `min_max`: `2(x − min)/(max − min + eps) − 1`. `quantiles`: `2(x − q01)/d − 1` with `d = q99 − q01`, replaced by eps only where it is 0. `identity`. |
 | `pi05` | Images: uint8 → `/255` → `x·2 − 1`, CHW. Slots in `input_features` order (see "Cameras"); `empty_cameras` extra slots filled with `−1`, mask false; stacked `images [n_slots, 1, 3, H, W]` f32 and `image_masks [n_slots, 1]` bool. Prompt: the normalized state is binned with `bin = digitize(x, linspace(−1, 1, 257)[:−1]) − 1`, which gives **−1 for x < −1** and 255 for x ≥ 1 − 2/256; text `"Task: {task}, State: {bins joined by ' '};\nAction: "`, task stripped with `_` and `\n` replaced by spaces. If `noise_shape` is set and the call carries no noise: `noise ~ N(0,1)` of `[1, *noise_shape]` f32. |
 | `smolvla_resize` | Images as in `pi05` at `image_resolution` (512). With a non-empty `image_key_reorder_map`, each value is a **slot index**. When `num_cameras` > 0, camera `name` goes to slot `map[name]`, every index below `num_cameras` that no camera takes is a masked dummy of `−1` in that position, and a value ≥ `num_cameras` refuses the load. When `num_cameras` ≤ 0 (the default), cameras are ordered by their slot values with no dummies. A duplicate or negative value always refuses the load. |
 | `new_line` | Append `"\n"` to the task if missing. |
 | `noise` | `noise ~ N(0,1)` of `[1, *shape]` f32, unless the call carries noise. |
 | `ov_tokenizer` | Run `tokenizer.xml` **on CPU, always** (its string ops are CPU-only; only the policy IR follows `--device`) → `tokenized_prompt` i64, `tokenized_prompt_mask` bool. Padding side, `max_length` and truncation live in the tokenizer IR and differ by package: Intel's π0.5 LIBERO pads left to 64 with a `truncation` state variable defaulting on; Intel's SmolVLA pads right to 48 with an always-on `Truncate` op; packages from our exporter (8f132416) carry the same `truncation` state variable, defaulting off, so an overlong prompt comes out wider than the port. See "Prompt length". |
-| `denormalize` | Inverse of `normalize` on `action`. |
+| `denormalize` | On `action`, not an exact inverse: `mean_std`: `x·std + mean`; `min_max`: `(x + 1)/2·(max − min) + min` (no eps in either); `quantiles`: `(x + 1)/2·d + q01`, `d` as in `normalize`. |
 | `action_chunk_trimmer` | Keep the first `n_action_steps` actions. |
 
 ### Prompt length
@@ -108,7 +126,11 @@ policies use the first rule that applies:
 3. Neither (Intel's published SmolVLA manifest): `camera_0..camera_{n−1}` in IR slot order, where n
    is the IR `images` port's first dimension minus any dummy slots.
 
-An empty map (the default in new SmolVLA exports) falls through to rule 2. A request must carry
+An empty map (the default in new SmolVLA exports) falls through to rule 2. New-style SmolVLA
+exports name features with a doubled prefix (`images.images.image`) where π0.5 exports of the same
+data strip it; the engine strips a second `images.` too, so both advertise `image` and `image2`. The shapes `input_features` declare are not the wire resolution:
+Intel's π0.5 LIBERO declares `[3, 256, 256]` while its image step resizes to 224, and clients send
+224×224. A request must carry
 exactly the advertised camera names; a missing or extra name is an error.
 
 Images must arrive at the model resolution, uint8 HWC RGB, so the engine never has to reproduce
@@ -186,6 +208,7 @@ Limits, all checked before work is queued:
 | `state_len` | the IR `state` port |
 | `chunk` `[T, D]` | T from `action_chunk_trimmer.n_action_steps` when present, else the IR output; D from the IR output |
 | `noise` | the mode above |
+| `noise_shape` | the IR `noise` port, `input` mode only (the decode rule and the message cap need it) |
 | `resize` | the image step: `center` (`pi05`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling |
 | `device`, `model`, `prompt_max_bytes` | the server |
 
@@ -252,6 +275,12 @@ machine.
     prove incompatible, step 0 finds out before any porting;
   - `openvino==2026.4.1` and a matching `openvino-tokenizers`;
   - torch CPU wheels.
+
+  The runtime pin is a uv override (`--overrides`), not a plain requirement: without it uv refuses
+  to resolve (step 0).
+- **Precision.** The policy is loaded with `dtype="float32"` and the IR saved with fp16 weights. The
+  tool's default (bf16) exports produce all-NaN actions under bf16 inference with a padded prompt
+  (step 0), so the exporter never writes one.
 
   The commit alone pins nothing below it (its `pyproject.toml` says `openvino>=2026.4`). Bump to a
   release when one carries the fix.
@@ -328,10 +357,10 @@ machine.
 
 ## Open questions
 
-1. **Tokenizer extension.** Is `openvino_tokenizers` shipped in the pinned GenAI SDK on the boxes?
-   Checked first. If not, the fallback is the `tokenizers` crate with the package's
-   `tokenizer.json`, and it must take the padding side, `max_length` and truncation from the
-   tokenizer IR, since only the IR carries them.
+1. **GPU f16 accuracy.** bf16 compute is off by up to 0.66 normalized units on the fp16-weight
+   package (step 0, CPU). The Arc GPU computes in f16, which has more mantissa than bf16 but less
+   range. It must be measured on a Lunar Lake box with a padded prompt before the 0.02 GPU tolerance
+   is trusted; if it fails, the engine runs the policy at f32 on the GPU instead.
 2. **Where the LIBERO simulator runs.** It needs MuJoCo and Linux. The engine needs an AI PC GPU.
    The two must reach each
    other over the network.

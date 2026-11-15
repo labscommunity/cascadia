@@ -751,6 +751,8 @@ mod tests {
         include_str!("../../tests/fixtures/policy/intel-pi05-libero-manifest.json");
     const SMOLVLA_LIBERO: &str =
         include_str!("../../tests/fixtures/policy/intel-smolvla-libero-manifest.json");
+    const SMOLVLA_NOISE: &str =
+        include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
     const DROID: &str =
         include_str!("../../tests/fixtures/policy/pi05-droid-placeholder-manifest.json");
 
@@ -822,6 +824,23 @@ mod tests {
         assert_eq!(s.image_resolution, Some([512, 512]));
         assert!(s.image_key_reorder_map.is_empty());
         assert!(m.input_features.is_empty());
+    }
+
+    #[test]
+    fn new_style_smolvla_manifest_parses() {
+        let m = PolicyManifest::parse(SMOLVLA_NOISE, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::SmolVla);
+        assert!(m.preprocessors.iter().any(|s| *s
+            == PreStep::Noise {
+                shape: vec![50, 32]
+            }));
+        let ImageStep::SmolVlaResize(s) = m.image_step() else {
+            panic!("smolvla image step")
+        };
+        assert!(s.image_key_reorder_map.is_empty());
+        assert_eq!(s.num_cameras, 0);
+        let noise = m.input_features.iter().find(|f| f.name == "noise").unwrap();
+        assert_eq!(noise.ftype, FeatureType::Common);
     }
 
     #[test]

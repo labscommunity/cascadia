@@ -6,5 +6,9 @@ Copied, unmodified:
 - `intel-smolvla-libero-manifest.json`: `manifest.json` of Hugging Face `OpenVINO/smolvla-libero-fp16-ov`.
 - `pi05-droid-placeholder-manifest.json`: our `lerobot/pi05_droid` export (physicalai-train 0.3.0),
   whose stats are identity placeholders; the loader must refuse it.
+- `smolvla-libero-noise-manifest.json`: our export of `HuggingFaceVLA/smolvla_libero` with
+  physical-ai-studio `8f132416` and the physicalai runtime `e3dd944`, dtype float32 with fp16
+  weights. New style: `noise` is a model input (`[1, 50, 32]`) and cameras are named
+  `images.images.<name>`.
 
 Fixtures generated from Intel's `physicalai` runtime by `tools/vla_reference.py` land here too.

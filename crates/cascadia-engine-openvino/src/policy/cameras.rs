@@ -34,11 +34,16 @@ fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
 }
 
 /// `images` is the bare single-camera key; `images.<name>` advertises `<name>`.
+///
+/// New-style SmolVLA exports double the prefix (`images.images.image`) where
+/// π0.5 exports of the same data strip it, so one more `images.` is stripped
+/// and both advertise `image`.
 fn advertised(key: &str) -> Option<String> {
     match key.strip_prefix("images") {
         Some("") => Some("image".into()),
         Some(rest) => rest
             .strip_prefix('.')
+            .map(|n| n.strip_prefix("images.").unwrap_or(n))
             .filter(|n| !n.is_empty())
             .map(str::to_string),
         None => None,
@@ -222,6 +227,8 @@ mod tests {
         include_str!("../../tests/fixtures/policy/intel-pi05-libero-manifest.json");
     const SMOLVLA_LIBERO: &str =
         include_str!("../../tests/fixtures/policy/intel-smolvla-libero-manifest.json");
+    const SMOLVLA_NOISE: &str =
+        include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
 
     fn manifest(image_step: Value, visual: &[&str]) -> PolicyManifest {
         let features: Vec<Value> = visual
@@ -331,6 +338,41 @@ mod tests {
         assert!(e.to_string().contains("neither"));
         let e = plan(json!({"type": "pi05"}), &["images.a", "images.a"]).unwrap_err();
         assert!(e.to_string().contains("declared twice"));
+        // The doubled prefix advertises the same name, so the two spellings collide.
+        let p = plan(
+            json!({"type": "pi05"}),
+            &["images.images.top", "images.wrist"],
+        )
+        .unwrap();
+        assert_eq!(p, fixed(&["top", "wrist"], &[Some(0), Some(1)]));
+        let e = plan(
+            json!({"type": "pi05"}),
+            &["images.top", "images.images.top"],
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("camera \"top\" declared twice"));
+        let e = plan(json!({"type": "pi05"}), &["images.images."]).unwrap_err();
+        assert!(e.to_string().contains("neither"));
+        // Only one extra prefix is stripped.
+        let p = plan(json!({"type": "pi05"}), &["images.images.images.x"]).unwrap();
+        assert_eq!(p, fixed(&["images.x"], &[Some(0)]));
+        let e = plan(
+            json!({"type": "smolvla_resize",
+                   "image_key_reorder_map": {"images.images.top": 0, "top": 1}}),
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("mapped twice"));
+    }
+
+    #[test]
+    fn new_style_smolvla_cameras_strip_the_doubled_prefix() {
+        // Empty map and num_cameras 0: rule 2, no dummies; the COMMON `noise`
+        // feature is not a camera.
+        let m = PolicyManifest::parse(SMOLVLA_NOISE, LoadOptions::default()).unwrap();
+        let p = CameraPlan::from_manifest(&m).unwrap();
+        assert_eq!(p, fixed(&["image", "image2"], &[Some(0), Some(1)]));
+        assert!(p.resolve(2).is_ok());
     }
 
     #[test]
