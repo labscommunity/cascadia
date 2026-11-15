@@ -6,6 +6,19 @@ use super::RequestError;
 /// Nesting a request needs is 3 (request, images, array); anything deeper is refused.
 const MAX_DEPTH: usize = 8;
 
+/// Values a message may hold. A three-camera request with noise is about 80
+/// (a numpy array is ~13), so this leaves headroom while keeping the decoded
+/// tree small however the message's bytes are spent (a MiB of 1-byte nils
+/// would otherwise be a million nodes).
+pub(crate) const MAX_VALUES: usize = 512;
+
+/// Entries in one map: the request has 5 keys, `images` one per camera, an
+/// array header 4.
+pub(crate) const MAX_MAP_LEN: usize = 32;
+
+/// Elements in one array: the only arrays in a request are numpy shapes.
+pub(crate) const MAX_ARRAY_LEN: usize = 8;
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Val<'a> {
     Nil,
@@ -40,7 +53,11 @@ impl<'a> Val<'a> {
 
 /// Parse one msgpack value that spans all of `buf`.
 pub(crate) fn parse(buf: &[u8]) -> Result<Val<'_>, RequestError> {
-    let mut r = Reader { buf, pos: 0 };
+    let mut r = Reader {
+        buf,
+        pos: 0,
+        values: 0,
+    };
     let v = r.value(0)?;
     if r.pos != buf.len() {
         return Err(RequestError::new(format!(
@@ -54,6 +71,7 @@ pub(crate) fn parse(buf: &[u8]) -> Result<Val<'_>, RequestError> {
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    values: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -87,9 +105,12 @@ impl<'a> Reader<'a> {
     }
 
     fn array(&mut self, n: usize, depth: usize) -> Result<Val<'a>, RequestError> {
-        // Every element takes at least one byte, so the claimed count cannot
-        // reserve more than the message holds.
-        let mut v = Vec::with_capacity(n.min(self.buf.len() - self.pos));
+        if n > MAX_ARRAY_LEN {
+            return Err(RequestError::new(format!(
+                "a msgpack array has {n} elements; at most {MAX_ARRAY_LEN} (numpy shapes)"
+            )));
+        }
+        let mut v = Vec::with_capacity(n);
         for _ in 0..n {
             v.push(self.value(depth + 1)?);
         }
@@ -97,7 +118,12 @@ impl<'a> Reader<'a> {
     }
 
     fn map(&mut self, n: usize, depth: usize) -> Result<Val<'a>, RequestError> {
-        let mut v = Vec::with_capacity(n.min((self.buf.len() - self.pos) / 2));
+        if n > MAX_MAP_LEN {
+            return Err(RequestError::new(format!(
+                "a msgpack map has {n} entries; at most {MAX_MAP_LEN}"
+            )));
+        }
+        let mut v = Vec::with_capacity(n);
         for _ in 0..n {
             let k = self.value(depth + 1)?;
             v.push((k, self.value(depth + 1)?));
@@ -108,6 +134,12 @@ impl<'a> Reader<'a> {
     fn value(&mut self, depth: usize) -> Result<Val<'a>, RequestError> {
         if depth > MAX_DEPTH {
             return Err(RequestError::new("msgpack nesting is too deep"));
+        }
+        self.values += 1;
+        if self.values > MAX_VALUES {
+            return Err(RequestError::new(format!(
+                "the message holds more than {MAX_VALUES} msgpack values"
+            )));
         }
         let m = self.be::<1>()?[0];
         Ok(match m {
@@ -329,10 +361,37 @@ mod tests {
     fn reader_refuses_malformed_input() {
         let e = |b: &[u8]| parse(b).unwrap_err().0;
         assert!(e(&[0xc6, 0xff, 0xff, 0xff, 0xff]).contains("truncated"));
-        assert!(e(&[0xdd, 0xff, 0xff, 0xff, 0xff]).contains("truncated"));
+        assert!(e(&[0x93, 0xc0]).contains("truncated"));
         assert!(e(&[0xc7, 0x01, 0x00, 0x00]).contains("unsupported"));
         assert!(e(&[0x01, 0x02]).contains("follow"));
         assert!(e(&[0xa1, 0xff]).contains("UTF-8"));
         assert!(e(&[0x91; 32]).contains("too deep"));
+    }
+
+    #[test]
+    fn reader_bounds_the_decoded_tree_by_structure() {
+        let e = |b: &[u8]| parse(b).unwrap_err().0;
+        // 100k one-byte nils fit well under the payload cap.
+        let mut nils = vec![0xdd];
+        nils.extend(100_000u32.to_be_bytes());
+        nils.extend(std::iter::repeat_n(0xc0, 100_000));
+        assert!(e(&nils).contains("100000 elements; at most 8"));
+        let mut map = vec![0xde];
+        map.extend(1000u16.to_be_bytes());
+        map.extend(std::iter::repeat_n(0xc0, 2000));
+        assert!(e(&map).contains("1000 entries; at most 32"));
+        // Every container within its limit, the total over the budget:
+        // 30 keys each holding an 8-element array is 30 * 10 values.
+        let mut wide = vec![0x80 | 2];
+        for _ in 0..2 {
+            wide.push(0xc0);
+            wide.extend([0xde, 0, 30]);
+            for _ in 0..30 {
+                wide.push(0xc0);
+                wide.push(0x98);
+                wide.extend([0xc0; 8]);
+            }
+        }
+        assert!(e(&wide).contains("more than 512 msgpack values"));
     }
 }

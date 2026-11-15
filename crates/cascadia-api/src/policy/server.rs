@@ -147,7 +147,10 @@ fn client_message(e: EngineError) -> String {
 
 /// One connection. The socket is read throughout, including while a request
 /// waits for the model lock and runs, so pings are answered and pongs seen.
-async fn serve_socket(socket: WebSocket, st: PolicyState, _slot: OwnedSemaphorePermit) {
+async fn serve_socket(socket: WebSocket, st: PolicyState, slot: OwnedSemaphorePermit) {
+    // Shared with the in-flight call, so a client that disconnects mid-call
+    // keeps its slot until the engine is done with its work.
+    let slot = Arc::new(slot);
     let (mut tx, mut rx) = socket.split();
     if tx
         .send(Message::Binary(st.metadata.as_ref().clone()))
@@ -174,8 +177,19 @@ async fn serve_socket(socket: WebSocket, st: PolicyState, _slot: OwnedSemaphoreP
                         busy = true;
                         let engine = st.engine.clone();
                         let done = done_tx.clone();
+                        let slot = slot.clone();
                         tokio::task::spawn_blocking(move || {
-                            let res = engine.lock().infer(&obs).map_err(client_message);
+                            let _slot = slot;
+                            if done.is_closed() {
+                                return;
+                            }
+                            let mut engine = engine.lock();
+                            // The connection may have gone while this waited for the lock.
+                            if done.is_closed() {
+                                return;
+                            }
+                            let res = engine.infer(&obs).map_err(client_message);
+                            drop(engine);
                             let _ = done.blocking_send(res);
                         });
                         None

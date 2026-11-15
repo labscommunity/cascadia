@@ -245,6 +245,39 @@ async fn a_slow_call_does_not_block_pings_or_reads() {
 }
 
 #[tokio::test]
+async fn a_client_that_disconnects_mid_call_keeps_its_slot_until_the_call_ends() {
+    let cfg = PolicyServerConfig {
+        max_connections: 1,
+        ..Default::default()
+    };
+    let addr = start(Duration::from_millis(1500), cfg, Duration::from_secs(10)).await;
+    let mut ws = connect(addr).await;
+    let sent = Instant::now();
+    ws.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ws.close(None).await.unwrap();
+    drop(ws);
+    // While the engine still runs the abandoned call, the slot stays taken.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    match connect_async(url(addr)).await {
+        Err(WsError::Http(resp)) => assert_eq!(resp.status(), 503),
+        Ok(_) => panic!("slot freed while the engine was still busy"),
+        Err(e) => panic!("unexpected error {e}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match connect_async(url(addr)).await {
+            Ok(_) => break,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(e) => panic!("slot never freed: {e}"),
+        }
+    }
+    assert!(sent.elapsed() >= Duration::from_millis(1500));
+}
+
+#[tokio::test]
 async fn a_client_that_stops_answering_pings_is_closed_and_frees_its_slot() {
     let cfg = PolicyServerConfig {
         max_connections: 1,
