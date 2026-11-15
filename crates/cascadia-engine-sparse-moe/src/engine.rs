@@ -1165,6 +1165,7 @@ impl Builder for SparseMoEBuilder {
             pending: VecDeque::new(),
             peer_disconnected: false,
             upstream_seen: false,
+            frame_kind: None,
             transport: self.transport,
             runtime_handle,
             rank,
@@ -1445,6 +1446,61 @@ async fn relink_worker(
     Ok(true)
 }
 
+/// Whether a frame that failed on a worker leaves the previous rank waiting for a
+/// reply that will never come (or, for a stream frame, leaves the slots out of
+/// step with rank 0), so the worker must drop its links rather than retry.
+fn frame_failure_drops_links(kind: FrameKind) -> bool {
+    matches!(
+        kind,
+        FrameKind::Forward
+            | FrameKind::ForwardNoSample
+            | FrameKind::ForwardBatch
+            | FrameKind::ForwardBatchPrefill
+            | FrameKind::ForwardBatchPrefillNoSample
+            | FrameKind::Capture
+            | FrameKind::CaptureV2
+            | FrameKind::Restore
+            | FrameKind::RestoreCarry
+            | FrameKind::StreamOpen
+            | FrameKind::StreamFeed
+            | FrameKind::StreamDecode
+            | FrameKind::StreamClose
+    )
+}
+
+/// Whether the transport has dropped either of a worker's peers.
+async fn worker_links_lost(
+    up: &TokioMutex<ActivationServer>,
+    down: Option<&TokioMutex<ActivationClient>>,
+) -> bool {
+    if !up.lock().await.is_connected() {
+        return true;
+    }
+    match down {
+        Some(d) => !d.lock().await.is_connected(),
+        None => false,
+    }
+}
+
+/// After a worker frame failed: latch a re-link (see [`relink_worker`]) when a
+/// peer is already gone or the frame cannot be retried, so the previous rank
+/// reads EOF now instead of waiting out its reply deadline. Mirrors the
+/// ov-dist-spec worker rule (`frame_error_drops_links`). `true` when it latched.
+fn latch_failed_frame(
+    transport: &StageTransport,
+    handle: &tokio::runtime::Handle,
+    kind: Option<FrameKind>,
+) -> bool {
+    if kind.is_some_and(frame_failure_drops_links) {
+        return true;
+    }
+    let Some(up) = transport.upstream.clone() else {
+        return true;
+    };
+    let down = transport.downstream.clone();
+    cascadia_runner::run_async(handle, worker_links_lost(&up, down.as_deref()))
+}
+
 /// One step of a latched worker: try [`relink_worker`]. `true` once re-linked
 /// (clear the latch and serve); `false` means return empty this step.
 fn relink_worker_step(
@@ -1643,6 +1699,8 @@ pub struct SparseMoEEngine {
     /// Set once a frame has arrived from the previous rank: after that, a
     /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
     upstream_seen: bool,
+    /// The frame `handle_one_frame` is serving, for `step_worker`'s failure rule.
+    frame_kind: Option<FrameKind>,
     /// Last-rank only: tokens this rank has sampled since the last
     /// `Reset`. Used as the `history` argument to `sampling::sample` so
     /// the repetition penalty has the recent local emit-stream to
@@ -3307,13 +3365,19 @@ impl SparseMoEEngine {
                 return Vec::new();
             }
         };
-        match self.handle_one_frame(&upstream) {
+        self.frame_kind = None;
+        let res = self.handle_one_frame(&upstream);
+        let kind = self.frame_kind.take();
+        match res {
             Ok(_) => Vec::new(),
             Err(e) => {
                 warn!(rank = self.rank, "worker frame failed: {e}");
-                // Don't hot-spin on a misbehaving peer. dist_spec uses
-                // the same 200 ms cool-off; same logic applies here.
-                std::thread::sleep(WORKER_BACKOFF);
+                if latch_failed_frame(&self.transport, &self.runtime_handle, kind) {
+                    self.peer_disconnected = true;
+                } else {
+                    // Don't hot-spin on a misbehaving peer.
+                    std::thread::sleep(WORKER_BACKOFF);
+                }
                 Vec::new()
             }
         }
@@ -3484,7 +3548,10 @@ impl SparseMoEEngine {
         let downstream = self.transport.downstream.clone();
         let recv = self.block_on(recv_kind_server(upstream));
         let kind = match classify_worker_recv(recv, &mut self.upstream_seen) {
-            WorkerRecv::Frame(k) => k,
+            WorkerRecv::Frame(k) => {
+                self.frame_kind = Some(k);
+                k
+            }
             WorkerRecv::Closed => {
                 // Clean upstream close — the driver finished its session.
                 // Latch the flag so subsequent step()s back off without
@@ -5075,7 +5142,11 @@ impl OvMoeEngine {
         };
         if let Err(e) = res {
             warn!("worker frame failed: {e}");
-            std::thread::sleep(WORKER_BACKOFF);
+            if latch_failed_frame(&self.transport, &self.runtime_handle, Some(kind)) {
+                self.peer_disconnected = true;
+            } else {
+                std::thread::sleep(WORKER_BACKOFF);
+            }
         }
         Vec::new()
     }
@@ -7819,16 +7890,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         if let Err(e) = res {
             warn!("worker frame failed: {e}");
-            if matches!(
-                kind,
-                FrameKind::StreamOpen
-                    | FrameKind::StreamFeed
-                    | FrameKind::StreamDecode
-                    | FrameKind::StreamClose
-            ) {
-                // No reply goes up for a failed stream frame: latch, so the
-                // link closes and rank 0 reads EOF now instead of waiting
-                // out its reply deadline.
+            if latch_failed_frame(&self.transport, &self.runtime_handle, Some(kind)) {
+                // No reply goes up for the failed frame: latch, so the link
+                // closes and rank 0 reads EOF now instead of waiting out its
+                // reply deadline.
                 self.peer_disconnected = true;
             } else {
                 std::thread::sleep(WORKER_BACKOFF);
@@ -8186,9 +8251,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let h = self.runner.hidden_size() as u32;
             // Same design rule as rank 0's head: the Token reply is owed to a frame
             // we just forwarded, so bound the wait on the strict deadline. If our
-            // own downstream is dead, this relay must surface an error that tears
-            // the stage down — an unbounded recv here would wedge this rank AND
-            // every upstream rank blocked waiting on our reply.
+            // own downstream is dead, the error makes step_worker drop both links
+            // (`latch_failed_frame`), so the ranks above read EOF instead of
+            // waiting on our reply.
             let reply_deadline = Self::reply_deadline();
             self.block_on(async {
                 if sample {
@@ -8757,6 +8822,62 @@ mod tests {
         p.decoded(2, Duration::from_millis(9));
         p.waited(Duration::from_secs(120), 1, 3, || Some(runner));
         assert_eq!((p.frames, p.wait), (0, Duration::ZERO));
+    }
+
+    /// A failed frame drops the links when the previous rank is waiting on it;
+    /// a failed one-way frame is retried on the same links.
+    #[test]
+    fn failed_frame_drops_links_only_when_a_reply_or_stream_state_is_owed() {
+        for k in [
+            FrameKind::Forward,
+            FrameKind::ForwardNoSample,
+            FrameKind::ForwardBatch,
+            FrameKind::ForwardBatchPrefill,
+            FrameKind::ForwardBatchPrefillNoSample,
+            FrameKind::Capture,
+            FrameKind::CaptureV2,
+            FrameKind::Restore,
+            FrameKind::RestoreCarry,
+            FrameKind::StreamOpen,
+            FrameKind::StreamFeed,
+            FrameKind::StreamDecode,
+            FrameKind::StreamClose,
+        ] {
+            assert!(frame_failure_drops_links(k), "{k:?}");
+        }
+        for k in [
+            FrameKind::Reset,
+            FrameKind::ForwardPrefill,
+            FrameKind::RestorePrefix,
+            FrameKind::CachePrefix,
+        ] {
+            assert!(!frame_failure_drops_links(k), "{k:?}");
+        }
+    }
+
+    /// A one-way frame that failed still drops the links when the transport
+    /// already dropped a peer.
+    #[tokio::test]
+    async fn worker_links_lost_sees_a_dropped_downstream() {
+        let (up_srv, _rank0) = {
+            let (mut s, port) = listening().await;
+            let mut c = ActivationClient::new("127.0.0.1", port);
+            c.connect().await.unwrap();
+            s.accept().await.unwrap();
+            (s, c)
+        };
+        let (mut next, port) = listening().await;
+        let mut down_cli = ActivationClient::new("127.0.0.1", port);
+        down_cli.connect().await.unwrap();
+        next.accept().await.unwrap();
+        let up = TokioMutex::new(up_srv);
+        let down = TokioMutex::new(down_cli);
+        assert!(!worker_links_lost(&up, Some(&down)).await);
+        down.lock().await.close().await;
+        assert!(worker_links_lost(&up, Some(&down)).await);
+        assert!(!worker_links_lost(&up, None).await);
+        up.lock().await.disconnect().await;
+        assert!(worker_links_lost(&up, None).await);
     }
 
     /// Rank 0's latched stream-path disconnect surfaces a connection-fatal Err
