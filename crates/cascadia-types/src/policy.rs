@@ -99,6 +99,12 @@ pub struct PolicySpec {
     /// The precision the model was compiled at (`f16` or `f32`).
     #[serde(default)]
     pub precision: String,
+    /// Whether a frame of another size may be resized to `height x width`
+    /// with `resize` (OpenCV `INTER_LINEAR` letterbox) on the server, because
+    /// that is exactly this package's own preprocessor resize. When false, a
+    /// client must send `height x width`.
+    #[serde(default)]
+    pub server_resize: bool,
 }
 
 #[cfg(test)]
@@ -122,6 +128,7 @@ mod tests {
             attribution: None,
             manifest_sha256: String::new(),
             precision: String::new(),
+            server_resize: false,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["noise"], "in_graph_random");

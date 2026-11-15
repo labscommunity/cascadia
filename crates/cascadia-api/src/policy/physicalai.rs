@@ -521,8 +521,10 @@ fn observation(
             };
             let img = if (img.height, img.width) == (spec.height, spec.width) {
                 img
-            } else {
+            } else if spec.server_resize {
                 resize_frame(&img, spec.height, spec.width, spec.resize)
+            } else {
+                return refuse(not_resizable(&cam, &img, spec));
             };
             Ok((cam, img))
         })
@@ -744,6 +746,24 @@ pub fn encode_reset_ok() -> Vec<u8> {
 }
 
 // ---- resizing ----
+
+/// Why a frame of another size is refused for a package whose own
+/// preprocessor resize is not ported: guessing at it would feed the robot
+/// frames its policy was not trained on.
+fn not_resizable(cam: &str, img: &Image, spec: &PolicySpec) -> String {
+    let (h, w) = (u64::from(spec.height), u64::from(spec.width));
+    let same_aspect = u64::from(img.height) * w == u64::from(img.width) * h;
+    let hint = if same_aspect {
+        format!(", or set max_image_side={}", h.max(w))
+    } else {
+        String::new()
+    };
+    format!(
+        "camera {cam:?} is {}x{}; this package's image preprocessing is not done on the \
+         server, so send frames at {h}x{w}{hint}",
+        img.height, img.width
+    )
+}
 
 /// One axis of OpenCV's `INTER_LINEAR`: for each output index, the source
 /// index and the weight of the next source sample.

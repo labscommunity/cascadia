@@ -595,6 +595,7 @@ mod tests {
             attribution: None,
             manifest_sha256: "ab".repeat(32),
             precision: "f32".into(),
+            server_resize: true,
         }
     }
 

@@ -33,6 +33,7 @@ fn spec() -> PolicySpec {
         attribution: None,
         manifest_sha256: "ab".repeat(32),
         precision: "f32".into(),
+        server_resize: true,
     }
 }
 
@@ -676,4 +677,32 @@ fn a_native_480x640_jpeg_passes_through() {
     assert!(d <= 3.0, "{d}");
     // The spec's own payload cap would have refused it.
     assert!(decode_predict(native, &spec(), max()).is_err());
+}
+
+#[test]
+fn packages_without_a_ported_resize_refuse_other_sizes() {
+    let mut s = spec();
+    s.server_resize = false;
+    let e = decode_predict(
+        fixture!("predict-native-480x640.msgpack"),
+        &s,
+        MAX_REQUEST_BYTES,
+    )
+    .unwrap_err();
+    assert!(e.message().contains("is 480x640"), "{e}");
+    assert!(e.message().contains("send frames at 16x16"), "{e}");
+    // 480x640 is not square, so max_image_side cannot make it 16x16.
+    assert!(!e.message().contains("max_image_side"), "{e}");
+    let (image, _) = frames();
+    let mut r = good();
+    r.images.pop();
+    let big: Vec<u8> = image.iter().copied().cycle().take(32 * 32 * 3).collect();
+    r = r.image(
+        "images.wrist",
+        val(|b| mp::image(b, "raw", "uint8", &[32, 32, 3], &big)),
+    );
+    let e = decode_predict(&r.pack(), &s, MAX_REQUEST_BYTES).unwrap_err();
+    assert!(e.message().contains("or set max_image_side=16"), "{e}");
+    // Frames at the model size need no resize.
+    decode_predict(fixture!("predict-raw.msgpack"), &s, max()).unwrap();
 }

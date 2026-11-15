@@ -40,6 +40,11 @@ pub struct ManifestSpec {
     pub n_action_steps: Option<usize>,
     /// The noise the manifest draws (`noise.shape` or `pi05`/`pi0` `noise_shape`), batch excluded.
     pub noise_shape: Option<Vec<usize>>,
+    /// Frames of another size can be resized by the API with `resize`: only
+    /// physicalai's own `pi05` and `smolvla_resize` (letterbox) steps, whose
+    /// bilinear arithmetic is ported there, and only with no `image_flip`
+    /// before them (a flip then a padded letterbox is not a letterbox then a flip).
+    pub server_resize: bool,
 }
 
 fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
@@ -86,7 +91,17 @@ impl ManifestSpec {
                 _ => noise_shape = Some(shape.clone()),
             }
         }
+        let ported = m.preprocessors.iter().any(|s| match s {
+            PreStep::Pi05(_) => true,
+            PreStep::SmolVlaResize(r) => !r.stretch,
+            _ => false,
+        });
+        let flips = m
+            .preprocessors
+            .iter()
+            .any(|s| matches!(s, PreStep::ImageFlip { .. }));
         Ok(Self {
+            server_resize: ported && !flips,
             cameras: CameraPlan::from_manifest(m)?,
             image_hw,
             resize,
@@ -201,6 +216,7 @@ pub fn derive_spec(
         attribution: m.attribution.clone(),
         manifest_sha256: String::new(),
         precision: String::new(),
+        server_resize: ms.server_resize,
     };
     if let Err(EngineError::InvalidConfig(m)) = cascadia_engine::payload_cap(&spec) {
         return refuse(m);
@@ -232,6 +248,37 @@ mod tests {
             action_shape: [30, 20],
             noise: NoiseMode::Input,
             noise_shape: Some(vec![30, 20]),
+        }
+    }
+
+    /// The server resizes other frame sizes only for physicalai's own `pi05`
+    /// and `smolvla_resize` letterboxes, never after an `image_flip`.
+    #[test]
+    fn only_ported_letterboxes_are_resized_on_the_server() {
+        let cases = [
+            ("intel-pi05-libero-manifest.json", true),
+            ("intel-smolvla-libero-manifest.json", true),
+            ("smolvla-libero-noise-manifest.json", true),
+            ("pi0-libero-manifest.json", false),
+            ("xvla-libero-manifest.json", false),
+            ("evo1-libero-manifest.json", false),
+            ("vlajepa-libero-manifest.json", false),
+            ("xr0-libero-manifest.json", false),
+            ("gr00t-libero-spatial-manifest.json", false),
+            ("molmoact2-libero-manifest.json", false),
+        ];
+        let opts = LoadOptions {
+            allow_identity_stats: true,
+        };
+        for (file, want) in cases {
+            let path = format!(
+                "{}/tests/fixtures/policy/{file}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let m = PolicyManifest::parse(&std::fs::read_to_string(&path).unwrap(), opts)
+                .unwrap_or_else(|e| panic!("{file}: {e}"));
+            let ms = ManifestSpec::from_manifest(&m).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_eq!(ms.server_resize, want, "{file}");
         }
     }
 

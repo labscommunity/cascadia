@@ -26,6 +26,7 @@ fn spec() -> PolicySpec {
         attribution: None,
         manifest_sha256: String::new(),
         precision: String::new(),
+        server_resize: false,
     }
 }
 
