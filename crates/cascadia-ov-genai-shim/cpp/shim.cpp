@@ -33,6 +33,7 @@
 #include <openvino/genai/chat_history.hpp>
 #include <openvino/genai/version.hpp>
 #include <openvino/core/version.hpp>
+#include <openvino/op/util/multi_subgraph_base.hpp>
 
 namespace {
 
@@ -185,6 +186,21 @@ std::string join_port_names(const Set& names) {
         out += n;
     }
     return out;
+}
+
+// get_ops() lists only top-level ops; an op inside a Loop, TensorIterator or
+// If body counts too (a RandomUniform there still draws in-graph noise).
+void record_op_types(const ov::Model& model, std::unordered_set<std::string>& out) {
+    for (const auto& op : model.get_ops()) {
+        out.insert(op->get_type_name());
+        if (const auto sub = ov::as_type_ptr<ov::op::util::MultiSubGraphOp>(op)) {
+            for (size_t i = 0; i < sub->get_internal_subgraphs_size(); ++i) {
+                if (const auto& body = sub->get_function(i)) {
+                    record_op_types(*body, out);
+                }
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -977,9 +993,7 @@ int32_t cascadia_runtime_compile_inspected(
             handle->core.add_extension(std::string(extension_path));
         }
         auto model = handle->core.read_model(std::string(model_xml_path));
-        for (const auto& op : model->get_ops()) {
-            handle->op_types.insert(op->get_type_name());
-        }
+        record_op_types(*model, handle->op_types);
         handle->ops_recorded = true;
         auto compiled = handle->core.compile_model(model, std::string(device), props);
         handle->compiled = std::make_shared<ov::CompiledModel>(std::move(compiled));

@@ -2509,4 +2509,19 @@ mod policy_support_tests {
         let ext = find_tokenizers_extension().unwrap();
         assert!(ext.is_file(), "{}", ext.display());
     }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn op_types_include_ops_inside_a_loop_body() {
+        // tests/fixtures/loop_random.xml: RandomUniform only inside a Loop body.
+        let xml = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/loop_random.xml"
+        );
+        let plugin = PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f32");
+        let rt = Runtime::compile_inspected(xml, "CPU", None, &plugin).unwrap();
+        assert!(rt.has_op_type("Loop").unwrap());
+        assert!(rt.has_op_type("RandomUniform").unwrap());
+        assert!(!rt.has_op_type("Multiply").unwrap());
+    }
 }
