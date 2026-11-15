@@ -9,6 +9,7 @@ pub mod chunk;
 pub mod error;
 pub mod load;
 pub mod peer;
+pub mod policy;
 pub mod shard;
 pub mod stats;
 pub mod task;
@@ -17,6 +18,7 @@ pub use chunk::{Chunk, FinishReason, TokenLogprobs, TopLogprob};
 pub use error::Error;
 pub use load::LoadProgress;
 pub use peer::{PeerEndpoint, PeerLayout};
+pub use policy::{ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention};
 pub use shard::{ShardPlan, ShardSpec};
 pub use stats::ApiStats;
 pub use task::{

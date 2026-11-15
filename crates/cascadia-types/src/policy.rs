@@ -1,0 +1,128 @@
+//! Robot-policy (VLA) value types: one observation in, one action chunk out.
+//!
+//! Engine-agnostic so the API, the CLI and every `PolicyEngine` share them.
+
+use serde::{Deserialize, Serialize};
+
+/// One camera frame: `height * width * 3` bytes, uint8 HWC RGB.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    pub height: u32,
+    pub width: u32,
+    pub data: Vec<u8>,
+}
+
+impl Image {
+    /// Byte length a well-formed frame of this size has, or `None` on overflow.
+    pub fn expected_len(&self) -> Option<usize> {
+        (self.height as usize)
+            .checked_mul(self.width as usize)?
+            .checked_mul(3)
+    }
+}
+
+/// One policy call's input.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Observation {
+    /// Camera name to frame; names must be exactly [`PolicySpec::cameras`].
+    pub images: Vec<(String, Image)>,
+    pub state: Vec<f32>,
+    pub prompt: String,
+    pub seed: Option<u64>,
+    /// Flow-matching start noise, row-major `[1, *noise_shape]`; only for
+    /// [`NoiseMode::Input`] packages.
+    pub noise: Option<Vec<f32>>,
+}
+
+/// One policy call's output: `actions` is row-major `[steps, dim]`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionChunk {
+    pub actions: Vec<f32>,
+    pub steps: usize,
+    pub dim: usize,
+    pub infer_ms: f64,
+}
+
+/// Where a package's flow-matching start noise comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseMode {
+    /// The model has a `noise` input; the engine draws it unless the call carries it.
+    Input,
+    /// A `RandomUniform` op inside the graph.
+    InGraphRandom,
+    /// Neither: the start is fixed in the graph.
+    Constant,
+}
+
+/// The letterbox convention a client must resize with before sending frames.
+///
+/// Both are bilinear with pad value 0 applied before scaling to `[-1, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeConvention {
+    /// Padding split evenly on both sides (`pi05`).
+    Center,
+    /// Padding on the top and left, content at the bottom right (`smolvla_resize`).
+    TopLeft,
+}
+
+/// What a loaded policy accepts and returns; served as `GET /v1/policy/metadata`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicySpec {
+    pub model: String,
+    pub device: String,
+    /// Camera names a request must carry, exactly.
+    pub cameras: Vec<String>,
+    pub height: u32,
+    pub width: u32,
+    pub state_len: usize,
+    /// `[T, D]` of the returned action chunk.
+    pub chunk: [usize; 2],
+    pub noise: NoiseMode,
+    pub resize: ResizeConvention,
+    pub prompt_max_bytes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_serializes_with_snake_case_enums() {
+        let spec = PolicySpec {
+            model: "m".into(),
+            device: "GPU".into(),
+            cameras: vec!["image".into(), "image2".into()],
+            height: 224,
+            width: 224,
+            state_len: 8,
+            chunk: [10, 7],
+            noise: NoiseMode::InGraphRandom,
+            resize: ResizeConvention::TopLeft,
+            prompt_max_bytes: 1024,
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["noise"], "in_graph_random");
+        assert_eq!(v["resize"], "top_left");
+        assert_eq!(v["chunk"], serde_json::json!([10, 7]));
+        assert_eq!(serde_json::from_value::<PolicySpec>(v).unwrap(), spec);
+    }
+
+    #[test]
+    fn image_expected_len_is_hwc_and_checked() {
+        let img = Image {
+            height: 2,
+            width: 3,
+            data: vec![],
+        };
+        assert_eq!(img.expected_len(), Some(18));
+        let huge = Image {
+            height: u32::MAX,
+            width: u32::MAX,
+            data: vec![],
+        };
+        // 64-bit usize: (2^32-1)^2 * 3 overflows.
+        assert_eq!(huge.expected_len(), None);
+    }
+}
