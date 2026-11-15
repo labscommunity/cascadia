@@ -475,7 +475,9 @@ fn gpu_enabled(test: &str) -> bool {
 }
 
 /// π0 on the GPU: f16 only. f32 weights (~12.5 GB) do not compile on a 16 GB
-/// Arc 140V, and that has to come back as a load error, not a panic.
+/// Arc 140V, and that has to come back as a load error, not a panic. That
+/// check runs in a child process: after the failed compile, every later GPU
+/// compile in the same process fails too (`CL_INVALID_EVENT`).
 #[test]
 fn pi0_gpu_infer_f16_and_f32_is_a_load_error() {
     let test = "pi0_gpu_infer_f16_and_f32_is_a_load_error";
@@ -504,13 +506,12 @@ fn pi0_gpu_infer_f16_and_f32_is_a_load_error() {
     assert!(got2.iter().all(|x| x.is_finite()));
     let diff = diff.max(max_abs_diff(&got2, &npz(&z, "ref_noise2").f32s()));
 
-    let opts = |precision| OvPolicyOptions {
+    let opts = OvPolicyOptions {
         device: "GPU".into(),
-        precision,
         ..OvPolicyOptions::default()
     };
     {
-        let mut engine = OvPolicyEngine::load(&dir, &opts(None)).unwrap();
+        let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
         let warm = engine.warmup().unwrap();
         assert_eq!(warm.len(), WARMUP_CALLS);
         let a = engine.infer(&observation(&engine, LIBERO_SOUP)).unwrap();
@@ -525,7 +526,30 @@ fn pi0_gpu_infer_f16_and_f32_is_a_load_error() {
     // GPU f16 vs PyTorch f32 was 3.2e-3 at most over both noise draws.
     assert!(diff <= 1e-2, "gpu pi0 f16 max abs diff {diff} > 1e-2");
 
-    match OvPolicyEngine::load(&dir, &opts(Some(Precision::F32))) {
+    let child = "pi0_gpu_f32_load_is_an_error_in_its_own_process";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", child, "--ignored", "--nocapture"])
+        .output()
+        .unwrap();
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{child}: {}\n{stdout}",
+        out.status
+    );
+}
+
+#[test]
+#[ignore = "run by pi0_gpu_infer_f16_and_f32_is_a_load_error, in its own process"]
+fn pi0_gpu_f32_load_is_an_error_in_its_own_process() {
+    let dir = PathBuf::from(std::env::var_os("CASCADIA_POLICY_PACKAGE_PI0").unwrap());
+    let opts = OvPolicyOptions {
+        device: "GPU".into(),
+        precision: Some(Precision::F32),
+        ..OvPolicyOptions::default()
+    };
+    match OvPolicyEngine::load(&dir, &opts) {
         Ok(_) => panic!("gpu pi0 f32 compiled; expected it to fail on a 16 GB GPU"),
         Err(e) => {
             eprintln!("gpu pi0 f32 load error: {e}");
@@ -637,6 +661,60 @@ fn xvla_observation(z: &[u8]) -> Observation {
     }
 }
 
+/// The served 7-wide rows against the reference's, per channel group.
+struct ServedDiff {
+    /// Plain max abs over the row, for the log only.
+    max: f32,
+    position: f32,
+    rotation_deg: f64,
+    /// The reference's raw (pre-threshold) gripper at each flipped row.
+    gripper_flips: Vec<f32>,
+}
+
+/// LIBERO's rotations sit near π, where an axis-angle and its antipode are the
+/// same rotation but differ by up to ~2π per component, so a tiny error can
+/// move the plain max by several units: rotations are compared as rotations.
+fn served_diff(got: &[f32], z: &[u8]) -> ServedDiff {
+    let want = npz(z, "ref7").f32s();
+    let raw_gripper: Vec<f32> = npz(z, "ref20").f32s().chunks(20).map(|r| r[9]).collect();
+    let rows = || got.chunks(7).zip(want.chunks(7));
+    ServedDiff {
+        max: max_abs_diff(got, &want),
+        position: rows()
+            .map(|(g, w)| max_abs_diff(&g[..3], &w[..3]))
+            .fold(0.0f32, f32::max),
+        rotation_deg: rows()
+            .map(|(g, w)| rotation_deg(&g[3..6], &w[3..6]))
+            .fold(0.0f64, f64::max),
+        gripper_flips: rows()
+            .zip(&raw_gripper)
+            .filter(|((g, w), _)| g[6] != w[6])
+            .map(|(_, &r)| r)
+            .collect(),
+    }
+}
+
+impl ServedDiff {
+    /// Position and rotation (in radians) within `bound`, no gripper flip.
+    fn assert_within(&self, label: &str, bound: f32) {
+        assert!(
+            self.position <= bound,
+            "{label} position diff {} > {bound}",
+            self.position
+        );
+        let rad = self.rotation_deg.to_radians();
+        assert!(
+            rad <= bound as f64,
+            "{label} rotation diff {rad} rad > {bound}"
+        );
+        assert!(
+            self.gripper_flips.is_empty(),
+            "{label} gripper flipped at raw {:?}",
+            self.gripper_flips
+        );
+    }
+}
+
 #[test]
 fn xvla_cpu_infer_matches_the_pytorch_reference() {
     let Some(dir) = xvla("xvla_cpu_infer_matches_the_pytorch_reference") else {
@@ -665,18 +743,13 @@ fn xvla_cpu_infer_matches_the_pytorch_reference() {
     let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
     let a = engine.infer(&xvla_observation(&z)).unwrap();
     assert_eq!((a.steps, a.dim, a.actions.len()), (30, 7, 210));
-    let want = npz(&z, "ref7").f32s();
-    let diff = max_abs_diff(&a.actions, &want);
+    let d = served_diff(&a.actions, &z);
     eprintln!(
-        "xvla engine cpu f32 vs pytorch f32 (served 7-wide): max abs {diff} infer_ms={:.0}",
-        a.infer_ms
+        "xvla engine cpu f32 vs pytorch f32 (served 7-wide): max abs {} position {} \
+         rotation {:.4} deg gripper flips {:?} infer_ms={:.0}",
+        d.max, d.position, d.rotation_deg, d.gripper_flips, a.infer_ms
     );
-    assert!(
-        diff <= 5e-4,
-        "max abs diff {diff}: {:?} vs {:?}",
-        &a.actions[..7],
-        &want[..7]
-    );
+    d.assert_within("xvla cpu f32", 5e-4);
 }
 
 /// Axis-angle to unit quaternion `(w, x, y, z)`.
@@ -700,15 +773,13 @@ fn rotation_deg(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// X-VLA on the GPU, end to end on the reference's raw inputs, against
-/// LeRobot's served 7-wide actions.
+/// LeRobot's served 7-wide actions ([`served_diff`]).
 ///
-/// f32 is held to the CPU bar's order (spike: 2.86e-4). f16 is held per
-/// channel, since a plain max on the served row would fail on two things
-/// that are not errors: an axis-angle flip near π, and a gripper whose raw
-/// value sits near the 0.5 threshold (the reference has one at 0.484). The
-/// spike's f16 effect was position <= 6.3e-3, rotation <= 1.34 deg, raw gripper
-/// <= 0.21; the bounds are about 3x that, and a gripper flip only counts where
-/// the reference's raw value is more than 0.25 from the threshold.
+/// f32 is held to 1e-3 (spike: 2.86e-4). The spike's f16 effect was position
+/// <= 6.3e-3, rotation <= 1.34 deg and raw gripper <= 0.21, so f16 is held to
+/// about 3x that, and a gripper flip counts only where the reference's raw
+/// value is more than 0.25 from the 0.5 threshold (one of its rows is at 0.484).
+/// The reference call comes before warmup so a warmup failure still shows it.
 #[test]
 fn xvla_gpu_infer_f16_and_f32() {
     let test = "xvla_gpu_infer_f16_and_f32";
@@ -719,8 +790,7 @@ fn xvla_gpu_infer_f16_and_f32() {
         return;
     }
     let z = reference(&dir);
-    let want = npz(&z, "ref7").f32s();
-    let raw_gripper: Vec<f32> = npz(&z, "ref20").f32s().chunks(20).map(|r| r[9]).collect();
+    let obs = xvla_observation(&z);
     for (precision, label) in [(None, "f16"), (Some(Precision::F32), "f32")] {
         let opts = OvPolicyOptions {
             device: "GPU".into(),
@@ -728,40 +798,42 @@ fn xvla_gpu_infer_f16_and_f32() {
             ..OvPolicyOptions::default()
         };
         let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
-        let warm = engine.warmup().unwrap();
-        assert_eq!(warm.len(), WARMUP_CALLS);
-        let a = engine.infer(&xvla_observation(&z)).unwrap();
+        let a = engine.infer(&obs).unwrap();
         assert_eq!((a.steps, a.dim, a.actions.len()), (30, 7, 210));
-        assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
-        let diff = max_abs_diff(&a.actions, &want);
-        let rows = || a.actions.chunks(7).zip(want.chunks(7));
-        let pos = rows()
-            .map(|(g, w)| max_abs_diff(&g[..3], &w[..3]))
-            .fold(0.0f32, f32::max);
-        let rot = rows()
-            .map(|(g, w)| rotation_deg(&g[3..6], &w[3..6]))
-            .fold(0.0f64, f64::max);
-        let flips: Vec<f32> = rows()
-            .zip(&raw_gripper)
-            .filter(|((g, w), _)| g[6] != w[6])
-            .map(|(_, &r)| r)
-            .collect();
+        let warm = engine.warmup();
+        let infer_ms = engine.infer(&obs).map(|b| b.infer_ms);
+        let d = served_diff(&a.actions, &z);
         eprintln!(
-            "gpu xvla {label} actions {:?} diff={diff} pos={pos} rot_deg={rot:.3} \
-             gripper_flips_at_raw={flips:?} infer_ms={:.1} warmup={warm:?}",
+            "gpu xvla {label} actions {:?} diff={} position={} rotation_deg={:.3} \
+             gripper_flips_at_raw={:?} infer_ms={infer_ms:.1?} warmup={warm:?}",
             &a.actions[..7],
-            a.infer_ms
+            d.max,
+            d.position,
+            d.rotation_deg,
+            d.gripper_flips
         );
         if precision.is_some() {
-            assert!(diff <= 1e-3, "gpu xvla f32 max abs diff {diff} > 1e-3");
+            d.assert_within("gpu xvla f32", 1e-3);
         } else {
-            assert!(pos <= 0.02, "gpu xvla f16 position diff {pos} > 0.02");
-            assert!(rot <= 4.0, "gpu xvla f16 rotation diff {rot} deg > 4");
             assert!(
-                flips.iter().all(|r| (r - 0.5).abs() <= 0.25),
-                "gpu xvla f16 gripper flipped away from the threshold: raw {flips:?}"
+                d.position <= 0.02,
+                "gpu xvla f16 position diff {} > 0.02",
+                d.position
+            );
+            assert!(
+                d.rotation_deg <= 4.0,
+                "gpu xvla f16 rotation diff {} deg > 4",
+                d.rotation_deg
+            );
+            assert!(
+                d.gripper_flips.iter().all(|r| (r - 0.5).abs() <= 0.25),
+                "gpu xvla f16 gripper flipped away from the threshold: raw {:?}",
+                d.gripper_flips
             );
         }
+        let warm = warm.unwrap_or_else(|e| panic!("gpu xvla {label} warmup: {e}"));
+        assert_eq!(warm.len(), WARMUP_CALLS);
+        infer_ms.unwrap();
     }
 }
 
