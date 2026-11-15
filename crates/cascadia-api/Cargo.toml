@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with /health, /v1/models, /v1/chat/completions."
 
+[features]
+default = []
+# Intel physicalai remote-inference front end (Zenoh) for the policy server.
+zenoh = ["dep:zenoh"]
+
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
@@ -37,6 +42,13 @@ bytes = { workspace = true }
 # formatter, silently stripping tools from the prompt.
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "json", "adjacent_loop_items"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+# JPEG frames in physicalai requests: pure Rust, no C toolchain, maintained as
+# the `image` crate's JPEG decoder.
+zune-jpeg = "0.5.15"
+# Pinned to the eclipse-zenoh release physicalai locks; TCP is the only link
+# its client opens.
+zenoh = { version = "=1.9.0", default-features = false, features = ["transport_tcp"], optional = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true }

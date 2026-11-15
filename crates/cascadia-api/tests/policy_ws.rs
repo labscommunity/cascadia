@@ -35,6 +35,8 @@ fn spec() -> PolicySpec {
         resize: ResizeConvention::TopLeft,
         prompt_max_bytes: 64,
         attribution: None,
+        manifest_sha256: String::new(),
+        precision: String::new(),
     }
 }
 

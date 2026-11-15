@@ -92,6 +92,13 @@ pub struct PolicySpec {
     /// The package's licence notice, served verbatim when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution: Option<String>,
+    /// SHA-256 (lowercase hex) of the package's `manifest.json` bytes, so two
+    /// fine-tunes with the same shapes advertise different metadata.
+    #[serde(default)]
+    pub manifest_sha256: String,
+    /// The precision the model was compiled at (`f16` or `f32`).
+    #[serde(default)]
+    pub precision: String,
 }
 
 #[cfg(test)]
@@ -113,6 +120,8 @@ mod tests {
             resize: ResizeConvention::TopLeft,
             prompt_max_bytes: 1024,
             attribution: None,
+            manifest_sha256: String::new(),
+            precision: String::new(),
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["noise"], "in_graph_random");

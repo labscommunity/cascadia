@@ -54,6 +54,7 @@ impl OvPolicyEngine {
         use super::spec::ServerFacts;
         use crate::runtime::map_ov_err;
         use cascadia_ov_genai_shim::Runtime;
+        use sha2::Digest;
 
         let manifest = PolicyManifest::load(dir, opts.manifest)?;
         let (device, config) = compile_config(&opts.device, opts.precision)?;
@@ -74,7 +75,14 @@ impl OvPolicyEngine {
             || dir.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        let pipeline = PolicyPipeline::new(
+        let manifest_bytes = std::fs::read(dir.join("manifest.json"))
+            .map_err(|e| EngineError::InvalidConfig(format!("read manifest.json: {e}")))?;
+        let manifest_sha256 = sha2::Sha256::digest(&manifest_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let precision = super::pipeline::compiled_precision(&device, opts.precision);
+        let mut pipeline = PolicyPipeline::new(
             manifest,
             ServerFacts {
                 model,
@@ -90,6 +98,7 @@ impl OvPolicyEngine {
             has_random_uniform,
             Box::new(tokenizer),
         )?;
+        pipeline.set_identity(manifest_sha256, precision);
         Ok(Self { pipeline })
     }
 }

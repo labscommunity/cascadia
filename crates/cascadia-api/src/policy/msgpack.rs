@@ -42,6 +42,26 @@ impl<'a> Val<'a> {
         }
     }
 
+    /// As JSON: bin becomes a UTF-8 string when it is one, else null.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        use serde_json::Value as J;
+        match self {
+            Val::Nil => J::Null,
+            Val::Bool(b) => J::Bool(*b),
+            Val::UInt(u) => (*u).into(),
+            Val::Int(i) => (*i).into(),
+            Val::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
+            Val::Str(s) => J::String((*s).to_string()),
+            Val::Bin(_) => self.key().map_or(J::Null, |s| J::String(s.to_string())),
+            Val::Array(a) => J::Array(a.iter().map(Val::to_json).collect()),
+            Val::Map(m) => J::Object(
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.key()?.to_string(), v.to_json())))
+                    .collect(),
+            ),
+        }
+    }
+
     pub(crate) fn as_u64(&self) -> Option<u64> {
         match *self {
             Val::UInt(u) => Some(u),

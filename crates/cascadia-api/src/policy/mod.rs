@@ -4,7 +4,10 @@
 //! Public because other serving front ends reuse the codec without the router.
 
 mod msgpack;
+pub mod physicalai;
 pub mod server;
+#[cfg(feature = "zenoh")]
+pub mod zenoh_server;
 
 use cascadia_engine::{check_observation, payload_cap, EngineError, PAYLOAD_MAX_BYTES};
 use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec};
@@ -304,17 +307,151 @@ pub fn check_reply(chunk: &ActionChunk) -> Result<(), RequestError> {
     Ok(())
 }
 
-/// The spec as JSON, served at `GET /v1/policy/metadata`.
-pub fn metadata_json(spec: &PolicySpec) -> String {
-    serde_json::to_string(spec).expect("PolicySpec serializes to JSON")
+/// What the metadata says beyond the spec (which carries `manifest_sha256`
+/// and `precision`), so a bridge can answer physicalai's handshake.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageIdentity {
+    /// `policy.name` in the package manifest.
+    pub policy_name: String,
+    /// The slowest warmup call, in milliseconds: the latency a client should budget for.
+    pub warmup_ms: Option<u32>,
 }
 
-/// The spec as one msgpack map, sent first on every WebSocket.
+impl PackageIdentity {
+    /// Read `manifest.json` in a package directory.
+    pub fn from_package_dir(dir: &std::path::Path) -> std::io::Result<Self> {
+        let bytes = std::fs::read(dir.join("manifest.json"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let policy_name = manifest["policy"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        Ok(Self {
+            policy_name,
+            warmup_ms: None,
+        })
+    }
+}
+
+/// The spec's fields plus `policy_name`, `chunk_size` (T) and `rtc_chunk_size`
+/// (always null: no RTC); `warmup_ms` too when `timing`.
+fn metadata_value(spec: &PolicySpec, id: &PackageIdentity, timing: bool) -> serde_json::Value {
+    let mut v = serde_json::to_value(spec).expect("PolicySpec serializes to JSON");
+    let o = v.as_object_mut().expect("PolicySpec is an object");
+    o.insert("policy_name".into(), id.policy_name.clone().into());
+    o.insert("chunk_size".into(), spec.chunk[0].into());
+    o.insert("rtc_chunk_size".into(), serde_json::Value::Null);
+    if timing {
+        o.insert("warmup_ms".into(), id.warmup_ms.into());
+    }
+    v
+}
+
+/// The spec as JSON, served at `GET /v1/policy/metadata`, with no identity.
+pub fn metadata_json(spec: &PolicySpec) -> String {
+    metadata_json_for(spec, &PackageIdentity::default())
+}
+
+/// The HTTP metadata, which also states `warmup_ms`.
+pub fn metadata_json_for(spec: &PolicySpec, id: &PackageIdentity) -> String {
+    metadata_value(spec, id, true).to_string()
+}
+
+/// The metadata as one msgpack map, sent first on every WebSocket, with no identity.
 pub fn encode_metadata(spec: &PolicySpec) -> Vec<u8> {
-    let v = serde_json::to_value(spec).expect("PolicySpec serializes to JSON");
+    encode_metadata_for(spec, &PackageIdentity::default())
+}
+
+/// The socket metadata. It carries no timing, so two loads of one package at
+/// one precision send identical bytes: a client may hash them to tell whether
+/// another server serves the same policy.
+pub fn encode_metadata_for(spec: &PolicySpec, id: &PackageIdentity) -> Vec<u8> {
     let mut w = Writer::default();
-    w.json(&v);
+    w.json(&metadata_value(spec, id, false));
     w.buf
+}
+
+/// The metadata a server sent, as [`encode_metadata_for`] writes it.
+pub fn decode_metadata(bytes: &[u8]) -> Result<(PolicySpec, PackageIdentity), RequestError> {
+    let v = msgpack::parse(bytes)?.to_json();
+    let spec: PolicySpec = serde_json::from_value(v.clone())
+        .map_err(|e| RequestError::new(format!("metadata is not a policy spec: {e}")))?;
+    let id = PackageIdentity {
+        policy_name: v["policy_name"].as_str().unwrap_or_default().to_string(),
+        warmup_ms: None,
+    };
+    Ok((spec, id))
+}
+
+/// A request for `obs` in openpi's layout, as `msgpack_numpy` packs it: what
+/// [`decode_request`] reads. `spec` gives the noise shape.
+pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Vec<u8> {
+    let mut w = Writer::default();
+    let n = 3 + usize::from(obs.seed.is_some()) + usize::from(obs.noise.is_some());
+    w.map(n);
+    w.str("images");
+    w.map(obs.images.len());
+    for (name, img) in &obs.images {
+        w.str(name);
+        ndarray_header(
+            &mut w,
+            "|u1",
+            &[img.height as usize, img.width as usize, 3],
+            &img.data,
+        );
+    }
+    let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    w.str("state");
+    ndarray_header(&mut w, "<f4", &[obs.state.len()], &f32s(&obs.state));
+    w.str("prompt");
+    w.str(&obs.prompt);
+    if let Some(seed) = obs.seed {
+        w.str("seed");
+        w.uint(seed);
+    }
+    if let Some(noise) = &obs.noise {
+        w.str("noise");
+        let mut shape = vec![1];
+        shape.extend(spec.noise_shape.iter().flatten());
+        ndarray_header(&mut w, "<f4", &shape, &f32s(noise));
+    }
+    w.buf
+}
+
+/// A reply [`encode_reply`] wrote: `actions` `<f4 [T, D]` and `infer_ms`.
+pub fn decode_reply(bytes: &[u8]) -> Result<ActionChunk, RequestError> {
+    let Val::Map(entries) = msgpack::parse(bytes)? else {
+        return refuse("a reply is one msgpack map");
+    };
+    let (mut actions, mut infer_ms) = (None, None);
+    for (k, v) in entries {
+        match (k.key(), v) {
+            (Some("actions"), v) => {
+                let a = NdArray::parse("actions", v)?;
+                let [steps, dim] = a.shape[..] else {
+                    return refuse(format!("actions has shape {:?}; expected [T, D]", a.shape));
+                };
+                actions = Some((a.floats("actions")?, steps as usize, dim as usize));
+            }
+            (Some("server_timing"), Val::Map(t)) => {
+                infer_ms = t.into_iter().find_map(|(k, v)| match (k.key(), v) {
+                    (Some("infer_ms"), Val::Float(f)) => Some(f),
+                    _ => None,
+                });
+            }
+            _ => {}
+        }
+    }
+    let Some((actions, steps, dim)) = actions else {
+        return refuse("the reply has no actions");
+    };
+    Ok(ActionChunk {
+        actions,
+        steps,
+        dim,
+        infer_ms: infer_ms.unwrap_or_default(),
+    })
 }
 
 /// The WebSocket message cap for `spec` ([`cascadia_engine::payload_cap`]).

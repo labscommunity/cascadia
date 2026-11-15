@@ -195,6 +195,8 @@ pub fn derive_spec(
         resize: ms.resize,
         prompt_max_bytes: server.prompt_max_bytes,
         attribution: m.attribution.clone(),
+        manifest_sha256: String::new(),
+        precision: String::new(),
     };
     if let Err(EngineError::InvalidConfig(m)) = cascadia_engine::payload_cap(&spec) {
         return refuse(m);

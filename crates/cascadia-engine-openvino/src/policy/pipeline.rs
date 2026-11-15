@@ -248,6 +248,16 @@ pub fn compile_config(
     Ok((dev, config))
 }
 
+/// The precision [`compile_config`] compiles at, as the metadata states it:
+/// CPU is always f32; GPU is f16 unless f32 is asked for.
+pub fn compiled_precision(device: &str, precision: Option<Precision>) -> &'static str {
+    let dev = device.to_ascii_uppercase();
+    match (dev.split('.').next().unwrap_or_default(), precision) {
+        ("GPU", Some(Precision::F32)) | ("CPU", _) => "f32",
+        _ => "f16",
+    }
+}
+
 /// The input ports a policy kind's IR takes. Each layout has its own binder
 /// and its own feeds; the prompt, noise and postprocessing are shared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1471,6 +1481,14 @@ impl PolicyPipeline {
             dim,
             infer_ms: start.elapsed().as_secs_f64() * 1e3,
         })
+    }
+}
+
+impl PolicyPipeline {
+    /// Record which package bytes and precision this pipeline serves.
+    pub fn set_identity(&mut self, manifest_sha256: String, precision: &str) {
+        self.spec.manifest_sha256 = manifest_sha256;
+        self.spec.precision = precision.to_string();
     }
 }
 
@@ -2739,6 +2757,15 @@ mod tests {
             .to_string()
             .contains("NPU"));
         assert!(compile_config("AUTO", None).is_err());
+    }
+
+    #[test]
+    fn the_spec_states_the_compiled_precision() {
+        assert_eq!(compiled_precision("CPU", None), "f32");
+        assert_eq!(compiled_precision("cpu", Some(Precision::F32)), "f32");
+        assert_eq!(compiled_precision("GPU", None), "f16");
+        assert_eq!(compiled_precision("GPU.1", Some(Precision::F16)), "f16");
+        assert_eq!(compiled_precision("gpu.1", Some(Precision::F32)), "f32");
     }
 
     #[test]

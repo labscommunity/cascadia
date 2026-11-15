@@ -263,6 +263,8 @@ mod tests {
             resize: ResizeConvention::Center,
             prompt_max_bytes: 16,
             attribution: None,
+            manifest_sha256: String::new(),
+            precision: String::new(),
         }
     }
 

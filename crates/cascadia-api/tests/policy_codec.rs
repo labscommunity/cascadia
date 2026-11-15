@@ -24,6 +24,8 @@ fn spec() -> PolicySpec {
         resize: ResizeConvention::TopLeft,
         prompt_max_bytes: 64,
         attribution: None,
+        manifest_sha256: String::new(),
+        precision: String::new(),
     }
 }
 
@@ -311,9 +313,41 @@ fn metadata_has_every_spec_field() {
     assert_eq!(json["noise_shape"], serde_json::json!([2, 3]));
     assert_eq!(json["resize"], "top_left");
     let packed = encode_metadata(&s);
-    // A fixmap of the 11 spec fields; keys are msgpack str, as Python dicts pack.
-    assert_eq!(packed[0], 0x80 | 11);
+    // A map16 of the 13 spec fields (`attribution` omitted when absent) plus
+    // policy_name, chunk_size and rtc_chunk_size; keys are msgpack str, as
+    // Python dicts pack.
+    assert_eq!(packed[..3], [0xde, 0, 16]);
+    assert_eq!(json["manifest_sha256"], "");
+    assert_eq!(json["precision"], "");
+    assert_eq!(json["chunk_size"], s.chunk[0]);
     assert!(packed.windows(8).any(|w| w == b"top_left"));
+}
+
+#[test]
+fn socket_metadata_is_the_same_on_every_load() {
+    use cascadia_api::policy::{decode_metadata, encode_metadata_for, PackageIdentity};
+    let mut s = spec();
+    s.manifest_sha256 = "cd".repeat(32);
+    s.precision = "f16".into();
+    let load = |ms| PackageIdentity {
+        policy_name: "smolvla".into(),
+        warmup_ms: ms,
+    };
+    let first = encode_metadata_for(&s, &load(Some(180)));
+    assert_eq!(first, encode_metadata_for(&s, &load(Some(2310))));
+    assert_eq!(first, encode_metadata_for(&s, &load(None)));
+    assert!(!first.windows(9).any(|w| w == b"warmup_ms"));
+    // The package and the precision do change it.
+    let mut f32 = s.clone();
+    f32.precision = "f32".into();
+    assert_ne!(first, encode_metadata_for(&f32, &load(Some(180))));
+    let mut other = s.clone();
+    other.manifest_sha256 = "ef".repeat(32);
+    assert_ne!(first, encode_metadata_for(&other, &load(Some(180))));
+    let (back, id) = decode_metadata(&first).unwrap();
+    assert_eq!(back, s);
+    assert_eq!(id.policy_name, "smolvla");
+    assert_eq!(id.warmup_ms, None);
 }
 
 #[test]

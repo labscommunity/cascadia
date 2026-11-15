@@ -17,7 +17,10 @@ use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
-use super::{check_reply, decode_request, encode_metadata, encode_reply, metadata_json};
+use super::{
+    check_reply, decode_request, encode_metadata_for, encode_reply, metadata_json_for,
+    PackageIdentity,
+};
 
 /// How often the server pings; a connection whose last ping got no pong by
 /// the next one is closed, so a dropped robot frees its slot.
@@ -35,6 +38,8 @@ pub struct PolicyServerConfig {
     pub allow_origins: Vec<String>,
     pub max_connections: usize,
     pub ping_every: Duration,
+    /// Package identity and warmup time the metadata advertises.
+    pub identity: PackageIdentity,
 }
 
 impl Default for PolicyServerConfig {
@@ -43,20 +48,81 @@ impl Default for PolicyServerConfig {
             allow_origins: Vec::new(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             ping_every: PING_EVERY,
+            identity: PackageIdentity::default(),
         }
     }
 }
 
 type SharedEngine = Arc<Mutex<Box<dyn PolicyEngine>>>;
 
+/// One loaded engine and the connection slots every front end draws from,
+/// so the WebSocket and Zenoh front ends share one model and one limit.
 #[derive(Clone)]
-struct PolicyState {
+pub struct SharedPolicy {
     engine: SharedEngine,
     spec: Arc<PolicySpec>,
+    slots: Arc<Semaphore>,
+    max_connections: usize,
+}
+
+impl SharedPolicy {
+    /// Refuses zero slots and a spec whose request cap exceeds
+    /// [`cascadia_engine::PAYLOAD_MAX_BYTES`].
+    pub fn new(engine: Box<dyn PolicyEngine>, max_connections: usize) -> EngineResult<Self> {
+        if max_connections == 0 {
+            return Err(EngineError::InvalidConfig(
+                "the policy server needs at least one connection slot".into(),
+            ));
+        }
+        let spec = engine.spec().clone();
+        payload_cap(&spec)?;
+        Ok(Self {
+            engine: Arc::new(Mutex::new(engine)),
+            spec: Arc::new(spec),
+            slots: Arc::new(Semaphore::new(max_connections)),
+            max_connections,
+        })
+    }
+
+    pub fn spec(&self) -> &PolicySpec {
+        &self.spec
+    }
+
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// A connection slot, or `None` when all are taken.
+    pub fn try_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.slots.clone().try_acquire_owned().ok()
+    }
+
+    /// The engine, waiting for any call in flight. Blocking.
+    pub fn lock(&self) -> parking_lot::MutexGuard<'_, Box<dyn PolicyEngine>> {
+        self.engine.lock()
+    }
+}
+
+/// One `infer` call; a panicking engine becomes an error, so every caller
+/// still gets an answer.
+pub fn infer_guarded(
+    engine: &mut dyn PolicyEngine,
+    obs: &cascadia_types::Observation,
+) -> EngineResult<ActionChunk> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.infer(obs))).unwrap_or_else(
+        |_| {
+            tracing::error!("policy engine panicked during infer");
+            Err(EngineError::Backend("internal error".into()))
+        },
+    )
+}
+
+#[derive(Clone)]
+struct PolicyState {
+    policy: SharedPolicy,
     metadata: Arc<Vec<u8>>,
     metadata_json: Arc<String>,
     max_payload: usize,
-    slots: Arc<Semaphore>,
     cfg: Arc<PolicyServerConfig>,
 }
 
@@ -67,27 +133,27 @@ pub fn policy_router(
     engine: Box<dyn PolicyEngine>,
     cfg: PolicyServerConfig,
 ) -> EngineResult<Router> {
-    if cfg.max_connections == 0 {
-        return Err(EngineError::InvalidConfig(
-            "the policy server needs at least one connection slot".into(),
-        ));
-    }
-    let spec = engine.spec().clone();
-    let max_payload = payload_cap(&spec)? as usize;
+    let policy = SharedPolicy::new(engine, cfg.max_connections)?;
+    Ok(shared_policy_router(policy, cfg))
+}
+
+/// The policy router over an engine other front ends may share; the slots
+/// come from `policy`, not `cfg.max_connections`.
+pub fn shared_policy_router(policy: SharedPolicy, cfg: PolicyServerConfig) -> Router {
+    let spec = policy.spec().clone();
+    let max_payload = payload_cap(&spec).unwrap_or(cascadia_engine::PAYLOAD_MAX_BYTES) as usize;
     let state = PolicyState {
-        metadata: Arc::new(encode_metadata(&spec)),
-        metadata_json: Arc::new(metadata_json(&spec)),
-        spec: Arc::new(spec),
-        engine: Arc::new(Mutex::new(engine)),
+        metadata: Arc::new(encode_metadata_for(&spec, &cfg.identity)),
+        metadata_json: Arc::new(metadata_json_for(&spec, &cfg.identity)),
+        policy,
         max_payload,
-        slots: Arc::new(Semaphore::new(cfg.max_connections)),
         cfg: Arc::new(cfg),
     };
-    Ok(Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/v1/policy/metadata", get(metadata))
         .route("/v1/policy/ws", get(ws))
-        .with_state(state))
+        .with_state(state)
 }
 
 async fn health() -> impl IntoResponse {
@@ -122,12 +188,12 @@ async fn ws(
         Ok(u) => u,
         Err(rejection) => return rejection.into_response(),
     };
-    let Ok(permit) = st.slots.clone().try_acquire_owned() else {
+    let Some(permit) = st.policy.try_slot() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "the policy server is full: {} connections are open",
-                st.cfg.max_connections
+                st.policy.max_connections()
             ),
         )
             .into_response();
@@ -171,11 +237,11 @@ async fn serve_socket(socket: WebSocket, st: PolicyState, slot: OwnedSemaphorePe
                 Some(Ok(Message::Binary(_))) if busy => Some(Message::Text(
                     "one request at a time: wait for the reply before sending the next".into(),
                 )),
-                Some(Ok(Message::Binary(bytes))) => match decode_request(&bytes, &st.spec) {
+                Some(Ok(Message::Binary(bytes))) => match decode_request(&bytes, st.policy.spec()) {
                     Err(e) => Some(Message::Text(e.0)),
                     Ok(obs) => {
                         busy = true;
-                        let engine = st.engine.clone();
+                        let policy = st.policy.clone();
                         let done = done_tx.clone();
                         let slot = slot.clone();
                         tokio::task::spawn_blocking(move || {
@@ -183,21 +249,13 @@ async fn serve_socket(socket: WebSocket, st: PolicyState, slot: OwnedSemaphorePe
                             if done.is_closed() {
                                 return;
                             }
-                            let mut engine = engine.lock();
+                            let mut engine = policy.lock();
                             // The connection may have gone while this waited for the lock.
                             if done.is_closed() {
                                 return;
                             }
-                            // A panicking engine must still answer, or the client
-                            // (openpi has no receive timeout) waits forever.
-                            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                engine.infer(&obs)
-                            }))
-                            .unwrap_or_else(|_| {
-                                tracing::error!("policy engine panicked during infer");
-                                Err(EngineError::Backend("internal error".into()))
-                            })
-                            .map_err(client_message);
+                            // openpi has no receive timeout, so a panic must still answer.
+                            let res = infer_guarded(&mut **engine, &obs).map_err(client_message);
                             drop(engine);
                             let _ = done.blocking_send(res);
                         });

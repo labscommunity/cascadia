@@ -1,0 +1,592 @@
+//! The physicalai codec against bytes physicalai's own `_protocol.py` packed
+//! (`tests/fixtures/physicalai/generate.py`), and every refusal.
+
+use cascadia_api::policy::physicalai::{
+    decode_control, decode_predict, encode_error, encode_metadata, encode_predict_reply,
+    encode_reset_ok, read_seq, ControlError, ErrorCode, ServerIdentity, Timings, NO_SEQ,
+};
+use cascadia_api::policy::{max_payload_bytes, metadata_json_for, PackageIdentity};
+use cascadia_types::{ActionChunk, NoiseMode, PolicySpec, ResizeConvention};
+
+macro_rules! fixture {
+    ($name:literal) => {
+        include_bytes!(concat!("fixtures/physicalai/", $name)).as_slice()
+    };
+}
+
+const SERVER_ID: &str = "0123456789abcdef0123456789abcdef";
+
+fn spec() -> PolicySpec {
+    PolicySpec {
+        model: "mock".into(),
+        device: "CPU".into(),
+        cameras: vec!["image".into(), "wrist".into()],
+        height: 16,
+        width: 16,
+        state_len: 3,
+        chunk: [2, 3],
+        noise: NoiseMode::Input,
+        noise_shape: Some(vec![2, 3]),
+        resize: ResizeConvention::TopLeft,
+        prompt_max_bytes: 64,
+        attribution: None,
+        manifest_sha256: "ab".repeat(32),
+        precision: "f32".into(),
+    }
+}
+
+fn max() -> u64 {
+    u64::from(max_payload_bytes(&spec()))
+}
+
+fn frames() -> (Vec<u8>, Vec<u8>) {
+    let f = fixture!("frames.rgb");
+    (f[..768].to_vec(), f[768..].to_vec())
+}
+
+fn identity() -> ServerIdentity {
+    ServerIdentity {
+        server_id: SERVER_ID.into(),
+        name: "cell1".into(),
+        policy_name: "smolvla".into(),
+        manifest_sha256: "ab".repeat(32),
+        backend: "openvino".into(),
+        device: "CPU".into(),
+    }
+}
+
+#[test]
+fn metadata_reply_is_byte_for_byte_physicalai() {
+    assert_eq!(max(), 67184, "generate.py's MAX_REQUEST_BYTES");
+    assert_eq!(
+        encode_metadata(&identity(), &spec(), max()),
+        fixture!("metadata.msgpack")
+    );
+}
+
+#[test]
+fn control_requests() {
+    decode_control(fixture!("metadata-request.msgpack"), max()).unwrap();
+    // {"protocol_version": 2}
+    assert_eq!(
+        decode_control(
+            &[
+                0x81, 0xb0, b'p', b'r', b'o', b't', b'o', b'c', b'o', b'l', b'_', b'v', b'e', b'r',
+                b's', b'i', b'o', b'n', 2
+            ],
+            max()
+        ),
+        Err(ControlError::UnsupportedVersion)
+    );
+    let mut extra = fixture!("metadata-request.msgpack").to_vec();
+    extra[0] = 0x82;
+    extra.extend([0xa1, b'x', 0x01]);
+    assert!(matches!(
+        decode_control(&extra, max()),
+        Err(ControlError::Invalid(e)) if e.message().contains("only protocol_version")
+    ));
+    assert!(matches!(
+        decode_control(&[0xc1], max()),
+        Err(ControlError::Invalid(_))
+    ));
+    assert!(matches!(
+        decode_control(&[0x01], max()),
+        Err(ControlError::Invalid(_))
+    ));
+}
+
+#[test]
+fn raw_and_jpeg_predicts_decode() {
+    let (image, wrist) = frames();
+    let raw = decode_predict(fixture!("predict-raw.msgpack"), &spec(), max()).unwrap();
+    assert_eq!((raw.seq, raw.budget_ms), (3, 2000));
+    let o = &raw.observation;
+    assert_eq!(o.state, [0.5, -1.0, 2.25]);
+    assert_eq!(o.prompt, "pick up the cube");
+    assert_eq!(o.noise, None);
+    assert_eq!(o.images[0].0, "image");
+    assert_eq!(o.images[0].1.data, image);
+    assert_eq!(o.images[1].0, "wrist");
+    assert_eq!(o.images[1].1.data, wrist);
+
+    let jpeg = decode_predict(fixture!("predict-jpeg.msgpack"), &spec(), max()).unwrap();
+    // OpenCV (libjpeg-turbo) decoded the same bytes in physicalai's server.
+    let cv = fixture!("predict-jpeg.decoded.rgb");
+    let ours: Vec<u8> = jpeg
+        .observation
+        .images
+        .iter()
+        .flat_map(|(_, i)| i.data.clone())
+        .collect();
+    let worst = ours
+        .iter()
+        .zip(cv)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap();
+    eprintln!("JPEG decode vs OpenCV: worst channel difference {worst}");
+    assert!(worst <= 2, "our JPEG decode differs from OpenCV by {worst}");
+}
+
+#[test]
+fn unbatched_frames_f64_state_and_noise() {
+    let r = decode_predict(fixture!("predict-unbatched-noise.msgpack"), &spec(), max()).unwrap();
+    assert_eq!(r.seq, 4);
+    assert_eq!(r.observation.state, [0.5, -1.0, 2.25]);
+    assert_eq!(
+        r.observation.noise.unwrap(),
+        [0.0, 1.0, -1.0, 0.5, -0.5, 2.0]
+    );
+    let mut constant = spec();
+    constant.noise = NoiseMode::Constant;
+    constant.noise_shape = None;
+    let e = decode_predict(
+        fixture!("predict-unbatched-noise.msgpack"),
+        &constant,
+        max(),
+    )
+    .unwrap_err();
+    assert!(e.message().contains("no noise input"), "{e}");
+}
+
+#[test]
+fn a_bare_images_key_is_the_only_camera() {
+    let mut one = spec();
+    one.cameras = vec!["front".into()];
+    let r = decode_predict(fixture!("predict-single-camera.msgpack"), &one, max()).unwrap();
+    assert_eq!(r.observation.images[0].0, "front");
+    let e = decode_predict(fixture!("predict-single-camera.msgpack"), &spec(), max()).unwrap_err();
+    assert!(e.message().contains("one-camera package"), "{e}");
+}
+
+#[test]
+fn reply_and_errors_are_byte_for_byte_physicalai() {
+    let chunk = ActionChunk {
+        actions: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        steps: 2,
+        dim: 3,
+        infer_ms: 250.0,
+    };
+    let t = Timings {
+        queue_s: 0.001,
+        compute_s: 0.25,
+        decode_s: 0.0005,
+    };
+    assert_eq!(
+        encode_predict_reply(&chunk, 3, SERVER_ID, t),
+        fixture!("reply.msgpack")
+    );
+    assert_eq!(
+        encode_error(ErrorCode::InvalidRequest, 3),
+        fixture!("error-invalid-request.msgpack")
+    );
+    assert_eq!(
+        encode_error(ErrorCode::UnsupportedVersion, NO_SEQ),
+        fixture!("error-unsupported-version.msgpack")
+    );
+    assert_eq!(encode_reset_ok(), fixture!("reset-ok.msgpack"));
+    let codes = [
+        (ErrorCode::InvalidRequest, "invalid_request"),
+        (ErrorCode::UnsupportedVersion, "unsupported_version"),
+        (ErrorCode::ShuttingDown, "shutting_down"),
+        (ErrorCode::Superseded, "superseded"),
+        (ErrorCode::Expired, "expired"),
+        (ErrorCode::ModelError, "model_error"),
+    ];
+    for (c, s) in codes {
+        assert_eq!(c.as_str(), s);
+    }
+}
+
+#[test]
+fn read_seq_takes_the_top_level_integer() {
+    assert_eq!(read_seq(fixture!("predict-raw.msgpack")), 3);
+    assert_eq!(read_seq(fixture!("metadata-request.msgpack")), NO_SEQ);
+    assert_eq!(read_seq(b"\xc1"), NO_SEQ);
+    // {"seq": -5}
+    assert_eq!(read_seq(&[0x81, 0xa3, b's', b'e', b'q', 0xfb]), -5);
+}
+
+#[test]
+fn the_websocket_metadata_carries_the_package_identity() {
+    let id = PackageIdentity {
+        policy_name: "smolvla".into(),
+        warmup_ms: Some(180),
+    };
+    let v: serde_json::Value = serde_json::from_str(&metadata_json_for(&spec(), &id)).unwrap();
+    assert_eq!(v["manifest_sha256"], "ab".repeat(32));
+    assert_eq!(v["precision"], "f32");
+    assert_eq!(v["policy_name"], "smolvla");
+    assert_eq!(v["chunk_size"], 2);
+    assert!(v["rtc_chunk_size"].is_null());
+    assert_eq!(v["warmup_ms"], 180);
+}
+
+// ---- refusals: hand-built requests in physicalai's layout ----
+
+mod mp {
+    pub fn str(b: &mut Vec<u8>, s: &str) {
+        assert!(s.len() < 32);
+        b.push(0xa0 | s.len() as u8);
+        b.extend(s.as_bytes());
+    }
+    pub fn bin(b: &mut Vec<u8>, d: &[u8]) {
+        b.push(0xc6);
+        b.extend((d.len() as u32).to_be_bytes());
+        b.extend(d);
+    }
+    pub fn uint(b: &mut Vec<u8>, u: u64) {
+        b.push(0xcf);
+        b.extend(u.to_be_bytes());
+    }
+    pub fn int(b: &mut Vec<u8>, i: i64) {
+        b.push(0xd3);
+        b.extend(i.to_be_bytes());
+    }
+    pub fn shape(b: &mut Vec<u8>, shape: &[u64]) {
+        b.push(0x90 | shape.len() as u8);
+        shape.iter().for_each(|&d| uint(b, d));
+    }
+    pub fn np(b: &mut Vec<u8>, dtype: &str, shape_: &[u64], data: &[u8]) {
+        b.push(0x84);
+        str(b, "__np__");
+        b.push(0xc3);
+        str(b, "dtype");
+        str(b, dtype);
+        str(b, "shape");
+        shape(b, shape_);
+        str(b, "data");
+        bin(b, data);
+    }
+    pub fn image(b: &mut Vec<u8>, codec: &str, dtype: &str, shape_: &[u64], data: &[u8]) {
+        b.push(0x84);
+        str(b, "codec");
+        str(b, codec);
+        str(b, "shape");
+        shape(b, shape_);
+        str(b, "dtype");
+        str(b, dtype);
+        str(b, "data");
+        bin(b, data);
+    }
+}
+
+/// Request parts, each overridable; `raw` bytes replace a part verbatim.
+#[derive(Clone)]
+struct Req {
+    version: Vec<u8>,
+    seq: Vec<u8>,
+    budget: Vec<u8>,
+    inputs: Vec<(String, Vec<u8>)>,
+    images: Vec<(String, Vec<u8>)>,
+    extra: bool,
+}
+
+fn f32s(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn val(f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut b = Vec::new();
+    f(&mut b);
+    b
+}
+
+fn good() -> Req {
+    let (image, wrist) = frames();
+    Req {
+        version: vec![1],
+        seq: vec![3],
+        budget: val(|b| mp::uint(b, 2000)),
+        inputs: vec![
+            (
+                "state".into(),
+                val(|b| mp::np(b, "float32", &[1, 3], &f32s(&[0.5, -1.0, 2.25]))),
+            ),
+            (
+                "task".into(),
+                val(|b| {
+                    b.push(0x91);
+                    mp::str(b, "pick up the cube");
+                }),
+            ),
+        ],
+        images: vec![
+            (
+                "images.image".into(),
+                val(|b| mp::image(b, "raw", "uint8", &[1, 16, 16, 3], &image)),
+            ),
+            (
+                "images.wrist".into(),
+                val(|b| mp::image(b, "raw", "uint8", &[16, 16, 3], &wrist)),
+            ),
+        ],
+        extra: false,
+    }
+}
+
+impl Req {
+    fn pack(&self) -> Vec<u8> {
+        let mut b = vec![0x80 | (5 + u8::from(self.extra))];
+        mp::str(&mut b, "protocol_version");
+        b.extend(&self.version);
+        mp::str(&mut b, "seq");
+        b.extend(&self.seq);
+        mp::str(&mut b, "budget_ms");
+        b.extend(&self.budget);
+        for (key, items) in [("inputs", &self.inputs), ("images", &self.images)] {
+            mp::str(&mut b, key);
+            b.push(0x80 | items.len() as u8);
+            for (k, v) in items {
+                mp::str(&mut b, k);
+                b.extend(v);
+            }
+        }
+        if self.extra {
+            mp::str(&mut b, "x");
+            b.push(0xc0);
+        }
+        b
+    }
+
+    fn input(mut self, k: &str, v: Vec<u8>) -> Self {
+        self.inputs.retain(|(n, _)| n != k);
+        self.inputs.push((k.into(), v));
+        self
+    }
+
+    fn image(mut self, k: &str, v: Vec<u8>) -> Self {
+        self.images.retain(|(n, _)| n != k);
+        self.images.push((k.into(), v));
+        self
+    }
+
+    fn without_input(mut self, k: &str) -> Self {
+        self.inputs.retain(|(n, _)| n != k);
+        self
+    }
+
+    fn refused(&self, want: &str) {
+        let e = decode_predict(&self.pack(), &spec(), max()).unwrap_err();
+        assert!(
+            e.message().contains(want),
+            "want {want:?}, got {:?}",
+            e.message()
+        );
+    }
+}
+
+#[test]
+fn the_hand_built_request_decodes() {
+    let r = decode_predict(&good().pack(), &spec(), max()).unwrap();
+    assert_eq!(r.observation.images.len(), 2);
+    assert_eq!(r.observation.state, [0.5, -1.0, 2.25]);
+}
+
+#[test]
+fn envelope_refusals() {
+    let mut r = good();
+    r.extra = true;
+    r.refused("unexpected or missing fields");
+    let mut r = good();
+    r.version = vec![2];
+    r.refused("Unsupported predict protocol version");
+    let mut r = good();
+    r.version = vec![0xc3];
+    r.refused("Unsupported predict protocol version");
+    let mut r = good();
+    r.seq = val(|b| mp::int(b, -1));
+    r.refused("Invalid prediction sequence");
+    let mut r = good();
+    r.seq = vec![0xc2];
+    r.refused("Invalid prediction sequence");
+    let mut r = good();
+    r.budget = vec![0];
+    r.refused("Invalid prediction budget");
+    let mut r = good();
+    r.budget = val(|b| mp::uint(b, 60_001));
+    r.refused("exceeds the server maximum");
+    let e = decode_predict(&[0xc1], &spec(), max()).unwrap_err();
+    assert!(
+        e.message().contains("Invalid MessagePack protocol map"),
+        "{e}"
+    );
+    let e = decode_predict(&[0x93, 1, 2, 3], &spec(), max()).unwrap_err();
+    assert!(e.message().contains("string-keyed"), "{e}");
+    let big = good().pack();
+    let e = decode_predict(&big, &spec(), big.len() as u64 - 1).unwrap_err();
+    assert!(e.message().contains("exceeds"), "{e}");
+}
+
+#[test]
+fn array_refusals() {
+    let np = |dtype: &str, shape: &[u64], data: &[u8]| val(|b| mp::np(b, dtype, shape, data));
+    good()
+        .input("state", np("float32", &[1, 3], &[0; 11]))
+        .refused("do not match its data length");
+    good()
+        .input("state", np("<U4", &[1], &[0; 4]))
+        .refused("Invalid __np__ array dtype");
+    good()
+        .input("state", np("float32", &[1, 4], &[0; 16]))
+        .refused("expected [3] or [1, 3]");
+    good()
+        .input("state", np("int32", &[3], &[0; 12]))
+        .refused("expected float32 or float64");
+    good()
+        .input("state", np("float32", &[3], &f32s(&[0.0, f32::NAN, 1.0])))
+        .refused("non-finite");
+    good()
+        .input("state", vec![0x01])
+        .refused("numeric arrays or list[str]");
+    let malformed = val(|b| {
+        b.push(0x82);
+        mp::str(b, "__np__");
+        b.push(0xc3);
+        mp::str(b, "dtype");
+        mp::str(b, "float32");
+    });
+    good()
+        .input("state", malformed)
+        .refused("Malformed __np__ array payload");
+    good()
+        .without_input("state")
+        .refused("missing input \"state\"");
+    good()
+        .without_input("task")
+        .refused("missing input \"task\"");
+    good()
+        .input("task", val(|b| b.push(0x90)))
+        .refused("exactly one string");
+    good()
+        .input("task", val(|b| mp::str(b, "x")))
+        .refused("numeric arrays or list[str]");
+    good()
+        .input("prompt", val(|b| b.push(0x90)))
+        .refused("unknown input \"prompt\"");
+    good()
+        .input("images.x", val(|b| b.push(0x90)))
+        .refused("separate images map");
+    let long = val(|b| {
+        b.push(0x91);
+        b.push(0xd9);
+        b.push(65);
+        b.extend([b'a'; 65]);
+    });
+    good().input("task", long).refused("the limit is 64");
+}
+
+#[test]
+fn image_refusals() {
+    let (image, _) = frames();
+    let img = |codec: &str, dtype: &str, shape: &[u64], data: &[u8]| {
+        val(|b| mp::image(b, codec, dtype, shape, data))
+    };
+    let s = [16, 16, 3];
+    good()
+        .image("wrist", img("raw", "uint8", &s, &image))
+        .refused("'images' namespace");
+    good()
+        .image("images.wrist", img("png", "uint8", &s, &image))
+        .refused("Malformed image codec");
+    good()
+        .image("images.wrist", img("raw", "float32", &s, &image))
+        .refused("Malformed image codec");
+    good()
+        .image("images.wrist", vec![0x01])
+        .refused("Image entry must be a map");
+    good()
+        .image("images.wrist", img("raw", "uint8", &[16, 0, 3], &[]))
+        .refused("positive integers");
+    good()
+        .image("images.wrist", img("raw", "uint8", &[256, 3], &[0; 768]))
+        .refused("HxWx3");
+    good()
+        .image(
+            "images.wrist",
+            img("raw", "uint8", &[16, 16, 4], &[0; 1024]),
+        )
+        .refused("HxWx3");
+    good()
+        .image(
+            "images.wrist",
+            img("raw", "uint8", &[2, 16, 16, 3], &[0; 1536]),
+        )
+        .refused("batch dimension must be one");
+    good()
+        .image("images.wrist", img("raw", "uint8", &s, &image[1..]))
+        .refused("does not match its shape");
+    good()
+        .image("images.wrist", img("raw", "uint8", &[4000, 4000, 3], &[]))
+        .refused("exceed max_request_bytes");
+    good()
+        .image("images.wrist", img("jpeg", "uint8", &s, b"nope"))
+        .refused("Malformed JPEG image data");
+    good()
+        .image(
+            "images.wrist",
+            img("jpeg", "uint8", &s, &[0xff, 0xd8, 0x00, 0x00, 0x00, 0x00]),
+        )
+        .refused("Malformed JPEG marker");
+    good()
+        .image(
+            "images.wrist",
+            img("jpeg", "uint8", &s, &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x40]),
+        )
+        .refused("Malformed JPEG segment");
+    good()
+        .image(
+            "images.wrist",
+            img("jpeg", "uint8", &s, &[0xff, 0xd8, 0xff, 0xd9, 0xff, 0xd9]),
+        )
+        .refused("JPEG image has no dimensions");
+    // A real 16x16 JPEG declared 8x8, and a truncated one.
+    let jpeg = jpeg_frame();
+    good()
+        .image("images.wrist", img("jpeg", "uint8", &[8, 8, 3], &jpeg))
+        .refused("JPEG dimensions do not match");
+    good()
+        .image(
+            "images.wrist",
+            img("jpeg", "uint8", &s, &jpeg[..jpeg.len() / 2]),
+        )
+        .refused("JPEG");
+    good()
+        .image("images.other", img("raw", "uint8", &s, &image))
+        .refused("unknown camera \"other\"");
+    good()
+        .image("images.wrist", img("raw", "uint8", &[8, 8, 3], &[0; 192]))
+        .refused("is 8x8; expected 16x16");
+    let mut r = good();
+    r.images.pop();
+    r.refused("missing camera \"wrist\"");
+    good()
+        .input("images.image", vec![0x01])
+        .refused("separate images map");
+}
+
+/// The `images.image` JPEG from the physicalai fixture.
+fn jpeg_frame() -> Vec<u8> {
+    let b = fixture!("predict-jpeg.msgpack");
+    let start = b.windows(2).position(|w| w == [0xff, 0xd8]).unwrap();
+    let end = start
+        + b[start..]
+            .windows(2)
+            .position(|w| w == [0xff, 0xd9])
+            .unwrap()
+        + 2;
+    b[start..end].to_vec()
+}
+
+#[test]
+fn a_duplicate_key_is_refused() {
+    let mut b = good().pack();
+    b[0] += 1;
+    mp::str(&mut b, "seq");
+    b.push(3);
+    let e = decode_predict(&b, &spec(), max()).unwrap_err();
+    assert!(
+        e.message().contains("unexpected or missing fields") || e.message().contains("twice"),
+        "{e}"
+    );
+}
