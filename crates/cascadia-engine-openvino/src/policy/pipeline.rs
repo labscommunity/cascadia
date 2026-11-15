@@ -10,7 +10,7 @@ use cascadia_ov_genai_shim::{DType, PluginConfig, PortInfo};
 use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec};
 
 use super::cameras::{images_tensor, CameraLayout};
-use super::manifest::{PolicyManifest, PostStep, PreStep, XVLA_ACTION_DIM};
+use super::manifest::{PolicyKind, PolicyManifest, PostStep, PreStep, XVLA_ACTION_DIM};
 use super::spec::{derive_spec, IrFacts, ServerFacts};
 use super::steps::{
     denormalize, new_line, normalize, pi05_bins, pi05_prompt, trim_actions,
@@ -140,10 +140,32 @@ pub fn compile_config(
     Ok((dev, config))
 }
 
+/// The input ports a policy kind's IR takes. Each layout has its own binder
+/// and its own feeds; the prompt, noise and postprocessing are shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortLayout {
+    /// SmolVLA, π0.5, π0, X-VLA: `state` (normalized), `tokenized_prompt`,
+    /// `tokenized_prompt_mask`, `images`, `image_masks`, optional `noise`.
+    ImageSlots,
+}
+
+impl PortLayout {
+    pub fn of(kind: PolicyKind) -> Self {
+        match kind {
+            PolicyKind::Pi05 | PolicyKind::Pi0 | PolicyKind::SmolVla | PolicyKind::Xvla => {
+                Self::ImageSlots
+            }
+        }
+    }
+}
+
 /// Tensor names the pipeline binds, plus the prompt port's length.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortBinding {
+    pub layout: PortLayout,
     pub noise: bool,
+    /// The port the token ids go to.
+    pub prompt_port: &'static str,
     pub prompt_len: usize,
 }
 
@@ -196,7 +218,67 @@ fn fixed(d: Option<usize>, what: &str) -> EngineResult<usize> {
     )
 }
 
-/// Check the compiled model's ports and read the facts the spec needs.
+/// Check the compiled model's ports against `m`'s policy kind and read the
+/// facts the spec needs.
+pub fn bind(
+    m: &PolicyManifest,
+    inputs: &[PortInfo],
+    outputs: &[PortInfo],
+    has_random_uniform: bool,
+) -> EngineResult<(PortBinding, IrFacts)> {
+    match PortLayout::of(m.policy) {
+        PortLayout::ImageSlots => bind_ports(inputs, outputs, has_random_uniform),
+    }
+}
+
+/// Inputs no layout lists refuse the load: the engine would leave them unset.
+fn refuse_unknown_inputs(inputs: &[PortInfo], known: &[&str]) -> EngineResult<()> {
+    match inputs
+        .iter()
+        .find(|p| !p.aliases.iter().any(|a| known.contains(&a.as_str())))
+    {
+        Some(p) => refuse(format!("input {:?} is not one the engine fills", p.aliases)),
+        None => Ok(()),
+    }
+}
+
+/// `noise`'s dims after the batch, when the model has one.
+fn noise_dims(inputs: &[PortInfo]) -> EngineResult<Option<Vec<usize>>> {
+    match port(inputs, NOISE) {
+        Some(p) => {
+            let d = dims(inputs, NOISE, &[DType::F32], p.dims.len().max(2), Some(0))?;
+            Ok(Some(
+                d[1..]
+                    .iter()
+                    .map(|&x| fixed(x, "a noise dim"))
+                    .collect::<EngineResult<Vec<_>>>()?,
+            ))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `[T, D]` of the `action` output.
+fn action_dims(outputs: &[PortInfo]) -> EngineResult<[usize; 2]> {
+    let action = dims(outputs, ACTION, &[DType::F32, DType::F16], 3, Some(0))?;
+    Ok([
+        fixed(action[1], "the action chunk length")?,
+        fixed(action[2], "the action dim")?,
+    ])
+}
+
+fn noise_mode(noise_shape: &Option<Vec<usize>>, has_random_uniform: bool) -> NoiseMode {
+    if noise_shape.is_some() {
+        NoiseMode::Input
+    } else if has_random_uniform {
+        NoiseMode::InGraphRandom
+    } else {
+        NoiseMode::Constant
+    }
+}
+
+/// [`PortLayout::ImageSlots`]: check the compiled model's ports and read the
+/// facts the spec needs.
 ///
 /// Refuses an input the engine does not fill, a missing input, or a dtype or
 /// shape the pipeline cannot produce, so a mismatch fails at load.
@@ -205,13 +287,10 @@ pub fn bind_ports(
     outputs: &[PortInfo],
     has_random_uniform: bool,
 ) -> EngineResult<(PortBinding, IrFacts)> {
-    let known = [STATE, NOISE, PROMPT, PROMPT_MASK, IMAGES, IMAGE_MASKS];
-    if let Some(p) = inputs
-        .iter()
-        .find(|p| !p.aliases.iter().any(|a| known.contains(&a.as_str())))
-    {
-        return refuse(format!("input {:?} is not one the engine fills", p.aliases));
-    }
+    refuse_unknown_inputs(
+        inputs,
+        &[STATE, NOISE, PROMPT, PROMPT_MASK, IMAGES, IMAGE_MASKS],
+    )?;
     let state = dims(inputs, STATE, &[DType::F32], 2, Some(0))?;
     let state_len = fixed(state[1], "the state length")?;
     let prompt = dims(inputs, PROMPT, &[DType::I64], 2, Some(0))?;
@@ -244,33 +323,14 @@ pub fn bind_ports(
             masks[0]
         ));
     }
-    let noise_shape = match port(inputs, NOISE) {
-        Some(p) => {
-            let d = dims(inputs, NOISE, &[DType::F32], p.dims.len().max(2), Some(0))?;
-            Some(
-                d[1..]
-                    .iter()
-                    .map(|&x| fixed(x, "a noise dim"))
-                    .collect::<EngineResult<Vec<_>>>()?,
-            )
-        }
-        None => None,
-    };
-    let action = dims(outputs, ACTION, &[DType::F32, DType::F16], 3, Some(0))?;
-    let action_shape = [
-        fixed(action[1], "the action chunk length")?,
-        fixed(action[2], "the action dim")?,
-    ];
-    let noise = if noise_shape.is_some() {
-        NoiseMode::Input
-    } else if has_random_uniform {
-        NoiseMode::InGraphRandom
-    } else {
-        NoiseMode::Constant
-    };
+    let noise_shape = noise_dims(inputs)?;
+    let action_shape = action_dims(outputs)?;
+    let noise = noise_mode(&noise_shape, has_random_uniform);
     Ok((
         PortBinding {
+            layout: PortLayout::ImageSlots,
             noise: noise_shape.is_some(),
+            prompt_port: PROMPT,
             prompt_len,
         },
         IrFacts {
@@ -416,13 +476,14 @@ impl PolicyPipeline {
         {
             return refuse("a prompt step (new_line / pi05 / pi0) comes after ov_tokenizer");
         }
-        let (binding, ir) = bind_ports(inputs, outputs, has_random_uniform)?;
+        let (binding, ir) = bind(&manifest, inputs, outputs, has_random_uniform)?;
         // Otherwise a tokenizer padded for another port loads and every infer fails.
         let empty = tokenizer.tokenize("")?;
         if empty.ids.len() != binding.prompt_len || empty.mask.len() != binding.prompt_len {
             return refuse(format!(
-                "the tokenizer pads to {} tokens; the model's tokenized_prompt port takes {}",
+                "the tokenizer pads to {} tokens; the model's {} port takes {}",
                 empty.ids.len(),
+                binding.prompt_port,
                 binding.prompt_len
             ));
         }
@@ -480,14 +541,29 @@ impl PolicyPipeline {
         refusal.map_or(Ok(()), |m| Err(EngineError::PromptTooLong(m)))
     }
 
-    fn run(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
-        let start = Instant::now();
-        if self.model.is_none() {
-            return Err(EngineError::NotLoaded);
+    /// Tokenize `text`; the ids must fill the prompt port exactly.
+    fn tokens(&mut self, text: &str) -> EngineResult<Tokens> {
+        let limit = self.binding.prompt_len;
+        let tokens = self
+            .tokenizer
+            .as_mut()
+            .ok_or(EngineError::NotLoaded)?
+            .tokenize(text)?;
+        if tokens.ids.len() != limit || tokens.mask.len() != limit {
+            return Err(EngineError::Backend(format!(
+                "the tokenizer produced {} ids and {} mask values; the model's prompt port takes {limit}",
+                tokens.ids.len(),
+                tokens.mask.len()
+            )));
         }
-        check_observation(&self.spec, obs)?;
-        self.check_prompt(&obs.prompt)?;
+        Ok(tokens)
+    }
 
+    /// [`PortLayout::ImageSlots`] inputs, all but `noise`.
+    fn image_slot_feeds(
+        &mut self,
+        obs: &Observation,
+    ) -> EngineResult<Vec<(&'static str, HostTensor)>> {
         let raw: Vec<f64> = obs.state.iter().map(|&x| f64::from(x)).collect();
         let text = prompt_text(&self.manifest, &obs.prompt, &raw, false)?;
         let mut state = raw;
@@ -503,22 +579,11 @@ impl PolicyPipeline {
         )?;
 
         let limit = self.binding.prompt_len;
-        let tokens = self
-            .tokenizer
-            .as_mut()
-            .ok_or(EngineError::NotLoaded)?
-            .tokenize(&text)?;
-        if tokens.ids.len() != limit || tokens.mask.len() != limit {
-            return Err(EngineError::Backend(format!(
-                "the tokenizer produced {} ids and {} mask values; the model's prompt port takes {limit}",
-                tokens.ids.len(),
-                tokens.mask.len()
-            )));
-        }
+        let tokens = self.tokens(&text)?;
 
         let (h, w) = (self.spec.height as usize, self.spec.width as usize);
         let slots = self.layout.slots.len();
-        let mut feeds = vec![
+        Ok(vec![
             (
                 STATE,
                 HostTensor {
@@ -554,7 +619,20 @@ impl PolicyPipeline {
                     data: TensorData::Bool(image_masks),
                 },
             ),
-        ];
+        ])
+    }
+
+    fn run(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
+        let start = Instant::now();
+        if self.model.is_none() {
+            return Err(EngineError::NotLoaded);
+        }
+        check_observation(&self.spec, obs)?;
+        self.check_prompt(&obs.prompt)?;
+
+        let mut feeds = match self.binding.layout {
+            PortLayout::ImageSlots => self.image_slot_feeds(obs)?,
+        };
         if self.binding.noise {
             let dims = self
                 .spec
