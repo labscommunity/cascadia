@@ -152,12 +152,7 @@ pub fn image_to_chw(hwc: &[u8], height: usize, width: usize, out: &mut Vec<f32>)
 }
 
 /// `action_chunk_trimmer`: keep the first `n` of `steps` rows of `dim` values.
-pub fn trim_actions(
-    mut actions: Vec<f32>,
-    steps: usize,
-    dim: usize,
-    n: usize,
-) -> (Vec<f32>, usize) {
+pub fn trim_actions<T>(mut actions: Vec<T>, steps: usize, dim: usize, n: usize) -> (Vec<T>, usize) {
     if steps > n {
         actions.truncate(n * dim);
         (actions, n)
