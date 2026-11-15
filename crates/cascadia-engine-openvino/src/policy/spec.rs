@@ -59,11 +59,16 @@ impl ManifestSpec {
                 let [h, w] = super::xr0::geometry(m, x)?.hw;
                 (Some([h as u32, w as u32]), ResizeConvention::Stretch)
             }
+            // Square frames only, so letterboxing them is the identity.
+            ImageStep::Gr00t(g) => {
+                let side = g.shortest_edge as u32;
+                (Some([side, side]), ResizeConvention::Center)
+            }
         };
         let mut noise_shape: Option<Vec<usize>> = None;
         for step in &m.preprocessors {
             let shape = match step {
-                PreStep::Noise { shape } => shape,
+                PreStep::Noise { shape, .. } => shape,
                 PreStep::Pi05(p) | PreStep::Pi0(p) => match &p.noise_shape {
                     Some(s) => s,
                     None => continue,
@@ -189,6 +194,7 @@ pub fn derive_spec(
         noise_shape: ir.noise_shape.clone(),
         resize: ms.resize,
         prompt_max_bytes: server.prompt_max_bytes,
+        attribution: m.attribution.clone(),
     };
     if let Err(EngineError::InvalidConfig(m)) = cascadia_engine::payload_cap(&spec) {
         return refuse(m);

@@ -3,6 +3,7 @@
 //! pipeline, which runs against fakes in the default stub build.
 
 pub mod cameras;
+pub mod gr00t;
 pub mod manifest;
 pub mod ov;
 pub mod pipeline;

@@ -23,6 +23,7 @@ fn spec() -> PolicySpec {
         noise_shape: Some(vec![2, 3]),
         resize: ResizeConvention::TopLeft,
         prompt_max_bytes: 64,
+        attribution: None,
     }
 }
 

@@ -262,6 +262,7 @@ mod tests {
             noise,
             resize: ResizeConvention::Center,
             prompt_max_bytes: 16,
+            attribution: None,
         }
     }
 

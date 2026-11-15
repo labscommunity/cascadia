@@ -26,8 +26,17 @@ Copied, unmodified:
 - `xr0-libero-manifest.json`: our export of `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO` (Intel's
   exporter, physical-ai-studio `8f132416`, runtime `e3dd944`), f32 with fp16 weights, the in-graph
   noise replaced by a `noise` input and a `noise` step after `xr0`.
+- `gr00t-libero-spatial-manifest.json`: our export of `nvidia/GR00T-N1.7-LIBERO`
+  (`libero_spatial`, revision `65854032`) with Intel's edge-ai-suites single-IR exporter
+  (`decbb06f`, Isaac-GR00T `3df8b382`), f32 with fp16 weights, static shapes and named ports, the
+  noise an input (`actions`). Built on NVIDIA Cosmos; licensed by NVIDIA Corporation under the
+  NVIDIA Open Model License.
 
 Generated:
+
+- `gr00t-area-resize-cv2.json`: FNV-1a 64 hashes and first rows of `cv2.resize(..., INTER_AREA)`
+  (opencv-python-headless 4.11.0.86) on a fixed uint8 pattern, for upscales and one stretch along
+  a single axis; GR00T resizes its 243-pixel crop back to 256 this way.
 
 - `xvla-rotation-reference.json`: rows of LeRobot 0.7.0's X-VLA `rotate6d_to_axis_angle`
   (`lerobot/policies/xvla/utils.py`, numpy 1.26.4) on float32 6-D rotations built from

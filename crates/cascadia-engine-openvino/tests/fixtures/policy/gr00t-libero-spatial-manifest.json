@@ -1,0 +1,355 @@
+{
+ "policy": {
+  "name": "gr00t_n1d7",
+  "source": {
+   "class_path": "gr00t.policy.gr00t_policy.Gr00tPolicy",
+   "hf_id": "nvidia/GR00T-N1.7-LIBERO",
+   "revision": "658540327860f93dd2cb9c1ed3e3b10fb792a0eb",
+   "subfolder": "libero_spatial",
+   "embodiment_tag": "libero_sim",
+   "backbone": "nvidia/Cosmos-Reason2-2B@9ce19a195e423419c349abfc86fd07178b230561",
+   "exporter": "open-edge-platform/edge-ai-suites@decbb06f robotics-ai-suite/pipelines/gr00t-n1d7-ov (Isaac-GR00T 3df8b382 + 8 patches)",
+   "license": "NVIDIA Open Model License",
+   "attribution": "Built on NVIDIA Cosmos"
+  }
+ },
+ "model": {
+  "runner": {
+   "class_path": "physicalai.inference.runners.single_pass.SinglePass"
+  },
+  "artifacts": {
+   "openvino": "gr00t.xml"
+  },
+  "preprocessors": [
+   {
+    "type": "image_flip",
+    "cameras": [
+     "image",
+     "wrist_image"
+    ]
+   },
+   {
+    "type": "gr00t_image",
+    "letterbox": true,
+    "shortest_edge": 256,
+    "crop_fraction": 0.95,
+    "interpolation": "area"
+   },
+   {
+    "type": "qwen_vl_patchify",
+    "patch_size": 16,
+    "temporal_patch_size": 2,
+    "merge_size": 2,
+    "image_mean": [
+     0.5,
+     0.5,
+     0.5
+    ],
+    "image_std": [
+     0.5,
+     0.5,
+     0.5
+    ],
+    "grid_thw": [
+     [
+      1,
+      16,
+      16
+     ],
+     [
+      1,
+      16,
+      16
+     ]
+    ]
+   },
+   {
+    "type": "normalize",
+    "mode": "min_max_clip",
+    "bounds": [
+     "q01",
+     "q99"
+    ],
+    "pad_to": 132,
+    "history": 1,
+    "stats": {
+     "state": {
+      "q01": [
+       -0.27276572585105896,
+       -0.237214133143425,
+       0.916006326675415,
+       2.779496669769287,
+       -1.3187512159347534,
+       -0.4198998212814331,
+       0.001503719249740243,
+       -0.03989770635962486
+      ],
+      "q99": [
+       0.1352936029434204,
+       0.362916499376297,
+       1.286232590675354,
+       3.2829697132110596,
+       0.9332759976387024,
+       0.6325722336769104,
+       0.03993396461009979,
+       -0.0016719202976673841
+      ],
+      "min": [
+       -0.3095473051071167,
+       -0.29250794649124146,
+       0.9095591306686401,
+       2.497488260269165,
+       -1.8006486892700195,
+       -0.7207611203193665,
+       -0.0004703797458205372,
+       -0.041536275297403336
+      ],
+      "max": [
+       0.1759040206670761,
+       0.3904820382595062,
+       1.3290715217590332,
+       3.4566118717193604,
+       1.2268599271774292,
+       1.0429412126541138,
+       0.041053611785173416,
+       0.000775813648942858
+      ],
+      "mean": [
+       -0.024462558329105377,
+       0.106529600918293,
+       1.0580483675003052,
+       3.0628468990325928,
+       -0.10464039444923401,
+       0.08307311683893204,
+       0.01995457336306572,
+       -0.020162804052233696
+      ],
+      "std": [
+       0.1101478561758995,
+       0.13784688711166382,
+       0.10442823916673634,
+       0.10451053828000996,
+       0.4112098217010498,
+       0.2176690548658371,
+       0.017260896041989326,
+       0.0171116404235363
+      ]
+     }
+    }
+   },
+   {
+    "type": "gr00t_prompt",
+    "formalize_language": true,
+    "template": "<|im_start|>user\n{images}{task}<|im_end|>\n",
+    "image": "<|vision_start|><|image_pad|><|vision_end|>"
+   },
+   {
+    "type": "ov_tokenizer",
+    "artifact": "tokenizer.xml"
+   },
+   {
+    "type": "qwen_vl_inputs",
+    "image_token_id": 151655,
+    "tokens_per_image": 64,
+    "seq_len": 192,
+    "pad_id": 0,
+    "padding_side": "right",
+    "rope": "qwen3_vl_mrope",
+    "merge_size": 2
+   },
+   {
+    "type": "constant",
+    "port": "embodiment_id",
+    "dtype": "int64",
+    "value": [
+     2
+    ]
+   },
+   {
+    "type": "noise",
+    "shape": [
+     40,
+     132
+    ],
+    "port": "actions"
+   }
+  ],
+  "postprocessors": [
+   {
+    "type": "action_chunk_trimmer",
+    "n_action_steps": 16
+   },
+   {
+    "type": "action_slice",
+    "dims": 7
+   },
+   {
+    "type": "denormalize",
+    "mode": "min_max_clip",
+    "bounds": [
+     "q01",
+     "q99"
+    ],
+    "stats": {
+     "action": {
+      "q01": [
+       -0.7454732060432434,
+       -0.6616071462631226,
+       -0.9375,
+       -0.1071428582072258,
+       -0.20678570866584778,
+       -0.1842857152223587,
+       0.0
+      ],
+      "q99": [
+       0.9375,
+       0.8758928775787354,
+       0.9321428537368774,
+       0.1039285734295845,
+       0.17678570747375488,
+       0.14571428298950195,
+       1.0
+      ],
+      "min": [
+       -0.9375,
+       -0.9375,
+       -0.9375,
+       -0.1875,
+       -0.3675000071525574,
+       -0.36000001430511475,
+       0.0
+      ],
+      "max": [
+       0.9375,
+       0.9375,
+       0.9375,
+       0.1971428543329239,
+       0.33642858266830444,
+       0.375,
+       1.0
+      ],
+      "mean": [
+       0.15312479436397552,
+       0.13707277178764343,
+       -0.15526802837848663,
+       -0.005176450591534376,
+       -0.01120874285697937,
+       -0.020194264128804207,
+       0.4578818082809448
+      ],
+      "std": [
+       0.41272708773612976,
+       0.34724321961402893,
+       0.50869220495224,
+       0.037266165018081665,
+       0.07244449853897095,
+       0.05762382969260216,
+       0.49827873706817627
+      ]
+     }
+    }
+   }
+  ],
+  "input_features": [
+   {
+    "class_path": "physicalai.inference.data.features.InferenceFeature",
+    "init_args": {
+     "ftype": "VISUAL",
+     "shape": [
+      3,
+      256,
+      256
+     ],
+     "name": "images.image",
+     "dtype": "float32"
+    }
+   },
+   {
+    "class_path": "physicalai.inference.data.features.InferenceFeature",
+    "init_args": {
+     "ftype": "VISUAL",
+     "shape": [
+      3,
+      256,
+      256
+     ],
+     "name": "images.wrist_image",
+     "dtype": "float32"
+    }
+   },
+   {
+    "class_path": "physicalai.inference.data.features.InferenceFeature",
+    "init_args": {
+     "ftype": "STATE",
+     "shape": [
+      8
+     ],
+     "name": "state",
+     "dtype": "float32"
+    }
+   },
+   {
+    "class_path": "physicalai.inference.data.features.InferenceFeature",
+    "init_args": {
+     "ftype": "LANGUAGE",
+     "shape": [
+      64
+     ],
+     "name": "task",
+     "dtype": "string"
+    }
+   },
+   {
+    "class_path": "physicalai.inference.data.features.InferenceFeature",
+    "init_args": {
+     "ftype": "COMMON",
+     "shape": [
+      40,
+      132
+     ],
+     "name": "noise",
+     "dtype": "float32"
+    }
+   }
+  ],
+  "output_features": [
+   {
+    "class_path": "physicalai.inference.data.features.InferenceFeature",
+    "init_args": {
+     "ftype": "ACTION",
+     "shape": [
+      16,
+      7
+     ],
+     "name": "action",
+     "dtype": "float32"
+    }
+   }
+  ]
+ },
+ "metadata": {
+  "state_layout": [
+   "x",
+   "y",
+   "z",
+   "roll",
+   "pitch",
+   "yaw",
+   "gripper_qpos_l",
+   "gripper_qpos_r"
+  ],
+  "action_layout": [
+   "x",
+   "y",
+   "z",
+   "roll",
+   "pitch",
+   "yaw",
+   "gripper"
+  ],
+  "gripper_client_rule": "LIBERO env: g' = -(2g-1) then sign (normalize_gripper_action binarize + invert_gripper_action)",
+  "attribution": "Built on NVIDIA Cosmos. Licensed by NVIDIA Corporation under the NVIDIA Open Model License."
+ },
+ "format": "policy_package",
+ "version": "1.0"
+}

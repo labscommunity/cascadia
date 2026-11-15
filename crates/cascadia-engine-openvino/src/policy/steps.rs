@@ -8,7 +8,7 @@
 
 use cascadia_engine::{EngineError, EngineResult};
 
-use super::manifest::{FeatureStats, NormMode, StatsStep, XVLA_ACTION_DIM};
+use super::manifest::{Bounds, FeatureStats, NormMode, StatsStep, XVLA_ACTION_DIM};
 
 /// `stats_normalizer.py` / `stats_denormalizer.py` `_EPS`.
 pub const EPS: f64 = 1e-8;
@@ -26,7 +26,7 @@ fn apply(
     step: &StatsStep,
     key: &str,
     x: &[f64],
-    f: impl Fn(NormMode, &FeatureStats, usize, f64) -> f64,
+    f: impl Fn(NormMode, Bounds, &FeatureStats, usize, f64) -> f64,
 ) -> EngineResult<Vec<f64>> {
     if step.mode == NormMode::Identity {
         return Ok(x.to_vec());
@@ -38,6 +38,7 @@ fn apply(
         NormMode::MeanStd => stat(&s.mean).len(),
         NormMode::MinMax => stat(&s.min).len(),
         NormMode::Quantiles => stat(&s.q01).len(),
+        NormMode::MinMaxClip => stat(s.bounds(step.bounds).0).len(),
         NormMode::Identity => unreachable!(),
     };
     if !x.len().is_multiple_of(n) {
@@ -52,7 +53,7 @@ fn apply(
             let d = i % n;
             match &s.mask {
                 Some(m) if !m[d] => v,
-                _ => f(step.mode, s, d, v),
+                _ => f(step.mode, step.bounds, s, d, v),
             }
         })
         .collect())
@@ -68,15 +69,35 @@ fn q_denom(s: &FeatureStats, d: usize) -> f64 {
     }
 }
 
-/// `normalize` (`stats_normalizer.py` `_normalize`).
+/// `min_max_clip`'s `(lo, hi)` for dimension `d`.
+fn clip_bounds(s: &FeatureStats, b: Bounds, d: usize) -> (f64, f64) {
+    let (lo, hi) = s.bounds(b);
+    (stat(lo)[d], stat(hi)[d])
+}
+
+/// `np.isclose(hi, lo)` with numpy's defaults (`rtol` 1e-5, `atol` 1e-8).
+fn is_close(hi: f64, lo: f64) -> bool {
+    (hi - lo).abs() <= 1e-8 + 1e-5 * lo.abs()
+}
+
+/// `normalize` (`stats_normalizer.py` `_normalize`; `min_max_clip`: GR00T's
+/// `normalize_values_minmax`, then the clip).
 pub fn normalize(step: &StatsStep, key: &str, x: &[f64]) -> EngineResult<Vec<f64>> {
-    apply(step, key, x, |mode, s, d, x| match mode {
+    apply(step, key, x, |mode, b, s, d, x| match mode {
         NormMode::MeanStd => (x - stat(&s.mean)[d]) / (stat(&s.std)[d] + EPS),
         NormMode::MinMax => {
             let (lo, hi) = (stat(&s.min)[d], stat(&s.max)[d]);
             2.0 * (x - lo) / (hi - lo + EPS) - 1.0
         }
         NormMode::Quantiles => 2.0 * (x - stat(&s.q01)[d]) / q_denom(s, d) - 1.0,
+        NormMode::MinMaxClip => {
+            let (lo, hi) = clip_bounds(s, b, d);
+            if is_close(hi, lo) {
+                0.0
+            } else {
+                (2.0 * (x - lo) / (hi - lo) - 1.0).clamp(-1.0, 1.0)
+            }
+        }
         NormMode::Identity => x,
     })
 }
@@ -84,13 +105,17 @@ pub fn normalize(step: &StatsStep, key: &str, x: &[f64]) -> EngineResult<Vec<f64
 /// `denormalize` (`stats_denormalizer.py` `_denormalize`); mean_std and
 /// min_max take no eps there.
 pub fn denormalize(step: &StatsStep, key: &str, x: &[f64]) -> EngineResult<Vec<f64>> {
-    apply(step, key, x, |mode, s, d, x| match mode {
+    apply(step, key, x, |mode, b, s, d, x| match mode {
         NormMode::MeanStd => x * stat(&s.std)[d] + stat(&s.mean)[d],
         NormMode::MinMax => {
             let (lo, hi) = (stat(&s.min)[d], stat(&s.max)[d]);
             (x + 1.0) / 2.0 * (hi - lo) + lo
         }
         NormMode::Quantiles => (x + 1.0) * q_denom(s, d) / 2.0 + stat(&s.q01)[d],
+        NormMode::MinMaxClip => {
+            let (lo, hi) = clip_bounds(s, b, d);
+            (x.clamp(-1.0, 1.0) + 1.0) / 2.0 * (hi - lo) + lo
+        }
         NormMode::Identity => x,
     })
 }
@@ -115,7 +140,7 @@ pub fn pi05_bins(state: &[f64]) -> Vec<i32> {
 }
 
 /// Python `str.isspace`: Rust's White_Space plus the separators U+001C..U+001F.
-fn py_space(c: char) -> bool {
+pub fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
@@ -345,6 +370,8 @@ mod tests {
         StatsStep {
             mode,
             features: vec![("state".into(), s)],
+            bounds: Bounds::MinMax,
+            pad_to: None,
         }
     }
 
@@ -415,10 +442,37 @@ mod tests {
     }
 
     #[test]
+    fn min_max_clip_zeroes_a_flat_range_and_clips_both_ways() {
+        // GR00T's normalize_values_minmax: 0 where np.isclose(hi, lo), then clip; decode clips first.
+        let mut s = step(
+            NormMode::MinMaxClip,
+            FeatureStats {
+                q01: Some(vec![0.0, 2.0, -1.0]),
+                q99: Some(vec![4.0, 2.0 + 1e-9, 1.0]),
+                min: Some(vec![-9.0, -9.0, -9.0]),
+                max: Some(vec![9.0, 9.0, 9.0]),
+                ..Default::default()
+            },
+        );
+        s.bounds = Bounds::Quantiles;
+        let y = normalize(&s, "state", &[1.0, 5.0, 3.0, 9.0, 0.0, -2.0]).unwrap();
+        assert_eq!(y, vec![-0.5, 0.0, 1.0, 1.0, 0.0, -1.0]);
+        let back = denormalize(&s, "state", &[0.5, 0.0, 2.0, -3.0, 1.0, 0.0]).unwrap();
+        close(&back, &[3.0, 2.0 + 0.5e-9, 1.0, 0.0, 2.0 + 1e-9, 0.0]);
+        s.bounds = Bounds::MinMax;
+        assert_eq!(
+            normalize(&s, "state", &[0.0, 0.0, 0.0]).unwrap(),
+            vec![0.0; 3]
+        );
+    }
+
+    #[test]
     fn identity_mode_mask_and_broadcast() {
         let id = StatsStep {
             mode: NormMode::Identity,
             features: vec![],
+            bounds: Bounds::MinMax,
+            pad_to: None,
         };
         assert_eq!(normalize(&id, "state", &[7.0]).unwrap(), vec![7.0]);
         let s = step(

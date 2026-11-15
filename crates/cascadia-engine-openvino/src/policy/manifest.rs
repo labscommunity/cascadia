@@ -25,6 +25,8 @@ pub enum PolicyKind {
     VlaJepa,
     /// Xiaomi-Robotics-0: Qwen3-VL ports like VLA-JEPA's, a raw padded state, `xr0_denormalize`.
     Xr0,
+    /// NVIDIA GR00T N1.7: Qwen3-VL ids with mRoPE positions, a constant embodiment id, noise to `actions`.
+    Gr00tN1d7,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +34,17 @@ pub enum NormMode {
     MeanStd,
     MinMax,
     Quantiles,
+    /// GR00T's: `2(x − lo)/(hi − lo) − 1`, 0 where `hi` and `lo` are close, clipped to
+    /// [−1, 1]; the inverse clips first. `lo`/`hi` are [`StatsStep::bounds`].
+    MinMaxClip,
     Identity,
+}
+
+/// The stats `min_max_clip` reads as its low and high bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bounds {
+    MinMax,
+    Quantiles,
 }
 
 /// One feature's statistics; only the stats the step's mode reads are checked.
@@ -54,6 +66,20 @@ pub struct StatsStep {
     pub mode: NormMode,
     /// `(input key, stats)`; the key is `state` for `normalize`, `action` for `denormalize`.
     pub features: Vec<(String, FeatureStats)>,
+    /// `min_max_clip` only.
+    pub bounds: Bounds,
+    /// `normalize` only: zero-pad the result to this width (GR00T's `max_state_dim`).
+    pub pad_to: Option<usize>,
+}
+
+impl FeatureStats {
+    /// `(lo, hi)` as `min_max_clip` reads them.
+    pub fn bounds(&self, b: Bounds) -> (&Option<Vec<f64>>, &Option<Vec<f64>>) {
+        match b {
+            Bounds::MinMax => (&self.min, &self.max),
+            Bounds::Quantiles => (&self.q01, &self.q99),
+        }
+    }
 }
 
 impl StatsStep {
@@ -119,6 +145,48 @@ pub struct Xr0Step {
     pub temporal_patch_size: usize,
 }
 
+/// GR00T's eval image transform (`image_augmentations.py`): letterbox to a
+/// square, shortest edge to `shortest_edge`, a centred `crop_fraction` crop,
+/// back to `shortest_edge` with OpenCV's `INTER_AREA`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gr00tImageStep {
+    pub letterbox: bool,
+    pub shortest_edge: usize,
+    pub crop_fraction: f64,
+}
+
+/// Qwen-VL `pixel_values` from `/255`, `(x − mean)/std` frames: the patch layout of [`super::qwen_vl`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct QwenVlPatchifyStep {
+    pub patch_size: usize,
+    pub temporal_patch_size: usize,
+    pub merge_size: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    /// `[t, h / patch, w / patch]` per camera, as the export fixed it.
+    pub grid_thw: Vec<[usize; 3]>,
+}
+
+/// GR00T's prompt: `template` with `{images}` (one `image` per camera) and `{task}`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gr00tPromptStep {
+    /// Lowercase, then drop every character but `\w` and `\s` (`formalize_language`).
+    pub formalize_language: bool,
+    pub template: String,
+    pub image: String,
+}
+
+/// Qwen-VL text inputs from unpadded ids: each image token repeated
+/// `tokens_per_image` times, right-padded to `seq_len`, Qwen3-VL mRoPE positions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QwenVlInputsStep {
+    pub image_token_id: i64,
+    pub tokens_per_image: usize,
+    pub seq_len: usize,
+    pub pad_id: i64,
+    pub merge_size: usize,
+}
+
 /// Intel's `xr0_denormalize`: `action * (std + eps) + mean` with per-timestep
 /// stats, then the first `action_dim` values of each row.
 #[derive(Clone, Debug, PartialEq)]
@@ -140,6 +208,8 @@ pub enum PreStep {
     NewLine,
     Noise {
         shape: Vec<usize>,
+        /// The input it feeds; `noise` when unset (GR00T: `actions`).
+        port: Option<String>,
     },
     OvTokenizer {
         artifact: String,
@@ -154,6 +224,15 @@ pub enum PreStep {
     },
     VlaJepaInputs(VlaJepaInputsStep),
     Xr0(Xr0Step),
+    Gr00tImage(Gr00tImageStep),
+    QwenVlPatchify(QwenVlPatchifyStep),
+    Gr00tPrompt(Gr00tPromptStep),
+    QwenVlInputs(QwenVlInputsStep),
+    /// An i64 input the graph takes as a constant (GR00T's `embodiment_id`).
+    Constant {
+        port: String,
+        values: Vec<i64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,6 +253,10 @@ pub enum PostStep {
         below: f64,
     },
     Xr0Denormalize(Xr0DenormalizeStep),
+    /// Keep the first `dims` values of each action row.
+    ActionSlice {
+        dims: usize,
+    },
 }
 
 /// Width of the X-VLA rotation step's output: position, axis-angle, gripper.
@@ -187,6 +270,10 @@ impl PostStep {
     pub fn out_dim(&self, dim: usize) -> EngineResult<usize> {
         match self {
             Self::Denormalize(_) | Self::ActionChunkTrimmer { .. } => Ok(dim),
+            Self::ActionSlice { dims } if *dims > dim => refuse(format!(
+                "action_slice keeps {dims} values of actions {dim} wide"
+            )),
+            Self::ActionSlice { dims } => Ok(*dims),
             Self::Xr0Denormalize(s) => {
                 let width = s.action_mean.first().map_or(0, Vec::len);
                 if width != dim {
@@ -234,6 +321,7 @@ pub enum ImageStep<'a> {
     SmolVlaResize(&'a SmolVlaResizeStep),
     VlaJepa(&'a VlaJepaInputsStep),
     Xr0(&'a Xr0Step),
+    Gr00t(&'a Gr00tImageStep),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -267,6 +355,9 @@ pub struct PolicyManifest {
     pub postprocessors: Vec<PostStep>,
     pub input_features: Vec<Feature>,
     pub output_features: Vec<Feature>,
+    /// Licence notice served in the metadata: the package's `NOTICE` file, else
+    /// `metadata.attribution`, else `policy.source.attribution`.
+    pub attribution: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -287,7 +378,14 @@ impl PolicyManifest {
         let path = dir.join("manifest.json");
         let text = std::fs::read_to_string(&path)
             .map_err(|e| EngineError::ModelNotFound(format!("{}: {e}", path.display())))?;
-        Self::parse(&text, opts)
+        let mut m = Self::parse(&text, opts)?;
+        if let Ok(notice) = std::fs::read_to_string(dir.join("NOTICE")) {
+            let notice = notice.trim();
+            if !notice.is_empty() {
+                m.attribution = Some(notice.to_string());
+            }
+        }
+        Ok(m)
     }
 
     pub fn parse(json: &str, opts: LoadOptions) -> EngineResult<Self> {
@@ -341,6 +439,15 @@ impl PolicyManifest {
             .collect::<EngineResult<Vec<_>>>()?;
         let input_features = features(model, "input_features")?;
         let output_features = features(model, "output_features")?;
+        let text_at = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_string);
+        let attribution =
+            text_at(root.get("metadata").and_then(|m| m.get("attribution"))).or_else(|| {
+                text_at(
+                    root.get("policy")
+                        .and_then(|p| p.get("source"))
+                        .and_then(|s| s.get("attribution")),
+                )
+            });
 
         let m = Self {
             policy,
@@ -350,6 +457,7 @@ impl PolicyManifest {
             postprocessors,
             input_features,
             output_features,
+            attribution,
         };
         m.check_pipeline()?;
         if !opts.allow_identity_stats {
@@ -367,6 +475,7 @@ impl PolicyManifest {
                 PreStep::SmolVlaResize(p) => Some(ImageStep::SmolVlaResize(p)),
                 PreStep::VlaJepaInputs(p) => Some(ImageStep::VlaJepa(p)),
                 PreStep::Xr0(p) => Some(ImageStep::Xr0(p)),
+                PreStep::Gr00tImage(p) => Some(ImageStep::Gr00t(p)),
                 _ => None,
             })
             .expect("parse guarantees one image step")
@@ -407,6 +516,51 @@ impl PolicyManifest {
         })
     }
 
+    /// GR00T's text and pixel steps; `parse` guarantees all four for `gr00t_n1d7`.
+    pub fn gr00t_steps(
+        &self,
+    ) -> Option<(
+        &Gr00tImageStep,
+        &QwenVlPatchifyStep,
+        &Gr00tPromptStep,
+        &QwenVlInputsStep,
+    )> {
+        let find = |f: fn(&PreStep) -> bool| self.preprocessors.iter().find(|s| f(s));
+        match (
+            find(|s| matches!(s, PreStep::Gr00tImage(_))),
+            find(|s| matches!(s, PreStep::QwenVlPatchify(_))),
+            find(|s| matches!(s, PreStep::Gr00tPrompt(_))),
+            find(|s| matches!(s, PreStep::QwenVlInputs(_))),
+        ) {
+            (
+                Some(PreStep::Gr00tImage(i)),
+                Some(PreStep::QwenVlPatchify(p)),
+                Some(PreStep::Gr00tPrompt(t)),
+                Some(PreStep::QwenVlInputs(q)),
+            ) => Some((i, p, t, q)),
+            _ => None,
+        }
+    }
+
+    /// `(port, values)` of each `constant` step, in manifest order.
+    pub fn constants(&self) -> impl Iterator<Item = (&str, &[i64])> {
+        self.preprocessors.iter().filter_map(|s| match s {
+            PreStep::Constant { port, values } => Some((port.as_str(), values.as_slice())),
+            _ => None,
+        })
+    }
+
+    /// The input the noise goes to: the `noise` step's `port`, else `noise`.
+    pub fn noise_port(&self) -> &str {
+        self.preprocessors
+            .iter()
+            .find_map(|s| match s {
+                PreStep::Noise { port: Some(p), .. } => Some(p.as_str()),
+                _ => None,
+            })
+            .unwrap_or("noise")
+    }
+
     pub fn denormalize(&self) -> impl Iterator<Item = &StatsStep> {
         self.postprocessors.iter().filter_map(|s| match s {
             PostStep::Denormalize(n) => Some(n),
@@ -424,12 +578,13 @@ impl PolicyManifest {
                     | PreStep::SmolVlaResize(_)
                     | PreStep::VlaJepaInputs(_)
                     | PreStep::Xr0(_)
+                    | PreStep::Gr00tImage(_)
             )
         });
         if images != 1 {
             return refuse(format!(
-                "{images} image steps (pi05 / pi0 / smolvla_resize / vla_jepa_inputs / xr0); \
-                 expected exactly one"
+                "{images} image steps (pi05 / pi0 / smolvla_resize / vla_jepa_inputs / xr0 / \
+                 gr00t_image); expected exactly one"
             ));
         }
         let tokenizers = count(|s| matches!(s, PreStep::OvTokenizer { .. }));
@@ -458,7 +613,90 @@ impl PolicyManifest {
             return refuse("more than one xvla_rotation_6d_to_axis_angle");
         }
         self.check_vla_jepa()?;
-        self.check_xr0()
+        self.check_xr0()?;
+        self.check_gr00t()
+    }
+
+    /// GR00T's steps are its own, and its normalize pads, so only GR00T's
+    /// state port takes them.
+    fn check_gr00t(&self) -> EngineResult<()> {
+        let own = |s: &PreStep| {
+            matches!(
+                s,
+                PreStep::Gr00tImage(_)
+                    | PreStep::QwenVlPatchify(_)
+                    | PreStep::Gr00tPrompt(_)
+                    | PreStep::QwenVlInputs(_)
+                    | PreStep::Constant { .. }
+            )
+        };
+        let padded = self.normalize().any(|s| s.pad_to.is_some())
+            || self
+                .preprocessors
+                .iter()
+                .any(|s| matches!(s, PreStep::Noise { port: Some(_), .. }));
+        if self.policy != PolicyKind::Gr00tN1d7 {
+            if let Some(s) = self.preprocessors.iter().find(|s| own(s)) {
+                return refuse(format!("{} needs policy.name \"gr00t_n1d7\"", pre_name(s)));
+            }
+            if padded {
+                return refuse("normalize pad_to and a noise port need policy.name \"gr00t_n1d7\"");
+            }
+            if self
+                .postprocessors
+                .iter()
+                .any(|s| matches!(s, PostStep::ActionSlice { .. }))
+            {
+                return refuse("action_slice needs policy.name \"gr00t_n1d7\"");
+            }
+            return Ok(());
+        }
+        for (name, f) in [
+            (
+                "qwen_vl_patchify",
+                (|s: &PreStep| matches!(s, PreStep::QwenVlPatchify(_))) as fn(&PreStep) -> bool,
+            ),
+            ("gr00t_prompt", |s| matches!(s, PreStep::Gr00tPrompt(_))),
+            ("qwen_vl_inputs", |s| matches!(s, PreStep::QwenVlInputs(_))),
+        ] {
+            let n = self.preprocessors.iter().filter(|s| f(s)).count();
+            if n != 1 {
+                return refuse(format!("{n} {name} steps; gr00t_n1d7 needs exactly one"));
+            }
+        }
+        if let Some(s) = self.preprocessors.iter().find(|s| {
+            !own(s)
+                && !matches!(
+                    s,
+                    PreStep::ImageFlip { .. }
+                        | PreStep::Normalize(_)
+                        | PreStep::OvTokenizer { .. }
+                        | PreStep::Noise { .. }
+                )
+        }) {
+            return refuse(format!(
+                "gr00t_n1d7 takes only image_flip, gr00t_image, qwen_vl_patchify, normalize, \
+                 gr00t_prompt, ov_tokenizer, qwen_vl_inputs, constant and noise; found {}",
+                pre_name(s)
+            ));
+        }
+        if self.normalize().count() > 1 {
+            return refuse("gr00t_n1d7 takes at most one normalize");
+        }
+        if let Some(s) = self.postprocessors.iter().find(|s| {
+            !matches!(
+                s,
+                PostStep::ActionChunkTrimmer { .. }
+                    | PostStep::ActionSlice { .. }
+                    | PostStep::Denormalize(_)
+            )
+        }) {
+            return refuse(format!(
+                "gr00t_n1d7 takes only action_chunk_trimmer, action_slice and denormalize; found {}",
+                post_name(s)
+            ));
+        }
+        super::gr00t::Gr00tGeometry::new(self).map(drop)
     }
 
     /// `xr0` and `xr0_denormalize` are XR0's alone, and an XR0 graph takes no
@@ -599,6 +837,11 @@ fn pre_name(s: &PreStep) -> &'static str {
         PreStep::VlaJepaPrompt { .. } => "vla_jepa_prompt",
         PreStep::VlaJepaInputs(_) => "vla_jepa_inputs",
         PreStep::Xr0(_) => "xr0",
+        PreStep::Gr00tImage(_) => "gr00t_image",
+        PreStep::QwenVlPatchify(_) => "qwen_vl_patchify",
+        PreStep::Gr00tPrompt(_) => "gr00t_prompt",
+        PreStep::QwenVlInputs(_) => "qwen_vl_inputs",
+        PreStep::Constant { .. } => "constant",
     }
 }
 
@@ -609,6 +852,7 @@ fn post_name(s: &PostStep) -> &'static str {
         PostStep::XvlaRotation6dToAxisAngle { .. } => "xvla_rotation_6d_to_axis_angle",
         PostStep::GripperBinarize { .. } => "gripper_binarize",
         PostStep::Xr0Denormalize(_) => "xr0_denormalize",
+        PostStep::ActionSlice { .. } => "action_slice",
     }
 }
 
@@ -619,6 +863,10 @@ fn is_placeholder(step: &StatsStep) -> bool {
         NormMode::MeanStd => all(&s.mean, 0.0) && all(&s.std, 1.0),
         NormMode::Quantiles => all(&s.q01, -1.0) && all(&s.q99, 1.0),
         NormMode::MinMax => all(&s.min, -1.0) && all(&s.max, 1.0),
+        NormMode::MinMaxClip => {
+            let (lo, hi) = s.bounds(step.bounds);
+            all(lo, -1.0) && all(hi, 1.0)
+        }
         NormMode::Identity => false,
     };
     !step.features.is_empty() && step.features.iter().all(|(_, s)| identity(s))
@@ -671,8 +919,10 @@ fn policy_kind(policy: Option<&Value>) -> EngineResult<PolicyKind> {
         Some("evo1") => Ok(PolicyKind::Evo1),
         Some("vlajepa") => Ok(PolicyKind::VlaJepa),
         Some("xr0") => Ok(PolicyKind::Xr0),
+        Some("gr00t_n1d7") => Ok(PolicyKind::Gr00tN1d7),
         other => refuse(format!(
-            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla, evo1, vlajepa, xr0"
+            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla, evo1, vlajepa, xr0, \
+             gr00t_n1d7"
         )),
     }
 }
@@ -698,6 +948,12 @@ const COMPONENTS: &[(&str, Option<&str>)] = &[
     ("vla_jepa_inputs", None),
     ("xr0", Some("XR0Preprocessor")),
     ("xr0_denormalize", Some("XR0Postprocessor")),
+    ("gr00t_image", None),
+    ("qwen_vl_patchify", None),
+    ("gr00t_prompt", None),
+    ("qwen_vl_inputs", None),
+    ("constant", None),
+    ("action_slice", None),
 ];
 
 fn short_name(class_path: &str) -> Option<&'static str> {
@@ -796,6 +1052,12 @@ struct StatsParams {
     stats_path: Option<String>,
     #[serde(default)]
     artifact: Option<String>,
+    #[serde(default)]
+    bounds: Option<Vec<String>>,
+    #[serde(default)]
+    pad_to: Option<i64>,
+    #[serde(default)]
+    history: Option<i64>,
 }
 
 fn mean_std() -> String {
@@ -895,6 +1157,62 @@ struct NoiseParams {
     #[serde(default)]
     #[allow(dead_code)]
     seed: Option<u64>,
+    #[serde(default)]
+    port: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Gr00tImageParams {
+    letterbox: bool,
+    shortest_edge: i64,
+    crop_fraction: f64,
+    interpolation: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QwenVlPatchifyParams {
+    patch_size: i64,
+    temporal_patch_size: i64,
+    merge_size: i64,
+    image_mean: [f64; 3],
+    image_std: [f64; 3],
+    grid_thw: Vec<[i64; 3]>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Gr00tPromptParams {
+    formalize_language: bool,
+    template: String,
+    image: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QwenVlInputsParams {
+    image_token_id: i64,
+    tokens_per_image: i64,
+    seq_len: i64,
+    pad_id: i64,
+    padding_side: String,
+    rope: String,
+    merge_size: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConstantParams {
+    port: String,
+    dtype: String,
+    value: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionSliceParams {
+    dims: i64,
 }
 
 #[derive(Deserialize)]
@@ -993,7 +1311,13 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
         "noise" => {
             let p: NoiseParams = typed(params, &ctx)?;
             check_shape(Some(&p.shape), &ctx)?;
-            PreStep::Noise { shape: p.shape }
+            if p.port.as_deref().is_some_and(str::is_empty) {
+                return refuse(format!("{ctx}: port is empty"));
+            }
+            PreStep::Noise {
+                shape: p.shape,
+                port: p.port,
+            }
         }
         "ov_tokenizer" => {
             let p: TokenizerParams = typed(params, &ctx)?;
@@ -1024,6 +1348,128 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
         }
         "vla_jepa_inputs" => PreStep::VlaJepaInputs(vla_jepa_inputs_step(params, &ctx)?),
         "xr0" => PreStep::Xr0(xr0_step(params, &ctx)?),
+        "gr00t_image" => {
+            let p: Gr00tImageParams = typed(params, &ctx)?;
+            if p.interpolation != "area" {
+                return refuse(format!(
+                    "{ctx}: interpolation {:?}; only area (OpenCV INTER_AREA) is supported",
+                    p.interpolation
+                ));
+            }
+            if p.shortest_edge < 1 {
+                return refuse(format!("{ctx}: shortest_edge must be at least 1"));
+            }
+            if !(p.crop_fraction > 0.0 && p.crop_fraction <= 1.0) {
+                return refuse(format!("{ctx}: crop_fraction must be in (0, 1]"));
+            }
+            PreStep::Gr00tImage(Gr00tImageStep {
+                letterbox: p.letterbox,
+                shortest_edge: p.shortest_edge as usize,
+                crop_fraction: p.crop_fraction,
+            })
+        }
+        "qwen_vl_patchify" => {
+            let p: QwenVlPatchifyParams = typed(params, &ctx)?;
+            if [p.patch_size, p.temporal_patch_size, p.merge_size]
+                .iter()
+                .any(|&v| v < 1)
+            {
+                return refuse(format!(
+                    "{ctx}: patch_size, temporal_patch_size and merge_size must be at least 1"
+                ));
+            }
+            let (mean, std) = (
+                p.image_mean.map(|x| x as f32),
+                p.image_std.map(|x| x as f32),
+            );
+            if mean.iter().any(|x| !x.is_finite())
+                || std.iter().any(|x| !x.is_finite() || *x == 0.0)
+            {
+                return refuse(format!(
+                    "{ctx}: image_mean and image_std must be finite, image_std non-zero"
+                ));
+            }
+            if p.grid_thw.is_empty() || p.grid_thw.iter().flatten().any(|&d| d < 1) {
+                return refuse(format!(
+                    "{ctx}: grid_thw must be non-empty, every dim at least 1"
+                ));
+            }
+            PreStep::QwenVlPatchify(QwenVlPatchifyStep {
+                patch_size: p.patch_size as usize,
+                temporal_patch_size: p.temporal_patch_size as usize,
+                merge_size: p.merge_size as usize,
+                image_mean: mean,
+                image_std: std,
+                grid_thw: p.grid_thw.iter().map(|g| g.map(|d| d as usize)).collect(),
+            })
+        }
+        "gr00t_prompt" => {
+            let p: Gr00tPromptParams = typed(params, &ctx)?;
+            for key in ["{images}", "{task}"] {
+                if p.template.matches(key).count() != 1 {
+                    return refuse(format!("{ctx}: template needs {key} exactly once"));
+                }
+            }
+            if p.image.is_empty() {
+                return refuse(format!("{ctx}: image is empty"));
+            }
+            PreStep::Gr00tPrompt(Gr00tPromptStep {
+                formalize_language: p.formalize_language,
+                template: p.template,
+                image: p.image,
+            })
+        }
+        "qwen_vl_inputs" => {
+            let p: QwenVlInputsParams = typed(params, &ctx)?;
+            if p.padding_side != "right" {
+                return refuse(format!(
+                    "{ctx}: padding_side {:?}; only right is supported",
+                    p.padding_side
+                ));
+            }
+            if p.rope != "qwen3_vl_mrope" {
+                return refuse(format!(
+                    "{ctx}: rope {:?}; only qwen3_vl_mrope is supported",
+                    p.rope
+                ));
+            }
+            if p.image_token_id < 0 || p.pad_id < 0 {
+                return refuse(format!(
+                    "{ctx}: image_token_id and pad_id must not be negative"
+                ));
+            }
+            if [p.tokens_per_image, p.seq_len, p.merge_size]
+                .iter()
+                .any(|&v| v < 1)
+            {
+                return refuse(format!(
+                    "{ctx}: tokens_per_image, seq_len and merge_size must be at least 1"
+                ));
+            }
+            PreStep::QwenVlInputs(QwenVlInputsStep {
+                image_token_id: p.image_token_id,
+                tokens_per_image: p.tokens_per_image as usize,
+                seq_len: p.seq_len as usize,
+                pad_id: p.pad_id,
+                merge_size: p.merge_size as usize,
+            })
+        }
+        "constant" => {
+            let p: ConstantParams = typed(params, &ctx)?;
+            if p.dtype != "int64" {
+                return refuse(format!(
+                    "{ctx}: dtype {:?}; only int64 is supported",
+                    p.dtype
+                ));
+            }
+            if p.port.is_empty() || p.value.is_empty() {
+                return refuse(format!("{ctx}: port and value must not be empty"));
+            }
+            PreStep::Constant {
+                port: p.port,
+                values: p.value,
+            }
+        }
         other => return refuse(format!("{ctx}: {other} is not a preprocessor")),
     })
 }
@@ -1209,6 +1655,15 @@ fn post_step(v: &Value) -> EngineResult<PostStep> {
                 action_eps: p.action_eps as f32,
             })
         }
+        "action_slice" => {
+            let p: ActionSliceParams = typed(params, &ctx)?;
+            if p.dims < 1 {
+                return refuse(format!("{ctx}: dims must be at least 1"));
+            }
+            PostStep::ActionSlice {
+                dims: p.dims as usize,
+            }
+        }
         "gripper_binarize" => {
             let p: GripperBinarizeParams = typed(params, &ctx)?;
             if p.index < 0 {
@@ -1258,8 +1713,34 @@ fn stats_step(params: Map<String, Value>, ctx: &str, target: &str) -> EngineResu
         "mean_std" => NormMode::MeanStd,
         "min_max" => NormMode::MinMax,
         "quantiles" => NormMode::Quantiles,
+        "min_max_clip" => NormMode::MinMaxClip,
         "identity" => NormMode::Identity,
         m => return refuse(format!("{ctx}: unknown mode {m:?}")),
+    };
+    let bounds = match (mode, p.bounds.as_deref()) {
+        (_, None) => Bounds::MinMax,
+        (NormMode::MinMaxClip, Some([lo, hi])) if lo == "min" && hi == "max" => Bounds::MinMax,
+        (NormMode::MinMaxClip, Some([lo, hi])) if lo == "q01" && hi == "q99" => Bounds::Quantiles,
+        (NormMode::MinMaxClip, Some(b)) => {
+            return refuse(format!(
+                "{ctx}: bounds {b:?}; expected [\"min\", \"max\"] or [\"q01\", \"q99\"]"
+            ))
+        }
+        (_, Some(_)) => return refuse(format!("{ctx}: bounds needs mode min_max_clip")),
+    };
+    if p.history.is_some_and(|h| h != 1) {
+        return refuse(format!(
+            "{ctx}: history {:?}; only 1 is supported",
+            p.history
+        ));
+    }
+    let pad_to = match p.pad_to {
+        None => None,
+        Some(_) if target != "state" => {
+            return refuse(format!("{ctx}: pad_to applies to normalize only"))
+        }
+        Some(n) if n < 1 => return refuse(format!("{ctx}: pad_to must be at least 1")),
+        Some(n) => Some(n as usize),
     };
     if p.stats_path.is_some() || p.artifact.is_some() {
         return refuse(format!(
@@ -1289,16 +1770,39 @@ fn stats_step(params: Map<String, Value>, ctx: &str, target: &str) -> EngineResu
         }
         features.push((
             key.clone(),
-            feature_stats(entry, mode, &format!("{ctx}[{key}]"))?,
+            feature_stats(entry, mode, bounds, &format!("{ctx}[{key}]"))?,
         ));
     }
     if mode != NormMode::Identity && features.is_empty() {
         return refuse(format!("{ctx}: no stats for {target:?}"));
     }
-    Ok(StatsStep { mode, features })
+    if let Some(n) = pad_to {
+        let width = features
+            .iter()
+            .filter_map(|(_, s)| s.mean.as_ref().or(s.q01.as_ref()).or(s.min.as_ref()))
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        if n < width {
+            return refuse(format!(
+                "{ctx}: pad_to {n} is narrower than the stats ({width})"
+            ));
+        }
+    }
+    Ok(StatsStep {
+        mode,
+        features,
+        bounds,
+        pad_to,
+    })
 }
 
-fn feature_stats(entry: &Value, mode: NormMode, ctx: &str) -> EngineResult<FeatureStats> {
+fn feature_stats(
+    entry: &Value,
+    mode: NormMode,
+    bounds: Bounds,
+    ctx: &str,
+) -> EngineResult<FeatureStats> {
     let Some(obj) = entry.as_object() else {
         return refuse(format!("{ctx}: not an object"));
     };
@@ -1341,6 +1845,8 @@ fn feature_stats(entry: &Value, mode: NormMode, ctx: &str) -> EngineResult<Featu
         NormMode::MeanStd => &[("mean", &s.mean), ("std", &s.std)],
         NormMode::MinMax => &[("min", &s.min), ("max", &s.max)],
         NormMode::Quantiles => &[("q01", &s.q01), ("q99", &s.q99)],
+        NormMode::MinMaxClip if bounds == Bounds::Quantiles => &[("q01", &s.q01), ("q99", &s.q99)],
+        NormMode::MinMaxClip => &[("min", &s.min), ("max", &s.max)],
         NormMode::Identity => &[],
     };
     let mut len = None;
@@ -1387,6 +1893,8 @@ mod tests {
         include_str!("../../tests/fixtures/policy/vlajepa-libero-manifest.json");
     const EVO1_LIBERO: &str = include_str!("../../tests/fixtures/policy/evo1-libero-manifest.json");
     const XR0_LIBERO: &str = include_str!("../../tests/fixtures/policy/xr0-libero-manifest.json");
+    const GR00T_LIBERO: &str =
+        include_str!("../../tests/fixtures/policy/gr00t-libero-spatial-manifest.json");
 
     fn parse(v: &Value) -> EngineResult<PolicyManifest> {
         PolicyManifest::parse(&v.to_string(), LoadOptions::default())
@@ -1464,7 +1972,8 @@ mod tests {
         assert_eq!(m.policy, PolicyKind::SmolVla);
         assert!(m.preprocessors.iter().any(|s| *s
             == PreStep::Noise {
-                shape: vec![50, 32]
+                shape: vec![50, 32],
+                port: None
             }));
         let ImageStep::SmolVlaResize(s) = m.image_step() else {
             panic!("smolvla image step")
@@ -1574,9 +2083,10 @@ mod tests {
                 temporal_patch_size: 2,
             }
         );
-        assert!(m
-            .preprocessors
-            .contains(&PreStep::Noise { shape: vec![7, 7] }));
+        assert!(m.preprocessors.contains(&PreStep::Noise {
+            shape: vec![7, 7],
+            port: None
+        }));
         assert!(m.postprocessors.is_empty());
         assert_eq!(m.normalize().count(), 0, "stats are graph constants");
     }
@@ -1738,6 +2248,170 @@ mod tests {
             "init_args": step
         });
         parse(&v).unwrap();
+    }
+
+    #[test]
+    fn gr00t_libero_manifest_parses() {
+        let m = PolicyManifest::parse(GR00T_LIBERO, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::Gr00tN1d7);
+        assert_eq!(m.model_artifact, "gr00t.xml");
+        let ImageStep::Gr00t(g) = m.image_step() else {
+            panic!("gr00t_image is the image step")
+        };
+        assert_eq!(
+            (g.shortest_edge, g.crop_fraction, g.letterbox),
+            (256, 0.95, true)
+        );
+        let (_, p, t, q) = m.gr00t_steps().unwrap();
+        assert_eq!(
+            (p.patch_size, p.temporal_patch_size, p.merge_size),
+            (16, 2, 2)
+        );
+        assert_eq!(p.grid_thw, vec![[1, 16, 16]; 2]);
+        assert!(t.formalize_language);
+        assert_eq!(
+            (q.image_token_id, q.tokens_per_image, q.seq_len, q.pad_id),
+            (151655, 64, 192, 0)
+        );
+        let n = m.normalize().next().unwrap();
+        assert_eq!(
+            (n.mode, n.bounds, n.pad_to),
+            (NormMode::MinMaxClip, Bounds::Quantiles, Some(132))
+        );
+        let d = m.denormalize().next().unwrap();
+        assert_eq!(
+            (d.mode, d.bounds, d.pad_to),
+            (NormMode::MinMaxClip, Bounds::Quantiles, None)
+        );
+        assert_eq!(
+            m.constants().collect::<Vec<_>>(),
+            [("embodiment_id", &[2i64][..])]
+        );
+        assert_eq!(m.noise_port(), "actions");
+        assert_eq!(m.flipped_cameras(), ["image", "wrist_image"]);
+        assert_eq!(
+            m.postprocessors[..2],
+            [
+                PostStep::ActionChunkTrimmer { n_action_steps: 16 },
+                PostStep::ActionSlice { dims: 7 }
+            ]
+        );
+        assert_eq!(
+            m.attribution.as_deref(),
+            Some("Built on NVIDIA Cosmos. Licensed by NVIDIA Corporation under the NVIDIA Open Model License.")
+        );
+        let geo = crate::policy::gr00t::Gr00tGeometry::new(&m).unwrap();
+        assert_eq!(
+            (
+                geo.side,
+                geo.crop,
+                geo.cameras,
+                geo.state_len,
+                geo.state_width
+            ),
+            (256, 243, 2, 8, 132)
+        );
+    }
+
+    #[test]
+    fn gr00t_steps_are_validated() {
+        let gr00t = || -> Value { serde_json::from_str(GR00T_LIBERO).unwrap() };
+        let at = |name: &str| {
+            gr00t()["model"]["preprocessors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|s| s["type"] == name)
+                .unwrap()
+        };
+        let set = |step: &str, key: &str, value: Value| {
+            let mut v = gr00t();
+            v["model"]["preprocessors"][at(step)][key] = value;
+            err(&v)
+        };
+        assert!(set("gr00t_image", "interpolation", json!("linear")).contains("only area"));
+        assert!(set("gr00t_image", "crop_fraction", json!(1.5))
+            .contains("crop_fraction must be in (0, 1]"));
+        assert!(set("gr00t_image", "resample", json!(1)).contains("unknown field `resample`"));
+        assert!(set("gr00t_image", "shortest_edge", json!(224))
+            .contains("square frames of shortest_edge"));
+        assert!(set("qwen_vl_patchify", "grid_thw", json!([[1, 16, 16]]))
+            .contains("for each of 2 cameras"));
+        assert!(set("qwen_vl_patchify", "image_std", json!([0.5, 0.0, 0.5]))
+            .contains("image_std non-zero"));
+        assert!(set("gr00t_prompt", "template", json!("{task}"))
+            .contains("needs {images} exactly once"));
+        assert!(set("qwen_vl_inputs", "padding_side", json!("left")).contains("only right"));
+        assert!(set("qwen_vl_inputs", "rope", json!("default")).contains("only qwen3_vl_mrope"));
+        assert!(set("qwen_vl_inputs", "tokens_per_image", json!(32))
+            .contains("not the 64 merged patches"));
+        assert!(
+            set("qwen_vl_inputs", "seq_len", json!(128)).contains("leave no room in seq_len 128")
+        );
+        assert!(set("constant", "dtype", json!("int32")).contains("only int64"));
+        assert!(
+            set("normalize", "bounds", json!(["q05", "q95"])).contains("bounds [\"q05\", \"q95\"]")
+        );
+        assert!(set("normalize", "history", json!(2)).contains("only 1 is supported"));
+        assert!(set("normalize", "pad_to", json!(4)).contains("narrower than the stats"));
+        assert!(
+            set("normalize", "mode", json!("quantiles")).contains("bounds needs mode min_max_clip")
+        );
+        // A non-square camera, a second normalize, a foreign step, a wide slice.
+        let mut v = gr00t();
+        v["model"]["input_features"][1]["init_args"]["shape"] = json!([3, 256, 320]);
+        assert!(err(&v).contains("square frames"));
+        let mut v = gr00t();
+        let n = v["model"]["preprocessors"][at("normalize")].clone();
+        v["model"]["preprocessors"].as_array_mut().unwrap().push(n);
+        assert!(err(&v).contains("at most one normalize"));
+        let mut v = gr00t();
+        v["model"]["preprocessors"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "new_line"}));
+        assert!(err(&v).contains("found new_line"));
+        let mut v = gr00t();
+        v["model"]["postprocessors"][1]["dims"] = json!(200);
+        let m = parse(&v).unwrap();
+        assert!(m.postprocessors[1]
+            .out_dim(132)
+            .unwrap_err()
+            .to_string()
+            .contains("keeps 200 values"));
+        let mut v = gr00t();
+        v["model"]["preprocessors"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|s| s["type"] != "qwen_vl_inputs");
+        assert!(err(&v).contains("0 qwen_vl_inputs steps"));
+        // GR00T's steps are its own.
+        let mut v = gr00t();
+        v["policy"] = json!({"name": "smolvla"});
+        assert!(
+            err(&v).contains("gr00t_image needs policy.name \"gr00t_n1d7\""),
+            "{}",
+            err(&v)
+        );
+        let mut v: Value = serde_json::from_str(SMOLVLA_NOISE).unwrap();
+        v["model"]["postprocessors"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "action_slice", "dims": 7}));
+        assert!(err(&v).contains("action_slice needs policy.name"));
+        let mut v: Value = serde_json::from_str(SMOLVLA_NOISE).unwrap();
+        for s in v["model"]["preprocessors"].as_array_mut().unwrap() {
+            if s["type"] == "noise" {
+                s["port"] = json!("actions");
+            }
+        }
+        assert!(err(&v).contains("a noise port need policy.name"));
+        // Identity bounds are a placeholder.
+        let mut v = gr00t();
+        let st = &mut v["model"]["postprocessors"][2]["stats"]["action"];
+        st["q01"] = json!(vec![-1.0; 7]);
+        st["q99"] = json!(vec![1.0; 7]);
+        assert!(err(&v).contains("denormalize stats are identity placeholders"));
     }
 
     #[test]

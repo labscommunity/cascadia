@@ -10,6 +10,7 @@ use cascadia_ov_genai_shim::{DType, PluginConfig, PortInfo};
 use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec};
 
 use super::cameras::{images_tensor, CameraLayout};
+use super::gr00t::Gr00tHost;
 use super::manifest::{
     ImageStep, PolicyKind, PolicyManifest, PostStep, PreStep, VlaJepaInputsStep, XVLA_ACTION_DIM,
 };
@@ -41,6 +42,7 @@ pub const INPUT_IDS: &str = "input_ids";
 pub const ATTENTION_MASK: &str = "attention_mask";
 pub const PIXEL_VALUES: &str = "pixel_values";
 pub const EMBODIED_POSITIONS: &str = "embodied_positions";
+pub const POSITION_IDS: &str = "position_ids";
 
 /// Every warmup state value. Not zero: X-VLA's LIBERO export reads part of the
 /// state as a rotation vector and divides by its norm behind a `1e-8` guard
@@ -260,6 +262,12 @@ pub enum PortLayout {
     /// XR0: `tokenized_prompt` and `tokenized_prompt_mask` (both i64),
     /// `pixel_values`, `state [1, 1, max_state_dim]` (raw, zero-padded), `noise`.
     Xr0,
+    /// GR00T N1.7: `input_ids`, `attention_mask` (i64, image tokens expanded),
+    /// `pixel_values`, `position_ids [3, 1, seq_len]`, `state [1, 1, pad_to]`
+    /// (normalized, zero-padded), the `constant` ports and the noise port, in
+    /// that order; each bound by name, else by its index (the CPU plugin renames
+    /// `state`). The one output is the action, whatever its name.
+    Gr00t,
 }
 
 impl PortLayout {
@@ -272,6 +280,7 @@ impl PortLayout {
             | PolicyKind::Evo1 => Self::ImageSlots,
             PolicyKind::VlaJepa => Self::VlaJepa,
             PolicyKind::Xr0 => Self::Xr0,
+            PolicyKind::Gr00tN1d7 => Self::Gr00t,
         }
     }
 }
@@ -283,7 +292,34 @@ pub struct PortBinding {
     pub noise: bool,
     /// The port the token ids go to.
     pub prompt_port: &'static str,
+    /// The tokenizer's width (GR00T: the unexpanded ids `seq_len` leaves room for).
     pub prompt_len: usize,
+    /// `(feed name, tensor name)` where the model's port has another name.
+    pub renames: Vec<(String, String)>,
+    pub noise_port: String,
+    pub action_port: String,
+}
+
+impl PortBinding {
+    fn new(layout: PortLayout, noise: bool, prompt_port: &'static str, prompt_len: usize) -> Self {
+        Self {
+            layout,
+            noise,
+            prompt_port,
+            prompt_len,
+            renames: Vec::new(),
+            noise_port: NOISE.into(),
+            action_port: ACTION.into(),
+        }
+    }
+
+    /// The model's name for feed `name`.
+    pub fn port_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.renames
+            .iter()
+            .find(|(feed, _)| feed == name)
+            .map_or(name, |(_, port)| port.as_str())
+    }
 }
 
 fn port<'a>(ports: &'a [PortInfo], name: &str) -> Option<&'a PortInfo> {
@@ -355,7 +391,138 @@ pub fn bind(
             }
             _ => refuse("xr0 needs an xr0 step"),
         },
+        PortLayout::Gr00t => bind_gr00t(m, &Gr00tHost::new(m)?, inputs, outputs),
     }
+}
+
+/// [`PortLayout::Gr00t`]: each input by name, else by its index when the
+/// port there carries none of the layout's names.
+pub fn bind_gr00t(
+    m: &PolicyManifest,
+    host: &Gr00tHost,
+    inputs: &[PortInfo],
+    outputs: &[PortInfo],
+) -> EngineResult<(PortBinding, IrFacts)> {
+    let has_noise = m
+        .preprocessors
+        .iter()
+        .any(|s| matches!(s, PreStep::Noise { .. }));
+    let mut want: Vec<String> = [INPUT_IDS, ATTENTION_MASK, PIXEL_VALUES, POSITION_IDS, STATE]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(m.constants().map(|(p, _)| p.to_string()))
+        .collect();
+    if has_noise {
+        want.push(m.noise_port().to_string());
+    }
+    if inputs.len() != want.len() {
+        return refuse(format!(
+            "the model has {} inputs; gr00t fills {} ({want:?})",
+            inputs.len(),
+            want.len()
+        ));
+    }
+    let named = |p: &PortInfo| p.aliases.iter().any(|a| want.contains(a));
+    let mut ports: Vec<PortInfo> = Vec::with_capacity(want.len());
+    let mut renames = Vec::new();
+    for (i, name) in want.iter().enumerate() {
+        let p = match inputs.iter().find(|p| p.aliases.contains(name)) {
+            Some(p) => p,
+            None if !named(&inputs[i]) => match inputs[i].aliases.first() {
+                Some(actual) => {
+                    renames.push((name.clone(), actual.clone()));
+                    &inputs[i]
+                }
+                None => return refuse(format!("input {i} has no name to bind {name:?} by")),
+            },
+            None => {
+                return refuse(format!(
+                    "the model has no {name:?} port, and input {i} is {:?}",
+                    inputs[i].aliases
+                ))
+            }
+        };
+        ports.push(PortInfo {
+            aliases: vec![name.clone()],
+            ..p.clone()
+        });
+    }
+    let seq = host.seq_len();
+    for name in [INPUT_IDS, ATTENTION_MASK] {
+        let d = dims(&ports, name, &[DType::I64], 2, Some(0))?;
+        if d[1] != Some(seq) {
+            return refuse(format!(
+                "{name:?} is {d:?}; qwen_vl_inputs seq_len is {seq}"
+            ));
+        }
+    }
+    let pos = dims(&ports, POSITION_IDS, &[DType::I64], 3, None)?;
+    if pos != [Some(3), Some(1), Some(seq)] {
+        return refuse(format!(
+            "position_ids is {pos:?}; gr00t makes [3, 1, {seq}]"
+        ));
+    }
+    let image_slots = pixel_slots(&ports, &host.geo.patches, "qwen_vl_patchify")?;
+    let width = host.geo.state_width;
+    let state = dims(&ports, STATE, &[DType::F32], 3, Some(0))?;
+    if state[1..] != [Some(1), Some(width)] {
+        return refuse(format!("state is {state:?}; gr00t makes [1, 1, {width}]"));
+    }
+    for (port, values) in m.constants() {
+        let d = dims(&ports, port, &[DType::I64], 1, None)?;
+        if d != [Some(values.len())] {
+            return refuse(format!(
+                "constant {port:?} has {} values; the port is {d:?}",
+                values.len()
+            ));
+        }
+    }
+    let noise_shape = if has_noise {
+        let p = m.noise_port();
+        let d = dims(&ports, p, &[DType::F32], 3, Some(0))?;
+        Some(
+            d[1..]
+                .iter()
+                .map(|&x| fixed(x, "a noise dim"))
+                .collect::<EngineResult<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
+    let action_port = match (port(outputs, ACTION), outputs) {
+        (Some(_), _) => ACTION.to_string(),
+        (None, [only]) => match only.aliases.first() {
+            Some(a) => a.clone(),
+            None => return refuse("the model's output has no name"),
+        },
+        (None, _) => {
+            return refuse(format!(
+                "the model has {} outputs and none is named \"action\"",
+                outputs.len()
+            ))
+        }
+    };
+    let out = [PortInfo {
+        aliases: vec![ACTION.into()],
+        ..port(outputs, &action_port).expect("found above").clone()
+    }];
+    let action_shape = action_dims(&out)?;
+    let noise = noise_mode(&noise_shape, false);
+    let mut binding = PortBinding::new(PortLayout::Gr00t, has_noise, INPUT_IDS, host.id_budget());
+    binding.renames = renames;
+    binding.noise_port = m.noise_port().to_string();
+    binding.action_port = action_port;
+    Ok((
+        binding,
+        IrFacts {
+            image_slots,
+            image_hw: None,
+            state_len: host.geo.state_len,
+            action_shape,
+            noise,
+            noise_shape,
+        },
+    ))
 }
 
 /// `pixel_values` checked against `geo`; returns the camera count.
@@ -407,12 +574,7 @@ pub fn bind_xr0(
     let action_shape = action_dims(outputs)?;
     let noise = noise_mode(&noise_shape, has_random_uniform);
     Ok((
-        PortBinding {
-            layout: PortLayout::Xr0,
-            noise: noise_shape.is_some(),
-            prompt_port: PROMPT,
-            prompt_len,
-        },
+        PortBinding::new(PortLayout::Xr0, noise_shape.is_some(), PROMPT, prompt_len),
         IrFacts {
             image_slots,
             image_hw: None,
@@ -467,12 +629,12 @@ pub fn bind_vla_jepa(
     let action_shape = action_dims(outputs)?;
     let noise = noise_mode(&noise_shape, has_random_uniform);
     Ok((
-        PortBinding {
-            layout: PortLayout::VlaJepa,
-            noise: noise_shape.is_some(),
-            prompt_port: INPUT_IDS,
+        PortBinding::new(
+            PortLayout::VlaJepa,
+            noise_shape.is_some(),
+            INPUT_IDS,
             prompt_len,
-        },
+        ),
         IrFacts {
             image_slots,
             image_hw: None,
@@ -580,12 +742,12 @@ pub fn bind_ports(
     let action_shape = action_dims(outputs)?;
     let noise = noise_mode(&noise_shape, has_random_uniform);
     Ok((
-        PortBinding {
-            layout: PortLayout::ImageSlots,
-            noise: noise_shape.is_some(),
-            prompt_port: PROMPT,
+        PortBinding::new(
+            PortLayout::ImageSlots,
+            noise_shape.is_some(),
+            PROMPT,
             prompt_len,
-        },
+        ),
         IrFacts {
             image_slots,
             image_hw,
@@ -694,15 +856,32 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
                 let geo = super::xr0::geometry(m, s)?;
                 text = super::xr0::render_prompt(&geo.views, geo.patches.image_pads(), &text);
             }
+            PreStep::Gr00tPrompt(s) => {
+                let cameras = super::gr00t::Gr00tGeometry::new(m)?.cameras;
+                text = super::gr00t::render_prompt(s, cameras, &text);
+            }
             PreStep::OvTokenizer { .. } => break,
             PreStep::Pi0(_)
             | PreStep::SmolVlaResize(_)
             | PreStep::Noise { .. }
             | PreStep::ImageFlip { .. }
-            | PreStep::VlaJepaInputs(_) => {}
+            | PreStep::VlaJepaInputs(_)
+            | PreStep::Gr00tImage(_)
+            | PreStep::QwenVlPatchify(_)
+            | PreStep::QwenVlInputs(_)
+            | PreStep::Constant { .. } => {}
         }
     }
     Ok(text)
+}
+
+/// The task as a template step puts it into the prompt, when that differs
+/// from the task as sent; the special-token guard checks both.
+fn templated_task(m: &PolicyManifest, task: &str) -> Option<String> {
+    m.preprocessors.iter().find_map(|s| match s {
+        PreStep::Gr00tPrompt(p) if p.formalize_language => Some(super::gr00t::formalize(task)),
+        _ => None,
+    })
 }
 
 /// A loaded policy: manifest steps, ports and spec around a model and tokenizer.
@@ -720,6 +899,8 @@ pub struct PolicyPipeline {
     vla_jepa: Option<VlaJepaHost>,
     /// [`PortLayout::Xr0`]'s.
     xr0: Option<Xr0Host>,
+    /// [`PortLayout::Gr00t`]'s.
+    gr00t: Option<Gr00tHost>,
     /// Task text to the refusal message, `None` when it fits.
     prompt_checks: HashMap<String, Option<Refusal>>,
     /// Set for a templated prompt (`vla_jepa_prompt`, `xr0`).
@@ -749,17 +930,30 @@ impl PolicyPipeline {
                     | PreStep::Pi0(_)
                     | PreStep::VlaJepaPrompt { .. }
                     | PreStep::Xr0(_)
+                    | PreStep::Gr00tPrompt(_)
             )
         }) {
             return refuse(
-                "a prompt step (new_line / pi05 / pi0 / vla_jepa_prompt / xr0) comes after \
-                 ov_tokenizer",
+                "a prompt step (new_line / pi05 / pi0 / vla_jepa_prompt / xr0 / gr00t_prompt) \
+                 comes after ov_tokenizer",
             );
+        }
+        if let Some(i) = manifest
+            .preprocessors
+            .iter()
+            .position(|s| matches!(s, PreStep::QwenVlInputs(_)))
+        {
+            if i < tok_at {
+                return refuse("qwen_vl_inputs comes before ov_tokenizer");
+            }
         }
         let (binding, ir) = bind(&manifest, inputs, outputs, has_random_uniform)?;
         // Otherwise a tokenizer padded for another port loads and every infer fails.
+        // GR00T's tokenizer does not pad: its ids are expanded and padded after it.
         let empty = tokenizer.tokenize("")?;
-        if empty.ids.len() != binding.prompt_len || empty.mask.len() != binding.prompt_len {
+        if binding.layout != PortLayout::Gr00t
+            && (empty.ids.len() != binding.prompt_len || empty.mask.len() != binding.prompt_len)
+        {
             return refuse(format!(
                 "the tokenizer pads to {} tokens; the model's {} port takes {}",
                 empty.ids.len(),
@@ -787,10 +981,16 @@ impl PolicyPipeline {
             ImageStep::Xr0(step) => Some(Xr0Host::new(&manifest, step)?),
             _ => None,
         };
-        let templated = manifest
-            .preprocessors
-            .iter()
-            .any(|s| matches!(s, PreStep::VlaJepaPrompt { .. } | PreStep::Xr0(_)));
+        let gr00t = match manifest.image_step() {
+            ImageStep::Gr00t(_) => Some(Gr00tHost::new(&manifest)?),
+            _ => None,
+        };
+        let templated = manifest.preprocessors.iter().any(|s| {
+            matches!(
+                s,
+                PreStep::VlaJepaPrompt { .. } | PreStep::Xr0(_) | PreStep::Gr00tPrompt(_)
+            )
+        });
         let guard = if templated {
             let template = prompt_text(&manifest, "", &[], false)?;
             let g = PromptGuard::new(&template, tokenizer.as_mut())?;
@@ -801,6 +1001,18 @@ impl PolicyPipeline {
                         "the xr0 template tokenizes to {:?} image pads; {} cameras need {want}",
                         g.count("<|image_pad|>"),
                         host.geo.views.len()
+                    ));
+                }
+            }
+            if let Some(host) = &gr00t {
+                let ids = tokenizer.tokenize(&template)?.ids;
+                let got = ids.iter().filter(|&&t| t == host.image_token_id()).count();
+                if got != host.geo.cameras {
+                    return refuse(format!(
+                        "the gr00t template tokenizes to {got} image tokens (id {}); {} cameras \
+                         need one each",
+                        host.image_token_id(),
+                        host.geo.cameras
                     ));
                 }
             }
@@ -825,6 +1037,7 @@ impl PolicyPipeline {
             tokenizer: Some(tokenizer),
             vla_jepa,
             xr0,
+            gr00t,
             prompt_checks: HashMap::new(),
             guard,
         })
@@ -836,8 +1049,14 @@ impl PolicyPipeline {
         if let Some(answer) = self.prompt_checks.get(task) {
             return answer.clone().map_or(Ok(()), |r| Err(r.error()));
         }
-        if let Some(m) = self.guard.as_ref().and_then(|g| g.check_task(task)) {
-            return self.remember(task, Some(Refusal::Structure(m)));
+        if let Some(g) = &self.guard {
+            let templated = templated_task(&self.manifest, task);
+            if let Some(m) = g
+                .check_task(task)
+                .or_else(|| templated.and_then(|t| g.check_task(&t)))
+            {
+                return self.remember(task, Some(Refusal::Structure(m)));
+            }
         }
         let zeros = vec![0.0; self.spec.state_len];
         let text = prompt_text(&self.manifest, task, &zeros, true)?;
@@ -851,7 +1070,17 @@ impl PolicyPipeline {
         } else {
             " with the worst-case state"
         };
-        let refusal = if tok.has_truncation_state() {
+        let refusal = if let Some(host) = &self.gr00t {
+            // Unpadded ids: the count is exact. Counted as the language tokens the images leave.
+            let images = host.geo.cameras;
+            (count > limit).then(|| {
+                format!(
+                    "the prompt needs {} language tokens; the limit is {}",
+                    count - images.min(count),
+                    limit - images
+                )
+            })
+        } else if tok.has_truncation_state() {
             (count > limit)
                 .then(|| format!("the prompt needs {count} tokens{worst}; the limit is {limit}"))
         } else {
@@ -883,6 +1112,9 @@ impl PolicyPipeline {
             .as_mut()
             .ok_or(EngineError::NotLoaded)?
             .tokenize(text)?;
+        if self.binding.layout == PortLayout::Gr00t {
+            return Ok(tokens);
+        }
         if tokens.ids.len() != limit || tokens.mask.len() != limit {
             return Err(EngineError::Backend(format!(
                 "the tokenizer produced {} ids and {} mask values; the model's prompt port takes {limit}",
@@ -1060,6 +1292,82 @@ impl PolicyPipeline {
         ])
     }
 
+    /// [`PortLayout::Gr00t`] inputs, all but the noise.
+    fn gr00t_feeds(&mut self, obs: &Observation) -> EngineResult<Vec<(String, HostTensor)>> {
+        let text = prompt_text(&self.manifest, &obs.prompt, &[], false)?;
+        let tokens = self.tokens(&text)?;
+        if let Some(g) = &self.guard {
+            g.check_ids(&tokens)?;
+        }
+        let host = self
+            .gr00t
+            .as_ref()
+            .expect("new builds the host for a gr00t layout");
+        let ids: Vec<i64> = tokens
+            .ids
+            .iter()
+            .zip(&tokens.mask)
+            .filter(|(_, &m)| m)
+            .map(|(&id, _)| id)
+            .collect();
+        let (input_ids, mask, position_ids) = host.inputs(&ids)?;
+        let pixels = host.pixel_values(&self.layout, &obs.images, &self.flip)?;
+        let mut state: Vec<f64> = obs.state.iter().map(|&x| f64::from(x)).collect();
+        for step in self.manifest.normalize() {
+            state = normalize(step, STATE, &state)?;
+        }
+        state.resize(host.geo.state_width, 0.0);
+        let seq = host.seq_len();
+        let feature = host.geo.patches.feature();
+        let mut feeds = vec![
+            (
+                INPUT_IDS.to_string(),
+                HostTensor {
+                    shape: vec![1, seq],
+                    data: TensorData::I64(input_ids),
+                },
+            ),
+            (
+                ATTENTION_MASK.to_string(),
+                HostTensor {
+                    shape: vec![1, seq],
+                    data: TensorData::I64(mask),
+                },
+            ),
+            (
+                PIXEL_VALUES.to_string(),
+                HostTensor {
+                    shape: vec![pixels.len() / feature, feature],
+                    data: TensorData::F32(pixels),
+                },
+            ),
+            (
+                POSITION_IDS.to_string(),
+                HostTensor {
+                    shape: vec![3, 1, seq],
+                    data: TensorData::I64(position_ids),
+                },
+            ),
+            (
+                STATE.to_string(),
+                HostTensor {
+                    shape: vec![1, 1, state.len()],
+                    data: TensorData::F32(state.iter().map(|&x| x as f32).collect()),
+                },
+            ),
+        ];
+        for (port, values) in self.manifest.constants() {
+            feeds.push((
+                port.to_string(),
+                HostTensor {
+                    shape: vec![values.len()],
+                    data: TensorData::I64(values.to_vec()),
+                },
+            ));
+        }
+        Ok(feeds)
+    }
+
     fn run(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
         let start = Instant::now();
         if self.model.is_none() {
@@ -1068,10 +1376,14 @@ impl PolicyPipeline {
         check_observation(&self.spec, obs)?;
         self.check_prompt(&obs.prompt)?;
 
+        let named = |f: Vec<(&'static str, HostTensor)>| -> Vec<(String, HostTensor)> {
+            f.into_iter().map(|(n, t)| (n.to_string(), t)).collect()
+        };
         let mut feeds = match self.binding.layout {
-            PortLayout::ImageSlots => self.image_slot_feeds(obs)?,
-            PortLayout::VlaJepa => self.vla_jepa_feeds(obs)?,
-            PortLayout::Xr0 => self.xr0_feeds(obs)?,
+            PortLayout::ImageSlots => named(self.image_slot_feeds(obs)?),
+            PortLayout::VlaJepa => named(self.vla_jepa_feeds(obs)?),
+            PortLayout::Xr0 => named(self.xr0_feeds(obs)?),
+            PortLayout::Gr00t => self.gr00t_feeds(obs)?,
         };
         if self.binding.noise {
             let dims = self
@@ -1088,7 +1400,7 @@ impl PolicyPipeline {
             let mut shape = vec![1];
             shape.extend(dims);
             feeds.push((
-                NOISE,
+                self.binding.noise_port.clone(),
                 HostTensor {
                     shape,
                     data: TensorData::F32(noise),
@@ -1098,10 +1410,10 @@ impl PolicyPipeline {
 
         let model = self.model.as_mut().ok_or(EngineError::NotLoaded)?;
         for (name, t) in &feeds {
-            model.set_input(name, t)?;
+            model.set_input(self.binding.port_name(name), t)?;
         }
         model.infer()?;
-        let (shape, out) = model.output_f32(ACTION)?;
+        let (shape, out) = model.output_f32(&self.binding.action_port)?;
         let [steps, dim] = self.action_shape;
         if shape != [1, steps, dim] {
             return Err(EngineError::Backend(format!(
@@ -1137,6 +1449,13 @@ impl PolicyPipeline {
                     let out = super::xr0::denormalize(s, &f, dim);
                     dim = s.action_dim.unwrap_or(dim);
                     actions = out.into_iter().map(f64::from).collect();
+                }
+                PostStep::ActionSlice { dims } => {
+                    actions = actions
+                        .chunks(dim)
+                        .flat_map(|row| row[..*dims].iter().copied())
+                        .collect();
+                    dim = *dims;
                 }
             }
         }
@@ -1217,6 +1536,7 @@ mod tests {
     struct FakeModel {
         log: Arc<Mutex<Log>>,
         output: (Vec<usize>, Vec<f32>),
+        action: &'static str,
     }
 
     impl PolicyModel for FakeModel {
@@ -1237,7 +1557,7 @@ mod tests {
             Ok(())
         }
         fn output_f32(&mut self, name: &str) -> EngineResult<(Vec<usize>, Vec<f32>)> {
-            assert_eq!(name, ACTION);
+            assert_eq!(name, self.action);
             Ok(self.output.clone())
         }
     }
@@ -1458,6 +1778,7 @@ mod tests {
             Box::new(FakeModel {
                 log: log.clone(),
                 output: (port_dims(outputs, ACTION), output),
+                action: ACTION,
             }),
             inputs,
             outputs,
@@ -1932,6 +2253,188 @@ mod tests {
             r.log.lock().unwrap().texts.last().unwrap(),
             "pick up the bowl"
         );
+    }
+
+    const GR00T_LIBERO: &str =
+        include_str!("../../tests/fixtures/policy/gr00t-libero-spatial-manifest.json");
+
+    /// Our GR00T export's ports as the CPU plugin shows them: `state` renamed.
+    fn gr00t_ports(state: &str) -> (Vec<PortInfo>, Vec<PortInfo>) {
+        (
+            vec![
+                port(INPUT_IDS, DType::I64, &[1, 192]),
+                port(ATTENTION_MASK, DType::I64, &[1, 192]),
+                port(PIXEL_VALUES, DType::F32, &[512, 1536]),
+                port(POSITION_IDS, DType::I64, &[3, 1, 192]),
+                port(state, DType::F32, &[1, 1, 132]),
+                port("embodiment_id", DType::I64, &[1]),
+                port("actions", DType::F32, &[1, 40, 132]),
+            ],
+            vec![port("predicted_action", DType::F32, &[1, 40, 132])],
+        )
+    }
+
+    /// The fixture with the fake tokenizer's `<|image_pad|>` id.
+    fn gr00t_manifest() -> String {
+        GR00T_LIBERO.replace("\"image_token_id\": 151655", "\"image_token_id\": 1001")
+    }
+
+    fn gr00t_rig(state_port: &str) -> EngineResult<Rig> {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let (inputs, outputs) = gr00t_ports(state_port);
+        let m = PolicyManifest::parse(&gr00t_manifest(), LoadOptions::default()).unwrap();
+        let engine = PolicyPipeline::new(
+            m,
+            server("CPU"),
+            Box::new(FakeModel {
+                log: log.clone(),
+                output: (
+                    vec![1, 40, 132],
+                    (0..40 * 132)
+                        .map(|i| (i % 132) as f32 / 66.0 - 1.0)
+                        .collect(),
+                ),
+                action: "predicted_action",
+            }),
+            &inputs,
+            &outputs,
+            false,
+            Box::new(FakeTokenizer {
+                log: log.clone(),
+                truncation_state: true,
+                port: 0,
+            }),
+        )?;
+        log.lock().unwrap().texts.clear();
+        Ok(Rig { engine, log })
+    }
+
+    #[test]
+    fn gr00t_binds_by_name_or_index_and_expands_its_prompt() {
+        let mut r = gr00t_rig("272").unwrap();
+        let spec = r.engine.spec().clone();
+        assert_eq!(spec.cameras, ["image", "wrist_image"]);
+        assert_eq!((spec.height, spec.width, spec.state_len), (256, 256, 8));
+        assert_eq!(spec.chunk, [16, 7]);
+        assert_eq!(
+            (spec.noise, spec.noise_shape.clone()),
+            (NoiseMode::Input, Some(vec![40, 132]))
+        );
+        assert_eq!(spec.resize, cascadia_types::ResizeConvention::Center);
+        assert!(spec
+            .attribution
+            .as_deref()
+            .unwrap()
+            .contains("NVIDIA Open Model License"));
+        let mut o = obs(&spec, "Pick up the BLACK bowl!");
+        o.seed = Some(3);
+        let a = r.engine.infer(&o).unwrap();
+        assert_eq!((a.steps, a.dim), (16, 7));
+        let log = r.log.lock().unwrap();
+        let names: Vec<&str> = log.inputs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                INPUT_IDS,
+                ATTENTION_MASK,
+                PIXEL_VALUES,
+                POSITION_IDS,
+                "272",
+                "embodiment_id",
+                "actions"
+            ]
+        );
+        assert_eq!(
+            log.texts.last().unwrap(),
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\
+             <|vision_start|><|image_pad|><|vision_end|>pick up the black bowl<|im_end|>\n"
+        );
+        drop(log);
+        let TensorData::I64(ids) = input(&r.log, INPUT_IDS).data else {
+            panic!()
+        };
+        assert_eq!(ids.iter().filter(|&&t| t == 1001).count(), 128);
+        let TensorData::I64(mask) = input(&r.log, ATTENTION_MASK).data else {
+            panic!()
+        };
+        let valid = mask.iter().filter(|&&m| m == 1).count();
+        assert!(mask[..valid].iter().all(|&m| m == 1) && ids[valid..].iter().all(|&t| t == 0));
+        let state = input(&r.log, "272");
+        assert_eq!(state.shape, [1, 1, 132]);
+        assert!(f32s(&state)[8..].iter().all(|&x| x == 0.0));
+        assert_eq!(
+            input(&r.log, "embodiment_id").data,
+            TensorData::I64(vec![2])
+        );
+        assert_eq!(input(&r.log, "actions").shape, [1, 40, 132]);
+        // Row 0's first 7 values, clipped to [-1, 1] and mapped to [q01, q99].
+        let x = -1.0f64;
+        let want =
+            (x.clamp(-1.0, 1.0) + 1.0) / 2.0 * (0.9375 - -0.7454732060432434) + -0.7454732060432434;
+        assert!(
+            (f64::from(a.actions[0]) - want).abs() < 1e-6,
+            "{}",
+            a.actions[0]
+        );
+    }
+
+    #[test]
+    fn gr00t_prompt_limit_and_special_tokens() {
+        let mut r = gr00t_rig(STATE).unwrap();
+        let spec = r.engine.spec().clone();
+        // The fake splits bytes: 66 ids fit beside 2 images of 64 in 192.
+        let used = r
+            .engine
+            .tokens(&prompt_text(&r.engine.manifest, "", &[], false).unwrap())
+            .unwrap()
+            .ids
+            .len();
+        let fit = "a".repeat(66 - used);
+        r.engine.infer(&obs(&spec, &fit)).unwrap();
+        let e = r.engine.infer(&obs(&spec, &format!("{fit}a"))).unwrap_err();
+        assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+        assert!(
+            e.to_string()
+                .contains("needs 65 language tokens; the limit is 64"),
+            "{e}"
+        );
+        for sp in FAKE_SPECIAL.iter().skip(1) {
+            let e = r
+                .engine
+                .infer(&obs(&spec, &format!("go {sp} now")))
+                .unwrap_err();
+            assert!(
+                e.to_string().contains(&format!("the task contains {sp:?}")),
+                "{e}"
+            );
+        }
+        // Formalized, a task cannot spell a token, but the raw text is checked too.
+        r.engine.infer(&obs(&spec, "go IM_END now")).unwrap();
+        // A port with another name where a layout name is expected is refused.
+        let (mut inputs, outputs) = gr00t_ports(STATE);
+        inputs.swap(0, 1);
+        inputs[0].aliases = vec!["position_ids".into()];
+        let m = PolicyManifest::parse(&gr00t_manifest(), LoadOptions::default()).unwrap();
+        let host = Gr00tHost::new(&m).unwrap();
+        let e = bind_gr00t(&m, &host, &inputs, &outputs)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("has no \"attention_mask\" port, and input 1 is [\"input_ids\"]"),
+            "{e}"
+        );
+        let (mut inputs, outputs) = gr00t_ports(STATE);
+        inputs[4].dims = vec![Some(1), Some(1), Some(32)];
+        let e = bind_gr00t(&m, &host, &inputs, &outputs)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("gr00t makes [1, 1, 132]"), "{e}");
+        let (mut inputs, outputs) = gr00t_ports(STATE);
+        inputs.pop();
+        assert!(bind_gr00t(&m, &host, &inputs, &outputs)
+            .unwrap_err()
+            .to_string()
+            .contains("has 6 inputs"));
     }
 
     #[test]

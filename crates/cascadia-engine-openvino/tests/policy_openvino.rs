@@ -6,7 +6,9 @@
 //! - `CASCADIA_POLICY_PACKAGE_XVLA`: `lerobot/xvla-libero`, cameras flipped on the host;
 //! - `CASCADIA_POLICY_PACKAGE_VLAJEPA`: `lerobot/VLA-JEPA-LIBERO`, prompt padded to 288;
 //! - `CASCADIA_POLICY_PACKAGE_EVO1`: `zuoxingdong/evo1_libero`, cameras flipped on the host;
-//! - `CASCADIA_POLICY_PACKAGE_XR0`: `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`, fp16 weights.
+//! - `CASCADIA_POLICY_PACKAGE_XR0`: `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`, fp16 weights;
+//! - `CASCADIA_POLICY_PACKAGE_GROOT`: `nvidia/GR00T-N1.7-LIBERO` (libero_spatial), Intel's
+//!   edge-ai-suites single-IR export, fp16 weights.
 //!
 //! The π0 and X-VLA references are the exporters' PyTorch f32 outputs, in the
 //! package's `ref.npz` (or `<dir>.ref.npz` beside it). VLA-JEPA's are LeRobot's
@@ -15,7 +17,10 @@
 //! actions in `ref.npz`, for the raw LIBERO frames in `frames.npz` (same rule).
 //! XR0's are Intel's runtime stages in `xr0-stages-f32.npz` (the exporter's
 //! `fixtures-f32.npz`, saved uncompressed) and PyTorch f32 in
-//! `xr0-libero-f32.ref.npz` (same rule).
+//! `xr0-libero-f32.ref.npz` (same rule). GR00T's are NVIDIA's `Gr00tPolicy`
+//! (PyTorch f32) graph inputs, raw output and decoded actions in `ref.npz`, for
+//! the frames and states in `gr00t-frames.npz` (regenerated from the
+//! exporter's seeds; same rule).
 #![cfg(feature = "openvino")]
 
 use std::path::{Path, PathBuf};
@@ -69,6 +74,14 @@ impl Npy {
         self.data
             .chunks_exact(8)
             .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    fn f64s(&self) -> Vec<f64> {
+        assert_eq!(self.descr, "<f8");
+        self.data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
             .collect()
     }
 
@@ -135,7 +148,7 @@ fn npz(bytes: &[u8], name: &str) -> Npy {
         .collect();
     let item = match &descr[1..] {
         "f4" => 4,
-        "i8" => 8,
+        "i8" | "f8" => 8,
         "b1" | "u1" => 1,
         u if u.starts_with('U') => 4 * u[1..].parse::<usize>().unwrap(),
         other => panic!("dtype {other}"),
@@ -1830,4 +1843,292 @@ fn assert_special_tasks_refused(
         specials.len()
     );
     pipeline.infer(base).unwrap();
+}
+
+fn gr00t(test: &str) -> Option<PathBuf> {
+    package_from("CASCADIA_POLICY_PACKAGE_GROOT", test)
+}
+
+/// `ref.npz`'s cases: frames and state seeds 0, 0, 1 with three noise draws.
+const GR00T_CASES: [(&str, &str); 3] = [("A", "A"), ("B_same_obs_new_noise", "A"), ("C", "C")];
+
+/// The reference fed NVIDIA's processor the frames as stored; the package's
+/// `image_flip` rotates both cameras, so the client sends them rotated.
+fn gr00t_observation(frames: &[u8], z: &[u8], case: &str, obs: &str) -> Observation {
+    let frame = |cam: &str| {
+        let a = npz(frames, &format!("{obs}_{cam}"));
+        assert_eq!(a.shape, [256, 256, 3]);
+        Image {
+            height: 256,
+            width: 256,
+            data: a.data.chunks_exact(3).rev().flatten().copied().collect(),
+        }
+    };
+    Observation {
+        images: vec![
+            ("image".into(), frame("image")),
+            ("wrist_image".into(), frame("wrist_image")),
+        ],
+        state: npz(frames, &format!("{obs}_state")).f32s(),
+        prompt: npz(frames, "task").string(),
+        seed: None,
+        noise: Some(npz(z, &format!("{case}__actions")).f32s()),
+    }
+}
+
+/// Our GR00T export's ports, read off `gr00t.xml`.
+fn gr00t_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+    let port = |name: &str, dtype, dims: &[usize]| PortInfo {
+        aliases: vec![name.into()],
+        dtype: Some(dtype),
+        dims: dims.iter().map(|&d| Some(d)).collect(),
+    };
+    (
+        vec![
+            port("input_ids", DType::I64, &[1, 192]),
+            port("attention_mask", DType::I64, &[1, 192]),
+            port("pixel_values", DType::F32, &[512, 1536]),
+            port("position_ids", DType::I64, &[3, 1, 192]),
+            port("state", DType::F32, &[1, 1, 132]),
+            port("embodiment_id", DType::I64, &[1]),
+            port("actions", DType::F32, &[1, 40, 132]),
+        ],
+        vec![port("predicted_action", DType::F32, &[1, 40, 132])],
+    )
+}
+
+fn f64_diff(got: &[f32], want: &[f64]) -> f64 {
+    assert_eq!(got.len(), want.len());
+    got.iter()
+        .zip(want)
+        .map(|(&g, &w)| (f64::from(g) - w).abs())
+        .fold(0.0, f64::max)
+}
+
+/// Every graph input NVIDIA's processor made, from the frames and state a
+/// client sends: ids, mask and mRoPE positions exact, pixel values and the
+/// padded state within 1e-6, the embodiment id and noise as given; NVIDIA's
+/// raw output through the postprocessors within 1e-6 of its decoded actions.
+/// No model run, so it needs no device.
+#[test]
+fn gr00t_engine_binds_the_reference_inputs() {
+    let Some(dir) = gr00t("gr00t_engine_binds_the_reference_inputs") else {
+        return;
+    };
+    let z = reference(&dir);
+    let frames = beside(&dir, "gr00t-frames.npz");
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let tokenizer = OvTokenizer::load(&dir.join(manifest.tokenizer_artifact())).unwrap();
+    let specials = tokenizer.special_tokens();
+    let bound = Arc::new(Mutex::new(Vec::new()));
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let (inputs, outputs) = gr00t_ports();
+    let mut pipeline = PolicyPipeline::new(
+        manifest,
+        ServerFacts {
+            model: "gr00t".into(),
+            device: "CPU".into(),
+            prompt_max_bytes: 1024,
+        },
+        Box::new(JepaRecorder {
+            inputs: bound.clone(),
+            output: output.clone(),
+            shape: vec![1, 40, 132],
+        }),
+        &inputs,
+        &outputs,
+        false,
+        Box::new(tokenizer),
+    )
+    .unwrap();
+    for (case, obs) in GR00T_CASES {
+        bound.lock().unwrap().clear();
+        *output.lock().unwrap() = npz(&z, &format!("{case}__pred")).f32s();
+        let o = gr00t_observation(&frames, &z, case, obs);
+        let a = pipeline.infer(&o).unwrap();
+        let got = bound.lock().unwrap().clone();
+        let get = |name: &str| {
+            got.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.data.clone())
+                .unwrap_or_else(|| panic!("{name} not bound"))
+        };
+        for name in [
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "embodiment_id",
+        ] {
+            assert_eq!(
+                get(name),
+                TensorData::I64(npz(&z, &format!("{case}__{name}")).i64s()),
+                "{case} {name}"
+            );
+        }
+        for name in ["pixel_values", "state"] {
+            let TensorData::F32(v) = get(name) else {
+                panic!("{name} is not f32")
+            };
+            let d = max_abs_diff(&v, &npz(&z, &format!("{case}__{name}")).f32s());
+            eprintln!("gr00t {case} {name} vs NVIDIA's processor: max abs {d:e}");
+            assert!(d <= 1e-6, "{case} {name} differs by {d}");
+        }
+        assert_eq!(get("actions"), TensorData::F32(o.noise.clone().unwrap()));
+        assert_eq!((a.steps, a.dim), (16, 7));
+        let d = f64_diff(&a.actions, &npz(&z, &format!("{case}__decoded")).f64s());
+        eprintln!("gr00t {case} postprocessors vs decode_action: max abs {d:e}");
+        assert!(d <= 1e-6, "{case} decode differs by {d}");
+    }
+    let base = gr00t_observation(&frames, &z, "A", "A");
+    assert_special_tasks_refused(
+        &mut pipeline,
+        &specials,
+        &[
+            "<|image_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+        ],
+        &base,
+    );
+}
+
+/// CPU f32 with fp16 weights against NVIDIA's PyTorch f32 on all three
+/// cases, as served (decoded, [16, 7]); the spike measured 3.3e-3. The
+/// prompt limit: 64 language tokens are served, 65 refused.
+#[test]
+fn gr00t_spec_prompt_limit_and_cpu_parity() {
+    let Some(dir) = gr00t("gr00t_spec_prompt_limit_and_cpu_parity") else {
+        return;
+    };
+    let z = reference(&dir);
+    let frames = beside(&dir, "gr00t-frames.npz");
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let spec = engine.spec().clone();
+    assert_eq!(spec.cameras, ["image", "wrist_image"]);
+    assert_eq!((spec.height, spec.width), (256, 256));
+    assert_eq!(spec.resize, ResizeConvention::Center);
+    assert_eq!((spec.state_len, spec.chunk), (8, [16, 7]));
+    assert_eq!(
+        (spec.noise, spec.noise_shape.clone()),
+        (NoiseMode::Input, Some(vec![40, 132]))
+    );
+    let notice = spec.attribution.clone().unwrap();
+    assert!(
+        notice.contains("NVIDIA Open Model License") && notice.contains("Built on NVIDIA Cosmos"),
+        "{notice}"
+    );
+    for (case, obs) in GR00T_CASES {
+        let a = engine
+            .infer(&gr00t_observation(&frames, &z, case, obs))
+            .unwrap();
+        let d = f64_diff(&a.actions, &npz(&z, &format!("{case}__decoded")).f64s());
+        eprintln!(
+            "gr00t engine cpu f32 vs pytorch f32 ({case}): max abs {d:.3e} infer_ms={:.0}",
+            a.infer_ms
+        );
+        assert!(d <= 8e-3, "{case}: max abs diff {d}");
+    }
+    // Language tokens of a k-word task: the ids less the two image tokens.
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let step = manifest
+        .preprocessors
+        .iter()
+        .find_map(|s| match s {
+            PreStep::Gr00tPrompt(p) => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let mut tok = OvTokenizer::load(&dir.join("tokenizer.xml")).unwrap();
+    let words = |k: usize| vec!["word"; k].join(" ");
+    let mut count = |k: usize| {
+        let text = cascadia_engine_openvino::policy::gr00t::render_prompt(&step, 2, &words(k));
+        tok.tokenize(&text).unwrap().ids.len() - 2
+    };
+    let fit = (1..80).find(|&k| count(k) == 64).unwrap();
+    assert_eq!(count(fit + 1), 65);
+    let mut o = gr00t_observation(&frames, &z, "A", "A");
+    o.prompt = words(fit + 1);
+    let e = engine.infer(&o).unwrap_err();
+    assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+    assert!(
+        e.to_string()
+            .contains("needs 65 language tokens; the limit is 64"),
+        "{e}"
+    );
+    o.prompt = words(fit);
+    engine.infer(&o).unwrap();
+}
+
+/// GR00T on the GPU: f16 within 1e-2 of PyTorch f32 as served (spike: 7.4e-3
+/// normalized). At `--precision f32` the GPU compile fails
+/// (`CL_INVALID_EVENT`), which must be a load error; that runs in a child
+/// process, as π0's does.
+#[test]
+fn gr00t_gpu_infer_f16_and_f32_is_a_load_error() {
+    let test = "gr00t_gpu_infer_f16_and_f32_is_a_load_error";
+    let Some(dir) = gr00t(test) else {
+        return;
+    };
+    if !gpu_enabled(test) {
+        return;
+    }
+    let z = reference(&dir);
+    let frames = beside(&dir, "gr00t-frames.npz");
+    {
+        let opts = OvPolicyOptions {
+            device: "GPU".into(),
+            ..OvPolicyOptions::default()
+        };
+        let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+        let warm = engine.warmup().unwrap();
+        assert_eq!(warm.len(), WARMUP_CALLS);
+        for (case, obs) in GR00T_CASES {
+            let a = engine
+                .infer(&gr00t_observation(&frames, &z, case, obs))
+                .unwrap();
+            assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
+            let d = f64_diff(&a.actions, &npz(&z, &format!("{case}__decoded")).f64s());
+            eprintln!(
+                "gpu gr00t f16 ({case}): max abs {d:.3e} infer_ms={:.1} warmup={warm:?}",
+                a.infer_ms
+            );
+            assert!(d <= 1e-2, "gpu gr00t f16 {case} max abs diff {d} > 1e-2");
+        }
+    }
+    let child = "gr00t_gpu_f32_load_is_an_error_in_its_own_process";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", child, "--ignored", "--nocapture"])
+        .output()
+        .unwrap();
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{child}: {}\n{stdout}",
+        out.status
+    );
+}
+
+#[test]
+#[ignore = "run by gr00t_gpu_infer_f16_and_f32_is_a_load_error, in its own process"]
+fn gr00t_gpu_f32_load_is_an_error_in_its_own_process() {
+    let dir = PathBuf::from(std::env::var_os("CASCADIA_POLICY_PACKAGE_GROOT").unwrap());
+    let opts = OvPolicyOptions {
+        device: "GPU".into(),
+        precision: Some(Precision::F32),
+        ..OvPolicyOptions::default()
+    };
+    match OvPolicyEngine::load(&dir, &opts) {
+        Ok(_) => panic!("gpu gr00t f32 compiled; expected it to fail on the Arc 140V"),
+        Err(e) => {
+            eprintln!("gpu gr00t f32 load error: {e}");
+            assert!(matches!(e, EngineError::Backend(_)), "{e}");
+            let m = e.to_string();
+            assert!(m.contains("gr00t.xml on GPU failed"), "{m}");
+            assert!(m.contains("try without --precision f32"), "{m}");
+        }
+    }
 }

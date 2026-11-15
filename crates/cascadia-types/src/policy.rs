@@ -89,6 +89,9 @@ pub struct PolicySpec {
     pub noise_shape: Option<Vec<usize>>,
     pub resize: ResizeConvention,
     pub prompt_max_bytes: usize,
+    /// The package's licence notice, served verbatim when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<String>,
 }
 
 #[cfg(test)]
@@ -109,12 +112,14 @@ mod tests {
             noise_shape: None,
             resize: ResizeConvention::TopLeft,
             prompt_max_bytes: 1024,
+            attribution: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["noise"], "in_graph_random");
         assert_eq!(v["resize"], "top_left");
         assert_eq!(v["chunk"], serde_json::json!([10, 7]));
         assert!(v["noise_shape"].is_null());
+        assert!(v.get("attribution").is_none());
         assert_eq!(serde_json::from_value::<PolicySpec>(v).unwrap(), spec);
     }
 
