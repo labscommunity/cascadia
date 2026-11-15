@@ -51,9 +51,20 @@ def test_xr0_camera_names_map_to_the_libero_cameras():
     c.check_metadata({"cameras": ["base", "wrist_left"], "state_len": 8, "chunk": [30, 7]})
 
 
+class _Controller:
+    use_delta = True
+
+
+class _Robot:
+    def __init__(self):
+        self.controller = _Controller()
+
+
 class _Env:
     def __init__(self):
         self.steps = 0
+        self.robots = [_Robot()]
+        self.modes = []
 
     def reset(self):
         pass
@@ -62,6 +73,7 @@ class _Env:
         return _obs()
 
     def step(self, _):
+        self.modes.append(self.robots[0].controller.use_delta)
         self.steps += 1
         return _obs(), 0.0, False, {}
 
@@ -95,3 +107,12 @@ def test_invert_gripper_binarizes_and_inverts_only_the_last_dim():
     out = c.invert_gripper(a)
     np.testing.assert_array_equal(out[:, :6], a[:, :6])
     np.testing.assert_array_equal(out[:, 6], [-1.0, 1.0])
+
+
+def test_absolute_control_mode_switches_after_the_settling_steps():
+    env = _Env()
+    c.run_episode(_Client(chunk=30), env, None, "t", _meta(["image"]), 30, 0, control_mode="absolute")
+    assert env.modes[: c.NUM_STEPS_WAIT] == [True] * c.NUM_STEPS_WAIT
+    assert set(env.modes[c.NUM_STEPS_WAIT :]) == {False}
+    c.run_episode(_Client(chunk=30), env, None, "t", _meta(["image"]), 30, 0)
+    assert env.robots[0].controller.use_delta is True

@@ -51,6 +51,13 @@ CAMERA_SOURCES = {
 }
 
 
+def set_control_mode(env, mode):
+    """LeRobot's LIBERO `control_mode`: `absolute` makes the OSC controller take end-effector poses
+    (X-VLA), `relative` deltas. Set after the settling steps, as LeRobot does."""
+    for robot in env.robots:
+        robot.controller.use_delta = mode == "relative"
+
+
 def invert_gripper(actions):
     """GR00T's LIBERO rule: gripper in [0, 1] -> -sign(2g - 1) (binarize, then invert)."""
     actions = np.array(actions, dtype=np.float32)
@@ -113,14 +120,17 @@ def check_metadata(meta):
 
 
 def run_episode(client, env, init_state, task, meta, max_steps, seed_base, flip=True, replan=None,
-                gripper="raw"):
+                gripper="raw", control_mode="relative"):
     env.reset()
     obs = env.set_init_state(init_state)
+    set_control_mode(env, "relative")  # the settling steps' dummy action is a delta
     plan, infer_ms, rtt_ms, done, t, error = [], [], [], False, 0, None
     while t < max_steps + NUM_STEPS_WAIT:
         if t < NUM_STEPS_WAIT:
             obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
             t += 1
+            if t == NUM_STEPS_WAIT:
+                set_control_mode(env, control_mode)
             continue
         if not plan:
             # A per-call seed makes both precisions draw the same noise on the same call.
@@ -156,6 +166,8 @@ def main():
                          "(packages whose manifest flips on the server)")
     ap.add_argument("--replan", type=int, default=None,
                     help="execute at most this many actions of each chunk (default: all)")
+    ap.add_argument("--control-mode", choices=["relative", "absolute"], default="relative",
+                    help="absolute: actions are end-effector poses (X-VLA), as LeRobot's env.control_mode")
     ap.add_argument("--gripper", choices=["raw", "binarize_invert"], default="raw",
                     help="binarize_invert: gripper g in [0, 1] -> -sign(2g - 1) (GR00T's LIBERO rule)")
     args = ap.parse_args()
@@ -174,7 +186,7 @@ def main():
     check_metadata(meta)
     print(f"server model={meta['model']} device={meta['device']} cameras={meta['cameras']} "
           f"{meta['height']}x{meta['width']} resize={meta['resize']} chunk={meta['chunk']} "
-          f"noise={meta['noise']} flip={args.flip} replan={args.replan} gripper={args.gripper}", flush=True)
+          f"noise={meta['noise']} flip={args.flip} replan={args.replan} gripper={args.gripper} control_mode={args.control_mode}", flush=True)
 
     out = args.out.open("w") if args.out else None
     n = k = errors = 0
@@ -198,6 +210,7 @@ def main():
             done, steps, infer_ms, rtt_ms, error = run_episode(
                 client, env, init_states[ep], task.language, meta, max_steps, seed_base,
                 args.flip == "both", args.replan, args.gripper,
+                args.control_mode,
             )
             wall = time.perf_counter() - t0
             n += 1
