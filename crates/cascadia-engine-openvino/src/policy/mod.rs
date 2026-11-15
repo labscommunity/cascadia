@@ -3,5 +3,6 @@
 //! derivation. Builds and tests in the default stub build.
 
 pub mod manifest;
+pub mod steps;
 
 pub use manifest::{LoadOptions, PolicyKind, PolicyManifest};
