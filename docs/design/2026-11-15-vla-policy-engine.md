@@ -59,11 +59,12 @@ claims until a stats source is settled (open question 3).
 
 v1:
 - Packages with `"format": "policy_package"`, version `1.x`, runner `SinglePass`, artifact
-  `openvino`, policies `smolvla`, `pi05`, `pi0`, `xvla`, `evo1` and `vlajepa`. Anything else is
-  refused at load with a clear error. The π0, X-VLA, EVO1 and VLA-JEPA packages are our exports
-  (Intel's runtime has no π0, X-VLA or EVO1, and its VLA-JEPA preprocessor is a draft); `xvla` and
+  `openvino`, policies `smolvla`, `pi05`, `pi0`, `xvla`, `evo1`, `vlajepa` and `xr0`. Anything else
+  is refused at load with a clear error. The π0, X-VLA, EVO1, VLA-JEPA and XR0 packages are our
+  exports (Intel's runtime has no π0, X-VLA or EVO1, its VLA-JEPA preprocessor is a draft, and its
+  XR0 export draws noise in the graph, which ours takes as an input); `xvla` and
   `evo1` take their cameras and prompt like `smolvla` (`evo1` strips the task with Python's
-  `str.strip()`, as LeRobot's EVO1 does). `vlajepa` has its own input ports (see "Port layouts").
+  `str.strip()`, as LeRobot's EVO1 does). `vlajepa` and `xr0` have their own input ports (see "Port layouts").
 - Devices: GPU (default, f16 unless `--precision f32`) and CPU (always f32). NPU is refused:
   SmolVLA and π0.5 fail NPU compilation as exported, and X-VLA compiles but returns wrong actions.
 - X-VLA's LIBERO packages flip `image2` on the host (`image_flip`), not in the graph: on the Arc
@@ -80,6 +81,10 @@ v1:
   (OpenVINO 2026.4.1) at f16 gets every flow step after the first wrong (max 2.19, no NaN) while f32
   and the CPU are right, and `rt_info` f32 pins do not help. An exporter must keep FCs with tens of
   thousands of inputs out of an f16 GPU graph.
+- XR0 (`XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`, Qwen3-VL-4B with a DiT, 5 flow steps) on the Arc
+  140V: fp16 weights at GPU f16 about 232 ms for a 30-step chunk, within 3.2e-3 of PyTorch f32, no
+  NaN, about 11 GB. At `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as
+  for π0; CPU f32 is about 5.6 s a call and 26 GB.
 - VLA-JEPA (`lerobot/VLA-JEPA-LIBERO`, Qwen3-VL-2B with all four flow steps in one graph) on the Arc
   140V: GPU f16 about 99 ms a call and within 8.2e-4 of PyTorch f32, GPU f32 about 610 ms, CPU f32
   about 3 s, no gripper flips. The GPU f16 default holds; LIBERO success is not yet measured.
@@ -126,6 +131,8 @@ Loading rules:
 | `gripper_binarize` | Ours (LeRobot EVO1's LIBERO postprocessing). `index`, `threshold`, `above`, `below`: each row's `a[index]` becomes `above` if `a[index] > threshold` (strictly), else `below`. Runs where it is listed (after `denormalize` for EVO1); an `index` outside the width at its step refuses the load. |
 | `vla_jepa_prompt` | Ours. `template`: the chat prompt with every `{instruction}` replaced by the task verbatim (no stripping); a template without `{instruction}` refuses the load. Must come before `ov_tokenizer`. |
 | `vla_jepa_inputs` | Ours, ported from Intel's draft `VLAJEPAPreprocessor` (runtime `e3dd944`). Frames uint8 HWC at exactly `image_resolution` (224×224; other sizes are refused, so Intel's first area resize is the identity) → `/255` → antialiased bicubic to `vision_resolution` (256×256) with separable matrices built at load like Intel's `_bicubic_weights` (`a = −0.5`, centre `(i + 0.5)·scale`, support `2·max(scale, 1)`, rows normalized in f64, stored f32; `rows @ img @ colsᵀ` summed in f64) → `(x − mean)/std` → tiled `temporal_patch_size` times → reshaped `(1, tp, 3, gh/m, m, p, gw/m, m, p)`, transposed `(0, 3, 6, 4, 7, 2, 1, 5, 8)` → `[gh·gw, 3·tp·p²]` per camera in `image_keys` order, concatenated into `pixel_values`. `embodied_positions`: the indices of `embodied_token_id` in the ids; anything but exactly `num_embodied_tokens` (at load, for the empty task, and per call) is refused. A `vision_resolution` not a multiple of `patch_size · merge_size`, or an unknown parameter, refuses the load. The state goes to the graph **raw** and the graph's actions are served as they are: its normalize and denormalize stats are graph constants, so a `vlajepa` manifest may not carry `normalize`, `denormalize` or any step but these, `ov_tokenizer`, `noise` and `action_chunk_trimmer` (and there is no placeholder-stats check to run). |
+| `xr0` | Intel's `XR0Preprocessor` (runtime `e3dd944`). Cameras are the VISUAL `input_features` in order, all one `[3, H, W]`; frames uint8 HWC at exactly that size, and only a size Intel's resize (sides to multiples of `image_factor`, area ≤ `image_max_pixels`) leaves alone, so its OpenCV resize never runs (LIBERO: 256×256). Pixels `(x · rescale_factor − mean)/std` in f32, then the Qwen patchify `vla_jepa_inputs` uses. Prompt: Qwen3-VL's chat template, `# <Title> View` per camera (`base` → Base, `wrist_left` → Left-Wrist, …) with `patches/merge²` image pads, then `Generate robot actions for the task:\n{task} /no_cot`, the task verbatim. State: raw, zero-padded to `max_state_dim`, `[1, 1, 32]`. `normalize_state: true`, a non-empty `image_key_view_map` or an unknown parameter refuses the load. `noise` may follow it. |
+| `xr0_denormalize` | Intel's `XR0Postprocessor`: `action · (std + action_eps) + mean` in f32 with per-timestep `[T, D]` stats (which must match the graph's output at load), then the first `action_dim` values of a row. `action_mode: delta` (needs a state passthrough output) and unknown parameters refuse the load; all-identity stats are a placeholder. |
 | `xvla_rotation_6d_to_axis_angle` | Ours, ported from LeRobot's step of that name. Each action row (at least `max(expected_action_dim, 10)` wide, checked at load) becomes 7 values: position `[0:3]` as is; the 6-D rotation `[3:9]` to axis-angle (Gram-Schmidt with LeRobot's `1e-6` eps, the quaternion as the top eigenvector of Bar-Itzhack's K with `w ≥ 0`, then axis × angle), in f64; the gripper `[9]` as 1 above 0.5, else −1. Near π the axis-angle sign follows `w ≥ 0`, as in LeRobot. |
 
 ### Port layouts
@@ -137,6 +144,7 @@ new kind with new ports adds a layout, not a branch inside another one.
 | Layout | Kinds | Inputs |
 |---|---|---|
 | image slots | `smolvla`, `pi05`, `pi0`, `xvla`, `evo1` | `state` f32 (normalized), `tokenized_prompt` i64, `tokenized_prompt_mask` bool, `images [slots, 1, 3, H, W]` f32, `image_masks [slots, 1]` bool, optional `noise` |
+| XR0 | `xr0` | `tokenized_prompt` i64 and `tokenized_prompt_mask` i64 `[1, 256]` (right-padded with `<|endoftext|>`), `pixel_values [512, 1536]` f32, `state [1, 1, 32]` f32 raw, `noise [1, 30, 32]`; `action [1, 30, 32]` normalized, then `xr0_denormalize` |
 | VLA-JEPA | `vlajepa` | `input_ids` i64 and `attention_mask` i64 `[1, L]` (the tokenizer pads right to L = 288 with `<|endoftext|>`, mask 0), `pixel_values [cameras·patches, 3·tp·p²]` f32 (`[512, 1536]`), `embodied_positions [1, 32]` i64, `state` f32 raw, `noise [1, 7, 7]`; `action [1, 7, 7]` is final |
 
 At load the VLA-JEPA binder checks `pixel_values`' width against the step's geometry, its rows
@@ -161,7 +169,8 @@ check tokenizes the task with the worst-case state (every bin `255`) and the rea
 
 VLA-JEPA's prompt carries no state, so its count is exact: its tokenizer IR's `truncation`
 variable defaults on, the engine holds it off, and a task is served up to exactly 288 tokens and
-refused at 289 (LIBERO's tasks take 221–234).
+refused at 289 (LIBERO's tasks take 221–234). XR0's works the same way at 256 (its LIBERO template
+alone is 191 tokens); truncating would cut the template.
 
 A refusal is an error frame naming the token limit. Intel's runtime truncates silently, which for
 π0.5 drops the `;\nAction: ` suffix; we deliberately do not.
@@ -189,7 +198,8 @@ OpenCV's bilinear resize pixel for pixel. The client resizes on the robot, and m
 package's padding convention, which the metadata states as `resize`: bilinear, pad value 0 before
 scaling, padded **centred** for `pi05` and **top and left** for `smolvla_resize` (content at the
 bottom right). VLA-JEPA's `resize` is `stretch`: a plain resize to 224×224 with no padding; so is EVO1's
-(`smolvla_resize` with `"resize": "stretch"`; LIBERO renders at 448, so the two agree there). openpi's `resize_with_pad` centres, so it is correct for π0.5 only; a 640×480 frame
+(`smolvla_resize` with `"resize": "stretch"`; LIBERO renders at 448, so the two agree there), and
+XR0's (`xr0`: frames at exactly 256×256). openpi's `resize_with_pad` centres, so it is correct for π0.5 only; a 640×480 frame
 sent to SmolVLA through it lands 64 rows off with no error. `tools/` ships a reference resize for
 each convention.
 
@@ -261,7 +271,7 @@ Limits, all checked before work is queued:
 | `chunk` `[T, D]` | T from `action_chunk_trimmer.n_action_steps` when present, else the IR output; D from the IR output after the postprocessors (7 for `xvla_rotation_6d_to_axis_angle`) |
 | `noise` | the mode above |
 | `noise_shape` | the IR `noise` port, `input` mode only (the decode rule and the message cap need it) |
-| `resize` | the image step: `center` (`pi05`, `pi0`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling; `stretch` (`vla_jepa_inputs`, `smolvla_resize` with `"resize": "stretch"`), no padding |
+| `resize` | the image step: `center` (`pi05`, `pi0`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling; `stretch` (`vla_jepa_inputs`, `xr0`, `smolvla_resize` with `"resize": "stretch"`), no padding |
 | `device`, `model`, `prompt_max_bytes` | the server |
 
 `WS /v1/policy/ws` uses openpi's framing, so `openpi_client.WebsocketClientPolicy` can drive it:

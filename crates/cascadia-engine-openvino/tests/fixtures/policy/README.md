@@ -23,6 +23,9 @@ Copied, unmodified:
   in Intel's manifest format), f32 with fp16 weights, `noise` as an input, both cameras flipped on
   the host, the action head's pooling FC split for the GPU at f16; `"resize": "stretch"` added to
   its `smolvla_resize` step.
+- `xr0-libero-manifest.json`: our export of `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO` (Intel's
+  exporter, physical-ai-studio `8f132416`, runtime `e3dd944`), f32 with fp16 weights, the in-graph
+  noise replaced by a `noise` input and a `noise` step after `xr0`.
 
 Generated:
 

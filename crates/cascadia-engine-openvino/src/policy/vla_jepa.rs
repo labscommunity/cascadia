@@ -10,6 +10,7 @@ use cascadia_types::Image;
 
 use super::cameras::CameraLayout;
 use super::manifest::VlaJepaInputsStep;
+use super::qwen_vl::PatchGeometry;
 
 /// Bicubic `a` of torchvision's antialiased resize.
 const BICUBIC_A: f64 = -0.5;
@@ -61,12 +62,9 @@ pub struct VlaJepaHost {
     rows: Vec<Taps>,
     cols: Vec<Taps>,
     in_hw: [usize; 2],
-    vision_hw: [usize; 2],
+    geo: PatchGeometry,
     mean: [f32; 3],
     std: [f32; 3],
-    patch: usize,
-    merge: usize,
-    temporal: usize,
     embodied_token_id: i64,
     num_embodied: usize,
 }
@@ -79,25 +77,31 @@ impl VlaJepaHost {
             rows: bicubic_taps(in_hw[0], vision_hw[0]),
             cols: bicubic_taps(in_hw[1], vision_hw[1]),
             in_hw,
-            vision_hw,
+            geo: PatchGeometry {
+                hw: vision_hw,
+                patch: step.patch_size,
+                merge: step.merge_size,
+                temporal: step.temporal_patch_size,
+            },
             mean: step.image_mean,
             std: step.image_std,
-            patch: step.patch_size,
-            merge: step.merge_size,
-            temporal: step.temporal_patch_size,
             embodied_token_id: step.embodied_token_id,
             num_embodied: step.num_embodied_tokens,
         }
     }
 
+    pub fn geometry(&self) -> &PatchGeometry {
+        &self.geo
+    }
+
     /// `pixel_values` rows per camera.
     pub fn patches(&self) -> usize {
-        (self.vision_hw[0] / self.patch) * (self.vision_hw[1] / self.patch)
+        self.geo.patches()
     }
 
     /// `pixel_values` row width: `3 * temporal_patch_size * patch_size²`.
     pub fn feature(&self) -> usize {
-        3 * self.temporal * self.patch * self.patch
+        self.geo.feature()
     }
 
     pub fn num_embodied(&self) -> usize {
@@ -151,7 +155,7 @@ impl VlaJepaHost {
                 )));
             }
             let chw = self.normalized(&img.data);
-            self.patchify(&chw, &mut out);
+            self.geo.patchify(&chw, &mut out);
         }
         Ok(out)
     }
@@ -162,7 +166,7 @@ impl VlaJepaHost {
     /// matmul result is; the row pass is rounded to f32 before the column pass.
     fn normalized(&self, hwc: &[u8]) -> Vec<f32> {
         let w = self.in_hw[1];
-        let [vh, vw] = self.vision_hw;
+        let [vh, vw] = self.geo.hw;
         let mut out = Vec::with_capacity(3 * vh * vw);
         let mut tmp = vec![0f32; vh * w];
         for c in 0..3 {
@@ -192,32 +196,6 @@ impl VlaJepaHost {
             }
         }
         out
-    }
-
-    /// Qwen2-VL's patchify of one CHW image: tiled `temporal_patch_size` times,
-    /// reshaped to `(1, tp, C, gh/m, m, p, gw/m, m, p)` and transposed by
-    /// `(0, 3, 6, 4, 7, 2, 1, 5, 8)`, appended as `gh * gw` rows.
-    fn patchify(&self, chw: &[f32], out: &mut Vec<f32>) {
-        let [vh, vw] = self.vision_hw;
-        let (p, m, tp) = (self.patch, self.merge, self.temporal);
-        let (gh, gw) = (vh / p, vw / p);
-        for bh in 0..gh / m {
-            for bw in 0..gw / m {
-                for mh in 0..m {
-                    for mw in 0..m {
-                        let (y0, x0) = ((bh * m + mh) * p, (bw * m + mw) * p);
-                        for c in 0..3 {
-                            for _ in 0..tp {
-                                for py in 0..p {
-                                    let at = c * vh * vw + (y0 + py) * vw + x0;
-                                    out.extend_from_slice(&chw[at..at + p]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -295,54 +273,6 @@ mod tests {
                 assert_eq!(v, f32::from(u8::from(i == j)), "{i} {j}");
             }
         }
-    }
-
-    /// The 9-D reshape and transpose, done the long way.
-    fn patchify_reference(
-        chw: &[f32],
-        h: usize,
-        w: usize,
-        p: usize,
-        m: usize,
-        tp: usize,
-    ) -> Vec<f32> {
-        let (gh, gw) = (h / p, w / p);
-        let feature = 3 * tp * p * p;
-        let mut out = vec![0f32; gh * gw * feature];
-        // Source index of (t, c, bh, mh, py, bw, mw, px); destination by the transposed order.
-        for t in 0..tp {
-            for c in 0..3 {
-                for bh in 0..gh / m {
-                    for mh in 0..m {
-                        for py in 0..p {
-                            for bw in 0..gw / m {
-                                for mw in 0..m {
-                                    for px in 0..p {
-                                        let y = (bh * m + mh) * p + py;
-                                        let x = (bw * m + mw) * p + px;
-                                        let row = ((bh * (gw / m) + bw) * m + mh) * m + mw;
-                                        let col = ((c * tp + t) * p + py) * p + px;
-                                        out[row * feature + col] = chw[c * h * w + y * w + x];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn patchify_is_the_qwen_reshape_and_transpose() {
-        // Not square, so rows and columns cannot be swapped unnoticed.
-        let host = VlaJepaHost::new(&step([8, 12], [8, 12], 2, 2));
-        assert_eq!((host.patches(), host.feature()), (24, 24));
-        let chw: Vec<f32> = (0..3 * 8 * 12).map(|i| i as f32).collect();
-        let mut got = Vec::new();
-        host.patchify(&chw, &mut got);
-        assert_eq!(got, patchify_reference(&chw, 8, 12, 2, 2, 2));
     }
 
     #[test]

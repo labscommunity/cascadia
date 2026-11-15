@@ -6,9 +6,11 @@ pub mod cameras;
 pub mod manifest;
 pub mod ov;
 pub mod pipeline;
+pub mod qwen_vl;
 pub mod spec;
 pub mod steps;
 pub mod vla_jepa;
+pub mod xr0;
 
 pub use cameras::{images_tensor, CameraLayout, CameraPlan};
 pub use manifest::{LoadOptions, PolicyKind, PolicyManifest};

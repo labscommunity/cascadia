@@ -67,7 +67,7 @@ pub enum ResizeConvention {
     /// Padding on the top and left, content at the bottom right (`smolvla_resize`).
     TopLeft,
     /// A plain stretch to `height x width`, no padding, aspect ratio not kept
-    /// (`vla_jepa_inputs`; `smolvla_resize` with `"resize": "stretch"`).
+    /// (`vla_jepa_inputs`, `xr0`; `smolvla_resize` with `"resize": "stretch"`).
     Stretch,
 }
 

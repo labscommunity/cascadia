@@ -5,20 +5,24 @@
 //! - `CASCADIA_POLICY_PACKAGE_PI0`: `lerobot/pi0_libero_finetuned_v044`;
 //! - `CASCADIA_POLICY_PACKAGE_XVLA`: `lerobot/xvla-libero`, cameras flipped on the host;
 //! - `CASCADIA_POLICY_PACKAGE_VLAJEPA`: `lerobot/VLA-JEPA-LIBERO`, prompt padded to 288;
-//! - `CASCADIA_POLICY_PACKAGE_EVO1`: `zuoxingdong/evo1_libero`, cameras flipped on the host.
+//! - `CASCADIA_POLICY_PACKAGE_EVO1`: `zuoxingdong/evo1_libero`, cameras flipped on the host;
+//! - `CASCADIA_POLICY_PACKAGE_XR0`: `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`, fp16 weights.
 //!
 //! The π0 and X-VLA references are the exporters' PyTorch f32 outputs, in the
 //! package's `ref.npz` (or `<dir>.ref.npz` beside it). VLA-JEPA's are LeRobot's
 //! f32 inputs and actions, `torch_ref.npz`, for the raw `inputs.npz` (each in
 //! the package, or `<dir>.<name>` beside it). EVO1's are LeRobot's served
 //! actions in `ref.npz`, for the raw LIBERO frames in `frames.npz` (same rule).
+//! XR0's are Intel's runtime stages in `xr0-stages-f32.npz` (the exporter's
+//! `fixtures-f32.npz`, saved uncompressed) and PyTorch f32 in
+//! `xr0-libero-f32.ref.npz` (same rule).
 #![cfg(feature = "openvino")]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cascadia_engine::{EngineError, EngineResult, PolicyEngine, WARMUP_CALLS};
-use cascadia_engine_openvino::policy::manifest::PreStep;
+use cascadia_engine_openvino::policy::manifest::{PostStep, PreStep};
 use cascadia_engine_openvino::policy::ov::OvTokenizer;
 use cascadia_engine_openvino::policy::pipeline::{
     HostTensor, NoiseRng, PolicyModel, PromptTokenizer, TensorData,
@@ -1156,10 +1160,11 @@ fn vlajepa_spec_tokenizer_and_cpu_parity() {
     );
 }
 
-/// Records what the pipeline binds and answers with `output` as `[1, 7, 7]`.
+/// Records what the pipeline binds and answers with `output` in `shape`.
 struct JepaRecorder {
     inputs: Arc<Mutex<Vec<(String, HostTensor)>>>,
     output: Arc<Mutex<Vec<f32>>>,
+    shape: Vec<usize>,
 }
 
 impl PolicyModel for JepaRecorder {
@@ -1171,7 +1176,7 @@ impl PolicyModel for JepaRecorder {
         Ok(())
     }
     fn output_f32(&mut self, _: &str) -> EngineResult<(Vec<usize>, Vec<f32>)> {
-        Ok((vec![1, 7, 7], self.output.lock().unwrap().clone()))
+        Ok((self.shape.clone(), self.output.lock().unwrap().clone()))
     }
 }
 
@@ -1213,6 +1218,7 @@ fn vlajepa_engine_binds_the_reference_inputs() {
         Box::new(JepaRecorder {
             inputs: bound.clone(),
             output: output.clone(),
+            shape: vec![1, 7, 7],
         }),
         &inputs,
         &outputs,
@@ -1460,6 +1466,297 @@ fn evo1_gpu_infer_f16_and_f32() {
             );
             assert_eq!(flips, 0, "gpu evo1 {label} real{i} gripper flips");
             assert!(d <= 2e-3, "gpu evo1 {label} real{i} max abs diff {d}");
+        }
+    }
+}
+
+fn xr0(test: &str) -> Option<PathBuf> {
+    package_from("CASCADIA_POLICY_PACKAGE_XR0", test)
+}
+
+/// A float `[1, 3, H, W]` frame in [0, 1] as the uint8 HWC a client sends:
+/// Intel's `_to_rgb_frame`, `round(clip(x, 0, 1) * 255)`.
+fn xr0_frame(a: &Npy) -> Image {
+    let (h, w) = (a.shape[2], a.shape[3]);
+    let px = a.f32s();
+    let mut hwc = vec![0u8; 3 * h * w];
+    for c in 0..3 {
+        for p in 0..h * w {
+            hwc[p * 3 + c] = (px[c * h * w + p].clamp(0.0, 1.0) * 255.0).round_ties_even() as u8;
+        }
+    }
+    Image {
+        height: h as u32,
+        width: w as u32,
+        data: hwc,
+    }
+}
+
+fn xr0_observation(z: &[u8], prefix: &str, task: String, noise: Vec<f32>) -> Observation {
+    Observation {
+        images: ["base", "wrist_left"]
+            .iter()
+            .map(|c| {
+                (
+                    c.to_string(),
+                    xr0_frame(&npz(z, &format!("{prefix}images.{c}"))),
+                )
+            })
+            .collect(),
+        state: npz(z, &format!("{prefix}state")).f32s(),
+        prompt: task,
+        seed: None,
+        noise: Some(noise),
+    }
+}
+
+/// The ports of our XR0 export, read off `xr0.xml`.
+fn xr0_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+    let port = |name: &str, dtype, dims: &[usize]| PortInfo {
+        aliases: vec![name.into()],
+        dtype: Some(dtype),
+        dims: dims.iter().map(|&d| Some(d)).collect(),
+    };
+    (
+        vec![
+            port("tokenized_prompt", DType::I64, &[1, 256]),
+            port("tokenized_prompt_mask", DType::I64, &[1, 256]),
+            port("pixel_values", DType::F32, &[512, 1536]),
+            port("state", DType::F32, &[1, 1, 32]),
+            port("noise", DType::F32, &[1, 30, 32]),
+        ],
+        vec![port("action", DType::F32, &[1, 30, 32])],
+    )
+}
+
+/// Every stage of Intel's runtime, bit for bit: the prompt text, ids and mask,
+/// pixel values, the padded state and the noise; the denormalized actions
+/// within 1e-6. No model run, so it needs no device.
+#[test]
+fn xr0_engine_binds_intels_stages() {
+    let Some(dir) = xr0("xr0_engine_binds_intels_stages") else {
+        return;
+    };
+    let z = beside(&dir, "xr0-stages-f32.npz");
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let task = npz(&z, "00_obs/task").string();
+    let want_prompt = npz(&z, "01_XR0Preprocessor/task").string();
+    assert_eq!(
+        cascadia_engine_openvino::policy::xr0::render_prompt(
+            &["base".into(), "wrist_left".into()],
+            64,
+            &task
+        ),
+        want_prompt
+    );
+    let tokenizer = OvTokenizer::load(&dir.join(manifest.tokenizer_artifact())).unwrap();
+    let bound = Arc::new(Mutex::new(Vec::new()));
+    let (inputs, outputs) = xr0_ports();
+    let mut pipeline = PolicyPipeline::new(
+        manifest,
+        ServerFacts {
+            model: "xr0".into(),
+            device: "CPU".into(),
+            prompt_max_bytes: 1024,
+        },
+        Box::new(JepaRecorder {
+            inputs: bound.clone(),
+            output: Arc::new(Mutex::new(npz(&z, "90_runner/action").f32s())),
+            shape: vec![1, 30, 32],
+        }),
+        &inputs,
+        &outputs,
+        false,
+        Box::new(tokenizer),
+    )
+    .unwrap();
+    let noise = npz(&z, "01_XR0Preprocessor/noise").f32s();
+    let a = pipeline
+        .infer(&xr0_observation(&z, "00_obs/", task, noise.clone()))
+        .unwrap();
+    let bound = bound.lock().unwrap();
+    let get = |name: &str| {
+        bound
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.data.clone())
+            .unwrap_or_else(|| panic!("{name} not bound"))
+    };
+    assert_eq!(
+        get("tokenized_prompt"),
+        TensorData::I64(npz(&z, "03_OVTokenizer/tokenized_prompt").i64s())
+    );
+    let mask: Vec<i64> = npz(&z, "03_OVTokenizer/tokenized_prompt_mask")
+        .bools()
+        .into_iter()
+        .map(i64::from)
+        .collect();
+    eprintln!(
+        "xr0 prompt: {} tokens of 256",
+        mask.iter().filter(|&&m| m == 1).count()
+    );
+    assert_eq!(get("tokenized_prompt_mask"), TensorData::I64(mask));
+    assert_eq!(
+        get("pixel_values"),
+        TensorData::F32(npz(&z, "01_XR0Preprocessor/pixel_values").f32s()),
+        "pixel_values bit for bit"
+    );
+    assert_eq!(
+        get("state"),
+        TensorData::F32(npz(&z, "01_XR0Preprocessor/state").f32s())
+    );
+    assert_eq!(get("noise"), TensorData::F32(noise));
+    assert_eq!((a.steps, a.dim), (30, 7));
+    let d = max_abs_diff(&a.actions, &npz(&z, "91_XR0Postprocessor/action").f32s());
+    eprintln!("xr0 denormalize vs intel: max abs {d}");
+    assert!(d <= 1e-6, "xr0_denormalize differs by {d}");
+}
+
+/// PyTorch f32's second draw, denormalized with the package's stats.
+fn xr0_second_reference(dir: &Path, z: &[u8]) -> Vec<f32> {
+    let manifest = PolicyManifest::load(dir, LoadOptions::default()).unwrap();
+    let Some(PostStep::Xr0Denormalize(s)) = manifest.postprocessors.first() else {
+        panic!("xr0_denormalize")
+    };
+    cascadia_engine_openvino::policy::xr0::denormalize(s, &npz(z, "ref2").f32s(), 32)
+}
+
+/// CPU f32 with fp16 weights against PyTorch f32 on both noise draws (spike:
+/// 8.3e-4 / 8.9e-4 on the 32-wide output), and the prompt limit: the tokenizer
+/// IR's `truncation` variable is held off, so 256 tokens are served and 257 refused.
+#[test]
+fn xr0_spec_prompt_limit_and_cpu_parity() {
+    let Some(dir) = xr0("xr0_spec_prompt_limit_and_cpu_parity") else {
+        return;
+    };
+    let z = beside(&dir, "xr0-libero-f32.ref.npz");
+    let task = npz(&z, "task").string();
+    let mut tok = OvTokenizer::load(&dir.join("tokenizer.xml")).unwrap();
+    assert!(tok.has_truncation_state());
+    let prompt = |t: &str| {
+        cascadia_engine_openvino::policy::xr0::render_prompt(
+            &["base".into(), "wrist_left".into()],
+            64,
+            t,
+        )
+    };
+    let words = |k: usize| vec!["word"; k].join(" ");
+    let mut count = |k: usize| {
+        let t = tok.tokenize(&prompt(&words(k))).unwrap();
+        (t.ids.len(), t.mask.iter().filter(|&&m| m).count())
+    };
+    let fit = (1..200).find(|&k| count(k).1 == 256).unwrap();
+    assert_eq!(
+        count(fit + 1),
+        (257, 257),
+        "held-off truncation leaves it wider"
+    );
+
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let spec = engine.spec().clone();
+    assert_eq!(spec.cameras, vec!["base", "wrist_left"]);
+    assert_eq!((spec.height, spec.width), (256, 256));
+    assert_eq!(spec.resize, ResizeConvention::Stretch);
+    assert_eq!((spec.state_len, spec.chunk), (8, [30, 7]));
+    assert_eq!(
+        (spec.noise, spec.noise_shape.clone()),
+        (NoiseMode::Input, Some(vec![30, 32]))
+    );
+    let second = xr0_second_reference(&dir, &z);
+    for (noise, want, label) in [
+        ("noise1", npz(&z, "act1").f32s(), "draw 1"),
+        ("noise2", second, "draw 2"),
+    ] {
+        let obs = xr0_observation(&z, "obs_", task.clone(), npz(&z, noise).f32s());
+        let a = engine.infer(&obs).unwrap();
+        assert_eq!((a.steps, a.dim, a.actions.len()), (30, 7, 210));
+        let d = max_abs_diff(&a.actions, &want);
+        eprintln!(
+            "xr0 engine cpu f32 vs pytorch f32 ({label}): max abs {d} infer_ms={:.0}",
+            a.infer_ms
+        );
+        assert!(d <= 1e-3, "{label}: max abs diff {d}");
+    }
+    let mut obs = xr0_observation(&z, "obs_", words(fit + 1), npz(&z, "noise1").f32s());
+    let e = engine.infer(&obs).unwrap_err();
+    assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+    assert!(
+        e.to_string().contains("needs 257 tokens; the limit is 256"),
+        "{e}"
+    );
+    obs.prompt = words(fit);
+    engine.infer(&obs).unwrap();
+}
+
+/// XR0 on the GPU: f16 within 1e-2 of PyTorch f32 (spike: 3.2e-3 / 4.5e-3).
+/// At `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), which must
+/// be a load error; that runs in a child process, as π0's does.
+#[test]
+fn xr0_gpu_infer_f16_and_f32_is_a_load_error() {
+    let test = "xr0_gpu_infer_f16_and_f32_is_a_load_error";
+    let Some(dir) = xr0(test) else {
+        return;
+    };
+    if !gpu_enabled(test) {
+        return;
+    }
+    let z = beside(&dir, "xr0-libero-f32.ref.npz");
+    let task = npz(&z, "task").string();
+    let second = xr0_second_reference(&dir, &z);
+    {
+        let opts = OvPolicyOptions {
+            device: "GPU".into(),
+            ..OvPolicyOptions::default()
+        };
+        let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+        let warm = engine.warmup().unwrap();
+        assert_eq!(warm.len(), WARMUP_CALLS);
+        for (noise, want, label) in [
+            ("noise1", npz(&z, "act1").f32s(), "draw 1"),
+            ("noise2", second, "draw 2"),
+        ] {
+            let obs = xr0_observation(&z, "obs_", task.clone(), npz(&z, noise).f32s());
+            let a = engine.infer(&obs).unwrap();
+            assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
+            let d = max_abs_diff(&a.actions, &want);
+            eprintln!(
+                "gpu xr0 f16 ({label}): max abs {d} infer_ms={:.1} warmup={warm:?}",
+                a.infer_ms
+            );
+            assert!(d <= 1e-2, "gpu xr0 f16 {label} max abs diff {d} > 1e-2");
+        }
+    }
+    let child = "xr0_gpu_f32_load_is_an_error_in_its_own_process";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", child, "--ignored", "--nocapture"])
+        .output()
+        .unwrap();
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{child}: {}\n{stdout}",
+        out.status
+    );
+}
+
+#[test]
+#[ignore = "run by xr0_gpu_infer_f16_and_f32_is_a_load_error, in its own process"]
+fn xr0_gpu_f32_load_is_an_error_in_its_own_process() {
+    let dir = PathBuf::from(std::env::var_os("CASCADIA_POLICY_PACKAGE_XR0").unwrap());
+    let opts = OvPolicyOptions {
+        device: "GPU".into(),
+        precision: Some(Precision::F32),
+        ..OvPolicyOptions::default()
+    };
+    match OvPolicyEngine::load(&dir, &opts) {
+        Ok(_) => panic!("gpu xr0 f32 compiled; expected it to fail on the Arc 140V"),
+        Err(e) => {
+            eprintln!("gpu xr0 f32 load error: {e}");
+            assert!(matches!(e, EngineError::Backend(_)), "{e}");
+            let m = e.to_string();
+            assert!(m.contains("xr0.xml on GPU failed"), "{m}");
+            assert!(m.contains("try without --precision f32"), "{m}");
         }
     }
 }

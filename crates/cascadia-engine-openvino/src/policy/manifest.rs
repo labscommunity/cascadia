@@ -23,6 +23,8 @@ pub enum PolicyKind {
     /// EVO1: SmolVLA's ports, cameras and prompt; the task is stripped as LeRobot does.
     Evo1,
     VlaJepa,
+    /// Xiaomi-Robotics-0: Qwen3-VL ports like VLA-JEPA's, a raw padded state, `xr0_denormalize`.
+    Xr0,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +102,34 @@ pub struct VlaJepaInputsStep {
     pub temporal_patch_size: usize,
 }
 
+/// Intel's `xr0` preprocessor: Qwen3-VL `pixel_values`, the multi-view chat
+/// prompt and the padded state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Xr0Step {
+    pub max_state_dim: usize,
+    /// Intel resizes each side to a multiple of this within `image_max_pixels`;
+    /// the engine takes only frames that resize leaves as they are.
+    pub image_factor: usize,
+    pub image_max_pixels: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub rescale_factor: f32,
+    pub patch_size: usize,
+    pub merge_size: usize,
+    pub temporal_patch_size: usize,
+}
+
+/// Intel's `xr0_denormalize`: `action * (std + eps) + mean` with per-timestep
+/// stats, then the first `action_dim` values of each row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Xr0DenormalizeStep {
+    /// `[steps][width]`, as the graph's action output.
+    pub action_mean: Vec<Vec<f32>>,
+    pub action_std: Vec<Vec<f32>>,
+    pub action_dim: Option<usize>,
+    pub action_eps: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PreStep {
     Normalize(StatsStep),
@@ -123,6 +153,7 @@ pub enum PreStep {
         template: String,
     },
     VlaJepaInputs(VlaJepaInputsStep),
+    Xr0(Xr0Step),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +173,7 @@ pub enum PostStep {
         above: f64,
         below: f64,
     },
+    Xr0Denormalize(Xr0DenormalizeStep),
 }
 
 /// Width of the X-VLA rotation step's output: position, axis-angle, gripper.
@@ -155,6 +187,21 @@ impl PostStep {
     pub fn out_dim(&self, dim: usize) -> EngineResult<usize> {
         match self {
             Self::Denormalize(_) | Self::ActionChunkTrimmer { .. } => Ok(dim),
+            Self::Xr0Denormalize(s) => {
+                let width = s.action_mean.first().map_or(0, Vec::len);
+                if width != dim {
+                    return refuse(format!(
+                        "xr0_denormalize stats are {width} wide; the actions are {dim}"
+                    ));
+                }
+                match s.action_dim {
+                    Some(d) if d > dim => refuse(format!(
+                        "xr0_denormalize action_dim {d} is wider than the actions ({dim})"
+                    )),
+                    Some(d) => Ok(d),
+                    None => Ok(dim),
+                }
+            }
             Self::GripperBinarize { index, .. } => {
                 if *index >= dim {
                     return refuse(format!(
@@ -186,6 +233,7 @@ pub enum ImageStep<'a> {
     Pi05(&'a Pi05Step),
     SmolVlaResize(&'a SmolVlaResizeStep),
     VlaJepa(&'a VlaJepaInputsStep),
+    Xr0(&'a Xr0Step),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -318,6 +366,7 @@ impl PolicyManifest {
                 PreStep::Pi05(p) | PreStep::Pi0(p) => Some(ImageStep::Pi05(p)),
                 PreStep::SmolVlaResize(p) => Some(ImageStep::SmolVlaResize(p)),
                 PreStep::VlaJepaInputs(p) => Some(ImageStep::VlaJepa(p)),
+                PreStep::Xr0(p) => Some(ImageStep::Xr0(p)),
                 _ => None,
             })
             .expect("parse guarantees one image step")
@@ -374,11 +423,12 @@ impl PolicyManifest {
                     | PreStep::Pi0(_)
                     | PreStep::SmolVlaResize(_)
                     | PreStep::VlaJepaInputs(_)
+                    | PreStep::Xr0(_)
             )
         });
         if images != 1 {
             return refuse(format!(
-                "{images} image steps (pi05 / pi0 / smolvla_resize / vla_jepa_inputs); \
+                "{images} image steps (pi05 / pi0 / smolvla_resize / vla_jepa_inputs / xr0); \
                  expected exactly one"
             ));
         }
@@ -407,7 +457,51 @@ impl PolicyManifest {
         if rotations > 1 {
             return refuse("more than one xvla_rotation_6d_to_axis_angle");
         }
-        self.check_vla_jepa()
+        self.check_vla_jepa()?;
+        self.check_xr0()
+    }
+
+    /// `xr0` and `xr0_denormalize` are XR0's alone, and an XR0 graph takes no
+    /// other host step: its state goes in raw.
+    fn check_xr0(&self) -> EngineResult<()> {
+        let pre = |s: &PreStep| matches!(s, PreStep::Xr0(_));
+        let post = |s: &PostStep| matches!(s, PostStep::Xr0Denormalize(_));
+        if self.policy != PolicyKind::Xr0 {
+            if self.preprocessors.iter().any(pre) || self.postprocessors.iter().any(post) {
+                return refuse("xr0 and xr0_denormalize need policy.name \"xr0\"");
+            }
+            return Ok(());
+        }
+        if !self.preprocessors.iter().any(pre) {
+            return refuse("xr0 needs an xr0 preprocessor");
+        }
+        if let Some(s) = self
+            .preprocessors
+            .iter()
+            .find(|s| !pre(s) && !matches!(s, PreStep::OvTokenizer { .. } | PreStep::Noise { .. }))
+        {
+            return refuse(format!(
+                "xr0 takes only xr0, noise and ov_tokenizer; found {}",
+                pre_name(s)
+            ));
+        }
+        if let Some(s) = self
+            .postprocessors
+            .iter()
+            .find(|s| !post(s) && !matches!(s, PostStep::ActionChunkTrimmer { .. }))
+        {
+            return refuse(format!(
+                "xr0 takes only xr0_denormalize and action_chunk_trimmer; found {}",
+                post_name(s)
+            ));
+        }
+        if self.postprocessors.iter().filter(|s| post(s)).count() != 1 {
+            return refuse("xr0 needs exactly one xr0_denormalize");
+        }
+        let ImageStep::Xr0(step) = self.image_step() else {
+            unreachable!("an xr0 step is the image step")
+        };
+        super::xr0::geometry(self, step).map(drop)
     }
 
     /// VLA-JEPA's graph normalizes the state and returns final actions, so a
@@ -465,6 +559,20 @@ impl PolicyManifest {
             .normalize()
             .map(|s| ("normalize", s))
             .chain(self.denormalize().map(|s| ("denormalize", s)));
+        let xr0_identity = self.postprocessors.iter().any(|s| match s {
+            PostStep::Xr0Denormalize(d) => {
+                d.action_mean.iter().flatten().all(|&x| x == 0.0)
+                    && d.action_std.iter().flatten().all(|&x| x == 1.0)
+            }
+            _ => false,
+        });
+        if xr0_identity {
+            return refuse(
+                "xr0_denormalize stats are identity placeholders (the export had no \
+                 normalization stats); re-export with real stats, or pass \
+                 --allow-identity-stats for testing",
+            );
+        }
         for (kind, step) in steps {
             if is_placeholder(step) {
                 return refuse(format!(
@@ -490,6 +598,7 @@ fn pre_name(s: &PreStep) -> &'static str {
         PreStep::ImageFlip { .. } => "image_flip",
         PreStep::VlaJepaPrompt { .. } => "vla_jepa_prompt",
         PreStep::VlaJepaInputs(_) => "vla_jepa_inputs",
+        PreStep::Xr0(_) => "xr0",
     }
 }
 
@@ -499,6 +608,7 @@ fn post_name(s: &PostStep) -> &'static str {
         PostStep::ActionChunkTrimmer { .. } => "action_chunk_trimmer",
         PostStep::XvlaRotation6dToAxisAngle { .. } => "xvla_rotation_6d_to_axis_angle",
         PostStep::GripperBinarize { .. } => "gripper_binarize",
+        PostStep::Xr0Denormalize(_) => "xr0_denormalize",
     }
 }
 
@@ -560,8 +670,9 @@ fn policy_kind(policy: Option<&Value>) -> EngineResult<PolicyKind> {
         Some("xvla") => Ok(PolicyKind::Xvla),
         Some("evo1") => Ok(PolicyKind::Evo1),
         Some("vlajepa") => Ok(PolicyKind::VlaJepa),
+        Some("xr0") => Ok(PolicyKind::Xr0),
         other => refuse(format!(
-            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla, evo1, vlajepa"
+            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla, evo1, vlajepa, xr0"
         )),
     }
 }
@@ -585,6 +696,8 @@ const COMPONENTS: &[(&str, Option<&str>)] = &[
     ("gripper_binarize", None),
     ("vla_jepa_prompt", None),
     ("vla_jepa_inputs", None),
+    ("xr0", Some("XR0Preprocessor")),
+    ("xr0_denormalize", Some("XR0Postprocessor")),
 ];
 
 fn short_name(class_path: &str) -> Option<&'static str> {
@@ -718,6 +831,52 @@ struct SmolVlaParams {
     image_layout: Option<String>,
     #[serde(default)]
     resize: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Xr0Params {
+    max_state_dim: i64,
+    image_factor: i64,
+    image_max_pixels: i64,
+    image_mean: [f64; 3],
+    image_std: [f64; 3],
+    rescale_factor: f64,
+    patch_size: i64,
+    merge_size: i64,
+    temporal_patch_size: i64,
+    #[serde(default)]
+    image_key_view_map: Option<Map<String, Value>>,
+    #[serde(default)]
+    normalize_state: bool,
+    // Identity unless normalize_state, which is refused.
+    #[serde(default)]
+    #[allow(dead_code)]
+    state_mean: Option<Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    state_std: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Xr0DenormalizeParams {
+    action_mean: Vec<Vec<f64>>,
+    action_std: Vec<Vec<f64>>,
+    #[serde(default)]
+    action_dim: Option<i64>,
+    #[serde(default = "absolute")]
+    action_mode: String,
+    #[serde(default = "xr0_eps")]
+    action_eps: f64,
+}
+
+fn absolute() -> String {
+    "absolute".into()
+}
+
+fn xr0_eps() -> f64 {
+    1e-6
 }
 
 #[derive(Deserialize)]
@@ -864,6 +1023,7 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
             }
         }
         "vla_jepa_inputs" => PreStep::VlaJepaInputs(vla_jepa_inputs_step(params, &ctx)?),
+        "xr0" => PreStep::Xr0(xr0_step(params, &ctx)?),
         other => return refuse(format!("{ctx}: {other} is not a preprocessor")),
     })
 }
@@ -918,6 +1078,52 @@ fn vla_jepa_inputs_step(params: Map<String, Value>, ctx: &str) -> EngineResult<V
     })
 }
 
+fn xr0_step(params: Map<String, Value>, ctx: &str) -> EngineResult<Xr0Step> {
+    let p: Xr0Params = typed(params, ctx)?;
+    if p.normalize_state {
+        return refuse(format!("{ctx}: normalize_state is not supported"));
+    }
+    if p.image_key_view_map.is_some_and(|m| !m.is_empty()) {
+        return refuse(format!(
+            "{ctx}: image_key_view_map is not supported; cameras follow input_features"
+        ));
+    }
+    let positive = [
+        ("max_state_dim", p.max_state_dim),
+        ("image_factor", p.image_factor),
+        ("image_max_pixels", p.image_max_pixels),
+        ("patch_size", p.patch_size),
+        ("merge_size", p.merge_size),
+        ("temporal_patch_size", p.temporal_patch_size),
+    ];
+    if let Some((name, _)) = positive.iter().find(|(_, v)| *v < 1) {
+        return refuse(format!("{ctx}: {name} must be at least 1"));
+    }
+    let (mean, std) = (
+        p.image_mean.map(|x| x as f32),
+        p.image_std.map(|x| x as f32),
+    );
+    let rescale = p.rescale_factor as f32;
+    if mean.iter().chain(&[rescale]).any(|x| !x.is_finite())
+        || std.iter().any(|x| !x.is_finite() || *x == 0.0)
+    {
+        return refuse(format!(
+            "{ctx}: image_mean, image_std and rescale_factor must be finite, image_std non-zero"
+        ));
+    }
+    Ok(Xr0Step {
+        max_state_dim: p.max_state_dim as usize,
+        image_factor: p.image_factor as usize,
+        image_max_pixels: p.image_max_pixels as usize,
+        image_mean: mean,
+        image_std: std,
+        rescale_factor: rescale,
+        patch_size: p.patch_size as usize,
+        merge_size: p.merge_size as usize,
+        temporal_patch_size: p.temporal_patch_size as usize,
+    })
+}
+
 fn pi05_step(params: Map<String, Value>, ctx: &str) -> EngineResult<Pi05Step> {
     let p: Pi05Params = typed(params, ctx)?;
     if p.empty_cameras < 0 {
@@ -955,6 +1161,53 @@ fn post_step(v: &Value) -> EngineResult<PostStep> {
             PostStep::XvlaRotation6dToAxisAngle {
                 expected_action_dim: p.expected_action_dim as usize,
             }
+        }
+        "xr0_denormalize" => {
+            let p: Xr0DenormalizeParams = typed(params, &ctx)?;
+            if p.action_mode != "absolute" {
+                return refuse(format!(
+                    "{ctx}: action_mode {:?}; only absolute is supported (delta needs the \
+                     graph's state passthrough)",
+                    p.action_mode
+                ));
+            }
+            let f32s = |v: Vec<Vec<f64>>| -> Vec<Vec<f32>> {
+                v.into_iter()
+                    .map(|r| r.into_iter().map(|x| x as f32).collect())
+                    .collect()
+            };
+            let (mean, std) = (f32s(p.action_mean), f32s(p.action_std));
+            let shape = |v: &[Vec<f32>]| (v.len(), v.first().map_or(0, Vec::len));
+            if mean.is_empty()
+                || mean.iter().any(|r| r.len() != shape(&mean).1)
+                || shape(&mean).1 == 0
+            {
+                return refuse(format!(
+                    "{ctx}: action_mean is not a non-empty [steps][width] array"
+                ));
+            }
+            if std.len() != mean.len() || std.iter().any(|r| r.len() != shape(&mean).1) {
+                return refuse(format!(
+                    "{ctx}: action_std {:?} differs from action_mean {:?}",
+                    shape(&std),
+                    shape(&mean)
+                ));
+            }
+            if mean.iter().chain(&std).flatten().any(|x| !x.is_finite())
+                || !p.action_eps.is_finite()
+            {
+                return refuse(format!("{ctx}: contains NaN or Inf"));
+            }
+            let action_dim = match p.action_dim {
+                Some(d) if d < 1 => return refuse(format!("{ctx}: action_dim must be at least 1")),
+                d => d.map(|d| d as usize),
+            };
+            PostStep::Xr0Denormalize(Xr0DenormalizeStep {
+                action_mean: mean,
+                action_std: std,
+                action_dim,
+                action_eps: p.action_eps as f32,
+            })
         }
         "gripper_binarize" => {
             let p: GripperBinarizeParams = typed(params, &ctx)?;
@@ -1133,6 +1386,7 @@ mod tests {
     const VLAJEPA_LIBERO: &str =
         include_str!("../../tests/fixtures/policy/vlajepa-libero-manifest.json");
     const EVO1_LIBERO: &str = include_str!("../../tests/fixtures/policy/evo1-libero-manifest.json");
+    const XR0_LIBERO: &str = include_str!("../../tests/fixtures/policy/xr0-libero-manifest.json");
 
     fn parse(v: &Value) -> EngineResult<PolicyManifest> {
         PolicyManifest::parse(&v.to_string(), LoadOptions::default())
@@ -1391,6 +1645,99 @@ mod tests {
             .to_string(),
             "invalid configuration: policy manifest: gripper_binarize index 7 is outside actions 7 wide"
         );
+    }
+
+    #[test]
+    fn xr0_libero_manifest_parses() {
+        let m = PolicyManifest::parse(XR0_LIBERO, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::Xr0);
+        let ImageStep::Xr0(x) = m.image_step() else {
+            panic!("xr0 is the image step")
+        };
+        assert_eq!(
+            (
+                x.max_state_dim,
+                x.patch_size,
+                x.merge_size,
+                x.temporal_patch_size
+            ),
+            (32, 16, 2, 2)
+        );
+        assert_eq!(x.rescale_factor, (1.0f64 / 255.0) as f32);
+        let PostStep::Xr0Denormalize(d) = &m.postprocessors[0] else {
+            panic!("xr0_denormalize")
+        };
+        assert_eq!(
+            (d.action_mean.len(), d.action_mean[0].len(), d.action_dim),
+            (30, 32, Some(7))
+        );
+        assert_eq!(d.action_eps, 1e-6);
+        assert_eq!(d.action_mean[29][0], 0.0628);
+        // Noise comes after xr0, as Intel's xr0 returns a new dict.
+        assert!(matches!(m.preprocessors[1], PreStep::Noise { .. }));
+    }
+
+    #[test]
+    fn xr0_steps_are_validated() {
+        let xr0 = || -> Value { serde_json::from_str(XR0_LIBERO).unwrap() };
+        let e = |v: &Value| err(v);
+        let mut v = xr0();
+        v["model"]["postprocessors"][0]["action_mode"] = json!("delta");
+        assert!(e(&v).contains("only absolute is supported"));
+        let mut v = xr0();
+        v["model"]["postprocessors"][0]["clip"] = json!(true);
+        assert!(e(&v).contains("unknown field `clip`"));
+        let mut v = xr0();
+        v["model"]["postprocessors"][0]["action_std"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(e(&v).contains("differs from action_mean"));
+        let mut v = xr0();
+        v["model"]["preprocessors"][0]["normalize_state"] = json!(true);
+        assert!(e(&v).contains("normalize_state is not supported"));
+        let mut v = xr0();
+        v["model"]["preprocessors"][0]["image_key_view_map"] = json!({"images.base": "ego"});
+        assert!(e(&v).contains("image_key_view_map is not supported"));
+        let mut v = xr0();
+        v["model"]["preprocessors"][0]["resample"] = json!("cubic");
+        assert!(e(&v).contains("unknown field `resample`"));
+        // Frames Intel would resize, and cameras of different sizes.
+        let mut v = xr0();
+        v["model"]["input_features"][1]["init_args"]["shape"] = json!([3, 480, 640]);
+        v["model"]["input_features"][2]["init_args"]["shape"] = json!([3, 480, 640]);
+        assert!(e(&v).contains("would be resized to [256, 320]"));
+        let mut v = xr0();
+        v["model"]["input_features"][2]["init_args"]["shape"] = json!([3, 224, 224]);
+        assert!(e(&v).contains("cameras differ in size"));
+        let mut v = xr0();
+        v["model"]["input_features"][0]["init_args"]["shape"] = json!([40]);
+        assert!(e(&v).contains("max_state_dim 32"));
+        // The graph's state goes in raw: no stats steps.
+        let mut v = xr0();
+        v["model"]["preprocessors"].as_array_mut().unwrap().insert(
+            0,
+            json!({"type": "normalize", "stats": {"state": {"mean": [0.5], "std": [2.0]}}}),
+        );
+        assert!(e(&v).contains("found normalize"));
+        let mut v = xr0();
+        v["policy"] = json!({"name": "smolvla"});
+        assert!(e(&v).contains("need policy.name \"xr0\""));
+        // Identity stats are a placeholder.
+        let mut v = xr0();
+        let p = &mut v["model"]["postprocessors"][0];
+        p["action_mean"] = json!(vec![vec![0.0; 32]; 30]);
+        p["action_std"] = json!(vec![vec![1.0; 32]; 30]);
+        assert!(e(&v).contains("xr0_denormalize stats are identity placeholders"));
+        // Intel's class names map to the steps.
+        let mut v = xr0();
+        let mut step = v["model"]["preprocessors"][0].clone();
+        step.as_object_mut().unwrap().remove("type");
+        v["model"]["preprocessors"][0] = json!({
+            "class_path": "physicalai.inference.preprocessors.XR0Preprocessor",
+            "init_args": step
+        });
+        parse(&v).unwrap();
     }
 
     #[test]
@@ -1665,7 +2012,7 @@ mod tests {
         assert!(err(&v).contains("unsupported component type \"resize\""));
         let mut v = base();
         v["model"]["preprocessors"][1] =
-            json!({"class_path": "physicalai.inference.preprocessors.XR0Preprocessor"});
+            json!({"class_path": "physicalai.inference.preprocessors.MolmoAct2Preprocessor"});
         assert!(err(&v).contains("unsupported component class_path"));
         let mut v = base();
         v["model"]["preprocessors"][1] = json!({"class_path": "evil.module.Pi05Preprocessor"});
@@ -1715,7 +2062,7 @@ mod tests {
         let mut v = base();
         v["policy"] = json!({"name": "pi0_fast"});
         assert!(err(&v).contains("policy.name Some(\"pi0_fast\")"));
-        assert!(err(&v).contains("xvla, evo1, vlajepa"));
+        assert!(err(&v).contains("xvla, evo1, vlajepa, xr0"));
         let mut v = base();
         v["policy"] =
             json!({"source": {"class_path": "physicalai.policies.smolvla.policy.SmolVLA"}});

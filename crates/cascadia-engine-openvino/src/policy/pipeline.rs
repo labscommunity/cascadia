@@ -13,12 +13,14 @@ use super::cameras::{images_tensor, CameraLayout};
 use super::manifest::{
     ImageStep, PolicyKind, PolicyManifest, PostStep, PreStep, VlaJepaInputsStep, XVLA_ACTION_DIM,
 };
+use super::qwen_vl::PatchGeometry;
 use super::spec::{derive_spec, IrFacts, ServerFacts};
 use super::steps::{
     denormalize, gripper_binarize, new_line, normalize, pi05_bins, pi05_prompt, py_strip,
     trim_actions, xvla_rotation_6d_to_axis_angle, NUM_BINS,
 };
 use super::vla_jepa::VlaJepaHost;
+use super::xr0::Xr0Host;
 
 /// Longest prompt a request may carry, in UTF-8 bytes.
 pub const PROMPT_MAX_BYTES: usize = 1024;
@@ -158,6 +160,9 @@ pub enum PortLayout {
     /// [n_cameras * patches, feature]`, `embodied_positions`, the raw `state`
     /// (the graph normalizes it), `noise`; `action` is final.
     VlaJepa,
+    /// XR0: `tokenized_prompt` and `tokenized_prompt_mask` (both i64),
+    /// `pixel_values`, `state [1, 1, max_state_dim]` (raw, zero-padded), `noise`.
+    Xr0,
 }
 
 impl PortLayout {
@@ -169,6 +174,7 @@ impl PortLayout {
             | PolicyKind::Xvla
             | PolicyKind::Evo1 => Self::ImageSlots,
             PolicyKind::VlaJepa => Self::VlaJepa,
+            PolicyKind::Xr0 => Self::Xr0,
         }
     }
 }
@@ -246,7 +252,79 @@ pub fn bind(
             ImageStep::VlaJepa(step) => bind_vla_jepa(step, inputs, outputs, has_random_uniform),
             _ => refuse("vlajepa needs a vla_jepa_inputs step"),
         },
+        PortLayout::Xr0 => match m.image_step() {
+            ImageStep::Xr0(step) => {
+                bind_xr0(&Xr0Host::new(m, step)?, inputs, outputs, has_random_uniform)
+            }
+            _ => refuse("xr0 needs an xr0 step"),
+        },
     }
+}
+
+/// `pixel_values` checked against `geo`; returns the camera count.
+fn pixel_slots(inputs: &[PortInfo], geo: &PatchGeometry, step: &str) -> EngineResult<usize> {
+    let px = dims(inputs, PIXEL_VALUES, &[DType::F32], 2, None)?;
+    let rows = fixed(px[0], "the pixel_values row count")?;
+    let feature = fixed(px[1], "the pixel_values width")?;
+    if feature != geo.feature() {
+        return refuse(format!(
+            "pixel_values rows are {feature} wide; {step} makes {}",
+            geo.feature()
+        ));
+    }
+    if rows == 0 || rows % geo.patches() != 0 {
+        return refuse(format!(
+            "pixel_values has {rows} rows, not a whole number of cameras of {} patches",
+            geo.patches()
+        ));
+    }
+    Ok(rows / geo.patches())
+}
+
+/// [`PortLayout::Xr0`]: the ports `host` fills.
+pub fn bind_xr0(
+    host: &Xr0Host,
+    inputs: &[PortInfo],
+    outputs: &[PortInfo],
+    has_random_uniform: bool,
+) -> EngineResult<(PortBinding, IrFacts)> {
+    refuse_unknown_inputs(inputs, &[PROMPT, PROMPT_MASK, PIXEL_VALUES, STATE, NOISE])?;
+    let ids = dims(inputs, PROMPT, &[DType::I64], 2, Some(0))?;
+    let prompt_len = fixed(ids[1], "the tokenized_prompt length")?;
+    let mask = dims(inputs, PROMPT_MASK, &[DType::I64], 2, Some(0))?;
+    if mask[1] != Some(prompt_len) {
+        return refuse(format!(
+            "tokenized_prompt_mask length {:?} differs from tokenized_prompt's {prompt_len}",
+            mask[1]
+        ));
+    }
+    let state = dims(inputs, STATE, &[DType::F32], 3, Some(0))?;
+    if state[1] != Some(1) || state[2] != Some(host.max_state_dim()) {
+        return refuse(format!(
+            "state is {state:?}; xr0 makes [1, 1, {}]",
+            host.max_state_dim()
+        ));
+    }
+    let image_slots = pixel_slots(inputs, &host.geo.patches, "xr0")?;
+    let noise_shape = noise_dims(inputs)?;
+    let action_shape = action_dims(outputs)?;
+    let noise = noise_mode(&noise_shape, has_random_uniform);
+    Ok((
+        PortBinding {
+            layout: PortLayout::Xr0,
+            noise: noise_shape.is_some(),
+            prompt_port: PROMPT,
+            prompt_len,
+        },
+        IrFacts {
+            image_slots,
+            image_hw: None,
+            state_len: host.geo.state_len,
+            action_shape,
+            noise,
+            noise_shape,
+        },
+    ))
 }
 
 /// [`PortLayout::VlaJepa`]: the ports `step` fills, checked against its geometry.
@@ -279,21 +357,7 @@ pub fn bind_vla_jepa(
         ));
     }
     let host = VlaJepaHost::new(step);
-    let px = dims(inputs, PIXEL_VALUES, &[DType::F32], 2, None)?;
-    let rows = fixed(px[0], "the pixel_values row count")?;
-    let feature = fixed(px[1], "the pixel_values width")?;
-    if feature != host.feature() {
-        return refuse(format!(
-            "pixel_values rows are {feature} wide; vla_jepa_inputs makes {}",
-            host.feature()
-        ));
-    }
-    if rows == 0 || rows % host.patches() != 0 {
-        return refuse(format!(
-            "pixel_values has {rows} rows, not a whole number of cameras of {} patches",
-            host.patches()
-        ));
-    }
+    let image_slots = pixel_slots(inputs, host.geometry(), "vla_jepa_inputs")?;
     let embodied = dims(inputs, EMBODIED_POSITIONS, &[DType::I64], 2, Some(0))?;
     let embodied = fixed(embodied[1], "the embodied_positions length")?;
     if embodied != step.num_embodied_tokens {
@@ -313,7 +377,7 @@ pub fn bind_vla_jepa(
             prompt_len,
         },
         IrFacts {
-            image_slots: rows / host.patches(),
+            image_slots,
             image_hw: None,
             state_len,
             action_shape,
@@ -529,6 +593,10 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
             PreStep::VlaJepaPrompt { template } => {
                 text = template.replace("{instruction}", &text);
             }
+            PreStep::Xr0(s) => {
+                let geo = super::xr0::geometry(m, s)?;
+                text = super::xr0::render_prompt(&geo.views, geo.patches.image_pads(), &text);
+            }
             PreStep::OvTokenizer { .. } => break,
             PreStep::Pi0(_)
             | PreStep::SmolVlaResize(_)
@@ -553,6 +621,8 @@ pub struct PolicyPipeline {
     tokenizer: Option<Box<dyn PromptTokenizer>>,
     /// [`PortLayout::VlaJepa`]'s precomputed pixel geometry.
     vla_jepa: Option<VlaJepaHost>,
+    /// [`PortLayout::Xr0`]'s.
+    xr0: Option<Xr0Host>,
     /// Task text to the refusal message, `None` when it fits.
     prompt_checks: HashMap<String, Option<String>>,
 }
@@ -579,10 +649,12 @@ impl PolicyPipeline {
                     | PreStep::Pi05(_)
                     | PreStep::Pi0(_)
                     | PreStep::VlaJepaPrompt { .. }
+                    | PreStep::Xr0(_)
             )
         }) {
             return refuse(
-                "a prompt step (new_line / pi05 / pi0 / vla_jepa_prompt) comes after ov_tokenizer",
+                "a prompt step (new_line / pi05 / pi0 / vla_jepa_prompt / xr0) comes after \
+                 ov_tokenizer",
             );
         }
         let (binding, ir) = bind(&manifest, inputs, outputs, has_random_uniform)?;
@@ -612,6 +684,10 @@ impl PolicyPipeline {
             }
             _ => None,
         };
+        let xr0 = match manifest.image_step() {
+            ImageStep::Xr0(step) => Some(Xr0Host::new(&manifest, step)?),
+            _ => None,
+        };
         let (spec, layout) = derive_spec(&manifest, &ir, server)?;
         let flip = layout
             .names
@@ -628,6 +704,7 @@ impl PolicyPipeline {
             model: Some(model),
             tokenizer: Some(tokenizer),
             vla_jepa,
+            xr0,
             prompt_checks: HashMap::new(),
         })
     }
@@ -646,8 +723,8 @@ impl PolicyPipeline {
         let tokens = tok.tokenize(&text)?;
         let count = tokens.mask.iter().filter(|&&m| m).count();
         let limit = self.binding.prompt_len;
-        // A VLA-JEPA prompt carries no state, so its count is exact.
-        let worst = if self.binding.layout == PortLayout::VlaJepa {
+        // Only the image-slot prompts (π0.5) carry the state; the others' counts are exact.
+        let worst = if self.binding.layout != PortLayout::ImageSlots {
             ""
         } else {
             " with the worst-case state"
@@ -807,6 +884,50 @@ impl PolicyPipeline {
         ])
     }
 
+    /// [`PortLayout::Xr0`] inputs, all but `noise`.
+    fn xr0_feeds(&mut self, obs: &Observation) -> EngineResult<Vec<(&'static str, HostTensor)>> {
+        let text = prompt_text(&self.manifest, &obs.prompt, &[], false)?;
+        let tokens = self.tokens(&text)?;
+        let host = self
+            .xr0
+            .as_ref()
+            .expect("new builds the host for an xr0 layout");
+        let pixels = host.pixel_values(&self.layout, &obs.images)?;
+        let feature = host.geo.patches.feature();
+        let limit = self.binding.prompt_len;
+        let state = host.state(&obs.state);
+        Ok(vec![
+            (
+                PROMPT,
+                HostTensor {
+                    shape: vec![1, limit],
+                    data: TensorData::I64(tokens.ids),
+                },
+            ),
+            (
+                PROMPT_MASK,
+                HostTensor {
+                    shape: vec![1, limit],
+                    data: TensorData::I64(tokens.mask.iter().map(|&m| i64::from(m)).collect()),
+                },
+            ),
+            (
+                PIXEL_VALUES,
+                HostTensor {
+                    shape: vec![pixels.len() / feature, feature],
+                    data: TensorData::F32(pixels),
+                },
+            ),
+            (
+                STATE,
+                HostTensor {
+                    shape: vec![1, 1, state.len()],
+                    data: TensorData::F32(state),
+                },
+            ),
+        ])
+    }
+
     fn run(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
         let start = Instant::now();
         if self.model.is_none() {
@@ -818,6 +939,7 @@ impl PolicyPipeline {
         let mut feeds = match self.binding.layout {
             PortLayout::ImageSlots => self.image_slot_feeds(obs)?,
             PortLayout::VlaJepa => self.vla_jepa_feeds(obs)?,
+            PortLayout::Xr0 => self.xr0_feeds(obs)?,
         };
         if self.binding.noise {
             let dims = self
@@ -878,6 +1000,12 @@ impl PolicyPipeline {
                     above,
                     below,
                 } => gripper_binarize(&mut actions, dim, *index, *threshold, *above, *below),
+                PostStep::Xr0Denormalize(s) => {
+                    let f: Vec<f32> = actions.iter().map(|&x| x as f32).collect();
+                    let out = super::xr0::denormalize(s, &f, dim);
+                    dim = s.action_dim.unwrap_or(dim);
+                    actions = out.into_iter().map(f64::from).collect();
+                }
             }
         }
         let actions: Vec<f32> = actions.iter().map(|&x| x as f32).collect();
@@ -1557,6 +1685,59 @@ mod tests {
             ],
             vec![port(ACTION, DType::F32, &[1, 50, 7])],
         )
+    }
+
+    const XR0_LIBERO: &str = include_str!("../../tests/fixtures/policy/xr0-libero-manifest.json");
+
+    /// The real ports of our XR0 LIBERO export.
+    fn xr0_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+        (
+            vec![
+                port(PROMPT, DType::I64, &[1, 2048]),
+                port(PROMPT_MASK, DType::I64, &[1, 2048]),
+                port(PIXEL_VALUES, DType::F32, &[512, 1536]),
+                port(STATE, DType::F32, &[1, 1, 32]),
+                port(NOISE, DType::F32, &[1, 30, 32]),
+            ],
+            vec![port(ACTION, DType::F32, &[1, 30, 32])],
+        )
+    }
+
+    #[test]
+    fn xr0_binds_its_ports_pads_the_state_and_denormalizes_per_row() {
+        // The byte tokenizer needs a wide port: the template alone is ~2 KB.
+        let out = vec![1.0f32; 30 * 32];
+        let mut r = rig_with(XR0_LIBERO, xr0_ports(), false, true, out);
+        let spec = r.engine.spec().clone();
+        assert_eq!(spec.cameras, vec!["base", "wrist_left"]);
+        assert_eq!(spec.chunk, [30, 7]);
+        let o = obs(&spec, "go");
+        let a = r.engine.infer(&o).unwrap();
+        assert_eq!((a.steps, a.dim, a.actions.len()), (30, 7, 210));
+        // 1 * (std + 1e-6) + mean, in f32, first row.
+        assert_eq!(a.actions[0], 1.0 * (0.335_501_02f32 + 1e-6) + 0.0628);
+        let (inputs, _) = xr0_ports();
+        for p in &inputs {
+            let t = input(&r.log, &p.aliases[0]);
+            let want: Vec<usize> = p.dims.iter().map(|d| d.unwrap()).collect();
+            assert_eq!(t.shape, want, "{}", p.aliases[0]);
+            assert_eq!(Some(t.dtype()), p.dtype, "{}", p.aliases[0]);
+        }
+        let mut state = o.state.clone();
+        state.resize(32, 0.0);
+        assert_eq!(input(&r.log, STATE).data, TensorData::F32(state));
+        let text = r.log.lock().unwrap().texts.last().unwrap().clone();
+        assert!(text.contains("# Base View\n<|vision_start|>"), "{text}");
+        assert!(text.contains("# Left-Wrist View"), "{text}");
+        assert_eq!(text.matches("<|image_pad|>").count(), 128);
+        assert!(text.ends_with(
+            "task:\ngo /no_cot<|im_end|>\n<|im_start|>assistant\n<cot></cot><|im_end|>\n"
+        ));
+        // base (10) in the first 256 rows, wrist_left (20) after.
+        let px = input(&r.log, PIXEL_VALUES);
+        let v = f32s(&px);
+        let norm = |b: u8| (f32::from(b) * (1.0f64 / 255.0) as f32 - 0.5) / 0.5;
+        assert_eq!((v[0], v[256 * 1536]), (norm(10), norm(20)));
     }
 
     #[test]

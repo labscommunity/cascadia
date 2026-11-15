@@ -56,6 +56,7 @@ impl CameraPlan {
             ImageStep::Pi05(p) => (p.empty_cameras, None),
             ImageStep::SmolVlaResize(s) => (0, Some(s)),
             ImageStep::VlaJepa(j) => return Self::from_keys(&j.image_keys),
+            ImageStep::Xr0(_) => (0, None),
         };
 
         if let Some(s) = smolvla.filter(|s| !s.image_key_reorder_map.is_empty()) {

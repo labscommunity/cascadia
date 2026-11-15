@@ -55,6 +55,10 @@ impl ManifestSpec {
             }
             ImageStep::SmolVlaResize(s) => (s.image_resolution, ResizeConvention::TopLeft),
             ImageStep::VlaJepa(j) => (Some(j.image_resolution), ResizeConvention::Stretch),
+            ImageStep::Xr0(x) => {
+                let [h, w] = super::xr0::geometry(m, x)?.hw;
+                (Some([h as u32, w as u32]), ResizeConvention::Stretch)
+            }
         };
         let mut noise_shape: Option<Vec<usize>> = None;
         for step in &m.preprocessors {
@@ -132,9 +136,18 @@ pub fn derive_spec(
     check_len(&mut m.normalize(), "state", ir.state_len)?;
     // The served width is what the postprocessors leave, not the IR's.
     let mut dim = ir_dim;
+    let mut rows = ir_steps;
     for step in &m.postprocessors {
-        if let PostStep::Denormalize(s) = step {
-            check_len(&mut std::iter::once(s), "action", dim)?;
+        match step {
+            PostStep::Denormalize(s) => check_len(&mut std::iter::once(s), "action", dim)?,
+            PostStep::Xr0Denormalize(s) if s.action_mean.len() != rows => {
+                return refuse(format!(
+                    "xr0_denormalize stats have {} rows; the actions have {rows}",
+                    s.action_mean.len()
+                ))
+            }
+            PostStep::ActionChunkTrimmer { n_action_steps } => rows = rows.min(*n_action_steps),
+            _ => {}
         }
         dim = step.out_dim(dim)?;
     }
@@ -284,6 +297,41 @@ mod tests {
         let m9 = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
         let e = derive_spec(&m9, &narrow, server()).unwrap_err().to_string();
         assert!(e.contains("at least 10 wide; they are 9"), "{e}");
+    }
+
+    #[test]
+    fn xr0_spec_serves_seven_of_the_graphs_thirty_two() {
+        const XR0: &str = include_str!("../../tests/fixtures/policy/xr0-libero-manifest.json");
+        let m = PolicyManifest::parse(XR0, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            image_slots: 2,
+            image_hw: None,
+            state_len: 8,
+            action_shape: [30, 32],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![30, 32]),
+        };
+        let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["base", "wrist_left"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1)]);
+        assert_eq!((spec.height, spec.width), (256, 256));
+        assert_eq!(spec.resize, ResizeConvention::Stretch);
+        assert_eq!((spec.state_len, spec.chunk), (8, [30, 7]));
+        // The stats must match the graph's output shape.
+        let short = IrFacts {
+            action_shape: [10, 32],
+            noise_shape: Some(vec![10, 32]),
+            ..ir.clone()
+        };
+        let e = derive_spec(&m, &short, server()).unwrap_err().to_string();
+        assert!(e.contains("30 rows; the actions have 10"), "{e}");
+        let narrow = IrFacts {
+            action_shape: [30, 16],
+            noise_shape: Some(vec![30, 16]),
+            ..ir
+        };
+        let e = derive_spec(&m, &narrow, server()).unwrap_err().to_string();
+        assert!(e.contains("stats are 32 wide; the actions are 16"), "{e}");
     }
 
     #[test]

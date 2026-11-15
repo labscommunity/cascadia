@@ -236,7 +236,7 @@ pub enum EngineKind {
     #[value(name = "sycl-llama")]
     SyclLlama,
     /// Robot policy (VLA) engine: serves a `policy_package` (SmolVLA, pi0.5, pi0, X-VLA, EVO1,
-    /// VLA-JEPA) over an openpi-compatible WebSocket. `cascadia run` only.
+    /// VLA-JEPA, XR0) over an openpi-compatible WebSocket. `cascadia run` only.
     #[value(name = "ov-policy")]
     OvPolicy,
 }
