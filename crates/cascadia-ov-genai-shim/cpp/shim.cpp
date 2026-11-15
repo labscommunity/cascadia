@@ -1702,6 +1702,42 @@ int32_t cascadia_runtime_input_dtype(
     catch (...) { set_last_error("unknown exception in input_dtype"); return 1; }
 }
 
+int32_t cascadia_runtime_port_info(
+    cascadia_runtime_t* handle, int32_t is_output, size_t idx,
+    uint32_t* out_dtype, int64_t* out_dims, size_t dims_cap, size_t* out_rank) {
+    if (!handle || !handle->compiled || !out_dtype || !out_rank ||
+        (dims_cap > 0 && !out_dims)) {
+        set_last_error("null arg in runtime_port_info"); return 1;
+    }
+    try {
+        const auto ports = is_output ? handle->compiled->outputs() : handle->compiled->inputs();
+        if (idx >= ports.size()) {
+            set_last_error("port_info: idx out of range"); return 1;
+        }
+        const auto& port = ports[idx];
+        const auto et = port.get_element_type();
+        const uint32_t code = code_from_dtype(et);
+        // code_from_dtype falls back to f32; report a type it does not know as OTHER.
+        *out_dtype = (code == CASCADIA_DTYPE_F32 && et != ov::element::f32)
+                         ? CASCADIA_DTYPE_OTHER : code;
+        const auto& ps = port.get_partial_shape();
+        if (ps.rank().is_dynamic()) {
+            set_last_error("port_info: port has a dynamic rank"); return 1;
+        }
+        const size_t rank = static_cast<size_t>(ps.rank().get_length());
+        *out_rank = rank;
+        if (!out_dims) return 0;
+        if (dims_cap < rank) {
+            set_last_error("port_info: dims_cap too small"); return 1;
+        }
+        for (size_t i = 0; i < rank; ++i) {
+            out_dims[i] = ps[i].is_static() ? ps[i].get_length() : -1;
+        }
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in port_info"); return 1; }
+}
+
 int32_t cascadia_runtime_output_byte_size(
     cascadia_runtime_t* handle, size_t output_idx, size_t* out_byte_size) {
     if (!handle || !handle->request || !out_byte_size) {

@@ -405,6 +405,17 @@ int32_t cascadia_runtime_input_shape(
 int32_t cascadia_runtime_input_dtype(
     cascadia_runtime_t* handle, size_t input_idx, uint32_t* out_dtype);
 
+/// Compiled-model facts of input (`is_output` == 0) or output port `idx`,
+/// read from the port rather than a request tensor, so they hold before any
+/// inference and for string or dynamic ports: the element type code
+/// (CASCADIA_DTYPE_*, or CASCADIA_DTYPE_OTHER for a type without one, e.g.
+/// string) and the dims, -1 where dynamic. Pass `out_dims=NULL, dims_cap=0`
+/// to learn the rank in `*out_rank`. A port of dynamic rank is an error.
+#define CASCADIA_DTYPE_OTHER 255u
+int32_t cascadia_runtime_port_info(
+    cascadia_runtime_t* handle, int32_t is_output, size_t idx,
+    uint32_t* out_dtype, int64_t* out_dims, size_t dims_cap, size_t* out_rank);
+
 /// Copy the output tensor's raw bytes into `out_buf`. `out_buf_size` must
 /// equal byte_size of the output tensor (call output_byte_size first).
 int32_t cascadia_runtime_output_byte_size(

@@ -247,6 +247,15 @@ mod sys {
             count: usize,
         ) -> c_int;
 
+        pub fn cascadia_runtime_port_info(
+            handle: *mut cascadia_runtime_t,
+            is_output: i32,
+            idx: usize,
+            out_dtype: *mut u32,
+            out_dims: *mut i64,
+            dims_cap: usize,
+            out_rank: *mut usize,
+        ) -> c_int;
         pub fn cascadia_runtime_destroy(handle: *mut cascadia_runtime_t);
         pub fn cascadia_runtime_reset_state(handle: *mut cascadia_runtime_t) -> c_int;
         pub fn cascadia_runtime_profiling(
@@ -1170,6 +1179,17 @@ impl DType {
     }
 }
 
+/// A compiled model's input or output port, as declared (no inference needed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortInfo {
+    /// Every tensor name of the port.
+    pub aliases: Vec<String>,
+    /// `None` for an element type without a [`DType`] (e.g. string).
+    pub dtype: Option<DType>,
+    /// `None` where the dim is dynamic.
+    pub dims: Vec<Option<usize>>,
+}
+
 /// Safe wrapper around the low-level OV Core/CompiledModel/InferRequest.
 /// Used by the ov-runtime + ov-dist-spec engines. The genai LLMPipeline
 /// has its own [`LlmPipeline`] type above.
@@ -1660,6 +1680,65 @@ impl Runtime {
             v.push(self.output_name(i)?);
         }
         Ok(v)
+    }
+
+    /// Input port `idx` as the compiled model declares it.
+    pub fn input_port(&self, idx: usize) -> Result<PortInfo> {
+        Ok(PortInfo {
+            aliases: self.input_aliases(idx)?,
+            ..self.port_facts(false, idx)?
+        })
+    }
+
+    /// Output port `idx` as the compiled model declares it.
+    pub fn output_port(&self, idx: usize) -> Result<PortInfo> {
+        Ok(PortInfo {
+            aliases: self.output_aliases(idx)?,
+            ..self.port_facts(true, idx)?
+        })
+    }
+
+    fn port_facts(&self, is_output: bool, idx: usize) -> Result<PortInfo> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = (is_output, idx);
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let (mut code, mut rank) = (0u32, 0usize);
+            let out = i32::from(is_output);
+            let rc = sys::cascadia_runtime_port_info(
+                self.handle,
+                out,
+                idx,
+                &mut code,
+                ptr::null_mut(),
+                0,
+                &mut rank,
+            );
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut dims = vec![0i64; rank];
+            let rc = sys::cascadia_runtime_port_info(
+                self.handle,
+                out,
+                idx,
+                &mut code,
+                dims.as_mut_ptr(),
+                rank,
+                &mut rank,
+            );
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(PortInfo {
+                aliases: Vec::new(),
+                dtype: (code != 255).then(|| DType::from_code(code)),
+                dims: dims.iter().map(|&d| usize::try_from(d).ok()).collect(),
+            })
+        }
     }
 
     /// Bind input by name. `data` must be `product(shape) * dtype.bytes_per_element` bytes.
