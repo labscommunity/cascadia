@@ -10,14 +10,18 @@
 #![cfg(feature = "openvino")]
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use cascadia_engine::{EngineError, PolicyEngine, WARMUP_CALLS};
+use cascadia_engine::{EngineError, EngineResult, PolicyEngine, WARMUP_CALLS};
 use cascadia_engine_openvino::policy::ov::OvTokenizer;
-use cascadia_engine_openvino::policy::pipeline::{NoiseRng, PromptTokenizer};
-use cascadia_engine_openvino::policy::{
-    compile_config, OvPolicyEngine, OvPolicyOptions, Precision,
+use cascadia_engine_openvino::policy::pipeline::{
+    HostTensor, NoiseRng, PolicyModel, PromptTokenizer, TensorData,
 };
-use cascadia_ov_genai_shim::{DType, Runtime};
+use cascadia_engine_openvino::policy::{
+    compile_config, LoadOptions, OvPolicyEngine, OvPolicyOptions, PolicyManifest, PolicyPipeline,
+    Precision, ServerFacts,
+};
+use cascadia_ov_genai_shim::{DType, PortInfo, Runtime};
 use cascadia_types::{Image, NoiseMode, Observation, ResizeConvention};
 
 fn package(test: &str) -> Option<PathBuf> {
@@ -750,6 +754,126 @@ fn xvla_cpu_infer_matches_the_pytorch_reference() {
         d.max, d.position, d.rotation_deg, d.gripper_flips, a.infer_ms
     );
     d.assert_within("xvla cpu f32", 5e-4);
+}
+
+/// Records what the pipeline binds and answers with the reference's raw output.
+struct Recorder {
+    inputs: Arc<Mutex<Vec<(String, HostTensor)>>>,
+    output: Vec<f32>,
+}
+
+impl PolicyModel for Recorder {
+    fn set_input(&mut self, name: &str, t: &HostTensor) -> EngineResult<()> {
+        self.inputs.lock().unwrap().push((name.into(), t.clone()));
+        Ok(())
+    }
+    fn infer(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+    fn output_f32(&mut self, _: &str) -> EngineResult<(Vec<usize>, Vec<f32>)> {
+        Ok((vec![1, 30, 20], self.output.clone()))
+    }
+}
+
+/// The engine's preprocessing binds every port exactly as the reference
+/// prepared it, and its postprocessing turns the reference's raw output into
+/// the reference's served actions. Needs no device and no model run, so a
+/// package whose manifest disagrees with its reference (a missing
+/// `image_flip`) fails here, naming the port, on any host.
+#[test]
+fn xvla_engine_binds_the_reference_inputs() {
+    let Some(dir) = xvla("xvla_engine_binds_the_reference_inputs") else {
+        return;
+    };
+    let z = reference(&dir);
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let (device, config) = compile_config("CPU", None).unwrap();
+    let rt = Runtime::compile_inspected(
+        dir.join(&manifest.model_artifact).to_str().unwrap(),
+        &device,
+        None,
+        &config,
+    )
+    .unwrap();
+    let inputs: Vec<PortInfo> = (0..rt.input_count())
+        .map(|i| rt.input_port(i).unwrap())
+        .collect();
+    let outputs: Vec<PortInfo> = (0..rt.output_count())
+        .map(|i| rt.output_port(i).unwrap())
+        .collect();
+    drop(rt);
+    let tokenizer = OvTokenizer::load(&dir.join(manifest.tokenizer_artifact())).unwrap();
+    let bound = Arc::new(Mutex::new(Vec::new()));
+    let model = Recorder {
+        inputs: bound.clone(),
+        output: npz(&z, "ref20").f32s(),
+    };
+    let mut pipeline = PolicyPipeline::new(
+        manifest,
+        ServerFacts {
+            model: "xvla".into(),
+            device,
+            prompt_max_bytes: 1024,
+        },
+        Box::new(model),
+        &inputs,
+        &outputs,
+        false,
+        Box::new(tokenizer),
+    )
+    .unwrap();
+    let a = pipeline.infer(&xvla_observation(&z)).unwrap();
+
+    let bound = bound.lock().unwrap();
+    for (name, got) in bound.iter() {
+        let want = npz(&z, &format!("in_{name}"));
+        assert_eq!(got.shape, want.shape, "{name} shape");
+        match &got.data {
+            TensorData::F32(v) if name == "images" => {
+                let w = want.f32s();
+                let n = 3 * 224 * 224;
+                for (slot, (g, w)) in v.chunks(n).zip(w.chunks(n)).enumerate() {
+                    let d = max_abs_diff(g, w);
+                    // A slot that matches only when turned around is an `image_flip` disagreement.
+                    let per_channel = |x: &[f32]| -> Vec<f32> {
+                        x.chunks(224 * 224)
+                            .flat_map(|c| c.iter().rev().copied())
+                            .collect()
+                    };
+                    let turned = max_abs_diff(&per_channel(g), w);
+                    eprintln!("xvla bound images slot {slot}: max abs {d}, rotated 180 {turned}");
+                    assert!(
+                        d <= 1e-6,
+                        "images slot {slot} differs from the reference by {d} \
+                         (by {turned} when rotated 180 degrees)"
+                    );
+                }
+            }
+            TensorData::F32(v) => assert_eq!(*v, want.f32s(), "{name}"),
+            TensorData::I64(v) => assert_eq!(*v, want.i64s(), "{name}"),
+            TensorData::Bool(v) => assert_eq!(*v, want.bools(), "{name}"),
+        }
+    }
+    let mut names: Vec<&str> = bound.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "image_masks",
+            "images",
+            "noise",
+            "state",
+            "tokenized_prompt",
+            "tokenized_prompt_mask"
+        ]
+    );
+
+    let d = served_diff(&a.actions, &z);
+    eprintln!(
+        "xvla postprocess vs pytorch (served 7-wide): position {} rotation {:.6} deg gripper flips {:?}",
+        d.position, d.rotation_deg, d.gripper_flips
+    );
+    d.assert_within("xvla postprocess", 1e-4);
 }
 
 /// Axis-angle to unit quaternion `(w, x, y, z)`.
