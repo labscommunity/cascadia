@@ -4,11 +4,13 @@
 
 pub mod cameras;
 pub mod manifest;
+pub mod ov;
 pub mod pipeline;
 pub mod spec;
 pub mod steps;
 
 pub use cameras::{images_tensor, CameraLayout, CameraPlan};
 pub use manifest::{LoadOptions, PolicyKind, PolicyManifest};
+pub use ov::{OvPolicyEngine, OvPolicyOptions};
 pub use pipeline::{compile_config, PolicyPipeline, Precision};
 pub use spec::{derive_spec, IrFacts, ManifestSpec, ServerFacts};

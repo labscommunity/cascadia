@@ -1,0 +1,296 @@
+//! `OvPolicyEngine`: a `policy_package` on the OpenVINO runtime. The policy
+//! IR follows the device; the tokenizer always runs on CPU, in its own
+//! runtime handle, because its string ops are CPU-only.
+
+use std::path::Path;
+
+use cascadia_engine::{EngineError, EngineResult, PolicyEngine};
+use cascadia_types::{ActionChunk, Observation, PolicySpec};
+
+use super::manifest::LoadOptions;
+use super::pipeline::{PolicyPipeline, Precision};
+
+/// How to load a package.
+#[derive(Clone, Debug)]
+pub struct OvPolicyOptions {
+    /// OpenVINO device for the policy IR: `GPU` (or `GPU.<n>`) or `CPU`.
+    pub device: String,
+    /// GPU compute precision; `None` keeps the device default (f16 on GPU).
+    pub precision: Option<Precision>,
+    pub manifest: LoadOptions,
+}
+
+impl Default for OvPolicyOptions {
+    fn default() -> Self {
+        Self {
+            device: "GPU".into(),
+            precision: None,
+            manifest: LoadOptions::default(),
+        }
+    }
+}
+
+pub struct OvPolicyEngine {
+    pipeline: PolicyPipeline,
+}
+
+impl OvPolicyEngine {
+    /// Load, compile and check a package directory. Nothing is served from a
+    /// package whose manifest, ports or tokenizer disagree.
+    #[cfg(not(feature = "openvino"))]
+    pub fn load(dir: &Path, opts: &OvPolicyOptions) -> EngineResult<Self> {
+        let _ = (dir, opts);
+        Err(EngineError::Backend(
+            "the ov-policy engine needs a build with --features openvino".into(),
+        ))
+    }
+
+    /// Load, compile and check a package directory. Nothing is served from a
+    /// package whose manifest, ports or tokenizer disagree.
+    #[cfg(feature = "openvino")]
+    pub fn load(dir: &Path, opts: &OvPolicyOptions) -> EngineResult<Self> {
+        use super::manifest::PolicyManifest;
+        use super::pipeline::{compile_config, PROMPT_MAX_BYTES, RANDOM_UNIFORM};
+        use super::spec::ServerFacts;
+        use crate::runtime::map_ov_err;
+        use cascadia_ov_genai_shim::Runtime;
+
+        let manifest = PolicyManifest::load(dir, opts.manifest)?;
+        let config = compile_config(&opts.device, opts.precision)?;
+        let xml = dir.join(&manifest.model_artifact);
+        let rt = Runtime::compile_inspected(utf8(&xml)?, &opts.device, None, &config)
+            .map_err(|e| context(&xml, map_ov_err(e)))?;
+        let inputs = (0..rt.input_count())
+            .map(|i| rt.input_port(i))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_ov_err)?;
+        let outputs = (0..rt.output_count())
+            .map(|i| rt.output_port(i))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_ov_err)?;
+        let has_random_uniform = rt.has_op_type(RANDOM_UNIFORM).map_err(map_ov_err)?;
+        let tokenizer = native::OvTokenizer::load(&dir.join(manifest.tokenizer_artifact()))?;
+        let model = dir.file_name().map_or_else(
+            || dir.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let pipeline = PolicyPipeline::new(
+            manifest,
+            ServerFacts {
+                model,
+                device: opts.device.clone(),
+                prompt_max_bytes: PROMPT_MAX_BYTES,
+            },
+            Box::new(native::OvModel {
+                rt,
+                outputs: outputs.clone(),
+            }),
+            &inputs,
+            &outputs,
+            has_random_uniform,
+            Box::new(tokenizer),
+        )?;
+        Ok(Self { pipeline })
+    }
+}
+
+impl PolicyEngine for OvPolicyEngine {
+    fn spec(&self) -> &PolicySpec {
+        self.pipeline.spec()
+    }
+
+    fn warmup(&mut self) {
+        self.pipeline.warmup();
+    }
+
+    fn infer(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
+        self.pipeline.infer(obs)
+    }
+
+    fn close(&mut self) {
+        self.pipeline.close();
+    }
+}
+
+#[cfg(feature = "openvino")]
+fn utf8(p: &Path) -> EngineResult<&str> {
+    p.to_str()
+        .ok_or_else(|| EngineError::InvalidConfig(format!("path is not UTF-8: {}", p.display())))
+}
+
+#[cfg(feature = "openvino")]
+fn context(path: &Path, e: EngineError) -> EngineError {
+    match e {
+        EngineError::Backend(m) => EngineError::Backend(format!("{}: {m}", path.display())),
+        other => other,
+    }
+}
+
+#[cfg(feature = "openvino")]
+pub use native::OvTokenizer;
+
+#[cfg(feature = "openvino")]
+mod native {
+    use std::path::Path;
+
+    use cascadia_engine::{EngineError, EngineResult};
+    use cascadia_ov_genai_shim::{
+        find_tokenizers_extension, DType, PluginConfig, PortInfo, Runtime,
+    };
+
+    use super::super::pipeline::{HostTensor, PolicyModel, PromptTokenizer, Tokens};
+    use super::{context, utf8};
+    use crate::runtime::map_ov_err;
+
+    /// The tokenizer IR's state variable that switches truncation.
+    const TRUNCATION: &str = "truncation";
+
+    fn index_of(ports: &[PortInfo], name: &str) -> EngineResult<usize> {
+        ports
+            .iter()
+            .position(|p| p.aliases.iter().any(|a| a == name))
+            .ok_or_else(|| EngineError::InvalidConfig(format!("no output named {name:?}")))
+    }
+
+    pub struct OvModel {
+        pub rt: Runtime,
+        pub outputs: Vec<PortInfo>,
+    }
+
+    impl PolicyModel for OvModel {
+        fn set_input(&mut self, name: &str, t: &HostTensor) -> EngineResult<()> {
+            self.rt
+                .set_input(name, t.dtype(), &t.shape, &t.to_bytes())
+                .map_err(map_ov_err)
+        }
+
+        fn infer(&mut self) -> EngineResult<()> {
+            self.rt.infer().map_err(map_ov_err)
+        }
+
+        fn output_f32(&mut self, name: &str) -> EngineResult<(Vec<usize>, Vec<f32>)> {
+            let idx = index_of(&self.outputs, name)?;
+            let (dtype, shape, bytes) = self.rt.output(idx).map_err(map_ov_err)?;
+            let values = match dtype {
+                DType::F32 => bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                DType::F16 => bytes
+                    .chunks_exact(2)
+                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect(),
+                other => {
+                    return Err(EngineError::Backend(format!(
+                        "output {name:?} is {other:?}; expected f32 or f16"
+                    )))
+                }
+            };
+            Ok((shape, values))
+        }
+    }
+
+    /// A package tokenizer compiled on CPU with the `openvino_tokenizers`
+    /// extension the loaded runtime ships.
+    pub struct OvTokenizer {
+        rt: Runtime,
+        input: String,
+        ids: usize,
+        mask: usize,
+        truncation: bool,
+    }
+
+    impl OvTokenizer {
+        pub fn load(xml: &Path) -> EngineResult<Self> {
+            let ext = find_tokenizers_extension().map_err(map_ov_err)?;
+            let mut rt = Runtime::compile_inspected(
+                utf8(xml)?,
+                "CPU",
+                Some(utf8(&ext)?),
+                &PluginConfig::new(),
+            )
+            .map_err(|e| context(xml, map_ov_err(e)))?;
+            if rt.input_count() != 1 {
+                return Err(EngineError::InvalidConfig(format!(
+                    "{}: a tokenizer takes one input, this one has {}",
+                    xml.display(),
+                    rt.input_count()
+                )));
+            }
+            let input = rt.input_name(0).map_err(map_ov_err)?;
+            let outputs = (0..rt.output_count())
+                .map(|i| rt.output_port(i))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_ov_err)?;
+            let ids = index_of(&outputs, "input_ids")?;
+            let mask = index_of(&outputs, "attention_mask")?;
+            let truncation = rt.set_state_bool(TRUNCATION, false).map_err(map_ov_err)?;
+            Ok(Self {
+                rt,
+                input,
+                ids,
+                mask,
+                truncation,
+            })
+        }
+
+        fn row(&self, idx: usize, what: &str) -> EngineResult<Vec<i64>> {
+            let (dtype, shape, bytes) = self.rt.output(idx).map_err(map_ov_err)?;
+            if shape.len() != 2 || shape[0] != 1 {
+                return Err(EngineError::Backend(format!(
+                    "tokenizer {what} is {shape:?}; expected [1, n]"
+                )));
+            }
+            Ok(match dtype {
+                DType::I64 => bytes
+                    .chunks_exact(8)
+                    .map(|c| i64::from_le_bytes(c.try_into().expect("8 bytes")))
+                    .collect(),
+                DType::I32 => bytes
+                    .chunks_exact(4)
+                    .map(|c| i64::from(i32::from_le_bytes(c.try_into().expect("4 bytes"))))
+                    .collect(),
+                DType::Bool | DType::I8 => bytes.iter().map(|&b| i64::from(b)).collect(),
+                other => {
+                    return Err(EngineError::Backend(format!(
+                        "tokenizer {what} is {other:?}; expected an integer type"
+                    )))
+                }
+            })
+        }
+    }
+
+    impl PromptTokenizer for OvTokenizer {
+        fn has_truncation_state(&self) -> bool {
+            self.truncation
+        }
+
+        fn tokenize(&mut self, text: &str) -> EngineResult<Tokens> {
+            if self.truncation {
+                // Assign writes the variable back every call; set it each time
+                // so nothing (a state reset) can turn truncation back on.
+                self.rt
+                    .set_state_bool(TRUNCATION, false)
+                    .map_err(map_ov_err)?;
+            }
+            self.rt
+                .set_input_strings(&self.input, &[text])
+                .map_err(map_ov_err)?;
+            self.rt.infer().map_err(map_ov_err)?;
+            let ids = self.row(self.ids, "input_ids")?;
+            let mask: Vec<bool> = self
+                .row(self.mask, "attention_mask")?
+                .iter()
+                .map(|&m| m != 0)
+                .collect();
+            if ids.len() != mask.len() {
+                return Err(EngineError::Backend(format!(
+                    "tokenizer returned {} ids and {} mask values",
+                    ids.len(),
+                    mask.len()
+                )));
+            }
+            Ok(Tokens { ids, mask })
+        }
+    }
+}

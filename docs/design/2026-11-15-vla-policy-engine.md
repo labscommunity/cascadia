@@ -60,7 +60,8 @@ claims until a stats source is settled (open question 3).
 v1:
 - Packages with `"format": "policy_package"`, version `1.x`, runner `SinglePass`, artifact
   `openvino`, policies `smolvla` and `pi05`. Anything else is refused at load with a clear error.
-- Devices: GPU (default) and CPU. NPU is refused: both models fail NPU compilation as exported.
+- Devices: GPU (default, f16 unless `--precision f32`) and CPU (always f32). NPU is refused: both
+  models fail NPU compilation as exported.
 - A single-box metadata endpoint and WebSocket, served by `cascadia run --engine ov-policy`.
 - `cascadia export-policy`: LeRobot checkpoints (Hugging Face) to a `policy_package`.
 
@@ -335,18 +336,20 @@ machine.
      It runs on our `input`-mode export of `HuggingFaceVLA/smolvla_libero` (not gated); Intel's
      published SmolVLA has no noise input. Differences are measured **before `denormalize`**, in
      normalized units, so every action dimension counts the same (a raw 0.05 is more than one
-     standard deviation of LIBERO's rotation actions). Tolerances are fixed up front: ≤ 1e-4 for
-     our CPU run against Intel's runtime on CPU, and ≤ 0.02 for GPU f16 against that CPU reference.
-     The CPU comparison only means "a port bug" when everything else is equal, so both sides set
-     `INFERENCE_PRECISION_HINT=f32` (OpenVINO's CPU plugin otherwise picks bf16 or f16 from the
-     hardware), the reference is generated on an `ai-pc` runner, and the reference file records the
-     generator's CPU and precision next to the package hashes. A first GPU run above
-     0.02 is a finding to investigate, not a threshold to adopt.
+     standard deviation of LIBERO's rotation actions). The CPU tolerance is fixed up front: ≤ 1e-4
+     for our CPU run against Intel's runtime on CPU. That only means "a port bug" when everything
+     else is equal, so both sides set `INFERENCE_PRECISION_HINT=f32` (OpenVINO's CPU plugin
+     otherwise picks bf16 or f16 from the hardware), the reference is generated on an `ai-pc`
+     runner, and the reference file records the generator's CPU and precision next to the package
+     hashes. The GPU at `--precision f32` must also stay within 1e-3 of that reference. The GPU at
+     the default f16 is gated only on finite output; its max and mean differences are printed and
+     recorded, and whether they matter is decided by the LIBERO comparison below, not by a number
+     chosen in advance (see "GPU precision").
 - **Accuracy.** `tools/vla_libero_client.py` adapts Intel's LIBERO benchmark observations to the
   WebSocket schema. It runs a few episodes of one suite on `HuggingFaceVLA/smolvla_libero` and
   `lerobot/pi05_libero_finetuned_v044`, both exported in `input` mode, against Intel's published
-  packages (`constant` and `in_graph_random`). Speed and parity do not show that a robot succeeds at
-  a task; this does. Where the simulator runs is open question 2.
+  packages (`constant` and `in_graph_random`), and runs our packages at both `--precision f16` and
+  `f32` on the GPU. Speed and parity do not show that a robot succeeds at a task; this does. Where the simulator runs is open question 2.
   The adapter connects through `openpi_client.WebsocketClientPolicy` exactly as the doc tells users
   to (`host="ws://…/v1/policy/ws"`, `port=None`), so the accuracy run is also the end-to-end
   interoperability test.
@@ -357,13 +360,22 @@ machine.
 
 ## Open questions
 
-1. **GPU f16 accuracy.** bf16 compute is off by up to 0.66 normalized units on the fp16-weight
-   package (step 0, CPU). The Arc GPU computes in f16, which has more mantissa than bf16 but less
-   range. It must be measured on a Lunar Lake box with a padded prompt before the 0.02 GPU tolerance
-   is trusted; if it fails, the engine runs the policy at f32 on the GPU instead.
-2. **Where the LIBERO simulator runs.** It needs MuJoCo and Linux. The engine needs an AI PC GPU.
-   The two must reach each
-   other over the network.
+1. **GPU precision (decided 2026-11-15, final call after LIBERO).** Measured on an Arc 140V
+   with our SmolVLA noise package and a real, padded prompt, five input draws against CPU f32:
+
+   | GPU mode | worst max abs (normalized) | mean abs | NaN | p50 latency |
+   |---|---|---|---|---|
+   | default f16 | 0.009 – 0.122 | 0.0013 – 0.0021 | 0 | 143 ms |
+   | `INFERENCE_PRECISION_HINT=f32` | ≤ 3.2e-4 | ~1e-6 | 0 | 346 ms |
+
+   The engine defaults to the GPU's f16 and takes `--precision f16|f32`. The LIBERO accuracy run
+   compares task success at both precisions: if f16 succeeds as often as f32, f16 stays the default;
+   otherwise the default becomes f32. CPU is always f32, because bf16 compute is off by up to 0.66
+   (step 0).
+2. **Where the LIBERO simulator runs.** Plan: the simulator on a Linux x86 machine (MuJoCo with CPU
+   rendering), the engine on an AI PC's GPU (the f16-versus-f32 comparison needs the GPU), joined
+   by an SSH tunnel. The added network delay doesn't affect an accuracy run,
+   since the simulator waits for each reply. To be confirmed before the run.
 3. **DROID statistics.** openpi publishes DROID norm stats with its checkpoints, but in its own
    format. Can the exporter take them through `--stats`?
 4. **GPU memory.** When an LLM engine and a policy share one box: out of scope for v1 (one engine
