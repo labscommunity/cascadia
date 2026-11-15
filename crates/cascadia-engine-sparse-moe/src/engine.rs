@@ -497,15 +497,13 @@ impl Builder for SparseMoEBuilder {
             })?;
             // The listener re-accepts after every drop, so take only the configured upstream.
             let up = peers.upstream.as_ref().expect("has_upstream");
-            let allowed =
-                cascadia_transport::expected_peer_ips(&up.host, up.port, &self.listen_host, port)
-                    .await
-                    .map_err(|e| EngineError::PeerRejected(format!("upstream {up}: {e}")))?;
-            if !allowed.is_empty() {
-                info!(upstream = %up, ?allowed, "sparse-moe worker accepts only its upstream");
-            }
             let mut server = ActivationServer::new(self.listen_host.clone(), port);
-            server.allow_peers(allowed);
+            if let Some(host) =
+                cascadia_transport::upstream_identity(&up.host, up.port, &self.listen_host, port)
+            {
+                info!(upstream = %up, "sparse-moe worker accepts only its upstream");
+                server.allow_upstream(&host, up.port).await;
+            }
             server.start().await.map_err(|e| {
                 EngineError::Backend(format!("listen {}:{}: {}", self.listen_host, port, e))
             })?;
