@@ -11,7 +11,7 @@ description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with 
 [features]
 default = []
 # Intel physicalai remote-inference front end (Zenoh) for the policy server.
-zenoh = ["dep:zenoh"]
+zenoh = ["dep:zenoh", "dep:tokio-tungstenite"]
 
 [dependencies]
 cascadia-types = { workspace = true }
@@ -49,6 +49,8 @@ zune-jpeg = "0.5.15"
 # its client opens.
 zenoh = { version = "=1.9.0", default-features = false, features = ["transport_tcp"], optional = true }
 sha2 = "0.10"
+# The policy bridge's openpi client (wss through rustls).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

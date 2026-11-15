@@ -3,6 +3,8 @@
 //!
 //! Public because other serving front ends reuse the codec without the router.
 
+#[cfg(feature = "zenoh")]
+pub mod bridge;
 mod msgpack;
 pub mod physicalai;
 pub mod server;

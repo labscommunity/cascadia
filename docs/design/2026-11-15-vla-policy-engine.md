@@ -347,6 +347,79 @@ no Python. Decoding rules:
 Keys are ours, so openpi clients are transport-compatible, not drop-in: a DROID client's
 `observation/joint_position` needs a mapping (out of scope for v1).
 
+## Intel remote-inference front end
+
+Intel's `physicalai` runtime runs a policy on another machine through `RemoteInferenceModel`, which
+speaks its own protocol (version 1) over Zenoh. `cascadia run --engine ov-policy --zenoh
+<HOST[:PORT]>` serves that protocol next to the WebSocket, so code written against
+`RemoteInferenceModel` drives a Cascadia policy with no change. It is behind the `zenoh` cargo
+feature (off by default) and uses the Rust `zenoh` crate pinned to 1.9.0, the release the Python
+client locks (`eclipse-zenoh==1.9.0`); an end-to-end run of Intel's own client against the Rust
+server is the proof of wire compatibility, not the version numbers.
+
+**Wire.** Byte for byte what `physicalai/inference/remote` exchanges, pinned by golden bytes that
+`crates/cascadia-api/tests/fixtures/physicalai/generate.py` packs with Intel's own `_protocol.py`:
+- Keys `physicalai/inference/<name>/metadata`, `/predict` and `/reset`. `<name>` is the slot name the
+  client is given (`--zenoh-name`, default the manifest's `policy.name`); without a port the server
+  listens on Intel's name-derived port (`20000 + sha256(prefix)[0..4] mod 40000`), which is what the
+  client dials when it is given none.
+- Handshake: `server_id` (fresh per start), `name`, `policy` (`name`, `manifest_sha256` = SHA-256 of
+  the package's `manifest.json` bytes, `backend`, `device`), `chunk_size` (T), `rtc` (not offered:
+  `supported: false`), `image_codecs` `["jpeg", "raw"]`, `max_request_bytes` (the same cap the
+  WebSocket uses). The client's `expected_policy` and `expected_manifest_sha256` check these.
+- Predict: `seq`, `budget_ms` (1 to 60000), `inputs` (tagged `__np__` arrays and string lists) and
+  `images` (JPEG or raw RGB, `HxWx3` or `1xHxWx3`), validated in the order Intel's server does.
+  The inputs then map onto the same `Observation` as a WebSocket request and pass the same
+  `check_observation`: `state` `[D]` or `[1, D]` (float32 or float64), `task` a one-string list
+  (the prompt), cameras as `images.<name>` with the advertised names, or a bare `images` for a
+  one-camera package (what Intel's `PolicySource` sends for one camera), and optional `noise` for
+  input-mode packages. Frames must be at the model resolution, as on the WebSocket.
+- Reply: `outputs.action` as float32 `[1, T, D]` (the shape Intel's own models return), `seq`,
+  `server_id` and the server's queue, compute and decode seconds. Reset replies `{ok: true}`;
+  policies keep no state between calls, so it only orders with the queue.
+- Errors go back through `reply_err` as `{protocol_version, code, seq}` with Intel's codes:
+  `invalid_request` (anything the decoder or `check_observation` refuses; the reason is logged, since
+  the protocol carries none), `unsupported_version`, `superseded` (a queued predict replaced by a
+  newer one), `expired` (the budget had passed when the model was free), `model_error`,
+  `shutting_down`.
+
+JPEG frames are decoded by `zune-jpeg`: pure Rust (no C toolchain or system libjpeg on any target),
+maintained, and the JPEG decoder of the `image` crate. Its pixels differ from OpenCV's
+libjpeg-turbo decode, which Intel's server uses, by at most 2 levels per channel on the fixture
+frames; the test bounds that difference.
+
+**Sharing.** Both front ends run on one engine: a `SharedPolicy` holds the engine mutex and the
+connection slots. The Zenoh front end takes one slot for as long as it serves (it is one robot, as in
+Intel's server: one worker, one call at a time, newer calls superseding queued ones), and its calls
+wait on the same mutex as WebSocket calls.
+
+**Security.** Like Intel's server, there is no authentication: the session is a peer that listens
+on the one configured TCP endpoint, never connects out, has multicast and gossip scouting and shared
+memory off, and bounds incoming messages to `max_request_bytes`. It binds loopback unless
+`--zenoh-allow-all-interfaces` is given, and then warns. Authenticated network access is not built
+on Zenoh: Zenoh's `usrpwd` check happens inside the transport against a static credential
+dictionary, so the queryable never learns who called, and Intel's predict message carries no client
+identity; per-client authorization cannot be enforced there. A deployment that needs it keeps Zenoh
+on loopback and puts an authenticated hop in front through the bridge below.
+
+**Bridge.** `cascadia policy-bridge --zenoh 127.0.0.1:<port> --upstream <ws(s) URL> [--token-file
+<path>] [--name <slot>]` serves Intel's protocol on loopback only (the same pinned Zenoh settings)
+and forwards each predict as one openpi call to any openpi server: Cascadia's own, or a gateway that
+takes `Authorization: Bearer`. The token is read from the file, sent only over `wss://` or to
+loopback, and never logged. One bridge serves one Intel client. Its handshake has a `server_id` minted
+for the bridge's lifetime, so an upstream reconnect is not a server restart to the client, and the
+name, `manifest_sha256` and chunk size the upstream's metadata states; a reconnect to an upstream
+whose metadata differs is refused. It honours `budget_ms` and superseding like Intel's server: a call
+still running when its budget ends is answered `expired`, its late reply is read and dropped (and
+counted) before the next call, and the bridge warns once when the upstream is slower than the
+client's budget. `reset` closes the upstream connection, so a new episode starts on a fresh one.
+
+**Metadata identity.** So a bridge can answer the handshake and a client can tell whether two
+servers serve the same policy, `PolicySpec` carries `manifest_sha256` and `precision` (`f16` or
+`f32`, as compiled), and the socket metadata adds `policy_name`, `chunk_size` and `rtc_chunk_size`
+(null). The socket metadata bytes hold no timing, so two loads of one package at one precision send
+identical bytes; the slowest warmup call appears only in `GET /v1/policy/metadata` as `warmup_ms`.
+
 ## Code layout
 
 | Where | Change |

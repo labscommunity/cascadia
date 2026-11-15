@@ -203,6 +203,11 @@ pub enum Command {
     /// Generate a shell completion script (bash, zsh, fish, …). See
     /// `cascadia completions --help`.
     Completions(CompletionsArgs),
+    /// Serve physicalai's remote-inference protocol on loopback and forward
+    /// each call to an openpi policy server (`cascadia run --engine ov-policy`,
+    /// or a gateway in front of one). One bridge per physicalai client.
+    /// Needs a build with `--features zenoh`.
+    PolicyBridge(PolicyBridgeArgs),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -939,6 +944,28 @@ pub struct RunArgs {
 }
 
 #[derive(Parser, Debug, Clone)]
+pub struct PolicyBridgeArgs {
+    /// Loopback `HOST[:PORT]` the physicalai client connects to; without a
+    /// port, physicalai's name-derived one.
+    #[arg(long, value_name = "HOST[:PORT]")]
+    pub zenoh: String,
+
+    /// The upstream policy socket, e.g. `ws://127.0.0.1:8000/v1/policy/ws`.
+    #[arg(long, value_name = "URL")]
+    pub upstream: String,
+
+    /// A file holding a bearer token for the upstream, sent as
+    /// `Authorization: Bearer`. Only over `wss://` or to loopback.
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<PathBuf>,
+
+    /// The slot name the physicalai client is given; defaults to the
+    /// upstream's policy name.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+#[derive(Parser, Debug, Clone)]
 pub struct CompletionsArgs {
     /// Shell to generate a completion script for.
     #[arg(value_enum)]
@@ -1276,6 +1303,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::ProfileDevices(args) => cmd_profile_devices(args),
         Command::ProfileStages(args) => cmd_profile_per_stage(args),
         Command::Place(args) => cmd_place(args),
+        Command::PolicyBridge(args) => cmd_policy_bridge(args).await,
         Command::RunPlacement(args) => cmd_run_placement(args).await,
         Command::Completions(args) => cmd_completions(args),
     }
@@ -1551,6 +1579,59 @@ async fn serve_policy_engine(
         z.stop().await;
     }
     res
+}
+
+/// `cascadia policy-bridge`: physicalai on loopback, openpi upstream.
+async fn cmd_policy_bridge(args: PolicyBridgeArgs) -> Result<()> {
+    let (host, port) = parse_zenoh_addr(&args.zenoh)?;
+    let token = match &args.token_file {
+        Some(path) => {
+            let t = std::fs::read_to_string(path)
+                .with_context(|| format!("reading the token file {}", path.display()))?;
+            let t = t.trim().to_string();
+            if t.is_empty() {
+                return Err(anyhow!("the token file {} is empty", path.display()));
+            }
+            Some(t)
+        }
+        None => None,
+    };
+    if let Some(name) = &args.name {
+        cascadia_api::policy::physicalai::check_name(name)
+            .map_err(|e| anyhow!("--name {name:?}: {e}"))?;
+    }
+    #[cfg(feature = "zenoh")]
+    {
+        use cascadia_api::policy::bridge::{start_bridge, Upstream};
+        use cascadia_api::policy::zenoh_server::ZenohListen;
+        let listen = ZenohListen {
+            name: args.name.unwrap_or_default(),
+            host,
+            port,
+            allow_all_interfaces: false,
+        };
+        let bridge = start_bridge(
+            Upstream {
+                url: args.upstream,
+                token,
+            },
+            listen,
+        )
+        .await?;
+        let shutdown =
+            install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
+        let sig = shutdown.await;
+        info!(signal = %sig, "shutdown signal received");
+        bridge.front.stop().await;
+        Ok(())
+    }
+    #[cfg(not(feature = "zenoh"))]
+    {
+        let _ = (host, port, token);
+        Err(anyhow!(
+            "policy-bridge needs a cascadia built with `--features zenoh`"
+        ))
+    }
 }
 
 fn cmd_completions(args: CompletionsArgs) -> Result<()> {

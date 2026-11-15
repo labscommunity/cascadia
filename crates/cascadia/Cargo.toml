@@ -14,7 +14,7 @@ openvino = ["cascadia-cli/openvino"]
 # Issue-34 Option C: KV-coordination surface (holder + multi-stage capture/RESTORE + total>1 cache).
 kv_coord = ["cascadia-cli/kv_coord"]
 dashboard-embed = ["cascadia-cli/dashboard-embed"]
-# physicalai remote inference over Zenoh (`run --zenoh`).
+# physicalai remote inference over Zenoh (`run --zenoh`, `policy-bridge`).
 zenoh = ["cascadia-cli/zenoh"]
 
 [[bin]]
