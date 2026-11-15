@@ -519,15 +519,51 @@ struct KvTensor {
     data: Vec<u8>,
 }
 
+/// Context cap for held shared KV when the tree's config states no
+/// `max_position_embeddings`: the longest Gemma 4 window (262,144 on 31B), so a
+/// missing config never rejects a real context.
+const SHARED_KV_MAX_CTX_FALLBACK: usize = 262_144;
+
+/// `max_position_embeddings` from the config the exporter copies next to the
+/// tokenizer (`text_config` when nested), or the pipeline dir's own config.json.
+fn read_max_ctx(pipeline_dir: &Path) -> Option<usize> {
+    ["tokenizer/config.json", "config.json"]
+        .iter()
+        .find_map(|f| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(pipeline_dir.join(f)).ok()?).ok()?;
+            let cfg = v.get("text_config").unwrap_or(&v);
+            cfg.get("max_position_embeddings")?
+                .as_u64()
+                .filter(|&m| m > 0)
+                .and_then(|m| usize::try_from(m).ok())
+        })
+}
+
+/// Bytes of a `[kvh, ctx, hd]` f32 tensor, or None if that overflows.
+fn kv_bytes(kvh: usize, ctx: usize, hd: usize) -> Option<usize> {
+    kvh.checked_mul(ctx)?.checked_mul(hd)?.checked_mul(4)
+}
+
 /// The shared KV a consumer stage has received this task, per wire tag. Fed
 /// whole to the `external_kv.*` inputs each step; frames replace (start 0) or
 /// append to it.
-#[derive(Default)]
 struct SharedKvBuf {
+    /// Most context rows a held tensor may reach: the model's window. Each
+    /// frame is bounded by the transport, but appends are not, so a peer (or a
+    /// bug) could otherwise grow a tensor without limit.
+    max_ctx: usize,
     tensors: std::collections::HashMap<i64, KvTensor>,
 }
 
 impl SharedKvBuf {
+    fn new(max_ctx: usize) -> Self {
+        Self {
+            max_ctx,
+            tensors: std::collections::HashMap::new(),
+        }
+    }
+
     fn clear(&mut self) {
         self.tensors.clear();
     }
@@ -547,13 +583,20 @@ impl SharedKvBuf {
         data: Vec<u8>,
     ) -> EngineResult<()> {
         let [kvh, n, hd] = shape.map(|d| d as usize);
-        if data.len() != kvh * n * hd * 4 {
+        if kv_bytes(kvh, n, hd) != Some(data.len()) {
             return Err(EngineError::Backend(format!(
                 "cross-KV frame (tag {tag}) carries {} bytes for shape {shape:?}",
                 data.len()
             )));
         }
         if start == 0 {
+            if n > self.max_ctx {
+                return Err(EngineError::Backend(format!(
+                    "cross-KV frame (tag {tag}) carries {n} context rows, past the model's \
+                     window of {}",
+                    self.max_ctx
+                )));
+            }
             self.tensors.insert(
                 tag,
                 KvTensor {
@@ -585,9 +628,20 @@ impl SharedKvBuf {
         // first so no source is overwritten before it moves, then fill the gap.
         // reserve_exact keeps the buffer at its real size instead of doubling.
         let row = hd * 4;
-        let (old, new) = (t.ctx, t.ctx + n);
-        t.data.reserve_exact(kvh * new * row - t.data.len());
-        t.data.resize(kvh * new * row, 0);
+        let old = t.ctx;
+        let grown = old
+            .checked_add(n)
+            .filter(|&c| c <= self.max_ctx)
+            .and_then(|c| Some((c, kv_bytes(kvh, c, hd)?)));
+        let Some((new, bytes)) = grown else {
+            return Err(EngineError::Backend(format!(
+                "cross-KV frame (tag {tag}) would grow the shared KV from {old} to {old} + {n} \
+                 context rows, past the model's window of {}",
+                self.max_ctx
+            )));
+        };
+        t.data.reserve_exact(bytes - t.data.len());
+        t.data.resize(bytes, 0);
         for h in (0..kvh).rev() {
             t.data
                 .copy_within(h * old * row..(h + 1) * old * row, h * new * row);
@@ -2297,6 +2351,8 @@ pub struct Gemma4Builder {
     num_kv_shared_layers: u32,
     /// Hidden-frame size from load(), for build()'s prompt bound.
     frame_bytes_per_token: usize,
+    /// Model context window, read in load() for the shared-KV cap.
+    max_ctx: usize,
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -2515,6 +2571,14 @@ impl Builder for Gemma4Builder {
         self.num_kv_shared_layers = pipeline_cfg.num_kv_shared_layers;
         self.frame_bytes_per_token =
             hidden_frame_bytes_per_token(&pipeline_cfg, stage_cfg.layer_end);
+        self.max_ctx = read_max_ctx(&self.pipeline_dir).unwrap_or_else(|| {
+            warn!(
+                fallback = SHARED_KV_MAX_CTX_FALLBACK,
+                "gemma4: config.json states no max_position_embeddings; capping shared KV at the \
+                 fallback"
+            );
+            SHARED_KV_MAX_CTX_FALLBACK
+        });
 
         events.push(LoadProgress::message(format!(
             "compiling stage {} on {}",
@@ -2666,7 +2730,7 @@ impl Builder for Gemma4Builder {
             active: None,
             cross_kv_out,
             external_kv_in,
-            external_kv: SharedKvBuf::default(),
+            external_kv: SharedKvBuf::new(self.max_ctx),
             cross_kv_tx: CrossKvSender::new(kv_deltas),
             step_warn: StepWarnLimiter::default(),
             #[cfg(feature = "kv_coord")]
@@ -3205,7 +3269,7 @@ mod tests {
 
     #[test]
     fn shared_kv_buf_appends_rows_per_head() {
-        let mut b = SharedKvBuf::default();
+        let mut b = SharedKvBuf::new(SHARED_KV_MAX_CTX_FALLBACK);
         b.apply(9, 0, 26, 0, [2, 3, 2], kv_tensor(1, 2, 0, 3, 2))
             .unwrap();
         b.apply(9, 3, 26, 3, [2, 2, 2], kv_tensor(1, 2, 3, 2, 2))
@@ -3219,7 +3283,7 @@ mod tests {
 
     #[test]
     fn shared_kv_buf_rejects_an_append_it_cannot_line_up() {
-        let mut b = SharedKvBuf::default();
+        let mut b = SharedKvBuf::new(SHARED_KV_MAX_CTX_FALLBACK);
         let d = |p, n, kvh, hd| kv_tensor(1, kvh, p, n, hd);
         // Nothing held yet.
         assert!(b.apply(9, 4, 26, 4, [2, 1, 2], d(4, 1, 2, 2)).is_err());
@@ -3241,11 +3305,63 @@ mod tests {
         assert_eq!(b.get(26).unwrap().1, kv_tensor(1, 2, 0, 5, 2).as_slice());
     }
 
+    /// Every frame is bounded by the transport; the held tensor is bounded only
+    /// here. A frame past the window, or whose size overflows, is rejected and
+    /// the held tensor is left as it was.
+    #[test]
+    fn shared_kv_buf_caps_the_context_and_rejects_overflow() {
+        let mut b = SharedKvBuf::new(8);
+        let d = |p, n| kv_tensor(1, 2, p, n, 2);
+        assert!(
+            b.apply(9, 0, 26, 0, [2, 9, 2], d(0, 9)).is_err(),
+            "full frame past the window"
+        );
+        b.apply(9, 0, 26, 0, [2, 6, 2], d(0, 6)).unwrap();
+        assert!(
+            b.apply(9, 6, 26, 6, [2, 3, 2], d(6, 3)).is_err(),
+            "append past the window"
+        );
+        let huge = [u32::MAX; 3];
+        assert!(
+            b.apply(9, 6, 26, 6, huge, vec![0; 4]).is_err(),
+            "size overflow"
+        );
+        assert!(
+            b.apply(9, 0, 27, 0, huge, vec![0; 4]).is_err(),
+            "size overflow, full"
+        );
+        assert!(b.get(27).is_none());
+        let (shape, bytes) = b.get(26).unwrap();
+        assert_eq!((shape, bytes), ([1, 2, 6, 2], d(0, 6).as_slice()));
+        // Up to the window is still fine.
+        b.apply(9, 6, 26, 6, [2, 2, 2], d(6, 2)).unwrap();
+        assert_eq!(b.get(26).unwrap().1, kv_tensor(1, 2, 0, 8, 2).as_slice());
+    }
+
+    #[test]
+    fn max_ctx_comes_from_the_copied_model_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_max_ctx(dir.path()), None);
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"max_position_embeddings": 4096}"#,
+        )
+        .unwrap();
+        assert_eq!(read_max_ctx(dir.path()), Some(4096));
+        std::fs::create_dir(dir.path().join("tokenizer")).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer/config.json"),
+            r#"{"text_config": {"max_position_embeddings": 131072}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_max_ctx(dir.path()), Some(131072));
+    }
+
     #[test]
     fn ingest_requires_each_consumed_tag_once_per_step() {
         let inputs = ext_in(&[26, 27]);
         let f = || WireTensor::new(WireDType::F32, [1, 1, 1], f32_to_bytes(&[1.0]));
-        let mut b = SharedKvBuf::default();
+        let mut b = SharedKvBuf::new(SHARED_KV_MAX_CTX_FALLBACK);
         let ing = |b: &mut SharedKvBuf, pos, seq, e: &[(i64, i64)], fr| {
             ingest_cross_kv(b, &inputs, pos, seq, e, fr)
         };
@@ -3316,7 +3432,7 @@ mod tests {
         for ((fresh_seq, lossy, deltas), want) in modes {
             let mode = format!("fresh_seq={fresh_seq} lossy={lossy} deltas={deltas}");
             let mut tx = CrossKvSender::new(deltas);
-            let mut buf = SharedKvBuf::default();
+            let mut buf = SharedKvBuf::new(SHARED_KV_MAX_CTX_FALLBACK);
             let (mut pos, mut seed, mut seq) = (0i64, 0u32, 1u64);
             let mut delta_rows = std::collections::HashMap::<i64, usize>::new();
             for step in &script {
