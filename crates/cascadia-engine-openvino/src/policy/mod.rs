@@ -8,6 +8,7 @@ pub mod ov;
 pub mod pipeline;
 pub mod qwen_vl;
 pub mod spec;
+pub mod special_tokens;
 pub mod steps;
 pub mod vla_jepa;
 pub mod xr0;

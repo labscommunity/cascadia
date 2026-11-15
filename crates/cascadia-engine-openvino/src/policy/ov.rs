@@ -195,6 +195,7 @@ mod native {
     };
 
     use super::super::pipeline::{HostTensor, PolicyModel, PromptTokenizer, Tokens};
+    use super::super::special_tokens as special;
     use super::{context, utf8};
     use crate::runtime::map_ov_err;
 
@@ -254,6 +255,7 @@ mod native {
         ids: usize,
         mask: usize,
         truncation: bool,
+        special: Vec<String>,
     }
 
     impl OvTokenizer {
@@ -287,6 +289,7 @@ mod native {
                 ids,
                 mask,
                 truncation,
+                special: special_tokens(xml),
             })
         }
 
@@ -316,9 +319,33 @@ mod native {
         }
     }
 
+    /// The IR's `SpecialTokensSplit` pattern plus `tokenizer.json`'s added
+    /// tokens beside it; an unreadable artefact adds nothing.
+    fn special_tokens(xml: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let (Ok(text), Ok(bin)) = (
+            std::fs::read_to_string(xml),
+            std::fs::read(xml.with_extension("bin")),
+        ) {
+            out.extend(special::from_tokenizer_ir(&text, &bin).unwrap_or_default());
+        }
+        if let Ok(json) = std::fs::read_to_string(xml.with_file_name("tokenizer.json")) {
+            for t in special::from_tokenizer_json(&json) {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
     impl PromptTokenizer for OvTokenizer {
         fn has_truncation_state(&self) -> bool {
             self.truncation
+        }
+
+        fn special_tokens(&self) -> Vec<String> {
+            self.special.clone()
         }
 
         fn tokenize(&mut self, text: &str) -> EngineResult<Tokens> {

@@ -15,6 +15,7 @@ use super::manifest::{
 };
 use super::qwen_vl::PatchGeometry;
 use super::spec::{derive_spec, IrFacts, ServerFacts};
+use super::special_tokens;
 use super::steps::{
     denormalize, gripper_binarize, new_line, normalize, pi05_bins, pi05_prompt, py_strip,
     trim_actions, xvla_rotation_6d_to_axis_angle, NUM_BINS,
@@ -104,6 +105,102 @@ pub trait PromptTokenizer: Send {
     /// than the port instead of being cut.
     fn has_truncation_state(&self) -> bool;
     fn tokenize(&mut self, text: &str) -> EngineResult<Tokens>;
+    /// Strings the tokenizer reads as special tokens (see `special_tokens`).
+    fn special_tokens(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Guards a prompt template against a task that spells its structure: a
+/// special token in the task would move image features or cut the template,
+/// and the model would get a silently wrong input.
+#[derive(Clone, Debug)]
+struct PromptGuard {
+    /// The tokenizer's special tokens and the template's markers.
+    forbidden: Vec<String>,
+    /// `(marker, id, count)`: each single-token marker and how often the
+    /// template's ids carry it; every call's ids must carry it as often.
+    counts: Vec<(String, i64, usize)>,
+}
+
+impl PromptGuard {
+    fn new(template: &str, tokenizer: &mut dyn PromptTokenizer) -> EngineResult<Self> {
+        let mut forbidden = tokenizer.special_tokens();
+        if forbidden.is_empty() {
+            return refuse(
+                "the tokenizer declares no special tokens, so a templated prompt cannot be \
+                 guarded against a task that spells one",
+            );
+        }
+        for m in special_tokens::template_markers(template) {
+            if !forbidden.contains(&m) {
+                forbidden.push(m);
+            }
+        }
+        let ids = |t: Tokens| -> Vec<i64> {
+            t.ids
+                .iter()
+                .zip(&t.mask)
+                .filter(|(_, &m)| m)
+                .map(|(&id, _)| id)
+                .collect()
+        };
+        let base = ids(tokenizer.tokenize(template)?);
+        let mut counts = Vec::new();
+        for m in &forbidden {
+            if let [id] = ids(tokenizer.tokenize(m)?)[..] {
+                counts.push((m.clone(), id, base.iter().filter(|&&x| x == id).count()));
+            }
+        }
+        Ok(Self { forbidden, counts })
+    }
+
+    fn check_task(&self, task: &str) -> Option<String> {
+        self.forbidden.iter().find(|f| task.contains(f.as_str())).map(|f| {
+            format!("the task contains {f:?}, which this policy's prompt reads as structure; remove it")
+        })
+    }
+
+    fn count(&self, marker: &str) -> Option<usize> {
+        self.counts
+            .iter()
+            .find(|(m, _, _)| m == marker)
+            .map(|c| c.2)
+    }
+
+    /// Defence in depth behind `check_task`: the ids keep the template's structure.
+    fn check_ids(&self, tokens: &Tokens) -> EngineResult<()> {
+        for (m, id, want) in &self.counts {
+            let got = tokens
+                .ids
+                .iter()
+                .zip(&tokens.mask)
+                .filter(|(&x, &on)| on && x == *id)
+                .count();
+            if got != *want {
+                return Err(EngineError::InvalidConfig(format!(
+                    "the prompt has {got} {m:?} tokens; the template has {want}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A cached answer for a task text.
+#[derive(Clone, Debug)]
+enum Refusal {
+    TooLong(String),
+    Structure(String),
+}
+
+impl Refusal {
+    fn error(self) -> EngineError {
+        match self {
+            Self::TooLong(m) => EngineError::PromptTooLong(m),
+            Self::Structure(m) => EngineError::InvalidConfig(m),
+        }
+    }
 }
 
 fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
@@ -624,7 +721,9 @@ pub struct PolicyPipeline {
     /// [`PortLayout::Xr0`]'s.
     xr0: Option<Xr0Host>,
     /// Task text to the refusal message, `None` when it fits.
-    prompt_checks: HashMap<String, Option<String>>,
+    prompt_checks: HashMap<String, Option<Refusal>>,
+    /// Set for a templated prompt (`vla_jepa_prompt`, `xr0`).
+    guard: Option<PromptGuard>,
 }
 
 impl PolicyPipeline {
@@ -688,6 +787,27 @@ impl PolicyPipeline {
             ImageStep::Xr0(step) => Some(Xr0Host::new(&manifest, step)?),
             _ => None,
         };
+        let templated = manifest
+            .preprocessors
+            .iter()
+            .any(|s| matches!(s, PreStep::VlaJepaPrompt { .. } | PreStep::Xr0(_)));
+        let guard = if templated {
+            let template = prompt_text(&manifest, "", &[], false)?;
+            let g = PromptGuard::new(&template, tokenizer.as_mut())?;
+            if let Some(host) = &xr0 {
+                let want = host.geo.views.len() * host.geo.patches.image_pads();
+                if g.count("<|image_pad|>") != Some(want) {
+                    return refuse(format!(
+                        "the xr0 template tokenizes to {:?} image pads; {} cameras need {want}",
+                        g.count("<|image_pad|>"),
+                        host.geo.views.len()
+                    ));
+                }
+            }
+            Some(g)
+        } else {
+            None
+        };
         let (spec, layout) = derive_spec(&manifest, &ir, server)?;
         let flip = layout
             .names
@@ -706,6 +826,7 @@ impl PolicyPipeline {
             vla_jepa,
             xr0,
             prompt_checks: HashMap::new(),
+            guard,
         })
     }
 
@@ -713,9 +834,10 @@ impl PolicyPipeline {
     /// per text with the worst-case state so the answer never changes mid-episode.
     fn check_prompt(&mut self, task: &str) -> EngineResult<()> {
         if let Some(answer) = self.prompt_checks.get(task) {
-            return answer
-                .clone()
-                .map_or(Ok(()), |m| Err(EngineError::PromptTooLong(m)));
+            return answer.clone().map_or(Ok(()), |r| Err(r.error()));
+        }
+        if let Some(m) = self.guard.as_ref().and_then(|g| g.check_task(task)) {
+            return self.remember(task, Some(Refusal::Structure(m)));
         }
         let zeros = vec![0.0; self.spec.state_len];
         let text = prompt_text(&self.manifest, task, &zeros, true)?;
@@ -742,11 +864,15 @@ impl PolicyPipeline {
                 )
             })
         };
+        self.remember(task, refusal.map(Refusal::TooLong))
+    }
+
+    fn remember(&mut self, task: &str, refusal: Option<Refusal>) -> EngineResult<()> {
         if self.prompt_checks.len() >= PROMPT_CACHE_MAX {
             self.prompt_checks.clear();
         }
         self.prompt_checks.insert(task.to_string(), refusal.clone());
-        refusal.map_or(Ok(()), |m| Err(EngineError::PromptTooLong(m)))
+        refusal.map_or(Ok(()), |r| Err(r.error()))
     }
 
     /// Tokenize `text`; the ids must fill the prompt port exactly.
@@ -837,6 +963,9 @@ impl PolicyPipeline {
     ) -> EngineResult<Vec<(&'static str, HostTensor)>> {
         let text = prompt_text(&self.manifest, &obs.prompt, &[], false)?;
         let tokens = self.tokens(&text)?;
+        if let Some(g) = &self.guard {
+            g.check_ids(&tokens)?;
+        }
         let host = self
             .vla_jepa
             .as_ref()
@@ -888,6 +1017,9 @@ impl PolicyPipeline {
     fn xr0_feeds(&mut self, obs: &Observation) -> EngineResult<Vec<(&'static str, HostTensor)>> {
         let text = prompt_text(&self.manifest, &obs.prompt, &[], false)?;
         let tokens = self.tokens(&text)?;
+        if let Some(g) = &self.guard {
+            g.check_ids(&tokens)?;
+        }
         let host = self
             .xr0
             .as_ref()
@@ -1118,13 +1250,44 @@ mod tests {
         port: usize,
     }
 
+    /// The fake's special tokens; the `<|…|>` ones are one id each (1000 + index).
+    const FAKE_SPECIAL: [&str; 6] = [
+        "\u{1}",
+        "<|image_pad|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+    ];
+
+    fn fake_ids(text: &str) -> Vec<i64> {
+        let mut ids = Vec::new();
+        let mut rest = text;
+        'outer: while !rest.is_empty() {
+            for (i, sp) in FAKE_SPECIAL.iter().enumerate().skip(1) {
+                if let Some(r) = rest.strip_prefix(sp) {
+                    ids.push(1000 + i as i64);
+                    rest = r;
+                    continue 'outer;
+                }
+            }
+            let c = rest.chars().next().unwrap();
+            ids.extend(rest[..c.len_utf8()].bytes().map(i64::from));
+            rest = &rest[c.len_utf8()..];
+        }
+        ids
+    }
+
     impl PromptTokenizer for FakeTokenizer {
         fn has_truncation_state(&self) -> bool {
             self.truncation_state
         }
+        fn special_tokens(&self) -> Vec<String> {
+            FAKE_SPECIAL.iter().map(|s| s.to_string()).collect()
+        }
         fn tokenize(&mut self, text: &str) -> EngineResult<Tokens> {
             self.log.lock().unwrap().texts.push(text.into());
-            let mut ids: Vec<i64> = text.bytes().map(i64::from).collect();
+            let mut ids: Vec<i64> = fake_ids(text);
             if !self.truncation_state {
                 ids.truncate(self.port);
             }
@@ -1615,7 +1778,7 @@ mod tests {
             .infer(&obs(&spec, "a\u{1}b"))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("33 embodied-action tokens"), "{e}");
+        assert!(e.contains("the task contains \"\\u{1}\""), "{e}");
     }
 
     #[test]
@@ -1769,6 +1932,70 @@ mod tests {
             r.log.lock().unwrap().texts.last().unwrap(),
             "pick up the bowl"
         );
+    }
+
+    #[test]
+    fn templated_prompts_refuse_a_task_that_spells_their_structure() {
+        for (name, mut r) in [
+            ("vlajepa", vla_jepa()),
+            (
+                "xr0",
+                rig_with(XR0_LIBERO, xr0_ports(), false, true, vec![1.0; 30 * 32]),
+            ),
+        ] {
+            let spec = r.engine.spec().clone();
+            // The tokenizer's special tokens and the template's own markers.
+            let markers = ["<cot>", "</cot>"];
+            for sp in FAKE_SPECIAL
+                .iter()
+                .chain(if name == "xr0" { &markers[..] } else { &[] })
+            {
+                let task = format!("pick up {sp} the bowl");
+                let e = r.engine.infer(&obs(&spec, &task)).unwrap_err();
+                assert!(matches!(e, EngineError::InvalidConfig(_)), "{name}: {e}");
+                assert!(
+                    e.to_string().contains(&format!("the task contains {sp:?}")),
+                    "{name}: {e}"
+                );
+                // Cached per task, like the length check: no second tokenize.
+                let before = r.log.lock().unwrap().texts.len();
+                assert!(r.engine.infer(&obs(&spec, &task)).is_err());
+                assert_eq!(r.log.lock().unwrap().texts.len(), before, "{name}");
+            }
+            r.engine.infer(&obs(&spec, "pick up the bowl")).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_guard_checks_the_ids_keep_the_templates_structure() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut tok = FakeTokenizer {
+            log,
+            truncation_state: true,
+            port: 64,
+        };
+        let g = PromptGuard::new("<|im_start|>a<|image_pad|><|image_pad|>b", &mut tok).unwrap();
+        assert_eq!(g.count("<|image_pad|>"), Some(2));
+        assert_eq!(g.count("<|im_start|>"), Some(1));
+        assert_eq!(g.count("<|im_end|>"), Some(0));
+        let ok = tok
+            .tokenize("<|im_start|>a go<|image_pad|><|image_pad|>b")
+            .unwrap();
+        g.check_ids(&ok).unwrap();
+        // A pad that slipped past the text check moves the image features.
+        let bad = tok
+            .tokenize("<|im_start|>a<|image_pad|> go<|image_pad|><|image_pad|>b")
+            .unwrap();
+        let e = g.check_ids(&bad).unwrap_err().to_string();
+        assert!(
+            e.contains("3 \"<|image_pad|>\" tokens; the template has 2"),
+            "{e}"
+        );
+        // Padding past the mask does not count.
+        let mut padded = ok.clone();
+        padded.ids.push(1002);
+        padded.mask.push(false);
+        g.check_ids(&padded).unwrap();
     }
 
     #[test]

@@ -1206,6 +1206,7 @@ fn vlajepa_engine_binds_the_reference_inputs() {
         .collect();
     drop(rt);
     let tokenizer = OvTokenizer::load(&dir.join(manifest.tokenizer_artifact())).unwrap();
+    let specials = tokenizer.special_tokens();
     let bound = Arc::new(Mutex::new(Vec::new()));
     let output = Arc::new(Mutex::new(vec![0.0; 49]));
     let mut pipeline = PolicyPipeline::new(
@@ -1293,6 +1294,22 @@ fn vlajepa_engine_binds_the_reference_inputs() {
             ]
         );
     }
+    assert_special_tasks_refused(
+        &mut pipeline,
+        &specials,
+        &[
+            "<|image_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|video_pad|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|embodied_action|>",
+            "<|action_0|>",
+            "<|endoftext|>",
+        ],
+        &r.observation(0),
+    );
 }
 
 /// GPU f16 (the default) within 2e-3 of PyTorch f32 with no gripper flip
@@ -1550,6 +1567,7 @@ fn xr0_engine_binds_intels_stages() {
         want_prompt
     );
     let tokenizer = OvTokenizer::load(&dir.join(manifest.tokenizer_artifact())).unwrap();
+    let specials = tokenizer.special_tokens();
     let bound = Arc::new(Mutex::new(Vec::new()));
     let (inputs, outputs) = xr0_ports();
     let mut pipeline = PolicyPipeline::new(
@@ -1571,10 +1589,26 @@ fn xr0_engine_binds_intels_stages() {
     )
     .unwrap();
     let noise = npz(&z, "01_XR0Preprocessor/noise").f32s();
-    let a = pipeline
-        .infer(&xr0_observation(&z, "00_obs/", task, noise.clone()))
-        .unwrap();
-    let bound = bound.lock().unwrap();
+    let obs = xr0_observation(&z, "00_obs/", task, noise.clone());
+    let a = pipeline.infer(&obs).unwrap();
+    let recorded = bound.lock().unwrap().clone();
+    assert_special_tasks_refused(
+        &mut pipeline,
+        &specials,
+        &[
+            "<|image_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|video_pad|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<cot>",
+            "</cot>",
+        ],
+        &obs,
+    );
+    let bound = recorded;
     let get = |name: &str| {
         bound
             .iter()
@@ -1759,4 +1793,41 @@ fn xr0_gpu_f32_load_is_an_error_in_its_own_process() {
             assert!(m.contains("try without --precision f32"), "{m}");
         }
     }
+}
+
+/// Every special token of the package's tokenizer, and the named structure
+/// strings, refused in a task before it is templated; `base` stays served.
+fn assert_special_tasks_refused(
+    pipeline: &mut PolicyPipeline,
+    specials: &[String],
+    named: &[&str],
+    base: &Observation,
+) {
+    for n in named {
+        assert!(
+            specials.iter().any(|s| s == n) || n.starts_with("<cot") || n.starts_with("</cot"),
+            "{n} not read from the tokenizer"
+        );
+    }
+    let all: Vec<&str> = specials
+        .iter()
+        .map(String::as_str)
+        .chain(named.iter().copied())
+        .collect();
+    for sp in &all {
+        let mut obs = base.clone();
+        obs.prompt = format!("{} {sp} now", base.prompt);
+        let e = pipeline.infer(&obs).unwrap_err();
+        assert!(
+            matches!(e, EngineError::InvalidConfig(_))
+                && e.to_string().contains("the task contains"),
+            "{sp}: {e}"
+        );
+    }
+    eprintln!(
+        "refused {} special-token tasks ({} from the tokenizer)",
+        all.len(),
+        specials.len()
+    );
+    pipeline.infer(base).unwrap();
 }

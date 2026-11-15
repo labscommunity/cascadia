@@ -135,6 +135,18 @@ Loading rules:
 | `xr0_denormalize` | Intel's `XR0Postprocessor`: `action · (std + action_eps) + mean` in f32 with per-timestep `[T, D]` stats (which must match the graph's output at load), then the first `action_dim` values of a row. `action_mode: delta` (needs a state passthrough output) and unknown parameters refuse the load; all-identity stats are a placeholder. |
 | `xvla_rotation_6d_to_axis_angle` | Ours, ported from LeRobot's step of that name. Each action row (at least `max(expected_action_dim, 10)` wide, checked at load) becomes 7 values: position `[0:3]` as is; the 6-D rotation `[3:9]` to axis-angle (Gram-Schmidt with LeRobot's `1e-6` eps, the quaternion as the top eigenvector of Bar-Itzhack's K with `w ≥ 0`, then axis × angle), in f64; the gripper `[9]` as 1 above 0.5, else −1. Near π the axis-angle sign follows `w ≥ 0`, as in LeRobot. |
 
+### Templated prompts
+
+`vla_jepa_prompt` and `xr0` put the task into a chat template, so a task that spells a special token
+(`<|image_pad|>`, `<|im_end|>`, `<|embodied_action|>`, …) would be tokenized as structure: image
+features would land in the wrong positions or the template would end early, and the model would
+get a silently wrong input. Such a task is refused (an error frame, checked once per task text like
+the length). The set is read from the package, not guessed: the strings in the tokenizer IR's
+`SpecialTokensSplit` pattern, `added_tokens` of a `tokenizer.json` beside it, and every `<…>`
+marker of the template itself (`<cot>`); a package whose tokenizer declares none is refused at
+load. Behind that, every call's ids must carry each single-token marker exactly as often as the
+template does (XR0: 64 image pads per camera, checked at load; VLA-JEPA: 32 embodied tokens).
+
 ### Port layouts
 
 Each policy kind names one port layout; the layout has its own port check (`bind_*`) and its own
