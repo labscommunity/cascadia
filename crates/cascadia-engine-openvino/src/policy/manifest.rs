@@ -20,6 +20,7 @@ pub enum PolicyKind {
     Pi0,
     SmolVla,
     Xvla,
+    VlaJepa,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +75,26 @@ pub struct SmolVlaResizeStep {
     pub num_cameras: i64,
 }
 
+/// VLA-JEPA's host inputs (Intel's `VLAJEPAPreprocessor` without the
+/// prompt, tokenizer and noise, which are their own steps here).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VlaJepaInputsStep {
+    /// Camera feature keys (`images.<name>`) in training order.
+    pub image_keys: Vec<String>,
+    /// The token whose positions the action head reads.
+    pub embodied_token_id: i64,
+    pub num_embodied_tokens: usize,
+    /// `[height, width]` frames arrive at.
+    pub image_resolution: [u32; 2],
+    /// `[height, width]` the vision encoder takes; a multiple of `patch_size * merge_size`.
+    pub vision_resolution: [u32; 2],
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub patch_size: usize,
+    pub merge_size: usize,
+    pub temporal_patch_size: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PreStep {
     Normalize(StatsStep),
@@ -92,6 +113,11 @@ pub enum PreStep {
     ImageFlip {
         cameras: Vec<String>,
     },
+    /// The prompt is `template` with every `{instruction}` replaced by the task.
+    VlaJepaPrompt {
+        template: String,
+    },
+    VlaJepaInputs(VlaJepaInputsStep),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -139,6 +165,7 @@ pub enum ImageStep<'a> {
     /// `pi05` or `pi0`: centre padding, `empty_cameras` dummy slots.
     Pi05(&'a Pi05Step),
     SmolVlaResize(&'a SmolVlaResizeStep),
+    VlaJepa(&'a VlaJepaInputsStep),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -270,6 +297,7 @@ impl PolicyManifest {
             .find_map(|s| match s {
                 PreStep::Pi05(p) | PreStep::Pi0(p) => Some(ImageStep::Pi05(p)),
                 PreStep::SmolVlaResize(p) => Some(ImageStep::SmolVlaResize(p)),
+                PreStep::VlaJepaInputs(p) => Some(ImageStep::VlaJepa(p)),
                 _ => None,
             })
             .expect("parse guarantees one image step")
@@ -322,12 +350,16 @@ impl PolicyManifest {
         let images = count(|s| {
             matches!(
                 s,
-                PreStep::Pi05(_) | PreStep::Pi0(_) | PreStep::SmolVlaResize(_)
+                PreStep::Pi05(_)
+                    | PreStep::Pi0(_)
+                    | PreStep::SmolVlaResize(_)
+                    | PreStep::VlaJepaInputs(_)
             )
         });
         if images != 1 {
             return refuse(format!(
-                "{images} image steps (pi05 / pi0 / smolvla_resize); expected exactly one"
+                "{images} image steps (pi05 / pi0 / smolvla_resize / vla_jepa_inputs); \
+                 expected exactly one"
             ));
         }
         let tokenizers = count(|s| matches!(s, PreStep::OvTokenizer { .. }));
@@ -355,6 +387,54 @@ impl PolicyManifest {
         if rotations > 1 {
             return refuse("more than one xvla_rotation_6d_to_axis_angle");
         }
+        self.check_vla_jepa()
+    }
+
+    /// VLA-JEPA's graph normalizes the state and returns final actions, so a
+    /// stats step or an action transform would be applied twice; its steps
+    /// belong to it alone.
+    fn check_vla_jepa(&self) -> EngineResult<()> {
+        let jepa =
+            |s: &PreStep| matches!(s, PreStep::VlaJepaPrompt { .. } | PreStep::VlaJepaInputs(_));
+        if self.policy != PolicyKind::VlaJepa {
+            return match self.preprocessors.iter().find(|s| jepa(s)) {
+                Some(_) => {
+                    refuse("vla_jepa_prompt and vla_jepa_inputs need policy.name \"vlajepa\"")
+                }
+                None => Ok(()),
+            };
+        }
+        let prompts = self
+            .preprocessors
+            .iter()
+            .filter(|s| matches!(s, PreStep::VlaJepaPrompt { .. }))
+            .count();
+        if prompts != 1 {
+            return refuse(format!(
+                "{prompts} vla_jepa_prompt steps; vlajepa needs exactly one"
+            ));
+        }
+        if let Some(s) = self
+            .preprocessors
+            .iter()
+            .find(|s| !jepa(s) && !matches!(s, PreStep::OvTokenizer { .. } | PreStep::Noise { .. }))
+        {
+            return refuse(format!(
+                "vlajepa takes only vla_jepa_prompt, ov_tokenizer, vla_jepa_inputs and noise; \
+                 found {}",
+                pre_name(s)
+            ));
+        }
+        if let Some(s) = self
+            .postprocessors
+            .iter()
+            .find(|s| !matches!(s, PostStep::ActionChunkTrimmer { .. }))
+        {
+            return refuse(format!(
+                "vlajepa's graph returns final actions; found postprocessor {}",
+                post_name(s)
+            ));
+        }
         Ok(())
     }
 
@@ -375,6 +455,29 @@ impl PolicyManifest {
             }
         }
         Ok(())
+    }
+}
+
+fn pre_name(s: &PreStep) -> &'static str {
+    match s {
+        PreStep::Normalize(_) => "normalize",
+        PreStep::Pi05(_) => "pi05",
+        PreStep::Pi0(_) => "pi0",
+        PreStep::SmolVlaResize(_) => "smolvla_resize",
+        PreStep::NewLine => "new_line",
+        PreStep::Noise { .. } => "noise",
+        PreStep::OvTokenizer { .. } => "ov_tokenizer",
+        PreStep::ImageFlip { .. } => "image_flip",
+        PreStep::VlaJepaPrompt { .. } => "vla_jepa_prompt",
+        PreStep::VlaJepaInputs(_) => "vla_jepa_inputs",
+    }
+}
+
+fn post_name(s: &PostStep) -> &'static str {
+    match s {
+        PostStep::Denormalize(_) => "denormalize",
+        PostStep::ActionChunkTrimmer { .. } => "action_chunk_trimmer",
+        PostStep::XvlaRotation6dToAxisAngle { .. } => "xvla_rotation_6d_to_axis_angle",
     }
 }
 
@@ -434,8 +537,9 @@ fn policy_kind(policy: Option<&Value>) -> EngineResult<PolicyKind> {
         Some("pi0") => Ok(PolicyKind::Pi0),
         Some("smolvla") => Ok(PolicyKind::SmolVla),
         Some("xvla") => Ok(PolicyKind::Xvla),
+        Some("vlajepa") => Ok(PolicyKind::VlaJepa),
         other => refuse(format!(
-            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla"
+            "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla, vlajepa"
         )),
     }
 }
@@ -456,6 +560,8 @@ const COMPONENTS: &[(&str, Option<&str>)] = &[
     ("action_chunk_trimmer", Some("ActionChunkTrimmer")),
     ("image_flip", None),
     ("xvla_rotation_6d_to_axis_angle", None),
+    ("vla_jepa_prompt", None),
+    ("vla_jepa_inputs", None),
 ];
 
 fn short_name(class_path: &str) -> Option<&'static str> {
@@ -623,6 +729,27 @@ struct XvlaRotationParams {
     expected_action_dim: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VlaJepaPromptParams {
+    template: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VlaJepaInputsParams {
+    image_keys: Vec<String>,
+    embodied_token_id: i64,
+    num_embodied_tokens: i64,
+    image_resolution: [u32; 2],
+    vision_resolution: [u32; 2],
+    image_mean: [f64; 3],
+    image_std: [f64; 3],
+    patch_size: u32,
+    merge_size: u32,
+    temporal_patch_size: u32,
+}
+
 fn xvla_row_read() -> i64 {
     XVLA_ROW_READ as i64
 }
@@ -685,7 +812,67 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
             }
             PreStep::ImageFlip { cameras: p.cameras }
         }
+        "vla_jepa_prompt" => {
+            let p: VlaJepaPromptParams = typed(params, &ctx)?;
+            if !p.template.contains("{instruction}") {
+                return refuse(format!("{ctx}: template has no {{instruction}}"));
+            }
+            PreStep::VlaJepaPrompt {
+                template: p.template,
+            }
+        }
+        "vla_jepa_inputs" => PreStep::VlaJepaInputs(vla_jepa_inputs_step(params, &ctx)?),
         other => return refuse(format!("{ctx}: {other} is not a preprocessor")),
+    })
+}
+
+fn vla_jepa_inputs_step(params: Map<String, Value>, ctx: &str) -> EngineResult<VlaJepaInputsStep> {
+    let p: VlaJepaInputsParams = typed(params, ctx)?;
+    if p.image_keys.is_empty() {
+        return refuse(format!("{ctx}: image_keys is empty"));
+    }
+    if p.embodied_token_id < 0 {
+        return refuse(format!("{ctx}: embodied_token_id is negative"));
+    }
+    if p.num_embodied_tokens < 1 {
+        return refuse(format!("{ctx}: num_embodied_tokens must be at least 1"));
+    }
+    if p.patch_size == 0 || p.merge_size == 0 || p.temporal_patch_size == 0 {
+        return refuse(format!(
+            "{ctx}: patch_size, merge_size and temporal_patch_size must be at least 1"
+        ));
+    }
+    check_resolution(Some(p.image_resolution), ctx)?;
+    let unit = p.patch_size * p.merge_size;
+    if p.vision_resolution.iter().any(|&d| d == 0 || d % unit != 0) {
+        return refuse(format!(
+            "{ctx}: vision_resolution {:?} is not a multiple of patch_size * merge_size ({unit})",
+            p.vision_resolution
+        ));
+    }
+    let (mean, std) = (
+        p.image_mean.map(|x| x as f32),
+        p.image_std.map(|x| x as f32),
+    );
+    if mean.iter().any(|x| !x.is_finite()) {
+        return refuse(format!("{ctx}: image_mean {mean:?} is not finite"));
+    }
+    if std.iter().any(|x| !x.is_finite() || *x == 0.0) {
+        return refuse(format!(
+            "{ctx}: image_std {std:?} must be finite and non-zero"
+        ));
+    }
+    Ok(VlaJepaInputsStep {
+        image_keys: p.image_keys,
+        embodied_token_id: p.embodied_token_id,
+        num_embodied_tokens: p.num_embodied_tokens as usize,
+        image_resolution: p.image_resolution,
+        vision_resolution: p.vision_resolution,
+        image_mean: mean,
+        image_std: std,
+        patch_size: p.patch_size as usize,
+        merge_size: p.merge_size as usize,
+        temporal_patch_size: p.temporal_patch_size as usize,
     })
 }
 
@@ -883,6 +1070,8 @@ mod tests {
         include_str!("../../tests/fixtures/policy/pi05-droid-placeholder-manifest.json");
     const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
     const XVLA_LIBERO: &str = include_str!("../../tests/fixtures/policy/xvla-libero-manifest.json");
+    const VLAJEPA_LIBERO: &str =
+        include_str!("../../tests/fixtures/policy/vlajepa-libero-manifest.json");
 
     fn parse(v: &Value) -> EngineResult<PolicyManifest> {
         PolicyManifest::parse(&v.to_string(), LoadOptions::default())
@@ -1039,6 +1228,110 @@ mod tests {
         );
         assert_eq!(m.normalize().count(), 0);
         assert_eq!(m.output_features[0].shape, vec![30, 7]);
+    }
+
+    #[test]
+    fn vlajepa_libero_manifest_parses() {
+        let m = PolicyManifest::parse(VLAJEPA_LIBERO, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::VlaJepa);
+        assert_eq!(m.model_artifact, "vlajepa.xml");
+        assert_eq!(m.tokenizer_artifact(), "tokenizer.xml");
+        let PreStep::VlaJepaPrompt { template } = &m.preprocessors[0] else {
+            panic!("the prompt step comes first")
+        };
+        assert_eq!(template.matches("{instruction}").count(), 1);
+        assert_eq!(template.matches("<|embodied_action|>").count(), 32);
+        let ImageStep::VlaJepa(j) = m.image_step() else {
+            panic!("vla_jepa_inputs is the image step")
+        };
+        assert_eq!(
+            *j,
+            VlaJepaInputsStep {
+                image_keys: vec!["images.image".into(), "images.image2".into()],
+                embodied_token_id: 151697,
+                num_embodied_tokens: 32,
+                image_resolution: [224, 224],
+                vision_resolution: [256, 256],
+                image_mean: [0.5; 3],
+                image_std: [0.5; 3],
+                patch_size: 16,
+                merge_size: 2,
+                temporal_patch_size: 2,
+            }
+        );
+        assert!(m
+            .preprocessors
+            .contains(&PreStep::Noise { shape: vec![7, 7] }));
+        assert!(m.postprocessors.is_empty());
+        assert_eq!(m.normalize().count(), 0, "stats are graph constants");
+    }
+
+    #[test]
+    fn vlajepa_steps_are_validated() {
+        let jepa = || -> Value { serde_json::from_str(VLAJEPA_LIBERO).unwrap() };
+        let e = |v: &Value| err(v);
+        let mut v = jepa();
+        v["model"]["preprocessors"][0]["template"] = json!("no placeholder");
+        assert!(e(&v).contains("template has no {instruction}"));
+        let mut v = jepa();
+        v["model"]["preprocessors"][0]["prefix"] = json!("x");
+        assert!(e(&v).contains("unknown field `prefix`"));
+        for (key, bad, want) in [
+            (
+                "vision_resolution",
+                json!([256, 250]),
+                "not a multiple of patch_size * merge_size (32)",
+            ),
+            ("vision_resolution", json!([0, 256]), "not a multiple"),
+            (
+                "image_resolution",
+                json!([224, 0]),
+                "image_resolution has a zero",
+            ),
+            ("num_embodied_tokens", json!(0), "at least 1"),
+            ("embodied_token_id", json!(-1), "negative"),
+            ("patch_size", json!(0), "at least 1"),
+            ("image_std", json!([0.5, 0.0, 0.5]), "image_std"),
+            ("image_keys", json!([]), "image_keys is empty"),
+        ] {
+            let mut v = jepa();
+            v["model"]["preprocessors"][2][key] = bad;
+            assert!(e(&v).contains(want), "{key}: {}", e(&v));
+        }
+        let mut v = jepa();
+        v["model"]["preprocessors"][2]["resample"] = json!("bilinear");
+        assert!(e(&v).contains("unknown field `resample`"));
+        let mut v = jepa();
+        v["model"]["preprocessors"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("patch_size");
+        assert!(e(&v).contains("missing field `patch_size`"));
+        // Stats and action transforms belong to the graph.
+        let mut v = jepa();
+        v["model"]["preprocessors"].as_array_mut().unwrap().insert(
+            0,
+            json!({"type": "normalize", "stats": {"state": {"mean": [0.5], "std": [2.0]}}}),
+        );
+        assert!(e(&v).contains("found normalize"));
+        let mut v = jepa();
+        v["model"]["postprocessors"] = json!([{"type": "denormalize",
+            "stats": {"action": {"mean": [0.5], "std": [2.0]}}}]);
+        assert!(e(&v).contains("final actions; found postprocessor denormalize"));
+        let mut v = jepa();
+        v["model"]["preprocessors"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        assert!(e(&v).contains("0 vla_jepa_prompt steps"));
+        // The steps are vlajepa's alone, and ours: type form only.
+        let mut v = jepa();
+        v["policy"] = json!({"name": "smolvla"});
+        assert!(e(&v).contains("need policy.name \"vlajepa\""));
+        let mut v = jepa();
+        v["model"]["preprocessors"][2] =
+            json!({"class_path": "physicalai.inference.preprocessors.VLAJEPAPreprocessor"});
+        assert!(e(&v).contains("unsupported component class_path"));
     }
 
     #[test]
@@ -1295,6 +1588,7 @@ mod tests {
         let mut v = base();
         v["policy"] = json!({"name": "pi0_fast"});
         assert!(err(&v).contains("policy.name Some(\"pi0_fast\")"));
+        assert!(err(&v).contains("xvla, vlajepa"));
         let mut v = base();
         v["policy"] =
             json!({"source": {"class_path": "physicalai.policies.smolvla.policy.SmolVLA"}});

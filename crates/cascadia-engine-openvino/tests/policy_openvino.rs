@@ -3,16 +3,20 @@
 //! directory is unset:
 //! - `CASCADIA_POLICY_PACKAGE`: `HuggingFaceVLA/smolvla_libero` (physical-ai-studio `8f132416`);
 //! - `CASCADIA_POLICY_PACKAGE_PI0`: `lerobot/pi0_libero_finetuned_v044`;
-//! - `CASCADIA_POLICY_PACKAGE_XVLA`: `lerobot/xvla-libero`, cameras flipped on the host.
+//! - `CASCADIA_POLICY_PACKAGE_XVLA`: `lerobot/xvla-libero`, cameras flipped on the host;
+//! - `CASCADIA_POLICY_PACKAGE_VLAJEPA`: `lerobot/VLA-JEPA-LIBERO`, prompt padded to 288.
 //!
 //! The π0 and X-VLA references are the exporters' PyTorch f32 outputs, in the
-//! package's `ref.npz` (or `<dir>.ref.npz` beside it).
+//! package's `ref.npz` (or `<dir>.ref.npz` beside it). VLA-JEPA's are LeRobot's
+//! f32 inputs and actions, `torch_ref.npz`, for the raw `inputs.npz` (each in
+//! the package, or `<dir>.<name>` beside it).
 #![cfg(feature = "openvino")]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cascadia_engine::{EngineError, EngineResult, PolicyEngine, WARMUP_CALLS};
+use cascadia_engine_openvino::policy::manifest::PreStep;
 use cascadia_engine_openvino::policy::ov::OvTokenizer;
 use cascadia_engine_openvino::policy::pipeline::{
     HostTensor, NoiseRng, PolicyModel, PromptTokenizer, TensorData,
@@ -126,7 +130,7 @@ fn npz(bytes: &[u8], name: &str) -> Npy {
     let item = match &descr[1..] {
         "f4" => 4,
         "i8" => 8,
-        "b1" => 1,
+        "b1" | "u1" => 1,
         u if u.starts_with('U') => 4 * u[1..].parse::<usize>().unwrap(),
         other => panic!("dtype {other}"),
     };
@@ -980,4 +984,347 @@ fn a_failed_compile_is_a_load_error() {
     let m = e.to_string();
     eprintln!("{m}");
     assert!(m.contains("xvla.xml on GPU failed"), "{m}");
+}
+
+fn vla_jepa(test: &str) -> Option<PathBuf> {
+    package_from("CASCADIA_POLICY_PACKAGE_VLAJEPA", test)
+}
+
+/// `name` in the package, or `<dir>.<name>` beside it.
+fn beside(dir: &Path, name: &str) -> Vec<u8> {
+    let inside = dir.join(name);
+    let path = if inside.exists() {
+        inside
+    } else {
+        dir.with_extension(name)
+    };
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The six reference cases: three LIBERO tasks, two seeded noise draws each, one frame pair.
+const VLA_JEPA_CASES: usize = 6;
+
+/// Qwen's `<|endoftext|>`, the tokenizer IR's right padding.
+const QWEN_PAD: i64 = 151643;
+
+struct JepaRef {
+    inputs: Vec<u8>,
+    torch: Vec<u8>,
+}
+
+impl JepaRef {
+    fn load(dir: &Path) -> Self {
+        Self {
+            inputs: beside(dir, "inputs.npz"),
+            torch: beside(dir, "torch_ref.npz"),
+        }
+    }
+
+    fn observation(&self, case: usize) -> Observation {
+        let frame = |key: &str| {
+            let a = npz(&self.inputs, &format!("frame/images.{key}"));
+            assert_eq!(
+                (a.descr.as_str(), a.shape.as_slice()),
+                ("|u1", &[224, 224, 3][..])
+            );
+            Image {
+                height: 224,
+                width: 224,
+                data: a.data,
+            }
+        };
+        Observation {
+            images: vec![
+                ("image".into(), frame("image")),
+                ("image2".into(), frame("image2")),
+            ],
+            state: npz(&self.inputs, &format!("{case}/state")).f32s(),
+            prompt: npz(&self.inputs, &format!("{case}/task")).string(),
+            seed: None,
+            noise: Some(npz(&self.inputs, &format!("{case}/noise")).f32s()),
+        }
+    }
+
+    fn ids(&self, case: usize) -> Vec<i64> {
+        npz(&self.torch, &format!("{case}/input_ids")).i64s()
+    }
+
+    fn actions(&self, case: usize) -> Vec<f32> {
+        npz(&self.torch, &format!("{case}/actions")).f32s()
+    }
+}
+
+fn template(m: &PolicyManifest) -> String {
+    m.preprocessors
+        .iter()
+        .find_map(|s| match s {
+            PreStep::VlaJepaPrompt { template } => Some(template.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// Max abs diff and the rows whose gripper (dim 6, ±1) disagrees.
+fn jepa_diff(got: &[f32], want: &[f32]) -> (f32, usize) {
+    let flips = got
+        .chunks(7)
+        .zip(want.chunks(7))
+        .filter(|(g, w)| g[6].signum() != w[6].signum())
+        .count();
+    (max_abs_diff(got, want), flips)
+}
+
+/// The IR's `truncation` variable defaults on; the engine holds it off, so
+/// the count is exact: 288 tokens are served and 289 refused.
+#[test]
+fn vlajepa_spec_tokenizer_and_cpu_parity() {
+    let Some(dir) = vla_jepa("vlajepa_spec_tokenizer_and_cpu_parity") else {
+        return;
+    };
+    let r = JepaRef::load(&dir);
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let tpl = template(&manifest);
+    let mut tok = OvTokenizer::load(&dir.join("tokenizer.xml")).unwrap();
+    assert!(tok.has_truncation_state());
+    for case in 0..VLA_JEPA_CASES {
+        let want = r.ids(case);
+        let task = r.observation(case).prompt;
+        let t = tok.tokenize(&tpl.replace("{instruction}", &task)).unwrap();
+        let n = want.len();
+        assert_eq!(t.ids.len(), 288);
+        assert_eq!(&t.ids[..n], &want[..], "case {case} ids");
+        assert!(
+            t.ids[n..].iter().all(|&id| id == QWEN_PAD),
+            "case {case} padding"
+        );
+        assert!(t.mask[..n].iter().all(|&m| m) && t.mask[n..].iter().all(|&m| !m));
+    }
+    // " word" is one token: find the count that fills the port exactly.
+    let words = |k: usize| vec!["word"; k].join(" ");
+    let count = |tok: &mut OvTokenizer, k: usize| {
+        let t = tok
+            .tokenize(&tpl.replace("{instruction}", &words(k)))
+            .unwrap();
+        (t.ids.len(), t.mask.iter().filter(|&&m| m).count())
+    };
+    let fit = (1..200).find(|&k| count(&mut tok, k).1 == 288).unwrap();
+    assert_eq!(
+        count(&mut tok, fit + 1),
+        (289, 289),
+        "held-off truncation leaves it wider"
+    );
+
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let spec = engine.spec().clone();
+    assert_eq!(spec.cameras, vec!["image", "image2"]);
+    assert_eq!((spec.height, spec.width), (224, 224));
+    assert_eq!(spec.resize, ResizeConvention::Stretch);
+    assert_eq!(spec.state_len, 8);
+    assert_eq!(spec.chunk, [7, 7]);
+    assert_eq!(
+        (spec.noise, spec.noise_shape.clone()),
+        (NoiseMode::Input, Some(vec![7, 7]))
+    );
+    let mut worst = 0f32;
+    for case in 0..VLA_JEPA_CASES {
+        let a = engine.infer(&r.observation(case)).unwrap();
+        assert_eq!((a.steps, a.dim, a.actions.len()), (7, 7, 49));
+        let (d, flips) = jepa_diff(&a.actions, &r.actions(case));
+        eprintln!(
+            "vlajepa engine cpu f32 vs pytorch f32 case {case}: max abs {d} gripper flips {flips} infer_ms={:.0}",
+            a.infer_ms
+        );
+        assert_eq!(flips, 0, "case {case}");
+        worst = worst.max(d);
+    }
+    eprintln!(
+        "vlajepa engine cpu f32 vs pytorch f32: worst max abs {worst} over {VLA_JEPA_CASES} cases"
+    );
+    assert!(worst <= 2e-4, "max abs diff {worst}");
+
+    let mut obs = r.observation(0);
+    obs.prompt = words(fit);
+    engine.infer(&obs).unwrap();
+    obs.prompt = words(fit + 1);
+    let e = engine.infer(&obs).unwrap_err();
+    assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+    assert!(
+        e.to_string().contains("needs 289 tokens; the limit is 288"),
+        "{e}"
+    );
+}
+
+/// Records what the pipeline binds and answers with `output` as `[1, 7, 7]`.
+struct JepaRecorder {
+    inputs: Arc<Mutex<Vec<(String, HostTensor)>>>,
+    output: Arc<Mutex<Vec<f32>>>,
+}
+
+impl PolicyModel for JepaRecorder {
+    fn set_input(&mut self, name: &str, t: &HostTensor) -> EngineResult<()> {
+        self.inputs.lock().unwrap().push((name.into(), t.clone()));
+        Ok(())
+    }
+    fn infer(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+    fn output_f32(&mut self, _: &str) -> EngineResult<(Vec<usize>, Vec<f32>)> {
+        Ok((vec![1, 7, 7], self.output.lock().unwrap().clone()))
+    }
+}
+
+/// The engine's host steps bind every port as LeRobot prepared it: ids and
+/// embodied positions exact, pixel values within 1e-6, the state and noise
+/// as sent; the graph's actions are served untouched. No model run.
+#[test]
+fn vlajepa_engine_binds_the_reference_inputs() {
+    let Some(dir) = vla_jepa("vlajepa_engine_binds_the_reference_inputs") else {
+        return;
+    };
+    let r = JepaRef::load(&dir);
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let (device, config) = compile_config("CPU", None).unwrap();
+    let rt = Runtime::compile_inspected(
+        dir.join(&manifest.model_artifact).to_str().unwrap(),
+        &device,
+        None,
+        &config,
+    )
+    .unwrap();
+    let inputs: Vec<PortInfo> = (0..rt.input_count())
+        .map(|i| rt.input_port(i).unwrap())
+        .collect();
+    let outputs: Vec<PortInfo> = (0..rt.output_count())
+        .map(|i| rt.output_port(i).unwrap())
+        .collect();
+    drop(rt);
+    let tokenizer = OvTokenizer::load(&dir.join(manifest.tokenizer_artifact())).unwrap();
+    let bound = Arc::new(Mutex::new(Vec::new()));
+    let output = Arc::new(Mutex::new(vec![0.0; 49]));
+    let mut pipeline = PolicyPipeline::new(
+        manifest,
+        ServerFacts {
+            model: "vlajepa".into(),
+            device,
+            prompt_max_bytes: 1024,
+        },
+        Box::new(JepaRecorder {
+            inputs: bound.clone(),
+            output: output.clone(),
+        }),
+        &inputs,
+        &outputs,
+        false,
+        Box::new(tokenizer),
+    )
+    .unwrap();
+    for case in 0..VLA_JEPA_CASES {
+        let obs = r.observation(case);
+        *output.lock().unwrap() = r.actions(case);
+        bound.lock().unwrap().clear();
+        let a = pipeline.infer(&obs).unwrap();
+        assert_eq!(
+            a.actions,
+            r.actions(case),
+            "case {case}: actions served untouched"
+        );
+        let bound = bound.lock().unwrap();
+        let get = |name: &str| {
+            bound
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_else(|| panic!("{name} not bound"))
+        };
+        let ids = r.ids(case);
+        let n = ids.len();
+        let TensorData::I64(got) = get("input_ids").data else {
+            panic!("input_ids is i64")
+        };
+        assert_eq!(&got[..n], &ids[..], "case {case} input_ids");
+        assert!(got[n..].iter().all(|&id| id == QWEN_PAD));
+        let TensorData::I64(mask) = get("attention_mask").data else {
+            panic!("attention_mask is i64")
+        };
+        let want_mask = npz(&r.torch, &format!("{case}/attention_mask")).i64s();
+        assert_eq!(&mask[..n], &want_mask[..]);
+        assert!(mask[n..].iter().all(|&m| m == 0));
+        assert_eq!(
+            get("embodied_positions").data,
+            TensorData::I64(npz(&r.torch, &format!("{case}/embodied_positions")).i64s()),
+            "case {case} embodied_positions"
+        );
+        let px = get("pixel_values");
+        assert_eq!(px.shape, vec![512, 1536]);
+        let TensorData::F32(px) = px.data else {
+            panic!("pixel_values is f32")
+        };
+        let d = max_abs_diff(&px, &npz(&r.torch, &format!("{case}/pixel_values")).f32s());
+        eprintln!("vlajepa bound pixel_values case {case}: max abs {d}");
+        assert!(d <= 1e-6, "case {case} pixel_values differ by {d}");
+        assert_eq!(
+            get("state").data,
+            TensorData::F32(obs.state.clone()),
+            "raw state"
+        );
+        assert_eq!(
+            get("noise").data,
+            TensorData::F32(obs.noise.clone().unwrap())
+        );
+        let mut names: Vec<&str> = bound.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "attention_mask",
+                "embodied_positions",
+                "input_ids",
+                "noise",
+                "pixel_values",
+                "state"
+            ]
+        );
+    }
+}
+
+/// GPU f16 (the default) within 2e-3 of PyTorch f32 with no gripper flip
+/// (spike: 8.2e-4); GPU f32 within 1e-3 (spike: 1.65e-4).
+#[test]
+fn vlajepa_gpu_infer_f16_and_f32() {
+    let test = "vlajepa_gpu_infer_f16_and_f32";
+    let Some(dir) = vla_jepa(test) else {
+        return;
+    };
+    if !gpu_enabled(test) {
+        return;
+    }
+    let r = JepaRef::load(&dir);
+    for (precision, label, bound) in [(None, "f16", 2e-3f32), (Some(Precision::F32), "f32", 1e-3)] {
+        let opts = OvPolicyOptions {
+            device: "GPU".into(),
+            precision,
+            ..OvPolicyOptions::default()
+        };
+        let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+        let warm = engine.warmup().unwrap();
+        assert_eq!(warm.len(), WARMUP_CALLS);
+        let (mut worst, mut flips, mut ms) = (0f32, 0, 0.0);
+        for case in 0..VLA_JEPA_CASES {
+            let a = engine.infer(&r.observation(case)).unwrap();
+            assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
+            let (d, f) = jepa_diff(&a.actions, &r.actions(case));
+            worst = worst.max(d);
+            flips += f;
+            ms = a.infer_ms;
+        }
+        eprintln!(
+            "gpu vlajepa {label}: worst max abs {worst} gripper flips {flips} over \
+             {VLA_JEPA_CASES} cases infer_ms={ms:.1} warmup={warm:?}"
+        );
+        assert_eq!(flips, 0, "gpu vlajepa {label} gripper flips");
+        assert!(
+            worst <= bound,
+            "gpu vlajepa {label} max abs diff {worst} > {bound}"
+        );
+    }
 }

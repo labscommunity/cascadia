@@ -56,7 +56,10 @@ def quat2axisangle(quat):
 
 
 def resize_with_pad(img, height, width, convention):
-    """Bilinear resize keeping the aspect ratio, padded with 0: centred, or on the top and left."""
+    """Bilinear resize keeping the aspect ratio, padded with 0: centred, or on the top and left;
+    or a plain stretch."""
+    if convention == "stretch":
+        return np.asarray(Image.fromarray(img).resize((width, height), resample=Image.BILINEAR))
     h, w = img.shape[:2]
     ratio = max(w / width, h / height)
     rh, rw = int(h / ratio), int(w / ratio)

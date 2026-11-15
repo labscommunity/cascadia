@@ -55,6 +55,7 @@ impl CameraPlan {
         let (empty_cameras, smolvla) = match m.image_step() {
             ImageStep::Pi05(p) => (p.empty_cameras, None),
             ImageStep::SmolVlaResize(s) => (0, Some(s)),
+            ImageStep::VlaJepa(j) => return Self::from_keys(&j.image_keys),
         };
 
         if let Some(s) = smolvla.filter(|s| !s.image_key_reorder_map.is_empty()) {
@@ -147,6 +148,26 @@ impl CameraPlan {
             .chain(std::iter::repeat_n(None, dummies))
             .collect();
         Ok(Self::Fixed(CameraLayout { names, slots }))
+    }
+
+    /// `vla_jepa_inputs.image_keys`: every key a camera, in that order, no dummies.
+    fn from_keys(keys: &[String]) -> EngineResult<Self> {
+        let mut names: Vec<String> = Vec::new();
+        for key in keys {
+            let Some(name) = advertised(key) else {
+                return refuse(format!(
+                    "image key {key:?} is neither `images` nor `images.<name>`"
+                ));
+            };
+            if names.contains(&name) {
+                return refuse(format!("camera {name:?} declared twice"));
+            }
+            names.push(name);
+        }
+        Ok(Self::Fixed(CameraLayout {
+            slots: (0..names.len()).map(Some).collect(),
+            names,
+        }))
     }
 
     /// Settle the layout against the IR's `images` slot count (its first dimension).

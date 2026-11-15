@@ -10,12 +10,15 @@ use cascadia_ov_genai_shim::{DType, PluginConfig, PortInfo};
 use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec};
 
 use super::cameras::{images_tensor, CameraLayout};
-use super::manifest::{PolicyKind, PolicyManifest, PostStep, PreStep, XVLA_ACTION_DIM};
+use super::manifest::{
+    ImageStep, PolicyKind, PolicyManifest, PostStep, PreStep, VlaJepaInputsStep, XVLA_ACTION_DIM,
+};
 use super::spec::{derive_spec, IrFacts, ServerFacts};
 use super::steps::{
     denormalize, new_line, normalize, pi05_bins, pi05_prompt, trim_actions,
     xvla_rotation_6d_to_axis_angle, NUM_BINS,
 };
+use super::vla_jepa::VlaJepaHost;
 
 /// Longest prompt a request may carry, in UTF-8 bytes.
 pub const PROMPT_MAX_BYTES: usize = 1024;
@@ -31,6 +34,10 @@ pub const PROMPT_MASK: &str = "tokenized_prompt_mask";
 pub const IMAGES: &str = "images";
 pub const IMAGE_MASKS: &str = "image_masks";
 pub const ACTION: &str = "action";
+pub const INPUT_IDS: &str = "input_ids";
+pub const ATTENTION_MASK: &str = "attention_mask";
+pub const PIXEL_VALUES: &str = "pixel_values";
+pub const EMBODIED_POSITIONS: &str = "embodied_positions";
 
 /// Every warmup state value. Not zero: X-VLA's LIBERO export reads part of the
 /// state as a rotation vector and divides by its norm behind a `1e-8` guard
@@ -147,6 +154,10 @@ pub enum PortLayout {
     /// SmolVLA, π0.5, π0, X-VLA: `state` (normalized), `tokenized_prompt`,
     /// `tokenized_prompt_mask`, `images`, `image_masks`, optional `noise`.
     ImageSlots,
+    /// VLA-JEPA: `input_ids` and `attention_mask` (both i64), `pixel_values
+    /// [n_cameras * patches, feature]`, `embodied_positions`, the raw `state`
+    /// (the graph normalizes it), `noise`; `action` is final.
+    VlaJepa,
 }
 
 impl PortLayout {
@@ -155,6 +166,7 @@ impl PortLayout {
             PolicyKind::Pi05 | PolicyKind::Pi0 | PolicyKind::SmolVla | PolicyKind::Xvla => {
                 Self::ImageSlots
             }
+            PolicyKind::VlaJepa => Self::VlaJepa,
         }
     }
 }
@@ -228,7 +240,85 @@ pub fn bind(
 ) -> EngineResult<(PortBinding, IrFacts)> {
     match PortLayout::of(m.policy) {
         PortLayout::ImageSlots => bind_ports(inputs, outputs, has_random_uniform),
+        PortLayout::VlaJepa => match m.image_step() {
+            ImageStep::VlaJepa(step) => bind_vla_jepa(step, inputs, outputs, has_random_uniform),
+            _ => refuse("vlajepa needs a vla_jepa_inputs step"),
+        },
     }
+}
+
+/// [`PortLayout::VlaJepa`]: the ports `step` fills, checked against its geometry.
+pub fn bind_vla_jepa(
+    step: &VlaJepaInputsStep,
+    inputs: &[PortInfo],
+    outputs: &[PortInfo],
+    has_random_uniform: bool,
+) -> EngineResult<(PortBinding, IrFacts)> {
+    refuse_unknown_inputs(
+        inputs,
+        &[
+            INPUT_IDS,
+            ATTENTION_MASK,
+            PIXEL_VALUES,
+            EMBODIED_POSITIONS,
+            STATE,
+            NOISE,
+        ],
+    )?;
+    let state = dims(inputs, STATE, &[DType::F32], 2, Some(0))?;
+    let state_len = fixed(state[1], "the state length")?;
+    let ids = dims(inputs, INPUT_IDS, &[DType::I64], 2, Some(0))?;
+    let prompt_len = fixed(ids[1], "the input_ids length")?;
+    let mask = dims(inputs, ATTENTION_MASK, &[DType::I64], 2, Some(0))?;
+    if mask[1] != Some(prompt_len) {
+        return refuse(format!(
+            "attention_mask length {:?} differs from input_ids' {prompt_len}",
+            mask[1]
+        ));
+    }
+    let host = VlaJepaHost::new(step);
+    let px = dims(inputs, PIXEL_VALUES, &[DType::F32], 2, None)?;
+    let rows = fixed(px[0], "the pixel_values row count")?;
+    let feature = fixed(px[1], "the pixel_values width")?;
+    if feature != host.feature() {
+        return refuse(format!(
+            "pixel_values rows are {feature} wide; vla_jepa_inputs makes {}",
+            host.feature()
+        ));
+    }
+    if rows == 0 || rows % host.patches() != 0 {
+        return refuse(format!(
+            "pixel_values has {rows} rows, not a whole number of cameras of {} patches",
+            host.patches()
+        ));
+    }
+    let embodied = dims(inputs, EMBODIED_POSITIONS, &[DType::I64], 2, Some(0))?;
+    let embodied = fixed(embodied[1], "the embodied_positions length")?;
+    if embodied != step.num_embodied_tokens {
+        return refuse(format!(
+            "embodied_positions takes {embodied}; num_embodied_tokens is {}",
+            step.num_embodied_tokens
+        ));
+    }
+    let noise_shape = noise_dims(inputs)?;
+    let action_shape = action_dims(outputs)?;
+    let noise = noise_mode(&noise_shape, has_random_uniform);
+    Ok((
+        PortBinding {
+            layout: PortLayout::VlaJepa,
+            noise: noise_shape.is_some(),
+            prompt_port: INPUT_IDS,
+            prompt_len,
+        },
+        IrFacts {
+            image_slots: rows / host.patches(),
+            image_hw: None,
+            state_len,
+            action_shape,
+            noise,
+            noise_shape,
+        },
+    ))
 }
 
 /// Inputs no layout lists refuse the load: the engine would leave them unset.
@@ -430,11 +520,15 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
                 };
                 text = pi05_prompt(&text, &bins);
             }
+            PreStep::VlaJepaPrompt { template } => {
+                text = template.replace("{instruction}", &text);
+            }
             PreStep::OvTokenizer { .. } => break,
             PreStep::Pi0(_)
             | PreStep::SmolVlaResize(_)
             | PreStep::Noise { .. }
-            | PreStep::ImageFlip { .. } => {}
+            | PreStep::ImageFlip { .. }
+            | PreStep::VlaJepaInputs(_) => {}
         }
     }
     Ok(text)
@@ -451,6 +545,8 @@ pub struct PolicyPipeline {
     action_shape: [usize; 2],
     model: Option<Box<dyn PolicyModel>>,
     tokenizer: Option<Box<dyn PromptTokenizer>>,
+    /// [`PortLayout::VlaJepa`]'s precomputed pixel geometry.
+    vla_jepa: Option<VlaJepaHost>,
     /// Task text to the refusal message, `None` when it fits.
     prompt_checks: HashMap<String, Option<String>>,
 }
@@ -470,11 +566,18 @@ impl PolicyPipeline {
             .iter()
             .position(|s| matches!(s, PreStep::OvTokenizer { .. }))
             .expect("parse guarantees one ov_tokenizer");
-        if manifest.preprocessors[tok_at..]
-            .iter()
-            .any(|s| matches!(s, PreStep::NewLine | PreStep::Pi05(_) | PreStep::Pi0(_)))
-        {
-            return refuse("a prompt step (new_line / pi05 / pi0) comes after ov_tokenizer");
+        if manifest.preprocessors[tok_at..].iter().any(|s| {
+            matches!(
+                s,
+                PreStep::NewLine
+                    | PreStep::Pi05(_)
+                    | PreStep::Pi0(_)
+                    | PreStep::VlaJepaPrompt { .. }
+            )
+        }) {
+            return refuse(
+                "a prompt step (new_line / pi05 / pi0 / vla_jepa_prompt) comes after ov_tokenizer",
+            );
         }
         let (binding, ir) = bind(&manifest, inputs, outputs, has_random_uniform)?;
         // Otherwise a tokenizer padded for another port loads and every infer fails.
@@ -487,6 +590,22 @@ impl PolicyPipeline {
                 binding.prompt_len
             ));
         }
+        let vla_jepa = match manifest.image_step() {
+            ImageStep::VlaJepa(step) => {
+                let host = VlaJepaHost::new(step);
+                // The template alone must carry the embodied tokens the IR reads.
+                let text = prompt_text(&manifest, "", &[], false)?;
+                host.embodied_positions(&tokenizer.tokenize(&text)?.ids)
+                    .map_err(|e| match e {
+                        EngineError::InvalidConfig(m) => {
+                            EngineError::InvalidConfig(format!("policy model: the empty task: {m}"))
+                        }
+                        other => other,
+                    })?;
+                Some(host)
+            }
+            _ => None,
+        };
         let (spec, layout) = derive_spec(&manifest, &ir, server)?;
         let flip = layout
             .names
@@ -502,6 +621,7 @@ impl PolicyPipeline {
             action_shape: ir.action_shape,
             model: Some(model),
             tokenizer: Some(tokenizer),
+            vla_jepa,
             prompt_checks: HashMap::new(),
         })
     }
@@ -520,15 +640,20 @@ impl PolicyPipeline {
         let tokens = tok.tokenize(&text)?;
         let count = tokens.mask.iter().filter(|&&m| m).count();
         let limit = self.binding.prompt_len;
+        // A VLA-JEPA prompt carries no state, so its count is exact.
+        let worst = if self.binding.layout == PortLayout::VlaJepa {
+            ""
+        } else {
+            " with the worst-case state"
+        };
         let refusal = if tok.has_truncation_state() {
-            (count > limit).then(|| {
-                format!("the prompt needs {count} tokens with the worst-case state; the limit is {limit}")
-            })
+            (count > limit)
+                .then(|| format!("the prompt needs {count} tokens{worst}; the limit is {limit}"))
         } else {
             // An always-on Truncate op: a full mask is the only sign of a cut.
             (count >= limit).then(|| {
                 format!(
-                    "the prompt fills all {limit} tokens with the worst-case state and may be \
+                    "the prompt fills all {limit} tokens{worst} and may be \
                      truncated; the limit is {} tokens",
                     limit.saturating_sub(1)
                 )
@@ -622,6 +747,60 @@ impl PolicyPipeline {
         ])
     }
 
+    /// [`PortLayout::VlaJepa`] inputs, all but `noise`. The state goes in raw.
+    fn vla_jepa_feeds(
+        &mut self,
+        obs: &Observation,
+    ) -> EngineResult<Vec<(&'static str, HostTensor)>> {
+        let text = prompt_text(&self.manifest, &obs.prompt, &[], false)?;
+        let tokens = self.tokens(&text)?;
+        let host = self
+            .vla_jepa
+            .as_ref()
+            .expect("new builds the host for a vlajepa layout");
+        let positions = host.embodied_positions(&tokens.ids)?;
+        let pixels = host.pixel_values(&self.layout, &obs.images)?;
+        let limit = self.binding.prompt_len;
+        let rows = pixels.len() / host.feature();
+        Ok(vec![
+            (
+                INPUT_IDS,
+                HostTensor {
+                    shape: vec![1, limit],
+                    data: TensorData::I64(tokens.ids),
+                },
+            ),
+            (
+                ATTENTION_MASK,
+                HostTensor {
+                    shape: vec![1, limit],
+                    data: TensorData::I64(tokens.mask.iter().map(|&m| i64::from(m)).collect()),
+                },
+            ),
+            (
+                PIXEL_VALUES,
+                HostTensor {
+                    shape: vec![rows, host.feature()],
+                    data: TensorData::F32(pixels),
+                },
+            ),
+            (
+                EMBODIED_POSITIONS,
+                HostTensor {
+                    shape: vec![1, positions.len()],
+                    data: TensorData::I64(positions),
+                },
+            ),
+            (
+                STATE,
+                HostTensor {
+                    shape: vec![1, obs.state.len()],
+                    data: TensorData::F32(obs.state.clone()),
+                },
+            ),
+        ])
+    }
+
     fn run(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
         let start = Instant::now();
         if self.model.is_none() {
@@ -632,6 +811,7 @@ impl PolicyPipeline {
 
         let mut feeds = match self.binding.layout {
             PortLayout::ImageSlots => self.image_slot_feeds(obs)?,
+            PortLayout::VlaJepa => self.vla_jepa_feeds(obs)?,
         };
         if self.binding.noise {
             let dims = self
@@ -909,7 +1089,12 @@ mod tests {
         output: Vec<f32>,
     ) -> Rig {
         let log = Arc::new(Mutex::new(Log::default()));
-        let port_len = port_dims(&inputs, PROMPT)[1];
+        let ids = if super::port(&inputs, PROMPT).is_some() {
+            PROMPT
+        } else {
+            INPUT_IDS
+        };
+        let port_len = port_dims(&inputs, ids)[1];
         let engine = pipeline_with(
             manifest,
             (&inputs, &outputs),
@@ -1178,6 +1363,171 @@ mod tests {
             r.log.lock().unwrap().texts.last().unwrap(),
             "pick up the bowl"
         );
+    }
+
+    const VLAJEPA_LIBERO: &str =
+        include_str!("../../tests/fixtures/policy/vlajepa-libero-manifest.json");
+
+    /// The real ports of our VLA-JEPA LIBERO export.
+    fn vla_jepa_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+        (
+            vec![
+                port(INPUT_IDS, DType::I64, &[1, 288]),
+                port(ATTENTION_MASK, DType::I64, &[1, 288]),
+                port(PIXEL_VALUES, DType::F32, &[512, 1536]),
+                port(EMBODIED_POSITIONS, DType::I64, &[1, 32]),
+                port(STATE, DType::F32, &[1, 8]),
+                port(NOISE, DType::F32, &[1, 7, 7]),
+            ],
+            vec![port(ACTION, DType::F32, &[1, 7, 7])],
+        )
+    }
+
+    /// The fixture with a template the byte tokenizer can read: 32 bytes of 1 are the embodied tokens.
+    fn vla_jepa_manifest(markers: usize) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(VLAJEPA_LIBERO).unwrap();
+        v["model"]["preprocessors"][0]["template"] =
+            serde_json::json!(format!("T:{{instruction}};{}", "\u{1}".repeat(markers)));
+        v["model"]["preprocessors"][2]["embodied_token_id"] = serde_json::json!(1);
+        v.to_string()
+    }
+
+    fn vla_jepa() -> Rig {
+        let out: Vec<f32> = (0..49).map(|i| i as f32 / 49.0 - 0.5).collect();
+        rig_with(&vla_jepa_manifest(32), vla_jepa_ports(), false, true, out)
+    }
+
+    #[test]
+    fn vla_jepa_binds_its_own_ports_with_a_raw_state_and_final_actions() {
+        let mut r = vla_jepa();
+        let spec = r.engine.spec().clone();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!((spec.height, spec.width), (224, 224));
+        assert_eq!(spec.resize, cascadia_types::ResizeConvention::Stretch);
+        assert_eq!(spec.chunk, [7, 7]);
+        assert_eq!(
+            (spec.noise, spec.noise_shape.clone()),
+            (NoiseMode::Input, Some(vec![7, 7]))
+        );
+        let o = obs(&spec, "go");
+        let a = r.engine.infer(&o).unwrap();
+        let out: Vec<f32> = (0..49).map(|i| i as f32 / 49.0 - 0.5).collect();
+        assert_eq!((a.steps, a.dim), (7, 7));
+        assert_eq!(a.actions, out, "the graph's actions are served as they are");
+
+        let (inputs, _) = vla_jepa_ports();
+        for p in &inputs {
+            let t = input(&r.log, &p.aliases[0]);
+            let want: Vec<usize> = p.dims.iter().map(|d| d.unwrap()).collect();
+            assert_eq!(t.shape, want, "{}", p.aliases[0]);
+            assert_eq!(Some(t.dtype()), p.dtype, "{}", p.aliases[0]);
+        }
+        // The task goes into the template verbatim.
+        let text = format!("T:go;{}", "\u{1}".repeat(32));
+        assert_eq!(r.log.lock().unwrap().texts.last().unwrap(), &text);
+        let TensorData::I64(ids) = input(&r.log, INPUT_IDS).data else {
+            panic!("ids are i64")
+        };
+        assert_eq!(
+            &ids[..text.len()],
+            text.bytes().map(i64::from).collect::<Vec<_>>()
+        );
+        let TensorData::I64(mask) = input(&r.log, ATTENTION_MASK).data else {
+            panic!("the mask is i64")
+        };
+        assert!(
+            mask[..text.len()].iter().all(|&m| m == 1)
+                && mask[text.len()..].iter().all(|&m| m == 0)
+        );
+        assert_eq!(
+            input(&r.log, EMBODIED_POSITIONS).data,
+            TensorData::I64((5..37).collect())
+        );
+        assert_eq!(input(&r.log, STATE).data, TensorData::F32(o.state.clone()));
+        // image (value 10) fills the first 256 rows, image2 (20) the rest.
+        let px = input(&r.log, PIXEL_VALUES);
+        let v = f32s(&px);
+        let norm = |b: u8| (f32::from(b) / 255.0 - 0.5) / 0.5;
+        assert!((v[0] - norm(10)).abs() <= 1e-6 && (v[256 * 1536] - norm(20)).abs() <= 1e-6);
+        assert!(!r
+            .log
+            .lock()
+            .unwrap()
+            .inputs
+            .iter()
+            .any(|(n, _)| n == IMAGES || n == PROMPT));
+    }
+
+    #[test]
+    fn vla_jepa_prompt_length_is_exact_and_spelled_embodied_tokens_are_refused() {
+        // "T:" + task + ";" + 32 markers: 253 bytes of task fill the 288 ids exactly.
+        let mut r = vla_jepa();
+        let spec = r.engine.spec().clone();
+        r.engine.infer(&obs(&spec, &"a".repeat(253))).unwrap();
+        let e = r.engine.infer(&obs(&spec, &"a".repeat(254))).unwrap_err();
+        assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "prompt too long: the prompt needs 289 tokens; the limit is 288"
+        );
+        let e = r
+            .engine
+            .infer(&obs(&spec, "a\u{1}b"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("33 embodied-action tokens"), "{e}");
+    }
+
+    #[test]
+    fn vla_jepa_load_refuses_a_template_or_ports_that_disagree() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let load = |manifest: &str, (i, o): (Vec<PortInfo>, Vec<PortInfo>)| {
+            pipeline_with(manifest, (&i, &o), false, true, 288, &log, vec![0.0; 49])
+                .err()
+                .expect("must not load")
+                .to_string()
+        };
+        let e = load(&vla_jepa_manifest(31), vla_jepa_ports());
+        assert!(e.contains("the empty task: the prompt has 31"), "{e}");
+        let m = vla_jepa_manifest(32);
+        let with = |i: usize, p: PortInfo| {
+            let (mut inputs, outputs) = vla_jepa_ports();
+            inputs[i] = p;
+            (inputs, outputs)
+        };
+        for (ports, want) in [
+            (
+                with(1, port(ATTENTION_MASK, DType::Bool, &[1, 288])),
+                "expected [I64]",
+            ),
+            (
+                with(1, port(ATTENTION_MASK, DType::I64, &[1, 200])),
+                "differs from input_ids",
+            ),
+            (
+                with(2, port(PIXEL_VALUES, DType::F32, &[512, 1024])),
+                "1024 wide",
+            ),
+            (
+                with(2, port(PIXEL_VALUES, DType::F32, &[500, 1536])),
+                "500 rows",
+            ),
+            (
+                with(2, port(PIXEL_VALUES, DType::F32, &[768, 1536])),
+                "the model has 3",
+            ),
+            (
+                with(3, port(EMBODIED_POSITIONS, DType::I64, &[1, 16])),
+                "takes 16",
+            ),
+            (
+                with(0, port(PROMPT, DType::I64, &[1, 288])),
+                "not one the engine fills",
+            ),
+        ] {
+            let e = load(&m, ports);
+            assert!(e.contains(want), "{want}: {e}");
+        }
     }
 
     #[test]

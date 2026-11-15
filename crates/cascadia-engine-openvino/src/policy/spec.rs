@@ -10,7 +10,7 @@ use super::manifest::{ImageStep, PolicyManifest, PostStep, PreStep, StatsStep};
 /// Facts only the compiled model can give.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IrFacts {
-    /// First dimension of the `images` input.
+    /// First dimension of the `images` input (VLA-JEPA: cameras in `pixel_values`).
     pub image_slots: usize,
     /// `[H, W]` of the `images` input, when static.
     pub image_hw: Option<[u32; 2]>,
@@ -51,6 +51,7 @@ impl ManifestSpec {
         let (image_hw, resize) = match m.image_step() {
             ImageStep::Pi05(p) => (p.image_resolution, ResizeConvention::Center),
             ImageStep::SmolVlaResize(s) => (s.image_resolution, ResizeConvention::TopLeft),
+            ImageStep::VlaJepa(j) => (Some(j.image_resolution), ResizeConvention::Stretch),
         };
         let mut noise_shape: Option<Vec<usize>> = None;
         for step in &m.preprocessors {
@@ -280,6 +281,36 @@ mod tests {
         let m9 = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
         let e = derive_spec(&m9, &narrow, server()).unwrap_err().to_string();
         assert!(e.contains("at least 10 wide; they are 9"), "{e}");
+    }
+
+    #[test]
+    fn vlajepa_spec_is_a_plain_stretch_at_the_image_resolution() {
+        const VLAJEPA: &str =
+            include_str!("../../tests/fixtures/policy/vlajepa-libero-manifest.json");
+        let m = PolicyManifest::parse(VLAJEPA, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            image_slots: 2,
+            image_hw: None,
+            state_len: 8,
+            action_shape: [7, 7],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![7, 7]),
+        };
+        let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1)]);
+        assert_eq!((spec.height, spec.width), (224, 224));
+        assert_eq!(spec.resize, ResizeConvention::Stretch);
+        assert_eq!(spec.chunk, [7, 7]);
+        assert_eq!(spec.noise_shape, Some(vec![7, 7]));
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["resize"], "stretch");
+        // pixel_values holding a different number of cameras than image_keys.
+        let three = IrFacts {
+            image_slots: 3,
+            ..ir
+        };
+        assert!(derive_spec(&m, &three, server()).is_err());
     }
 
     #[test]

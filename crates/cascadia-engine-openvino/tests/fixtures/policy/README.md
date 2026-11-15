@@ -16,6 +16,9 @@ Copied, unmodified:
 - `xvla-libero-manifest.json`: our export of `lerobot/xvla-libero` (LeRobot 0.7.0 modules in
   Intel's manifest format), f32 with fp16 weights, `noise` as an input, `image2` flipped on the
   host by `image_flip`, actions served 7 wide by `xvla_rotation_6d_to_axis_angle`.
+- `vlajepa-libero-manifest.json`: our export of `lerobot/VLA-JEPA-LIBERO` (Intel's draft VLA-JEPA
+  exporter, physical-ai-studio PR 1416), f32 with fp16 weights, the prompt padded right to 288
+  tokens for a static graph; state normalization and action denormalization are graph constants.
 
 Generated:
 

@@ -8,6 +8,7 @@ pub mod ov;
 pub mod pipeline;
 pub mod spec;
 pub mod steps;
+pub mod vla_jepa;
 
 pub use cameras::{images_tensor, CameraLayout, CameraPlan};
 pub use manifest::{LoadOptions, PolicyKind, PolicyManifest};

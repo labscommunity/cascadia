@@ -55,9 +55,10 @@ pub enum NoiseMode {
     Constant,
 }
 
-/// The letterbox convention a client must resize with before sending frames.
+/// The convention a client must resize with before sending frames.
 ///
-/// Both are bilinear with pad value 0 applied before scaling to `[-1, 1]`.
+/// `Center` and `TopLeft` are bilinear letterboxes with pad value 0 applied
+/// before scaling to `[-1, 1]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResizeConvention {
@@ -65,6 +66,9 @@ pub enum ResizeConvention {
     Center,
     /// Padding on the top and left, content at the bottom right (`smolvla_resize`).
     TopLeft,
+    /// A plain stretch to `height x width`, no padding, aspect ratio not kept
+    /// (`vla_jepa_inputs`).
+    Stretch,
 }
 
 /// What a loaded policy accepts and returns; served as `GET /v1/policy/metadata`.
