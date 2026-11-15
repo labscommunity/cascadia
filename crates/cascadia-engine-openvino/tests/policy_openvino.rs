@@ -8,7 +8,8 @@
 //! - `CASCADIA_POLICY_PACKAGE_EVO1`: `zuoxingdong/evo1_libero`, cameras flipped on the host;
 //! - `CASCADIA_POLICY_PACKAGE_XR0`: `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`, fp16 weights;
 //! - `CASCADIA_POLICY_PACKAGE_GROOT`: `nvidia/GR00T-N1.7-LIBERO` (libero_spatial), Intel's
-//!   edge-ai-suites single-IR export, fp16 weights.
+//!   edge-ai-suites single-IR export, fp16 weights;
+//! - `CASCADIA_POLICY_PACKAGE_MOLMOACT2`: `allenai/MolmoAct2-LIBERO`, Intel's exporter, fp16 weights.
 //!
 //! The π0 and X-VLA references are the exporters' PyTorch f32 outputs, in the
 //! package's `ref.npz` (or `<dir>.ref.npz` beside it). VLA-JEPA's are LeRobot's
@@ -20,7 +21,10 @@
 //! `xr0-libero-f32.ref.npz` (same rule). GR00T's are NVIDIA's `Gr00tPolicy`
 //! (PyTorch f32) graph inputs, raw output and decoded actions in `ref.npz`, for
 //! the frames and states in `gr00t-frames.npz` (regenerated from the
-//! exporter's seeds; same rule).
+//! exporter's seeds; same rule). MolmoAct2's are Intel's runtime stages in
+//! `molmoact2-stages-f32.npz` (the exporter's `fixtures-f32.npz`, saved
+//! uncompressed) and the PyTorch f32 pipeline on a real LIBERO frame pair in
+//! `molmoact2-e2e.npz` (same rule).
 #![cfg(feature = "openvino")]
 
 use std::path::{Path, PathBuf};
@@ -2128,6 +2132,351 @@ fn gr00t_gpu_f32_load_is_an_error_in_its_own_process() {
             assert!(matches!(e, EngineError::Backend(_)), "{e}");
             let m = e.to_string();
             assert!(m.contains("gr00t.xml on GPU failed"), "{m}");
+            assert!(m.contains("try without --precision f32"), "{m}");
+        }
+    }
+}
+
+fn molmoact2(test: &str) -> Option<PathBuf> {
+    package_from("CASCADIA_POLICY_PACKAGE_MOLMOACT2", test)
+}
+
+/// A float `[1, 3, H, W]` frame as the uint8 HWC a client sends: Intel's
+/// `_resize` conversion, `clip(x · 255, 0, 255)` truncated.
+fn molmo_frame(a: &Npy) -> Image {
+    let (h, w) = (a.shape[2], a.shape[3]);
+    let px = a.f32s();
+    let scale = if px.iter().fold(f32::MIN, |m, &x| m.max(x)) <= 1.0 {
+        255.0
+    } else {
+        1.0
+    };
+    let mut hwc = vec![0u8; 3 * h * w];
+    for c in 0..3 {
+        for p in 0..h * w {
+            hwc[p * 3 + c] = (px[c * h * w + p] * scale).clamp(0.0, 255.0) as u8;
+        }
+    }
+    Image {
+        height: h as u32,
+        width: w as u32,
+        data: hwc,
+    }
+}
+
+fn molmo_observation(z: &[u8], prefix: &str, task: String) -> Observation {
+    Observation {
+        images: ["image", "wrist_image"]
+            .iter()
+            .map(|c| {
+                (
+                    c.to_string(),
+                    molmo_frame(&npz(z, &format!("{prefix}images.{c}"))),
+                )
+            })
+            .collect(),
+        state: npz(z, &format!("{prefix}state")).f32s(),
+        prompt: task,
+        seed: None,
+        noise: None,
+    }
+}
+
+/// The ports of our MolmoAct2 export.
+fn molmoact2_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+    let port = |name: &str, dtype, dims: &[usize]| PortInfo {
+        aliases: vec![name.into()],
+        dtype: Some(dtype),
+        dims: dims.iter().map(|&d| Some(d)).collect(),
+    };
+    (
+        vec![
+            port("input_ids", DType::I64, &[1, 650]),
+            port("attention_mask", DType::I64, &[1, 650]),
+            port("token_type_ids", DType::I64, &[1, 650]),
+            port("images", DType::F32, &[1, 2, 729, 588]),
+            port("token_pooling", DType::I64, &[1, 392, 4]),
+            port("action_dim_is_pad", DType::Bool, &[1, 32]),
+        ],
+        vec![port("action", DType::F32, &[1, 10, 7])],
+    )
+}
+
+/// Every stage of Intel's runtime, bit for bit: the prompt text, the
+/// tokenizer's ids, all six graph inputs; its postprocessor within 1e-6. No
+/// model run, so it needs no device.
+#[test]
+fn molmoact2_engine_binds_intels_stages() {
+    let Some(dir) = molmoact2("molmoact2_engine_binds_intels_stages") else {
+        return;
+    };
+    let z = beside(&dir, "molmoact2-stages-f32.npz");
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let task = npz(&z, "00_obs/task").string();
+    let obs = molmo_observation(&z, "00_obs/", task.clone());
+    let step = manifest
+        .preprocessors
+        .iter()
+        .find_map(|s| match s {
+            PreStep::MolmoAct2(p) => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        cascadia_engine_openvino::policy::molmoact2::render_prompt(&step, &task, &obs.state),
+        npz(&z, "01_MolmoAct2Preprocessor/task").string()
+    );
+    let mut tok = OvTokenizer::load(&dir.join(manifest.tokenizer_artifact())).unwrap();
+    let t = tok
+        .tokenize(&npz(&z, "01_MolmoAct2Preprocessor/task").string())
+        .unwrap();
+    assert_eq!(t.ids, npz(&z, "02_OVTokenizer/tokenized_prompt").i64s());
+    assert_eq!(
+        t.mask,
+        npz(&z, "02_OVTokenizer/tokenized_prompt_mask").bools()
+    );
+    let specials = tok.special_tokens();
+    let bound = Arc::new(Mutex::new(Vec::new()));
+    let (inputs, outputs) = molmoact2_ports();
+    let mut pipeline = PolicyPipeline::new(
+        manifest,
+        ServerFacts {
+            model: "molmoact2".into(),
+            device: "CPU".into(),
+            prompt_max_bytes: 1024,
+        },
+        Box::new(JepaRecorder {
+            inputs: bound.clone(),
+            output: Arc::new(Mutex::new(npz(&z, "90_runner/action").f32s())),
+            shape: vec![1, 10, 7],
+        }),
+        &inputs,
+        &outputs,
+        false,
+        Box::new(tok),
+    )
+    .unwrap();
+    let a = pipeline.infer(&obs).unwrap();
+    let got = bound.lock().unwrap().clone();
+    let get = |name: &str| {
+        got.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.data.clone())
+            .unwrap_or_else(|| panic!("{name} not bound"))
+    };
+    let stage = |name: &str| format!("03_MolmoAct2ModelInputs/{name}");
+    for name in [
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+        "token_pooling",
+    ] {
+        assert_eq!(
+            get(name),
+            TensorData::I64(npz(&z, &stage(name)).i64s()),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        get("images"),
+        TensorData::F32(npz(&z, &stage("images")).f32s()),
+        "images bit for bit"
+    );
+    assert_eq!(
+        get("action_dim_is_pad"),
+        TensorData::Bool(npz(&z, &stage("action_dim_is_pad")).bools())
+    );
+    assert_eq!((a.steps, a.dim), (10, 7));
+    let d = max_abs_diff(
+        &a.actions,
+        &npz(&z, "91_MolmoAct2Postprocessor/action").f32s(),
+    );
+    eprintln!("molmoact2 postprocess vs intel: max abs {d:e}");
+    assert!(d <= 1e-6, "molmoact2_postprocess differs by {d}");
+    assert_special_tasks_refused(
+        &mut pipeline,
+        &specials,
+        &[
+            "<|image|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<action_output>",
+            "<state_start>",
+            "<state_end>",
+            "<state_7>",
+            "<setup_start>",
+            "<control_end>",
+        ],
+        &obs,
+    );
+    // Lowercased by the task normalization, so still structure.
+    let mut upper = obs.clone();
+    upper.prompt = "pick <STATE_7> up".into();
+    let e = pipeline.infer(&upper).unwrap_err();
+    assert!(
+        e.to_string().contains("the task contains \"<state_7>\""),
+        "{e}"
+    );
+}
+
+/// CPU f32 with fp16 weights against the PyTorch f32 pipeline on a real LIBERO
+/// frame pair, as served; and the prompt limit: the tokenizer IR's
+/// `truncation` variable is held off, so 255 tokens are served and 256 refused.
+#[test]
+fn molmoact2_spec_prompt_limit_and_cpu_parity() {
+    let Some(dir) = molmoact2("molmoact2_spec_prompt_limit_and_cpu_parity") else {
+        return;
+    };
+    let z = beside(&dir, "molmoact2-e2e.npz");
+    let task = npz(&z, "task").string();
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let step = manifest
+        .preprocessors
+        .iter()
+        .find_map(|s| match s {
+            PreStep::MolmoAct2(p) => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let mut tok = OvTokenizer::load(&dir.join("tokenizer.xml")).unwrap();
+    assert!(tok.has_truncation_state());
+    let words = |k: usize| vec!["word"; k].join(" ");
+    let state = npz(&z, "obs_state").f32s();
+    let mut count = |k: usize| {
+        let text =
+            cascadia_engine_openvino::policy::molmoact2::render_prompt(&step, &words(k), &state);
+        let t = tok.tokenize(&text).unwrap();
+        (t.ids.len(), t.mask.iter().filter(|&&m| m).count())
+    };
+    let fit = (1..300).find(|&k| count(k).1 == 255).unwrap();
+    assert_eq!(
+        count(fit + 1),
+        (256, 256),
+        "held-off truncation leaves it wider"
+    );
+
+    // The IR alone on PyTorch's own graph inputs, compiled and dropped first.
+    let feeds: Vec<_> = [
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+        "images",
+        "token_pooling",
+        "action_dim_is_pad",
+    ]
+    .iter()
+    .map(|n| feed(&z, n, &format!("pre_{n}")))
+    .collect();
+    let (shape, raw) = ir_on_cpu(&dir.join("molmoact2.xml"), &feeds);
+    assert_eq!(shape, [1, 10, 7]);
+    let ir_diff = max_abs_diff(&raw, &npz(&z, "norm_actions").f32s());
+    eprintln!("molmoact2 IR cpu f32 vs pytorch f32 (normalized): max abs {ir_diff:.3e}");
+
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let spec = engine.spec().clone();
+    assert_eq!(spec.cameras, ["image", "wrist_image"]);
+    assert_eq!((spec.height, spec.width), (378, 378));
+    assert_eq!(spec.resize, ResizeConvention::Stretch);
+    assert_eq!((spec.state_len, spec.chunk), (8, [10, 7]));
+    assert_eq!(
+        (spec.noise, spec.noise_shape.clone()),
+        (NoiseMode::Constant, None)
+    );
+    let obs = molmo_observation(&z, "obs_", task);
+    let a = engine.infer(&obs).unwrap();
+    assert_eq!((a.steps, a.dim, a.actions.len()), (10, 7, 70));
+    let d = max_abs_diff(&a.actions, &npz(&z, "actions").f32s());
+    eprintln!(
+        "molmoact2 engine cpu f32 vs pytorch f32: max abs {d:.3e} infer_ms={:.0}",
+        a.infer_ms
+    );
+    // OpenVINO 2026.4.1's ARM CPU plugin computes this graph wrong: on macOS the IR
+    // alone is 0.61 off PyTorch on PyTorch's own inputs, while x86 is within 1e-3.
+    if cfg!(target_arch = "aarch64") {
+        eprintln!(
+            "skip the molmoact2 cpu parity bound on aarch64: the IR alone is {ir_diff:.3e} off \
+             (an ARM CPU plugin fault, not the host steps); x86 holds it"
+        );
+    } else {
+        assert!(ir_diff <= 1e-3, "IR max abs diff {ir_diff}");
+        assert!(d <= 1e-3, "max abs diff {d}");
+    }
+    let mut long = obs.clone();
+    long.prompt = words(fit + 1);
+    let e = engine.infer(&long).unwrap_err();
+    assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+    assert!(
+        e.to_string().contains("needs 256 tokens; the limit is 255"),
+        "{e}"
+    );
+    long.prompt = words(fit);
+    engine.infer(&long).unwrap();
+}
+
+/// MolmoAct2 on the GPU: f16 within 1e-2 of PyTorch f32 as served (spike:
+/// 9.9e-4 normalized). At `--precision f32` the GPU compile fails
+/// (`CL_INVALID_EVENT`), which must be a load error; that runs in a child
+/// process, as π0's does.
+#[test]
+fn molmoact2_gpu_infer_f16_and_f32_is_a_load_error() {
+    let test = "molmoact2_gpu_infer_f16_and_f32_is_a_load_error";
+    let Some(dir) = molmoact2(test) else {
+        return;
+    };
+    if !gpu_enabled(test) {
+        return;
+    }
+    let z = beside(&dir, "molmoact2-e2e.npz");
+    {
+        let opts = OvPolicyOptions {
+            device: "GPU".into(),
+            ..OvPolicyOptions::default()
+        };
+        let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+        let warm = engine.warmup().unwrap();
+        assert_eq!(warm.len(), WARMUP_CALLS);
+        let a = engine
+            .infer(&molmo_observation(&z, "obs_", npz(&z, "task").string()))
+            .unwrap();
+        assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
+        let d = max_abs_diff(&a.actions, &npz(&z, "actions").f32s());
+        eprintln!(
+            "gpu molmoact2 f16: max abs {d:.3e} infer_ms={:.1} warmup={warm:?}",
+            a.infer_ms
+        );
+        assert!(d <= 1e-2, "gpu molmoact2 f16 max abs diff {d} > 1e-2");
+    }
+    let child = "molmoact2_gpu_f32_load_is_an_error_in_its_own_process";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", child, "--ignored", "--nocapture"])
+        .output()
+        .unwrap();
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{child}: {}\n{stdout}",
+        out.status
+    );
+}
+
+#[test]
+#[ignore = "run by molmoact2_gpu_infer_f16_and_f32_is_a_load_error, in its own process"]
+fn molmoact2_gpu_f32_load_is_an_error_in_its_own_process() {
+    let dir = PathBuf::from(std::env::var_os("CASCADIA_POLICY_PACKAGE_MOLMOACT2").unwrap());
+    let opts = OvPolicyOptions {
+        device: "GPU".into(),
+        precision: Some(Precision::F32),
+        ..OvPolicyOptions::default()
+    };
+    match OvPolicyEngine::load(&dir, &opts) {
+        Ok(_) => panic!("gpu molmoact2 f32 compiled; expected it to fail on the Arc 140V"),
+        Err(e) => {
+            eprintln!("gpu molmoact2 f32 load error: {e}");
+            assert!(matches!(e, EngineError::Backend(_)), "{e}");
+            let m = e.to_string();
+            assert!(m.contains("molmoact2.xml on GPU failed"), "{m}");
             assert!(m.contains("try without --precision f32"), "{m}");
         }
     }

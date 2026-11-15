@@ -31,6 +31,9 @@ Copied, unmodified:
   (`decbb06f`, Isaac-GR00T `3df8b382`), f32 with fp16 weights, static shapes and named ports, the
   noise an input (`actions`). Built on NVIDIA Cosmos; licensed by NVIDIA Corporation under the
   NVIDIA Open Model License.
+- `molmoact2-libero-manifest.json`: Intel's export of `allenai/MolmoAct2-LIBERO` (revision
+  `0d24a92b`; physical-ai-studio `8f132416`, runtime `e3dd944`), f32 with fp16 weights, no noise
+  input (flow matching starts from zeros in the graph).
 
 Generated:
 

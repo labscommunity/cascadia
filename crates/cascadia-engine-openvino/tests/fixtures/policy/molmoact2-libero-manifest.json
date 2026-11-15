@@ -1,0 +1,296 @@
+{
+  "policy": {
+    "name": "molmoact2",
+    "source": {
+      "class_path": "physicalai.policies.molmoact2.policy.MolmoAct2"
+    }
+  },
+  "model": {
+    "runner": {
+      "class_path": "physicalai.inference.runners.single_pass.SinglePass"
+    },
+    "artifacts": {
+      "openvino": "molmoact2.xml"
+    },
+    "preprocessors": [
+      {
+        "type": "molmoact2",
+        "image_keys": [
+          "image",
+          "wrist_image"
+        ],
+        "state_stats": {
+          "mean": [
+            -0.04651878279191748,
+            0.034409066787269356,
+            0.7645525031210381,
+            2.9722094975655056,
+            -0.22046978549041713,
+            -0.1255794031738752,
+            0.026914253269017054,
+            -0.027190783616938205
+          ],
+          "std": [
+            0.10494395508556839,
+            0.1517661933220375,
+            0.378516707505034,
+            0.34427344187858827,
+            0.9069468516043042,
+            0.32539190149967406,
+            0.01417590382231912,
+            0.014058894296088888
+          ],
+          "min": [
+            -0.4828203022480011,
+            -0.3255046010017395,
+            0.008128180168569088,
+            0.35277295112609863,
+            -3.641430377960205,
+            -1.842738389968872,
+            -0.0013586411951109767,
+            -0.042040832340717316
+          ],
+          "max": [
+            0.21031762659549713,
+            0.39128610491752625,
+            1.3660105466842651,
+            3.6714255809783936,
+            3.560650587081909,
+            1.386339545249939,
+            0.04233968257904053,
+            0.0013633022317662835
+          ],
+          "q01": [
+            -0.31479429659059555,
+            -0.26691552643710226,
+            0.5194626050191016,
+            2.159994551314992,
+            -1.801294177865994,
+            -0.8949778881389838,
+            0.003382730811955442,
+            -0.04008920533069468
+          ],
+          "q99": [
+            0.1222615490116252,
+            0.3140223876046953,
+            1.042961724319958,
+            3.277638017923068,
+            1.724488202195691,
+            0.5659922739094448,
+            0.04009682017699841,
+            -0.003493522538066522
+          ],
+          "mask": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false
+          ]
+        },
+        "normalization_mode": "QUANTILES",
+        "image_size": [
+          378,
+          378
+        ],
+        "num_state_tokens": 256,
+        "setup_type": "single franka robotic arm in libero",
+        "control_mode": "delta end-effector pose",
+        "add_setup_tokens": true,
+        "add_control_tokens": true
+      },
+      {
+        "type": "ov_tokenizer",
+        "artifact": "tokenizer.xml"
+      },
+      {
+        "type": "molmoact2_inputs",
+        "max_action_dim": 32,
+        "action_dim": 7,
+        "bos_token_id": 151645,
+        "pad_token_id": 151643,
+        "image_placeholder_token_id": 154629,
+        "image_start_token_id": 154624,
+        "image_end_token_id": 154625,
+        "image_patch_id": 154626,
+        "image_col_id": 154627,
+        "low_res_image_start_token_id": 154628,
+        "frame_start_token_id": 154631,
+        "frame_end_token_id": 154632,
+        "image_low_res_id": 154630,
+        "image_size": [
+          378,
+          378
+        ],
+        "patch_size": 14,
+        "pooling_size": [
+          2,
+          2
+        ],
+        "image_mean": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "image_std": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "image_crop_mode": "resize",
+        "image_use_col_tokens": true,
+        "use_single_crop_col_tokens": false,
+        "use_single_crop_start_token": true,
+        "image_token_ids": [
+          154626,
+          154627,
+          154624,
+          154628,
+          154631,
+          154625,
+          154632,
+          154630
+        ]
+      }
+    ],
+    "postprocessors": [
+      {
+        "type": "molmoact2_postprocess",
+        "action_key": "action",
+        "action_stats": {
+          "mean": [
+            0.06278156570450202,
+            0.08684081017968912,
+            -0.09037305936952836,
+            0.0005407430783705141,
+            0.0056433796450358715,
+            -0.005229098518603562,
+            -0.04964072167678376
+          ],
+          "std": [
+            0.3355237114945633,
+            0.3784469867268323,
+            0.44472859911256607,
+            0.03924354049229973,
+            0.06339296407444922,
+            0.07797027713976648,
+            0.9987671529022402
+          ],
+          "min": [
+            -0.9375,
+            -0.9375,
+            -0.9375,
+            -0.2582142949104309,
+            -0.375,
+            -0.3675000071525574,
+            -1.0
+          ],
+          "max": [
+            0.9375,
+            0.9375,
+            0.9375,
+            0.3557142913341522,
+            0.375,
+            0.375,
+            1.0
+          ],
+          "q01": [
+            -0.6792031928846481,
+            -0.7736573115323259,
+            -0.8728073904104404,
+            -0.10277447185825356,
+            -0.15509810617083444,
+            -0.20289961475228455,
+            -1.0
+          ],
+          "q99": [
+            0.8536542808794264,
+            0.8637811051429717,
+            0.9363295547540081,
+            0.13045695485814487,
+            0.18015313802054606,
+            0.24129727661704234,
+            0.9999914155282784
+          ],
+          "mask": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false
+          ]
+        },
+        "normalization_mode": "QUANTILES"
+      }
+    ],
+    "input_features": [
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "VISUAL",
+          "shape": [
+            3,
+            378,
+            378
+          ],
+          "name": "images.image",
+          "dtype": "float32"
+        }
+      },
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "VISUAL",
+          "shape": [
+            3,
+            378,
+            378
+          ],
+          "name": "images.wrist_image",
+          "dtype": "float32"
+        }
+      },
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "STATE",
+          "shape": [
+            8
+          ],
+          "name": "state",
+          "dtype": "float32"
+        }
+      },
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "LANGUAGE",
+          "shape": [],
+          "name": "task",
+          "dtype": "string"
+        }
+      }
+    ],
+    "output_features": [
+      {
+        "class_path": "physicalai.inference.data.features.InferenceFeature",
+        "init_args": {
+          "ftype": "ACTION",
+          "shape": [
+            10,
+            7
+          ],
+          "name": "action",
+          "dtype": "float32"
+        }
+      }
+    ]
+  },
+  "format": "policy_package",
+  "version": "1.0"
+}

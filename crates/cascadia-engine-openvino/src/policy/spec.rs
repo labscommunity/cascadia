@@ -64,6 +64,10 @@ impl ManifestSpec {
                 let side = g.shortest_edge as u32;
                 (Some([side, side]), ResizeConvention::Center)
             }
+            ImageStep::MolmoAct2(s) => (
+                Some(s.image_size.map(|d| d as u32)),
+                ResizeConvention::Stretch,
+            ),
         };
         let mut noise_shape: Option<Vec<usize>> = None;
         for step in &m.preprocessors {

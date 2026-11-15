@@ -59,13 +59,14 @@ claims until a stats source is settled (open question 3).
 
 v1:
 - Packages with `"format": "policy_package"`, version `1.x`, runner `SinglePass`, artifact
-  `openvino`, policies `smolvla`, `pi05`, `pi0`, `xvla`, `evo1`, `vlajepa`, `xr0` and `gr00t_n1d7`.
-  Anything else is refused at load with a clear error. The π0, X-VLA, EVO1, VLA-JEPA and XR0 packages are our
+  `openvino`, policies `smolvla`, `pi05`, `pi0`, `xvla`, `evo1`, `vlajepa`, `xr0`, `gr00t_n1d7` and
+  `molmoact2`. Anything else is refused at load with a clear error. The π0, X-VLA, EVO1, VLA-JEPA and XR0 packages are our
   exports (Intel's runtime has no π0, X-VLA or EVO1, its VLA-JEPA preprocessor is a draft, and its
   XR0 export draws noise in the graph, which ours takes as an input); `xvla` and
   `evo1` take their cameras and prompt like `smolvla` (`evo1` strips the task with Python's
-  `str.strip()`, as LeRobot's EVO1 does). `vlajepa`, `xr0` and `gr00t_n1d7` have their own input
-  ports (see "Port layouts"). The `gr00t_n1d7` package is Intel's edge-ai-suites single-IR export of
+  `str.strip()`, as LeRobot's EVO1 does). `vlajepa`, `xr0`, `gr00t_n1d7` and `molmoact2` have their
+  own input ports (see "Port layouts"). The `molmoact2` package is Intel's own export, with its own
+  runtime steps. The `gr00t_n1d7` package is Intel's edge-ai-suites single-IR export of
   NVIDIA's checkpoint, saved with fp16 weights, static shapes and named ports.
 - Devices: GPU (default, f16 unless `--precision f32`) and CPU (always f32). NPU is refused:
   SmolVLA and π0.5 fail NPU compilation as exported, and X-VLA compiles but returns wrong actions.
@@ -97,6 +98,13 @@ v1:
   7.1e-3 off NVIDIA's model, a gap not yet traced. At `--precision f32` the GPU compile fails
   (`CL_INVALID_EVENT`), a load error as for π0. One package per embodiment and camera count.
   NVIDIA's licence notice (the package's `NOTICE`) is served as the metadata's `attribution`.
+- MolmoAct2 (`allenai/MolmoAct2-LIBERO`, 5.4B, 10 flow steps from zeros in one graph) on the Arc
+  140V: GPU f16 about 0.92 s for a 10-step chunk, within 1e-3 (normalized) of PyTorch f32, no NaN,
+  about 10 GB; at `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for
+  π0. The x86 CPU at f32 is within 1e-3 of PyTorch; OpenVINO 2026.4.1's ARM CPU plugin computes the
+  graph wrong (the IR alone is 0.61 off PyTorch on PyTorch's own inputs on macOS), so MolmoAct2 on
+  an ARM CPU is not usable. Its noise is `constant`: the graph starts from zeros, so calls are
+  deterministic. The weights' licence is unstated on the model card (the code is Apache-2.0).
 - A single-box metadata endpoint and WebSocket, served by `cascadia run --engine ov-policy`.
 - `cascadia export-policy`: LeRobot checkpoints (Hugging Face) to a `policy_package`.
 
@@ -107,6 +115,7 @@ promised).
 | Kind | Tier |
 |---|---|
 | `gr00t_n1d7` | experimental until LIBERO (parity on random frames only) |
+| `molmoact2` | experimental until LIBERO (parity on one LIBERO frame pair) |
 
 Not in v1: π0-FAST and other policies until each export is checked; NPU; multi-stage
 sharding; per-robot key mappings for existing openpi clients; real-time chunking (RTC) server side;
@@ -156,11 +165,14 @@ Loading rules:
 | `gr00t_prompt` | Ours. With `formalize_language`, the task lowercased and every character but `\w` and `\s` dropped (Python's `re.sub(r"[^\w\s]", "", task.lower())`; Rust keeps the few combining marks Unicode counts as alphabetic, which Python drops); then `template` with `{images}` replaced by `image` once per camera and `{task}` by the task. |
 | `qwen_vl_inputs` | Ours. The tokenizer's unpadded ids, each `image_token_id` repeated `tokens_per_image` (the merged patches of a frame, checked at load) times, right-padded with `pad_id` to `seq_len`, `attention_mask` 1 on the ids; `position_ids [3, 1, seq_len]` are Qwen3-VL's mRoPE (text: one position for all three rows; an image: `t`, `t + row`, `t + col` over the merged grid, the next text at its maximum + 1), 0 on the padding. `padding_side` other than `right` or `rope` other than `qwen3_vl_mrope` refuses the load. Must follow `ov_tokenizer`. |
 | `constant` | Ours. An `int64` `value` fed to `port` on every call (GR00T's `embodiment_id`); its length must be the port's. |
+| `molmoact2` | Intel's `MolmoAct2Preprocessor` (runtime `e3dd944`), with Intel's f32 arithmetic (its stats are f32 arrays). Cameras are `image_keys` (`images.` optional) in order; frames uint8 HWC at exactly `image_size` (378×378), so its `INTER_LINEAR_EXACT` resize is the identity. State: quantile-normalized with the mask (masked dims pass through), clipped to [−1, 1], each value written as `<state_{rint((s + 1)/2 · (num_state_tokens − 1))}>` between `<state_start>` and `<state_end>` (NaN → 0, ±inf → ±1), one added token per value, so the prompt's length does not move with the state. Task: whitespace runs to one space, one leading `task:` / `instruction:` / `language instruction:` / `goal:` (`:` or `-`, case-insensitive) and then one leading `the task is to` / `your task is to` dropped, trailing `.,!?;:` dropped, lowercased. Prompt: `Image 1<|image|>Image 2<|image|>` (one camera: `<|image|>`), then `<|im_start|>user\nThe task is to {task}. The setup is <setup_start>{setup_type}<setup_end>. The current state of the robot is {state tokens}. The expected control mode is <control_start>{control_mode}<control_end>. Given these, what action should the robot take to complete the task?<|im_end|>\n<|im_start|>assistant\n<action_output>` (setup and control wrapped only when non-empty, flagged and not already wrapped). A `normalization_mode` other than `QUANTILES`, missing `state_stats` or an unknown parameter refuses the load. |
+| `molmoact2_inputs` | Intel's `MolmoAct2ModelInputs`, single-crop `resize` mode only (`image_crop_mode` otherwise refuses the load). BOS (`bos_token_id`) prepended to the valid ids unless already first, the width growing by one; each `<|image|>` placeholder becomes `image_start`, `image_patch` × the pooled grid (with `image_col_id` per row when `use_single_crop_col_tokens`), `image_end`; re-padded with `pad_token_id` to the expanded length plus the pads, mask 1 over the ids; `token_type_ids` 1 on `image_token_ids` under the mask. `images [1, cameras, patches, patch²·3]`: `(x/255 − mean)/std` in f32, row-major 14×14 patches each flattened `(py, px, c)`. `token_pooling [1, cameras · pooled, 4]`: the patch-index grid padded with −1 up to whole 2×2 cells (before: half the pad, after: the rest), one row per cell, image `k`'s indices offset by `k · patches`. `action_dim_is_pad [1, max_action_dim]`: false for the first `action_dim`. Must follow `ov_tokenizer`. |
+| `molmoact2_postprocess` | Intel's `MolmoAct2Postprocessor`: `action` clipped to [−1, 1], then the f32 quantile denormalize with its mask (masked dims stay clipped). An `action_key` other than `action`, missing `action_stats` or a non-quantile mode refuses the load; identity quantiles in either block are a placeholder. |
 | `xvla_rotation_6d_to_axis_angle` | Ours, ported from LeRobot's step of that name. Each action row (at least `max(expected_action_dim, 10)` wide, checked at load) becomes 7 values: position `[0:3]` as is; the 6-D rotation `[3:9]` to axis-angle (Gram-Schmidt with LeRobot's `1e-6` eps, the quaternion as the top eigenvector of Bar-Itzhack's K with `w ≥ 0`, then axis × angle), in f64; the gripper `[9]` as 1 above 0.5, else −1. Near π the axis-angle sign follows `w ≥ 0`, as in LeRobot. |
 
 ### Templated prompts
 
-`vla_jepa_prompt`, `xr0` and `gr00t_prompt` put the task into a chat template, so a task that spells a special token
+`vla_jepa_prompt`, `xr0`, `gr00t_prompt` and `molmoact2` put the task into a chat template, so a task that spells a special token
 (`<|image_pad|>`, `<|im_end|>`, `<|embodied_action|>`, …) would be tokenized as structure: image
 features would land in the wrong positions or the template would end early, and the model would
 get a silently wrong input. Such a task is refused (an error frame, checked once per task text like
@@ -170,7 +182,10 @@ marker of the template itself (`<cot>`); a package whose tokenizer declares none
 load. Behind that, every call's ids must carry each single-token marker exactly as often as the
 template does (XR0: 64 image pads per camera, checked at load; VLA-JEPA: 32 embodied tokens;
 GR00T: one image token per camera, checked at load). Where a step rewrites the task first
-(`gr00t_prompt`'s `formalize_language`), both the task as sent and as rewritten are checked.
+(`gr00t_prompt`'s `formalize_language`, `molmoact2`'s lowercasing), both the task as sent and as
+rewritten are checked. MolmoAct2's state tokens (`<state_0>` … `<state_255>`) are refused in a
+task too, but not counted, since they change with the state; its `<|image|>` placeholders are
+checked at load, one per camera.
 
 ### Port layouts
 
@@ -183,6 +198,7 @@ new kind with new ports adds a layout, not a branch inside another one.
 | image slots | `smolvla`, `pi05`, `pi0`, `xvla`, `evo1` | `state` f32 (normalized), `tokenized_prompt` i64, `tokenized_prompt_mask` bool, `images [slots, 1, 3, H, W]` f32, `image_masks [slots, 1]` bool, optional `noise` |
 | XR0 | `xr0` | `tokenized_prompt` i64 and `tokenized_prompt_mask` i64 `[1, 256]` (right-padded with `<|endoftext|>`), `pixel_values [512, 1536]` f32, `state [1, 1, 32]` f32 raw, `noise [1, 30, 32]`; `action [1, 30, 32]` normalized, then `xr0_denormalize` |
 | GR00T | `gr00t_n1d7` | in this order, each bound by name or else by its index (the CPU plugin renames `state`): `input_ids` and `attention_mask` i64 `[1, 192]`, `pixel_values [512, 1536]` f32, `position_ids [3, 1, 192]` i64, `state [1, 1, 132]` f32 (normalized, zero-padded), the `constant` ports (`embodiment_id [1]` i64), the noise port (`actions [1, 40, 132]`); the one output (`predicted_action [1, 40, 132]`, normalized), whatever its name; then `action_chunk_trimmer` 16, `action_slice` 7, `denormalize` |
+| MolmoAct2 | `molmoact2` | `input_ids`, `attention_mask` and `token_type_ids` i64 `[1, 650]` (the tokenizer's 255, BOS, and 2 × 197 for the expanded images), `images [1, 2, 729, 588]` f32, `token_pooling [1, 392, 4]` i64, `action_dim_is_pad [1, 32]` bool; no state or noise input; `action [1, 10, 7]` normalized, then `molmoact2_postprocess` |
 | VLA-JEPA | `vlajepa` | `input_ids` i64 and `attention_mask` i64 `[1, L]` (the tokenizer pads right to L = 288 with `<|endoftext|>`, mask 0), `pixel_values [cameras·patches, 3·tp·p²]` f32 (`[512, 1536]`), `embodied_positions [1, 32]` i64, `state` f32 raw, `noise [1, 7, 7]`; `action [1, 7, 7]` is final |
 
 At load the VLA-JEPA binder checks `pixel_values`' width against the step's geometry, its rows
@@ -211,7 +227,10 @@ refused at 289 (LIBERO's tasks take 221–234). XR0's works the same way at 256 
 alone is 191 tokens); truncating would cut the template. GR00T's tokenizer does not pad: the
 image tokens it emits are expanded to 64 each after it, so the prompt may hold `seq_len` less
 what the images take, 64 language tokens (template and task) beside two cameras; the count is
-exact and a task over it is refused, in language tokens (LIBERO's example uses 28).
+exact and a task over it is refused, in language tokens (LIBERO's example uses 28). MolmoAct2's
+tokenizer pads right to 255 with a `truncation` variable the engine holds off, so a task is served
+up to exactly 255 tokens (LIBERO's prompt takes 95, the state tokens one each whatever the state)
+and refused at 256; every call's ids must then expand to exactly the graph's 650.
 
 A refusal is an error frame naming the token limit. Intel's runtime truncates silently, which for
 π0.5 drops the `;\nAction: ` suffix; we deliberately do not.
@@ -241,7 +260,8 @@ scaling, padded **centred** for `pi05` and **top and left** for `smolvla_resize`
 bottom right). VLA-JEPA's `resize` is `stretch`: a plain resize to 224×224 with no padding; so is EVO1's
 (`smolvla_resize` with `"resize": "stretch"`; LIBERO renders at 448, so the two agree there), and
 XR0's (`xr0`: frames at exactly 256×256). GR00T's is `center` (its letterbox pads evenly with 0),
-and only square frames at exactly 256×256 are taken, which the letterbox leaves alone. openpi's `resize_with_pad` centres, so it is correct for π0.5 only; a 640×480 frame
+and only square frames at exactly 256×256 are taken, which the letterbox leaves alone. MolmoAct2's
+is `stretch`: a plain resize to 378×378 (OpenCV `INTER_LINEAR_EXACT`, no padding). openpi's `resize_with_pad` centres, so it is correct for π0.5 only; a 640×480 frame
 sent to SmolVLA through it lands 64 rows off with no error. `tools/` ships a reference resize for
 each convention.
 
@@ -314,7 +334,7 @@ Limits, all checked before work is queued:
 | `noise` | the mode above |
 | `noise_shape` | the IR `noise` port, `input` mode only (the decode rule and the message cap need it) |
 | `attribution` | the package's `NOTICE` file, else the manifest's `metadata.attribution`, else `policy.source.attribution`; omitted when there is none (GR00T's NVIDIA Open Model License notice) |
-| `resize` | the image step: `center` (`pi05`, `pi0`, `gr00t_image`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling; `stretch` (`vla_jepa_inputs`, `xr0`, `smolvla_resize` with `"resize": "stretch"`), no padding |
+| `resize` | the image step: `center` (`pi05`, `pi0`, `gr00t_image`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling; `stretch` (`vla_jepa_inputs`, `xr0`, `molmoact2`, `smolvla_resize` with `"resize": "stretch"`), no padding |
 | `device`, `model`, `prompt_max_bytes` | the server |
 
 `WS /v1/policy/ws` uses openpi's framing, so `openpi_client.WebsocketClientPolicy` can drive it:

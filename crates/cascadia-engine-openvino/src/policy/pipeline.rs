@@ -14,6 +14,7 @@ use super::gr00t::Gr00tHost;
 use super::manifest::{
     ImageStep, PolicyKind, PolicyManifest, PostStep, PreStep, VlaJepaInputsStep, XVLA_ACTION_DIM,
 };
+use super::molmoact2::MolmoAct2Host;
 use super::qwen_vl::PatchGeometry;
 use super::spec::{derive_spec, IrFacts, ServerFacts};
 use super::special_tokens;
@@ -43,6 +44,9 @@ pub const ATTENTION_MASK: &str = "attention_mask";
 pub const PIXEL_VALUES: &str = "pixel_values";
 pub const EMBODIED_POSITIONS: &str = "embodied_positions";
 pub const POSITION_IDS: &str = "position_ids";
+pub const TOKEN_TYPE_IDS: &str = "token_type_ids";
+pub const TOKEN_POOLING: &str = "token_pooling";
+pub const ACTION_DIM_IS_PAD: &str = "action_dim_is_pad";
 
 /// Every warmup state value. Not zero: X-VLA's LIBERO export reads part of the
 /// state as a rotation vector and divides by its norm behind a `1e-8` guard
@@ -126,7 +130,13 @@ struct PromptGuard {
 }
 
 impl PromptGuard {
-    fn new(template: &str, tokenizer: &mut dyn PromptTokenizer) -> EngineResult<Self> {
+    /// `varying`: strings refused in a task whose count the template does not
+    /// fix (MolmoAct2's state tokens).
+    fn new(
+        template: &str,
+        tokenizer: &mut dyn PromptTokenizer,
+        varying: &[String],
+    ) -> EngineResult<Self> {
         let mut forbidden = tokenizer.special_tokens();
         if forbidden.is_empty() {
             return refuse(
@@ -150,8 +160,16 @@ impl PromptGuard {
         let base = ids(tokenizer.tokenize(template)?);
         let mut counts = Vec::new();
         for m in &forbidden {
+            if varying.contains(m) {
+                continue;
+            }
             if let [id] = ids(tokenizer.tokenize(m)?)[..] {
                 counts.push((m.clone(), id, base.iter().filter(|&&x| x == id).count()));
+            }
+        }
+        for v in varying {
+            if !forbidden.contains(v) {
+                forbidden.push(v.clone());
             }
         }
         Ok(Self { forbidden, counts })
@@ -278,6 +296,10 @@ pub enum PortLayout {
     /// that order; each bound by name, else by its index (the CPU plugin renames
     /// `state`). The one output is the action, whatever its name.
     Gr00t,
+    /// MolmoAct2: `input_ids`, `attention_mask`, `token_type_ids` (i64, image
+    /// tokens expanded), `images [1, cameras, patches, patch²·3]`, `token_pooling`,
+    /// `action_dim_is_pad` (bool); no state or noise input.
+    MolmoAct2,
 }
 
 impl PortLayout {
@@ -291,6 +313,7 @@ impl PortLayout {
             PolicyKind::VlaJepa => Self::VlaJepa,
             PolicyKind::Xr0 => Self::Xr0,
             PolicyKind::Gr00tN1d7 => Self::Gr00t,
+            PolicyKind::MolmoAct2 => Self::MolmoAct2,
         }
     }
 }
@@ -402,7 +425,92 @@ pub fn bind(
             _ => refuse("xr0 needs an xr0 step"),
         },
         PortLayout::Gr00t => bind_gr00t(m, &Gr00tHost::new(m)?, inputs, outputs),
+        PortLayout::MolmoAct2 => {
+            bind_molmoact2(&MolmoAct2Host::new(m)?, inputs, outputs, has_random_uniform)
+        }
     }
+}
+
+/// [`PortLayout::MolmoAct2`]: the ports `host` fills, sized by its geometry.
+pub fn bind_molmoact2(
+    host: &MolmoAct2Host,
+    inputs: &[PortInfo],
+    outputs: &[PortInfo],
+    has_random_uniform: bool,
+) -> EngineResult<(PortBinding, IrFacts)> {
+    refuse_unknown_inputs(
+        inputs,
+        &[
+            INPUT_IDS,
+            ATTENTION_MASK,
+            TOKEN_TYPE_IDS,
+            IMAGES,
+            TOKEN_POOLING,
+            ACTION_DIM_IS_PAD,
+        ],
+    )?;
+    let ids = dims(inputs, INPUT_IDS, &[DType::I64], 2, Some(0))?;
+    let seq = fixed(ids[1], "the input_ids length")?;
+    for name in [ATTENTION_MASK, TOKEN_TYPE_IDS] {
+        let d = dims(inputs, name, &[DType::I64], 2, Some(0))?;
+        if d[1] != Some(seq) {
+            return refuse(format!("{name:?} is {d:?}; input_ids is [1, {seq}]"));
+        }
+    }
+    let cams = host.geo.cameras.len();
+    let images = dims(inputs, IMAGES, &[DType::F32], 4, Some(0))?;
+    let want = [
+        Some(cams),
+        Some(host.geo.patches_per_image()),
+        Some(host.geo.patch_pixels),
+    ];
+    if images[1..] != want {
+        return refuse(format!(
+            "images is {images:?}; molmoact2_inputs makes [1, {cams}, {}, {}]",
+            host.geo.patches_per_image(),
+            host.geo.patch_pixels
+        ));
+    }
+    let pool = dims(inputs, TOKEN_POOLING, &[DType::I64], 3, Some(0))?;
+    let cells = host.token_pooling().len() / cams.max(1) / host.geo.pooled_per_image().max(1);
+    if pool[1..] != [Some(cams * host.geo.pooled_per_image()), Some(cells)] {
+        return refuse(format!(
+            "token_pooling is {pool:?}; molmoact2_inputs makes [1, {}, {cells}]",
+            cams * host.geo.pooled_per_image()
+        ));
+    }
+    let pad = dims(inputs, ACTION_DIM_IS_PAD, &[DType::Bool], 2, Some(0))?;
+    if pad[1] != Some(host.max_action_dim()) {
+        return refuse(format!(
+            "action_dim_is_pad is {pad:?}; max_action_dim is {}",
+            host.max_action_dim()
+        ));
+    }
+    // The tokenizer's width: the sequence less BOS and what the images add.
+    let added = 1 + cams * (host.image_tokens().len() - 1);
+    let Some(width) = seq.checked_sub(added).filter(|&w| w > 0) else {
+        return refuse(format!(
+            "input_ids is {seq} long; BOS and {cams} images alone take {}",
+            added + 1
+        ));
+    };
+    let action_shape = action_dims(outputs)?;
+    Ok((
+        PortBinding::new(
+            PortLayout::MolmoAct2,
+            false,
+            "input_ids (before BOS and image expansion)",
+            width,
+        ),
+        IrFacts {
+            image_slots: cams,
+            image_hw: None,
+            state_len: host.geo.state_len,
+            action_shape,
+            noise: noise_mode(&None, has_random_uniform),
+            noise_shape: None,
+        },
+    ))
 }
 
 /// [`PortLayout::Gr00t`]: each input by name, else by its index when the
@@ -870,6 +978,10 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
                 let cameras = super::gr00t::Gr00tGeometry::new(m)?.cameras;
                 text = super::gr00t::render_prompt(s, cameras, &text);
             }
+            PreStep::MolmoAct2(s) => {
+                let raw: Vec<f32> = state.iter().map(|&x| x as f32).collect();
+                text = super::molmoact2::render_prompt(s, &text, &raw);
+            }
             PreStep::OvTokenizer { .. } => break,
             PreStep::Pi0(_)
             | PreStep::SmolVlaResize(_)
@@ -879,7 +991,8 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
             | PreStep::Gr00tImage(_)
             | PreStep::QwenVlPatchify(_)
             | PreStep::QwenVlInputs(_)
-            | PreStep::Constant { .. } => {}
+            | PreStep::Constant { .. }
+            | PreStep::MolmoAct2Inputs(_) => {}
         }
     }
     Ok(text)
@@ -890,6 +1003,7 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
 fn templated_task(m: &PolicyManifest, task: &str) -> Option<String> {
     m.preprocessors.iter().find_map(|s| match s {
         PreStep::Gr00tPrompt(p) if p.formalize_language => Some(super::gr00t::formalize(task)),
+        PreStep::MolmoAct2(_) => Some(super::molmoact2::normalize_text(task)),
         _ => None,
     })
 }
@@ -911,6 +1025,8 @@ pub struct PolicyPipeline {
     xr0: Option<Xr0Host>,
     /// [`PortLayout::Gr00t`]'s.
     gr00t: Option<Gr00tHost>,
+    /// [`PortLayout::MolmoAct2`]'s.
+    molmoact2: Option<MolmoAct2Host>,
     /// Task text to the refusal message, `None` when it fits.
     prompt_checks: HashMap<String, Option<Refusal>>,
     /// Set for a templated prompt (`vla_jepa_prompt`, `xr0`).
@@ -941,20 +1057,28 @@ impl PolicyPipeline {
                     | PreStep::VlaJepaPrompt { .. }
                     | PreStep::Xr0(_)
                     | PreStep::Gr00tPrompt(_)
+                    | PreStep::MolmoAct2(_)
             )
         }) {
             return refuse(
-                "a prompt step (new_line / pi05 / pi0 / vla_jepa_prompt / xr0 / gr00t_prompt) \
-                 comes after ov_tokenizer",
+                "a prompt step (new_line / pi05 / pi0 / vla_jepa_prompt / xr0 / gr00t_prompt / \
+                 molmoact2) comes after ov_tokenizer",
             );
         }
         if let Some(i) = manifest
             .preprocessors
             .iter()
-            .position(|s| matches!(s, PreStep::QwenVlInputs(_)))
+            .position(|s| matches!(s, PreStep::QwenVlInputs(_) | PreStep::MolmoAct2Inputs(_)))
         {
             if i < tok_at {
-                return refuse("qwen_vl_inputs comes before ov_tokenizer");
+                return refuse(format!(
+                    "{} comes before ov_tokenizer",
+                    if matches!(manifest.preprocessors[i], PreStep::QwenVlInputs(_)) {
+                        "qwen_vl_inputs"
+                    } else {
+                        "molmoact2_inputs"
+                    }
+                ));
             }
         }
         let (binding, ir) = bind(&manifest, inputs, outputs, has_random_uniform)?;
@@ -995,15 +1119,27 @@ impl PolicyPipeline {
             ImageStep::Gr00t(_) => Some(Gr00tHost::new(&manifest)?),
             _ => None,
         };
+        let molmoact2 = match manifest.image_step() {
+            ImageStep::MolmoAct2(_) => Some(MolmoAct2Host::new(&manifest)?),
+            _ => None,
+        };
         let templated = manifest.preprocessors.iter().any(|s| {
             matches!(
                 s,
-                PreStep::VlaJepaPrompt { .. } | PreStep::Xr0(_) | PreStep::Gr00tPrompt(_)
+                PreStep::VlaJepaPrompt { .. }
+                    | PreStep::Xr0(_)
+                    | PreStep::Gr00tPrompt(_)
+                    | PreStep::MolmoAct2(_)
             )
         });
         let guard = if templated {
-            let template = prompt_text(&manifest, "", &[], false)?;
-            let g = PromptGuard::new(&template, tokenizer.as_mut())?;
+            let zeros = vec![0.0; ir.state_len];
+            let template = prompt_text(&manifest, "", &zeros, false)?;
+            let varying = molmoact2
+                .as_ref()
+                .map(|h| super::molmoact2::state_tokens(h.num_state_tokens()))
+                .unwrap_or_default();
+            let g = PromptGuard::new(&template, tokenizer.as_mut(), &varying)?;
             if let Some(host) = &xr0 {
                 let want = host.geo.views.len() * host.geo.patches.image_pads();
                 if g.count("<|image_pad|>") != Some(want) {
@@ -1011,6 +1147,23 @@ impl PolicyPipeline {
                         "the xr0 template tokenizes to {:?} image pads; {} cameras need {want}",
                         g.count("<|image_pad|>"),
                         host.geo.views.len()
+                    ));
+                }
+            }
+            if let Some(host) = &molmoact2 {
+                let t = tokenizer.tokenize(&template)?;
+                let got = t
+                    .ids
+                    .iter()
+                    .zip(&t.mask)
+                    .filter(|(&id, &m)| m && id == host.placeholder_id())
+                    .count();
+                if got != host.geo.cameras.len() {
+                    return refuse(format!(
+                        "the molmoact2 template tokenizes to {got} image placeholders (id {}); \
+                         {} cameras need one each",
+                        host.placeholder_id(),
+                        host.geo.cameras.len()
                     ));
                 }
             }
@@ -1048,6 +1201,7 @@ impl PolicyPipeline {
             vla_jepa,
             xr0,
             gr00t,
+            molmoact2,
             prompt_checks: HashMap::new(),
             guard,
         })
@@ -1378,6 +1532,80 @@ impl PolicyPipeline {
         Ok(feeds)
     }
 
+    /// [`PortLayout::MolmoAct2`] inputs; the state is in the prompt.
+    fn molmoact2_feeds(
+        &mut self,
+        obs: &Observation,
+    ) -> EngineResult<Vec<(&'static str, HostTensor)>> {
+        let raw: Vec<f64> = obs.state.iter().map(|&x| f64::from(x)).collect();
+        let text = prompt_text(&self.manifest, &obs.prompt, &raw, false)?;
+        let tokens = self.tokens(&text)?;
+        if let Some(g) = &self.guard {
+            g.check_ids(&tokens)?;
+        }
+        let host = self
+            .molmoact2
+            .as_ref()
+            .expect("new builds the host for a molmoact2 layout");
+        let (ids, mask, types) = host.inputs(&tokens.ids, &tokens.mask)?;
+        let seq = host.seq_len(self.binding.prompt_len);
+        if ids.len() != seq {
+            return Err(EngineError::InvalidConfig(format!(
+                "the prompt expands to {} tokens; the model takes exactly {seq}",
+                ids.len()
+            )));
+        }
+        let images = host.images(&self.layout, &obs.images)?;
+        let pooling = host.token_pooling();
+        let cams = host.geo.cameras.len();
+        let cells = pooling.len() / (cams * host.geo.pooled_per_image());
+        let pad = host.action_dim_is_pad();
+        Ok(vec![
+            (
+                INPUT_IDS,
+                HostTensor {
+                    shape: vec![1, seq],
+                    data: TensorData::I64(ids),
+                },
+            ),
+            (
+                ATTENTION_MASK,
+                HostTensor {
+                    shape: vec![1, seq],
+                    data: TensorData::I64(mask),
+                },
+            ),
+            (
+                TOKEN_TYPE_IDS,
+                HostTensor {
+                    shape: vec![1, seq],
+                    data: TensorData::I64(types),
+                },
+            ),
+            (
+                IMAGES,
+                HostTensor {
+                    shape: vec![1, cams, host.geo.patches_per_image(), host.geo.patch_pixels],
+                    data: TensorData::F32(images),
+                },
+            ),
+            (
+                TOKEN_POOLING,
+                HostTensor {
+                    shape: vec![1, cams * host.geo.pooled_per_image(), cells],
+                    data: TensorData::I64(pooling),
+                },
+            ),
+            (
+                ACTION_DIM_IS_PAD,
+                HostTensor {
+                    shape: vec![1, pad.len()],
+                    data: TensorData::Bool(pad),
+                },
+            ),
+        ])
+    }
+
     fn run(&mut self, obs: &Observation) -> EngineResult<ActionChunk> {
         let start = Instant::now();
         if self.model.is_none() {
@@ -1394,6 +1622,7 @@ impl PolicyPipeline {
             PortLayout::VlaJepa => named(self.vla_jepa_feeds(obs)?),
             PortLayout::Xr0 => named(self.xr0_feeds(obs)?),
             PortLayout::Gr00t => self.gr00t_feeds(obs)?,
+            PortLayout::MolmoAct2 => named(self.molmoact2_feeds(obs)?),
         };
         if self.binding.noise {
             let dims = self
@@ -1459,6 +1688,13 @@ impl PolicyPipeline {
                     let out = super::xr0::denormalize(s, &f, dim);
                     dim = s.action_dim.unwrap_or(dim);
                     actions = out.into_iter().map(f64::from).collect();
+                }
+                PostStep::MolmoAct2Post(q) => {
+                    let f: Vec<f32> = actions.iter().map(|&x| x as f32).collect();
+                    actions = super::molmoact2::postprocess(q, &f)
+                        .into_iter()
+                        .map(f64::from)
+                        .collect();
                 }
                 PostStep::ActionSlice { dims } => {
                     actions = actions
@@ -1589,13 +1825,14 @@ mod tests {
     }
 
     /// The fake's special tokens; the `<|…|>` ones are one id each (1000 + index).
-    const FAKE_SPECIAL: [&str; 6] = [
+    const FAKE_SPECIAL: [&str; 7] = [
         "\u{1}",
         "<|image_pad|>",
         "<|im_start|>",
         "<|im_end|>",
         "<|vision_start|>",
         "<|vision_end|>",
+        "<|image|>",
     ];
 
     fn fake_ids(text: &str) -> Vec<i64> {
@@ -1735,7 +1972,11 @@ mod tests {
         } else {
             INPUT_IDS
         };
-        let port_len = port_dims(&inputs, ids)[1];
+        let port_len = match super::port(&inputs, TOKEN_POOLING) {
+            // MolmoAct2's tokenizer is the sequence less BOS and two images' tokens.
+            Some(_) => port_dims(&inputs, ids)[1] - 1 - 2 * 197,
+            None => port_dims(&inputs, ids)[1],
+        };
         let engine = pipeline_with(
             manifest,
             (&inputs, &outputs),
@@ -2455,6 +2696,165 @@ mod tests {
             .contains("has 6 inputs"));
     }
 
+    const MOLMOACT2_LIBERO: &str =
+        include_str!("../../tests/fixtures/policy/molmoact2-libero-manifest.json");
+
+    /// Our MolmoAct2 export's ports with a `seq`-long text (650 in the export;
+    /// the fake tokenizer spends one id per byte, so the rig takes 1395).
+    fn molmoact2_ports_of(seq: usize) -> (Vec<PortInfo>, Vec<PortInfo>) {
+        (
+            vec![
+                port(INPUT_IDS, DType::I64, &[1, seq]),
+                port(ATTENTION_MASK, DType::I64, &[1, seq]),
+                port(TOKEN_TYPE_IDS, DType::I64, &[1, seq]),
+                port(IMAGES, DType::F32, &[1, 2, 729, 588]),
+                port(TOKEN_POOLING, DType::I64, &[1, 392, 4]),
+                port(ACTION_DIM_IS_PAD, DType::Bool, &[1, 32]),
+            ],
+            vec![port(ACTION, DType::F32, &[1, 10, 7])],
+        )
+    }
+
+    fn molmoact2_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+        molmoact2_ports_of(650)
+    }
+
+    /// The fixture with the fake tokenizer's `<|image|>` id.
+    fn molmoact2() -> Rig {
+        let manifest = MOLMOACT2_LIBERO.replace(
+            "\"image_placeholder_token_id\": 154629",
+            "\"image_placeholder_token_id\": 1006",
+        );
+        rig_with(
+            &manifest,
+            molmoact2_ports_of(1395),
+            false,
+            true,
+            vec![2.0; 70],
+        )
+    }
+
+    #[test]
+    fn molmoact2_builds_its_prompt_and_expands_images() {
+        let mut r = molmoact2();
+        let spec = r.engine.spec().clone();
+        assert_eq!(spec.cameras, ["image", "wrist_image"]);
+        assert_eq!((spec.height, spec.width, spec.state_len), (378, 378, 8));
+        assert_eq!(
+            (spec.chunk, spec.noise, spec.noise_shape.clone()),
+            ([10, 7], NoiseMode::Constant, None)
+        );
+        assert_eq!(spec.resize, cascadia_types::ResizeConvention::Stretch);
+        let mut o = obs(&spec, "Task: Pick up the BOWL.");
+        o.state[0] = 99.0;
+        let a = r.engine.infer(&o).unwrap();
+        // Clipped to 1, then mapped to q99; the gripper (masked) is clipped only.
+        assert_eq!((a.steps, a.dim), (10, 7));
+        assert!(
+            (a.actions[0] - 0.853_654_3_f32).abs() < 1e-6,
+            "{}",
+            a.actions[0]
+        );
+        assert_eq!(a.actions[6], 1.0);
+        let text = r.log.lock().unwrap().texts.last().unwrap().clone();
+        assert!(
+            text.starts_with(
+                "Image 1<|image|>Image 2<|image|><|im_start|>user\nThe task is to pick up the bowl. \
+                 The setup is <setup_start>single franka robotic arm in libero<setup_end>. \
+                 The current state of the robot is <state_start><state_255><state_"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("<|im_end|>\n<|im_start|>assistant\n<action_output>"),
+            "{text}"
+        );
+        let TensorData::I64(ids) = input(&r.log, INPUT_IDS).data else {
+            panic!()
+        };
+        assert_eq!(ids.len(), 1395);
+        assert_eq!(ids[0], 151645, "BOS");
+        assert_eq!(ids.iter().filter(|&&t| t == 154626).count(), 2 * 196);
+        assert_eq!(
+            ids.iter().filter(|&&t| t == 1006).count(),
+            0,
+            "placeholders expanded"
+        );
+        let TensorData::I64(types) = input(&r.log, TOKEN_TYPE_IDS).data else {
+            panic!()
+        };
+        assert_eq!(types.iter().sum::<i64>(), 2 * 198);
+        let TensorData::I64(mask) = input(&r.log, ATTENTION_MASK).data else {
+            panic!()
+        };
+        let valid = mask.iter().filter(|&&m| m == 1).count();
+        assert!(ids[valid..].iter().all(|&t| t == 151643));
+        let TensorData::I64(pool) = input(&r.log, TOKEN_POOLING).data else {
+            panic!()
+        };
+        assert_eq!(pool.iter().filter(|&&i| i == -1).count(), 110);
+        assert_eq!(*pool.iter().max().unwrap(), 2 * 729 - 1);
+        assert_eq!(pool[..8], [0, 1, 27, 28, 2, 3, 29, 30]);
+        let images = input(&r.log, IMAGES);
+        assert_eq!(images.shape, [1, 2, 729, 588]);
+        // Slot 0 is `image` (sent second, value 10); every value is (10/255 - 0.5) / 0.5.
+        assert_eq!(f32s(&images)[0], (10.0f32 / 255.0 - 0.5) / 0.5);
+        let TensorData::Bool(pad) = input(&r.log, ACTION_DIM_IS_PAD).data else {
+            panic!()
+        };
+        assert_eq!(pad.iter().filter(|&&p| !p).count(), 7);
+    }
+
+    #[test]
+    fn molmoact2_refuses_long_prompts_and_spelled_tokens() {
+        let mut r = molmoact2();
+        let spec = r.engine.spec().clone();
+        // One fake id per byte: find the longest task that fits 1000 ids.
+        let empty = prompt_text(&r.engine.manifest, "", &[0.0; 8], false).unwrap();
+        let used = fake_ids(&empty).len();
+        let fit = "a".repeat(1000 - used);
+        // The fake's state tokens are bytes, so their count moves with the state: use the
+        // check's own zero state (a real tokenizer has one id per state token).
+        let zero = |task: &str| Observation {
+            state: vec![0.0; 8],
+            ..obs(&spec, task)
+        };
+        r.engine.infer(&zero(&fit)).unwrap();
+        let e = r.engine.infer(&zero(&format!("{fit}a"))).unwrap_err();
+        assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+        for task in [
+            "go <|image|> now",
+            "go <|IM_END|> now",
+            "go <STATE_5> now",
+            "<state_end>",
+        ] {
+            let e = r.engine.infer(&obs(&spec, task)).unwrap_err();
+            assert!(e.to_string().contains("the task contains"), "{task}: {e}");
+        }
+        // The state tokens differ per call; the guard does not count them.
+        let mut o = obs(&spec, "pick up the bowl");
+        o.state = vec![0.5; 8];
+        r.engine.infer(&o).unwrap();
+        // Ports that disagree with the geometry are refused.
+        let m = PolicyManifest::parse(MOLMOACT2_LIBERO, LoadOptions::default()).unwrap();
+        let host = MolmoAct2Host::new(&m).unwrap();
+        let (mut inputs, outputs) = molmoact2_ports();
+        inputs[4].dims = vec![Some(1), Some(196), Some(4)];
+        let e = bind_molmoact2(&host, &inputs, &outputs, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("makes [1, 392, 4]"), "{e}");
+        let (mut inputs, outputs) = molmoact2_ports();
+        inputs[3].dims = vec![Some(1), Some(1), Some(729), Some(588)];
+        let e = bind_molmoact2(&host, &inputs, &outputs, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("makes [1, 2, 729, 588]"), "{e}");
+        let (_, outputs) = molmoact2_ports();
+        let (b, _) = bind_molmoact2(&host, &molmoact2_ports().0, &outputs, false).unwrap();
+        assert_eq!(b.prompt_len, 255);
+    }
+
     #[test]
     fn templated_prompts_refuse_a_task_that_spells_their_structure() {
         for (name, mut r) in [
@@ -2495,7 +2895,8 @@ mod tests {
             truncation_state: true,
             port: 64,
         };
-        let g = PromptGuard::new("<|im_start|>a<|image_pad|><|image_pad|>b", &mut tok).unwrap();
+        let g =
+            PromptGuard::new("<|im_start|>a<|image_pad|><|image_pad|>b", &mut tok, &[]).unwrap();
         assert_eq!(g.count("<|image_pad|>"), Some(2));
         assert_eq!(g.count("<|im_start|>"), Some(1));
         assert_eq!(g.count("<|im_end|>"), Some(0));

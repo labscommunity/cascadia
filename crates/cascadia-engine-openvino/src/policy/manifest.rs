@@ -27,6 +27,8 @@ pub enum PolicyKind {
     Xr0,
     /// NVIDIA GR00T N1.7: Qwen3-VL ids with mRoPE positions, a constant embodiment id, noise to `actions`.
     Gr00tN1d7,
+    /// Ai2 MolmoAct2: state tokens in the prompt, Molmo image tokens and pooling, a deterministic start.
+    MolmoAct2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +189,55 @@ pub struct QwenVlInputsStep {
     pub merge_size: usize,
 }
 
+/// Quantile stats as Intel's MolmoAct2 steps hold them: f32 arrays
+/// (`normalization_stats`), so the arithmetic is f32 too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct F32Quantiles {
+    pub q01: Vec<f32>,
+    pub q99: Vec<f32>,
+    /// Where false, the value passes through untransformed.
+    pub mask: Option<Vec<bool>>,
+}
+
+/// Intel's `molmoact2` preprocessor (runtime `e3dd944`): the state normalized
+/// and written as state tokens into the chat prompt; frames stay as sent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MolmoAct2Step {
+    /// Camera keys in training order, `images.` optional.
+    pub image_keys: Vec<String>,
+    pub state: F32Quantiles,
+    /// `[height, width]` frames arrive at; the engine never resizes.
+    pub image_size: [usize; 2],
+    pub num_state_tokens: usize,
+    pub setup_type: String,
+    pub control_mode: String,
+    pub add_setup_tokens: bool,
+    pub add_control_tokens: bool,
+}
+
+/// Intel's `molmoact2_inputs` (`MolmoAct2ModelInputs`), single-crop `resize` mode only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MolmoAct2InputsStep {
+    pub max_action_dim: usize,
+    pub action_dim: usize,
+    pub bos_token_id: i64,
+    pub pad_token_id: i64,
+    pub image_placeholder_token_id: i64,
+    pub image_start_token_id: i64,
+    pub image_end_token_id: i64,
+    pub image_patch_id: i64,
+    pub image_col_id: Option<i64>,
+    pub image_size: [usize; 2],
+    pub patch_size: usize,
+    pub pooling_size: [usize; 2],
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    /// `use_single_crop_col_tokens`, else `image_use_col_tokens`.
+    pub single_crop_col_tokens: bool,
+    /// Ids that are image tokens (`token_type_ids` 1).
+    pub image_token_ids: Vec<i64>,
+}
+
 /// Intel's `xr0_denormalize`: `action * (std + eps) + mean` with per-timestep
 /// stats, then the first `action_dim` values of each row.
 #[derive(Clone, Debug, PartialEq)]
@@ -233,6 +284,8 @@ pub enum PreStep {
         port: String,
         values: Vec<i64>,
     },
+    MolmoAct2(MolmoAct2Step),
+    MolmoAct2Inputs(MolmoAct2InputsStep),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -257,6 +310,8 @@ pub enum PostStep {
     ActionSlice {
         dims: usize,
     },
+    /// Intel's `molmoact2_postprocess`: clip to [−1, 1], then the f32 quantile denormalize.
+    MolmoAct2Post(F32Quantiles),
 }
 
 /// Width of the X-VLA rotation step's output: position, axis-angle, gripper.
@@ -274,6 +329,11 @@ impl PostStep {
                 "action_slice keeps {dims} values of actions {dim} wide"
             )),
             Self::ActionSlice { dims } => Ok(*dims),
+            Self::MolmoAct2Post(q) if q.q01.len() != dim => refuse(format!(
+                "molmoact2_postprocess stats have {} values; the actions are {dim} wide",
+                q.q01.len()
+            )),
+            Self::MolmoAct2Post(_) => Ok(dim),
             Self::Xr0Denormalize(s) => {
                 let width = s.action_mean.first().map_or(0, Vec::len);
                 if width != dim {
@@ -322,6 +382,7 @@ pub enum ImageStep<'a> {
     VlaJepa(&'a VlaJepaInputsStep),
     Xr0(&'a Xr0Step),
     Gr00t(&'a Gr00tImageStep),
+    MolmoAct2(&'a MolmoAct2Step),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -476,6 +537,7 @@ impl PolicyManifest {
                 PreStep::VlaJepaInputs(p) => Some(ImageStep::VlaJepa(p)),
                 PreStep::Xr0(p) => Some(ImageStep::Xr0(p)),
                 PreStep::Gr00tImage(p) => Some(ImageStep::Gr00t(p)),
+                PreStep::MolmoAct2(p) => Some(ImageStep::MolmoAct2(p)),
                 _ => None,
             })
             .expect("parse guarantees one image step")
@@ -579,12 +641,13 @@ impl PolicyManifest {
                     | PreStep::VlaJepaInputs(_)
                     | PreStep::Xr0(_)
                     | PreStep::Gr00tImage(_)
+                    | PreStep::MolmoAct2(_)
             )
         });
         if images != 1 {
             return refuse(format!(
                 "{images} image steps (pi05 / pi0 / smolvla_resize / vla_jepa_inputs / xr0 / \
-                 gr00t_image); expected exactly one"
+                 gr00t_image / molmoact2); expected exactly one"
             ));
         }
         let tokenizers = count(|s| matches!(s, PreStep::OvTokenizer { .. }));
@@ -614,7 +677,71 @@ impl PolicyManifest {
         }
         self.check_vla_jepa()?;
         self.check_xr0()?;
-        self.check_gr00t()
+        self.check_gr00t()?;
+        self.check_molmoact2()
+    }
+
+    /// MolmoAct2's steps are its own; its graph takes no other host step.
+    fn check_molmoact2(&self) -> EngineResult<()> {
+        let own_pre =
+            |s: &PreStep| matches!(s, PreStep::MolmoAct2(_) | PreStep::MolmoAct2Inputs(_));
+        let own_post = |s: &PostStep| matches!(s, PostStep::MolmoAct2Post(_));
+        if self.policy != PolicyKind::MolmoAct2 {
+            if self.preprocessors.iter().any(own_pre) || self.postprocessors.iter().any(own_post) {
+                return refuse(
+                    "molmoact2, molmoact2_inputs and molmoact2_postprocess need policy.name \
+                     \"molmoact2\"",
+                );
+            }
+            return Ok(());
+        }
+        let inputs = self
+            .preprocessors
+            .iter()
+            .filter(|s| matches!(s, PreStep::MolmoAct2Inputs(_)))
+            .count();
+        if inputs != 1 {
+            return refuse(format!(
+                "{inputs} molmoact2_inputs steps; molmoact2 needs exactly one"
+            ));
+        }
+        if let Some(s) = self
+            .preprocessors
+            .iter()
+            .find(|s| !own_pre(s) && !matches!(s, PreStep::OvTokenizer { .. }))
+        {
+            return refuse(format!(
+                "molmoact2 takes only molmoact2, ov_tokenizer and molmoact2_inputs; found {}",
+                pre_name(s)
+            ));
+        }
+        if let Some(s) = self
+            .postprocessors
+            .iter()
+            .find(|s| !own_post(s) && !matches!(s, PostStep::ActionChunkTrimmer { .. }))
+        {
+            return refuse(format!(
+                "molmoact2 takes only molmoact2_postprocess and action_chunk_trimmer; found {}",
+                post_name(s)
+            ));
+        }
+        if self.postprocessors.iter().filter(|s| own_post(s)).count() != 1 {
+            return refuse("molmoact2 needs exactly one molmoact2_postprocess");
+        }
+        super::molmoact2::MolmoAct2Geometry::new(self).map(drop)
+    }
+
+    /// MolmoAct2's prompt and input steps; `parse` guarantees both for `molmoact2`.
+    pub fn molmoact2_steps(&self) -> Option<(&MolmoAct2Step, &MolmoAct2InputsStep)> {
+        let pre = self.preprocessors.iter().find_map(|s| match s {
+            PreStep::MolmoAct2(p) => Some(p),
+            _ => None,
+        })?;
+        let inputs = self.preprocessors.iter().find_map(|s| match s {
+            PreStep::MolmoAct2Inputs(p) => Some(p),
+            _ => None,
+        })?;
+        Some((pre, inputs))
     }
 
     /// GR00T's steps are its own, and its normalize pads, so only GR00T's
@@ -804,6 +931,22 @@ impl PolicyManifest {
             }
             _ => false,
         });
+        let quantile_identity =
+            |q: &F32Quantiles| q.q01.iter().all(|&x| x == -1.0) && q.q99.iter().all(|&x| x == 1.0);
+        let molmo_identity = self
+            .preprocessors
+            .iter()
+            .any(|s| matches!(s, PreStep::MolmoAct2(p) if quantile_identity(&p.state)))
+            || self
+                .postprocessors
+                .iter()
+                .any(|s| matches!(s, PostStep::MolmoAct2Post(q) if quantile_identity(q)));
+        if molmo_identity {
+            return refuse(
+                "molmoact2 stats are identity placeholders (the export had no normalization \
+                 stats); re-export with real stats, or pass --allow-identity-stats for testing",
+            );
+        }
         if xr0_identity {
             return refuse(
                 "xr0_denormalize stats are identity placeholders (the export had no \
@@ -842,6 +985,8 @@ fn pre_name(s: &PreStep) -> &'static str {
         PreStep::Gr00tPrompt(_) => "gr00t_prompt",
         PreStep::QwenVlInputs(_) => "qwen_vl_inputs",
         PreStep::Constant { .. } => "constant",
+        PreStep::MolmoAct2(_) => "molmoact2",
+        PreStep::MolmoAct2Inputs(_) => "molmoact2_inputs",
     }
 }
 
@@ -853,6 +998,7 @@ fn post_name(s: &PostStep) -> &'static str {
         PostStep::GripperBinarize { .. } => "gripper_binarize",
         PostStep::Xr0Denormalize(_) => "xr0_denormalize",
         PostStep::ActionSlice { .. } => "action_slice",
+        PostStep::MolmoAct2Post(_) => "molmoact2_postprocess",
     }
 }
 
@@ -920,9 +1066,10 @@ fn policy_kind(policy: Option<&Value>) -> EngineResult<PolicyKind> {
         Some("vlajepa") => Ok(PolicyKind::VlaJepa),
         Some("xr0") => Ok(PolicyKind::Xr0),
         Some("gr00t_n1d7") => Ok(PolicyKind::Gr00tN1d7),
+        Some("molmoact2") => Ok(PolicyKind::MolmoAct2),
         other => refuse(format!(
             "policy.name {other:?}; supported: pi05, pi0, smolvla, xvla, evo1, vlajepa, xr0, \
-             gr00t_n1d7"
+             gr00t_n1d7, molmoact2"
         )),
     }
 }
@@ -954,6 +1101,9 @@ const COMPONENTS: &[(&str, Option<&str>)] = &[
     ("qwen_vl_inputs", None),
     ("constant", None),
     ("action_slice", None),
+    ("molmoact2", Some("MolmoAct2Preprocessor")),
+    ("molmoact2_inputs", Some("MolmoAct2ModelInputs")),
+    ("molmoact2_postprocess", Some("MolmoAct2Postprocessor")),
 ];
 
 fn short_name(class_path: &str) -> Option<&'static str> {
@@ -1215,6 +1365,246 @@ struct ActionSliceParams {
     dims: i64,
 }
 
+fn quantiles_mode() -> String {
+    "QUANTILES".into()
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MolmoAct2Params {
+    image_keys: Vec<String>,
+    #[serde(default)]
+    state_stats: Option<Map<String, Value>>,
+    #[serde(default = "quantiles_mode")]
+    normalization_mode: String,
+    #[serde(default = "molmo_size")]
+    image_size: [i64; 2],
+    #[serde(default = "molmo_state_tokens")]
+    num_state_tokens: i64,
+    #[serde(default)]
+    setup_type: String,
+    #[serde(default)]
+    control_mode: String,
+    #[serde(default = "yes")]
+    add_setup_tokens: bool,
+    #[serde(default = "yes")]
+    add_control_tokens: bool,
+}
+
+fn molmo_size() -> [i64; 2] {
+    [378, 378]
+}
+
+fn molmo_state_tokens() -> i64 {
+    256
+}
+
+fn molmo_patch() -> i64 {
+    14
+}
+
+fn molmo_pool() -> [i64; 2] {
+    [2, 2]
+}
+
+fn resize_mode() -> String {
+    "resize".into()
+}
+
+fn no() -> Option<bool> {
+    Some(false)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MolmoAct2InputsParams {
+    max_action_dim: i64,
+    action_dim: i64,
+    bos_token_id: i64,
+    pad_token_id: i64,
+    image_placeholder_token_id: i64,
+    image_start_token_id: i64,
+    image_end_token_id: i64,
+    image_patch_id: i64,
+    image_col_id: Option<i64>,
+    low_res_image_start_token_id: Option<i64>,
+    #[serde(default)]
+    frame_start_token_id: Option<i64>,
+    #[serde(default)]
+    frame_end_token_id: Option<i64>,
+    #[serde(default)]
+    image_low_res_id: Option<i64>,
+    #[serde(default = "molmo_size")]
+    image_size: [i64; 2],
+    #[serde(default = "molmo_patch")]
+    patch_size: i64,
+    #[serde(default = "molmo_pool")]
+    pooling_size: [i64; 2],
+    #[serde(default)]
+    image_mean: Option<[f64; 3]>,
+    #[serde(default)]
+    image_std: Option<[f64; 3]>,
+    #[serde(default = "resize_mode")]
+    image_crop_mode: String,
+    #[serde(default = "yes")]
+    image_use_col_tokens: bool,
+    #[serde(default = "no")]
+    use_single_crop_col_tokens: Option<bool>,
+    // The low-res start token only marks multi-crop images; resize mode has one crop.
+    #[serde(default = "yes")]
+    #[allow(dead_code)]
+    use_single_crop_start_token: bool,
+    #[serde(default)]
+    image_token_ids: Option<Vec<i64>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MolmoAct2PostParams {
+    action_key: String,
+    #[serde(default)]
+    action_stats: Option<Map<String, Value>>,
+    #[serde(default = "quantiles_mode")]
+    normalization_mode: String,
+}
+
+/// MolmoAct2's `state_stats` / `action_stats`: q01, q99 and the mask, as f32.
+fn f32_quantiles(
+    stats: Option<Map<String, Value>>,
+    mode: &str,
+    ctx: &str,
+) -> EngineResult<F32Quantiles> {
+    if !mode.eq_ignore_ascii_case("quantiles") {
+        return refuse(format!(
+            "{ctx}: normalization_mode {mode:?}; only QUANTILES is supported"
+        ));
+    }
+    let Some(stats) = stats.filter(|s| !s.is_empty()) else {
+        return refuse(format!(
+            "{ctx}: no stats; serving would send unnormalized values"
+        ));
+    };
+    let s = feature_stats(
+        &Value::Object(stats),
+        NormMode::Quantiles,
+        Bounds::MinMax,
+        ctx,
+    )?;
+    let f32s = |v: Option<Vec<f64>>| -> Vec<f32> {
+        v.unwrap_or_default()
+            .into_iter()
+            .map(|x| x as f32)
+            .collect()
+    };
+    Ok(F32Quantiles {
+        q01: f32s(s.q01),
+        q99: f32s(s.q99),
+        mask: s.mask,
+    })
+}
+
+fn molmo_dims(v: [i64; 2], name: &str, ctx: &str) -> EngineResult<[usize; 2]> {
+    if v.iter().any(|&d| d < 1) {
+        return refuse(format!("{ctx}: {name} {v:?} must be positive"));
+    }
+    Ok(v.map(|d| d as usize))
+}
+
+fn molmoact2_step(params: Map<String, Value>, ctx: &str) -> EngineResult<MolmoAct2Step> {
+    let p: MolmoAct2Params = typed(params, ctx)?;
+    if p.image_keys.is_empty() {
+        return refuse(format!("{ctx}: image_keys is empty"));
+    }
+    if p.num_state_tokens < 1 {
+        return refuse(format!("{ctx}: num_state_tokens must be at least 1"));
+    }
+    Ok(MolmoAct2Step {
+        image_keys: p.image_keys,
+        state: f32_quantiles(
+            p.state_stats,
+            &p.normalization_mode,
+            &format!("{ctx}.state_stats"),
+        )?,
+        image_size: molmo_dims(p.image_size, "image_size", ctx)?,
+        num_state_tokens: p.num_state_tokens as usize,
+        setup_type: p.setup_type,
+        control_mode: p.control_mode,
+        add_setup_tokens: p.add_setup_tokens,
+        add_control_tokens: p.add_control_tokens,
+    })
+}
+
+fn molmoact2_inputs_step(
+    params: Map<String, Value>,
+    ctx: &str,
+) -> EngineResult<MolmoAct2InputsStep> {
+    let p: MolmoAct2InputsParams = typed(params, ctx)?;
+    if p.image_crop_mode != "resize" {
+        return refuse(format!(
+            "{ctx}: image_crop_mode {:?}; only resize is supported",
+            p.image_crop_mode
+        ));
+    }
+    if p.max_action_dim < 1 || p.action_dim < 1 || p.action_dim > p.max_action_dim {
+        return refuse(format!(
+            "{ctx}: action_dim {} must be in 1..=max_action_dim {}",
+            p.action_dim, p.max_action_dim
+        ));
+    }
+    if p.patch_size < 1 {
+        return refuse(format!("{ctx}: patch_size must be at least 1"));
+    }
+    let (mean, std) = (
+        p.image_mean.unwrap_or([0.5; 3]).map(|x| x as f32),
+        p.image_std.unwrap_or([0.5; 3]).map(|x| x as f32),
+    );
+    if mean.iter().any(|x| !x.is_finite()) || std.iter().any(|x| !x.is_finite() || *x == 0.0) {
+        return refuse(format!(
+            "{ctx}: image_mean and image_std must be finite, image_std non-zero"
+        ));
+    }
+    // MolmoAct2InputConfig: the configured image token ids when none are given.
+    let image_token_ids = p.image_token_ids.unwrap_or_else(|| {
+        [
+            Some(p.image_patch_id),
+            p.image_col_id,
+            Some(p.image_start_token_id),
+            p.low_res_image_start_token_id,
+            p.frame_start_token_id,
+            Some(p.image_end_token_id),
+            p.frame_end_token_id,
+            p.image_low_res_id,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    });
+    Ok(MolmoAct2InputsStep {
+        max_action_dim: p.max_action_dim as usize,
+        action_dim: p.action_dim as usize,
+        bos_token_id: p.bos_token_id,
+        pad_token_id: p.pad_token_id,
+        image_placeholder_token_id: p.image_placeholder_token_id,
+        image_start_token_id: p.image_start_token_id,
+        image_end_token_id: p.image_end_token_id,
+        image_patch_id: p.image_patch_id,
+        image_col_id: p.image_col_id,
+        image_size: molmo_dims(p.image_size, "image_size", ctx)?,
+        patch_size: p.patch_size as usize,
+        pooling_size: molmo_dims(p.pooling_size, "pooling_size", ctx)?,
+        image_mean: mean,
+        image_std: std,
+        single_crop_col_tokens: p
+            .use_single_crop_col_tokens
+            .unwrap_or(p.image_use_col_tokens),
+        image_token_ids,
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TokenizerParams {
@@ -1454,6 +1844,8 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
                 merge_size: p.merge_size as usize,
             })
         }
+        "molmoact2" => PreStep::MolmoAct2(molmoact2_step(params, &ctx)?),
+        "molmoact2_inputs" => PreStep::MolmoAct2Inputs(molmoact2_inputs_step(params, &ctx)?),
         "constant" => {
             let p: ConstantParams = typed(params, &ctx)?;
             if p.dtype != "int64" {
@@ -1654,6 +2046,20 @@ fn post_step(v: &Value) -> EngineResult<PostStep> {
                 action_dim,
                 action_eps: p.action_eps as f32,
             })
+        }
+        "molmoact2_postprocess" => {
+            let p: MolmoAct2PostParams = typed(params, &ctx)?;
+            if p.action_key != "action" {
+                return refuse(format!(
+                    "{ctx}: action_key {:?}; the engine reads the graph's \"action\"",
+                    p.action_key
+                ));
+            }
+            PostStep::MolmoAct2Post(f32_quantiles(
+                p.action_stats,
+                &p.normalization_mode,
+                &format!("{ctx}.action_stats"),
+            )?)
         }
         "action_slice" => {
             let p: ActionSliceParams = typed(params, &ctx)?;
@@ -1895,6 +2301,8 @@ mod tests {
     const XR0_LIBERO: &str = include_str!("../../tests/fixtures/policy/xr0-libero-manifest.json");
     const GR00T_LIBERO: &str =
         include_str!("../../tests/fixtures/policy/gr00t-libero-spatial-manifest.json");
+    const MOLMOACT2_LIBERO: &str =
+        include_str!("../../tests/fixtures/policy/molmoact2-libero-manifest.json");
 
     fn parse(v: &Value) -> EngineResult<PolicyManifest> {
         PolicyManifest::parse(&v.to_string(), LoadOptions::default())
@@ -2415,6 +2823,97 @@ mod tests {
     }
 
     #[test]
+    fn molmoact2_libero_manifest_parses() {
+        let m = PolicyManifest::parse(MOLMOACT2_LIBERO, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::MolmoAct2);
+        assert_eq!(m.model_artifact, "molmoact2.xml");
+        let ImageStep::MolmoAct2(p) = m.image_step() else {
+            panic!("molmoact2 is the image step")
+        };
+        assert_eq!(p.image_keys, ["image", "wrist_image"]);
+        assert_eq!((p.image_size, p.num_state_tokens), ([378, 378], 256));
+        assert_eq!(p.state.q01.len(), 8);
+        assert!(!p.state.mask.as_deref().unwrap()[7]);
+        assert_eq!(p.setup_type, "single franka robotic arm in libero");
+        let (_, q) = m.molmoact2_steps().unwrap();
+        assert_eq!(
+            (q.max_action_dim, q.action_dim, q.bos_token_id),
+            (32, 7, 151645)
+        );
+        assert_eq!((q.patch_size, q.pooling_size), (14, [2, 2]));
+        assert!(!q.single_crop_col_tokens);
+        assert_eq!(q.image_token_ids.len(), 8);
+        let PostStep::MolmoAct2Post(a) = &m.postprocessors[0] else {
+            panic!("molmoact2_postprocess")
+        };
+        assert_eq!(
+            (a.q01.len(), a.q01[6], a.mask.as_deref().unwrap()[6]),
+            (7, -1.0, false)
+        );
+        let geo = crate::policy::molmoact2::MolmoAct2Geometry::new(&m).unwrap();
+        assert_eq!(
+            (geo.patches, geo.pooled, geo.patch_pixels, geo.state_len),
+            ([27, 27], [14, 14], 588, 8)
+        );
+    }
+
+    #[test]
+    fn molmoact2_steps_are_validated() {
+        let molmo = || -> Value { serde_json::from_str(MOLMOACT2_LIBERO).unwrap() };
+        let set = |pre: Option<usize>, key: &str, value: Value| {
+            let mut v = molmo();
+            match pre {
+                Some(i) => v["model"]["preprocessors"][i][key] = value,
+                None => v["model"]["postprocessors"][0][key] = value,
+            }
+            err(&v)
+        };
+        assert!(
+            set(Some(2), "image_crop_mode", json!("overlap-and-resize-c2")).contains("only resize")
+        );
+        assert!(set(Some(0), "normalization_mode", json!("MEAN_STD")).contains("only QUANTILES"));
+        assert!(set(Some(0), "state_stats", Value::Null).contains("no stats"));
+        assert!(set(None, "action_stats", Value::Null).contains("no stats"));
+        assert!(set(None, "action_key", json!("actions")).contains("action_key \"actions\""));
+        assert!(set(Some(2), "action_dim", json!(40)).contains("1..=max_action_dim 32"));
+        assert!(set(Some(2), "image_size", json!([224, 224]))
+            .contains("differs from molmoact2_inputs'"));
+        assert!(set(Some(0), "image_keys", json!([])).contains("image_keys is empty"));
+        assert!(set(Some(0), "image_keys", json!(["image", "images.image"])).contains("repeated"));
+        assert!(set(Some(2), "use_crops", json!(true)).contains("unknown field `use_crops`"));
+        // SO-101's joint-frame steps stay refused.
+        let mut v = molmo();
+        v["model"]["preprocessors"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, json!({"type": "joint_frame_preprocess"}));
+        assert!(err(&v).contains("unsupported component type \"joint_frame_preprocess\""));
+        let mut v = molmo();
+        v["model"]["postprocessors"].as_array_mut().unwrap().push(
+            json!({"type": "denormalize", "stats": {"action": {"mean": [0.0], "std": [2.0]}}}),
+        );
+        assert!(err(&v).contains("found denormalize"));
+        let mut v = molmo();
+        v["policy"] = json!({"name": "pi05"});
+        assert!(err(&v).contains("need policy.name \"molmoact2\""));
+        // Identity quantiles are a placeholder.
+        let mut v = molmo();
+        let st = &mut v["model"]["postprocessors"][0]["action_stats"];
+        st["q01"] = json!(vec![-1.0; 7]);
+        st["q99"] = json!(vec![1.0; 7]);
+        assert!(err(&v).contains("molmoact2 stats are identity placeholders"));
+        // Intel's class names map to the steps.
+        let mut v = molmo();
+        let mut step = v["model"]["preprocessors"][2].clone();
+        step.as_object_mut().unwrap().remove("type");
+        v["model"]["preprocessors"][2] = json!({
+            "class_path": "physicalai.inference.preprocessors.MolmoAct2ModelInputs",
+            "init_args": step
+        });
+        parse(&v).unwrap();
+    }
+
+    #[test]
     fn vlajepa_steps_are_validated() {
         let jepa = || -> Value { serde_json::from_str(VLAJEPA_LIBERO).unwrap() };
         let e = |v: &Value| err(v);
@@ -2686,7 +3185,7 @@ mod tests {
         assert!(err(&v).contains("unsupported component type \"resize\""));
         let mut v = base();
         v["model"]["preprocessors"][1] =
-            json!({"class_path": "physicalai.inference.preprocessors.MolmoAct2Preprocessor"});
+            json!({"class_path": "physicalai.inference.preprocessors.JointFramePreprocessor"});
         assert!(err(&v).contains("unsupported component class_path"));
         let mut v = base();
         v["model"]["preprocessors"][1] = json!({"class_path": "evil.module.Pi05Preprocessor"});

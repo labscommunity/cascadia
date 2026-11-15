@@ -56,6 +56,13 @@ impl CameraPlan {
             ImageStep::Pi05(p) => (p.empty_cameras, None),
             ImageStep::SmolVlaResize(s) => (0, Some(s)),
             ImageStep::VlaJepa(j) => return Self::from_keys(&j.image_keys),
+            ImageStep::MolmoAct2(_) => {
+                let names = super::molmoact2::MolmoAct2Geometry::new(m)?.cameras;
+                return Ok(Self::Fixed(CameraLayout {
+                    slots: (0..names.len()).map(Some).collect(),
+                    names,
+                }));
+            }
             ImageStep::Xr0(_) | ImageStep::Gr00t(_) => (0, None),
         };
 

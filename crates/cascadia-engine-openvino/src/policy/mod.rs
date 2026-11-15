@@ -5,6 +5,7 @@
 pub mod cameras;
 pub mod gr00t;
 pub mod manifest;
+pub mod molmoact2;
 pub mod ov;
 pub mod pipeline;
 pub mod qwen_vl;
