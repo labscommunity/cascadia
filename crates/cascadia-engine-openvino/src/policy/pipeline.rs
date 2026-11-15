@@ -32,6 +32,11 @@ pub const IMAGES: &str = "images";
 pub const IMAGE_MASKS: &str = "image_masks";
 pub const ACTION: &str = "action";
 
+/// Every warmup state value. Not zero: X-VLA's LIBERO export reads part of the
+/// state as a rotation vector and divides by its norm behind a `1e-8` guard
+/// that is 0 in f16, so an all-zero state is all-NaN on the GPU default.
+const WARMUP_STATE: f32 = 0.1;
+
 /// Op type that marks a package whose start noise is drawn inside the graph.
 pub const RANDOM_UNIFORM: &str = "RandomUniform";
 
@@ -638,7 +643,7 @@ impl PolicyEngine for PolicyPipeline {
                 .iter()
                 .map(|c| (c.clone(), frame.clone()))
                 .collect(),
-            state: vec![0.0; self.spec.state_len],
+            state: vec![WARMUP_STATE; self.spec.state_len],
             prompt: String::new(),
             seed: Some(0),
             noise: None,
@@ -1303,6 +1308,15 @@ mod tests {
             1,
             "stops at the first failure"
         );
+    }
+
+    #[test]
+    fn warmup_state_has_no_zero_rotation() {
+        let mut r = rig_with(XVLA_LIBERO, xvla_ports(), false, true, vec![0.5; 600]);
+        r.engine.warmup().unwrap();
+        let log = r.log.lock().unwrap();
+        let (_, state) = log.inputs.iter().find(|(n, _)| n == STATE).unwrap();
+        assert_eq!(state.data, TensorData::F32(vec![WARMUP_STATE; 8]));
     }
 
     #[test]
