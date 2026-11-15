@@ -16,6 +16,47 @@ pub const NOISE_ABS_MAX: f32 = 10.0;
 /// show the steady-state time.
 pub const WARMUP_CALLS: usize = 3;
 
+/// Bytes a WebSocket message may carry beyond the arrays and the prompt:
+/// msgpack keys, ndarray headers and the frame header.
+pub const PAYLOAD_FRAMING_BYTES: u64 = 64 * 1024;
+
+/// Largest WebSocket message cap a package may need; a spec over it is
+/// refused at load. 8 MiB less the framing allowance.
+pub const PAYLOAD_MAX_BYTES: u32 = 8 * 1024 * 1024 - 64 * 1024;
+
+/// The WebSocket message cap for `spec`: every camera's `H*W*3` bytes, the
+/// state as f64 (numpy's default dtype, the widest a request may send), the
+/// noise as f32, the prompt cap, plus [`PAYLOAD_FRAMING_BYTES`].
+///
+/// Refuses a spec whose cap overflows or exceeds [`PAYLOAD_MAX_BYTES`].
+pub fn payload_cap(spec: &PolicySpec) -> EngineResult<u32> {
+    let frame = u64::from(spec.height)
+        .checked_mul(u64::from(spec.width))
+        .and_then(|p| p.checked_mul(3));
+    let noise = match &spec.noise_shape {
+        Some(shape) => shape
+            .iter()
+            .try_fold(1u64, |a, &d| a.checked_mul(d as u64))
+            .and_then(|n| n.checked_mul(4)),
+        None => Some(0),
+    };
+    let total = frame
+        .and_then(|f| f.checked_mul(spec.cameras.len() as u64))
+        .zip((spec.state_len as u64).checked_mul(8))
+        .and_then(|(a, b)| a.checked_add(b))
+        .zip(noise)
+        .and_then(|(a, b)| a.checked_add(b))
+        .and_then(|a| a.checked_add(spec.prompt_max_bytes as u64))
+        .and_then(|a| a.checked_add(PAYLOAD_FRAMING_BYTES));
+    match total {
+        Some(t) if t <= u64::from(PAYLOAD_MAX_BYTES) => Ok(t as u32),
+        _ => Err(EngineError::InvalidConfig(format!(
+            "a request for this package needs {} bytes; the WebSocket limit is {PAYLOAD_MAX_BYTES}",
+            total.map_or_else(|| "more than 2^64".into(), |t| t.to_string())
+        ))),
+    }
+}
+
 /// A loaded robot policy. Held behind a mutex by the server, so it must be `Send`.
 pub trait PolicyEngine: Send {
     fn spec(&self) -> &PolicySpec;
@@ -320,6 +361,28 @@ mod tests {
         assert_eq!(e.calls(), 3);
         e.close();
         assert!(matches!(e.infer(&obs()), Err(EngineError::NotLoaded)));
+    }
+
+    #[test]
+    fn payload_cap_sums_the_arrays_and_refuses_over_the_bound() {
+        let s = spec(NoiseMode::Input);
+        // 2 cameras * 2*2*3 + 3 states * 8 + noise 6 * 4 + prompt 16 + framing.
+        assert_eq!(
+            payload_cap(&s).unwrap() as u64,
+            24 + 24 + 24 + 16 + PAYLOAD_FRAMING_BYTES
+        );
+        let mut big = spec(NoiseMode::Constant);
+        big.height = 1024;
+        big.width = 1024;
+        big.cameras = vec!["a".into(), "b".into(), "c".into()];
+        let e = payload_cap(&big).unwrap_err().to_string();
+        assert!(e.contains("WebSocket limit is 8323072"), "{e}");
+        big.height = u32::MAX;
+        big.width = u32::MAX;
+        assert!(payload_cap(&big)
+            .unwrap_err()
+            .to_string()
+            .contains("more than 2^64"));
     }
 
     #[test]

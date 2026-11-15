@@ -158,6 +158,9 @@ pub fn derive_spec(
         resize: ms.resize,
         prompt_max_bytes: server.prompt_max_bytes,
     };
+    if let Err(EngineError::InvalidConfig(m)) = cascadia_engine::payload_cap(&spec) {
+        return refuse(m);
+    }
     Ok((spec, layout))
 }
 
@@ -325,6 +328,19 @@ mod tests {
         let mut ir = pi05_ir();
         ir.image_slots = 2;
         assert!(derive_spec(&pi05(), &ir, server()).is_err());
+    }
+
+    #[test]
+    fn a_package_over_the_websocket_limit_is_refused() {
+        let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+        let step = v["model"]["preprocessors"][1].as_object_mut().unwrap();
+        step.remove("image_resolution");
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let mut ir = pi05_ir();
+        // Two 1500x1500 frames are 12.9 MiB.
+        ir.image_hw = Some([1500, 1500]);
+        let e = derive_spec(&m, &ir, server()).unwrap_err().to_string();
+        assert!(e.contains("WebSocket limit"), "{e}");
     }
 
     #[test]
