@@ -82,3 +82,16 @@ def test_replan_executes_at_most_that_many_actions_per_chunk(replan, calls):
         client, _Env(), None, "t", _meta(["image"]), 30, 0, replan=replan
     )
     assert client.calls == calls == len(infer_ms)
+
+
+def test_wrist_image_maps_to_the_eye_in_hand_camera():
+    obs = _obs()
+    req = c.observation(obs, "t", _meta(["image", "wrist_image"]), 0, flip=False)
+    np.testing.assert_array_equal(req["images"]["wrist_image"], obs["robot0_eye_in_hand_image"])
+
+
+def test_invert_gripper_binarizes_and_inverts_only_the_last_dim():
+    a = np.array([[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.9], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.2]], np.float32)
+    out = c.invert_gripper(a)
+    np.testing.assert_array_equal(out[:, :6], a[:, :6])
+    np.testing.assert_array_equal(out[:, 6], [-1.0, 1.0])

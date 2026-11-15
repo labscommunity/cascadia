@@ -47,7 +47,15 @@ CAMERA_SOURCES = {
     "image2": "robot0_eye_in_hand_image",
     "base": "agentview_image",  # XR0
     "wrist_left": "robot0_eye_in_hand_image",
+    "wrist_image": "robot0_eye_in_hand_image",  # GR00T, MolmoAct2
 }
+
+
+def invert_gripper(actions):
+    """GR00T's LIBERO rule: gripper in [0, 1] -> -sign(2g - 1) (binarize, then invert)."""
+    actions = np.array(actions, dtype=np.float32)
+    actions[..., -1] = -np.sign(2.0 * actions[..., -1] - 1.0)
+    return actions
 
 
 def quat2axisangle(quat):
@@ -104,7 +112,8 @@ def check_metadata(meta):
         sys.exit(f"server action dim {meta['chunk'][1]}, LIBERO actions are 7")
 
 
-def run_episode(client, env, init_state, task, meta, max_steps, seed_base, flip=True, replan=None):
+def run_episode(client, env, init_state, task, meta, max_steps, seed_base, flip=True, replan=None,
+                gripper="raw"):
     env.reset()
     obs = env.set_init_state(init_state)
     plan, infer_ms, rtt_ms, done, t, error = [], [], [], False, 0, None
@@ -124,7 +133,8 @@ def run_episode(client, env, init_state, task, meta, max_steps, seed_base, flip=
                 break
             rtt_ms.append((time.perf_counter() - t0) * 1000)
             infer_ms.append(float(reply["server_timing"]["infer_ms"]))
-            plan.extend(np.asarray(reply["actions"])[:replan])
+            actions = np.asarray(reply["actions"])[:replan]
+            plan.extend(invert_gripper(actions) if gripper == "binarize_invert" else actions)
         obs, _, done, _ = env.step(plan.pop(0).tolist())
         if done:
             break
@@ -146,6 +156,8 @@ def main():
                          "(packages whose manifest flips on the server)")
     ap.add_argument("--replan", type=int, default=None,
                     help="execute at most this many actions of each chunk (default: all)")
+    ap.add_argument("--gripper", choices=["raw", "binarize_invert"], default="raw",
+                    help="binarize_invert: gripper g in [0, 1] -> -sign(2g - 1) (GR00T's LIBERO rule)")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -162,7 +174,7 @@ def main():
     check_metadata(meta)
     print(f"server model={meta['model']} device={meta['device']} cameras={meta['cameras']} "
           f"{meta['height']}x{meta['width']} resize={meta['resize']} chunk={meta['chunk']} "
-          f"noise={meta['noise']} flip={args.flip} replan={args.replan}", flush=True)
+          f"noise={meta['noise']} flip={args.flip} replan={args.replan} gripper={args.gripper}", flush=True)
 
     out = args.out.open("w") if args.out else None
     n = k = errors = 0
@@ -185,7 +197,7 @@ def main():
             seed_base = args.seed * 1_000_000 + task_id * 10_000 + ep * 1_000
             done, steps, infer_ms, rtt_ms, error = run_episode(
                 client, env, init_states[ep], task.language, meta, max_steps, seed_base,
-                args.flip == "both", args.replan,
+                args.flip == "both", args.replan, args.gripper,
             )
             wall = time.perf_counter() - t0
             n += 1
