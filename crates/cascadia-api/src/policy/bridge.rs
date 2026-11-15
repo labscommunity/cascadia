@@ -42,10 +42,28 @@ pub struct Upstream {
 impl std::fmt::Debug for Upstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Upstream")
-            .field("url", &self.url)
+            .field("url", &display_url(&self.url))
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
+}
+
+/// `(scheme, authority, path)`; the authority keeps any userinfo, the path
+/// drops the query and fragment.
+fn split_url(url: &str) -> (&str, &str, &str) {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let path = &tail[..tail.find(['?', '#']).unwrap_or(tail.len())];
+    (scheme, authority, path)
+}
+
+/// The URL as it may be logged: `scheme://host:port/path`, without userinfo,
+/// query or fragment, any of which can carry a credential.
+pub fn display_url(url: &str) -> String {
+    let (scheme, authority, path) = split_url(url);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{scheme}://{host}{path}")
 }
 
 fn host_is_loopback(url: &str) -> bool {
@@ -72,6 +90,12 @@ impl Upstream {
                 "--upstream must be a ws:// or wss:// URL".into(),
             ));
         }
+        if split_url(&self.url).1.contains('@') {
+            return Err(ZenohError(
+                "--upstream must not carry user:password@; put the credential in --token-file"
+                    .into(),
+            ));
+        }
         if self.token.is_some() && !tls && !host_is_loopback(&self.url) {
             return Err(ZenohError(
                 "a token is only sent over wss://, or ws:// to loopback".into(),
@@ -86,7 +110,7 @@ impl Upstream {
             .url
             .as_str()
             .into_client_request()
-            .map_err(|e| format!("upstream URL: {e}"))?;
+            .map_err(|e| format!("upstream URL: {}", redact(&e.to_string(), self)))?;
         if let Some(t) = &self.token {
             let mut v = HeaderValue::from_str(&format!("Bearer {t}"))
                 .map_err(|_| "the token is not a valid header value".to_string())?;
@@ -97,8 +121,8 @@ impl Upstream {
         let (mut ws, _) = tokio_tungstenite::connect_async(req).await.map_err(|e| {
             format!(
                 "connect {}: {}",
-                self.url,
-                redact(&e.to_string(), &self.token)
+                display_url(&self.url),
+                redact(&e.to_string(), self)
             )
         })?;
         loop {
@@ -117,11 +141,19 @@ impl Upstream {
     }
 }
 
-fn redact(s: &str, token: &Option<String>) -> String {
-    match token {
-        Some(t) if !t.is_empty() => s.replace(t.as_str(), "<redacted>"),
-        _ => s.to_string(),
+/// `s` without the token or the URL's query and fragment, for an error that
+/// may echo the request.
+fn redact(s: &str, up: &Upstream) -> String {
+    let mut s = s.to_string();
+    if let Some(t) = up.token.as_deref().filter(|t| !t.is_empty()) {
+        s = s.replace(t, "<redacted>");
     }
+    let (scheme, authority, path) = split_url(&up.url);
+    let kept = scheme.len() + "://".len() + authority.len() + path.len();
+    if let Some(tail) = up.url.get(kept..).filter(|t| !t.is_empty()) {
+        s = s.replace(tail, "");
+    }
+    s
 }
 
 /// Identity fields the client pins; a reconnect that changes one is refused.
@@ -187,7 +219,10 @@ impl BridgeBackend {
                         )));
                     }
                     self.counts.reconnects.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(upstream = %self.upstream.url, "reconnected to the upstream");
+                    tracing::info!(
+                        upstream = %display_url(&self.upstream.url),
+                        "reconnected to the upstream"
+                    );
                     c.ws = Some(ws);
                     c.stale = 0;
                 }
@@ -301,13 +336,18 @@ pub async fn start_bridge(
     }
     let (ws, spec, identity) = tokio::time::timeout(CONNECT_TIMEOUT, upstream.connect())
         .await
-        .map_err(|_| ZenohError(format!("no metadata from {} within 10 s", upstream.url)))?
+        .map_err(|_| {
+            ZenohError(format!(
+                "no metadata from {} within 10 s",
+                display_url(&upstream.url)
+            ))
+        })?
         .map_err(ZenohError)?;
     if listen.name.is_empty() {
         listen.name = identity.policy_name.clone();
     }
     tracing::info!(
-        upstream = %upstream.url,
+        upstream = %display_url(&upstream.url),
         policy = %identity.policy_name,
         manifest_sha256 = %spec.manifest_sha256,
         precision = %spec.precision,
@@ -361,9 +401,47 @@ mod tests {
     }
 
     #[test]
+    fn logged_urls_drop_userinfo_query_and_fragment() {
+        assert_eq!(
+            display_url("wss://user:pass@gw.example:8443/v1/policy/ws?token=abc#frag"),
+            "wss://gw.example:8443/v1/policy/ws"
+        );
+        assert_eq!(
+            display_url("ws://127.0.0.1:8000?api_key=k"),
+            "ws://127.0.0.1:8000"
+        );
+        assert_eq!(
+            display_url("ws://[::1]:8000/v1/policy/ws"),
+            "ws://[::1]:8000/v1/policy/ws"
+        );
+        let u = up("wss://gw.example/v1/policy/ws?api_key=k", false);
+        assert!(!format!("{u:?}").contains("api_key"));
+    }
+
+    #[test]
+    fn userinfo_in_the_upstream_url_is_refused() {
+        for url in [
+            "wss://user:pass@gw.example/v1/policy/ws",
+            "ws://tok@127.0.0.1:8000/x",
+        ] {
+            let e = up(url, false).check().unwrap_err().0;
+            assert!(e.contains("--token-file"), "{url}: {e}");
+        }
+        // An '@' after the authority is not userinfo.
+        up("ws://127.0.0.1:8000/v1/policy/ws?x=a@b", false)
+            .check()
+            .unwrap();
+    }
+
+    #[test]
     fn the_token_is_never_printed() {
         let u = up("wss://gw.example/v1/policy/ws", true);
         assert!(!format!("{u:?}").contains("s3cret"));
-        assert_eq!(redact("bad s3cret here", &u.token), "bad <redacted> here");
+        assert_eq!(redact("bad s3cret here", &u), "bad <redacted> here");
+        let q = up("ws://127.0.0.1:1/x?api_key=k#f", false);
+        assert_eq!(
+            redact("Unable to connect to ws://127.0.0.1:1/x?api_key=k#f", &q),
+            "Unable to connect to ws://127.0.0.1:1/x"
+        );
     }
 }
