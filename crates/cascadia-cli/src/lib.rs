@@ -55,6 +55,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
         EngineKind::SparseMoe => "sparse-moe",
         EngineKind::Qwen36Moe => "qwen35",
         EngineKind::SyclLlama => "sycl-llama",
+        EngineKind::OvPolicy => "ov-policy",
     }
 }
 
@@ -234,6 +235,17 @@ pub enum EngineKind {
     /// weight streaming (disk-tier O1), orthogonal to the host interposer.
     #[value(name = "sycl-llama")]
     SyclLlama,
+    /// Robot policy (VLA) engine: serves a `policy_package` (SmolVLA, pi0.5)
+    /// over an openpi-compatible WebSocket. `cascadia run` only.
+    #[value(name = "ov-policy")]
+    OvPolicy,
+}
+
+/// `--precision` for `--engine ov-policy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum PolicyPrecision {
+    F16,
+    F32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -789,9 +801,33 @@ pub struct RunArgs {
     pub engine: EngineKind,
 
     /// API bind address. Defaults to `:8000` (all interfaces, port
-    /// 8000). Pass e.g. `127.0.0.1:8000` to bind loopback only.
-    #[arg(long, default_value = ":8000")]
-    pub api: String,
+    /// 8000); `--engine ov-policy` defaults to `127.0.0.1:8000`, because the
+    /// policy API is unauthenticated and drives a robot. Pass e.g.
+    /// `127.0.0.1:8000` to bind loopback only.
+    #[arg(long)]
+    pub api: Option<String>,
+
+    /// `--engine ov-policy` only: GPU compute precision (default f16). CPU
+    /// always runs f32 and refuses f16.
+    #[arg(long, value_enum)]
+    pub precision: Option<PolicyPrecision>,
+
+    /// `--engine ov-policy` only: a browser `Origin` allowed to open the
+    /// WebSocket (repeatable). Requests without an `Origin` header (robots,
+    /// scripts) are always allowed; any other origin is refused.
+    #[arg(long, value_name = "ORIGIN")]
+    pub policy_allow_origin: Vec<String>,
+
+    /// `--engine ov-policy` only: concurrent WebSocket connections; one more
+    /// is refused with HTTP 503.
+    #[arg(long, default_value_t = cascadia_api::policy::server::DEFAULT_MAX_CONNECTIONS as u32,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub policy_max_connections: u32,
+
+    /// `--engine ov-policy` only: serve a package whose normalization stats
+    /// are identity placeholders. For testing; actions from it are not usable.
+    #[arg(long)]
+    pub allow_identity_stats: bool,
 
     /// `--engine qwen35` only: prefix-cache budget in GiB (0 disables; default
     /// min(16 GiB, RAM/4)). See `cascadia worker --help`.
@@ -1228,13 +1264,57 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+impl RunArgs {
+    /// `--api`, or when absent: loopback for the unauthenticated policy API,
+    /// all interfaces for the chat engines. Resolved per engine because clap
+    /// cannot tell an explicit `--api :8000` from a default.
+    fn api_addr(&self) -> String {
+        self.api.clone().unwrap_or_else(|| {
+            match self.engine {
+                EngineKind::OvPolicy => "127.0.0.1:8000",
+                _ => ":8000",
+            }
+            .to_string()
+        })
+    }
+}
+
+/// Refuse the policy flags on any other engine rather than ignore them.
+fn check_policy_flags(args: &RunArgs) -> Result<()> {
+    if args.engine == EngineKind::OvPolicy {
+        return Ok(());
+    }
+    let used = [
+        ("--precision", args.precision.is_some()),
+        (
+            "--policy-allow-origin",
+            !args.policy_allow_origin.is_empty(),
+        ),
+        (
+            "--policy-max-connections",
+            args.policy_max_connections as usize
+                != cascadia_api::policy::server::DEFAULT_MAX_CONNECTIONS,
+        ),
+        ("--allow-identity-stats", args.allow_identity_stats),
+    ];
+    match used.iter().find(|(_, set)| *set) {
+        Some((flag, _)) => Err(anyhow!("{flag} applies to --engine ov-policy only")),
+        None => Ok(()),
+    }
+}
+
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
+    check_policy_flags(&args)?;
+    if args.engine == EngineKind::OvPolicy {
+        return cmd_run_policy(args).await;
+    }
+    let api = args.api_addr();
     let mut worker = WorkerArgs::single_node(
         args.model,
         args.device,
         args.engine,
-        args.api,
+        api,
         args.prefix_cache_gb,
         args.api_max_body_mb,
         args.ep_workers,
@@ -1255,6 +1335,85 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.elastic_share = args.elastic_share;
     worker.llama_mtp = args.llama_mtp;
     cmd_worker(worker).await
+}
+
+/// `cascadia run --engine ov-policy`: load and warm the package, then serve
+/// the policy router (no chat routes, no dashboard).
+async fn cmd_run_policy(args: RunArgs) -> Result<()> {
+    use cascadia_engine::PolicyEngine;
+    use cascadia_engine_openvino::policy::{
+        compile_config, LoadOptions, OvPolicyEngine, OvPolicyOptions, Precision,
+    };
+
+    let api = args.api_addr();
+    check_api_addr_is_tcp(Some(&api))?;
+    let (host, port) = parse_addr(&api, "0.0.0.0")?;
+    let precision = args.precision.map(|p| match p {
+        PolicyPrecision::F16 => Precision::F16,
+        PolicyPrecision::F32 => Precision::F32,
+    });
+    // Device and precision errors (NPU, CPU f16) before any file is read.
+    compile_config(&args.device, precision)?;
+    let dir = PathBuf::from(&args.model);
+    if !dir.is_dir() {
+        return Err(anyhow!(
+            "no policy package directory at {}
+             --engine ov-policy takes a local policy_package directory (manifest.json,              the policy IR and the tokenizer IR); see docs/engines/ov-policy.md",
+            args.model
+        ));
+    }
+    let opts = OvPolicyOptions {
+        device: args.device.clone(),
+        precision,
+        manifest: LoadOptions {
+            allow_identity_stats: args.allow_identity_stats,
+        },
+    };
+    let engine = tokio::task::spawn_blocking(move || -> Result<Box<dyn PolicyEngine>> {
+        let mut engine = OvPolicyEngine::load(&dir, &opts)
+            .with_context(|| format!("loading policy package {}", dir.display()))?;
+        let ms = engine.warmup().context("policy warmup")?;
+        info!(warmup_ms = ?ms, "policy warmed");
+        Ok(Box::new(engine))
+    })
+    .await
+    .context("policy load task")??;
+    let cfg = cascadia_api::policy::server::PolicyServerConfig {
+        allow_origins: args.policy_allow_origin,
+        max_connections: args.policy_max_connections as usize,
+        ..Default::default()
+    };
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port))
+        .await
+        .with_context(|| format!("bind {host}:{port}"))?;
+    let shutdown = install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
+    serve_policy_engine(listener, engine, cfg, shutdown).await
+}
+
+/// Serve a loaded policy engine on `listener` until `shutdown` resolves.
+async fn serve_policy_engine(
+    listener: tokio::net::TcpListener,
+    engine: Box<dyn cascadia_engine::PolicyEngine>,
+    cfg: cascadia_api::policy::server::PolicyServerConfig,
+    shutdown: impl std::future::Future<Output = ShutdownSignal>,
+) -> Result<()> {
+    use cascadia_api::policy::server::{policy_router, serve_policy, HEADER_READ_TIMEOUT};
+
+    let spec = engine.spec().clone();
+    let app = policy_router(engine, cfg)?;
+    let addr = listener.local_addr()?;
+    info!(
+        model = %spec.model,
+        device = %spec.device,
+        cameras = ?spec.cameras,
+        chunk = ?spec.chunk,
+        "serving policy at ws://{addr}/v1/policy/ws (metadata: http://{addr}/v1/policy/metadata)"
+    );
+    tokio::select! {
+        res = serve_policy(listener, app, HEADER_READ_TIMEOUT) => res.context("serve_policy")?,
+        sig = shutdown => info!(signal = %sig, "shutdown signal received"),
+    }
+    Ok(())
 }
 
 fn cmd_completions(args: CompletionsArgs) -> Result<()> {
@@ -1280,6 +1439,7 @@ fn cmd_engines() -> Result<()> {
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI, sliding window); gemma4_cached_v1.x shards");
     println!("  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)");
     println!("  sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); bin via --llama-bin / CASCADIA_LLAMA_BIN / PATH; --elastic = GGML_STREAM_WEIGHTS device-side streaming (needs a streaming build, scripts/build-llama-stream.sh)");
+    println!("  ov-policy      robot policy (VLA): SmolVLA / pi0.5 policy_package on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
     println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
     Ok(())
 }
@@ -1710,6 +1870,7 @@ fn preflight_model_path(args: &WorkerArgs) -> Result<()> {
 fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn Builder>> {
     warn_ignored_ov_perf_flags(args);
     match args.engine {
+        EngineKind::OvPolicy => Err(policy_needs_run()),
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
         EngineKind::OvGenai => {
             if args.total != 1 {
@@ -2201,7 +2362,17 @@ fn check_api_addr_is_tcp(api: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn policy_needs_run() -> anyhow::Error {
+    anyhow!(
+        "--engine ov-policy serves one policy on one machine: use \
+         `cascadia run --engine ov-policy <package-dir>`, not `cascadia worker`"
+    )
+}
+
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
+    if args.engine == EngineKind::OvPolicy {
+        return Err(policy_needs_run());
+    }
     if args.rank >= args.total {
         return Err(anyhow!(
             "--rank must be in [0, {}); got {}",
@@ -4097,11 +4268,12 @@ mod tests {
         let Command::Run(args) = cli.cmd else {
             panic!("expected run subcommand");
         };
+        let api = args.api_addr();
         let worker = WorkerArgs::single_node(
             args.model,
             args.device,
             args.engine,
-            args.api,
+            api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
             Vec::new(),
@@ -4130,11 +4302,12 @@ mod tests {
         let Command::Run(args) = cli.cmd else {
             panic!("expected run");
         };
+        let api = args.api_addr();
         let worker = WorkerArgs::single_node(
             args.model,
             args.device,
             args.engine,
-            args.api,
+            api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
             args.ep_workers,
@@ -4142,6 +4315,158 @@ mod tests {
         );
         assert_eq!(worker.ep_placement, Some(PathBuf::from("placement.json")));
         assert_eq!(worker.ep_workers, ["127.0.0.1:9201", "127.0.0.1:9202"]);
+    }
+
+    fn run_args(argv: &[&str]) -> RunArgs {
+        let mut full = vec!["cascadia", "run"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).expect("parse run argv").cmd {
+            Command::Run(a) => a,
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn ov_policy_binds_loopback_unless_api_is_given() {
+        assert_eq!(
+            run_args(&["pkg", "--engine", "ov-policy"]).api_addr(),
+            "127.0.0.1:8000"
+        );
+        assert_eq!(run_args(&["m"]).api_addr(), ":8000");
+        assert_eq!(
+            run_args(&["pkg", "--engine", "ov-policy", "--api", ":8000"]).api_addr(),
+            ":8000"
+        );
+    }
+
+    #[test]
+    fn policy_flags_are_refused_on_other_engines() {
+        for flags in [
+            &["--precision", "f32"][..],
+            &["--policy-allow-origin", "http://x"],
+            &["--policy-max-connections", "2"],
+            &["--allow-identity-stats"],
+        ] {
+            let mut argv = vec!["m"];
+            argv.extend_from_slice(flags);
+            let e = check_policy_flags(&run_args(&argv))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("ov-policy only"), "{e}");
+            argv.extend(["--engine", "ov-policy"]);
+            check_policy_flags(&run_args(&argv)).unwrap();
+        }
+        assert!(
+            Cli::try_parse_from(["cascadia", "run", "m", "--policy-max-connections", "0"]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ov_policy_refuses_bad_devices_and_precisions_before_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().to_str().unwrap();
+        for (argv, want) in [
+            (
+                vec![
+                    pkg,
+                    "--engine",
+                    "ov-policy",
+                    "--device",
+                    "CPU",
+                    "--precision",
+                    "f16",
+                ],
+                "always runs f32",
+            ),
+            (
+                vec![pkg, "--engine", "ov-policy", "--device", "NPU"],
+                "NPU is not supported",
+            ),
+            (
+                vec!["/no/such/pkg", "--engine", "ov-policy", "--device", "CPU"],
+                "no policy package directory",
+            ),
+        ] {
+            let e = format!("{:#}", cmd_run(run_args(&argv)).await.unwrap_err());
+            assert!(e.contains(want), "{e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_refuses_ov_policy() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--engine",
+            "ov-policy",
+        ])
+        .unwrap();
+        let Command::Worker(w) = cli.cmd else {
+            panic!("expected worker")
+        };
+        assert!(build_builder(&w, 0)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("cascadia run"));
+        let e = cmd_worker(w).await.unwrap_err().to_string();
+        assert!(e.contains("cascadia run --engine ov-policy"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_policy_serve_path_serves_metadata_and_no_chat_routes() {
+        use cascadia_types::{NoiseMode, PolicySpec, ResizeConvention};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let spec = PolicySpec {
+            model: "mock".into(),
+            device: "CPU".into(),
+            cameras: vec!["image".into()],
+            height: 2,
+            width: 2,
+            state_len: 2,
+            chunk: [1, 2],
+            noise: NoiseMode::Constant,
+            noise_shape: None,
+            resize: ResizeConvention::Center,
+            prompt_max_bytes: 16,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_policy_engine(
+            listener,
+            Box::new(cascadia_engine::MockPolicyEngine::new(spec.clone())),
+            Default::default(),
+            async move {
+                let _ = stop_rx.await;
+                ShutdownSignal::Sigint
+            },
+        ));
+        let get = |path: &'static str| async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).await.unwrap();
+            out
+        };
+        let meta = get("/v1/policy/metadata").await;
+        assert!(meta.starts_with("HTTP/1.1 200"), "{meta}");
+        let body = meta.split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(serde_json::from_str::<PolicySpec>(body).unwrap(), spec);
+        assert!(get("/v1/models").await.starts_with("HTTP/1.1 404"));
+        stop_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     /// The engine renamed from `qwen36-moe` to `qwen35`; the old spelling is
