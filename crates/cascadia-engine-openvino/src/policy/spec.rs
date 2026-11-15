@@ -96,10 +96,14 @@ impl ManifestSpec {
             ImageStep::Pi05(_) => Some(ServerResize::Letterbox),
             ImageStep::SmolVlaResize(r) if !r.stretch => Some(ServerResize::Letterbox),
             ImageStep::VlaJepa(_) => Some(ServerResize::Area),
-            ImageStep::Xr0(x) => Some(ServerResize::SmartResizeCubic {
-                factor: x.image_factor as u32,
-                max_pixels: x.image_max_pixels as u32,
-            }),
+            // On x86, physicalai's OpenCV resizes these with Intel IPP, which the
+            // API does not reproduce; see `XR0_CUBIC_EXACT` there.
+            ImageStep::Xr0(x) if cfg!(target_arch = "aarch64") => {
+                Some(ServerResize::SmartResizeCubic {
+                    factor: x.image_factor as u32,
+                    max_pixels: x.image_max_pixels as u32,
+                })
+            }
             // EVO1's antialiased bicubic stretch, GR00T's INTER_AREA square and
             // MolmoAct2's processor are not ported.
             _ => None,
@@ -274,7 +278,8 @@ mod tests {
                 Some(ServerResize::SmartResizeCubic {
                     factor: 32,
                     max_pixels: 90000,
-                }),
+                })
+                .filter(|_| cfg!(target_arch = "aarch64")),
             ),
             ("xvla-libero-manifest.json", None),
             ("evo1-libero-manifest.json", None),

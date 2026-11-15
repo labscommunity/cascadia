@@ -868,6 +868,11 @@ fn server_resize(cam: &str, img: &Image, spec: &PolicySpec) -> Result<Image, Req
             Ok(resize_frame(img, spec.height, spec.width, spec.resize))
         }
         Some(ServerResize::Area) => Ok(area_frame(img, spec.height, spec.width)),
+        Some(ServerResize::SmartResizeCubic { .. }) if !XR0_CUBIC_EXACT => refuse(format!(
+            "camera {cam:?} is {}x{}; on x86 physicalai resizes XR0 frames with Intel IPP, which \
+             this server does not reproduce, so send frames at {}x{}",
+            img.height, img.width, spec.height, spec.width
+        )),
         Some(ServerResize::SmartResizeCubic { factor, max_pixels }) => {
             match smart_resize(img.height, img.width, factor, max_pixels) {
                 Some(hw) if hw == (spec.height, spec.width) => {
@@ -998,12 +1003,19 @@ pub fn smart_resize(height: u32, width: u32, factor: u32, max_pixels: u32) -> Op
     Some((nh as u32, nw as u32))
 }
 
+/// Whether [`cubic_frame`] is what physicalai's own runtime computes here. On
+/// AArch64 its OpenCV runs the code ported below, byte for byte. On x86 the
+/// opencv-python wheel hands `INTER_CUBIC` on `u8` to Intel IPP, whose
+/// rounding differs (up to 1 level on a few percent of bytes) and is not
+/// public, so XR0 frames of another size are refused there.
+pub const XR0_CUBIC_EXACT: bool = cfg!(target_arch = "aarch64");
+
 /// Bytes OpenCV's 128-bit vector loops process at once.
 const VLANES: usize = 16;
 
 /// OpenCV's `v_muladd`: fused on AArch64 (NEON `vfmaq`), a product then a sum
-/// on x86 builds without FMA in the baseline. Only the AArch64 path is checked
-/// against OpenCV here.
+/// on x86 builds without FMA in the baseline. Both match OpenCV's own code on
+/// their platform; on x86 the wheel's IPP path is used instead (see above).
 #[inline]
 fn muladd(a: f32, b: f32, c: f32) -> f32 {
     if cfg!(target_arch = "aarch64") {

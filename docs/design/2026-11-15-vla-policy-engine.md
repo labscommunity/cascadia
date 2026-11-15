@@ -404,8 +404,12 @@ server is the proof of wire compatibility, not the version numbers.
     padded with 0 on the top and left or centred as `resize` says.
   - `area` (VLA-JEPA): physicalai's first step, average pooling as torch `interpolate(mode="area")`,
     to `image_resolution`; the engine then runs its antialiased bicubic step as before.
-  - `smart_resize_cubic` (XR0): Qwen's `smart_resize` target and OpenCV `INTER_CUBIC` on `u8`, byte
-    for byte. The export takes one frame size, so only frames that resize lands on it are taken;
+  - `smart_resize_cubic` (XR0, AArch64 servers only): Qwen's `smart_resize` target and OpenCV
+    `INTER_CUBIC` on `u8`, byte for byte, including OpenCV's 16-byte `f32` vector loop. On x86 the
+    opencv-python wheel physicalai pins (5.0.0.93) hands this resize to Intel IPP, whose bytes differ
+    from OpenCV's own code by 1 level on about 4% of them and are not public, so an x86 server
+    advertises no server resize for XR0 and refuses frames of another size. (With IPP turned off,
+    x86 OpenCV gives the same bytes as AArch64, and so does this port on x86.) The export takes one frame size, so only frames that resize lands on it are taken;
     others are refused naming the size they would become (a 480x640 camera becomes 256x320, which
     a 256x256 LIBERO export cannot take, on physicalai's own server too).
 

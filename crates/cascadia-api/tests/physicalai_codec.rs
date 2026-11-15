@@ -5,7 +5,7 @@ use cascadia_api::policy::physicalai::{
     area_frame, area_frame_f32, cubic_frame, decode_control, decode_predict, encode_error,
     encode_metadata, encode_predict_reply, encode_reset_ok, read_seq, resize_frame,
     resize_frame_f32, smart_resize, ControlError, ErrorCode, ServerIdentity, Timings,
-    MAX_REQUEST_BYTES, NO_SEQ,
+    MAX_REQUEST_BYTES, NO_SEQ, XR0_CUBIC_EXACT,
 };
 use cascadia_api::policy::{max_payload_bytes, metadata_json_for, PackageIdentity};
 use cascadia_types::{ActionChunk, Image, NoiseMode, PolicySpec, ResizeConvention, ServerResize};
@@ -838,6 +838,18 @@ fn xr0_takes_frames_its_resize_sends_to_the_export_size() {
             val(|b| mp::image(b, "raw", "uint8", &[h, w, 3], &data)),
         )
     };
+    if !XR0_CUBIC_EXACT {
+        // x86: physicalai's resize is Intel IPP's, which is not reproduced.
+        let e = decode_predict(
+            &raw(20, 20, read_fixture("xr0-20x20.rgb")).pack(),
+            &s,
+            MAX_REQUEST_BYTES,
+        )
+        .unwrap_err();
+        assert!(e.message().contains("Intel IPP"), "{e}");
+        assert!(e.message().contains("send frames at 16x16"), "{e}");
+        return;
+    }
     let ok = decode_predict(
         &raw(20, 20, read_fixture("xr0-20x20.rgb")).pack(),
         &s,
