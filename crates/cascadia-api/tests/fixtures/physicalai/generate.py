@@ -16,7 +16,10 @@ import argparse
 import json
 from pathlib import Path
 
+import cv2
 import numpy as np
+from physicalai.inference.preprocessors.pi05 import Pi05Preprocessor
+from physicalai.inference.preprocessors.smolvla import ResizeSmolVLA
 from physicalai.inference.remote import _protocol as p
 from physicalai.transport import derive_port
 
@@ -89,12 +92,58 @@ def cases():
     yield "reset-ok.msgpack", p.encode_message({"protocol_version": 1, "ok": True})
 
 
+def native(h, w, seed):
+    """A smooth frame with some texture, as a camera would send at its own resolution."""
+    y, x = np.mgrid[0:h, 0:w].astype(np.float64)
+    rng = np.random.default_rng(seed)
+    base = np.stack([x / w * 255, y / h * 255, 128 + 100 * np.sin(x / 3) * np.cos(y / 5)], axis=-1)
+    return np.clip(base + rng.normal(0, 12, base.shape), 0, 255).astype(np.uint8)
+
+
+def resizes():
+    """Each convention's resize as physicalai's server runs it, on float32 [0, 1] frames, x255.
+
+    top_left: ResizeSmolVLA._resize_with_pad; center: Pi05Preprocessor._resize_with_pad;
+    stretch: cv2.resize INTER_LINEAR on float32 (ResizePreprocessor's stretch arithmetic).
+    """
+    for name, (h, w) in {"down": (48, 64), "tall": (40, 18), "up": (6, 10)}.items():
+        img = native(h, w, len(name))
+        f = img.astype(np.float32)[np.newaxis] / 255.0
+        top_left = ResizeSmolVLA._resize_with_pad(np.transpose(f, (0, 3, 1, 2)), W, H, pad_value=0)
+        center = Pi05Preprocessor._resize_with_pad(f, W, H, pad_value=0)
+        stretch = cv2.resize(f[0], (W, H), interpolation=cv2.INTER_LINEAR)
+        outs = {
+            "top_left": np.transpose(top_left[0], (1, 2, 0)),
+            "center": center[0],
+            "stretch": stretch,
+        }
+        yield f"resize-{name}.rgb", img.tobytes()
+        for conv, out in outs.items():
+            assert out.shape == (H, W, 3), (conv, out.shape)
+            yield f"resize-{name}-{conv}.f32", (out.astype(np.float32) * 255.0).astype("<f4").tobytes()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, required=True)
     out = ap.parse_args().out
     for name, data in cases():
         (out / name).write_bytes(data)
+    for name, data in resizes():
+        (out / name).write_bytes(data)
+    # An unchanged client at a camera's native 480x640, JPEG.
+    big = inputs()
+    big["images.image"] = native(480, 640, 1)[np.newaxis]
+    big["images.wrist"] = native(480, 640, 2)
+    (out / "predict-native-480x640.msgpack").write_bytes(predict(big, "jpeg", seq=6))
+    # What physicalai's server feeds SmolVLA from it: OpenCV's decode, then the top-left letterbox.
+    _, decoded = p.decode_predict_request((out / "predict-native-480x640.msgpack").read_bytes())
+    golden = b""
+    for key in ("images.image", "images.wrist"):
+        f = decoded[key].astype(np.float32).reshape(1, 480, 640, 3) / 255.0
+        r = ResizeSmolVLA._resize_with_pad(np.transpose(f, (0, 3, 1, 2)), W, H, pad_value=0)
+        golden += (np.transpose(r[0], (1, 2, 0)).astype(np.float32) * 255.0).astype("<f4").tobytes()
+    (out / "predict-native-480x640.top_left.f32").write_bytes(golden)
     # What physicalai's own decoder makes of the JPEG frames (OpenCV), to bound our decoder's
     # difference from it.
     _, decoded = p.decode_predict_request((out / "predict-jpeg.msgpack").read_bytes())

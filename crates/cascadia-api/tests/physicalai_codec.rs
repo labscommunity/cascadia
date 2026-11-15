@@ -3,10 +3,11 @@
 
 use cascadia_api::policy::physicalai::{
     decode_control, decode_predict, encode_error, encode_metadata, encode_predict_reply,
-    encode_reset_ok, read_seq, ControlError, ErrorCode, ServerIdentity, Timings, NO_SEQ,
+    encode_reset_ok, read_seq, resize_frame, resize_frame_f32, ControlError, ErrorCode,
+    ServerIdentity, Timings, MAX_REQUEST_BYTES, NO_SEQ,
 };
 use cascadia_api::policy::{max_payload_bytes, metadata_json_for, PackageIdentity};
-use cascadia_types::{ActionChunk, NoiseMode, PolicySpec, ResizeConvention};
+use cascadia_types::{ActionChunk, Image, NoiseMode, PolicySpec, ResizeConvention};
 
 macro_rules! fixture {
     ($name:literal) => {
@@ -367,7 +368,11 @@ impl Req {
     }
 
     fn refused(&self, want: &str) {
-        let e = decode_predict(&self.pack(), &spec(), max()).unwrap_err();
+        self.refused_within(max(), want);
+    }
+
+    fn refused_within(&self, max_bytes: u64, want: &str) {
+        let e = decode_predict(&self.pack(), &spec(), max_bytes).unwrap_err();
         assert!(
             e.message().contains(want),
             "want {want:?}, got {:?}",
@@ -555,8 +560,8 @@ fn image_refusals() {
         .image("images.other", img("raw", "uint8", &s, &image))
         .refused("unknown camera \"other\"");
     good()
-        .image("images.wrist", img("raw", "uint8", &[8, 8, 3], &[0; 192]))
-        .refused("is 8x8; expected 16x16");
+        .image("images.wrist", img("raw", "uint8", &[4097, 1, 3], &[]))
+        .refused_within(MAX_REQUEST_BYTES, "at most 4096 pixels a side");
     let mut r = good();
     r.images.pop();
     r.refused("missing camera \"wrist\"");
@@ -589,4 +594,86 @@ fn a_duplicate_key_is_refused() {
         e.message().contains("unexpected or missing fields") || e.message().contains("twice"),
         "{e}"
     );
+}
+
+// ---- frames at another resolution are resized as physicalai's server does ----
+
+fn f32s_of(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn worst(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn resizes_match_physicalai_for_every_convention() {
+    let cases: [(&str, u32, u32, &[u8]); 3] = [
+        ("down", 48, 64, fixture!("resize-down.rgb")),
+        ("tall", 40, 18, fixture!("resize-tall.rgb")),
+        ("up", 6, 10, fixture!("resize-up.rgb")),
+    ];
+    let convs = [
+        (ResizeConvention::TopLeft, "top_left"),
+        (ResizeConvention::Center, "center"),
+        (ResizeConvention::Stretch, "stretch"),
+    ];
+    let golden = |name: &str, conv: &str| -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/tests/fixtures/physicalai/resize-{name}-{conv}.f32",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    for (name, h, w, rgb) in cases {
+        let img = Image {
+            height: h,
+            width: w,
+            data: rgb.to_vec(),
+        };
+        for (conv, label) in convs {
+            let want = f32s_of(&golden(name, label));
+            let ours = resize_frame_f32(&img, 16, 16, conv);
+            let d = worst(&ours, &want);
+            eprintln!("resize {name} {h}x{w} {label}: worst |ours - physicalai| = {d} (of 255)");
+            assert!(d < 1e-3, "{name} {label}: {d}");
+            // The u8 frame the engine gets is within rounding of physicalai's float frame.
+            let u8s: Vec<f32> = resize_frame(&img, 16, 16, conv)
+                .data
+                .iter()
+                .map(|&b| f32::from(b))
+                .collect();
+            assert!(worst(&u8s, &want) <= 0.5 + 1e-3, "{name} {label} u8");
+        }
+    }
+}
+
+#[test]
+fn a_native_480x640_jpeg_passes_through() {
+    let native = fixture!("predict-native-480x640.msgpack");
+    let r = decode_predict(native, &spec(), MAX_REQUEST_BYTES).unwrap();
+    assert_eq!(r.seq, 6);
+    let frames: Vec<f32> = r
+        .observation
+        .images
+        .iter()
+        .inspect(|(_, i)| assert_eq!((i.height, i.width), (16, 16)))
+        .flat_map(|(_, i)| i.data.iter().map(|&b| f32::from(b)))
+        .collect();
+    // physicalai's server: OpenCV's JPEG decode, then the same letterbox. Our JPEG
+    // decoder differs from OpenCV's by a level or two before averaging.
+    let d = worst(
+        &frames,
+        &f32s_of(fixture!("predict-native-480x640.top_left.f32")),
+    );
+    eprintln!("native 480x640 JPEG to 16x16 top_left: worst |ours - physicalai| = {d} (of 255)");
+    assert!(d <= 3.0, "{d}");
+    // The spec's own payload cap would have refused it.
+    assert!(decode_predict(native, &spec(), max()).is_err());
 }

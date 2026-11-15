@@ -25,7 +25,7 @@ use zenoh::{Session, Wait};
 use super::physicalai::{
     check_name, decode_control, decode_predict, encode_error, encode_metadata,
     encode_predict_reply, encode_reset_ok, key_prefix, read_seq, ControlError, ErrorCode,
-    ServerIdentity, Timings, NO_SEQ,
+    ServerIdentity, Timings, MAX_REQUEST_BYTES, NO_SEQ,
 };
 use super::server::{infer_guarded, SharedPolicy};
 use super::{check_reply, max_payload_bytes, PackageIdentity};
@@ -416,7 +416,8 @@ impl ZenohFrontEnd {
         backend: Box<dyn Backend>,
     ) -> Result<Self, ZenohError> {
         let endpoint = listen.endpoint()?;
-        let max_bytes = u64::from(max_payload_bytes(&advert.spec));
+        // Frames may come at the camera's native size and are resized here.
+        let max_bytes = MAX_REQUEST_BYTES.max(u64::from(max_payload_bytes(&advert.spec)));
         let config = secure_config(&endpoint, max_bytes)?;
         let id = ServerIdentity {
             server_id: uuid::Uuid::new_v4().simple().to_string(),

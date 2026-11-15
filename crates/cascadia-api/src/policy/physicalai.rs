@@ -10,7 +10,7 @@
 //! request. The transport (Zenoh) lives in `zenoh_server`.
 
 use cascadia_engine::{check_observation, EngineError};
-use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec};
+use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention};
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
@@ -25,6 +25,13 @@ pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_REQUEST_BUDGET_MS: u64 = 60_000;
 
 pub const IMAGE_CODECS: [&str; 2] = ["jpeg", "raw"];
+
+/// physicalai's default `max_request_bytes`: room for frames at a camera's
+/// native resolution, which its client sends unless told to downscale.
+pub const MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Largest frame side accepted before resizing.
+pub const MAX_IMAGE_SIDE: u64 = 4096;
 
 /// The `seq` an error carries when the request had none.
 pub const NO_SEQ: i128 = -1;
@@ -392,6 +399,11 @@ fn decode_images(v: Val<'_>, budget: &mut u64) -> Result<Vec<(String, Image)>, R
             return refuse("Decoded image arrays exceed max_request_bytes");
         };
         let (h, w) = (shape[shape.len() - 3], shape[shape.len() - 2]);
+        if h > MAX_IMAGE_SIDE || w > MAX_IMAGE_SIDE {
+            return refuse(format!(
+                "Image is {h}x{w}; at most {MAX_IMAGE_SIDE} pixels a side"
+            ));
+        }
         let pixels = if *codec == "raw" {
             if data.len() as u64 != size {
                 return refuse("Raw image data length does not match its shape");
@@ -506,6 +518,11 @@ fn observation(
                     spec.cameras
                 ))
                 }
+            };
+            let img = if (img.height, img.width) == (spec.height, spec.width) {
+                img
+            } else {
+                resize_frame(&img, spec.height, spec.width, spec.resize)
             };
             Ok((cam, img))
         })
@@ -724,4 +741,101 @@ pub fn encode_reset_ok() -> Vec<u8> {
     w.str("ok");
     w.bool(true);
     w.buf
+}
+
+// ---- resizing ----
+
+/// One axis of OpenCV's `INTER_LINEAR`: for each output index, the source
+/// index and the weight of the next source sample.
+fn linear_taps(src: usize, dst: usize) -> Vec<(usize, f32)> {
+    let scale = 1.0 / (dst as f64 / src as f64);
+    (0..dst)
+        .map(|d| {
+            let f = ((d as f64 + 0.5) * scale - 0.5) as f32;
+            let mut s = f.floor() as i64;
+            let mut f = f - s as f32;
+            if s < 0 {
+                (s, f) = (0, 0.0);
+            }
+            if s >= src as i64 - 1 {
+                (s, f) = (src as i64 - 1, 0.0);
+            }
+            (s as usize, f)
+        })
+        .collect()
+}
+
+/// `cv2.resize(..., INTER_LINEAR)` of an RGB frame held as `f32`: rows
+/// first, then columns, as OpenCV does. Values stay in the input's scale.
+fn bilinear(src: &[f32], sh: usize, sw: usize, dh: usize, dw: usize) -> Vec<f32> {
+    let xs = linear_taps(sw, dw);
+    let ys = linear_taps(sh, dh);
+    let row = |y: usize| -> Vec<f32> {
+        let line = &src[y * sw * 3..(y + 1) * sw * 3];
+        let mut out = Vec::with_capacity(dw * 3);
+        for &(x, f) in &xs {
+            let x1 = (x + 1).min(sw - 1);
+            for c in 0..3 {
+                let a = line[x * 3 + c];
+                let b = if f == 0.0 { 0.0 } else { line[x1 * 3 + c] };
+                out.push(a * (1.0 - f) + b * f);
+            }
+        }
+        out
+    };
+    let mut out = Vec::with_capacity(dh * dw * 3);
+    for &(y, f) in &ys {
+        let r0 = row(y);
+        if f == 0.0 {
+            out.extend_from_slice(&r0);
+        } else {
+            let r1 = row((y + 1).min(sh - 1));
+            out.extend(r0.iter().zip(&r1).map(|(a, b)| a * (1.0 - f) + b * f));
+        }
+    }
+    out
+}
+
+/// The frame resized to `height x width` as physicalai's server preprocessor
+/// for `conv` does it, in `f32` on `[0, 255]`: bilinear (`INTER_LINEAR`, no
+/// antialiasing) to the aspect-kept size with pad 0 on the top and left
+/// (`smolvla_resize`) or centred (`pi05`), or a plain bilinear stretch.
+/// Exposed for tests; [`decode_predict`] rounds it to `u8`.
+pub fn resize_frame_f32(img: &Image, height: u32, width: u32, conv: ResizeConvention) -> Vec<f32> {
+    let (sh, sw) = (img.height as usize, img.width as usize);
+    let (h, w) = (height as usize, width as usize);
+    let src: Vec<f32> = img.data.iter().map(|&b| f32::from(b)).collect();
+    if conv == ResizeConvention::Stretch {
+        return bilinear(&src, sh, sw, h, w);
+    }
+    let ratio = f64::max(sw as f64 / w as f64, sh as f64 / h as f64);
+    let rh = ((sh as f64 / ratio) as usize).clamp(1, h);
+    let rw = ((sw as f64 / ratio) as usize).clamp(1, w);
+    let inner = if (rh, rw) == (sh, sw) {
+        src
+    } else {
+        bilinear(&src, sh, sw, rh, rw)
+    };
+    let (top, left) = match conv {
+        ResizeConvention::TopLeft => (h - rh, w - rw),
+        _ => ((h - rh) / 2, (w - rw) / 2),
+    };
+    let mut out = vec![0.0f32; h * w * 3];
+    for y in 0..rh {
+        let at = ((top + y) * w + left) * 3;
+        out[at..at + rw * 3].copy_from_slice(&inner[y * rw * 3..(y + 1) * rw * 3]);
+    }
+    out
+}
+
+/// [`resize_frame_f32`] rounded to the `u8` frame the engine takes.
+pub fn resize_frame(img: &Image, height: u32, width: u32, conv: ResizeConvention) -> Image {
+    Image {
+        height,
+        width,
+        data: resize_frame_f32(img, height, width, conv)
+            .into_iter()
+            .map(|v| v.round().clamp(0.0, 255.0) as u8)
+            .collect(),
+    }
 }

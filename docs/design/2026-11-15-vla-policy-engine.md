@@ -253,7 +253,7 @@ Intel's π0.5 LIBERO declares `[3, 256, 256]` while its image step resizes to 22
 224×224. A request must carry
 exactly the advertised camera names; a missing or extra name is an error.
 
-Images must arrive at the model resolution, uint8 HWC RGB, so the engine never has to reproduce
+On the WebSocket, images must arrive at the model resolution, uint8 HWC RGB (the physicalai front end resizes for its clients; see "Intel remote-inference front end"), so the engine never has to reproduce
 OpenCV's bilinear resize pixel for pixel. The client resizes on the robot, and must use the
 package's padding convention, which the metadata states as `resize`: bilinear, pad value 0 before
 scaling, padded **centred** for `pi05` and **top and left** for `smolvla_resize` (content at the
@@ -385,15 +385,26 @@ server is the proof of wire compatibility, not the version numbers.
   client dials when it is given none.
 - Handshake: `server_id` (fresh per start), `name`, `policy` (`name`, `manifest_sha256` = SHA-256 of
   the package's `manifest.json` bytes, `backend`, `device`), `chunk_size` (T), `rtc` (not offered:
-  `supported: false`), `image_codecs` `["jpeg", "raw"]`, `max_request_bytes` (the same cap the
-  WebSocket uses). The client's `expected_policy` and `expected_manifest_sha256` check these.
+  `supported: false`), `image_codecs` `["jpeg", "raw"]`, `max_request_bytes` (32 MiB, physicalai's
+  default, since frames arrive at the camera's resolution). The client's `expected_policy` and `expected_manifest_sha256` check these.
 - Predict: `seq`, `budget_ms` (1 to 60000), `inputs` (tagged `__np__` arrays and string lists) and
   `images` (JPEG or raw RGB, `HxWx3` or `1xHxWx3`), validated in the order Intel's server does.
   The inputs then map onto the same `Observation` as a WebSocket request and pass the same
   `check_observation`: `state` `[D]` or `[1, D]` (float32 or float64), `task` a one-string list
   (the prompt), cameras as `images.<name>` with the advertised names, or a bare `images` for a
   one-camera package (what Intel's `PolicySource` sends for one camera), and optional `noise` for
-  input-mode packages. Frames must be at the model resolution, as on the WebSocket.
+  input-mode packages.
+- Frames: physicalai's client sends them at the camera's native resolution (unless it is given
+  `max_image_side`) and physicalai's server resizes them in the model's preprocessor, so this front
+  end does the same before the observation is checked: at most 4096 pixels a side, decoded bytes
+  within `max_request_bytes`, then OpenCV's `INTER_LINEAR` arithmetic in `f32` (no antialiasing)
+  to the package's `resize`: the aspect-kept size padded with 0 on the top and left
+  (`smolvla_resize`) or centred (`pi05`), or a plain stretch. The result is rounded to the `u8`
+  frame the engine takes, within 0.5/255 of physicalai's own float frame; the golden pixels come
+  from physicalai's `ResizeSmolVLA` and `Pi05Preprocessor` resize functions and `cv2.resize`.
+  Stretch packages with their own kernel (VLA-JEPA's bicubic, XR0's cubic) get the bilinear
+  stretch, so for bit-exact frames such clients send the model resolution. The WebSocket keeps
+  its exact-size rule: openpi clients resize on the robot.
 - Reply: `outputs.action` as float32 `[1, T, D]` (the shape Intel's own models return), `seq`,
   `server_id` and the server's queue, compute and decode seconds. Reset replies `{ok: true}`;
   policies keep no state between calls, so it only orders with the queue.
