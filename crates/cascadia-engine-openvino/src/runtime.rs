@@ -5176,7 +5176,7 @@ impl Builder for OvRuntimeBuilder {
                 ShimDType::F16 | ShimDType::Bf16 => 2,
                 ShimDType::F32 | ShimDType::I32 => 4,
                 ShimDType::I64 => 8,
-                ShimDType::I8 => 1,
+                ShimDType::I8 | ShimDType::Bool => 1,
             };
             let layer_bytes = kvh * past_len * hd * elem_bytes;
             let n = layers.len();
