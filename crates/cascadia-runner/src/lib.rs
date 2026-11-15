@@ -54,8 +54,9 @@ const MAX_DEFERRED_CANCELS: usize = 4096;
 pub enum RelayExit {
     /// The engine slot emptied (clean teardown via [`Runner::close`]).
     SlotEmpty,
-    /// A `step()` hit an unrecoverable peer-link failure; the caller should
-    /// exit non-zero so the supervisor rebuilds the stage.
+    /// A `step()` returned a connection-fatal error; the caller should exit
+    /// non-zero so the supervisor rebuilds the stage. Engines that re-link in
+    /// place never return one for a lost link.
     ConnectionFatal,
 }
 
@@ -621,11 +622,12 @@ impl Runner {
     ///
     /// A `step()` that returns a *connection-fatal* `Err` ([dead/dropped
     /// socket, idle-ceiling fire](EngineError::is_connection_fatal)) ends
-    /// the loop with [`RelayExit::ConnectionFatal`]: the worker's upstream
-    /// socket can only be re-accepted by a rebuild, so the caller exits
+    /// the loop with [`RelayExit::ConnectionFatal`], so the caller exits
     /// non-zero and lets the supervisor (systemd `Restart=on-failure`)
     /// rebuild the stage — rather than spin-and-flood at the backoff rate
-    /// forever. A *non-fatal* `Err` (bad frame kind, transient inference
+    /// forever. Engines whose workers re-link in place (ov-dist-spec,
+    /// sparse-moe) never return one for a lost link: they keep stepping
+    /// while they re-accept. A *non-fatal* `Err` (bad frame kind, transient inference
     /// failure) is logged and driving continues, throttled by
     /// `RELAY_ERR_BACKOFF` so it can't peg a core; the backoff resets on
     /// any non-empty `Ok` step. Engines MAY additionally self-throttle.
@@ -653,8 +655,8 @@ impl Runner {
             // Engine.step is sync; just drain. A non-fatal Err is logged
             // but the loop keeps driving — relay engines recover their own
             // state and a transient frame error must not take the stage
-            // down. A connection-fatal Err is unrecoverable in-process, so
-            // bail and let the supervisor rebuild us.
+            // down. A connection-fatal Err is one the engine cannot recover
+            // in-process, so bail and let the supervisor rebuild us.
             let failed = match engine.step() {
                 Ok(_) => false,
                 Err(e) if e.is_connection_fatal() => {

@@ -342,6 +342,15 @@ pub enum TransportError {
     #[error("recv_raw size {0} exceeds MAX_RAW_BYTES ({})", MAX_RAW_BYTES)]
     RawSizeTooLarge(usize),
 
+    #[error(
+        "malformed frame header: payload {payload_len} bytes, shape {shape:?}, dtype {dtype_code}"
+    )]
+    MalformedFrame {
+        payload_len: u32,
+        shape: [u32; 3],
+        dtype_code: u32,
+    },
+
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 
@@ -448,12 +457,104 @@ pub struct TransferStats {
     pub bytes: usize,
 }
 
+/// Slowest transfer tolerated, so a peer moving a byte per wait can't hold a stage forever.
+const MIN_TRANSFER_BYTES_PER_SEC: u64 = 64 * 1024;
+
+/// Bounds one transfer by progress, not total time: it fails after `idle` without a byte, or once
+/// it has taken longer than its size needs at [`MIN_TRANSFER_BYTES_PER_SEC`].
+struct TransferDeadline {
+    idle: Duration,
+    started: Instant,
+    ceiling: Duration,
+    len: usize,
+}
+
+impl TransferDeadline {
+    fn new(len: usize, idle: Duration) -> Self {
+        Self {
+            idle,
+            started: Instant::now(),
+            ceiling: idle.max(Duration::from_secs(len as u64 / MIN_TRANSFER_BYTES_PER_SEC)),
+            len,
+        }
+    }
+
+    fn next_wait(&self) -> Duration {
+        self.idle
+            .min(self.ceiling.saturating_sub(self.started.elapsed()))
+    }
+
+    fn timed_out(&self, what: &str, done: usize) -> TransportError {
+        TransportError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{what} timed out: {done} of {} bytes after {:?} (idle limit {:?})",
+                self.len,
+                self.started.elapsed(),
+                self.idle
+            ),
+        ))
+    }
+}
+
+/// How long a send may make no progress. A peer computing a prefill isn't reading, so a healthy
+/// peer can stall a large frame as long as a prefill reply may take: the same budget applies.
+fn send_idle_timeout() -> Duration {
+    recv_timeout().saturating_mul(PREFILL_REPLY_TIMEOUT_FACTOR)
+}
+
+async fn write_with_progress<W: AsyncWrite + Unpin>(
+    sock: &mut W,
+    data: &[u8],
+    deadline: &TransferDeadline,
+) -> TransportResult<()> {
+    let mut written = 0;
+    while written < data.len() {
+        match tokio::time::timeout(deadline.next_wait(), sock.write(&data[written..])).await {
+            Ok(Ok(0)) => return Err(TransportError::Io(io::ErrorKind::WriteZero.into())),
+            Ok(Ok(n)) => written += n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(deadline.timed_out("send", written)),
+        }
+    }
+    Ok(())
+}
+
+async fn flush_with_progress<W: AsyncWrite + Unpin>(
+    sock: &mut W,
+    deadline: &TransferDeadline,
+) -> TransportResult<()> {
+    match tokio::time::timeout(deadline.next_wait(), sock.flush()).await {
+        Ok(res) => Ok(res?),
+        Err(_) => Err(deadline.timed_out("flush", deadline.len)),
+    }
+}
+
+async fn send_raw_bytes<W: AsyncWrite + Unpin>(sock: &mut W, bytes: &[u8]) -> TransportResult<()> {
+    let deadline = TransferDeadline::new(bytes.len(), send_idle_timeout());
+    write_with_progress(sock, bytes, &deadline).await?;
+    flush_with_progress(sock, &deadline).await?;
+    cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
+        .with_label_values(&["raw"])
+        .inc_by(bytes.len() as u64);
+    Ok(())
+}
+
 /// Send a tensor over a connected stream.
 pub async fn send_tensor<W: AsyncWrite + Unpin>(
     sock: &mut W,
     tensor: &Tensor,
 ) -> TransportResult<TransferStats> {
+    send_tensor_within(sock, tensor, send_idle_timeout()).await
+}
+
+async fn send_tensor_within<W: AsyncWrite + Unpin>(
+    sock: &mut W,
+    tensor: &Tensor,
+    idle: Duration,
+) -> TransportResult<TransferStats> {
     let start = Instant::now();
+    let deadline = TransferDeadline::new(HEADER_SIZE + tensor.data.len(), idle);
     let mut header = [0u8; HEADER_SIZE];
     header[0..4].copy_from_slice(&(tensor.data.len() as u32).to_be_bytes());
     header[4..8].copy_from_slice(&(tensor.dtype as u32).to_be_bytes());
@@ -461,7 +562,7 @@ pub async fn send_tensor<W: AsyncWrite + Unpin>(
     header[12..16].copy_from_slice(&tensor.shape[1].to_be_bytes());
     header[16..20].copy_from_slice(&tensor.shape[2].to_be_bytes());
 
-    sock.write_all(&header).await?;
+    write_with_progress(sock, &header, &deadline).await?;
     // Large single bursts (~750 KB hidden frames at 70B scale) were observed
     // to intermittently vanish inside DERP-relayed tailscale paths while the
     // 20-byte header and ≤500 KB frames always arrived (2026-07-19 fleet
@@ -470,22 +571,22 @@ pub async fn send_tensor<W: AsyncWrite + Unpin>(
     // one extra flush per 256 KB). Opt out with CASCADIA_SEND_BURST_BYTES=0.
     let burst = send_burst_bytes();
     if burst == 0 || tensor.data.len() <= burst {
-        sock.write_all(&tensor.data).await?;
+        write_with_progress(sock, &tensor.data, &deadline).await?;
     } else {
-        // No sleep after the FINAL part, and the receiver's whole-frame
-        // recv deadline still applies: total pacing delay must stay far
+        // No sleep after the FINAL part, and the receiver's minimum-rate
+        // limit still applies: total pacing delay must stay far
         // below recv_timeout (burst is clamped >= 64 KiB so a 256 MiB
         // frame adds at most ~8 s of sleeps).
         let mut parts = tensor.data.chunks(burst).peekable();
         while let Some(part) = parts.next() {
-            sock.write_all(part).await?;
-            sock.flush().await?;
+            write_with_progress(sock, part, &deadline).await?;
+            flush_with_progress(sock, &deadline).await?;
             if parts.peek().is_some() {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
         }
     }
-    sock.flush().await?;
+    flush_with_progress(sock, &deadline).await?;
 
     let elapsed = start.elapsed();
     cascadia_metrics::TRANSPORT_SEND_SECONDS.observe(elapsed.as_secs_f64());
@@ -512,7 +613,7 @@ fn send_burst_bytes() -> usize {
 
 /// Parse the CASCADIA_SEND_BURST_BYTES knob. Unset or `0` → pacing OFF; a value
 /// below the 64 KiB floor is clamped UP to 64 KiB (so a 256 MiB frame can't turn
-/// into millions of 2 ms sleeps and blow the receiver's whole-frame deadline);
+/// into millions of 2 ms sleeps and blow the receiver's minimum-rate limit);
 /// anything at/above the floor is used verbatim. Both a set-but-unparseable
 /// value (`256k`, a trailing space, …) AND a silently-clamped small value are
 /// warned about — otherwise the operator fat-fingering the one knob they reach
@@ -627,8 +728,8 @@ async fn recv_tensor_inner<R: AsyncRead + Unpin>(
 /// diverge between them. It is also where PR #112's payload metrics are
 /// booked, so every caller feeds the same histograms.
 ///
-/// `body_timeout` bounds the payload read: `None` uses the strict
-/// [`recv_timeout`] (the three frame-start-only callers), `Some(d)` charges the
+/// `body_timeout` bounds the payload read: `None` limits progress, not total
+/// time (see [`recv_exact`]; the three frame-start-only callers), `Some(d)` charges the
 /// body against a caller-owned overall deadline — see [`recv_tensor_token`].
 async fn decode_header_and_recv_body<R: AsyncRead + Unpin>(
     sock: &mut R,
@@ -650,16 +751,21 @@ async fn decode_header_and_recv_body<R: AsyncRead + Unpin>(
     // to catch malformed/forged headers before we allocate. Use
     // checked_mul to avoid silent u64 wrap on adversarial shapes.
     let dtype = DType::from_code(dtype_code);
+    let malformed = || TransportError::MalformedFrame {
+        payload_len,
+        shape: [d0, d1, d2],
+        dtype_code,
+    };
     let elems = (d0 as u64)
         .checked_mul(d1 as u64)
         .and_then(|x| x.checked_mul(d2 as u64));
     if let Some(e) = elems {
         let expected = e.checked_mul(dtype.bytes_per_element() as u64);
         if expected != Some(payload_len as u64) {
-            return Err(TransportError::PayloadTooLarge(payload_len as u64));
+            return Err(malformed());
         }
     } else {
-        return Err(TransportError::PayloadTooLarge(payload_len as u64));
+        return Err(malformed());
     }
 
     let mut data = vec![0u8; payload_len as usize];
@@ -881,11 +987,11 @@ fn recv_error_is_connection_fatal(err: &TransportError) -> bool {
         TransportError::FrameStartTimeout(_) => false,
         // A clean EOF needs no drop — the next call fails cleanly on its own.
         TransportError::SocketClosed => false,
-        // Protocol/validation failures on a live link: the peer misbehaved on
-        // one frame, but the connection can still deliver a good one next.
-        TransportError::RankTooHigh(_)
-        | TransportError::PayloadTooLarge(_)
-        | TransportError::RawSizeTooLarge(_) => false,
+        // The header was consumed and the body wasn't, so the next read would
+        // parse tensor bytes as a header.
+        TransportError::PayloadTooLarge(_) | TransportError::MalformedFrame { .. } => true,
+        // Refused before reading anything: the stream is still aligned.
+        TransportError::RankTooHigh(_) | TransportError::RawSizeTooLarge(_) => false,
         // Lifecycle states, not recv failures on a live socket.
         TransportError::ConnectTimeout(_)
         | TransportError::NotStarted
@@ -1014,17 +1120,27 @@ async fn recv_exact<R: AsyncRead + Unpin>(sock: &mut R, buf: &mut [u8]) -> Trans
     // that a wedged peer is detected within one or two heartbeats.
     // Waiting for a frame to BEGIN is exempt — see recv_exact_frame_start.
     //
-    // NOTE: this is a single wall-clock bound over the WHOLE remaining
-    // buffer, not an idle/no-progress timeout. Assumption: inter-stage
-    // frames are small (hidden states, KB–MB), so 60 s wall-clock ≈ a
-    // genuine stall, not a slow-but-progressing transfer. A mid-frame
-    // timeout is now connection-fatal (the socket is dropped), so a
-    // slow-but-progressing LARGE transfer on a degraded link would be
-    // killed — acceptable at the current frame sizes. If large mid-frame
-    // transfers ever land (e.g. KV-cache blobs), switch to an idle/
-    // no-progress timeout (reset the deadline on each read that returns
-    // bytes) so progress, not total size, is what's bounded.
-    recv_exact_within(sock, buf, recv_timeout()).await
+    // Progress is what's bounded, not total time: gemma4 sends 23,552 bytes
+    // per token, so a healthy slow link can need minutes for one frame.
+    recv_exact_progress(sock, buf, recv_timeout()).await
+}
+
+async fn recv_exact_progress<R: AsyncRead + Unpin>(
+    sock: &mut R,
+    buf: &mut [u8],
+    idle: Duration,
+) -> TransportResult<()> {
+    let deadline = TransferDeadline::new(buf.len(), idle);
+    let mut read = 0;
+    while read < buf.len() {
+        match tokio::time::timeout(deadline.next_wait(), sock.read(&mut buf[read..])).await {
+            Ok(Ok(0)) => return Err(TransportError::SocketClosed),
+            Ok(Ok(n)) => read += n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(deadline.timed_out("recv_exact", read)),
+        }
+    }
+    Ok(())
 }
 
 async fn recv_exact_within<R: AsyncRead + Unpin>(
@@ -1052,6 +1168,166 @@ async fn recv_exact_within<R: AsyncRead + Unpin>(
     }
 }
 
+/// The upstream host a stage listening on `listen_host:listen_port` should accept from, given its
+/// configured upstream `peer_host:peer_port` (brackets stripped from an IPv6 literal). `None`
+/// when the endpoint carries no peer identity: it is the stage's own listen address (a command
+/// line that knows only `--listen`), an unspecified address, or a unix socket.
+pub fn upstream_identity(
+    peer_host: &str,
+    peer_port: u16,
+    listen_host: &str,
+    listen_port: u16,
+) -> Option<String> {
+    let own = peer_host == listen_host && peer_port == listen_port;
+    let host = peer_host.trim_start_matches('[').trim_end_matches(']');
+    let unspecified = host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified());
+    if own || unspecified || TransportAddr::from_host_port(peer_host, peer_port).is_unix() {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+/// How often a refused peer may trigger a fresh lookup of the configured upstream host.
+const UPSTREAM_RESOLVE_EVERY: Duration = Duration::from_secs(5);
+/// Bound on one lookup; it runs inside `accept`.
+const UPSTREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+/// A refused address is logged at most once per this window (an upstream re-dials every few seconds).
+const REFUSED_LOG_EVERY: Duration = Duration::from_secs(60);
+
+type ResolveFut =
+    Pin<Box<dyn std::future::Future<Output = io::Result<Vec<std::net::IpAddr>>> + Send>>;
+type Resolver = std::sync::Arc<dyn Fn(String, u16) -> ResolveFut + Send + Sync>;
+
+/// Most refused addresses remembered for per-address logging; beyond it one summary line.
+const REFUSED_LOG_CAP: usize = 256;
+
+#[derive(Debug, PartialEq, Eq)]
+enum RefusedLog {
+    Address,
+    /// The address table is full: this many refusals since the last summary.
+    Others(u64),
+    Quiet,
+}
+
+/// Which TCP peers an [`ActivationServer`] accepts. Empty (no host, no addresses) takes any.
+#[derive(Default)]
+struct PeerAllow {
+    /// Configured upstream, looked up again when an unknown peer dials (its address may change
+    /// in a process that never restarts).
+    host: Option<(String, u16)>,
+    /// Last good lookup, canonical. Empty with a host set means not resolved yet: refuse all,
+    /// since an allowlist that failed to resolve must not fall back to accepting any host.
+    ips: Vec<std::net::IpAddr>,
+    resolved_at: Option<Instant>,
+    refused_logged: std::collections::HashMap<std::net::IpAddr, Instant>,
+    /// Refusals not logged by address since the last summary (the table was full).
+    refused_unlogged: u64,
+    refused_summary_at: Option<Instant>,
+    #[cfg(test)]
+    resolver: Option<Resolver>,
+    #[cfg(test)]
+    resolve_every: Option<Duration>,
+}
+
+impl PeerAllow {
+    fn resolver(&self) -> Resolver {
+        #[cfg(test)]
+        if let Some(r) = &self.resolver {
+            return r.clone();
+        }
+        std::sync::Arc::new(|host: String, port: u16| {
+            Box::pin(async move {
+                Ok(tokio::net::lookup_host((host.as_str(), port))
+                    .await?
+                    .map(|a| a.ip())
+                    .collect())
+            }) as ResolveFut
+        })
+    }
+
+    fn resolve_every(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.resolve_every {
+            return d;
+        }
+        UPSTREAM_RESOLVE_EVERY
+    }
+
+    /// Look the configured host up. A failure keeps the last good set (or none).
+    async fn resolve_now(&mut self) {
+        let Some((host, port)) = self.host.clone() else {
+            return;
+        };
+        self.resolved_at = Some(Instant::now());
+        let lookup = (self.resolver())(host.clone(), port);
+        match tokio::time::timeout(UPSTREAM_RESOLVE_TIMEOUT, lookup).await {
+            Ok(Ok(found)) if !found.is_empty() => {
+                let mut ips: Vec<_> = found.into_iter().map(|ip| ip.to_canonical()).collect();
+                ips.sort();
+                ips.dedup();
+                if ips != self.ips {
+                    info!(upstream = %host, ?ips, "upstream address set");
+                }
+                self.ips = ips;
+            }
+            Ok(Ok(_)) => {
+                warn!(upstream = %host, "upstream resolved to no address; refusing peers until it does")
+            }
+            Ok(Err(e)) => {
+                warn!(upstream = %host, error = %e, "upstream lookup failed; keeping the last address set")
+            }
+            Err(_) => {
+                warn!(upstream = %host, "upstream lookup timed out; keeping the last address set")
+            }
+        }
+    }
+
+    async fn admit(&mut self, ip: std::net::IpAddr) -> bool {
+        if self.host.is_none() && self.ips.is_empty() {
+            return true;
+        }
+        if self.ips.contains(&ip) {
+            return true;
+        }
+        let due = self
+            .resolved_at
+            .is_none_or(|t| t.elapsed() >= self.resolve_every());
+        if self.host.is_some() && due {
+            self.resolve_now().await;
+            return self.ips.contains(&ip);
+        }
+        false
+    }
+
+    /// What to log for a refusal of `ip` at `now`: the address once per window, and once the
+    /// per-address table is full (a flood of distinct sources) one summary per window instead.
+    fn refused_log(&mut self, ip: std::net::IpAddr, now: Instant) -> RefusedLog {
+        let fresh = |t: &Instant| now.duration_since(*t) < REFUSED_LOG_EVERY;
+        if let Some(t) = self.refused_logged.get_mut(&ip) {
+            if fresh(t) {
+                return RefusedLog::Quiet;
+            }
+            *t = now;
+            return RefusedLog::Address;
+        }
+        if self.refused_logged.len() >= REFUSED_LOG_CAP {
+            self.refused_logged.retain(|_, t| fresh(t));
+        }
+        if self.refused_logged.len() < REFUSED_LOG_CAP {
+            self.refused_logged.insert(ip, now);
+            return RefusedLog::Address;
+        }
+        self.refused_unlogged += 1;
+        if self.refused_summary_at.is_some_and(|t| fresh(&t)) {
+            return RefusedLog::Quiet;
+        }
+        self.refused_summary_at = Some(now);
+        RefusedLog::Others(std::mem::take(&mut self.refused_unlogged))
+    }
+}
+
 /// Server side of an activation link: receives activations from upstream.
 /// Binds TCP (`host:port`) or a Unix domain socket (`unix:/path.sock`,
 /// in-host stages) — the frame protocol on top is identical.
@@ -1061,6 +1337,8 @@ pub struct ActivationServer {
     client: Option<ActivationStream>,
     accepted_peer: Option<String>,
     actual_port: u16,
+    /// TCP peers `accept` takes; see [`ActivationServer::allow_upstream`].
+    peer_allow: PeerAllow,
     /// Unix socket this server bound and therefore OWNS — unlinked on
     /// [`close`](Self::close) and on `Drop` so a crash-restart can re-bind.
     #[cfg(unix)]
@@ -1234,6 +1512,7 @@ impl ActivationServer {
             client: None,
             accepted_peer: None,
             actual_port,
+            peer_allow: PeerAllow::default(),
             #[cfg(unix)]
             owned_unix_path: None,
         }
@@ -1303,13 +1582,42 @@ impl ActivationServer {
         self.actual_port
     }
 
+    /// Take TCP connections only from `host` (see [`upstream_identity`]). The listener is
+    /// unauthenticated, so a stage that knows its upstream refuses every other host. The host is
+    /// looked up now and again when an unknown peer dials (at most every few seconds); until a
+    /// lookup succeeds every peer is refused. Unix sockets are owner-only already and are not
+    /// filtered. Only the ov-dist-spec and sparse-moe worker builders call this; the ov-runtime,
+    /// qwen36 and gemma4 listeners take any peer.
+    pub async fn allow_upstream(&mut self, host: &str, port: u16) {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        self.peer_allow.host = Some((host.to_string(), port));
+        self.peer_allow.ips.clear();
+        self.peer_allow.resolve_now().await;
+    }
+
+    /// Accept the next connection. A TCP peer outside [`allow_upstream`](Self::allow_upstream) is
+    /// closed with a warning and the wait goes on, so a caller's timeout bounds the whole wait.
     pub async fn accept(&mut self) -> TransportResult<()> {
         let listener = self.listener.as_ref().ok_or(TransportError::NotStarted)?;
         let (stream, peer) = match listener {
-            ActivationListener::Tcp(l) => {
+            ActivationListener::Tcp(l) => loop {
                 let (sock, addr) = l.accept().await?;
-                (ActivationStream::Tcp(sock), addr.to_string())
-            }
+                let ip = addr.ip().to_canonical();
+                let allow = &mut self.peer_allow;
+                if allow.admit(ip).await {
+                    break (ActivationStream::Tcp(sock), addr.to_string());
+                }
+                match allow.refused_log(ip, Instant::now()) {
+                    RefusedLog::Address => {
+                        warn!(refused = %addr, upstream = ?allow.host.as_ref().map(|h| &h.0), allowed = ?allow.ips, "ActivationServer refused a connection from an unexpected peer")
+                    }
+                    RefusedLog::Others(n) => {
+                        warn!(refused = n, upstream = ?allow.host.as_ref().map(|h| &h.0), "ActivationServer refused connections from other unexpected peers")
+                    }
+                    RefusedLog::Quiet => {}
+                }
+                drop(sock);
+            },
             #[cfg(unix)]
             ActivationListener::Unix(l) => {
                 let (sock, _addr) = l.accept().await?;
@@ -1384,9 +1692,14 @@ impl ActivationServer {
         self.accepted_peer = None;
     }
 
+    /// A failed send may have written part of a frame, so it poisons the connection.
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        let res = send_tensor(sock, tensor).await;
+        if res.is_err() {
+            self.poison().await;
+        }
+        res
     }
 
     /// Send raw bytes over the established connection. Used by the
@@ -1394,12 +1707,11 @@ impl ActivationServer {
     /// (kind + logical_pos_start).
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        sock.write_all(bytes).await?;
-        sock.flush().await?;
-        cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
-            .with_label_values(&["raw"])
-            .inc_by(bytes.len() as u64);
-        Ok(())
+        let res = send_raw_bytes(sock, bytes).await;
+        if res.is_err() {
+            self.poison().await;
+        }
+        res
     }
 
     /// Receive exactly `n` raw bytes from the established connection.
@@ -1418,6 +1730,17 @@ impl ActivationServer {
             .with_label_values(&["raw"])
             .inc_by(n as u64);
         Ok(buf)
+    }
+
+    /// Whether an upstream peer is accepted (a fatal recv or a failed send drops it).
+    pub fn is_connected(&self) -> bool {
+        self.client.is_some()
+    }
+
+    /// Drop the accepted peer but keep listening, so the next [`accept`](Self::accept)
+    /// takes a re-dialed upstream. [`close`](Self::close) is for shutdown.
+    pub async fn disconnect(&mut self) {
+        self.poison().await;
     }
 
     pub async fn close(&mut self) {
@@ -1481,6 +1804,11 @@ impl ActivationClient {
 
     pub fn for_addr(target: TransportAddr) -> Self {
         Self { target, sock: None }
+    }
+
+    /// Whether a socket is held (a fatal recv or a failed send drops it).
+    pub fn is_connected(&self) -> bool {
+        self.sock.is_some()
     }
 
     /// One connect attempt for the configured target flavor.
@@ -1603,9 +1931,14 @@ impl ActivationClient {
         Ok(())
     }
 
+    /// A failed send may have written part of a frame, so it poisons the connection.
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        let res = send_tensor(sock, tensor).await;
+        if res.is_err() {
+            self.poison().await;
+        }
+        res
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
@@ -1680,12 +2013,11 @@ impl ActivationClient {
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        sock.write_all(bytes).await?;
-        sock.flush().await?;
-        cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
-            .with_label_values(&["raw"])
-            .inc_by(bytes.len() as u64);
-        Ok(())
+        let res = send_raw_bytes(sock, bytes).await;
+        if res.is_err() {
+            self.poison().await;
+        }
+        res
     }
 
     pub async fn recv_raw(&mut self, n: usize) -> TransportResult<Vec<u8>> {
@@ -3104,6 +3436,487 @@ mod tests {
             got.is_ok(),
             "idle gap under the ceiling must not time out: {:?}",
             got.err()
+        );
+    }
+
+    fn f32_header(elems: u32) -> [u8; HEADER_SIZE] {
+        let mut h = [0u8; HEADER_SIZE];
+        h[0..4].copy_from_slice(&(elems * 4).to_be_bytes());
+        h[4..8].copy_from_slice(&(DType::F32 as u32).to_be_bytes());
+        h[8..12].copy_from_slice(&1u32.to_be_bytes());
+        h[12..16].copy_from_slice(&1u32.to_be_bytes());
+        h[16..20].copy_from_slice(&elems.to_be_bytes());
+        h
+    }
+
+    /// The body of a rejected frame is still on the wire, so the next read
+    /// would parse tensor bytes as a header. The connection has to go.
+    async fn rejected_frame_case(
+        header: [u8; HEADER_SIZE],
+        uds_tag: Option<&str>,
+    ) -> TransportError {
+        let (mut server, mut peer) = server_with_raw_peer(uds_tag).await;
+        peer.write_all(&header).await.unwrap();
+        peer.write_all(&[0xAB; 4096]).await.unwrap();
+        peer.flush().await.unwrap();
+        let first = server.recv().await.expect_err("frame must be rejected");
+        let second = server.recv().await;
+        assert!(
+            matches!(second, Err(TransportError::NotConnected)),
+            "the next recv must not read the rejected frame's body, got {second:?}"
+        );
+        first
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_drops_the_connection() {
+        let elems = (MAX_TENSOR_BYTES / 4 + 1) as u32;
+        let err = rejected_frame_case(f32_header(elems), None).await;
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shape_mismatch_is_malformed_and_drops_the_connection() {
+        let mut header = f32_header(4);
+        header[16..20].copy_from_slice(&5u32.to_be_bytes());
+        let err = rejected_frame_case(header, None).await;
+        assert!(
+            matches!(
+                err,
+                TransportError::MalformedFrame {
+                    payload_len: 16,
+                    shape: [1, 1, 5],
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflowing_shape_is_malformed_and_drops_the_connection() {
+        let mut header = f32_header(4);
+        header[8..20].copy_from_slice(&[0xFF; 12]);
+        let err = rejected_frame_case(header, None).await;
+        assert!(
+            matches!(err, TransportError::MalformedFrame { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_rejected_frame_drops_the_connection() {
+        let elems = (MAX_TENSOR_BYTES / 4 + 1) as u32;
+        let err = rejected_frame_case(f32_header(elems), Some("reject")).await;
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// The chain recovers from an oversized reply: the client drops on the
+    /// reject, re-dials, and the server, which kept its listener, accepts it.
+    #[tokio::test]
+    async fn oversized_reply_then_redial_round_trips_a_frame() {
+        let (mut server, mut client) = connected_pair(None).await;
+        let elems = (MAX_TENSOR_BYTES / 4 + 1) as u32;
+        server.send_raw(&f32_header(elems)).await.unwrap();
+        server.send_raw(&[0xAB; 4096]).await.unwrap();
+        let err = client
+            .recv()
+            .await
+            .expect_err("oversized frame must be rejected");
+        assert!(
+            matches!(err, TransportError::PayloadTooLarge(_)),
+            "got {err:?}"
+        );
+        assert!(!client.is_connected(), "a rejected frame drops the client");
+        server.disconnect().await;
+        assert!(!server.is_connected());
+
+        client.try_connect().await.unwrap();
+        server.accept().await.unwrap();
+        let t = Tensor::from_2d(DType::F32, 1, 2, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        client.send(&t).await.unwrap();
+        let (got, _) = server.recv().await.unwrap();
+        assert_eq!(got.data, t.data);
+        server.send(&t).await.unwrap();
+        let (back, _) = client.recv().await.unwrap();
+        assert_eq!(back.data, t.data);
+    }
+
+    /// A resolver whose answer the test changes; `None` fails the lookup.
+    fn scripted_resolver(
+        answer: std::sync::Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
+    ) -> Resolver {
+        std::sync::Arc::new(move |_host: String, _port: u16| {
+            let found = *answer.lock().unwrap();
+            Box::pin(async move {
+                found
+                    .map(|ip| vec![ip])
+                    .ok_or_else(|| io::Error::other("no such host"))
+            }) as ResolveFut
+        })
+    }
+
+    /// Dial `server` and report whether `accept` refused the dial.
+    async fn refused(server: &mut ActivationServer, host: &str, port: u16) -> bool {
+        let mut peer = TcpStream::connect((host, port)).await.unwrap();
+        if tokio::time::timeout(Duration::from_millis(300), server.accept())
+            .await
+            .is_ok()
+        {
+            return false;
+        }
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut buf))
+            .await
+            .expect("the refused peer was left open")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "a refused peer must read EOF");
+        true
+    }
+
+    /// A stage that knows its upstream refuses every other host, and takes a
+    /// peer once the configured host re-resolves to it (the upstream moved, in
+    /// a process that never restarts).
+    #[tokio::test]
+    async fn accept_follows_the_upstream_host_as_it_re_resolves() {
+        let (mut server, addr) = started_server(None).await;
+        let TransportAddr::Tcp { host, port } = addr else {
+            unreachable!("tcp server")
+        };
+        let answer = std::sync::Arc::new(std::sync::Mutex::new(Some("192.0.2.1".parse().unwrap())));
+        server.peer_allow.resolver = Some(scripted_resolver(answer.clone()));
+        server.peer_allow.resolve_every = Some(Duration::ZERO);
+        server.allow_upstream("upstream.example", 9200).await;
+        assert!(
+            refused(&mut server, &host, port).await,
+            "a stranger was accepted"
+        );
+        assert!(!server.is_connected());
+
+        *answer.lock().unwrap() = Some("::ffff:127.0.0.1".parse().unwrap());
+        assert!(
+            !refused(&mut server, &host, port).await,
+            "the re-resolved upstream was refused"
+        );
+        assert!(server.is_connected());
+    }
+
+    /// A lookup that fails at start leaves the stage refusing every peer (not
+    /// accepting any) until the host resolves.
+    #[tokio::test]
+    async fn an_unresolved_upstream_refuses_all_until_it_resolves() {
+        let (mut server, addr) = started_server(None).await;
+        let TransportAddr::Tcp { host, port } = addr else {
+            unreachable!("tcp server")
+        };
+        let answer = std::sync::Arc::new(std::sync::Mutex::new(None));
+        server.peer_allow.resolver = Some(scripted_resolver(answer.clone()));
+        server.peer_allow.resolve_every = Some(Duration::ZERO);
+        server.allow_upstream("upstream.example", 9200).await;
+        assert!(server.peer_allow.ips.is_empty());
+        assert!(refused(&mut server, &host, port).await);
+
+        *answer.lock().unwrap() = Some("127.0.0.1".parse().unwrap());
+        assert!(!refused(&mut server, &host, port).await);
+    }
+
+    #[tokio::test]
+    async fn a_bracketed_ipv6_upstream_resolves() {
+        assert_eq!(
+            upstream_identity("[fd7a::1]", 9201, "0.0.0.0", 9100).as_deref(),
+            Some("fd7a::1")
+        );
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.allow_upstream("[::1]", 9201).await;
+        assert_eq!(
+            server.peer_allow.ips,
+            vec!["::1".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_refused_address_is_logged_once_per_window() {
+        let mut allow = PeerAllow::default();
+        let a: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let b: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        assert_eq!(allow.refused_log(a, t0), RefusedLog::Address);
+        assert_eq!(allow.refused_log(a, at(2)), RefusedLog::Quiet);
+        assert_eq!(allow.refused_log(a, at(59)), RefusedLog::Quiet);
+        assert_eq!(allow.refused_log(b, at(2)), RefusedLog::Address);
+        assert_eq!(allow.refused_log(a, at(61)), RefusedLog::Address);
+    }
+
+    /// A flood of distinct sources inside one window keeps the table bounded
+    /// and logs at most one line per remembered address plus one summary.
+    #[test]
+    fn a_refusal_flood_is_bounded() {
+        let mut allow = PeerAllow::default();
+        let t0 = Instant::now();
+        let mut lines = 0;
+        for i in 0..1000u32 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i));
+            let now = t0 + Duration::from_millis(u64::from(i));
+            if allow.refused_log(ip, now) != RefusedLog::Quiet {
+                lines += 1;
+            }
+            assert!(allow.refused_logged.len() <= REFUSED_LOG_CAP);
+        }
+        assert!(lines <= REFUSED_LOG_CAP + 1, "{lines} log lines");
+        // The next window summarises the refusals the table had no room for.
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 99));
+        assert!(matches!(
+            allow.refused_log(ip, t0 + Duration::from_secs(61)),
+            RefusedLog::Address
+        ));
+    }
+
+    #[test]
+    fn upstream_identity_only_for_a_real_upstream() {
+        let id = |h: &str, p: u16| upstream_identity(h, p, "0.0.0.0", 9100);
+        // No peer identity: the stage's own listen address, an unspecified
+        // address, a unix socket.
+        assert_eq!(id("0.0.0.0", 9100), None);
+        assert_eq!(upstream_identity("10.0.0.5", 9100, "10.0.0.5", 9100), None);
+        assert_eq!(id("::", 9200), None);
+        assert_eq!(id("[::]", 9200), None);
+        assert_eq!(id("unix:/tmp/x.sock", 0), None);
+        assert_eq!(id("10.1.2.3", 9200).as_deref(), Some("10.1.2.3"));
+        assert_eq!(id("node-a", 9200).as_deref(), Some("node-a"));
+    }
+
+    /// A fatal recv drops only the accepted peer; the listener stays bound
+    /// until `close()`.
+    #[tokio::test]
+    async fn after_a_fatal_recv_the_server_still_accepts_until_close() {
+        let (mut server, addr) = started_server(None).await;
+        let TransportAddr::Tcp { host, port } = addr else {
+            unreachable!("tcp server")
+        };
+        let mut peer = TcpStream::connect((host.as_str(), port)).await.unwrap();
+        server.accept().await.unwrap();
+        let elems = (MAX_TENSOR_BYTES / 4 + 1) as u32;
+        peer.write_all(&f32_header(elems)).await.unwrap();
+        peer.flush().await.unwrap();
+        assert!(matches!(
+            server.recv().await,
+            Err(TransportError::PayloadTooLarge(_))
+        ));
+        assert!(!server.is_connected());
+
+        let _peer2 = TcpStream::connect((host.as_str(), port)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("accept must not hang")
+            .unwrap();
+        assert!(server.is_connected());
+
+        server.close().await;
+        assert!(matches!(
+            server.accept().await,
+            Err(TransportError::NotStarted)
+        ));
+    }
+
+    #[test]
+    fn rejections_are_fatal_only_when_a_frame_was_left_on_the_wire() {
+        assert!(recv_error_is_connection_fatal(
+            &TransportError::PayloadTooLarge(1)
+        ));
+        assert!(recv_error_is_connection_fatal(
+            &TransportError::MalformedFrame {
+                payload_len: 1,
+                shape: [1, 1, 1],
+                dtype_code: 0,
+            }
+        ));
+        // Refused before reading anything: the stream is still aligned.
+        assert!(!recv_error_is_connection_fatal(
+            &TransportError::RawSizeTooLarge(1)
+        ));
+        assert!(!recv_error_is_connection_fatal(
+            &TransportError::RankTooHigh(1)
+        ));
+    }
+
+    /// Finding from a slow relay link: a frame that keeps moving must not be
+    /// killed for taking longer than the recv timeout overall.
+    #[tokio::test]
+    async fn slow_but_progressing_body_outlives_the_recv_timeout() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        set_frame_idle_ceiling_secs(60);
+        let (mut server, mut peer) = server_with_raw_peer(None).await;
+        const ELEMS: u32 = 128 * 1024; // 512 KiB: 8 s at the minimum rate
+        let writer = tokio::spawn(async move {
+            peer.write_all(&f32_header(ELEMS)).await.unwrap();
+            for chunk in vec![7u8; ELEMS as usize * 4].chunks(ELEMS as usize * 4 / 6) {
+                peer.write_all(chunk).await.unwrap();
+                peer.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            peer
+        });
+        let t0 = Instant::now();
+        let got = server.recv().await;
+        let elapsed = t0.elapsed();
+        set_activation_timeout_secs(0);
+        set_frame_idle_ceiling_secs(0);
+        let (tensor, _) = got.expect("a progressing frame must arrive");
+        assert_eq!(tensor.data.len(), ELEMS as usize * 4);
+        assert!(
+            tensor.data.iter().all(|b| *b == 7),
+            "body must arrive intact"
+        );
+        assert!(
+            elapsed > Duration::from_secs(1),
+            "must outlive the recv timeout: {elapsed:?}"
+        );
+        writer.await.unwrap();
+    }
+
+    /// A large declared size must not buy a stalled peer a long wait.
+    #[tokio::test]
+    async fn stalled_large_body_fails_after_the_idle_wait() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        set_frame_idle_ceiling_secs(60);
+        let (mut server, mut peer) = server_with_raw_peer(None).await;
+        peer.write_all(&f32_header(4 * 1024 * 1024)).await.unwrap(); // 16 MiB: 256 s at the minimum rate
+        peer.write_all(&[1u8; 1024]).await.unwrap();
+        peer.flush().await.unwrap();
+        let t0 = Instant::now();
+        let got = server.recv().await;
+        let elapsed = t0.elapsed();
+        set_activation_timeout_secs(0);
+        set_frame_idle_ceiling_secs(0);
+        assert!(
+            matches!(&got, Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::TimedOut),
+            "got {got:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must fail on idle: {elapsed:?}"
+        );
+    }
+
+    /// Bytes every so often reset the idle wait, so only the minimum rate can
+    /// stop a peer dribbling forever.
+    #[tokio::test]
+    async fn dribbling_peer_fails_at_the_minimum_rate() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        set_frame_idle_ceiling_secs(60);
+        let (mut server, mut peer) = server_with_raw_peer(None).await;
+        let writer = tokio::spawn(async move {
+            peer.write_all(&f32_header(32 * 1024)).await.unwrap(); // 128 KiB: 2 s at the minimum rate
+            loop {
+                if peer.write_all(&[1u8]).await.is_err() || peer.flush().await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let t0 = Instant::now();
+        let got = server.recv().await;
+        let elapsed = t0.elapsed();
+        set_activation_timeout_secs(0);
+        set_frame_idle_ceiling_secs(0);
+        writer.abort();
+        assert!(
+            matches!(&got, Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::TimedOut),
+            "got {got:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1800) && elapsed < Duration::from_secs(4),
+            "must stop at the minimum rate, not the idle wait: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_a_peer_not_reading_fails_after_the_idle_wait() {
+        let (mut sock, _peer) = tokio::io::duplex(1024);
+        let tensor = Tensor::from_2d(DType::I8, 1, 64 * 1024, vec![0u8; 64 * 1024]);
+        let t0 = Instant::now();
+        let got = send_tensor_within(&mut sock, &tensor, Duration::from_millis(300)).await;
+        assert!(
+            matches!(&got, Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::TimedOut),
+            "got {got:?}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn send_to_a_slow_reader_outlives_the_idle_wait() {
+        let (mut sock, mut peer) = tokio::io::duplex(16 * 1024);
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut total = 0;
+            while total < HEADER_SIZE + 128 * 1024 {
+                total += peer.read(&mut buf).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            total
+        });
+        let tensor = Tensor::from_2d(DType::I8, 1, 128 * 1024, vec![0u8; 128 * 1024]);
+        let idle = Duration::from_millis(300);
+        let t0 = Instant::now();
+        send_tensor_within(&mut sock, &tensor, idle)
+            .await
+            .expect("progress must keep the send alive");
+        assert!(
+            t0.elapsed() > idle,
+            "the transfer must have outlived the idle wait"
+        );
+        reader.await.unwrap();
+    }
+
+    /// A send that failed may have written part of a frame, so the stream
+    /// can't carry another one.
+    #[tokio::test]
+    async fn failed_server_send_poisons_the_connection() {
+        let (mut server, peer) = server_with_raw_peer(None).await;
+        drop(peer);
+        let tensor = Tensor::from_2d(DType::I8, 1, 1024 * 1024, vec![0u8; 1024 * 1024]);
+        let mut sent = 0;
+        while server.send(&tensor).await.is_ok() {
+            sent += 1;
+            assert!(sent < 100, "send to a closed peer must fail");
+        }
+        let next = server.send(&tensor).await;
+        assert!(
+            matches!(next, Err(TransportError::NotConnected)),
+            "got {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_client_send_poisons_the_connection() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let mut client = ActivationClient::new("127.0.0.1", server.port());
+        let (accepted, connected) = tokio::join!(server.accept(), client.connect());
+        accepted.unwrap();
+        connected.unwrap();
+        server.close().await;
+        let tensor = Tensor::from_2d(DType::I8, 1, 1024 * 1024, vec![0u8; 1024 * 1024]);
+        let mut sent = 0;
+        while client.send(&tensor).await.is_ok() {
+            sent += 1;
+            assert!(sent < 100, "send to a closed peer must fail");
+        }
+        let next = client.send(&tensor).await;
+        assert!(
+            matches!(next, Err(TransportError::NotConnected)),
+            "got {next:?}"
         );
     }
 }
