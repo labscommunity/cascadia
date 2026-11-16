@@ -18,7 +18,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use super::zenoh_server::{
     Advert, Backend, BackendError, Computed, ZenohError, ZenohFrontEnd, ZenohListen,
@@ -37,6 +37,9 @@ pub struct Upstream {
     pub url: String,
     /// Sent as `Authorization: Bearer <token>`; never logged.
     pub token: Option<String>,
+    /// PEM file of the CA certificates a `wss://` upstream is checked
+    /// against, in place of the public web roots.
+    pub ca_file: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for Upstream {
@@ -44,6 +47,7 @@ impl std::fmt::Debug for Upstream {
         f.debug_struct("Upstream")
             .field("url", &display_url(&self.url))
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("ca_file", &self.ca_file)
             .finish()
     }
 }
@@ -101,11 +105,20 @@ impl Upstream {
                 "a token is only sent over wss://, or ws:// to loopback".into(),
             ));
         }
+        if self.ca_file.is_some() && !tls {
+            return Err(ZenohError(
+                "--ca-file applies to a wss:// upstream only".into(),
+            ));
+        }
         Ok(())
     }
 
-    /// Open the socket and read the metadata it sends first.
-    async fn connect(&self) -> Result<(Ws, PolicySpec, PackageIdentity), String> {
+    /// Open the socket and read the metadata it sends first. `tls` replaces
+    /// the public web roots (`--ca-file`).
+    async fn connect(
+        &self,
+        tls: Option<&Connector>,
+    ) -> Result<(Ws, PolicySpec, PackageIdentity), String> {
         let mut req = self
             .url
             .as_str()
@@ -118,7 +131,14 @@ impl Upstream {
             req.headers_mut().insert(AUTHORIZATION, v);
         }
         // The error may echo the request; keep only its kind.
-        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.map_err(|e| {
+        let connected = match tls {
+            Some(c) => {
+                tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(c.clone()))
+                    .await
+            }
+            None => tokio_tungstenite::connect_async(req).await,
+        };
+        let (mut ws, _) = connected.map_err(|e| {
             format!(
                 "connect {}: {}",
                 display_url(&self.url),
@@ -156,6 +176,53 @@ fn redact(s: &str, up: &Upstream) -> String {
     s
 }
 
+/// The CA certificates a `--ca-file` holds, as the only roots a `wss://`
+/// upstream's certificate may chain to.
+struct TrustedCa {
+    connector: Connector,
+    roots: usize,
+}
+
+/// Read `path` as PEM and trust its `CERTIFICATE` blocks; other blocks are
+/// skipped. Errors name the file and never quote it.
+fn load_ca_file(path: &std::path::Path) -> Result<TrustedCa, ZenohError> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let bad = |why: String| ZenohError(format!("--ca-file {}: {why}", path.display()));
+    let certs = CertificateDer::pem_file_iter(path)
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| match e {
+            rustls::pki_types::pem::Error::Io(e) => bad(e.to_string()),
+            // Other variants quote the offending line.
+            _ => bad("is not a valid PEM file".into()),
+        })?;
+    if certs.is_empty() {
+        return Err(bad(
+            "no PEM certificate (-----BEGIN CERTIFICATE-----) in it".into(),
+        ));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for (i, cert) in certs.into_iter().enumerate() {
+        roots.add(cert).map_err(|e| {
+            bad(format!(
+                "certificate {} is not a valid certificate: {e}",
+                i + 1
+            ))
+        })?;
+    }
+    let n = roots.len();
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| bad(e.to_string()))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(TrustedCa {
+        connector: Connector::Rustls(std::sync::Arc::new(config)),
+        roots: n,
+    })
+}
+
 /// Identity fields the client pins; a reconnect that changes one is refused.
 fn same_policy(a: &PolicySpec, b: &PolicySpec) -> bool {
     a == b
@@ -178,6 +245,7 @@ pub struct BridgeCounts {
 
 pub struct BridgeBackend {
     upstream: Upstream,
+    tls: Option<Connector>,
     spec: PolicySpec,
     rt: tokio::runtime::Handle,
     conn: Mutex<Conn>,
@@ -207,7 +275,11 @@ impl BridgeBackend {
     async fn call(&self, c: &mut Conn, obs: &Observation, deadline: Instant) -> Step {
         let left = |now: Instant| deadline.saturating_duration_since(now);
         if c.ws.is_none() {
-            let res = tokio::time::timeout(left(Instant::now()), self.upstream.connect()).await;
+            let res = tokio::time::timeout(
+                left(Instant::now()),
+                self.upstream.connect(self.tls.as_ref()),
+            )
+            .await;
             match res {
                 Err(_) => return Step::Done(Err(BackendError::Expired)),
                 Ok(Err(e)) => return Step::Done(Err(BackendError::Model(e))),
@@ -335,15 +407,24 @@ pub async fn start_bridge(
     if listen.allow_all_interfaces {
         return Err(ZenohError("the bridge listens on loopback only".into()));
     }
-    let (ws, spec, identity) = tokio::time::timeout(CONNECT_TIMEOUT, upstream.connect())
-        .await
-        .map_err(|_| {
-            ZenohError(format!(
-                "no metadata from {} within 10 s",
-                display_url(&upstream.url)
-            ))
-        })?
-        .map_err(ZenohError)?;
+    let tls = match &upstream.ca_file {
+        Some(path) => {
+            let ca = load_ca_file(path)?;
+            tracing::info!(ca_file = %path.display(), roots = ca.roots, "trusting only --ca-file");
+            Some(ca.connector)
+        }
+        None => None,
+    };
+    let (ws, spec, identity) =
+        tokio::time::timeout(CONNECT_TIMEOUT, upstream.connect(tls.as_ref()))
+            .await
+            .map_err(|_| {
+                ZenohError(format!(
+                    "no metadata from {} within 10 s",
+                    display_url(&upstream.url)
+                ))
+            })?
+            .map_err(ZenohError)?;
     if listen.name.is_empty() {
         listen.name = identity.policy_name.clone();
     }
@@ -351,12 +432,14 @@ pub async fn start_bridge(
         upstream = %display_url(&upstream.url),
         policy = %identity.policy_name,
         manifest_sha256 = %spec.manifest_sha256,
+        package_sha256 = %spec.package_sha256,
         precision = %spec.precision,
         "upstream policy"
     );
     let counts = std::sync::Arc::new(BridgeCounts::default());
     let backend = BridgeBackend {
         upstream,
+        tls,
         spec: spec.clone(),
         rt: tokio::runtime::Handle::current(),
         conn: Mutex::new(Conn {
@@ -384,7 +467,84 @@ mod tests {
         Upstream {
             url: url.into(),
             token: token.then(|| "s3cret".to_string()),
+            ca_file: None,
         }
+    }
+
+    /// A throwaway self-signed CA made for this test (its key was discarded).
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBfDCCASKgAwIBAgIUCphMVlh5do4Qx3v5Gvjw3FNcBakwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQY2FzY2FkaWEgdGVzdCBDQTAgFw0yNjExMTYxNDI1MjVaGA8y
+MTI2MTAyMzE0MjUyNVowGzEZMBcGA1UEAwwQY2FzY2FkaWEgdGVzdCBDQTBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABJlpWpKsOp2K4smHmA9TnmVByK6xJkfOcDbT
+MCVcbVX4SRdtc6IvokYP/Egfcq450Cw4NmlMuNo3mQlzNQPGZZ+jQjBAMB0GA1Ud
+DgQWBBSJxMu853vt4Qj7vAD+SQeT8Cu/pTAPBgNVHRMBAf8EBTADAQH/MA4GA1Ud
+DwEB/wQEAwICBDAKBggqhkjOPQQDAgNIADBFAiBXfUj2fbs151EW0gAXbKOQOW8k
+mkjA+/cDNceaJbMkLwIhAPIzdcgHgqRqhxVhV+fgiFEG9PzyIw+VzdcidPmTYk9q
+-----END CERTIFICATE-----
+";
+
+    fn ca_file(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_ca_file_with_a_certificate_is_trusted() {
+        let t = tempfile::tempdir().unwrap();
+        let p = ca_file(t.path(), "ca.crt", TEST_CA);
+        assert_eq!(load_ca_file(&p).unwrap().roots, 1);
+        // Two CAs, and a non-certificate block between them, are fine.
+        let two =
+            format!("{TEST_CA}-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n{TEST_CA}");
+        let p = ca_file(t.path(), "two.crt", &two);
+        assert_eq!(load_ca_file(&p).unwrap().roots, 2);
+    }
+
+    fn refused(path: &std::path::Path) -> String {
+        match load_ca_file(path) {
+            Ok(_) => panic!("{} was accepted", path.display()),
+            Err(e) => e.0,
+        }
+    }
+
+    #[test]
+    fn a_bad_ca_file_is_refused_without_echoing_it() {
+        let t = tempfile::tempdir().unwrap();
+        let body = "not a certificate SECRETISH-LINE\n";
+        let garbage = ca_file(t.path(), "garbage.crt", body);
+        let e = refused(&garbage);
+        assert!(
+            e.contains("garbage.crt") && e.contains("no PEM certificate"),
+            "{e}"
+        );
+        assert!(!e.contains("SECRETISH"), "{e}");
+
+        let bad_der = "-----BEGIN CERTIFICATE-----\nAAAAAAAA\n-----END CERTIFICATE-----\n";
+        let e = refused(&ca_file(t.path(), "bad.crt", bad_der));
+        assert!(
+            e.contains("bad.crt") && e.contains("not a valid certificate"),
+            "{e}"
+        );
+        assert!(!e.contains("AAAAAAAA"), "{e}");
+
+        let cut = &TEST_CA[..TEST_CA.len() - 30];
+        let e = refused(&ca_file(t.path(), "cut.crt", cut));
+        assert!(e.contains("cut.crt"), "{e}");
+        assert!(!e.contains("MIIB"), "{e}");
+
+        let e = refused(&t.path().join("missing.crt"));
+        assert!(e.contains("missing.crt"), "{e}");
+    }
+
+    #[test]
+    fn a_ca_file_needs_wss() {
+        let mut u = up("ws://127.0.0.1:8000/v1/policy/ws", false);
+        u.ca_file = Some("ca.crt".into());
+        assert!(u.check().unwrap_err().0.contains("wss://"));
+        u.url = "wss://gw.example/v1/policy/ws".into();
+        u.check().unwrap();
     }
 
     #[test]

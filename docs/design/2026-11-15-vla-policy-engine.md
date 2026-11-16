@@ -540,10 +540,16 @@ identity; per-client authorization cannot be enforced there. A deployment that n
 on loopback and puts an authenticated hop in front through the bridge below.
 
 **Bridge.** `cascadia policy-bridge --zenoh 127.0.0.1:<port> --upstream <ws(s) URL> [--token-file
-<path>] [--name <slot>]` serves Intel's protocol on loopback only (the same pinned Zenoh settings)
-and forwards each predict as one openpi call to any openpi server: Cascadia's own, or a gateway that
-takes `Authorization: Bearer`. The token is read from the file, sent only over `wss://` or to
-loopback, and never logged. One bridge serves one Intel client. Its handshake has a `server_id` minted
+<path>] [--ca-file <pem>] [--name <slot>]` serves Intel's protocol on loopback only (the same pinned
+Zenoh settings) and forwards each predict as one openpi call to any openpi server: Cascadia's own, or
+a gateway that takes `Authorization: Bearer`. The token is read from the file, sent only over
+`wss://` or to loopback, and never logged. A `wss://` upstream is checked against the public web
+roots, or, with `--ca-file`, against the `CERTIFICATE` blocks of that PEM file **instead**: a
+gateway behind a private CA is trusted for that CA alone, so a publicly issued certificate for the
+same host name is not also accepted. `--ca-file` with a `ws://` upstream, an unreadable file, one
+with no certificate or one whose certificate does not parse refuses the start with an error naming
+the file; the error never quotes the file, and the certificates are never logged (only their
+count). One bridge serves one Intel client. Its handshake has a `server_id` minted
 for the bridge's lifetime, so an upstream reconnect is not a server restart to the client, and the
 name, `manifest_sha256` and chunk size the upstream's metadata states; a reconnect to an upstream
 whose metadata differs is refused. It honours `budget_ms` and superseding like Intel's server: a call

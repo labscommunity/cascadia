@@ -959,6 +959,11 @@ pub struct PolicyBridgeArgs {
     #[arg(long, value_name = "PATH")]
     pub token_file: Option<PathBuf>,
 
+    /// A PEM file of CA certificates to check a `wss://` upstream against,
+    /// instead of the public web roots: a gateway behind a private CA.
+    #[arg(long, value_name = "PEM")]
+    pub ca_file: Option<PathBuf>,
+
     /// The slot name the physicalai client is given; defaults to the
     /// upstream's policy name.
     #[arg(long, value_name = "NAME")]
@@ -1615,6 +1620,7 @@ async fn cmd_policy_bridge(args: PolicyBridgeArgs) -> Result<()> {
             Upstream {
                 url: args.upstream,
                 token,
+                ca_file: args.ca_file,
             },
             listen,
         )
@@ -4444,6 +4450,25 @@ mod tests {
             panic!("expected shard subcommand");
         };
         assert_eq!(args.target, ShardTarget::Npu);
+    }
+
+    #[test]
+    fn policy_bridge_takes_a_ca_file() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "policy-bridge",
+            "--zenoh",
+            "127.0.0.1:7447",
+            "--upstream",
+            "wss://gw.example/v1/policy/ws",
+            "--ca-file",
+            "private-ca.crt",
+        ])
+        .expect("parse policy-bridge --ca-file");
+        let Command::PolicyBridge(args) = cli.cmd else {
+            panic!("expected policy-bridge subcommand");
+        };
+        assert_eq!(args.ca_file, Some(PathBuf::from("private-ca.crt")));
     }
 
     /// Omitting `--target` defaults to the cpu-gpu path (backward compatible).

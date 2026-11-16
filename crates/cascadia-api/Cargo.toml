@@ -11,7 +11,7 @@ description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with 
 [features]
 default = []
 # Intel physicalai remote-inference front end (Zenoh) for the policy server.
-zenoh = ["dep:zenoh", "dep:tokio-tungstenite"]
+zenoh = ["dep:zenoh", "dep:tokio-tungstenite", "dep:rustls"]
 
 [dependencies]
 cascadia-types = { workspace = true }
@@ -51,9 +51,13 @@ zenoh = { version = "=1.9.0", default-features = false, features = ["transport_t
 sha2 = "0.10"
 # The policy bridge's openpi client (wss through rustls).
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+# `--ca-file`: the bridge's own root store, on the ring provider the rest of
+# the tree already uses.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
 async-trait = { workspace = true }
 tokio-tungstenite = "0.24"
+tempfile = { workspace = true }
