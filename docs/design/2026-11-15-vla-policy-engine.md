@@ -314,6 +314,24 @@ weights `w` from `inference_delay` and `execution_horizon`, and `v_t -= min(c·r
   smaller graph (SmolVLA: 42,757 IR ops against 67,583; 63 `Cos` against 492), so the two compile
   to different kernels. They agree within 1.1e-5 on CPU f32, and the RTC package matches PyTorch within
   1e-6. Robots that do not send the fields, and packages exported without RTC, behave as before.
+- **Measured** (2026-11-16, SmolVLA `HuggingFaceVLA/smolvla_libero` and π0.5
+  `lerobot/pi05_libero_finetuned_v044` exported with physical-ai-studio `8f132416`, input-mode
+  noise, OpenVINO 2026.4.1):
+
+  | | SmolVLA | π0.5 |
+  |---|---|---|
+  | CPU f32 (x86), weight 0 vs no fields | bit-identical | bit-identical |
+  | CPU f32 (x86), no fields vs the export without RTC | 1.07e-5 | 1.73e-6 |
+  | CPU f32 (x86), RTC vs PyTorch RTC (f32 twin) | 1.01e-6 | 1.10e-6 |
+  | Arc 140V GPU f16 vs CPU f32: plain / RTC | 3.4e-3 / 4.2e-3 | 1.0e-3 / 7.7e-4 |
+  | Arc 140V GPU f16 p50, 50-step chunk: plain / RTC | 315 / 313 ms | 618 / 616 ms |
+
+  Delayed LIBERO (`libero_spatial`, 10 tasks × 3 episodes, seed 7, GPU f16; the robot keeps
+  executing D old actions while a chunk is computed, horizon 20, `max_guidance_weight` 5), RTC off
+  against on with the same schedule: SmolVLA (D 5) 9/30 and 7/30 successes, seam jump mean 0.425
+  against 0.044 (p90 0.864 against 0.080); π0.5 (D 10) 26/30 and 25/30, seam jump mean 0.360
+  against 0.035 (p90 1.155 against 0.062). RTC removes about 90% of the jump between chunks;
+  success is unchanged within the run's noise.
 - **Checks** (physicalai's `_validate_rtc_inputs`): `1 <= execution_horizon <= T / 2`,
   `0 <= inference_delay <= execution_horizon`, `max_guidance_weight` finite and non-negative,
   the leftover `T × D` finite values. A package without RTC refuses the fields rather than
