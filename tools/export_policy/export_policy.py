@@ -8,8 +8,9 @@ manages (tools/export_policy/requirements.txt). Two subcommands:
       verdict: policy type, licence, gated-tokenizer access, normalization stats. The CLI decides
       whether to refuse. Needs only huggingface_hub.
   export --model ID --preflight FILE --out DIR [--rtc] [--stats FILE] [--verify]
-      Loads the policy in float32, exports it with physical-ai-studio's OpenVINO exporter into a
-      float32 IR, and saves the package's IR from it with fp16 weights.
+      Loads the policy in float32 at the preflight's commit, exports it with physical-ai-studio's
+      OpenVINO exporter into a float32 IR, and saves the package's IR from it with fp16 weights.
+      DIR is the CLI's staging directory, renamed into place only when everything succeeded.
 
 Heavy modules are imported inside the functions that need them, so the helpers above `main` import
 with the standard library alone (tools/tests/test_export_policy.py).
@@ -33,6 +34,14 @@ STAT_KEYS = ("mean", "std", "q01", "q99", "min", "max")
 MODE_KEYS = {"mean_std": ("mean", "std"), "quantiles": ("q01", "q99"), "min_max": ("min", "max")}
 # Manifest stats entries fed from the --stats file's "state" or "action" block.
 STATS_SOURCE = {"state": "state", "action": "action", "prev_chunk_left_over": "action"}
+# Values that leave a dimension as it is, for padding stats narrower than the package. LeRobot
+# normalizes the state at the robot's width and only then zero-pads it to max_state_dim
+# (lerobot v0.6.0: processor/normalize_processor.py `_apply_transform`, then
+# policies/pi05/modeling_pi05.py `pad_vector`); identity stats on the padded dimensions map a zero
+# pad to zero in every mode, which is the same thing.
+IDENTITY_PAD = {"mean": 0.0, "std": 1.0, "q01": -1.0, "q99": 1.0, "min": -1.0, "max": 1.0}
+# The manifest's mode when a step names none (cascadia-engine-openvino's manifest default).
+DEFAULT_MODE = "mean_std"
 
 
 def log(line: str) -> None:
@@ -114,7 +123,7 @@ def apply_stats(manifest: dict, stats: dict) -> list[str]:
     for step in model.get("preprocessors", []) + model.get("postprocessors", []):
         if step.get("type") not in ("normalize", "denormalize"):
             continue
-        mode = step.get("mode")
+        mode = step.get("mode") or DEFAULT_MODE
         for name, entry in step.get("stats", {}).items():
             source = STATS_SOURCE.get(name)
             if source is None:
@@ -124,12 +133,12 @@ def apply_stats(manifest: dict, stats: dict) -> list[str]:
             for key in STAT_KEYS:
                 if key not in supplied:
                     continue
-                if len(supplied[key]) != width:
+                values = [float(v) for v in supplied[key]]
+                if not values or len(values) > width:
                     raise ValueError(
-                        f"{source}.{key} has {len(supplied[key])} values; the package's {name} "
-                        f"has {width}"
+                        f"{source}.{key} has {len(values)} values; the package's {name} has {width}"
                     )
-                entry[key] = [float(v) for v in supplied[key]]
+                entry[key] = values + [IDENTITY_PAD[key]] * (width - len(values))
             missing = [k for k in MODE_KEYS.get(mode, ()) if k not in supplied]
             if missing:
                 raise ValueError(
@@ -141,12 +150,52 @@ def apply_stats(manifest: dict, stats: dict) -> list[str]:
     return done
 
 
-def _read_json(model: str, filename: str) -> dict | None:
+def package_mode(kind: str, pre: dict | None, config: dict) -> str:
+    """The normalize/denormalize mode physical-ai-studio 8f132416 writes into the manifest.
+
+    SmolVLA always writes mean_std. pi0.5 takes the checkpoint's one non-identity mode when its
+    preprocessor uses a single one (`detect_normalization_mode`), else the config's
+    `normalization_mode`, else QUANTILES.
+    """
+    if kind == "smolvla":
+        return "mean_std"
+    modes = set()
+    for step in (pre or {}).get("steps", []):
+        norm_map = step.get("norm_map") or step.get("config", {}).get("norm_map") or {}
+        modes.update(v for v in norm_map.values() if v != "IDENTITY")
+    detected = next(iter(modes)) if len(modes) == 1 and modes <= {"MEAN_STD", "QUANTILES"} else None
+    return (detected or config.get("normalization_mode") or "QUANTILES").lower()
+
+
+def feature_width(config: dict, section: str, ftype: str) -> int | None:
+    """The last dimension of the config's first `ftype` feature in `section`."""
+    for feature in (config.get(section) or {}).values():
+        if feature.get("type") == ftype and feature.get("shape"):
+            return int(feature["shape"][-1])
+    return None
+
+
+def copy_package(src: Path, dst: Path, ir: str) -> None:
+    """Copy the exporter's output, subdirectories included, except the IR and its weights."""
+    rel = Path(ir)
+    if not ir or rel.is_absolute() or rel.drive or ".." in rel.parts:
+        raise ValueError(f"model.artifacts.openvino {ir!r} is not a path inside the package")
+    skip = {rel, rel.with_suffix(".bin")}
+    for p in sorted(src.rglob("*")):
+        r = p.relative_to(src)
+        if p.is_dir() or r in skip:
+            continue
+        (dst / r).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, dst / r)
+
+
+def _read_json(model: str, filename: str, revision: str | None) -> dict | None:
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
     try:
-        return json.loads(Path(hf_hub_download(model, filename)).read_text(encoding="utf-8"))
+        path = hf_hub_download(model, filename, revision=revision)
+        return json.loads(Path(path).read_text(encoding="utf-8"))
     except (EntryNotFoundError, LocalEntryNotFoundError):
         return None
 
@@ -173,9 +222,9 @@ def _gated_access(repo: str) -> tuple[bool, str]:
 
 def preflight(model: str) -> dict:
     from huggingface_hub import model_info
-    from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+    from huggingface_hub.errors import HfHubHTTPError, HFValidationError, RepositoryNotFoundError
 
-    out: dict = {"model": model, "error": None, "gated": None, "stats": None}
+    out: dict = {"model": model, "error": None, "gated": None, "stats": None, "revision": None}
     files = None
     try:
         info = model_info(model)
@@ -183,6 +232,9 @@ def preflight(model: str) -> dict:
         out["revision"] = info.sha
         card = info.card_data
         out["license"] = (card.get("license") if card else None) or None
+    except HFValidationError as e:
+        out["error"] = f"{model!r} is not a valid Hugging Face model id ({e})"
+        return out
     except RepositoryNotFoundError:
         out["error"] = f"{model}: no such model on Hugging Face (or it is private and you are not logged in)"
         return out
@@ -193,7 +245,8 @@ def preflight(model: str) -> dict:
         out["revision"], out["license"] = None, None
     out["license_files"] = license_files(files)
 
-    config = _read_json(model, "config.json")
+    revision = out["revision"]
+    config = _read_json(model, "config.json", revision)
     if config is None:
         out["error"] = f"{model} has no config.json; is it a LeRobot policy checkpoint?"
         return out
@@ -201,29 +254,49 @@ def preflight(model: str) -> dict:
     out["policy_type"] = kind
     out["chunk_size"] = config.get("chunk_size")
     out["n_action_steps"] = config.get("n_action_steps")
+    out["state_dim"] = feature_width(config, "input_features", "STATE")
+    out["action_dim"] = feature_width(config, "output_features", "ACTION")
     if kind not in SUPPORTED:
         return out
     gated = GATED_TOKENIZER.get(kind)
     if gated:
         ok, detail = _gated_access(gated)
         out["gated"] = {"repo": gated, "ok": ok, "detail": detail}
-    pre = _read_json(model, "policy_preprocessor.json")
-    post = _read_json(model, "policy_postprocessor.json")
+    pre = _read_json(model, "policy_preprocessor.json", revision)
+    post = _read_json(model, "policy_postprocessor.json", revision)
+    out["stats_mode"] = package_mode(kind, pre, config)
     problem = stats_problem(pre, post, files)
     out["stats"] = {"ok": problem is None, "detail": problem or "present"}
     return out
 
 
+def _bind_revision(kind: str, model: str, revision: str | None) -> None:
+    """Make the policy loader fetch `model` at the commit the preflight resolved, not `main`."""
+    if not revision:
+        return
+    import importlib
+
+    module = importlib.import_module(f"physicalai.policies.{kind}.policy")
+    orig = module.hf_hub_download
+
+    def bound(repo_id, *args, **kwargs):
+        if str(repo_id) == model and kwargs.get("revision") is None:
+            kwargs["revision"] = revision
+        return orig(repo_id, *args, **kwargs)
+
+    module.hf_hub_download = bound
+
+
 def _load_policy(kind: str, model: str, rtc: bool):
+    # n_action_steps=None keeps the checkpoint's chunk length (the default 50 rejects 15-step
+    # checkpoints such as DROID's).
     if kind == "smolvla":
         from physicalai.policies import SmolVLA as cls
 
-        policy = cls(pretrained_name_or_path=model, dtype="float32")
+        policy = cls(pretrained_name_or_path=model, dtype="float32", n_action_steps=None)
     else:
         from physicalai.policies import Pi05 as cls
 
-        # n_action_steps=None keeps the checkpoint's chunk length (the default 50 rejects 15-step
-        # checkpoints such as DROID's).
         policy = cls(
             pretrained_name_or_path=model,
             dtype="float32",
@@ -293,12 +366,14 @@ def export(args: argparse.Namespace) -> int:
     import torch
 
     pre = json.loads(Path(args.preflight).read_text(encoding="utf-8"))
-    kind = pre["policy_type"]
+    kind, revision = pre["policy_type"], pre.get("revision")
+    # --out is the CLI's staging directory; the f32 IR goes beside it, under the same unique name.
     out = Path(args.out)
-    tmp = out.with_name(out.name + ".f32-tmp")
+    tmp = out.with_name(out.name + ".f32")
     stats = load_stats(Path(args.stats)) if args.stats else None
 
     t0 = time.perf_counter()
+    _bind_revision(kind, args.model, revision)
     policy = _load_policy(kind, args.model, args.rtc)
     log(
         f"LOAD OK {time.perf_counter() - t0:.0f}s kind={kind} chunk={policy.config.chunk_size} "
@@ -323,12 +398,10 @@ def export(args: argparse.Namespace) -> int:
         ir = manifest["model"]["artifacts"]["openvino"]
         log(f"EXPORT OK {time.perf_counter() - t0:.0f}s ir={ir}")
         out.mkdir(parents=True, exist_ok=True)
-        ir_bin = Path(ir).with_suffix(".bin").name
-        for p in tmp.iterdir():
-            if p.name not in (ir, ir_bin):
-                shutil.copy2(p, out / p.name)
+        copy_package(tmp, out, ir)
+        (out / ir).parent.mkdir(parents=True, exist_ok=True)
         ov.save_model(ov.Core().read_model(tmp / ir), str(out / ir), compress_to_fp16=True)
-        log(f"FP16 OK bin_mb={round((out / ir_bin).stat().st_size / 1e6)}")
+        log(f"FP16 OK bin_mb={round((out / ir).with_suffix('.bin').stat().st_size / 1e6)}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -348,7 +421,7 @@ def export(args: argparse.Namespace) -> int:
         from huggingface_hub import hf_hub_download
 
         for name in pre["license_files"]:
-            shutil.copy2(hf_hub_download(args.model, name), out / name)
+            shutil.copy2(hf_hub_download(args.model, name, revision=revision), out / name)
         log(f"LICENCE OK copied {', '.join(pre['license_files'])}")
 
     if args.verify:

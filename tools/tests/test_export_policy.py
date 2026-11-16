@@ -113,14 +113,80 @@ class ApplyStats(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "q01, q99"):
             ep.apply_stats(m, stats)
 
-    def test_width_must_match(self):
+    def test_wider_than_the_package_is_refused(self):
         stats = {"state": {"mean": [1.0] * 32, "std": [1.0] * 32}, "action": {"mean": [0] * 7, "std": [1] * 7}}
         with self.assertRaisesRegex(ValueError, "32 values; the package's state has 8"):
             ep.apply_stats(_manifest(), stats)
 
+    def test_narrower_stats_pad_with_the_identity(self):
+        # pi0.5 DROID: the package's state and action are 32 wide, real stats 8 wide.
+        for mode, keys, pad in (
+            ("mean_std", ("mean", "std"), (0.0, 1.0)),
+            ("quantiles", ("q01", "q99"), (-1.0, 1.0)),
+            ("min_max", ("min", "max"), (-1.0, 1.0)),
+        ):
+            m = _manifest(mode=mode, width=32)
+            real = {k: [5.0] * 8 for k in keys}
+            ep.apply_stats(m, {"state": real, "action": {k: [5.0] * 7 for k in keys}})
+            state = m["model"]["preprocessors"][1]["stats"]["state"]
+            for k, v in zip(keys, pad):
+                self.assertEqual(state[k], [5.0] * 8 + [v] * 24, (mode, k))
+
+    def test_a_step_without_mode_is_mean_std(self):
+        m = _manifest()
+        for step in m["model"]["preprocessors"][1:] + m["model"]["postprocessors"]:
+            del step["mode"]
+        stats = {"state": {"q01": [0] * 8, "q99": [1] * 8}, "action": {"q01": [0] * 7, "q99": [1] * 7}}
+        with self.assertRaisesRegex(ValueError, "mean_std"):
+            ep.apply_stats(m, stats)
+
     def test_needs_a_normalize_step(self):
         with self.assertRaisesRegex(ValueError, "no normalize"):
             ep.apply_stats({"model": {"preprocessors": [], "postprocessors": []}}, {"state": {}, "action": {}})
+
+
+class PackageMode(unittest.TestCase):
+    def test_smolvla_is_always_mean_std(self):
+        self.assertEqual(ep.package_mode("smolvla", _normalizer(STATE, norm=("QUANTILES", "QUANTILES")), {}), "mean_std")
+
+    def test_pi05_follows_the_checkpoint_or_defaults_to_quantiles(self):
+        self.assertEqual(ep.package_mode("pi05", _normalizer(STATE), {}), "mean_std")
+        self.assertEqual(ep.package_mode("pi05", _normalizer(STATE, norm=("QUANTILES", "QUANTILES")), {}), "quantiles")
+        mixed = _normalizer(STATE, norm=("MEAN_STD", "QUANTILES"))
+        self.assertEqual(ep.package_mode("pi05", mixed, {}), "quantiles")
+        self.assertEqual(ep.package_mode("pi05", mixed, {"normalization_mode": "MEAN_STD"}), "mean_std")
+        self.assertEqual(ep.package_mode("pi05", None, {}), "quantiles")
+
+
+class Widths(unittest.TestCase):
+    def test_from_config_features(self):
+        config = {
+            "input_features": {"observation.state": {"type": "STATE", "shape": [8]},
+                               "observation.images.a": {"type": "VISUAL", "shape": [3, 2, 2]}},
+            "output_features": {"action": {"type": "ACTION", "shape": [7]}},
+        }
+        self.assertEqual(ep.feature_width(config, "input_features", "STATE"), 8)
+        self.assertEqual(ep.feature_width(config, "output_features", "ACTION"), 7)
+        self.assertIsNone(ep.feature_width({}, "output_features", "ACTION"))
+
+
+class CopyPackage(unittest.TestCase):
+    def test_copies_subdirectories_and_skips_a_nested_ir(self):
+        with tempfile.TemporaryDirectory() as t:
+            src, dst = Path(t, "src"), Path(t, "dst")
+            (src / "ir").mkdir(parents=True)
+            (src / "assets").mkdir()
+            for rel in ("manifest.json", "ir/model.xml", "ir/model.bin", "assets/a.txt", "tokenizer.xml"):
+                (src / rel).write_text(rel)
+            ep.copy_package(src, dst, "ir/model.xml")
+            got = sorted(str(p.relative_to(dst)) for p in dst.rglob("*") if p.is_file())
+            self.assertEqual(got, ["assets/a.txt", "manifest.json", "tokenizer.xml"])
+
+    def test_refuses_an_ir_outside_the_package(self):
+        with tempfile.TemporaryDirectory() as t:
+            for bad in ("../x.xml", "/abs/x.xml", ""):
+                with self.assertRaises(ValueError):
+                    ep.copy_package(Path(t), Path(t, "o"), bad)
 
 
 class LoadStats(unittest.TestCase):
