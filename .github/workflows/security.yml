@@ -48,3 +48,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
           command: check all
+          # The action's default, stated so it is not dropped by accident:
+          # optional features (`zenoh`, `openvino`) ship in releases, so
+          # their dependency trees must pass the gate too.
+          arguments: --all-features

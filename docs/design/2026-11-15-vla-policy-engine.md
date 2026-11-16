@@ -461,9 +461,14 @@ Intel's `physicalai` runtime runs a policy on another machine through `RemoteInf
 speaks its own protocol (version 1) over Zenoh. `cascadia run --engine ov-policy --zenoh
 <HOST[:PORT]>` serves that protocol next to the WebSocket, so code written against
 `RemoteInferenceModel` drives a Cascadia policy with no change. It is behind the `zenoh` cargo
-feature (off by default) and uses the Rust `zenoh` crate pinned to 1.9.0, the release the Python
-client locks (`eclipse-zenoh==1.9.0`); an end-to-end run of Intel's own client against the Rust
-server is the proof of wire compatibility, not the version numbers.
+feature (off in a plain `cargo build`; the release bundles build with it, so `--zenoh` and
+`cascadia policy-bridge` ship) and uses the Rust `zenoh` crate pinned to 1.9.0, the release the
+Python client locks (`eclipse-zenoh==1.9.0`); an end-to-end run of Intel's own client against the
+Rust server is the proof of wire compatibility, not the version numbers. Two advisories in that
+tree are recorded in `deny.toml` as not reachable: lz4_flex's decompression (RUSTSEC-2026-0041) is
+compiled only with zenoh's `transport_compression`, which is off, and unsafe-libyaml
+(RUSTSEC-2024-0449) parses only YAML config files, which the server never loads. zenoh 1.10.2 still
+carries both, so a bump would not clear them.
 
 **Wire.** Byte for byte what `physicalai/inference/remote` exchanges, pinned by golden bytes that
 `crates/cascadia-api/tests/fixtures/physicalai/generate.py` packs with Intel's own `_protocol.py`:
@@ -606,9 +611,10 @@ at one precision send identical bytes; the slowest warmup call appears only in
   argument in a container or tarball build, which has no `.git`; one left set in a shell
   overrides git too), else the checkout's `HEAD`, else `unknown`. It has no time or host in it, so two builds of one commit on one runtime give the same
   string, and `engine_build(runtime)` gives it for any runtime string. It is not in the metadata
-  bytes. A build from a modified working tree reports its `HEAD` commit. An `engine_build` with
-  `+unknown` (or otherwise not of this form) never matches anything, itself included, since it
-  cannot tell two engines apart; `engine_build_is_known(&str)` applies that rule.
+  bytes. A build from a modified working tree (`git status --porcelain` not empty, untracked
+  files included) reports `<HEAD>-dirty`. An `engine_build` with `+unknown`, a `-dirty` sha, or
+  otherwise not of this form never matches anything, itself included, since it cannot tell two
+  engines apart; `engine_build_is_known(&str)` applies that rule.
 - Two servers compute the same actions for a request when `package_sha256`, `precision`, `device`
   and `engine_build` agree and `engine_build_is_known` holds; a client that fails a session over
   from one server to another should require all of that (the socket metadata carries the first
@@ -618,15 +624,16 @@ at one precision send identical bytes; the slowest warmup call appears only in
 
 | Where | Change |
 |---|---|
-| `cascadia-types` | `policy.rs`: `Observation { images: Vec<(String, Image)>, state: Vec<f32>, prompt: String, seed: Option<u64>, noise: Option<Vec<f32>> }`, `ActionChunk { actions: Vec<f32>, steps, dim, infer_ms }`, `PolicySpec` (fields as in "API"). |
+| `cascadia-types` | `policy.rs`: `Observation { images: Vec<(String, Image)>, state: Vec<f32>, prompt: String, seed: Option<u64>, noise: Option<Vec<f32>>, rtc: Option<RtcInputs> }`, `ActionChunk { actions: Vec<f32>, steps, dim, infer_ms }`, `PolicySpec` (fields as in "API"). |
 | `cascadia-engine` | `PolicyEngine: Send { fn spec(&self) -> &PolicySpec; fn warmup(&mut self) -> EngineResult<Vec<u32>>; fn infer(&mut self, obs: &Observation) -> EngineResult<ActionChunk>; fn close(&mut self) {} }` and a deterministic `MockPolicyEngine` for API and CLI tests on macOS. `warmup` makes `WARMUP_CALLS` (3) calls on zero frames, zero state, an empty prompt and seed 0, and returns each call's `infer_ms` rounded up to whole milliseconds; any failed call is returned as the error, so a package that cannot infer fails its load instead of serving errors. A caller can size a per-call timeout from the slowest. |
 | `cascadia-ov-genai-shim` | A `bool` dtype in `dtype_from_code`, `code_from_dtype`, the header defines and Rust `DType` (`from_code`, `bytes_per_element`); a string-tensor input for the tokenizer; a separate CPU runtime handle for the tokenizer, with the `openvino_tokenizers` extension added to that handle's `ov::Core`, and a way to set an infer request's state variable (`truncation`); `cascadia_runtime_has_op_type(handle, type)`, answered from op types recorded off the `ov::Model` before compile. Alias lookup already exists (`input_aliases`). |
-| `cascadia-engine-openvino` | `policy.rs`: manifest parsing (both component forms, version check, path confinement), port checks, the steps above, noise-mode detection, `OvPolicyEngine`. |
-| `cascadia-api` | Policy router on its own state (the chat `AppState` stays untouched), the limits above, `axum` `ws` feature, msgpack with bin keys. The codec is a public module, `cascadia_api::policy`, so other serving layers can reuse it: `decode_request(&[u8], &PolicySpec) -> Result<Observation, RequestError>` (every decoding rule above; `RequestError` carries the client-facing message), `encode_reply(&ActionChunk) -> Vec<u8>`, `encode_metadata(&PolicySpec) -> Vec<u8>`, `metadata_json(&PolicySpec) -> String`, and `max_payload_bytes(&PolicySpec) -> u32` (the WebSocket cap formula). |
-| `cascadia-cli` | `EngineKind::OvPolicy`, the policy serve path in `cmd_run`, `RunArgs.api` as `Option<String>`, refusal in `worker`/`build_builder`, `export-policy` with its driver script and hashed requirements file embedded by `include_str!` (as `cascadia shard` embeds `EXPORT_REQUIREMENTS`, since a release bundle carries only the binary), a `doctor` check for the tokenizer extension. |
-| `tools/` | `vla_reference.py` (fixture generator), `vla_libero_client.py` (benchmark adapter). Sources only; nothing here is read at run time. |
-| `.github/workflows/ai-pc-tests.yml` | A step that reads the repository variable `CASCADIA_POLICY_PACKAGE_DIR`, checks the package hashes, exports `CASCADIA_POLICY_PACKAGE` and runs the policy tests (see "Testing"). |
-| docs | `docs/engines/ov-policy.md`; `ARCHITECTURE.md` and `docs/engines/README.md` updated for the sibling trait and the new routes. |
+| `cascadia-engine-openvino` | `policy/`: manifest parsing (both component forms, version check, path confinement), port checks, the steps above (one module per family: `gr00t`, `molmoact2`, `qwen_vl`, `vla_jepa`, `xr0`), noise-mode detection, package identity (`package.rs`), `OvPolicyEngine` (`ov.rs`). `build.rs` sets the sha `engine_build` reports. |
+| `cascadia-api` | Policy router on its own state (the chat `AppState` stays untouched), the limits above, `axum` `ws` feature, msgpack with bin keys. The codec is a public module, `cascadia_api::policy`, so other serving layers can reuse it: `decode_request(&[u8], &PolicySpec) -> Result<Observation, RequestError>` (every decoding rule above; `RequestError` carries the client-facing message), `encode_reply(&ActionChunk) -> Vec<u8>`, `encode_metadata(&PolicySpec) -> Vec<u8>`, `metadata_json(&PolicySpec) -> String`, and `max_payload_bytes(&PolicySpec) -> u32` (the WebSocket cap formula). Behind the `zenoh` feature: `physicalai` (Intel's wire codec), `zenoh_server` and `bridge`. |
+| `cascadia-cli` | `EngineKind::OvPolicy`, the policy serve path in `cmd_run`, `RunArgs.api` as `Option<String>`, refusal in `worker`/`build_builder`, `--zenoh` and `policy-bridge` (feature `zenoh`), `export-policy` with its driver script and hashed requirements file embedded by `include_str!` (as `cascadia shard` embeds `EXPORT_REQUIREMENTS`, since a release bundle carries only the binary), a `doctor` check for the tokenizer extension. |
+| `tools/` | `vla_reference.py` (the codec's golden msgpack bytes), `vla_libero_client.py` (benchmark adapter, with a reference resize per convention). Sources only; nothing here is read at run time. |
+| `.github/workflows/ai-pc-tests.yml` | Two steps that read the repository variable `CASCADIA_POLICY_PACKAGE_DIR`, check the package's `manifest.json` against the committed fixture and print the hashes of its top-level `.json`, `.xml` and `.bin` files, export `CASCADIA_POLICY_PACKAGE` and run `policy_openvino` with `CASCADIA_POLICY_GPU=1`; both skip when the variable is unset (see "Testing"). |
+| `.github/workflows/ci.yml`, `security.yml`, `release.yml` | A `zenoh` lane: clippy and tests of `cascadia-api` and `cascadia-cli` with `--features zenoh` on Linux, a Windows compile of `cascadia-api --features zenoh`. cargo-deny runs with `--all-features` (stated explicitly). Release bundles build with `openvino,dashboard-embed,zenoh`. |
+| docs | `docs/engines/ov-policy.md`; `docs/ARCHITECTURE.md` and `docs/engines/README.md` updated for the sibling trait and the new routes; a policy-endpoint note in `SECURITY.md`. |
 
 ## Exporter: `cascadia export-policy`
 
@@ -724,66 +731,82 @@ machine.
 
 ## Testing
 
-- **Fixtures.** `tools/vla_reference.py` runs Intel's `physicalai` runtime at `e3dd944` on small
-  inputs and writes fixtures to `crates/cascadia-engine-openvino/tests/fixtures/policy/`, under
-  100 KB in total, plus one end-to-end reference per staged package (input, noise and expected
-  actions, a few KB). Python runs only when fixtures are regenerated, never in CI. Cases:
-  - each `normalize`/`denormalize` mode, and the placeholder-stats refusal (our DROID manifest);
-  - π0.5 binning, including values below −1 and above 1;
-  - prompt text;
-  - camera ordering under all three rules, and dummy slots;
-  - token ids for a few prompts per tokenizer (ids only, no weights), including one that fills the
-    port;
-  - golden msgpack bytes for requests and replies, packed by the real `openpi_client`.
+What runs where, as shipped. Items marked **not shipped** are planned and not in the repo.
+
+- **Fixtures.** Committed, all small (about 115 KB under
+  `crates/cascadia-engine-openvino/tests/fixtures/policy/`; its README names each file's source):
+  - the manifests of Intel's published packages and of our exports, copied unmodified, including
+    our DROID manifest for the placeholder-stats refusal;
+  - generated references: OpenCV's `INTER_AREA` resize for GR00T, LeRobot's X-VLA rotation
+    conversion, and the SmolVLA end-to-end reference (served actions for the fixed inputs of
+    `tests/policy_openvino.rs`, from an independent numpy + OpenVINO Python pipeline on CPU with
+    `INFERENCE_PRECISION_HINT=f32`; the file records that source);
+  - golden msgpack bytes for openpi requests and replies, packed by the real `openpi_client`
+    (`tools/vla_reference.py msgpack` into `crates/cascadia-api/tests/fixtures/policy/`), and
+    physicalai's wire bytes and resize pixels, packed by Intel's own code
+    (`crates/cascadia-api/tests/fixtures/physicalai/generate.py`).
+
+  Python runs only when fixtures are regenerated, never in CI. **Not shipped:** a generator that
+  runs Intel's `physicalai` runtime for per-step fixtures and token ids; the step tests carry their
+  expected values in the Rust tests.
 - **No OpenVINO (the stub CI lane and macOS).** Unit tests against those fixtures: manifest parsing,
   both component forms, path confinement, version refusal, placeholder stats, request decoding with
   every rejection rule, msgpack bytes against the golden fixtures, and API/CLI against
-  `MockPolicyEngine`.
+  `MockPolicyEngine`. The physicalai front end and the bridge are behind `zenoh`, which the stub
+  lane does not build: `ci.yml`'s `zenoh` lane runs clippy and the tests of `cascadia-api` and
+  `cascadia-cli` with `--features zenoh` on Linux and compiles `cascadia-api --features zenoh` on
+  Windows. `security.yml` runs cargo-deny with `--all-features`, so the zenoh tree is audited too.
 - **With OpenVINO.** On the self-hosted AI-PC lane (`ai-pc-tests.yml`), the only lane that runs
   `cargo test --features openvino`; the Linux lane only type-checks. The tests are ordinary tests
   that print a skip reason and return when `CASCADIA_POLICY_PACKAGE` is unset (`#[ignore]` is fixed
   at compile time, and the lane does not pass `--ignored`).
-  - **Staging.** The lane is a pool of runners, so the package is staged on every runner with the
-    `ai-pc` label, at the path in the repository variable `CASCADIA_POLICY_PACKAGE_DIR`.
-  - **Hash check.** The committed reference records the SHA-256 of the package's `manifest.json`
-    and IR files. When the variable is set, a missing directory or a hash mismatch **fails** the
-    step; only an unset variable skips. The step prints the hashes it ran against.
+  - **Staging.** The lane is a pool of runners, so the package (our `input`-mode export of
+    `HuggingFaceVLA/smolvla_libero`) is staged on every runner with the `ai-pc` label, at the path
+    in the repository variable `CASCADIA_POLICY_PACKAGE_DIR`.
+  - **Hash check.** When the variable is unset, the check step prints a skip line and the test step
+    is skipped. When it is set, a missing directory, a missing `manifest.json`, or a
+    `manifest.json` whose SHA-256 differs from the committed fixture
+    (`smolvla-libero-noise-manifest.json`) **fails** the step. It prints the SHA-256 of every
+    top-level `.json`, `.xml` and `.bin` file it ran against. **Not shipped:** committed hashes of
+    the IR files; until they are recorded, a package with the right manifest and different weights
+    passes the check and is caught only by the reference comparison below.
+  - The tests then run with `CASCADIA_POLICY_PACKAGE` set and `CASCADIA_POLICY_GPU=1`.
 
-  Steps:
-  1. Tokenizer ids against the fixtures, and the prompt-length check with the worst-case state.
-  2. End to end against the committed reference for that package, with the same `noise` passed in.
-     It runs on our `input`-mode export of `HuggingFaceVLA/smolvla_libero` (not gated); Intel's
-     published SmolVLA has no noise input. Differences are measured **before `denormalize`**, in
-     normalized units, so every action dimension counts the same (a raw 0.05 is more than one
-     standard deviation of LIBERO's rotation actions). The CPU tolerance is fixed up front: ≤ 1e-4
-     for our CPU run against Intel's runtime on CPU. That only means "a port bug" when everything
-     else is equal, so both sides set `INFERENCE_PRECISION_HINT=f32` (OpenVINO's CPU plugin
-     otherwise picks bf16 or f16 from the hardware), the reference is generated on an `ai-pc`
-     runner, and the reference file records the generator's CPU and precision next to the package
-     hashes. The GPU at `--precision f32` must also stay within 1e-3 of that reference. The GPU at
-     the default f16 is gated only on finite output; its max and mean differences are printed and
-     recorded, and whether they matter is decided by the LIBERO comparison below, not by a number
-     chosen in advance (see "GPU precision").
-- **Accuracy.** `tools/vla_libero_client.py` adapts Intel's LIBERO benchmark observations to the
-  WebSocket schema. It runs a few episodes of one suite on `HuggingFaceVLA/smolvla_libero` and
-  `lerobot/pi05_libero_finetuned_v044`, both exported in `input` mode, against Intel's published
-  packages (`constant` and `in_graph_random`), and runs our packages at both `--precision f16` and
-  `f32` on the GPU. Speed and parity do not show that a robot succeeds at a task; this does. Where the simulator runs is open question 2.
-  The adapter connects through `openpi_client.WebsocketClientPolicy` exactly as the doc tells users
-  to (`host="ws://…/v1/policy/ws"`, `port=None`), so the accuracy run is also the end-to-end
-  interoperability test.
-- **RTC.** `policy_openvino`'s RTC tests take SmolVLA and π0.5 LIBERO exported with and without RTC
-  from one checkpoint, the RTC export's float32 twin, and raw inputs with Intel's PyTorch outputs
-  for them (`CASCADIA_POLICY_PACKAGE_<M>_RTC`, `_NORTC`, `_RTC_F32`, `CASCADIA_POLICY_RTC_REF_<M>`):
-  guidance off is bit-identical to no fields and within 1e-4 of the plain export; with guidance on
-  the CPU f32 chunk is within 1e-4 of PyTorch's RTC path; on the GPU at f16 it is finite and
-  deviates from CPU f32 by at most twice the plain chunk's deviation plus 1e-3. A delayed-LIBERO
-  A/B (`tools/vla_libero_client.py --async-delay D --execution-horizon S [--rtc W]`) compares
-  success and seam jumps with RTC off and on under the same schedule.
-- **Rig.** Latency through `cascadia run` on a Core Ultra AI PC for SmolVLA and π0.5 LIBERO, plus one
-  scripted check through the real `openpi_client`: the metadata arrives first, one `infer` returns
-  actions, a bad request raises the error frame's text, and a fifth connection is refused at
-  capacity.
+  Steps (`tests/policy_openvino.rs`, the `smolvla_*` tests):
+  1. The package spec, tokenizer ids for a known prompt, and the prompt-length refusal past the
+     port.
+  2. End to end against the committed reference with the same `noise` passed in: the served
+     actions on CPU within 1e-4, and two CPU calls within 1e-5 of each other. The comparison is on
+     the served (denormalized) actions, not before `denormalize`; the reference is the independent
+     Python pipeline above, not Intel's runtime. The GPU at `--precision f32` must stay within 1e-3
+     of the reference; the GPU at the default f16 must be finite and within 0.5, with its
+     differences printed. Whether those matter is decided by the LIBERO comparison below, not by a
+     number chosen in advance (see "GPU precision").
+  3. The compile cache gives bit-identical CPU actions; `model_id` replaces the directory name;
+     `gpu_memory_bytes` is `None` on CPU and measured on the GPU.
+
+  The other kinds' tests (`CASCADIA_POLICY_PACKAGE_<KIND>`, listed at the top of
+  `tests/policy_openvino.rs`) take packages and references no runner stages; they run by hand.
+- **Accuracy (by hand, not in CI).** `tools/vla_libero_client.py` adapts LIBERO observations to the
+  WebSocket schema and connects through `openpi_client.WebsocketClientPolicy` exactly as
+  `docs/engines/ov-policy.md` tells users to (`host="ws://…/v1/policy/ws"`, `port=None`), so an
+  accuracy run is also the end-to-end interoperability test. It runs episodes of one suite against
+  our `input`-mode exports and Intel's published packages, at `--precision f16` and `f32` on the
+  GPU. Speed and parity do not show that a robot succeeds at a task; this does. Where the simulator
+  runs is open question 2.
+- **RTC (by hand).** `policy_openvino`'s RTC tests take SmolVLA and π0.5 LIBERO exported with and
+  without RTC from one checkpoint, the RTC export's float32 twin, and raw inputs with Intel's
+  PyTorch outputs for them (`CASCADIA_POLICY_PACKAGE_<M>_RTC`, `_NORTC`, `_RTC_F32`,
+  `CASCADIA_POLICY_RTC_REF_<M>`): guidance off is bit-identical to no fields and within 1e-4 of the
+  plain export; with guidance on the CPU f32 chunk is within 1e-4 of PyTorch's RTC path; on the GPU
+  at f16 it is finite and deviates from CPU f32 by at most twice the plain chunk's deviation plus
+  1e-3. A delayed-LIBERO A/B (`tools/vla_libero_client.py --async-delay D --execution-horizon S
+  [--rtc W]`) compares success and seam jumps with RTC off and on under the same schedule.
+- **Rig (by hand).** Latency through `cascadia run` on a Core Ultra AI PC for SmolVLA and π0.5
+  LIBERO, plus a check through the real `openpi_client`: the metadata arrives first, one `infer`
+  returns actions, a bad request raises the error frame's text, and a fifth connection is refused
+  at capacity. **Not shipped:** a script for this check; `tests/policy_ws.rs` covers the same
+  behaviour against `MockPolicyEngine` over a real TCP socket.
 
 ## Open questions
 

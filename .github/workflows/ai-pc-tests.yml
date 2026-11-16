@@ -149,6 +149,65 @@ jobs:
           INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
         run: cargo test -p cascadia-engine-openvino -p cascadia-ov-genai-shim -p cascadia-engine-sparse-moe --features openvino --no-fail-fast
 
+      # ov-policy end to end on a staged package (docs/design/
+      # 2026-11-15-vla-policy-engine.md, "Testing"): our input-mode export of
+      # HuggingFaceVLA/smolvla_libero, staged on every `ai-pc` runner at the
+      # path in repository variable CASCADIA_POLICY_PACKAGE_DIR. Unset: both
+      # steps skip (the tests above already printed their skip reasons). Set:
+      # a missing directory or a manifest.json that is not the committed
+      # fixture fails, so the tests never run against an unknown package.
+      # File writes use .NET, not Out-File: PowerShell 5.1's utf8 writes a BOM.
+      - name: Check the staged policy package
+        id: policy-package
+        shell: powershell
+        env:
+          PACKAGE_DIR: ${{ vars.CASCADIA_POLICY_PACKAGE_DIR }}
+        run: |
+          $dir = $env:PACKAGE_DIR
+          if ([string]::IsNullOrWhiteSpace($dir)) {
+            Write-Host "skip: repository variable CASCADIA_POLICY_PACKAGE_DIR is not set"
+            exit 0
+          }
+          if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            Write-Host "::error::CASCADIA_POLICY_PACKAGE_DIR ($dir) is not a directory on this runner"
+            exit 1
+          }
+          $manifest = Join-Path $dir "manifest.json"
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            Write-Host "::error::no manifest.json in $dir"
+            exit 1
+          }
+          # The fixture is committed with LF endings, and Git for Windows may
+          # check it out with CRLF: hash it with CRLF turned back into LF.
+          $fixture = "crates\cascadia-engine-openvino\tests\fixtures\policy\smolvla-libero-noise-manifest.json"
+          $raw = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $fixture))
+          $lf = New-Object System.Collections.Generic.List[byte]
+          for ($i = 0; $i -lt $raw.Length; $i++) {
+            if (-not ($raw[$i] -eq 13 -and $i + 1 -lt $raw.Length -and $raw[$i + 1] -eq 10)) { $lf.Add($raw[$i]) }
+          }
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          $want = -join ($sha.ComputeHash($lf.ToArray()) | ForEach-Object { $_.ToString("x2") })
+          $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifest).Hash.ToLower()
+          Write-Host "package hashes (sha256):"
+          Get-ChildItem -LiteralPath $dir -File |
+            Where-Object { $_.Extension -in ".json", ".xml", ".bin" } |
+            Sort-Object Name |
+            ForEach-Object { Write-Host ("  {0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower(), $_.Name) }
+          if ($got -ne $want) {
+            Write-Host "::error::manifest.json sha256 $got is not the committed fixture's $want ($fixture)"
+            exit 1
+          }
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "CASCADIA_POLICY_PACKAGE=$dir`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "staged=true`n")
+
+      - name: Run policy tests on the staged package
+        if: steps.policy-package.outputs.staged == 'true'
+        env:
+          INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
+          # Every ai-pc runner has an Intel iGPU: run the GPU f16/f32 cases too.
+          CASCADIA_POLICY_GPU: "1"
+        run: cargo test -p cascadia-engine-openvino --features openvino --test policy_openvino --no-fail-fast
+
       # Optional end-to-end smoke once a small model is staged on the runners:
       # bring up the cascadia binary against the real engine and hit
       # /v1/chat/completions. Left commented until the model fixture path is

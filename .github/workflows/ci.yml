@@ -189,6 +189,50 @@ jobs:
           cargo check --workspace --all-targets
           --features cascadia-engine-openvino/kv_coord,cascadia-engine-sparse-moe/kv_coord
 
+  zenoh:
+    # `zenoh` is off by default, so the `test` job never compiles the physicalai
+    # front end (`run --zenoh`, `policy-bridge`) or runs its tests. The release
+    # bundles ship it, so Windows compiles it here too rather than first at tag
+    # time; its tests run on Linux (the zenoh tree has no OpenVINO dependency).
+    name: zenoh feature (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: ci-zenoh
+
+      - name: Lint (clippy, --features zenoh)
+        if: runner.os == 'Linux'
+        # Per-package `pkg/feature` syntax, as in kv-coord.
+        run: >
+          cargo clippy -p cascadia-api -p cascadia-cli --all-targets
+          --features cascadia-api/zenoh,cascadia-cli/zenoh
+
+      - name: Test (--features zenoh)
+        if: runner.os == 'Linux'
+        run: >
+          cargo test -p cascadia-api -p cascadia-cli
+          --features cascadia-api/zenoh,cascadia-cli/zenoh
+
+      - name: Check (Windows, --features zenoh)
+        if: runner.os == 'Windows'
+        run: cargo check -p cascadia-api --all-targets --features zenoh
+
   # Pre-flight the Linux release compile: the openvino C++ shim (gemv_offload.cpp)
   # is only built with --features openvino on ubuntu-22.04 + g++-12 + OV SDK.
   # ci's stub build never touches it, so GCC errors like v0.1.3/v0.1.4
