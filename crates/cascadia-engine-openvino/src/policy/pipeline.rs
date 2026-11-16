@@ -52,6 +52,10 @@ pub const PREV_CHUNK_LEFT_OVER: &str = "prev_chunk_left_over";
 pub const INFERENCE_DELAY: &str = "inference_delay";
 pub const MAX_GUIDANCE_WEIGHT: &str = "max_guidance_weight";
 pub const EXECUTION_HORIZON: &str = "execution_horizon";
+/// Bound on a normalized leftover value. Real leftovers are actions the model
+/// produced, a few standard deviations from the mean; past this the graph's
+/// f32, and the GPU's f16 (max 65504), arithmetic can overflow into NaN.
+pub const RTC_LEFTOVER_NORMALIZED_MAX: f64 = 1e4;
 const RTC_PORTS: [&str; 4] = [
     PREV_CHUNK_LEFT_OVER,
     INFERENCE_DELAY,
@@ -1480,6 +1484,16 @@ impl PolicyPipeline {
         for step in self.manifest.normalize() {
             left = normalize(step, PREV_CHUNK_LEFT_OVER, &left)?;
         }
+        if let Some(x) = left
+            .iter()
+            .find(|x| !x.is_finite() || x.abs() > RTC_LEFTOVER_NORMALIZED_MAX)
+        {
+            return Err(EngineError::InvalidConfig(format!(
+                "prev_chunk_left_over normalizes to {x:e}; it must stay within \
+                 {RTC_LEFTOVER_NORMALIZED_MAX:e} standard deviations of the action mean \
+                 (send back the actions this server returned)"
+            )));
+        }
         let tensor = |shape: &[usize], data| HostTensor {
             shape: shape.to_vec(),
             data,
@@ -2368,6 +2382,92 @@ mod tests {
         assert_eq!(i64s(&input(&r.log, EXECUTION_HORIZON)), &[1]);
         let zeros = normalized_action(&m, &[0.0; 350]);
         assert_eq!(f32s(&input(&r.log, PREV_CHUNK_LEFT_OVER)), zeros.as_slice());
+    }
+
+    /// A finite leftover whose normalized value is huge would make the graph's
+    /// f32 (or GPU f16) arithmetic overflow into a NaN chunk; it is refused as
+    /// a bad request before the model runs.
+    #[test]
+    fn rtc_leftover_that_normalizes_out_of_range_is_refused() {
+        let mut r = smolvla_rtc();
+        let spec = r.engine.spec().clone();
+        let m = PolicyManifest::parse(SMOLVLA_RTC, LoadOptions::default()).unwrap();
+        let s = m
+            .normalize()
+            .find_map(|s| s.stats_for(PREV_CHUNK_LEFT_OVER))
+            .unwrap()
+            .clone();
+        let (mean, std) = (s.mean.unwrap(), s.std.unwrap());
+        let at = |sigmas: f64| -> Vec<f32> {
+            (0..350)
+                .map(|i| (mean[i % 7] + sigmas * (std[i % 7] + 1e-8)) as f32)
+                .collect()
+        };
+        let call = |r: &mut Rig, left: Vec<f32>| {
+            let mut o = obs(&spec, "pick up the bowl");
+            o.rtc = Some(cascadia_types::RtcInputs {
+                prev_chunk_left_over: left,
+                inference_delay: 1,
+                max_guidance_weight: 5.0,
+                execution_horizon: 10,
+            });
+            r.engine.infer(&o)
+        };
+        let infers = r.log.lock().unwrap().infers;
+        for left in [vec![3e38; 350], at(70_000.0)] {
+            let e = call(&mut r, left).unwrap_err();
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{e}");
+            assert!(
+                e.to_string().contains("prev_chunk_left_over normalizes to"),
+                "{e}"
+            );
+        }
+        assert_eq!(r.log.lock().unwrap().infers, infers, "the model ran");
+        // Far but plausible values pass.
+        call(&mut r, at(500.0)).unwrap();
+    }
+
+    /// The leftover's stats are only read for a model with the RTC ports: a
+    /// plain package loads exactly as before, even with a bad entry.
+    #[test]
+    fn rtc_leftover_stats_only_matter_with_the_rtc_ports() {
+        let mut v: serde_json::Value = serde_json::from_str(SMOLVLA_RTC).unwrap();
+        for step in v["model"]["preprocessors"].as_array_mut().unwrap() {
+            if let Some(stats) = step.get_mut("stats").and_then(|v| v.as_object_mut()) {
+                stats.insert(
+                    PREV_CHUNK_LEFT_OVER.into(),
+                    serde_json::json!({"mean": [0.0], "std": "bad"}),
+                );
+            }
+        }
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        assert!(m.normalize().all(|s| s.features.len() == 1));
+        let log = Arc::new(Mutex::new(Log::default()));
+        let (inputs, outputs) = smolvla_ports();
+        pipeline_with(
+            &v.to_string(),
+            (&inputs, &outputs),
+            false,
+            true,
+            48,
+            &log,
+            vec![],
+        )
+        .unwrap();
+        let (inputs, outputs) = smolvla_rtc_ports();
+        let e = pipeline_with(
+            &v.to_string(),
+            (&inputs, &outputs),
+            false,
+            true,
+            48,
+            &log,
+            vec![],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("prev_chunk_left_over"), "{e}");
     }
 
     #[test]

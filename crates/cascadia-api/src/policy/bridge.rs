@@ -246,11 +246,12 @@ impl BridgeBackend {
                 Ok(None) => return Step::Retry("upstream closed".into()),
             }
         }
+        let request = match encode_request(obs, &self.spec) {
+            Ok(r) => r,
+            Err(e) => return Step::Done(Err(BackendError::Invalid(e.0))),
+        };
         let started = Instant::now();
-        if let Err(e) = ws
-            .send(Message::Binary(encode_request(obs, &self.spec)))
-            .await
-        {
+        if let Err(e) = ws.send(Message::Binary(request)).await {
             return Step::Retry(e.to_string());
         }
         let budget = left(started);

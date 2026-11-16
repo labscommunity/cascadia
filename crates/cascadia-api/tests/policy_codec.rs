@@ -210,7 +210,7 @@ fn decodes_openpi_client_rtc_fields() {
 fn rtc_fields_round_trip_and_take_a_batch_of_one() {
     let mut obs = decode_request(REQUEST_RTC, &rtc_spec()).unwrap();
     obs.noise = Some(vec![0.5; 6]);
-    let back = decode_request(&encode_request(&obs, &rtc_spec()), &rtc_spec()).unwrap();
+    let back = decode_request(&encode_request(&obs, &rtc_spec()).unwrap(), &rtc_spec()).unwrap();
     assert_eq!(back, obs);
     // physicalai's runtime sends the leftover as [1, T, D].
     let rtc = |left: Array, delay: Option<u64>| {
@@ -437,6 +437,67 @@ fn socket_metadata_is_the_same_on_every_load() {
     assert_eq!(back, s);
     assert_eq!(id.policy_name, "smolvla");
     assert_eq!(id.warmup_ms, None);
+}
+
+/// The non-RTC metadata is byte for byte what 2522a4d57 (before RTC) sent, so
+/// a package's metadata hash is unchanged. The fixtures were captured from
+/// that commit in both serde_json map modes; the test picks the one matching
+/// the mode this build compiled (run it with `--features
+/// serde_json/preserve_order` for the insertion-ordered one).
+#[test]
+fn non_rtc_metadata_bytes_are_unchanged_in_both_map_modes() {
+    use cascadia_api::policy::{encode_metadata_for, metadata_json_for, PackageIdentity};
+    let s = PolicySpec {
+        model: "smolvla-libero".into(),
+        device: "GPU".into(),
+        cameras: vec!["image".into(), "image2".into()],
+        height: 512,
+        width: 512,
+        state_len: 8,
+        chunk: [50, 7],
+        noise: NoiseMode::Input,
+        noise_shape: Some(vec![50, 32]),
+        resize: ResizeConvention::TopLeft,
+        prompt_max_bytes: 1024,
+        attribution: None,
+        manifest_sha256: "ab".repeat(32),
+        precision: "f16".into(),
+        server_resize: Some(cascadia_types::ServerResize::Letterbox),
+        rtc_chunk_size: None,
+    };
+    let id = PackageIdentity {
+        policy_name: "smolvla".into(),
+        warmup_ms: Some(180),
+    };
+    let mut probe = serde_json::Map::new();
+    probe.insert("b".into(), 1.into());
+    probe.insert("a".into(), 2.into());
+    let ordered = probe.keys().next().map(String::as_str) == Some("b");
+    let (bytes, json): (&[u8], &str) = if ordered {
+        (
+            include_bytes!("fixtures/policy/metadata-nortc-ordered.msgpack"),
+            include_str!("fixtures/policy/metadata-nortc-ordered.json"),
+        )
+    } else {
+        (
+            include_bytes!("fixtures/policy/metadata-nortc-sorted.msgpack"),
+            include_str!("fixtures/policy/metadata-nortc-sorted.json"),
+        )
+    };
+    eprintln!(
+        "serde_json map mode: {}",
+        if ordered { "preserve_order" } else { "sorted" }
+    );
+    assert_eq!(encode_metadata_for(&s, &id), bytes);
+    assert_eq!(metadata_json_for(&s, &id), json);
+}
+
+#[test]
+fn rtc_fields_on_a_package_without_rtc_are_not_encoded() {
+    let mut obs = decode_request(REQUEST_RTC, &rtc_spec()).unwrap();
+    obs.noise = None;
+    let e = encode_request(&obs, &spec()).unwrap_err();
+    assert!(e.0.contains("takes no RTC inputs"), "{e}");
 }
 
 #[test]

@@ -83,6 +83,9 @@ def cases():
     yield "predict-raw.msgpack", predict(inputs(), "raw")
     # The RTC inputs exactly as physicalai's RTCExecution injects them: one action of the
     # previous chunk executed, the rest padded to [1, T, D], numpy scalars for the rest.
+    # This drives RTCExecution's private `_rtc_queue`, `_chunk_size` and `_inject_rtc_inputs`,
+    # as they are at physicalai e3dd9445a188f99c30afd92077b22a927c16b2bb; a later runtime may
+    # rename them.
     queue = RTCActionQueue()
     prev = np.array([[0.25, -0.5, 1.0], [0.75, 0.5, -1.0]], dtype=np.float32)
     queue.merge(prev, prev)

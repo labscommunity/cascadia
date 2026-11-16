@@ -172,6 +172,31 @@ fn rtc_refusals() {
         e.contains("execution_horizon must be a single number"),
         "{e}"
     );
+    // Big-endian data is refused, never read as little-endian (`>f4` 5.0 would be 5.7e-41).
+    for (dtype, bytes) in [
+        (">f4", 5f32.to_be_bytes().to_vec()),
+        (">f8", 5f64.to_be_bytes().to_vec()),
+        (">i8", 1i64.to_be_bytes().to_vec()),
+    ] {
+        let e = err(req().input("max_guidance_weight", scalar(dtype, &bytes)));
+        assert!(e.contains("big-endian"), "{dtype}: {e}");
+    }
+    let e = err(req().input(
+        "prev_chunk_left_over",
+        val(|b| mp::np(b, ">f4", &[1, 2, 3], &[0; 24])),
+    ));
+    assert!(e.contains("big-endian"), "{e}");
+    // Native and explicit little-endian orders are read.
+    for dtype in ["<f4", "=f4", "float32"] {
+        decode_predict(
+            &req()
+                .input("max_guidance_weight", scalar(dtype, &5f32.to_le_bytes()))
+                .pack(),
+            &rtc_spec(),
+            max,
+        )
+        .unwrap_or_else(|e| panic!("{dtype}: {e}"));
+    }
     // A package without RTC refuses the scalars before reading them.
     let e = decode_predict(
         &good()

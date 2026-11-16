@@ -226,6 +226,9 @@ pub fn derive_spec(
                 ir.action_shape
             ));
         }
+        if let Some(Err(e)) = m.normalize().find_map(|s| s.rtc_leftover.as_ref()) {
+            return refuse(format!("prev_chunk_left_over stats: {e}"));
+        }
         if !m
             .normalize()
             .any(|s| s.stats_for(PREV_CHUNK_LEFT_OVER).is_some())

@@ -372,6 +372,7 @@ mod tests {
             features: vec![("state".into(), s)],
             bounds: Bounds::MinMax,
             pad_to: None,
+            rtc_leftover: None,
         }
     }
 
@@ -473,6 +474,7 @@ mod tests {
             features: vec![],
             bounds: Bounds::MinMax,
             pad_to: None,
+            rtc_leftover: None,
         };
         assert_eq!(normalize(&id, "state", &[7.0]).unwrap(), vec![7.0]);
         let s = step(

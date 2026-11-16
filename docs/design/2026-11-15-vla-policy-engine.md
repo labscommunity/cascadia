@@ -302,7 +302,8 @@ weights `w` from `inference_delay` and `execution_horizon`, and `v_t -= min(c·r
   shape-changing postprocessor), since the client resends what it has not executed of that very
   chunk; anything else is a load error. Its `normalize` step carries the action statistics under
   `prev_chunk_left_over`, and the engine normalizes the leftover with them before the graph, as
-  physicalai's runtime does; a package without them is refused.
+  physicalai's runtime does; a package without them is refused. Those statistics are read only
+  for a model with the RTC ports, so a plain package loads exactly as before.
 - **Stateless server.** The client keeps the action queue and sends the leftover on every call, as
   physicalai's `RTCExecution` does (the leftover zero-padded at the end to `[T, D]`, in the action
   space the server returned). Any call can go to any server, so replay and failover need nothing
@@ -313,7 +314,7 @@ weights `w` from `inference_delay` and `execution_horizon`, and `v_t -= min(c·r
   from the same checkpoint without RTC the chunk is not bit-identical: the RTC trace folds to a
   smaller graph (SmolVLA: 42,757 IR ops against 67,583; 63 `Cos` against 492), so the two compile
   to different kernels. They agree within 1.1e-5 on CPU f32, and the RTC package matches PyTorch within
-  1e-6. Robots that do not send the fields, and packages exported without RTC, behave as before.
+  1.1e-6. Robots that do not send the fields, and packages exported without RTC, behave as before.
 - **Measured** (2026-11-16, SmolVLA `HuggingFaceVLA/smolvla_libero` and π0.5
   `lerobot/pi05_libero_finetuned_v044` exported with physical-ai-studio `8f132416`, input-mode
   noise, OpenVINO 2026.4.1):
@@ -442,7 +443,9 @@ no Python. Decoding rules:
   `[1, *noise_shape]`; every value finite with |x| ≤ 10.
 - RTC fields: only for a package with `rtc_chunk_size` (an error otherwise). `prev_chunk_left_over`
   dtype `<f4`, shape `[T, D]` or `[1, T, D]`; the scalars as plain numbers or numpy scalars; the
-  ranges in "Real-time chunking". `None` for any of them counts as absent.
+  ranges in "Real-time chunking". `None` for any of them counts as absent. A leftover that
+  normalizes past 1e4 standard deviations (or to a non-finite value) is refused before the model
+  runs, since the graph's f32 and the GPU's f16 arithmetic would overflow into NaN.
 - Before anything is allocated: `len(data) == itemsize · Π shape`, computed with checked arithmetic.
   Any mismatch is an error naming the expected value.
 - Replies: if any action is non-finite (possible from f16 overflow on the GPU), the call returns an

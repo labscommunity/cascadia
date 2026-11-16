@@ -193,6 +193,12 @@ fn np_array<'a>(v: &Val<'a>, budget: &mut u64) -> Result<Option<NpArray<'a>>, Re
     else {
         return refuse("Malformed __np__ array payload");
     };
+    // Every reader here is little-endian; a `>` array would be read as wrong values.
+    if dtype.starts_with('>') {
+        return refuse(format!(
+            "__np__ array dtype {dtype} is big-endian; send little-endian (<) or native arrays"
+        ));
+    }
     let Some((_, itemsize)) = np_dtype(dtype) else {
         return refuse("Invalid __np__ array dtype");
     };

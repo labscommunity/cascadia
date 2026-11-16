@@ -421,8 +421,14 @@ impl PackageIdentity {
 fn metadata_value(spec: &PolicySpec, id: &PackageIdentity, timing: bool) -> serde_json::Value {
     let mut v = serde_json::to_value(spec).expect("PolicySpec serializes to JSON");
     let o = v.as_object_mut().expect("PolicySpec is an object");
+    // Keep the key order the metadata had before `rtc_chunk_size` joined the
+    // spec (it followed `chunk_size`), so that with serde_json's
+    // `preserve_order` a package's metadata bytes, and their hash, are
+    // unchanged. It is the spec's last field, so removing it moves nothing.
+    let rtc = o.remove("rtc_chunk_size").unwrap_or_default();
     o.insert("policy_name".into(), id.policy_name.clone().into());
     o.insert("chunk_size".into(), spec.chunk[0].into());
+    o.insert("rtc_chunk_size".into(), rtc);
     if timing {
         o.insert("warmup_ms".into(), id.warmup_ms.into());
     }
@@ -466,8 +472,12 @@ pub fn decode_metadata(bytes: &[u8]) -> Result<(PolicySpec, PackageIdentity), Re
 }
 
 /// A request for `obs` in openpi's layout, as `msgpack_numpy` packs it: what
-/// [`decode_request`] reads. `spec` gives the noise shape.
-pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Vec<u8> {
+/// [`decode_request`] reads. `spec` gives the noise and leftover shapes; RTC
+/// inputs for a package without RTC are refused.
+pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Result<Vec<u8>, RequestError> {
+    if obs.rtc.is_some() && spec.rtc_chunk_size.is_none() {
+        return refuse("this package takes no RTC inputs; export it with RTC enabled");
+    }
     let mut w = Writer::default();
     let n = 3
         + usize::from(obs.seed.is_some())
@@ -500,8 +510,7 @@ pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Vec<u8> {
         shape.extend(spec.noise_shape.iter().flatten());
         ndarray_header(&mut w, "<f4", &shape, &f32s(noise));
     }
-    if let Some(rtc) = &obs.rtc {
-        let t = spec.rtc_chunk_size.unwrap_or_default();
+    if let (Some(rtc), Some(t)) = (&obs.rtc, spec.rtc_chunk_size) {
         w.str("prev_chunk_left_over");
         let shape = [t, spec.chunk[1]];
         ndarray_header(&mut w, "<f4", &shape, &f32s(&rtc.prev_chunk_left_over));
@@ -512,7 +521,7 @@ pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Vec<u8> {
         w.str("execution_horizon");
         w.uint(rtc.execution_horizon.into());
     }
-    w.buf
+    Ok(w.buf)
 }
 
 /// A reply [`encode_reply`] wrote: `actions` `<f4 [T, D]` and `infer_ms`.
