@@ -440,8 +440,10 @@ impl UvHost {
             .with_context(|| format!("writing {}", reqs.display()))?;
         eprintln!("Preparing the {kind} environment in {}", dir.display());
         if !python.is_file() {
+            // A run killed mid-create leaves the directory without a Python; build over it.
             self.uv(&[
                 "venv".as_ref(),
+                "--allow-existing".as_ref(),
                 "--python".as_ref(),
                 PYTHON_VERSION.as_ref(),
                 dir.as_os_str(),

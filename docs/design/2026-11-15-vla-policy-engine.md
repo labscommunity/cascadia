@@ -637,7 +637,13 @@ follow that, because its dependencies would collide.) Python is needed only on t
 machine.
 
 - **Requires `uv`.** Nothing in the repo ships it; when `uv` is not on PATH the exporter refuses
-  with the install command, before doing anything else.
+  with the install command, before doing anything else. It also needs `git`, which uv uses for the
+  two git-pinned packages.
+- **Files.** `tools/export_policy/`: the driver (`export_policy.py`), the inputs
+  (`pyproject.toml`), and `lock.sh`, which compiles them into `requirements.txt` and
+  `requirements-preflight.txt`. The CLI embeds the driver and both requirement files; each
+  environment lives under `<cache>/cascadia/export-policy/`, named by a hash of its requirements, so
+  a new pin set gets a new environment.
 - **Pinned install.** The environment installs from a hashed requirements file (`uv pip compile
   --generate-hashes`) embedded in the binary:
   - `physicalai-train` at `physical-ai-studio` `8f132416` (it contains `374d2cb9`);
@@ -648,8 +654,11 @@ machine.
   - `openvino==2026.4.1` and a matching `openvino-tokenizers`;
   - torch CPU wheels.
 
-  The runtime pin is a uv override (`--overrides`), not a plain requirement: without it uv refuses
-  to resolve (step 0).
+  The runtime pin is a uv override (`override-dependencies` in the inputs, the same mechanism as
+  `--overrides`), not a plain requirement: without it uv refuses to resolve (step 0). torch and
+  torchvision come from the PyTorch CPU index. The install is `uv pip sync --verify-hashes`: every
+  wheel is checked against its hash, while the two git packages, which uv cannot hash (both take
+  their version from git), are pinned by full commit.
 - **Precision.** The policy is loaded with `dtype="float32"` and the IR saved with fp16 weights. The
   tool's default (bf16) exports produce all-NaN actions under bf16 inference with a padded prompt
   (step 0), so the exporter never writes one.
@@ -660,21 +669,34 @@ machine.
   rejects 15-step checkpoints.
 - **`--rtc`** exports the RTC port group (SmolVLA and π0.5): the policy's `rtc_enabled` is set and
   `n_action_steps` is the full chunk, so the package has no trimmer.
-- **Refusals before anything is downloaded:**
+- **Refusals before the checkpoint is downloaded.** Memory and a serving box are checked before
+  any environment exists; the gated files and statistics are read from Hugging Face metadata only,
+  in a small environment holding `huggingface_hub` at the export environment's versions (a few MB),
+  before the export environment is installed:
   - **Memory.** Less than 32 GiB of available RAM plus free swap (the main gate), or less than
     15 GiB of physical RAM as the OS reports it (a 16 GiB VM reports about 15.6). Measured: 14.3 GB
     RSS plus up to 10 GB swap for π0.5, completed on a 16 GiB box with 48 GiB swap. A 38.6 GB Mac
     with other work running froze and needed a forced restart.
   - **A serving box.** A cascadia node or OVMS process running on this host. The message suggests a
     disposable Linux machine.
-  - **Gated files.** No access to `google/paligemma-3b-pt-224` for π0/π0.5, with a message saying
-    how to accept the Gemma licence.
-  - **Missing statistics.** No normalization stats in the checkpoint, unless `--stats <file>` is
-    given. This catches the identity stats above.
-- **Licence.** The package gets the upstream licence and a Gemma-terms notice, and the exporter
-  prints which terms apply.
-- **`--verify`** runs the traced input through PyTorch and OpenVINO, on CPU fp32 and on GPU f16
-  when a GPU is present, and prints the max and mean differences.
+  - **Gated files.** No access to `google/paligemma-3b-pt-224` for π0.5, with a message saying
+    how to accept the Gemma licence. (`8f132416` exports SmolVLA and π0.5 only; any other policy
+    type is refused.)
+  - **Missing statistics.** No normalization stats in the checkpoint (no `policy_preprocessor.json`,
+    a normalizer with no STATE feature, an unnormalizer with no ACTION feature, or a `state_file`
+    missing from the repository), unless `--stats <file>` is given. This catches the identity
+    stats above. The file is JSON, `{"state": {...}, "action": {...}}`, with `mean`/`std`,
+    `q01`/`q99` or `min`/`max`; it replaces the values in every `normalize` and `denormalize` step
+    (the RTC leftover takes the action block), and each step's mode must find its keys.
+- **Licence.** The package gets a `NOTICE` (the checkpoint, its revision, the model card's
+  licence, and for π0.5 the Gemma Terms of Use notice), which the engine serves as `attribution`,
+  plus any licence files at the checkpoint's repository root. The exporter prints which terms
+  apply before and after the export.
+- **`--verify`** runs the traced input through PyTorch and the package's IR, on CPU fp32 and on
+  GPU f16 when a GPU is present, and prints the max and mean differences; a non-finite output
+  fails the export.
+- **`cascadia doctor`** reports whether the `openvino_tokenizers` extension the engine tokenizes
+  with is found beside the loaded OpenVINO core or under `INTEL_OPENVINO_DIR`.
 
 ## Testing
 
