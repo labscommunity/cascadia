@@ -28,9 +28,15 @@ pub fn package_sha256(dir: &Path) -> std::io::Result<String> {
 
 /// [`package_sha256`] without the top-level files named in `ignore`: files a
 /// deployer writes next to the package that never reach the engine (a staging
-/// checksum, say). Each is an exact file name, no glob and no path; the same
-/// name in a subdirectory, or a directory of that name, still counts. A name
-/// with a separator, a glob character, `.` or `..` is refused (`InvalidInput`).
+/// checksum, say). Each is a file name, no glob and no path, matched without
+/// case (as APFS and NTFS open it); the same name in a subdirectory, or a
+/// directory of that name, still counts. A name with a separator, a glob
+/// character, `.` or `..` is refused (`InvalidInput`).
+///
+/// This does not know which files the engine reads: ignoring one makes two
+/// packages that compute different actions match. Check the list against the
+/// package's manifest with [`check_digest_ignore`] first, as
+/// `OvPolicyEngine::load` does.
 pub fn package_sha256_with(dir: &Path, ignore: &[String]) -> std::io::Result<String> {
     digest(dir, ignore, None)
 }
@@ -42,17 +48,11 @@ pub(crate) fn digest(
     ignore: &[String],
     skip: Option<&Path>,
 ) -> std::io::Result<String> {
-    if let Some(bad) = ignore.iter().find(|n| {
-        n.is_empty() || *n == "." || *n == ".." || n.contains(['/', '\\', '*', '?', '[', '\0'])
-    }) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("digest ignore entry {bad:?} is not a plain file name"),
-        ));
-    }
+    check_plain_names(ignore)?;
+    let ignore: Vec<String> = ignore.iter().map(|n| n.to_lowercase()).collect();
     let skip = skip.and_then(|p| p.canonicalize().ok());
     let mut files = Vec::new();
-    walk(dir, "", ignore, skip.as_deref(), &mut files)?;
+    walk(dir, "", &ignore, skip.as_deref(), &mut files)?;
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut listing = Sha256::new();
     for (rel, path) in files {
@@ -74,6 +74,66 @@ pub(crate) fn digest_error(dir: &Path, e: std::io::Error) -> EngineError {
         }
         _ => EngineError::Backend(msg),
     }
+}
+
+fn check_plain_names(ignore: &[String]) -> std::io::Result<()> {
+    match ignore.iter().find(|n| {
+        n.is_empty() || *n == "." || *n == ".." || n.contains(['/', '\\', '*', '?', '[', '\0'])
+    }) {
+        Some(bad) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("digest ignore entry {bad:?} is not a plain file name"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Read beside the tokenizer IR for the added special tokens.
+pub(crate) const TOKENIZER_JSON: &str = "tokenizer.json";
+
+/// Refuse a digest-ignore list [`package_sha256_with`] would accept but the
+/// engine could notice: anything but plain names, or a top-level name (without
+/// case) the engine may open for this manifest. Those are `manifest.json`,
+/// `NOTICE`, every manifest-named artifact and any file sharing its stem
+/// (its `.bin` weights, a `.json` beside it), and the `tokenizer.json` beside
+/// the tokenizer IR.
+pub fn check_digest_ignore(
+    manifest: &super::manifest::PolicyManifest,
+    ignore: &[String],
+) -> Result<(), EngineError> {
+    check_plain_names(ignore).map_err(|e| EngineError::InvalidConfig(e.to_string()))?;
+    let top = |p: &str| !p.contains(['/', '\\']);
+    let mut names = vec!["manifest.json".to_string(), "NOTICE".to_string()];
+    let mut stems = Vec::new();
+    for artifact in [
+        manifest.model_artifact.as_str(),
+        manifest.tokenizer_artifact(),
+    ] {
+        if top(artifact) {
+            names.push(artifact.to_string());
+            if let Some(stem) = Path::new(artifact).file_stem() {
+                stems.push(stem.to_string_lossy().to_lowercase());
+            }
+        }
+    }
+    if top(manifest.tokenizer_artifact()) {
+        names.push(TOKENIZER_JSON.to_string());
+    }
+    for n in ignore {
+        let lower = n.to_lowercase();
+        let stem = Path::new(&lower)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned());
+        if names.iter().any(|r| r.to_lowercase() == lower)
+            || stem.is_some_and(|s| stems.contains(&s))
+        {
+            return Err(EngineError::InvalidConfig(format!(
+                "digest_ignore names {n:?}, which the engine may read; it must stay in the \
+                 package identity"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// SHA-256 of one file, read in 1 MiB blocks. Opened without blocking where
@@ -146,7 +206,8 @@ fn walk(
         }
         let path = entry.path();
         let kind = entry.file_type().map_err(|e| at(&rel, e))?;
-        if prefix.is_empty() && !kind.is_dir() && ignore.contains(&rel) {
+        // `digest` lowercased `ignore`.
+        if prefix.is_empty() && !kind.is_dir() && ignore.contains(&rel.to_lowercase()) {
             continue;
         }
         if kind.is_dir() {
@@ -191,7 +252,8 @@ pub fn engine_build_is_known(build: &str) -> bool {
     let Some((engine, runtime)) = rest.split_once(" openvino/") else {
         return false;
     };
-    let sha = engine.split_once('+').map_or("", |(_, sha)| sha);
+    // The version may carry its own `+` build metadata; the sha comes last.
+    let sha = engine.rsplit_once('+').map_or("", |(_, sha)| sha);
     !sha.is_empty() && sha != "unknown" && !runtime.is_empty()
 }
 
@@ -444,6 +506,69 @@ mod tests {
             engine_build_is_known(&engine_build("2026.4.1-1")),
             GIT_SHA != "unknown"
         );
+    }
+
+    fn smolvla() -> super::super::manifest::PolicyManifest {
+        super::super::manifest::PolicyManifest::parse(
+            include_str!("../../tests/fixtures/policy/intel-smolvla-libero-manifest.json"),
+            super::super::manifest::LoadOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_ignore_name_the_engine_can_open_is_refused() {
+        let m = smolvla();
+        // The fixture's artifacts sit at the top: smolvla.xml, tokenizer.xml.
+        assert_eq!(m.model_artifact, "smolvla.xml");
+        assert_eq!(m.tokenizer_artifact(), "tokenizer.xml");
+        for read in [
+            "manifest.json",
+            "NOTICE",
+            "smolvla.xml",
+            "smolvla.bin",
+            "smolvla.json",
+            "tokenizer.xml",
+            "tokenizer.bin",
+            // Read beside the tokenizer IR for its added special tokens.
+            "tokenizer.json",
+            // Case-insensitive file systems open these as the same files.
+            "Tokenizer.xml",
+            "TOKENIZER.JSON",
+            "Manifest.json",
+            "notice",
+        ] {
+            let e = check_digest_ignore(&m, &[read.to_string()]).unwrap_err();
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{read}");
+            assert!(e.to_string().contains("engine"), "{read}: {e}");
+        }
+        check_digest_ignore(&m, &[".staging-sha256".into()]).unwrap();
+        // Not a plain name: refused the same way.
+        let e = check_digest_ignore(&m, &["ir/x".into()]).unwrap_err();
+        assert!(matches!(e, EngineError::InvalidConfig(_)), "{e}");
+    }
+
+    #[test]
+    fn ignore_names_match_without_case() {
+        let t = tempfile::tempdir().unwrap();
+        let a = package(t.path(), "a", b"w");
+        let b = package(t.path(), "b", b"w");
+        fs::write(b.join(".staging-sha256"), b"bookkeeping").unwrap();
+        assert_eq!(
+            package_sha256(&a).unwrap(),
+            package_sha256_with(&b, &[".Staging-SHA256".to_string()]).unwrap()
+        );
+    }
+
+    #[test]
+    fn engine_build_is_known_reads_the_last_plus() {
+        // A version with semver build metadata keeps its own '+'.
+        assert!(engine_build_is_known(
+            "cascadia-ov-policy/0.2.7+local+abc123 openvino/2026.4.1-1"
+        ));
+        assert!(!engine_build_is_known(
+            "cascadia-ov-policy/0.2.7+local+unknown openvino/2026.4.1-1"
+        ));
     }
 
     #[test]

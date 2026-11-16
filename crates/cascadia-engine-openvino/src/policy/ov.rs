@@ -27,8 +27,8 @@ pub struct OvPolicyOptions {
     pub cache_dir: Option<PathBuf>,
     /// Top-level file names left out of `PolicySpec.package_sha256`: files a
     /// deployer writes next to the package that never reach the engine (see
-    /// [`super::package_sha256_with`]). Naming a file the engine reads is a
-    /// load error.
+    /// [`super::package_sha256_with`]). A name the engine may open is a load
+    /// error ([`super::check_digest_ignore`]).
     pub digest_ignore: Vec<String>,
 }
 
@@ -99,7 +99,7 @@ impl OvPolicyEngine {
         }
         // Before the compile, which for MolmoAct2 on CPU takes about 20 GB.
         super::pipeline::refuse_known_bad_device(manifest.policy, &device, std::env::consts::ARCH)?;
-        refuse_ignoring_engine_files(&opts.digest_ignore, &manifest)?;
+        super::package::check_digest_ignore(&manifest, &opts.digest_ignore)?;
         // After the cheap refusals, before the compile can write a cache.
         let package_sha256 =
             super::package::digest(dir, &opts.digest_ignore, opts.cache_dir.as_deref())
@@ -167,34 +167,6 @@ impl PolicyEngine for OvPolicyEngine {
     }
 }
 
-/// Refuse a digest-ignore name the engine itself reads: the manifest, the
-/// licence notice, or a top-level model or tokenizer IR and its weights.
-#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
-fn refuse_ignoring_engine_files(
-    ignore: &[String],
-    manifest: &super::manifest::PolicyManifest,
-) -> EngineResult<()> {
-    let mut read = vec!["manifest.json".to_string(), "NOTICE".to_string()];
-    for xml in [
-        manifest.model_artifact.as_str(),
-        manifest.tokenizer_artifact(),
-    ] {
-        read.push(xml.to_string());
-        read.push(
-            Path::new(xml)
-                .with_extension("bin")
-                .to_string_lossy()
-                .into_owned(),
-        );
-    }
-    match ignore.iter().find(|n| read.contains(n)) {
-        Some(n) => Err(EngineError::InvalidConfig(format!(
-            "digest_ignore names {n:?}, which the engine reads; it must stay in the package identity"
-        ))),
-        None => Ok(()),
-    }
-}
-
 /// `PolicySpec.model`: `model_id` when given (refused unless a valid policy
 /// name), else the package directory name.
 #[cfg_attr(not(feature = "openvino"), allow(dead_code))]
@@ -258,29 +230,6 @@ pub use native::OvTokenizer;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_digest_ignore_name_the_engine_reads_is_refused() {
-        let m = super::super::manifest::PolicyManifest::parse(
-            include_str!("../../tests/fixtures/policy/intel-smolvla-libero-manifest.json"),
-            LoadOptions::default(),
-        )
-        .unwrap();
-        let bin = Path::new(&m.model_artifact)
-            .with_extension("bin")
-            .to_string_lossy()
-            .into_owned();
-        for read in [
-            "manifest.json",
-            "NOTICE",
-            m.model_artifact.as_str(),
-            bin.as_str(),
-        ] {
-            let e = refuse_ignoring_engine_files(&[read.to_string()], &m).unwrap_err();
-            assert!(matches!(e, EngineError::InvalidConfig(_)), "{read}");
-        }
-        refuse_ignoring_engine_files(&[".staging-sha256".into()], &m).unwrap();
-    }
 
     #[test]
     fn the_served_model_is_the_model_id_else_the_directory_name() {
@@ -473,7 +422,9 @@ mod native {
         ) {
             out.extend(special::from_tokenizer_ir(&text, &bin).unwrap_or_default());
         }
-        if let Ok(json) = std::fs::read_to_string(xml.with_file_name("tokenizer.json")) {
+        if let Ok(json) =
+            std::fs::read_to_string(xml.with_file_name(crate::policy::package::TOKENIZER_JSON))
+        {
             for t in special::from_tokenizer_json(&json) {
                 if !out.contains(&t) {
                     out.push(t);

@@ -582,11 +582,14 @@ at one precision send identical bytes; the slowest warmup call appears only in
   make two equal packages look different, which refuses a failover, never the reverse. Two
   exceptions. `OvPolicyOptions.cache_dir`, when it lies inside the package: the compile cache never
   changes outputs and is written after the digest is taken. And `OvPolicyOptions.digest_ignore`
-  (`package_sha256_with(dir, ignore)`), empty by default: exact top-level file names, no globs and
-  no paths, for files a deployer writes next to the package that never reach the engine (a staging
-  checksum, say), so two nodes staged by one deployer with the same files still match. The same
-  name in a subdirectory still counts, and naming a file the engine reads (`manifest.json`,
-  `NOTICE`, a top-level model or tokenizer IR or its `.bin`) is a load error. The digest is taken
+  (`package_sha256_with(dir, ignore)`), empty by default: top-level file names, no globs and no
+  paths, matched without case (as APFS and NTFS open them), for files a deployer writes next to the
+  package that never reach the engine (a staging checksum, say), so two nodes staged by one
+  deployer with the same files still match. The same name in a subdirectory still counts.
+  `package_sha256_with` does not know which files the engine reads; `check_digest_ignore(manifest,
+  ignore)` does, and `load` runs it: it refuses, without case, `manifest.json`, `NOTICE`, every
+  manifest-named top-level artifact and any file sharing its stem (`.bin` weights, a `.json` beside
+  it), and the `tokenizer.json` read beside the tokenizer IR for its added special tokens. The digest is taken
   at load after the cheap refusals (device, manifest) and before the compile, reading every file
   once in 1 MiB blocks. A refusal (an entry above, a bad ignore name) is a configuration error; any
   other I/O error while hashing (a file shared or replaced mid-walk, an interrupted read) is a
@@ -600,8 +603,8 @@ at one precision send identical bytes; the slowest warmup call appears only in
   commit the crate was built from (`unknown` outside a git checkout) and the runtime build is
   `ov::get_version().buildNumber` of the OpenVINO runtime actually loaded, not the one compiled
   against. The sha is the build environment's `CASCADIA_GIT_SHA` when set (pass it as a build
-  argument in a container or tarball build, which has no `.git`), else the checkout's `HEAD`, else
-  `unknown`. It has no time or host in it, so two builds of one commit on one runtime give the same
+  argument in a container or tarball build, which has no `.git`; one left set in a shell
+  overrides git too), else the checkout's `HEAD`, else `unknown`. It has no time or host in it, so two builds of one commit on one runtime give the same
   string, and `engine_build(runtime)` gives it for any runtime string. It is not in the metadata
   bytes. A build from a modified working tree reports its `HEAD` commit. An `engine_build` with
   `+unknown` (or otherwise not of this form) never matches anything, itself included, since it
