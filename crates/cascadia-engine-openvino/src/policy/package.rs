@@ -8,7 +8,8 @@ use cascadia_engine::EngineError;
 use sha2::{Digest, Sha256};
 
 /// The commit the engine was built from: `CASCADIA_GIT_SHA` at build time,
-/// else the git checkout's `HEAD`, else `unknown`.
+/// else the git checkout's `HEAD` (`<sha>-dirty` from a modified working
+/// tree), else `unknown`.
 const GIT_SHA: &str = env!("CASCADIA_GIT_SHA");
 
 /// SHA-256 (lowercase hex) over every file under `dir`, so two packages that
@@ -243,8 +244,9 @@ pub fn engine_build(openvino_runtime: &str) -> String {
 }
 
 /// Whether an [`engine_build`] string names a known commit and runtime. One
-/// that does not (`+unknown`, a build outside git without `CASCADIA_GIT_SHA`)
-/// must never match another, itself included: it cannot tell two engines apart.
+/// that does not (`+unknown`, a build outside git without `CASCADIA_GIT_SHA`,
+/// or `+<sha>-dirty`, a build from a modified working tree) must never match
+/// another, itself included: it cannot tell two engines apart.
 pub fn engine_build_is_known(build: &str) -> bool {
     let Some(rest) = build.strip_prefix("cascadia-ov-policy/") else {
         return false;
@@ -254,7 +256,7 @@ pub fn engine_build_is_known(build: &str) -> bool {
     };
     // The version may carry its own `+` build metadata; the sha comes last.
     let sha = engine.rsplit_once('+').map_or("", |(_, sha)| sha);
-    !sha.is_empty() && sha != "unknown" && !runtime.is_empty()
+    !sha.is_empty() && sha != "unknown" && !sha.ends_with("-dirty") && !runtime.is_empty()
 }
 
 #[cfg(test)]
@@ -504,7 +506,7 @@ mod tests {
         assert!(!engine_build_is_known(""));
         assert_eq!(
             engine_build_is_known(&engine_build("2026.4.1-1")),
-            GIT_SHA != "unknown"
+            GIT_SHA != "unknown" && !GIT_SHA.ends_with("-dirty")
         );
     }
 
@@ -572,6 +574,16 @@ mod tests {
     }
 
     #[test]
+    fn a_dirty_build_never_matches() {
+        assert!(!engine_build_is_known(
+            "cascadia-ov-policy/0.2.7+02f48c2969d9a14bbdb5f09b2997dd1c9612dcd2-dirty openvino/2026.4.1-1"
+        ));
+        assert!(!engine_build_is_known(
+            "cascadia-ov-policy/0.2.7+local+abc123-dirty openvino/2026.4.1-1"
+        ));
+    }
+
+    #[test]
     fn engine_build_is_stable_and_follows_the_runtime() {
         let a = engine_build("2026.4.1-20466-abc");
         assert_eq!(a, engine_build("2026.4.1-20466-abc"));
@@ -580,8 +592,10 @@ mod tests {
         assert!(a.ends_with("openvino/2026.4.1-20466-abc"), "{a}");
         assert!(a.contains(super::GIT_SHA), "{a}");
         let sha = super::GIT_SHA;
+        let commit = sha.strip_suffix("-dirty").unwrap_or(sha);
         assert!(
-            sha == "unknown" || (sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit())),
+            sha == "unknown"
+                || (commit.len() == 40 && commit.bytes().all(|c| c.is_ascii_hexdigit())),
             "{sha}"
         );
     }
