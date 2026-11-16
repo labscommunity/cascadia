@@ -647,6 +647,14 @@ machine.
   The adapter connects through `openpi_client.WebsocketClientPolicy` exactly as the doc tells users
   to (`host="ws://…/v1/policy/ws"`, `port=None`), so the accuracy run is also the end-to-end
   interoperability test.
+- **RTC.** `policy_openvino`'s RTC tests take SmolVLA and π0.5 LIBERO exported with and without RTC
+  from one checkpoint, the RTC export's float32 twin, and raw inputs with Intel's PyTorch outputs
+  for them (`CASCADIA_POLICY_PACKAGE_<M>_RTC`, `_NORTC`, `_RTC_F32`, `CASCADIA_POLICY_RTC_REF_<M>`):
+  guidance off is bit-identical to no fields and within 1e-4 of the plain export; with guidance on
+  the CPU f32 chunk is within 1e-4 of PyTorch's RTC path; on the GPU at f16 it is finite and
+  deviates from CPU f32 by at most twice the plain chunk's deviation plus 1e-3. A delayed-LIBERO
+  A/B (`tools/vla_libero_client.py --async-delay D --execution-horizon S [--rtc W]`) compares
+  success and seam jumps with RTC off and on under the same schedule.
 - **Rig.** Latency through `cascadia run` on a Core Ultra AI PC for SmolVLA and π0.5 LIBERO, plus one
   scripted check through the real `openpi_client`: the metadata arrives first, one `infer` returns
   actions, a bad request raises the error frame's text, and a fifth connection is refused at
