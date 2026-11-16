@@ -636,14 +636,17 @@ environment: it uses the caller's Python and prints a `pip install` line; the ex
 follow that, because its dependencies would collide.) Python is needed only on the exporting
 machine.
 
-- **Requires `uv`.** Nothing in the repo ships it; when `uv` is not on PATH the exporter refuses
-  with the install command, before doing anything else. It also needs `git`, which uv uses for the
-  two git-pinned packages.
+- **Requires `uv` 0.13.6 or newer.** Nothing in the repo ships it; when `uv` is missing or older
+  the exporter refuses with the install or `uv self update` command, before doing anything else.
+  0.13.0 brought `--require-build-hashes`, 0.13.6 the pinned CPython 3.12.16. It also needs `git`,
+  which uv uses for the two git-pinned packages. Every uv call runs with `--no-config` and without
+  `UV_*` variables other than `UV_CACHE_DIR`, so a user's uv settings cannot change the install.
 - **Files.** `tools/export_policy/`: the driver (`export_policy.py`), the inputs
-  (`pyproject.toml`), and `lock.sh`, which compiles them into `requirements.txt` and
-  `requirements-preflight.txt`. The CLI embeds the driver and both requirement files; each
-  environment lives under `<cache>/cascadia/export-policy/`, named by a hash of its requirements, so
-  a new pin set gets a new environment.
+  (`pyproject.toml`), and `lock.sh`, which compiles them into `requirements.txt`,
+  `requirements-preflight.txt` and `build-constraints.txt` (with `--exclude-newer` at a fixed date,
+  so a relock with the same inputs gives the same files). The CLI embeds the driver and the three
+  files; each environment is a uv-managed CPython 3.12.16 under `<cache>/cascadia/export-policy/`,
+  named by a hash of the Python version and its pins, so a new pin set gets a new environment.
 - **Pinned install.** The environment installs from a hashed requirements file (`uv pip compile
   --generate-hashes`) embedded in the binary:
   - `physicalai-train` at `physical-ai-studio` `8f132416` (it contains `374d2cb9`);
@@ -656,17 +659,29 @@ machine.
 
   The runtime pin is a uv override (`override-dependencies` in the inputs, the same mechanism as
   `--overrides`), not a plain requirement: without it uv refuses to resolve (step 0). torch and
-  torchvision come from the PyTorch CPU index. The install is `uv pip sync --verify-hashes`: every
-  wheel is checked against its hash, while the two git packages, which uv cannot hash (both take
-  their version from git), are pinned by full commit.
+  torchvision come from the PyTorch CPU index. The preflight environment (wheels only) installs
+  with `--require-hashes`. The export environment cannot: uv refuses `--require-hashes` for git
+  requirements (checked with uv 0.13.8), and the two packages cannot be hashed archives because
+  both take their version from git. It installs with `--verify-hashes`, so every wheel is checked
+  against its hash and the git packages are pinned by full commit, plus `--build-constraints
+  build-constraints.txt --require-build-hashes` (a uv preview feature), so the build backends that
+  turn those commits and the two sdist-only packages (`docopt`, `pyturbojpeg`) into wheels must
+  match their hashes too.
 - **Precision.** The policy is loaded with `dtype="float32"` and the IR saved with fp16 weights. The
   tool's default (bf16) exports produce all-NaN actions under bf16 inference with a padded prompt
   (step 0), so the exporter never writes one.
 
   The commit alone pins nothing below it (its `pyproject.toml` says `openvino>=2026.4`). Bump to a
   release when one carries the fix.
-- **Chunk length** comes from the checkpoint (`n_action_steps=None`); the loader's default of 50
-  rejects 15-step checkpoints.
+- **Chunk length** comes from the checkpoint (`n_action_steps=None`, for SmolVLA too); the
+  loader's default of 50 rejects 15-step checkpoints. The CLI compares the exported manifest with
+  the checkpoint's `chunk_size` and `n_action_steps` (a trimmer exactly when they differ, none with
+  `--rtc`) and refuses a package that disagrees.
+- **Revision.** The preflight resolves the checkpoint's commit; every later download (config,
+  weights, statistics, licence files) is bound to that commit, and `NOTICE` names it.
+- **No half-made package.** The export, `--stats`, the licence files, `NOTICE` and `--verify` all
+  happen in a staging directory beside `--out` (`.<name>.partial-<pid>`, refused if it exists),
+  which is renamed to `--out` only when everything succeeded and removed on any failure.
 - **`--rtc`** exports the RTC port group (SmolVLA and π0.5): the policy's `rtc_enabled` is set and
   `n_action_steps` is the full chunk, so the package has no trimmer.
 - **Refusals before the checkpoint is downloaded.** Memory and a serving box are checked before
@@ -677,8 +692,11 @@ machine.
     15 GiB of physical RAM as the OS reports it (a 16 GiB VM reports about 15.6). Measured: 14.3 GB
     RSS plus up to 10 GB swap for π0.5, completed on a 16 GiB box with 48 GiB swap. A 38.6 GB Mac
     with other work running froze and needed a forced restart.
-  - **A serving box.** A cascadia node or OVMS process running on this host. The message suggests a
-    disposable Linux machine.
+  - **A serving box.** A cascadia node or OVMS process, or `cascadia run`, `worker`,
+    `run-placement` or `serve` (found after any global flags), on this host. The message suggests
+    a disposable Linux machine.
+  - **Bad arguments.** A model id that is not `owner/name` under Hugging Face's rules, or an
+    `--out` with no directory name (`.`, `/`).
   - **Gated files.** No access to `google/paligemma-3b-pt-224` for π0.5, with a message saying
     how to accept the Gemma licence. (`8f132416` exports SmolVLA and π0.5 only; any other policy
     type is refused.)
@@ -687,7 +705,13 @@ machine.
     missing from the repository), unless `--stats <file>` is given. This catches the identity
     stats above. The file is JSON, `{"state": {...}, "action": {...}}`, with `mean`/`std`,
     `q01`/`q99` or `min`/`max`; it replaces the values in every `normalize` and `denormalize` step
-    (the RTC leftover takes the action block), and each step's mode must find its keys.
+    (the RTC leftover takes the action block; a step without a mode is `mean_std`), and each
+    step's mode must find its keys. Widths and keys are checked against the checkpoint's config
+    before the export environment is installed. Stats narrower than the package (DROID: 8-wide
+    stats, 32-wide state and action) are padded with the mode's identity (mean 0 and std 1, q01 −1
+    and q99 1, min −1 and max 1): LeRobot normalizes at the robot's width and then zero-pads
+    (lerobot v0.6.0 `NormalizerProcessorStep`, then `pad_vector` in `modeling_pi05.py`), and an
+    identity stat maps that zero pad to zero.
 - **Licence.** The package gets a `NOTICE` (the checkpoint, its revision, the model card's
   licence, and for π0.5 the Gemma Terms of Use notice), which the engine serves as `attribution`,
   plus any licence files at the checkpoint's repository root. The exporter prints which terms

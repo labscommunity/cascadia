@@ -26,8 +26,17 @@ pub(crate) const PREFLIGHT_REQUIREMENTS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/export_policy/requirements-preflight.txt"
 ));
+/// Hashed build backends for the two git packages and the sdist-only wheels.
+pub(crate) const BUILD_CONSTRAINTS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/export_policy/build-constraints.txt"
+));
 
-const PYTHON_VERSION: &str = "3.12";
+/// The interpreter of both environments, a uv-managed CPython (uv 0.13.6 is the first to ship it).
+const PYTHON_VERSION: &str = "3.12.16";
+/// `--require-build-hashes` arrived in uv 0.13.0 and CPython 3.12.16 in 0.13.6.
+const MIN_UV: (u64, u64, u64) = (0, 13, 6);
+const STAT_KEYS: [&str; 6] = ["mean", "std", "q01", "q99", "min", "max"];
 /// torch and torchvision come from here as CPU wheels; every wheel is checked against its hash.
 const TORCH_CPU_INDEX: &str = "https://download.pytorch.org/whl/cpu";
 const SUPPORTED: [&str; 2] = ["smolvla", "pi05"];
@@ -65,6 +74,7 @@ pub struct ExportPolicyArgs {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HostFacts {
     pub uv: Option<PathBuf>,
+    pub uv_version: Option<(u64, u64, u64)>,
     pub git: Option<PathBuf>,
     pub total_ram: u64,
     pub available_ram: u64,
@@ -97,6 +107,17 @@ pub(crate) struct Preflight {
     pub gated: Option<GatedCheck>,
     #[serde(default)]
     pub stats: Option<StatsCheck>,
+    #[serde(default)]
+    pub chunk_size: Option<u64>,
+    #[serde(default)]
+    pub n_action_steps: Option<u64>,
+    #[serde(default)]
+    pub state_dim: Option<usize>,
+    #[serde(default)]
+    pub action_dim: Option<usize>,
+    /// The mode the exporter will write into the manifest's normalize steps.
+    #[serde(default)]
+    pub stats_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,7 +141,195 @@ pub(crate) trait ExportHost {
     fn preflight(&mut self, model: &str) -> Result<Preflight>;
     /// The full export environment.
     fn prepare_export(&mut self) -> Result<()>;
-    fn export(&mut self, args: &ExportPolicyArgs, preflight: &Preflight) -> Result<()>;
+    /// Writes the package into `dir`, the staging directory.
+    fn export(&mut self, args: &ExportPolicyArgs, preflight: &Preflight, dir: &Path) -> Result<()>;
+}
+
+/// `uv 0.13.8 (3d97a6aad 2026-11-12 ...)` → (0, 13, 8).
+pub(crate) fn parse_uv_version(s: &str) -> Option<(u64, u64, u64)> {
+    let version = s.split_whitespace().nth(1)?;
+    let mut parts = version.split('.').map(|p| {
+        let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u64>().ok()
+    });
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// Hugging Face's repo id rules (`validate_repo_id`), with the owner required.
+pub(crate) fn validate_model_id(id: &str) -> Result<()> {
+    let part_ok = |p: &str| {
+        (1..=96).contains(&p.len())
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && !p.starts_with(['-', '.'])
+            && !p.ends_with(['-', '.'])
+            && !p.contains("--")
+            && !p.contains("..")
+    };
+    match id.split_once('/') {
+        Some((owner, name)) if part_ok(owner) && part_ok(name) && !name.ends_with(".git") => Ok(()),
+        _ => Err(anyhow!(
+            "`{id}` is not a Hugging Face model id: owner/name, each 1 to 96 letters, digits, \
+             `-`, `_` or `.`"
+        )),
+    }
+}
+
+/// The keys a normalize step of `mode` reads.
+fn mode_keys(mode: &str) -> &'static [&'static str] {
+    match mode {
+        "mean_std" => &["mean", "std"],
+        "quantiles" => &["q01", "q99"],
+        "min_max" => &["min", "max"],
+        _ => &[],
+    }
+}
+
+/// Checks a `--stats` file against the checkpoint's widths and the manifest's mode, before the
+/// export environment is installed. Narrower stats are fine: the driver pads them.
+pub(crate) fn stats_refusal(stats: &serde_json::Value, p: &Preflight) -> Option<String> {
+    let blocks = [
+        (
+            "state",
+            stats
+                .get("state")
+                .or_else(|| stats.get("observation.state")),
+            p.state_dim,
+        ),
+        ("action", stats.get("action"), p.action_dim),
+    ];
+    for (block, entry, dim) in blocks {
+        let Some(entry) = entry.and_then(serde_json::Value::as_object) else {
+            return Some(format!("--stats: no \"{block}\" block"));
+        };
+        for key in STAT_KEYS {
+            let Some(values) = entry.get(key) else {
+                continue;
+            };
+            let Some(values) = values
+                .as_array()
+                .filter(|v| v.iter().all(|x| x.as_f64().is_some_and(f64::is_finite)))
+            else {
+                return Some(format!(
+                    "--stats: {block}.{key} must be a list of finite numbers"
+                ));
+            };
+            if values.is_empty() || dim.is_some_and(|d| values.len() > d) {
+                return Some(format!(
+                    "--stats: {block}.{key} has {} values; the checkpoint's {block} is {} wide \
+                     (narrower stats are padded with the identity)",
+                    values.len(),
+                    dim.map_or("?".into(), |d| d.to_string()),
+                ));
+            }
+        }
+        if let Some(mode) = p.stats_mode.as_deref() {
+            let missing: Vec<&str> = mode_keys(mode)
+                .iter()
+                .copied()
+                .filter(|k| !entry.contains_key(*k))
+                .collect();
+            if !missing.is_empty() {
+                return Some(format!(
+                    "--stats: the package normalizes with {mode}, so the {block} block needs {}",
+                    missing.join(" and ")
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The exported manifest serves as many actions per call as the checkpoint says.
+pub(crate) fn check_exported_chunk(m: &serde_json::Value, p: &Preflight, rtc: bool) -> Result<()> {
+    let model = &m["model"];
+    let args_of = |f: &serde_json::Value| f.get("init_args").cloned().unwrap_or(f.clone());
+    let action = model["output_features"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(args_of)
+        .find(|f| f["name"] == "action" || f["ftype"] == "ACTION" || f["type"] == "ACTION");
+    let steps = action.and_then(|f| f["shape"].get(0).and_then(serde_json::Value::as_u64));
+    if let (Some(chunk), Some(steps)) = (p.chunk_size, steps) {
+        if chunk != steps {
+            return Err(anyhow!(
+                "the exported graph returns {steps} actions per call, but the checkpoint's \
+                 chunk_size is {chunk}"
+            ));
+        }
+    }
+    let trimmer = model["postprocessors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(args_of)
+        .find(|s| {
+            s["type"] == "action_chunk_trimmer"
+                || s["class_path"]
+                    .as_str()
+                    .is_some_and(|c| c.to_ascii_lowercase().contains("trimmer"))
+        })
+        .map(|s| s["n_action_steps"].as_u64());
+    let want = match (rtc, p.n_action_steps, p.chunk_size) {
+        (true, _, _) => None,
+        (false, Some(n), Some(c)) if n != c => Some(n),
+        _ => None,
+    };
+    match (trimmer, want) {
+        (None, None) => Ok(()),
+        (Some(Some(got)), Some(want)) if got == want => Ok(()),
+        (got, want) => Err(anyhow!(
+            "the exported package keeps {} actions per call, but {}",
+            got.flatten()
+                .map_or("every one of its".into(), |g| g.to_string()),
+            if rtc {
+                "an --rtc package must serve the whole chunk".to_string()
+            } else {
+                format!(
+                    "the checkpoint's n_action_steps is {}",
+                    want.map_or("the whole chunk".into(), |w| w.to_string())
+                )
+            }
+        )),
+    }
+}
+
+/// Where the package is built before it is renamed to `--out`: beside it, named by our pid.
+pub(crate) fn staging_dir(out: &Path) -> Result<PathBuf> {
+    let name = out
+        .file_name()
+        .ok_or_else(|| anyhow!("--out {} has no directory name", out.display()))?;
+    let parent = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    Ok(parent.join(format!(
+        ".{}.partial-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    )))
+}
+
+/// Removes the staging directory and the exporter's f32 IR beside it unless committed.
+struct Staging {
+    dir: PathBuf,
+    committed: bool,
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(sibling(&self.dir, ".f32"));
+        }
+    }
+}
+
+fn sibling(dir: &Path, suffix: &str) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    dir.with_file_name(name)
 }
 
 pub(crate) fn uv_install_hint() -> String {
@@ -144,6 +353,30 @@ pub(crate) fn host_refusal(f: &HostFacts) -> Option<String> {
              with it. Install uv:\n  {}\nthen open a new shell and run this again.",
             uv_install_hint()
         ));
+    }
+    match f.uv_version {
+        None => {
+            return Some(
+                "could not read the version of uv (`uv --version`); export-policy needs uv \
+                 0.13.6 or newer"
+                    .into(),
+            )
+        }
+        Some(v) if v < MIN_UV => {
+            return Some(format!(
+                "uv {}.{}.{} is too old: export-policy needs uv {}.{}.{} or newer, which checks \
+                 the hashes of build dependencies and ships Python {PYTHON_VERSION}. Run \
+                 `uv self update` (or reinstall uv: {}).",
+                v.0,
+                v.1,
+                v.2,
+                MIN_UV.0,
+                MIN_UV.1,
+                MIN_UV.2,
+                uv_install_hint()
+            ))
+        }
+        Some(_) => {}
     }
     if f.git.is_none() {
         return Some(
@@ -180,10 +413,8 @@ pub(crate) fn serving_process(procs: &[ProcessFacts], own_pid: u32) -> Option<St
         match name {
             "ovms" => Some(format!("OVMS (pid {})", p.pid)),
             "cascadia-node" => Some(format!("a cascadia node (pid {})", p.pid)),
-            "cascadia" => p
-                .args
-                .get(1)
-                .filter(|a| matches!(a.as_str(), "run" | "worker" | "run-placement"))
+            "cascadia" => subcommand(&p.args)
+                .filter(|a| matches!(*a, "run" | "worker" | "run-placement" | "serve"))
                 .map(|a| format!("`cascadia {a}` (pid {})", p.pid)),
             _ => None,
         }
@@ -195,8 +426,31 @@ pub(crate) fn serving_process(procs: &[ProcessFacts], own_pid: u32) -> Option<St
     ))
 }
 
+/// The subcommand of a cascadia command line: the first word after the global flags.
+fn subcommand(args: &[String]) -> Option<&str> {
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--log-level" {
+            it.next();
+        } else if !a.starts_with('-') {
+            return Some(a);
+        }
+    }
+    None
+}
+
 /// Local argument checks that need no network.
 pub(crate) fn check_inputs(args: &ExportPolicyArgs) -> Result<()> {
+    validate_model_id(&args.model)?;
+    let staging = staging_dir(&args.out)?;
+    for p in [staging.clone(), sibling(&staging, ".f32")] {
+        if p.exists() {
+            return Err(anyhow!(
+                "{} already exists; remove it if no export is running",
+                p.display()
+            ));
+        }
+    }
     if args.out.exists() {
         let mut entries = std::fs::read_dir(&args.out)
             .with_context(|| format!("--out {}: not a readable directory", args.out.display()))?;
@@ -339,11 +593,42 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     if let Some(why) = preflight_refusal(&pre, &args.model, args.stats.is_some()) {
         return Err(anyhow!(why));
     }
+    if let Some(path) = &args.stats {
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        if let Some(why) = stats_refusal(&doc, &pre) {
+            return Err(anyhow!(why));
+        }
+    }
     print_terms(&pre);
     host.prepare_export()?;
-    host.export(args, &pre)?;
-    std::fs::write(args.out.join("NOTICE"), notice_text(&pre, &args.model))
-        .with_context(|| format!("writing {}", args.out.join("NOTICE").display()))?;
+
+    let dir = staging_dir(&args.out)?;
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // create_dir, not create_dir_all: a directory that appeared since the check is not ours.
+    std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut staging = Staging {
+        dir: dir.clone(),
+        committed: false,
+    };
+    host.export(args, &pre, &dir)?;
+    let manifest = std::fs::read_to_string(dir.join("manifest.json"))
+        .context("reading the exported manifest.json")?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest).context("parsing the exported manifest.json")?;
+    check_exported_chunk(&manifest, &pre, args.rtc)?;
+    std::fs::write(dir.join("NOTICE"), notice_text(&pre, &args.model))
+        .with_context(|| format!("writing {}", dir.join("NOTICE").display()))?;
+    if args.out.exists() {
+        std::fs::remove_dir(&args.out)
+            .with_context(|| format!("--out {} is no longer empty", args.out.display()))?;
+    }
+    std::fs::rename(&dir, &args.out)
+        .with_context(|| format!("renaming {} to {}", dir.display(), args.out.display()))?;
+    staging.committed = true;
+    let _ = std::fs::remove_dir_all(sibling(&dir, ".f32"));
     eprintln!("\nPackage written to {}.", args.out.display());
     print_terms(&pre);
     eprintln!(
@@ -382,6 +667,78 @@ fn venv_python(dir: &Path) -> PathBuf {
     }
 }
 
+/// A `UV_*` variable the export's uv calls drop: an index, a hash or a Python mirror setting would
+/// change what gets installed. The cache directory only changes where.
+pub(crate) fn is_scrubbed_uv_var(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|n| n.starts_with("UV_") && n != "UV_CACHE_DIR")
+}
+
+/// uv with no uv.toml or pyproject.toml settings and no `UV_*` variables but the cache dir.
+fn uv_command(uv: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(uv);
+    for (name, _) in std::env::vars_os() {
+        if is_scrubbed_uv_var(&name) {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.arg("--no-config").stdin(std::process::Stdio::null());
+    cmd
+}
+
+fn os_args(args: &[&std::ffi::OsStr]) -> Vec<std::ffi::OsString> {
+    args.iter().map(|a| a.to_os_string()).collect()
+}
+
+/// `uv venv` for an environment: a uv-managed CPython at the pinned version.
+pub(crate) fn venv_args(dir: &Path) -> Vec<std::ffi::OsString> {
+    // A run killed mid-create leaves the directory without a Python; build over it.
+    os_args(&[
+        "venv".as_ref(),
+        "--allow-existing".as_ref(),
+        "--managed-python".as_ref(),
+        "--python".as_ref(),
+        PYTHON_VERSION.as_ref(),
+        dir.as_os_str(),
+    ])
+}
+
+/// `uv pip sync` for an environment. Without build constraints (the preflight, wheels only)
+/// every requirement must carry a hash. With them (the export) uv cannot require hashes: the two
+/// git packages have none and are pinned by commit, so every wheel's hash is verified and the
+/// build backends that turn those commits into wheels must match `build_constraints`' hashes.
+pub(crate) fn sync_args(
+    python: &Path,
+    requirements: &Path,
+    build_constraints: Option<&Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = os_args(&[
+        "pip".as_ref(),
+        "sync".as_ref(),
+        "--python".as_ref(),
+        python.as_os_str(),
+    ]);
+    match build_constraints {
+        None => args.push("--require-hashes".into()),
+        Some(bc) => args.extend(os_args(&[
+            "--verify-hashes".as_ref(),
+            "--build-constraints".as_ref(),
+            bc.as_os_str(),
+            "--require-build-hashes".as_ref(),
+            "--preview-features".as_ref(),
+            "build-dependency-hashes".as_ref(),
+            // Exact pins plus hashes, so taking each wheel from whichever index has it is safe;
+            // first-index matching would look for every package on the torch index only.
+            "--index-strategy".as_ref(),
+            "unsafe-best-match".as_ref(),
+            "--extra-index-url".as_ref(),
+            TORCH_CPU_INDEX.as_ref(),
+        ])),
+    }
+    args.push(requirements.as_os_str().to_os_string());
+    args
+}
+
 /// The real host: uv environments under the Cascadia cache, the driver in a temp dir.
 struct UvHost {
     uv: PathBuf,
@@ -412,10 +769,9 @@ impl UvHost {
         })
     }
 
-    fn uv(&self, args: &[&std::ffi::OsStr]) -> Result<()> {
-        let status = std::process::Command::new(&self.uv)
+    fn uv(&self, args: &[std::ffi::OsString]) -> Result<()> {
+        let status = uv_command(&self.uv)
             .args(args)
-            .stdin(std::process::Stdio::null())
             .status()
             .with_context(|| format!("running {}", self.uv.display()))?;
         if !status.success() {
@@ -425,8 +781,16 @@ impl UvHost {
     }
 
     /// The environment for `requirements`, built once and reused while the pins stay the same.
-    fn ensure_env(&self, kind: &str, requirements: &str, torch_index: bool) -> Result<PathBuf> {
-        let id = requirements_id(requirements);
+    fn ensure_env(
+        &self,
+        kind: &str,
+        requirements: &str,
+        build_constraints: Option<&str>,
+    ) -> Result<PathBuf> {
+        let id = requirements_id(&format!(
+            "{PYTHON_VERSION}\n{requirements}\n{}",
+            build_constraints.unwrap_or_default()
+        ));
         let dir = self.root.join(format!("{kind}-{id}"));
         let python = venv_python(&dir);
         let stamp = dir.join(".cascadia-ready");
@@ -435,39 +799,20 @@ impl UvHost {
         }
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("creating {}", self.root.display()))?;
-        let reqs = self.root.join(format!("{kind}-{id}.txt"));
-        std::fs::write(&reqs, requirements)
-            .with_context(|| format!("writing {}", reqs.display()))?;
+        let write = |suffix: &str, text: &str| -> Result<PathBuf> {
+            let path = self.root.join(format!("{kind}-{id}{suffix}"));
+            std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+            Ok(path)
+        };
+        let reqs = write(".txt", requirements)?;
+        let bc = build_constraints
+            .map(|text| write("-build.txt", text))
+            .transpose()?;
         eprintln!("Preparing the {kind} environment in {}", dir.display());
         if !python.is_file() {
-            // A run killed mid-create leaves the directory without a Python; build over it.
-            self.uv(&[
-                "venv".as_ref(),
-                "--allow-existing".as_ref(),
-                "--python".as_ref(),
-                PYTHON_VERSION.as_ref(),
-                dir.as_os_str(),
-            ])?;
+            self.uv(&venv_args(&dir))?;
         }
-        let mut sync: Vec<&std::ffi::OsStr> = vec![
-            "pip".as_ref(),
-            "sync".as_ref(),
-            "--python".as_ref(),
-            python.as_os_str(),
-            "--verify-hashes".as_ref(),
-        ];
-        if torch_index {
-            // Exact pins plus hashes, so taking each wheel from whichever index has it is safe;
-            // first-index matching would look for every package on the torch index only.
-            sync.extend::<[&std::ffi::OsStr; 4]>([
-                "--index-strategy".as_ref(),
-                "unsafe-best-match".as_ref(),
-                "--extra-index-url".as_ref(),
-                TORCH_CPU_INDEX.as_ref(),
-            ]);
-        }
-        sync.push(reqs.as_os_str());
-        self.uv(&sync)?;
+        self.uv(&sync_args(&python, &reqs, bc.as_deref()))?;
         std::fs::write(&stamp, &id).with_context(|| format!("writing {}", stamp.display()))?;
         Ok(python)
     }
@@ -514,6 +859,10 @@ impl ExportHost for UvHost {
             })
             .collect();
         HostFacts {
+            uv_version: find_on_path("uv").and_then(|uv| {
+                let out = uv_command(&uv).arg("--version").output().ok()?;
+                parse_uv_version(&String::from_utf8_lossy(&out.stdout))
+            }),
             uv: find_on_path("uv"),
             git: find_on_path("git"),
             total_ram: sys.total_memory(),
@@ -525,8 +874,7 @@ impl ExportHost for UvHost {
     }
 
     fn prepare_preflight(&mut self) -> Result<()> {
-        self.preflight_python =
-            Some(self.ensure_env("preflight", PREFLIGHT_REQUIREMENTS, false)?);
+        self.preflight_python = Some(self.ensure_env("preflight", PREFLIGHT_REQUIREMENTS, None)?);
         Ok(())
     }
 
@@ -552,11 +900,16 @@ impl ExportHost for UvHost {
     }
 
     fn prepare_export(&mut self) -> Result<()> {
-        self.export_python = Some(self.ensure_env("env", REQUIREMENTS, true)?);
+        self.export_python = Some(self.ensure_env("env", REQUIREMENTS, Some(BUILD_CONSTRAINTS))?);
         Ok(())
     }
 
-    fn export(&mut self, args: &ExportPolicyArgs, _preflight: &Preflight) -> Result<()> {
+    fn export(
+        &mut self,
+        args: &ExportPolicyArgs,
+        _preflight: &Preflight,
+        dir: &Path,
+    ) -> Result<()> {
         let python = self
             .export_python
             .clone()
@@ -565,7 +918,7 @@ impl ExportHost for UvHost {
         cmd.args(["export", "--model", &args.model, "--preflight"])
             .arg(self.preflight_file())
             .arg("--out")
-            .arg(&args.out);
+            .arg(dir);
         if args.rtc {
             cmd.arg("--rtc");
         }
@@ -611,6 +964,7 @@ mod tests {
     fn roomy() -> HostFacts {
         HostFacts {
             uv: Some("/usr/bin/uv".into()),
+            uv_version: Some((0, 13, 8)),
             git: Some("/usr/bin/git".into()),
             total_ram: 16 * GIB,
             available_ram: 10 * GIB,
@@ -642,8 +996,28 @@ mod tests {
                 ok: true,
                 detail: "access granted".into(),
             }),
+            chunk_size: Some(50),
+            n_action_steps: Some(50),
+            state_dim: Some(8),
+            action_dim: Some(7),
+            stats_mode: Some("mean_std".into()),
             ..Default::default()
         }
+    }
+
+    fn manifest(trimmer: Option<u64>, steps: u64) -> String {
+        let post = match trimmer {
+            Some(n) => format!(r#"{{"type": "action_chunk_trimmer", "n_action_steps": {n}}}"#),
+            None => r#"{"type": "denormalize"}"#.into(),
+        };
+        format!(
+            r#"{{"model": {{"postprocessors": [{post}], "output_features": [
+                {{"init_args": {{"ftype": "ACTION", "name": "action", "shape": [{steps}, 7]}}}}]}}}}"#
+        )
+    }
+
+    fn stats_json(state: &str, action: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(r#"{{"state": {state}, "action": {action}}}"#)).unwrap()
     }
 
     #[test]
@@ -928,7 +1302,14 @@ mod tests {
         for (name, text) in [
             ("requirements.txt", REQUIREMENTS),
             ("requirements-preflight.txt", PREFLIGHT_REQUIREMENTS),
+            ("build-constraints.txt", BUILD_CONSTRAINTS),
         ] {
+            for path in ["/var/", "/tmp", "/Users/", "/home/", ":\\"] {
+                assert!(
+                    !text.contains(path),
+                    "{name} carries a machine path ({path})"
+                );
+            }
             let joined = text.replace("\\\n", " ");
             let reqs: Vec<&str> = joined
                 .lines()
@@ -962,6 +1343,13 @@ mod tests {
         ] {
             assert!(REQUIREMENTS.contains(want), "requirements.txt lacks {want:?}");
         }
+        assert!(!PREFLIGHT_REQUIREMENTS.contains(" @ git+"));
+        for backend in ["\nhatchling==", "\nhatch-vcs==", "\nsetuptools=="] {
+            assert!(
+                BUILD_CONSTRAINTS.contains(backend),
+                "build constraints lack {backend:?}"
+            );
+        }
         let hub = REQUIREMENTS
             .lines()
             .find(|l| l.starts_with("huggingface-hub=="))
@@ -977,6 +1365,10 @@ mod tests {
         facts: HostFacts,
         preflight: Preflight,
         calls: Vec<&'static str>,
+        manifest: String,
+        fail: bool,
+        /// The staging directory the export was given, and whether --out existed meanwhile.
+        staged: Option<(PathBuf, bool)>,
     }
 
     impl ExportHost for FakeHost {
@@ -996,10 +1388,16 @@ mod tests {
             self.calls.push("prepare_export");
             Ok(())
         }
-        fn export(&mut self, a: &ExportPolicyArgs, _p: &Preflight) -> Result<()> {
+        fn export(&mut self, a: &ExportPolicyArgs, _p: &Preflight, dir: &Path) -> Result<()> {
             self.calls.push("export");
-            std::fs::create_dir_all(&a.out)?;
-            std::fs::write(a.out.join("manifest.json"), "{}")?;
+            self.staged = Some((dir.to_path_buf(), a.out.join("manifest.json").exists()));
+            std::fs::create_dir_all(dir.join("sub"))?;
+            std::fs::create_dir_all(sibling(dir, ".f32"))?;
+            std::fs::write(dir.join("manifest.json"), &self.manifest)?;
+            std::fs::write(dir.join("sub").join("x"), "x")?;
+            if self.fail {
+                return Err(anyhow!("exporter died"));
+            }
             Ok(())
         }
     }
@@ -1009,13 +1407,304 @@ mod tests {
         pre: Preflight,
         a: &ExportPolicyArgs,
     ) -> (Result<()>, Vec<&'static str>) {
+        let (r, host) = run_host(facts, pre, a, manifest(None, 50), false);
+        (r, host.calls)
+    }
+
+    fn run_host(
+        facts: HostFacts,
+        pre: Preflight,
+        a: &ExportPolicyArgs,
+        manifest: String,
+        fail: bool,
+    ) -> (Result<()>, FakeHost) {
         let mut host = FakeHost {
             facts,
             preflight: pre,
             calls: vec![],
+            manifest,
+            fail,
+            staged: None,
         };
         let r = run_export(a, &mut host);
-        (r, host.calls)
+        (r, host)
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn strs(v: &[std::ffi::OsString]) -> Vec<String> {
+        v.iter().map(|s| s.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn uv_command_lines_pin_python_and_check_every_hash() {
+        let v = strs(&venv_args(Path::new("env")));
+        assert_eq!(
+            v,
+            [
+                "venv",
+                "--allow-existing",
+                "--managed-python",
+                "--python",
+                "3.12.16",
+                "env"
+            ]
+        );
+        // preflight: wheels only, so every requirement must carry a hash
+        let pre = strs(&sync_args(Path::new("py"), Path::new("r.txt"), None));
+        assert!(pre.contains(&"--require-hashes".into()), "{pre:?}");
+        assert!(!pre.iter().any(|a| a.contains("index")), "{pre:?}");
+        assert_eq!(pre.last().unwrap(), "r.txt");
+        // export: wheel hashes verified, git pins by commit, build backends hash-checked
+        let full = strs(&sync_args(
+            Path::new("py"),
+            Path::new("r.txt"),
+            Some(Path::new("b.txt")),
+        ));
+        for want in [
+            "--verify-hashes",
+            "--require-build-hashes",
+            "build-dependency-hashes",
+            TORCH_CPU_INDEX,
+        ] {
+            assert!(
+                full.contains(&want.to_string()),
+                "missing {want} in {full:?}"
+            );
+        }
+        let at = full
+            .iter()
+            .position(|a| a == "--build-constraints")
+            .unwrap();
+        assert_eq!(full[at + 1], "b.txt");
+        assert!(!full.contains(&"--require-hashes".into()));
+    }
+
+    #[test]
+    fn only_the_uv_cache_dir_survives_from_the_environment() {
+        for (name, scrubbed) in [
+            ("UV_INDEX_URL", true),
+            ("UV_EXTRA_INDEX_URL", true),
+            ("UV_NO_VERIFY_HASHES", true),
+            ("UV_PYTHON_INSTALL_MIRROR", true),
+            ("UV_CACHE_DIR", false),
+            ("HF_TOKEN", false),
+            ("PATH", false),
+        ] {
+            assert_eq!(is_scrubbed_uv_var(name.as_ref()), scrubbed, "{name}");
+        }
+    }
+
+    #[test]
+    fn refuses_an_old_or_unreadable_uv() {
+        let f = HostFacts {
+            uv_version: Some((0, 10, 4)),
+            ..roomy()
+        };
+        let msg = host_refusal(&f).unwrap();
+        for want in ["0.10.4", "0.13.6", "uv self update"] {
+            assert!(msg.contains(want), "missing {want:?} in {msg}");
+        }
+        let f = HostFacts {
+            uv_version: None,
+            ..roomy()
+        };
+        assert!(host_refusal(&f).unwrap().contains("uv --version"));
+        let f = HostFacts {
+            uv_version: Some((0, 13, 6)),
+            ..roomy()
+        };
+        assert_eq!(host_refusal(&f), None);
+        assert_eq!(
+            parse_uv_version("uv 0.13.8 (3d97a6aad 2026-11-12 aarch64-apple-darwin)"),
+            Some((0, 13, 8))
+        );
+        assert_eq!(parse_uv_version("uv 1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_uv_version("uv 0.14.0-rc.1"), Some((0, 14, 0)));
+        assert_eq!(parse_uv_version("garbage"), None);
+    }
+
+    #[test]
+    fn finds_the_subcommand_after_global_flags() {
+        for argv in [
+            &["cascadia", "--log-level", "debug", "run", "pkg"][..],
+            &["cascadia", "--log-level=info", "worker", "--rank", "0"],
+            &["/opt/bin/cascadia", "serve"],
+        ] {
+            let procs = [proc(9, "cascadia", argv)];
+            assert!(serving_process(&procs, 1).is_some(), "{argv:?}");
+        }
+        // `run` as the value of a global flag is not the subcommand
+        let procs = [proc(
+            9,
+            "cascadia",
+            &["cascadia", "--log-level", "run", "doctor"],
+        )];
+        assert_eq!(serving_process(&procs, 1), None);
+        let procs = [proc(
+            9,
+            "cascadia",
+            &["cascadia", "export-policy", "m/x", "--out", "run"],
+        )];
+        assert_eq!(serving_process(&procs, 1), None);
+    }
+
+    #[test]
+    fn validates_model_ids() {
+        for ok in [
+            "lerobot/smolvla_libero",
+            "HuggingFaceVLA/smolvla_libero",
+            "a/b.c-d_e",
+        ] {
+            validate_model_id(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        let long = format!("a/{}", "b".repeat(97));
+        for bad in [
+            "smolvla",
+            "a/b/c",
+            "/b",
+            "a/",
+            "a b/c",
+            "a/b--c",
+            "a/b..c",
+            "a/.b",
+            "a/b-",
+            "a/b.git",
+            "../x",
+            long.as_str(),
+        ] {
+            let err = validate_model_id(bad).unwrap_err().to_string();
+            assert!(err.contains("model id"), "{bad}: {err}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = check_inputs(&args("nope", &dir.path().join("p"))).unwrap_err();
+        assert!(err.to_string().contains("model id"), "{err}");
+    }
+
+    #[test]
+    fn refuses_an_out_without_a_file_name() {
+        for out in [".", "/", "..", "pkg/.."] {
+            let err = check_inputs(&args("m/x", Path::new(out)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--out"), "{out}: {err}");
+        }
+    }
+
+    #[test]
+    fn stats_widths_and_modes_are_checked_before_the_export_environment() {
+        let p = passing("pi05");
+        let ok = stats_json(
+            r#"{"mean": [0,0,0,0,0,0,0,0], "std": [1,1,1,1,1,1,1,1]}"#,
+            r#"{"mean": [0], "std": [1]}"#,
+        );
+        assert_eq!(stats_refusal(&ok, &p), None);
+        let wide = stats_json(
+            r#"{"mean": [0,0,0,0,0,0,0,0,0], "std": [1]}"#,
+            r#"{"mean": [0], "std": [1]}"#,
+        );
+        let msg = stats_refusal(&wide, &p).unwrap();
+        assert!(
+            msg.contains("state.mean has 9 values") && msg.contains("8"),
+            "{msg}"
+        );
+        let empty = stats_json(
+            r#"{"mean": [], "std": [1]}"#,
+            r#"{"mean": [0], "std": [1]}"#,
+        );
+        assert!(stats_refusal(&empty, &p).unwrap().contains("state.mean"));
+        let mut q = passing("pi05");
+        q.stats_mode = Some("quantiles".into());
+        let msg = stats_refusal(&ok, &q).unwrap();
+        assert!(
+            msg.contains("quantiles") && msg.contains("q01") && msg.contains("q99"),
+            "{msg}"
+        );
+        // DROID: 8-wide stats for a 32-wide package are padded later
+        let mut droid = passing("pi05");
+        droid.state_dim = Some(32);
+        droid.action_dim = Some(32);
+        assert_eq!(stats_refusal(&ok, &droid), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s.json");
+        std::fs::write(&file, wide.to_string()).unwrap();
+        let mut a = args("lerobot/pi05_droid", &dir.path().join("pkg"));
+        a.stats = Some(file);
+        let mut no_stats = passing("pi05");
+        no_stats.stats.as_mut().unwrap().ok = false;
+        let (r, calls) = run_fake(roomy(), no_stats, &a);
+        assert!(r.unwrap_err().to_string().contains("9 values"));
+        assert_eq!(calls, ["facts", "prepare_preflight", "preflight"]);
+    }
+
+    #[test]
+    fn exported_chunk_must_match_the_checkpoint() {
+        let doc = |t, s| serde_json::from_str::<serde_json::Value>(&manifest(t, s)).unwrap();
+        let mut p = passing("smolvla");
+        check_exported_chunk(&doc(None, 50), &p, false).unwrap();
+        assert!(check_exported_chunk(&doc(Some(10), 50), &p, false).is_err());
+        assert!(check_exported_chunk(&doc(None, 40), &p, false).is_err());
+        p.n_action_steps = Some(1);
+        check_exported_chunk(&doc(Some(1), 50), &p, false).unwrap();
+        let err = check_exported_chunk(&doc(None, 50), &p, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("n_action_steps"), "{err}");
+        // --rtc serves the whole chunk whatever the checkpoint says
+        check_exported_chunk(&doc(None, 50), &p, true).unwrap();
+        assert!(check_exported_chunk(&doc(Some(1), 50), &p, true).is_err());
+    }
+
+    #[test]
+    fn exports_into_a_staging_dir_and_renames_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = args("lerobot/smolvla_libero", &dir.path().join("pkg"));
+        let (r, host) = run_host(roomy(), passing("smolvla"), &a, manifest(None, 50), false);
+        r.unwrap();
+        let (staged, out_seen) = host.staged.unwrap();
+        assert_eq!(staged, staging_dir(&a.out).unwrap());
+        assert!(!out_seen, "--out existed while exporting");
+        assert_eq!(entries(&a.out), ["NOTICE", "manifest.json", "sub"]);
+        assert_eq!(entries(dir.path()), ["pkg"]);
+        // an existing empty --out is replaced
+        let a2 = args("lerobot/smolvla_libero", &dir.path().join("empty"));
+        std::fs::create_dir(&a2.out).unwrap();
+        run_host(roomy(), passing("smolvla"), &a2, manifest(None, 50), false)
+            .0
+            .unwrap();
+        assert!(a2.out.join("NOTICE").is_file());
+    }
+
+    #[test]
+    fn a_failed_export_leaves_nothing_behind() {
+        for (m, fail) in [(manifest(None, 50), true), (manifest(Some(3), 50), false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = args("lerobot/smolvla_libero", &dir.path().join("pkg"));
+            let (r, _) = run_host(roomy(), passing("smolvla"), &a, m, fail);
+            assert!(r.is_err());
+            assert!(entries(dir.path()).is_empty(), "{:?}", entries(dir.path()));
+        }
+    }
+
+    #[test]
+    fn never_touches_an_existing_staging_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = args("lerobot/smolvla_libero", &dir.path().join("pkg"));
+        let staging = staging_dir(&a.out).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("keep"), "x").unwrap();
+        let (r, calls) = run_fake(roomy(), passing("smolvla"), &a);
+        assert!(r.unwrap_err().to_string().contains("already exists"));
+        assert_eq!(calls, ["facts"]);
+        assert!(staging.join("keep").is_file());
     }
 
     #[test]
